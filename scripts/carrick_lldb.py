@@ -318,6 +318,119 @@ def cmd_where(debugger, command, exe_ctx, result, internal_dict):
     )
 
 
+# ----- event ring (carrick_runtime::event_ring) ---------------------------
+#
+# Reads the lock-free in-memory diagnostic ring from a LIVE carrick process or a
+# CORE file — the durable, non-perturbing way to see the fork/socket/epoll event
+# history of a hung guest process (e.g. the forkserver-from-forkserver deadlock).
+# Mirrors the Rust decode in `crates/carrick-runtime/src/event_ring.rs`.
+
+_EVENTRING_N = 8192  # must match event_ring::N
+
+# kind -> (name, formatter(a, b, c))
+_EVENTRING_KINDS = {
+    1: ("BIND", lambda a, b, c: f"gfd={a} hfd={b} pathhash={c & 0xffffffff:#010x}"),
+    2: ("LISTEN", lambda a, b, c: f"hfd={a}"),
+    3: ("CONNECT", lambda a, b, c: f"hfd={a} rc={b} pathhash={c & 0xffffffff:#010x}"),
+    4: ("ACCEPT", lambda a, b, c: f"listener_hfd={a} ret={b}"),
+    5: ("EPADD", lambda a, b, c: f"kq={a} hfd={b} events={c & 0xffffffff:#x}"),
+    6: ("EPWAIT", lambda a, b, c: f"kq={a} ready={b} timeout={c}"),
+    7: ("FORK", lambda a, b, c: f"child_pid={a}"),
+    8: ("EXEC", lambda a, b, c: f"path_present={a}"),
+}
+
+
+def _signed32(x: int) -> int:
+    x &= 0xFFFFFFFF
+    return x - (1 << 32) if x & 0x8000_0000 else x
+
+
+def _static_load_addr(target, fullname: str) -> Optional[int]:
+    """Load address of a Rust static (e.g. carrick_runtime::event_ring::RING),
+    via DWARF globals first then the symbol table — works for live + core.
+
+    Rust mangles statics with a trailing `::h<hash>`, so the demangled symbol is
+    `carrick_runtime::event_ring::RING::h0382...`; we match by name COMPONENTS
+    (module + base both present) rather than by exact string."""
+    module_name = fullname.split("::")[-2]  # "event_ring"
+    base = fullname.split("::")[-1]  # "RING" / "IDX"
+
+    var_list = target.FindGlobalVariables(base, 50)
+    for i in range(var_list.GetSize()):
+        var = var_list.GetValueAtIndex(i)
+        name = var.GetName() or ""
+        parts = name.split("::")
+        if module_name in parts and base in parts:
+            addr = var.GetLoadAddress()
+            if addr != lldb.LLDB_INVALID_ADDRESS:
+                return addr
+
+    for module in target.modules:
+        for sym in module:
+            name = sym.GetName() or ""
+            if "event_ring" not in name:
+                continue
+            parts = name.split("::")
+            if module_name in parts and base in parts:
+                addr = sym.GetStartAddress().GetLoadAddress(target)
+                if addr != lldb.LLDB_INVALID_ADDRESS:
+                    return addr
+    return None
+
+
+def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
+    """carrick eventring — decode the in-memory event ring (live or core)"""
+    target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
+    if not target or not target.IsValid():
+        result.SetError("no target; `lldb <binary>` (attach) or `lldb -c <core> <binary>`")
+        return
+    process = exe_ctx.GetProcess() or target.GetProcess()
+    if not process or not process.IsValid():
+        result.SetError(
+            "no process/core loaded. Attach to a live carrick (`lldb -p <pid>`) "
+            "or load a core (`lldb -c <core> target/release/carrick`)."
+        )
+        return
+    idx_addr = _static_load_addr(target, "carrick_runtime::event_ring::IDX")
+    ring_addr = _static_load_addr(target, "carrick_runtime::event_ring::RING")
+    if idx_addr is None or ring_addr is None:
+        result.SetError(
+            "event_ring RING/IDX symbols not found — the binary must retain "
+            "symbols (release keeps them unless explicitly stripped)."
+        )
+        return
+    err = lldb.SBError()
+    raw_idx = process.ReadMemory(idx_addr, 8, err)
+    if not err.Success():
+        result.SetError(f"read IDX @ {_fmt_hex(idx_addr)} failed: {err.GetCString()}")
+        return
+    total = int.from_bytes(raw_idx, "little")
+    count = min(total, _EVENTRING_N)
+    start = total - count
+    # Bulk-read the whole ring once (128 KiB) so a core read is one round-trip.
+    raw_ring = process.ReadMemory(ring_addr, _EVENTRING_N * 16, err)
+    if not err.Success():
+        result.SetError(f"read RING @ {_fmt_hex(ring_addr)} failed: {err.GetCString()}")
+        return
+    pid = process.GetProcessID()
+    out = [f"# carrick event ring  pid={pid}  total={total}  showing={count}"]
+    for k in range(count):
+        gi = start + k
+        off = (gi % _EVENTRING_N) * 16
+        lo = int.from_bytes(raw_ring[off : off + 8], "little")
+        hi = int.from_bytes(raw_ring[off + 8 : off + 16], "little")
+        a = _signed32(lo & 0xFFFFFFFF)
+        b = _signed32(lo >> 32)
+        c = _signed32(hi & 0xFFFFFFFF)
+        kind = (hi >> 32) & 0xFF
+        spec = _EVENTRING_KINDS.get(kind)
+        if spec is None:
+            continue  # torn/empty slot
+        name, fmt = spec
+        out.append(f"{gi:6} {name:8} {fmt(a, b, c)}")
+    result.AppendMessage("\n".join(out))
+
+
 # ----- the top-level `carrick` multiplex command --------------------------
 
 _SUBCOMMANDS = {
@@ -327,6 +440,7 @@ _SUBCOMMANDS = {
     "decode-esr": cmd_decode_esr,
     "gva": cmd_gva,
     "where": cmd_where,
+    "eventring": cmd_eventring,
 }
 
 
