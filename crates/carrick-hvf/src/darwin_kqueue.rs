@@ -371,17 +371,42 @@ mod tests {
 
     #[test]
     fn kqueue_closes_fd_on_drop() {
-        let fd = {
+        // `Kqueue::drop` must close its fd. Asserting that the freed fd *number*
+        // reads back EBADF after a single drop is racy under the parallel test
+        // harness: the moment Drop closes the fd, another test thread can reuse
+        // that number for a fresh descriptor, so F_GETFD nondeterministically
+        // reads back as a live, unrelated fd (observed: == FD_CLOEXEC from a
+        // sibling's new CLOEXEC fd). Inspecting the bare number is therefore racy
+        // to read and unsafe to close/dup2 (it might clobber the sibling).
+        //
+        // But that reuse can only happen *because* Drop freed the number — so
+        // retry until we observe an iteration where it is still free and reads
+        // back EBADF. A correct Drop reaches that within a try or two; a Drop that
+        // failed to close would read back its own live kqueue on every attempt and
+        // never reach EBADF, failing the bounded loop. Only ever *reads* the fd.
+        let mut observed_close = false;
+        for _ in 0..128 {
             let kqueue = Kqueue::new_internal().expect("kqueue should open");
             let fd = kqueue.raw_fd();
-            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
-            fd
-        };
-
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+            assert!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+                "fd must be live while the Kqueue is held"
+            );
+            drop(kqueue);
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF),
+                    "a closed fd must report EBADF"
+                );
+                observed_close = true;
+                break;
+            }
+            // The freed number was reused before we looked; retry with a fresh one.
+        }
+        assert!(
+            observed_close,
+            "Kqueue::drop never closed its fd: F_GETFD never read back EBADF in 128 attempts"
         );
     }
 
