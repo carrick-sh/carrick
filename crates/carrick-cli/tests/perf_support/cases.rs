@@ -16,6 +16,10 @@ pub struct PerfCase {
     /// better (latency, us). Controls the win/lose direction of the reported
     /// carrick/docker ratio.
     pub higher_is_better: bool,
+    /// true = bind-mount `.bench-scratch` into the guest (carrick `--fs host -v`
+    /// / docker `-v`) at /mnt and set `BENCH_DIR=/mnt`; native gets
+    /// `BENCH_DIR=<abs .bench-scratch>`. The direct-host-FD-vs-virtiofs disk test.
+    pub mount_scratch: bool,
 }
 
 /// Registered workloads. Adding one = an entry here + a probe in
@@ -30,6 +34,7 @@ pub const CASES: &[PerfCase] = &[
         metric_key: "tcp_rr_p50_us",
         unit: "us",
         higher_is_better: false,
+        mount_scratch: false,
     },
     // Throughput (higher better): loopback bulk stream — exercises carrick's
     // per-call bounce-buffer memcpy vs docker's in-kernel loopback.
@@ -40,6 +45,7 @@ pub const CASES: &[PerfCase] = &[
         metric_key: "tcp_stream_mbps",
         unit: "MB/s",
         higher_is_better: true,
+        mount_scratch: false,
     },
     // Latency (lower better): deep-path stat storm — carrick's cap-std
     // per-component openat re-walk vs docker's single in-kernel VFS walk.
@@ -50,6 +56,29 @@ pub const CASES: &[PerfCase] = &[
         metric_key: "stat_p50_us",
         unit: "us",
         higher_is_better: false,
+        mount_scratch: false,
+    },
+    // Throughput (higher better): bulk WRITE over a bind mount — carrick's
+    // direct host FD (--fs host -v) vs docker's virtiofs VM-boundary round-trip.
+    // The sharpest test of the "no virtiofs abstraction" disk thesis.
+    PerfCase {
+        probe: "perf_disk_vol",
+        dimension: "disk",
+        workload: "vol_write",
+        metric_key: "disk_vol_write_mbps",
+        unit: "MB/s",
+        higher_is_better: true,
+        mount_scratch: true,
+    },
+    // Throughput (higher better): bulk READ over the same bind mount.
+    PerfCase {
+        probe: "perf_disk_vol",
+        dimension: "disk",
+        workload: "vol_read",
+        metric_key: "disk_vol_read_mbps",
+        unit: "MB/s",
+        higher_is_better: true,
+        mount_scratch: true,
     },
 ];
 

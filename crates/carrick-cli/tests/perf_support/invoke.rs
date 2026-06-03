@@ -83,15 +83,55 @@ fn feed_stdin(child: &mut std::process::Child, bytes: &[u8]) {
     });
 }
 
+/// Guest mount point for the bind-mount disk cases.
+const GUEST_MOUNT: &str = "/mnt";
+
+/// Shell snippet that exports BENCH_DIR before exec'ing the base64-injected
+/// probe — env-forwarding into the guest isn't relied on, so the probe reads
+/// its target dir from the shell it inherits.
+fn mounted_snippet() -> String {
+    format!("export BENCH_DIR={GUEST_MOUNT}; {PROBE_SNIPPET}")
+}
+
+/// `-v` spec mounting the gitignored internal-SSD scratch dir at GUEST_MOUNT.
+fn scratch_mount_spec(repo_root: &Path) -> String {
+    format!("{}/.bench-scratch:{GUEST_MOUNT}", repo_root.display())
+}
+
 /// Run `probe_b64` under carrick (cold lane: a fresh `carrick run`), with
-/// CARRICK_EXPOSED_CPUS=CPU_PIN. `repo_root` is the workspace root; `run_id` is
-/// reaped on timeout. Returns combined guest output.
-pub fn run_carrick(bin: &PathBuf, repo_root: &Path, run_id: &str, probe_b64: &[u8]) -> String {
+/// CARRICK_EXPOSED_CPUS=CPU_PIN. When `mount`, bind-mounts `.bench-scratch` at
+/// /mnt (`-v`, needs `--fs host`) and points the probe at it via BENCH_DIR.
+/// `repo_root` is the workspace root; `run_id` is reaped on timeout.
+pub fn run_carrick(
+    bin: &PathBuf,
+    repo_root: &Path,
+    run_id: &str,
+    probe_b64: &[u8],
+    mount: bool,
+) -> String {
+    let snippet = if mount {
+        mounted_snippet()
+    } else {
+        PROBE_SNIPPET.to_string()
+    };
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--platform".into(),
+        PLATFORM.into(),
+        "--raw".into(),
+        "--fs".into(),
+        "host".into(),
+    ];
+    if mount {
+        args.push("-v".into());
+        args.push(scratch_mount_spec(repo_root));
+    }
+    args.push(IMAGE.into());
+    args.push("/bin/sh".into());
+    args.push("-c".into());
+    args.push(snippet);
     let mut child = Command::new(bin)
-        .args([
-            "run", "--platform", PLATFORM, "--raw", "--fs", "host",
-            IMAGE, "/bin/sh", "-c", PROBE_SNIPPET,
-        ])
+        .args(&args)
         .env("CARRICK_RUN_ID", run_id)
         .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
         .stdin(std::process::Stdio::piped())
@@ -109,12 +149,14 @@ pub fn run_carrick(bin: &PathBuf, repo_root: &Path, run_id: &str, probe_b64: &[u
 /// aarch64-apple-darwin binary from the bench-native crate; it self-times and
 /// prints the same key=value output as the guest probes. No base64/stdin
 /// injection, no run-id, no cleanup — it is just a host process.
-pub fn run_native(native_bin: &Path) -> String {
-    let out = match Command::new(native_bin)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-    {
+pub fn run_native(native_bin: &Path, bench_dir: Option<&str>) -> String {
+    let mut cmd = Command::new(native_bin);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(d) = bench_dir {
+        cmd.env("BENCH_DIR", d);
+    }
+    let out = match cmd.output() {
         Ok(o) => o,
         Err(e) => return format!("<native spawn failed: {e}>"),
     };
@@ -125,12 +167,31 @@ pub fn run_native(native_bin: &Path) -> String {
 
 /// Run `probe_b64` under Docker, pinned to 4 CPUs via --cpuset-cpus so `nproc`
 /// inside the container is 4 (CFS --cpus would NOT change nproc).
-pub fn run_docker(repo_root: &Path, run_id: &str, probe_b64: &[u8]) -> String {
+pub fn run_docker(repo_root: &Path, run_id: &str, probe_b64: &[u8], mount: bool) -> String {
+    let snippet = if mount {
+        mounted_snippet()
+    } else {
+        PROBE_SNIPPET.to_string()
+    };
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-i".into(),
+        "--rm".into(),
+        "--platform".into(),
+        PLATFORM.into(),
+        "--cpuset-cpus".into(),
+        "0-3".into(),
+    ];
+    if mount {
+        args.push("-v".into());
+        args.push(scratch_mount_spec(repo_root));
+    }
+    args.push(IMAGE.into());
+    args.push("/bin/sh".into());
+    args.push("-c".into());
+    args.push(snippet);
     let mut child = Command::new("docker")
-        .args([
-            "run", "-i", "--rm", "--platform", PLATFORM, "--cpuset-cpus", "0-3",
-            IMAGE, "/bin/sh", "-c", PROBE_SNIPPET,
-        ])
+        .args(&args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
