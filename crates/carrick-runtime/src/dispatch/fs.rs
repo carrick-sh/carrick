@@ -2018,6 +2018,9 @@ impl SyscallDispatcher {
         if let Err(errno) = self.layered_metadata(&resolved) {
             return Ok(errno.into());
         }
+        if let Some(errno) = self.chmod_permission_errno(&resolved) {
+            return Ok(errno.into());
+        }
         let mode = self.maybe_clear_setgid(&resolved, (mode & 0o7777) as u32);
         if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
             return match m.vfs.chmod(&m.full_path, mode) {
@@ -2078,6 +2081,23 @@ impl SyscallDispatcher {
             return Some(LINUX_EPERM);
         }
         None
+    }
+
+    /// chmod(2)/fchmod(2) permission: only the file owner or a process with
+    /// CAP_FOWNER (modeled as euid==0) may change a file's mode; everyone else
+    /// gets EPERM (Linux fs/attr.c chmod_common -> inode_owner_or_capable). When
+    /// the backend can't supply an owner (the in-memory backend has no real
+    /// owner/mode), we don't enforce — matching the legacy root model used
+    /// elsewhere on that backend (and mirroring `maybe_clear_setgid`'s lookup).
+    fn chmod_permission_errno(&self, path: &str) -> Option<i32> {
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return None;
+        }
+        match self.fs.rootfs_vfs.overlay.get_owner(path) {
+            Some((owner_uid, _)) if owner_uid != creds.euid => Some(LINUX_EPERM),
+            _ => None,
+        }
     }
 
     /// Apply chown to the file backing an fd, recording the guest-visible owner
@@ -6086,6 +6106,9 @@ impl SyscallDispatcher {
                     _ => None,
                 });
             if let Some(path) = path {
+                if let Some(errno) = this.chmod_permission_errno(&path) {
+                    return Ok(errno.into());
+                }
                 let mode = this.maybe_clear_setgid(&path, mode);
                 if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
                     if let Err(errno) = m.vfs.chmod(&m.full_path, mode) {
