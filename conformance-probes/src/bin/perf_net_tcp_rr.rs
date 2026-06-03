@@ -28,7 +28,9 @@ fn main() {
 
     let server = thread::spawn(move || {
         let (mut conn, _) = listener.accept().expect("accept");
-        conn.set_nodelay(true).ok();
+        // Enforce (not best-effort) on the server side too: a silent Nagle here
+        // would skew the measured RR latency. Loopback never fails this.
+        conn.set_nodelay(true).expect("server nodelay");
         let mut byte = [0u8; 1];
         // Echo until the client hangs up (read returns 0).
         loop {
