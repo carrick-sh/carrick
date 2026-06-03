@@ -306,6 +306,15 @@ underlying gap got fixed):
 
 ## Language-runtime conformance snapshot — 2026-06-02
 
+> [!NOTE]
+> **Superseded by the generated [support matrix](support-matrix.md).** As of
+> 2026-06-03 the language/LTP runs are driven by the unified
+> [`carrick-conformance`](../crates/carrick-conformance) harness
+> (`scripts/conformance/suites.toml`); `just conformance` / `just matrix` render
+> `docs/support-matrix.md` from results, which is the current source of truth.
+> The hand-written snapshot below is kept for its method notes + the historical
+> 2026-06-02 numbers.
+
 A *different* axis from the probe map above: end-to-end differential runs of real
 language test suites under `carrick run` vs the **Docker linux/arm64 oracle**
 (same image, same args; outcome-category diff). These are discovery runs, not the
