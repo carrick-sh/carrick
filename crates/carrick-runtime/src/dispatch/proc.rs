@@ -673,9 +673,7 @@ impl SyscallDispatcher {
                         .as_ref()
                         .and_then(|t| t.registry.thread_name(t.tid))
                         .unwrap_or_else(|| this.proc.lock().task_name);
-                    if memory.write_bytes(arg2, &name).is_err() {
-                        return Ok(LINUX_EFAULT.into());
-                    }
+                    memory.write_bytes(arg2, &name)?;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_SET_PDEATHSIG => {
@@ -772,9 +770,7 @@ impl SyscallDispatcher {
                 }
                 LINUX_PR_GET_CHILD_SUBREAPER => {
                     let value = this.proc.lock().child_subreaper as i32;
-                    if memory.write_bytes(arg2, &value.to_ne_bytes()).is_err() {
-                        return Ok(LINUX_EFAULT.into());
-                    }
+                    memory.write_bytes(arg2, &value.to_ne_bytes())?;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 // PR_SET_TIMERSLACK: arg2 = new slack in ns (0 → reset to the
@@ -1020,9 +1016,7 @@ impl SyscallDispatcher {
             }
             let mask = this.proc.lock().affinity.clone();
             let buf = affinity_to_bytes(&mask, kernel_bytes);
-            if memory.write_bytes(address.0, &buf).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(address.0, &buf)?;
             Ok(DispatchOutcome::Returned {
                 value: kernel_bytes as i64,
             })
@@ -1033,10 +1027,7 @@ impl SyscallDispatcher {
             let memory = &*cx.memory;
 
             let read_len = size.min(128);
-            let bytes = match memory.read_bytes(address.0, read_len) {
-                Ok(bytes) => bytes,
-                Err(_) => return Ok(LINUX_EFAULT.into()),
-            };
+            let bytes = memory.read_bytes(address.0, read_len)?;
             let target = this.resolve_affinity_target(cx, pid);
             if matches!(target, AffinityTarget::NotFound) {
                 return Ok(LINUX_ESRCH.into());
@@ -1109,9 +1100,7 @@ impl SyscallDispatcher {
             }
             let memory = &mut *cx.memory;
             let prio: i32 = 0;
-            if memory.write_bytes(address.0, &prio.to_le_bytes()).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(address.0, &prio.to_le_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1148,9 +1137,7 @@ impl SyscallDispatcher {
             let memory = &mut *cx.memory;
             let mut buf = [0u8; SCHED_ATTR_SIZE_VER0 as usize];
             buf[0..4].copy_from_slice(&(SCHED_ATTR_SIZE_VER0 as u32).to_le_bytes());
-            if memory.write_bytes(attr.0, &buf).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(attr.0, &buf)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1213,9 +1200,7 @@ impl SyscallDispatcher {
             let mut buf = [0u8; 16];
             buf[0..8].copy_from_slice(&0i64.to_le_bytes());
             buf[8..16].copy_from_slice(&0i64.to_le_bytes());
-            if memory.write_bytes(address.0, &buf).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(address.0, &buf)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1405,9 +1390,7 @@ impl SyscallDispatcher {
             } else {
                 LinuxUtsname::carrick_aarch64_with_nodename(nodename)
             };
-            if memory.write_bytes(address.0, uts.abi_bytes()).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(address.0, uts.abi_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1651,9 +1634,7 @@ impl SyscallDispatcher {
                     build_sigchld_siginfo(ns_si_pid, info.si_uid, info.si_code, info.si_status)
                 };
                 let memory = &mut *cx.memory;
-                if memory.write_bytes(infop_addr.0, &bytes).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                memory.write_bytes(infop_addr.0, &bytes)?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1769,9 +1750,7 @@ impl SyscallDispatcher {
             let host_status = translate_wait_status(host_status);
             if wstatus_addr.0 != 0 {
                 let bytes = host_status.to_ne_bytes();
-                if memory.write_bytes(wstatus_addr.0, &bytes).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                memory.write_bytes(wstatus_addr.0, &bytes)?;
             }
             // PID namespace (§5.3): the guest must see the reaped child's
             // ns-local pid, not its host pid — critical for `wait4(-1)` where
@@ -1915,9 +1894,7 @@ impl SyscallDispatcher {
             if getrandom::fill(&mut bytes).is_err() {
                 fill_deterministic_bootstrap_random(&mut bytes);
             }
-            if memory.write_bytes(address.0, &bytes).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(address.0, &bytes)?;
             Ok(DispatchOutcome::Returned {
                 value: length as i64,
             })

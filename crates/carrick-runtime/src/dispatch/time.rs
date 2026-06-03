@@ -348,10 +348,7 @@ impl SyscallDispatcher {
             }
             let mut signum = crate::linux_abi::LINUX_SIGALRM;
             if sevp.0 != 0 {
-                let bytes = match memory.read_bytes(sevp.0, 16) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(LINUX_EFAULT.into()),
-                };
+                let bytes = memory.read_bytes(sevp.0, 16)?;
                 let signo = i32::from_le_bytes(bytes[8..12].try_into().unwrap_or([0; 4]));
                 let notify = i32::from_le_bytes(bytes[12..16].try_into().unwrap_or([0; 4]));
                 const LINUX_SIGEV_SIGNAL: i32 = 0;
@@ -465,9 +462,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EFAULT.into());
             }
             let spec = build_itimerspec_ns(value_ns, interval_ns);
-            if memory.write_bytes(cur_ptr.0, spec.as_bytes()).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(cur_ptr.0, spec.as_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -600,9 +595,7 @@ impl SyscallDispatcher {
                 ),
                 _ => rusage_from(host.user_us, host.system_us, host.maxrss_bytes, host.majflt),
             };
-            if memory.write_bytes(usage.0, rusage.abi_bytes()).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(usage.0, rusage.abi_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 

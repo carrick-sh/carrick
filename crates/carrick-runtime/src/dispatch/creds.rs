@@ -524,9 +524,7 @@ impl SyscallDispatcher {
                 if ptr.0 == 0 {
                     continue;
                 }
-                if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                cx.memory.write_bytes(ptr.0, &value.to_le_bytes())?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -541,9 +539,7 @@ impl SyscallDispatcher {
                 if ptr.0 == 0 {
                     continue;
                 }
-                if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                cx.memory.write_bytes(ptr.0, &value.to_le_bytes())?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -573,9 +569,7 @@ impl SyscallDispatcher {
             for g in &groups {
                 bytes.extend_from_slice(&g.to_le_bytes());
             }
-            if cx.memory.write_bytes(list.0, &bytes).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            cx.memory.write_bytes(list.0, &bytes)?;
             Ok(DispatchOutcome::Returned {
                 value: groups.len() as i64,
             })
@@ -629,10 +623,7 @@ impl SyscallDispatcher {
             let n = size as usize;
             let mut groups = Vec::with_capacity(n);
             if n > 0 {
-                let bytes = match cx.memory.read_bytes(list.0, n * 4) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(LINUX_EFAULT.into()),
-                };
+                let bytes = cx.memory.read_bytes(list.0, n * 4)?;
                 for chunk in bytes.chunks_exact(4) {
                     groups.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }

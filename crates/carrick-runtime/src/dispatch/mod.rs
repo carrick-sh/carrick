@@ -1058,6 +1058,18 @@ impl From<i32> for DispatchError {
     }
 }
 
+impl From<MemoryError> for DispatchError {
+    /// A guest-memory access fault is the guest handing us a bad pointer →
+    /// `EFAULT`. Lets handlers `?`-propagate `memory.read_bytes(..)` /
+    /// `write_bytes(..)` directly instead of the `match { Err(_) => return
+    /// Ok(LINUX_EFAULT.into()) }` boilerplate (in handlers returning
+    /// `Result<_, DispatchError>`; helpers returning `Result<_, i32>` keep
+    /// `.map_err(|_| LINUX_EFAULT)?`).
+    fn from(_: MemoryError) -> Self {
+        DispatchError::Errno(LINUX_EFAULT)
+    }
+}
+
 /// Lower a syscall handler's result for the run loop. A
 /// [`DispatchError::Errno`] is a guest-visible errno, so it becomes a normal
 /// [`DispatchOutcome::Errno`]; every other `DispatchError` variant is a fatal

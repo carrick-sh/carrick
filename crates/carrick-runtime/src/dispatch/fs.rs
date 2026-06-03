@@ -2214,9 +2214,7 @@ impl SyscallDispatcher {
             if bytes.len() > size {
                 return Ok(LINUX_ERANGE.into());
             }
-            if cx.memory.write_bytes(address, &bytes).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            cx.memory.write_bytes(address, &bytes)?;
             // Linux getcwd(2) returns the LENGTH of the buffer filled (including
             // the terminating NUL), not the buffer address. glibc tolerates a
             // positive non-length, but tools that use the return value as a
@@ -2870,10 +2868,7 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(LINUX_EBADF.into());
                     };
-                    let bytes = match cx.memory.read_bytes(arg, 8) {
-                        Ok(b) => b,
-                        Err(_) => return Ok(LINUX_EFAULT.into()),
-                    };
+                    let bytes = cx.memory.read_bytes(arg, 8)?;
                     let owner_type = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                     let owner_pid = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
                     if owner_type != LINUX_F_OWNER_TID
@@ -2893,9 +2888,7 @@ impl SyscallDispatcher {
                     let mut buf = [0u8; 8];
                     buf[0..4].copy_from_slice(&owner_type.to_le_bytes());
                     buf[4..8].copy_from_slice(&owner_pid.to_le_bytes());
-                    if cx.memory.write_bytes(arg, &buf).is_err() {
-                        return Ok(LINUX_EFAULT.into());
-                    }
+                    cx.memory.write_bytes(arg, &buf)?;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_F_SETSIG => {
@@ -3906,9 +3899,7 @@ impl SyscallDispatcher {
                 *offset += 1;
             }
 
-            if memory.write_bytes(address, &out).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(address, &out)?;
 
             Ok(DispatchOutcome::Returned {
                 value: out.len() as i64,
@@ -4224,9 +4215,7 @@ impl SyscallDispatcher {
             let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
             let read_len = remaining.len().min(length);
             let bytes = &remaining[..read_len];
-            if memory.write_bytes(address, bytes).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(address, bytes)?;
             *offset += read_len;
             Ok(DispatchOutcome::Returned {
                 value: read_len as i64,
@@ -4403,9 +4392,7 @@ impl SyscallDispatcher {
 
             let read_len = if offset < contents.len() {
                 let bytes = &contents[offset..][..contents[offset..].len().min(length)];
-                if memory.write_bytes(buffer, bytes).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                memory.write_bytes(buffer, bytes)?;
                 bytes.len()
             } else {
                 0
@@ -5371,10 +5358,7 @@ impl SyscallDispatcher {
                 }
             };
             let memory = &mut *cx.memory;
-            let range = match memory.read_bytes(cstat_range.0, 16) {
-                Ok(b) => b,
-                Err(_) => return Ok(LINUX_EFAULT.into()),
-            };
+            let range = memory.read_bytes(cstat_range.0, 16)?;
             let off = u64::from_le_bytes(range[0..8].try_into().unwrap_or([0; 8]));
             let len = u64::from_le_bytes(range[8..16].try_into().unwrap_or([0; 8]));
             let page = crate::linux_abi::LINUX_PAGE_SIZE;
@@ -5388,9 +5372,7 @@ impl SyscallDispatcher {
             // nr_recently_evicted (5 × u64). Only nr_cache is non-zero.
             let mut cs = [0u8; 40];
             cs[0..8].copy_from_slice(&nr_cache.to_le_bytes());
-            if memory.write_bytes(cstat.0, &cs).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            memory.write_bytes(cstat.0, &cs)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -5869,9 +5851,7 @@ impl SyscallDispatcher {
             // exactly what was stored (an undecodable target round-trips).
             let decoded = crate::pathcodec::decode_to_bytes(&target);
             let written = decoded.len().min(buffer_size);
-            if cx.memory.write_bytes(buffer, &decoded[..written]).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
+            cx.memory.write_bytes(buffer, &decoded[..written])?;
             Ok(DispatchOutcome::Returned {
                 value: written as i64,
             })
