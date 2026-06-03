@@ -34,14 +34,22 @@ my parallel duplicate (a `free_aliased`/`free_alias_range` of the same design) w
 dropped in favor of the canonical version; only my M11 (overlay-slot free on
 munmap) was re-applied on top. Gate after rebase: see the test sweep below.
 
-> **Verification caveat:** these are **host-harness** tests (the in-process
-> `SyscallDispatcher` over `LinearMemory`, plus lib unit tests) — they prove the
-> carrick side behaves correctly in isolation. They are **NOT** the
-> `conformance-probes/` Docker-oracle differential probes (those need a
-> codesigned binary + HVF + Docker, unavailable here). Two fixes assert
-> oracle-sensitive values from spec rather than a live diff: **M5** (SO_RCVBUF 2×
-> doubling + 212992 default) and **H4/M9** (`signalfd_siginfo`/`siginfo_t` field
-> offsets) — spot-check these against Docker before fully relying on them.
+**Verification — full stack, including the Docker oracle on real HVF (2026-06-02):**
+1. Host-harness tests: the in-process `SyscallDispatcher`/`LinearMemory` integration
+   suite + lib unit tests — all green.
+2. **Real HVF**: all 8 new probes built static (`aarch64-unknown-linux-musl`) and run
+   under a codesigned `carrick run-elf` — every assertion `=true`, exit 0. So the
+   fixes hold on the actual vCPU/trap path, not just the dispatch harness.
+3. **Docker-oracle diff**: the same 8 probes run under `docker run --platform
+   linux/arm64` and diffed line-for-line vs carrick — **8/8 MATCH, 0 DIFF.** This
+   RESOLVES the earlier oracle-sensitivity caveats: **M5** (SO_RCVBUF 2× doubling)
+   and **M9** (`siginfo_t` si_code/si_pid offsets) match Linux exactly.
+4. Regression sample: 15 existing probes in the touched subsystems (signals,
+   altstack, sigwait, pause/EINTR, execve, fork-mask, epoll, pipe, posix-timers,
+   sysvshm, waits) diffed vs the oracle on HVF — **14 MATCH**; the lone DIFF is
+   `killtarget`'s negative-pgid delivery, a process-group-context artifact of the
+   bare `docker run` (probe runs as PID 1) on a probe this branch does NOT touch,
+   not a carrick regression.
 
 M10 and M12 are **documented-intentional** resolutions (the underlying mechanism
 is already satisfied by the host — see their entries), not new code paths.
