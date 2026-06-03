@@ -186,7 +186,7 @@ for p in "${pkgs[@]}"; do
     "/b/$n.test" -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
     -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.docker" 2>&1
 
-  pkill -9 -f "carrick:$CARRICK_RUN_ID" 2>/dev/null
+  pkill -9 -f "carrick:$CARRICK_RUN_ID:" 2>/dev/null  # trailing ':' anchors the id (no prefix over-match)
   # Build the carrick subcommand. ROOTFS_PKGS run inside a coherent debian
   # rootfs (same image + bind mounts as the Docker oracle), with the test binary
   # referenced by its in-rootfs mount path (/b/$n.test) so argv[0] has real
@@ -216,7 +216,7 @@ for p in "${pkgs[@]}"; do
   else
     timeout -s KILL "$RUN_TIMEOUT" "$carrick" "${carrick_args[@]}" > "$cache/logs/$n.carrick" 2>&1
   fi
-  pkill -9 -f "carrick:$CARRICK_RUN_ID" 2>/dev/null
+  pkill -9 -f "carrick:$CARRICK_RUN_ID:" 2>/dev/null  # trailing ':' anchors the id (no prefix over-match)
 
   gap=$(comm -23 <(verdicts "$cache/logs/$n.docker"  | grep '^PASS ' | awk '{print $2}' | sort -u) \
                  <(verdicts "$cache/logs/$n.carrick" | grep '^PASS ' | awk '{print $2}' | sort -u))
