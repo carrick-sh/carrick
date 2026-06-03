@@ -414,6 +414,23 @@ impl FutexTable {
                         if bucket.generation.load(Ordering::Acquire) != wait.generation {
                             return false;
                         }
+                        // Re-check interruptibility UNDER the park lock, not just at
+                        // the loop top. A fork quiesce (or a pending signal) can
+                        // begin AFTER the loop-top `interrupted()` check but before
+                        // this park — and the quiesce's wake is ONE-SHOT (it fires
+                        // before this thread is parked, so it misses us). Without
+                        // this guard the thread parks forever while
+                        // `is_quiescing()==true`, stalling `wait_quiesced` → the
+                        // fork times out and EAGAINs → the guest retries → a
+                        // fork-retry LIVELOCK that froze concurrent `go build`s.
+                        // Returning false here yields ParkResult::Invalid; the
+                        // loop re-checks `interrupted()` at the top and returns
+                        // Interrupted so the run loop reaches `park_if_quiescing`.
+                        // (Found by core post-mortem: a vCPU thread stuck here
+                        // while 7 siblings sat in the quiesce barrier.)
+                        if interrupted() {
+                            return false;
+                        }
                         registered.set(true);
                         bucket.waiters.fetch_add(1, Ordering::AcqRel);
                         true
