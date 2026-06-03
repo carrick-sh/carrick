@@ -383,13 +383,13 @@ Evidence:
 - The durable memory design says ordinary guest `mmap`/`munmap`/`mprotect` and
   shared-memory lifetime should not use late `hv_vm_map`/`hv_vm_unmap`/
   `hv_vm_protect` after vCPU threads exist
-  (`docs/superpowers/specs/2026-05-26-durable-memory-architecture-design.md:17-24`).
+  (`docs/archive/superpowers/specs/2026-05-26-durable-memory-architecture-design.md:17-24`).
 
 Expected behavior:
 
 - The durable direction is stable stage-2 topology with guest-visible memory
   semantics owned by stage-1 page tables
-  (`docs/superpowers/specs/2026-05-26-durable-memory-architecture-design.md:128-132`).
+  (`docs/archive/superpowers/specs/2026-05-26-durable-memory-architecture-design.md:128-132`).
 
 Why current code may diverge:
 
@@ -626,7 +626,7 @@ Follow-up:
 - Do not promote a packed-struct finding without a concrete unaligned reference.
   The Rust rule is real, but the inspected production code generally copies
   packed fields out before use or goes through `zerocopy` helpers.
-- `gap-research.md` remains historical context. This audit intentionally does
+- `../archive/gap-research.md` remains historical context. This audit intentionally does
   not overwrite it or re-open already-closed items without current evidence.
 
 ## Static Enforcement Candidates

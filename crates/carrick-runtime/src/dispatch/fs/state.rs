@@ -81,7 +81,7 @@ pub(in crate::dispatch) struct IoState {
 /// (~100ns/fstat) but fatal here; 1024 keeps such scans cheap. The tradeoff is a
 /// benign skip-vs-run divergence on test_no_leaking (it opens 1026 fds; Docker's
 /// huge limit makes it skip, carrick runs it and PASSES). See
-/// docs/cpython-wave2-runner-notes.md.
+/// docs/archive/cpython-wave2-runner-notes.md.
 pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024;
 /// Hard RLIMIT_NOFILE we expose to the guest (its setrlimit may raise the soft
 /// limit up to this). Matches the value getrlimit has always reported.
