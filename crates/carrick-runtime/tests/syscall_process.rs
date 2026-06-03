@@ -240,18 +240,20 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
     // report under its REAL name (not "unknown" — that path is covered by
     // `unknown_syscall_returns_enosys_and_records_report_entry`).
     //
-    // execveat(281) is such a syscall today. The original version of this test
-    // also listed clone(220)/execve(221)/clone3(435), but those now have real
-    // handlers (clone→Fork, execve→Execve, clone3), so they no longer report
-    // ENOSYS. If a real execveat handler lands, point this at the next
-    // still-unimplemented named syscall.
+    // lookup_dcookie(18) is such a syscall today: it's in the aarch64 name
+    // table but Linux removed it, so carrick will never give it a handler (it
+    // falls through to the unimplemented catch-all → ENOSYS). The original
+    // version of this test listed clone(220)/execve(221)/clone3(435)/
+    // execveat(281), but those all gained real handlers, so they no longer
+    // report ENOSYS. If lookup_dcookie ever gains a handler (it won't), point
+    // this at the next still-unimplemented named syscall.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
         .dispatch(
-            SyscallRequest::new(281, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            SyscallRequest::new(18, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
         )
@@ -259,20 +261,20 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 38 });
 
     let report = reporter.finish();
-    // execveat(281) is a number the aarch64 table recognises (Planned), so it
-    // surfaces in the `deferred_syscalls` bucket — "recognised, not yet
+    // lookup_dcookie(18) is a number the aarch64 table recognises (Deferred),
+    // so it surfaces in the `deferred_syscalls` bucket — "recognised, not yet
     // emulated" — under its real name, NOT in `unhandled_syscalls` (which is
     // reserved for genuinely unknown numbers like 9999).
     assert!(
-        report.unhandled_syscalls.iter().all(|e| e.number != 281),
+        report.unhandled_syscalls.iter().all(|e| e.number != 18),
         "recognised syscalls must not land in the truly-unknown bucket",
     );
     let entry = report
         .deferred_syscalls
         .iter()
-        .find(|entry| entry.number == 281)
-        .expect("execveat should surface as a deferred syscall in the compat report");
-    assert_eq!(entry.name, "execveat");
+        .find(|entry| entry.number == 18)
+        .expect("lookup_dcookie should surface as a deferred syscall in the compat report");
+    assert_eq!(entry.name, "lookup_dcookie");
     assert_eq!(entry.count, 1);
 }
 
@@ -437,7 +439,11 @@ fn blocking_wait4_for_specific_child_parks_on_proc_exit() {
         outcome,
         DispatchOutcome::WaitOnProcExit {
             pid: child,
-            block_signals: 0,
+            // c81fd54: the blocking wait folds the default-ignored signals
+            // (SIGCHLD|SIGURG|SIGWINCH) into its block mask so an inert pending
+            // signal can't spuriously EINTR it. A fresh dispatcher has no
+            // installed handlers, so that default-ignore set is the whole mask.
+            block_signals: (1 << 16) | (1 << 22) | (1 << 27),
         }
     );
 }
@@ -513,7 +519,11 @@ fn waitid_wexited_ignores_stopped_child() {
         outcome,
         DispatchOutcome::WaitOnProcExit {
             pid: child,
-            block_signals: 0,
+            // c81fd54: the blocking wait folds the default-ignored signals
+            // (SIGCHLD|SIGURG|SIGWINCH) into its block mask so an inert pending
+            // signal can't spuriously EINTR it. A fresh dispatcher has no
+            // installed handlers, so that default-ignore set is the whole mask.
+            block_signals: (1 << 16) | (1 << 22) | (1 << 27),
         }
     );
 }
