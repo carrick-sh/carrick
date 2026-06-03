@@ -1,4 +1,72 @@
-//! Socket, netlink, fd-set, and epoll helper routines for net dispatch.
+//! Socket, netlink, fd-set, and epoll helper routines for net dispatch — the
+//! Linux↔Darwin translation layer that [`super`]'s handlers call.
+//!
+//! # Theory of operation
+//!
+//! Everything here is a pure-ish translation primitive: it converts a Linux ABI
+//! shape (a `sockaddr`, an fd-set bitmap, an rtnetlink message) to/from the
+//! Darwin shape, or it stands in for a Linux subsystem that Darwin lacks. The
+//! handlers in [`super`] stay short because the layout math and the family
+//! quirks live here.
+//!
+//! ## sockaddr translation (the AF families)
+//!
+//! `read_linux_sockaddr` parses a guest-formatted `sockaddr` into the macOS BSD
+//! form (which carries a leading `sa_len` byte Linux omits) ready for
+//! `bind`/`connect`/`sendto`; `host_to_linux_sockaddr` + `write_linux_sockaddr`
+//! reverse it for `getsockname`/`getpeername`/`accept`/`recvfrom`. AF_INET and
+//! AF_INET6 differ only structurally; one substantive behavior fold lives here:
+//! Linux treats the whole `127.0.0.0/8` as loopback on `lo`, but macOS assigns
+//! only `127.0.0.1` to `lo0`, so a bind/connect to e.g. `127.0.1.1` (the
+//! Debian-convention hostname address carrick seeds in `/etc/hosts`) would fail
+//! EADDRNOTAVAIL — every `127/8` address is folded onto `127.0.0.1` in the
+//! single shared converter so bind/connect/sendto/sendmsg all agree.
+//!
+//! ## AF_UNIX: the features macOS lacks
+//!
+//! Linux AF_UNIX has three things macOS does not: an **abstract namespace**
+//! (sockets named by a leading-NUL byte string, with no filesystem node),
+//! **autobind** (an empty bind asks the kernel for a unique abstract name), and
+//! a much longer `sun_path`. carrick bridges all three by mapping every guest
+//! AF_UNIX name to a real host filesystem socket under a per-run directory:
+//!
+//!   - A guest `sun_path` (pathname or abstract) is FNV-1a hashed to a fixed
+//!     16-hex-digit `<hash>.sock` host node (`unix_socket_host_path`). The hash
+//!     is deterministic so a `bind` and a later `connect` to the same name land
+//!     on the same host node, and it is short enough to always fit macOS's
+//!     `sun_path` even for a long abstract name. Abstract names live under an
+//!     `abstract/` subdir so they cannot collide with real pathname sockets.
+//!   - Because the host node name is a one-way hash, a process-global registry
+//!     (`unix_path_registry`) records host-path → original-guest-`sun_path` so
+//!     `getsockname`/`getpeername`/`accept` reverse-translate to EXACTLY the
+//!     bytes the guest used (abstract = leading NUL + name; pathname = no
+//!     trailing NUL) — otherwise a peer re-translating a returned address would
+//!     miss. The registry is process-global rather than fork-shared because the
+//!     process that bound/connected a socket is the same one that later queries
+//!     its address.
+//!   - `autobind_unix_host_path` synthesises Linux's `NUL + 5 hex digits`
+//!     abstract name itself and registers it, since macOS has no autobind.
+//!
+//! SEQPACKET has no macOS AF_UNIX backing, so it is created as a STREAM socket
+//! (`host_socktype_backing`) and message boundaries are reframed by the handler
+//! on top (`OpenDescription::HostSocket.seqpacket`); see [`super`].
+//!
+//! ## Synthetic rtnetlink
+//!
+//! macOS has no AF_NETLINK. `build_netlink_reply` is the synthetic rtnetlink
+//! "kernel": it inspects a guest's dump request and emits a well-formed,
+//! `NLM_F_MULTI`, `NLMSG_DONE`-terminated reply describing a loopback-only host
+//! — RTM_GETLINK→`lo`, RTM_GETADDR→`127.0.0.1/8`, RTM_GETROUTE→the connected
+//! route, everything else→an empty dump. `push_nlmsg` does the `NLMSG_ALIGNTO`
+//! framing; `drain_netlink_queue` is the read(2)-side that copies queued reply
+//! bytes into guest memory. This is enough for glibc's `__check_pf` and for
+//! `ip`/`ss` to function rather than abort on EAFNOSUPPORT.
+//!
+//! ## fd-set and epoll helpers
+//!
+//! The remaining routines do the bit-twiddling for `select`'s `fd_set` bitmaps
+//! and read/write the Linux `epoll_event` struct for the [`super`] epoll
+//! handlers.
 
 use std::collections::VecDeque;
 

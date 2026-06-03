@@ -1,5 +1,84 @@
-//! Guest virtual-address layout, ELF/rootfs loading, page tables, and
-//! linear-memory helpers used by the trap engine and syscall dispatcher.
+//! Guest virtual-address layout, ELF loading, the boot page tables and
+//! trampolines, and the linear-memory accessor — everything needed to build the
+//! [`AddressSpace`] the trap engine maps onto a vCPU.
+//!
+//! # Theory of operation
+//!
+//! On real Linux the kernel owns the process address space: it picks where the
+//! image, stack, heap and mmap arenas land, sets up page tables, and provides
+//! the entry path into userspace and the vDSO. carrick has no guest kernel, so
+//! this module *is* that layout authority. It produces a fixed, deterministic
+//! map of the guest's virtual address space and the EL1 machinery needed to
+//! enter it.
+//!
+//! ## The 1 TiB / 40-bit IPA ceiling
+//!
+//! M-series HVF caps the guest Intermediate Physical Address at 40 bits — 1 TiB.
+//! Every region must fit under that, and (with one exception) is **identity
+//! mapped**: the guest VA equals the IPA that `hv_vm_map` uses, so [`ipa_for_va`]
+//! is the identity for everything but the Rosetta window. The layout constants
+//! at the top of this file are the canonical map; each one carries the empirical
+//! reason it sits where it does (e.g. the mmap arena is 32 GiB because a
+//! multithreaded Go program overran 2 GiB; the stack is 8 MiB because CPython
+//! sizes its C-recursion guard from `RLIMIT_STACK`). Treat them as load-bearing
+//! and re-derive the const-asserted invariants if you move anything.
+//!
+//! ## EL1 vs EL0: the "kernel hole"
+//!
+//! The HVF vCPU boots at EL1h; guest user code must run at EL0t. carrick owns a
+//! small set of EL1-only pages — an `eret` entry trampoline, the exception
+//! vector table (whose lower-EL synchronous slot forwards `svc #0` to HVF via
+//! `hvc`), the stage-1 page tables, and a TLBI-maintenance trampoline — that
+//! live together in a 2 MiB "kernel hole" at [`LINUX_KERNEL_REGION_BASE`]
+//! (180 GiB), well above any guest image and below every user arena. The page
+//! tables mark that block kernel-only (`AP=00`, `UXN=1`); everything else is
+//! user-accessible (`AP=01`, `PXN=1`). [`is_carrick_el1_vector_va`] is the
+//! load-bearing predicate that keeps a cross-thread kick from mistaking a
+//! captured EL1 vector PC for a resumable guest-EL0 PC.
+//!
+//! ## The stage-1 MMU: why it exists at all
+//!
+//! [`stage1_identity_page_tables`] is the marquee function. Without an enabled
+//! stage-1 MMU, ARMv8 treats all guest memory as Device-nGnRnE, where
+//! `ldaxr`/`stlxr` (the exclusive-access ops underpinning every libc mutex and
+//! futex fast path) are prohibited — the original "stage-2 wall". carrick
+//! installs this identity map, marks memory Normal Inner-Shareable WB-cacheable,
+//! and flips `SCTLR_EL1.M=1`; the per-page AP/PXN/UXN bits are shaped to dodge
+//! Apple Silicon's FEAT_PAN3 fault (full detail in that function's doc).
+//! Because the host edits the table bytes out-of-band (here at boot, and via
+//! [`crate::page_table`] at runtime) while the guest's stage-1 TLB is stale, the
+//! EL1 maintenance trampoline ([`el1_maintenance_bytes`]) must run a
+//! `tlbi vmalle1is` before the guest can observe an edit.
+//!
+//! ## Regions are an initialised prefix, not a full buffer
+//!
+//! A [`MemoryRegion`] stores only its bytes-with-content prefix; every byte past
+//! it reads as zero (the `zeroed_region` heap/arena/aperture regions carry an
+//! *empty* prefix and rely on HVF demand-zeroing untouched pages). This keeps a
+//! guest process from pinning gigabytes of zero RSS, and is the zero-fill
+//! guarantee the dispatcher's anonymous-mmap bump arena builds on. The
+//! [`GuestMemory`] impl at the bottom of this file enforces it: a read straddling
+//! the prefix copies the overlap and leaves the tail zero.
+//!
+//! ## Construction order
+//!
+//! An [`AddressSpace`] is built by a chain of consuming `with_*` builders on top
+//! of the loaded ELF: `with_el0_trampoline` / `with_el1_vectors` /
+//! `with_stage1_page_tables` add the kernel-hole machinery and record the EL1
+//! control-register targets (`el0_trampoline_entry`, `el1_vectors_base`,
+//! `stage1_page_tables_base`) the trap engine programs into ELR_EL1 / VBAR_EL1 /
+//! TTBR0_EL1; `with_vdso` and `with_linux_initial_stack` add the vDSO pages and
+//! the argv/envp/auxv stack image. Each rebuilds through `from_regions` so the
+//! region-overlap check keeps re-running.
+//!
+//! ## High-VA aliasing (Rosetta + dynamic)
+//!
+//! The 40-bit ceiling means a guest VA at or above 1 TiB cannot be backed
+//! identity-mapped. Apple's Rosetta interpreter is fixed-linked at `2^47`, and
+//! Rosetta reserves its working set near 240 TiB; for both, carrick aliases the
+//! high VA down to a free low IPA and carries the matching VA→IPA path in the
+//! stage-1 tables ([`is_rosetta_va`] / [`is_high_va`]). This is the only place a
+//! guest VA differs from its IPA.
 
 use std::fs;
 use std::io::Read;
@@ -1215,38 +1294,60 @@ fn region_from_load_segments(
     })
 }
 
-/// Build the byte image of the EL0 entry trampoline page. Offset 0 is a
-/// single `eret`; the rest of the page is filled with `nop` so a stray fetch
-/// beyond the entry instruction doesn't immediately fault.
-/// Build a stage-1 identity-mapping page table for the EL0/EL1 guest with
-/// per-region AP so it survives Apple Silicon's FEAT_PAN3 check.
+/// Build the boot stage-1 identity-mapping page tables for the EL0/EL1 guest,
+/// with per-region access permissions that survive Apple Silicon's FEAT_PAN3
+/// check. These tables are what let carrick flip `SCTLR_EL1.M=1`: with the MMU
+/// on, guest memory is Normal Inner-Shareable WB-cacheable (MAIR index 0), so
+/// the load/store-exclusive instructions (`ldaxr`/`stlxr`) that musl, glibc and
+/// Go rely on for their lock primitives actually work. Run MMU-off, ARMv8
+/// treats every access as Device-nGnRnE and exclusives are architecturally
+/// prohibited — the original stage-2 wall (see `docs/tier-b-wall.md`).
 ///
-/// On Apple Silicon HVF the vCPU starts with PSTATE.PAN=1 regardless of
-/// what the host writes to CPSR via `set_reg`. With FEAT_PAN3 (mandatory
-/// on ARMv8.3+), any EL1 instruction fetch from a page whose descriptor
-/// has AP[1]=1 (i.e. AP=01, user-accessible) raises a permission fault.
-/// To work around that we split the identity map so:
+/// THE FEAT_PAN3 WORKAROUND. On Apple Silicon HVF the vCPU starts with
+/// `PSTATE.PAN=1` regardless of what the host writes to CPSR via `set_reg`.
+/// With FEAT_PAN3 (mandatory on ARMv8.3+), any EL1 instruction fetch from a
+/// page whose descriptor has `AP[1]=1` (`i.e.` `AP=01`, user-accessible) raises
+/// a permission fault. carrick runs guest EL1 (the entry trampoline, exception
+/// vectors and TLBI-maintenance trampoline all execute at EL1), so it cannot
+/// simply mark every page user-accessible. The identity map is therefore split
+/// by who fetches from each page:
 ///
-/// * Pages EL1 fetches from (trampoline 0x10000, vectors 0x20000, this
-///   page-table region at 0x30000) live in the first 2 MiB block of
-///   L1A[0] and use AP=00 (RW at EL1 only, no EL0 access). UXN=1 so
-///   user code can never accidentally jump into kernel pages.
-/// * Pages EL0 fetches from (user PIE/static text, interpreter, heap,
-///   mmap arena, stack) live in every other block at any level and use
-///   AP=01 + PXN=1 + UXN=0 (RW at both ELs, no EL1 instruction fetch).
-///   PXN=1 is what bypasses FEAT_PAN3 — EL1 isn't allowed to fetch from
-///   these pages, so the PAN check never fires.
+/// * Pages EL1 fetches from (the entry trampoline, exception vectors, and these
+///   page tables — all inside the kernel hole's first 2 MiB block at
+///   [`LINUX_KERNEL_REGION_BASE`]) use `AP=00` (RW at EL1 only, no EL0) with
+///   `UXN=1`, so user code can never jump into kernel pages.
+/// * Pages EL0 fetches from (user PIE/static text, interpreter, heap, mmap
+///   arena, stack — every other block at any level) use `AP=01` + `PXN=1` +
+///   `UXN=0` (RW at both ELs, no EL1 instruction fetch). The `PXN=1` is what
+///   bypasses FEAT_PAN3: EL1 is not allowed to fetch from these pages, so the
+///   PAN check never fires on them.
 ///
-/// Buffer layout (16 KiB total, four 4 KiB pages):
+/// Buffer layout — eight 4 KiB tables in the first eight pages of the region,
+/// followed by the spare pool [`crate::page_table`] carves runtime sub-tables
+/// from (see [`LINUX_PAGE_TABLES_SIZE`]). All translation is identity (`IPA ==
+/// VA`) except the Rosetta high-VA alias:
 ///
-/// * Page 0 (0x000–0xFFF): L0 table — two table descriptors.
-/// * Page 1 (0x1000–0x1FFF): L1A — L1A[0] is a table descriptor pointing
-///   at the L2 sub-table; L1A[1..511] are user 1 GiB block descriptors.
-/// * Page 2 (0x2000–0x2FFF): L1B — all 512 entries are user 1 GiB block
-///   descriptors covering 512 GiB..1 TiB.
-/// * Page 3 (0x3000–0x3FFF): L2 sub-table for the first 1 GiB — L2[0] is
-///   the kernel-only 2 MiB block covering 0..2 MiB; L2[1..511] are user
-///   2 MiB block descriptors covering 2 MiB..1 GiB.
+/// * Page 0 — L0: two table descriptors covering `0..1 TiB`, plus the
+///   `L0[256]` entry for the Rosetta `2^47` alias.
+/// * Page 1 — L1A (`0..512 GiB`): index 0 is a table descriptor to L2A;
+///   indices `1..512` are user 1 GiB blocks, except the one covering the kernel
+///   hole, which is a table descriptor to L2B. The mmap arena's blocks also get
+///   `UXN` set (NX by default; W^X).
+/// * Page 2 — L1B (`512 GiB..1 TiB`): 512 user 1 GiB block descriptors.
+/// * Page 3 — L2A (first 1 GiB in 2 MiB blocks): index 0 is a table descriptor
+///   to L3A (so the first 2 MiB is fine-grained for the null guard); indices
+///   `1..512` are user 2 MiB blocks.
+/// * Page 4 — L2B (the 1 GiB region holding the kernel hole, in 2 MiB blocks):
+///   the hole's first 2 MiB block is kernel-only; the rest are user.
+/// * Page 5 — L3A (first 2 MiB in 4 KiB pages): `VA 0..0x10000` is left invalid
+///   as the null guard (a guest NULL deref faults cleanly at stage 1 →
+///   SIGSEGV, matching Linux `mmap_min_addr`); `0x10000..2 MiB` are user pages
+///   so a static binary loading at `0x10000` (Go's `go` toolchain) can run.
+/// * Pages 6–7 — L1/L2 for the Rosetta alias: map the 2 MiB window at
+///   [`LINUX_ROSETTA_VA_BASE`] (`2^47`) down to the low IPA
+///   [`LINUX_ROSETTA_IPA_BASE`], so Apple's non-relocatable Rosetta `ET_EXEC`
+///   runs from its fixed link base while the real `hv_vm_map` stays inside HVF's
+///   40-bit IPA. Harmless for non-amd64 guests (they never touch `2^47`).
 pub fn stage1_identity_page_tables() -> Vec<u8> {
     let size = LINUX_PAGE_TABLES_SIZE as usize;
     let mut bytes = vec![0_u8; size];

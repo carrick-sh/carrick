@@ -1,14 +1,72 @@
 //! seccomp(2) filter emulation.
 //!
-//! The dispatcher already sees every guest syscall, so a classic-BPF (cBPF)
-//! filter check fits naturally at the dispatch seam: before a handler runs,
-//! installed filters are evaluated against a `seccomp_data` view of the call
-//! and the resulting action (allow / errno / kill / …) is applied.
+//! # Theory of operation
 //!
-//! This is a faithful interpreter for the cBPF subset libseccomp emits (LD
-//! ABS/IMM, JMP JA/JEQ/JGT/JGE/JSET, ALU AND, RET A/K, MISC TAX/TXA). Anything
-//! malformed or out of the modelled subset evaluates to `SECCOMP_RET_KILL_PROCESS`
-//! (fail-closed), and evaluation is step-bounded so a bad filter can't loop.
+//! On Linux, seccomp installs a classic-BPF (cBPF) program that the kernel runs
+//! on the syscall-entry path: the program reads a `struct seccomp_data` snapshot
+//! of the call (syscall number, audit arch, instruction pointer, the six raw
+//! arguments) and returns an action word telling the kernel to allow the call,
+//! fail it with an errno, kill the thread/process, trap, trace, or log. The
+//! whole feature is "let the process restrict its own future syscalls", which is
+//! exactly the seam carrick's dispatcher already owns: every guest syscall is
+//! already intercepted before any host work happens. So instead of a kernel
+//! attach point we evaluate the installed filters in the dispatcher, against a
+//! [`SeccompData`] we build from the trap frame, and apply the action there.
+//!
+//! ## What this module is
+//!
+//! A small, self-contained cBPF *interpreter* plus the per-process filter store.
+//! It models exactly the instruction subset libseccomp (and therefore Docker /
+//! systemd / browser sandboxes) actually emit:
+//!
+//! * `BPF_LD`/`BPF_LDX` in ABS mode (read a 32-bit word out of `seccomp_data`)
+//!   and IMM mode (load a constant);
+//! * `BPF_JMP` with `JA`/`JEQ`/`JGT`/`JGE`/`JSET`, against the immediate `k` or
+//!   the X register;
+//! * `BPF_ALU` `AND` (the only ALU op libseccomp generates — masking arg bits);
+//! * `BPF_RET` of the accumulator or an immediate;
+//! * `BPF_MISC` `TAX`/`TXA` (the A↔X transfers used by arg comparisons).
+//!
+//! ## The two load-bearing invariants
+//!
+//! * **Fail-closed.** Anything outside the modelled subset — an unknown opcode,
+//!   an ALU op we don't implement, a program that falls off the end without a
+//!   `RET`, or one that exceeds the step bound — evaluates to
+//!   `SECCOMP_RET_KILL_PROCESS`, the most restrictive action. A filter we cannot
+//!   fully understand must never silently *weaken* the sandbox the guest asked
+//!   for; the safe direction is to over-deny, not under-deny.
+//!
+//! * **Bounded evaluation.** [`eval_filter`] runs at most `MAX_STEPS`
+//!   instructions. cBPF jumps are forward-only by construction, but a malformed
+//!   program (e.g. a hostile `prctl(PR_SET_SECCOMP)` payload reaching us through
+//!   the guest) must not be able to spin a dispatcher thread; hitting the bound
+//!   is treated as malformed and fails closed.
+//!
+//! ## Stacking and "most restrictive wins"
+//!
+//! Linux lets a process install several filters; a syscall is run through *all*
+//! of them and the kernel keeps the numerically-smallest (most restrictive)
+//! action. [`SeccompState`] mirrors that: each `seccomp(SET_MODE_FILTER)` /
+//! `prctl(PR_SET_SECCOMP)` pushes another program, and [`SeccompState::check`]
+//! returns the minimum action word across the stack (so a single
+//! `RET_KILL`/`RET_ERRNO` anywhere wins over an `RET_ALLOW`). The action lives in
+//! the high 16 bits; the low [`SECCOMP_RET_DATA`] bits carry the payload — e.g.
+//! the errno for `RET_ERRNO` — so comparison masks with
+//! [`SECCOMP_RET_ACTION_FULL`] before ordering.
+//!
+//! ## Honest limitations
+//!
+//! This is a policy *evaluator*, not the full seccomp surface. It models the
+//! decision (which action fires for a given call) but not the kernel-side
+//! delivery machinery behind the non-trivial actions: `RET_TRAP` does not raise
+//! a real `SIGSYS` with a populated `siginfo`, `RET_TRACE` has no ptracer to
+//! hand off to, `RET_LOG`/audit emission is not wired, and the user-notify
+//! (`SECCOMP_RET_USER_NOTIF` / `SECCOMP_FILTER_FLAG_*`) path is absent. The
+//! interpreter is also intentionally cBPF-only: it does not implement the
+//! arg-pointer-dereferencing tricks (cBPF can't follow pointers anyway), and any
+//! BPF mode beyond ABS/IMM loads as zero. The common, dominant case — "deny this
+//! set of syscall numbers with EPERM, allow the rest", optionally arch-gated —
+//! is exact; see the `tests` module for the canonical libseccomp shape.
 
 use parking_lot::Mutex;
 

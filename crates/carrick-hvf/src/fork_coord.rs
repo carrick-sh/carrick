@@ -1,5 +1,22 @@
 //! Coordination for Carrick-owned host state that must be quiesced around
 //! real host fork operations.
+//!
+//! THEORY OF OPERATION
+//!
+//! [`crate::fork_quiesce`] handles the GUEST threads around a fork; this module
+//! handles Carrick's own daemon HOST thread — the [`crate::vcpu_kick`]
+//! `SignalPump`. `fork(2)` carries only the calling thread into the child, so a
+//! background pump thread that is alive at the fork point becomes a dead stub in
+//! the child (its kqueue/pipes inherited but unowned) and a duplicate in the
+//! parent's address space. [`ForkCoordinator::prepare_host_fork`] therefore STOPS
+//! and JOINS the pump before `libc::fork`, yielding a [`PreparedHostFork`] token
+//! that the three post-fork paths (parent, child, error) trade back in to
+//! restart a fresh pump. The pump is held behind a `Mutex<Option<SignalPump>>`
+//! and `start_signal_pump` is idempotent, so a child that re-forks re-runs the
+//! whole stop/restart cycle cleanly. The stop is the BOUNDED `SignalPump::stop`
+//! (see [`crate::vcpu_kick`]) so a pump that can no longer be woken — the
+//! forkserver-from-forkserver lost-wake case — detaches rather than hanging the
+//! host fork.
 
 use std::sync::Arc;
 

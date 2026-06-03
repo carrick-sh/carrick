@@ -1,8 +1,77 @@
-//! Carrick runtime crate.
+//! Carrick runtime — the core that runs an unmodified Linux ELF binary as a
+//! native macOS process.
 //!
-//! This crate hosts the Linux ABI translation layer, guest address-space
-//! management, syscall dispatcher, rootfs/VFS support, signal/thread handling,
-//! and HVF trap engine used by the CLI and engine crates.
+//! # Theory of operation
+//!
+//! Carrick has **no guest Linux kernel**. A Linux ELF is loaded into a guest
+//! address space, executed at EL0 under Apple's Hypervisor.framework (HVF), and
+//! every `svc #0` (the AArch64 syscall instruction) traps back to the host. The
+//! trapped syscall is then *emulated* — translated to Darwin host primitives
+//! (real file descriptors, `kqueue`, `__ulock`, `posix_spawn`, `fork`) — and the
+//! result is written back into the guest registers before resuming. To the
+//! Linux process it is running on Linux; there is no VM image, no init, no guest
+//! ring-0 code. carrick is simultaneously the VMM *and* the kernel the guest
+//! thinks it is talking to.
+//!
+//! This crate is the union of those two roles. The split between them is
+//! reflected in the module layout:
+//!
+//! - **The exec engine** (the leaf crate `carrick-hvf`, re-exported below under
+//!   `crate::trap`, `crate::thread`, `crate::io_wait`, …): the HVF trap engine
+//!   that owns the vCPUs, fork/exec address-space surgery, the SIMD/FP restore
+//!   shim, cross-thread vCPU coordination (the kicker, the fork/page-table
+//!   quiesce barriers), the Darwin `kqueue` wrapper, and host-signal capture.
+//!   This is the "VMM half".
+//! - **The kernel half** (this crate proper): [`dispatch`] — the syscall
+//!   dispatcher and its subsystems — plus [`vfs`]/[`rootfs`]/[`overlay`]/
+//!   [`fs_backend`] (the filesystem the guest sees), [`namespace`] (UID/GID +
+//!   PID namespace emulation), [`container`] (docker-style run state), and the
+//!   `/proc` and signal machinery. None of these touch HVF directly; they
+//!   answer syscalls.
+//! - **The lifecycle** ([`runtime`], [`execute`]): the glue that wires the two
+//!   halves together. It loads the image, installs the EL0 trampoline / EL1
+//!   vectors / stage-1 page tables, then drives the trap → dispatch → complete
+//!   loop until the guest exits. It also owns the fork/clone model
+//!   (`libc::fork` for guest processes, one host thread + one HVF vCPU per guest
+//!   thread), fault-to-signal translation, the interactive pty bridge
+//!   ([`pty_relay`]/[`interactive_supervisor`]), and the namespace supervisor
+//!   ([`namespace::supervisor`]). Start reading at [`runtime`].
+//!
+//! # The leaf-crate re-exports
+//!
+//! Several subsystems were lifted out of this crate into leaf crates to cut the
+//! build-graph fan-out (a ~40k-line monolith re-linking on every edit). They are
+//! re-exported below under their *original* `crate::<module>` paths, so every
+//! call site across the runtime — and every `carrick_runtime::<module>` path the
+//! CLI/engine crates use — is unchanged. When you see `crate::trap::…` or
+//! `crate::memory::…` in this crate, the code physically lives in `carrick-hvf`
+//! / `carrick-mem` / `carrick-host` / `carrick-abi`; the boundary is a build
+//! optimisation, not a semantic one.
+//!
+//! # Sharp edges (read before touching the lifecycle)
+//!
+//! - **HVF is not fork-safe.** A VM live in the parent at `libc::fork(2)` makes
+//!   the child's `hv_vm_create` return `HV_BUSY`. Every fork in carrick is
+//!   therefore choreographed: the namespace supervisor forks *before* any VM
+//!   exists, and a guest `fork(2)` from a multithreaded guest first quiesces all
+//!   sibling vCPUs, tears the VM down, forks, and rebuilds. See [`runtime`].
+//! - **A forked child must `_exit`, never unwind.** It shares the parent's fd
+//!   table; dropping an fd-owning value on the way out double-closes an inherited
+//!   fd and trips std's IO-safety abort (`SIGABRT`). The lifecycle code branches
+//!   on "am I a forked child" on every exit path for exactly this reason.
+//! - **One vCPU per guest thread, one process VM.** Stage-2 mappings are shared
+//!   across all vCPUs, but stage-1 page-table edits (mmap/mprotect/munmap) and
+//!   forks are stop-the-world events coordinated through the quiesce barriers in
+//!   `carrick-hvf::fork_quiesce`.
+
+// carrick-runtime is an INTERNAL crate (consumed only by carrick-engine and
+// carrick-cli), and its rustdoc is built with `--document-private-items` so the
+// Big Theory Statements above and on each module can cross-link the internal
+// run-loop / lifecycle items they describe (`run_vcpu_until_exit`,
+// `maybe_fork_ns_supervisor`, `SupervisorRole`, `ThreadRuntimeState::handle_fork`,
+// …). Those items are deliberately NOT public API; allow the internal doc links
+// rather than widen the public surface just to satisfy rustdoc.
+#![allow(rustdoc::private_intra_doc_links)]
 
 #[cfg(target_os = "macos")]
 pub mod apfs;

@@ -230,8 +230,8 @@ fn parse_apfs_list_for(stdout: &str, target_name: &str) -> Vec<VolumeInfo> {
     out
 }
 
-/// Walk the same stdout looking for the "Mount Point: <path>" or
-/// "Mount Point: Not Mounted" line under the given device's section.
+/// Walk the same stdout looking for the `Mount Point: <path>` or
+/// `Mount Point: Not Mounted` line under the given device's section.
 fn find_mount_point_for(stdout: &str, device: &str) -> Option<PathBuf> {
     let header_needle = format!("+-> Volume {} ", device);
     let mut in_section = false;

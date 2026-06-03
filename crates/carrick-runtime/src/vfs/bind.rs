@@ -1,5 +1,32 @@
-//! Bind-mount VFS implementation backed by host paths with Linux errno
-//! translation.
+//! Bind mounts: a real macOS path exposed at a guest path.
+//!
+//! # Theory of operation
+//!
+//! Unlike the synthetic mounts ([`super::proc`], [`super::sys`]) and the
+//! immutable rootfs, a [`BindVfs`] is a thin pass-through to a *real* host
+//! directory or file. It is the `docker run -v host:guest` mechanism, and
+//! carrick also uses it internally for `/dev/shm` (a per-process host tmpfs
+//! stand-in) and for single-file binds such as the `run-elf` executable
+//! surfaced at `/proc/self/exe`.
+//!
+//! The whole job is two translations:
+//!
+//! * **Path** — `BindVfs::to_host` maps a guest path to a host path by
+//!   stripping the mount point and rejoining onto `host_path`. The mount point
+//!   *itself* maps to `host_path` verbatim (no trailing-slash join), so a
+//!   single-file bind works: joining an empty component would append a `/` and
+//!   make `open(2)` return `ENOTDIR` on a regular file.
+//! * **Errno** — every host failure is run through
+//!   [`crate::dispatch::macos_to_linux_errno`] so the guest sees Linux errno
+//!   numbers, not Darwin ones.
+//!
+//! `readonly` gates the mutators: a read-only bind returns `EROFS` from
+//! `open`-for-write, `mkdir`, `unlink`, `rename`, and friends, exactly as a
+//! `ro` bind mount would on Linux. Because the backing is a real kernel file,
+//! inotify-style watches ([`watch_fd`](Vfs::watch_fd)) open a host
+//! `O_EVTONLY`/`O_RDONLY` fd that the dispatcher's epoll/kqueue machinery
+//! drives, and `read_file` can serve an executable for the ELF loader (which
+//! runs before the guest has any fds).
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;

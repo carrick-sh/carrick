@@ -1,36 +1,85 @@
 //! Unified virtual filesystem layer for carrick.
 //!
-//! Today carrick reaches into four separate code paths for filesystem
-//! syscalls:
+//! # Theory of operation
 //!
-//! 1. **`/proc/*`** — synthetic files owned by [`proc::ProcVfs`].
-//! 2. **`/sys/*`** — synthetic files owned by [`sys::SysVfs`].
-//! 3. **`/dev/*`** — `host_dev_passthrough()` returns a macOS path
-//!    that the dispatcher opens via raw `libc::open` and wraps as a
-//!    `HostPipe`.
-//! 4. **`/` (rootfs + writes)** — read-only [`crate::rootfs::RootFs`]
-//!    from the OCI image, plus a writable overlay implemented by the
-//!    [`crate::fs_backend::FsBackend`] trait.
+//! Every guest filesystem syscall — `openat`, `stat`/`statx`, `readlinkat`,
+//! `getdents64`, `unlinkat`, `mkdirat`, `renameat2`, `symlinkat`, `linkat`,
+//! `fchmodat`, `utimensat`, … — resolves an absolute guest path and then asks
+//! one question: *who owns this path?* The answer is a [`Vfs`] implementation.
+//! This module is the routing layer that turns a path into the mount that
+//! serves it, plus the trait every mount implements and the small set of
+//! value types ([`Metadata`], [`DirEnt`], [`OpenFlags`], [`VfsHandle`]) that
+//! cross the dispatcher↔mount boundary.
 //!
-//! This module defines a single [`Vfs`] trait that all four surfaces
-//! will eventually implement, and a [`mount::VfsMounts`] table that
-//! routes `path`-based syscalls to the longest-prefix-matching mount.
+//! The mental model is a stripped-down Linux mount table. [`mount::VfsMounts`]
+//! holds `(mount_point, Box<dyn Vfs>)` pairs and routes each path to the
+//! **longest-prefix-matching** mount on component boundaries (so `/proc-foo`
+//! does *not* route to a `/proc` mount). The dispatcher installs the special
+//! and synthetic surfaces into this table at guest setup (`dispatch/fs/state.rs`):
 //!
-//! Migration is planned in four PRs (see `memory/plan_vfs_refactor.md`):
+//! * `/proc` → [`ProcVfs`] — synthetic procfs rendered from live dispatcher state.
+//! * `/sys` → [`SysVfs`] — synthetic sysfs (CPU topology, cgroup stubs, …).
+//! * `/dev` → [`DevVfs`] — passthrough to macOS's same-named char devices
+//!   (`/dev/null`, `/dev/zero`, `/dev/urandom`, …) plus the guest tty.
+//! * `/dev/pts` → [`DevptsVfs`] — real macOS ptys behind a guest pts index.
+//! * `/etc/resolv.conf` → [`ResolvConfVfs`] and `/etc/services` →
+//!   [`EtcServicesVfs`] — single-file mounts that inject host-derived config
+//!   the OCI scratch lacks (the `docker run --net host` contract).
+//! * `/dev/shm` and any `-v` bind → [`BindVfs`] — a host directory exposed at
+//!   a guest path with Linux errno translation.
 //!
-//! 1. **Scaffold (this commit).** Trait + mount table + tests; nothing
-//!    in the dispatcher consults `Vfs` yet.
-//! 2. **`DevVfs`** — moves chardev passthrough behind the trait.
-//! 3. **`ProcVfs` + `SysVfs`** — moves the synthetic generators behind
-//!    sub-mountable Vfs implementations.
-//! 4. **`RootFsVfs`** — subsumes the immutable rootfs + writable
-//!    overlay split; every dispatcher fs syscall flows through the
-//!    Vfs after this lands.
+//! ## The `/` mount is special: it is NOT in the table
 //!
-//! Step 1 landed the path-level trait + mount table. Step 2 (this
-//! revision) adds the `open` method and a [`VfsHandle`] discriminated
-//! union that the dispatcher converts to its own `OpenDescription`
-//! enum. `DevVfs` is the first concrete user of `open`.
+//! There is no `/` entry in [`mount::VfsMounts`]. The rootfs is the *fallback*:
+//! when [`VfsMounts::resolve`] returns `None`, the path is served by the
+//! dispatcher's [`RootFsVfs`] field (`fs.rootfs_vfs`) — the immutable OCI
+//! rootfs ([`crate::rootfs::RootFs`]) with a writable overlay
+//! ([`crate::fs_backend::FsBackend`]) layered on top. This split is deliberate:
+//! the synthetic/special mounts are few, small, and side-effect-light, so a
+//! trait object behind a longest-prefix walk is cheap; the `/` mount is the
+//! hot path touched by nearly every fs syscall, so the dispatcher still reaches
+//! into `rootfs_vfs.rootfs` and `rootfs_vfs.overlay` directly (and through
+//! [`RootFsVfs::open_for_dispatch`]) rather than paying trait-object dispatch
+//! on every lookup. `RootFsVfs` also *implements* [`Vfs`], and its trait
+//! methods consult exactly the same overlay+rootfs state, so the two access
+//! paths are byte-identical; the direct-field access is a performance and
+//! incrementality choice, not a correctness fork.
+//!
+//! ## Errno-native, path-native interface
+//!
+//! Two design choices keep the trait thin:
+//!
+//! * Failures are raw Linux errno [`i32`] ([`VfsError`]), the same currency
+//!   the dispatcher's error pipeline already speaks — no per-mount translation
+//!   layer. A read-only mount returns `EROFS` from the mutating defaults; an
+//!   absent path returns `ENOENT`; an unimplemented op returns `ENOSYS`.
+//! * Every method receives the **full absolute guest path** the dispatcher
+//!   resolved, not a mount-relative tail. Mounts like `ProcVfs`/`SysVfs`
+//!   already know they live under `/proc`/`/sys` and match on the whole path,
+//!   so stripping the prefix would only churn allocations. Backends that
+//!   prefer the relative form ask for it explicitly via
+//!   [`VfsMounts::resolve_relative`].
+//!
+//! ## Open returns a handle, not an fd
+//!
+//! [`Vfs::open`] returns a [`VfsHandle`] discriminated union — a host fd, an
+//! in-memory byte blob, a synthetic directory listing, or a pty end — that
+//! the dispatcher converts into its own private `OpenDescription`. This keeps
+//! the trait independent of the dispatcher's fd-table internals: a mount
+//! describes *what kind of thing* it opened; the dispatcher owns how that
+//! becomes a guest fd. Live state a mount needs at open time (the loaded
+//! address space for `/proc/self/maps`, argv/environ/auxv, signal masks) is
+//! threaded through [`OpenContext`] rather than coupling the trait to the
+//! dispatcher struct.
+//!
+//! ## History
+//!
+//! This layer was introduced by the VFS refactor (`memory/plan_vfs_refactor.md`):
+//! before it, the dispatcher reached into four ad-hoc code paths — inline
+//! `/proc`/`/sys` generators, a `host_dev_passthrough()` + raw `libc::open`
+//! block for `/dev`, and the rootfs/overlay pair — with no common contract.
+//! The refactor unified all of them behind [`Vfs`] + the mount table; the only
+//! surviving direct-access path is the `/` rootfs hot path described above.
 
 pub mod bind;
 pub mod dev;
@@ -156,20 +205,25 @@ pub struct OpenFlags {
     pub mode: u32,
 }
 
-/// What a successful [`Vfs::open`] returns. Each variant carries
-/// just enough information for the dispatcher to construct its own
-/// `OpenDescription` without the Vfs needing to know about that
-/// private enum. New variants are added per migration step:
+/// What a successful [`Vfs::open`] returns. Each variant carries just
+/// enough information for the dispatcher to construct its own private
+/// `OpenDescription` *without* the mount needing to know about that enum —
+/// the variant names *what kind of thing* was opened, and the dispatcher
+/// owns the fd-table bookkeeping. Which mount returns which variant:
 ///
-/// * Step 2 (DevVfs): [`HostFd`](VfsHandle::HostFd) — a real macOS fd
-///   that the dispatcher will wrap as a `HostPipe` description.
-/// * Step 3 (ProcVfs/SysVfs): a `Bytes` variant for synthetic files.
-/// * Step 4 (RootFsVfs): variants for overlay-backed regular files
-///   and directories.
-/// * devpts Phase A: [`Directory`](VfsHandle::Directory) — a synthetic
-///   directory listing served entirely from `Vec<DirEnt>` in memory,
-///   for mounts like `/dev` that own their own listing rather than
-///   delegating to the rootfs layer.
+/// * [`HostFd`](VfsHandle::HostFd) — a real macOS fd, returned by [`DevVfs`]
+///   for char-device passthrough; the dispatcher wraps it as a `HostPipe`.
+/// * [`Bytes`](VfsHandle::Bytes) — an in-memory blob, returned by the
+///   synthetic mounts ([`ProcVfs`], [`SysVfs`], [`ResolvConfVfs`],
+///   [`EtcServicesVfs`]); becomes `OpenDescription::SyntheticFile`.
+/// * [`Pty`](VfsHandle::Pty) — a master/slave pty end, returned by [`DevVfs`]
+///   (`/dev/ptmx`, `/dev/tty`) and [`DevptsVfs`] (`/dev/pts/N`); becomes a
+///   `HostPipe` tagged with [`PtyRole`] so the ioctl handler treats it as a tty.
+/// * [`Directory`](VfsHandle::Directory) — a synthetic listing served entirely
+///   from a `Vec<DirEnt>` in memory, returned by [`DevVfs`] for `/dev` so
+///   `ls /dev` shows the device nodes rather than the (typically empty) `/dev`
+///   in the OCI image layer. The rootfs `/` mount serves its directories
+///   through [`RootFsVfs::open_for_dispatch`] instead, not this variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsHandle {
     /// A host fd that the dispatcher should route I/O through via the
@@ -238,16 +292,24 @@ pub struct OpenContext<'a> {
     pub sig_shdpnd: u64,
 }
 
-/// The path-and-metadata surface of a single mount point. Open-side
-/// operations (returning per-fd state) land in step 2 of the
-/// migration plan — for now the dispatcher continues to drive its
-/// `OpenDescription` table directly.
+/// One mount's view of the filesystem: path metadata ([`lookup`](Vfs::lookup),
+/// [`readlink`](Vfs::readlink), [`readdir`](Vfs::readdir)), the open side
+/// ([`open`](Vfs::open), returning a [`VfsHandle`]), and the mutating ops
+/// (`mkdir`/`unlink`/`rename`/`chmod`/…). Almost every method has a default
+/// body so a mount only overrides what it actually supports: read-only mounts
+/// inherit `EROFS` for the mutators, metadata-only mounts inherit `ENOSYS`
+/// for [`open`](Vfs::open), and so on. This is why a single-file synthetic
+/// mount like [`ResolvConfVfs`] can be a handful of methods.
 ///
-/// Every method takes the *full* absolute path the dispatcher
-/// resolved; the mount table strips the prefix only for callers that
-/// ask for it via [`VfsMounts::resolve_relative`]. This keeps the
-/// `ProcVfs`/`SysVfs` implementations simple — they already know
-/// they live under `/proc` / `/sys`.
+/// Every method takes the *full* absolute path the dispatcher resolved; the
+/// mount table strips the prefix only for callers that ask for it via
+/// [`VfsMounts::resolve_relative`]. This keeps the `ProcVfs`/`SysVfs`
+/// implementations simple — they already know they live under `/proc` / `/sys`
+/// and match on the whole path.
+///
+/// The trait is `Send + Sync` because the mount table is shared across the
+/// guest's per-thread vCPUs; mounts that hold mutable host state (the pty
+/// table, the writable overlay) carry their own interior locking.
 pub trait Vfs: Send + Sync {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError>;
 

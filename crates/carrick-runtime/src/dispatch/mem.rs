@@ -1,5 +1,52 @@
-//! mem syscall handlers. Methods on `SyscallDispatcher`; see
-//! `super` for the dispatcher struct and the normalized dispatch table.
+//! Memory management: `brk`, `mmap`/`munmap`/`mremap`, `mprotect`, `madvise`,
+//! and the `/proc/self/maps` & `auxv` views.
+//!
+//! # Theory of operation
+//!
+//! Guest memory is HVF stage-2-mapped guest RAM, and the central constraint is:
+//! mutating stage-2 mappings AFTER a sibling vCPU exists is unsafe on arm64 HVF
+//! (there is no EL0-reachable stage-2 TLB flush — the coherence bug documented
+//! in the project history). So this allocator is designed to avoid post-boot
+//! `hv_vm_map` almost entirely. It does its work by carving guest virtual
+//! address space out of regions that were already mapped at boot, and by
+//! re-pointing stage-1 page-table leaves rather than touching stage-2.
+//!
+//! ## Three arenas ([`MemState`])
+//!
+//! 1. **The anonymous mmap bump arena** (`mmap_next`). A plain bump cursor over
+//!    lazily-zeroed guest RAM. `MAP_PRIVATE|MAP_ANONYMOUS` allocations bump it;
+//!    `free_regions` reclaims `munmap`'d holes (coalesced) so a churning guest
+//!    does not exhaust the arena. The **zero-fill invariant** is the sharp edge:
+//!    the bump path assumes `[mmap_next, …)` is pristine and SKIPS zero-fill,
+//!    while reused free regions get zeroed. That breaks when `munmap` lowers
+//!    `mmap_next` back over pages the guest already dirtied — a later bump
+//!    allocation would hand back STALE bytes instead of the zeroed anon memory
+//!    Linux guarantees. `mmap_dirty_high` is the fix: a MONOTONIC high-water
+//!    that `munmap` never lowers, so the mmap handler can zero exactly the
+//!    re-handed-out (below-high-water) ranges and leave the genuinely-fresh
+//!    tail lazily zero. (This is the CPython `test_subprocess` SEGV root cause —
+//!    see the `mmap_dirty_high` field doc and the project memory.)
+//! 2. **The shared aperture** (`shared`). A single region `hv_vm_map`'d ONCE at
+//!    boot; `MAP_SHARED` mmaps (including SysV `shmat`) carve sub-ranges out of
+//!    it, so no stage-2 mutation happens at mmap time.
+//! 3. **The private overlay aperture** (`overlay`). A `MAP_FIXED|MAP_PRIVATE`
+//!    that lands on a shared-aperture VA carves a slot here and re-points the
+//!    VA's stage-1 leaf to it (stores stay private), again with no post-vCPU
+//!    `hv_vm_map`. Per-process — fork snapshots it.
+//!
+//! ## `brk` and the `/proc` views
+//!
+//! `brk` advances/retreats the program break (`brk_current`) within the heap
+//! region. `/proc/self/maps` is rendered from the boot-captured `AddressSpace`
+//! snapshot (`address_space_regions`) with the heap end tracking `brk_current`
+//! and the mmap arena end tracking `mmap_next`; `/proc/self/auxv` echoes the
+//! exact serialized ELF auxiliary vector written to the guest stack at exec
+//! (`linux_auxv_image`). `mprotect` adjusts stage-1 leaf permissions;
+//! `madvise`/`msync`/`mlock`/`mincore`/`membarrier` are mostly advisory or
+//! best-effort given the boot-mapped model.
+//!
+//! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
+//! dispatcher struct and the normalized dispatch table.
 use super::*;
 
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.

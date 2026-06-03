@@ -1,5 +1,42 @@
-//! creds syscall handlers. Methods on `SyscallDispatcher`; see
-//! `super` for the dispatcher struct and the normalized dispatch table.
+//! Credentials: uid/gid identity, capabilities, umask, and process priority.
+//!
+//! # Theory of operation
+//!
+//! carrick runs the entire guest as ONE host identity (whatever the macOS user
+//! launched it as), so it cannot truly become another uid. But it must still
+//! pass the identity DANCE that real software performs, and that dance is
+//! verify-after-set: apt's `_apt` privsep does `setresuid`/`setresgid` to drop
+//! privilege, then immediately `getuid`/`geteuid`/`getresuid` to CONFIRM the
+//! new identity ("Could not switch group" if it doesn't match). Returning the
+//! host's real identity unconditionally would break that.
+//!
+//! So the model is a faithful in-memory credential register file
+//! ([`CredState`]): accept every `set*uid`/`set*gid`/`setres*`/`setre*` the
+//! guest requests, store the new (real, effective, saved) ids, and echo them
+//! back from the corresponding `get*` calls. The default identity is root
+//! (uid 0 / gid 0) — what `id` shows in a typical container. The host kernel is
+//! NOT consulted for these (it would answer for the real macOS user); the one
+//! exception is anything that genuinely affects host behavior, which is folded
+//! into VFS access checks via the tracked `fsuid`/`fsgid`.
+//!
+//! Subtleties worth knowing before touching this:
+//!
+//!   - `fsuid`/`fsgid` (the VFS-access identity) track `euid`/`egid` — every
+//!     `set*uid`/`set*gid` resets them — but `setfsuid`/`setfsgid` can point
+//!     them elsewhere independently, and (per the Linux quirk) those two return
+//!     the PREVIOUS value, not the new one.
+//!   - Capabilities (`capget`/`capset`) are recorded/echoed; carrick runs as
+//!     root-equivalent so the cap sets are permissive, but the calls must
+//!     succeed and round-trip for libcap-based feature checks.
+//!   - `nice` is a per-process attribute, so `setpriority`/`getpriority`
+//!     store it in a process-global static (correct: fork gives a fresh
+//!     address space) and translate between the user value `[-20,19]` and the
+//!     kernel-ABI `20 - nice` that glibc converts back. `is_self_priority_target`
+//!     accepts the caller's pid, `LINUX_BOOTSTRAP_PID`, and (under a PID
+//!     namespace) the ns-pid that maps back to us.
+//!
+//! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
+//! dispatcher struct and the normalized dispatch table.
 use super::*;
 
 /// Per-process nice value (the calling process's PRIO_PROCESS priority).

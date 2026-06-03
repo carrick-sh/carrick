@@ -1,11 +1,31 @@
 //! Sub-allocator and backing-object model for the fixed, boot-mapped shared
 //! aperture (`LINUX_SHARED_FILE_BASE`, `LINUX_SHARED_FILE_SIZE`).
 //!
-//! The aperture itself is a single host `MAP_ANON | MAP_SHARED | MAP_NORESERVE`
-//! region `hv_vm_map`'d once before vCPU threads exist (see
-//! `linux_runtime_regions` in `memory.rs`). Guest `MAP_SHARED` mmaps then carve
-//! sub-ranges out of it here, so NO `hv_vm_map`/`hv_vm_unmap` runs after vCPUs
-//! exist. This is the spec's "stable stage-2 aperture topology" rule.
+//! THEORY OF OPERATION
+//!
+//! The central invariant of carrick's threaded memory model is that the guest's
+//! stage-2 (HVF) mapping topology must be STABLE once vCPU threads exist:
+//! arm64 HVF has no host-driven stage-2 TLB flush (it is EL2-only), so an
+//! `hv_vm_map`/`hv_vm_unmap` after sibling vCPUs are running can leave a stale
+//! stage-2 translation on another core and corrupt or hang the guest. The fix is
+//! to map ONE large region — the shared aperture, a single host
+//! `MAP_ANON | MAP_SHARED | MAP_NORESERVE` window `hv_vm_map`'d exactly once at
+//! boot, before any vCPU exists (see `linux_runtime_regions` in `memory.rs`) —
+//! and then satisfy every guest `MAP_SHARED` request by carving a sub-range out
+//! of that already-mapped window. This file is that carver. NO HVF call ever
+//! happens here; it is pure host-memory bookkeeping, so it composes safely with
+//! sibling vCPUs running.
+//!
+//! [`SharedAperture`] is a bump-plus-free-list sub-allocator over the window,
+//! granule-aligned (`0x4000`). [`BackingObject`] records WHAT backs each live
+//! slot — the skeleton of the durable-memory spec's backing-object model:
+//! `SharedAnon` (lives in the aperture, shared across `fork`, never copied),
+//! `SharedFile` (file bytes copied in on map, dirty bytes written back to a
+//! dup'd host fd on `msync`/`munmap`), and `PrivateAnon` (a
+//! `MAP_FIXED|MAP_PRIVATE` that landed on a shared-aperture VA, backed instead by
+//! a per-process private overlay window so its stores stay private across fork).
+//! The `source` tag on an overlay slot ([`SharedAperture::find_by_source`]) lets
+//! a re-`MAP_FIXED` over the same VA find and free the slot it replaces.
 
 use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
 
@@ -100,9 +120,10 @@ impl SharedAperture {
         self.alloc_sourced(len, backing, None)
     }
 
-    /// Like [`alloc`], but tags the slot with the shared-aperture VA it backs
-    /// (a `PrivateAnon` overlay slot), so [`find_by_source`] can locate it for a
-    /// re-`MAP_FIXED` over the same VA.
+    /// Like [`alloc`](Self::alloc), but tags the slot with the shared-aperture
+    /// VA it backs (a `PrivateAnon` overlay slot), so
+    /// [`find_by_source`](Self::find_by_source) can locate it for a re-`MAP_FIXED`
+    /// over the same VA.
     pub fn alloc_sourced(
         &mut self,
         len: u64,

@@ -1,4 +1,22 @@
-//! Shared helpers for Carrick integration and CLI tests.
+//! Shared helpers for carrick integration and CLI tests.
+//!
+//! carrick boots a guest from a container-style rootfs assembled out of OCI
+//! layers — each layer a gzipped tar. The end-to-end tests (`carrick-cli`'s
+//! `cli.rs`, `carrick-runtime`'s integration suites) need to synthesise those
+//! layers in-memory rather than ship binary fixtures on disk: a one-file
+//! `etc/motd`, a directory tree, a symlink graph. This crate is just the tar+gzip
+//! builders that do that — [`gzip_tar`] (files at mode 0644), [`gzip_tar_with_modes`]
+//! (explicit per-file modes, for the chmod/exec-bit cases), and
+//! [`gzip_tar_with_links`] (files plus symlinks, for the path-resolution tests).
+//!
+//! It is a separate crate, rather than a `#[cfg(test)]` module, for one reason:
+//! the same fixture builders are consumed from MULTIPLE crates' test targets
+//! (`carrick-cli/tests/cli.rs`, `carrick-runtime/tests/...`), and a test-only
+//! module can't be shared across crate boundaries. Pulling them here also keeps
+//! the dev-dependencies they need (`tar`, `flate2`) out of the production crates'
+//! graphs. Because it is test-only support, `clippy::unwrap_used` is allowed
+//! crate-wide — these helpers run only in tests, where a panic IS the failure
+//! report and propagating a `Result` would only add noise.
 
 #![allow(clippy::unwrap_used)]
 

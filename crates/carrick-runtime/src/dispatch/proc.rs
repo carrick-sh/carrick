@@ -1,5 +1,64 @@
-//! proc syscall handlers. Methods on `SyscallDispatcher`; see
-//! `super` for the dispatcher struct and the normalized dispatch table.
+//! Process lifecycle, scheduling, identity, and `prctl` — the syscalls that
+//! create, name, schedule, and reap tasks.
+//!
+//! # Theory of operation
+//!
+//! The load-bearing decision behind this whole file: **a guest process is a
+//! real macOS process, and a guest thread is a real macOS thread.** carrick
+//! does not simulate a process table — it forks. The host process tree mirrors
+//! the guest process tree, and the host scheduler runs guest threads. That
+//! makes most of `proc` thin, but it forces a few non-obvious identity rules.
+//!
+//! ## fork vs. clone(CLONE_THREAD)
+//!
+//! `clone` is the fork/thread fork: the kernel's flag-consistency rules are
+//! enforced UP FRONT (CLONE_THREAD ⇒ CLONE_SIGHAND ⇒ CLONE_VM, else EINVAL)
+//! before dispatch chooses a path, so a malformed thread-clone fails like Linux
+//! instead of silently taking the fork path. When the full `THREAD_MASK` is set
+//! the handler returns a `CloneThread` outcome (the runtime creates a new vCPU
+//! thread sharing the address space); otherwise it is a process fork (a real
+//! host `fork`, a fresh address space, the host child becoming a guest child).
+//! Thread creation is what apt/dpkg, Go, Node and CPython all actually depend
+//! on; the per-thread-vCPU model lives in the runtime, not here.
+//!
+//! ## Identity in a mirrored tree ([`ProcState`])
+//!
+//! Because guest pids ARE host pids, identity queries mostly defer to the host
+//! — but two cases need help. `getppid` must distinguish the ROOT guest process
+//! (which reports the stable bootstrap/init parent) from a forked child (which
+//! reports its real host parent, which — because the trees mirror — IS its
+//! guest parent); `bootstrap_host_pid`, captured before any guest fork and
+//! inherited through the copied address space, is the discriminator. And a guest
+//! under a PID namespace names itself by its ns-pid, so the `sched_pid_*` /
+//! `is_self` predicates accept the host pid, `LINUX_BOOTSTRAP_PID`, a live
+//! sibling thread's tid, and (under a pid ns) the ns-pid that maps back to us.
+//!
+//! ## prctl: mostly a faithful register file
+//!
+//! Most `prctl` options have no host effect; carrick's job is to RECORD them so
+//! the matching `PR_GET_*` reads back exactly what was set (dumpable, task comm
+//! name, pdeathsig, keepcaps, child-subreaper, no-new-privs, timerslack). These
+//! round-trip even when the modulated behavior is a follow-up, because real
+//! programs (init systems, libcap, seccomp installers) feature-check by setting
+//! and reading back. The exceptions with teeth: `PR_SET_NAME` feeds
+//! `/proc/self/comm`; `PR_SET_NO_NEW_PRIVS` is a one-way latch (the seccomp
+//! precondition); `PR_SET_MEM_MODEL_TSO` flips a flag the runtime loop reads to
+//! toggle ACTLR_EL1 x86-TSO ordering (Rosetta), since the dispatcher can't
+//! reach the vCPU.
+//!
+//! ## scheduling, affinity, and the rest
+//!
+//! carrick has a uniform SCHED_OTHER / priority-0 model, so `sched_get*`
+//! queries answer the same for any valid pid — the only thing that varies is
+//! "does this task exist?" (`sched_pid_exists`, which falls through to a host
+//! `kill(pid, 0)` probe for peer processes). Affinity is recorded as an
+//! observable mask (inherited across fork via the address-space copy) without
+//! physically pinning the host thread. `getrandom` and the interval timers
+//! (`itimers`, whose expiry signal is delivered by an `EVFILT_TIMER` on the
+//! signal pump's kqueue — see `crate::itimer`) round out the file.
+//!
+//! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
+//! dispatcher struct and the normalized dispatch table.
 use super::*;
 
 /// Process I/O priority stored by `ioprio_set` and echoed by `ioprio_get`.
@@ -175,7 +234,7 @@ pub(super) struct ProcState {
     /// set→get round-trips; Apple Silicon scheduling is advisory, so we honour
     /// the observable mask without physically pinning the host thread. Affinity
     /// is inherited across `fork`, which the address-space copy gives us for
-    /// free. See [[host_facts]].
+    /// free. See `host_facts`.
     pub affinity: Vec<u64>,
     /// Whether hardware x86_64 TSO memory ordering is active for this guest
     /// (`prctl(PR_SET_MEM_MODEL, PR_SET_MEM_MODEL_TSO)`, set by Rosetta). Tracked

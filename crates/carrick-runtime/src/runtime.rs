@@ -1,5 +1,111 @@
-//! Guest runtime loops for single-threaded and threaded execution, signal
-//! delivery, fork/exec, and wait handling.
+//! The run lifecycle: load an image, drive the trap→dispatch→complete loop, and
+//! own the fork/clone, signal-delivery, and fault-handling models.
+//!
+//! # The loop
+//!
+//! Every `run_*` entry point converges on [`finish_and_run_image`], which
+//! finalises a loaded [`AddressSpace`] (EL0 trampoline → EL1 vectors → stage-1
+//! page tables → vDSO) and enters the trap engine. The core of the runtime is a
+//! tight loop:
+//!
+//! 1. `next_syscall` runs the vCPU (`hv_vcpu_run`) until the guest executes
+//!    `svc #0`, faults synchronously at EL0, or is forced out by a cross-thread
+//!    kick.
+//! 2. The trapped frame (`x8` = syscall number, `x0..x5` = args) is handed to
+//!    the [`SyscallDispatcher`], which emulates it against Darwin host
+//!    primitives and returns a [`DispatchOutcome`].
+//! 3. The loop acts on the outcome — write the return value into `x0` and resume
+//!    (`Returned`/`Errno`), block on host fds and re-dispatch on readiness
+//!    (`WaitOn*`), spawn/teardown a process or thread (`Fork`/`CloneThread`/
+//!    `Execve`/`Exit`), or pop a signal frame (`SigReturn`).
+//! 4. Between syscalls it delivers any pending signal ([`deliver_pending_signal`]).
+//!
+//! There are **two** loop implementations, chosen by the guest's threading:
+//!
+//! - **Single-threaded** ([`run_combined_syscall_loop_with_dispatcher`], and its
+//!   split-view sibling [`run_split_loop`]): one vCPU, no locks, no thread
+//!   registry. Used by `run-elf` of a static binary, the in-process test
+//!   harnesses, and LTP fixtures. A guest `fork(2)` here is a plain `libc::fork`;
+//!   the child keeps running the same loop.
+//! - **Multi-threaded** ([`run_threaded_hvf_loop`] → [`run_vcpu_until_exit`]):
+//!   **one host thread plus one HVF vCPU per guest thread**, all sharing one
+//!   process VM (stage-2 mappings are visible to every vCPU). Shared kernel
+//!   state lives behind [`KernelState`] (an `Arc`, each subsystem internally
+//!   synchronised — there is no longer a single big lock). This is the path real
+//!   workloads (Go, CPython, Node, apt/dpkg) take.
+//!
+//! Both loops produce a [`RunResult`] (exit code + captured stdio + the
+//! [`CompatReport`]).
+//!
+//! # The fork/clone model (the hard part)
+//!
+//! macOS HVF is **not fork-safe**: a live VM in the parent at `libc::fork(2)`
+//! makes the child's `hv_vm_create` return `HV_BUSY`. carrick has three distinct
+//! fork shapes, and each works around this differently:
+//!
+//! - **`clone(2)` that creates a thread** (`CLONE_VM`): no `libc::fork` at all.
+//!   [`ThreadRuntimeState::spawn_clone_thread`] spawns a host thread that builds
+//!   its own vCPU in the *same* VM and runs [`run_vcpu_until_exit`]. HVF caps
+//!   concurrent vCPUs (64 on this host); a guest with more live threads than the
+//!   cap blocks in `wait_for_vcpu_slot` until one frees, since `clone(2)` already
+//!   reported success and the guest may `join` the thread.
+//! - **`fork(2)` from a single-threaded guest**: a plain `libc::fork`. The
+//!   engine snapshots and rebuilds the address space; the child resets its
+//!   per-process state (event ring, self-pipe, kqueue — none survive fork) and
+//!   continues.
+//! - **`fork(2)` from a multithreaded guest** ([`ThreadRuntimeState::handle_fork`]):
+//!   a *stop-the-world*. `libc::fork` replicates only the calling thread, so the
+//!   child would otherwise inherit carrick locks held by threads that no longer
+//!   exist. The forker therefore quiesces every **other** live vCPU at its
+//!   lock-safe run-loop top (via the kicker + the [`fork_quiesce`] barrier),
+//!   tears the VM down, forks, and republishes a rebuilt VM the parked siblings
+//!   recreate their vCPUs in. Concurrent forks serialise transparently (a loser
+//!   parks at the in-flight fork's barrier). The quiesce loop re-reads the live
+//!   sibling count every iteration — a sibling that exits mid-quiesce must drop
+//!   out, or the wait would spin forever waiting for a parker that no longer
+//!   exists (this was the multithreaded-fork wedge).
+//!
+//! [`fork_quiesce`]: crate::fork_quiesce
+//!
+//! Orthogonal to fork, a stage-1 **page-table edit** (mmap/mprotect/munmap that
+//! changes the guest's shared descriptors) is its own, lighter stop-the-world:
+//! [`ThreadRuntimeState::pt_pause`] kicks in-guest siblings out so none walks a
+//! half-edited table, but — unlike fork — it *keeps* every vCPU alive. The
+//! handshake between an editing coordinator and a vCPU about to enter the guest
+//! is a Dekker pattern on `quiescing` ↔ `in_guest` (SeqCst), so neither side
+//! misses the other.
+//!
+//! # PID-namespace placement and the supervisor
+//!
+//! A container `carrick run` that requests PID-ns placement forks the
+//! [`namespace::supervisor`](crate::namespace::supervisor) **before any VM
+//! exists** ([`maybe_fork_ns_supervisor`]):
+//! the parent becomes the userspace stand-in for the Linux kernel (orphan
+//! reparenting, exit-status harvest, teardown) and never creates a VM; the child
+//! continues into HVF as the guest-init (ns-pid 1). The three outcomes are
+//! [`SupervisorRole`]. `run-elf` never requests placement, so this is a no-op
+//! there.
+//!
+//! # Faults are signals
+//!
+//! A synchronous guest EL0 fault (nil deref, bad access, `BRK`, single-step) is
+//! not fatal to carrick: [`fault`]'s `deliver_fault_signal` maps the `ESR_EL1`
+//! to the Linux `(signum, si_code)` the kernel would deliver (SIGSEGV/SIGBUS/
+//! SIGTRAP) and injects it into the guest, so Go's `sigpanic`/`recover`, glibc
+//! backtraces, and any installed handler run exactly as on Linux.
+//!
+//! # The forked-child `_exit` rule (do not break this)
+//!
+//! A `libc::fork`ed child shares the parent's fd table. Unwinding through an
+//! fd-owning `Drop` (the dispatcher's buffers, an `applevisor::Vcpu`) in the
+//! child double-closes an inherited fd — tripping std's IO-safety abort — or
+//! runs the no-VM `Vcpu` Drop and panics. So on **every** exit path the loops
+//! check `is_forked_child()` / `is_forked_guest_process()` and route through the
+//! `_exit`-based [`exec`] helpers (`forked_child_exit` flushes buffered stdio to
+//! the inherited host fds then `_exit`s; `forked_child_die_by_signal` re-raises
+//! the signal so the parent's `wait4` reports `WIFSIGNALED`).
+//!
+//! [`AddressSpace`]: crate::memory::AddressSpace
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1435,9 +1541,9 @@ impl ThreadRuntimeState {
         );
     }
 
-    /// Return-side companion to [`trace_syscall`]: logs what carrick handed back
-    /// to the guest. A value in [-4095, -1] is -errno (decoded); otherwise a
-    /// plain return. Pairs with the entry line so the trap stream is a full
+    /// Return-side companion to [`Self::trace_syscall`]: logs what carrick handed
+    /// back to the guest. A value in `[-4095, -1]` is -errno (decoded); otherwise
+    /// a plain return. Pairs with the entry line so the trap stream is a full
     /// request+result log — the reducer aligns it against the Docker oracle to
     /// localise a wrong-errno divergence or the last syscall before a hang.
     fn trace_syscall_return(&self, traps: usize, ret: Option<i64>) {
@@ -2897,7 +3003,7 @@ pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
 /// — exactly as Linux `binfmt_misc` redirects a foreign-arch binary to its
 /// registered interpreter:
 ///
-///   argv = ["<rosetta>", "<target>", <original argv[1..]>]
+///   argv = [`<rosetta>`, `<target>`, `<original argv[1..]>`]
 ///
 /// Returns:
 ///

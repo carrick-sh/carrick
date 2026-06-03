@@ -1,5 +1,38 @@
 //! Compatibility reporting primitives for syscall coverage, unknown flags,
 //! partial implementations, and runtime diagnostics.
+//!
+//! THEORY OF OPERATION
+//!
+//! Every syscall the dispatcher handles flows a [`CompatEvent`] through
+//! [`CompatReporter::record`]. That single funnel does three things, in order of
+//! cost: it fires the matching USDT probe (gated on a DTrace consumer, so
+//! near-free when none is attached), optionally emits a verbose stderr line
+//! (opt-in via `CARRICK_TRACE_SYSCALLS`, the env check cached once at
+//! construction so it is not re-read per syscall), and then AGGREGATES the event
+//! inline.
+//!
+//! The aggregation design is the load-bearing decision. An earlier version
+//! stored one `CompatEvent` per syscall in a `Vec` and allocated a `String` name
+//! on the hot path even when nobody consumed the report — an unbounded heap
+//! growth that taxed every syscall-heavy run. Now `record` keeps only what a
+//! report needs: lock-free `AtomicU64` counters for the common entry/return
+//! events, and small dedup `HashMap`s (behind a `parking_lot::Mutex`) for the
+//! RARE events — unhandled syscalls, partial implementations, unknown flag bits,
+//! unhandled ioctls, unimplemented `/proc` and `/sys` reads, unsupported
+//! signals. A syscall-heavy run thus costs a few integer increments rather than
+//! a heap push. The detailed aggregate report stays always-on because the maps
+//! are cheap and only grow with the number of DISTINCT rare events.
+//!
+//! [`CompatReport`] is the rendered snapshot (text or JSON), cross-referenced
+//! against the static [`crate::syscall`] metadata table to compute coverage. The
+//! `unknown_syscall_flags` channel in particular exists to catch Linux ABI drift
+//! LOUDLY — a guest passing a flag bit carrick doesn't recognise surfaces here
+//! instead of being silently dropped.
+//!
+//! This module also owns the two `#[repr(C)]` register-snapshot structs
+//! ([`SyscallArgs`], [`GuestRegs`]) that the hot-path USDT probes pass to DTrace
+//! by raw pointer; their field layout is mirrored by the `.d` scripts and is
+//! therefore an ABI — see the per-struct docs and [`crate::probes`].
 
 use std::borrow::Cow;
 use std::collections::HashMap;

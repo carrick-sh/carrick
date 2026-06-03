@@ -1,5 +1,42 @@
-//! Thin safe wrapper around Darwin kqueue/kevent operations used by waits,
-//! epoll emulation, timers, and signal pumping.
+//! Thin safe wrapper around Darwin `kqueue`/`kevent`.
+//!
+//! THEORY OF OPERATION
+//!
+//! `kqueue` is the one host primitive that unifies almost every "wait for
+//! something" in the carrick concurrency cluster, because it watches fd
+//! readiness, process exit, timers, vnode changes, and a user-triggered wake
+//! source through ONE blocking call — which is exactly what lets a guest thread
+//! park on a guest fd AND its signal self-pipe AND a fork-quiesce wake at the
+//! same time. The Linux features layered on top all reduce to a [`Kevent`]
+//! filter:
+//!
+//!   * `EVFILT_READ`/`EVFILT_WRITE`/`EVFILT_EXCEPT` — blocking-I/O waits
+//!     ([`crate::io_wait`]) and epoll emulation. `with_udata` stashes the guest
+//!     fd so a returned event maps straight back without a reverse lookup.
+//!   * `EVFILT_PROC`/`NOTE_EXIT` — a guest child's exit, the macOS-native
+//!     process-lifecycle tracking that backs both pidfd and SIGCHLD delivery.
+//!     `proc_exit` additionally arms `NOTE_EXITSTATUS` so the event's `data`
+//!     carries the exit status, which the namespace supervisor harvests before
+//!     launchd reaps the host zombie (after which `waitpid` is ECHILD).
+//!   * `EVFILT_TIMER` — `setitimer`/POSIX-timer expiry on the signal pump's
+//!     kqueue ([`crate::itimer`]).
+//!   * `EVFILT_USER` (`NOTE_TRIGGER`) — an explicit cross-thread wake of the
+//!     signal pump; the async-signal-safe path uses the self-pipe instead, since
+//!     `kevent` is not async-signal-safe.
+//!   * `EVFILT_VNODE` — the backing for inotify watches.
+//!
+//! INVARIANT — EDGE vs LEVEL is a correctness choice, not a tuning knob. Wake
+//! pipes and vnode/user watches are registered `EV_CLEAR` (edge-triggered) on
+//! purpose: a wake pipe whose write end closed sits at permanent EOF, and a
+//! level-triggered read filter would report it readable on EVERY `kevent` — a
+//! drain cannot clear an EOF — busy-spinning a vCPU at 100% (the CPython
+//! forkserver hang; see [`crate::io_wait`]). `EV_CLEAR` delivers the EOF edge
+//! once, then is quiet.
+//!
+//! The wrapper is deliberately thin: [`Kqueue`] is just an RAII fd owner, and
+//! [`Kevent`] is `#[repr(transparent)]` over `libc::kevent` so call sites never
+//! hand-build a raw `kevent`. The `EVFILT_EXCEPT`/`NOTE_OOB` constants are
+//! defined here because the pinned `libc` version doesn't expose them.
 
 use std::os::fd::RawFd;
 
@@ -138,11 +175,13 @@ impl Kevent {
     /// One-shot: fires once on exit.
     ///
     /// Armed with `NOTE_EXITSTATUS` as well as `NOTE_EXIT` so the returned
-    /// event's `data` field carries the exit status ([`proc_exit_status`]). Under
-    /// plain `NOTE_EXIT` macOS leaves `data` at 0; the NsSupervisor needs the
-    /// real status to harvest a namespace member's exit code before launchd
-    /// reaps the host zombie (after which `waitpid` is ECHILD). Detection-only
-    /// callers ([`proc_exit_ident`]) are unaffected by the extra fflag.
+    /// event's `data` field carries the exit status
+    /// ([`proc_exit_status`](Self::proc_exit_status)). Under plain `NOTE_EXIT`
+    /// macOS leaves `data` at 0; the NsSupervisor needs the real status to
+    /// harvest a namespace member's exit code before launchd reaps the host
+    /// zombie (after which `waitpid` is ECHILD). Detection-only callers
+    /// ([`proc_exit_ident`](Self::proc_exit_ident)) are unaffected by the extra
+    /// fflag.
     pub fn proc_exit(pid: i32) -> Self {
         Self::new(
             pid as usize,
@@ -183,7 +222,8 @@ impl Kevent {
         self.0.fflags
     }
 
-    /// The integer previously stashed via [`with_udata`] (the guest fd).
+    /// The integer previously stashed via [`with_udata`](Self::with_udata) (the
+    /// guest fd).
     pub fn udata_i32(self) -> i32 {
         self.0.udata as isize as i32
     }

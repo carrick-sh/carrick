@@ -228,8 +228,8 @@ impl InotifyState {
     /// records up to the caller's buffer size, keeping the remainder queued
     /// (`pending`) for the next read.
     /// An empty return means no events are ready (caller maps to EAGAIN / a
-    /// wait on [`poll_fd`]). A non-empty queue with `max_bytes` too small for a
-    /// single record is signalled by `Err(EINVAL)`, matching Linux.
+    /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
+    /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
         let mut events = [Kevent::empty(); 32];
         let timeout = libc::timespec {

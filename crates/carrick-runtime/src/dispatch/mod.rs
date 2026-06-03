@@ -1,7 +1,128 @@
-//! Linux syscall dispatch core.
+//! Linux syscall dispatch core — theory of operation.
 //!
-//! This module owns guest ABI request decoding, descriptor state, wait
-//! outcomes, and shared syscall helpers used by the per-domain handlers.
+//! # The problem
+//!
+//! A guest Linux process runs as a native macOS process. When it executes an
+//! `svc #0`, HVF traps to the carrick runtime with the aarch64 syscall frame
+//! (`x8` = number, `x0..x5` = args). There is no guest kernel: every Linux
+//! syscall must be *re-implemented* against Darwin host primitives. This module
+//! is where a decoded syscall request turns into an effect — and, crucially,
+//! into a description of what the *run loop* must do next that the dispatcher
+//! itself cannot (block, fork, exec, park a vCPU). It owns guest-ABI request
+//! decoding, the open-descriptor / fd-table state, the wait-outcome protocol,
+//! and the shared helpers the per-domain handler modules
+//! (`fs`, `proc`, `net`, `mem`, `signal`, …) build on.
+//!
+//! # The dispatch table: one normalized contract, macro-generated
+//!
+//! Every migrated handler has the *same* signature — a method on
+//! [`SyscallDispatcher`] taking `&mut SyscallCtx<M>` and returning
+//! `Result<DispatchOutcome, DispatchError>`. The `normalized_dispatch!` macro
+//! (below) expands a `number => handler` list into two functions:
+//! `dispatch_normalized` (the `match` that builds a [`SyscallCtx`] and calls the
+//! handler) and `dispatch_normalized_known` (a membership test the threaded path
+//! uses to decide whether a syscall is claimed at all). The macro table is the
+//! single authoritative syscall registry: any number it does not claim is
+//! genuinely unimplemented and returns `-ENOSYS`. There is no hand-written
+//! mega-`match` anymore — the legacy fall-through arm has shrunk to nothing, so
+//! an unclaimed number records a structured compat event and ENOSYSes rather
+//! than panicking. **The supervisor never panics on guest input.**
+//!
+//! [`SyscallCtx`] is a *transient narrow borrow*: it bundles the request, a
+//! scoped `&mut` of guest memory, the compat reporter, and (on the threaded
+//! path) a [`ThreadCtx`] with this thread's tid plus the shared thread/futex
+//! tables. It exists only for the duration of one dispatched syscall, so a
+//! handler borrows exactly the guest memory and per-thread coordination it needs
+//! and nothing else.
+//!
+//! # BKL-free: per-subsystem locks, two entry points
+//!
+//! Historically the dispatcher was guarded by one big lock (the "BKL"). It is
+//! not anymore. [`SyscallDispatcher`] is shared as a plain `Arc` and each
+//! subsystem owns its own interior lock — `io` (fd table / stdio / cwd),
+//! `mem`, `proc`, `creds`, `signal`, `fs`, `seccomp`, `sysv`. A handler that
+//! touches only one subsystem takes only that subsystem's lock; sibling threads
+//! in other subsystems run concurrently. The two public entry points reflect the
+//! two runtime models:
+//!
+//! - [`SyscallDispatcher::dispatch`] (`&mut self`) — the single-threaded /
+//!   fork-based path and the unit tests. Tid-aware handlers see `thread: None`
+//!   and fall back to pid-based answers.
+//! - [`SyscallDispatcher::dispatch_threaded`] (`&self`) — the multi-threaded
+//!   path. There is **no dispatcher-wide fallback** here: a handler that touches
+//!   process-wide state MUST guard it with a subsystem lock. The threaded path
+//!   first tries `dispatch_threaded_independent` (a
+//!   lock-free hot subset: `gettid`, `sched_yield`, futex, thread-targeted
+//!   `tgkill`/`tkill`, `set_tid_address`), then the normalized table; anything
+//!   else is ENOSYS on this path.
+//!
+//! Both paths run the seccomp pre-check first (installed cBPF filters veto a
+//! syscall before its handler — ERRNO or fail-closed kill, mirroring the kernel)
+//! and bracket the call with `SyscallEntry`/`SyscallReturn` compat events.
+//!
+//! The **lock-ordering invariant** is load-bearing and stated in full in the
+//! comment immediately below this doc block; the short version is: never hold a
+//! subsystem lock across a guest-memory callback or a blocking host wait, and
+//! acquire fd/open-description state before fs-overlay state before `pty_table`
+//! before the proc/signal/thread registries.
+//!
+//! # `DispatchOutcome`: the handler↔run-loop protocol
+//!
+//! A handler runs to completion synchronously and returns a [`DispatchOutcome`].
+//! Most outcomes are trivial — [`DispatchOutcome::Returned`] /
+//! [`DispatchOutcome::Errno`] (the run loop writes the value or `-errno` into
+//! `x0`) or [`DispatchOutcome::Exit`]. The interesting variants are *requests*:
+//! the dispatcher reached a point it cannot finish in place — because finishing
+//! would require blocking, forking, replacing the address space, or touching the
+//! vCPU — so it hands the run loop (`runtime.rs`) a structured description of
+//! what to do and (for the blocking cases) *re-dispatches the same syscall*
+//! afterwards. The categories:
+//!
+//! - **Address-space / vCPU effects the dispatcher cannot perform.**
+//!   [`DispatchOutcome::Fork`] (real `libc::fork` against the trap engine),
+//!   [`DispatchOutcome::Execve`] (tear down + reload the ELF; argv/env are raw
+//!   *byte* strings, not UTF-8), [`DispatchOutcome::CloneThread`] (spawn a host
+//!   thread + sibling vCPU sharing the VM), [`DispatchOutcome::ThreadExit`],
+//!   [`DispatchOutcome::SigReturn`] (pop the sigframe, don't advance PC),
+//!   [`DispatchOutcome::SetMemoryModel`] (Rosetta TSO via `ACTLR_EL1`),
+//!   [`DispatchOutcome::MapHostAlias`] (back a high-VA / `MAP_SHARED` mapping),
+//!   and [`DispatchOutcome::SignalThread`] (kick a sibling vCPU to deliver).
+//!
+//! - **Blocking that MUST NOT happen under a dispatcher lock.** A handler that
+//!   blocks while holding a subsystem lock starves every sibling thread (a
+//!   `FUTEX_WAKE`, a GIL handoff, a server's workers). So the value-check /
+//!   readiness-check happens *under* the lock, and if the call must block the
+//!   handler returns a wait outcome and the run loop drops all locks, parks
+//!   interruptibly, then re-dispatches. These are [`DispatchOutcome::FutexWait`]
+//!   / [`DispatchOutcome::SharedFutexWait`] (futex value matched → park on the
+//!   parking-lot token or, for `MAP_SHARED` inter-process futexes, the host
+//!   `__ulock`), [`DispatchOutcome::WaitOnFds`] / [`DispatchOutcome::WaitOnFdsSelect`]
+//!   / [`DispatchOutcome::WaitOnPollFds`] (poll/select/epoll-style fd readiness,
+//!   serviced by the per-thread kqueue or `poll(2)`), [`DispatchOutcome::WaitOnProcExit`]
+//!   (a blocking `waitid` parks on `EVFILT_PROC`/`NOTE_EXIT`),
+//!   [`DispatchOutcome::WaitOnSignals`] (`rt_sigtimedwait`), and
+//!   [`DispatchOutcome::WaitOnSleep`] (`nanosleep` via the per-thread waiter, so
+//!   the sleep is interruptible AND can park for a fork-quiesce — a sibling stuck
+//!   in a synchronous host nanosleep would deadlock a multithreaded fork).
+//!
+//! The re-dispatch contract is what makes the wait outcomes correct: a handler
+//! writes nothing speculative, the run loop blocks, and on a *ready* wake it
+//! calls the same syscall again — which now finds the fd ready / the signal
+//! pending / the child reaped and completes normally. A *timeout* or *signal*
+//! wake is completed by the run loop directly (`on_timeout` value, or `EINTR`).
+//! See each variant's doc for its exact completion rule.
+//!
+//! # The fs subsystem
+//!
+//! The filesystem handlers (in `fs.rs` and `fs/`) route every path-bearing
+//! syscall through the unified VFS mount table first (`FsState::vfs_mounts`
+//! — `/dev`, `/proc`, `/sys`), falling through to the `/` mount: an immutable OCI
+//! rootfs plus a writable overlay. Descriptors live in the fd table
+//! (`fd_table`) as `OpenDescription` values — a per-open-file-description
+//! union spanning in-memory `File`/`Directory`, host-fd-backed `HostFile` /
+//! `HostSocket` / `HostPipe`, and the anonymous-inode fds (eventfd, epoll,
+//! timerfd, signalfd, inotify, pidfd). The fd allocator is POSIX
+//! lowest-free-descriptor, capped at the guest's soft `RLIMIT_NOFILE`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path};
@@ -742,7 +863,7 @@ pub enum DispatchOutcome {
         /// is delivered after the syscall, per the persistent mask). `0` = none.
         block_signals: u64,
     },
-    /// Like [`WaitOnFds`] but for `select`/`pselect6`, whose fd-set bitmaps are
+    /// Like [`DispatchOutcome::WaitOnFds`] but for `select`/`pselect6`, whose fd-set bitmaps are
     /// BOTH input and output (unlike `poll`'s separate `events`/`revents`).
     /// The handler therefore leaves the guest fd-sets UNMODIFIED across the
     /// wait, so:
@@ -768,7 +889,7 @@ pub enum DispatchOutcome {
         /// wait times out. Empty when no fd-set was supplied.
         clear_on_timeout: Vec<(u64, usize)>,
     },
-    /// Same contract as [`WaitOnFds`], but serviced by `poll(2)` instead of
+    /// Same contract as [`DispatchOutcome::WaitOnFds`], but serviced by `poll(2)` instead of
     /// the runtime's per-thread kqueue. This is for epoll's backing kqueue fd:
     /// polling a kqueue fd observes pending epoll events without consuming
     /// them, so the runtime can re-dispatch `epoll_pwait` and let that call
@@ -1578,7 +1699,7 @@ impl SyscallDispatcher {
     /// process's working directory. carrick's overlay/rootfs/bind-mount layers
     /// all key on absolute guest paths, so a bare relative path (e.g. Go
     /// os/exec `TestCommandRelativeName`, which sets `cmd.Path = "dirBase/base"`
-    /// with `cmd.Dir = "/"`) would miss every layer and fail ENOENT. argv[0] is
+    /// with `cmd.Dir = "/"`) would miss every layer and fail ENOENT. `argv[0]` is
     /// left untouched by the caller (Linux preserves whatever the caller
     /// passed); only the path used to LOAD the image is absolutized.
     pub fn resolve_exec_path(&self, path: &str) -> String {
@@ -2544,7 +2665,7 @@ fn dispatch_threaded_signal_route(
 /// Linux kernel itself uses on the wire. The compiler refuses to pass
 /// `T` here unless the trait is implemented, which forces every new
 /// ABI struct to declare its kernel size up front and have a paired
-/// const assert validating ABI_SIZE <= size_of::<T>().
+/// const assert validating `ABI_SIZE <= size_of::<T>()`.
 fn write_kernel_struct<T: KernelAbi>(
     memory: &mut impl GuestMemory,
     address: u64,
@@ -2950,14 +3071,12 @@ fn write_stat_record(
     }
 }
 
-/// Build and write a `stat` from REAL on-disk values ([`RealStat`]):
-/// the true file type (so a symlink stat'd with `AT_SYMLINK_NOFOLLOW`
-/// reports S_IFLNK) and the real `st_nlink` (a true hard link reports
-/// >1). Type/mode bits come from a [`RootFsMetadata`] carrying the
-/// > real `kind`; `st_nlink` is overridden with the disk value.
-/// > Build a [`RealStat`](crate::fs_backend::RealStat) from a live `libc::stat`
-/// > (e.g. an `fstat` of a host fd), so an fd-based stat reports the SAME real
-/// > size/kind/times as the path-based `real_stat` that statx/newfstatat use.
+/// Build a [`RealStat`](crate::fs_backend::RealStat) from a live `libc::stat`
+/// (e.g. an `fstat` of a host fd) carrying the REAL on-disk values: the true
+/// file type (so a symlink stat'd with `AT_SYMLINK_NOFOLLOW` reports S_IFLNK)
+/// and the real `st_nlink` (a true hard link reports more than 1). An fd-based
+/// stat then reports the SAME real size/kind/times as the path-based
+/// `real_stat` that statx/newfstatat use.
 ///
 /// Without this, `fstat` returned `st_mtime = 0` (the zeroed open-time
 /// metadata) while statx/newfstatat returned the real mtime. apt records each
@@ -3836,7 +3955,7 @@ fn read_guest_string_array_bytes(
     Err(LINUX_E2BIG)
 }
 
-/// Adapter from the VFS-trait [`vfs::Metadata`] back to
+/// Adapter from the VFS-trait [`Metadata`](crate::vfs::Metadata) back to
 /// [`RootFsMetadata`] for the dispatcher's existing stat/statx
 /// writers, which still take the rootfs-shaped struct. Used by every
 /// dispatcher fs syscall that's been migrated to consult

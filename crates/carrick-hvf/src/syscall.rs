@@ -1,5 +1,26 @@
 //! Static AArch64 syscall metadata used for dispatch grouping, coverage
 //! reporting, and compatibility summaries.
+//!
+//! THEORY OF OPERATION
+//!
+//! This is a compile-time table — `AARCH64_SYSCALLS`, kept sorted by number so
+//! [`lookup_aarch64`] can binary-search it — that maps each Linux/aarch64 syscall
+//! number to its name, the [`SyscallHandler`] subsystem that owns it, a
+//! [`SupportLevel`] (`BringUp`/`Planned`/`Deferred`), and an optional compat
+//! note. It is pure metadata: it does NOT dispatch anything itself. Two
+//! consumers read it. The [`crate::compat`] reporter cross-references it to turn
+//! raw event counters into a coverage report ("of the N syscalls a real kernel
+//! exposes, which has carrick actually serviced, and at what support level").
+//! And the handler grouping ([`handler_for_aarch64`]) is the canonical
+//! number→subsystem partition that keeps the report's buckets aligned with how
+//! the dispatcher is actually carved up.
+//!
+//! `handler_for_aarch64` is written as `const` range matches rather than a
+//! per-syscall annotation precisely because the aarch64 numbering is dense and
+//! contiguous within a subsystem; the ranges are the compact expression of that
+//! structure. Keep this table in sync with the dispatcher: a syscall that gains
+//! a handler but stays `Deferred`/`Unimplemented` here will under-report
+//! coverage, and the reverse over-reports it.
 
 use serde::Serialize;
 
