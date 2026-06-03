@@ -3258,25 +3258,7 @@ impl SyscallDispatcher {
                     0
                 };
                 // Honor the guest's optlen (it offers 4; clamp defensively).
-                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
-                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-                    Err(_) => return Ok(LINUX_EFAULT.into()),
-                };
-                let bytes = val.to_ne_bytes();
-                let n = (guest_optlen as usize).min(bytes.len());
-                if optval_addr != 0
-                    && n > 0
-                    && memory.write_bytes(optval_addr, &bytes[..n]).is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                if memory
-                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                return write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes());
             }
             // SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF: report the GUEST-intended
             // value, not carrick's host-side widening. REUSEPORT defaults to 0
@@ -3312,25 +3294,7 @@ impl SyscallDispatcher {
                         0
                     }
                 };
-                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
-                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-                    Err(_) => return Ok(LINUX_EFAULT.into()),
-                };
-                let bytes = val.to_ne_bytes();
-                let n = (guest_optlen as usize).min(bytes.len());
-                if optval_addr != 0
-                    && n > 0
-                    && memory.write_bytes(optval_addr, &bytes[..n]).is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                if memory
-                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                return write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes());
             }
             // SO_RCVTIMEO/SO_SNDTIMEO readback: the set side stores these per
             // open-file-description and bypasses the (dead) host fd, so the
@@ -3357,24 +3321,7 @@ impl SyscallDispatcher {
                     let mut tv_bytes = [0u8; 16];
                     tv_bytes[0..8].copy_from_slice(&tv_sec.to_ne_bytes());
                     tv_bytes[8..16].copy_from_slice(&tv_usec.to_ne_bytes());
-                    let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
-                        Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-                        Err(_) => return Ok(LINUX_EFAULT.into()),
-                    };
-                    let n = (guest_optlen as usize).min(16);
-                    if optval_addr != 0
-                        && n > 0
-                        && memory.write_bytes(optval_addr, &tv_bytes[..n]).is_err()
-                    {
-                        return Ok(LINUX_EFAULT.into());
-                    }
-                    if memory
-                        .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
-                        .is_err()
-                    {
-                        return Ok(LINUX_EFAULT.into());
-                    }
-                    return Ok(DispatchOutcome::Returned { value: 0 });
+                    return write_sockopt_value(memory, optval_addr, optlen_addr, &tv_bytes);
                 }
             }
             // SO_PEERCRED: Linux returns `struct ucred { pid, uid, gid }`. macOS
@@ -3425,24 +3372,7 @@ impl SyscallDispatcher {
                 ucred[8..12].copy_from_slice(&gid.to_ne_bytes());
                 // Honor the guest's optlen: write at most what it offered and
                 // report the bytes actually written (Linux clamps to the buffer).
-                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
-                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-                    Err(_) => return Ok(LINUX_EFAULT.into()),
-                };
-                let n = (guest_optlen as usize).min(crate::linux_abi::LINUX_UCRED_SIZE);
-                if optval_addr != 0
-                    && n > 0
-                    && memory.write_bytes(optval_addr, &ucred[..n]).is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                if memory
-                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                return write_sockopt_value(memory, optval_addr, optlen_addr, &ucred);
             }
             let (host_fd, _family) = match this.host_socket_lookup(fd) {
                 Ok(t) => t,
@@ -3477,25 +3407,12 @@ impl SyscallDispatcher {
                     crate::dispatch::macos_to_linux_errno(host_err)
                 };
                 // Honor the guest's optlen (it may pass <4); clamp like Linux.
-                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
-                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-                    Err(_) => return Ok(LINUX_EFAULT.into()),
-                };
-                let n = (guest_optlen as usize).min(4);
-                let bytes = linux_err.to_ne_bytes();
-                if optval_addr != 0
-                    && n > 0
-                    && memory.write_bytes(optval_addr, &bytes[..n]).is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                if memory
-                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                return write_sockopt_value(
+                    memory,
+                    optval_addr,
+                    optlen_addr,
+                    &linux_err.to_ne_bytes(),
+                );
             }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,
