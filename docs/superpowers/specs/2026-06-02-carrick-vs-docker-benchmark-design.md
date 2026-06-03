@@ -207,6 +207,17 @@ Takeaway: after the copy fixes, carrick's *emulation* overhead is small on netwo
 
 **2026-06-02 — path-resolution amplification (the disk-metadata fix).** `carrick trace` (count) of the in-process stat probe showed **~400 host syscalls per single 8-deep guest `stat`** (134 `openat`). The amplifier was `resolve_at_path`'s two per-component passes — `validate_intermediate_dirs` (ENOTDIR check) and `resolve_intermediate_symlinks` (rewrite) — each calling `layered_lstat` per component, so a K-deep path cost **O(K²)** host syscalls on *every* path-based fs op (open/create/write/stat/access), not just stat. (A first attempt patched `RootFsVfs::lookup`, which serves open/access not the stat hot path; reverted clean.) Fix: a new `FsBackend::validate_parents_fast` — **one kernel-walked `openat(parent, O_DIRECTORY)` + `F_GETPATH` byte-exact check**. When every intermediate exists, is a directory, and has no symlink/Unicode-alias redirection (the common case), it skips BOTH O(K²) passes; a non-dir intermediate returns ENOTDIR; any symlink/alias/missing/non-host case falls back to the *exact* slow path. **Result: 8-deep `stat` 1200 µs → 59 µs (~20×), host `openat` 133.7 → 4.0 per stat (~33× fewer)** — carrick from ~1200× native to ~59× (vs Docker ~2600× → ~130×). Benefits the **write path** too (open/create/write share `resolve_at_path`). Validated: **full conformance suite green** (`4 passed; 0 failed`). The residual ~59× over native is `real_stat`/xattr reads + the irreducible APFS-vs-ext4 stack penalty.
 
+### Volume-mount disk (bind-mount thesis): carrick **wins**
+
+The sharpest disk-thesis test — bulk IO over a **bind mount** (`perf_disk_vol`, `.bench-scratch` on the internal SSD): carrick `--fs host -v` (direct host FD) vs Docker `-v` (virtiofs across the VM boundary) vs native (writes straight to the host dir).
+
+| MB/s ↑ | native | carrick `-v` | docker `-v` (virtiofs) | carrick/docker |
+|---|---|---|---|---|
+| vol_write | 2327* | 4661* | 1765 | **2.64×** |
+| vol_read | 18915 | 9610 | 3984 | **2.41×** |
+
+**carrick beats Docker 2.4–2.6× on bulk bind-mount IO** — the direct host FD vs virtiofs's VM-boundary round-trip, exactly the "no virtiofs abstraction → IO wins" thesis, and the mirror image of the `stat_storm` *metadata* loss (cap-std). \* **fsync confound on the WRITE-vs-native column only:** the same probe source builds to `F_FULLFSYNC` on the native (aarch64-apple-darwin) target but a plain Linux `fsync` in the guest (aarch64-linux-musl), so the native write ceiling is artificially slow and the *carrick-vs-docker* write number (both Linux `fsync`) is the fair one. The cache-served read column is clean (carrick 51% of native, docker 21%).
+
 ---
 
 ## 9. Threats to validity
