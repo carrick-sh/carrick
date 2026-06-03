@@ -7,8 +7,8 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
@@ -22,7 +22,11 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Per-sample run id, stamped into the carrick guest title for scoped cleanup.
 pub fn perf_run_id() -> String {
-    format!("cr-perf-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "cr-perf-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn scoped_kill_guests(repo_root: &Path, run_id: &str) {

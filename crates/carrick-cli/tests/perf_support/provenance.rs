@@ -3,8 +3,8 @@
 //! over time (the reusable-baseline requirement). Capture functions shell out to
 //! `sysctl`/`sw_vers`/`git`/`docker`; all are best-effort (None on failure) so a
 //! row is still written when an optional fact is unavailable.
-use std::process::Command;
 use super::stats::Summary;
+use std::process::Command;
 
 fn cmd_stdout(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
@@ -38,7 +38,16 @@ impl HostFacts {
 
 /// OCI digest of the pinned image, e.g. ubuntu:24.04 -> sha256:...
 pub fn image_digest(image: &str) -> Option<String> {
-    cmd_stdout("docker", &["image", "inspect", "--format", "{{index .RepoDigests 0}}", image])
+    cmd_stdout(
+        "docker",
+        &[
+            "image",
+            "inspect",
+            "--format",
+            "{{index .RepoDigests 0}}",
+            image,
+        ],
+    )
 }
 
 pub fn git_sha() -> Option<String> {
@@ -88,7 +97,10 @@ pub fn append_row(repo_root: &std::path::Path, date: &str, row: &ResultRow) -> s
     let dir = repo_root.join("docs/perf-results");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{date}-{}.jsonl", row.dimension));
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     let line = serde_json::to_string(row).map_err(std::io::Error::other)?;
     writeln!(f, "{line}")
 }
@@ -108,7 +120,13 @@ mod tests {
             metric: "tcp_rr_p50_us".into(),
             unit: "us".into(),
             higher_is_better: false,
-            summary: Summary { p50: 8.4, p95: 14.0, min: 6.1, iqr: 1.2, n: 8 },
+            summary: Summary {
+                p50: 8.4,
+                p95: 14.0,
+                min: 6.1,
+                iqr: 1.2,
+                n: 8,
+            },
             samples: vec![8.4, 8.5, 8.3],
             noisy: false,
             nproc: Some(4),
@@ -142,7 +160,8 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("perf-prov-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         append_row(&tmp, "2026-06-02", &fake_row()).unwrap();
-        let body = std::fs::read_to_string(tmp.join("docs/perf-results/2026-06-02-network.jsonl")).unwrap();
+        let body = std::fs::read_to_string(tmp.join("docs/perf-results/2026-06-02-network.jsonl"))
+            .unwrap();
         assert_eq!(body.lines().count(), 1);
         std::fs::remove_dir_all(&tmp).ok();
     }

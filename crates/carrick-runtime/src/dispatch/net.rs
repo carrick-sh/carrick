@@ -2973,12 +2973,12 @@ impl SyscallDispatcher {
                 let n = n.host_syscall_errno()?;
                 // Copy path: flush the bounce into guest. Zero-copy: the kernel
                 // already wrote straight into guest memory, nothing to copy.
-                if !zero_copy && n > 0 {
-                    if let Some(b) = recv_copy.as_ref() {
-                        if memory.write_bytes(buf_addr, &b[..n as usize]).is_err() {
-                            return Err(LINUX_EFAULT);
-                        }
-                    }
+                if !zero_copy
+                    && n > 0
+                    && let Some(b) = recv_copy.as_ref()
+                    && memory.write_bytes(buf_addr, &b[..n as usize]).is_err()
+                {
+                    return Err(LINUX_EFAULT);
                 }
                 if used_addr && src_addr != 0 && src_len_addr != 0 {
                     let used = (sa_len as usize).min(sa.len());

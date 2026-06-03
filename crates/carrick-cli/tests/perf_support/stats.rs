@@ -69,8 +69,20 @@ mod tests {
 
     #[test]
     fn noisy_when_spread_wide() {
-        let tight = Summary { p50: 100.0, p95: 105.0, min: 99.0, iqr: 5.0, n: 8 };
-        let wide = Summary { p50: 100.0, p95: 180.0, min: 90.0, iqr: 40.0, n: 8 };
+        let tight = Summary {
+            p50: 100.0,
+            p95: 105.0,
+            min: 99.0,
+            iqr: 5.0,
+            n: 8,
+        };
+        let wide = Summary {
+            p50: 100.0,
+            p95: 180.0,
+            min: 90.0,
+            iqr: 40.0,
+            n: 8,
+        };
         assert!(!is_noisy(&tight));
         assert!(is_noisy(&wide));
     }
