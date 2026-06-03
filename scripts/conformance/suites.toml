@@ -80,16 +80,42 @@ known_gaps = [
 # Prebaked image driver: the test binary lives at /conformance/<pkg>.test and
 # runs with -w at the package's GOROOT src dir (mirrors go-conformance-image.sh).
 
+# go-runtime SMOKE: a curated subset of PURE runtime tests (channels, defers,
+# callers, user-arena, debuglog) that do NOT exec the go toolchain. The FULL
+# `-test.run Test` set is no longer a viable fast gate: now that `go build` works
+# under carrick (the fork-dropped guest_shared-alias fix), the many runtime
+# subtests that build+run helper programs PROCEED past their previously-crashing
+# telemetry-counter access and then hang on UNSUPPORTED cgo nested builds
+# (TestCgo*, TestSegv/*InCgo, TestCoroCgoCallback, …). cgo + nested-toolchain
+# robustness is a separate tracked gap; see the go-full suite below for the heavy
+# run. This subset gives a fast, reliable smoke signal for the runtime itself.
 [[suite]]
 name = "go-runtime"
 ecosystem = "go"
 image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/runtime.test", "-test.v", "-test.run", "Test", "-test.short"]
+cmd = ["/conformance/runtime.test", "-test.v", "-test.run", "^(TestChan|TestUserArena|TestCallers|TestDebugLog|TestBitCursor|TestFinalizerRegisterABI|TestRecoverMatching|TestConditionalDefers|TestGoexitDefer|TestMultiConsumer|TestSelfSelect|TestNonblockRecvRace|TestPseudoRandomSend)$", "-test.short"]
 verdict = "gotest"
 tier = "smoke"
-weight = "heavy"
-timeout_s = 180
+weight = "light"
+timeout_s = 120
 workdir = "/usr/local/go/src/runtime"
+carrick_flags = ["--raw", "--fs", "host"]
+
+# go-build SMOKE: the workload that motivated the fork-alias fix — compile AND
+# run a trivial program through the real `go` toolchain (forks go -> compile ->
+# link). Was a hard SIGSEGV before; now exits 0. The `shell` verdict keys on the
+# exit code, so a future regression (crash) reads as REGRESSION vs the docker
+# oracle's clean exit.
+[[suite]]
+name = "go-build"
+ecosystem = "go"
+image = "localhost:5005/carrick-go-conformance:1.24"
+cmd = ["/bin/sh", "-c", "cd /tmp && printf 'package main\\nfunc main(){println(\"ok\")}\\n' > h.go && GOCACHE=/tmp/gc /usr/local/go/bin/go build -o /tmp/h ./h.go && /tmp/h && echo BUILD_OK"]
+verdict = "shell"
+tier = "smoke"
+weight = "heavy"
+timeout_s = 120
+workdir = "/tmp"
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
