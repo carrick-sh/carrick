@@ -170,9 +170,14 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
         mk("carrick", "cold", &carrick_vals, carrick_nproc),
         mk("docker", "docker", &docker_vals, docker_nproc),
     ];
+    // Guard the divisor: a degenerate docker p50 of 0 would yield inf/NaN.
+    let ratio = if rows[1].summary.p50 > 0.0 {
+        rows[0].summary.p50 / rows[1].summary.p50
+    } else {
+        f64::NAN
+    };
     for r in &rows {
         provenance::append_row(root, &date, r).expect("append row");
-        let ratio = rows[0].summary.p50 / rows[1].summary.p50;
         eprintln!("perf[{}] {} {}={:.3}{} p95={:.3} (n={}){}",
             case.workload, r.engine, r.metric, r.summary.p50, r.unit, r.summary.p95, r.summary.n,
             if r.engine == "docker" { format!("  RATIO carrick/docker={ratio:.2}") } else { String::new() });
@@ -190,6 +195,15 @@ fn today_string() -> String {
 
 #[test]
 fn perf_gate() {
+    // PERF_LOCK only serializes within THIS test binary. The hard constraint
+    // (carrick and Docker never run concurrently during a timed sample) holds
+    // because the benchmark is invoked as `just bench` == `cargo test --test
+    // perf_runner perf_gate` ONLY — never alongside the conformance suite. Do
+    // NOT run `cargo test -p carrick-cli` (all binaries) with the signed binary
+    // + Docker + built probes present: that could let perf_gate overlap a
+    // conformance case across the two test processes. The structural fix is a
+    // cross-process flock (fd-lock) acquired by BOTH this gate and conformance;
+    // it is a deferred hardening (see the benchmark design doc, §9 / deferred).
     let _serial = PERF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = repo_root();
 
