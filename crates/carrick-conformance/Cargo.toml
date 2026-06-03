@@ -1,0 +1,26 @@
+[package]
+name = "carrick-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Differential conformance harness: runs each suite in scripts/conformance/suites.toml
+# under `carrick run` AND `docker run` (the Linux oracle), diffs outcome categories,
+# and renders the committed support matrix. A pure orchestrator — it links NONE of the
+# guest stack (no carrick-runtime, no HVF); it shells out to the signed `carrick` binary
+# and the `docker` CLI. See docs/superpowers/specs/2026-06-03-conformance-harness-design.md.
+[[bin]]
+name = "carrick-conformance"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+regex = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
