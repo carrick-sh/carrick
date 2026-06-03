@@ -2114,6 +2114,35 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Snapshot the EL0 fault registers, fire the `vcpu_fault` trace probe,
+    /// stash the ESR for the signal frame's `esr_context`, and build the
+    /// [`TrapError::EL0Fault`]. `from_el0_direct` distinguishes the direct
+    /// EL0-abort exit (`true` — runtime redirects PC) from the HVC-trampoline
+    /// underlying fault (`false` — runtime redirects ELR_EL1).
+    fn capture_el0_fault(&mut self, syndrome: u64, from_el0_direct: bool) -> TrapError {
+        use applevisor::prelude::*;
+        let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+        let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+        let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
+        let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
+        let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
+        let x30 = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
+        let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+        crate::probes::vcpu_fault(syndrome, elr, far, x30, sp, unsafe { libc::getpid() });
+        self.last_fault_esr = syndrome;
+        TrapError::EL0Fault {
+            syndrome,
+            elr,
+            far,
+            x16,
+            x17,
+            x29,
+            x30,
+            sp,
+            from_el0_direct,
+        }
+    }
+
     fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         use applevisor::prelude::*;
 
@@ -2188,31 +2217,10 @@ impl HvfInner {
         // CPython faulthandler._stack_overflow expects exactly this — instead of
         // fataling with "unexpected exception".
         if is_aarch64_el0_abort_exception(exception.syndrome) {
-            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-            let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
-            let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
-            let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
-            let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
-            let x30 = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
-            let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-            crate::probes::vcpu_fault(exception.syndrome, elr, far, x30, sp, unsafe {
-                libc::getpid()
-            });
-            // Stash the fault ESR for the signal frame's esr_context (Rosetta's
-            // handler requires it). This direct-EL0-abort path is post-rewrite;
-            // the HVC-underlying path below stashes it too.
-            self.last_fault_esr = exception.syndrome;
-            return Err(TrapError::EL0Fault {
-                syndrome: exception.syndrome,
-                elr,
-                far,
-                x16,
-                x17,
-                x29,
-                x30,
-                sp,
-                from_el0_direct: true,
-            });
+            // Direct EL0-abort exit (post-rewrite); the HVC-underlying path below
+            // also routes through capture_el0_fault (which stashes the ESR for
+            // the signal frame's esr_context — Rosetta's handler requires it).
+            return Err(self.capture_el0_fault(exception.syndrome, true));
         }
         if !is_aarch64_syscall_exception(exception.syndrome) {
             return Err(TrapError::UnexpectedException {
@@ -2235,16 +2243,6 @@ impl HvfInner {
                 }
                 let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
                 let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
-                let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
-                let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
-                let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
-                let x30 = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
-                let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-                // Fire the fault probe so `carrick trace` can catch the exact
-                // fault (and `--stack`-walk the guest) — fires only here, never
-                // on the happy path, so it doesn't perturb the timing-sensitive
-                // c>=20 race it's meant to diagnose.
-                crate::probes::vcpu_fault(underlying, elr, far, x30, sp, unsafe { libc::getpid() });
                 // Decoded fault diagnostics for `carrick trace` (vcpu-fault-regs)
                 // as SCALARS — the faulting instruction word + the base register
                 // a load/store dereferenced and its value. So a script sees e.g.
@@ -2285,19 +2283,7 @@ impl HvfInner {
                     );
                     crate::probes::pt_fault_walk(far, d[0], d[1], d[2], d[3]);
                 }
-                // Stash the fault ESR for the signal frame's esr_context.
-                self.last_fault_esr = underlying;
-                return Err(TrapError::EL0Fault {
-                    syndrome: underlying,
-                    elr,
-                    far,
-                    x16,
-                    x17,
-                    x29,
-                    x30,
-                    sp,
-                    from_el0_direct: false,
-                });
+                return Err(self.capture_el0_fault(underlying, false));
             }
         }
         self.last_exit_class = aarch64_exception_class(exception.syndrome);
