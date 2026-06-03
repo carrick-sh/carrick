@@ -1184,10 +1184,6 @@ fn linux_madvise_advice_is_supported(advice: u64) -> bool {
     )
 }
 
-fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
-    value.div_ceil(alignment).checked_mul(alignment)
-}
-
 fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
     let Some(end) = address.checked_add(length) else {
         return false;

@@ -93,7 +93,8 @@ use crate::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_CLKTCK, LINUX_AT_EGID, LINUX_AT_ENTRY, LINUX_AT_EUID, LINUX_AT_EXECFN,
     LINUX_AT_FLAGS, LINUX_AT_GID, LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_NULL, LINUX_AT_PAGESZ,
     LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM, LINUX_AT_PLATFORM, LINUX_AT_RANDOM,
-    LINUX_AT_SECURE, LINUX_AT_UID, LINUX_PAGE_SIZE, LinuxAuxvEntry,
+    LINUX_AT_SECURE, LINUX_AT_UID, LINUX_PAGE_SIZE, LinuxAuxvEntry, align_down_u64,
+    align_down_usize, align_up_u64,
 };
 use carrick_guest_mem::{GuestMemory, MemoryError};
 use serde::Serialize;
@@ -1098,23 +1099,6 @@ fn write_stack_strings(
     }
     addrs.reverse();
     Ok(addrs)
-}
-
-fn align_down_usize(value: usize, alignment: usize) -> usize {
-    value / alignment * alignment
-}
-
-fn align_down_u64(value: u64, alignment: u64) -> u64 {
-    value / alignment * alignment
-}
-
-fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
-    let remainder = value % alignment;
-    if remainder == 0 {
-        Some(value)
-    } else {
-        value.checked_add(alignment - remainder)
-    }
 }
 
 fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
