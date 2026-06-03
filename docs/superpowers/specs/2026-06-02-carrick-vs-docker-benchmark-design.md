@@ -187,6 +187,10 @@ Host: Mac16,12 (M4, 4P+6E), macOS 26.6, Docker 29.5.2, linux/arm64, `nproc=4` en
 
 Net: the **"no-abstraction → IO wins" thesis holds for latency-bound small ops and is contradicted for bulk/metadata by carrick-side implementation overhead** — exactly the prove-or-diagnose split the benchmark was built to surface. Both losses point at concrete, fixable call-sites.
 
+### Optimization log (diagnose → fix → re-measure)
+
+**2026-06-02 — bulk-throughput copy (commit `1577b26`).** A `carrick trace` of `tcp_stream` (count-only D script to avoid dynvar drops; then timed `sendto`/`recvfrom`) showed the hot path is `sendto`(25,207)/`recvfrom`(36,278) at a **1:1** guest→host syscall ratio (no amplification), with `sendto` ≈ **59 µs/call**. Reading the copy primitive revealed `read_guest_bytes`/`write_guest_bytes` used a **byte-at-a-time `read_volatile` loop** (`trap.rs:1508/1521`) — ~33 µs of that 59 µs — because the volatile byte loop can't vectorize (the volatility is required: guest RAM is `MAP_SHARED`, a non-volatile read racing a guest write is language-level UB). Fix: widen the volatile unit to `usize` words on the guest side (aligned word-volatile + byte head/tail), plain unaligned ops on the private host buffer — preserves the UB guarantee at ~8× fewer guest accesses. **Result: `tcp_stream` carrick 4.3 → 8.9 GB/s (+106%), gap to Docker 5.1× → 2.4×.** Control: `stat_storm` unchanged (+0.9%, it's path-walk-bound), confirming the fix is targeted at the copy. Residual gap is HVF trap-per-syscall + the kernel's own loopback copy; **Fix B (zero-copy `sendto`/`recvfrom` via host iovecs into guest-mapped memory, validated writable)** would chase the rest. ⚠️ This touches a core memory primitive used on every guest↔host transfer; an exhaustive alignment/length unit test was added, but the full differential conformance suite should be run before this lands in a standalone runtime PR.
+
 ---
 
 ## 9. Threats to validity
