@@ -264,6 +264,7 @@ impl PageTableManager {
         let idx = indices(va);
         let mut out = [0u64; 4];
         let mut table_off = 0usize;
+        #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let off = table_off + idx[level] * 8;
             if off + 8 > self.bytes.len() {
@@ -298,6 +299,7 @@ impl PageTableManager {
     pub fn translate(&self, va: u64) -> Option<u64> {
         let idx = indices(va);
         let mut table_off = 0usize;
+        #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let off = table_off + idx[level] * 8;
             if off + 8 > self.bytes.len() {
@@ -310,7 +312,7 @@ impl PageTableManager {
             let is_table_or_page = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if level == 3 {
                 // L3 leaf must be a page (TYPE_TABLE_OR_PAGE); 0b01 is invalid here.
-                return is_table_or_page.then(|| (desc & PA_MASK_4KIB) | (va & 0xFFF));
+                return is_table_or_page.then_some((desc & PA_MASK_4KIB) | (va & 0xFFF));
             }
             if is_table_or_page {
                 // Table descriptor: descend to the next level.
@@ -390,6 +392,7 @@ impl PageTableManager {
     fn leaf_offset(&mut self, va: u64, allocate: bool) -> Result<(usize, usize), PageTableError> {
         let idx = indices(va);
         let mut table_off = 0usize; // L0 at byte offset 0
+        #[allow(clippy::needless_range_loop)]
         for level in 0..4usize {
             let off = table_off + idx[level] * 8;
             if level == 3 {
@@ -488,42 +491,30 @@ impl PageTableManager {
         let l1_entry = l1_off + idx[1] * 8;
 
         // L3 -> L2: the L2 entry must point at a spare L3 table of uniform pages.
-        if let Some(l2_pa) = self.child_table_pa(l1_entry) {
-            if let Ok(l2_off) = self.pa_to_off(l2_pa) {
-                let l2_entry = l2_off + idx[2] * 8;
-                if let Some(l3_pa) = self.child_table_pa(l2_entry) {
-                    if self.is_spare_table(l3_pa) {
-                        if let Ok(l3_off) = self.pa_to_off(l3_pa) {
-                            if let Some((base, attrs)) = self.uniform_block(
-                                l3_off,
-                                PA_MASK_4KIB,
-                                1 << 12,
-                                TYPE_TABLE_OR_PAGE,
-                            ) {
-                                self.write_desc(
-                                    l2_entry,
-                                    (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK,
-                                );
-                                self.free_table(l3_pa);
-                            }
-                        }
-                    }
-                }
+        if let Some(l2_pa) = self.child_table_pa(l1_entry)
+            && let Ok(l2_off) = self.pa_to_off(l2_pa)
+        {
+            let l2_entry = l2_off + idx[2] * 8;
+            if let Some(l3_pa) = self.child_table_pa(l2_entry)
+                && self.is_spare_table(l3_pa)
+                && let Ok(l3_off) = self.pa_to_off(l3_pa)
+                && let Some((base, attrs)) =
+                    self.uniform_block(l3_off, PA_MASK_4KIB, 1 << 12, TYPE_TABLE_OR_PAGE)
+            {
+                self.write_desc(l2_entry, (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK);
+                self.free_table(l3_pa);
             }
         }
 
         // L2 -> L1: the L1 entry must point at a spare L2 table of uniform blocks.
-        if let Some(l2_pa) = self.child_table_pa(l1_entry) {
-            if self.is_spare_table(l2_pa) {
-                if let Ok(l2_off) = self.pa_to_off(l2_pa) {
-                    if let Some((base, attrs)) =
-                        self.uniform_block(l2_off, PA_MASK_2MIB, 1 << 21, TYPE_BLOCK)
-                    {
-                        self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
-                        self.free_table(l2_pa);
-                    }
-                }
-            }
+        if let Some(l2_pa) = self.child_table_pa(l1_entry)
+            && self.is_spare_table(l2_pa)
+            && let Ok(l2_off) = self.pa_to_off(l2_pa)
+            && let Some((base, attrs)) =
+                self.uniform_block(l2_off, PA_MASK_2MIB, 1 << 21, TYPE_BLOCK)
+        {
+            self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
+            self.free_table(l2_pa);
         }
     }
 
@@ -562,8 +553,8 @@ impl PageTableManager {
     fn satisfies(op: PtOp, valid: bool, ap: u64, uxn_set: bool) -> bool {
         match op {
             PtOp::Invalidate => !valid,
-            PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set == !exec,
-            PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set == !exec,
+            PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec,
+            PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec,
         }
     }
 
@@ -761,7 +752,7 @@ impl PageTableManager {
         } else {
             (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
         };
-        if va % TWO_MIB == 0 && ipa % TWO_MIB == 0 {
+        if va.is_multiple_of(TWO_MIB) && ipa.is_multiple_of(TWO_MIB) {
             // Map the 2 MiB-aligned BULK as L2 block leaves (one descriptor per
             // 2 MiB, no per-2-MiB L3 table), then the sub-2-MiB TAIL as 4 KiB
             // pages (a single L3 table). A multi-GiB alias whose length is not a
@@ -809,6 +800,7 @@ impl PageTableManager {
     fn descend_creating(&mut self, va: u64, target_level: usize) -> Result<usize, PageTableError> {
         let idx = indices(va);
         let mut table_off = 0usize; // L0 at byte offset 0
+        #[allow(clippy::needless_range_loop)]
         for level in 0..target_level {
             let off = table_off + idx[level] * 8;
             let desc = self.read_desc(off);

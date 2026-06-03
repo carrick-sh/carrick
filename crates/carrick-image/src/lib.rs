@@ -373,7 +373,12 @@ fn layers_in_manifest_order(
                 descriptor.digest
             )));
         };
-        let layer = bucket.pop().expect("non-empty layer bucket");
+        let Some(layer) = bucket.pop() else {
+            return Err(OciBootstrapError::InvalidDigest(format!(
+                "manifest layer bucket unexpectedly empty for {}",
+                descriptor.digest
+            )));
+        };
         if !bucket.is_empty() {
             by_digest.insert(descriptor.digest.clone(), bucket);
         }
@@ -409,7 +414,12 @@ fn layer_summaries_in_manifest_order(
                 descriptor.digest
             )));
         };
-        let layer = bucket.pop().expect("non-empty layer summary bucket");
+        let Some(layer) = bucket.pop() else {
+            return Err(OciBootstrapError::InvalidDigest(format!(
+                "manifest layer summary bucket unexpectedly empty for {}",
+                descriptor.digest
+            )));
+        };
         if !bucket.is_empty() {
             by_digest.insert(descriptor.digest.clone(), bucket);
         }
@@ -568,14 +578,14 @@ impl ImageStore {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if path.file_name().and_then(|n| n.to_str()) == Some("carrick-image.json") {
-                    if let Some(info) = self.image_info_from_summary(&path) {
-                        out.push(info);
-                    }
+                } else if path.file_name().and_then(|n| n.to_str()) == Some("carrick-image.json")
+                    && let Some(info) = self.image_info_from_summary(&path)
+                {
+                    out.push(info);
                 }
             }
         }
-        out.sort_by(|a, b| b.created_secs.cmp(&a.created_secs));
+        out.sort_by_key(|o| std::cmp::Reverse(o.created_secs));
         out
     }
 
@@ -862,6 +872,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn layers_are_reordered_to_manifest_order() {
         use oci_client::client::ImageLayer;
         use oci_client::manifest::{OciDescriptor, OciImageManifest};
@@ -904,6 +915,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn layer_summaries_are_reordered_to_manifest_order() {
         use oci_client::manifest::{OciDescriptor, OciImageManifest};
 

@@ -1492,7 +1492,7 @@ pub(in crate::dispatch) fn build_host_scm_rights(host_fds: &[i32]) -> Vec<u8> {
     if host_fds.is_empty() {
         return Vec::new();
     }
-    let data_len = (host_fds.len() * std::mem::size_of::<i32>()) as u32;
+    let data_len = std::mem::size_of_val(host_fds) as u32;
     let space = unsafe { libc::CMSG_SPACE(data_len) } as usize;
     let mut buf = vec![0u8; space];
     unsafe {

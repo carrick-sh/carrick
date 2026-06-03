@@ -235,8 +235,8 @@ mod tests {
     fn full_caps_covers_modeled_range() {
         // CAP_LAST_CAP=40 → bits 0..=40 set.
         assert_eq!(FULL_CAPS, (1u64 << 41) - 1);
-        assert!(FULL_CAPS & (1 << 40) != 0);
-        assert!(FULL_CAPS & (1 << 41) == 0);
+        const { assert!(FULL_CAPS & (1 << 40) != 0) };
+        const { assert!(FULL_CAPS & (1 << 41) == 0) };
     }
 
     #[test]

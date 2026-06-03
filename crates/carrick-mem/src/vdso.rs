@@ -521,12 +521,12 @@ mod tests {
         // The versioned dynamic symbol Go looks up must be present and defined.
         let mut found = false;
         for sym in elf.dynsyms.iter() {
-            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                if name == "__kernel_clock_gettime" {
-                    assert!(sym.st_value >= 64, "func must point into the code");
-                    assert!(sym.is_function());
-                    found = true;
-                }
+            if let Some(name) = elf.dynstrtab.get_at(sym.st_name)
+                && name == "__kernel_clock_gettime"
+            {
+                assert!(sym.st_value >= 64, "func must point into the code");
+                assert!(sym.is_function());
+                found = true;
             }
         }
         assert!(found, "__kernel_clock_gettime not exported");

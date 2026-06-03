@@ -46,7 +46,7 @@ pub(crate) struct SockFilter {
 impl SockFilter {
     /// Parse a packed filter program (`struct sock_filter[]`, 8 bytes each).
     pub(crate) fn parse_program(bytes: &[u8]) -> Option<Vec<SockFilter>> {
-        if bytes.is_empty() || bytes.len() % 8 != 0 {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(8) {
             return None;
         }
         let mut prog = Vec::with_capacity(bytes.len() / 8);

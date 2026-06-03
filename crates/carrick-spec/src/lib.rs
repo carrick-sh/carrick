@@ -276,8 +276,10 @@ mod tests {
         // Additive: a config JSON without stop_signal still loads.
         let legacy: ImageConfig = serde_json::from_str("{}").expect("legacy loads");
         assert!(legacy.stop_signal.is_none());
-        let mut c = ImageConfig::default();
-        c.stop_signal = Some("SIGQUIT".to_string());
+        let c = ImageConfig {
+            stop_signal: Some("SIGQUIT".to_string()),
+            ..Default::default()
+        };
         let round: ImageConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(round.stop_signal.as_deref(), Some("SIGQUIT"));
     }

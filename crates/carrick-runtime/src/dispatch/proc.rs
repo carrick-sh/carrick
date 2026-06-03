@@ -36,7 +36,7 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
 fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     pid == 0
         || pid == std::process::id() as u64
-        || pid == LINUX_BOOTSTRAP_PID as u64
+        || pid == LINUX_BOOTSTRAP_PID
         || cx.thread.is_some_and(|thread| pid == thread.tid as u64)
 }
 
@@ -354,12 +354,12 @@ impl SyscallDispatcher {
         cx: &SyscallCtx<M>,
         pid: u64,
     ) -> AffinityTarget {
-        if pid == 0 || pid == std::process::id() as u64 {
-            AffinityTarget::SelfProc
-        } else if cx
-            .thread
-            .as_ref()
-            .is_some_and(|t| t.registry.is_live(pid as crate::thread::ThreadId))
+        if pid == 0
+            || pid == std::process::id() as u64
+            || cx
+                .thread
+                .as_ref()
+                .is_some_and(|t| t.registry.is_live(pid as crate::thread::ThreadId))
         {
             AffinityTarget::SelfProc
         } else if crate::host_proc::is_guest_process(pid as u32) {
@@ -758,8 +758,8 @@ impl SyscallDispatcher {
         }
 
         fn gettid(this, cx) {
-            if let Some(t) = cx.thread {
-                if t.registry.live_count() > 1 {
+            if let Some(t) = cx.thread
+                && t.registry.live_count() > 1 {
                     // Multi-threaded: report the per-thread tid. The MAIN
                     // thread's tid equals the process's host pid, so in a PID
                     // namespace it must read as the process's ns-pid (a thread
@@ -776,7 +776,6 @@ impl SyscallDispatcher {
                         value: i64::from(ns_tid),
                     });
                 }
-            }
             Ok(this.getpid())
         }
 
@@ -1544,8 +1543,8 @@ impl SyscallDispatcher {
             clear_unrequested_waitid_state(&mut info, options);
             let si_pid = info.si_pid;
             if si_pid == 0 && !guest_nohang {
-                if idtype == LINUX_P_PIDFD {
-                    if let Some(host_fd) = this.host_fd_for_poll(id as i32) {
+                if idtype == LINUX_P_PIDFD
+                    && let Some(host_fd) = this.host_fd_for_poll(id as i32) {
                         return Ok(DispatchOutcome::WaitOnPollFds {
                             fds: vec![(host_fd, libc::POLLIN)],
                             timeout: None,
@@ -1553,7 +1552,6 @@ impl SyscallDispatcher {
                             block_signals: 0,
                         });
                     }
-                }
                 if idtype == LINUX_P_PID {
                     // Same no-interrupt mask as wait4: a blocked or
                     // delivered-and-dropped signal must not EINTR the park.
@@ -1704,7 +1702,7 @@ impl SyscallDispatcher {
                     // the bad pgid (LTP waitpid04 INT_MIN case). Remap only that
                     // case — a valid pgid with no children stays ECHILD, and
                     // every other error passes through unchanged.
-                    if (pid.0 as i32) < -1 && errno == LINUX_EINVAL {
+                    if pid.0 < -1 && errno == LINUX_EINVAL {
                         return Ok(LINUX_ESRCH.into());
                     }
                     return Ok(errno.into());

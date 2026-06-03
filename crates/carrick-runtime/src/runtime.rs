@@ -536,6 +536,7 @@ where
 }
 
 /// The caller's role after [`maybe_fork_ns_supervisor`].
+#[allow(clippy::large_enum_variant)]
 enum SupervisorRole {
     /// PARENT (NsSupervisor): it ran the kqueue loop until the guest-init exited;
     /// the result carries the init's exit code to propagate up.
@@ -889,7 +890,7 @@ where
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
-                        crate::event_ring::rec(crate::event_ring::FORK, child_pid as i32, 0, 0);
+                        crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
                         waiter = crate::io_wait::ThreadWaiter::new(this_tid);
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
@@ -1372,7 +1373,7 @@ impl ThreadRuntimeState {
             }
         }
         b.set_quiescing();
-        let tid = self.this_tid as i32;
+        let tid = self.this_tid;
         crate::probes::pt_pause_begin(
             tid,
             i32::from(self.kicker.any_other_in_guest(self.this_tid)),
@@ -2119,10 +2120,10 @@ impl ThreadRuntimeState {
                 // kqueue exists (rearm covers the registration-before-pump race).
                 crate::host_signal::register_child_exit_watch(
                     child_pid,
-                    self.this_tid as i32,
+                    self.this_tid,
                     i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
                 );
-                crate::event_ring::rec(crate::event_ring::FORK, child_pid as i32, 0, 0);
+                crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its
                 // fd to the guest pidfd-out pointer. The child's pid mirrors a
                 // real host pid, so the pidfd watches it via EVFILT_PROC.
@@ -2782,9 +2783,7 @@ fn shared_futex_wait(
     let host_value = unsafe { (host_addr as *const u32).read() };
     crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
     loop {
-        if crate::host_signal::has_pending_for(this_tid as i32)
-            || crate::fork_quiesce::is_quiescing()
-        {
+        if crate::host_signal::has_pending_for(this_tid) || crate::fork_quiesce::is_quiescing() {
             return -(crate::linux_abi::LINUX_EINTR as i64);
         }
         // Slice the kernel wait so a pending guest signal (whose cross-thread
@@ -2901,14 +2900,16 @@ pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
 ///   argv = ["<rosetta>", "<target>", <original argv[1..]>]
 ///
 /// Returns:
-///   * `None`         — the binary is AArch64 (or not an ELF we recognise); the
-///                      caller proceeds with the original bytes/argv.
-///   * `Some(Ok(..))` — the binary is x86_64; `(rosetta_bytes, new_argv)`.
-///   * `Some(Err(e))` — the binary is x86_64 but Rosetta isn't readable on this
-///                      host (`-errno` for the caller to surface).
+///
+/// - `None`         — the binary is AArch64 (or not an ELF we recognise); the
+///   caller proceeds with the original bytes/argv.
+/// - `Some(Ok(..))` — the binary is x86_64; `(rosetta_bytes, new_argv)`.
+/// - `Some(Err(e))` — the binary is x86_64 but Rosetta isn't readable on this
+///   host (`-errno` for the caller to surface).
 ///
 /// Rosetta itself is statically linked, so the AddressSpace loader never needs
 /// to resolve a PT_INTERP for it from the guest VFS.
+#[allow(clippy::type_complexity)]
 pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
     target_path: &str,
     target_bytes: &[u8],

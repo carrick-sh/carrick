@@ -89,49 +89,6 @@ pub(crate) fn validate_publish(specs: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{parse_volume_mount, validate_publish};
-
-    #[test]
-    fn publish_identity_map_accepted() {
-        assert!(validate_publish(&["80:80".into()]).is_ok());
-        assert!(validate_publish(&["127.0.0.1:80:80".into()]).is_ok());
-        assert!(validate_publish(&["80:80/tcp".into()]).is_ok());
-        assert!(validate_publish(&[]).is_ok());
-    }
-
-    #[test]
-    fn publish_remap_rejected() {
-        assert!(validate_publish(&["8080:80".into()]).is_err());
-        assert!(validate_publish(&["127.0.0.1:8080:80".into()]).is_err());
-        assert!(validate_publish(&["80".into()]).is_err()); // random host port
-    }
-
-    #[test]
-    fn publish_malformed_rejected() {
-        assert!(validate_publish(&["a:b:c:d".into()]).is_err());
-        assert!(validate_publish(&["80:notaport".into()]).is_err());
-    }
-
-    #[test]
-    fn volume_z_option_accepted_as_rw() {
-        let m = parse_volume_mount("/h:/g:z").unwrap();
-        assert!(!m.readonly);
-    }
-
-    #[test]
-    fn volume_ro_with_z_is_readonly() {
-        let m = parse_volume_mount("/h:/g:ro,z").unwrap();
-        assert!(m.readonly);
-    }
-
-    #[test]
-    fn volume_unknown_option_rejected() {
-        assert!(parse_volume_mount("/h:/g:bogus").is_err());
-    }
-}
-
 pub(crate) fn parse_mount_flag(s: &str) -> anyhow::Result<carrick_spec::Mount> {
     let mut source = None;
     let mut target = None;
@@ -260,4 +217,47 @@ pub(crate) fn human_age(created_secs: u64) -> String {
         (age / (86_400 * 365), "year")
     };
     format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_volume_mount, validate_publish};
+
+    #[test]
+    fn publish_identity_map_accepted() {
+        assert!(validate_publish(&["80:80".into()]).is_ok());
+        assert!(validate_publish(&["127.0.0.1:80:80".into()]).is_ok());
+        assert!(validate_publish(&["80:80/tcp".into()]).is_ok());
+        assert!(validate_publish(&[]).is_ok());
+    }
+
+    #[test]
+    fn publish_remap_rejected() {
+        assert!(validate_publish(&["8080:80".into()]).is_err());
+        assert!(validate_publish(&["127.0.0.1:8080:80".into()]).is_err());
+        assert!(validate_publish(&["80".into()]).is_err()); // random host port
+    }
+
+    #[test]
+    fn publish_malformed_rejected() {
+        assert!(validate_publish(&["a:b:c:d".into()]).is_err());
+        assert!(validate_publish(&["80:notaport".into()]).is_err());
+    }
+
+    #[test]
+    fn volume_z_option_accepted_as_rw() {
+        let m = parse_volume_mount("/h:/g:z").unwrap();
+        assert!(!m.readonly);
+    }
+
+    #[test]
+    fn volume_ro_with_z_is_readonly() {
+        let m = parse_volume_mount("/h:/g:ro,z").unwrap();
+        assert!(m.readonly);
+    }
+
+    #[test]
+    fn volume_unknown_option_rejected() {
+        assert!(parse_volume_mount("/h:/g:bogus").is_err());
+    }
 }

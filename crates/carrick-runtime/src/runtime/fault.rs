@@ -65,6 +65,7 @@ pub(super) fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
 /// (no handler, signal blocked, or untranslatable fault — Linux forces the
 /// default action), `None` to resume into the injected handler. `elr` is the
 /// faulting instruction's PC (resumed unless the handler advances it).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn deliver_fault_signal(
     kernel: &Kernel,
     engine: &mut HvfTrapEngine,

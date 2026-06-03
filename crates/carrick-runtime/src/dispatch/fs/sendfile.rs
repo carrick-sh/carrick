@@ -97,7 +97,7 @@ impl SyscallDispatcher {
             return None;
         }
         let st = unsafe { st.assume_init() };
-        Some((st.st_dev as i64, st.st_ino as u64))
+        Some((st.st_dev as i64, st.st_ino))
     }
 
     fn host_file_copy_info(&self, fd: i32) -> Option<HostFileCopyInfo> {

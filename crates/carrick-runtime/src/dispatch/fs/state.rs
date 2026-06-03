@@ -83,9 +83,6 @@ pub(in crate::dispatch) struct IoState {
 /// huge limit makes it skip, carrick runs it and PASSES). See
 /// docs/archive/cpython-wave2-runner-notes.md.
 pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024;
-/// Hard RLIMIT_NOFILE we expose to the guest (its setrlimit may raise the soft
-/// limit up to this). Matches the value getrlimit has always reported.
-pub(in crate::dispatch) const NOFILE_HARD: u64 = 1024 * 1024;
 
 impl IoState {
     pub(in crate::dispatch) fn new() -> Self {

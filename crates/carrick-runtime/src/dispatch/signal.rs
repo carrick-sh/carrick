@@ -310,16 +310,10 @@ impl SyscallDispatcher {
         let ignored_mask = s
             .handlers
             .iter()
-            .filter_map(|(&signum, action)| {
-                // `then(|| ...)` is LAZY: `then_some(1u64 << signum)` eagerly
-                // evaluates the shift for EVERY handler, so a handler on signum
-                // >= 64 (Go installs SIGRT handlers up to 64) overflowed the
-                // shift and panicked carrick on execve — which hung a Go
-                // subprocess mid-crash (sync TestMutexMisuse). The guard keeps
-                // signum <= 63 so `1u64 << signum` is in range.
-                (action.sa_handler == crate::linux_abi::LINUX_SIG_IGN && (1..=63).contains(&signum))
-                    .then(|| 1u64 << signum)
+            .filter(|&(&signum, action)| {
+                action.sa_handler == crate::linux_abi::LINUX_SIG_IGN && (1..=63).contains(&signum)
             })
+            .map(|(&signum, _action)| 1u64 << signum)
             .fold(0u64, |mask, bit| mask | bit);
         // Keep only SIG_IGN dispositions; a caught handler → default (absent).
         s.handlers
@@ -1213,12 +1207,10 @@ impl SyscallDispatcher {
                 let memory = &*cx.memory;
                 if let Ok(bytes) =
                     memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
-                {
-                    if let Some(mut info) = LinuxSiginfo::read_from_bytes(&bytes).ok() {
+                    && let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes) {
                         info.si_signo = s;
                         user_info = Some(info);
                     }
-                }
             }
 
             // If `tgid` names a sibling thread, deliver to that thread directly

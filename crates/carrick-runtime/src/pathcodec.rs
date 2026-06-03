@@ -106,7 +106,7 @@ fn push_char_escaping_window(out: &mut String, c: char) {
 #[inline]
 fn escape_byte(b: u8) -> char {
     // PUA_BASE + b is always a valid scalar (well within the BMP PUA).
-    char::from_u32(PUA_BASE + b as u32).expect("PUA escape scalar is valid")
+    char::from_u32(PUA_BASE + b as u32).unwrap_or(char::REPLACEMENT_CHARACTER)
 }
 
 /// Decode an encoded path `String` back to the original opaque bytes.

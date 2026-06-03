@@ -19,7 +19,7 @@ pub(crate) fn current_supplementary_groups() -> Vec<u32> {
         return Vec::new();
     }
     groups.truncate(n as usize);
-    groups.into_iter().map(|g| g as u32).collect()
+    groups.into_iter().collect()
 }
 
 #[cfg(target_os = "macos")]

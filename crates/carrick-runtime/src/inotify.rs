@@ -248,14 +248,13 @@ impl InotifyState {
             };
             let wd = watched.wd;
             let requested = inner.watches.get(&wd).map(|w| w.mask).unwrap_or(0);
-            if let Some(scan_dir) = watched.scan_dir {
-                if let Some(records) =
+            if let Some(scan_dir) = watched.scan_dir
+                && let Some(records) =
                     Self::scan_directory_records(&mut inner, fd, wd, requested, scan_dir)
-                    && !records.is_empty()
-                {
-                    inner.pending.extend(records);
-                    continue;
-                }
+                && !records.is_empty()
+            {
+                inner.pending.extend(records);
+                continue;
             }
             let mask = note_to_linux_mask(ev.fflags(), requested);
             if mask == 0 {
@@ -282,7 +281,9 @@ impl InotifyState {
             if out.len() + record.len() > max_bytes {
                 break;
             }
-            let record = inner.pending.pop_front().expect("pending front exists");
+            let Some(record) = inner.pending.pop_front() else {
+                break;
+            };
             out.extend_from_slice(&record);
         }
         Ok(out)

@@ -787,10 +787,7 @@ mod tests {
         // dup() of a closed/invalid fd fails (EBADF) deterministically, no
         // rlimit perturbation. new() must return Err, not park on the raw fd.
         let bad = 100_000; // not an open fd in the test process
-        assert!(matches!(
-            super::PinnedWaitFds::new(&[(bad, libc::POLLIN)]),
-            Err(_)
-        ));
+        assert!(super::PinnedWaitFds::new(&[(bad, libc::POLLIN)]).is_err());
     }
 
     /// A wake pipe whose write end is closed (EOF) must NOT re-fire its

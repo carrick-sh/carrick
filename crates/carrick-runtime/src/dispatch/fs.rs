@@ -56,9 +56,9 @@ fn forward_record_lock<M: GuestMemory>(
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
     let l_type_host: i16 = match l_type_linux {
-        LINUX_F_RDLCK => libc::F_RDLCK as i16,
-        LINUX_F_WRLCK => libc::F_WRLCK as i16,
-        LINUX_F_UNLCK => libc::F_UNLCK as i16,
+        LINUX_F_RDLCK => libc::F_RDLCK,
+        LINUX_F_WRLCK => libc::F_WRLCK,
+        LINUX_F_UNLCK => libc::F_UNLCK,
         _ => return DispatchOutcome::errno(LINUX_EINVAL),
     };
     let host_cmd: i32 = match linux_cmd {
@@ -1759,9 +1759,7 @@ impl SyscallDispatcher {
         // any total path > PATH_MAX (4096) at resolution time. carrick lacked
         // these limits, so a too-long path SUCCEEDED instead of failing
         // (LTP lstat02/stat03/truncate03/open13/… "returned 0, expected -1").
-        if let Err(errno) = check_path_length(path) {
-            return Err(errno);
-        }
+        check_path_length(path)?;
         // The anchor directory a relative path resolves against (already a real,
         // symlink-free path): "/" for an absolute path, the cwd for AT_FDCWD, else
         // the dirfd's directory.
@@ -2289,7 +2287,6 @@ impl SyscallDispatcher {
         fn pipe2(this, cx, pipefd: GuestPtr, flags: u64) {
 
             let address = pipefd.0;
-            let flags = flags;
             let memory = &mut *cx.memory;
             // Accept O_DIRECT as a no-op flag. Real Linux uses it to request
             // packet-mode pipes (each write becomes a discrete packet, reads
@@ -2412,7 +2409,6 @@ impl SyscallDispatcher {
 
             let old_fd: Fd = oldfd;
             let new_fd: Fd = newfd;
-            let flags = flags;
             // Linux dup3 only honours O_CLOEXEC in `flags` (else EINVAL), and
             // new_fd must be a valid descriptor number: out of range (negative or
             // >= RLIMIT_NOFILE soft limit) is EBADF, NOT EINVAL. old_fd == new_fd
@@ -2500,7 +2496,6 @@ impl SyscallDispatcher {
 
             let fd: Fd = fd;
             let command = cmd;
-            let arg = arg;
             // A stdio fd the guest explicitly closed (and did not reopen) is a
             // genuinely closed descriptor: every fcntl on it is EBADF, NOT the
             // implicit-stdio fallbacks below (F_GETFL/F_GETFD/F_SETFL on bare
@@ -2870,8 +2865,8 @@ impl SyscallDispatcher {
                         Ok(b) => b,
                         Err(_) => return Ok(LINUX_EFAULT.into()),
                     };
-                    let owner_type = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
-                    let owner_pid = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    let owner_type = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    let owner_pid = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
                     if owner_type != LINUX_F_OWNER_TID
                         && owner_type != LINUX_F_OWNER_PID
                         && owner_type != LINUX_F_OWNER_PGRP
@@ -2922,7 +2917,6 @@ impl SyscallDispatcher {
 
             let fd: Fd = fd;
             let ioctl_request = request;
-            let arg = arg;
             // A tty *control* ioctl (tcsetpgrp/tcsetattr/winsize) issued on the
             // host pty from a background process group raises SIGTTOU regardless
             // of TOSTOP and would STOP the real carrick process. Linux suppresses
@@ -3471,7 +3465,6 @@ impl SyscallDispatcher {
         fn flock(this, cx, fd: Fd, operation: u64) {
 
             let fd: Fd = fd;
-            let operation = operation;
             if !this.fd_is_valid(fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
@@ -3504,7 +3497,6 @@ impl SyscallDispatcher {
         fn fallocate(this, cx, fd: Fd, mode: u64, offset: u64, len: u64) {
 
             let fd: Fd = fd;
-            let mode = mode;
             let offset = i64::from_ne_bytes(offset.to_ne_bytes());
             let length = i64::from_ne_bytes(len.to_ne_bytes());
             if mode & !LINUX_FALLOC_FL_SUPPORTED != 0 {
@@ -3574,14 +3566,13 @@ impl SyscallDispatcher {
                             {
                                 return Ok(errno.into());
                             }
-                            if new_size > st.st_size as u64 {
-                                if let Err(errno) =
+                            if new_size > st.st_size as u64
+                                && let Err(errno) =
                                     (unsafe { libc::ftruncate(*host_fd, new_size as libc::off_t) })
                                         .host_syscall_errno()
                                 {
                                     return Ok(errno.into());
                                 }
-                            }
                         }
                         writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
@@ -3699,10 +3690,7 @@ impl SyscallDispatcher {
 
         fn openat(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64, mode: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
-            let flags = flags;
-            let mode = mode;
             this.open_at_path(dirfd, pathname, flags, mode, &*cx.memory, cx.reporter)
 
         }
@@ -3710,7 +3698,6 @@ impl SyscallDispatcher {
         fn openat2(this, cx, dirfd: u64, pathname: GuestPtr, how: GuestPtr, size: u64) {
 
             let how_address = how.0;
-            let size = size;
             let arg0 = dirfd;
             let arg1 = pathname.0;
             // copy_struct_from_user semantics for `open_how`:
@@ -3805,9 +3792,6 @@ impl SyscallDispatcher {
 
         fn close_range(this, cx, first: u64, last: u64, flags: u64) {
 
-            let first = first;
-            let last = last;
-            let flags = flags;
             // CLOSE_RANGE_UNSHARE=2 is a no-op for us (single fd table);
             // CLOSE_RANGE_CLOEXEC=4 would mark fds CLOEXEC instead of
             // closing — accept the bit and apply CLOEXEC.
@@ -3930,7 +3914,6 @@ impl SyscallDispatcher {
 
             let fd: Fd = fd;
             let offset = offset as i64;
-            let whence = whence;
             let Some(open_file) = this.open_file(fd.0) else {
                 // lseek on stdio with no OpenDescription is, on Linux, a
                 // valid call on an unseekable pipe/tty — kernel returns
@@ -4769,7 +4752,7 @@ impl SyscallDispatcher {
                             DispatchOutcome::errno(LINUX_EAGAIN)
                         } else {
                             DispatchOutcome::WaitOnFds {
-                                fds: vec![(sock_fd, libc::POLLOUT as i16)],
+                                fds: vec![(sock_fd, libc::POLLOUT)],
                                 timeout: None,
                                 on_timeout: -(LINUX_EAGAIN as i64),
                                 block_signals: 0,
@@ -4976,7 +4959,6 @@ impl SyscallDispatcher {
             let off_out_address = off_out.0;
             let count =
                 usize::try_from(len).map_err(|_| DispatchError::LengthTooLarge(len))?;
-            let flags = flags;
             let memory = &mut *cx.memory;
             if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
                 return Ok(LINUX_EINVAL.into());
@@ -5267,11 +5249,10 @@ impl SyscallDispatcher {
                 Ok(host_fd) => host_fd,
                 Err(errno) => return Ok(errno.into()),
             };
-            if let Some(host_fd) = host_fd {
-                if let Err(errno) = flush_host_fd(host_fd) {
+            if let Some(host_fd) = host_fd
+                && let Err(errno) = flush_host_fd(host_fd) {
                     return Ok(errno.into());
                 }
-            }
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -5510,10 +5491,10 @@ impl SyscallDispatcher {
                 }
             };
 
-            let nonblocking = this.io_is_nonblocking(fd as i32, 0);
+            let nonblocking = this.io_is_nonblocking(fd, 0);
 
             if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
-                let has = this.open_file(fd as i32).is_some();
+                let has = this.open_file(fd).is_some();
                 eprintln!(
                     "[WRDBG] guest_fd={fd} in_table={has} n={} bytes={:02x?}",
                     bytes.len(),
@@ -5525,7 +5506,7 @@ impl SyscallDispatcher {
             // a pipe, an eventfd, or some other resource. Only after we've
             // confirmed there's no open description do we fall back to the
             // dispatcher's built-in stdout/stderr buffers.
-            if let Some(open_file) = this.open_file(fd as i32) {
+            if let Some(open_file) = this.open_file(fd) {
                 // Take an inner scope so the borrow on the description ends
                 // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
                 #[allow(dead_code)]
@@ -5660,7 +5641,7 @@ impl SyscallDispatcher {
             }
             // A stdio fd the guest explicitly closed (and did not reopen) is
             // genuinely closed: write is EBADF, not a host-stream/buffer write.
-            if this.stdio_is_closed(fd as i32) {
+            if this.stdio_is_closed(fd) {
                 return Ok(LINUX_EBADF.into());
             }
             if *this.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
@@ -5669,7 +5650,7 @@ impl SyscallDispatcher {
                 // delays interactive output until process exit: busybox ash writes
                 // its post-Enter newline to fd 2 via write(2), so buffering left the
                 // newline stuck and the next command's output ran onto the prompt.
-                return Ok(Self::write_all_stdio(fd as i32, &bytes));
+                return Ok(Self::write_all_stdio(fd, &bytes));
             }
             match fd {
                 1 => this.io.stdout.lock().extend_from_slice(&bytes),
@@ -5696,10 +5677,10 @@ impl SyscallDispatcher {
             };
             // A stdio fd the guest explicitly closed (and did not reopen) is
             // genuinely closed: writev is EBADF, not a host-stream/buffer write.
-            if this.stdio_is_closed(fd as i32) {
+            if this.stdio_is_closed(fd) {
                 return Ok(LINUX_EBADF.into());
             }
-            let nonblocking = this.io_is_nonblocking(fd as i32, 0);
+            let nonblocking = this.io_is_nonblocking(fd, 0);
 
             let mut total = 0usize;
             for iovec in iovecs {
@@ -5722,7 +5703,7 @@ impl SyscallDispatcher {
                 // redirects (eg `dup3(pipe_write, 1)`) actually plumb
                 // through the redirected description rather than the
                 // built-in stdout buffer.
-                if let Some(open_file) = this.open_file(fd as i32) {
+                if let Some(open_file) = this.open_file(fd) {
                     enum FileWriteback {
                         None,
                         Update { path: String, contents: Vec<u8> },
@@ -5847,7 +5828,7 @@ impl SyscallDispatcher {
                     // BLOCKING-IO-OK: streamed writev to the inherited stdout/
                     // stderr (the user's tty/pipe); blocking is correct backpressure.
                     // Full write loop — never drop the tail on an O_NONBLOCK slave.
-                    match Self::write_all_stdio(fd as i32, &bytes) {
+                    match Self::write_all_stdio(fd, &bytes) {
                         DispatchOutcome::Returned { value } => {
                             total = total
                                 .checked_add(value as usize)
@@ -5875,7 +5856,6 @@ impl SyscallDispatcher {
 
         fn readlinkat(this, cx, dirfd: u64, pathname: GuestPtr, buf: GuestPtr, bufsiz: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
             let buffer = buf.0;
             let buffer_size =
@@ -5968,7 +5948,6 @@ impl SyscallDispatcher {
 
         fn mknodat(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, dev: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
             let mode = mode as u32;
             let path = match read_guest_c_string(&*cx.memory, pathname) {
@@ -6093,9 +6072,7 @@ impl SyscallDispatcher {
 
         fn mkdirat(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
-            let mode = mode;
             let path = match read_guest_c_string(&*cx.memory, pathname) {
                 Ok(path) => path,
                 Err(errno) => return Ok(errno.into()),
@@ -6252,9 +6229,7 @@ impl SyscallDispatcher {
 
         fn fchownat(this, cx, dirfd: u64, pathname: GuestPtr, owner: u64, group: u64, flags: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
-            let flags = flags;
             if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -6376,11 +6351,8 @@ impl SyscallDispatcher {
 
         fn linkat(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr, flags: u64) {
 
-            let olddirfd = olddirfd;
             let oldpath = oldpath.0;
-            let newdirfd = newdirfd;
             let newpath = newpath.0;
-            let flags = flags;
             // linkat accepts AT_SYMLINK_FOLLOW + AT_EMPTY_PATH (NOT
             // AT_SYMLINK_NOFOLLOW — that is a *at-stat/chmod flag); reject any
             // other bit with EINVAL, before path faults. (audit M4; probe linkatflag)
@@ -6487,7 +6459,6 @@ impl SyscallDispatcher {
         fn symlinkat(this, cx, target: GuestPtr, newdirfd: u64, linkpath: GuestPtr) {
 
             let target = target.0;
-            let newdirfd = newdirfd;
             let linkpath = linkpath.0;
             let target_path = match read_guest_c_string(&*cx.memory, target) {
                 Ok(target) => target,
@@ -6566,7 +6537,6 @@ impl SyscallDispatcher {
             // mode either, so reject them.
             const RENAME_NOREPLACE: u64 = 1;
             const RENAME_EXCHANGE: u64 = 2;
-            let flags = flags;
             if flags & !RENAME_NOREPLACE != 0 {
                 if flags & RENAME_EXCHANGE != 0 {
                     return Ok(LINUX_EINVAL.into());
@@ -6649,9 +6619,7 @@ impl SyscallDispatcher {
 
         fn unlinkat(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
-            let flags = flags;
             if flags & !LINUX_AT_REMOVEDIR != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -6712,10 +6680,8 @@ impl SyscallDispatcher {
 
         fn utimensat(this, cx, dirfd: u64, pathname: GuestPtr, times: GuestPtr, flags: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
             let times = times.0;
-            let flags = flags;
             let memory = &*cx.memory;
             if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
                 return Ok(LINUX_EINVAL.into());
@@ -6848,10 +6814,8 @@ impl SyscallDispatcher {
 
         fn newfstatat(this, cx, dirfd: u64, pathname: GuestPtr, statbuf: GuestPtr, flags: u64) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
             let statbuf = statbuf.0;
-            let flags = flags;
             let memory = &mut *cx.memory;
             let path = match read_guest_c_string(memory, pathname) {
                 Ok(path) => path,
@@ -6977,10 +6941,7 @@ impl SyscallDispatcher {
 
         fn statx(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64, mask: u64, statxbuf: GuestPtr) {
 
-            let dirfd = dirfd;
             let pathname = pathname.0;
-            let flags = flags;
-            let mask = mask;
             let statxbuf = statxbuf.0;
             let memory = &mut *cx.memory;
 
