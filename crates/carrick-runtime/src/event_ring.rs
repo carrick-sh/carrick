@@ -5,13 +5,17 @@
 //! the race enough to change the manifestation (see
 //! `docs/forkserver-parent-process-deadlock.md`).
 //!
-//! Recording is hot-path-cheap: an atomic `fetch_add` index + two atomic
-//! `store`s into a fixed array — no lock, no syscall, no allocation, ~ns. The
-//! perturbing part (formatting + writing a file) happens OFF the vCPU thread on
-//! a 1 Hz watchdog thread, so the guest's syscall timing is left intact.
+//! Recording is hot-path-cheap and ALWAYS ON: an atomic `fetch_add` index + two
+//! atomic `store`s into a fixed array — no lock, no syscall, no allocation, ~ns.
+//! It is unconditional on purpose, so the ring is present in a core file or a
+//! live process from ANY run with nothing pre-armed — an intermittent Heisenbug
+//! you can't predict still leaves its history behind. Read it post-mortem with
+//! the lldb plugin: `lldb -c <core> target/release/carrick` then
+//! `carrick eventring` (works on a live `lldb -p <pid>` too).
 //!
-//! Entirely gated on the `CARRICK_EVENTRING` env var (a dir to dump into); when
-//! unset, every `rec_*` is a single relaxed atomic load + early return.
+//! Only the perturbing, autonomous FILE dump is opt-in: set `CARRICK_EVENTRING`
+//! to a directory and a 1 Hz watchdog thread (OFF the vCPU thread, so guest
+//! syscall timing is intact) writes `<dir>/carrick-ring.<pid>`.
 //!
 //! Each carrick process is one guest process, so the ring is per-process. On a
 //! guest fork the child inherits the parent's ring memory but only the forking
@@ -57,17 +61,14 @@ fn dir() -> Option<&'static str> {
         .as_deref()
 }
 
-#[inline]
-fn enabled() -> bool {
-    dir().is_some()
-}
-
-/// Append one event. Hot-path-cheap; no-op when the ring is disabled.
+/// Append one event. ALWAYS records (a few relaxed atomics, no lock/syscall/
+/// alloc — ~ns) so the ring is present in a core file or live process from ANY
+/// run, with no env pre-armed. That is the point: an intermittent Heisenbug you
+/// can't predict still leaves its fork/socket/epoll history in the ring, readable
+/// post-mortem via `lldb ... carrick eventring`. Only the perturbing FILE dump
+/// (the 1 Hz watchdog) is gated on `CARRICK_EVENTRING`.
 #[inline]
 pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
-    if !enabled() {
-        return;
-    }
     let lo = (a as u32 as u64) | ((b as u32 as u64) << 32);
     let hi = (c as u32 as u64) | ((kind as u64) << 32);
     let i = IDX.fetch_add(1, Ordering::Relaxed) % N;
@@ -75,7 +76,7 @@ pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
     // a good chance of also seeing the matching lo.
     RING[i].lo.store(lo, Ordering::Relaxed);
     RING[i].hi.store(hi, Ordering::Relaxed);
-    ensure_watchdog();
+    maybe_start_watchdog();
 }
 
 /// Cheap, stable 32-bit hash of an AF_UNIX path, so a `connect` can be matched
@@ -91,20 +92,29 @@ pub fn path_hash(path: &[u8]) -> i32 {
 }
 
 /// Reset the ring + re-arm the watchdog for a freshly forked child (its
-/// inherited watchdog thread did not survive the fork).
+/// inherited watchdog thread did not survive the fork). The child keeps its OWN
+/// event history from here, so a per-process core shows that process's events.
 pub fn reinit_after_fork() {
-    if !enabled() {
-        return;
-    }
     IDX.store(0, Ordering::SeqCst);
     WATCHDOG.store(false, Ordering::SeqCst);
 }
 
-fn ensure_watchdog() {
-    if WATCHDOG.swap(true, Ordering::SeqCst) {
-        return; // already running for this process
+/// Spawn the (gated) 1 Hz file-dump watchdog once per process. Cheap no-op on
+/// the hot path: a relaxed load, and — unless `CARRICK_EVENTRING` is set — never
+/// spawns anything. The recording itself is unconditional (see `rec`).
+fn maybe_start_watchdog() {
+    if WATCHDOG.load(Ordering::Relaxed) {
+        return;
     }
-    let Some(d) = dir() else { return };
+    let Some(d) = dir() else {
+        // No file dump requested; mark "started" so we don't re-check the env
+        // every event. The ring is still recorded for lldb/core post-mortem.
+        WATCHDOG.store(true, Ordering::Relaxed);
+        return;
+    };
+    if WATCHDOG.swap(true, Ordering::SeqCst) {
+        return; // another thread won the race
+    }
     let path = format!("{d}/carrick-ring.{}", std::process::id());
     let _ = std::thread::Builder::new()
         .name("carrick-eventring".to_owned())
