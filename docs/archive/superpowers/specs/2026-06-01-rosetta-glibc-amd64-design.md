@@ -133,7 +133,7 @@ fixed gets a regression test.
   maintainer scripts, dpkg.
 
 Per-rung loop: run under `CARRICK_TRACE_TRAPS=1` / `carrick trace`
-(`scripts/rosetta-open.d`, `scripts/rosetta-fault.d`), isolate the gap
+(`scripts/dtrace/rosetta-open.d`, `scripts/dtrace/rosetta-fault.d`), isolate the gap
 (ENOSYS / EFAULT / translator fault) with systematic-debugging, fix, add a test.
 Gaps that materially expand scope are surfaced, not silently absorbed.
 
@@ -194,6 +194,6 @@ build (`just build`) and `CARRICK_ACCEPT_ROSETTA_TERMS=1`.
   unmerged layer (working glibc path, decoded Alpine fault).
 - `docs/rosetta.md` @ `main` — the base-era doc that still calls TTBR1 the next step.
 - Commit range `origin/feat/rosetta-amd64..origin/feat/rosetta-ttbr1` (8 commits).
-- `scripts/rosetta-demo.sh`, `scripts/rosetta-open.d`, `scripts/rosetta-fault.d`
+- `scripts/rosetta-demo.sh`, `scripts/dtrace/rosetta-open.d`, `scripts/dtrace/rosetta-fault.d`
   @ `origin/feat/rosetta-ttbr1`.
 - `docker/for-mac#6773`, `crystal-lang/crystal#6934` — the static-PIE-musl Rosetta limit.

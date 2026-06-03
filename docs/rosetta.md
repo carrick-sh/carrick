@@ -119,7 +119,7 @@ Fresh trace evidence with `carrick trace`:
   path shape.
 - `carrick trace` shows the same `read(fd=0, count=8192) -> 1366`, then EOF
   sequence; only Carrick/Rosetta's translated dash parse result differs.
-- `scripts/trace-guest-mem-copy.d` compares Carrick's selected syscall-copy
+- `scripts/dtrace/trace-guest-mem-copy.d` compares Carrick's selected syscall-copy
   mapping against the guest's live high-VA stage-1 translation. For the failing
   fd-input read, the checked write into `0x555555574ac0` is a `MATCH`
   (`va_off=0x2ac0`, `ipa_off=0x2ac0`) and the payload fingerprint matches the
@@ -157,7 +157,7 @@ key fingerprint" error. A reduced direct check showed the sharper symptom:
   `80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`.
 - `carrick trace` shows `gpgv` reads the keyring and InRelease through `read(2)`
   buffers, not file-backed mmap, and no unhandled/partial syscall is reported.
-- `scripts/trace-guest-mem-copy.d` reproduced `BADSIG` while reporting zero
+- `scripts/dtrace/trace-guest-mem-copy.d` reproduced `BADSIG` while reporting zero
   `MISMATCH` events. The checked high-VA syscall-copy buffers for the keyring and
   InRelease reads all matched the live stage-1 backing, including the keyring
   `3607`-byte read and the InRelease
@@ -196,7 +196,7 @@ key fingerprint" error. A reduced direct check showed the sharper symptom:
   output with the same mmap/mprotect/munmap/prlimit families and 84
   `getrandom` returns. The small event-count differences are not leading causes
   because the no-getrandom and no-TSO runs remain bad.
-- `scripts/trace-write-buffers.d` shows the recurring bad output chunks
+- `scripts/dtrace/trace-write-buffers.d` shows the recurring bad output chunks
   (`57344`, `122880`, `188416`) are already corrupted in the guest buffer before
   Carrick performs the host `write(2)`. The selected mapping and
   start/25%/50%/75%/last stage-1 samples for those write buffers all report

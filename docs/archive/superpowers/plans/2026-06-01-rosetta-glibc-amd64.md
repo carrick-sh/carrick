@@ -757,7 +757,7 @@ Expected: PASS.
 ```sh
 CARRICK_ACCEPT_ROSETTA_TERMS=1 CARRICK_TRACE_TRAPS=1 target/release/carrick run --platform linux/amd64 --fs host debian:stable /bin/uname -m 2>&1 | tail -60
 # or the DTrace fault probe (page-table walk on a fault):
-target/release/carrick trace --script scripts/rosetta-fault.d -- run --platform linux/amd64 --fs host debian:stable /bin/uname -m
+target/release/carrick trace --script scripts/dtrace/rosetta-fault.d -- run --platform linux/amd64 --fs host debian:stable /bin/uname -m
 ```
 Compare the failing trap against Phase 0 Step 3. Likely suspects in order: TBI/strip mismatch (Tasks 4/5/6 not landed together), the canonical-bits test rejecting a valid high-half address, or a missing ID-reg encoding (Task 7).
 
