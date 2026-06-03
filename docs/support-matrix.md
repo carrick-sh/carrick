@@ -6,32 +6,40 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ## CPython
 
-1 suite — 1 DIFF
+5 suites — 4 MATCH · 1 DIFF
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
 | `cpython-smoke` | smoke | 473/473 | 471/471 | DIFF | 2 |
+| `cpython-math` | full | 76/76 | 76/76 | MATCH | 0 |
+| `cpython-json` | full | 173/173 | 173/173 | MATCH | 0 |
+| `cpython-glob` | full | 15/15 | 15/15 | MATCH | 0 |
+| `cpython-fcntl` | full | 8/8 | 8/8 | MATCH | 0 |
 
 ## Go
 
-1 suite — 1 NEW
+4 suites — 3 MATCH · 1 DIFF
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
-| `go-runtime` | smoke | 835/983 | 984/984 | NEW | 0 known · 150 NEW |
+| `go-runtime` | smoke | 835/983 | 984/984 | DIFF | 150 |
+| `go-sync` | full | 52/52 | 52/52 | MATCH | 0 |
+| `go-context` | full | 58/58 | 58/58 | MATCH | 0 |
+| `go-time` | full | 170/170 | 170/170 | MATCH | 0 |
 
 ## Node.js / libuv
 
-2 suites — 2 MATCH
+3 suites — 3 MATCH
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
 | `node-app-smoke` | smoke | SUCCESS | SUCCESS | MATCH | 0 |
 | `node-v8-smoke` | smoke | SUCCESS | SUCCESS | MATCH | 0 |
+| `node-libuv` | full | FAILURE | FAILURE | MATCH | 0 |
 
 ## LTP
 
-6 suites — 6 MATCH
+10 suites — 10 MATCH
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
@@ -41,6 +49,10 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-epoll_create01` | smoke | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-getcpu01` | smoke | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sched_yield01` | smoke | 1/1 | 1/1 | MATCH | 0 |
+| `ltp-eventfd01` | full | 0/1 | 0/2 | MATCH | 0 |
+| `ltp-pipe01` | full | 0/1 | 0/2 | MATCH | 0 |
+| `ltp-gettimeofday01` | full | 0/1 | 0/2 | MATCH | 0 |
+| `ltp-sched_getaffinity01` | full | 0/1 | 0/2 | MATCH | 0 |
 
 ---
 
