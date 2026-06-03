@@ -27,7 +27,11 @@ use std::sync::OnceLock;
 /// Per-run id (from `CARRICK_RUN_ID`, inherited across guest forks via the
 /// environment), cached once. Lets cleanup scope to a single run instead of
 /// reaping every `carrick:` host process — the hazard that forces the
-/// conformance gate and the LTP sweeps to run serially.
+/// conformance gate and the LTP sweeps to run serially. The CLI gives EVERY
+/// `carrick run` a sensible default for this (precedence: explicit
+/// `CARRICK_RUN_ID` → the container `--name` → an auto 12-hex short id from the
+/// `carrick ps` id space), so a run is scoped + reapable by default with no env
+/// var to set — see `crate::commands` (carrick-cli).
 static RUN_ID: OnceLock<Option<String>> = OnceLock::new();
 
 fn run_id() -> Option<&'static str> {
