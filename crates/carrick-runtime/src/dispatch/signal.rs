@@ -1260,79 +1260,11 @@ impl SyscallDispatcher {
         /// pops it from `pending_siginfos[(tid, signum)]` and writes it into
         /// the sigframe instead of synthesising SI_USER.
         fn rt_sigqueueinfo(this, cx, tgid: Pid, sig: Signal, info_ptr: GuestPtr) {
+            // rt_sigqueueinfo routes on the tgid itself (LTP rt_sigqueueinfo01
+            // permits a non-leader tid here because find_vpid + thread_group
+            // still resolve to the same process), so route_target == ns_target.
             let tgid = i64::from(tgid.0);
-            let signum = sig.0 as u64;
-            if !is_valid_signum(signum) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            let s = signum as i32;
-
-            // Read the caller's siginfo once up front — same source of truth
-            // regardless of whether we deliver to self, a sibling, or a peer.
-            // The kernel re-stamps si_signo per the rt_sigqueueinfo(2) ABI.
-            let mut user_info: Option<LinuxSiginfo> = None;
-            if info_ptr.0 != 0 {
-                let memory = &*cx.memory;
-                if let Ok(bytes) =
-                    memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
-                    && let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes) {
-                        info.si_signo = s;
-                        user_info = Some(info);
-                    }
-            }
-
-            // If `tgid` names a sibling thread, deliver to that thread directly
-            // (parallels what tkill/tgkill do). LTP `rt_sigqueueinfo01` relies
-            // on this: it spawns a thread, calls
-            // `rt_sigqueueinfo(sibling_tid, SIGUSR1, &info)`, and expects the
-            // sibling's SA_SIGINFO handler to observe the queued payload. Linux
-            // permits a non-leader tid here because `find_vpid` plus
-            // `thread_group` still resolves to the same process; we mirror that
-            // by routing to the sibling tid so its SA_SIGINFO frame carries
-            // the original `si_value`.
-            if let Some(routed) = this.route_thread_signal(cx, tgid, signum) {
-                let target_tid = tgid as crate::thread::ThreadId;
-                if let Some(info) = user_info {
-                    this.record_pending_siginfo(target_tid, s, info);
-                }
-                return Ok(routed);
-            }
-
-            // PID namespace (§5.3): not a sibling thread → translate the ns-pid
-            // target to its host pid for the self/cross-process decision and the
-            // host route. A foreign ns-pid is ESRCH. Identity when ns is off.
-            let tgid = if crate::namespace::pid::enabled() && tgid > 0 {
-                match crate::namespace::pid::ns_to_host_or_self(tgid as u32) {
-                    Some(h) => i64::from(h as i32),
-                    None => return Ok(LINUX_ESRCH.into()),
-                }
-            } else {
-                tgid
-            };
-            let host_pid = std::process::id() as i64;
-            let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-            let is_self = tgid == host_pid || tgid == bootstrap_pid;
-
-            if !is_self {
-                // Cross-process (target is some other host pid, not a sibling
-                // thread of ours). Defer to bootstrap_signal_send for the
-                // kill(2)-style host route. User siginfo payload doesn't
-                // cross the process boundary today — receiver synthesises
-                // SI_USER, same shape as a host kill — tracked separately.
-                return Ok(bootstrap_signal_send(
-                    tgid, /*tid_required=*/ false, signum,
-                ));
-            }
-
-            // Single-threaded self-target (or multi-threaded but no thread
-            // registry hit): queue against the caller's tid so the delivery
-            // pairs with the same SA_SIGINFO frame.
-            let tid = Self::ctx_tid(cx);
-            if let Some(info) = user_info {
-                this.record_pending_siginfo(tid, s, info);
-            }
-            this.mark_signal_pending(tid, s);
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(this.sigqueueinfo_common(cx, tgid, tgid, sig.0 as u64, info_ptr))
         }
 
         /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo): queue `sig` with the
@@ -1344,63 +1276,15 @@ impl SyscallDispatcher {
         /// queued si_ptr payload (signal-to-self, to a sibling, and to the
         /// parent thread).
         fn rt_tgsigqueueinfo(this, cx, tgid: Pid, tid: Pid, sig: Signal, info_ptr: GuestPtr) {
-            let tgid = i64::from(tgid.0);
-            let tid = i64::from(tid.0);
-            let signum = sig.0 as u64;
-            if !is_valid_signum(signum) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            let s = signum as i32;
-
-            // Read the caller's siginfo; the kernel re-stamps si_signo.
-            let mut user_info: Option<LinuxSiginfo> = None;
-            if info_ptr.0 != 0 {
-                let memory = &*cx.memory;
-                if let Ok(bytes) =
-                    memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
-                    && let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes)
-                {
-                    info.si_signo = s;
-                    user_info = Some(info);
-                }
-            }
-
-            // Route to the named thread `tid` (within our process). Mirrors
-            // rt_sigqueueinfo's sibling path so the SA_SIGINFO frame carries the
-            // original si_value.
-            if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
-                let target_tid = tid as crate::thread::ThreadId;
-                if let Some(info) = user_info {
-                    this.record_pending_siginfo(target_tid, s, info);
-                }
-                return Ok(routed);
-            }
-
-            // PID namespace (§5.3): translate the ns-pid thread-group to its
-            // host pid for the self/cross-process decision. Foreign → ESRCH.
-            let tgid = if crate::namespace::pid::enabled() && tgid > 0 {
-                match crate::namespace::pid::ns_to_host_or_self(tgid as u32) {
-                    Some(h) => i64::from(h as i32),
-                    None => return Ok(LINUX_ESRCH.into()),
-                }
-            } else {
-                tgid
-            };
-            // Cross-process: the target thread-group is some other host pid.
-            let host_pid = std::process::id() as i64;
-            let is_self = tgid == host_pid || tgid == LINUX_BOOTSTRAP_PID as i64;
-            if !is_self {
-                return Ok(bootstrap_signal_send(tgid, /*tid_required=*/ false, signum));
-            }
-
-            // Self-target single-threaded (or no sibling hit): queue against the
-            // caller's tid so delivery pairs with the same SA_SIGINFO frame.
-            let ctid = Self::ctx_tid(cx);
-            if let Some(info) = user_info {
-                this.record_pending_siginfo(ctid, s, info);
-            }
-            this.mark_signal_pending(ctid, s);
-            Ok(DispatchOutcome::Returned { value: 0 })
+            // Same delivery machinery as rt_sigqueueinfo, but routing keys on the
+            // explicit `tid` while the self/cross-process decision uses `tgid`.
+            Ok(this.sigqueueinfo_common(
+                cx,
+                i64::from(tid.0),
+                i64::from(tgid.0),
+                sig.0 as u64,
+                info_ptr,
+            ))
         }
 
         /// rt_sigreturn(): pop signal frame and restore registers.
@@ -1441,6 +1325,77 @@ impl SyscallDispatcher {
             });
         }
         None
+    }
+
+    /// Shared body of `rt_sigqueueinfo`/`rt_tgsigqueueinfo`: read the caller's
+    /// `siginfo_t` once, route to `route_target` if it names a live sibling
+    /// (carrying the queued payload into that thread's SA_SIGINFO frame), else
+    /// translate `ns_target` through the PID namespace and either forward
+    /// cross-process or mark-pending against the caller. `route_target` is the
+    /// tgid for `rt_sigqueueinfo` and the explicit tid for `rt_tgsigqueueinfo`;
+    /// `ns_target` is the tgid in both.
+    fn sigqueueinfo_common<M: GuestMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        route_target: i64,
+        ns_target: i64,
+        signum: u64,
+        info_ptr: GuestPtr,
+    ) -> DispatchOutcome {
+        if !is_valid_signum(signum) {
+            return LINUX_EINVAL.into();
+        }
+        let s = signum as i32;
+
+        // Read the caller's siginfo once; the kernel re-stamps si_signo.
+        let mut user_info: Option<LinuxSiginfo> = None;
+        if info_ptr.0 != 0 {
+            let memory = &*ctx.memory;
+            if let Ok(bytes) = memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
+                && let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes)
+            {
+                info.si_signo = s;
+                user_info = Some(info);
+            }
+        }
+
+        // Sibling-thread route: deliver directly so the SA_SIGINFO frame carries
+        // the original si_value (LTP rt_sigqueueinfo01 / rt_tgsigqueueinfo01).
+        if let Some(routed) = self.route_thread_signal(ctx, route_target, signum) {
+            let target_tid = route_target as crate::thread::ThreadId;
+            if let Some(info) = user_info {
+                self.record_pending_siginfo(target_tid, s, info);
+            }
+            return routed;
+        }
+
+        // PID namespace (§5.3): translate the ns-pid thread-group to its host pid
+        // for the self/cross-process decision. Foreign ns-pid → ESRCH; identity
+        // when ns is off.
+        let ns_target = if crate::namespace::pid::enabled() && ns_target > 0 {
+            match crate::namespace::pid::ns_to_host_or_self(ns_target as u32) {
+                Some(h) => i64::from(h as i32),
+                None => return LINUX_ESRCH.into(),
+            }
+        } else {
+            ns_target
+        };
+        let host_pid = std::process::id() as i64;
+        let is_self = ns_target == host_pid || ns_target == LINUX_BOOTSTRAP_PID as i64;
+        if !is_self {
+            // Cross-process: kill(2)-style host route. The user payload doesn't
+            // cross the process boundary today (receiver synthesises SI_USER).
+            return bootstrap_signal_send(ns_target, /*tid_required=*/ false, signum);
+        }
+
+        // Self-target (single-threaded, or no sibling registry hit): queue
+        // against the caller's tid so delivery pairs with the same frame.
+        let tid = Self::ctx_tid(ctx);
+        if let Some(info) = user_info {
+            self.record_pending_siginfo(tid, s, info);
+        }
+        self.mark_signal_pending(tid, s);
+        DispatchOutcome::Returned { value: 0 }
     }
 }
 
