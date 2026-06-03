@@ -1313,10 +1313,7 @@ impl SyscallDispatcher {
                         None
                     } else {
                         let timespec = read_timespec(memory, timeout_address.0)?;
-                        match duration_from_linux_timespec(timespec) {
-                            Ok(t) => t,
-                            Err(errno) => return Ok(errno.into()),
-                        }
+                        duration_from_linux_timespec(timespec)?
                     };
                     if let Some(host_addr) = shared_host_addr {
                         return Ok(DispatchOutcome::SharedFutexWait {
@@ -1806,10 +1803,7 @@ impl SyscallDispatcher {
                     None => return Ok(LINUX_EBADF.into()),
                 }
             } else {
-                match this.resolve_at_path(dirfd, &path_str) {
-                    Ok(p) => p,
-                    Err(errno) => return Ok(errno.into()),
-                }
+                this.resolve_at_path(dirfd, &path_str)?
             };
             let argv = read_guest_string_array_bytes(memory, argv_addr.0)?;
             let env = read_guest_string_array_bytes(memory, envp_addr.0)?;
