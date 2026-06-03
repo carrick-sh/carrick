@@ -1106,17 +1106,18 @@ impl SyscallDispatcher {
             sig_caught,
             sig_shdpnd,
         };
+        let open_flags = LinuxOpenFlags::from_bits_retain(flags);
         let vfs_flags = crate::vfs::OpenFlags {
             read: matches!(access, LINUX_O_RDONLY | LINUX_O_RDWR),
             write: matches!(access, LINUX_O_WRONLY | LINUX_O_RDWR),
-            nonblock: flags & LINUX_O_NONBLOCK != 0,
-            cloexec: flags & LINUX_O_CLOEXEC != 0,
-            append: flags & LINUX_O_APPEND != 0,
-            trunc: flags & LINUX_O_TRUNC != 0,
-            create: flags & LINUX_O_CREAT != 0,
-            excl: flags & LINUX_O_EXCL != 0,
-            directory: flags & LINUX_O_DIRECTORY != 0,
-            nofollow: flags & crate::linux_abi::LINUX_O_NOFOLLOW != 0,
+            nonblock: open_flags.contains(LinuxOpenFlags::NONBLOCK),
+            cloexec: open_flags.contains(LinuxOpenFlags::CLOEXEC),
+            append: open_flags.contains(LinuxOpenFlags::APPEND),
+            trunc: open_flags.contains(LinuxOpenFlags::TRUNC),
+            create: open_flags.contains(LinuxOpenFlags::CREAT),
+            excl: open_flags.contains(LinuxOpenFlags::EXCL),
+            directory: open_flags.contains(LinuxOpenFlags::DIRECTORY),
+            nofollow: open_flags.contains(LinuxOpenFlags::NOFOLLOW),
             mode: create_mode,
         };
         let handle = {
