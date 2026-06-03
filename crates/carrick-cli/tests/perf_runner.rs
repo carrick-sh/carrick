@@ -145,7 +145,7 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     let mk = |engine: &str, lane: &str, vals: &[f64], nproc: Option<u64>| -> ResultRow {
         let s: Summary = stats::summarize(vals).expect("non-empty");
         ResultRow {
-            schema: 1,
+            schema: 2,
             epoch_secs: provenance::epoch_secs(),
             dimension: case.dimension.into(),
             workload: case.workload.into(),
@@ -153,6 +153,7 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
             lane: lane.into(),
             metric: case.metric_key.into(),
             unit: case.unit.into(),
+            higher_is_better: case.higher_is_better,
             summary: s,
             samples: vals.to_vec(),
             noisy: stats::is_noisy(&s),
@@ -170,17 +171,39 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
         mk("carrick", "cold", &carrick_vals, carrick_nproc),
         mk("docker", "docker", &docker_vals, docker_nproc),
     ];
-    // Guard the divisor: a degenerate docker p50 of 0 would yield inf/NaN.
-    let ratio = if rows[1].summary.p50 > 0.0 {
-        rows[0].summary.p50 / rows[1].summary.p50
+    // Direction-aware comparison. `ratio` is always carrick/docker on the raw
+    // metric; the winner and the fold-difference depend on the metric direction.
+    let (cp, dp) = (rows[0].summary.p50, rows[1].summary.p50);
+    let ratio = if dp > 0.0 { cp / dp } else { f64::NAN };
+    let winner_is_carrick = if case.higher_is_better { cp >= dp } else { cp <= dp };
+    let winner = if ratio.is_nan() {
+        "?"
+    } else if winner_is_carrick {
+        "carrick"
     } else {
-        f64::NAN
+        "docker"
+    };
+    // Fold advantage of the winner over the loser (>= 1.0); reads cleanly for
+    // both small (1.2x) and huge (2589x) gaps, unlike a raw percentage.
+    let factor = {
+        let (hi, lo) = (cp.max(dp), cp.min(dp));
+        if lo > 0.0 { hi / lo } else { f64::INFINITY }
     };
     for r in &rows {
         provenance::append_row(root, &date, r).expect("append row");
-        eprintln!("perf[{}] {} {}={:.3}{} p95={:.3} (n={}){}",
-            case.workload, r.engine, r.metric, r.summary.p50, r.unit, r.summary.p95, r.summary.n,
-            if r.engine == "docker" { format!("  RATIO carrick/docker={ratio:.2}") } else { String::new() });
+        let tail = if r.engine == "docker" {
+            format!(
+                "  ratio(c/d)={ratio:.3}  WINNER={winner} ({factor:.2}x {})",
+                if case.higher_is_better { "throughput" } else { "latency" }
+            )
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "perf[{}] {} {}={:.3}{} p95={:.3} (n={}){}{}",
+            case.workload, r.engine, r.metric, r.summary.p50, r.unit, r.summary.p95,
+            r.summary.n, if r.noisy { " NOISY" } else { "" }, tail
+        );
     }
     rows
 }
