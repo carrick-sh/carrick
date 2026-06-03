@@ -20,10 +20,7 @@ impl SyscallDispatcher {
             return Ok(LINUX_EINVAL.into());
         }
 
-        let path = match read_guest_c_string(memory, pathname) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let path = read_guest_c_string(memory, pathname)?;
         if path.is_empty() {
             if flags & LINUX_AT_EMPTY_PATH == 0 {
                 return Ok(LINUX_ENOENT.into());
@@ -35,10 +32,7 @@ impl SyscallDispatcher {
             return Ok(self.fd_access(dirfd as i32, mode));
         }
 
-        let path = match self.resolve_at_path(dirfd, &path) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let path = self.resolve_at_path(dirfd, &path)?;
         Ok(self.access_resolved_path(&path, mode, flags))
     }
 
