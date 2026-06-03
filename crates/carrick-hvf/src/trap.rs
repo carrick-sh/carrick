@@ -2125,10 +2125,29 @@ impl HvfInner {
     /// [`TrapError::EL0Fault`]. `from_el0_direct` distinguishes the direct
     /// EL0-abort exit (`true` — runtime redirects PC) from the HVC-trampoline
     /// underlying fault (`false` — runtime redirects ELR_EL1).
-    fn capture_el0_fault(&mut self, syndrome: u64, from_el0_direct: bool) -> TrapError {
+    ///
+    /// `direct_fault` carries the AUTHORITATIVE fault info for the direct path:
+    /// `(true_pc, fault_va)` from HVF's exit (`Reg::PC` + `exception
+    /// .virtual_address`). On that path the guest's EL1 vector never runs, so
+    /// `ELR_EL1`/`FAR_EL1` are STALE (left over from the last `svc` — e.g.
+    /// elr=post-svc, far=0), which would otherwise be baked into the guest's
+    /// SIGSEGV frame as a bogus resume-PC + `si_addr`. The HVC-trampoline path
+    /// passes `None`: there the EL1 vector latched both sysregs, so they are
+    /// authoritative and the runtime relies on `ELR_EL1` for the re-run.
+    fn capture_el0_fault(
+        &mut self,
+        syndrome: u64,
+        from_el0_direct: bool,
+        direct_fault: Option<(u64, u64)>,
+    ) -> TrapError {
         use applevisor::prelude::*;
-        let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-        let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+        let (elr, far) = match direct_fault {
+            Some((true_pc, fault_va)) => (true_pc, fault_va),
+            None => (
+                self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0),
+                self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0),
+            ),
+        };
         let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
         let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
         let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
@@ -2223,10 +2242,95 @@ impl HvfInner {
         // CPython faulthandler._stack_overflow expects exactly this — instead of
         // fataling with "unexpected exception".
         if is_aarch64_el0_abort_exception(exception.syndrome) {
+            // CARRICK_TRACE_FAULT: dump the AUTHORITATIVE fault info from the HVF
+            // exit (exception.virtual_address + guest Reg::PC) next to the EL1
+            // sysregs (ELR_EL1/FAR_EL1), which are STALE on this direct exit (the
+            // guest's EL1 vector never ran), plus the full GPR set so the register
+            // holding the bad pointer is visible. Diagnostic only; off by default.
+            if std::env::var_os("CARRICK_TRACE_FAULT").is_some() {
+                let pc = self.vcpu.get_reg(Reg::PC).unwrap_or(0);
+                let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                let far_reg = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+                let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                let mut gprs = [0u64; 31];
+                for (i, slot) in gprs.iter_mut().enumerate() {
+                    if let Some(r) = GPR_TABLE.get(i) {
+                        *slot = self.vcpu.get_reg(*r).unwrap_or(0);
+                    }
+                }
+                eprintln!(
+                    "FAULTDUMP pid={} esr=0x{:x} exit_va=0x{:x} exit_pa=0x{:x} pc=0x{:x} elr_stale=0x{:x} far_stale=0x{:x} sp=0x{:x}",
+                    unsafe { libc::getpid() },
+                    exception.syndrome,
+                    exception.virtual_address,
+                    exception.physical_address,
+                    pc,
+                    elr,
+                    far_reg,
+                    sp,
+                );
+                eprintln!(
+                    "FAULTGPR pid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x} x6=0x{:x} x7=0x{:x} x8=0x{:x} x9=0x{:x} x10=0x{:x} x11=0x{:x} x12=0x{:x} x13=0x{:x} x14=0x{:x} x15=0x{:x}",
+                    unsafe { libc::getpid() },
+                    gprs[0],
+                    gprs[1],
+                    gprs[2],
+                    gprs[3],
+                    gprs[4],
+                    gprs[5],
+                    gprs[6],
+                    gprs[7],
+                    gprs[8],
+                    gprs[9],
+                    gprs[10],
+                    gprs[11],
+                    gprs[12],
+                    gprs[13],
+                    gprs[14],
+                    gprs[15],
+                );
+                eprintln!(
+                    "FAULTGPR2 pid={} x16=0x{:x} x17=0x{:x} x18=0x{:x} x19=0x{:x} x20=0x{:x} x21=0x{:x} x22=0x{:x} x23=0x{:x} x24=0x{:x} x25=0x{:x} x26=0x{:x} x27=0x{:x} x28=0x{:x} x29=0x{:x} x30=0x{:x}",
+                    unsafe { libc::getpid() },
+                    gprs[16],
+                    gprs[17],
+                    gprs[18],
+                    gprs[19],
+                    gprs[20],
+                    gprs[21],
+                    gprs[22],
+                    gprs[23],
+                    gprs[24],
+                    gprs[25],
+                    gprs[26],
+                    gprs[27],
+                    gprs[28],
+                    gprs[29],
+                    gprs[30],
+                );
+                // Read the faulting instruction word at the TRUE pc (Reg::PC).
+                if let Ok(b) = self.read_guest_bytes(pc, 4) {
+                    let insn = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    eprintln!(
+                        "FAULTINSN pid={} pc=0x{:x} insn=0x{:08x}",
+                        unsafe { libc::getpid() },
+                        pc,
+                        insn
+                    );
+                }
+            }
             // Direct EL0-abort exit (post-rewrite); the HVC-underlying path below
             // also routes through capture_el0_fault (which stashes the ESR for
             // the signal frame's esr_context — Rosetta's handler requires it).
-            return Err(self.capture_el0_fault(exception.syndrome, true));
+            // ELR_EL1/FAR_EL1 are STALE here (the guest EL1 vector never ran), so
+            // pass HVF's authoritative faulting PC (Reg::PC) + VA
+            // (exception.virtual_address) for the signal frame's resume-PC + si_addr.
+            let true_pc = self.vcpu.get_reg(Reg::PC).unwrap_or(0);
+            return Err(self.capture_el0_fault(
+                exception.syndrome,
+                true,
+                Some((true_pc, exception.virtual_address)),
+            ));
         }
         if !is_aarch64_syscall_exception(exception.syndrome) {
             return Err(TrapError::UnexpectedException {
@@ -2289,7 +2393,9 @@ impl HvfInner {
                     );
                     crate::probes::pt_fault_walk(far, d[0], d[1], d[2], d[3]);
                 }
-                return Err(self.capture_el0_fault(underlying, false));
+                // HVC-trampoline path: the guest EL1 vector latched ELR_EL1/FAR_EL1,
+                // so they are authoritative — pass None to read them.
+                return Err(self.capture_el0_fault(underlying, false, None));
             }
         }
         self.last_exit_class = aarch64_exception_class(exception.syndrome);
@@ -3274,6 +3380,15 @@ impl HvfInner {
         mcontext.sp = frame.saved_sp;
         mcontext.pc = frame.saved_pc;
         mcontext.pstate = frame.saved_spsr;
+        // The arm64 kernel records the faulting VA in sigcontext.fault_address for
+        // a synchronous memory fault (SIGSEGV/SIGBUS). Linux fault handlers read it
+        // there, NOT from siginfo.si_addr — Go's `sigctxt.fault()` returns
+        // `c.regs().fault_address`, and the `addr=0x..` in its crash report comes
+        // from it. Leaving it 0 made every guest SIGSEGV look like a nil deref.
+        // Mirror si_addr (= the faulting VA) here; non-fault signals leave it 0.
+        if let Some((_, si_addr)) = fault_siginfo {
+            mcontext.fault_address = si_addr;
+        }
         // Save V0–V31 + FPSR/FPCR as a Linux fpsimd_context at the start of
         // sigcontext.__reserved, so the handler can't leak SIMD state into the
         // interrupted thread (aarch64 memcpy/memset use V registers) and so a
