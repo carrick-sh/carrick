@@ -467,9 +467,12 @@ impl SyscallDispatcher {
             return Ok(LINUX_EINVAL.into());
         }
         let writable_request = access == LINUX_O_WRONLY || access == LINUX_O_RDWR;
-        let want_create = flags & LINUX_O_CREAT != 0;
-        let want_excl = flags & LINUX_O_EXCL != 0;
-        let want_trunc = flags & LINUX_O_TRUNC != 0;
+        // Parse the open flags once; `flags` (raw u64) is still used below where
+        // the access-mode bits or a raw mask (e.g. `flags & !O_CLOEXEC`) is needed.
+        let open_flags = LinuxOpenFlags::from_bits_retain(flags);
+        let want_create = open_flags.contains(LinuxOpenFlags::CREAT);
+        let want_excl = open_flags.contains(LinuxOpenFlags::EXCL);
+        let want_trunc = open_flags.contains(LinuxOpenFlags::TRUNC);
 
         // O_TMPFILE: `pathname` names a directory; the result is an unnamed,
         // writable regular file. It's never linked anywhere — exactly the
@@ -486,7 +489,7 @@ impl SyscallDispatcher {
         // File is PER-PROCESS (copied, not shared, across fork) so the child's
         // write never reached the parent → FAIL. MemoryBackend has no kernel fd
         // (open_anon_fd → None) and keeps the in-memory File fallback.
-        if flags & crate::linux_abi::LINUX_O_TMPFILE != 0 {
+        if open_flags.contains(LinuxOpenFlags::TMPFILE) {
             if !writable_request {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -613,7 +616,7 @@ impl SyscallDispatcher {
         // parses the result as an ELF, so a returned symlink corrupts it.
         // Best-effort: a non-symlink or not-yet-existent (O_CREAT) path is left
         // unchanged.
-        if flags & crate::linux_abi::LINUX_O_NOFOLLOW == 0 && !(want_create && want_excl) {
+        if !(open_flags.contains(LinuxOpenFlags::NOFOLLOW) || (want_create && want_excl)) {
             // Follow the trailing symlink. A genuine symlink CYCLE surfaces here
             // as ELOOP (canonicalize_following caps at 40 hops); Linux open(2)
             // returns ELOOP for it, so propagate that rather than swallowing the
@@ -654,7 +657,7 @@ impl SyscallDispatcher {
             if let Ok(md) = self.layered_lstat(&path)
                 && md.kind == RootFsEntryKind::Symlink
             {
-                if flags & crate::linux_abi::LINUX_O_DIRECTORY != 0 {
+                if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
                     return Ok(LINUX_ENOTDIR.into());
                 }
                 return Ok(crate::linux_abi::LINUX_ELOOP.into());
@@ -792,7 +795,7 @@ impl SyscallDispatcher {
         // O_DIRECTORY: opening anything that isn't a directory fails ENOTDIR
         // (LTP open08). Close a host fd the dispatch already opened so it
         // doesn't leak.
-        if flags & LINUX_O_DIRECTORY != 0 {
+        if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
             match &dispatch_result {
                 Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
                     unsafe {
