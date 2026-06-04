@@ -15,7 +15,15 @@
 //! Off unless `CARRICK_DEADLOCK_WATCHDOG_MS` is set. Diagnostic only.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// PROCESS-LOCAL "has this process ever dispatched a guest syscall?" flag (NOT
+/// in the shared page — each process has its own). Only a process that has
+/// actually run guest syscalls holds deadlock-relevant state worth coring; the
+/// ns-supervisor and the orchestrator parent merely park in `kevent`/`poll` and
+/// never `tick()`, so coring them wastes the (bounded) capture. `arm()`-ed in
+/// every process, but the self-core is gated on this being `true`.
+static LOCAL_TICKED: AtomicBool = AtomicBool::new(false);
 
 /// The shared progress word, in a `MAP_SHARED` page inherited across fork.
 fn counter() -> &'static AtomicU64 {
@@ -47,19 +55,49 @@ fn counter() -> &'static AtomicU64 {
 /// Advance global progress. Called on every syscall dispatch (cheap, relaxed).
 pub fn tick() {
     counter().fetch_add(1, Ordering::Relaxed);
+    // Mark THIS process as a real guest dispatcher (see `LOCAL_TICKED`). A single
+    // relaxed store on the hot path — cheaper than a load+branch, and idempotent.
+    LOCAL_TICKED.store(true, Ordering::Relaxed);
 }
 
-/// Tree-wide "a core has been taken" latch, in the SAME shared page (offset 8),
-/// so at most ONE process in the whole tree spawns lldb on a deadlock — without
-/// it, every stuck process self-cores at once (12 concurrent `sudo lldb` was an
-/// effective fork bomb). Returns true exactly once across the tree.
+/// Has this process ever dispatched a guest syscall? Gates self-core eligibility.
+fn local_ticked() -> bool {
+    LOCAL_TICKED.load(Ordering::Relaxed)
+}
+
+/// Tree-wide cap on how many processes self-core on a single deadlock. Default 1
+/// (one stuck guest is enough to start); raise via `CARRICK_DEADLOCK_WATCHDOG_MAX_CORES`
+/// to capture e.g. the stuck `go` PARENT *and* its pre-exec CHILD together. The
+/// cap (plus the `local_ticked` gate) is what keeps this from being the original
+/// every-stuck-process-self-cores fork bomb (12 concurrent `sudo lldb`).
+fn max_cores() -> u64 {
+    static CELL: OnceLock<u64> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("CARRICK_DEADLOCK_WATCHDOG_MAX_CORES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&k| k > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// Bounded tree-wide core-claim counter, in the SAME shared page (offset 8), so
+/// at most `max_cores()` processes in the whole tree spawn lldb on a deadlock —
+/// without a cap, every stuck process self-cores at once (12 concurrent `sudo
+/// lldb` was an effective fork bomb). Returns true for the first `max_cores()`
+/// callers across the tree.
 fn claim_core_slot() -> bool {
     // SAFETY: the shared page is 4096 bytes; a second AtomicU64 fits at +8.
     let base = counter() as *const AtomicU64 as usize;
     let latch = unsafe { &*((base + 8) as *const AtomicU64) };
-    latch
-        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
+    claim_below(latch, max_cores())
+}
+
+/// Pure claim arithmetic (testable without the process-global shared page):
+/// the first `max` callers get `true`, the rest `false`. `fetch_add` returns the
+/// PRE-increment value, so callers see 0,1,…,max-1 → true and max,… → false.
+fn claim_below(latch: &AtomicU64, max: u64) -> bool {
+    latch.fetch_add(1, Ordering::SeqCst) < max
 }
 
 fn window_ms() -> Option<u64> {
@@ -99,11 +137,24 @@ pub fn arm() {
                 }
                 // No global syscall progress for the window: a true deadlock.
                 let pid = unsafe { libc::getpid() };
-                // At most ONE process in the tree spawns lldb — otherwise every
-                // stuck process self-cores at once (a fork bomb).
+                // Eligibility gate: only a process that has actually dispatched a
+                // guest syscall holds deadlock-relevant state. The ns-supervisor
+                // and orchestrator parent just park in `kevent`/`poll` and never
+                // `tick()` — without this gate one of THEM can win the bounded
+                // claim and core its own useless parked state, leaving the truly
+                // stuck go-build guests un-cored. (Observed: a core that was only
+                // `namespace::supervisor::run` in `kevent`, ring `total=0`.)
+                if !local_ticked() {
+                    eprintln!(
+                        "DEADLOCK WATCHDOG pid={pid}: tree-wide stall ({ms}ms) but this process never dispatched a guest syscall (supervisor/orchestrator) — deferring the core to a stuck guest"
+                    );
+                    return;
+                }
+                // Bounded: only the first `max_cores()` stuck GUESTS spawn lldb —
+                // otherwise every stuck process self-cores at once (a fork bomb).
                 if !claim_core_slot() {
                     eprintln!(
-                        "DEADLOCK WATCHDOG pid={pid}: tree-wide stall ({ms}ms); another process is taking the core"
+                        "DEADLOCK WATCHDOG pid={pid}: tree-wide stall ({ms}ms); core quota reached, another guest is taking it"
                     );
                     return;
                 }
@@ -122,7 +173,11 @@ pub fn arm() {
                         &pid.to_string(),
                         "-b",
                         "-o",
-                        &format!("process save-core {path}"),
+                        // modified-memory: captures dirty pages (incl. the event
+                        // ring + Rust statics) but not the multi-GB clean guest
+                        // window, so the core stays ~100MB and the carrick_lldb
+                        // `eventring` reader works (a `stack` core misses it).
+                        &format!("process save-core --style modified-memory {path}"),
                         "-o",
                         "detach",
                         "-o",
@@ -144,4 +199,26 @@ pub fn arm() {
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_below_grants_exactly_max_then_denies() {
+        let latch = AtomicU64::new(0);
+        // Default cap of 1: first claimant cores, the rest defer.
+        assert!(claim_below(&latch, 1), "1st claim should win");
+        assert!(!claim_below(&latch, 1), "2nd claim should be denied");
+        assert!(!claim_below(&latch, 1), "3rd claim should be denied");
+
+        // A raised cap (e.g. capture the go PARENT + a stuck CHILD) grants exactly
+        // that many across the tree, then denies — bounding the lldb fan-out.
+        let latch = AtomicU64::new(0);
+        assert!(claim_below(&latch, 3));
+        assert!(claim_below(&latch, 3));
+        assert!(claim_below(&latch, 3));
+        assert!(!claim_below(&latch, 3), "4th claim past cap of 3 is denied");
+    }
 }
