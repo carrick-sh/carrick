@@ -24,7 +24,7 @@ impl Ecosystem {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerdictKind {
     Regrtest,
@@ -34,21 +34,21 @@ pub enum VerdictKind {
     Shell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Smoke,
     Full,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Weight {
     Heavy,
     Light,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct EnvKv {
     pub key: String,
     pub val: String,
@@ -56,13 +56,13 @@ pub struct EnvKv {
 
 /// A value that may be shared across both engines or specialized per-engine.
 /// Resolution: the engine-specific value wins, else `both`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct EnginePair<T> {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub both: Option<T>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carrick: Option<T>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<T>,
 }
 
@@ -75,7 +75,7 @@ impl<T: Clone> EnginePair<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Suite {
     pub name: String,
     pub ecosystem: Ecosystem,
@@ -87,32 +87,35 @@ pub struct Suite {
     pub tier: Tier,
     pub weight: Weight,
     pub timeout_s: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_gaps: Vec<String>,
-    /// Per-engine `--entrypoint` (Node pins `{ both = "/usr/local/bin/nodejs-conformance" }`).
-    #[serde(default)]
-    pub entrypoint: Option<EnginePair<String>>,
     /// carrick-only envelope flags (e.g. `["--raw","--fs","memory"]`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carrick_flags: Vec<String>,
     /// docker-only flags (e.g. `["--user","65534"]`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docker_flags: Vec<String>,
     /// `-v` specs applied to both.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bind_mounts: Vec<String>,
     /// `-e` specs applied to both.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvKv>,
     /// `-e` specs, carrick side only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_carrick: Vec<EnvKv>,
     /// `-e` specs, docker side only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_docker: Vec<EnvKv>,
     /// `-w`, applied to both.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// Per-engine `--entrypoint` (Node pins `{ both = "/usr/local/bin/nodejs-conformance" }`).
+    /// MUST stay LAST: it is the only nested-struct (table) field, so keeping it
+    /// after every scalar/array keeps `toml::to_string` valid (a `[[suite]]`
+    /// element must list all values before any sub-table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<EnginePair<String>>,
 }
 
 impl Suite {
@@ -135,7 +138,7 @@ impl Suite {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Manifest {
     #[serde(default)]
     pub suite: Vec<Suite>,

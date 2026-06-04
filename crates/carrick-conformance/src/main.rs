@@ -12,6 +12,7 @@
 //! overlap (two-phase); every kill is SCOPED to one run-id (no unscoped reap).
 
 mod engine;
+mod generate;
 mod manifest;
 mod matrix;
 mod parsers;
@@ -64,6 +65,11 @@ struct Args {
     /// Print the planned carrick + docker argv for each suite, run nothing.
     #[arg(long)]
     dry_run: bool,
+    /// Regenerate the manifest (suites.toml) for full coverage by enumerating
+    /// every module per ecosystem via docker, then exit. With --dry-run, print
+    /// counts only and do not write.
+    #[arg(long)]
+    generate_suites: bool,
     #[arg(long, default_value = "target/release/carrick")]
     carrick_bin: PathBuf,
 }
@@ -89,6 +95,11 @@ fn run() -> anyhow::Result<ExitCode> {
             "rendered docs/support-matrix.md from {}",
             args.jsonl.display()
         );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if args.generate_suites {
+        generate::generate_suites(&args.manifest, args.dry_run)?;
         return Ok(ExitCode::SUCCESS);
     }
 
