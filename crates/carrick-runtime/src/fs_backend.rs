@@ -340,6 +340,18 @@ pub trait FsBackend: Send + Sync {
         None
     }
 
+    /// Dispatch-level fast stat: serve `path`'s `RealStat` straight from the
+    /// stat cache (one revalidating `fstatat` through a cached contained parent
+    /// fd), letting the `newfstatat`/`statx` handlers skip `resolve_at_path`'s
+    /// parent-containment `openat` entirely on a hit. Returns `None` whenever the
+    /// cache is disabled or the path is not a plain cached regular file/dir
+    /// (symlinks, escapes, cross-mount, /proc, errors) — the caller then takes
+    /// the full resolve-and-stat path. Default: `None`. See
+    /// [`HostFsBackend::stat_cache`].
+    fn stat_cache_lookup(&self, _path: &str) -> Option<RealStat> {
+        None
+    }
+
     /// Fast intermediate-path validation for the resolver's hot path: validate
     /// the PARENT chain of a lexically-joined guest absolute `abs` with the
     /// kernel in ~one syscall (openat the parent + F_GETPATH byte-exact),
@@ -789,6 +801,52 @@ pub struct HostFsBackend {
     /// vCPUs exited mid-quiesce — is fixed (runtime.rs recomputes it live), so
     /// the win (test_glob 140s→48s) is on by default.
     fast_fs: bool,
+    /// Dir-fd-anchored stat cache. Default ON (`CARRICK_FS_STATCACHE=0` opts out).
+    /// Maps a leaf path → a cached `RealStat` + the leaf's identity snapshot
+    /// (ino/ctime/mtime/size) + an `OwnedFd` of its CONTAINED parent dir. A
+    /// repeat stat revalidates with ONE `fstatat(parent_fd, name, AT_NOFOLLOW)`
+    /// (≈1µs) and reuses the cached kind/mode/owner when the identity is
+    /// unchanged — replacing the 2 containment `openat`s + the xattr reads, so a
+    /// hot path approaches the HVF trap floor (~1.8µs ≈ native; ~55× → ~2.5×
+    /// native on perf_disk_meta). The per-hit revalidation catches every
+    /// in-place mutation (chmod/chown/write/unlink → re-fill or ENOENT);
+    /// clear-on-fork and clear-on-rename cover the in-process structural cases.
+    /// RESIDUAL coherence window (the reason it is opt-out, not unconditional):
+    /// another carrick process concurrently RENAMING a directory this process has
+    /// cached as a parent — that single case can briefly serve a stale path until
+    /// eviction. Validated regression-free across the full conformance matrix.
+    /// See docs/fs-host-capstd-amplification.md.
+    stat_cache: parking_lot::Mutex<std::collections::HashMap<PathBuf, StatCacheEntry>>,
+    /// The pid that owns the current `stat_cache` contents. carrick COW-forks for
+    /// guest `clone`/`fork` (and for the default private-PID-namespace guest
+    /// init), so a child inherits the map + dup'd parent fds. On the first cache
+    /// use after a pid change we DROP the inherited entries and adopt the cache
+    /// for this process — so each process caches its own view and never trusts a
+    /// sibling's stale fd. `0` (no real pid) forces the first use to adopt.
+    cache_pid: std::sync::atomic::AtomicU32,
+    /// `CARRICK_FS_STATCACHE` enabled (default ON — see `stat_cache`).
+    use_stat_cache: bool,
+}
+
+/// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
+/// `parent_fd` is a CONTAINED directory fd (verified via F_GETPATH when the
+/// entry was filled) used as a trusted anchor: `fstatat(parent_fd, name)` of a
+/// single component cannot escape it. See [`HostFsBackend::stat_cache`].
+#[cfg(target_os = "macos")]
+struct StatCacheEntry {
+    parent_fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    ino: u64,
+    ctime: (i64, i64),
+    mtime: (i64, i64),
+    size: i64,
+    real: RealStat,
+}
+
+/// Non-macOS placeholder so the `stat_cache` field type is well-formed; the
+/// cache is only populated/consulted on macOS (the only `--fs host` fast path).
+#[cfg(not(target_os = "macos"))]
+struct StatCacheEntry {
+    real: RealStat,
 }
 
 /// F_GETPATH of a cap-std dir fd → its absolute host path (macOS), used as the
@@ -818,6 +876,29 @@ fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
     }
 }
 
+/// `true` iff the open fd's real host path (`F_GETPATH`) lives at or under
+/// `root_prefix` — the sandbox-containment check for the fast paths. An
+/// intermediate (or followed-leaf) symlink the kernel resolved out of the root
+/// shows an outside path here and is rejected. `F_GETPATH` on an open fd is a
+/// cheap (no-path-walk) read of the vnode's cached path.
+#[cfg(target_os = "macos")]
+fn fd_contained_under(fd: std::os::fd::RawFd, root_prefix: &str) -> bool {
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) } < 0 {
+        return false;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    match std::str::from_utf8(&buf[..end]) {
+        Ok(got) => {
+            got == root_prefix
+                || (got.len() > root_prefix.len()
+                    && got.starts_with(root_prefix)
+                    && got.as_bytes()[root_prefix.len()] == b'/')
+        }
+        Err(_) => false,
+    }
+}
+
 /// `--fs host` fast stat path enabled. Default ON (`CARRICK_FAST_FS=0` opts out).
 /// It was briefly default-off because it aggravated a fork-quiesce wedge; that
 /// wedge (stale `others` count — see runtime.rs fork loop) is now fixed, so the
@@ -825,6 +906,15 @@ fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
 fn fast_fs_enabled() -> bool {
     !matches!(
         std::env::var("CARRICK_FAST_FS").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// `--fs host` stat cache enabled. Default ON (`CARRICK_FS_STATCACHE=0` opts
+/// out). See [`HostFsBackend::stat_cache`] for the speed/coherence trade-off.
+fn stat_cache_enabled() -> bool {
+    !matches!(
+        std::env::var("CARRICK_FS_STATCACHE").as_deref(),
         Ok("0") | Ok("false")
     )
 }
@@ -875,6 +965,9 @@ impl HostFsBackend {
             owner_pid: unsafe { libc::getpid() as u32 },
             root_prefix,
             fast_fs,
+            stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cache_pid: std::sync::atomic::AtomicU32::new(0),
+            use_stat_cache: stat_cache_enabled(),
         })
     }
 
@@ -910,6 +1003,9 @@ impl HostFsBackend {
             owner_pid: unsafe { libc::getpid() as u32 },
             root_prefix,
             fast_fs,
+            stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cache_pid: std::sync::atomic::AtomicU32::new(0),
+            use_stat_cache: stat_cache_enabled(),
         }
     }
 
@@ -946,13 +1042,27 @@ impl HostFsBackend {
     /// (→ cap-std handles it) for symlink leaves, FIFOs/sockets/devices, escapes
     /// (an intermediate symlink the kernel followed out of the sandbox root), or
     /// any error. See docs/fs-host-capstd-amplification.md.
+    /// Open `rel` ONCE under the sandbox root and resolve everything a stat
+    /// needs from the resulting fd: type (`fstat`), sandbox containment
+    /// (`F_GETPATH`), and the guest mode/owner/socket xattrs (`fgetxattr`). A
+    /// single in-kernel path walk replaces the old `fstatat` + separate
+    /// containment `openat` + one `getxattr` PER attribute (each its own full
+    /// re-walk of the path; ~7 walks of a deep path per guest stat, see
+    /// docs/fs-host-capstd-amplification.md). `O_EVTONLY` opens "for event
+    /// monitoring only": `fstat`/`F_GETPATH`/`fgetxattr` all work, but the kernel
+    /// records NO access, so atime is preserved exactly as the guest set it (the
+    /// property the path-based xattr peeks were introduced for). Returns the
+    /// still-open fd (auto-closed on drop, including every early return) so the
+    /// caller can read fd-relative xattrs with no further walk. `None` (→ the
+    /// cap-std slow path) for symlink leaves, FIFOs/sockets/devices, sandbox
+    /// escapes, or any error.
     #[cfg(target_os = "macos")]
-    fn fast_lstat_contained(
+    fn fast_open_contained(
         &self,
         rel: &Path,
         follow: bool,
-    ) -> Option<(libc::stat, RootFsEntryKind)> {
-        use std::os::fd::AsRawFd;
+    ) -> Option<(std::os::fd::OwnedFd, libc::stat, RootFsEntryKind)> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
         if !self.fast_fs {
             return None;
@@ -961,68 +1071,98 @@ impl HostFsBackend {
         let rel_c = std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?;
         let dir_fd = self.dir.as_raw_fd();
 
-        // 1. lstat/stat in ONE syscall (kernel resolves the whole path).
+        // ONE open. O_EVTONLY: event-monitoring open — fstat/F_GETPATH/fgetxattr
+        // all work but the kernel records no access, so atime is untouched (this
+        // is what made the per-attr path getxattrs necessary; folding them onto
+        // one O_EVTONLY fd keeps the atime guarantee AND collapses the walks).
+        // O_NONBLOCK so a (racing) FIFO can't wedge the open. O_NOFOLLOW on lstat
+        // (`!follow`) so a leaf symlink isn't traversed; on stat (`follow`) it IS
+        // traversed and the F_GETPATH containment below proves the *target* is
+        // in-sandbox.
+        const O_EVTONLY: libc::c_int = 0x8000;
+        let mut oflags = O_EVTONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        if !follow {
+            oflags |= libc::O_NOFOLLOW;
+        }
+        let raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), oflags, 0) };
+        if raw < 0 {
+            return None; // symlink leaf (O_NOFOLLOW→ELOOP), ENOENT, … → cap-std
+        }
+        // SAFETY: `raw` is a freshly-opened owned fd; OwnedFd closes it on drop,
+        // covering every `?`/`return None` below as well as the caller's drop.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // Type via fstat on the open fd — no extra path walk.
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        let at_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-        if unsafe { libc::fstatat(dir_fd, rel_c.as_ptr(), &mut st, at_flags) } != 0 {
+        if unsafe { libc::fstat(raw, &mut st) } != 0 {
             return None;
         }
         let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        // Regular files report File here; the AF_UNIX-socket-marker check (rare)
+        // is folded into the single fd_carrick_meta xattr pass the metadata/stat
+        // callers do, so the glob lookup hot path pays no socket read at all.
         let kind = if typ == libc::S_IFDIR as u32 {
             RootFsEntryKind::Directory
         } else if typ == libc::S_IFREG as u32 {
-            if read_socket_xattr(&self.dir, rel) {
-                RootFsEntryKind::Socket
-            } else {
-                RootFsEntryKind::File
-            }
+            RootFsEntryKind::File
         } else {
             return None; // symlink/FIFO/socket-node/device → cap-std path
         };
 
-        // 2. Containment: open the entry and verify its real host path (F_GETPATH)
-        //    is under the sandbox root. O_NONBLOCK so a (racing) FIFO can't block
-        //    us; O_NOFOLLOW on lstat so a leaf-symlink swap can't redirect. An
-        //    intermediate symlink the kernel followed out of the root is caught.
-        let mut oflags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
-        if kind == RootFsEntryKind::Directory {
-            oflags |= libc::O_DIRECTORY;
-        }
-        if !follow {
-            oflags |= libc::O_NOFOLLOW;
-        }
-        let fd = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), oflags, 0) };
-        if fd < 0 {
+        // Containment: the opened inode's real host path (F_GETPATH) must live
+        // under the sandbox root. Catches an intermediate (or, on follow, a leaf)
+        // symlink the kernel resolved out of the root. Nothing was read or
+        // created, so a failed check is a clean reject (drop the fd → close, fall
+        // back to cap-std, which re-roots absolute symlink targets correctly).
+        if !fd_contained_under(raw, root_prefix) {
             return None;
         }
-        let mut buf = [0u8; libc::PATH_MAX as usize];
-        let getpath_ok =
-            unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) } >= 0;
-        unsafe { libc::close(fd) };
-        if !getpath_ok {
-            return None;
-        }
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        let got = std::str::from_utf8(&buf[..end]).ok()?;
-        let contained = got == root_prefix
-            || (got.len() > root_prefix.len()
-                && got.starts_with(root_prefix)
-                && got.as_bytes()[root_prefix.len()] == b'/');
-        if !contained {
-            return None;
-        }
-        Some((st, kind))
+        Some((fd, st, kind))
+    }
+
+    /// Thin wrapper over [`HostFsBackend::fast_open_contained`] for callers that
+    /// only need `(stat, kind)` — the fd is closed immediately on drop.
+    #[cfg(target_os = "macos")]
+    fn fast_lstat_contained(
+        &self,
+        rel: &Path,
+        follow: bool,
+    ) -> Option<(libc::stat, RootFsEntryKind)> {
+        self.fast_open_contained(rel, follow)
+            .map(|(_fd, st, kind)| (st, kind))
     }
 
     #[cfg(target_os = "macos")]
     fn fast_real_stat(&self, normalized: &Path, follow: bool) -> Option<RealStat> {
+        use std::os::fd::AsRawFd;
         let rel = Self::rel_path(normalized)?; // None == root dir: let cap-std handle
-        let (st, kind) = self.fast_lstat_contained(rel, follow)?;
 
-        // Build RealStat (mode/owner via the fast path-based xattr helpers).
+        // Opt-in stat cache: a repeat stat of a non-symlink leaf is served by one
+        // revalidating fstatat through the cached contained parent fd, skipping
+        // both containment opens and the xattr reads. Returns None for symlink
+        // leaves / misses-that-aren't-cacheable, which fall through to the
+        // (uncached) fd-centric path below. See `stat_cache`.
+        if self.stat_cache_active()
+            && let Some(rs) = self.stat_cache_get_or_fill(rel)
+        {
+            return Some(rs);
+        }
+
+        let (fd, st, kind) = self.fast_open_contained(rel, follow)?;
+        let raw = fd.as_raw_fd();
+
+        // mode/owner/socket via ONE flistxattr-gated pass on the ALREADY-OPEN fd
+        // — no path walk, no atime bump. Symlink leaves never reach here
+        // (fast_open_contained returns None for them), so the link-following
+        // owner reads (XATTR_NOFOLLOW) stay on the cap-std slow path.
         let is_dir = kind == RootFsEntryKind::Directory;
-        let override_mode = read_mode_xattr(&self.dir, rel, is_dir);
-        let owner = read_owner_xattr(&self.dir, rel, is_dir, false);
+        let (override_mode, uid, gid, is_socket) = fd_carrick_meta(raw);
+        // A regular file carrying the socket marker reports S_IFSOCK.
+        let kind = if !is_dir && is_socket {
+            RootFsEntryKind::Socket
+        } else {
+            kind
+        };
         let on_disk_mode = st.st_mode as u32 & 0o7777;
         let default_mode = if is_dir { 0o755 } else { 0o644 };
         Some(RealStat {
@@ -1034,8 +1174,8 @@ impl HostFsBackend {
             } else {
                 on_disk_mode
             }),
-            uid: owner.0.unwrap_or(0),
-            gid: owner.1.unwrap_or(0),
+            uid: uid.unwrap_or(0),
+            gid: gid.unwrap_or(0),
             size: st.st_size as u64,
             atime: (st.st_atime, st.st_atime_nsec),
             mtime: (st.st_mtime, st.st_mtime_nsec),
@@ -1054,6 +1194,195 @@ impl HostFsBackend {
         _rel: &Path,
         _follow: bool,
     ) -> Option<(libc::stat, RootFsEntryKind)> {
+        None
+    }
+
+    /// The stat cache may be consulted: enabled (default ON) and the `--fs host`
+    /// fast path is live. Cross-process coherence is handled inside `stat_cache_get_or_fill`
+    /// (clear-on-fork + per-hit revalidation), not by gating on a pid. See
+    /// `stat_cache`.
+    #[cfg(target_os = "macos")]
+    fn stat_cache_active(&self) -> bool {
+        self.use_stat_cache && self.fast_fs && self.root_prefix.is_some()
+    }
+
+    /// Serve `rel`'s `RealStat` from the cache, revalidating with one
+    /// `fstatat(parent_fd, name, AT_NOFOLLOW)`; on a miss, open the CONTAINED
+    /// parent, lstat the leaf, read its xattr metadata, and cache the result
+    /// keyed on the leaf path. Returns `None` (→ the uncached fd-centric path /
+    /// cap-std handles it) for symlink leaves, FIFOs/devices, escapes, or errors
+    /// — i.e. anything not a plain contained regular file or directory.
+    #[cfg(target_os = "macos")]
+    fn stat_cache_get_or_fill(&self, rel: &Path) -> Option<RealStat> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        const O_EVTONLY: libc::c_int = 0x8000;
+
+        let name = rel.file_name()?; // leaf is always a single component here
+        let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
+
+        // --- Revalidate an existing entry: ONE fstatat through the cached,
+        //     already-contained parent fd (no path walk, no openat). Clone the
+        //     needed bits out from under the lock so the syscall runs unlocked.
+        //     Under the same lock, adopt-and-clear if we crossed a fork (a child
+        //     must not trust the parent's inherited fds).
+        let me = unsafe { libc::getpid() } as u32;
+        let cached = {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut map = self.stat_cache.lock();
+            if self.cache_pid.load(Relaxed) != me {
+                map.clear();
+                self.cache_pid.store(me, Relaxed);
+            }
+            map.get(rel)
+                .map(|e| (e.parent_fd.clone(), e.ino, e.ctime, e.mtime, e.size, e.real))
+        };
+        if let Some((parent_fd, ino, ctime, mtime, size, real)) = cached {
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            let ok = unsafe {
+                libc::fstatat(
+                    parent_fd.as_raw_fd(),
+                    name_c.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0;
+            let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+            if ok
+                && st.st_ino == ino
+                && (st.st_ctime, st.st_ctime_nsec) == ctime
+                && (st.st_mtime, st.st_mtime_nsec) == mtime
+                && st.st_size == size
+                && typ != libc::S_IFLNK as u32
+            {
+                // Identity unchanged ⇒ kind/mode/owner still valid; the only
+                // mutators of those (chmod/chown/hardlink) all bump ctime, which
+                // we just checked. Refresh the volatile fields (incl. atime).
+                return Some(RealStat {
+                    ino: st.st_ino,
+                    nlink: st.st_nlink as u32,
+                    size: st.st_size as u64,
+                    atime: (st.st_atime, st.st_atime_nsec),
+                    mtime: (st.st_mtime, st.st_mtime_nsec),
+                    ctime: (st.st_ctime, st.st_ctime_nsec),
+                    ..real
+                });
+            }
+            // Stale (changed / removed / now a symlink): drop and re-fill.
+            self.stat_cache.lock().remove(rel);
+        }
+
+        // --- Fill: open the CONTAINED parent (the trusted anchor for all future
+        //     revalidations), lstat the leaf, read its metadata, then cache.
+        let root_prefix = self.root_prefix.as_deref()?;
+        let dir_fd = self.dir.as_raw_fd();
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        let parent_fd: OwnedFd = if parent.as_os_str().is_empty() {
+            // Leaf directly under the sandbox root — dup the root dir fd so the
+            // cache owns an independent lifetime. The root is contained by def.
+            let raw = unsafe { libc::dup(dir_fd) };
+            if raw < 0 {
+                return None;
+            }
+            unsafe { OwnedFd::from_raw_fd(raw) }
+        } else {
+            let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes()).ok()?;
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+            let raw = unsafe { libc::openat(dir_fd, parent_c.as_ptr(), flags, 0) };
+            if raw < 0 {
+                return None; // ENOTDIR / ENOENT / … → not cacheable
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            // The parent's real path must be under the sandbox root (an
+            // intermediate symlink the kernel followed out is rejected here).
+            if !fd_contained_under(fd.as_raw_fd(), root_prefix) {
+                return None;
+            }
+            fd
+        };
+
+        // lstat the leaf relative to the contained parent — a single component
+        // under a trusted anchor cannot escape it (AT_SYMLINK_NOFOLLOW: a symlink
+        // leaf is reported, not traversed).
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                parent_fd.as_raw_fd(),
+                name_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return None;
+        }
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        let is_dir = typ == libc::S_IFDIR as u32;
+        if !is_dir && typ != libc::S_IFREG as u32 {
+            return None; // symlink/FIFO/device → existing path / cap-std
+        }
+
+        // Metadata via one flistxattr-gated fd pass (O_NOFOLLOW: confirmed
+        // non-symlink; O_EVTONLY: no atime bump).
+        let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let leaf_raw = unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
+        if leaf_raw < 0 {
+            return None;
+        }
+        let leaf_fd = unsafe { OwnedFd::from_raw_fd(leaf_raw) };
+        let (override_mode, uid, gid, is_socket) = fd_carrick_meta(leaf_fd.as_raw_fd());
+        let kind = if is_dir {
+            RootFsEntryKind::Directory
+        } else if is_socket {
+            RootFsEntryKind::Socket
+        } else {
+            RootFsEntryKind::File
+        };
+        let on_disk_mode = st.st_mode as u32 & 0o7777;
+        let default_mode = if is_dir { 0o755 } else { 0o644 };
+        let real = RealStat {
+            kind,
+            ino: st.st_ino,
+            nlink: st.st_nlink as u32,
+            mode: override_mode.unwrap_or(if on_disk_mode == 0 {
+                default_mode
+            } else {
+                on_disk_mode
+            }),
+            uid: uid.unwrap_or(0),
+            gid: gid.unwrap_or(0),
+            size: st.st_size as u64,
+            atime: (st.st_atime, st.st_atime_nsec),
+            mtime: (st.st_mtime, st.st_mtime_nsec),
+            ctime: (st.st_ctime, st.st_ctime_nsec),
+        };
+        let mut map = self.stat_cache.lock();
+        // Bounded: a pathological working set just resets the cache (correctness
+        // is unaffected — every entry is independently revalidated on hit).
+        if map.len() >= 4096 {
+            map.clear();
+        }
+        map.insert(
+            rel.to_path_buf(),
+            StatCacheEntry {
+                parent_fd: std::sync::Arc::new(parent_fd),
+                ino: st.st_ino,
+                ctime: (st.st_ctime, st.st_ctime_nsec),
+                mtime: (st.st_mtime, st.st_mtime_nsec),
+                size: st.st_size,
+                real,
+            },
+        );
+        Some(real)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn stat_cache_active(&self) -> bool {
+        false
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn stat_cache_get_or_fill(&self, _rel: &Path) -> Option<RealStat> {
         None
     }
 
@@ -1309,6 +1638,42 @@ fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
 
 pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
     fget_u32_xattr(fd, CARRICK_MODE_XATTR)
+}
+
+/// Read carrick's guest metadata (mode / owner uid+gid / AF_UNIX-socket marker)
+/// for an open fd in ONE `flistxattr` plus a targeted `fgetxattr` for only the
+/// attributes actually present — instead of an unconditional read per attribute
+/// (each ~5 µs on APFS; see docs/fs-host-capstd-amplification.md). The
+/// overwhelmingly common scratch file carries at most the mode xattr (uid/gid
+/// appear only after a guest `chown`, the socket marker only on a bound AF_UNIX
+/// node), so this collapses the typical 3–4 reads to one list + one read; a
+/// file with no carrick xattrs costs just the list. Falls back to direct reads
+/// if the name buffer is too small (a file with unusually many xattrs).
+#[cfg(target_os = "macos")]
+fn fd_carrick_meta(fd: std::os::fd::RawFd) -> (Option<u32>, Option<u32>, Option<u32>, bool) {
+    let mut names = [0u8; 1024];
+    let n = unsafe { libc::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len(), 0) };
+    if n < 0 || n as usize > names.len() {
+        // flistxattr error, or more names than the probe buffer holds: read each
+        // attribute directly (correct, just not collapsed). Rare on scratch.
+        return (
+            fget_u32_xattr(fd, CARRICK_MODE_XATTR),
+            fget_u32_xattr(fd, CARRICK_UID_XATTR),
+            fget_u32_xattr(fd, CARRICK_GID_XATTR),
+            fget_u32_xattr(fd, CARRICK_SOCKET_XATTR).is_some(),
+        );
+    }
+    // Each listed name is NUL-terminated; the CARRICK_*_XATTR constants carry a
+    // trailing NUL, so the NUL-inclusive slices compare equal byte-for-byte.
+    let listed = &names[..n as usize];
+    let has = |name: &[u8]| listed.split_inclusive(|&b| b == 0).any(|s| s == name);
+    let read_if = |present: bool, name| present.then(|| fget_u32_xattr(fd, name)).flatten();
+    (
+        read_if(has(CARRICK_MODE_XATTR), CARRICK_MODE_XATTR),
+        read_if(has(CARRICK_UID_XATTR), CARRICK_UID_XATTR),
+        read_if(has(CARRICK_GID_XATTR), CARRICK_GID_XATTR),
+        has(CARRICK_SOCKET_XATTR),
+    )
 }
 
 /// Read the (uid, gid) owner xattrs from a fd. `None` for either if unset.
@@ -1667,13 +2032,23 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         // Fast contained dir/file stat (no cap-std per-component walk) — the
-        // bulk of glob/stat cost. Symlinks/FIFOs fall through to cap-std below.
-        if let Some((st, kind)) = self.fast_lstat_contained(rel, false) {
+        // bulk of glob/stat cost. One open serves the stat (fstat), containment
+        // (F_GETPATH) and mode/socket (flistxattr-gated fgetxattr). Symlinks/
+        // FIFOs fall through to cap-std below. macOS-only (the non-macOS fast
+        // path is a no-op), so the fd-centric core is used directly.
+        #[cfg(target_os = "macos")]
+        if let Some((fd, st, kind)) = self.fast_open_contained(rel, false) {
+            use std::os::fd::AsRawFd;
             if !self.name_matches_on_disk(rel) {
                 return None;
             }
             let is_dir = kind == RootFsEntryKind::Directory;
-            let override_mode = read_mode_xattr(&self.dir, rel, is_dir);
+            let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
+            let kind = if !is_dir && is_socket {
+                RootFsEntryKind::Socket
+            } else {
+                kind
+            };
             let on_disk = st.st_mode as u32 & 0o7777;
             let default = if is_dir { 0o755 } else { 0o644 };
             return Some(RootFsMetadata {
@@ -2025,6 +2400,15 @@ impl FsBackend for HostFsBackend {
         self.dir
             .rename(&src_rel, &self.dir, &dst_rel)
             .map_err(|_| BackendError::Io)?;
+        // A rename can move a directory that the stat cache holds as a parent
+        // anchor; a cached fd silently follows the inode to its new location, so
+        // a later stat by the OLD path would wrongly resolve under the new one
+        // (the single case the per-hit revalidation can't detect, since
+        // ino/ctime are unchanged). Renames are rare relative to stats — drop
+        // the whole cache. No-op when the cache is disabled/empty.
+        if self.use_stat_cache {
+            self.stat_cache.lock().clear();
+        }
         Ok(true)
     }
 
@@ -2644,6 +3028,23 @@ impl FsBackend for HostFsBackend {
             let _ = abs;
             ParentResolve::Slow
         }
+    }
+
+    fn stat_cache_lookup(&self, path: &str) -> Option<RealStat> {
+        // Disabled / non-macOS short-circuits via stat_cache_active() == false.
+        if !self.stat_cache_active() {
+            return None;
+        }
+        let normalized = normalize(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        // Same Unicode-alias guard real_stat applies before its fast path: a
+        // differently-normalized leaf the host VFS would alias must miss (the
+        // caller then resolves it the slow way → ENOENT). ASCII leaves (the hot
+        // case) short-circuit this with no syscall.
+        if !self.name_matches_on_disk(rel) {
+            return None;
+        }
+        self.stat_cache_get_or_fill(rel)
     }
 
     fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {

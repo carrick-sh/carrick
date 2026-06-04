@@ -6712,6 +6712,26 @@ impl SyscallDispatcher {
             // the raw path before resolve_at_path normalizes the slash away.
             let requires_dir = path.ends_with('/') || path.ends_with("/.");
 
+            // Dispatch-level stat-cache fast path (default on; CARRICK_FS_STATCACHE=0
+            // opts out): a repeat stat of a plain absolute path is served by one revalidating
+            // fstatat through a cached, contained parent fd — skipping
+            // resolve_at_path's parent-containment openat. Gated so normalize(path)
+            // equals the resolved path (the cache key): AT_FDCWD, absolute, no
+            // "..", not /proc//sys, no trailing slash. Any miss (symlink, escape,
+            // cross-mount, /proc, error) returns None → the full resolve-and-stat
+            // below. write_stat_real's `path` only feeds the type bits (from
+            // real.kind), so a hit is byte-identical to the slow path.
+            if !requires_dir
+                && dirfd == LINUX_AT_FDCWD
+                && path.starts_with('/')
+                && !path.starts_with("/proc")
+                && !path.starts_with("/sys")
+                && !path.split('/').any(|c| c == "..")
+                && let Some(real) = this.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
+            {
+                return Ok(write_stat_real(memory, statbuf, &path, &real));
+            }
+
             let path = this.resolve_at_path(dirfd, &path)?;
             // Synthetic /proc /sys paths first.
             if let Some(contents) =
@@ -6837,6 +6857,20 @@ impl SyscallDispatcher {
             // symlink even under AT_SYMLINK_NOFOLLOW, and a non-directory final →
             // ENOTDIR (matches newfstatat; man path_resolution(7)).
             let requires_dir = path.ends_with('/') || path.ends_with("/.");
+
+            // Dispatch-level stat-cache fast path — see the twin block in
+            // `newfstatat` for the gating rationale. write_statx_real's `path`
+            // only feeds the type bits, so a hit is byte-identical.
+            if !requires_dir
+                && dirfd == LINUX_AT_FDCWD
+                && path.starts_with('/')
+                && !path.starts_with("/proc")
+                && !path.starts_with("/sys")
+                && !path.split('/').any(|c| c == "..")
+                && let Some(real) = this.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
+            {
+                return Ok(write_statx_real(memory, statxbuf, &path, &real));
+            }
 
             let path = this.resolve_at_path(dirfd, &path)?;
             if let Some(contents) =
