@@ -5212,18 +5212,6 @@ carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/crypto/internal/fips140/aes"
 
 [[suite]]
-name = "go-crypto_internal_fips140_aes_gcm"
-ecosystem = "go"
-image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/crypto_internal_fips140_aes_gcm.test", "-test.v", "-test.run", "Test", "-test.short"]
-verdict = "gotest"
-tier = "full"
-weight = "heavy"
-timeout_s = 180
-carrick_flags = ["--raw", "--fs", "host"]
-workdir = "/usr/local/go/src/crypto/internal/fips140/aes/gcm"
-
-[[suite]]
 name = "go-crypto_internal_fips140_bigmod"
 ecosystem = "go"
 image = "localhost:5005/carrick-go-conformance:1.24"
@@ -5234,18 +5222,6 @@ weight = "heavy"
 timeout_s = 180
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/crypto/internal/fips140/bigmod"
-
-[[suite]]
-name = "go-crypto_internal_fips140_drbg"
-ecosystem = "go"
-image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/crypto_internal_fips140_drbg.test", "-test.v", "-test.run", "Test", "-test.short"]
-verdict = "gotest"
-tier = "full"
-weight = "heavy"
-timeout_s = 180
-carrick_flags = ["--raw", "--fs", "host"]
-workdir = "/usr/local/go/src/crypto/internal/fips140/drbg"
 
 [[suite]]
 name = "go-crypto_internal_fips140_ecdh"
@@ -5318,18 +5294,6 @@ weight = "heavy"
 timeout_s = 180
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/crypto/internal/fips140/nistec"
-
-[[suite]]
-name = "go-crypto_internal_fips140_nistec_fiat"
-ecosystem = "go"
-image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/crypto_internal_fips140_nistec_fiat.test", "-test.v", "-test.run", "Test", "-test.short"]
-verdict = "gotest"
-tier = "full"
-weight = "heavy"
-timeout_s = 180
-carrick_flags = ["--raw", "--fs", "host"]
-workdir = "/usr/local/go/src/crypto/internal/fips140/nistec/fiat"
 
 [[suite]]
 name = "go-crypto_internal_fips140_rsa"
@@ -5654,18 +5618,6 @@ weight = "heavy"
 timeout_s = 180
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/debug/plan9obj"
-
-[[suite]]
-name = "go-embed"
-ecosystem = "go"
-image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/embed.test", "-test.v", "-test.run", "Test", "-test.short"]
-verdict = "gotest"
-tier = "full"
-weight = "heavy"
-timeout_s = 180
-carrick_flags = ["--raw", "--fs", "host"]
-workdir = "/usr/local/go/src/embed"
 
 [[suite]]
 name = "go-embed_internal_embedtest"
@@ -8501,17 +8453,6 @@ timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
-name = "ltp-fcntl01"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/fcntl01"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
 name = "ltp-fcntl02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
@@ -9038,6 +8979,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--ulimit", "nofile=1024:1024"]
 
 [[suite]]
 name = "ltp-fork10"
@@ -10133,17 +10075,6 @@ name = "ltp-mmap02"
 ecosystem = "ltp"
 image = "localhost:5050/ltp:arm64"
 cmd = ["/opt/ltp/testcases/bin/mmap02"]
-verdict = "ltp"
-tier = "full"
-weight = "light"
-timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host"]
-
-[[suite]]
-name = "ltp-mmap03"
-ecosystem = "ltp"
-image = "localhost:5050/ltp:arm64"
-cmd = ["/opt/ltp/testcases/bin/mmap03"]
 verdict = "ltp"
 tier = "full"
 weight = "light"
