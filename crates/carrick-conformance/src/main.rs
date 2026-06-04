@@ -15,6 +15,7 @@ mod engine;
 mod generate;
 mod manifest;
 mod matrix;
+mod oracle;
 mod parsers;
 mod verdict;
 
@@ -72,6 +73,20 @@ struct Args {
     generate_suites: bool,
     #[arg(long, default_value = "target/release/carrick")]
     carrick_bin: PathBuf,
+    /// Committed docker-oracle cache (parsed results, one JSONL line per suite).
+    /// Docker is run only for suites whose determinant key is absent here — so a
+    /// routine gate executes ONLY carrick and diffs against the cached oracle.
+    #[arg(long, default_value = "scripts/conformance/oracle-cache.jsonl")]
+    oracle_cache: PathBuf,
+    /// Ignore the oracle cache: re-run docker for every selected suite and
+    /// overwrite their cached results (use after rebuilding an image's contents).
+    #[arg(long)]
+    refresh_oracle: bool,
+    /// Seed the oracle cache from a completed gate's results.jsonl (reconstructs
+    /// each suite's docker side from its recorded per-id pairs) and exit —
+    /// capturing a finished run's docker work without re-running any container.
+    #[arg(long)]
+    seed_oracle: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -100,6 +115,11 @@ fn run() -> anyhow::Result<ExitCode> {
 
     if args.generate_suites {
         generate::generate_suites(&args.manifest, args.dry_run)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Some(results) = &args.seed_oracle {
+        seed_oracle(&args.manifest, results, &args.oracle_cache)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -162,9 +182,29 @@ fn run() -> anyhow::Result<ExitCode> {
         out
     });
 
-    // ---- Phase 2: ALL docker, strictly after phase 1. ----
-    eprintln!("phase 2/3: {n} docker runs (workers={workers})");
-    let docker_outs = fan_out(n, workers, |i| {
+    // ---- Phase 2: docker — but ONLY for suites whose oracle is not already
+    // cached. The docker oracle for a deterministic suite is stable, so it needs
+    // to run once, ever; a cached suite contributes its committed result and
+    // runs no container. Strictly after phase 1 (carrick ‖ docker never overlap).
+    let mut cache = oracle::OracleCache::load(&args.oracle_cache);
+    let cached: Vec<Option<parsers::SuiteResult>> = if args.refresh_oracle {
+        vec![None; n]
+    } else {
+        selected.iter().map(|s| cache.get(s)).collect()
+    };
+    let need_docker: Vec<usize> = (0..n).filter(|&i| cached[i].is_none()).collect();
+    eprintln!(
+        "phase 2/3: {} docker run(s), {} cached oracle(s){} (workers={workers})",
+        need_docker.len(),
+        n - need_docker.len(),
+        if args.refresh_oracle {
+            " [--refresh-oracle]"
+        } else {
+            ""
+        },
+    );
+    let fresh_outs = fan_out(need_docker.len(), workers, |j| {
+        let i = need_docker[j];
         let s = &selected[i];
         let _g =
             (s.weight == Weight::Heavy).then(|| heavy.lock().unwrap_or_else(|e| e.into_inner()));
@@ -174,13 +214,56 @@ fn run() -> anyhow::Result<ExitCode> {
         out
     });
 
+    // Parse fresh docker runs, fold comparable ones into the cache, key them back
+    // by suite index for phase 3.
+    let mut fresh: std::collections::BTreeMap<usize, DockerSide> =
+        std::collections::BTreeMap::new();
+    for (j, out) in fresh_outs.into_iter().enumerate() {
+        let i = need_docker[j];
+        let s = &selected[i];
+        let side = match out.and_then(|r| r.ok()) {
+            Some(o) => {
+                let res = parsers::parse(verdict_kind(s), &o.raw());
+                cache.insert(s, res.clone()); // refuses to cache a non-comparable oracle
+                DockerSide {
+                    result: res,
+                    run_id: o.run_id,
+                    argv: o.argv,
+                }
+            }
+            None => DockerSide {
+                result: parsers::SuiteResult::empty(),
+                run_id: String::new(),
+                argv: engine::docker_dry_run(s, "spawn-failed"),
+            },
+        };
+        fresh.insert(i, side);
+    }
+    if cache.dirty() {
+        cache.save()?;
+        eprintln!(
+            "oracle cache: updated {} ({} new)",
+            args.oracle_cache.display(),
+            need_docker.len()
+        );
+    }
+
     // ---- Phase 3: classify (runs neither engine). ----
     eprintln!("phase 3/3: classify");
     let mut reports = Vec::with_capacity(n);
-    for ((s, cout), dout) in selected.iter().zip(&carrick_outs).zip(&docker_outs) {
+    for (i, (s, cout)) in selected.iter().zip(&carrick_outs).enumerate() {
         let cout = cout.as_ref().and_then(|r| r.as_ref().ok());
-        let dout = dout.as_ref().and_then(|r| r.as_ref().ok());
-        reports.push(build_report(s, cout, dout, &baseline));
+        let docker = match &cached[i] {
+            Some(res) => DockerSide {
+                result: res.clone(),
+                run_id: "<cached>".to_string(),
+                argv: engine::docker_dry_run(s, "<cached>"),
+            },
+            None => fresh
+                .remove(&i)
+                .expect("every non-cached suite has a fresh docker side"),
+        };
+        reports.push(build_report(s, cout, &docker, &baseline));
     }
 
     write_reports(&args.jsonl, &reports)?;
@@ -201,10 +284,19 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
+/// The docker (oracle) side of one suite, already parsed — sourced either from a
+/// fresh `docker run` or the committed oracle cache (so phase 3 is agnostic to
+/// which).
+struct DockerSide {
+    result: parsers::SuiteResult,
+    run_id: String,
+    argv: Vec<String>,
+}
+
 fn build_report(
     s: &Suite,
     cout: Option<&engine::RunOutput>,
-    dout: Option<&engine::RunOutput>,
+    docker: &DockerSide,
     baseline: &Baseline,
 ) -> SuiteReport {
     let (c_raw, c_timed, c_runid, c_argv) = match cout {
@@ -221,23 +313,10 @@ fn build_report(
             vec![],
         ),
     };
-    let (d_raw, d_runid, d_argv) = match dout {
-        Some(o) => (o.raw(), o.run_id.clone(), o.argv.clone()),
-        None => (
-            parsers::Raw {
-                stdout: String::new(),
-                stderr: "docker run failed to spawn".into(),
-                exit_code: -1,
-                timed_out: false,
-            },
-            String::new(),
-            vec![],
-        ),
-    };
 
     let c_res = parsers::parse(verdict_kind(s), &c_raw);
-    let d_res = parsers::parse(verdict_kind(s), &d_raw);
-    let cl = classify(s, &c_res, c_timed, &d_res, baseline);
+    let d_res = &docker.result;
+    let cl = classify(s, &c_res, c_timed, d_res, baseline);
 
     SuiteReport {
         name: s.name.clone(),
@@ -251,20 +330,62 @@ fn build_report(
         },
         docker: SideSummary {
             result: d_res.result,
-            totals: d_res.totals,
+            totals: d_res.totals.clone(),
         },
         new_diffs: cl.new_diffs,
         known_diffs: cl.known_diffs,
         carrick_run_id: c_runid,
-        docker_run_id: d_runid,
+        docker_run_id: docker.run_id.clone(),
         carrick_argv: c_argv,
-        docker_argv: d_argv,
+        docker_argv: docker.argv.clone(),
         pairs: cl.pairs,
     }
 }
 
 fn verdict_kind(s: &Suite) -> manifest::VerdictKind {
     s.verdict
+}
+
+/// Import a completed gate's docker side into the oracle cache, reconstructing
+/// each suite's docker `SuiteResult` from the per-id pairs recorded in
+/// `results.jsonl` — so the (expensive) docker work of a finished run is captured
+/// without re-running a single container. Suites whose report has no comparable
+/// docker data (crash/timeout/oracle-fail) are skipped: they must be re-run.
+fn seed_oracle(manifest_path: &Path, results: &Path, cache_path: &Path) -> anyhow::Result<()> {
+    // Operator-controlled CLI paths in a local dev tool — same trust model as the
+    // other IO helpers below; not untrusted/network input.
+    let manifest = Manifest::from_toml(&std::fs::read_to_string(manifest_path)?)?; // nosemgrep
+    let by_name: std::collections::HashMap<&str, &Suite> = manifest
+        .suite
+        .iter()
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+    let reports = read_reports(results)?;
+    let mut cache = oracle::OracleCache::load(cache_path);
+    let (mut seeded, mut skipped, mut unknown) = (0usize, 0usize, 0usize);
+    for r in &reports {
+        let Some(s) = by_name.get(r.name.as_str()) else {
+            unknown += 1;
+            continue;
+        };
+        match oracle::docker_result_from_report(r) {
+            Some(res) => {
+                if cache.insert(s, res) {
+                    seeded += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            None => skipped += 1,
+        }
+    }
+    cache.save()?;
+    eprintln!(
+        "seeded {seeded} oracle(s) into {} from {} ({skipped} non-comparable skipped, {unknown} not in manifest)",
+        cache_path.display(),
+        results.display(),
+    );
+    Ok(())
 }
 
 fn bless(
