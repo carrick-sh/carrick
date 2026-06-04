@@ -2101,6 +2101,11 @@ pub const LINUX_CLONE_VM: u64 = 0x0000_0100;
 pub const LINUX_CLONE_FS: u64 = 0x0000_0200;
 pub const LINUX_CLONE_FILES: u64 = 0x0000_0400;
 pub const LINUX_CLONE_SIGHAND: u64 = 0x0000_0800;
+/// vfork(2)-style clone: the child shares the parent's address space
+/// (`CLONE_VM`) and the parent is SUSPENDED until the child `execve`s or
+/// `_exit`s. Go `os/exec` / glibc `posix_spawn` use `CLONE_VM|CLONE_VFORK[|CLONE_PIDFD]`.
+/// Deliberately NOT part of `THREAD_MASK`.
+pub const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
 pub const LINUX_CLONE_THREAD: u64 = 0x0001_0000;
 pub const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
 pub const LINUX_CLONE_PARENT_SETTID: u64 = 0x0010_0000;
@@ -2176,6 +2181,10 @@ bitflags! {
         /// Allocate a pidfd for the child. Legacy clone(2) returns it via the
         /// parent_tid pointer (arg2); clone3 via clone_args.pidfd.
         const PIDFD = 0x0000_1000;
+        /// vfork: share the address space + suspend the parent until the child
+        /// execve/_exit. Not in `THREAD_MASK` (a vfork child is a process, not a
+        /// thread). See [`LINUX_CLONE_VFORK`].
+        const VFORK = LINUX_CLONE_VFORK;
         const THREAD = LINUX_CLONE_THREAD;
         const SETTLS = LINUX_CLONE_SETTLS;
         const PARENT_SETTID = LINUX_CLONE_PARENT_SETTID;

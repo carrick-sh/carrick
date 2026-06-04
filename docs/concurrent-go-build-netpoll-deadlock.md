@@ -1,9 +1,65 @@
 # Concurrent `go build` deadlock: a layered fork-path problem
 
-**Status:** core post-mortem cracked it into TWO layers. **Layer 1 (fork-quiesce
-vs futex park) FIXED** (`418d13e`). **Layer 2 (fork+exec child stuck pre-exec
-under concurrency) residual** — task #20. Found 2026-06-03 following up the
-go-build fix. Separate from the go-build crash (fixed) and from cgo support.
+**Status: RESOLVED 2026-06-03 — faithful `vfork` implemented.** The root cause
+was that carrick mis-modeled Go's `clone(CLONE_VM|CLONE_VFORK)` exec-spawn as an
+ordinary CoW `fork` (separate address space, parent not suspended). The fix gives
+the vfork child a SHARED address space and SUSPENDS the parent until the child
+`execve`/`_exit`. Validation: the N=4 concurrent `go build` reproducer now reaches
+`ALL_DONE` (was a reliable hang); a new `vforkvmshare` conformance probe is GREEN;
+all clone/fork/exec regression probes (incl. `forkcow`, `mtforkcorrupt`) MATCH;
+CPython `test_subprocess` (341 tests, `posix_spawn`) passes; all Rust tests pass.
+A 4-dimension adversarial review found 5 latent hazards, all fixed (see
+"Implementation" below). The full ecosystem gate (`just conformance full`, 23
+CPython/Go/Node/LTP suites) reports **no regressions**.
+
+Note on `go-build` in the gate: it shows an intermittent hang under HEAVY
+cross-guest concurrency (the 8-worker gate phase) and so renders as `CRASH`/`NEW`
+(non-gating). This is **pre-existing, not a vfork regression** — an isolation
+A/B under 12 concurrent single-builds gave the OLD CoW-fork binary 9/12 (3 hung)
+vs the NEW vfork binary ~17/18 (the fix REDUCED the hang rate). The residual
+flake is separate HVF resource pressure (system-wide vCPU-cap exhaustion when
+many multithreaded guests run at once — the `TestConcurrentExec` HV_BUSY family,
+[[project_go_osexec_mtfork]]), not the `CLONE_VFORK` deadlock fixed here.
+
+## Implementation (the fix)
+
+Files: `carrick-abi/src/lib.rs` (+`CLONE_VFORK`), `dispatch/proc.rs` (classify),
+`dispatch/mod.rs` (`Fork{vfork: Option<u64>}`), `runtime.rs` (`handle_fork`
+suspend + `handle_execve` release), `carrick-hvf/src/trap.rs` (`fork_vfork` /
+`share_vm`, `set_guest_sp_el0`).
+
+1. **Classify** — `clone`/`clone3` with `CLONE_VM|CLONE_VFORK` (not the full
+   `THREAD_MASK`) → `DispatchOutcome::Fork{ vfork: Some(child_stack), .. }`
+   (`Some` ⇒ vfork; `child_stack` = SP, 0/NULL for Go).
+2. **Share guest RAM** — `HvfInner::fork(share_vm=true)` forces the existing
+   `guest_shared` Borrowed-buffer branch for every region (guest RAM is already
+   host-`MAP_SHARED`, so the child's writes land in the parent's pages = true
+   `CLONE_VM`) — EXCEPT the stage-1 page-table backing, kept private so the
+   child's own (cloned) `PageTableManager` can't corrupt the parent.
+3. **Suspend the parent** — `handle_fork` blocks the parent vCPU on an inherited
+   pipe until the child `execve`s (writes a byte in `handle_execve`) or exits (the
+   OS closes the write end → EOF). Bounded by a 60 s timeout backstop; share and
+   suspend are strictly coupled (a `pipe()` failure degrades to a plain CoW fork).
+4. **Un-share on execve** — `execve_into` already rebuilds a fresh private VM, so
+   the child detaches automatically.
+
+Adversarial-review fixes: (A) gate the RAM-share on the suspend pipe existing
+(never share without suspend); (B) bound the suspend read with a timeout; (C)
+keep the page-table backing private for the vfork child; (D) clone3 SP =
+`stack+stack_size`, not the base; (E) `FD_CLOEXEC` the pipe + drop an inherited
+`vfork_release_fd` in the child arm (a grandchild can't strand the parent).
+
+Known limitation: a vfork child that does `mmap`/`mprotect` BEFORE `execve` won't
+have those edits visible to the parent (real vfork-for-exec children — Go,
+`posix_spawn` — never do this; the alternative would corrupt the parent).
+
+---
+
+## Historical investigation (how it was found)
+
+(Pre-fix layered framing kept below.) **Status:** core post-mortem cracked it
+into TWO layers. **Layer 1 (fork-quiesce vs futex park) FIXED** (`418d13e`).
+**Layer 2** was the `vfork` mis-modeling now resolved above. Found 2026-06-03.
 
 ## How it was cracked: CORE post-mortem
 
@@ -42,7 +98,136 @@ Next: core the forked CHILD (the `[running]` m) and find why its pre-exec
 syscall path stalls (stage-2 coherence of the just-forked child? a signal-mask
 syscall? vCPU not progressing?).
 
-(Older framing kept below for the reproducer + ruled-out vCPU-cap evidence.)
+## Capture tooling (2026-06-03): safe harness + watchdog targeting fix
+
+**N=4 reproduces** (`scripts/go-deadlock-capture.sh 4`): of 4 concurrent builds,
+1 & 4 printed `BUILT`, 2 & 3 hung — exactly the Layer-2 shape.
+
+Two tooling problems surfaced and were fixed:
+
+1. **The naive launch fork-bombed the host.** A hung concurrent `go build` leaves
+   N builds × GOMAXPROCS vCPU host-threads spinning (the Layer-2 stall is BUSY,
+   not blocked) and the watchdog CORES but does not KILL, so the spin outlived the
+   capture until a human noticed — all 10 cores pinned, UI starved. Fix:
+   `scripts/go-deadlock-capture.sh` runs the guest under `taskpolicy -b` (darwin
+   background QoS, inherited by every vCPU thread + forked child → E-cores,
+   deprioritized) + `nice -n 20` (lowest priority — NOT `nice -20`, which would
+   RAISE it), and a supervisor auto-SIGKILLs the whole run tree
+   the instant the watchdog's core is fully written (waits for lldb "corefile
+   created"/"detached" so the dump isn't truncated). An EXIT/TERM/INT trap + a
+   hard wall-clock deadline + scoped `pkill -f <run-id>` guarantee no orphan
+   spinner even on TaskStop.
+
+2. **The watchdog cored the WRONG process.** The first N=4 core
+   (`/tmp/deadlock-3695.core`) was NOT a stuck guest: thread #1 was
+   `namespace::supervisor::run` parked in `kevent` (the ns-init reaper, which
+   never dispatches → never `tick()`s) and thread #2 was the watchdog itself in
+   `Command::output`/`poll` (blocked on the `sudo lldb` it spawned). Event ring
+   `total=0`. The tree-global progress counter means ANY process notices the
+   tree-wide stall, and the single-shot core latch was won by this non-dispatching
+   waiter — spending the one capture on useless parked state while the genuinely
+   stuck go-build children never cored. Fix (`deadlock_watchdog.rs`): a
+   process-local `LOCAL_TICKED` flag (set in `tick()`) gates self-core eligibility
+   — only a process that has actually run guest syscalls may core — and the
+   single-shot latch became a bounded counter (`CARRICK_DEADLOCK_WATCHDOG_MAX_CORES`,
+   default 1) so a re-run can grab the stuck `go` PARENT *and* a pre-exec CHILD
+   together. With the gate, the supervisor/orchestrator can never win the latch.
+
+### Watchdog can't self-core under throttle → external capture
+
+A throttled re-run (`taskpolicy -b`) confirmed the eligibility-gate fix (the
+supervisor logged *"never dispatched a guest syscall … deferring"*) but captured
+NO guest core: the hung guests' spinning vCPU threads **starve their own
+in-process watchdog thread** (all at background QoS on the E-cores), so only the
+idle supervisor's watchdog runs. Lesson: the in-process self-core is unreliable
+under exactly the throttle that keeps the host usable. `scripts/go-deadlock-capture-ext.sh`
+captures EXTERNALLY instead — the harness runs at normal priority OUTSIDE the
+throttled tree, detects the hang (no new `BUILT` for STALL_S), and `sudo lldb`
+cores EVERY carrick pid in the run (tagging each with `%cpu` so the spinning
+guests stand out from the idle supervisor/driver).
+
+## Layer-2 root cause REFINED (2026-06-03): forked child busy-spins in guest code
+
+The external capture cracked the real shape (N=4, build 1 hung). The `%cpu`
+column split the run cleanly:
+
+- **`go` driver** (`carrick:…: go`, %cpu≈0): ALL threads parked — 7 Go M's in
+  `FutexTable::wait_prepared_with_token`, 1 netpoller M in `io_wait::ThreadWaiter::wait`
+  (kevent). Event ring = a long tail of `EPWAIT ready=0 timeout=0` (normal Go
+  netpoll history) then quiescent. It is *waiting on its children*, not stuck.
+- **Two forked children** (%cpu≈92–96, single vCPU thread each): the one vCPU
+  thread is pinned **inside `hv_trap` → `Hv::Vcpu::run()` → `run_until_syscall`**,
+  and their **event ring is EMPTY (`total=0`)**.
+
+So the old "child stuck in a pre-exec syscall (rt_sigprocmask)" framing is WRONG.
+The truth: the child `fork()`s and then **spins in guest code, issuing ZERO
+syscalls and taking ZERO faults, never reaching `execve`** (empty ring = no
+`EXEC`). `run_until_syscall`'s only in-loop `continue` (the post-fork shared-alias
+stage-2 re-map) is **bounded at 8 attempts**, so this is NOT a fault-remap loop —
+`hv_vcpu_run` simply never returns. That is a **pure guest-side busy-wait**:
+the child is spinning on a memory location whose expected cross-thread update is
+not visible in its freshly-rebuilt child VM — i.e. **post-fork stage-2 memory
+incoherence** (cf. [[project_go_build_mmap_coherence]] / the SHARED_FILE stage-2
+coherence wall). The `go` driver then parks on the child forever → tree-wide
+syscall stall → deadlock.
+
+This also explains why the in-process watchdog's *no-tick* trigger is the right
+signal (the child genuinely issues no syscalls) but its self-core can't fire from
+the starved child (above).
+
+## CONFIRMED root cause (oracle strace, 2026-06-03): `CLONE_VM|CLONE_VFORK` mis-modeled as `fork`
+
+A real-Linux `strace -f -e clone,clone3` of Go `os/exec` (golang:1.24-bookworm,
+Docker arm64 oracle) shows the exec spawn is **vfork**, not fork:
+
+```
+clone(child_stack=NULL, flags=CLONE_VM|CLONE_PIDFD|CLONE_VFORK)            = <pid>
+clone(child_stack=NULL, flags=CLONE_VM|CLONE_PIDFD|CLONE_VFORK|SIGCHLD)    = <pid>
+```
+
+`CLONE_VM` = child SHARES the parent address space; `CLONE_VFORK` = parent is
+SUSPENDED until the child `execve`s/exits; `child_stack=NULL` = child runs on the
+parent's stack. (The `CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM` clones are normal
+Go M threads — carrick handles those correctly.)
+
+Carrick's `THREAD_MASK = VM|FS|FILES|SIGHAND|THREAD` (`carrick-abi/src/lib.rs`).
+The vfork clone sets `VM` but NOT `FS|FILES|SIGHAND|THREAD`, so
+`(flags & THREAD_MASK) == THREAD_MASK` is false and it falls through to
+`DispatchOutcome::Fork` (`dispatch/proc.rs` clone/clone3) → a full `libc::fork`
++ separate rebuilt HVF VM. **`CLONE_VFORK` is unmodeled** (no member in
+`LinuxCloneFlags`; grep-empty in the tree) and **the parent is never suspended**.
+
+This matches the captured deadlock exactly:
+- The vfork CHILD runs Go's constrained pre-exec code assuming a SHARED address
+  space + suspended parent; carrick gave it a SEPARATE CoW VM, so it busy-spins
+  on shared-memory coordination that can never resolve (the captured child:
+  pinned in `hv_vcpu_run`, zero syscalls, empty ring).
+- The PARENT (`go` driver) expects to be SUSPENDED until the child execs; instead
+  it ran on and parked waiting for a child that never reports back (captured: all
+  driver threads parked in futex/netpoll).
+- N=1 usually races through; concurrency reliably wedges it.
+
+This SUPERSEDES the "generic post-fork stage-2 coherence" framing above — the
+specific defect is the missing `CLONE_VM`(non-thread) + `CLONE_VFORK` semantics.
+
+**Fix direction:** model the vfork-for-exec clone faithfully — child shares the
+address space (or, pragmatically, a CoW snapshot is fine since a suspended parent
+won't mutate it and the child execs almost immediately) AND **suspend the parent
+vCPU until the child `execve`s or `_exit`s**, then resume it. Distinguish this
+`CLONE_VM`-without-`CLONE_THREAD` (+`CLONE_VFORK`) case from both a full fork and
+a full thread clone in `dispatch/proc.rs`. Add `CLONE_VFORK` to `LinuxCloneFlags`.
+Probe-gate with a red repro (concurrent vfork-exec) before/after.
+
+Cores from the capture run kept at `/tmp/go-dlx-n4-18733.cores/`.
+
+---
+
+> **SUPERSEDED (history).** Everything below is the original "netpoll / lost
+> wakeup" investigation. It is kept only for the N=12 reproducer and the
+> ruled-out vCPU-cap evidence. The "lost wakeup in the futex/netpoll path" and
+> "fix target: futex" conclusions are **red herrings** — the confirmed cause is
+> the `CLONE_VM|CLONE_VFORK` mis-modeling above. Do not act on the fix target in
+> this section.
 
 ## Symptom
 
