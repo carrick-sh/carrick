@@ -28,11 +28,15 @@ impl VerdictParser for LtpParser {
         }
         let text = super::strip_carrick_banners(&raw.combined());
 
-        let (mut passed, mut failed, mut broken, mut conf) = (0usize, 0usize, 0usize, 0usize);
+        let (mut passed, mut failed, mut broken, mut conf, mut skipped) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
 
-        // Tier 1: the Summary block (`passed   5` / `failed   1` / `broken   0`).
+        // Tier 1: the Summary block (`passed 5` / `failed 1` / `broken 0` /
+        // `skipped N`). `skipped` is captured so a not-exercised run (all-zero
+        // pass/fail/broken, nonzero skipped — e.g. a TCONF in a Docker container
+        // that lacks cgroups/LTP_DEV) classifies as Conf, not a phantom Empty.
         let mut tier1 = false;
-        if let Ok(re) = Regex::new(r"(?m)^(passed|failed|broken)\s+(\d+)\s*$") {
+        if let Ok(re) = Regex::new(r"(?m)^(passed|failed|broken|skipped)\s+(\d+)\s*$") {
             for caps in re.captures_iter(&text) {
                 let (Some(k), Some(v)) = (caps.get(1), caps.get(2)) else {
                     continue;
@@ -42,13 +46,14 @@ impl VerdictParser for LtpParser {
                     "passed" => passed += n,
                     "failed" => failed += n,
                     "broken" => broken += n,
+                    "skipped" => skipped += n,
                     _ => {}
                 }
                 tier1 = true;
             }
         }
 
-        // Tier 2: old-API per-line token counting.
+        // Tier 2: old-API per-line `TPASS/TFAIL/TBROK/TCONF` token counting.
         if !tier1 {
             for line in text.lines() {
                 if line.contains("TPASS") {
@@ -63,30 +68,53 @@ impl VerdictParser for LtpParser {
             }
         }
 
+        // Tier 3: legacy block-report API — tests that print NEITHER a Summary
+        // NOR `TPASS/TFAIL` tokens. Two forms, both gated on "no modern tokens
+        // seen" so this never perturbs new-API output:
+        //   (a) an explicit `... PASSED` / `... FAILED` word per case (fcntl16/
+        //       19/20/21 on `TINFO` lines);
+        //   (b) success signalled purely by a clean exit — the test ran (it
+        //       emitted `TINFO`) and exited 0 with no failure token (fcntl11's
+        //       Enter/Exit-block trail, mmap10's iteration log). A real crash
+        //       exits non-zero (or 124/137, handled above) and stays Empty.
+        if !tier1 && passed + failed + broken + conf == 0 {
+            for line in text.lines() {
+                if line.contains("FAILED") {
+                    failed += 1;
+                } else if line.contains("PASSED") {
+                    passed += 1;
+                }
+            }
+            if passed + failed == 0 && raw.exit_code == 0 && text.contains("TINFO") {
+                passed = 1; // old-API success-by-clean-exit
+            }
+        }
+
         let t = Totals {
             n: passed + failed + broken,
             passed,
             failed,
             broken,
-            skipped: 0,
+            skipped,
         };
 
-        let (summary, result) = if t.n == 0 && conf == 0 {
-            // No tokens at all -> crashed before producing a verdict.
-            return SuiteResult {
-                totals: t,
-                result: SuiteOutcome::Empty,
-                ids: BTreeMap::new(),
-            };
-        } else if broken > 0 {
+        let (summary, result) = if broken > 0 {
             (Outcome::Broken, SuiteOutcome::Failure)
         } else if failed > 0 {
             (Outcome::Fail, SuiteOutcome::Failure)
         } else if passed > 0 {
             (Outcome::Ok, SuiteOutcome::Success)
-        } else {
-            // only TCONF -> not exercised on this kernel
+        } else if conf > 0 || skipped > 0 {
+            // only TCONF / skipped-only Summary -> not exercised on this kernel
             (Outcome::Conf, SuiteOutcome::Success)
+        } else {
+            // No tokens at all and no clean-exit signal -> crashed before
+            // producing a verdict.
+            return SuiteResult {
+                totals: t,
+                result: SuiteOutcome::Empty,
+                ids: BTreeMap::new(),
+            };
         };
 
         let mut ids = BTreeMap::new();
@@ -151,6 +179,66 @@ mod tests {
     #[test]
     fn empty_is_empty() {
         let r = LtpParser.parse(&raw("nothing here\n"));
+        assert_eq!(r.result, SuiteOutcome::Empty);
+    }
+
+    #[test]
+    fn skipped_only_summary_is_conf() {
+        // clone303/madvise06/08: new-API run that SKIPPED (e.g. cgroup EROFS in
+        // a container) -> Summary with only `skipped`, all else 0.
+        let out = "tst_cgroup.c: TCONF: '/sys/fs/cgroup/ltp' read-only\nSummary:\npassed   0\nfailed   0\nbroken   0\nskipped  1\nwarnings 0\n";
+        let r = LtpParser.parse(&raw(out));
+        assert_eq!(r.ids.get("summary"), Some(&Outcome::Conf));
+        assert_eq!(r.result, SuiteOutcome::Success);
+        assert_eq!(r.totals.skipped, 1);
+        assert_eq!(r.totals.n, 0);
+    }
+
+    #[test]
+    fn old_api_passed_word_counts() {
+        // fcntl16/19/20/21: legacy per-case `... PASSED` on TINFO lines, no
+        // Summary and no TPASS token.
+        let out = "fcntl16  0  TINFO  :  Test case 1: without mandatory locking PASSED\nfcntl16  0  TINFO  :  Test case 2: with mandatory record locking PASSED\nfcntl16  0  TINFO  :  Test case 3: mandatory locking with NODELAY PASSED\n";
+        let r = LtpParser.parse(&raw(out));
+        assert_eq!(r.totals.passed, 3);
+        assert_eq!(r.ids.get("summary"), Some(&Outcome::Ok));
+        assert_eq!(r.result, SuiteOutcome::Success);
+    }
+
+    #[test]
+    fn old_api_failed_word_counts() {
+        let out = "t  0  TINFO  :  Test case 1: PASSED\nt  0  TINFO  :  Test case 2: FAILED\n";
+        let r = LtpParser.parse(&raw(out));
+        assert_eq!(r.totals.failed, 1);
+        assert_eq!(r.result, SuiteOutcome::Failure);
+    }
+
+    #[test]
+    fn old_api_clean_exit_is_success() {
+        // fcntl11/mmap10: only TINFO Enter/Exit-block (or iteration) trail, no
+        // verdict token, exit 0 -> success by clean exit.
+        let out = "mmap10  0  TINFO  :  use /dev/zero.\nmmap10  0  TINFO  :  start tests.\nmmap10  0  TINFO  :  use /dev/zero.\nmmap10  0  TINFO  :  start tests.\n";
+        let r = LtpParser.parse(&Raw {
+            stdout: out.to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        });
+        assert_eq!(r.result, SuiteOutcome::Success);
+        assert_eq!(r.totals.passed, 1);
+    }
+
+    #[test]
+    fn tinfo_with_nonzero_exit_stays_empty() {
+        // A crash mid-run (TINFO printed, then a non-zero exit, no verdict) must
+        // NOT be rescued by the clean-exit arm.
+        let out = "t  0  TINFO  :  start tests.\n";
+        let r = LtpParser.parse(&Raw {
+            stdout: out.to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            timed_out: false,
+        });
         assert_eq!(r.result, SuiteOutcome::Empty);
     }
 }
