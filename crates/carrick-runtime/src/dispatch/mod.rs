@@ -1800,6 +1800,8 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
+        // Tree-wide forward-progress beat for the deadlock watchdog.
+        crate::deadlock_watchdog::tick();
         self.dispatch_inner(request, memory, reporter, None)
     }
 
