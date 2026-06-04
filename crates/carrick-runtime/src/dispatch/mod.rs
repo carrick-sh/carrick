@@ -732,6 +732,14 @@ pub enum DispatchOutcome {
         /// `exit_signal`). Delivered to the parent on child exit instead of a
         /// hardcoded SIGCHLD. `0` means "no exit signal" (e.g. `clone(0)`).
         exit_signal: u32,
+        /// `CLONE_VFORK` (+`CLONE_VM`): the vfork-for-exec shape (Go `os/exec`,
+        /// glibc `posix_spawn`). `Some(child_stack)` requests the vfork path — the
+        /// runtime forks a child that SHARES the parent's guest RAM (not a CoW
+        /// snapshot) and SUSPENDS the parent vCPU until the child `execve`s or
+        /// `_exit`s. `child_stack` is the clone's stack argument: `0` (NULL, which
+        /// Go uses) keeps the parent's SP, a nonzero value runs the child on that
+        /// stack. `None` is an ordinary CoW fork.
+        vfork: Option<u64>,
     },
     /// `execve(2)` succeeded so far in the dispatcher (path readable,
     /// argv/envp resolved). The runtime must:

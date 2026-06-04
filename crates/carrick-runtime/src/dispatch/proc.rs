@@ -597,9 +597,18 @@ impl SyscallDispatcher {
         // clone3 carries the exit signal in its own field; mask to the low
         // byte (signal domain) — faithful and bounded.
         let exit_signal = (args.exit_signal & 0xff) as u32;
+        // vfork-for-exec: same classification as legacy clone (see `clone`).
+        // clone3's `stack` is the BASE and `stack_size` the length, so the stack
+        // POINTER (SP, which grows down on aarch64) is base+size — mirror the
+        // thread path's `stack + stack_size` (legacy clone instead passes the SP
+        // directly). For Go's child_stack=NULL both are 0 → 0 (use parent SP).
+        let vfork = (flags & LinuxCloneFlags::VFORK.bits() != 0
+            && flags & LinuxCloneFlags::VM.bits() != 0)
+            .then_some(args.stack.wrapping_add(args.stack_size));
         DispatchOutcome::Fork {
             pidfd_out,
             exit_signal,
+            vfork,
         }
     }
 
@@ -1832,9 +1841,19 @@ impl SyscallDispatcher {
             // (CSIGNAL = 0xff). Thread it through so the parent receives the
             // requested signal on child exit instead of a hardcoded SIGCHLD.
             let exit_signal = (flags & 0xff) as u32;
+            // vfork-for-exec (Go os/exec / glibc posix_spawn): CLONE_VM|CLONE_VFORK
+            // without the full THREAD_MASK (excluded above). The child shares the
+            // parent's address space and the parent is suspended until the child
+            // execve/_exit — serviced by the runtime's vfork fork path. A plain
+            // CLONE_VM without CLONE_VFORK stays an ordinary CoW fork (sharing RAM
+            // without the suspend would race the parent).
+            let vfork = (flags & LinuxCloneFlags::VFORK.bits() != 0
+                && flags & LinuxCloneFlags::VM.bits() != 0)
+                .then_some(stack);
             Ok(DispatchOutcome::Fork {
                 pidfd_out,
                 exit_signal,
+                vfork,
             })
         }
 

@@ -71,6 +71,8 @@ fn clone_fork_flags_still_fork() {
         DispatchOutcome::Fork {
             pidfd_out: None,
             exit_signal: 0x11,
+            // 0x1200011 has neither CLONE_VM nor CLONE_VFORK → ordinary fork.
+            vfork: None,
         }
     );
 }

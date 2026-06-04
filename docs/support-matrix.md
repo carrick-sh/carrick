@@ -18,11 +18,12 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ## Go
 
-4 suites — 3 MATCH · 1 DIFF
+5 suites — 4 MATCH · 1 NEW
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
-| `go-runtime` | smoke | 835/983 | 984/984 | DIFF | 150 |
+| `go-runtime` | smoke | 29/29 | 29/29 | MATCH | 0 |
+| `go-build` | smoke | CRASH | SUCCESS | NEW | 0 |
 | `go-sync` | full | 52/52 | 52/52 | MATCH | 0 |
 | `go-context` | full | 58/58 | 58/58 | MATCH | 0 |
 | `go-time` | full | 170/170 | 170/170 | MATCH | 0 |
