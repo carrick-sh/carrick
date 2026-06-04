@@ -2987,8 +2987,26 @@ where
             let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action);
             // If rt_sigqueueinfo queued a caller-supplied siginfo for this
             // (tid, signum), pop it now and hand it to inject_signal so the
-            // SA_SIGINFO handler sees the original si_value payload.
-            let queued_siginfo = dispatcher.take_pending_siginfo(tid, pending);
+            // SA_SIGINFO handler sees the original si_value payload. Failing
+            // that, a plain cross-process kill leaves no queued siginfo — but the
+            // host handler captured the sender's host pid, so synthesise an
+            // SI_USER siginfo with the sender's ns-pid (identity when pid-ns is
+            // off) instead of the all-zero si_pid that made LTP kill10 loop on
+            // "received signal from 0".
+            let queued_siginfo = dispatcher.take_pending_siginfo(tid, pending).or_else(|| {
+                let sender_host = crate::host_signal::take_sender_for(pending);
+                (sender_host > 0).then(|| {
+                    let ns_pid =
+                        crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
+                    let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
+                    crate::linux_abi::LinuxSiginfo::kill(
+                        pending,
+                        crate::linux_abi::LINUX_SI_USER,
+                        ns_pid,
+                        uid,
+                    )
+                })
+            });
             match trap.inject_signal(
                 pending,
                 action.sa_handler,
