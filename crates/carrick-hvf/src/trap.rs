@@ -2803,12 +2803,34 @@ impl HvfInner {
     /// the inherited MAP_SHARED backing). Used to back a cross-process futex
     /// with the public `os_sync_wait_on_address` API (see `crate::ulock`).
     fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
-        let mapping = self.mapping_for_range(address, 4)?;
-        if !mapping.guest_shared {
-            return None;
+        // Fast path: the region is in THIS thread's mapping list.
+        if let Some(mapping) = self.mapping_for_range(address, 4) {
+            if !mapping.guest_shared {
+                return None; // present but private/anon — not a cross-process futex
+            }
+            let offset = (address - mapping.start) as usize;
+            return Some(unsafe { mapping.host_addr.add(offset) } as usize);
         }
-        let offset = (address - mapping.start) as usize;
-        Some(unsafe { mapping.host_addr.add(offset) } as usize)
+        // Slow path: a fork rebuild replayed only the forking thread's mappings,
+        // so a MAP_SHARED-file alias mapped by another thread is absent from THIS
+        // thread's list — yet the guest CPU still reaches it via the lazy on-fault
+        // re-map keyed off the process-global alias registry. Recover the host
+        // backing from that same registry so a dispatcher-side futex-word read in
+        // a forked child doesn't spuriously EFAULT (→ glibc futex_fatal_error /
+        // SIGABRT, seen in CPython multiprocessing SyncManager teardown waiting on
+        // a shared semaphore). High-VA aliases sit at the deterministic
+        // ipa = va - HIGH_VA_THRESHOLD + ALIAS_IPA_BASE (the exact mapping the
+        // fault handler inverts).
+        if address >= crate::memory::LINUX_HIGH_VA_THRESHOLD {
+            let ipa = address
+                .wrapping_sub(crate::memory::LINUX_HIGH_VA_THRESHOLD)
+                .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE);
+            if let Some(b) = lookup_shared_alias(ipa) {
+                let offset = (ipa - b.ipa) as usize;
+                return Some(b.host_addr + offset);
+            }
+        }
+        None
     }
 
     fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
