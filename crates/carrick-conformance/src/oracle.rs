@@ -164,13 +164,21 @@ fn is_cacheable(result: &SuiteResult) -> bool {
 /// can seed the cache without re-running docker. The report's `pairs` carry the
 /// `[carrick, docker]` outcome of every compared id; the docker element rebuilds
 /// the oracle's id map exactly (Absent docker entries — carrick-only ids — are
-/// dropped, matching what a fresh docker run would record).
+/// dropped, matching what a fresh docker run would record). An empty id map is
+/// legitimate (a suite that ran as a single unit with no per-id breakdown).
 ///
-/// Returns `None` when the report has no comparable per-id docker data: a
-/// crash/timeout/oracle-fail run suppresses `pairs`, and such a run must be
-/// re-executed against docker, never frozen into the cache.
+/// The gate is the *verdict*, not whether `pairs` is empty: only Match/Diff/New/
+/// Regression mean the per-id comparison actually ran, so `pairs` faithfully
+/// reflects docker (even when empty). Crash/timeout SUPPRESS `pairs` before that
+/// comparison, and oracle-fail means docker produced nothing comparable — those
+/// must be re-run against docker, never frozen, so they return `None`.
 pub fn docker_result_from_report(r: &crate::verdict::SuiteReport) -> Option<SuiteResult> {
-    if r.pairs.is_empty() || !is_cacheable_outcome(r.docker.result) {
+    use crate::verdict::Verdict;
+    let comparison_ran = matches!(
+        r.verdict,
+        Verdict::Match | Verdict::Diff | Verdict::New | Verdict::Regression
+    );
+    if !comparison_ran || !is_cacheable_outcome(r.docker.result) {
         return None;
     }
     let mut ids = BTreeMap::new();
@@ -332,6 +340,7 @@ mod tests {
 
     fn report(
         name: &str,
+        verdict: crate::verdict::Verdict,
         docker: SuiteOutcome,
         pairs: &[(&str, [Outcome; 2])],
     ) -> crate::verdict::SuiteReport {
@@ -343,7 +352,7 @@ mod tests {
             name: name.into(),
             ecosystem: "cpython".into(),
             tier: "full".into(),
-            verdict: crate::verdict::Verdict::Match,
+            verdict,
             gating: false,
             carrick: crate::verdict::SideSummary {
                 result: SuiteOutcome::Success,
@@ -368,9 +377,11 @@ mod tests {
 
     #[test]
     fn reconstructs_docker_oracle_from_report() {
+        use crate::verdict::Verdict;
         // docker side reported t1=Ok, t2=Fail; t3 is carrick-only (docker Absent).
         let r = report(
             "s",
+            Verdict::Match,
             SuiteOutcome::Failure,
             &[
                 ("t1", [Outcome::Ok, Outcome::Ok]),
@@ -389,15 +400,49 @@ mod tests {
     }
 
     #[test]
+    fn caches_success_with_no_per_id_breakdown() {
+        use crate::verdict::Verdict;
+        // A MATCH/SUCCESS suite that ran as a single unit (no per-id ids, so the
+        // per-id comparison genuinely produced an empty `pairs`) is a perfectly
+        // cacheable oracle: result Success with an empty id map. The full 1228
+        // run surfaced 44 such suites being wrongly skipped.
+        let r = report("m", Verdict::Match, SuiteOutcome::Success, &[]);
+        let res = docker_result_from_report(&r).expect("empty-ids success is cacheable");
+        assert_eq!(res.result, SuiteOutcome::Success);
+        assert!(res.ids.is_empty());
+    }
+
+    #[test]
     fn refuses_to_reconstruct_suppressed_or_broken_report() {
-        // Empty pairs (a crash/timeout suppressed them) -> None even if docker ok.
-        assert!(docker_result_from_report(&report("a", SuiteOutcome::Success, &[])).is_none());
-        // Non-comparable docker outcome -> None.
+        use crate::verdict::Verdict;
+        // Crash/timeout verdicts SUPPRESS pairs (the per-id diff never ran), so the
+        // empty id map is not the real docker oracle — must re-run, never seed,
+        // even though docker itself succeeded.
         assert!(
             docker_result_from_report(&report(
-                "b",
+                "crash",
+                Verdict::CarrickCrash,
+                SuiteOutcome::Success,
+                &[]
+            ))
+            .is_none()
+        );
+        assert!(
+            docker_result_from_report(&report(
+                "timeout",
+                Verdict::Timeout,
+                SuiteOutcome::Success,
+                &[]
+            ))
+            .is_none()
+        );
+        // Oracle itself broke (docker None) -> None regardless of verdict.
+        assert!(
+            docker_result_from_report(&report(
+                "oraclefail",
+                Verdict::OracleFail,
                 SuiteOutcome::None,
-                &[("t", [Outcome::Ok, Outcome::Absent])]
+                &[]
             ))
             .is_none()
         );
