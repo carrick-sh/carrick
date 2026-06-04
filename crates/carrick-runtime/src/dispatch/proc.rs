@@ -1742,6 +1742,27 @@ impl SyscallDispatcher {
             if result == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            // Terminal reap of a child (not a WUNTRACED/WCONTINUED state report):
+            // CANCEL its async exit-signal watch. carrick's pump delivers a
+            // child-exit signal (default SIGCHLD) asynchronously off EVFILT_PROC/
+            // NOTE_EXIT on a separate thread; under load that delivery can LAG
+            // past this synchronous reap and land in the parent's NEXT operation.
+            // LTP kill12 relies on the opposite (Linux delivers SIGCHLD with the
+            // child's exit, before waitpid returns): its `chflag` (set by the
+            // parent's SIGCHLD handler) is then satisfied spuriously by a previous
+            // child's lagging exit-SIGCHLD, so the parent signals the next child
+            // before it has installed its SIG_IGN and the child dies by the test
+            // signal. Dropping the watch at reap suppresses that stale delivery.
+            // We CANCEL but do NOT re-deliver: a parent that wanted the SIGCHLD
+            // waited for it before reaping (the pump delivered it then, taking the
+            // watch — `take_child_exit_parent` here returns None), whereas a parent
+            // that reaps unconditionally (kill12, and reap-heavy signal storms like
+            // kill10) neither needs nor should be flooded with an extra per-reap
+            // SIGCHLD. The parked WaitOnProcExit path is woken+delivered by the
+            // pump in lock-step and never lags, so it is unaffected.
+            if libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status) {
+                let _ = crate::host_signal::take_child_exit_parent(result);
+            }
             let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
             let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
             let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
