@@ -1255,6 +1255,26 @@ impl HvfTrapEngine {
         Err(TrapError::UnsupportedPlatform)
     }
 
+    /// Set the guest's user stack pointer (`SP_EL0`). Used for a vfork clone that
+    /// supplies an explicit `child_stack`: an ordinary `fork(2)` keeps the
+    /// parent's SP (correct for `child_stack == NULL`, which Go `os/exec` uses),
+    /// but a `clone` with a real child stack (e.g. glibc/musl's `clone()` wrapper
+    /// with a child function) requires the child to run on that stack. The caller
+    /// (`handle_fork`) sets it on the child AFTER the fork, before resuming.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        self.inner
+            .vcpu
+            .set_sys_reg(SysReg::SP_EL0, sp)
+            .map_err(hvf_error)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn set_guest_sp_el0(&self, _sp: u64) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     /// Back a dynamic high-VA `mmap` (see `DispatchOutcome::MapHostAlias`).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn map_host_alias(
@@ -1289,7 +1309,17 @@ impl HvfTrapEngine {
     /// expectations.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        self.inner.fork()
+        self.inner.fork(false)
+    }
+
+    /// vfork-style fork (`CLONE_VM|CLONE_VFORK`): the child SHARES the parent's
+    /// guest RAM instead of getting a CoW snapshot. MUST be paired with
+    /// parent-suspend — the caller (`handle_fork`) blocks the parent vCPU until
+    /// the child `execve`s or `_exit`s, because sharing RAM with a running parent
+    /// would let them race on the same physical pages.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
+        self.inner.fork(true)
     }
 
     /// Build a [`ThreadSpec`] for a thread-creating clone. Snapshots the
@@ -1356,6 +1386,11 @@ impl HvfTrapEngine {
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
 
@@ -3804,7 +3839,7 @@ impl HvfInner {
         Ok(restored_sigmask)
     }
 
-    fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
+    fn fork(&mut self, share_vm: bool) -> Result<ForkOutcome, TrapError> {
         use applevisor::prelude::*;
 
         // Pre-fork: snapshot vCPU state and capture mapping descriptors.
@@ -3836,7 +3871,26 @@ impl HvfInner {
         // choosing `mapping_descs` below.
         let mut child_descs: Vec<ForkMappingDesc> = Vec::with_capacity(mapping_descs.len());
         for desc in &mapping_descs {
-            let child_host = if desc.guest_shared {
+            // vfork (CLONE_VM): the child SHARES the parent's address space, so map
+            // the SAME host buffer for EVERY region (no private snapshot) — exactly
+            // the `guest_shared` branch, generalized. Guest RAM is host-MAP_SHARED,
+            // so the child's writes land in the parent's RAM (true CLONE_VM). This
+            // is only sound because the parent vCPU is SUSPENDED for the whole vfork
+            // window (caller: handle_fork), and the child detaches into its own
+            // private VM on execve (execve_into rebuilds fresh buffers).
+            //
+            // EXCEPTION: the stage-1 page-table BACKING stays PRIVATE even for a
+            // vfork child. The child keeps its own (cloned) PageTableManager whose
+            // bump cursor matches a private backing; the managers are per-process
+            // (separate after libc::fork), so sharing the PT backing would let a
+            // pre-execve mmap/mprotect in the child rewrite the SAME table pages the
+            // suspended parent's manager believes it owns → live-L2/L3 corruption.
+            // Data/heap/stack ARE shared (the point of CLONE_VM); only the PT
+            // backing is excluded, so a pre-execve mmap is invisible to the parent
+            // (which real vfork-for-exec children — Go, posix_spawn — never do)
+            // rather than corrupting it.
+            let is_page_table_region = desc.start == crate::memory::LINUX_PAGE_TABLES_BASE;
+            let child_host = if (share_vm && !is_page_table_region) || desc.guest_shared {
                 ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
             } else {
                 ForkMappingHost::Owned(clone_region_for_child(

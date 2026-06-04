@@ -995,7 +995,16 @@ where
             DispatchOutcome::Fork {
                 pidfd_out,
                 exit_signal,
+                vfork,
             } => {
+                // The single-threaded loop (run-elf) keeps the ordinary CoW fork
+                // even for a vfork clone: it has no sibling threads, and Go / the
+                // conformance gate exercise the THREADED loop
+                // (run_vcpu_until_exit / handle_fork) where the faithful vfork
+                // share-RAM + parent-suspend lives. A run-elf vfork therefore
+                // behaves as a plain fork — safe (same as before), just not the
+                // faithful CLONE_VM|CLONE_VFORK.
+                let _ = vfork;
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
@@ -1455,6 +1464,12 @@ struct ThreadRuntimeState {
     waiter: crate::io_wait::ThreadWaiter,
     max_traps: usize,
     trace: bool,
+    /// Set on a vfork (`CLONE_VM|CLONE_VFORK`) CHILD: the write end of the pipe
+    /// whose read end the suspended PARENT blocks on. The child writes one byte
+    /// (then closes it) at its first `execve` to release the parent; any other
+    /// child exit closes this fd implicitly, giving the parent's `read()` EOF.
+    /// `None` on the parent and on ordinary (non-vfork) children.
+    vfork_release_fd: Option<i32>,
 }
 
 impl ThreadRuntimeState {
@@ -1477,6 +1492,7 @@ impl ThreadRuntimeState {
             waiter: crate::io_wait::ThreadWaiter::new(this_tid),
             max_traps,
             trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
+            vfork_release_fd: None,
         }
     }
 
@@ -2050,7 +2066,7 @@ impl ThreadRuntimeState {
     }
 
     fn handle_execve(
-        &self,
+        &mut self,
         kernel: &Kernel,
         engine: &mut HvfTrapEngine,
         path: String,
@@ -2082,6 +2098,17 @@ impl ThreadRuntimeState {
                 apply_image_proc_state(&kernel.dispatcher, &img);
                 kernel.dispatcher.close_cloexec_fds();
                 engine.execve_into(&img)?;
+                // vfork: the execve SUCCEEDED and we now have our own private VM
+                // (execve_into rebuilt fresh, un-shared buffers). Release the
+                // suspended parent by writing one byte to the inherited pipe, then
+                // close it so the new program doesn't inherit the host fd. A FAILED
+                // execve returns above via `?` WITHOUT releasing — the child then
+                // `_exit`s and the parent's `read()` gets EOF instead (faithful
+                // vfork: parent resumes on successful execve OR child exit).
+                if let Some(fd) = self.vfork_release_fd.take() {
+                    let _ = unsafe { libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
+                    unsafe { libc::close(fd) };
+                }
                 Ok(())
             }
             Err(errno) => {
@@ -2098,7 +2125,14 @@ impl ThreadRuntimeState {
         engine: &mut HvfTrapEngine,
         pidfd_out: Option<u64>,
         exit_signal: u32,
+        vfork: Option<u64>,
     ) -> Result<Option<i64>, RuntimeError> {
+        // vfork (CLONE_VM|CLONE_VFORK): the child SHARES the parent's guest RAM
+        // (engine.fork_vfork() below) and the parent vCPU is SUSPENDED here until
+        // the child execve's or exits (Parent arm below). The two are
+        // co-dependent — shared RAM with a concurrently-running parent would race
+        // on the same physical pages — so they are wired together. An ordinary
+        // fork (`vfork == false`) keeps the CoW snapshot and does not suspend.
         // Serialize forks: at most one quiesce/fork in flight. When another
         // fork already holds the token, BLOCK rather than surfacing EAGAIN —
         // a multithreaded guest (Go's os/exec spawning concurrently) does not
@@ -2223,10 +2257,55 @@ impl ThreadRuntimeState {
         // bounded to the guest's used prefix, not all 32 GiB (see
         // clone_region_for_child / GUEST_ARENA_HIGH_WATER).
         crate::trap::set_guest_arena_high_water(kernel.dispatcher.mmap_arena_high_water());
+        // vfork: an inherited pipe to SUSPEND the parent until the child
+        // execve/_exit. Created BEFORE the fork so BOTH processes inherit BOTH
+        // ends; these are host fds (NOT in the guest fd table). On a pipe()
+        // failure, degrade to a non-suspending shared fork (vfork_pipe = None) —
+        // the RAM share is still correct, only the suspend is skipped — rather
+        // than fail the guest's clone.
+        let vfork_pipe: Option<(i32, i32)> = if vfork.is_some() {
+            let mut fds = [0i32; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+                // CLOEXEC hygiene: carrick's guest execve is an in-process VM
+                // rebuild (not a host exec), so handle_execve still closes the
+                // write end explicitly — but mark both ends CLOEXEC so a real host
+                // exec (orchestrator helpers) can never inherit them. (macOS has
+                // no pipe2, so set FD_CLOEXEC after pipe.)
+                unsafe {
+                    libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                    libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                Some((fds[0], fds[1]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let prepared_fork = kernel.fork.prepare_host_fork();
-        let fork_outcome = match engine.fork() {
+        // vfork shares the parent's guest RAM (CLONE_VM); an ordinary fork takes a
+        // private CoW snapshot of each region. CRITICAL: gate the SHARE on the
+        // suspend pipe existing, NOT on vfork.is_some() — if pipe() failed
+        // (vfork_pipe == None) the parent CANNOT be suspended, and sharing RAM
+        // with a running parent silently corrupts guest memory. So a pipe()
+        // failure degrades to a plain CoW fork (share + suspend stay strictly
+        // coupled: either both or neither). The child-stack SP set below stays
+        // keyed on `vfork` because a CoW child of a clone()-with-stack still needs
+        // its SP.
+        let fork_result = if vfork_pipe.is_some() {
+            engine.fork_vfork()
+        } else {
+            engine.fork()
+        };
+        let fork_outcome = match fork_result {
             Ok(outcome) => outcome,
             Err(error) => {
+                if let Some((r, w)) = vfork_pipe {
+                    unsafe {
+                        libc::close(r);
+                        libc::close(w);
+                    }
+                }
                 if quiesced {
                     fork_barrier().end_quiesce();
                 }
@@ -2280,13 +2359,100 @@ impl ThreadRuntimeState {
                 // PID namespace: allocate the child's ns-pid + record the
                 // mapping (we are its ns-parent), and return the ns-pid as the
                 // fork retval (§5.3). Identity when namespaces are off.
-                i64::from(crate::namespace::pid::register_child(
+                let retval = i64::from(crate::namespace::pid::register_child(
                     child_pid as u32,
                     std::process::id(),
-                ))
+                ));
+                // vfork: SUSPEND this (parent) vCPU thread until the child
+                // execve's (it writes one byte) or exits (the OS closes the
+                // child's write end → our read() returns EOF). We still hold
+                // `_topology` for the whole function, so no concurrent fork can
+                // quiesce us (a sibling forker blocks on the topology lock until
+                // we resume) — a plain blocking read is therefore safe and cannot
+                // deadlock the quiesce. Retry on EINTR so a delivered signal does
+                // not cut the vfork window short. The child's own syscalls keep
+                // the deadlock-watchdog tree-global progress counter advancing, so
+                // a legitimately suspended parent is not mistaken for a stall.
+                if let Some((vf_read, _vf_write)) = vfork_pipe {
+                    unsafe { libc::close(_vf_write) }; // parent only reads
+                    // Bounded suspend: the child should execve/_exit within ms, but
+                    // a pathological guest (a child that blocks before execve, or a
+                    // contrived process-shared-futex rendezvous with a frozen
+                    // sibling) must NOT wedge the parent forever — we still hold
+                    // topology_lock here, so an indefinite block would stall every
+                    // sibling fork/thread-spawn in the process. Poll with a deadline
+                    // (EINTR re-polls on the remaining budget); on expiry resume the
+                    // parent DEGRADED with a loud diagnostic rather than hanging.
+                    const VFORK_SUSPEND_TIMEOUT: Duration = Duration::from_secs(60);
+                    let deadline = std::time::Instant::now() + VFORK_SUSPEND_TIMEOUT;
+                    let mut byte = [0u8; 1];
+                    loop {
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            tracing::error!(
+                                child_pid,
+                                "vfork parent-suspend timed out (60s) waiting for child \
+                                 execve/_exit; resuming parent degraded"
+                            );
+                            break;
+                        }
+                        let remaining_ms =
+                            (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+                        let mut pfd = libc::pollfd {
+                            fd: vf_read,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let r = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+                        if r > 0 {
+                            // Readable: a byte (child execve'd) or EOF (child exited).
+                            let _ = unsafe { libc::read(vf_read, byte.as_mut_ptr().cast(), 1) };
+                            break;
+                        }
+                        if r == 0 {
+                            continue; // deadline re-checked at loop top
+                        }
+                        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                            break; // unexpected poll error — stop waiting
+                        }
+                        // EINTR → re-poll on the remaining budget.
+                    }
+                    unsafe { libc::close(vf_read) };
+                }
+                retval
             }
             crate::trap::ForkOutcome::Child => {
                 kernel.dispatcher.clear_output_buffers();
+                // A forked child must NOT inherit its PARENT's vfork suspend-pipe
+                // write end (copied across libc::fork). Holding it open would keep
+                // the grandparent's pipe alive — defeating the EOF release if this
+                // child's parent _exits without execve — and re-firing it at our
+                // OWN execve would release the grandparent spuriously. Drop the
+                // inherited copy so only the genuine vfork child holds the writer.
+                if let Some(stale) = self.vfork_release_fd.take() {
+                    unsafe { libc::close(stale) };
+                }
+                // vfork: keep the WRITE end of OUR suspend pipe (close the read
+                // end the parent owns). `handle_execve` writes one byte to it at
+                // our first successful execve to release the parent; any other
+                // exit closes it implicitly → the parent's read() gets EOF.
+                if let Some((vf_read, vf_write)) = vfork_pipe {
+                    unsafe { libc::close(vf_read) };
+                    self.vfork_release_fd = Some(vf_write);
+                }
+                // vfork with an explicit child_stack (clone's stack arg != 0): run
+                // the child on it. fork(2) keeps the parent's SP, which is correct
+                // for child_stack==NULL (Go os/exec) but wrong for a clone() that
+                // supplies a stack + child function (glibc/musl's clone() wrapper):
+                // such a child expects SP == child_stack so it can pop fn/arg the
+                // parent pushed there (visible via shared RAM). Set it before resume.
+                if let Some(child_stack) = vfork {
+                    if child_stack != 0 {
+                        if let Err(e) = engine.set_guest_sp_el0(child_stack) {
+                            tracing::warn!(?e, "vfork: failed to set child SP_EL0");
+                        }
+                    }
+                }
                 // Don't inherit the parent's accumulated guest CPU time: the
                 // child's new vCPU starts the hypervisor exec clock at zero.
                 crate::guest_cpu::reset();
@@ -2646,9 +2812,10 @@ fn run_vcpu_until_exit(
                 DispatchOutcome::Fork {
                     pidfd_out,
                     exit_signal,
+                    vfork,
                 } => {
                     if let Some(retval) =
-                        state.handle_fork(&kernel, &mut engine, pidfd_out, exit_signal)?
+                        state.handle_fork(&kernel, &mut engine, pidfd_out, exit_signal, vfork)?
                     {
                         last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                     }
