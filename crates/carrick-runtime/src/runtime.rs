@@ -809,6 +809,9 @@ fn finish_and_run_image(
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
 ) -> Result<RunResult, RuntimeError> {
+    // Arm this (initial) process's deadlock watchdog; forked children re-arm in
+    // the ForkOutcome::Child path. No-op unless CARRICK_DEADLOCK_WATCHDOG_MS set.
+    crate::deadlock_watchdog::arm();
     let image = image
         .with_el0_trampoline()?
         .with_el1_vectors()?
@@ -1031,6 +1034,9 @@ where
                         // self-pipe is shared with the parent — give the child
                         // fresh ones so its parked-thread wakes are its own.
                         crate::host_signal::reinit_after_fork();
+                        // Threads don't survive fork: re-arm the child's deadlock
+                        // watchdog (shares the tree-global progress counter).
+                        crate::deadlock_watchdog::arm();
                         // PID namespace: block until the parent has registered
                         // our ns-pid, so our first getpid()/getppid() see the
                         // mapping (§5.3). No-op when namespaces are off.
