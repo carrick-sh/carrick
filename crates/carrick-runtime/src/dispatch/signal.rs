@@ -785,7 +785,7 @@ impl SyscallDispatcher {
             } else {
                 i64::from(pid.0)
             };
-            if signal_is_self_target(pid, /*tid_required=*/ false) {
+            if signal_is_self_target(pid) {
                 let tid = Self::ctx_tid(cx);
                 // Linux populates si_pid/si_uid with the sender's identity for a
                 // kill(2)-delivered signal (si_code SI_USER). Queue that siginfo
@@ -885,7 +885,7 @@ impl SyscallDispatcher {
             if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
                 return Ok(routed);
             }
-            if signal_is_self_target(tid, /*tid_required=*/ true) {
+            if signal_is_self_target(tid) {
                 let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
                 return Ok(this.raise_self(self_tid, signum));
             }
@@ -1453,14 +1453,16 @@ fn rt_sigtimedwait_deliver(
 /// getpid() exposes the host pid, so glibc uses that as the self-id;
 /// accept it, LINUX_BOOTSTRAP_PID (1), and — for the pid form — 0
 /// (process-group, which is just us in the single-process bootstrap).
-fn signal_is_self_target(target: i64, tid_required: bool) -> bool {
+fn signal_is_self_target(target: i64) -> bool {
     let host_pid = std::process::id() as i64;
     let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-    if tid_required {
-        target == host_pid || target == bootstrap_pid
-    } else {
-        target == host_pid || target == bootstrap_pid || target == 0
-    }
+    // NOTE: pid 0 is deliberately NOT self here. kill(0, sig) targets the
+    // caller's whole PROCESS GROUP (which after a fork includes child guest
+    // processes); routing it through the self path would deliver only to the
+    // caller and leave the group members unsignalled (LTP kill02 "Process 1 did
+    // not receive"). It must fall through to bootstrap_signal_send_as's host
+    // group-kill. (tgkill/tkill use tid_required=true and never pass 0.)
+    target == host_pid || target == bootstrap_pid
 }
 
 /// True iff `x` names THIS process (or thread) — host pid, bootstrap pid, or,
