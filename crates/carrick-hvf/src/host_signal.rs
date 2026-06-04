@@ -866,10 +866,17 @@ fn record_sender(signum: i32, host_pid: i32) {
     }
 }
 
-/// Take (and clear) the recorded sender host pid for `signum`; 0 when none.
-pub fn take_sender_for(signum: i32) -> i32 {
+/// The last recorded sender host pid for `signum` (0 when none ever recorded).
+/// READ, not take: clearing on read raced under a signal flood — a coalesced or
+/// re-delivered signal whose slot a prior delivery had already consumed read 0
+/// (LTP kill10 "received unexpected signal from 0"). Leaving the slot means a
+/// delivery always sees the most-recent sender; `handle_routed` overwrites it on
+/// each cross-process arrival and `raise_for_self` records self, so a stale
+/// cross-process value never leaks into a self-raise. (Standard signals coalesce
+/// — only the last sender survives, matching Linux.)
+pub fn last_sender_for(signum: i32) -> i32 {
     if (1..=64).contains(&signum) {
-        SENDER_PID[(signum - 1) as usize].swap(0, Ordering::SeqCst)
+        SENDER_PID[(signum - 1) as usize].load(Ordering::SeqCst)
     } else {
         0
     }

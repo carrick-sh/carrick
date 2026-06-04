@@ -2994,7 +2994,7 @@ where
             // off) instead of the all-zero si_pid that made LTP kill10 loop on
             // "received signal from 0".
             let queued_siginfo = dispatcher.take_pending_siginfo(tid, pending).or_else(|| {
-                let sender_host = crate::host_signal::take_sender_for(pending);
+                let sender_host = crate::host_signal::last_sender_for(pending);
                 (sender_host > 0).then(|| {
                     let ns_pid =
                         crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
