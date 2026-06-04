@@ -1084,6 +1084,9 @@ pub const LINUX_UCONTEXT_SIGMASK_PAD_BYTES: usize = 120;
 pub const LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES: usize = 4096;
 
 pub const LINUX_SI_USER: i32 = 0;
+/// `si_code` for a `sigqueue(3)`/`rt_sigqueueinfo(2)`-delivered signal — the
+/// handler's `si_value` carries the sender's payload.
+pub const LINUX_SI_QUEUE: i32 = -1;
 /// `si_code` for a `tkill(2)`/`tgkill(2)`-delivered signal (and glibc/musl
 /// `raise(3)`, which uses `tgkill`). Distinct from `SI_USER` (`kill(2)`).
 pub const LINUX_SI_TKILL: i32 = -6;
@@ -1125,6 +1128,19 @@ impl LinuxSiginfo {
         s.si_signo = si_signo;
         s.si_code = si_code;
         s.si_addr = (u64::from(si_uid) << 32) | u64::from(si_pid as u32);
+        s
+    }
+
+    /// Build an `SI_QUEUE` real-time siginfo carrying the sender's identity AND
+    /// `si_value` (sigval). The `_rt` union member is
+    /// `{ int si_pid; uint si_uid; sigval si_value; }` at offsets 16/20/24 on
+    /// aarch64: si_pid/si_uid share `si_addr`'s 8 bytes (see [`Self::kill`]), and
+    /// the 8-byte `si_value` immediately follows at offset 24 — the start of
+    /// `_pad`. So a guest reading `info->si_value.sival_int`/`.sival_ptr` sees
+    /// what `sigqueue(3)`/`rt_sigqueueinfo(2)` passed.
+    pub fn rt_queue(si_signo: i32, si_pid: i32, si_uid: u32, si_value: i64) -> Self {
+        let mut s = Self::kill(si_signo, LINUX_SI_QUEUE, si_pid, si_uid);
+        s._pad[0..8].copy_from_slice(&si_value.to_le_bytes());
         s
     }
 }
