@@ -1514,9 +1514,16 @@ pub(crate) fn bootstrap_signal_send_as(
     let self_target = if tid_required {
         target == host_pid || target == bootstrap_pid
     } else {
-        // kill(0, sig) targets the calling process's process group; in our
-        // single-process bootstrap that's still just us.
-        target == host_pid || target == bootstrap_pid || target == 0
+        // A specific self-pid (kill(getpid())) is self. kill(0) is NOT self: it
+        // targets the caller's whole PROCESS GROUP, which after a guest fork
+        // includes child guest processes (separate host pids in the same host
+        // group). It must reach them via the host group-kill below — the same
+        // path kill(-pgid) takes — not raise_for_self, which signals only the
+        // caller and made LTP kill02 TFAIL ("Process 1 did not receive the
+        // signal"). Self is still covered: the host group-kill delivers to the
+        // caller's own host process too, routed into the guest like any other
+        // cross-process signal (identical to how kill(-own_pgid) already works).
+        target == host_pid || target == bootstrap_pid
     };
     if self_target {
         if signum == 0 {
@@ -1527,6 +1534,20 @@ pub(crate) fn bootstrap_signal_send_as(
         // slot between vCPU iterations and either injects a handler frame or
         // applies the default action (terminate with 128 + signum).
         crate::host_signal::raise_for_self(signum as i32);
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    // kill(0) = the caller's process group. Fanning it out via a host group-kill
+    // is safe ONLY when carrick leads its own process group (so the group holds
+    // just carrick + its guest children) — true under the conformance harness
+    // (which spawns carrick with its own process group) and after any guest
+    // setpgrp/setsid. If carrick is NOT the group leader (a bare foreground
+    // `carrick run` still in the launcher's group), a host kill(0) would escape
+    // to the launcher's other jobs — so degrade to self-only delivery: correct
+    // for the contained case, safe for the shared one.
+    if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {
+        if signum != 0 {
+            crate::host_signal::raise_for_self(signum as i32);
+        }
         return DispatchOutcome::Returned { value: 0 };
     }
     // Cross-process: enforce kill(2)'s Linux permission model when both
@@ -1553,7 +1574,10 @@ pub(crate) fn bootstrap_signal_send_as(
     // the host kernel knows whether `target` is one of our descendants
     // and returns ESRCH itself if not. Negative pids (process-group kill)
     // pass through too.
-    if target == 0 || target < i32::MIN as i64 || target > i32::MAX as i64 {
+    // target == 0 (the caller's process group) and target < -1 (a specific
+    // process group) both deliver to a host process group via libc::kill below;
+    // only an out-of-i32 target is a genuinely non-existent pid.
+    if target < i32::MIN as i64 || target > i32::MAX as i64 {
         return DispatchOutcome::errno(LINUX_ESRCH);
     }
     // Translate the Linux signum to the host's numbering: the target is a real

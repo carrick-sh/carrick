@@ -847,6 +847,34 @@ fn drain_fd(fd: RawFd) {
     }
 }
 
+/// Sender's HOST pid for the most recent pending signal of each signum (index =
+/// signum-1, for 1..=64). The host handler stores it from `siginfo_t.si_pid`
+/// (SI_USER/SI_QUEUE/SI_TKILL carry the sender); the delivery path reads it to
+/// populate the guest siginfo's si_pid instead of synthesising 0 — which made
+/// LTP kill10 loop forever on "received signal from 0". A single atomic store
+/// keeps it async-signal-safe. 0 = no sender recorded (default action / timer).
+static SENDER_PID: [std::sync::atomic::AtomicI32; 64] = {
+    const Z: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    [Z; 64]
+};
+
+/// Record `host_pid` as the sender of `signum`. Async-signal-safe (one atomic
+/// store); out-of-range signums are ignored.
+fn record_sender(signum: i32, host_pid: i32) {
+    if (1..=64).contains(&signum) {
+        SENDER_PID[(signum - 1) as usize].store(host_pid, Ordering::SeqCst);
+    }
+}
+
+/// Take (and clear) the recorded sender host pid for `signum`; 0 when none.
+pub fn take_sender_for(signum: i32) -> i32 {
+    if (1..=64).contains(&signum) {
+        SENDER_PID[(signum - 1) as usize].swap(0, Ordering::SeqCst)
+    } else {
+        0
+    }
+}
+
 /// Publish a pending guest signum AND wake parked waiters. The single store +
 /// the pipe write are both async-signal-safe, so this is callable from a host
 /// signal handler.
@@ -927,7 +955,15 @@ extern "C" fn handle_routed(
             return;
         }
     }
-    publish_pending(host_to_linux_signum(host_signum));
+    let linux_signum = host_to_linux_signum(host_signum);
+    // Capture the sender's host pid so the delivery path can populate the guest
+    // siginfo's si_pid (else 0 → LTP kill10 loops on "signal from 0"). SI_USER/
+    // SI_QUEUE/SI_TKILL carry it; for a kernel-generated code (>0, only reached
+    // here for the non-fault asynchronous signals) si_pid is 0 anyway.
+    if !info.is_null() {
+        record_sender(linux_signum, unsafe { (*info).si_pid });
+    }
+    publish_pending(linux_signum);
 }
 
 /// Install a host handler for `linux_signum` so a cross-process `kill` from
@@ -1093,6 +1129,9 @@ pub fn raise_for_self(signum: i32) {
     // Dispatch context (not a signal handler), so the probe is safe here —
     // unlike `publish_pending` itself, which a host handler also calls.
     crate::probes::signal_publish(0, signum, 0);
+    // The sender is THIS process; record it so the delivery path's si_pid is
+    // self (and never a stale cross-process sender left from a prior signal).
+    record_sender(signum, unsafe { libc::getpid() });
     publish_pending(signum);
 }
 
