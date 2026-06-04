@@ -176,6 +176,28 @@ fn is_rt_signal(signum: i32) -> bool {
     (32..=64).contains(&signum)
 }
 
+/// A cross-process `kill`/`sigqueue` to a *specific* guest process that a plain
+/// host kill cannot carry faithfully, so it must route through the shared
+/// explicit-signal ring + SIGINFO nudge (`host_signal` xsignal) instead — the
+/// ring delivers it through the receiver's in-guest `deliver_pending_signal`,
+/// which honours the guest disposition (SIG_IGN drop / handler / SIG_DFL term):
+///   * SIGCHLD (17) — a host SIGCHLD is swallowed by the receiver's wait4/kqueue
+///     child-exit pump, so its guest SIGCHLD handler never runs (LTP kill12).
+///   * Synchronous faults SIGILL(4)/SIGTRAP(5)/SIGABRT(6)/SIGBUS(7)/SIGFPE(8)/
+///     SIGSEGV(11) — their HOST disposition is shared with a genuine guest fault
+///     (which arrives as a vmexit, not a host signal), so a guest `SIG_IGN`
+///     cannot be mirrored to the host (`set_host_ignore` excludes them). A host
+///     kill of one then takes the host default action and core-dumps the
+///     receiver instead of being ignored (LTP kill12's `sigset(sig, SIG_IGN)`
+///     loop). Routing through the ring keeps the host fault disposition intact
+///     while still honouring the guest's ignore/handler.
+///   * RT signals (32..=64) — macOS has no such signal number to host-kill with.
+fn cross_process_needs_xsig(signum: i32) -> bool {
+    signum == crate::linux_abi::LINUX_SIGCHLD
+        || matches!(signum, 4 | 5 | 6 | 7 | 8 | 11)
+        || is_rt_signal(signum)
+}
+
 fn sanitize_signal_mask(mut mask: u64) -> u64 {
     #[allow(clippy::unwrap_used)]
     let unmaskable = sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
@@ -1375,8 +1397,28 @@ impl SyscallDispatcher {
         let host_pid = std::process::id() as i64;
         let is_self = ns_target == host_pid || ns_target == LINUX_BOOTSTRAP_PID as i64;
         if !is_self {
-            // Cross-process: kill(2)-style host route. The user payload doesn't
-            // cross the process boundary today (receiver synthesises SI_USER).
+            // Cross-process signal that a plain host kill can't carry faithfully
+            // (RT 32..=64, SIGCHLD, or a guest-disposition-honouring fault sig):
+            // route it through the shared explicit-signal ring carrying the
+            // sender's si_value (sigval), and nudge the target — its SA_SIGINFO
+            // handler then observes SI_QUEUE + the payload. `ns_target` is
+            // already the target's HOST pid here.
+            if cross_process_needs_xsig(s) {
+                let target_host = ns_target as i32;
+                let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
+                let sender_uid = self.cred_snapshot().euid;
+                // si_value lives at offset 24 of the siginfo = `_pad[0..8]`.
+                let value = user_info
+                    .and_then(|i| i._pad.get(0..8).and_then(|b| b.try_into().ok()))
+                    .map(i64::from_le_bytes)
+                    .unwrap_or(0);
+                if crate::host_signal::xsig_enqueue(target_host, s, sender_ns, sender_uid, value) {
+                    crate::host_signal::xsig_nudge(target_host);
+                    return DispatchOutcome::Returned { value: 0 };
+                }
+            }
+            // Non-RT (or ring full): kill(2)-style host route (SIGCHLD itself is
+            // routed via the ring inside bootstrap_signal_send_as).
             return bootstrap_signal_send(ns_target, /*tid_required=*/ false, signum);
         }
 
@@ -1581,6 +1623,20 @@ pub(crate) fn bootstrap_signal_send_as(
     // only an out-of-i32 target is a genuinely non-existent pid.
     if target < i32::MIN as i64 || target > i32::MAX as i64 {
         return DispatchOutcome::errno(LINUX_ESRCH);
+    }
+    // A plain host kill can't faithfully carry some cross-process signals to
+    // another carrick process, so route them through the shared explicit-signal
+    // ring + a SIGINFO nudge (see host_signal xsignal + cross_process_needs_xsig)
+    // when the target is a specific process.
+    if target > 0 && cross_process_needs_xsig(signum as i32) {
+        let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
+        let sender_uid = caller_euid.unwrap_or_else(|| unsafe { libc::getuid() });
+        if crate::host_signal::xsig_enqueue(target as i32, signum as i32, sender_ns, sender_uid, 0)
+        {
+            crate::host_signal::xsig_nudge(target as i32);
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        // Ring full / unavailable: fall through to the host kill below.
     }
     // Translate the Linux signum to the host's numbering: the target is a real
     // host process, and Linux/macOS disagree on several numbers (e.g. SIGUSR1
