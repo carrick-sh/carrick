@@ -13,6 +13,7 @@
 
 mod engine;
 mod generate;
+mod images;
 mod manifest;
 mod matrix;
 mod oracle;
@@ -82,6 +83,11 @@ struct Args {
     /// overwrite their cached results (use after rebuilding an image's contents).
     #[arg(long)]
     refresh_oracle: bool,
+    /// Skip the pre-run image-freshness guard (which re-pulls carrick's copy of
+    /// any image whose registry digest moved, so carrick and docker run the same
+    /// bytes). Use offline or when you deliberately want carrick's cached image.
+    #[arg(long)]
+    no_image_refresh: bool,
     /// Seed the oracle cache from a completed gate's results.jsonl (reconstructs
     /// each suite's docker side from its recorded per-id pairs) and exit —
     /// capturing a finished run's docker work without re-running any container.
@@ -161,6 +167,18 @@ fn run() -> anyhow::Result<ExitCode> {
 
     let pid = std::process::id();
     let carrick_bin = args.carrick_bin.to_string_lossy().into_owned();
+
+    // Image-freshness guard: re-pull carrick's copy of any selected image whose
+    // registry digest moved, SERIALLY before the parallel carrick phase, so
+    // carrick and docker run identical bytes (see images.rs). Skipped on request.
+    if !args.no_image_refresh {
+        let imgs: Vec<String> = selected.iter().map(|s| s.image.clone()).collect();
+        let refreshed = images::refresh_stale_images(&imgs, &carrick_bin);
+        if refreshed > 0 {
+            eprintln!("image-guard: re-pulled {refreshed} stale image(s)");
+        }
+    }
+
     let n = selected.len();
     let workers = std::thread::available_parallelism()
         .map(|c| c.get().saturating_sub(2).clamp(1, 8))
