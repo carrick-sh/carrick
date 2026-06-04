@@ -2487,7 +2487,7 @@ fn dispatch_threaded_futex(
         };
     }
 
-    let word = match read_u32(memory, address) {
+    let word = match read_futex_word(memory, address) {
         Ok(word) => word,
         Err(errno) => return DispatchOutcome::Errno { errno },
     };
@@ -3619,6 +3619,30 @@ pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i
         .read_into(address, &mut buf)
         .map_err(|_| LINUX_EFAULT)?;
     Ok(u32::from_ne_bytes(buf))
+}
+
+/// Read a futex word, falling back to the fork-coherent shared mapping when the
+/// dispatcher's software guest-memory view can't translate the address. A
+/// MAP_SHARED semaphore's futex word is reachable in a forked child via the
+/// host `__ulock`-keyed shared pointer (the same one the wait/wake paths read)
+/// even when the child's software memory view misses the high shared aperture
+/// (the guest CPU reaches it through HVF stage-2, but the dispatcher's read
+/// does not). Surfacing the read EFAULT instead trips glibc's
+/// `futex_fatal_error()` (SIGABRT) on a VALID cross-process futex — observed in
+/// CPython multiprocessing SyncManager teardown, where a forked server child's
+/// `FUTEX_WAIT_BITSET|CLOCK_REALTIME` on a shared semaphore aborted the process.
+pub(super) fn read_futex_word(memory: &impl GuestMemory, address: u64) -> Result<u32, i32> {
+    match read_u32(memory, address) {
+        Ok(word) => Ok(word),
+        Err(errno) => match memory.shared_futex_host_addr(address) {
+            // SAFETY: a resolved shared host addr points into a live MAP_SHARED
+            // region in THIS process — the identical pointer `shared_futex_wait`
+            // reads at the wait site. `read_unaligned` avoids assuming stricter
+            // alignment than the guest futex ABI's 4-byte guarantee.
+            Some(host_addr) => Ok(unsafe { (host_addr as *const u32).read_unaligned() }),
+            None => Err(errno),
+        },
+    }
 }
 
 pub(super) fn write_u32(
@@ -5057,6 +5081,40 @@ mod overlay_dispatch_tests {
         );
 
         assert_eq!(0i32.host_syscall_result().unwrap(), 0);
+    }
+
+    /// A MAP_SHARED futex word the dispatcher's software memory view can't
+    /// translate (read fails) must still be read via the fork-coherent shared
+    /// host pointer — never surfaced as EFAULT, which aborts glibc's futex code.
+    /// Regression for the CPython multiprocessing SyncManager SIGABRT (a forked
+    /// child's timed wait on a shared semaphore at the high mmap aperture).
+    #[test]
+    fn read_futex_word_falls_back_to_shared_mapping() {
+        struct SharedOnly {
+            word: u32,
+        }
+        impl GuestMemory for SharedOnly {
+            fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+            fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                })
+            }
+            fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+                Some(&self.word as *const u32 as usize)
+            }
+        }
+        // Software read fails, but the shared host pointer yields the word.
+        let mem = SharedOnly { word: 0x00C0_FFEE };
+        assert_eq!(read_futex_word(&mem, 0x1_0001_6000_00), Ok(0x00C0_FFEE));
+
+        // No shared mapping -> EFAULT propagates unchanged (no regression for
+        // a genuinely bad private/anon address).
+        let lin = LinearMemory::new(0x1000, vec![0u8; 8]);
+        assert_eq!(read_futex_word(&lin, 0x9_9999_9999), Err(LINUX_EFAULT));
     }
 
     struct CountingMemory {

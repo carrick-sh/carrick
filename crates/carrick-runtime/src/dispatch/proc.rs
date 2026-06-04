@@ -1232,7 +1232,7 @@ impl SyscallDispatcher {
             if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let word = read_u32(memory, address.0)?;
+            let word = read_futex_word(memory, address.0)?;
 
             if matches!(
                 command,
