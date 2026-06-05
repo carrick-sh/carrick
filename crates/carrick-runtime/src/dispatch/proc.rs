@@ -71,6 +71,12 @@ static IOPRIO_VALUE: std::sync::atomic::AtomicU32 =
 /// (list.next, futex_offset, list_op_pending). set_robust_list requires the
 /// caller's `len` to equal this exactly; get_robust_list reports it.
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
+const LINUX_PTRACE_PEEKTEXT: u64 = 1;
+const LINUX_PTRACE_PEEKDATA: u64 = 2;
+const LINUX_PTRACE_PEEKUSER: u64 = 3;
+const LINUX_PTRACE_POKETEXT: u64 = 4;
+const LINUX_PTRACE_POKEDATA: u64 = 5;
+const LINUX_PTRACE_POKEUSER: u64 = 6;
 
 /// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
 /// Build the [`DispatchOutcome::CloneThread`] for a thread-creating clone/clone3.
@@ -175,6 +181,16 @@ fn sched_policy_is_known(policy: i32) -> bool {
             | LINUX_SCHED_IDLE
             | LINUX_SCHED_DEADLINE
     )
+}
+
+fn ptrace_text_data_addr_is_invalid(addr: GuestPtr) -> bool {
+    let signed_addr = addr.0 as i64;
+    signed_addr < 0 || addr.0 < 4096
+}
+
+fn ptrace_user_addr_is_invalid(addr: GuestPtr) -> bool {
+    let signed_addr = addr.0 as i64;
+    signed_addr < 0 || addr.0 > 4096
 }
 
 /// Read a `struct sched_param { int sched_priority; }` out of guest memory
@@ -1414,7 +1430,7 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn ptrace(this, cx, request: u64, pid: Pid, _addr: GuestPtr, data: u64) {
+        fn ptrace(this, cx, request: u64, pid: Pid, addr: GuestPtr, data: u64) {
             let host_pid = |pid: Pid| -> Option<Pid> {
                 if crate::namespace::pid::enabled() && pid.0 > 0 {
                     crate::namespace::pid::ns_to_host_or_self(pid.0 as u32)
@@ -1473,6 +1489,39 @@ impl SyscallDispatcher {
                         )
                     },
                     None => return Ok(LINUX_ESRCH.into()),
+                },
+                LINUX_PTRACE_PEEKTEXT
+                | LINUX_PTRACE_PEEKDATA
+                | LINUX_PTRACE_POKETEXT
+                | LINUX_PTRACE_POKEDATA => match host_pid(pid) {
+                    Some(pid) if pid.0 > 0 => {
+                        let exists = unsafe { libc::kill(pid.0, 0) == 0 }
+                            || std::io::Error::last_os_error().raw_os_error()
+                                == Some(libc::EPERM);
+                        if !exists {
+                            return Ok(LINUX_ESRCH.into());
+                        }
+                        if ptrace_text_data_addr_is_invalid(addr) {
+                            return Ok(crate::linux_abi::LINUX_EIO.into());
+                        }
+                        return Ok(LINUX_ENOSYS.into());
+                    }
+                    _ => return Ok(LINUX_ESRCH.into()),
+                },
+                LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => match host_pid(pid) {
+                    Some(pid) if pid.0 > 0 => {
+                        let exists = unsafe { libc::kill(pid.0, 0) == 0 }
+                            || std::io::Error::last_os_error().raw_os_error()
+                                == Some(libc::EPERM);
+                        if !exists {
+                            return Ok(LINUX_ESRCH.into());
+                        }
+                        if ptrace_user_addr_is_invalid(addr) {
+                            return Ok(crate::linux_abi::LINUX_EIO.into());
+                        }
+                        return Ok(LINUX_ENOSYS.into());
+                    }
+                    _ => return Ok(LINUX_ESRCH.into()),
                 },
                 _ => return Ok(LINUX_ENOSYS.into()),
             };
