@@ -16,8 +16,8 @@ it parses this doc + the probe binaries on disk and fails CI if the doc cites
 a probe that doesn't exist):
 
 ```
-Owned invariant probes (on disk):  280
-Invariant rows with an owning test: 124/124 (100%)
+Owned invariant probes (on disk):  281
+Invariant rows with an owning test: 125/125 (100%)
 Distinct curated LTP tests owned:   501/501 (100%)
 ```
 
@@ -110,6 +110,7 @@ underlying gap got fixed):
 | `epollexclusive` | (1) Detect "kqueue drained but all events filtered out by user mask" and switch to a signal-pipe-only sleep so polling kq_fd doesn't tight-loop. (2) Honor an empty interest set: `epoll_pwait(epfd, …, timeout)` with no fds added now sleeps the timeout (interruptible by signals) instead of returning 0 immediately. (3) Implement EPOLLONESHOT: after the first delivery the interest is disarmed (events cleared, host kqueue filter removed) until `EPOLL_CTL_MOD` re-arms it. Added the LINUX_EPOLLONESHOT / LINUX_EPOLLEXCLUSIVE constants. |
 | `pipeextra` | (1) `pipe2(O_DIRECT)` accepted as a no-op flag (Darwin pipes don't have packet mode but the regular-pipe write-then-read subset matches; aarch64 O_DIRECT is 0o200000, NOT the asm-generic 0o40000 — checking the wrong value silently rejected every probe). (2) `ioctl(FIONREAD)` on a HostPipe / HostSocket forwards to the host fd so the guest sees the kernel's actual queued-byte count (was hardcoded 0). |
 | `ptracetraceme` | Minimal ptrace tracee stop/continue surface: `PTRACE_TRACEME` succeeds, self-target `SIGSTOP` produces a Linux `WIFSTOPPED`/`WSTOPSIG(SIGSTOP)` parent wait status, positive ptrace pids are translated through the pid namespace, `PTRACE_CONT` resumes the child, and final wait reaps its normal exit. |
+| `sigactionresetinfo` | SA_RESETHAND resets the disposition to SIG_DFL on handler entry without clearing SA_SIGINFO from the `sigaction(SIG, NULL, &old)` state observed inside that handler. |
 
 ## Signals & process control
 
@@ -147,6 +148,7 @@ underlying gap got fixed):
 | **ptrace nonfatal signal-delivery stops: traced self-`SIGTERM`, `SIGSTOP`, `SIGCONT`, and Linux RT signals report a waitable stop instead of falling through to normal exit; `PTRACE_CONT(..., 0)` resumes to normal exit** | ✅ `ptracesignalstop` | ptrace05 signal-delivery stop matrix |
 | **ptrace exec stop: a `PTRACE_TRACEME` child that successfully `execve`s reports a SIGTRAP stop to its parent before the new image runs; `PTRACE_CONT(..., 0)` resumes to normal exit** | ✅ `traceexecstop` | ptrace06 setup / exec-stop leg |
 | **ptrace invalid PEEK/POKE errno: invalid TEXT/DATA/USER PEEK/POKE requests against a stopped tracee fail with Linux-compatible `EIO`/`EFAULT`, not the generic unsupported-syscall `ENOSYS`** | ✅ `ptraceinvaliderrno` | ptrace06 invalid request errno matrix |
+| **SA_RESETHAND + SA_SIGINFO: a one-shot handler resets its disposition to SIG_DFL before the handler runs, but an in-handler `sigaction(SIG, NULL, &old)` query still reports SA_SIGINFO instead of an empty action** | ✅ `sigactionresetinfo` + 🧪 `signal::tests::sa_resethand_resets_disposition_to_default_on_handler_entry` | sigaction01 |
 | **`WCOREDUMP(status)` set for core-dumping signals (SIGABRT/SIGSEGV/SIGQUIT/SIGILL/SIGTRAP/SIGBUS/SIGFPE/SIGXCPU/SIGXFSZ/SIGSYS), unset for non-core signals (SIGTERM/SIGKILL) — 0x80 bit synthesized through macOS's default RLIMIT_CORE=0** | ✅ `coredumpbit` | abort01 |
 | **signalfd4 (syscall 74, emulated — macOS has no signalfd): SFD_CLOEXEC→FD_CLOEXEC, SFD_NONBLOCK→O_NONBLOCK on the returned fd, unknown flag bit→EINVAL (fd-flag surface only; signal-read delivery is a tracked follow-up)** | ✅ `signalfd4` | signalfd4_01, signalfd4_02 |
 

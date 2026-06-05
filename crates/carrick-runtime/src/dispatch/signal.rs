@@ -478,11 +478,13 @@ impl SyscallDispatcher {
         signal.masks.insert(tid, handler_mask);
         // SA_RESETHAND (one-shot): the disposition is reset to SIG_DFL *before*
         // the handler runs, so a second occurrence of the signal takes the
-        // default action. Mirrors the execve reset's "caught → absent = SIG_DFL"
-        // convention. (`signal()`-via-`SA_RESETHAND|SA_NODEFER` and raw one-shot
-        // handlers depend on this; without it the handler re-enters forever.)
+        // default action. Keep the action record with the reset disposition
+        // rather than deleting it outright: Linux still reports metadata such
+        // as SA_SIGINFO to an in-handler sigaction(SIG, NULL, &old) query.
         if action.sa_flags & crate::linux_abi::LINUX_SA_RESETHAND != 0 {
-            signal.handlers.remove(&signum);
+            let mut reset = action;
+            reset.sa_handler = crate::linux_abi::LINUX_SIG_DFL;
+            signal.handlers.insert(signum, reset);
         }
         // Record whether this handler runs on the alt stack (SA_ONSTACK + an
         // alt stack is configured), so sigaltstack queries report SS_ONSTACK and
@@ -1885,7 +1887,8 @@ mod tests {
         // A one-shot (SA_RESETHAND) handler for SIGUSR1 (10).
         let mut oneshot = LinuxSigaction::empty();
         oneshot.sa_handler = 0x4000;
-        oneshot.sa_flags = crate::linux_abi::LINUX_SA_RESETHAND;
+        oneshot.sa_flags =
+            crate::linux_abi::LINUX_SA_RESETHAND | crate::linux_abi::LINUX_SA_SIGINFO;
         d.signal.lock().handlers.insert(10, oneshot);
         assert!(d.registered_signal_handler(10).is_some());
 
@@ -1895,6 +1898,15 @@ mod tests {
         assert!(
             d.registered_signal_handler(10).is_none(),
             "SA_RESETHAND handler must reset to SIG_DFL on entry"
+        );
+        let reset = d.signal.lock().handlers.get(&10).copied().unwrap();
+        let reset_handler = reset.sa_handler;
+        let reset_flags = reset.sa_flags;
+        assert_eq!(reset_handler, crate::linux_abi::LINUX_SIG_DFL);
+        assert_ne!(
+            reset_flags & crate::linux_abi::LINUX_SA_SIGINFO,
+            0,
+            "SA_RESETHAND must not clear SA_SIGINFO from sigaction old state"
         );
 
         // Control: a handler WITHOUT SA_RESETHAND persists across entry.

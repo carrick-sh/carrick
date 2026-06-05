@@ -268,6 +268,9 @@ pub const LINUX_SA_NODEFER: u64 = 0x4000_0000;
 /// `SA_RESETHAND`: reset the handler to `SIG_DFL` on entry (one-shot handler).
 pub const LINUX_SA_RESETHAND: u64 = 0x8000_0000;
 
+/// `SA_SIGINFO`: use the three-argument `sa_sigaction` handler form.
+pub const LINUX_SA_SIGINFO: u64 = 0x0000_0004;
+
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
 #[repr(C, packed)]
@@ -2688,7 +2691,8 @@ const _: () = {
 // `sa_flags` bits carrick honors must occupy disjoint bit positions — an
 // overlap would make one flag silently imply another in rt_sigaction.
 const _: () = {
-    const SA_FLAGS: [u64; 5] = [
+    const SA_FLAGS: [u64; 6] = [
+        LINUX_SA_SIGINFO,
         LINUX_SA_RESTORER,
         LINUX_SA_ONSTACK,
         LINUX_SA_RESTART,
