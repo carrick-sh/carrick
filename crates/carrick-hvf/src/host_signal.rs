@@ -928,12 +928,31 @@ pub fn drain_pump_pipe() {
 }
 
 fn drain_fd(fd: RawFd) {
+    // Wake pipes are created non-blocking, but fork/fd churn must not turn a
+    // drain into an unbounded host read if that invariant is violated.
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl < 0 {
+        return;
+    }
+    if fl & libc::O_NONBLOCK == 0
+        && unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) } != 0
+    {
+        return;
+    }
     let mut buf = [0u8; 64];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
+        if n > 0 {
+            continue;
+        }
+        if n == 0 {
             break;
         }
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if errno == Some(libc::EINTR) {
+            continue;
+        }
+        break;
     }
 }
 
@@ -1515,6 +1534,45 @@ mod tests {
         drain_pump_pipe();
         assert!(!pipe_is_readable(pump_pipe_read_fd()));
         PROC_PENDING.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn drain_fd_forces_empty_pipe_nonblocking() {
+        let _g = TEST_LOCK.lock();
+        let (read_fd, write_fd) = open_internal_pipe().expect("internal pipe");
+        unsafe {
+            let fl = libc::fcntl(read_fd, libc::F_GETFL);
+            assert!(fl >= 0);
+            assert!(fl & libc::O_NONBLOCK != 0);
+            assert_eq!(
+                libc::fcntl(read_fd, libc::F_SETFL, fl & !libc::O_NONBLOCK),
+                0
+            );
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            drain_fd(read_fd);
+            let _ = tx.send(start.elapsed());
+            unsafe { libc::close(read_fd) };
+        });
+
+        let elapsed = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(elapsed) => elapsed,
+            Err(err) => {
+                unsafe { libc::close(write_fd) };
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+                handle
+                    .join()
+                    .expect("drain thread exits after writer close");
+                panic!("drain_fd blocked on an empty internal pipe: {err}");
+            }
+        };
+
+        unsafe { libc::close(write_fd) };
+        handle.join().expect("drain thread exits");
+        assert!(elapsed < std::time::Duration::from_millis(50));
     }
 
     #[test]
