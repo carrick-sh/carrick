@@ -191,3 +191,19 @@ pub(super) fn forked_child_die_by_signal(
         libc::_exit(128 + signum)
     }
 }
+
+pub(super) fn stop_by_signal(signum: i32) {
+    let host_signum = crate::host_signal::linux_to_host_signum(signum);
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(host_signum, &action, std::ptr::null_mut());
+
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, host_signum);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(host_signum);
+    }
+}

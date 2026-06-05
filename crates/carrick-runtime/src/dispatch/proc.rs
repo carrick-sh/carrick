@@ -1403,8 +1403,70 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn ptrace(this, cx) {
-            Ok(LINUX_ENOSYS.into())
+        fn ptrace(this, cx, request: u64, pid: Pid, _addr: GuestPtr, data: u64) {
+            let host_pid = |pid: Pid| -> Option<Pid> {
+                if crate::namespace::pid::enabled() && pid.0 > 0 {
+                    crate::namespace::pid::ns_to_host_or_self(pid.0 as u32)
+                        .map(|host| Pid(host as i32))
+                } else {
+                    Some(pid)
+                }
+            };
+            let host_signal_data = || -> i32 {
+                let linux_signal = data as i32;
+                if linux_signal == 0 {
+                    0
+                } else {
+                    crate::host_signal::linux_to_host_signum(linux_signal)
+                }
+            };
+
+            let result = match request {
+                0 => unsafe {
+                    libc::ptrace(
+                        libc::PT_TRACE_ME,
+                        0,
+                        std::ptr::null_mut::<libc::c_char>(),
+                        0,
+                    )
+                },
+                7 => match host_pid(pid) {
+                    Some(pid) => unsafe {
+                        libc::ptrace(
+                            libc::PT_CONTINUE,
+                            pid.0,
+                            1usize as *mut libc::c_char,
+                            host_signal_data(),
+                        )
+                    },
+                    None => return Ok(LINUX_ESRCH.into()),
+                },
+                8 => match host_pid(pid) {
+                    Some(pid) => unsafe {
+                        libc::ptrace(
+                            libc::PT_KILL,
+                            pid.0,
+                            std::ptr::null_mut::<libc::c_char>(),
+                            0,
+                        )
+                    },
+                    None => return Ok(LINUX_ESRCH.into()),
+                },
+                17 => match host_pid(pid) {
+                    Some(pid) => unsafe {
+                        libc::ptrace(
+                            libc::PT_DETACH,
+                            pid.0,
+                            1usize as *mut libc::c_char,
+                            host_signal_data(),
+                        )
+                    },
+                    None => return Ok(LINUX_ESRCH.into()),
+                },
+                _ => return Ok(LINUX_ENOSYS.into()),
+            };
+            result.host_syscall_errno()?;
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn reboot(this, cx) {
