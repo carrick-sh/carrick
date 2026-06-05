@@ -17,6 +17,7 @@
 // production code, so allow unwrap/expect across this integration test file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -812,10 +813,31 @@ fn probes_dir(lane: Lane) -> PathBuf {
     ))
 }
 
-/// Enumerate probe executables in `probes_dir()`: top-level files only, no
-/// extensions (skip anything with a '.'), skipping cargo's bookkeeping dirs.
+fn probe_source_names() -> BTreeSet<String> {
+    let src_dir = repo_path("conformance-probes/src/bin");
+    let Ok(entries) = std::fs::read_dir(src_dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Enumerate built probe executables with matching `src/bin/*.rs` sources.
+/// Cargo leaves deleted binaries in `target/.../release`; filtering through the
+/// source list keeps stale artifacts out of the line-exact gate.
 fn probe_binaries(lane: Lane) -> Vec<PathBuf> {
     let dir = probes_dir(lane);
+    let source_names = probe_source_names();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return out;
@@ -831,6 +853,9 @@ fn probe_binaries(lane: Lane) -> Vec<PathBuf> {
         };
         if name.contains('.') {
             continue; // skips *.d, *.rlib, .fingerprint files, etc.
+        }
+        if !source_names.contains(name) {
+            continue; // skips stale binaries for probes whose source was removed
         }
         out.push(path);
     }
