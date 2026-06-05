@@ -1055,6 +1055,12 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     // (grandchild_report_ok=false). MATCHes 6/6 standalone — same host-saturation
     // jitter class as sigchld/waitsiblingsigchld, not a code regression.
     "pidnsinitreap",
+    // waitexitstorm: 1050 fork+blocking-wait cycles intentionally exceed the
+    // old 1024 namespace-member capacity. It MATCHes standalone, but under the
+    // 8-way Carrick fan-out the fork storm can exceed the 45s case deadline.
+    // Keep it in the serial lane so the gate still runs it without weakening
+    // the invariant.
+    "waitexitstorm",
 ];
 
 fn is_timing_sensitive(probe: &std::path::Path) -> bool {
