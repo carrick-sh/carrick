@@ -951,10 +951,20 @@ impl HostFsBackend {
 
     pub fn new_in(scratch_root: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(scratch_root)?;
+        let root_lock_path = scratch_root.join(".carrick.sweep.lock");
+        let root_lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&root_lock_path)?;
+        let mut root_lock = fd_lock::RwLock::new(root_lock_file);
+        let root_guard = root_lock.write()?;
         sweep_orphans(scratch_root);
 
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
+        drop(root_guard);
         let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
         let root_prefix = host_root_prefix(&dir);
         let fast_fs = fast_fs_enabled();
@@ -3531,6 +3541,22 @@ mod tests {
         a.set_file_contents("/hello", b"world".to_vec()).unwrap();
         let b = HostFsBackend::attach(scratch.path()).unwrap();
         assert_eq!(b.file_contents("/hello").as_deref(), Some(&b"world"[..]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_new_in_parallel_allocation_survives_sweeper() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let root = root.path();
+                scope.spawn(move || {
+                    for _ in 0..16 {
+                        let _backend = HostFsBackend::new_in(root).unwrap();
+                    }
+                });
+            }
+        });
     }
 
     #[cfg(target_os = "macos")]
