@@ -589,6 +589,18 @@ pub fn register_child(child_host_pid: u32, parent_host_pid: u32) -> u32 {
     }
 }
 
+/// Forget a namespace member after its terminal wait consumed the zombie.
+///
+/// A dead-but-unreaped child must stay in the table so `wait4(ns_pid)` can still
+/// translate to the host pid. Once the wait succeeds, Linux removes the zombie
+/// from the process table; Carrick can likewise free the fixed-size member slot
+/// for later fork storms while keeping ns-pids monotonic and never recycled.
+pub fn unregister_reaped(host_pid: u32) {
+    if let Some(r) = region() {
+        r.unregister_reaped(host_pid);
+    }
+}
+
 /// `carrick exec`: attach the running container's file-backed region and join it
 /// as a new member — a fresh ns-pid, parented OUTSIDE the namespace (the
 /// `carrick exec` CLI, so the exec'd guest's ns-ppid is 0, matching docker exec).
@@ -716,6 +728,35 @@ impl NsSharedRegion {
                 .store(exit_status, Ordering::Relaxed);
             self.members[i].flags.store(MEMBER_DEAD, Ordering::Release);
         }
+    }
+
+    /// Free the slot for `host_pid` after the guest has reaped it. Readers treat
+    /// `HOST_PID_REGISTERING` as unpublished, so claim that tombstone first,
+    /// clear the payload, then publish `host_pid=0` as a reusable slot.
+    pub fn unregister_reaped(&self, host_pid: u32) -> bool {
+        if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
+            return false;
+        }
+        for slot in &self.members {
+            if slot
+                .host_pid
+                .compare_exchange(
+                    host_pid,
+                    HOST_PID_REGISTERING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                slot.ns_pid.store(0, Ordering::Relaxed);
+                slot.parent_host_pid.store(0, Ordering::Relaxed);
+                slot.exit_status.store(0, Ordering::Relaxed);
+                slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
+                slot.host_pid.store(0, Ordering::Release);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -878,6 +919,44 @@ mod tests {
         slot.host_pid.store(200, Ordering::Release);
         assert_eq!(region.host_to_ns(200), Some(2));
         assert_eq!(region.ns_to_host(2), Some(200));
+
+        unsafe {
+            libc::munmap(ptr, size);
+        }
+    }
+
+    #[test]
+    fn reaped_member_slot_can_be_reused_without_recycling_ns_pid() {
+        let size = std::mem::size_of::<NsSharedRegion>();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let region: &NsSharedRegion = unsafe { &*ptr.cast::<NsSharedRegion>() };
+        region.next_pid.store(2, Ordering::Relaxed);
+
+        let first_ns = region.alloc_ns_pid();
+        assert_eq!(first_ns, 2);
+        assert_eq!(region.register(200, first_ns, 100), Some(0));
+        region.mark_dead(200, 0);
+        assert_eq!(region.ns_to_host(first_ns), Some(200));
+
+        assert!(region.unregister_reaped(200));
+        assert_eq!(region.ns_to_host(first_ns), None);
+        assert_eq!(region.host_to_ns(200), None);
+
+        let second_ns = region.alloc_ns_pid();
+        assert_eq!(second_ns, 3);
+        assert_eq!(region.register(201, second_ns, 100), Some(0));
+        assert_eq!(region.ns_to_host(second_ns), Some(201));
+        assert_eq!(region.ns_to_host(first_ns), None);
 
         unsafe {
             libc::munmap(ptr, size);
