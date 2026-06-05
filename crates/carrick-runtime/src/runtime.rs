@@ -2921,28 +2921,9 @@ where
     T: SyscallTrap,
 {
     // Drain the cross-process explicit-signal ring into pending state, so the
-    // normal delivery below runs each with the sender's identity. The ring
-    // carries the cross-process signals a plain host kill can't deliver
-    // faithfully (see signal::cross_process_needs_xsig): a guest-SENT SIGCHLD, a
-    // synchronous-fault signal whose guest SIG_IGN can't be mirrored to the
-    // shared host fault disposition, or an RT signal macOS has no number for.
-    // Runs in dispatch context, where the dispatcher locks are safe.
-    if crate::host_signal::xsig_has_pending() {
-        for (signum, sender_ns, sender_uid, value) in crate::host_signal::xsig_drain_for_self() {
-            let info = if signum >= 32 {
-                crate::linux_abi::LinuxSiginfo::rt_queue(signum, sender_ns, sender_uid, value)
-            } else {
-                crate::linux_abi::LinuxSiginfo::kill(
-                    signum,
-                    crate::linux_abi::LINUX_SI_USER,
-                    sender_ns,
-                    sender_uid,
-                )
-            };
-            dispatcher.record_pending_siginfo(tid, signum, info);
-            dispatcher.mark_signal_pending(tid, signum);
-        }
-    }
+    // normal delivery below runs each with the sender's identity. Runs in
+    // dispatch context, where the dispatcher locks are safe.
+    dispatcher.drain_xsignals_for_tid(tid);
 
     let pending = crate::host_signal::take_pending_for(tid);
     let pending = if pending == 0 {
