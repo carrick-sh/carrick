@@ -718,6 +718,9 @@ pub enum DispatchOutcome {
     Exit {
         code: i32,
     },
+    SignalDeath {
+        signum: i32,
+    },
     /// `clone(2)` with process-creation flags. The runtime must perform
     /// a real macOS fork against the trap engine, then write the child
     /// pid (parent) or 0 (child) into x0 to complete the syscall.
@@ -957,6 +960,7 @@ impl DispatchOutcome {
             DispatchOutcome::Returned { value } => (*value, None),
             DispatchOutcome::Errno { errno } => (-(*errno as i64), Some(*errno)),
             DispatchOutcome::Exit { code } => (*code as i64, None),
+            DispatchOutcome::SignalDeath { signum } => ((128 + *signum) as i64, None),
             DispatchOutcome::Fork { .. } => (0, None),
             DispatchOutcome::Execve { .. } => (0, None),
             DispatchOutcome::SigReturn => (0, None),
