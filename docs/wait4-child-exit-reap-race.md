@@ -145,6 +145,16 @@ cluster, `fix(proc)` `7d6a778`). Keep these green:
   - `.agents/skills/ltp-conformance/scripts/ltp-check.sh kill02 kill10 kill12`
     → MATCH=3 DIFF=0
   - `GOMAXPROCS=1 go build -p=1` of `runtime/testdata/testprogcgo` → OK
+- 2026-06-05 follow-up: the faithful probe path later reproduced the timeout
+  again (`just conformance-probes`: `arm64:waitexitstorm` hit the 45s deadline;
+  `scripts/run-probe.sh waitexitstorm` exceeded its 60s helper timeout). A bare
+  `run-elf` measurement was 64.72s real / 61.58s sys. `wait_proc_exit` now
+  peeks `waitid(WNOWAIT|WNOHANG)` before arming EVFILT_PROC, so an
+  immediate-exit child avoids per-child kqueue add/delete bookkeeping. New
+  validation: bare `run-elf` `waitexitstorm` → `all_reaped=true` in 41.74s real
+  / 39.07s sys; `/usr/bin/time -lp scripts/run-probe.sh waitexitstorm` → MATCH
+  in 45.56s real / 42.76s sys; `just conformance-probes` → OK (`4 passed; 0
+  failed`, 255.84s).
 - Green regression guards landed for the (ruled-out but real) epoll EOF path:
   `epolletpipeeof`, `epolletblockedhup`, `epolletchildhup`, `epolletmanyhup`
   (all MATCH — pipe writer-close edges ARE delivered, including the multi-fd
