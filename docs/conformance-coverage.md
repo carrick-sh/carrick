@@ -17,7 +17,7 @@ a probe that doesn't exist):
 
 ```
 Owned invariant probes (on disk):  283
-Invariant rows with an owning test: 127/127 (100%)
+Invariant rows with an owning test: 128/128 (100%)
 Distinct curated LTP tests owned:   501/501 (100%)
 ```
 
@@ -129,6 +129,7 @@ underlying gap got fixed):
 | SA_ONSTACK delivery on the alt stack | ✅ `signals`/`altstacktid` | sigaltstack01/02 |
 | **SA_RESTART restarts wait4; non-SA_RESTART EINTRs; awaited-child exit never spurious-EINTRs** | ✅ `waitrestart` | (reap blocker — whole tst_test suite) |
 | **A blocking `waitpid(A)` is NOT interrupted by a sibling child B's default-ignore SIGCHLD (no handler → delivered-and-dropped → no EINTR); a SIGCHLD HANDLER without SA_RESTART DOES interrupt (EINTR). The dispatcher folds blocked + effectively-ignored signals into the wait's no-interrupt mask** | ✅ `waitsiblingsigchld` | futex_cmp_requeue01 / any multi-child SAFE_WAITPID reap |
+| **Internal signal wake pipes at EOF do not spin a waiter: drain reports EOF as a dead wake source, removes the kqueue read filter, and falls back to bounded polling instead of repeating `kevent -> read(0)` forever** | 🧪 `io_wait::tests::wake_pipe_at_eof_does_not_refire` + `host_signal::tests::drain_fd_reports_dead_on_eof` | CPython forkserver/process-pool diagnostic |
 | **execve resets caught handlers→SIG_DFL, keeps SIG_IGN, preserves mask + pending; sigaltstack is preserved (empirically, despite man-page wording)** | ✅ `execvereset` + 🧪 `signal::tests::execve_resets_…` | (shell-wrapped tests; pause/kill) |
 | **fork: child inherits blocked mask; child pending cleared; parent pending survives** | ✅ `maskfork` | (fork signal semantics) |
 | **death-by-signal → wait4 WIFSIGNALED/WTERMSIG; clean exit → WIFEXITED** | ✅ `signalexit` | kill03/06/09 |
