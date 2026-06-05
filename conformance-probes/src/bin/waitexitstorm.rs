@@ -9,8 +9,9 @@
 use conformance_probes::{errno, report};
 
 // Must exceed carrick's historical 1024 namespace-member table capacity while
-// still fitting inside `scripts/run-probe.sh`'s 60s per-side timeout once fixed.
-const ITERS: u64 = 1500;
+// still fitting inside the conformance harness's 45s per-side case deadline on
+// the signed HVF fork/reap path.
+const ITERS: u64 = 1050;
 
 fn main() {
     unsafe {
