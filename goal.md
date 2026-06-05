@@ -305,6 +305,23 @@ just conformance-probes
   test result: ok. 4 passed; 0 failed; finished in 219.94s
 ```
 
+2026-06-05 follow-up: a later final-tree probe gate reproduced the
+`waitexitstorm` timeout (`arm64:waitexitstorm` hit the 45s harness deadline, and
+`scripts/run-probe.sh waitexitstorm` exceeded its 60s helper timeout). A bare
+`run-elf` measurement showed the hot path had regressed to 64.72s real /
+61.58s sys. `wait_proc_exit` now peeks `waitid(WNOWAIT|WNOHANG)` before arming
+an EVFILT_PROC watch, so immediate-exit children skip per-child kqueue
+add/delete bookkeeping. New validation:
+
+```text
+target/release/carrick run-elf .../waitexitstorm
+  all_reaped=true, real 41.74, sys 39.07
+/usr/bin/time -lp scripts/run-probe.sh waitexitstorm
+  MATCH, real 45.56, sys 42.76
+just conformance-probes
+  test result: ok. 4 passed; 0 failed; finished in 255.84s
+```
+
 ## Next autonomous slice
 
 1. Reduce `go-os_signal` `TestAtomicStop`, starting from final run
