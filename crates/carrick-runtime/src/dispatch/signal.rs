@@ -202,6 +202,17 @@ fn namespace_member_standard_kill_needs_xsig(signum: i32) -> bool {
     (1..32).contains(&signum) && !matches!(signum, LINUX_SIGKILL | LINUX_SIGSTOP)
 }
 
+fn stop_self_by_signal(signum: i32) {
+    let host_signum = crate::host_signal::linux_to_host_signum(signum);
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, host_signum);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(host_signum);
+    }
+}
+
 fn should_route_specific_xsig(target_host_pid: i32, signum: i32) -> bool {
     if target_host_pid <= 0 {
         return false;
@@ -752,6 +763,10 @@ impl SyscallDispatcher {
             return DispatchOutcome::Returned { value: 0 };
         }
         let s = signum as i32;
+        if s == LINUX_SIGSTOP {
+            stop_self_by_signal(s);
+            return DispatchOutcome::Returned { value: 0 };
+        }
         if self.signal_blocked(tid, s) {
             self.mark_signal_pending(tid, s);
         } else {
