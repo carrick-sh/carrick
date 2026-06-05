@@ -278,6 +278,11 @@ pub(super) struct ProcState {
     /// so `PR_GET_MEM_MODEL` reports the current model. The actual ACTLR_EL1
     /// toggle happens in the runtime loop (the dispatcher can't reach the vCPU).
     pub tso_enabled: bool,
+    /// This process successfully called `ptrace(PTRACE_TRACEME)`. Linux reports
+    /// self-delivered signals to the tracer before applying default/ignore
+    /// dispositions; Carrick needs this bit so the signal path can avoid routing
+    /// those through the ordinary pending-signal queue.
+    pub ptrace_traceme: bool,
 }
 
 /// Default affinity mask for `ncpu` logical CPUs: the low `ncpu` bits set
@@ -385,6 +390,7 @@ impl ProcState {
             itimers: [None, None, None],
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
             tso_enabled: false,
+            ptrace_traceme: false,
         }
     }
 }
@@ -1466,6 +1472,9 @@ impl SyscallDispatcher {
                 _ => return Ok(LINUX_ENOSYS.into()),
             };
             result.host_syscall_errno()?;
+            if request == 0 {
+                this.proc.lock().ptrace_traceme = true;
+            }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -1810,6 +1819,37 @@ impl SyscallDispatcher {
             if result == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            if host_wait_status_is_stopped_by(host_status, LINUX_SIGKILL) {
+                let host_sigkill = crate::host_signal::linux_to_host_signum(LINUX_SIGKILL);
+                let cont = unsafe {
+                    libc::ptrace(
+                        libc::PT_CONTINUE,
+                        result,
+                        1usize as *mut libc::c_char,
+                        host_sigkill,
+                    )
+                };
+                cont.host_syscall_errno()?;
+                loop {
+                    let r = unsafe {
+                        libc::wait4(result, &mut host_status, host_options, &mut host_rusage)
+                    };
+                    match r.host_syscall_errno() {
+                        Ok(value) => {
+                            if value != 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        Err(errno) => {
+                            if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
+                                continue;
+                            }
+                            return Ok(errno.into());
+                        }
+                    }
+                }
+            }
             // Terminal reap of a child (not a WUNTRACED/WCONTINUED state report):
             // CANCEL its async exit-signal watch. carrick's pump delivers a
             // child-exit signal (default SIGCHLD) asynchronously off EVFILT_PROC/
@@ -2088,6 +2128,15 @@ fn translate_wait_status(status: i32) -> i32 {
         // Exited normally: high byte is the exit code, left untouched.
         status
     }
+}
+
+fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
+    let low = status & 0x7f;
+    if low != 0x7f {
+        return false;
+    }
+    let host_stopsig = (status >> 8) & 0xff;
+    crate::host_signal::host_to_linux_signum(host_stopsig) == linux_signum
 }
 
 /// Darwin can report a stopped child from `waitid(WEXITED|WNOWAIT)`. Linux only

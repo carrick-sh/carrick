@@ -52,11 +52,11 @@ This goal starts from a green regression gate. The target is to reduce NEW rows
 by fixing verified process-control gaps, not by blessing, quarantining, or
 weakening the gate.
 
-Current targeted ptrace rerun after the first reducer:
+Current targeted ptrace rerun after the `ptracesigdeath` reducer:
 
 ```text
-ltp-ptrace05  carrick 82/103, oracle 63/63, run conf-24123-c00
-ltp-ptrace06  carrick no parseable summary, oracle 48/48, run conf-24123-c01
+ltp-ptrace05  carrick 806/1184, oracle 63/63, run conf-27543-c00
+ltp-ptrace06  carrick no parseable summary, oracle 48/48, run conf-27543-c01
 ```
 
 ## Primary target rows
@@ -66,8 +66,8 @@ wait-status, stop-state, or signal-interruption behavior:
 
 | Row | Ecosystem | Current carrick | Oracle | Why it belongs here |
 | --- | --- | --- | --- | --- |
-| `ltp-ptrace05` | LTP | 82/103 after `ptracetraceme` | 63/63 | `PTRACE_TRACEME` is no longer `ENOSYS`; remaining failures are tracee signal-delivery/death semantics. |
-| `ltp-ptrace06` | LTP | no parseable summary after `ptracetraceme` | 48/48 | Same tracee-state surface, likely exec-stop or ptrace signal delivery hiding the LTP summary. |
+| `ltp-ptrace05` | LTP | 806/1184 after `ptracesigdeath` | 63/63 | `PTRACE_TRACEME` and traced self-`SIGKILL` are no longer the blocker; remaining failures are broader signal-delivery stop semantics (`ptrace05.c:149`). |
+| `ltp-ptrace06` | LTP | no parseable summary after `ptracesigdeath` | 48/48 | Same tracee-state surface, likely exec-stop or unimplemented ptrace request/state hiding the LTP summary. |
 | `go-os_exec` | Go | 0/0 | 86/86 | Process execution test suite stalls or exits before classified Go assertions. |
 | `go-syscall` | Go | 0/0 | 34/34 | Broad syscall package fallout; inspect for process/wait/signal cases first. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
@@ -169,9 +169,14 @@ Exit criteria:
   delivered twice through the pending-signal path.
 - `ptracesigdeath` exists and fails on the current carrick before the runtime
   change.
+- Runtime implements traced self-`SIGKILL` as signal death rather than a
+  ptrace-visible stop, and routes at least one default-ignored traced self-signal
+  through a ptrace stop before `PTRACE_CONT`.
+- Probe matches Docker Linux. Landed 2026-06-05: `ptracesigdeath` owns traced
+  self-`SIGKILL` wait status and default-ignored `SIGCHLD` stop/continue.
 - `ltp-ptrace05` improves beyond 82/103 and no longer reports the
-  `ptrace05.c:139` / `ptrace05.c:149` failure signatures, or each remaining
-  assertion is split into its own reducer.
+  `ptrace05.c:139` SIGKILL-stop failure; remaining `ptrace05.c:149` cases must
+  be split into their own reducer.
 - `ltp-ptrace06` produces a parseable summary, improves, or is reclassified with
   an exact exec-stop blocker.
 
@@ -233,8 +238,8 @@ Keep this section current as classifications and fixes land.
 
 | Row | Classification | Owner/probe | Status |
 | --- | --- | --- | --- |
-| `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. After `ptracetraceme`, targeted rerun `conf-24123-c00` improves to 82/103 vs oracle 63/63; remaining failures are tracee signal semantics (`SIGKILL` should kill instead of stop; several non-stop signal cases still say "Didn't stop as expected"). | `ptracetraceme` landed; next reducer should own ptrace signal-delivery/death semantics before `traceexecstop` | minimal TRACEME stop/continue path owned; remaining signal-specific ptrace semantics |
-| `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. After `ptracetraceme`, targeted rerun `conf-24123-c01` still emits no parseable stdout summary, only the root-user warning on stderr. | `traceexecstop` plus ptrace signal/death reducer | minimal `PTRACE_TRACEME` stop/continue path owned; still no LTP summary |
+| `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. After `ptracetraceme`, targeted rerun `conf-24123-c00` improves to 82/103 vs oracle 63/63. After `ptracesigdeath`, targeted rerun `conf-27543-c00` improves to 806/1184; `SIGKILL` now reports "Killed with SIGKILL, as expected" and the old `ptrace05.c:139` signature is gone, while remaining failures are `ptrace05.c:149` signal-delivery stop cases. | `ptracetraceme` and `ptracesigdeath` landed; next reducer should own the remaining nonfatal/stop-signal delivery cases before `traceexecstop` | TRACEME stop/continue and traced self-`SIGKILL` death owned; remaining signal-specific ptrace stop semantics |
+| `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. After `ptracetraceme`, targeted rerun `conf-24123-c01` still emits no parseable stdout summary, only the root-user warning on stderr. After `ptracesigdeath`, targeted rerun `conf-27543-c01` still emits no parseable stdout summary, only the root-user warning on stderr. | `traceexecstop` plus remaining ptrace signal-stop reducer | minimal `PTRACE_TRACEME` stop/continue and traced self-`SIGKILL` death owned; still no LTP summary |
 | `go-os_exec` | process/wait workload does useful work but exits without a parseable suite summary in `conf-42088-c593`; tail ends after `TestIgnorePipeErrorOnSuccess`, and live observation saw an `os_exec.test` child stopped. | `stoppedwaitstatus` before broader `subprocesspipes` | classified; reduce the stopped/waited child path |
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
@@ -248,12 +253,13 @@ Keep this section current as classifications and fixes land.
 
 ## Next autonomous slice
 
-1. Read the upstream LTP `ptrace05.c` and `ptrace06.c` assertions for the exact
-   `ptrace05.c:139` and `ptrace05.c:149` expectations.
-2. Add `ptracesigdeath` as a RED reducer for the current carrick behavior.
-3. Fix the narrow signal/death translation path without broad debugger support.
-4. Validate with `scripts/run-probe.sh ptracesigdeath`,
-   `just conformance-probes`, and targeted
+1. Add a `ptracesignalstop` reducer that enumerates the remaining
+   `ptrace05.c:149` failures, including Linux stop signals and real-time signal
+   numbers that Darwin cannot faithfully raise as host signals.
+2. Replace the traced-child nonfatal self-signal path's host-raise shortcut with
+   a deterministic Linux wait-status model only as far as the probe requires.
+3. Validate with `scripts/run-probe.sh ptracesignalstop`,
+   `scripts/run-probe.sh ptracesigdeath`, `just conformance-probes`, and targeted
    `just conformance full --suite ltp-ptrace05 --suite ltp-ptrace06 --no-image-refresh`.
-5. Update this file and `docs/conformance-coverage.md`, then land a logical
+4. Update this file and `docs/conformance-coverage.md`, then land a logical
    commit with the validation commands in the body.

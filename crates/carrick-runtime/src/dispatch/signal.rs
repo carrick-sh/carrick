@@ -865,6 +865,18 @@ impl SyscallDispatcher {
             };
             if signal_is_self_target(pid) {
                 let tid = Self::ctx_tid(cx);
+                if this.proc.lock().ptrace_traceme && signum != 0 {
+                    if signum == LINUX_SIGKILL as u64 {
+                        return Ok(DispatchOutcome::SignalDeath {
+                            signum: LINUX_SIGKILL,
+                        });
+                    }
+                    let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
+                    unsafe {
+                        libc::raise(host_signum);
+                    }
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
                 // Linux populates si_pid/si_uid with the sender's identity for a
                 // kill(2)-delivered signal (si_code SI_USER). Queue that siginfo
                 // so the SA_SIGINFO handler sees the real sender instead of the
