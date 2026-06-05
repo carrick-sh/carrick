@@ -1,12 +1,18 @@
 # Guest-Side Syscall Shim — Vetting, Validation & Implementation
 
-Status: **Phase 1 (EL1-vector identity fast path) implemented**; Tiers 2–3 and
-`gettid` deferred with validated next steps below.
+Status / progress (most recent first):
 
-This document records the result of vetting the exploration in
-`implementation_plan.md` (the LD_PRELOAD / shared-ring / EL1-vector shim) against
-the actual carrick codebase, validates which parts are sound, and specifies the
-slice that has been implemented.
+- **Tier 1 complete** — `gettid` serviced at EL1 via a per-vCPU `TPIDR_EL1` read
+  (with a `cbz` trap-fallback guard), joining `getpid`/`getuid`/`geteuid`/
+  `getgid`/`getegid`. Full-stack: `gettid` host traps 1000 → 0.
+- **Phase 1 (EL1-vector identity fast path)** — the per-process identity reads.
+
+Deferred with validated next steps (§6): Tier 2 (`futex` ring), Tier 3
+(`write`/`read`), Phase 4 (LD_PRELOAD).
+
+This document records the result of vetting the exploration in `goal.md` (the
+LD_PRELOAD / shared-ring / EL1-vector shim) against the actual carrick codebase,
+validates which parts are sound, and tracks the implementation as it lands.
 
 ---
 
@@ -137,6 +143,20 @@ address is materialised inside the handler (after the eligibility decision) so
 `x0` (= syscall arg0) is never corrupted on the fallthrough path. `ldr w0`
 zero-extends — matching the kernel's 32-bit unsigned return for these calls.
 
+**`gettid` (per-thread).** Unlike the per-process reads, `gettid` differs per
+thread, and all threads of a process share one identity page (one VM). So its
+handler reads the tid from the **per-vCPU `TPIDR_EL1`** instead, which carrick
+stamps with the thread's guest-visible tid (`TPIDR_EL1` is EL1-only and unused by
+carrick — the guest uses `TPIDR_EL0` for TLS):
+
+```asm
+h_gettid:  mrs x0, TPIDR_EL1 ; cbz x0, <fallthrough> ; eret
+```
+
+The `cbz` is defense-in-depth: a tid is never 0, so an unstamped `TPIDR_EL1`
+(a missed per-vCPU stamp) traps to the host (correct, slow) rather than returning
+a wrong `gettid()==0`.
+
 Cost: a handful of EL1 `cmp`s added to every *trapped* syscall (negligible vs a
 µs-scale VM exit); intercepted calls save the entire exit.
 
@@ -151,6 +171,11 @@ Cost: a handful of EL1 `cmp`s added to every *trapped* syscall (negligible vs a
 - **Cred mutations** — `creds.rs` `set*uid`/`set*gid` handlers re-stamp the cred
   fields via `cx.memory` (`stamp_identity_creds`) after mutating `CredState`,
   capturing the snapshot before dropping the lock to avoid re-entrancy.
+- **Per-vCPU tid (`gettid`)** — `stamp_guest_tid` writes `TPIDR_EL1` via
+  `HvfTrapEngine::set_guest_thread_id` at every vCPU (re)creation: thread entry
+  (`run_vcpu_until_exit` — main at boot, each worker at spawn), fork child, and
+  exec. The shim only ever runs under the threaded loop, so this one chokepoint
+  covers it; the `cbz` guard backstops any gap.
 
 ### ptrace interaction
 
@@ -184,12 +209,9 @@ is the escape hatch.
 
 ## 6. Deferred — validated next steps (not implemented here)
 
-- **`gettid` via per-vCPU TPIDR_EL1.** `TPIDR_EL1` is unused by carrick (only
-  `TPIDR_EL0` for guest TLS — `trap.rs:1052`), so it is free to hold a per-vCPU
-  pointer to a per-thread slot. Pre-allocate a fixed slot array in one boot-mapped
-  kernel-hole page (no post-vCPU `hv_vm_map`), set `TPIDR_EL1` per vCPU at thread
-  spawn (`runtime.rs:1915`), write the slot's tid; stub does
-  `mrs x0,TPIDR_EL1; ldr w0,[x0,#tid]`.
+- ~~**`gettid` via per-vCPU TPIDR_EL1.**~~ **DONE** — implemented as a direct
+  `mrs x0, TPIDR_EL1` (the tid value lives in the sysreg, not a slot the doc
+  originally sketched), with a `cbz` trap-fallback guard. See §4.
 - **Tier 2 — `futex(FUTEX_WAKE)` / `close` / `madvise` via a command ring.**
   Ring in the boot-mapped shared aperture (`shared_aperture.rs`, satisfies the
   no-post-vCPU-`hv_vm_map` stage-2 stability invariant); fire-and-forget; a host
@@ -211,17 +233,24 @@ Done:
 - **Unit (`cargo test -p carrick-runtime`)** — `identity_snapshot` reads the same
   sources as the `getpid`/`get*id` handlers (fast and trap paths can't disagree).
 - **End-to-end on real HVF** (`trap_hvf.rs`, gated/self-skipping; run by
-  ad-hoc-signing the test binary with the hypervisor entitlement):
-  `el1_shim_services_getpid_at_el1_without_a_host_trap` runs a `getpid; exit_group`
-  guest and asserts the FIRST host-visible trap is `exit_group` (94), not getpid
-  (172), with `x0` == the stamped pid — proving the dispatcher executes correctly
-  under `PSTATE.PAN=1`. `el1_legacy_vectors_trap_getpid_to_the_host` is the
-  control (getpid DOES trap without the shim).
-- **Full-stack** — `CARRICK_TRACE_TRAPS=1 carrick run-elf <getpid-loop>` with the
-  shim off vs `CARRICK_SYSCALL_SHIM=1` on: getpid (x8=172) host traps drop to zero.
-- Compile + `cargo clippy` clean for the changed code; `just test` host suite green
-  (one PRE-EXISTING integration failure, `dispatch_declares_no_abi_constants` on
-  `LINUX_PTRACE_PEEKTEXT` in `dispatch/proc.rs`, is unrelated to this change).
+  ad-hoc-signing the test binary with the hypervisor entitlement — note HVF
+  allows ONE VM per process, so run each `el1_*` test in its OWN process via
+  `--exact`):
+  - `el1_shim_services_getpid_at_el1_without_a_host_trap` runs a `getpid;
+    exit_group` guest and asserts the FIRST host-visible trap is `exit_group`
+    (94), not getpid (172), with `x0` == the stamped pid — proving the dispatcher
+    executes correctly under `PSTATE.PAN=1`. `el1_legacy_vectors_trap_getpid_to_the_host`
+    is the control (getpid DOES trap without the shim).
+  - `el1_shim_services_gettid_from_tpidr_el1` asserts `gettid` returns the stamped
+    `TPIDR_EL1` value with no host trap; `el1_shim_gettid_guard_traps_when_tpidr_el1_unstamped`
+    asserts the `cbz` guard traps (x8=178) instead of returning 0 when unstamped.
+- **Full-stack** — `CARRICK_TRACE_TRAPS=1 carrick run-elf <loop>` with the shim
+  off vs `CARRICK_SYSCALL_SHIM=1` on: `getpid` host traps 1001 → 0 (value matches
+  the real pid), and `gettid` host traps 1000 → 0 (value matches the tid).
+- Compile + `cargo clippy` clean for the changed code; carrick-mem (56) +
+  carrick-runtime lib (302) green (one PRE-EXISTING integration failure,
+  `dispatch_declares_no_abi_constants` on `LINUX_PTRACE_PEEKTEXT` in
+  `dispatch/proc.rs`, is unrelated to this change).
 
 Pending (full rollout): the Docker-backed `just conformance` gate run with
 `CARRICK_SYSCALL_SHIM=1` before flipping the default to on.

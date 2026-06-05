@@ -1284,6 +1284,26 @@ impl HvfTrapEngine {
         Err(TrapError::UnsupportedPlatform)
     }
 
+    /// Stamp this vCPU's `TPIDR_EL1` with the running guest thread's
+    /// guest-visible tid, which the EL1 syscall-shim dispatcher returns for
+    /// `gettid` without a VM exit. `TPIDR_EL1` is EL1-only and otherwise unused
+    /// by carrick (the guest uses `TPIDR_EL0` for TLS), so it is free to carry
+    /// the per-thread id. Re-stamped whenever the vCPU is (re)created
+    /// (boot/clone/fork/exec). See `docs/syscall-shim-design.md`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        self.inner
+            .vcpu
+            .set_sys_reg(SysReg::TPIDR_EL1, tid)
+            .map_err(hvf_error)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn set_guest_thread_id(&self, _tid: u64) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     /// Back a dynamic high-VA `mmap` (see `DispatchOutcome::MapHostAlias`).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn map_host_alias(
