@@ -123,7 +123,10 @@ use fault::deliver_fault_signal;
 #[cfg(test)]
 use fault::el0_debug_signal;
 mod exec;
-use exec::{forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_by_signal};
+use exec::{
+    forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_after_traced_exec,
+    stop_by_signal,
+};
 
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
 /// wait predicates can reach the same instance).
@@ -1104,6 +1107,7 @@ where
                         apply_image_proc_state(&dispatcher, &new_image);
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
+                        stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {
                         let value = -(errno as i64);
@@ -2132,6 +2136,7 @@ impl ThreadRuntimeState {
                     let _ = unsafe { libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
                     unsafe { libc::close(fd) };
                 }
+                stop_after_traced_exec(&kernel.dispatcher);
                 Ok(())
             }
             Err(errno) => {

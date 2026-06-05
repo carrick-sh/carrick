@@ -404,6 +404,11 @@ impl SyscallDispatcher {
         std::process::id() != self.proc.lock().bootstrap_host_pid
     }
 
+    /// True after the process successfully called `ptrace(PTRACE_TRACEME)`.
+    pub(crate) fn is_ptrace_traceme(&self) -> bool {
+        self.proc.lock().ptrace_traceme
+    }
+
     /// Parse a `struct sock_fprog *` at `fprog_ptr` and install its cBPF program
     /// as a seccomp filter. Shared by `seccomp(SECCOMP_SET_MODE_FILTER)` and the
     /// legacy `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)` entry point.
