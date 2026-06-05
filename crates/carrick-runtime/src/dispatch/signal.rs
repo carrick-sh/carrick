@@ -577,6 +577,30 @@ impl SyscallDispatcher {
         front
     }
 
+    /// Drain cross-process explicit signals queued for this host process into
+    /// dispatcher pending state for `tid`, preserving siginfo payloads. Normal
+    /// async delivery and synchronous waits (`rt_sigtimedwait`/sigwait) both use
+    /// this so an xsignal can be consumed by either path.
+    pub(crate) fn drain_xsignals_for_tid(&self, tid: crate::thread::ThreadId) {
+        if !crate::host_signal::xsig_has_pending() {
+            return;
+        }
+        for (signum, sender_ns, sender_uid, value) in crate::host_signal::xsig_drain_for_self() {
+            let info = if signum >= 32 {
+                LinuxSiginfo::rt_queue(signum, sender_ns, sender_uid, value)
+            } else {
+                LinuxSiginfo::kill(
+                    signum,
+                    crate::linux_abi::LINUX_SI_USER,
+                    sender_ns,
+                    sender_uid,
+                )
+            };
+            self.record_pending_siginfo(tid, signum, info);
+            self.mark_signal_pending(tid, signum);
+        }
+    }
+
     pub fn restore_signal_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
         self.signal
             .lock()
@@ -1263,6 +1287,7 @@ impl SyscallDispatcher {
                 timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
             }
 
+            this.drain_xsignals_for_tid(tid);
             let memory = &mut *cx.memory;
             if let Some(signum) = this.take_pending_in(tid, wait_set) {
                 // Carry any queued rt_sigqueueinfo payload (si_code/pid/uid/value)
