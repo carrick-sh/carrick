@@ -228,9 +228,37 @@ mod setid {
     }
 }
 
+/// The per-process identity values the EL1 syscall shim serves from the guest
+/// identity page (getpid/getuid/geteuid/getgid/getegid). Snapshotted by the
+/// runtime and stamped into guest memory at boot/fork/exec; see
+/// `docs/syscall-shim-design.md`. All are per-process and stable except across
+/// the cred-mutating syscalls, which re-stamp at the point of change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IdentitySnapshot {
+    pub pid: u32,
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+}
+
 impl SyscallDispatcher {
     pub(super) fn cred_snapshot(&self) -> CredState {
         *self.creds.lock()
+    }
+
+    /// The current per-process identity the EL1 shim must report. Reads the same
+    /// sources as the `getpid`/`get*id` handlers so the fast path and the trap
+    /// path can never disagree.
+    pub(crate) fn identity_snapshot(&self) -> IdentitySnapshot {
+        let c = self.cred_snapshot();
+        IdentitySnapshot {
+            pid: crate::namespace::pid::self_ns_pid(),
+            uid: c.ruid,
+            euid: c.euid,
+            gid: c.rgid,
+            egid: c.egid,
+        }
     }
 
     pub(super) fn getpid(&self) -> DispatchOutcome {
@@ -239,6 +267,38 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned {
             value: i64::from(crate::namespace::pid::self_ns_pid()),
         }
+    }
+
+    /// Re-stamp the credential fields of the EL1 shim's identity page after a
+    /// `set*uid`/`set*gid`, so a fast-path `getuid`/`geteuid`/`getgid`/`getegid`
+    /// reflects the new identity (apt's `_apt` privsep verifies the drop right
+    /// after — see this module's theory of operation). No-op unless the shim is
+    /// enabled. `creds` is passed by value so callers stamp AFTER dropping the
+    /// `creds` lock (the snapshot avoids a re-entrant lock / deadlock).
+    pub(super) fn stamp_identity_creds<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<M>,
+        creds: &CredState,
+    ) {
+        if !crate::syscall_shim_enabled() {
+            return;
+        }
+        use crate::memory::{
+            IDENTITY_OFF_EGID, IDENTITY_OFF_EUID, IDENTITY_OFF_GID, IDENTITY_OFF_UID,
+            LINUX_IDENTITY_PAGE_BASE as B,
+        };
+        let _ = cx
+            .memory
+            .write_bytes(B + IDENTITY_OFF_UID, &creds.ruid.to_le_bytes());
+        let _ = cx
+            .memory
+            .write_bytes(B + IDENTITY_OFF_EUID, &creds.euid.to_le_bytes());
+        let _ = cx
+            .memory
+            .write_bytes(B + IDENTITY_OFF_GID, &creds.rgid.to_le_bytes());
+        let _ = cx
+            .memory
+            .write_bytes(B + IDENTITY_OFF_EGID, &creds.egid.to_le_bytes());
     }
 
     /// The supplementary group list `getgroups(2)` reports: the primary egid
@@ -450,8 +510,10 @@ impl SyscallDispatcher {
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
+            let snap = *creds;
             drop(creds);
             crate::cred_ipc::publish_self(new_euid);
+            this.stamp_identity_creds(cx, &snap);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -463,6 +525,9 @@ impl SyscallDispatcher {
                 Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
+            let snap = *creds;
+            drop(creds);
+            this.stamp_identity_creds(cx, &snap);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -475,8 +540,10 @@ impl SyscallDispatcher {
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
+            let snap = *creds;
             drop(creds);
             crate::cred_ipc::publish_self(new_euid);
+            this.stamp_identity_creds(cx, &snap);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -488,6 +555,9 @@ impl SyscallDispatcher {
                 Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
+            let snap = *creds;
+            drop(creds);
+            this.stamp_identity_creds(cx, &snap);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -499,8 +569,10 @@ impl SyscallDispatcher {
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
+            let snap = *creds;
             drop(creds);
             crate::cred_ipc::publish_self(new_euid);
+            this.stamp_identity_creds(cx, &snap);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -511,6 +583,9 @@ impl SyscallDispatcher {
                 Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
+            let snap = *creds;
+            drop(creds);
+            this.stamp_identity_creds(cx, &snap);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -859,5 +934,26 @@ mod setid_tests {
         assert_eq!(setid::set(false, (100, 100, 50), 50), Ok((100, 50, 50)));
         // setuid(999): not real/saved → EPERM.
         assert_eq!(setid::set(false, (100, 100, 50), 999), Err(()));
+    }
+}
+
+#[cfg(test)]
+mod identity_snapshot_tests {
+    use super::*;
+
+    /// `identity_snapshot()` must read the SAME sources as the getpid/get*id
+    /// handlers, so the EL1 fast path and the trap path can never disagree.
+    #[test]
+    fn snapshot_mirrors_getpid_and_cred_snapshot() {
+        let d = SyscallDispatcher::new();
+        let id = d.identity_snapshot();
+        let c = d.cred_snapshot();
+        assert_eq!(id.pid, crate::namespace::pid::self_ns_pid());
+        assert_eq!(
+            (id.uid, id.euid, id.gid, id.egid),
+            (c.ruid, c.euid, c.rgid, c.egid),
+        );
+        // Default container identity is root.
+        assert_eq!((id.uid, id.euid, id.gid, id.egid), (0, 0, 0, 0));
     }
 }
