@@ -400,6 +400,12 @@ impl ThreadWaiter {
         {
             return WaitResult::Interrupted;
         }
+        // Fork/wait storms commonly reach this point after the child has already
+        // become reapable. Peek before arming EVFILT_PROC so the hot path avoids
+        // add/delete kqueue bookkeeping for every immediate-exit child.
+        if child_status_ready(pid) {
+            return WaitResult::Ready;
+        }
         // Fast path: park in kevent() on the per-thread kqueue's EVFILT_PROC.
         if let Some(kq) = self.kq.as_ref() {
             match self.wait_proc_exit_kqueue(kq, pid, block_mask) {
