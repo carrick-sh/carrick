@@ -52,11 +52,11 @@ This goal starts from a green regression gate. The target is to reduce NEW rows
 by fixing verified process-control gaps, not by blessing, quarantining, or
 weakening the gate.
 
-Current targeted ptrace rerun after the `traceexecstop` reducer:
+Current targeted ptrace rerun after the `ptraceinvaliderrno` reducer:
 
 ```text
-ltp-ptrace05  MATCH, carrick 63/63, oracle 63/63, run conf-31128-c00
-ltp-ptrace06  carrick 0/48, oracle 48/48, run conf-31128-c01
+ltp-ptrace05  MATCH, carrick 63/63, oracle 63/63, run conf-51453-c00
+ltp-ptrace06  MATCH, carrick 48/48, oracle 48/48, run conf-51453-c01
 ```
 
 ## Primary target rows
@@ -67,7 +67,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | Row | Ecosystem | Current carrick | Oracle | Why it belongs here |
 | --- | --- | --- | --- | --- |
 | `ltp-ptrace05` | LTP | MATCH 63/63 after `ptracesignalstop` | 63/63 | `PTRACE_TRACEME`, traced self-`SIGKILL`, `SIGCONT`, and Linux RT signal-delivery stops are now owned. |
-| `ltp-ptrace06` | LTP | 0/48 after `traceexecstop` | 48/48 | Exec-stop setup is now owned; remaining failures are unsupported invalid PEEK/POKE request errno (`ENOSYS` vs Linux `EIO`/`EFAULT`). |
+| `ltp-ptrace06` | LTP | MATCH 48/48 after `ptraceinvaliderrno` | 48/48 | Exec-stop setup and invalid PEEK/POKE request errno are now owned without claiming full debugger memory/register access. |
 | `go-os_exec` | Go | MATCH 86/86 in targeted rerun `conf-93241-c156` | 86/86 | Previously 0/0; current evidence shows process execution suite parity, so keep watching it as pressure coverage rather than the next reducer. |
 | `go-syscall` | Go | 0/0 | 34/34 | Broad syscall package fallout; inspect for process/wait/signal cases first. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
@@ -107,6 +107,7 @@ points to a sharper invariant.
 | `ptracetraceme` | Child calls `ptrace(PTRACE_TRACEME)`, raises/stops, parent observes the Linux wait status, then continues/reaps it. |
 | `ptracesigdeath` | A traced child receiving `SIGKILL` dies with a signaled wait status, while ordinary delivered signals report the Linux ptrace stop expected by `ptrace05`. |
 | `traceexecstop` | A traced child that execs reports the expected stop/exec wait status rather than disappearing or running through silently. |
+| `ptraceinvaliderrno` | Invalid PEEK/POKE TEXT/DATA/USER ptrace requests against a stopped tracee return Linux-compatible `EIO`/`EFAULT` rather than `ENOSYS`. |
 | `stoppedwaitstatus` | Parent observes stopped, continued, signaled, and exited states with Linux-compatible `waitpid`/`waitid` status encoding. |
 | `setpgidrules` | `setpgid` validates session/process-group constraints, races, and self/child cases like Linux. |
 | `pauseinterrupt2` | A sleeping child interrupted by the relevant signal returns `EINTR` or restarts exactly when Linux does. |
@@ -192,6 +193,15 @@ Exit criteria:
 - `ltp-ptrace06` now produces a parseable summary and improves from none to
   0/48 vs oracle 48/48 in `conf-31128-c01`; the remaining blocker is invalid
   PEEK/POKE request errno.
+- `ptraceinvaliderrno` exists and fails on the current carrick before the
+  runtime change for invalid TEXT/DATA/USER PEEK/POKE request errno.
+- Runtime maps only the invalid PEEK/POKE address cases that Linux definitively
+  answers with `EIO`, leaving non-invalid debugger memory/register access
+  unsupported.
+- Probe matches Docker Linux. Landed 2026-06-05: `ptraceinvaliderrno` owns the
+  ptrace06 invalid request errno matrix.
+- `ltp-ptrace06` matches the cached Docker oracle: 48/48 vs 48/48 in
+  `conf-51453-c01`.
 
 ### Milestone 3: Stabilize exec/wait/subprocess semantics
 
@@ -252,7 +262,7 @@ Keep this section current as classifications and fixes land.
 | Row | Classification | Owner/probe | Status |
 | --- | --- | --- | --- |
 | `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. After `ptracetraceme`, targeted rerun `conf-24123-c00` improves to 82/103 vs oracle 63/63. After `ptracesigdeath`, targeted rerun `conf-27543-c00` improves to 806/1184; `SIGKILL` now reports "Killed with SIGKILL, as expected". After `ptracesignalstop`, targeted rerun `conf-7738-c00` matches 63/63 vs oracle 63/63. | `ptracetraceme`, `ptracesigdeath`, and `ptracesignalstop` | MATCH; ptrace05 signal-death and signal-delivery stop matrix owned |
-| `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. After `ptracetraceme`, targeted rerun `conf-24123-c01` still emits no parseable stdout summary, only the root-user warning on stderr. After `ptracesigdeath` and `ptracesignalstop`, targeted rerun `conf-7738-c01` still emits no parseable stdout summary. After `traceexecstop`, targeted rerun `conf-31128-c01` emits 48 TFAIL lines, all `ENOSYS` where Linux expects `EIO` or `EFAULT` for invalid PEEK/POKE requests. | `traceexecstop` landed; next `ptraceinvaliderrno` reducer | exec-stop setup owned; invalid ptrace request errno remains |
+| `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. After `ptracetraceme`, targeted rerun `conf-24123-c01` still emits no parseable stdout summary, only the root-user warning on stderr. After `ptracesigdeath` and `ptracesignalstop`, targeted rerun `conf-7738-c01` still emits no parseable stdout summary. After `traceexecstop`, targeted rerun `conf-31128-c01` emits 48 TFAIL lines, all `ENOSYS` where Linux expects `EIO` or `EFAULT` for invalid PEEK/POKE requests. After `ptraceinvaliderrno`, targeted rerun `conf-51453-c01` matches 48/48 vs oracle 48/48. | `traceexecstop` and `ptraceinvaliderrno` | MATCH; exec-stop setup and invalid ptrace request errno owned |
 | `go-os_exec` | previously process/wait workload exited without a parseable suite summary in `conf-42088-c593`; targeted rerun `conf-93241-c156` now matches 86/86 vs oracle 86/86 with assertion ids aligned. | keep as process-control pressure coverage; no reducer needed unless it regresses | MATCH |
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
@@ -266,13 +276,13 @@ Keep this section current as classifications and fixes land.
 
 ## Next autonomous slice
 
-1. Add a `ptraceinvaliderrno` reducer for the `ptrace06` invalid PEEK/POKE
-   request matrix now visible in `conf-31128-c01`.
-2. Implement only the minimal ptrace request surface needed for invalid
-   PEEK/POKE requests to report Linux-compatible `EIO`/`EFAULT` instead of
-   `ENOSYS`, without claiming general debugger memory/register access.
-3. Validate with the new reducer, existing ptrace probes,
-   `just conformance-probes`, and targeted
-   `just conformance full --suite ltp-ptrace05 --suite ltp-ptrace06 --no-image-refresh`.
+1. Reduce `ltp-pause02` with `pauseinterrupt2`, using the raw
+   `conf-42088-c959` signature as the starting oracle.
+2. Fix only the proven signal interruption/restart rule; keep adjacent
+   `go-os_signal` and `ltp-sigaction01` as pressure coverage unless the
+   reducer proves the same root cause.
+3. Validate with the new reducer, adjacent signal/process probes, targeted
+   `just conformance full --suite ltp-pause02 --suite go-os_signal --suite ltp-sigaction01 --no-image-refresh`,
+   and the relevant owned-probe gate.
 4. Update this file and `docs/conformance-coverage.md`, then land a logical
    commit with the validation commands in the body.
