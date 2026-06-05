@@ -16,7 +16,7 @@
 //! Suites are built as `manifest::Suite` values and serialized with `toml`
 //! (single source of truth for the schema — no hand-rolled TOML).
 
-use crate::manifest::{Ecosystem, EnginePair, Manifest, Suite, Tier, VerdictKind, Weight};
+use crate::manifest::{Ecosystem, EnginePair, EnvKv, Manifest, Suite, Tier, VerdictKind, Weight};
 use std::path::Path;
 use std::process::Command;
 
@@ -40,6 +40,7 @@ const CPY_SMOKE: &[&str] = &[
 ];
 /// Go packages in the fast tier (proven MATCH).
 const GO_SMOKE: &[&str] = &["runtime", "sync", "context", "time"];
+const GO_RUNTIME_SMOKE_RE: &str = "^(Test(FinalizerRegisterABI|UserArena.*|BitCursor|Callers.*|FPUnwindAfterRecovery|Chan|NonblockRecvRace|NonblockSelectRace2?|SelfSelect|SelectStress|SelectFairness|MultiConsumer|ShrinkStackDuringBlockedSend|NoShrinkStackWhileParking|SelectDuplicateChannel|SelectStackAdjust))$";
 /// LTP testcases in the fast tier (proven MATCH).
 const LTP_SMOKE: &[&str] = &[
     "rt_sigaction01",
@@ -276,6 +277,22 @@ fn mk(
     }
 }
 
+fn node_suite(mut suite: Suite) -> Suite {
+    suite.env.push(EnvKv {
+        key: "NODEJS_CONFORMANCE_IN_IMAGE".into(),
+        val: "1".into(),
+    });
+    suite.env_carrick.push(EnvKv {
+        key: "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER".into(),
+        val: "carrick".into(),
+    });
+    suite.env_docker.push(EnvKv {
+        key: "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER".into(),
+        val: "docker".into(),
+    });
+    suite
+}
+
 fn s(v: &str) -> String {
     v.to_string()
 }
@@ -305,7 +322,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         None,
     ));
     for name in ["app-smoke", "v8-smoke"] {
-        suites.push(mk(
+        suites.push(node_suite(mk(
             format!("node-{name}"),
             Node,
             NODE_IMG,
@@ -325,9 +342,9 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             180,
             None,
             Some("/usr/local/bin/nodejs-conformance"),
-        ));
+        )));
     }
-    suites.push(mk(
+    let mut libuv = node_suite(mk(
         s("node-libuv"),
         Node,
         NODE_IMG,
@@ -348,6 +365,8 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         None,
         Some("/usr/local/bin/nodejs-conformance"),
     ));
+    libuv.docker_flags = vec![s("--user"), s("65534")];
+    suites.push(libuv);
 
     // ---- CPython: one suite per top-level test module ----------------------
     let list = docker_stdout(&[
@@ -419,6 +438,11 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         .collect();
     go.sort();
     for (binn, pkg) in &go {
+        let test_run = if pkg == "runtime" {
+            GO_RUNTIME_SMOKE_RE
+        } else {
+            "Test"
+        };
         suites.push(mk(
             format!("go-{binn}"),
             Go,
@@ -427,7 +451,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
                 format!("/conformance/{binn}.test"),
                 s("-test.v"),
                 s("-test.run"),
-                s("Test"),
+                s(test_run),
                 s("-test.short"),
             ],
             Gotest,

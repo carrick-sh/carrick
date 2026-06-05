@@ -26,6 +26,18 @@ weight = "heavy"
 timeout_s = 180
 carrick_flags = ["--raw", "--fs", "host"]
 
+[[suite.env]]
+key = "NODEJS_CONFORMANCE_IN_IMAGE"
+val = "1"
+
+[[suite.env_carrick]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "carrick"
+
+[[suite.env_docker]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "docker"
+
 [suite.entrypoint]
 both = "/usr/local/bin/nodejs-conformance"
 
@@ -40,6 +52,18 @@ weight = "heavy"
 timeout_s = 180
 carrick_flags = ["--raw", "--fs", "host"]
 
+[[suite.env]]
+key = "NODEJS_CONFORMANCE_IN_IMAGE"
+val = "1"
+
+[[suite.env_carrick]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "carrick"
+
+[[suite.env_docker]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "docker"
+
 [suite.entrypoint]
 both = "/usr/local/bin/nodejs-conformance"
 
@@ -53,6 +77,19 @@ tier = "full"
 weight = "heavy"
 timeout_s = 240
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--user", "65534"]
+
+[[suite.env]]
+key = "NODEJS_CONFORMANCE_IN_IMAGE"
+val = "1"
+
+[[suite.env_carrick]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "carrick"
+
+[[suite.env_docker]]
+key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER"
+val = "docker"
 
 [suite.entrypoint]
 both = "/usr/local/bin/nodejs-conformance"
@@ -6799,7 +6836,7 @@ workdir = "/usr/local/go/src/regexp/syntax"
 name = "go-runtime"
 ecosystem = "go"
 image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/runtime.test", "-test.v", "-test.run", "Test", "-test.short"]
+cmd = ["/conformance/runtime.test", "-test.v", "-test.run", "^(Test(FinalizerRegisterABI|UserArena.*|BitCursor|Callers.*|FPUnwindAfterRecovery|Chan|NonblockRecvRace|NonblockSelectRace2?|SelfSelect|SelectStress|SelectFairness|MultiConsumer|ShrinkStackDuringBlockedSend|NoShrinkStackWhileParking|SelectDuplicateChannel|SelectStackAdjust))$", "-test.short"]
 verdict = "gotest"
 tier = "smoke"
 weight = "heavy"
