@@ -11,6 +11,18 @@ parent/child cleanup under fork-heavy workloads. LTP remains the discovery
 oracle, but every runtime fix must land with a carrick-owned deterministic
 probe or focused unit test before we claim the behavior is done.
 
+## Ambitious autonomous target
+
+Drive the current process-control cluster from classified NEW rows to owned,
+boring behavior without weakening the gate. The near-term push is to finish the
+remaining ptrace signal/death semantics, then use that sharper process-state
+model to make the Go `os/exec` and CPython process-pool rows produce comparable
+summaries instead of disappearing mid-workload.
+
+This is autonomous because every step has a current raw row, a Linux oracle, and
+a reducer path. We do not need to bless, quarantine, or invent broad ptrace
+debugger support to make measurable progress.
+
 ## Current baseline
 
 Baseline date: 2026-06-05.
@@ -40,6 +52,13 @@ This goal starts from a green regression gate. The target is to reduce NEW rows
 by fixing verified process-control gaps, not by blessing, quarantining, or
 weakening the gate.
 
+Current targeted ptrace rerun after the first reducer:
+
+```text
+ltp-ptrace05  carrick 82/103, oracle 63/63, run conf-24123-c00
+ltp-ptrace06  carrick no parseable summary, oracle 48/48, run conf-24123-c01
+```
+
 ## Primary target rows
 
 These are the first rows to investigate because they share process-control,
@@ -47,8 +66,8 @@ wait-status, stop-state, or signal-interruption behavior:
 
 | Row | Ecosystem | Current carrick | Oracle | Why it belongs here |
 | --- | --- | --- | --- | --- |
-| `ltp-ptrace05` | LTP | 39/1143 | 63/63 | `ptrace(PTRACE_TRACEME)` returns `ENOSYS`; traced-child stop semantics are absent. |
-| `ltp-ptrace06` | LTP | 0/3 | 48/48 | Same missing ptrace/tracee stop surface, with broader assertion loss. |
+| `ltp-ptrace05` | LTP | 82/103 after `ptracetraceme` | 63/63 | `PTRACE_TRACEME` is no longer `ENOSYS`; remaining failures are tracee signal-delivery/death semantics. |
+| `ltp-ptrace06` | LTP | no parseable summary after `ptracetraceme` | 48/48 | Same tracee-state surface, likely exec-stop or ptrace signal delivery hiding the LTP summary. |
 | `go-os_exec` | Go | 0/0 | 86/86 | Process execution test suite stalls or exits before classified Go assertions. |
 | `go-syscall` | Go | 0/0 | 34/34 | Broad syscall package fallout; inspect for process/wait/signal cases first. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
@@ -86,6 +105,7 @@ points to a sharper invariant.
 | Probe | Invariant |
 | --- | --- |
 | `ptracetraceme` | Child calls `ptrace(PTRACE_TRACEME)`, raises/stops, parent observes the Linux wait status, then continues/reaps it. |
+| `ptracesigdeath` | A traced child receiving `SIGKILL` dies with a signaled wait status, while ordinary delivered signals report the Linux ptrace stop expected by `ptrace05`. |
 | `traceexecstop` | A traced child that execs reports the expected stop/exec wait status rather than disappearing or running through silently. |
 | `stoppedwaitstatus` | Parent observes stopped, continued, signaled, and exited states with Linux-compatible `waitpid`/`waitid` status encoding. |
 | `setpgidrules` | `setpgid` validates session/process-group constraints, races, and self/child cases like Linux. |
@@ -123,14 +143,20 @@ For each primary target row:
 Exit criteria: every primary row has a one-line classification and a chosen
 first reducer/probe.
 
-### Milestone 2: Own ptrace stop semantics
+### Milestone 2: Own ptrace stop and signal-death semantics
 
 Start with `ltp-ptrace05` and `ltp-ptrace06`.
 
-Known current fact: syscall 117 is wired in `dispatch/proc.rs` but returns
-`ENOSYS`. The first useful behavior is not full debugger support; it is enough
-tracee state for the canonical `PTRACE_TRACEME` child-stop path to behave like
-Linux.
+Initial fact: syscall 117 was wired in `dispatch/proc.rs` but returned
+`ENOSYS`. Current fact: the canonical `PTRACE_TRACEME` child-stop path is owned
+by `ptracetraceme`, and the next gap is tracee signal delivery. `ltp-ptrace05`
+now reports `SIGKILL` stopping instead of killing the tracee and several signal
+cases that do not stop when Linux expects a ptrace stop. `ltp-ptrace06` still
+produces no parseable stdout summary.
+
+The next useful behavior is not full debugger support; it is enough tracee
+signal/death and exec-stop state for the canonical LTP rows to reach assertion
+parity or expose a separate, named blocker.
 
 Exit criteria:
 
@@ -141,8 +167,13 @@ Exit criteria:
   are probe-owned, positive ptrace pids are translated through the pid
   namespace, and self-target `SIGSTOP` stops directly instead of being
   delivered twice through the pending-signal path.
-- `ltp-ptrace05` and `ltp-ptrace06` improve or are reclassified with exact
-  remaining blockers.
+- `ptracesigdeath` exists and fails on the current carrick before the runtime
+  change.
+- `ltp-ptrace05` improves beyond 82/103 and no longer reports the
+  `ptrace05.c:139` / `ptrace05.c:149` failure signatures, or each remaining
+  assertion is split into its own reducer.
+- `ltp-ptrace06` produces a parseable summary, improves, or is reclassified with
+  an exact exec-stop blocker.
 
 ### Milestone 3: Stabilize exec/wait/subprocess semantics
 
@@ -178,7 +209,8 @@ This goal is complete when all of the following are true:
 - The total NEW count drops from 67 to 45 or lower, or every remaining
   process-control NEW row is proven to be a distinct non-process-control gap.
 - `ltp-ptrace05` and `ltp-ptrace06` no longer fail because `ptrace` returns
-  `ENOSYS`.
+  `ENOSYS`, because `SIGKILL` is reported as a stop, or because tracee exec-stop
+  state is absent.
 - `go-os_exec` no longer reports `0/0` against an 86/86 oracle.
 - `cpython-concurrent_futures` no longer reports `0/0` against a 20/20 oracle,
   unless the exact remaining assertion is documented and owned by a follow-up.
@@ -213,3 +245,15 @@ Keep this section current as classifications and fixes land.
 | `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
 | `go-os_signal` | signal delivery/status mismatch: raw `conf-42088-c595` shows `TestAtomicStop` failing because one iteration exits status 2 where Docker expects `SIGINT`; `TestTerminalSignal` is an existing oracle-matching fail. | `pauseinterrupt2` or new `atomicstop` reducer | classified; adjacent signal runtime path |
 | `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`. | focused signal-action unit/probe | classified; adjacent, lower priority than pause/ptrace |
+
+## Next autonomous slice
+
+1. Read the upstream LTP `ptrace05.c` and `ptrace06.c` assertions for the exact
+   `ptrace05.c:139` and `ptrace05.c:149` expectations.
+2. Add `ptracesigdeath` as a RED reducer for the current carrick behavior.
+3. Fix the narrow signal/death translation path without broad debugger support.
+4. Validate with `scripts/run-probe.sh ptracesigdeath`,
+   `just conformance-probes`, and targeted
+   `just conformance full --suite ltp-ptrace05 --suite ltp-ptrace06 --no-image-refresh`.
+5. Update this file and `docs/conformance-coverage.md`, then land a logical
+   commit with the validation commands in the body.
