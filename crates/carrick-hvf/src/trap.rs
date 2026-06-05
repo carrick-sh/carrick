@@ -718,6 +718,15 @@ mod vcpu_gate {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn virtual_machine_with_private_signals_blocked(
+    config: applevisor::vm::VirtualMachineConfig,
+) -> applevisor::error::Result<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>
+{
+    let _guard = crate::host_signal::block_hvf_private_thread_signals();
+    applevisor::vm::VirtualMachine::with_config(config)
+}
+
 /// Enable EL0 direct reads of `CNTVCT_EL0`/`CNTFRQ_EL0` (`CNTKCTL_EL1.EL0VCTEN |
 /// EL0PCTEN`) on a freshly-created vCPU. Must run on EVERY vCPU — initial,
 /// per-thread, fork/execve rebuild. If only some vCPUs have it, the others trap
@@ -1528,7 +1537,7 @@ impl HvfTrapEngine {
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
+        let vm = virtual_machine_with_private_signals_blocked(config).map_err(hvf_error)?;
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(vcpu.id());
@@ -3982,7 +3991,7 @@ impl HvfInner {
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
+        let new_vm = virtual_machine_with_private_signals_blocked(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(new_vcpu.id());
@@ -4280,7 +4289,7 @@ impl HvfInner {
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
-        let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
+        let new_vm = virtual_machine_with_private_signals_blocked(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(new_vcpu.id());

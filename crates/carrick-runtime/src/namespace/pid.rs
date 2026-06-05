@@ -39,6 +39,11 @@ pub const MEMBER_SLOTS: usize = 1024;
 /// ns-pid 1 — the namespace init (`pid_namespaces(7)`).
 pub const NS_INIT_PID: u32 = 1;
 
+/// Sentinel used while a process is filling a slot. Readers must treat it as
+/// unpublished; the real host pid is release-stored only after the rest of the
+/// slot is initialized.
+pub const HOST_PID_REGISTERING: u32 = u32::MAX;
+
 /// One member of a PID namespace. All fields are atomic so they can be read and
 /// written cross-process through the shared mapping. `host_pid == 0` marks a
 /// free slot.
@@ -618,16 +623,18 @@ impl NsSharedRegion {
         for (i, slot) in self.members.iter().enumerate() {
             if slot
                 .host_pid
-                .compare_exchange(0, host_pid, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(0, HOST_PID_REGISTERING, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 slot.ns_pid.store(ns_pid, Ordering::Relaxed);
                 slot.parent_host_pid
                     .store(parent_host_pid, Ordering::Relaxed);
                 slot.exit_status.store(0, Ordering::Relaxed);
-                // flags Release-published so a reader that sees host_pid also
-                // sees ALIVE (it was set when the slot was last freed/zeroed).
-                slot.flags.store(MEMBER_ALIVE, Ordering::Release);
+                slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
+                // Publish host_pid last so a concurrent reader never sees a
+                // half-filled slot. The Release pairs with host_to_ns/ns_to_host
+                // Acquire loads before they read ns_pid/parent/flags.
+                slot.host_pid.store(host_pid, Ordering::Release);
                 return Some(i);
             }
         }
@@ -638,6 +645,9 @@ impl NsSharedRegion {
     /// host pid is not a member (caller decides the fallback — e.g. 0 for a
     /// parent outside the ns).
     pub fn host_to_ns(&self, host_pid: u32) -> Option<u32> {
+        if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
+            return None;
+        }
         for slot in &self.members {
             if slot.host_pid.load(Ordering::Acquire) == host_pid {
                 return Some(slot.ns_pid.load(Ordering::Acquire));
@@ -650,10 +660,12 @@ impl NsSharedRegion {
     /// member (caller maps to `ESRCH`).
     pub fn ns_to_host(&self, ns_pid: u32) -> Option<u32> {
         for slot in &self.members {
-            if slot.host_pid.load(Ordering::Acquire) != 0
-                && slot.ns_pid.load(Ordering::Acquire) == ns_pid
-            {
-                return Some(slot.host_pid.load(Ordering::Acquire));
+            let host_pid = slot.host_pid.load(Ordering::Acquire);
+            if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
+                continue;
+            }
+            if slot.ns_pid.load(Ordering::Acquire) == ns_pid {
+                return Some(host_pid);
             }
         }
         None
@@ -667,6 +679,9 @@ impl NsSharedRegion {
 
     /// Find the slot index for a host pid, if registered.
     pub fn slot_of(&self, host_pid: u32) -> Option<usize> {
+        if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
+            return None;
+        }
         self.members
             .iter()
             .position(|s| s.host_pid.load(Ordering::Acquire) == host_pid)
@@ -682,7 +697,9 @@ impl NsSharedRegion {
     /// (design §3.6 step 3). Called by the NsSupervisor on a parent's death.
     pub fn mark_children_orphaned(&self, dead_host_pid: u32) {
         for slot in &self.members {
-            if slot.host_pid.load(Ordering::Acquire) != 0
+            let host_pid = slot.host_pid.load(Ordering::Acquire);
+            if host_pid != 0
+                && host_pid != HOST_PID_REGISTERING
                 && slot.parent_host_pid.load(Ordering::Acquire) == dead_host_pid
                 && slot.flags.load(Ordering::Acquire) == MEMBER_ALIVE
             {
@@ -822,6 +839,45 @@ mod tests {
         // mark the child dead
         region.mark_dead(200, 0);
         assert_eq!(region.flags_of(200), Some(MEMBER_DEAD));
+
+        unsafe {
+            libc::munmap(ptr, size);
+        }
+    }
+
+    #[test]
+    fn in_progress_registration_slot_is_not_visible() {
+        let size = std::mem::size_of::<NsSharedRegion>();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let region: &NsSharedRegion = unsafe { &*ptr.cast::<NsSharedRegion>() };
+
+        let slot = &region.members[0];
+        assert!(
+            slot.host_pid
+                .compare_exchange(0, HOST_PID_REGISTERING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        );
+        slot.ns_pid.store(2, Ordering::Relaxed);
+        slot.parent_host_pid.store(100, Ordering::Relaxed);
+        slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
+
+        assert_eq!(region.host_to_ns(200), None);
+        assert_eq!(region.ns_to_host(2), None);
+        assert_eq!(region.slot_of(HOST_PID_REGISTERING), None);
+
+        slot.host_pid.store(200, Ordering::Release);
+        assert_eq!(region.host_to_ns(200), Some(2));
+        assert_eq!(region.ns_to_host(2), Some(200));
 
         unsafe {
             libc::munmap(ptr, size);

@@ -198,6 +198,23 @@ fn cross_process_needs_xsig(signum: i32) -> bool {
         || is_rt_signal(signum)
 }
 
+fn namespace_member_standard_kill_needs_xsig(signum: i32) -> bool {
+    (1..32).contains(&signum) && !matches!(signum, LINUX_SIGKILL | LINUX_SIGSTOP)
+}
+
+fn should_route_specific_xsig(target_host_pid: i32, signum: i32) -> bool {
+    if target_host_pid <= 0 {
+        return false;
+    }
+    if cross_process_needs_xsig(signum) {
+        return true;
+    }
+    if !namespace_member_standard_kill_needs_xsig(signum) || !crate::namespace::pid::enabled() {
+        return false;
+    }
+    crate::namespace::pid::host_to_ns_or_self(target_host_pid as u32) != 0
+}
+
 fn sanitize_signal_mask(mut mask: u64) -> u64 {
     #[allow(clippy::unwrap_used)]
     let unmaskable = sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
@@ -1398,12 +1415,10 @@ impl SyscallDispatcher {
         let is_self = ns_target == host_pid || ns_target == LINUX_BOOTSTRAP_PID as i64;
         if !is_self {
             // Cross-process signal that a plain host kill can't carry faithfully
-            // (RT 32..=64, SIGCHLD, or a guest-disposition-honouring fault sig):
-            // route it through the shared explicit-signal ring carrying the
-            // sender's si_value (sigval), and nudge the target — its SA_SIGINFO
-            // handler then observes SI_QUEUE + the payload. `ns_target` is
-            // already the target's HOST pid here.
-            if cross_process_needs_xsig(s) {
+            // for this target: route it through the shared explicit-signal ring
+            // carrying sender identity and optional si_value, then nudge the
+            // target. `ns_target` is already the target's HOST pid here.
+            if should_route_specific_xsig(ns_target as i32, s) {
                 let target_host = ns_target as i32;
                 let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
                 let sender_uid = self.cred_snapshot().euid;
@@ -1417,8 +1432,8 @@ impl SyscallDispatcher {
                     return DispatchOutcome::Returned { value: 0 };
                 }
             }
-            // Non-RT (or ring full): kill(2)-style host route (SIGCHLD itself is
-            // routed via the ring inside bootstrap_signal_send_as).
+            // Non-ring route (or ring full outside a private pid namespace):
+            // kill(2)-style host route.
             return bootstrap_signal_send(ns_target, /*tid_required=*/ false, signum);
         }
 
@@ -1625,15 +1640,22 @@ pub(crate) fn bootstrap_signal_send_as(
         return DispatchOutcome::errno(LINUX_ESRCH);
     }
     // A plain host kill can't faithfully carry some cross-process signals to
-    // another carrick process, so route them through the shared explicit-signal
-    // ring + a SIGINFO nudge (see host_signal xsignal + cross_process_needs_xsig)
-    // when the target is a specific process.
-    if target > 0 && cross_process_needs_xsig(signum as i32) {
+    // another carrick process. For private-pid-namespace members, route every
+    // catchable specific-target signal through the shared explicit-signal ring
+    // too: the ring carries sender ns-pid directly, instead of relying on a
+    // process-global host siginfo side channel that races under signal floods.
+    let route_xsig = target > 0 && should_route_specific_xsig(target as i32, signum as i32);
+    if route_xsig {
         let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
         let sender_uid = caller_euid.unwrap_or_else(|| unsafe { libc::getuid() });
         if crate::host_signal::xsig_enqueue(target as i32, signum as i32, sender_ns, sender_uid, 0)
         {
             crate::host_signal::xsig_nudge(target as i32);
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if crate::namespace::pid::enabled()
+            && namespace_member_standard_kill_needs_xsig(signum as i32)
+        {
             return DispatchOutcome::Returned { value: 0 };
         }
         // Ring full / unavailable: fall through to the host kill below.
@@ -1652,6 +1674,22 @@ pub(crate) fn bootstrap_signal_send_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_member_xsig_policy_routes_catchable_standard_signals() {
+        assert!(namespace_member_standard_kill_needs_xsig(
+            crate::linux_abi::LINUX_SIGUSR1
+        ));
+        assert!(namespace_member_standard_kill_needs_xsig(
+            crate::linux_abi::LINUX_SIGUSR2
+        ));
+        assert!(namespace_member_standard_kill_needs_xsig(15));
+        assert!(!namespace_member_standard_kill_needs_xsig(0));
+        assert!(!namespace_member_standard_kill_needs_xsig(LINUX_SIGKILL));
+        assert!(!namespace_member_standard_kill_needs_xsig(LINUX_SIGSTOP));
+        assert!(!namespace_member_standard_kill_needs_xsig(34));
+        assert!(!namespace_member_standard_kill_needs_xsig(65));
+    }
 
     #[test]
     fn rt_signals_queue_while_standard_signals_coalesce() {
