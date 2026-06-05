@@ -107,6 +107,28 @@ enum ProcExitWait {
     KqueueDead,
 }
 
+#[cfg(target_os = "macos")]
+fn child_status_ready(pid: i32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc == 0 {
+        // si_pid != 0 means the child has exited. WNOWAIT leaves it reapable
+        // for the caller's re-dispatched wait4/waitid.
+        info.si_pid != 0
+    } else {
+        // Already reaped (or never ours). Report ready so the caller surfaces
+        // the real status/ECHILD exactly as it would without this backstop.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+}
+
 /// A per-thread kqueue + its registration of the self-pipe wake channel.
 pub struct ThreadWaiter {
     #[cfg(target_os = "macos")]
@@ -433,6 +455,17 @@ impl ThreadWaiter {
             if thread_pipe_woke && let Some(thread_wake) = self.thread_wake.as_ref() {
                 thread_wake.drain();
             }
+            // Backstop poll (mirrors `wait_proc_exit_fallback`). `EVFILT_PROC`/
+            // `NOTE_EXIT` is the fast wake, but it is lost if the child exits in
+            // the window between the guest's `wait4` WNOHANG pre-check (child
+            // still alive) and our registration of the proc watch: the child is
+            // already a zombie when the knote arms, so its exit edge is in the
+            // past and may not fire. Re-poll the child directly so a missed edge
+            // can never strand the parent. `WNOWAIT` peeks and leaves the zombie
+            // for the caller's re-dispatched `wait4` to reap.
+            if child_status_ready(pid) {
+                break WaitResult::Ready;
+            }
             if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
                 || crate::fork_quiesce::is_quiescing()
             {
@@ -464,25 +497,7 @@ impl ThreadWaiter {
             {
                 return WaitResult::Interrupted;
             }
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-                )
-            };
-            if rc == 0 {
-                // si_pid != 0 ⇒ the child has exited (left reapable by WNOWAIT).
-                // si_pid == 0 ⇒ still running (WNOHANG found nothing yet).
-                if info.si_pid != 0 {
-                    return WaitResult::Ready;
-                }
-            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
-                // Not (or no longer) our child: already reaped, or never ours.
-                // Report Ready so the caller's waitid surfaces the real status
-                // (or ECHILD) exactly as it would have without this fallback.
+            if child_status_ready(pid) {
                 return WaitResult::Ready;
             }
             // Still running: park briefly on the signal pipes (interruptible),
