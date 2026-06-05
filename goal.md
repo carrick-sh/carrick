@@ -198,15 +198,15 @@ Keep this section current as classifications and fixes land.
 
 | Row | Classification | Owner/probe | Status |
 | --- | --- | --- | --- |
-| `ltp-ptrace05` | unclassified | `ptracetraceme` candidate | open |
-| `ltp-ptrace06` | unclassified | `ptracetraceme` / `traceexecstop` candidate | open |
-| `go-os_exec` | unclassified | `subprocesspipes` candidate | open |
-| `go-syscall` | unclassified | pending assertion diff | open |
-| `cpython-subprocess` | unclassified | pending assertion diff | open |
-| `cpython-concurrent_futures` | unclassified | pending raw-output reducer | open |
-| `ltp-setpgid01` | unclassified | `setpgidrules` candidate | open |
-| `ltp-pause02` | unclassified | `pauseinterrupt2` candidate | open |
-| `ltp-kill10` | unclassified count match | assertion diff required | open |
-| `ltp-kill12` | unclassified count match | assertion diff required | open |
-| `go-os_signal` | unclassified | pending assertion diff | open |
-| `ltp-sigaction01` | unclassified | pending assertion diff | open |
+| `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. | `ptracetraceme` first, then `traceexecstop` if exec-stop remains. | classified; first runtime milestone |
+| `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. | `ptracetraceme` / `traceexecstop` | classified; blocked behind minimal `PTRACE_TRACEME` ownership |
+| `go-os_exec` | process/wait workload does useful work but exits without a parseable suite summary in `conf-42088-c593`; tail ends after `TestIgnorePipeErrorOnSuccess`, and live observation saw an `os_exec.test` child stopped. | `stoppedwaitstatus` before broader `subprocesspipes` | classified; reduce the stopped/waited child path |
+| `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
+| `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
+| `cpython-concurrent_futures` | process-pool/forkserver run starts and passes fork/forkserver cases, then stops mid-`ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_early_shutdown` without a regrtest summary. | `subprocesspipes` / process-pool reducer | classified; reduce forkserver shutdown/harness exit |
+| `ltp-setpgid01` | inversion risk: carrick reports both `setpgid(1, 1)` and `setpgid(0, 0)` pass, while cached oracle has one failure. This needs the Docker assertion refreshed before treating carrick as better or worse. | `setpgidrules` plus `--refresh-oracle --suite ltp-setpgid01` | classified; oracle assertion required before fix |
+| `ltp-pause02` | signal interruption/restart bug: raw `conf-42088-c959` reports unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`. | `pauseinterrupt2` | classified; runtime signal interruption path |
+| `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
+| `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
+| `go-os_signal` | signal delivery/status mismatch: raw `conf-42088-c595` shows `TestAtomicStop` failing because one iteration exits status 2 where Docker expects `SIGINT`; `TestTerminalSignal` is an existing oracle-matching fail. | `pauseinterrupt2` or new `atomicstop` reducer | classified; adjacent signal runtime path |
+| `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`. | focused signal-action unit/probe | classified; adjacent, lower priority than pause/ptrace |
