@@ -282,13 +282,19 @@ pub struct ThreadWakePipe {
     fds: Arc<ThreadWakeFds>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainResult {
+    Drained,
+    Dead,
+}
+
 impl ThreadWakePipe {
     pub fn read_fd(&self) -> RawFd {
         self.fds.read_fd
     }
 
-    pub fn drain(&self) {
-        drain_fd(self.fds.read_fd);
+    pub fn drain(&self) -> DrainResult {
+        drain_fd(self.fds.read_fd)
     }
 }
 
@@ -908,36 +914,36 @@ fn wake_thread_waiter(tid: i32) -> bool {
 }
 
 /// Drain the self-pipe (non-blocking). Called by a waiter after it observes the
-/// pipe readable so the level-triggered `EVFILT_READ` doesn't spin. Racing
+/// pipe readable so queued wake bytes do not keep the source readable. Racing
 /// drains across threads are harmless — `has_pending` is the source of truth.
-pub fn drain_pending_pipe() {
+pub fn drain_pending_pipe() -> DrainResult {
     let r = PENDING_PIPE_READ.load(Ordering::SeqCst);
     if r < 0 {
-        return;
+        return DrainResult::Dead;
     }
-    drain_fd(r);
+    drain_fd(r)
 }
 
 /// Drain the signal pump's dedicated wake pipe.
-pub fn drain_pump_pipe() {
+pub fn drain_pump_pipe() -> DrainResult {
     let r = PUMP_PIPE_READ.load(Ordering::SeqCst);
     if r < 0 {
-        return;
+        return DrainResult::Dead;
     }
-    drain_fd(r);
+    drain_fd(r)
 }
 
-fn drain_fd(fd: RawFd) {
+pub(crate) fn drain_fd(fd: RawFd) -> DrainResult {
     // Wake pipes are created non-blocking, but fork/fd churn must not turn a
     // drain into an unbounded host read if that invariant is violated.
     let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if fl < 0 {
-        return;
+        return DrainResult::Dead;
     }
     if fl & libc::O_NONBLOCK == 0
         && unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) } != 0
     {
-        return;
+        return DrainResult::Dead;
     }
     let mut buf = [0u8; 64];
     loop {
@@ -946,14 +952,18 @@ fn drain_fd(fd: RawFd) {
             continue;
         }
         if n == 0 {
-            break;
+            return DrainResult::Dead;
         }
         let errno = std::io::Error::last_os_error().raw_os_error();
         if errno == Some(libc::EINTR) {
             continue;
         }
+        if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
+            return DrainResult::Drained;
+        }
         break;
     }
+    DrainResult::Dead
 }
 
 /// Sender's HOST pid for the most recent pending signal of each signum (index =
@@ -1573,6 +1583,15 @@ mod tests {
         unsafe { libc::close(write_fd) };
         handle.join().expect("drain thread exits");
         assert!(elapsed < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn drain_fd_reports_dead_on_eof() {
+        let _g = TEST_LOCK.lock();
+        let (read_fd, write_fd) = open_internal_pipe().expect("internal pipe");
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+        assert_eq!(drain_fd(read_fd), DrainResult::Dead);
+        assert_eq!(unsafe { libc::close(read_fd) }, 0);
     }
 
     #[test]

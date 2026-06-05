@@ -27,11 +27,10 @@
 //!
 //! INVARIANT — EDGE vs LEVEL is a correctness choice, not a tuning knob. Wake
 //! pipes and vnode/user watches are registered `EV_CLEAR` (edge-triggered) on
-//! purpose: a wake pipe whose write end closed sits at permanent EOF, and a
-//! level-triggered read filter would report it readable on EVERY `kevent` — a
-//! drain cannot clear an EOF — busy-spinning a vCPU at 100% (the CPython
-//! forkserver hang; see [`crate::io_wait`]). `EV_CLEAR` delivers the EOF edge
-//! once, then is quiet.
+//! purpose to avoid duplicate wake-byte delivery before userspace drains them.
+//! EOF is still special: after userspace reads `0`, Darwin can deliver the EOF
+//! edge again, so [`crate::io_wait`] deletes dead wake-pipe filters and falls
+//! back to bounded polling instead of busy-spinning a vCPU at 100%.
 //!
 //! The wrapper is deliberately thin: [`Kqueue`] is just an RAII fd owner, and
 //! [`Kevent`] is `#[repr(transparent)]` over `libc::kevent` so call sites never
