@@ -274,6 +274,35 @@ Keep this section current as classifications and fixes land.
 | `go-os_signal` | signal delivery/status mismatch: raw `conf-42088-c595` shows `TestAtomicStop` failing because one iteration exits status 2 where Docker expects `SIGINT`; `TestTerminalSignal` is an existing oracle-matching fail. | `pauseinterrupt2` or new `atomicstop` reducer | classified; adjacent signal runtime path |
 | `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`. | focused signal-action unit/probe | classified; adjacent, lower priority than pause/ptrace |
 
+### Probe-gate pressure
+
+2026-06-05: `just conformance-probes` had become the immediate blocker after
+the ptrace rows were fixed. `waitexitstorm` was correctness-MATCH only with a
+long timeout: a carrick-only long run completed in 69.06s real / 66.20s sys,
+and the default probe gate timed out. A focused `carrick trace` showed per-fork
+parent waiter churn (`kqueue`, wake pipes, fd close/fcntl traffic) dominating
+host kernel time.
+
+Runtime fix: keep the parent's existing `ThreadWaiter` across fork in both
+single-threaded and threaded paths. A single-thread fork child can start with a
+process-only waiter and upgrade before its first blocking syscall; the threaded
+fork child keeps a full waiter because the `itimer` fork-child busy-wait probe
+depends on immediate signal-pump wake registration.
+
+Validation after the fix:
+
+```text
+scripts/run-probe.sh itimer              MATCH
+scripts/run-probe.sh waitexitstorm       MATCH
+/usr/bin/time -lp scripts/run-probe.sh waitexitstorm
+  real 39.93
+  sys  37.30
+target/release/carrick run-elf .../itimer          exit 0
+target/release/carrick run-elf .../waitexitstorm   exit 0
+just conformance-probes
+  test result: ok. 4 passed; 0 failed; finished in 219.94s
+```
+
 ## Next autonomous slice
 
 1. Reduce `ltp-pause02` with `pauseinterrupt2`, using the raw

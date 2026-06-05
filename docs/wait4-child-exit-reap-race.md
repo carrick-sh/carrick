@@ -122,10 +122,26 @@ cluster, `fix(proc)` `7d6a778`). Keep these green:
   `wait_proc_exit_kqueue` waitid backstop. Build green 3/3.
 - Bug 2 (ECHILD storm): **FIXED** — namespace member slots are freed on terminal
   wait reaps; `waitexitstorm` is committed and MATCH.
+- Gate-performance follow-up: **FIXED** — `waitexitstorm` still matched with a
+  long timeout, but exceeded the conformance-probe gate after 60s. A focused
+  trace showed the fork storm spending host kernel time recreating parent-side
+  waiters (`kqueue`/wake pipes/fd churn) on every fork. Parent fork branches now
+  retain their existing `ThreadWaiter`; the threaded child keeps a full waiter
+  because `itimer` fork-child delivery depends on immediate signal-pump wake
+  registration, while the single-thread child can use a process-only waiter
+  until it blocks.
 - Current validation:
   - `scripts/run-probe.sh waitexitstorm` → MATCH (`all_reaped=true`)
+  - `/usr/bin/time -lp scripts/run-probe.sh waitexitstorm` → MATCH in 39.93s
+    real / 37.30s sys after the waiter-lifetime fix; before this slice,
+    carrick-only with a long timeout took 69.06s real / 66.20s sys.
+  - `scripts/run-probe.sh itimer` → MATCH, including
+    `itimer_fork_child_delivered=true`
   - `scripts/run-probe.sh waitidspec` / `waitrestart` / `waitsiblingsigchld` /
     `pidnswait` / `pidnsinitreap` / `cloneexitsig` → MATCH
+  - `target/release/carrick run-elf conformance-probes/target/aarch64-unknown-linux-musl/release/itimer`
+    and `.../waitexitstorm` → exit 0 on the single-thread path
+  - `just conformance-probes` → OK (`4 passed; 0 failed`, 219.94s)
   - `.agents/skills/ltp-conformance/scripts/ltp-check.sh kill02 kill10 kill12`
     → MATCH=3 DIFF=0
   - `GOMAXPROCS=1 go build -p=1` of `runtime/testdata/testprogcgo` → OK

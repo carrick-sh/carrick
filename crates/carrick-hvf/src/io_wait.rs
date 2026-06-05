@@ -142,6 +142,11 @@ pub struct ThreadWaiter {
     /// syscall (which would surface a wrong EINTR). Process-directed signals
     /// still interrupt any thread.
     tid: crate::thread::ThreadId,
+    /// Created by a freshly forked child before it has performed any blocking
+    /// syscall. It keeps process-directed signal wakeups via the process
+    /// self-pipe, but skips the per-thread kqueue/wake-pipe until the child
+    /// actually needs to park.
+    deferred_full_init: bool,
 }
 
 /// kqueue registration for a WAKE pipe (the process-directed self-pipe and the
@@ -193,6 +198,7 @@ impl ThreadWaiter {
             process_pipe_read,
             thread_wake,
             tid,
+            deferred_full_init: false,
         }
     }
 
@@ -202,6 +208,24 @@ impl ThreadWaiter {
             process_pipe_read: -1,
             thread_wake: None,
             tid,
+            deferred_full_init: false,
+        }
+    }
+
+    pub fn process_only(tid: crate::thread::ThreadId) -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            kq: None,
+            process_pipe_read: crate::host_signal::pending_pipe_read_fd(),
+            thread_wake: None,
+            tid,
+            deferred_full_init: true,
+        }
+    }
+
+    pub fn ensure_full(&mut self) {
+        if self.deferred_full_init {
+            *self = Self::new(self.tid);
         }
     }
 
