@@ -477,7 +477,7 @@ pub fn take_pending_in_for(tid: i32, wait_set: u64) -> i32 {
 /// `kevent`/`futex` to decide whether to break its wait so the trap loop can
 /// run delivery — without waking siblings for a signal that isn't theirs.
 pub fn has_pending_for(tid: i32) -> bool {
-    if PROC_PENDING.load(Ordering::SeqCst) != 0 || XSIG_DIRTY.load(Ordering::SeqCst) {
+    if PROC_PENDING.load(Ordering::SeqCst) != 0 || xsig_has_unblocked_for_self(0) {
         return true;
     }
     #[allow(clippy::expect_used)]
@@ -494,11 +494,10 @@ pub fn has_pending_for(tid: i32) -> bool {
 /// mask) but must not break the wait. `block_mask == 0` is identical to
 /// [`has_pending_for`]. SIGKILL/SIGSTOP can't be blocked, matching the kernel.
 pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
-    // A queued cross-process SIGCHLD/RT (xsignal) is always deliverable-for-
-    // waking: its signum isn't known until the dispatch-context drain, so it
-    // can't be pre-filtered by block_mask here (a genuinely-blocked one is then
-    // held pending by the normal post-drain delivery path).
-    if XSIG_DIRTY.load(Ordering::SeqCst) {
+    // A queued cross-process signal may be sitting in the xsignal ring. Peek at
+    // the ring without consuming it so a temporary ppoll/epoll_pwait mask can
+    // keep genuinely blocked signals pending until the syscall returns.
+    if xsig_has_unblocked_for_self(block_mask) {
         return true;
     }
     // Any pending bit that isn't blocked is deliverable. SIGKILL/SIGSTOP can
@@ -512,6 +511,16 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
     #[allow(clippy::expect_used)]
     let guard = THREAD_PENDING.lock();
     guard.get(&tid).is_some_and(|&mask| deliverable(mask))
+}
+
+fn signal_unblocked_by_mask(signum: i32, block_mask: u64) -> bool {
+    let bit = thread_pending_bit(signum);
+    if bit == 0 {
+        return false;
+    }
+    let always_deliverable = thread_pending_bit(crate::linux_abi::LINUX_SIGKILL)
+        | thread_pending_bit(crate::linux_abi::LINUX_SIGSTOP);
+    bit & (!block_mask | always_deliverable) != 0
 }
 
 pub fn has_process_pending() -> bool {
@@ -1094,6 +1103,25 @@ pub fn xsig_has_pending() -> bool {
     XSIG_DIRTY.load(Ordering::SeqCst)
 }
 
+fn xsig_has_unblocked_for_self(block_mask: u64) -> bool {
+    if !XSIG_DIRTY.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Some(ring) = xsig_ring() else {
+        return true;
+    };
+    let me = std::process::id() as i32;
+    for slot in ring.slots.iter() {
+        if slot.used.load(Ordering::Acquire) == 1
+            && slot.target_host_pid.load(Ordering::Acquire) == me
+            && signal_unblocked_by_mask(slot.signum.load(Ordering::Acquire), block_mask)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Drain every entry targeting THIS process, clearing the dirty flag. Called in
 /// DISPATCH context (may allocate / take locks). Returns
 /// `(signum, sender_ns_pid, sender_uid, value)` per entry.
@@ -1557,6 +1585,31 @@ mod tests {
         record_sender(12, 44_001);
         record_sender(12, 0);
         assert_eq!(last_sender_for(12), 44_001);
+    }
+
+    #[test]
+    fn xsignal_peek_honors_temporary_block_mask() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        PROC_PENDING.store(0, Ordering::SeqCst);
+        xsig_init();
+        let _ = xsig_drain_for_self();
+
+        let signum = crate::linux_abi::LINUX_SIGUSR1;
+        let blocked = thread_pending_bit(signum);
+        assert!(xsig_enqueue(std::process::id() as i32, signum, 42, 0, 0));
+        XSIG_DIRTY.store(true, Ordering::SeqCst);
+
+        assert!(has_pending_for(900_050));
+        assert!(has_unblocked_pending_for(900_050, 0));
+        assert!(!has_unblocked_pending_for(900_050, blocked));
+        assert!(has_unblocked_pending_for(
+            900_050,
+            thread_pending_bit(crate::linux_abi::LINUX_SIGUSR2)
+        ));
+
+        let _ = xsig_drain_for_self();
+        XSIG_DIRTY.store(false, Ordering::SeqCst);
     }
 
     fn pipe_is_readable(fd: i32) -> bool {
