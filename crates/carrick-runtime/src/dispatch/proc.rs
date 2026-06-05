@@ -1621,7 +1621,7 @@ impl SyscallDispatcher {
             // cutime). Only on a TERMINAL reap that consumed the zombie: si_pid
             // set, not WNOWAIT (peek leaves the zombie for the real reap), and an
             // exit/kill code (not stop/continue). (audit M4; probe waitidcputime)
-            {
+            let terminal_reap = {
                 const CLD_EXITED: i32 = 1;
                 const CLD_KILLED: i32 = 2;
                 const CLD_DUMPED: i32 = 3;
@@ -1630,8 +1630,11 @@ impl SyscallDispatcher {
                     let child_guest_us =
                         crate::guest_cpu::reap_child_guest_ns(info.si_pid as u32) / 1000;
                     crate::guest_cpu::add_reaped_child(child_guest_us, 0);
+                    true
+                } else {
+                    false
                 }
-            }
+            };
             if infop_addr.0 != 0 {
                 let bytes = if info.si_pid == 0 {
                     [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
@@ -1644,6 +1647,9 @@ impl SyscallDispatcher {
                 };
                 let memory = &mut *cx.memory;
                 memory.write_bytes(infop_addr.0, &bytes)?;
+            }
+            if terminal_reap {
+                crate::namespace::pid::unregister_reaped(info.si_pid as u32);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1760,7 +1766,8 @@ impl SyscallDispatcher {
             // kill10) neither needs nor should be flooded with an extra per-reap
             // SIGCHLD. The parked WaitOnProcExit path is woken+delivered by the
             // pump in lock-step and never lags, so it is unaffected.
-            if libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status) {
+            let terminal_reap = libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status);
+            if terminal_reap {
                 let _ = crate::host_signal::take_child_exit_parent(result);
             }
             let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
@@ -1786,6 +1793,9 @@ impl SyscallDispatcher {
             // ns-local pid, not its host pid — critical for `wait4(-1)` where
             // the arg was never translated. Identity when namespaces are off.
             let ns_result = crate::namespace::pid::host_to_ns_or_self(result as u32);
+            if terminal_reap {
+                crate::namespace::pid::unregister_reaped(result as u32);
+            }
             Ok(DispatchOutcome::Returned {
                 value: i64::from(ns_result),
             })

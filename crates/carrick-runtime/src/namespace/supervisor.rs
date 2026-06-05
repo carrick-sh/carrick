@@ -60,9 +60,10 @@ pub fn run(init_host_pid: i32, reg_pipe_read: i32) -> SupervisorExit {
         Kevent::proc_exit(init_host_pid),
     ]);
 
-    // Track which members we've already armed a watch for (by slot index), so a
-    // pipe wake / periodic rescan only arms new entries.
-    let mut watched = vec![false; pid::MEMBER_SLOTS];
+    // Track which host pid each slot is armed for. Slots are reused after a
+    // terminal wait reaps a child, so a plain per-slot boolean would skip the
+    // replacement member and miss its exit.
+    let mut watched = vec![0u32; pid::MEMBER_SLOTS];
     arm_member_watches(&kq, &mut watched);
 
     let mut events = [Kevent::empty(); 8];
@@ -128,20 +129,21 @@ pub fn run(init_host_pid: i32, reg_pipe_read: i32) -> SupervisorExit {
 /// yet. If a member already exited, `kevent` either fires immediately or errors
 /// with ESRCH — both are handled by the loop (the immediate event marks it
 /// dead; a missed one is caught by the periodic rescan).
-fn arm_member_watches(kq: &Kqueue, watched: &mut [bool]) {
+fn arm_member_watches(kq: &Kqueue, watched: &mut [u32]) {
     let Some(region) = pid::region() else { return };
     for (i, slot) in region.members().iter().enumerate() {
-        if watched[i] {
-            continue;
-        }
         let host = slot.host_pid.load(Ordering::Acquire);
         if host == 0 || host == HOST_PID_REGISTERING {
+            watched[i] = 0;
+            continue;
+        }
+        if watched[i] == host {
             continue;
         }
         // Arm the watch; ignore ESRCH (already gone — the rescan / immediate
         // fire covers it).
         let _ = kq.apply(&[Kevent::proc_exit(host as i32)]);
-        watched[i] = true;
+        watched[i] = host;
     }
 }
 
