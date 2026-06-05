@@ -207,3 +207,9 @@ pub(super) fn stop_by_signal(signum: i32) {
         libc::raise(host_signum);
     }
 }
+
+pub(super) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
+    if dispatcher.is_ptrace_traceme() {
+        stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);
+    }
+}
