@@ -1,3 +1,8 @@
+// Integration test: non-`#[test]` helpers (image builders / engine setup) aren't
+// covered by clippy's allow-unwrap-in-tests heuristic, so allow unwrap/expect
+// file-wide here, as the conformance integration test does.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use carrick_runtime::elf::SegmentPerms;
 use carrick_runtime::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE};
 use carrick_runtime::trap::{
@@ -326,5 +331,82 @@ fn el1_legacy_vectors_trap_getpid_to_the_host() {
     assert_eq!(
         frame.x8, 172,
         "without the shim, getpid must trap to the host"
+    );
+}
+
+// gettid (178) is per-thread: the EL1 handler reads TPIDR_EL1, which the runtime
+// stamps with the thread's guest-visible tid. movz x8,#178 ; svc ; movz x8,#94 ; svc
+const GETTID_PROBE_CODE: [u32; 4] = [0xD280_1648, 0xD400_0001, 0xD280_0BC8, 0xD400_0001];
+
+fn gettid_probe_image(shim: bool) -> AddressSpace {
+    let code: Vec<u8> = GETTID_PROBE_CODE
+        .iter()
+        .flat_map(|i| i.to_le_bytes())
+        .collect();
+    let base = AddressSpace::from_segments(
+        SHIM_PROBE_ENTRY,
+        [(
+            SHIM_PROBE_ENTRY,
+            SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            code,
+            16,
+        )],
+    )
+    .unwrap()
+    .with_el0_trampoline()
+    .unwrap();
+    let base = if shim {
+        base.with_el1_vectors_shim()
+            .and_then(|a| a.with_identity_page())
+            .unwrap()
+    } else {
+        base.with_el1_vectors().unwrap()
+    };
+    base.with_stage1_page_tables()
+        .and_then(|a| a.with_linux_initial_stack(vec!["t"], Vec::<&str>::new()))
+        .unwrap()
+}
+
+#[test]
+fn el1_shim_services_gettid_from_tpidr_el1() {
+    use carrick_runtime::trap::SyscallTrap;
+
+    let Some(mut engine) = shim_probe_engine_or_skip() else {
+        return;
+    };
+    engine.map_address_space(&gettid_probe_image(true)).unwrap();
+    // Stamp the per-vCPU tid exactly like the runtime does at thread setup.
+    const SENTINEL_TID: u64 = 0x4321;
+    engine.set_guest_thread_id(SENTINEL_TID).unwrap();
+
+    let frame = engine.next_syscall().unwrap().expect("guest must trap");
+    assert_eq!(
+        frame.x8, 94,
+        "gettid (178) must be serviced at EL1; first host trap is exit_group"
+    );
+    assert_eq!(
+        frame.x0, SENTINEL_TID,
+        "fast-path gettid must return the per-vCPU TPIDR_EL1 tid"
+    );
+}
+
+#[test]
+fn el1_shim_gettid_guard_traps_when_tpidr_el1_unstamped() {
+    use carrick_runtime::trap::SyscallTrap;
+
+    let Some(mut engine) = shim_probe_engine_or_skip() else {
+        return;
+    };
+    // Do NOT stamp TPIDR_EL1 (left 0). The cbz guard must fall through to the
+    // host trap rather than return a wrong gettid==0.
+    engine.map_address_space(&gettid_probe_image(true)).unwrap();
+    let frame = engine.next_syscall().unwrap().expect("guest must trap");
+    assert_eq!(
+        frame.x8, 178,
+        "unstamped TPIDR_EL1 must trap gettid to the host (cbz guard), not return 0"
     );
 }
