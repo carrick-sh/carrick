@@ -1325,7 +1325,8 @@ impl HostFsBackend {
         // Metadata via one flistxattr-gated fd pass (O_NOFOLLOW: confirmed
         // non-symlink; O_EVTONLY: no atime bump).
         let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-        let leaf_raw = unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
+        let leaf_raw =
+            unsafe { libc::openat(parent_fd.as_raw_fd(), name_c.as_ptr(), leaf_flags, 0) };
         if leaf_raw < 0 {
             return None;
         }
@@ -1652,7 +1653,8 @@ pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
 #[cfg(target_os = "macos")]
 fn fd_carrick_meta(fd: std::os::fd::RawFd) -> (Option<u32>, Option<u32>, Option<u32>, bool) {
     let mut names = [0u8; 1024];
-    let n = unsafe { libc::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len(), 0) };
+    let n =
+        unsafe { libc::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len(), 0) };
     if n < 0 || n as usize > names.len() {
         // flistxattr error, or more names than the probe buffer holds: read each
         // attribute directly (correct, just not collapsed). Rare on scratch.
