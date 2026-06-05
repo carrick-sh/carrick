@@ -988,6 +988,19 @@ where
                     trap_limit_hit: false,
                 });
             }
+            DispatchOutcome::SignalDeath { signum } => {
+                if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
+                    forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+                }
+                return Ok(RunResult {
+                    exit_code: 128 + signum,
+                    stdout: dispatcher.stdout().to_vec(),
+                    stderr: dispatcher.stderr().to_vec(),
+                    traps,
+                    report: reporter.finish(),
+                    trap_limit_hit: false,
+                });
+            }
             DispatchOutcome::Returned { value } => {
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
@@ -2737,6 +2750,29 @@ fn run_vcpu_until_exit(
                         // exit_group(94) or fatal process termination: flush
                         // shared buffers and terminate the entire host process
                         // because other guest threads share the address space.
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                        let out = kernel.dispatcher.stdout();
+                        let err = kernel.dispatcher.stderr();
+                        let _ = unsafe { libc::write(1, out.as_ptr() as *const _, out.len()) };
+                        let _ = unsafe { libc::write(2, err.as_ptr() as *const _, err.len()) };
+                        unsafe { libc::_exit(code) };
+                    }
+                    let result = assemble_run_result(&kernel, code, traps, false);
+                    return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
+                }
+                DispatchOutcome::SignalDeath { signum } => {
+                    crate::trap::dump_kick_stats();
+                    if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                        forked_child_die_by_signal(
+                            signum,
+                            kernel.dispatcher.stdout(),
+                            kernel.dispatcher.stderr(),
+                        );
+                    }
+                    let code = 128 + signum;
+                    let last = state.registry.exit(state.this_tid);
+                    if !last {
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         let out = kernel.dispatcher.stdout();
