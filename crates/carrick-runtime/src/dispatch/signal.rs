@@ -871,9 +871,22 @@ impl SyscallDispatcher {
                             signum: LINUX_SIGKILL,
                         });
                     }
-                    let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
-                    unsafe {
-                        libc::raise(host_signum);
+                    if signum == crate::linux_abi::LINUX_SIGCONT as u64
+                        || is_rt_signal(signum as i32)
+                    {
+                        // Darwin has no host signal numbers for Linux RT
+                        // signals (32..=64), and SIGCONT's host default action
+                        // is "continue" rather than a tracee delivery stop. A
+                        // traced Linux child still becomes waitable as a ptrace
+                        // signal-delivery stop; use a host SIGSTOP as the
+                        // carrier so the parent observes WIFSTOPPED instead of
+                        // the child falling through to normal exit.
+                        stop_self_by_signal(LINUX_SIGSTOP);
+                    } else {
+                        let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
+                        unsafe {
+                            libc::raise(host_signum);
+                        }
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
