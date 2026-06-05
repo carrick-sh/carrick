@@ -17,6 +17,7 @@
 //! to a bounded `poll` loop.
 
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -137,6 +138,10 @@ pub struct ThreadWaiter {
     process_pipe_read: RawFd,
     /// Per-thread wake pipe for thread-directed signals.
     thread_wake: Option<crate::host_signal::ThreadWakePipe>,
+    /// True once this waiter observes EOF/error on an internal wake pipe. Its
+    /// kqueue registration can no longer provide reliable signal wakeups; use
+    /// bounded poll slices instead.
+    wake_pipe_dead: AtomicBool,
     /// The guest tid this waiter runs for, so a pending signal targeted at a
     /// *sibling* thread doesn't spuriously interrupt this thread's blocking
     /// syscall (which would surface a wrong EINTR). Process-directed signals
@@ -150,23 +155,27 @@ pub struct ThreadWaiter {
 }
 
 /// kqueue registration for a WAKE pipe (the process-directed self-pipe and the
-/// per-thread wake channel). These MUST be edge-triggered (`EV_CLEAR`): a wake
-/// byte produces exactly one event, and after it is retrieved the filter is
-/// quiet until the next write.
-///
-/// This is a CORRECTNESS requirement, not an optimisation. If such a wake pipe
-/// ever reaches EOF — its write end closed, e.g. in a forked child whose pump /
-/// pending-pipe was torn down or not reinstalled — a level-triggered
-/// (`EV_ADD`-only) read filter reports it readable on EVERY `kevent`, and the
-/// drain (`drain_pending_pipe` / `ThreadWakePipe::drain`) cannot clear an EOF.
-/// `wait_kqueue`/`wait_proc_exit_kqueue` would then loop kevent→drain→kevent
-/// forever, pinning a vCPU thread at 100% CPU (the CPython
-/// multiprocessing-forkserver `test_parent_process` hang). `EV_CLEAR` delivers
-/// the EOF edge once, then the loop parks normally on its timeout slice and is
-/// still woken by a real wake byte (a fresh edge).
+/// per-thread wake channel). These are edge-triggered (`EV_CLEAR`) to avoid
+/// duplicate delivery before the waiter drains a wake byte. EOF is still
+/// special: after a drain reads `0`, Darwin can re-deliver the EOF edge, so the
+/// wait path must delete that registration and fall back to bounded polling.
 #[cfg(target_os = "macos")]
 fn wake_pipe_read_kevent(fd: RawFd) -> Kevent {
     Kevent::read(fd, libc::EV_ADD | libc::EV_CLEAR)
+}
+
+#[cfg(target_os = "macos")]
+fn delete_wake_pipe_registration(kq: &Kqueue, fd: RawFd) {
+    let _ = kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
+}
+
+#[cfg(target_os = "macos")]
+fn drain_wake_pipe_registration(kq: &Kqueue, fd: RawFd) -> crate::host_signal::DrainResult {
+    let result = crate::host_signal::drain_fd(fd);
+    if result == crate::host_signal::DrainResult::Dead {
+        delete_wake_pipe_registration(kq, fd);
+    }
+    result
 }
 
 impl ThreadWaiter {
@@ -197,6 +206,7 @@ impl ThreadWaiter {
             kq,
             process_pipe_read,
             thread_wake,
+            wake_pipe_dead: AtomicBool::new(false),
             tid,
             deferred_full_init: false,
         }
@@ -207,6 +217,7 @@ impl ThreadWaiter {
         Self {
             process_pipe_read: -1,
             thread_wake: None,
+            wake_pipe_dead: AtomicBool::new(false),
             tid,
             deferred_full_init: false,
         }
@@ -218,6 +229,7 @@ impl ThreadWaiter {
             kq: None,
             process_pipe_read: crate::host_signal::pending_pipe_read_fd(),
             thread_wake: None,
+            wake_pipe_dead: AtomicBool::new(false),
             tid,
             deferred_full_init: true,
         }
@@ -227,6 +239,38 @@ impl ThreadWaiter {
         if self.deferred_full_init {
             *self = Self::new(self.tid);
         }
+    }
+
+    fn has_dead_wake_pipe(&self) -> bool {
+        self.wake_pipe_dead.load(Ordering::SeqCst)
+    }
+
+    fn mark_dead_wake_pipe(&self) {
+        self.wake_pipe_dead.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn drain_process_wake_pipe(&self, kq: &Kqueue) -> crate::host_signal::DrainResult {
+        if self.process_pipe_read < 0 {
+            return crate::host_signal::DrainResult::Dead;
+        }
+        let result = drain_wake_pipe_registration(kq, self.process_pipe_read);
+        if result == crate::host_signal::DrainResult::Dead {
+            self.mark_dead_wake_pipe();
+        }
+        result
+    }
+
+    #[cfg(target_os = "macos")]
+    fn drain_thread_wake_pipe(&self, kq: &Kqueue) -> crate::host_signal::DrainResult {
+        let Some(thread_wake) = self.thread_wake.as_ref() else {
+            return crate::host_signal::DrainResult::Dead;
+        };
+        let result = drain_wake_pipe_registration(kq, thread_wake.read_fd());
+        if result == crate::host_signal::DrainResult::Dead {
+            self.mark_dead_wake_pipe();
+        }
+        result
     }
 
     /// Test/diagnostic hook: close the per-thread kqueue's fd and invalidate the
@@ -301,7 +345,9 @@ impl ThreadWaiter {
         let result;
         #[cfg(target_os = "macos")]
         {
-            if let Some(kq) = self.kq.as_ref() {
+            if !self.has_dead_wake_pipe()
+                && let Some(kq) = self.kq.as_ref()
+            {
                 result = self.wait_kqueue(kq, wait_fds, timeout, block_mask);
                 crate::probes::io_wait_end(
                     self.tid,
@@ -407,7 +453,9 @@ impl ThreadWaiter {
             return WaitResult::Ready;
         }
         // Fast path: park in kevent() on the per-thread kqueue's EVFILT_PROC.
-        if let Some(kq) = self.kq.as_ref() {
+        if !self.has_dead_wake_pipe()
+            && let Some(kq) = self.kq.as_ref()
+        {
             match self.wait_proc_exit_kqueue(kq, pid, block_mask) {
                 ProcExitWait::Done(result) => return result,
                 // The kqueue fd was closed out from under us; abandon it and poll
@@ -428,6 +476,7 @@ impl ThreadWaiter {
         let mut changes = vec![Kevent::proc_exit(pid)];
         let cap = (1 + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
+        let mut wake_pipe_dead = false;
         let result = loop {
             // Bound the wait even when a signal pipe exists. A freshly forked
             // child can race signal-pump/self-pipe reinitialisation; the kqueue
@@ -480,10 +529,16 @@ impl ThreadWaiter {
                 break WaitResult::Ready;
             }
             if process_pipe_woke {
-                crate::host_signal::drain_pending_pipe();
+                if self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead {
+                    wake_pipe_dead = true;
+                    break WaitResult::Interrupted;
+                }
             }
-            if thread_pipe_woke && let Some(thread_wake) = self.thread_wake.as_ref() {
-                thread_wake.drain();
+            if thread_pipe_woke
+                && self.drain_thread_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
+            {
+                wake_pipe_dead = true;
+                break WaitResult::Interrupted;
             }
             // Backstop poll (mirrors `wait_proc_exit_fallback`). `EVFILT_PROC`/
             // `NOTE_EXIT` is the fast wake, but it is lost if the child exits in
@@ -509,7 +564,11 @@ impl ThreadWaiter {
             tv_nsec: 0,
         };
         let _ = kq.wait(&[Kevent::proc_exit_delete(pid)], &mut [], Some(&zero));
-        ProcExitWait::Done(result)
+        if wake_pipe_dead {
+            ProcExitWait::KqueueDead
+        } else {
+            ProcExitWait::Done(result)
+        }
     }
 
     /// Bounded fallback for `wait_proc_exit` when the per-thread kqueue is
@@ -634,10 +693,16 @@ impl ThreadWaiter {
                 break WaitResult::Ready;
             }
             if process_pipe_woke {
-                crate::host_signal::drain_pending_pipe();
+                if self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead {
+                    self.clear_fd_registrations(kq, fds);
+                    return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
+                }
             }
-            if thread_pipe_woke && let Some(thread_wake) = self.thread_wake.as_ref() {
-                thread_wake.drain();
+            if thread_pipe_woke
+                && self.drain_thread_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
+            {
+                self.clear_fd_registrations(kq, fds);
+                return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
             }
             if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
                 || crate::fork_quiesce::is_quiescing()
@@ -703,7 +768,8 @@ impl ThreadWaiter {
                 revents: 0,
             })
             .collect();
-        let process_signal_index = if self.process_pipe_read >= 0 {
+        let include_signal_pipes = !self.has_dead_wake_pipe();
+        let process_signal_index = if include_signal_pipes && self.process_pipe_read >= 0 {
             let index = pollfds.len();
             pollfds.push(libc::pollfd {
                 fd: self.process_pipe_read,
@@ -714,15 +780,19 @@ impl ThreadWaiter {
         } else {
             None
         };
-        let thread_signal_index = self.thread_wake.as_ref().map(|thread_wake| {
-            let index = pollfds.len();
-            pollfds.push(libc::pollfd {
-                fd: thread_wake.read_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            index
-        });
+        let thread_signal_index = if include_signal_pipes {
+            self.thread_wake.as_ref().map(|thread_wake| {
+                let index = pollfds.len();
+                pollfds.push(libc::pollfd {
+                    fd: thread_wake.read_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                index
+            })
+        } else {
+            None
+        };
         loop {
             if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
                 || crate::fork_quiesce::is_quiescing()
@@ -757,14 +827,44 @@ impl ThreadWaiter {
                     .and_then(|index| pollfds.get(index))
                     .is_some_and(|pfd| pfd.revents != 0)
                 {
-                    crate::host_signal::drain_pending_pipe();
+                    if crate::host_signal::drain_fd(self.process_pipe_read)
+                        == crate::host_signal::DrainResult::Dead
+                    {
+                        self.mark_dead_wake_pipe();
+                        if let Some(index) = process_signal_index
+                            && let Some(pfd) = pollfds.get_mut(index)
+                        {
+                            pfd.fd = -1;
+                            pfd.events = 0;
+                        }
+                        if let Some(index) = thread_signal_index
+                            && let Some(pfd) = pollfds.get_mut(index)
+                        {
+                            pfd.fd = -1;
+                            pfd.events = 0;
+                        }
+                    }
                 }
                 if thread_signal_index
                     .and_then(|index| pollfds.get(index))
                     .is_some_and(|pfd| pfd.revents != 0)
                     && let Some(thread_wake) = self.thread_wake.as_ref()
                 {
-                    thread_wake.drain();
+                    if thread_wake.drain() == crate::host_signal::DrainResult::Dead {
+                        self.mark_dead_wake_pipe();
+                        if let Some(index) = process_signal_index
+                            && let Some(pfd) = pollfds.get_mut(index)
+                        {
+                            pfd.fd = -1;
+                            pfd.events = 0;
+                        }
+                        if let Some(index) = thread_signal_index
+                            && let Some(pfd) = pollfds.get_mut(index)
+                        {
+                            pfd.fd = -1;
+                            pfd.events = 0;
+                        }
+                    }
                 }
                 if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
                     || crate::fork_quiesce::is_quiescing()
@@ -784,6 +884,9 @@ impl ThreadWaiter {
     }
 
     fn signal_pipe_count(&self) -> usize {
+        if self.has_dead_wake_pipe() {
+            return 0;
+        }
         usize::from(self.process_pipe_read >= 0) + usize::from(self.thread_wake.is_some())
     }
 }
@@ -804,6 +907,11 @@ fn duration_to_timespec(d: Duration) -> libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
         tv_nsec: d.subsec_nanos() as libc::c_long,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn remaining_timeout(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
 }
 
 #[cfg(test)]
@@ -835,15 +943,11 @@ mod tests {
         assert!(super::PinnedWaitFds::new(&[(bad, libc::POLLIN)]).is_err());
     }
 
-    /// A wake pipe whose write end is closed (EOF) must NOT re-fire its
-    /// EVFILT_READ on every `kevent`. A level-triggered (`EV_ADD`-only)
-    /// registration does — and the wait loop's drain cannot clear an EOF — so
-    /// `wait_kqueue` would loop kevent→drain→kevent forever, pinning a vCPU
-    /// thread at 100% CPU (the CPython multiprocessing-forkserver
-    /// `test_parent_process` hang, where a forked child's process signal-wake
-    /// pipe sat at EOF). Edge-triggered (`EV_CLEAR`, via `wake_pipe_read_kevent`)
-    /// delivers the EOF edge once, then is quiet. RED with `EV_ADD`; GREEN with
-    /// `EV_ADD | EV_CLEAR`.
+    /// A wake pipe whose write end is closed (EOF) must not re-fire its
+    /// EVFILT_READ forever after the wait loop drains it. Darwin can deliver
+    /// EOF again even for an `EV_CLEAR` registration once userspace reads `0`,
+    /// so the waiter must delete the read filter and fall back to bounded poll
+    /// slices.
     #[cfg(target_os = "macos")]
     #[test]
     fn wake_pipe_at_eof_does_not_refire() {
@@ -864,8 +968,13 @@ mod tests {
         // The EOF edge is delivered once (a watcher must still learn of it).
         let n1 = kq.wait(&[], &mut out, Some(&zero)).expect("wait1");
         assert!(n1 >= 1, "EOF should be delivered at least once; n1={n1}");
-        // No new write occurred: a SECOND drain must be quiet. A level-triggered
-        // filter re-fires the EOF forever (the busy-spin); edge-triggered is 0.
+        assert_eq!(
+            super::drain_wake_pipe_registration(&kq, r),
+            crate::host_signal::DrainResult::Dead
+        );
+        // No new write occurred: a SECOND wait must be quiet after the waiter
+        // drains the EOF edge. A refire here models the busy-spin trace:
+        // kevent -> read(EOF) -> kevent -> read(EOF) forever.
         let n2 = kq.wait(&[], &mut out, Some(&zero)).expect("wait2");
         assert_eq!(unsafe { libc::close(r) }, 0);
         assert_eq!(

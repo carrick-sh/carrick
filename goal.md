@@ -74,6 +74,19 @@ futex word aliasing is ruled out as the root cause. Recent targeted
 remains pressure coverage rather than the next reducer until it produces a
 fresh deterministic RED.
 
+Update after EOF wake-pipe tracing: the forkserver class exposed a real host
+sys-time bug where a forked child repeatedly woke on an internal wake-pipe EOF
+and spun through `fcntl(F_GETFL)` plus `read(...)=0`. That behavior is now
+owned by `io_wait::tests::wake_pipe_at_eof_does_not_refire` and
+`host_signal::tests::drain_fd_reports_dead_on_eof`: EOF drains mark the waiter's
+wake channel dead, remove the kqueue read filter, and fall back to bounded poll
+slices. The full forkserver class still timed out in `procgoal-cf-eof-97926`
+at `test_max_tasks_early_shutdown`, but samples no longer show the high-CPU EOF
+loop; they show a quiescent wait graph with the parent supervisor parked in
+`kevent`, forkserver threads in futex/kqueue waits, one worker in `wait_poll`,
+and one worker in `shared_futex_wait`. The next reducer should target that
+blocked wait/reap/futex state, not the already-owned EOF spin.
+
 ## Primary target rows
 
 These are the first rows to investigate because they share process-control,
