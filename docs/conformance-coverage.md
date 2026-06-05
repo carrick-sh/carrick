@@ -16,8 +16,8 @@ it parses this doc + the probe binaries on disk and fails CI if the doc cites
 a probe that doesn't exist):
 
 ```
-Owned invariant probes (on disk):  281
-Invariant rows with an owning test: 125/125 (100%)
+Owned invariant probes (on disk):  283
+Invariant rows with an owning test: 127/127 (100%)
 Distinct curated LTP tests owned:   501/501 (100%)
 ```
 
@@ -135,6 +135,7 @@ underlying gap got fixed):
 | **Pending on unblock: standard coalesces to 1, real-time queues N** | ✅ `pendingunblock` + 🧪 `rt_signals_queue_…` | (RT vs standard delivery) |
 | ppoll: blocked signal raised mid-wait does NOT interrupt | ✅ `ppollsig` | ppoll01 |
 | **pause(): unblocked signal mid-wait → handler runs, returns -1/EINTR** *(carrick gap exposed: pause() doesn't wake on a setitimer-delivered SIGALRM — TIMEOUT)* | ✅ `pauseeintr` | pause01 |
+| **Child-directed SIGINT wakes a forked child blocked in `pause()` with -1/EINTR, and that child-directed signal does not interrupt the parent** | ✅ `pauseinterrupt2` | pause02 diagnostic |
 | **sigsuspend(empty): pending blocked sig delivered, handler runs, returns -1/EINTR, original mask restored, pending consumed** | ✅ `pauseeintr` | sigsuspend01 |
 | sigprocmask BLOCK/UNBLOCK round-trip (sighold/sigrelse equivalent) | ✅ `pauseeintr` + `signals` | sighold02, sigrelse01 |
 | **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
@@ -181,6 +182,7 @@ underlying gap got fixed):
 |---|---|---|
 | Cross-process futex WAIT/WAKE on MAP_SHARED word (`__ulock`) | ✅ `futexshare` | futex_wait02/03, futex_wake02/03 |
 | **`FUTEX_WAKE(INT_MAX)` returns exactly N when N waiters are parked on a MAP_SHARED word — `__ulock_wake_any` lock-structure zombie window neutralised by sched_yield between iterations** | ✅ `futexwakecount` | futex_wake03 |
+| **Distinct futex words in the same `MAP_SHARED` page remain independent wait keys: waking word A once cannot wake or consume the waiter parked on word B** | ✅ `futexsharedalias` | CPython forkserver/process-pool diagnostic; rules out same-page shared futex word aliasing |
 | **Diagnostic: `FUTEX_WAKE` on a fresh MAP_SHARED page with no waiters returns 0 (no phantom counts)** | ✅ `futexghost` | (no LTP equiv — repro for e0dd202) |
 | sched affinity / getcpu / hw cpu count | ✅ `cpucount` | sched_getaffinity01, getcpu01/02 |
 | POSIX timers: create/settime/gettime remaining/getoverrun/delete + stale-id EINVAL; SIGEV_SIGNAL delivers SIGUSR1 | ✅ `posixtimers` | timer_create01–07, timer_settime01/02, timer_gettime01, timer_delete01, timer_getoverrun01 |
