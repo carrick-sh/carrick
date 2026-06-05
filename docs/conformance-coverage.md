@@ -16,9 +16,9 @@ it parses this doc + the probe binaries on disk and fails CI if the doc cites
 a probe that doesn't exist):
 
 ```
-Owned invariant probes (on disk):  73
-Invariant rows with an owning test: 77/77 (100%)
-Distinct curated LTP tests owned:   432/432 (100%)
+Owned invariant probes (on disk):  276
+Invariant rows with an owning test: 120/120 (100%)
+Distinct curated LTP tests owned:   501/501 (100%)
 ```
 
 This is the number the project tracks INSTEAD of "LTP MATCH count": the probe
@@ -109,6 +109,7 @@ underlying gap got fixed):
 | `clone3args` | Strict arg validation in `dispatch::SyscallDispatcher::clone3`: `args_size` must be one of CLONE_ARGS_SIZE_VER0/1/2 (64/80/88); unknown flag bits (outside the 0x100..0x4_0000_0000 range) → EINVAL; mismatched `stack`/`stack_size` pair → EINVAL. Before: any bogus clone3 silently forked, creating an exponential fork-bomb in the rest of the probe. |
 | `epollexclusive` | (1) Detect "kqueue drained but all events filtered out by user mask" and switch to a signal-pipe-only sleep so polling kq_fd doesn't tight-loop. (2) Honor an empty interest set: `epoll_pwait(epfd, …, timeout)` with no fds added now sleeps the timeout (interruptible by signals) instead of returning 0 immediately. (3) Implement EPOLLONESHOT: after the first delivery the interest is disarmed (events cleared, host kqueue filter removed) until `EPOLL_CTL_MOD` re-arms it. Added the LINUX_EPOLLONESHOT / LINUX_EPOLLEXCLUSIVE constants. |
 | `pipeextra` | (1) `pipe2(O_DIRECT)` accepted as a no-op flag (Darwin pipes don't have packet mode but the regular-pipe write-then-read subset matches; aarch64 O_DIRECT is 0o200000, NOT the asm-generic 0o40000 — checking the wrong value silently rejected every probe). (2) `ioctl(FIONREAD)` on a HostPipe / HostSocket forwards to the host fd so the guest sees the kernel's actual queued-byte count (was hardcoded 0). |
+| `ptracetraceme` | Minimal ptrace tracee stop/continue surface: `PTRACE_TRACEME` succeeds, self-target `SIGSTOP` produces a Linux `WIFSTOPPED`/`WSTOPSIG(SIGSTOP)` parent wait status, positive ptrace pids are translated through the pid namespace, `PTRACE_CONT` resumes the child, and final wait reaps its normal exit. |
 
 ## Signals & process control
 
@@ -141,6 +142,7 @@ underlying gap got fixed):
 | **get_robust_list (syscall 100, was ENOSYS) + set_robust_list len validation: set_robust_list rejects len != sizeof(robust_list_head)=24 → EINVAL; get_robust_list gives EFAULT on NULL head/len ptr, ESRCH for a nonexistent pid, EPERM for another live task, and succeeds for self (carrick has no robust-futex death cleanup, so the head is reported empty — errno/return contract only)** | ✅ `robustlist` | set_robust_list01, get_robust_list01 (EPERM leg gated by the LTP test, not the probe — see probe note) |
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
 | **Default-disposition death-by-signal: SIGTERM/SIGKILL kill child→WIFSIGNALED/WTERMSIG; abort() resets SIGABRT→SIG_DFL and re-raises** | ✅ `abortdeath` | kill05, kill07, abort01 |
+| **ptrace TRACEME stop/continue: traced child reports SIGSTOP through waitpid, PTRACE_CONT resumes it, and the final wait reaps normal exit** | ✅ `ptracetraceme` | ptrace05/06 TRACEME stop leg |
 | **`WCOREDUMP(status)` set for core-dumping signals (SIGABRT/SIGSEGV/SIGQUIT/SIGILL/SIGTRAP/SIGBUS/SIGFPE/SIGXCPU/SIGXFSZ/SIGSYS), unset for non-core signals (SIGTERM/SIGKILL) — 0x80 bit synthesized through macOS's default RLIMIT_CORE=0** | ✅ `coredumpbit` | abort01 |
 | **signalfd4 (syscall 74, emulated — macOS has no signalfd): SFD_CLOEXEC→FD_CLOEXEC, SFD_NONBLOCK→O_NONBLOCK on the returned fd, unknown flag bit→EINVAL (fd-flag surface only; signal-read delivery is a tracked follow-up)** | ✅ `signalfd4` | signalfd4_01, signalfd4_02 |
 

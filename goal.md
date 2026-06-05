@@ -134,10 +134,13 @@ Linux.
 
 Exit criteria:
 
-- `ptracetraceme` probe exists and fails on current carrick.
+- `ptracetraceme` probe exists and fails on the pre-fix carrick.
 - Runtime implements the minimal Linux-compatible tracee state needed by the
   probe.
-- Probe matches Docker Linux.
+- Probe matches Docker Linux. Landed 2026-06-05: `PTRACE_TRACEME`/`PTRACE_CONT`
+  are probe-owned, positive ptrace pids are translated through the pid
+  namespace, and self-target `SIGSTOP` stops directly instead of being
+  delivered twice through the pending-signal path.
 - `ltp-ptrace05` and `ltp-ptrace06` improve or are reclassified with exact
   remaining blockers.
 
@@ -198,8 +201,8 @@ Keep this section current as classifications and fixes land.
 
 | Row | Classification | Owner/probe | Status |
 | --- | --- | --- | --- |
-| `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. | `ptracetraceme` first, then `traceexecstop` if exec-stop remains. | classified; first runtime milestone |
-| `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. | `ptracetraceme` / `traceexecstop` | classified; blocked behind minimal `PTRACE_TRACEME` ownership |
+| `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. | `ptracetraceme`; `traceexecstop` if LTP still fails after rerun | `ptracetraceme` landed and matches Docker; rerun LTP row to classify remaining exec-stop/assertion blockers |
+| `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. | `ptracetraceme` / `traceexecstop` | minimal `PTRACE_TRACEME` stop/continue path owned; rerun to split remaining ptrace06 blockers |
 | `go-os_exec` | process/wait workload does useful work but exits without a parseable suite summary in `conf-42088-c593`; tail ends after `TestIgnorePipeErrorOnSuccess`, and live observation saw an `os_exec.test` child stopped. | `stoppedwaitstatus` before broader `subprocesspipes` | classified; reduce the stopped/waited child path |
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |

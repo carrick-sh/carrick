@@ -123,7 +123,7 @@ use fault::deliver_fault_signal;
 #[cfg(test)]
 use fault::el0_debug_signal;
 mod exec;
-use exec::{forked_child_die_by_signal, forked_child_exit, load_execve_image};
+use exec::{forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_by_signal};
 
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
 /// wait predicates can reach the same instance).
@@ -918,23 +918,28 @@ where
                 let pc = runtime.current_pc()?;
                 if let Some(action) =
                     deliver_pending_signal(runtime, &dispatcher, None, this_tid, Some(pc))?
-                    && let Some(signum) = action.term_signal
                 {
-                    if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
-                        forked_child_die_by_signal(
-                            signum,
-                            dispatcher.stdout(),
-                            dispatcher.stderr(),
-                        );
+                    if let Some(signum) = action.stop_signal {
+                        stop_by_signal(signum);
+                        continue;
                     }
-                    return Ok(RunResult {
-                        exit_code: 128 + signum,
-                        stdout: dispatcher.stdout().to_vec(),
-                        stderr: dispatcher.stderr().to_vec(),
-                        traps,
-                        report: reporter.finish(),
-                        trap_limit_hit: false,
-                    });
+                    if let Some(signum) = action.term_signal {
+                        if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
+                            forked_child_die_by_signal(
+                                signum,
+                                dispatcher.stdout(),
+                                dispatcher.stderr(),
+                            );
+                        }
+                        return Ok(RunResult {
+                            exit_code: 128 + signum,
+                            stdout: dispatcher.stdout().to_vec(),
+                            stderr: dispatcher.stderr().to_vec(),
+                            traps,
+                            report: reporter.finish(),
+                            trap_limit_hit: false,
+                        });
+                    }
                 }
                 continue;
             }
@@ -1176,19 +1181,24 @@ where
 
         if let Some(action) =
             deliver_pending_signal(runtime, &dispatcher, last_syscall_retval, this_tid, None)?
-            && let Some(signum) = action.term_signal
         {
-            if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
-                forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+            if let Some(signum) = action.stop_signal {
+                stop_by_signal(signum);
+                continue;
             }
-            return Ok(RunResult {
-                exit_code: 128 + signum,
-                stdout: dispatcher.stdout().to_vec(),
-                stderr: dispatcher.stderr().to_vec(),
-                traps,
-                report: reporter.finish(),
-                trap_limit_hit: false,
-            });
+            if let Some(signum) = action.term_signal {
+                if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
+                    forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+                }
+                return Ok(RunResult {
+                    exit_code: 128 + signum,
+                    stdout: dispatcher.stdout().to_vec(),
+                    stderr: dispatcher.stderr().to_vec(),
+                    traps,
+                    report: reporter.finish(),
+                    trap_limit_hit: false,
+                });
+            }
         }
     }
 
@@ -2901,8 +2911,34 @@ fn assemble_run_result(
 /// (terminate) applies. The conventional process exit code is `128 + signum`,
 /// but a forked child instead dies BY this signal (see
 /// `forked_child_die_by_signal`) so the parent's `wait4` reports WIFSIGNALED.
+/// `stop_signal` is the sibling default action: stop the host process by the
+/// translated signal, then continue the guest loop after SIGCONT/ptrace resume.
 struct PendingSignalAction {
     term_signal: Option<i32>,
+    stop_signal: Option<i32>,
+}
+
+impl PendingSignalAction {
+    fn ignored() -> Self {
+        Self {
+            term_signal: None,
+            stop_signal: None,
+        }
+    }
+
+    fn terminate(signum: i32) -> Self {
+        Self {
+            term_signal: Some(signum),
+            stop_signal: None,
+        }
+    }
+
+    fn stop(signum: i32) -> Self {
+        Self {
+            term_signal: None,
+            stop_signal: Some(signum),
+        }
+    }
 }
 
 /// Drain whatever signal is sitting in the host pending slot and
@@ -2947,10 +2983,10 @@ where
     // guest unblocks it (rt_sigprocmask) or waits for it (rt_sigtimedwait).
     if dispatcher.signal_blocked(tid, pending) {
         dispatcher.mark_signal_pending(tid, pending);
-        return Ok(Some(PendingSignalAction { term_signal: None }));
+        return Ok(Some(PendingSignalAction::ignored()));
     }
     if dispatcher.signal_is_ignored(pending) {
-        return Ok(Some(PendingSignalAction { term_signal: None }));
+        return Ok(Some(PendingSignalAction::ignored()));
     }
     match dispatcher.registered_signal_handler(pending) {
         Some(action) => {
@@ -3024,16 +3060,16 @@ where
                 queued_siginfo,
                 restart_syscall,
             ) {
-                Ok(()) => Ok(Some(PendingSignalAction { term_signal: None })),
+                Ok(()) => Ok(Some(PendingSignalAction::ignored())),
                 // Linux force_sigsegv: the signal frame couldn't be written to
                 // the user stack (guest mprotect'd its own stack PROT_NONE, bad
                 // SP, ...). Terminate the whole thread-group by SIGSEGV (exit
                 // 139) instead of a fatal carrick error — and a sibling thread
                 // takes the group down cleanly rather than silently vanishing
                 // and deadlocking its peers.
-                Err(TrapError::SignalDeliveryFault) => Ok(Some(PendingSignalAction {
-                    term_signal: Some(11), // SIGSEGV
-                })),
+                Err(TrapError::SignalDeliveryFault) => {
+                    Ok(Some(PendingSignalAction::terminate(11))) // SIGSEGV
+                }
                 Err(e) => Err(e.into()),
             }
         }
@@ -3047,12 +3083,9 @@ where
         // ignore, a no-op) fell through to `_exit(128+23)=151` — the ~30% flaky
         // `go build` failure (multithreaded `go` fork+exec'ing `go tool compile`).
         // Linux ignores it; so must we.
-        None if is_default_ignore_signal(pending) => {
-            Ok(Some(PendingSignalAction { term_signal: None }))
-        }
-        None => Ok(Some(PendingSignalAction {
-            term_signal: Some(pending),
-        })),
+        None if is_default_ignore_signal(pending) => Ok(Some(PendingSignalAction::ignored())),
+        None if is_default_stop_signal(pending) => Ok(Some(PendingSignalAction::stop(pending))),
+        None => Ok(Some(PendingSignalAction::terminate(pending))),
     }
 }
 
@@ -3091,6 +3124,16 @@ fn is_default_ignore_signal(signum: i32) -> bool {
         crate::linux_abi::LINUX_SIGCHLD
             | crate::linux_abi::LINUX_SIGURG
             | crate::linux_abi::LINUX_SIGWINCH
+    )
+}
+
+fn is_default_stop_signal(signum: i32) -> bool {
+    matches!(
+        signum,
+        crate::linux_abi::LINUX_SIGSTOP
+            | crate::linux_abi::LINUX_SIGTSTP
+            | crate::linux_abi::LINUX_SIGTTIN
+            | crate::linux_abi::LINUX_SIGTTOU
     )
 }
 
@@ -3167,21 +3210,28 @@ fn service_signals_threaded(
     interrupted_pc: Option<u64>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-    if let Some(action) = deliver_pending_signal(
-        engine,
-        &kernel.dispatcher,
-        last_syscall_retval,
-        this_tid,
-        interrupted_pc,
-    )? && let Some(signum) = action.term_signal
     {
-        if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
-            let out = kernel.dispatcher.stdout();
-            let err = kernel.dispatcher.stderr();
-            forked_child_die_by_signal(signum, &out, &err);
+        if let Some(action) = deliver_pending_signal(
+            engine,
+            &kernel.dispatcher,
+            last_syscall_retval,
+            this_tid,
+            interrupted_pc,
+        )? {
+            if let Some(signum) = action.stop_signal {
+                stop_by_signal(signum);
+                return Ok(None);
+            }
+            if let Some(signum) = action.term_signal {
+                if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                    let out = kernel.dispatcher.stdout();
+                    let err = kernel.dispatcher.stderr();
+                    forked_child_die_by_signal(signum, &out, &err);
+                }
+                let result = assemble_run_result(kernel, 128 + signum, traps, false);
+                return Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))));
+            }
         }
-        let result = assemble_run_result(kernel, 128 + signum, traps, false);
-        return Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))));
     }
     Ok(None)
 }
