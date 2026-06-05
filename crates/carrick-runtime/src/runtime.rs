@@ -1030,7 +1030,6 @@ where
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                        waiter = crate::io_wait::ThreadWaiter::new(this_tid);
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
                         // (parent) tid when it exits — without a host SIGCHLD
@@ -1072,8 +1071,11 @@ where
                         // mapping (§5.3). No-op when namespaces are off.
                         crate::namespace::pid::await_self_registration();
                         // The child's pid changed; its waiter watches for
-                        // signals targeted at the new tid (or process-directed).
-                        waiter = crate::io_wait::ThreadWaiter::new(std::process::id() as ThreadId);
+                        // process-directed signals immediately, then upgrades
+                        // to a per-thread kqueue only if it parks.
+                        waiter = crate::io_wait::ThreadWaiter::process_only(
+                            std::process::id() as ThreadId
+                        );
                         0
                     }
                 };
@@ -1281,68 +1283,78 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 timeout,
                 on_timeout,
                 block_signals,
-            } => match waiter.wait(&fds, timeout, block_signals) {
-                WaitResult::Ready => continue,
-                WaitResult::TimedOut => {
-                    return Ok(DispatchOutcome::Returned { value: on_timeout });
+            } => {
+                waiter.ensure_full();
+                match waiter.wait(&fds, timeout, block_signals) {
+                    WaitResult::Ready => continue,
+                    WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                    // Could not pin a watched fd (host fd table exhausted). The
+                    // errno is already Linux; surface it verbatim.
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
-                WaitResult::Interrupted => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: crate::linux_abi::LINUX_EINTR,
-                    });
-                }
-                // Could not pin a watched fd (host fd table exhausted). The
-                // errno is already Linux; surface it verbatim.
-                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            },
+            }
             DispatchOutcome::WaitOnFdsSelect {
                 fds,
                 timeout,
                 block_signals,
                 clear_on_timeout,
-            } => match waiter.wait(&fds, timeout, block_signals) {
-                // A fd became ready -> re-dispatch; the handler re-reads the
-                // (untouched) input sets and reports the now-ready fds.
-                WaitResult::Ready => continue,
-                // Timeout -> select returns 0 with the fd-sets zeroed. The
-                // handler left them intact (so Ready/EINTR are correct), so
-                // zero them here before completing.
-                WaitResult::TimedOut => {
-                    for (addr, len) in &clear_on_timeout {
-                        let zeros = vec![0u8; *len];
-                        let _ = memory.write_bytes(*addr, &zeros);
+            } => {
+                waiter.ensure_full();
+                match waiter.wait(&fds, timeout, block_signals) {
+                    // A fd became ready -> re-dispatch; the handler re-reads the
+                    // (untouched) input sets and reports the now-ready fds.
+                    WaitResult::Ready => continue,
+                    // Timeout -> select returns 0 with the fd-sets zeroed. The
+                    // handler left them intact (so Ready/EINTR are correct), so
+                    // zero them here before completing.
+                    WaitResult::TimedOut => {
+                        for (addr, len) in &clear_on_timeout {
+                            let zeros = vec![0u8; *len];
+                            let _ = memory.write_bytes(*addr, &zeros);
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    return Ok(DispatchOutcome::Returned { value: 0 });
+                    // Signal interrupt -> EINTR; Linux leaves the fd-sets
+                    // unmodified on EINTR, and the handler already did.
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
-                // Signal interrupt -> EINTR; Linux leaves the fd-sets unmodified
-                // on EINTR, and the handler already did.
-                WaitResult::Interrupted => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: crate::linux_abi::LINUX_EINTR,
-                    });
-                }
-                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            },
+            }
             DispatchOutcome::WaitOnPollFds {
                 fds,
                 timeout,
                 on_timeout,
                 block_signals,
-            } => match waiter.wait_poll(&fds, timeout, block_signals) {
-                WaitResult::Ready => continue,
-                WaitResult::TimedOut => {
-                    return Ok(DispatchOutcome::Returned { value: on_timeout });
+            } => {
+                waiter.ensure_full();
+                match waiter.wait_poll(&fds, timeout, block_signals) {
+                    WaitResult::Ready => continue,
+                    WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                    // Could not pin a watched fd (host fd table exhausted). The
+                    // errno is already Linux; surface it verbatim.
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
-                WaitResult::Interrupted => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: crate::linux_abi::LINUX_EINTR,
-                    });
-                }
-                // Could not pin a watched fd (host fd table exhausted). The
-                // errno is already Linux; surface it verbatim.
-                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            },
+            }
             DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                waiter.ensure_full();
                 match waiter.wait_proc_exit(pid, block_signals) {
                     // Ready (child exited) -> re-dispatch the waitid to reap.
                     WaitResult::Ready => continue,
@@ -1368,6 +1380,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         });
                     }
                 };
+                waiter.ensure_full();
                 match waiter.wait(&[], Some(slice), !wait_set) {
                     WaitResult::Ready | WaitResult::Interrupted => continue,
                     WaitResult::TimedOut => {
@@ -1394,6 +1407,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 if now >= deadline {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
+                waiter.ensure_full();
                 match waiter.wait(&[], Some(deadline - now), 0) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
@@ -1682,82 +1696,92 @@ impl ThreadRuntimeState {
                     timeout,
                     on_timeout,
                     block_signals,
-                } => match self.waiter.wait(&fds, timeout, block_signals) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break Ok(DispatchOutcome::Returned { value: on_timeout });
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        if crate::fork_quiesce::is_quiescing() {
-                            self.release_and_park_vcpu_for_fork(engine)?;
-                            continue;
+                } => {
+                    self.waiter.ensure_full();
+                    match self.waiter.wait(&fds, timeout, block_signals) {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            break Ok(DispatchOutcome::Returned { value: on_timeout });
                         }
-                        break Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
+                        crate::io_wait::WaitResult::Interrupted => {
+                            if crate::fork_quiesce::is_quiescing() {
+                                self.release_and_park_vcpu_for_fork(engine)?;
+                                continue;
+                            }
+                            break Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                        // Could not pin a watched fd (host fd table exhausted).
+                        // The errno is already Linux; surface it verbatim.
+                        crate::io_wait::WaitResult::Errno(errno) => {
+                            break Ok(DispatchOutcome::Errno { errno });
+                        }
                     }
-                    // Could not pin a watched fd (host fd table exhausted). The
-                    // errno is already Linux; surface it verbatim.
-                    crate::io_wait::WaitResult::Errno(errno) => {
-                        break Ok(DispatchOutcome::Errno { errno });
-                    }
-                },
+                }
                 DispatchOutcome::WaitOnFdsSelect {
                     fds,
                     timeout,
                     block_signals,
                     clear_on_timeout,
-                } => match self.waiter.wait(&fds, timeout, block_signals) {
-                    // See the non-threaded loop above for the select fd-set
-                    // input==output rationale: leave the sets intact across the
-                    // wait; zero them only on timeout.
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        for (addr, len) in &clear_on_timeout {
-                            let zeros = vec![0u8; *len];
-                            let _ = engine.write_bytes(*addr, &zeros);
+                } => {
+                    self.waiter.ensure_full();
+                    match self.waiter.wait(&fds, timeout, block_signals) {
+                        // See the non-threaded loop above for the select fd-set
+                        // input==output rationale: leave the sets intact across
+                        // the wait; zero them only on timeout.
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            for (addr, len) in &clear_on_timeout {
+                                let zeros = vec![0u8; *len];
+                                let _ = engine.write_bytes(*addr, &zeros);
+                            }
+                            break Ok(DispatchOutcome::Returned { value: 0 });
                         }
-                        break Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        if crate::fork_quiesce::is_quiescing() {
-                            self.release_and_park_vcpu_for_fork(engine)?;
-                            continue;
+                        crate::io_wait::WaitResult::Interrupted => {
+                            if crate::fork_quiesce::is_quiescing() {
+                                self.release_and_park_vcpu_for_fork(engine)?;
+                                continue;
+                            }
+                            break Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
                         }
-                        break Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
+                        crate::io_wait::WaitResult::Errno(errno) => {
+                            break Ok(DispatchOutcome::Errno { errno });
+                        }
                     }
-                    crate::io_wait::WaitResult::Errno(errno) => {
-                        break Ok(DispatchOutcome::Errno { errno });
-                    }
-                },
+                }
                 DispatchOutcome::WaitOnPollFds {
                     fds,
                     timeout,
                     on_timeout,
                     block_signals,
-                } => match self.waiter.wait_poll(&fds, timeout, block_signals) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break Ok(DispatchOutcome::Returned { value: on_timeout });
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        if crate::fork_quiesce::is_quiescing() {
-                            self.release_and_park_vcpu_for_fork(engine)?;
-                            continue;
+                } => {
+                    self.waiter.ensure_full();
+                    match self.waiter.wait_poll(&fds, timeout, block_signals) {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            break Ok(DispatchOutcome::Returned { value: on_timeout });
                         }
-                        break Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
+                        crate::io_wait::WaitResult::Interrupted => {
+                            if crate::fork_quiesce::is_quiescing() {
+                                self.release_and_park_vcpu_for_fork(engine)?;
+                                continue;
+                            }
+                            break Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                        // Could not pin a watched fd (host fd table exhausted).
+                        // The errno is already Linux; surface it verbatim.
+                        crate::io_wait::WaitResult::Errno(errno) => {
+                            break Ok(DispatchOutcome::Errno { errno });
+                        }
                     }
-                    // Could not pin a watched fd (host fd table exhausted). The
-                    // errno is already Linux; surface it verbatim.
-                    crate::io_wait::WaitResult::Errno(errno) => {
-                        break Ok(DispatchOutcome::Errno { errno });
-                    }
-                },
+                }
                 DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                    self.waiter.ensure_full();
                     match self.waiter.wait_proc_exit(pid, block_signals) {
                         // Ready (child exited) → re-dispatch the waitid to reap.
                         crate::io_wait::WaitResult::Ready => continue,
@@ -1788,6 +1812,7 @@ impl ThreadRuntimeState {
                             });
                         }
                     };
+                    self.waiter.ensure_full();
                     match self.waiter.wait(&[], Some(slice), !wait_set) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
@@ -1823,6 +1848,7 @@ impl ThreadRuntimeState {
                     if now >= deadline {
                         break Ok(DispatchOutcome::Returned { value: 0 });
                     }
+                    self.waiter.ensure_full();
                     match self.waiter.wait(&[], Some(deadline - now), 0) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
@@ -2357,7 +2383,6 @@ impl ThreadRuntimeState {
                 kernel
                     .fork
                     .restart_after_parent_fork(prepared_fork, &self.kicker, &self.futex);
-                self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                 // engine.fork() rebuilt this thread's own vCPU, so its old
                 // kicker handle is stale. Re-register the new one (under the
                 // topology lock we still hold) — otherwise a later fork can't
