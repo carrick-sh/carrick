@@ -73,10 +73,10 @@ wait-status, stop-state, or signal-interruption behavior:
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
 | `cpython-concurrent_futures` | CPython | 0/0 | 20/20 | Process-pool/forkserver behavior currently fails to produce a comparable result. |
 | `ltp-setpgid01` | LTP | 2/2 | 1/2 | Inversion risk: may be under-enforcement rather than better behavior. |
-| `ltp-pause02` | LTP | 0/3 | 1/1 | Signal interruption/restart behavior around sleeping processes. |
+| `ltp-pause02` | LTP | MATCH 1/1 in final targeted rerun `conf-71289-c01` | 1/1 | Signal interruption/restart behavior around sleeping processes; current evidence is owned by existing pause/sigsuspend probes. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
-| `go-os_signal` | Go | 28/30 | 29/30 | Adjacent signal/process-control surface. |
-| `ltp-sigaction01` | LTP | 3/4 | 4/4 | Adjacent signal ABI row; only include fixes that affect this goal's process-control path. |
+| `go-os_signal` | Go | 28/30 in final targeted rerun `conf-71289-c00` | 29/30 | Adjacent signal/process-control surface; `TestAtomicStop` is unstable/new and `TestTerminalSignal` still fails on both carrick and oracle. |
+| `ltp-sigaction01` | LTP | MATCH 4/4 after `sigactionresetinfo`, final targeted rerun `conf-71289-c02` | 4/4 | Adjacent signal ABI row; SA_RESETHAND + SA_SIGINFO old-state preservation is now owned. |
 
 Rows outside this cluster can be fixed opportunistically if a reducer proves the
 same root cause, but they are not part of this goal's success criteria.
@@ -224,7 +224,9 @@ milestones.
 Exit criteria:
 
 - `setpgidrules` or a focused unit test owns the process-group invariant.
-- `pauseinterrupt2` or an existing signal probe owns the interruption invariant.
+- Existing signal probes own the current `ltp-pause02` interruption invariant, and
+  `sigactionresetinfo` owns the adjacent SA_RESETHAND + SA_SIGINFO reset-state
+  rule that moved `ltp-sigaction01` to MATCH.
 - Count inversions are fixed unless assertion-level evidence proves a LinuxKit
   oracle weakness; proven oracle weaknesses must be documented as non-goal
   evidence, not used to hide an unimplemented carrick behavior.
@@ -268,11 +270,11 @@ Keep this section current as classifications and fixes land.
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
 | `cpython-concurrent_futures` | process-pool/forkserver run starts and passes fork/forkserver cases, then stops mid-`ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_early_shutdown` without a regrtest summary. | `subprocesspipes` / process-pool reducer | classified; reduce forkserver shutdown/harness exit |
 | `ltp-setpgid01` | inversion risk: carrick reports both `setpgid(1, 1)` and `setpgid(0, 0)` pass, while cached oracle has one failure. This needs the Docker assertion refreshed before treating carrick as better or worse. | `setpgidrules` plus `--refresh-oracle --suite ltp-setpgid01` | classified; oracle assertion required before fix |
-| `ltp-pause02` | signal interruption/restart bug: raw `conf-42088-c959` reports unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`. | `pauseinterrupt2` | classified; runtime signal interruption path |
+| `ltp-pause02` | prior signal interruption/restart bug: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; final targeted rerun `conf-71289-c01` matches 1/1 vs oracle 1/1. | `pauseeintr` and existing signal probes | MATCH; no new `pauseinterrupt2` reducer needed unless this regresses |
 | `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
 | `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
-| `go-os_signal` | signal delivery/status mismatch: raw `conf-42088-c595` shows `TestAtomicStop` failing because one iteration exits status 2 where Docker expects `SIGINT`; `TestTerminalSignal` is an existing oracle-matching fail. | `pauseinterrupt2` or new `atomicstop` reducer | classified; adjacent signal runtime path |
-| `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`. | focused signal-action unit/probe | classified; adjacent, lower priority than pause/ptrace |
+| `go-os_signal` | adjacent signal delivery/status mismatch: raw `conf-42088-c595` showed `TestAtomicStop` failing because one iteration exited status 2 where Docker expected `SIGINT`; rerun `conf-53106-c00` happened to match, but final rerun `conf-71289-c00` is NEW again with `TestAtomicStop` failing at iteration 3 (`exit status 2`, expected SIGINT). `TestTerminalSignal` remains an oracle-matching fail. | `atomicstop` reducer | current NEW; reduce next |
+| `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`; fixed by preserving SA_SIGINFO metadata in the reset SIG_DFL action for in-handler `sigaction(SIG, NULL, &old)`. | `sigactionresetinfo` + `signal::tests::sa_resethand_resets_disposition_to_default_on_handler_entry` | MATCH 4/4 vs oracle 4/4 in `conf-71289-c02` |
 
 ### Probe-gate pressure
 
@@ -305,13 +307,15 @@ just conformance-probes
 
 ## Next autonomous slice
 
-1. Reduce `ltp-pause02` with `pauseinterrupt2`, using the raw
-   `conf-42088-c959` signature as the starting oracle.
-2. Fix only the proven signal interruption/restart rule; keep adjacent
-   `go-os_signal` and `ltp-sigaction01` as pressure coverage unless the
-   reducer proves the same root cause.
-3. Validate with the new reducer, adjacent signal/process probes, targeted
-   `just conformance full --suite ltp-pause02 --suite go-os_signal --suite ltp-sigaction01 --no-image-refresh`,
+1. Reduce `go-os_signal` `TestAtomicStop`, starting from final run
+   `conf-71289-c00`: iteration 3 exits with status 2 where Docker expects
+   `SIGINT`; the prior `conf-53106-c00` MATCH means the reducer should stress
+   repeated signal Stop/Reset races rather than assuming a deterministic single
+   syscall miss.
+2. Add an `atomicstop` reducer or focused runtime test for the exact signal
+   disposition/termination race before touching runtime behavior.
+3. Validate with the new reducer, adjacent process/signal probes, targeted
+   `just conformance full --suite go-os_signal --suite ltp-pause02 --suite ltp-sigaction01 --no-image-refresh`,
    and the relevant owned-probe gate.
 4. Update this file and `docs/conformance-coverage.md`, then land a logical
    commit with the validation commands in the body.
