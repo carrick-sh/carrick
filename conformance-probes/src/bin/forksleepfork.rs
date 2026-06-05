@@ -35,7 +35,11 @@ fn main() {
     // remains after the WaitOnSleep fix), SIGALRM terminates the probe so it
     // DIFFs deterministically (carrick: just `thread_created=true`; Docker:
     // all four lines) instead of hanging the harness for a full deadline.
-    unsafe { libc::alarm(8) };
+    let alarm_secs = std::env::var("FORKSLEEPFORK_ALARM_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(8);
+    unsafe { libc::alarm(alarm_secs) };
 
     // Spawn the sleeping sibling thread.
     // pthread_t is a pointer on musl, an integer on glibc — `zeroed` is valid

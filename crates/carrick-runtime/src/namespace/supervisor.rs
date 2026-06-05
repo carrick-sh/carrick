@@ -25,7 +25,7 @@ use std::sync::atomic::Ordering;
 
 use crate::darwin_kqueue::{Kevent, Kqueue};
 
-use super::pid::{self, MEMBER_DEAD};
+use super::pid::{self, HOST_PID_REGISTERING, MEMBER_DEAD};
 
 /// Outcome of running the supervisor loop: the guest-init's `waitpid` status
 /// (to be converted to an exit code and propagated up).
@@ -135,7 +135,7 @@ fn arm_member_watches(kq: &Kqueue, watched: &mut [bool]) {
             continue;
         }
         let host = slot.host_pid.load(Ordering::Acquire);
-        if host == 0 {
+        if host == 0 || host == HOST_PID_REGISTERING {
             continue;
         }
         // Arm the watch; ignore ESRCH (already gone — the rescan / immediate
@@ -169,7 +169,7 @@ fn teardown(_kq: &Kqueue, init_host_pid: i32) {
     if let Some(region) = pid::region() {
         for slot in region.members() {
             let host = slot.host_pid.load(Ordering::Acquire);
-            if host == 0 || host as i32 == init_host_pid {
+            if host == 0 || host == HOST_PID_REGISTERING || host as i32 == init_host_pid {
                 continue;
             }
             if slot.flags.load(Ordering::Acquire) != MEMBER_DEAD {

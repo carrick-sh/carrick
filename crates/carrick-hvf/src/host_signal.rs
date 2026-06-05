@@ -141,6 +141,57 @@ pub fn host_to_linux_signum(host: i32) -> i32 {
         .unwrap_or(host)
 }
 
+fn hvf_private_thread_signal_set(set: &mut libc::sigset_t) {
+    unsafe {
+        libc::sigemptyset(set);
+        for linux in 1..=63 {
+            // Do not mask uncatchable signals, SIGCHLD/SIGPIPE special cases,
+            // or host-synchronous fault/assertion signals in Apple's helper
+            // threads. We only want to keep guest-routed asynchronous signals
+            // off HVF-private pthreads.
+            if matches!(linux, 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 17 | 19 | 31) {
+                continue;
+            }
+            let host = linux_to_host_signum(linux);
+            if (1..=libc::SIGUSR2).contains(&host) {
+                let _ = libc::sigaddset(set, host);
+            }
+        }
+        // Carrick's explicit cross-process signal nudge uses host SIGINFO. It
+        // has no guest-signum mapping, but it is still Carrick-owned routing and
+        // should not land on HVF's private helper threads.
+        let _ = libc::sigaddset(set, XSIG_NUDGE_HOST_SIGNUM);
+    }
+}
+
+pub struct HvfPrivateSignalMaskGuard {
+    old: libc::sigset_t,
+    active: bool,
+}
+
+impl Drop for HvfPrivateSignalMaskGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// Temporarily block guest-routed host signals in the current thread so any
+/// private pthreads HVF spawns during VM creation inherit that blocked mask.
+/// Dropping the guard restores Carrick's own thread mask immediately.
+pub fn block_hvf_private_thread_signals() -> HvfPrivateSignalMaskGuard {
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        let mut old: libc::sigset_t = core::mem::zeroed();
+        hvf_private_thread_signal_set(&mut set);
+        let active = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) == 0;
+        HvfPrivateSignalMaskGuard { old, active }
+    }
+}
+
 /// Bitmask of Linux signums for which we've installed a host handler, so
 /// `ensure_host_handler` is idempotent per signal. Bit `n` = signum `n`.
 static INSTALLED_MASK: AtomicU64 = AtomicU64::new(0);
@@ -807,11 +858,30 @@ fn notify_waiters_fallback() {
     }
 }
 
-/// Wake every blocking-I/O waiter via the process-wide self-pipe (the channel
-/// all `io_wait` kqueues watch). Used by the fork quiesce to nudge threads
-/// blocked in `io_wait` back to their run-loop top so they reach the barrier.
+fn wake_thread_waiter_fds(fds: &ThreadWakeFds) -> bool {
+    let byte = [1u8];
+    let rc = unsafe { libc::write(fds.write_fd, byte.as_ptr() as *const libc::c_void, 1) };
+    rc >= 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+}
+
+/// Wake every blocking-I/O waiter. The process-wide self-pipe is useful as a
+/// fallback, but it is not a reliable broadcast: all waiters share one read fd,
+/// and one waiter can drain the byte before siblings observe it. Fork quiesce
+/// needs every parked vCPU thread to return to the run-loop barrier, so also
+/// nudge each registered per-thread wake pipe.
 pub fn wake_all_waiters() {
     notify_waiters_fallback();
+    let waiters: Vec<Arc<ThreadWakeFds>> = {
+        #[allow(clippy::expect_used)]
+        THREAD_WAITERS
+            .lock()
+            .values()
+            .map(|registration| Arc::clone(&registration.fds))
+            .collect()
+    };
+    for fds in waiters {
+        let _ = wake_thread_waiter_fds(&fds);
+    }
 }
 
 fn wake_thread_waiter(tid: i32) -> bool {
@@ -825,9 +895,7 @@ fn wake_thread_waiter(tid: i32) -> bool {
     let Some(fds) = write_fd else {
         return false;
     };
-    let byte = [1u8];
-    let rc = unsafe { libc::write(fds.write_fd, byte.as_ptr() as *const libc::c_void, 1) };
-    rc >= 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+    wake_thread_waiter_fds(&fds)
 }
 
 /// Drain the self-pipe (non-blocking). Called by a waiter after it observes the
@@ -872,9 +940,11 @@ static SENDER_PID: [std::sync::atomic::AtomicI32; 64] = {
 };
 
 /// Record `host_pid` as the sender of `signum`. Async-signal-safe (one atomic
-/// store); out-of-range signums are ignored.
+/// store); out-of-range signums and host deliveries with no real sender pid are
+/// ignored. A zero `si_pid` must not clobber the previous real sender for a
+/// coalesced standard signal under a signal flood (LTP kill10).
 fn record_sender(signum: i32, host_pid: i32) {
-    if (1..=64).contains(&signum) {
+    if host_pid > 0 && (1..=64).contains(&signum) {
         SENDER_PID[(signum - 1) as usize].store(host_pid, Ordering::SeqCst);
     }
 }
@@ -1444,6 +1514,51 @@ mod tests {
         drop(target);
     }
 
+    #[test]
+    fn wake_all_waiters_broadcasts_to_private_pipes() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        PROC_PENDING.store(0, Ordering::SeqCst);
+
+        let first = register_thread_waiter(900_040).expect("first waiter pipe");
+        let second = register_thread_waiter(900_041).expect("second waiter pipe");
+
+        wake_all_waiters();
+        assert!(pipe_is_readable(pending_pipe_read_fd()));
+        assert!(pipe_is_readable(first.read_fd()));
+        assert!(pipe_is_readable(second.read_fd()));
+
+        drain_pending_pipe();
+        first.drain();
+        second.drain();
+        assert!(!pipe_is_readable(pending_pipe_read_fd()));
+        assert!(!pipe_is_readable(first.read_fd()));
+        assert!(!pipe_is_readable(second.read_fd()));
+        drop(second);
+        drop(first);
+    }
+
+    #[test]
+    fn hvf_private_signal_mask_guard_restores_current_thread_mask() {
+        let _g = TEST_LOCK.lock();
+        let before = signal_is_blocked(libc::SIGUSR1);
+        {
+            let _guard = block_hvf_private_thread_signals();
+            assert!(signal_is_blocked(libc::SIGUSR1));
+            assert!(signal_is_blocked(libc::SIGALRM));
+            assert!(!signal_is_blocked(libc::SIGTRAP));
+        }
+        assert_eq!(signal_is_blocked(libc::SIGUSR1), before);
+    }
+
+    #[test]
+    fn zero_sender_does_not_clobber_last_real_sender() {
+        let _g = TEST_LOCK.lock();
+        record_sender(12, 44_001);
+        record_sender(12, 0);
+        assert_eq!(last_sender_for(12), 44_001);
+    }
+
     fn pipe_is_readable(fd: i32) -> bool {
         assert!(fd >= 0);
         let mut pollfd = libc::pollfd {
@@ -1454,6 +1569,17 @@ mod tests {
         let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
         assert!(rc >= 0);
         rc > 0 && (pollfd.revents & libc::POLLIN) != 0
+    }
+
+    fn signal_is_blocked(signum: libc::c_int) -> bool {
+        unsafe {
+            let mut current: libc::sigset_t = core::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current),
+                0
+            );
+            libc::sigismember(&current, signum) == 1
+        }
     }
 
     #[test]
