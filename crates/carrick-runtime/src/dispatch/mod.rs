@@ -667,7 +667,7 @@ pub struct ThreadCtx<'a> {
     pub futex: &'a crate::thread::FutexTable,
 }
 
-pub(super) fn guest_visible_tid(
+pub(crate) fn guest_visible_tid(
     tid: crate::thread::ThreadId,
     registry: &crate::thread::ThreadRegistry,
 ) -> Option<u32> {

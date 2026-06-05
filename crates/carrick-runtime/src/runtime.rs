@@ -875,6 +875,25 @@ fn stamp_identity_page<M: GuestMemory>(memory: &mut M, dispatcher: &SyscallDispa
     }
 }
 
+/// Stamp the running guest thread's guest-visible tid into the vCPU's TPIDR_EL1,
+/// which the EL1 shim returns for `gettid` without a VM exit (no-op unless the
+/// shim is enabled). Must run whenever the vCPU is (re)created — boot, clone,
+/// fork, exec — since TPIDR_EL1 resets. The EL1 gettid handler traps normally if
+/// this is left 0, so a missed stamp is a slow-but-correct fallback, never a
+/// wrong tid. See `docs/syscall-shim-design.md`.
+fn stamp_guest_tid(
+    engine: &crate::trap::HvfTrapEngine,
+    this_tid: ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+) {
+    if !crate::syscall_shim_enabled() {
+        return;
+    }
+    if let Some(tid) = crate::dispatch::guest_visible_tid(this_tid, registry) {
+        let _ = engine.set_guest_thread_id(u64::from(tid));
+    }
+}
+
 fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMapsEntry> {
     image
         .regions()
@@ -2301,8 +2320,10 @@ impl ThreadRuntimeState {
                 apply_image_proc_state(&kernel.dispatcher, &img);
                 kernel.dispatcher.close_cloexec_fds();
                 engine.execve_into(&img)?;
-                // execve_into rebuilt a fresh (zeroed) identity page.
+                // execve_into rebuilt a fresh vCPU: re-stamp the identity page
+                // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
                 stamp_identity_page(engine, &kernel.dispatcher);
+                stamp_guest_tid(engine, self.this_tid, &self.registry);
                 // vfork: the execve SUCCEEDED and we now have our own private VM
                 // (execve_into rebuilt fresh, un-shared buffers). Release the
                 // suspended parent by writing one byte to the inherited pipe, then
@@ -2691,8 +2712,10 @@ impl ThreadRuntimeState {
                 // PID namespace: block until the parent registered our ns-pid
                 // before any guest code runs (§5.3). No-op when ns off.
                 crate::namespace::pid::await_self_registration();
-                // Re-stamp the identity page: the child's pid changed.
+                // Re-stamp identity + tid: the child's pid changed and the vCPU
+                // was rebuilt (fresh registry holds only this thread).
                 stamp_identity_page(engine, &kernel.dispatcher);
+                stamp_guest_tid(engine, self.this_tid, &self.registry);
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                 self.kicker
                     .register(self.this_tid, engine.vcpu_kick_handle());
@@ -2804,6 +2827,9 @@ fn run_vcpu_until_exit(
 ) -> Result<VcpuLoopOutcome, RuntimeError> {
     let mut state = ThreadRuntimeState::new(registry, futex, this_tid, threads, kicker, max_traps);
     state.register_vcpu(&engine);
+    // Stamp this thread's tid into TPIDR_EL1 for the EL1 gettid fast path (main
+    // thread at boot; each worker at spawn). Re-stamped after fork/exec below.
+    stamp_guest_tid(&engine, state.this_tid, &state.registry);
     // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
     let result: Result<VcpuLoopOutcome, RuntimeError> = (|| {

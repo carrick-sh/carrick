@@ -205,6 +205,12 @@ pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[
     (176, IDENTITY_OFF_GID),  // getgid
     (177, IDENTITY_OFF_EGID), // getegid
 ];
+/// Linux aarch64 `gettid` (178). Unlike the per-process identity reads it is
+/// per-thread, so the EL1 fast path reads it from `TPIDR_EL1` — which carrick
+/// sets per vCPU to that thread's guest-visible tid — instead of the shared
+/// identity page. (`TPIDR_EL1` is otherwise unused by carrick; the guest uses
+/// `TPIDR_EL0` for TLS.)
+pub const GETTID_NR: u16 = 178;
 // The identity page must stay inside the kernel hole's first 2 MiB block so it
 // inherits the kernel-only (AP=00) block mapping from `stage1_identity_page_tables`.
 const _: () = assert!(
@@ -249,6 +255,9 @@ const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 const AARCH64_SVC0_OPCODE: u32 = 0xd400_0001;
 // AArch64 `nop` opcode, used as trampoline page padding.
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
+// AArch64 `mrs x0, TPIDR_EL1` (TPIDR_EL1 = S3_0_C13_C0_4). The shim's gettid
+// handler reads the per-vCPU thread id carrick stamps into TPIDR_EL1.
+const AARCH64_MRS_X0_TPIDR_EL1_OPCODE: u32 = 0xd538_d080;
 // AArch64 `tlbi vmalle1is` — invalidate all stage-1 TLB entries for the
 // current EL in the inner-shareable domain. Required after the host flips
 // SCTLR_EL1.M from 0 to 1 via `set_sys_reg` because the guest never
@@ -1844,6 +1853,11 @@ fn enc_beq(pc: u64, target: u64) -> u32 {
     let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
     0x5400_0000 | (imm19 << 5)
 }
+// `cbz x0, <target>`: branch if x0 == 0. imm19 (units of 4) in bits[23:5], Rt=0.
+fn enc_cbz_x0(pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0xB400_0000 | (imm19 << 5)
+}
 // `movz x0, #imm16, lsl #(hw*16)`.
 fn enc_movz_x0(imm16: u16, hw: u32) -> u32 {
     0xD280_0000 | (hw << 21) | (u32::from(imm16) << 5)
@@ -1912,9 +1926,31 @@ pub fn el1_vectors_bytes_shim() -> Vec<u8> {
         put(&mut bytes, handler + 12, enc_ldr_w0_x0(off));
         put(&mut bytes, handler + 16, AARCH64_ERET_OPCODE);
     }
+    // gettid (178): per-thread, so read the vCPU's TPIDR_EL1 (the runtime stamps
+    // it with this thread's guest-visible tid) instead of the shared page. Its
+    // handler sits right after the page handlers.
+    let gettid_handler = HANDLER_BASE + IDENTITY_SYSCALLS.len() * HANDLER_LEN;
+    put(&mut bytes, cursor, enc_cmp_x8_imm(GETTID_NR));
+    put(
+        &mut bytes,
+        cursor + 4,
+        enc_beq((cursor + 4) as u64, gettid_handler as u64),
+    );
+    cursor += 8;
+    // The fallthrough trap lands here once the gettid cmp/b.eq is placed.
+    let fallthrough = cursor;
+    // gettid handler: read TPIDR_EL1; if it is 0 (unstamped — a tid is never 0)
+    // trap normally instead of returning a wrong 0; otherwise eret with the tid.
+    put(&mut bytes, gettid_handler, AARCH64_MRS_X0_TPIDR_EL1_OPCODE);
+    put(
+        &mut bytes,
+        gettid_handler + 4,
+        enc_cbz_x0((gettid_handler + 4) as u64, fallthrough as u64),
+    );
+    put(&mut bytes, gettid_handler + 8, AARCH64_ERET_OPCODE);
     // Fallthrough: not intercepted -> forward to the host like the legacy slot.
-    put(&mut bytes, cursor, AARCH64_HVC_SYSCALL_OPCODE);
-    put(&mut bytes, cursor + 4, AARCH64_ERET_OPCODE);
+    put(&mut bytes, fallthrough, AARCH64_HVC_SYSCALL_OPCODE);
+    put(&mut bytes, fallthrough + 4, AARCH64_ERET_OPCODE);
     debug_assert!(
         cursor + 8 <= dispatch + AARCH64_VECTOR_SLOT_SIZE,
         "shim dispatcher overruns its 0x80 vector slot"
@@ -2639,18 +2675,29 @@ mod el1_shim_tests {
             None
         }
     }
+    /// `cbz x0, <target>` at byte offset `pc` → Some(absolute target offset).
+    fn decode_cbz_x0(op: u32, pc: usize) -> Option<usize> {
+        if op & 0xFF00_001F != 0xB400_0000 {
+            return None;
+        }
+        let imm19 = ((op >> 5) & 0x7FFFF) as i64;
+        let signed = (imm19 << 45) >> 45;
+        Some((pc as i64 + (signed << 2)) as usize)
+    }
 
     const ERET: u32 = 0xD69F_03E0;
     const HVC2: u32 = 0xD400_0042;
+    const MRS_TPIDR_EL1_X0: u32 = 0xD538_D080; // mrs x0, TPIDR_EL1
 
-    /// The shim dispatcher must service EXACTLY the identity syscalls, each
-    /// branching to a handler that builds the identity page base in x0, loads
-    /// its field, and erets; non-intercepted syscalls fall through to hvc #2.
+    /// The shim dispatcher must service EXACTLY the per-process identity syscalls
+    /// (each via a page-read handler) plus `gettid` (via a per-vCPU TPIDR_EL1
+    /// read), and fall through to `hvc #2` for everything else.
     #[test]
-    fn shim_dispatches_every_identity_syscall_to_its_field() {
+    fn shim_dispatches_identity_and_gettid() {
         let bytes = el1_vectors_bytes_shim();
         let mut pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
-        let mut seen: Vec<(u16, u64)> = Vec::new();
+        let mut page_seen: Vec<(u16, u64)> = Vec::new();
+        let mut sysreg_seen: Vec<u16> = Vec::new();
         loop {
             let op = rd_u32(&bytes, pc);
             if op == HVC2 {
@@ -2665,30 +2712,59 @@ mod el1_shim_tests {
                 .unwrap_or_else(|| panic!("expected `cmp x8,#n` at {pc:#x}, got {op:#010x}"));
             let target = decode_beq(rd_u32(&bytes, pc + 4), pc + 4)
                 .unwrap_or_else(|| panic!("expected `b.eq` at {:#x}", pc + 4));
-            let (lo, hw0) = decode_movz_x0(rd_u32(&bytes, target)).expect("handler movz x0");
-            let (mid, hw1) = decode_movk_x0(rd_u32(&bytes, target + 4)).expect("handler movk #16");
-            let (hi, hw2) = decode_movk_x0(rd_u32(&bytes, target + 8)).expect("handler movk #32");
-            assert_eq!((hw0, hw1, hw2), (0, 1, 2), "page base built lo/mid/hi");
-            assert_eq!(
-                lo | (mid << 16) | (hi << 32),
-                LINUX_IDENTITY_PAGE_BASE,
-                "handler must address the identity page"
-            );
-            let off = decode_ldr_w0_x0(rd_u32(&bytes, target + 12)).expect("ldr w0,[x0,#off]");
-            assert_eq!(
-                rd_u32(&bytes, target + 16),
-                ERET,
-                "handler must end with eret"
-            );
-            seen.push((nr, off));
+            let h0 = rd_u32(&bytes, target);
+            if h0 == MRS_TPIDR_EL1_X0 {
+                // gettid: `mrs x0, TPIDR_EL1 ; cbz x0, <fallthrough> ; eret`.
+                // The cbz traps normally if TPIDR_EL1 is unstamped (0) — a tid is
+                // never 0 — so a missed per-vCPU stamp degrades to a correct trap,
+                // not a wrong gettid==0.
+                let guard = decode_cbz_x0(rd_u32(&bytes, target + 4), target + 4)
+                    .expect("gettid handler must guard with `cbz x0, <fallthrough>`");
+                assert_eq!(
+                    rd_u32(&bytes, guard),
+                    HVC2,
+                    "gettid cbz must branch to the host-trap fallthrough"
+                );
+                assert_eq!(
+                    rd_u32(&bytes, target + 8),
+                    ERET,
+                    "gettid handler must eret after the guard"
+                );
+                sysreg_seen.push(nr);
+            } else {
+                // page read: movz/movk/movk build the page base in x0, then ldr.
+                let (lo, hw0) = decode_movz_x0(h0).expect("handler movz x0");
+                let (mid, hw1) =
+                    decode_movk_x0(rd_u32(&bytes, target + 4)).expect("handler movk #16");
+                let (hi, hw2) =
+                    decode_movk_x0(rd_u32(&bytes, target + 8)).expect("handler movk #32");
+                assert_eq!((hw0, hw1, hw2), (0, 1, 2), "page base built lo/mid/hi");
+                assert_eq!(
+                    lo | (mid << 16) | (hi << 32),
+                    LINUX_IDENTITY_PAGE_BASE,
+                    "handler must address the identity page"
+                );
+                let off = decode_ldr_w0_x0(rd_u32(&bytes, target + 12)).expect("ldr w0,[x0,#off]");
+                assert_eq!(
+                    rd_u32(&bytes, target + 16),
+                    ERET,
+                    "handler must end with eret"
+                );
+                page_seen.push((nr, off));
+            }
             pc += 8;
         }
         let mut expected = IDENTITY_SYSCALLS.to_vec();
-        seen.sort_unstable();
+        page_seen.sort_unstable();
         expected.sort_unstable();
         assert_eq!(
-            seen, expected,
-            "dispatcher must cover exactly the identity syscalls"
+            page_seen, expected,
+            "page-read handlers must be exactly the identity syscalls"
+        );
+        assert_eq!(
+            sysreg_seen,
+            vec![GETTID_NR],
+            "gettid must be serviced via a TPIDR_EL1 read"
         );
     }
 
