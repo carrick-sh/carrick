@@ -179,6 +179,38 @@ const _: () = assert!(
     (LINUX_EL1_MAINT_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_EL1_MAINT_SIZE <= 0x200000,
     "EL1 maintenance trampoline escapes the kernel-only first 2 MiB block",
 );
+// Carrick's per-process identity data page. The EL1 syscall-shim vector
+// dispatcher (`el1_vectors_bytes_shim`) reads pid/uid/gid from here to service
+// getpid/getuid/geteuid/getgid/getegid entirely at EL1 — no VM exit. It sits
+// immediately past the EL1 maintenance trampoline, still inside the kernel
+// hole's first 2 MiB block, so it inherits the kernel-only (AP=00) block
+// mapping: the EL1 stub can read it under PSTATE.PAN=1, and guest EL0 cannot.
+// The host (runtime layer) stamps it via `write_guest_bytes`, exactly as it
+// stamps the read-only vvar.
+pub const LINUX_IDENTITY_PAGE_BASE: u64 = LINUX_EL1_MAINT_BASE + LINUX_EL1_MAINT_SIZE;
+pub const LINUX_IDENTITY_PAGE_SIZE: u64 = 0x4000;
+// Field byte offsets within the identity page (one little-endian u32 each).
+pub const IDENTITY_OFF_PID: u64 = 0x00;
+pub const IDENTITY_OFF_UID: u64 = 0x04;
+pub const IDENTITY_OFF_EUID: u64 = 0x08;
+pub const IDENTITY_OFF_GID: u64 = 0x0C;
+pub const IDENTITY_OFF_EGID: u64 = 0x10;
+// Linux aarch64 syscall numbers serviced by the EL1 identity fast path, paired
+// with the page offset holding the answer. Pure per-process register reads with
+// no host involvement (see docs/syscall-shim-design.md).
+pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[
+    (172, IDENTITY_OFF_PID),  // getpid
+    (174, IDENTITY_OFF_UID),  // getuid
+    (175, IDENTITY_OFF_EUID), // geteuid
+    (176, IDENTITY_OFF_GID),  // getgid
+    (177, IDENTITY_OFF_EGID), // getegid
+];
+// The identity page must stay inside the kernel hole's first 2 MiB block so it
+// inherits the kernel-only (AP=00) block mapping from `stage1_identity_page_tables`.
+const _: () = assert!(
+    (LINUX_IDENTITY_PAGE_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_IDENTITY_PAGE_SIZE <= 0x200000,
+    "identity page escapes the kernel-only first 2 MiB block",
+);
 // User-mode rt_sigreturn trampoline. This must be outside the first 2 MiB,
 // whose stage-1 block is kernel-only for the EL0-entry/vector pages, and it
 // must not collide with ET_EXEC binaries that commonly start at 0x200000. Keep
@@ -814,7 +846,20 @@ impl AddressSpace {
     ///   exception just returns to wherever it came from instead of
     ///   crashing on an unmapped vector fetch.
     pub fn with_el1_vectors(self) -> Result<Self, AddressSpaceError> {
-        let bytes = el1_vectors_bytes();
+        self.with_el1_vectors_from_bytes(el1_vectors_bytes())
+    }
+
+    /// Like [`with_el1_vectors`](Self::with_el1_vectors) but installs the
+    /// syscall-shim dispatcher ([`el1_vectors_bytes_shim`]) at the sync slot, so
+    /// the [`IDENTITY_SYSCALLS`] are serviced at EL1 with no VM exit. Pair it
+    /// with [`with_identity_page`](Self::with_identity_page) (the data the
+    /// dispatcher reads). Behaviour for every non-intercepted syscall is
+    /// identical to the legacy vectors.
+    pub fn with_el1_vectors_shim(self) -> Result<Self, AddressSpaceError> {
+        self.with_el1_vectors_from_bytes(el1_vectors_bytes_shim())
+    }
+
+    fn with_el1_vectors_from_bytes(self, bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
         let start = LINUX_EL1_VECTORS_BASE;
         let end =
             start
@@ -849,6 +894,59 @@ impl AddressSpace {
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = Some(LINUX_EL1_VECTORS_BASE);
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        Ok(image)
+    }
+
+    /// Append the per-process identity data page (zero-filled; the host stamps
+    /// pid/uid/gid into it). It lives in the kernel hole so the EL1 shim
+    /// dispatcher can read it under `PSTATE.PAN=1`. `shared:false`, so fork takes
+    /// a private snapshot and the child re-stamps.
+    ///
+    /// `write:true` marks the *host*-visible mapping writable so the runtime can
+    /// stamp it through the ordinary checked `GuestMemory::write_bytes` (used by
+    /// the boot/fork/exec and cred-mutation stamps). It is NOT guest-EL0-writable:
+    /// the kernel hole's first 2 MiB block is mapped `AP=00` (kernel-only) by
+    /// `stage1_identity_page_tables`, independent of this region's perms — so guest
+    /// EL0 can neither read nor write it; only the EL1 stub reads it. (The vvar is
+    /// read-only because it is stamped via the *unchecked* `write_guest_bytes`
+    /// instead; the identity page reuses the checked path so the dispatcher's
+    /// cred handlers can re-stamp it with the `cx.memory` they already hold.)
+    pub fn with_identity_page(self) -> Result<Self, AddressSpaceError> {
+        let start = LINUX_IDENTITY_PAGE_BASE;
+        let end = start.checked_add(LINUX_IDENTITY_PAGE_SIZE).ok_or(
+            AddressSpaceError::RegionOverflow {
+                start,
+                size: LINUX_IDENTITY_PAGE_SIZE,
+            },
+        )?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            bytes: vec![0u8; LINUX_IDENTITY_PAGE_SIZE as usize],
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            stage1_page_tables_base,
+            ..
+        } = self;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         Ok(image)
     }
@@ -1736,6 +1834,94 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
     bytes
 }
 
+// ---- AArch64 encoders for the EL1 syscall-shim dispatcher ----
+// `cmp x8, #imm` == `subs xzr, x8, #imm` (no shift). imm12 in bits[21:10].
+fn enc_cmp_x8_imm(imm: u16) -> u32 {
+    0xF100_011F | ((u32::from(imm) & 0xFFF) << 10)
+}
+// `b.eq <target>`: PC-relative, imm19 (in units of 4) in bits[23:5], cond=EQ(0).
+fn enc_beq(pc: u64, target: u64) -> u32 {
+    let imm19 = (((target as i64 - pc as i64) >> 2) as u32) & 0x7FFFF;
+    0x5400_0000 | (imm19 << 5)
+}
+// `movz x0, #imm16, lsl #(hw*16)`.
+fn enc_movz_x0(imm16: u16, hw: u32) -> u32 {
+    0xD280_0000 | (hw << 21) | (u32::from(imm16) << 5)
+}
+// `movk x0, #imm16, lsl #(hw*16)`.
+fn enc_movk_x0(imm16: u16, hw: u32) -> u32 {
+    0xF280_0000 | (hw << 21) | (u32::from(imm16) << 5)
+}
+// `ldr w0, [x0, #off]` (off must be a multiple of 4).
+fn enc_ldr_w0_x0(off: u64) -> u32 {
+    0xB940_0000 | (((off as u32 / 4) & 0xFFF) << 10)
+}
+
+/// Like [`el1_vectors_bytes`], but the lower-EL synchronous slot (0x400) holds
+/// the syscall-shim dispatcher: a `cmp x8`/`b.eq` chain that services the
+/// [`IDENTITY_SYSCALLS`] directly at EL1 (loading the answer from the identity
+/// page into `x0` and `eret`-ing — zero VM exits), falling through to the
+/// legacy `hvc #2; eret` for everything else. Every other slot is unchanged.
+///
+/// The dispatcher clobbers only NZCV (the `cmp`s) and — on the intercepted
+/// paths — `x0` (the syscall return register). `eret` restores EL0's PSTATE
+/// from SPSR_EL1, so the flag clobber is invisible; the fallthrough path leaves
+/// `x0..x5,x8` untouched so the host sees an unperturbed syscall frame. The
+/// per-syscall handlers live in the page's `nop` tail (past the 2 KiB vector
+/// table), branch-reachable from the slot, and build the (kernel-hole, AP=00)
+/// identity-page address in `x0` only AFTER the eligibility decision.
+pub fn el1_vectors_bytes_shim() -> Vec<u8> {
+    // Start from the legacy page (all slots = eret, 0x400 = hvc #2; eret, tail
+    // = nop) and overwrite the sync slot + the handler tail.
+    let mut bytes = el1_vectors_bytes();
+    let put = |bytes: &mut [u8], off: usize, op: u32| {
+        bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+
+    // Handlers go in the nop tail right after the 16-slot (2 KiB) vector table.
+    const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE; // 0x800
+    const HANDLER_LEN: usize = 5 * 4; // movz, movk, movk, ldr, eret
+    let base = LINUX_IDENTITY_PAGE_BASE;
+    let (lo, mid, hi) = (
+        (base & 0xFFFF) as u16,
+        ((base >> 16) & 0xFFFF) as u16,
+        ((base >> 32) & 0xFFFF) as u16,
+    );
+    debug_assert_eq!(
+        base >> 48,
+        0,
+        "identity page base needs only 3 mov immediates"
+    );
+
+    let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+    let mut cursor = dispatch;
+    for (i, &(nr, off)) in IDENTITY_SYSCALLS.iter().enumerate() {
+        let handler = HANDLER_BASE + i * HANDLER_LEN;
+        // dispatcher: cmp x8,#nr ; b.eq handler
+        put(&mut bytes, cursor, enc_cmp_x8_imm(nr));
+        put(
+            &mut bytes,
+            cursor + 4,
+            enc_beq((cursor + 4) as u64, handler as u64),
+        );
+        cursor += 8;
+        // handler: build the page base in x0, load the field, eret.
+        put(&mut bytes, handler, enc_movz_x0(lo, 0));
+        put(&mut bytes, handler + 4, enc_movk_x0(mid, 1));
+        put(&mut bytes, handler + 8, enc_movk_x0(hi, 2));
+        put(&mut bytes, handler + 12, enc_ldr_w0_x0(off));
+        put(&mut bytes, handler + 16, AARCH64_ERET_OPCODE);
+    }
+    // Fallthrough: not intercepted -> forward to the host like the legacy slot.
+    put(&mut bytes, cursor, AARCH64_HVC_SYSCALL_OPCODE);
+    put(&mut bytes, cursor + 4, AARCH64_ERET_OPCODE);
+    debug_assert!(
+        cursor + 8 <= dispatch + AARCH64_VECTOR_SLOT_SIZE,
+        "shim dispatcher overruns its 0x80 vector slot"
+    );
+    bytes
+}
+
 fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
     Ok(vec![
         MemoryRegion {
@@ -2402,5 +2588,199 @@ mod stage1_tests {
         assert_eq!(shared.end, LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE);
         assert!(shared.shared, "shared aperture must be flagged shared");
         assert!(shared.perms.read && shared.perms.write);
+    }
+}
+
+#[cfg(test)]
+mod el1_shim_tests {
+    use super::*;
+
+    fn rd_u32(b: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+    }
+    /// `cmp x8, #imm` (== `subs xzr, x8, #imm`, no shift) → Some(imm).
+    fn decode_cmp_x8(op: u32) -> Option<u16> {
+        if op & !(0xFFF << 10) == 0xF100_011F {
+            Some(((op >> 10) & 0xFFF) as u16)
+        } else {
+            None
+        }
+    }
+    /// `b.eq <target>` at byte offset `pc` → Some(absolute target byte offset).
+    fn decode_beq(op: u32, pc: usize) -> Option<usize> {
+        if op & 0xFF00_001F != 0x5400_0000 {
+            return None;
+        }
+        let imm19 = ((op >> 5) & 0x7FFFF) as i64;
+        let signed = (imm19 << 45) >> 45; // sign-extend 19 bits
+        Some((pc as i64 + (signed << 2)) as usize)
+    }
+    /// `ldr w0, [x0, #off]` → Some(off).
+    fn decode_ldr_w0_x0(op: u32) -> Option<u64> {
+        if op & !(0xFFF << 10) == 0xB940_0000 {
+            Some((((op >> 10) & 0xFFF) as u64) * 4)
+        } else {
+            None
+        }
+    }
+    /// `movz x0, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
+    fn decode_movz_x0(op: u32) -> Option<(u64, u32)> {
+        if op & 0xFF80_001F == 0xD280_0000 {
+            Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
+        } else {
+            None
+        }
+    }
+    /// `movk x0, #imm16, lsl #(hw*16)` → Some((imm16, hw)).
+    fn decode_movk_x0(op: u32) -> Option<(u64, u32)> {
+        if op & 0xFF80_001F == 0xF280_0000 {
+            Some((((op >> 5) & 0xFFFF) as u64, (op >> 21) & 0x3))
+        } else {
+            None
+        }
+    }
+
+    const ERET: u32 = 0xD69F_03E0;
+    const HVC2: u32 = 0xD400_0042;
+
+    /// The shim dispatcher must service EXACTLY the identity syscalls, each
+    /// branching to a handler that builds the identity page base in x0, loads
+    /// its field, and erets; non-intercepted syscalls fall through to hvc #2.
+    #[test]
+    fn shim_dispatches_every_identity_syscall_to_its_field() {
+        let bytes = el1_vectors_bytes_shim();
+        let mut pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+        let mut seen: Vec<(u16, u64)> = Vec::new();
+        loop {
+            let op = rd_u32(&bytes, pc);
+            if op == HVC2 {
+                assert_eq!(
+                    rd_u32(&bytes, pc + 4),
+                    ERET,
+                    "hvc #2 must be followed by eret"
+                );
+                break;
+            }
+            let nr = decode_cmp_x8(op)
+                .unwrap_or_else(|| panic!("expected `cmp x8,#n` at {pc:#x}, got {op:#010x}"));
+            let target = decode_beq(rd_u32(&bytes, pc + 4), pc + 4)
+                .unwrap_or_else(|| panic!("expected `b.eq` at {:#x}", pc + 4));
+            let (lo, hw0) = decode_movz_x0(rd_u32(&bytes, target)).expect("handler movz x0");
+            let (mid, hw1) = decode_movk_x0(rd_u32(&bytes, target + 4)).expect("handler movk #16");
+            let (hi, hw2) = decode_movk_x0(rd_u32(&bytes, target + 8)).expect("handler movk #32");
+            assert_eq!((hw0, hw1, hw2), (0, 1, 2), "page base built lo/mid/hi");
+            assert_eq!(
+                lo | (mid << 16) | (hi << 32),
+                LINUX_IDENTITY_PAGE_BASE,
+                "handler must address the identity page"
+            );
+            let off = decode_ldr_w0_x0(rd_u32(&bytes, target + 12)).expect("ldr w0,[x0,#off]");
+            assert_eq!(
+                rd_u32(&bytes, target + 16),
+                ERET,
+                "handler must end with eret"
+            );
+            seen.push((nr, off));
+            pc += 8;
+        }
+        let mut expected = IDENTITY_SYSCALLS.to_vec();
+        seen.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "dispatcher must cover exactly the identity syscalls"
+        );
+    }
+
+    /// The dispatcher must stay inside the 0x80-byte vector slot.
+    #[test]
+    fn shim_dispatcher_fits_in_its_vector_slot() {
+        let bytes = el1_vectors_bytes_shim();
+        let mut pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+        while rd_u32(&bytes, pc) != HVC2 {
+            pc += 8;
+        }
+        // hvc #2 + eret must both fit before the next slot boundary.
+        assert!(
+            pc + 8 <= AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET + AARCH64_VECTOR_SLOT_SIZE,
+            "dispatcher overruns its 0x80 slot"
+        );
+    }
+
+    /// Other slots are untouched (slot 0 stays a bare eret).
+    #[test]
+    fn shim_leaves_spurious_slots_as_bare_eret() {
+        assert_eq!(rd_u32(&el1_vectors_bytes_shim(), 0), ERET);
+    }
+
+    /// Regression guard: the default (non-shim) vector page keeps the flat
+    /// `hvc #2` forward at the sync slot.
+    #[test]
+    fn legacy_vectors_have_no_dispatcher() {
+        assert_eq!(
+            rd_u32(&el1_vectors_bytes(), AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET),
+            HVC2
+        );
+    }
+
+    fn minimal_image() -> AddressSpace {
+        AddressSpace::from_segments(
+            0x1000,
+            [(
+                0x1000,
+                SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+                vec![0xd4, 0x20, 0x00, 0x00],
+                4,
+            )],
+        )
+        .unwrap()
+    }
+
+    /// `with_el1_vectors_shim` installs the vector region with the dispatcher at
+    /// the sync slot (records `el1_vectors_base` just like the legacy builder).
+    #[test]
+    fn with_el1_vectors_shim_installs_dispatcher_region() {
+        let image = minimal_image().with_el1_vectors_shim().unwrap();
+        assert_eq!(image.el1_vectors_base(), Some(LINUX_EL1_VECTORS_BASE));
+        let region = image
+            .regions()
+            .iter()
+            .find(|r| r.start == LINUX_EL1_VECTORS_BASE)
+            .expect("EL1 vector region must be present");
+        assert_eq!(
+            rd_u32(region.bytes(), AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET),
+            enc_cmp_x8_imm(172),
+            "sync slot must start with `cmp x8,#172` (getpid)"
+        );
+    }
+
+    /// `with_identity_page` installs a per-process, read-only kernel-hole region
+    /// of the right size the host can stamp.
+    #[test]
+    fn with_identity_page_installs_kernel_hole_region() {
+        let image = minimal_image().with_identity_page().unwrap();
+        let region = image
+            .regions()
+            .iter()
+            .find(|r| r.start == LINUX_IDENTITY_PAGE_BASE)
+            .expect("identity page region must be present");
+        assert_eq!(
+            region.end,
+            LINUX_IDENTITY_PAGE_BASE + LINUX_IDENTITY_PAGE_SIZE
+        );
+        assert!(
+            region.perms.read && region.perms.write && !region.perms.execute,
+            "identity page is host-writable (checked stamp path) but never executable; \
+             guest EL0 is blocked by the kernel-hole AP=00 mapping, not these perms"
+        );
+        assert!(
+            !region.shared,
+            "identity page is per-process (private snapshot on fork)"
+        );
+        assert_eq!(region.bytes().len(), LINUX_IDENTITY_PAGE_SIZE as usize);
     }
 }

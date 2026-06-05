@@ -777,6 +777,9 @@ fn run_address_space_with_hvf_and_dispatcher(
         // ELF instead of the legacy summary. Language runtimes, malloc
         // implementations, and debuggers parse these; refreshed again on each execve.
         apply_image_proc_state(&dispatcher, &image);
+        // Boot-stamp the identity page before the guest runs a single syscall,
+        // so the very first fast-path getpid/get*id reads the right value.
+        stamp_identity_page(&mut trap, &dispatcher);
         run_threaded_hvf_loop(trap, dispatcher, max_traps)
     })();
     match run {
@@ -815,10 +818,16 @@ fn finish_and_run_image(
     // Arm this (initial) process's deadlock watchdog; forked children re-arm in
     // the ForkOutcome::Child path. No-op unless CARRICK_DEADLOCK_WATCHDOG_MS set.
     crate::deadlock_watchdog::arm();
-    let image = image
-        .with_el0_trampoline()?
-        .with_el1_vectors()?
-        .with_stage1_page_tables()?;
+    let image = image.with_el0_trampoline()?;
+    // The syscall shim swaps the legacy EL1 vectors for the identity-fast-path
+    // dispatcher and adds the kernel-hole identity page it reads. Opt-in; the
+    // legacy path is byte-identical when off. See docs/syscall-shim-design.md.
+    let image = if crate::syscall_shim_enabled() {
+        image.with_el1_vectors_shim()?.with_identity_page()?
+    } else {
+        image.with_el1_vectors()?
+    };
+    let image = image.with_stage1_page_tables()?;
     let image = with_optional_vdso(image)?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
@@ -839,6 +848,31 @@ fn finish_and_run_image(
 fn apply_image_proc_state(dispatcher: &SyscallDispatcher, image: &AddressSpace) {
     dispatcher.set_address_space_regions(proc_maps_from_address_space(image));
     dispatcher.set_auxv_image(image.linux_auxv_image().to_vec());
+}
+
+/// Stamp the per-process identity page the EL1 syscall shim reads (no-op unless
+/// the shim is enabled). Must run before the guest issues any intercepted
+/// syscall: at boot, and again in a forked child / after execve, since the
+/// child's pid and the new image's identity differ. Credential changes
+/// (`set*uid`/`set*gid`) re-stamp from the dispatcher itself. See
+/// `docs/syscall-shim-design.md`.
+fn stamp_identity_page<M: GuestMemory>(memory: &mut M, dispatcher: &SyscallDispatcher) {
+    if !crate::syscall_shim_enabled() {
+        return;
+    }
+    let id = dispatcher.identity_snapshot();
+    let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+    for (off, val) in [
+        (crate::memory::IDENTITY_OFF_PID, id.pid),
+        (crate::memory::IDENTITY_OFF_UID, id.uid),
+        (crate::memory::IDENTITY_OFF_EUID, id.euid),
+        (crate::memory::IDENTITY_OFF_GID, id.gid),
+        (crate::memory::IDENTITY_OFF_EGID, id.egid),
+    ] {
+        // Best-effort: the page is only absent when the shim is off (handled
+        // above) or on a non-HVF stub; a stamp failure can't corrupt the guest.
+        let _ = memory.write_bytes(base + off, &val.to_le_bytes());
+    }
 }
 
 fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMapsEntry> {
@@ -1071,6 +1105,9 @@ where
                         // our ns-pid, so our first getpid()/getppid() see the
                         // mapping (§5.3). No-op when namespaces are off.
                         crate::namespace::pid::await_self_registration();
+                        // Re-stamp the identity page: the child's pid changed
+                        // (ns-pid now registered), so a fast-path getpid is right.
+                        stamp_identity_page(runtime, &dispatcher);
                         // The child's pid changed; its waiter watches for
                         // process-directed signals immediately, then upgrades
                         // to a per-thread kqueue only if it parks.
@@ -1110,6 +1147,8 @@ where
                         apply_image_proc_state(&dispatcher, &new_image);
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
+                        // execve_into rebuilt a fresh (zeroed) identity page.
+                        stamp_identity_page(runtime, &dispatcher);
                         stop_after_traced_exec(&dispatcher);
                     }
                     Err(errno) => {
@@ -2262,6 +2301,8 @@ impl ThreadRuntimeState {
                 apply_image_proc_state(&kernel.dispatcher, &img);
                 kernel.dispatcher.close_cloexec_fds();
                 engine.execve_into(&img)?;
+                // execve_into rebuilt a fresh (zeroed) identity page.
+                stamp_identity_page(engine, &kernel.dispatcher);
                 // vfork: the execve SUCCEEDED and we now have our own private VM
                 // (execve_into rebuilt fresh, un-shared buffers). Release the
                 // suspended parent by writing one byte to the inherited pipe, then
@@ -2650,6 +2691,8 @@ impl ThreadRuntimeState {
                 // PID namespace: block until the parent registered our ns-pid
                 // before any guest code runs (§5.3). No-op when ns off.
                 crate::namespace::pid::await_self_registration();
+                // Re-stamp the identity page: the child's pid changed.
+                stamp_identity_page(engine, &kernel.dispatcher);
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                 self.kicker
                     .register(self.this_tid, engine.vcpu_kick_handle());
