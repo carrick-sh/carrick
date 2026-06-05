@@ -199,3 +199,132 @@ fn hvf_engine_maps_address_space_when_backend_is_available() {
     assert_eq!(engine.mapped_region_count(), 1);
     assert_eq!(engine.program_counter().unwrap(), 0x4000);
 }
+
+// ---- EL1 syscall-shim identity fast path (end-to-end on real HVF) ----
+// These run a 4-instruction guest — `getpid; exit_group` — under a real vCPU.
+// With the shim, `getpid` (svc, x8=172) is serviced entirely at EL1 from the
+// kernel-hole identity page and never reaches the host; the FIRST host-visible
+// trap is `exit_group` (x8=94) carrying the stamped pid in x0. The legacy
+// control proves the setup is honest: without the shim, `getpid` DOES trap.
+// Self-skip (pass) when HVF isn't available, like the other engine tests.
+
+const SHIM_PROBE_ENTRY: u64 = 0x10000; // low user VA (EL0-executable)
+// movz x8,#172 ; svc #0 ; movz x8,#94 ; svc #0  (getpid then exit_group)
+const SHIM_PROBE_CODE: [u32; 4] = [0xD280_1588, 0xD400_0001, 0xD280_0BC8, 0xD400_0001];
+
+fn shim_probe_code_bytes() -> Vec<u8> {
+    SHIM_PROBE_CODE
+        .iter()
+        .flat_map(|i| i.to_le_bytes())
+        .collect()
+}
+
+fn shim_probe_engine_or_skip() -> Option<HvfTrapEngine> {
+    match HvfTrapEngine::new() {
+        Ok(engine) => {
+            eprintln!("[hvf-shim-test] RUN: engine created, executing guest");
+            Some(engine)
+        }
+        // No usable HVF (CI Linux, or an unsigned macOS test binary lacking the
+        // hypervisor entitlement) -> skip. Marker so a signed run can confirm the
+        // assertions actually executed (not silently skipped). NOTE: HVF allows
+        // ONE VM per process, so run these two tests in SEPARATE processes
+        // (`--exact`) to exercise both — a shared `cargo test` run lets only the
+        // first create a VM; the second skips.
+        Err(_) => {
+            eprintln!("[hvf-shim-test] SKIP: HVF engine unavailable");
+            None
+        }
+    }
+}
+
+#[test]
+fn el1_shim_services_getpid_at_el1_without_a_host_trap() {
+    use carrick_runtime::dispatch::GuestMemory;
+    use carrick_runtime::memory::{IDENTITY_OFF_PID, LINUX_IDENTITY_PAGE_BASE};
+    use carrick_runtime::trap::SyscallTrap;
+
+    let image = AddressSpace::from_segments(
+        SHIM_PROBE_ENTRY,
+        [(
+            SHIM_PROBE_ENTRY,
+            SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shim_probe_code_bytes(),
+            16,
+        )],
+    )
+    .unwrap()
+    .with_el0_trampoline()
+    .and_then(|a| a.with_el1_vectors_shim())
+    .and_then(|a| a.with_identity_page())
+    .and_then(|a| a.with_stage1_page_tables())
+    .and_then(|a| a.with_linux_initial_stack(vec!["t"], Vec::<&str>::new()))
+    .unwrap();
+
+    let Some(mut engine) = shim_probe_engine_or_skip() else {
+        return;
+    };
+    engine.map_address_space(&image).unwrap();
+    // Boot-stamp the identity page exactly like the runtime does.
+    const SENTINEL_PID: u32 = 0xABCD;
+    engine
+        .write_bytes(
+            LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_PID,
+            &SENTINEL_PID.to_le_bytes(),
+        )
+        .unwrap();
+
+    // The first host-visible trap must be exit_group (94), NOT getpid (172):
+    // getpid was answered at EL1. And x0 must carry the stamped pid, proving the
+    // EL1 handler read the identity page and returned it in the syscall result.
+    let frame = engine.next_syscall().unwrap().expect("guest must trap");
+    assert_eq!(
+        frame.x8, 94,
+        "getpid (172) must NOT reach the host; first trap is exit_group"
+    );
+    assert_eq!(
+        frame.x0 & 0xFFFF_FFFF,
+        u64::from(SENTINEL_PID),
+        "fast-path getpid must return the stamped identity-page pid"
+    );
+}
+
+#[test]
+fn el1_legacy_vectors_trap_getpid_to_the_host() {
+    use carrick_runtime::trap::SyscallTrap;
+
+    // Same guest, legacy vectors (no shim): getpid MUST trap to the host first.
+    let image = AddressSpace::from_segments(
+        SHIM_PROBE_ENTRY,
+        [(
+            SHIM_PROBE_ENTRY,
+            SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shim_probe_code_bytes(),
+            16,
+        )],
+    )
+    .unwrap()
+    .with_el0_trampoline()
+    .and_then(|a| a.with_el1_vectors())
+    .and_then(|a| a.with_stage1_page_tables())
+    .and_then(|a| a.with_linux_initial_stack(vec!["t"], Vec::<&str>::new()))
+    .unwrap();
+
+    let Some(mut engine) = shim_probe_engine_or_skip() else {
+        return;
+    };
+    engine.map_address_space(&image).unwrap();
+    let frame = engine.next_syscall().unwrap().expect("guest must trap");
+    assert_eq!(
+        frame.x8, 172,
+        "without the shim, getpid must trap to the host"
+    );
+}

@@ -51,10 +51,19 @@ pub(super) fn load_execve_image(
             .or_else(|| std::fs::read(p).ok())
     })
     .map_err(|_| LINUX_ENOENT)?;
+    // Mirror the boot builder: the syscall shim installs the identity-fast-path
+    // EL1 vectors + the kernel-hole identity page (see finish_and_run_image).
+    let vectors_and_id = |a: AddressSpace| -> Result<AddressSpace, AddressSpaceError> {
+        if crate::syscall_shim_enabled() {
+            a.with_el1_vectors_shim()?.with_identity_page()
+        } else {
+            a.with_el1_vectors()
+        }
+    };
     let image = raw
         .with_vdso_auxv(vdso_enabled_for_debug())
         .with_el0_trampoline()
-        .and_then(|a| a.with_el1_vectors())
+        .and_then(vectors_and_id)
         .and_then(|a| a.with_stage1_page_tables())
         .and_then(with_optional_vdso)
         .and_then(|a| a.with_linux_initial_stack(argv, env))
