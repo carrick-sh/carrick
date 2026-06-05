@@ -42,31 +42,70 @@ liability; a red one you've root-caused is progress.
   treacherous as a precise gate (see "Reading results honestly").
 - **Conformance probes** (`conformance-probes/src/bin/*.rs`) are small, you
   wrote them, they print **deterministic** lines (booleans/relationships, never
-  raw times/pids), and the harness (`tests/conformance.rs`) compares carrick vs
-  Docker **line-exact** in `cargo test`. They are the precise gate and the
-  durable artifact. The LTP sweep tells you where to dig; the probe nails it
-  down so it can never silently regress.
+  raw times/pids), and the harness (`crates/carrick-cli/tests/conformance.rs`,
+  run via `just conformance-probes`) compares carrick vs Docker **line-exact**.
+  They are the precise gate and the durable artifact. The LTP sweep tells you
+  where to dig; the probe nails it down so it can never silently regress.
+
+The broad differential sweep itself now lives in the unified
+`carrick-conformance` harness (the `just conformance` recipes below), which spans
+four ecosystems — `cpython·go·node·ltp` — not just LTP.
 
 ## Setup
 
-```sh
-# 1. Build SIGNED, always — `cargo build` strips the HVF entitlement → HV_DENIED
-./scripts/build-signed.sh
+carrick needs the HVF entitlement, so it must run as a **SIGNED** binary — a bare
+`cargo build` strips the signature → HV_DENIED (0xfae94007). Always build through
+`just`, which routes every build through `scripts/build-signed.sh`:
 
-# 2. Local registry on :5050 (NOT :5000 — macOS ControlCenter/AirPlay owns it)
-docker start registry 2>/dev/null \
-  || docker run -d --restart=always -p 5050:5000 --name registry registry:2
-docker push localhost:5050/ltp:arm64        # built by docker/ltp/Dockerfile
-export CARRICK_INSECURE_REGISTRIES=localhost:5050
+```sh
+just build        # build + codesign the whole workspace (carrick AND the harness)
 ```
+
+The differential harness pulls its Linux images from two local registries —
+`:5050` (cpython + ltp) and `:5005` (go + node); NOT `:5000`, macOS
+ControlCenter/AirPlay owns it. **You don't set them up by hand.** The durable,
+self-healing driver does the whole dance — starts/creates both registries,
+pushes any image the registry doesn't already serve, rebuilds the signed binary
++ harness, then runs:
+
+```sh
+scripts/conformance/run-full.sh              # full tier: registries + build + run
+TIER=smoke scripts/conformance/run-full.sh   # fast gate
+```
+
+The harness sets `CARRICK_INSECURE_REGISTRIES` itself per-suite, so no manual
+export is needed. Once the registries are up, the `just` recipes are the quick
+day-to-day entry points:
+
+| recipe | what it does |
+| --- | --- |
+| `just conformance` | full differential gate (cpython·go·node·ltp) vs the cached Docker oracle |
+| `just conformance smoke` / `just conformance-quick` | fast pre-merge tier; non-zero exit on any regression |
+| `just conformance-probes` | the line-exact ABI probe gate (`crates/carrick-cli/tests/conformance.rs`) |
+| `just conformance full --ecosystem ltp` | restrict to one ecosystem (repeatable; also `--suite <name>`) |
+| `just conformance full --bless` | record: rewrite `scripts/conformance/baseline.jsonl` + `docs/support-matrix.md` |
+| `just matrix` | re-render `docs/support-matrix.md` from the latest results (runs nothing) |
+| `just test` | host `--lib` unit tests (the regression check after a fix) |
+
+A routine run executes ONLY carrick and diffs against the committed oracle cache
+(`scripts/conformance/oracle-cache.jsonl`); Docker is re-run for a suite only
+when its cache key is absent — or you pass `--refresh-oracle` after rebuilding an
+image's contents. An image-freshness guard re-pulls carrick's copy of any image
+whose registry digest moved, so carrick and Docker run identical bytes.
 
 ## Discover: run the differential sweep
 
-Use the bundled scripts (durable; the verdict logic is the subtle part):
+The unified harness (`just conformance`, above) IS the differential sweep for the
+suites in the manifest (`scripts/conformance/suites.toml`) — it runs each under
+carrick and diffs against the Docker oracle. For ad-hoc LTP work OUTSIDE that
+curated manifest — checking specific tests by name, or sweeping the full LTP
+suite to find the gap denominator — use the bundled scripts (durable; the verdict
+logic is the subtle part):
 
 ```sh
 .agents/skills/ltp-conformance/scripts/ltp-check.sh pause01 futex_wake03 ...
-.agents/skills/ltp-conformance/scripts/ltp-sweep.sh   # the full curated 4-area sweep
+.agents/skills/ltp-conformance/scripts/ltp-sweep.sh        # curated 4-area subset (~192)
+.agents/skills/ltp-conformance/scripts/ltp-full-sweep.sh   # every LTP syscall binary (~1457)
 ```
 
 Each test runs under Docker (the oracle) and under
@@ -154,8 +193,9 @@ futex on shared mmap), `procstat.rs` (a paused child's `/proc/<pid>/stat` state)
   alpine /<probe>`. Gotchas: `run-elf`'s rootfs is EMPTY — `mkdir("/tmp")` before
   opening a file there; and a shared-FILE/`__ulock` futex only engages under
   `--fs host` (real host file → host `MAP_SHARED`), not `--fs memory`.
-- The harness `tests/conformance.rs` auto-discovers probe binaries and
-  line-diffs them in `cargo test --release` — that's the permanent gate.
+- The harness `crates/carrick-cli/tests/conformance.rs` auto-discovers probe
+  binaries and line-diffs them; run it with `just conformance-probes` — that's
+  the permanent gate.
 
 ## Fix it right
 
@@ -170,7 +210,7 @@ futex on shared mmap), `procstat.rs` (a paused child's `/proc/<pid>/stat` state)
   cross-thread wakeups via `kqueue` `EVFILT_USER`, fork-coherent shared memory
   via host `MAP_SHARED`. It's less state to manage, and it's more faithful.
 - After fixing: re-run the probe (must MATCH) AND the originating LTP test, plus
-  `cargo test --release --lib` for regressions. Only then is it done.
+  `just test` (host `--lib` suite) for regressions. Only then is it done.
 
 ## Honest scoping
 
