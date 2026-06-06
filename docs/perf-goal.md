@@ -22,6 +22,7 @@ Landed slices:
 - `efd09cdb8115dd5895d13212e945886337fb5f9a` - `perf(io): use borrowed pwritev buffers`
 - `f820d05` - `docs(perf): record pwritev burst result`
 - `45086059c0ecb4a0a4dd6f03968a5bbf8f0b1d9d` - `perf(io): use borrowed readv buffers`
+- `dd72b8eff34b3f6c5e82dc211cff6d5b19584508` - `perf(io): move blocking write buffers`
 
 Measured branch evidence:
 
@@ -50,6 +51,11 @@ Measured branch evidence:
   - Commit `4508605` uses host `libc::readv`/`libc::preadv` when all non-empty guest iovecs expose `host_ptr_for_write`.
   - Fallback coverage keeps mixed host-pointer/non-host-pointer reads on the existing staged path.
   - Filtered `just bench quick` wrote `preadv_burst` rows to `docs/perf-results/2026-06-05-syscall.jsonl`: Carrick p50 `19852.375` us, p95 `22193.875` us, marked noisy; Docker p50 `2571.125` us, p95 `2902.375` us, marked noisy.
+- Blocking host-write continuation ownership:
+  - RED test `dispatch::overlay_dispatch_tests::blocking_host_write_from_owned_bytes_reuses_buffer_storage` initially failed because no owned-buffer handoff path existed.
+  - Commit `dd72b8e` moves already-staged write/writev `Vec<u8>` buffers into `BlockingHostWrite` continuations instead of cloning them after partial blocking pipe progress.
+  - Allocation evidence is direct pointer/capacity preservation in the continuation test.
+  - Behavior probes matched Docker/Linux for blocking pipe signal interruption, partial nonblocking writev, and broken-pipe SIGPIPE/EPIPE.
 
 ## First-Principles Cost Model
 
@@ -209,7 +215,7 @@ Milestone 2C: blocking write ownership and existing `writev` path cleanup.
 - [x] Confirm EINTR, EAGAIN, partial-write, and retry behavior are unchanged.
 - [x] Run focused I/O tests and relevant conformance probes.
 - [x] Record allocation or wall-time evidence for repeated small blocking writes.
-- [ ] Commit as a separate logical slice.
+- [x] Commit as a separate logical slice.
 
 Progress:
 
@@ -219,6 +225,7 @@ Progress:
 - 2026-06-06: Focused Rust checks passed: `cargo test -p carrick-runtime blocking_host_write_from_owned_bytes_reuses_buffer_storage -- --nocapture`, `cargo test -p carrick-runtime large_blocking_host_pipe_write_hands_off_after_partial_progress -- --nocapture`, and `cargo test -p carrick-runtime --test integration writev -- --nocapture`.
 - 2026-06-06: Pre-commit hygiene passed: `cargo fmt --all -- --check` and `git diff --check`.
 - 2026-06-06: Signed-build conformance probes matched Docker/Linux: `scripts/run-probe.sh blockingpipewrite`, `scripts/run-probe.sh writevpartial`, and `scripts/run-probe.sh sigpipewrite`.
+- 2026-06-06: Committed runtime/test/ledger slice as `dd72b8eff34b3f6c5e82dc211cff6d5b19584508` (`perf(io): move blocking write buffers`).
 
 ### 3. VFS Streaming and Dirty-Range Writeback
 
@@ -345,11 +352,11 @@ Repo-local result artifacts:
 
 ## Immediate Next Slice
 
-Continue Milestone 2C.
+Continue Milestone 3.
 
-- [ ] Add RED coverage for the blocking-write handoff path that proves an owned staged buffer is not cloned when it can be transferred.
-- [ ] Replace clone-on-handoff with ownership transfer for already-staged write buffers.
-- [ ] Confirm EINTR, EAGAIN, partial-write, and retry behavior are unchanged.
-- [ ] Run focused I/O tests and relevant conformance probes.
-- [ ] Record allocation or wall-time evidence for repeated small blocking writes.
-- [ ] Commit the blocking-write ownership slice separately from borrowed vector I/O.
+- [ ] Add a large-file metadata probe that opens/stats/lookups a file without reading its contents.
+- [ ] Add a large-file small-write test that fails if the backend rewrites or clones the full file.
+- [ ] Add backend API support for range writes or fd-backed mutation on regular mutable files.
+- [ ] Keep whole-file behavior as fallback for in-memory files, symlinks, directories, and special files.
+- [ ] Run focused filesystem tests and a build-tool-like workload with many small file updates.
+- [ ] Record before/after wall-time and byte-copy/writeback evidence.
