@@ -9,6 +9,21 @@ The name refers to a type of knot used to join two heavy ropes of different size
 
 ---
 
+## Install
+
+Apple Silicon macOS only.
+
+```sh
+brew tap carrick-sh/carrick
+brew install --HEAD carrick
+```
+
+carrick is built from source and ad-hoc codesigned with the
+`com.apple.security.hypervisor` entitlement during install, so it can run Linux
+guests via Hypervisor.framework. To build from source instead, see Quick Start.
+
+---
+
 ## Quick Start
 
 ```sh
