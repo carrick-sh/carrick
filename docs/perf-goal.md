@@ -62,6 +62,8 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `229105b` - `perf(fs): avoid duplicate fd path records`
+- `af1ee02` - `docs(perf): replace first-principles plan`
 - `04ffaa1` - `docs(perf): record vfs fallthrough result`
 - `8a7659a` - `perf(fs): skip vfs context on rootfs open`
 - `1f35251` - `docs(perf): record memory nofollow result`
@@ -77,7 +79,7 @@ Relevant result file:
 
 - `docs/perf-results/2026-06-06-disk.jsonl` contains
   `overlay_small_updates` rows for `4bae00f`, `0a08b5f`, `0d9ee96`,
-  `76d0aac`, and `8a7659a`.
+  `76d0aac`, `8a7659a`, and `229105b`.
 
 ## Current Evidence
 
@@ -227,6 +229,9 @@ Landed removals:
   canonicalization for memory regular-file opens.
 - `8a7659a`: skipped VFS `OpenContext` construction for rootfs/overlay
   fallthrough opens.
+- `229105b`: skipped duplicate `fd_open_paths` records for path-carrying
+  memory `File` and `Directory` descriptors while keeping conservative records
+  for named FIFO, pty, host-backed, and synthetic descriptor classes.
 
 Useful current signal:
 
@@ -237,11 +242,20 @@ Useful current signal:
 - Direct `8a7659a` signed runs were around `4.2` to `5.7` ms.
 - `8a7659a` harness rows were noisy/high and should not be treated as the
   primary signal.
+- Direct `229105b` signed runs were `8058.917`, `4995.709`, and `4510.291` us;
+  treat the first as an outlier and the latter two as the useful low-overhead
+  signal.
+- `229105b` trace kept the same guest syscall shape: `openat=594`,
+  `fcntl=593`, `close=593`, `write=583`, `lseek=577`, `ftruncate=16`,
+  `unlinkat=16`.
+- `229105b` harness rows were noisy/high: Carrick p50 `7562.125` us then
+  `7175.000` us; Docker p50 `802.666` us then `815.166` us, with the second
+  Docker row noisy.
 
 Remaining:
 
-- Attribute the full post-`8a7659a` guest-open route between fd-table
-  installation, path record bookkeeping, close cleanup, and fd flag handling.
+- Attribute the remaining full guest-open route between fd-table installation,
+  close cleanup, fd flag handling, and any non-path descriptor bookkeeping.
 - Decide whether the remaining repeated `openat`/`fcntl`/`lseek`/`write`/`close`
   trap shape can be reduced only by a dynamic interposer or by a safe
   runtime-local fast path.
@@ -297,7 +311,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
 
 **Steps:**
 
-- [ ] Inspect all writers and readers of `fd_open_paths`.
+- [x] Inspect all writers and readers of `fd_open_paths`.
 
   Run:
 
@@ -305,7 +319,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   rg -n "fd_open_paths|record_path|proc_self_fd_number|proc_self_fdinfo_number|install_fd_at_or_above" crates/carrick-runtime/src
   ```
 
-- [ ] Classify which descriptor families need `fd_open_paths` because the open
+- [x] Classify which descriptor families need `fd_open_paths` because the open
   description cannot answer a guest-facing path.
 
   Expected conservative keepers:
@@ -316,7 +330,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   - special `/proc` or `/dev` nodes where the guest-facing readlink string is not
     simply the `OpenDescription` path
 
-- [ ] Add test-only counters for `fd_open_paths` insertions and lookups.
+- [x] Add test-only counters for `fd_open_paths` insertions and lookups.
 
   Put counters next to the insertion path in `crates/carrick-runtime/src/dispatch/fs.rs`
   or in a small helper if the insertion sites are spread out:
@@ -328,7 +342,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   static FD_OPEN_PATH_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
   ```
 
-- [ ] Write the RED test for the smallest duplicate case.
+- [x] Write the RED test for the smallest duplicate case.
 
   Test name:
 
@@ -342,7 +356,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   fd_open_paths insertions should be 0 for memory OpenDescription::File
   ```
 
-- [ ] Preserve `/proc/self/fd/N` behavior while removing duplicate storage.
+- [x] Preserve `/proc/self/fd/N` behavior while removing duplicate storage.
 
   The intended design is:
 
@@ -353,7 +367,20 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   - Keep `fd_open_paths` for descriptor classes where the open description is
     insufficient or intentionally synthetic.
 
-- [ ] Run focused checks.
+  Progress at `af1ee02` plus worktree runtime changes:
+
+  - RED observed:
+    `cargo test -p carrick-runtime dispatch::fs::tests::memory_file_open_does_not_duplicate_path_record_for_proc_fd -- --nocapture`
+    failed with `left: 1 right: 0`.
+  - GREEN observed after the runtime change with the same command.
+  - The test also verifies `readlinkat("/proc/self/fd/3")` still returns
+    `/regular.bin` through `OpenDescription::open_path()`.
+  - The runtime change skips `fd_open_paths` insertion only for
+    `OpenDescription::File` and `OpenDescription::Directory`; named FIFO, pty,
+    host-backed, and intentionally synthetic records keep the conservative map
+    path.
+
+- [x] Run focused checks.
 
   ```sh
   cargo test -p carrick-runtime memory_file_open_does_not_duplicate_path_record_for_proc_fd -- --nocapture
@@ -362,7 +389,14 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   cargo test -p carrick-runtime --test integration memory_overlay_regular_open_skips_legacy_kind_lookups -- --nocapture
   ```
 
-- [ ] Run broad compile/format checks.
+  Additional adjacent checks run:
+
+  ```sh
+  cargo test -p carrick-runtime --test integration memory_overlay_regular_open_skips_fifo_probe_when_backend_cannot_have_fifos -- --nocapture
+  cargo test -p carrick-runtime --test integration memory_overlay_open_uses_single_backend_snapshot_for_shared_file -- --nocapture
+  ```
+
+- [x] Run broad compile/format checks.
 
   ```sh
   cargo test -p carrick-runtime --tests --no-run
@@ -370,12 +404,14 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   git diff --check
   ```
 
-- [ ] Commit only runtime files.
+- [x] Commit only runtime files.
 
   ```sh
   git add crates/carrick-runtime/src/dispatch/fs.rs crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs crates/carrick-runtime/src/dispatch/fd_table.rs crates/carrick-runtime/src/dispatch/fs/stat.rs
   git commit -m "perf(fs): avoid duplicate fd path records"
   ```
+
+  Committed as `229105b`.
 
 ## Task 2: Measure the remaining open/close route
 
@@ -389,20 +425,22 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
 
 **Steps:**
 
-- [ ] Build a signed binary.
+- [x] Build a signed binary.
 
   ```sh
   ./scripts/build-signed.sh
   ```
 
-- [ ] Run a direct signed smoke sample for `overlay_small_updates`.
+- [x] Run direct signed smoke samples for `overlay_small_updates`.
 
   ```sh
   target/release/carrick run-elf --raw --fs memory \
     conformance-probes/target/aarch64-unknown-linux-musl/release/perf_overlay_small_updates
   ```
 
-- [ ] Run `carrick trace` with trace output separated from guest output.
+  Samples at `229105b`: `8058.917`, `4995.709`, and `4510.291` us.
+
+- [x] Run `carrick trace` with trace output separated from guest output.
 
   ```sh
   CARRICK_RUN_ID=perf-overlay-post-fd-path \
@@ -411,7 +449,11 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
     conformance-probes/target/aarch64-unknown-linux-musl/release/perf_overlay_small_updates
   ```
 
-- [ ] Run the filtered perf harness.
+  Trace file: `/tmp/carrick-overlay-small-updates-post-fd-path.trace`.
+  Aggregation: `openat=594`, `fcntl=593`, `close=593`, `write=583`,
+  `lseek=577`, `ftruncate=16`, `unlinkat=16`.
+
+- [x] Run the filtered perf harness.
 
   ```sh
   CARRICK_PERF_FILTER=overlay_small_updates \
@@ -421,7 +463,15 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
   ```
 
-- [ ] Append JSONL rows with the exact current `git_sha`.
+- [x] Append JSONL rows with the exact current `git_sha`.
+
+  The harness appended two Carrick/Docker row pairs for
+  `229105b17d5fc1796abf48aa0098300063472638`:
+
+  - run `cr-perf-82952`: Carrick p50 `7562.125` us, p95 `8324.708` us,
+    noisy; Docker p50 `802.666` us, p95 `857.958` us.
+  - run `cr-perf-83343`: Carrick p50 `7175.000` us, p95 `7902.416` us,
+    noisy; Docker p50 `815.166` us, p95 `1594.958` us, noisy.
 
 - [ ] Validate result JSON and docs diff.
 
