@@ -24,10 +24,12 @@
 //! ```
 //!
 //! For a docker `run`, the CLI builds a [`carrick_engine::CliRunRequest`] and
-//! hands it to `Engine::run`, which resolves+pulls the image, merges
-//! entrypoint+cmd+env into a `RunSpec`, and calls `Runtime::execute` — the entry
-//! to the actual HVF guest. The CLI never touches the manifest, the rootfs tar,
-//! or the vCPU; it only chooses the output shape and the process exit code. The
+//! hands it to `Engine::resolve`, which resolves+pulls the image and merges
+//! entrypoint+cmd+env into a `RunSpec`. The CLI *then* — after the async image
+//! pull has been torn down, so no tokio runtime is live across the fork — calls
+//! `Runtime::execute`, the entry to the actual HVF guest. The CLI never touches
+//! the manifest, the rootfs tar, or the vCPU; it only chooses the output shape
+//! and the process exit code. The
 //! one place the CLI *does* reach below the engine is `run-elf` (and its
 //! `dispatch-syscall` sibling), which loads a host ELF directly through
 //! `carrick-runtime` for unit-test / conformance fixtures with no OCI image at
