@@ -72,6 +72,20 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency (lower better): repeated epoll_wait wakeups on a stable pipe
+    // registration. This is a broader event-loop shape than a raw blocking
+    // read and separates steady-state waits from epoll_ctl churn.
+    PerfCase {
+        probe: "perf_epoll_pipe_loop",
+        dimension: "syscall",
+        workload: "epoll_pipe_loop",
+        metric_key: "epoll_pipe_loop_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): many small dynamic-style writes to stdout.
     PerfCase {
         probe: "perf_stdio_burst",
@@ -325,6 +339,11 @@ mod tests {
                 "wait_pipe_pingpong",
                 "perf_wait_pipe_pingpong",
                 "wait_pipe_pingpong_p50_us",
+            ),
+            (
+                "epoll_pipe_loop",
+                "perf_epoll_pipe_loop",
+                "epoll_pipe_loop_p50_us",
             ),
         ];
 
