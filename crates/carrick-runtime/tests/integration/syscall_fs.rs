@@ -3100,7 +3100,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
 
 #[test]
 fn synthetic_proc_surface_serves_common_process_and_system_files() {
-    let paths: [(&str, &[u8]); 19] = [
+    let paths: [(&str, &[u8]); 20] = [
         ("/proc/cmdline", b"BOOT_IMAGE="),
         ("/proc/diskstats", b""),
         ("/proc/filesystems", b"overlay"),
@@ -3115,6 +3115,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
         ("/proc/self/cmdline", b"/proc/self/exe"),
         ("/proc/self/comm", b"exe"),
         ("/proc/self/limits", b"Max open files"),
+        ("/proc/self/mounts", b"overlay / overlay"),
         ("/proc/self/statm", b"0 0"),
         ("/proc/self/status", b"Name:\texe"),
         ("/proc/sys/kernel/osrelease", b"carrick"),

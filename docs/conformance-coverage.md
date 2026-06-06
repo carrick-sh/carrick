@@ -17,7 +17,7 @@ a probe that doesn't exist):
 
 ```
 Owned invariant probes (on disk):  288
-Invariant rows with an owning test: 134/134 (100%)
+Invariant rows with an owning test: 136/136 (100%)
 Distinct curated LTP tests owned:   502/502 (100%)
 ```
 
@@ -169,6 +169,7 @@ underlying gap got fixed):
 | **setpgid session-leader rule under PID namespace translation: a namespace-visible session leader, including pid 1 when the host SID differs from the host PGID, fails `setpgid()` with EPERM before Carrick delegates to Darwin; forked non-leader children can still create/join process groups** | 🧪 `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid` + ✅ `setpgidparentgroup` / `proclife` | setpgid01 |
 | **execve from a multithreaded process replaces the whole thread group: sibling guest threads are terminated before the HVF VM is rebuilt, and the new image starts with `Threads: 1`** | ✅ `execthreads` + 🧪 `thread::tests::remove_all_except_keeps_exec_owner_live` | Go `syscall.TestExec` |
 | **vfork parent resumes with its own fast-path identity after the child shares guest RAM and exits/execs: `getpid()` stays stable and `kill(getpid(), SIGUSR1)` still reaches the parent handler** | ✅ `vforkpid` | Go `os/signal.TestDetectNohup` → `TestStop` / `TestSIGCONT` / `TestSignalTrace` |
+| **`/proc/self/mounts` is openable and mirrors `/proc/mounts`, so Linux cgroup helpers can discover the synthetic mount table instead of TBROKing on ENOENT before reaching the syscall under test** | 🧪 `syscall_fs::synthetic_proc_surface_serves_common_process_and_system_files` | clone303 cgroup setup |
 | fork memory isolation (COW) across .data/.bss/heap/mmap | ✅ `forkcow` | (fork correctness) |
 | MAP_SHARED coherence across multi-level fork, both directions | ✅ `forkshared` | (tst_checkpoint shared mem) |
 | fork+wait4+SIGCHLD/SIGUSR1 + list-walk leaves heap intact; wait status correct | ✅ `forksigwalk` | (shell/framework fork+reap) |
