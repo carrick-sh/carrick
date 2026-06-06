@@ -706,6 +706,157 @@ impl SyscallRequest {
     }
 }
 
+#[derive(Eq)]
+struct PinnedHostFd {
+    fd: i32,
+}
+
+impl PinnedHostFd {
+    fn new(fd: i32) -> Result<Self, i32> {
+        let duped = unsafe { libc::dup(fd) };
+        if duped < 0 {
+            let host = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EMFILE);
+            return Err(macos_to_linux_errno(host));
+        }
+        Ok(Self { fd: duped })
+    }
+}
+
+impl Drop for PinnedHostFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+impl std::fmt::Debug for PinnedHostFd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PinnedHostFd").field(&self.fd).finish()
+    }
+}
+
+impl PartialEq for PinnedHostFd {
+    fn eq(&self, other: &Self) -> bool {
+        self.fd == other.fd
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct BlockingHostWrite {
+    #[serde(skip_serializing)]
+    host_fd: std::sync::Arc<PinnedHostFd>,
+    #[serde(skip_serializing)]
+    bytes: Vec<u8>,
+    offset: usize,
+    tid: crate::thread::ThreadId,
+    sigpipe_on_epipe: bool,
+}
+
+impl BlockingHostWrite {
+    fn new(
+        host_fd: i32,
+        bytes: &[u8],
+        offset: usize,
+        tid: crate::thread::ThreadId,
+        sigpipe_on_epipe: bool,
+    ) -> Result<Self, i32> {
+        Ok(Self {
+            host_fd: std::sync::Arc::new(PinnedHostFd::new(host_fd)?),
+            bytes: bytes.to_vec(),
+            offset,
+            tid,
+            sigpipe_on_epipe,
+        })
+    }
+
+    pub(crate) fn host_fd(&self) -> i32 {
+        self.host_fd.fd
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn tid(&self) -> crate::thread::ThreadId {
+        self.tid
+    }
+
+    pub(crate) fn sigpipe_on_epipe(&self) -> bool {
+        self.sigpipe_on_epipe
+    }
+}
+
+impl std::fmt::Debug for BlockingHostWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingHostWrite")
+            .field("host_fd", &self.host_fd.fd)
+            .field("bytes_len", &self.bytes.len())
+            .field("offset", &self.offset)
+            .field("tid", &self.tid)
+            .field("sigpipe_on_epipe", &self.sigpipe_on_epipe)
+            .finish()
+    }
+}
+
+pub(crate) enum BlockingHostWriteStep {
+    Done(DispatchOutcome),
+    Wait,
+}
+
+pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> BlockingHostWriteStep {
+    loop {
+        if write.offset >= write.bytes.len() {
+            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
+                value: write.bytes.len() as i64,
+            });
+        }
+        let n = unsafe {
+            libc::write(
+                write.host_fd(),
+                write.bytes[write.offset..].as_ptr() as *const _,
+                write.bytes.len() - write.offset,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        crate::probes::host_pipe_io(write.host_fd(), 1, n as i64);
+        if let Err(errno) = n.host_syscall_errno() {
+            if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
+                if crate::host_signal::has_unblocked_pending_for(write.tid, 0) {
+                    return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
+                        value: write.offset as i64,
+                    });
+                }
+                return BlockingHostWriteStep::Wait;
+            }
+            if write.offset > 0 {
+                return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
+                    value: write.offset as i64,
+                });
+            }
+            return BlockingHostWriteStep::Done(DispatchOutcome::Errno { errno });
+        }
+        if n == 0 {
+            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
+                value: write.offset as i64,
+            });
+        }
+        write.offset += n as usize;
+        if write.offset >= write.bytes.len() {
+            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
+                value: write.bytes.len() as i64,
+            });
+        }
+        if crate::host_signal::has_unblocked_pending_for(write.tid, 0) {
+            return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
+                value: write.offset as i64,
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
@@ -874,6 +1025,13 @@ pub enum DispatchOutcome {
         /// is delivered after the syscall, per the persistent mask). `0` = none.
         block_signals: u64,
     },
+    /// A blocking `write(2)` to a host FIFO made partial progress and then hit
+    /// host EAGAIN. Re-dispatching the original syscall would duplicate the
+    /// written prefix, while parking inside the dispatcher would starve sibling
+    /// threads that may close the read end or deliver the interrupting signal.
+    /// The runtime owns this staged continuation, waits for POLLOUT with the
+    /// dispatcher lock released, and completes with the Linux-visible result.
+    BlockingHostWrite(BlockingHostWrite),
     /// Like [`DispatchOutcome::WaitOnFds`] but for `select`/`pselect6`, whose fd-set bitmaps are
     /// BOTH input and output (unlike `poll`'s separate `events`/`revents`).
     /// The handler therefore leaves the guest fd-sets UNMODIFIED across the
@@ -975,6 +1133,7 @@ impl DispatchOutcome {
             DispatchOutcome::FutexWait { .. } => (0, None),
             DispatchOutcome::SharedFutexWait { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
+            DispatchOutcome::BlockingHostWrite(_) => (0, None),
             DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
             DispatchOutcome::WaitOnProcExit { .. } => (0, None),
@@ -4316,46 +4475,13 @@ fn read_host_pipe(
     DispatchOutcome::Returned { value: n as i64 }
 }
 
-/// Result of parking a blocking pipe write that has made partial progress.
-enum PipeWriteWait {
-    /// The fd is writable (or errored) — retry the write.
-    Ready,
-    /// A guest signal is pending (or a fork quiesce began) — stop and surface
-    /// the partial count already written.
-    Interrupted,
-}
-
-/// Park the calling guest thread until `host_fd` is writable, a guest signal
-/// becomes pending for `tid`, or a fork quiesce begins. The bounded poll timeout
-/// backstops the case where the interrupting host signal was consumed before we
-/// parked, so the pending flag is always re-checked.
-fn wait_pipe_writable(host_fd: i32, tid: crate::thread::ThreadId) -> PipeWriteWait {
-    loop {
-        if crate::host_signal::has_unblocked_pending_for(tid, 0)
-            || crate::fork_quiesce::is_quiescing()
-        {
-            return PipeWriteWait::Interrupted;
-        }
-        let mut pfd = libc::pollfd {
-            fd: host_fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // 50ms backstop: poll is normally woken immediately either by POLLOUT
-        // (the reader drained the pipe) or by the host signal interrupting it.
-        let r = unsafe { libc::poll(&mut pfd, 1, 50) };
-        if r > 0 && (pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0 {
-            return PipeWriteWait::Ready;
-        }
-    }
-}
-
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
 fn write_host_pipe(
     bytes: &[u8],
     host_fd: i32,
     nonblocking: bool,
     tid: crate::thread::ThreadId,
+    sigpipe_on_epipe: bool,
 ) -> DispatchOutcome {
     if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
         eprintln!(
@@ -4365,12 +4491,12 @@ fn write_host_pipe(
         );
     }
     crate::dispatch::net::set_host_nonblocking(host_fd);
-    // A blocking write to a pipe must not return a short count: Linux blocks
-    // until every byte is written, or returns the partial count when a signal
-    // interrupts it after partial progress (EINTR if zero progress). Loop until
-    // complete, parking on POLLOUT in a signal-aware wait. (Small <=PIPE_BUF
-    // writes were already looped for atomicity; this generalizes it to any size
-    // so e.g. a >capacity unbuffered write blocks as it would on Linux.)
+    // A blocking large pipe write may make partial progress before the host fd
+    // reports EAGAIN. At that point we cannot re-dispatch the original syscall
+    // (it would re-send the written prefix), but we also cannot park inside the
+    // dispatcher because a sibling guest thread may be the reader/closer needed
+    // to unblock this write. Hand the staged bytes to the runtime so it can wait
+    // with dispatcher progress released.
     let block_until_complete = !nonblocking && {
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         (unsafe { libc::fstat(host_fd, &mut st) }) == 0
@@ -4423,18 +4549,23 @@ fn write_host_pipe(
             // (see read_host_pipe).
             if e == LINUX_EAGAIN || e == LINUX_EINTR {
                 if block_until_complete && offset > 0 {
-                    // Partial progress already made: we cannot re-dispatch the
-                    // whole syscall (it would re-send the written prefix), so
-                    // block here until the pipe is writable or a signal lands,
-                    // surfacing the partial count on interrupt.
-                    match wait_pipe_writable(host_fd, tid) {
-                        PipeWriteWait::Ready => continue,
-                        PipeWriteWait::Interrupted => {
-                            return DispatchOutcome::Returned {
-                                value: offset as i64,
-                            };
-                        }
+                    if crate::host_signal::has_unblocked_pending_for(tid, 0) {
+                        return DispatchOutcome::Returned {
+                            value: offset as i64,
+                        };
                     }
+                    return match BlockingHostWrite::new(
+                        host_fd,
+                        bytes,
+                        offset,
+                        tid,
+                        sigpipe_on_epipe,
+                    ) {
+                        Ok(write) => DispatchOutcome::BlockingHostWrite(write),
+                        Err(_) => DispatchOutcome::Returned {
+                            value: offset as i64,
+                        },
+                    };
                 }
                 return would_block_outcome(host_fd, libc::POLLOUT, nonblocking);
             }
@@ -4449,6 +4580,20 @@ fn write_host_pipe(
                 if crate::host_signal::has_unblocked_pending_for(tid, 0)
                     || crate::fork_quiesce::is_quiescing()
                 {
+                    if crate::fork_quiesce::is_quiescing() {
+                        return match BlockingHostWrite::new(
+                            host_fd,
+                            bytes,
+                            offset,
+                            tid,
+                            sigpipe_on_epipe,
+                        ) {
+                            Ok(write) => DispatchOutcome::BlockingHostWrite(write),
+                            Err(_) => DispatchOutcome::Returned {
+                                value: offset as i64,
+                            },
+                        };
+                    }
                     return DispatchOutcome::Returned {
                         value: offset as i64,
                     };
@@ -4590,6 +4735,30 @@ mod overlay_dispatch_tests {
             Err(_) => panic!("expected next fd install to succeed"),
         };
         assert_eq!(next, 6);
+    }
+
+    #[test]
+    fn large_blocking_host_pipe_write_hands_off_after_partial_progress() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+        let bytes = vec![0xA5; 4 * 1024 * 1024];
+        let outcome = write_host_pipe(&bytes, fds[1], false, 0x7FFE_0101, true);
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        let DispatchOutcome::BlockingHostWrite(write) = outcome else {
+            panic!("large pipe write should hand off after partial progress, got {outcome:?}");
+        };
+        assert!(
+            write.offset() > 0 && write.offset() < bytes.len(),
+            "expected a positive partial offset after filling the pipe, got {}",
+            write.offset()
+        );
+        assert!(write.sigpipe_on_epipe());
     }
 
     #[test]

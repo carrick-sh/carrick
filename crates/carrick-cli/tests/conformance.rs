@@ -99,6 +99,7 @@ use std::time::{Duration, Instant};
 /// forked `rm`/`http` stuck on an HVF vCPU) must not stall the whole run —
 /// the case is killed, marked FAIL(timeout), and the harness moves on.
 const CASE_DEADLINE: Duration = Duration::from_secs(45);
+const WAITEXITSTORM_DEADLINE: Duration = Duration::from_secs(60);
 
 use bollard::Docker;
 use bollard::container::{
@@ -867,6 +868,15 @@ fn probe_binaries(lane: Lane) -> Vec<PathBuf> {
 /// base64 of the probe) to the child's STDIN. Mirrors `run_carrick`'s
 /// deadline + process-group-kill + sweep pattern, but pipes stdin.
 fn run_carrick_probe(bin: &PathBuf, lane: Lane, stdin_bytes: &[u8]) -> String {
+    run_carrick_probe_with_deadline(bin, lane, stdin_bytes, CASE_DEADLINE)
+}
+
+fn run_carrick_probe_with_deadline(
+    bin: &PathBuf,
+    lane: Lane,
+    stdin_bytes: &[u8],
+    deadline: Duration,
+) -> String {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
     let run_id = case_run_id();
@@ -916,7 +926,7 @@ fn run_carrick_probe(bin: &PathBuf, lane: Lane, stdin_bytes: &[u8]) -> String {
         std::thread::spawn(move || {
             let start = Instant::now();
             while !done.load(Ordering::Relaxed) {
-                if start.elapsed() > CASE_DEADLINE {
+                if start.elapsed() > deadline {
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                     scoped_kill_guests(&run_id);
                     return true;
@@ -930,7 +940,7 @@ fn run_carrick_probe(bin: &PathBuf, lane: Lane, stdin_bytes: &[u8]) -> String {
     done.store(true, Ordering::Relaxed);
     let timed_out = watcher.join().unwrap_or(false);
     if timed_out {
-        return format!("<TIMEOUT after {}s>", CASE_DEADLINE.as_secs());
+        return format!("<TIMEOUT after {}s>", deadline.as_secs());
     }
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -1056,10 +1066,11 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     // jitter class as sigchld/waitsiblingsigchld, not a code regression.
     "pidnsinitreap",
     // waitexitstorm: 1050 fork+blocking-wait cycles intentionally exceed the
-    // old 1024 namespace-member capacity. It MATCHes standalone, but under the
-    // 8-way Carrick fan-out the fork storm can exceed the 45s case deadline.
-    // Keep it in the serial lane so the gate still runs it without weakening
-    // the invariant.
+    // old 1024 namespace-member capacity. It MATCHes standalone, but runs close
+    // enough to the default 45s case deadline that full-gate host load can trip
+    // a false timeout. Keep it in the serial lane and give it the same 60s bound
+    // as scripts/run-probe.sh so the gate still runs it without weakening the
+    // invariant.
     "waitexitstorm",
 ];
 
@@ -1098,7 +1109,12 @@ fn run_one_probe(bin: &PathBuf, lane: Lane, probe: &std::path::Path) -> (String,
     // carrick THEN docker, sequentially — so a single `run_one_probe` call never
     // overlaps the two. (The parallel gate path uses the two-phase split below so
     // it doesn't either; this fn is the serial quarantine path.)
-    let carrick_out = run_carrick_probe(bin, lane, &encoded);
+    let deadline = if name == "waitexitstorm" {
+        WAITEXITSTORM_DEADLINE
+    } else {
+        CASE_DEADLINE
+    };
+    let carrick_out = run_carrick_probe_with_deadline(bin, lane, &encoded, deadline);
     let docker_out = run_docker_probe(lane, &encoded);
     classify_probe(name, &carrick_out, docker_out)
 }
