@@ -79,6 +79,7 @@ fn clone_fork_flags_still_fork() {
 
 // --- Sub-task B: per-thread tid + real futex via dispatch_threaded ---
 
+use carrick_runtime::linux_abi::{LINUX_SI_TKILL, LinuxSiginfo};
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 use std::sync::Arc;
 
@@ -462,6 +463,11 @@ const LINUX_SIG_BLOCK: u64 = 0;
 const LINUX_SIG_UNBLOCK: u64 = 1;
 const SIGUSR1: u64 = 10;
 
+fn read_siginfo_i32(info: &LinuxSiginfo, offset: usize) -> i32 {
+    let bytes = info.as_bytes();
+    i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
 #[test]
 fn tgkill_to_sibling_emits_signalthread() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
@@ -490,6 +496,48 @@ fn tgkill_to_sibling_emits_signalthread() {
             tid: sibling,
             signum: SIGUSR1 as i32,
         }
+    );
+}
+
+#[test]
+fn tgkill_to_sibling_queues_si_tkill_siginfo() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    let sibling = registry.register_child(0);
+
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(
+                131,
+                SyscallArgs::from([1000, sibling as u64, SIGUSR1, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SignalThread {
+            tid: sibling,
+            signum: SIGUSR1 as i32,
+        }
+    );
+    let info = dispatcher
+        .take_pending_siginfo(sibling, SIGUSR1 as i32)
+        .expect("tgkill should queue SI_TKILL siginfo for the target thread");
+    assert_eq!(read_siginfo_i32(&info, 0), SIGUSR1 as i32);
+    assert_eq!(read_siginfo_i32(&info, 8), LINUX_SI_TKILL);
+    assert_eq!(
+        read_siginfo_i32(&info, 16),
+        std::process::id() as i32,
+        "sender pid"
     );
 }
 

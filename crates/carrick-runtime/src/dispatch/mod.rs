@@ -3465,6 +3465,8 @@ impl SyscallDispatcher {
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
         let proc = self.proc.lock();
         let mem = self.mem_snapshot();
+        let creds = self.cred_snapshot();
+        let groups = self.current_groups();
         crate::vfs::SyntheticProcContext {
             executable_path: proc.executable_path.clone(),
             argv: proc.argv.clone(),
@@ -3474,6 +3476,13 @@ impl SyscallDispatcher {
             address_space_regions: mem.address_space_regions,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
+            ruid: creds.ruid,
+            euid: creds.euid,
+            suid: creds.suid,
+            rgid: creds.rgid,
+            egid: creds.egid,
+            sgid: creds.sgid,
+            groups,
             sig_ignored,
             sig_caught,
             sig_shdpnd,
