@@ -417,6 +417,17 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .tag_image(&src, &dst)
                 .with_context(|| format!("failed to tag {source} as {target}"))?;
         }
+        Commands::Build {
+            tag,
+            file,
+            build_arg,
+            no_cache,
+            platform,
+            push,
+            context,
+        } => {
+            run_build(&store, tag, file, build_arg, no_cache, platform, push, context)?;
+        }
         Commands::Run {
             image,
             platform,
@@ -979,4 +990,262 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The kaniko executor image, pinned to the spike-validated version. The build
+/// wrapper runs this exact image as a carrick guest; bumping it is a deliberate
+/// re-validation step, not an incidental dependency update.
+const KANIKO_IMAGE: &str = "gcr.io/kaniko-project/executor:v1.24.0";
+
+/// The destination used when no `-t/--tag` is given. kaniko requires a
+/// `--destination` even for a `--no-push` build (it stamps the image's
+/// `RepoTags`, which is what `carrick load` then tags the image as).
+const DEFAULT_BUILD_TAG: &str = "carrick-build:latest";
+
+/// `carrick build` — a thin wrapper that builds a Dockerfile by running the real
+/// kaniko executor as a carrick guest, then loads the result into the store.
+///
+/// This reimplements nothing: it composes the already-proven loop of
+/// `carrick run --fs host -v <context>:/workspace [-v <out>:/out] <kaniko> …`
+/// (the server-as-translator pattern: shell out to our own binary, inheriting
+/// stdio so kaniko's progress streams live) and then either lets kaniko push or
+/// ingests the resulting tar with [`ImageStore::load_docker_archive`].
+#[allow(clippy::too_many_arguments)]
+fn run_build(
+    store: &ImageStore,
+    tag: Option<String>,
+    file: std::path::PathBuf,
+    build_arg: Vec<String>,
+    no_cache: bool,
+    platform: Option<String>,
+    push: bool,
+    context: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    // The build context must exist and be a directory. Canonicalise it so the
+    // `-v` bind mount gets an absolute host path (carrick run resolves the mount
+    // source against its launch dir otherwise).
+    let context_abs = context.canonicalize().with_context(|| {
+        format!(
+            "build context {} does not exist or is not accessible",
+            context.display()
+        )
+    })?;
+    if !context_abs.is_dir() {
+        bail!("build context {} is not a directory", context_abs.display());
+    }
+
+    // The Dockerfile path is RELATIVE to the context; reject an absolute `-f`
+    // (it would not resolve inside the guest's /workspace mount) so the failure
+    // is a clear CLI error rather than an opaque kaniko ENOENT.
+    if file.is_absolute() {
+        bail!(
+            "-f/--file {} must be relative to the build context",
+            file.display()
+        );
+    }
+    let dockerfile_rel = file.to_string_lossy().into_owned();
+
+    // kaniko's `--destination` is required even for `--no-push`; default it.
+    let destination = tag.unwrap_or_else(|| DEFAULT_BUILD_TAG.to_owned());
+
+    let me = std::env::current_exe().context("failed to resolve current carrick binary path")?;
+
+    // The output dir for the built tar is only needed on the `--no-push` path.
+    // Keep the TempDir alive for the duration of the build + ingest.
+    let out_dir = if push {
+        None
+    } else {
+        Some(tempfile::tempdir().context("failed to create temp output directory for image tar")?)
+    };
+    let out_path = out_dir.as_ref().map(|d| d.path().to_path_buf());
+
+    let argv = kaniko_run_argv(
+        &me.to_string_lossy(),
+        &context_abs.to_string_lossy(),
+        out_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        &dockerfile_rel,
+        &destination,
+        &build_arg,
+        no_cache,
+        platform.as_deref(),
+    );
+
+    // Shell out to ourselves, inheriting stdio so kaniko's build progress
+    // streams straight to the user (same translator pattern as `carrick serve`
+    // / `carrick trace`). argv[0] is the carrick binary path.
+    let (program, args) = argv
+        .split_first()
+        .context("internal error: empty kaniko run argv")?;
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to spawn {program} for the kaniko build"))?;
+    if !status.success() {
+        // kaniko's own diagnostics already streamed to the user's terminal.
+        bail!("build failed (kaniko exited with {status})");
+    }
+
+    if push {
+        // kaniko already pushed to the registry; nothing to ingest.
+        println!("Successfully built {destination}");
+        println!("Successfully pushed {destination}");
+        return Ok(());
+    }
+
+    // `--no-push`: ingest the tar kaniko wrote into the store, directly via the
+    // store method (no third process). kaniko tags the image per the tar's
+    // RepoTags (our `--destination`).
+    let tar = out_path
+        .as_ref()
+        .context("internal error: missing output tar path for --no-push build")?
+        .join("image.tar");
+    let summaries = store
+        .load_docker_archive(&tar)
+        .with_context(|| format!("failed to load built image from {}", tar.display()))?;
+
+    println!("Successfully built {destination}");
+    for summary in &summaries {
+        println!("Successfully tagged {}", summary.image);
+    }
+    Ok(())
+}
+
+/// Build the `carrick run` argv that runs kaniko over the build context. Pure
+/// (no IO) so the flag mapping is unit-testable. `argv[0]` is the carrick
+/// binary path; the rest is `run --fs host …` followed by the kaniko image and
+/// its executor flags.
+///
+/// `out_dir` is `Some` for the `--no-push` path (kaniko writes `image.tar`
+/// there via a `/out` bind mount); `None` for `--push` (kaniko pushes directly,
+/// so there is no `/out` mount, no `--tar-path`, and no `--no-push`).
+#[allow(clippy::too_many_arguments)]
+fn kaniko_run_argv(
+    carrick_bin: &str,
+    context_abs: &str,
+    out_dir: Option<String>,
+    dockerfile_rel: &str,
+    destination: &str,
+    build_args: &[String],
+    no_cache: bool,
+    platform: Option<&str>,
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        carrick_bin.to_owned(),
+        "run".to_owned(),
+        "--fs".to_owned(),
+        "host".to_owned(),
+        // A long build must never be killed by the trap budget: run effectively
+        // uncapped. `--max-traps` takes a usize; usize::MAX is the largest value.
+        "--max-traps".to_owned(),
+        usize::MAX.to_string(),
+        "-v".to_owned(),
+        format!("{context_abs}:/workspace"),
+    ];
+    if let Some(out) = &out_dir {
+        argv.push("-v".to_owned());
+        argv.push(format!("{out}:/out"));
+    }
+    // The kaniko image, then its executor args (everything after this is parsed
+    // by kaniko, not carrick — `carrick run`'s trailing_var_arg captures it).
+    argv.push(KANIKO_IMAGE.to_owned());
+    argv.push("--context".to_owned());
+    argv.push("dir:///workspace".to_owned());
+    argv.push("--dockerfile".to_owned());
+    argv.push(format!("/workspace/{dockerfile_rel}"));
+    if out_dir.is_some() {
+        // No-push: build to a tar that carrick then loads.
+        argv.push("--no-push".to_owned());
+        argv.push("--tar-path".to_owned());
+        argv.push("/out/image.tar".to_owned());
+    }
+    argv.push("--destination".to_owned());
+    argv.push(destination.to_owned());
+    for ba in build_args {
+        argv.push("--build-arg".to_owned());
+        argv.push(ba.clone());
+    }
+    if no_cache {
+        argv.push("--no-cache".to_owned());
+    }
+    if let Some(p) = platform {
+        argv.push("--customPlatform".to_owned());
+        argv.push(p.to_owned());
+    }
+    argv
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    #[test]
+    fn kaniko_argv_no_push_maps_flags() {
+        let argv = kaniko_run_argv(
+            "/usr/local/bin/carrick",
+            "/abs/context",
+            Some("/tmp/out".to_owned()),
+            "Dockerfile",
+            "app",
+            &["X=1".to_owned()],
+            false,
+            None,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/local/bin/carrick",
+                "run",
+                "--fs",
+                "host",
+                "--max-traps",
+                &usize::MAX.to_string(),
+                "-v",
+                "/abs/context:/workspace",
+                "-v",
+                "/tmp/out:/out",
+                "gcr.io/kaniko-project/executor:v1.24.0",
+                "--context",
+                "dir:///workspace",
+                "--dockerfile",
+                "/workspace/Dockerfile",
+                "--no-push",
+                "--tar-path",
+                "/out/image.tar",
+                "--destination",
+                "app",
+                "--build-arg",
+                "X=1",
+            ]
+        );
+    }
+
+    #[test]
+    fn kaniko_argv_push_omits_out_mount_and_no_push() {
+        let argv = kaniko_run_argv(
+            "carrick",
+            "/ctx",
+            None,
+            "docker/Dockerfile.prod",
+            "registry.example.com/app:v2",
+            &[],
+            true,
+            Some("linux/amd64"),
+        );
+        // No /out mount, no --no-push, no --tar-path on the push path.
+        assert!(!argv.iter().any(|a| a == "--no-push"));
+        assert!(!argv.iter().any(|a| a == "--tar-path"));
+        assert!(!argv.iter().any(|a| a == "/out"));
+        assert!(argv.windows(2).any(|w| w[0] == "-v" && w[1] == "/ctx:/workspace"));
+        // Dockerfile path is joined under /workspace.
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--dockerfile" && w[1] == "/workspace/docker/Dockerfile.prod")
+        );
+        // Destination, no-cache, and customPlatform all pass through.
+        assert!(argv.windows(2).any(|w| w[0] == "--destination" && w[1] == "registry.example.com/app:v2"));
+        assert!(argv.iter().any(|a| a == "--no-cache"));
+        assert!(argv.windows(2).any(|w| w[0] == "--customPlatform" && w[1] == "linux/amd64"));
+        // The kaniko image is always present.
+        assert!(argv.iter().any(|a| a == KANIKO_IMAGE));
+    }
 }
