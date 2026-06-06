@@ -74,6 +74,17 @@ pub const CASES: &[PerfCase] = &[
         mount_scratch: false,
         cross_boundary: false,
     },
+    // Latency (lower better): many small positional host-file pwritev calls.
+    PerfCase {
+        probe: "perf_pwritev_burst",
+        dimension: "syscall",
+        workload: "pwritev_burst",
+        metric_key: "pwritev_burst_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: false,
+    },
     // Latency (lower better): fresh private anonymous mmap churn without
     // touching mapped pages. This exposes runtime zero-fill/page-dirtying that
     // Linux avoids for untouched anonymous VMAs.
@@ -196,6 +207,11 @@ mod tests {
             ),
             ("stdio_burst", "perf_stdio_burst", "stdio_burst_total_us"),
             ("writev_burst", "perf_writev_burst", "writev_burst_total_us"),
+            (
+                "pwritev_burst",
+                "perf_pwritev_burst",
+                "pwritev_burst_total_us",
+            ),
         ];
 
         for (workload, probe, metric_key) in required {
