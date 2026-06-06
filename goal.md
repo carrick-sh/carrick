@@ -138,7 +138,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `go-syscall` | Go | 0/0 | 34/34 | Broad syscall package fallout; inspect for process/wait/signal cases first. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
 | `cpython-concurrent_futures` | CPython | MATCH 20/20 in cache-backed `conf-35590-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 in refreshed Docker oracle `conf-28227-d00` | Runtime hangs and the stale oracle-id cache mismatch are cleared. |
-| `ltp-setpgid01` | LTP | 2/2 | 1/2 | Inversion risk: may be under-enforcement rather than better behavior. |
+| `ltp-setpgid01` | LTP | MATCH 1/2 in `conf-3259-c00` | 1/2 | PID-namespace session-leader rule is now owned; `setpgid(1, 1)` fails EPERM like Docker Linux while forked non-leader `setpgid(0, 0)` still succeeds. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
 | `go-os_signal` | Go | unstable pressure row: NEW 28/30 in `conf-71289-c00`, MATCH 29/30 in `conf-18439-c00` | 29/30 | Adjacent signal/process-control surface; `TestAtomicStop` flips, while `TestTerminalSignal` still fails on both carrick and oracle. |
@@ -312,7 +312,10 @@ milestones.
 
 Exit criteria:
 
-- `setpgidrules` or a focused unit test owns the process-group invariant.
+- `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid`
+  owns the PID-namespace session-leader rule for `setpgid`, with
+  `setpgidparentgroup` and `proclife` preserving child process-group joins and
+  ordinary self-group behavior.
 - `pauseinterrupt2` or a sharper focused reducer owns the unstable
   `ltp-pause02` interruption invariant, and `sigactionresetinfo` owns the
   adjacent SA_RESETHAND + SA_SIGINFO reset-state rule that moved
@@ -360,7 +363,7 @@ Keep this section current as classifications and fixes land.
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
 | `cpython-concurrent_futures` | runtime hangs are fixed: the exact five-iteration early-shutdown reducer completes, `ProcessPoolForkserverProcessPoolExecutorTest` passes 21 tests, `ProcessPoolForkExecutorDeadlockTest` passes 16 tests, and refreshed harness run `conf-28227-c00` matches Docker oracle run `conf-28227-d00` at 20/20 with 239 paired assertion ids. The previous `conf-98558-c00` row was `NEW` only because the committed oracle cache had totals but no Docker per-test ids. | `futexsharedalias`, wake-pipe drain tests, `host_signal::tests::missed_child_exit_watch_*`, `blockingpipewrite`, `dispatch::overlay_dispatch_tests::large_blocking_host_pipe_write_hands_off_after_partial_progress`, refreshed oracle-cache entry | MATCH; keep as pressure coverage |
-| `ltp-setpgid01` | inversion risk: carrick reports both `setpgid(1, 1)` and `setpgid(0, 0)` pass, while cached oracle has one failure. This needs the Docker assertion refreshed before treating carrick as better or worse. | `setpgidrules` plus `--refresh-oracle --suite ltp-setpgid01` | classified; oracle assertion required before fix |
+| `ltp-setpgid01` | real under-enforcement after oracle refresh: Docker `conf-43101-d00` fails `setpgid(1, 1)` with `EPERM` and passes the forked-child `setpgid(0, 0)` leg. Carrick had reported both as TPASS because the harness starts Carrick in a fresh host process group but the same host session; PID namespace mapping recorded only the init host PGID, so guest `getsid(0)` / session-leader checks missed host SID values that differ from PGID. | `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid`, `setpgidparentgroup`, `proclife` | MATCH 1/2 vs oracle 1/2 in `conf-3259-c00`; process-group session-leader rule owned |
 | `ltp-pause02` | signal interruption/restart bug when it reproduces: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; rerun `conf-71289-c01` matched, and later `conf-18439-c01` reproduced the same signature, but latest focused attempts and `pauseinterrupt2` are currently MATCH. | `pauseinterrupt2` or sharper interruption reducer if the row turns RED again | pressure coverage; no runtime fix without fresh RED |
 | `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
 | `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
@@ -415,17 +418,11 @@ just conformance-probes
 
 ## Next autonomous slice
 
-1. Refresh `ltp-setpgid01` against Docker before changing runtime behavior: the
-   current row is an inversion risk, and we need the live Linux assertion line
-   for `setpgid(1, 1)` / `setpgid(0, 0)` before deciding whether Carrick is
-   under-enforcing a process-group rule or the cached oracle was stale.
-2. If the refreshed row still diverges, reduce the exact process-group rule into
-   `setpgidrules` or a focused unit test before editing runtime state.
-3. Keep `go-syscall` `TestExec` as the next language-runtime pressure row after
-   the process-group audit, especially if `ltp-setpgid01` proves to be oracle
-   staleness rather than a Carrick bug.
-4. Keep `ltp-pause02` and `go-os_signal` as adjacent pressure rows. Do not fix
+1. Move the next runtime reducer to `go-syscall` `TestExec`: refresh or rerun
+   the row, then split the process-control failure from unrelated namespace,
+   capability, and file-mode fallout before changing runtime behavior.
+2. Keep `ltp-pause02` and `go-os_signal` as adjacent pressure rows. Do not fix
    them from memory or stale output; wait for a fresh deterministic RED and then
    split a separate `pauseinterrupt2` or `atomicstop` reducer if needed.
-5. Update this file and `docs/conformance-coverage.md`, then land a logical
+3. Update this file and `docs/conformance-coverage.md`, then land a logical
    commit with the validation commands in the body.
