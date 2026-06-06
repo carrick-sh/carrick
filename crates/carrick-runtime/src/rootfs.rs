@@ -246,6 +246,11 @@ fn apply_tar_to_dir<R: Read>(
         let mut entry = entry?;
         let raw_path = entry.path()?.into_owned();
         let path = normalize_layer_path(&raw_path)?;
+        if path.as_os_str().is_empty() {
+            // A layer entry for the rootfs root itself (`/` or `./`) — nothing
+            // to create; the root already exists. (kaniko emits such an entry.)
+            continue;
+        }
 
         // Whiteout detection — replicates apply_layer exactly.
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
@@ -564,6 +569,10 @@ impl RootFs {
             let mut entry = entry?;
             let raw_path = entry.path()?.into_owned();
             let path = normalize_layer_path(&raw_path)?;
+            if path.as_os_str().is_empty() {
+                // Root entry (`/` or `./`) — the rootfs root already exists.
+                continue;
+            }
 
             if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
                 if file_name == OPAQUE_WHITEOUT {
@@ -736,7 +745,13 @@ impl LayerSource {
 }
 
 fn normalize_layer_path(path: &Path) -> Result<PathBuf, RootFsError> {
-    normalize_path(path, false)
+    // Layer tar entries are conventionally relative (`./etc/foo`), but some
+    // tools (e.g. kaniko) emit absolute entries (`/etc/foo`) and a bare root
+    // entry (`/` or `./`). Treat a leading `/` as rootfs-relative; a `..` that
+    // escapes the root is still rejected by `normalize_path`. A root entry
+    // normalizes to the empty path, which the apply loops skip (the rootfs root
+    // already exists).
+    normalize_path(path, true)
 }
 
 fn normalize_rootfs_path(path: &Path) -> Result<PathBuf, RootFsError> {
@@ -860,6 +875,35 @@ mod tests {
     fn layer_path_escaping_root_is_rejected() {
         let err = normalize_layer_path(Path::new("../escape")).unwrap_err();
         assert!(matches!(err, RootFsError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn layer_root_and_absolute_paths_normalize() {
+        // A layer entry for the rootfs root itself ("/" or "./") normalizes to
+        // the empty path (the apply loops skip it). kaniko emits such an entry.
+        assert!(
+            normalize_layer_path(Path::new("/"))
+                .unwrap()
+                .as_os_str()
+                .is_empty()
+        );
+        assert!(
+            normalize_layer_path(Path::new("./"))
+                .unwrap()
+                .as_os_str()
+                .is_empty()
+        );
+        // An absolute layer entry is treated as rootfs-relative (leading `/`
+        // stripped), not rejected.
+        assert_eq!(
+            normalize_layer_path(Path::new("/etc/services")).unwrap(),
+            PathBuf::from("etc/services")
+        );
+        // A `..` escape is still rejected even with a leading `/`.
+        assert!(matches!(
+            normalize_layer_path(Path::new("/../escape")).unwrap_err(),
+            RootFsError::UnsafePath(_)
+        ));
     }
 
     #[test]
