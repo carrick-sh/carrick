@@ -247,7 +247,7 @@ Remaining VFS questions:
 
 ### 2. Wait Path fd Pinning and kqueue Churn
 
-Status: next structural runtime target to measure.
+Status: retained fd pinning landed; transient kqueue setup remains.
 
 Repeated waits on stable descriptors should not pay repeated fd duplication,
 transient kqueue registration, and teardown when open-description lifetime is
@@ -270,9 +270,14 @@ Key code:
 
 Known current shape:
 
-- `PinnedWaitFds` duplicates each wait fd at every wait handoff.
-- `HvfEventLoop` then waits through kqueue or poll fallback using the duplicated
-  descriptors.
+- Direct host read/write waits carry retained host-fd owners when the
+  dispatcher already has an `OpenFile` anchor, so `PinnedWaitFds` can skip
+  per-wait `dup` for those descriptors.
+- Raw wait targets, including broad poll/select/epoll paths where descriptor
+  lifetime is not yet anchored, still use the fail-closed per-wait `dup`
+  fallback.
+- `HvfEventLoop` still waits through kqueue or poll fallback, and the kqueue
+  path still registers and deletes fd filters around each wait.
 - Runtime dispatch has `WaitOnFds`, `WaitOnFdsSelect`, and `WaitOnFdsPoll`
   paths.
 - Existing probes cover many poll/epoll correctness cases, but there is no
@@ -299,17 +304,19 @@ Immediate measurement slice:
   - higher is better: `false`
   - Carrick fs mode: `host`
   - scratch mount: `false`
-- [ ] Add correctness coverage for fd close/reuse during or near a wait if a
+- [x] Add correctness coverage for fd close/reuse during or near a wait if a
   narrow uncovered gap is visible.
 - [x] Count current `dup`, `close`, and `kevent` setup cost with DTrace if the
   host permits it.
-- [ ] Implement the smallest retained-wait-target change only if count evidence
+- [x] Implement the smallest retained-wait-target change only if count evidence
   shows the churn is still material.
-- [ ] Keep fd duplication fallback where descriptor lifetime cannot be anchored
+- [x] Keep fd duplication fallback where descriptor lifetime cannot be anchored
   safely.
 - [ ] Consider persistent kqueue subscriptions only with generation checks.
-- [ ] Run wake-pipe, signal, process-exit, fd-reuse, poll, select, and epoll
-  tests before claiming runtime behavior changes.
+- [x] Run wake-pipe, fd-reuse, poll, select, and epoll tests before claiming
+  this retained-fd runtime behavior change.
+- [ ] Run signal and process-exit tests before claiming any future persistent
+  kqueue subscription behavior change.
 
 Suggested probe design:
 
@@ -371,6 +378,36 @@ Progress:
   `close=7059`, and `kevent=14091`. This confirms the current wait path still
   pays roughly two fd pins and four kqueue calls per handoff even when the
   watched descriptors are stable.
+- 2026-06-06: Count evidence justified a narrow retained-wait-target change:
+  `WaitFds` now carries private `HostFdRef` lifetime guards, direct host
+  read/write waits mark their fds anchored when an `OpenFile` owner is already
+  available, and `PinnedWaitFds` skips `dup` only for anchored fds. Raw
+  wait targets still use the fail-closed `dup` fallback.
+- 2026-06-06: Added correctness coverage for the retained target: the new
+  `anchored_wait_fd_uses_original_fd_without_closing_it` test failed before
+  `PinnedWaitFds` honored anchored fds (`left: 5`, `right: 3`) and passes after
+  the change. The dispatcher test
+  `anchored_wait_fds_keep_host_fd_live_after_open_file_drop` proves the
+  `WaitFds` guard keeps a host fd pollable after the original `OpenFile` drops,
+  modeling guest close/reuse while the runtime is parked.
+- 2026-06-06: Focused runtime checks passed:
+  `cargo test -p carrick-hvf io_wait::tests -- --nocapture`,
+  `cargo test -p carrick-runtime anchored_wait_fds_keep_host_fd_live_after_open_file_drop -- --nocapture`,
+  `cargo test -p carrick-runtime --test integration kqueue_wait -- --nocapture`,
+  `cargo test -p carrick-runtime --test integration epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready -- --nocapture`,
+  `cargo test -p carrick-runtime --test integration epoll_wakes_accepted_socket_after_peer_write -- --nocapture`,
+  `cargo test -p carrick-runtime --test integration ppoll_reports_eventfd_pipe_and_invalid_fd_readiness -- --nocapture`,
+  `cargo test -p carrick-runtime --test integration pselect6_reports_eventfd_pipe_and_write_readiness -- --nocapture`,
+  `cargo test -p carrick-runtime --test integration close_of_added_fd_auto_removes_it_from_epoll_interest -- --nocapture`,
+  `cargo test -p carrick-runtime --tests --no-run`, `cargo fmt --all -- --check`,
+  `git diff --check`, and `./scripts/build-signed.sh`.
+- 2026-06-06: Post-runtime-slice filtered perf run passed at
+  `db6d5cc86d583e94cba4c2f9473f667117cdbd51` and appended rows to
+  `docs/perf-results/2026-06-06-syscall.jsonl`: Carrick p50 `15.542` us,
+  p95 `16.000` us; Docker p50 `23.667` us, p95 `23.667` us. Direct DTrace on
+  the same probe counted `close=61` and `kevent=14069`, with no `dup` entries in
+  the aggregation. The retained-fd slice removed the per-wait `dup` churn and
+  most matching close churn; transient kqueue registration/deletion remains.
 
 ### 3. Borrowed Guest-Memory I/O Follow-Through
 
@@ -496,6 +533,8 @@ Start wait-path fd pinning measurement.
 - [x] Run focused registry/probe checks.
 - [x] Run one short Carrick-vs-Docker perf sample set.
 - [x] Attempt host syscall counts for `dup`, `close`, and `kevent`.
-- [ ] Decide whether retained wait targets are justified by measured churn.
-- [ ] If justified, implement the smallest retained-wait-target change with fd
+- [x] Decide whether retained wait targets are justified by measured churn.
+- [x] If justified, implement the smallest retained-wait-target change with fd
   close/reuse correctness coverage.
+- [ ] Decide whether persistent kqueue subscriptions are justified by the
+  remaining `kevent` count.
