@@ -309,6 +309,26 @@ fn rewrite_dev_fd_alias(path: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vfs_open_fallthrough_does_not_build_open_context() {
+        fd_helpers::reset_open_fd_numbers_calls();
+
+        let dispatcher = SyscallDispatcher::new();
+        let outcome = dispatcher.try_vfs_open("/tmp/not-a-vfs-mount", LINUX_O_RDWR, 0, 0);
+
+        assert_eq!(outcome, VfsOpenAttempt::FallThrough);
+        assert_eq!(
+            fd_helpers::open_fd_numbers_calls(),
+            0,
+            "unmounted rootfs/overlay opens should fall through before building OpenContext"
+        );
+    }
+}
+
 fn proc_self_fd_number(path: &str) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
@@ -1209,9 +1229,13 @@ impl SyscallDispatcher {
         flags: u64,
         create_mode: u32,
     ) -> VfsOpenAttempt {
-        // Build the OpenContext from owned/copy data so the mut
-        // borrow of `vfs_mounts` doesn't conflict with reads from
-        // sibling fields.
+        let Some(m) = self.fs.vfs_mounts.resolve(path) else {
+            return VfsOpenAttempt::FallThrough;
+        };
+
+        // Build the OpenContext only after a mount claims the path. Rootfs and
+        // overlay fallthrough opens are the hot path and do not need proc, fd,
+        // signal, or memory snapshots for VFS mounts.
         let proc = self.proc.lock();
         let exec_path = proc.executable_path.clone();
         let argv = proc.argv.clone();
@@ -1256,18 +1280,13 @@ impl SyscallDispatcher {
             nofollow: open_flags.contains(LinuxOpenFlags::NOFOLLOW),
             mode: create_mode,
         };
-        let handle = {
-            let Some(m) = self.fs.vfs_mounts.resolve(path) else {
+        let handle = match m.vfs.open(&m.full_path, vfs_flags, &ctx) {
+            Ok(h) => h,
+            Err(errno) if errno == LINUX_ENOSYS => {
                 return VfsOpenAttempt::FallThrough;
-            };
-            match m.vfs.open(&m.full_path, vfs_flags, &ctx) {
-                Ok(h) => h,
-                Err(errno) if errno == LINUX_ENOSYS => {
-                    return VfsOpenAttempt::FallThrough;
-                }
-                Err(errno) => {
-                    return VfsOpenAttempt::Errno(errno);
-                }
+            }
+            Err(errno) => {
+                return VfsOpenAttempt::Errno(errno);
             }
         };
         match handle {
