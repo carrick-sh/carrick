@@ -377,9 +377,33 @@ pub fn spawn_signal_pump(
                                 )]);
                                 continue;
                             }
+                            let cpu_timer = crate::itimer::is_cpu_timer(which);
+                            if cpu_timer {
+                                if let Some(crate::itimer::CpuTimerDecision::Wait { delay_ns }) =
+                                    crate::itimer::cpu_timer_decision(which)
+                                {
+                                    let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                                        ident,
+                                        libc::EV_ADD | libc::EV_ONESHOT,
+                                        i64::try_from(delay_ns.max(1)).unwrap_or(i64::MAX),
+                                    )]);
+                                    continue;
+                                }
+                            }
                             let signum = crate::itimer::signum_for(which);
                             crate::probes::itimer_fire(signum, 0);
                             crate::host_signal::publish_process_signal(signum);
+                            if cpu_timer {
+                                let interval = crate::itimer::interval_ns(which);
+                                if interval > 0 {
+                                    let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                                        ident,
+                                        libc::EV_ADD | libc::EV_ONESHOT,
+                                        i64::try_from(interval).unwrap_or(i64::MAX),
+                                    )]);
+                                }
+                                continue;
+                            }
                             // A two-phase timer (it_value != it_interval) is armed
                             // as a one-shot for it_value; on that first fire we arm
                             // the periodic timer exactly once. take_needs_periodic

@@ -16,8 +16,8 @@ it parses this doc + the probe binaries on disk and fails CI if the doc cites
 a probe that doesn't exist):
 
 ```
-Owned invariant probes (on disk):  288
-Invariant rows with an owning test: 136/136 (100%)
+Owned invariant probes (on disk):  289
+Invariant rows with an owning test: 137/137 (100%)
 Distinct curated LTP tests owned:   502/502 (100%)
 ```
 
@@ -156,6 +156,7 @@ underlying gap got fixed):
 | **SA_RESETHAND + SA_SIGINFO: a one-shot handler resets its disposition to SIG_DFL before the handler runs, but an in-handler `sigaction(SIG, NULL, &old)` query still reports SA_SIGINFO instead of an empty action** | ✅ `sigactionresetinfo` + 🧪 `signal::tests::sa_resethand_resets_disposition_to_default_on_handler_entry` | sigaction01 |
 | **`WCOREDUMP(status)` set for core-dumping signals (SIGABRT/SIGSEGV/SIGQUIT/SIGILL/SIGTRAP/SIGBUS/SIGFPE/SIGXCPU/SIGXFSZ/SIGSYS), unset for non-core signals (SIGTERM/SIGKILL) — 0x80 bit synthesized through macOS's default RLIMIT_CORE=0** | ✅ `coredumpbit` | abort01 |
 | **signalfd4 (syscall 74, emulated — macOS has no signalfd): SFD_CLOEXEC→FD_CLOEXEC, SFD_NONBLOCK→O_NONBLOCK on the returned fd, unknown flag bit→EINVAL (fd-flag surface only; signal-read delivery is a tracked follow-up)** | ✅ `signalfd4` | signalfd4_01, signalfd4_02 |
+| **ITIMER_PROF does not tick while the process is idle in a blocking sleep; busy ITIMER_VIRTUAL/ITIMER_PROF delivery still works** | ✅ `itimerprofidle` + ✅ `itimer` | Go runtime/pprof CPU profile magnitude |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)
 - _(none — all signals-backlog rows are owned by probes)_

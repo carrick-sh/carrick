@@ -2331,9 +2331,10 @@ impl HvfInner {
         let mut alias_remap_attempts: u32 = 0;
         let exit = loop {
             let run_start = std::time::Instant::now();
+            crate::guest_cpu::begin_active();
             let run_result = self.vcpu.run();
             let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            crate::guest_cpu::add(run_ns);
+            crate::guest_cpu::finish_active(run_ns);
             run_result.map_err(hvf_error)?;
             let exit = self.vcpu.get_exit_info();
             if exit.reason == ExitReason::CANCELED {
