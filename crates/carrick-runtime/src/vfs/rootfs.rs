@@ -177,6 +177,16 @@ impl RootFsVfs {
         want_trunc: bool,
         writable_request: bool,
     ) -> Result<OpenDispatchResult, i32> {
+        if !(want_create && want_excl)
+            && let Some(entry) = self.overlay.shared_file_entry(path, want_trunc)
+        {
+            return Ok(OpenDispatchResult::RootFsBackedFile {
+                metadata: entry.metadata,
+                contents: entry.contents,
+                writable: writable_request,
+            });
+        }
+
         // Overlay-first: tombstone short-circuits to ENOENT for the
         // non-create case (with O_CREAT we treat it as "no file in
         // the way" and let the caller create).
