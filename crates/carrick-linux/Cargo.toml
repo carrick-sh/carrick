@@ -8,6 +8,13 @@ license.workspace = true
 name = "carrick_linux"
 path = "src/lib.rs"
 
+# The MVP `run-elf` entry point. Self-contained (no carrick-runtime dep), so it
+# links for aarch64-linux independently of the macOS dispatch layer. On non-Linux
+# hosts `main` is a stub (the lib is empty there), so the workspace still builds.
+[[bin]]
+name = "carrick-linux"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 

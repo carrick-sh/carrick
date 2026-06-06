@@ -105,8 +105,7 @@ closure-linux:
 # The full CLI can't cross-compile from macOS (ring/oci-client need a C cross
 # toolchain), so the real Linux binary is built natively here.
 build-linux:
-    cargo build --release --no-default-features --features platform-linux \
-        -p carrick-linux
+    cargo build --release -p carrick-linux
 
 # LOCAL (L2): run the freestanding hello-aarch64 under carrick-linux on real
 # /dev/kvm (M3-nested HVF lane) and diff stdout + exit code against the native
