@@ -342,9 +342,8 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 /// the runtime's fork parent branch (normal dispatch context). No host SIGCHLD
 /// handler is installed — see `CHILD_WATCHES`. If the pump kqueue is not yet
 /// registered, the mapping is still recorded and the pump arms the watch when it
-/// next learns the pid (we re-arm on every register); a missing watch only
-/// delays SIGCHLD, never breaks `wait4`. The `EV_ONESHOT` watch (see
-/// `Kevent::proc_exit`) auto-removes once it fires.
+/// next learns the pid (we re-arm on every register). The `EV_ONESHOT` watch
+/// (see `Kevent::proc_exit`) auto-removes once it fires.
 pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i32) {
     if child_pid <= 0 {
         return;
@@ -365,13 +364,13 @@ pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i
         .insert(child_pid, (parent_tid, exit_signal));
     let kq = PUMP_KQUEUE.load(Ordering::SeqCst);
     if kq >= 0 {
-        // ENOENT (the child already exited and was reaped before we armed) is
-        // fine: the reap path delivers no SIGCHLD in that race, matching the
-        // kernel's collapse of a missed wait into the eventual wait4 return.
-        let _ = crate::darwin_kqueue::apply_changes(
+        let result = crate::darwin_kqueue::apply_changes(
             kq,
             &[crate::darwin_kqueue::Kevent::proc_exit(child_pid)],
         );
+        if let Err(errno) = result {
+            handle_child_exit_watch_arm_error(child_pid, errno);
+        }
     }
 }
 
@@ -379,7 +378,8 @@ pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i
 /// guest child. Called by the signal pump right after it publishes its kqueue,
 /// so any child registered before the pump existed (or before it learned its
 /// kqueue) is still observed. Idempotent: re-adding an existing watch is a
-/// no-op; ENOENT for an already-exited child is harmless.
+/// no-op. If the child is already gone, synthesize the exit signal that the
+/// missed one-shot watch can no longer publish.
 pub fn rearm_child_watches(kq: i32) {
     if kq < 0 {
         return;
@@ -389,10 +389,30 @@ pub fn rearm_child_watches(kq: i32) {
         CHILD_WATCHES.lock().keys().copied().collect()
     };
     for pid in pids {
-        let _ = crate::darwin_kqueue::apply_changes(
+        let result = crate::darwin_kqueue::apply_changes(
             kq,
             &[crate::darwin_kqueue::Kevent::proc_exit(pid)],
         );
+        if let Err(errno) = result {
+            handle_child_exit_watch_arm_error(pid, errno);
+        }
+    }
+}
+
+fn handle_child_exit_watch_arm_error(child_pid: i32, errno: i32) {
+    if errno == libc::ESRCH || errno == libc::ENOENT {
+        publish_child_exit_signal(child_pid);
+    }
+}
+
+fn publish_child_exit_signal(child_pid: i32) -> bool {
+    if let Some((parent_tid, exit_signal)) = take_child_exit_parent(child_pid) {
+        if exit_signal != 0 {
+            publish_pending_for(parent_tid, exit_signal);
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -1512,6 +1532,43 @@ mod tests {
         register_child_exit_watch(-1, 1234, crate::linux_abi::LINUX_SIGCHLD);
         assert!(!is_tracked_child(0));
         assert!(!is_tracked_child(-1));
+    }
+
+    #[test]
+    fn missed_child_exit_watch_publishes_exit_signal_once() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        PUMP_KQUEUE.store(-1, Ordering::SeqCst);
+        let child_pid = 0x7FFD_0001;
+        let parent_tid = 0x7FFD_0002;
+
+        register_child_exit_watch(child_pid, parent_tid, crate::linux_abi::LINUX_SIGCHLD);
+        assert!(publish_child_exit_signal(child_pid));
+
+        assert!(!is_tracked_child(child_pid));
+        assert_eq!(
+            take_pending_for(parent_tid),
+            crate::linux_abi::LINUX_SIGCHLD
+        );
+        assert_eq!(take_pending_for(parent_tid), NO_PENDING_SIGNAL);
+        assert!(!publish_child_exit_signal(child_pid));
+        drain_pump_pipe();
+    }
+
+    #[test]
+    fn missed_child_exit_watch_honors_zero_exit_signal() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        PUMP_KQUEUE.store(-1, Ordering::SeqCst);
+        let child_pid = 0x7FFD_0011;
+        let parent_tid = 0x7FFD_0012;
+
+        register_child_exit_watch(child_pid, parent_tid, 0);
+        assert!(publish_child_exit_signal(child_pid));
+
+        assert!(!is_tracked_child(child_pid));
+        assert_eq!(take_pending_for(parent_tid), NO_PENDING_SIGNAL);
+        drain_pump_pipe();
     }
 
     #[test]
