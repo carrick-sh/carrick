@@ -139,6 +139,25 @@ impl RootFsVfs {
                 mtime_nanos: 0,
             });
         }
+        if let Some(metadata) = self.overlay.fast_nofollow_metadata(path) {
+            let kind = match metadata.kind {
+                RootFsEntryKind::File => EntryKind::File,
+                RootFsEntryKind::Directory => EntryKind::Directory,
+                RootFsEntryKind::CharDevice => EntryKind::CharDevice,
+                RootFsEntryKind::Fifo => EntryKind::Fifo,
+                RootFsEntryKind::Socket => EntryKind::Socket,
+                RootFsEntryKind::Symlink => EntryKind::Symlink,
+            };
+            return Ok(Metadata {
+                kind,
+                mode: metadata.mode,
+                size: metadata.size as u64,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
         // A symlink in the immutable rootfs layer: report the link, not its
         // target. Non-symlink entries fall through to the regular (following)
         // lookup, which is identical for them.
