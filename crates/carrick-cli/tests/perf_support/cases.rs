@@ -58,6 +58,20 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency (lower better): blocking read wakeup on a stable pipe fd. This
+    // isolates per-wait fd pinning, kqueue registration, and wake bookkeeping
+    // from explicit timeout sleep.
+    PerfCase {
+        probe: "perf_wait_pipe_pingpong",
+        dimension: "syscall",
+        workload: "wait_pipe_pingpong",
+        metric_key: "wait_pipe_pingpong_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): many small dynamic-style writes to stdout.
     PerfCase {
         probe: "perf_stdio_burst",
@@ -278,6 +292,11 @@ mod tests {
                 "pwritev_burst_total_us",
             ),
             ("preadv_burst", "perf_preadv_burst", "preadv_burst_total_us"),
+            (
+                "wait_pipe_pingpong",
+                "perf_wait_pipe_pingpong",
+                "wait_pipe_pingpong_p50_us",
+            ),
         ];
 
         for (workload, probe, metric_key) in required {
