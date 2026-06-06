@@ -11,7 +11,10 @@
 mod support;
 
 #[cfg(target_os = "macos")]
-use carrick_runtime::fs_backend::{FsBackend, HostFsBackend};
+use carrick_runtime::fs_backend::HostFsBackend;
+use carrick_runtime::fs_backend::{
+    BackendError, FsBackend, MemoryBackend, OverlayEntry, OverlayEntryKind,
+};
 use carrick_runtime::linux_abi::{
     LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR, LINUX_EFAULT, LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR,
 };
@@ -56,6 +59,180 @@ fn write_syscall_rejects_bad_guest_pointer_with_efault() {
 
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 14 });
     assert!(dispatcher.stdout().is_empty());
+}
+
+#[derive(Default)]
+struct CountingMemoryBackend {
+    inner: MemoryBackend,
+    max_writeback_payload_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingMemoryBackend {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset_counts(&self) {
+        self.max_writeback_payload_len
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn max_writeback_payload_len(&self) -> usize {
+        self.max_writeback_payload_len
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn bump_max_writeback_payload_len(&self, len: usize) {
+        let mut current = self.max_writeback_payload_len();
+        while len > current {
+            match self.max_writeback_payload_len.compare_exchange(
+                current,
+                len,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl FsBackend for CountingMemoryBackend {
+    fn lookup(&self, path: &str) -> Option<OverlayEntry> {
+        self.inner.lookup(path)
+    }
+
+    fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
+        self.inner.lookup_kind(path)
+    }
+
+    fn metadata(&self, path: &str) -> Option<carrick_runtime::rootfs::RootFsMetadata> {
+        self.inner.metadata(path)
+    }
+
+    fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+        self.inner.file_contents(path)
+    }
+
+    fn make_dir(&self, path: &str) -> Result<(), BackendError> {
+        self.inner.make_dir(path)
+    }
+
+    fn create_file(&self, path: &str) -> Result<(), BackendError> {
+        self.inner.create_file(path)
+    }
+
+    fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
+        self.bump_max_writeback_payload_len(contents.len());
+        self.inner.set_file_contents(path, contents)
+    }
+
+    fn write_file_range(
+        &self,
+        path: &str,
+        offset: usize,
+        bytes: &[u8],
+        final_size: usize,
+    ) -> Result<(), BackendError> {
+        self.bump_max_writeback_payload_len(bytes.len());
+        self.inner.write_file_range(path, offset, bytes, final_size)
+    }
+
+    fn remove_entry(&self, path: &str) -> bool {
+        self.inner.remove_entry(path)
+    }
+
+    fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
+        self.inner.mark_deleted(path)
+    }
+
+    fn child_names(&self, dir: &str) -> Vec<(String, carrick_runtime::rootfs::RootFsEntryKind)> {
+        self.inner.child_names(dir)
+    }
+
+    fn deleted_child_names(&self, dir: &str) -> Vec<String> {
+        self.inner.deleted_child_names(dir)
+    }
+
+    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
+        self.inner.rename_overlay_entry(from, to)
+    }
+
+    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
+        self.inner.open_raw_fd(path, write, create, trunc)
+    }
+}
+
+#[test]
+fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
+    const LARGE_FILE_LEN: usize = 4 * 1024 * 1024;
+
+    let backend = CountingMemoryBackend::new();
+    backend
+        .set_file_contents("/large.bin", vec![0x41; LARGE_FILE_LEN])
+        .unwrap();
+    backend.reset_counts();
+    let counts = backend.max_writeback_payload_len.clone();
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/large.bin\0").unwrap();
+    memory.write_bytes(0x4100, b"Z").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([3, 0x4100, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(56, SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([4, 0x4200, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(memory.read_bytes(0x4200, 1).unwrap(), b"Z");
+
+    let max_rewrite = counts.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        max_rewrite <= 1,
+        "one-byte write should not rewrite or clone the whole {LARGE_FILE_LEN}-byte file; max writeback payload was {max_rewrite}"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]

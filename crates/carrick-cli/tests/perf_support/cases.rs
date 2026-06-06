@@ -144,6 +144,18 @@ pub const CASES: &[PerfCase] = &[
         mount_scratch: false,
         cross_boundary: false,
     },
+    // Latency (lower better): metadata/open/access storm against a large sparse
+    // file. This verifies the metadata path stays payload-size independent.
+    PerfCase {
+        probe: "perf_large_meta",
+        dimension: "disk",
+        workload: "large_meta",
+        metric_key: "large_meta_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: false,
+    },
     // Throughput (higher better): bulk WRITE over a bind mount — carrick's
     // direct host FD (--fs host -v) vs docker's virtiofs VM-boundary round-trip.
     // The sharpest test of the "no virtiofs abstraction" disk thesis.
@@ -254,6 +266,27 @@ mod tests {
         assert!(!case.higher_is_better);
         assert!(!case.mount_scratch);
         assert!(!case.cross_boundary);
+    }
+
+    #[test]
+    fn registry_contains_disk_perf_surface() {
+        let required = [
+            ("stat_storm", "perf_disk_meta", "stat_p50_us"),
+            ("large_meta", "perf_large_meta", "large_meta_total_us"),
+        ];
+
+        for (workload, probe, metric_key) in required {
+            let case = CASES
+                .iter()
+                .find(|case| case.workload == workload)
+                .unwrap_or_else(|| panic!("missing disk perf workload {workload}"));
+            assert_eq!(case.dimension, "disk");
+            assert_eq!(case.probe, probe);
+            assert_eq!(case.metric_key, metric_key);
+            assert_eq!(case.unit, "us");
+            assert!(!case.higher_is_better);
+            assert!(!case.cross_boundary);
+        }
     }
 
     #[test]
