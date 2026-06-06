@@ -86,6 +86,7 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest committed runtime slices:
 
+- `76d0aac` - `perf(fs): fast path memory nofollow metadata`
 - `0d9ee96` - `perf(fs): skip impossible memory fifo probe`
 - `0a08b5f` - `perf(fs): snapshot memory overlay opens`
 - `4bae00f` - `perf(fs): avoid cloning memory files on open`
@@ -103,7 +104,7 @@ Latest committed runtime slices:
 Documentation/result state:
 
 - `docs/perf-results/2026-06-06-disk.jsonl` has appended rows for
-  `overlay_small_updates` at `4bae00f`, `0a08b5f`, and `0d9ee96`.
+  `overlay_small_updates` at `4bae00f`, `0a08b5f`, `0d9ee96`, and `76d0aac`.
 
 ## Current Evidence
 
@@ -422,6 +423,50 @@ What disappeared at `0d9ee96`:
 - One FIFO metadata probe per guest regular-file open under `--fs memory`.
 - No guest traps disappeared; this was pre-rootfs open-handler work.
 
+Follow-up runtime slice at `76d0aac`:
+
+- After the FIFO slice, full memory regular-file `openat` still had one legacy
+  kind lookup from trailing-symlink canonicalization falling through
+  `lookup_nofollow` to the generic rootfs lookup.
+- RED coverage:
+  `memory_overlay_regular_open_skips_legacy_kind_lookups` first failed with
+  `lookup_kind calls=1`.
+- Added `FsBackend::fast_nofollow_metadata`, defaulting to conservative `None`,
+  and overrode it for `MemoryBackend`.
+- `RootFsVfs::lookup_nofollow` now asks this metadata-only hook before falling
+  through the generic lookup. This avoids using `shared_file_entry` for
+  canonicalization, so the path does not clone dirty-range maps just to answer
+  metadata.
+- Focused checks passed:
+  - `cargo test -p carrick-runtime --test integration memory_overlay_regular_open_skips_legacy_kind_lookups -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration memory_overlay_regular_open_skips_fifo_probe_when_backend_cannot_have_fifos -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration memory_overlay_open_uses_single_backend_snapshot_for_shared_file -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration rootfs_overlay -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration small_write_to_large_overlay_file_does_not_rewrite_whole_file -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration truncate -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration copy_file_range_ -- --nocapture`
+  - `cargo test -p carrick-runtime --tests --no-run`
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - `./scripts/build-signed.sh`
+- Post-change `carrick trace` still showed the same guest trap shape:
+  `openat=594`, `fcntl=593`, `close=593`, `write=583`, and `lseek=577`.
+- Filtered perf rows at `76d0aac` in
+  `docs/perf-results/2026-06-06-disk.jsonl`:
+  - First harness row after rebuild was a high outlier: Carrick p50
+    `8966.875` us, p95 `9170.667` us; Docker p50 `892.500` us, p95
+    `970.959` us.
+  - Immediate rerun recovered: Carrick p50 `4734.250` us, p95 `4775.000` us;
+    Docker p50 `806.375` us, p95 `1028.584` us, Docker noisy.
+  - Treat the second row plus direct runs as the useful current signal, while
+    keeping the high row as recorded measurement history.
+
+What disappeared at `76d0aac`:
+
+- The remaining legacy `lookup_kind` pass for memory regular-file opens during
+  no-follow canonicalization.
+- No guest traps disappeared; this was path-canonicalization handler work.
+
 Remaining overlay decision:
 
 - [x] Identify whether the remaining `overlay_small_updates` gap is host kernel
@@ -431,9 +476,11 @@ Remaining overlay decision:
   `open_for_dispatch` helper.
 - [x] Remove the measured impossible FIFO metadata probe for memory regular-file
   opens.
-- [ ] Attribute the post-`0d9ee96` full guest-open cost between trailing-symlink
-  canonicalization, syscall dispatch, descriptor table work, and fd
-  installation.
+- [x] Remove the measured no-follow canonicalization legacy kind lookup for
+  memory regular-file opens.
+- [ ] Attribute the post-`76d0aac` full guest-open cost between VFS mount
+  fallthrough/context construction, syscall dispatch, descriptor table work,
+  and fd installation.
 - [ ] Decide whether the remaining repeated `openat`/`fcntl`/`lseek`/`write`/
   `close` trap shape can be reduced only by a dynamic interposer or by a safe
   runtime-local fast path.
@@ -487,7 +534,7 @@ Deferred:
 
 ## Immediate Next Slice
 
-The next slice should start from the post-`0d9ee96` `overlay_small_updates`
+The next slice should start from the post-`76d0aac` `overlay_small_updates`
 shape.
 
 Working theory:
@@ -497,13 +544,15 @@ Working theory:
 - Whole-file memory overlay cloning on open is fixed.
 - Repeated backend passes inside `open_for_dispatch` for memory files are fixed.
 - Impossible FIFO metadata probes for memory regular-file opens are fixed.
-- The committed perf row moved from Carrick p50 `6063.542` us at `0a08b5f` to
-  `4823.792` us at `0d9ee96`, but the workload is still trap/handler dominated
-  and about `5.79x` slower than Docker.
+- The no-follow canonicalization legacy kind lookup for memory regular-file
+  opens is fixed.
+- Useful committed perf rows moved from Carrick p50 `6063.542` us at `0a08b5f`
+  to `4823.792` us at `0d9ee96` and `4734.250` us on the clean `76d0aac`
+  rerun. The first `76d0aac` row was a high outlier and remains in the result
+  log.
 - Remaining cost is the repeated guest syscall pattern plus in-process runtime
-  work before and after `open_for_dispatch`: trailing-symlink
-  canonicalization, VFS mount fallthrough/context construction, fd-table
-  installation, `fcntl`, `lseek`, `write`, and `close`.
+  work before and after open dispatch: VFS mount fallthrough/context
+  construction, fd-table installation, `fcntl`, `lseek`, `write`, and `close`.
 - If the goal is to reduce traps rather than only reduce handler cost, the next
   candidate is a narrow dynamic interposer or guest-side batching workload, but
   it must be proven against a dynamic binary and must not become a correctness
@@ -517,9 +566,11 @@ Tasks:
   remove it with a runtime-local fast path.
 - [x] Add focused RED coverage for the impossible memory-backend FIFO probe and
   remove it with a conservative backend capability hook.
+- [x] Add focused RED coverage for the remaining no-follow canonicalization
+  lookup and remove it with a metadata-only fast path.
 - [ ] Add runtime-local counters or focused tracing around the remaining full
-  guest open route: trailing symlink canonicalization, VFS-mount fallthrough and
-  context construction, fd-table installation, and path record bookkeeping.
+  guest open route: VFS-mount fallthrough/context construction, fd-table
+  installation, and path record bookkeeping.
 - [ ] If open/close setup dominates without host kernel work, design a RED test
   for the smallest runtime-local fast path before changing behavior.
 - [ ] If trap count dominates and runtime-local work is small, add a dynamic
