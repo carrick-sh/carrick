@@ -2,11 +2,12 @@
 //! and a JSON response body. Each returns the body bytes; the router wraps them
 //! in a response with the right status.
 
-use crate::serve::model::{CreateBody, CreateResponse, InfoResponse, VersionResponse, WaitResponse};
+use crate::serve::model::{
+    CreateBody, CreateResponse, InfoResponse, VersionResponse, WaitResponse,
+};
 
 pub(crate) fn version_json() -> String {
-    serde_json::to_string(&VersionResponse::default())
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&VersionResponse::default()).unwrap_or_else(|_| "{}".to_string())
 }
 
 pub(crate) fn info_json() -> String {
@@ -70,8 +71,13 @@ pub(crate) fn wait_container(id: &str) -> (u16, String) {
     // Bound the wait so a stuck guest cannot hang the connection forever.
     match crate::serve::spawn::wait_container(id, std::time::Duration::from_secs(300)) {
         Ok(code) => {
-            let resp = WaitResponse { status_code: code as i64 };
-            (200, serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string()))
+            let resp = WaitResponse {
+                status_code: code as i64,
+            };
+            (
+                200,
+                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string()),
+            )
         }
         Err(e) => (500, error_json(&e.to_string())),
     }

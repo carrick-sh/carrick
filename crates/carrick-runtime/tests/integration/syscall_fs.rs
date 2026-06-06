@@ -8428,7 +8428,9 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
     // entry. Path is at 0x4000, the new-contents scratch at 0x4100.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x20000]);
     memory.write_bytes(0x4000, b"/etc/services\0").unwrap();
-    memory.write_bytes(0x4100, b"carrick-test 9999/tcp\n").unwrap();
+    memory
+        .write_bytes(0x4100, b"carrick-test 9999/tcp\n")
+        .unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
@@ -8452,7 +8454,12 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
         DispatchOutcome::Returned { value } => value as u64,
         other => panic!("control openat read: {other:?}"),
     };
-    let n = match run(&mut dispatcher, &mut memory, 63, [fd, 0x8000, 0x10000, 0, 0, 0]) {
+    let n = match run(
+        &mut dispatcher,
+        &mut memory,
+        63,
+        [fd, 0x8000, 0x10000, 0, 0, 0],
+    ) {
         DispatchOutcome::Returned { value } => value as usize,
         other => panic!("control read: {other:?}"),
     };
@@ -8461,8 +8468,10 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
         String::from_utf8_lossy(&injected).contains("smtp"),
         "control: synthetic /etc/services must list smtp, got {n} bytes"
     );
-    assert_eq!(run(&mut dispatcher, &mut memory, 57, [fd, 0, 0, 0, 0, 0]),
-        DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 57, [fd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
 
     // unlinkat("/etc/services"): before the fix this routed to the read-only
     // EtcServicesVfs and returned EROFS (30). After the fix the injection is
@@ -8525,8 +8534,10 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
         DispatchOutcome::Returned { value: 22 },
         "write of new /etc/services contents must succeed"
     );
-    assert_eq!(run(&mut dispatcher, &mut memory, 57, [fd, 0, 0, 0, 0, 0]),
-        DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 57, [fd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
 
     // Re-open for read: the overlay's NEW contents win, NOT the synthetic file.
     let fd = match run(
@@ -8538,7 +8549,12 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
         DispatchOutcome::Returned { value } => value as u64,
         other => panic!("reopen read after recreate: {other:?}"),
     };
-    let n = match run(&mut dispatcher, &mut memory, 63, [fd, 0x8000, 0x10000, 0, 0, 0]) {
+    let n = match run(
+        &mut dispatcher,
+        &mut memory,
+        63,
+        [fd, 0x8000, 0x10000, 0, 0, 0],
+    ) {
         DispatchOutcome::Returned { value } => value as usize,
         other => panic!("read after recreate: {other:?}"),
     };

@@ -910,9 +910,8 @@ impl ImageStore {
             OciBootstrapError::Archive("archive has no manifest.json".to_string())
         })?;
         let archive_manifest: Vec<DockerArchiveManifestEntry> =
-            serde_json::from_slice(manifest_bytes).map_err(|e| {
-                OciBootstrapError::Archive(format!("parsing manifest.json: {e}"))
-            })?;
+            serde_json::from_slice(manifest_bytes)
+                .map_err(|e| OciBootstrapError::Archive(format!("parsing manifest.json: {e}")))?;
         let image_entry = archive_manifest.first().ok_or_else(|| {
             OciBootstrapError::Archive("manifest.json has no image entries".to_string())
         })?;
@@ -1538,8 +1537,7 @@ mod tests {
         let expected_digest = sha256_digest(&layer);
         assert_eq!(summary.layers[0].digest, expected_digest);
         assert_eq!(
-            summary.layers[0].media_type,
-            IMAGE_LAYER_GZIP_MEDIA_TYPE,
+            summary.layers[0].media_type, IMAGE_LAYER_GZIP_MEDIA_TYPE,
             "gzip magic bytes => gzip media type"
         );
         let blob_path = store.blob_path(&expected_digest).unwrap();
@@ -1563,7 +1561,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
         assert_eq!(&reloaded, summary);
         let image_dir = store.image_dir(&image);
-        assert_eq!(std::fs::read(image_dir.join("config.json")).unwrap(), config);
+        assert_eq!(
+            std::fs::read(image_dir.join("config.json")).unwrap(),
+            config
+        );
         assert!(image_dir.join("manifest.json").exists());
 
         // The store now resolves the tag with no further work, and the layer
@@ -1616,7 +1617,9 @@ mod tests {
             header.set_size(contents.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, "f", &contents[..]).unwrap();
+            builder
+                .append_data(&mut header, "f", &contents[..])
+                .unwrap();
             builder.finish().unwrap();
         }
         let archive = docker_archive(
@@ -1645,7 +1648,9 @@ mod tests {
             header.set_size(3);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, "junk", &b"abc"[..]).unwrap();
+            builder
+                .append_data(&mut header, "junk", &b"abc"[..])
+                .unwrap();
             builder.finish().unwrap();
         }
         let tar_path = tmp.path().join("bad.tar");
@@ -1674,6 +1679,11 @@ mod tests {
             assert!(store.blob_path(&layer.digest).unwrap().exists());
         }
         assert!(summary.config_size > 0);
-        assert!(summary.digest.as_deref().is_some_and(|d| d.starts_with("sha256:")));
+        assert!(
+            summary
+                .digest
+                .as_deref()
+                .is_some_and(|d| d.starts_with("sha256:"))
+        );
     }
 }

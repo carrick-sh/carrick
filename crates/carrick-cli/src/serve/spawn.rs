@@ -93,7 +93,10 @@ pub(crate) fn remove_container(id: &str) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let out = Command::new(exe).arg("rm").arg("-f").arg(&real).output()?;
     if !out.status.success() {
-        anyhow::bail!("carrick rm failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "carrick rm failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
@@ -108,7 +111,10 @@ pub(crate) fn start_container(id: &str) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let out = Command::new(exe).arg("start").arg(&real).output()?;
     if !out.status.success() {
-        anyhow::bail!("carrick start failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "carrick start failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }

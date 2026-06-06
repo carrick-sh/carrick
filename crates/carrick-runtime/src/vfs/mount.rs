@@ -423,7 +423,10 @@ mod tests {
         m.mount("/proc", mount("proc"));
         m.mount("/", mount("root"));
         // Before override, the synthetic mount owns the path.
-        assert_eq!(m.resolve("/etc/services").unwrap().vfs.name(), "etc_services");
+        assert_eq!(
+            m.resolve("/etc/services").unwrap().vfs.name(),
+            "etc_services"
+        );
         assert!(!m.is_overridden("/etc/services"));
 
         m.override_path("/etc/services");

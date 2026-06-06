@@ -146,7 +146,8 @@ fn unpack_context(gz_tar: &[u8], dest: &Path) -> std::io::Result<()> {
 /// A relative path is safe to extract iff it has no root/prefix and no `..`
 /// component (only `Normal`/`CurDir` parts).
 fn is_safe_relative(path: &Path) -> bool {
-    path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    path.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 /// One NDJSON frame: `serde_json`-serialise `value` and append a trailing
@@ -211,10 +212,7 @@ async fn run_build_streaming(
         tx.send(Ok(Frame::data(ndjson_frame(&value)))).await.is_ok()
     }
 
-    async fn send_error(
-        tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
-        msg: &str,
-    ) {
+    async fn send_error(tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>, msg: &str) {
         let _ = send_json(
             tx,
             serde_json::json!({
@@ -242,7 +240,8 @@ async fn run_build_streaming(
     // owns the (in-memory) gz-tar bytes and unpacks them through the gz/tar
     // decoders directly.
     let ctx_for_unpack = ctx_dir.clone();
-    let unpack = tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_for_unpack)).await;
+    let unpack =
+        tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_for_unpack)).await;
     match unpack {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -464,8 +463,7 @@ mod tests {
         let mut gz = Vec::new();
         {
             use std::io::Write;
-            let mut enc =
-                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
             enc.write_all(&tar_buf).unwrap();
             enc.finish().unwrap();
         }

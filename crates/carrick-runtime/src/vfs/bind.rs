@@ -661,7 +661,8 @@ mod tests {
         // The child is an ordinary entry: it can be deleted, and that hits the
         // real host file.
         assert!(src.join("Dockerfile").exists());
-        vfs.unlink("/workspace/Dockerfile").expect("unlink child ok");
+        vfs.unlink("/workspace/Dockerfile")
+            .expect("unlink child ok");
         assert!(
             !src.join("Dockerfile").exists(),
             "child unlink should remove the host file"

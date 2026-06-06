@@ -38,7 +38,9 @@ fn strip_version(path: &str) -> &str {
 fn container_action(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("/containers/")?;
     let (id, action) = rest.split_once('/')?;
-    if id.is_empty() || action.is_empty() { return None; }
+    if id.is_empty() || action.is_empty() {
+        return None;
+    }
     Some((id, action))
 }
 
@@ -94,12 +96,8 @@ pub(crate) async fn route(
 
     let resp = match (&method, path.as_str()) {
         (&Method::GET, "/_ping") => text(StatusCode::OK, "OK"),
-        (&Method::GET, "/version") => {
-            json(StatusCode::OK, crate::serve::handlers::version_json())
-        }
-        (&Method::GET, "/info") => {
-            json(StatusCode::OK, crate::serve::handlers::info_json())
-        }
+        (&Method::GET, "/version") => json(StatusCode::OK, crate::serve::handlers::version_json()),
+        (&Method::GET, "/info") => json(StatusCode::OK, crate::serve::handlers::info_json()),
         (&Method::POST, "/containers/create") => {
             let name = query_param(&query, "name");
             let (status, body) =
@@ -112,16 +110,27 @@ pub(crate) async fn route(
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("start") => {
             let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
             let (status, body) = crate::serve::handlers::start_container(id);
-            json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
         }
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("wait") => {
-            let id_owned = container_action(p).map(|(id, _)| id.to_string()).unwrap_or_default();
+            let id_owned = container_action(p)
+                .map(|(id, _)| id.to_string())
+                .unwrap_or_default();
             let (status, body) = tokio::task::spawn_blocking(move || {
                 crate::serve::handlers::wait_container(&id_owned)
             })
             .await
-            .unwrap_or((500, crate::serve::handlers::error_json("wait task panicked")));
-            json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
+            .unwrap_or((
+                500,
+                crate::serve::handlers::error_json("wait task panicked"),
+            ));
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
         }
         (&Method::DELETE, p)
             if p.strip_prefix("/containers/")
@@ -129,7 +138,10 @@ pub(crate) async fn route(
         {
             let id = p.strip_prefix("/containers/").unwrap_or_default();
             let (status, body) = crate::serve::handlers::remove_container(id);
-            json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
         }
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };

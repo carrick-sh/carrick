@@ -1162,8 +1162,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::R
     for entry in std::fs::read_dir(src) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .with_context(|| format!("failed to read directory {}", src.display()))?
     {
-        let entry =
-            entry.with_context(|| format!("failed to read entry in {}", src.display()))?;
+        let entry = entry.with_context(|| format!("failed to read entry in {}", src.display()))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
@@ -1362,7 +1361,10 @@ mod build_tests {
         assert!(!argv.iter().any(|a| a == "--no-push"));
         assert!(!argv.iter().any(|a| a == "--tar-path"));
         assert!(!argv.iter().any(|a| a == "/out"));
-        assert!(argv.windows(2).any(|w| w[0] == "-v" && w[1] == "/ctx:/workspace"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/ctx:/workspace")
+        );
         // Dockerfile path is joined under /workspace.
         assert!(
             argv.windows(2)
@@ -1370,10 +1372,16 @@ mod build_tests {
         );
         // Destination, no-cache (kaniko's valid --cache=false, not the
         // nonexistent --no-cache), and customPlatform all pass through.
-        assert!(argv.windows(2).any(|w| w[0] == "--destination" && w[1] == "registry.example.com/app:v2"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--destination" && w[1] == "registry.example.com/app:v2")
+        );
         assert!(argv.iter().any(|a| a == "--cache=false"));
         assert!(!argv.iter().any(|a| a == "--no-cache"));
-        assert!(argv.windows(2).any(|w| w[0] == "--customPlatform" && w[1] == "linux/amd64"));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--customPlatform" && w[1] == "linux/amd64")
+        );
         // The kaniko image is always present.
         assert!(argv.iter().any(|a| a == KANIKO_IMAGE));
         // --use-new-run is NOT emitted: kaniko uses its faithful default
@@ -1404,7 +1412,16 @@ mod build_tests {
         );
         // push path
         let push = kaniko_run_argv(
-            "carrick", "/ctx", None, "Dockerfile", "app", &[], false, false, None, None,
+            "carrick",
+            "/ctx",
+            None,
+            "Dockerfile",
+            "app",
+            &[],
+            false,
+            false,
+            None,
+            None,
         );
         for argv in [&no_push, &push] {
             assert!(
@@ -1430,9 +1447,18 @@ mod build_tests {
             None,  // cache_repo
             None,
         );
-        assert!(argv.iter().any(|a| a == "--cache=true"), "expected --cache=true in {argv:?}");
-        assert!(!argv.iter().any(|a| a == "--cache-repo"), "unexpected --cache-repo in {argv:?}");
-        assert!(!argv.iter().any(|a| a == "--cache=false"), "unexpected --cache=false in {argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "--cache=true"),
+            "expected --cache=true in {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--cache-repo"),
+            "unexpected --cache-repo in {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--cache=false"),
+            "unexpected --cache=false in {argv:?}"
+        );
     }
 
     /// `--cache --cache-repo localhost:5000/cache` → both `--cache=true` and
@@ -1446,17 +1472,24 @@ mod build_tests {
             "Dockerfile",
             "app:latest",
             &[],
-            false,                     // no_cache
-            true,                      // cache
+            false,                        // no_cache
+            true,                         // cache
             Some("localhost:5000/cache"), // cache_repo
             None,
         );
-        assert!(argv.iter().any(|a| a == "--cache=true"), "expected --cache=true in {argv:?}");
         assert!(
-            argv.windows(2).any(|w| w[0] == "--cache-repo" && w[1] == "localhost:5000/cache"),
+            argv.iter().any(|a| a == "--cache=true"),
+            "expected --cache=true in {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--cache-repo" && w[1] == "localhost:5000/cache"),
             "expected --cache-repo localhost:5000/cache in {argv:?}",
         );
-        assert!(!argv.iter().any(|a| a == "--cache=false"), "unexpected --cache=false in {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--cache=false"),
+            "unexpected --cache=false in {argv:?}"
+        );
     }
 
     /// `--no-cache --cache` (both) → `--cache=false` wins; no `--cache=true`.
@@ -1474,8 +1507,14 @@ mod build_tests {
             Some("localhost:5000/cache"),
             None,
         );
-        assert!(argv.iter().any(|a| a == "--cache=false"), "expected --cache=false in {argv:?}");
-        assert!(!argv.iter().any(|a| a == "--cache=true"), "unexpected --cache=true in {argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "--cache=false"),
+            "expected --cache=false in {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--cache=true"),
+            "unexpected --cache=true in {argv:?}"
+        );
     }
 
     /// Default (no cache flags) → no `--cache=*` emitted at all.
@@ -1493,6 +1532,9 @@ mod build_tests {
             None,
             None,
         );
-        assert!(!argv.iter().any(|a| a.starts_with("--cache")), "unexpected cache flag in {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--cache")),
+            "unexpected cache flag in {argv:?}"
+        );
     }
 }
