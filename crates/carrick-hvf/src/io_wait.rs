@@ -571,11 +571,11 @@ impl ThreadWaiter {
             if proc_woke {
                 break WaitResult::Ready;
             }
-            if process_pipe_woke {
-                if self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead {
-                    wake_pipe_dead = true;
-                    break WaitResult::Interrupted;
-                }
+            if process_pipe_woke
+                && self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
+            {
+                wake_pipe_dead = true;
+                break WaitResult::Interrupted;
             }
             if thread_pipe_woke
                 && self.drain_thread_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
@@ -729,11 +729,11 @@ impl ThreadWaiter {
             if fd_ready {
                 break WaitResult::Ready;
             }
-            if process_pipe_woke {
-                if self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead {
-                    self.clear_fd_registrations(kq, fds);
-                    return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
-                }
+            if process_pipe_woke
+                && self.drain_process_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
+            {
+                self.clear_fd_registrations(kq, fds);
+                return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
             }
             if thread_pipe_woke
                 && self.drain_thread_wake_pipe(kq) == crate::host_signal::DrainResult::Dead
@@ -859,44 +859,41 @@ impl ThreadWaiter {
                 if process_signal_index
                     .and_then(|index| pollfds.get(index))
                     .is_some_and(|pfd| pfd.revents != 0)
-                {
-                    if crate::host_signal::drain_fd(self.process_pipe_read)
+                    && crate::host_signal::drain_fd(self.process_pipe_read)
                         == crate::host_signal::DrainResult::Dead
+                {
+                    self.mark_dead_wake_pipe();
+                    if let Some(index) = process_signal_index
+                        && let Some(pfd) = pollfds.get_mut(index)
                     {
-                        self.mark_dead_wake_pipe();
-                        if let Some(index) = process_signal_index
-                            && let Some(pfd) = pollfds.get_mut(index)
-                        {
-                            pfd.fd = -1;
-                            pfd.events = 0;
-                        }
-                        if let Some(index) = thread_signal_index
-                            && let Some(pfd) = pollfds.get_mut(index)
-                        {
-                            pfd.fd = -1;
-                            pfd.events = 0;
-                        }
+                        pfd.fd = -1;
+                        pfd.events = 0;
+                    }
+                    if let Some(index) = thread_signal_index
+                        && let Some(pfd) = pollfds.get_mut(index)
+                    {
+                        pfd.fd = -1;
+                        pfd.events = 0;
                     }
                 }
                 if thread_signal_index
                     .and_then(|index| pollfds.get(index))
                     .is_some_and(|pfd| pfd.revents != 0)
                     && let Some(thread_wake) = self.thread_wake.as_ref()
+                    && thread_wake.drain() == crate::host_signal::DrainResult::Dead
                 {
-                    if thread_wake.drain() == crate::host_signal::DrainResult::Dead {
-                        self.mark_dead_wake_pipe();
-                        if let Some(index) = process_signal_index
-                            && let Some(pfd) = pollfds.get_mut(index)
-                        {
-                            pfd.fd = -1;
-                            pfd.events = 0;
-                        }
-                        if let Some(index) = thread_signal_index
-                            && let Some(pfd) = pollfds.get_mut(index)
-                        {
-                            pfd.fd = -1;
-                            pfd.events = 0;
-                        }
+                    self.mark_dead_wake_pipe();
+                    if let Some(index) = process_signal_index
+                        && let Some(pfd) = pollfds.get_mut(index)
+                    {
+                        pfd.fd = -1;
+                        pfd.events = 0;
+                    }
+                    if let Some(index) = thread_signal_index
+                        && let Some(pfd) = pollfds.get_mut(index)
+                    {
+                        pfd.fd = -1;
+                        pfd.events = 0;
                     }
                 }
                 if self.should_interrupt(block_mask) {

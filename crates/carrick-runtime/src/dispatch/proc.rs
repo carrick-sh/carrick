@@ -60,6 +60,12 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+// ptrace(2) PEEK/POKE request numbers live in the shared ABI crate (the
+// dispatch ABI-constant gate forbids module-level LINUX_* declarations here).
+use crate::linux_abi::{
+    LINUX_PTRACE_PEEKDATA, LINUX_PTRACE_PEEKTEXT, LINUX_PTRACE_PEEKUSER, LINUX_PTRACE_POKEDATA,
+    LINUX_PTRACE_POKETEXT, LINUX_PTRACE_POKEUSER,
+};
 
 /// Process I/O priority stored by `ioprio_set` and echoed by `ioprio_get`.
 /// carrick has no real I/O scheduler; default is IOPRIO_CLASS_BE(2) level 4 =
@@ -71,12 +77,6 @@ static IOPRIO_VALUE: std::sync::atomic::AtomicU32 =
 /// (list.next, futex_offset, list_op_pending). set_robust_list requires the
 /// caller's `len` to equal this exactly; get_robust_list reports it.
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
-const LINUX_PTRACE_PEEKTEXT: u64 = 1;
-const LINUX_PTRACE_PEEKDATA: u64 = 2;
-const LINUX_PTRACE_PEEKUSER: u64 = 3;
-const LINUX_PTRACE_POKETEXT: u64 = 4;
-const LINUX_PTRACE_POKEDATA: u64 = 5;
-const LINUX_PTRACE_POKEUSER: u64 = 6;
 
 fn translate_setpgid_args(pid: i32, pgid: i32) -> Result<(i32, i32), i32> {
     if !crate::namespace::pid::enabled() {
@@ -91,10 +91,10 @@ fn translate_setpgid_args(pid: i32, pgid: i32) -> Result<(i32, i32), i32> {
     let idempotent_init_self_setpgid = pid == 0
         && target_ns_pid == crate::namespace::pid::NS_INIT_PID
         && (pgid == 0 || pgid as u32 == target_ns_pid);
-    if crate::namespace::pid::ns_pid_is_session_leader(target_ns_pid) {
-        if !idempotent_init_self_setpgid {
-            return Err(LINUX_EPERM);
-        }
+    if crate::namespace::pid::ns_pid_is_session_leader(target_ns_pid)
+        && !idempotent_init_self_setpgid
+    {
+        return Err(LINUX_EPERM);
     }
 
     let host_pid = if pid == 0 {
@@ -1504,7 +1504,7 @@ impl SyscallDispatcher {
                         libc::ptrace(
                             libc::PT_CONTINUE,
                             pid.0,
-                            1usize as *mut libc::c_char,
+                            std::ptr::without_provenance_mut::<libc::c_char>(1),
                             host_signal_data(),
                         )
                     },
@@ -1526,7 +1526,7 @@ impl SyscallDispatcher {
                         libc::ptrace(
                             libc::PT_DETACH,
                             pid.0,
-                            1usize as *mut libc::c_char,
+                            std::ptr::without_provenance_mut::<libc::c_char>(1),
                             host_signal_data(),
                         )
                     },
@@ -1911,7 +1911,7 @@ impl SyscallDispatcher {
                     libc::ptrace(
                         libc::PT_CONTINUE,
                         result,
-                        1usize as *mut libc::c_char,
+                        std::ptr::without_provenance_mut::<libc::c_char>(1),
                         host_sigkill,
                     )
                 };

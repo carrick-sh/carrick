@@ -2769,12 +2769,11 @@ impl ThreadRuntimeState {
                 // supplies a stack + child function (glibc/musl's clone() wrapper):
                 // such a child expects SP == child_stack so it can pop fn/arg the
                 // parent pushed there (visible via shared RAM). Set it before resume.
-                if let Some(child_stack) = vfork {
-                    if child_stack != 0 {
-                        if let Err(e) = engine.set_guest_sp_el0(child_stack) {
-                            tracing::warn!(?e, "vfork: failed to set child SP_EL0");
-                        }
-                    }
+                if let Some(child_stack) = vfork
+                    && child_stack != 0
+                    && let Err(e) = engine.set_guest_sp_el0(child_stack)
+                {
+                    tracing::warn!(?e, "vfork: failed to set child SP_EL0");
                 }
                 // Don't inherit the parent's accumulated guest CPU time: the
                 // child's new vCPU starts the hypervisor exec clock at zero.
