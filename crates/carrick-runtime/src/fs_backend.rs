@@ -149,6 +149,13 @@ pub trait FsBackend: Send + Sync {
         None
     }
 
+    /// Return no-follow metadata in one cheap backend pass when the backend can
+    /// prove the path is not a symlink. The default is conservative because host
+    /// backends may need real lstat/readlink behavior.
+    fn fast_nofollow_metadata(&self, _path: &str) -> Option<RootFsMetadata> {
+        None
+    }
+
     /// `True` iff `path` is currently tombstoned.
     fn is_deleted(&self, path: &str) -> bool {
         matches!(self.lookup_kind(path), Some(OverlayEntryKind::Deleted))
@@ -900,6 +907,10 @@ impl FsBackend for MemoryBackend {
             },
             contents,
         })
+    }
+
+    fn fast_nofollow_metadata(&self, path: &str) -> Option<RootFsMetadata> {
+        self.metadata(path)
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
