@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use assert_cmd::Command;
+use futures_util::stream::StreamExt;
 use std::time::Duration;
 
 /// Kills the spawned `carrick serve` child on drop, so a panicking assertion in
@@ -158,4 +159,29 @@ async fn create_then_start_runs() {
     // best-effort cleanup (container runs `echo hi` and exits quickly)
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
         .args(["rm", "-f", "m0start"]).output();
+}
+
+#[tokio::test]
+async fn wait_returns_exit_code() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker = bollard::Docker::connect_with_unix(
+        &sock, 30, bollard::API_DEFAULT_VERSION,
+    ).unwrap();
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0wait"]).output();
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
+        ..Default::default()
+    };
+    docker.create_container(
+        Some(bollard::container::CreateContainerOptions { name: "m0wait".to_string(), ..Default::default() }),
+        body,
+    ).await.unwrap();
+    docker.start_container("m0wait", None::<bollard::container::StartContainerOptions<String>>).await.unwrap();
+    let mut waits = docker.wait_container("m0wait", None::<bollard::container::WaitContainerOptions<String>>);
+    let result = waits.next().await.unwrap().unwrap();
+    assert_eq!(result.status_code, 0);
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0wait"]).output();
 }

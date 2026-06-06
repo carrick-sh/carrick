@@ -86,6 +86,15 @@ pub(crate) async fn route(
             let (status, body) = crate::serve::handlers::start_container(id);
             json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
         }
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("wait") => {
+            let id_owned = container_action(p).map(|(id, _)| id.to_string()).unwrap_or_default();
+            let (status, body) = tokio::task::spawn_blocking(move || {
+                crate::serve::handlers::wait_container(&id_owned)
+            })
+            .await
+            .unwrap_or((500, crate::serve::handlers::error_json("wait task panicked")));
+            json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
+        }
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };
     Ok(resp)
