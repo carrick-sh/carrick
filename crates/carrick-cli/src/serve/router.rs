@@ -20,6 +20,14 @@ fn strip_version(path: &str) -> &str {
     path
 }
 
+/// Parse `/containers/<id>/<action>` into `(id, action)`.
+fn container_action(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/containers/")?;
+    let (id, action) = rest.split_once('/')?;
+    if id.is_empty() || action.is_empty() { return None; }
+    Some((id, action))
+}
+
 /// Pull a single `key=value` out of a raw query string (`a=1&b=2`).
 fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
@@ -72,6 +80,11 @@ pub(crate) async fn route(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
             )
+        }
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("start") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let (status, body) = crate::serve::handlers::start_container(id);
+            json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
         }
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };

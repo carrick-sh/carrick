@@ -58,6 +58,14 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
     }
 }
 
+/// Docker returns 204 No Content on a successful start.
+pub(crate) fn start_container(id: &str) -> (u16, String) {
+    match crate::serve::spawn::start_container(id) {
+        Ok(()) => (204, String::new()),
+        Err(e) => (500, error_json(&e.to_string())),
+    }
+}
+
 pub(crate) fn error_json(msg: &str) -> String {
     format!(
         "{{\"message\":{}}}",

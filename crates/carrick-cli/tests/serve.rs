@@ -26,6 +26,28 @@ fn serve_help_lists_docker_api_flag() {
         .stdout(predicates::str::contains("--docker-api"));
 }
 
+/// Codesign the test binary once with the hypervisor entitlement. The server we
+/// spawn shells out to ITSELF (current_exe) to boot a guest under HVF, which
+/// requires the `com.apple.security.hypervisor` entitlement; an unsigned binary
+/// fails with HV_DENIED. assert_cmd's `cargo_bin` path is shared across the
+/// concurrently-run tests in this binary, so sign it exactly once.
+fn ensure_codesigned(bin: &std::path::Path) {
+    use std::sync::Once;
+    static SIGNED: Once = Once::new();
+    SIGNED.call_once(|| {
+        let out = std::process::Command::new("codesign")
+            .args(["--force", "--sign", "-", "--entitlements", "scripts/entitlements.plist"])
+            .arg(bin)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+}
+
 /// Spawn `carrick serve` on a temp socket, returning a (guard, socket_path,
 /// tempdir). The guard kills the server on drop.
 fn spawn_server() -> (ServerGuard, String, tempfile::TempDir) {
@@ -33,6 +55,7 @@ fn spawn_server() -> (ServerGuard, String, tempfile::TempDir) {
     let sock = dir.path().join("carrick.sock");
     let sock_str = sock.to_str().unwrap().to_string();
     let bin = assert_cmd::cargo::cargo_bin("carrick");
+    ensure_codesigned(&bin);
     let mut child = std::process::Command::new(bin)
         .args(["serve", "--docker-api", "--host", &sock_str])
         .spawn()
@@ -108,4 +131,31 @@ async fn create_returns_id() {
         .unwrap();
     assert_eq!(created.id.len(), 64);
     let _ = docker.remove_container("m0create", None).await;
+}
+
+#[tokio::test]
+async fn create_then_start_runs() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker = bollard::Docker::connect_with_unix(
+        &sock, 30, bollard::API_DEFAULT_VERSION,
+    ).unwrap();
+    // idempotency: the registry is persistent and DELETE isn't wired until Task 8.
+    let _ = docker.remove_container("m0start", None).await;
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0start"]).output();
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
+        ..Default::default()
+    };
+    docker.create_container(
+        Some(bollard::container::CreateContainerOptions { name: "m0start".to_string(), ..Default::default() }),
+        body,
+    ).await.unwrap();
+    docker.start_container("m0start", None::<bollard::container::StartContainerOptions<String>>)
+        .await
+        .unwrap();
+    // best-effort cleanup (container runs `echo hi` and exits quickly)
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0start"]).output();
 }
