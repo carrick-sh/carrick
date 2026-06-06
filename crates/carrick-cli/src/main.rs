@@ -91,6 +91,7 @@ mod debug;
 mod fs_setup;
 mod lifecycle;
 mod runtime_util;
+mod serve;
 mod trace_cli;
 
 use clap::Parser;
