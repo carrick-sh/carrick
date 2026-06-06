@@ -27,6 +27,14 @@ fn text(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
 }
 
+fn json(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
 /// The single service entry point. Infallible at the HTTP layer: every handler
 /// error becomes a response, never a panic (the no-panic gate).
 pub(crate) async fn route(
@@ -37,6 +45,12 @@ pub(crate) async fn route(
 
     let resp = match (&method, path.as_str()) {
         (&Method::GET, "/_ping") => text(StatusCode::OK, "OK"),
+        (&Method::GET, "/version") => {
+            json(StatusCode::OK, crate::serve::handlers::version_json())
+        }
+        (&Method::GET, "/info") => {
+            json(StatusCode::OK, crate::serve::handlers::info_json())
+        }
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };
     Ok(resp)
