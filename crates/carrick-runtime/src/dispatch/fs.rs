@@ -806,6 +806,18 @@ impl SyscallDispatcher {
         } else {
             0
         };
+        // A write-intent open (O_CREAT or write access) of an OVERRIDABLE
+        // single-file injection (/etc/services, /etc/resolv.conf) DETACHES the
+        // injection: the read-only synthetic mount would otherwise EACCES on the
+        // write. Record the override, then let the open fall through to the
+        // writable overlay (after override_path, `resolve` returns None so
+        // `try_vfs_open` no longer claims the path).
+        if (writable_request || want_create)
+            && let Some(m) = self.fs.vfs_mounts.resolve(&path)
+            && m.vfs.overridable()
+        {
+            self.fs.vfs_mounts.override_path(&path);
+        }
         let vfs_outcome = self.try_vfs_open(&path, access, flags, vfs_create_mode);
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
@@ -1868,6 +1880,16 @@ impl SyscallDispatcher {
             return Ok(LINUX_EROFS.into());
         }
         let no_replace = flags & RENAME_NOREPLACE != 0;
+        // Renaming OVER an OVERRIDABLE single-file injection (/etc/services,
+        // /etc/resolv.conf) DETACHES it: the read-only synthetic mount would
+        // EROFS on the rename target. Record the override so the new path falls
+        // through to the writable overlay (after this, `resolve(&resolved_new)`
+        // returns None and the rename lands in the overlay below).
+        if let Some(mnew) = self.fs.vfs_mounts.resolve(&resolved_new)
+            && mnew.vfs.overridable()
+        {
+            self.fs.vfs_mounts.override_path(&resolved_new);
+        }
         let old_is_vfs_mount = self.fs.vfs_mounts.resolve(&resolved_old).is_some();
         if let Some(mnew) = self.fs.vfs_mounts.resolve(&resolved_new) {
             if !old_is_vfs_mount {
@@ -6955,6 +6977,31 @@ impl SyscallDispatcher {
             // unlinkat must mirror that or LTP's SAFE_UNLINK(shm_path) — which
             // creates the IPC region then immediately unlinks it (the mapping
             // outlives the name) — fails ENOENT and TBROKs setup_ipc.
+            // An OVERRIDABLE single-file injection (/etc/services, /etc/resolv.conf)
+            // is just a default the guest may replace: unlinking it must DETACH
+            // the injection rather than EROFS from the read-only synthetic mount
+            // (kaniko's image-unpack unlinks /etc/services to lay down the base
+            // image's copy). Record the override so the path falls through to the
+            // overlay everywhere thereafter; the injection isn't a real overlay
+            // file, so "unlink" just means stop injecting. If the overlay DOES
+            // happen to carry the path, also run the normal overlay delete.
+            if let Some(m) = this.fs.vfs_mounts.resolve(&resolved)
+                && m.vfs.overridable()
+            {
+                this.fs.vfs_mounts.override_path(&resolved);
+                let overlay_result = if remove_dir {
+                    this.fs.rootfs_vfs.rmdir(&resolved)
+                } else {
+                    this.fs.rootfs_vfs.unlink(&resolved)
+                };
+                // A missing overlay file is expected (the injection had no real
+                // backing) — that's still a successful detach. Only a non-ENOENT
+                // error from a real overlay file should surface.
+                return match overlay_result {
+                    Ok(()) | Err(LINUX_ENOENT) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(errno.into()),
+                };
+            }
             let result = if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
                 if remove_dir { m.vfs.rmdir(&m.full_path) } else { m.vfs.unlink(&m.full_path) }
             } else if remove_dir {

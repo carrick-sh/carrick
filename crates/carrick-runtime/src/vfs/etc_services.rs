@@ -74,6 +74,13 @@ impl Vfs for EtcServicesVfs {
         })
     }
 
+    /// A guest may replace or delete its own /etc/services (e.g. an image
+    /// builder unpacking a base image's copy): a mutation detaches this
+    /// injection so the path falls through to the writable overlay.
+    fn overridable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "etc_services"
     }
@@ -111,5 +118,12 @@ mod tests {
         assert!(!bytes.is_empty());
         assert!(String::from_utf8_lossy(&bytes).contains("smtp"));
         assert_eq!(v.read_file("/etc/hosts"), Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn etc_services_is_overridable() {
+        // It is an injected default the guest may replace (kaniko unlinks it to
+        // lay down the base image's copy), so it must report overridable.
+        assert!(EtcServicesVfs::new().overridable());
     }
 }

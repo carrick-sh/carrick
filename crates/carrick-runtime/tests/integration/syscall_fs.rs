@@ -8403,3 +8403,148 @@ fn f_getfl_strips_creation_only_open_flags() {
         "F_GETFL must keep O_NONBLOCK"
     );
 }
+
+/// A guest must be able to OVERRIDE the synthetic, single-file `/etc/services`
+/// injection: kaniko's image-unpack `unlink(/etc/services)`s to lay down the
+/// base image's copy, and many workloads rewrite `/etc/resolv.conf`. The
+/// injected mount is read-only, so before the fix an unlink/write returned
+/// EROFS/EACCES. After the fix a guest mutation DETACHES the injection so the
+/// path falls through to the writable overlay — the guest's version wins, and a
+/// delete-without-recreate makes the path ENOENT. An untouched injection still
+/// serves as the fallback default.
+#[test]
+fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
+    const LINUX_O_RDONLY: u64 = 0;
+    // A rootfs whose /etc is a real directory (so the overlay can create the new
+    // /etc/services after the injection is detached) — exactly the kaniko
+    // `--fs host` scratch shape, where /etc already exists.
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs motd\n".as_slice(),
+    )]))])
+    .unwrap();
+    // The macOS host's /etc/services is many KB and opens with a comment banner,
+    // so the read buffer (at 0x8000) must be large enough to capture an smtp
+    // entry. Path is at 0x4000, the new-contents scratch at 0x4100.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x20000]);
+    memory.write_bytes(0x4000, b"/etc/services\0").unwrap();
+    memory.write_bytes(0x4100, b"carrick-test 9999/tcp\n").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // Control: WITHOUT any mutation, /etc/services reads the synthetic
+    // injection (the common case still works). The macOS host's services file
+    // (or carrick's built-in fallback) always lists smtp.
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("control openat read: {other:?}"),
+    };
+    let n = match run(&mut dispatcher, &mut memory, 63, [fd, 0x8000, 0x10000, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as usize,
+        other => panic!("control read: {other:?}"),
+    };
+    let injected = memory.read_bytes(0x8000, n).unwrap();
+    assert!(
+        String::from_utf8_lossy(&injected).contains("smtp"),
+        "control: synthetic /etc/services must list smtp, got {n} bytes"
+    );
+    assert_eq!(run(&mut dispatcher, &mut memory, 57, [fd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 });
+
+    // unlinkat("/etc/services"): before the fix this routed to the read-only
+    // EtcServicesVfs and returned EROFS (30). After the fix the injection is
+    // detached and the unlink succeeds (0).
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            35,
+            [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 },
+        "unlinkat(/etc/services) of an overridable injection must succeed"
+    );
+
+    // After unlink without recreate, the path is gone: openat read → ENOENT (2),
+    // not the synthetic injection.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno { errno: 2 },
+        "after unlink the detached injection must be ENOENT, not the synthetic file"
+    );
+    // newfstatat agrees: ENOENT.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4000, 0x4300, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno { errno: 2 },
+        "stat after unlink must be ENOENT"
+    );
+
+    // Recreate /etc/services with NEW contents via O_CREAT|O_WRONLY, write,
+    // close — this lands in the writable overlay, not the synthetic mount.
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0x4000,
+            LINUX_O_CREAT | LINUX_O_WRONLY,
+            0o644,
+            0,
+            0,
+        ],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("recreate openat O_CREAT|O_WRONLY: {other:?}"),
+    };
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 64, [fd, 0x4100, 22, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 22 },
+        "write of new /etc/services contents must succeed"
+    );
+    assert_eq!(run(&mut dispatcher, &mut memory, 57, [fd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 });
+
+    // Re-open for read: the overlay's NEW contents win, NOT the synthetic file.
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("reopen read after recreate: {other:?}"),
+    };
+    let n = match run(&mut dispatcher, &mut memory, 63, [fd, 0x8000, 0x10000, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as usize,
+        other => panic!("read after recreate: {other:?}"),
+    };
+    assert_eq!(
+        memory.read_bytes(0x8000, n).unwrap(),
+        b"carrick-test 9999/tcp\n",
+        "after override+recreate the overlay contents must win over the injection"
+    );
+}

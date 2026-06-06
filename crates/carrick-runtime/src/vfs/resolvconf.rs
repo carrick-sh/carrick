@@ -85,6 +85,13 @@ impl Vfs for ResolvConfVfs {
         })
     }
 
+    /// A guest commonly rewrites /etc/resolv.conf: a mutation detaches this
+    /// injection so the path falls through to the writable overlay (the guest's
+    /// version wins; a delete makes it gone until recreated).
+    fn overridable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "resolvconf"
     }
@@ -232,6 +239,13 @@ mod tests {
                 "unexpected resolv.conf line: {t:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolv_conf_is_overridable() {
+        // It is an injected default the guest commonly rewrites, so it must
+        // report overridable (a guest mutation detaches the injection).
+        assert!(ResolvConfVfs::new().overridable());
     }
 
     #[test]
