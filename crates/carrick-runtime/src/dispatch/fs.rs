@@ -496,6 +496,7 @@ impl SyscallDispatcher {
             let creds = self.cred_snapshot();
             let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
             if let Some(host_fd) = self.fs.rootfs_vfs.overlay.open_anon_fd(create_mode) {
+                crate::dispatch::net::set_host_nonblocking(host_fd);
                 let description = OpenDescription::HostFile {
                     host_fd,
                     metadata: RootFsMetadata {
@@ -725,12 +726,14 @@ impl SyscallDispatcher {
                     // Track this FIFO end for kernel-backed writer-close EOF
                     // readiness (macOS won't report it — see dispatch::fifo_beacon).
                     crate::dispatch::fifo_beacon::register_open(host_fd, access_idx);
+                    crate::dispatch::net::set_host_nonblocking(host_fd);
                     let description = OpenDescription::HostPipe {
                         host_fd,
                         is_read_end: access != LINUX_O_WRONLY,
                         base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                         pty: None,
                         bidirectional: access == LINUX_O_RDWR,
+                        write_kind: HostWriteKind::PipeLike,
                     };
                     let open_file = OpenFile {
                         description: Arc::new(RwLock::new(description)),
@@ -832,15 +835,18 @@ impl SyscallDispatcher {
                 host_fd,
                 metadata,
                 writable,
-            }) => (
-                OpenDescription::HostFile {
-                    host_fd,
-                    metadata,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                    writable,
-                },
-                Some(HostFdRef::new(host_fd)),
-            ),
+            }) => {
+                crate::dispatch::net::set_host_nonblocking(host_fd);
+                (
+                    OpenDescription::HostFile {
+                        host_fd,
+                        metadata,
+                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                        writable,
+                    },
+                    Some(HostFdRef::new(host_fd)),
+                )
+            }
             Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
                 if writable_request {
                     return Ok(LINUX_EISDIR.into());
@@ -895,6 +901,7 @@ impl SyscallDispatcher {
                     .overlay
                     .open_raw_fd(&path, true, true, want_trunc)
                 {
+                    crate::dispatch::net::set_host_nonblocking(host_fd);
                     // The host create used the host process umask; force the
                     // guest-requested mode onto the new file.
                     let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
@@ -1038,6 +1045,8 @@ impl SyscallDispatcher {
                     Ok(duped) => duped,
                     Err(errno) => return DispatchOutcome::errno(errno),
                 };
+                crate::dispatch::net::set_host_nonblocking(duped);
+                let write_kind = HostWriteKind::for_host_fd(duped);
                 (
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
@@ -1045,6 +1054,7 @@ impl SyscallDispatcher {
                         base: OpenDescriptionBase::new(0),
                         pty: None,
                         bidirectional: false,
+                        write_kind,
                     })),
                     Some(HostFdRef::new(duped)),
                 )
@@ -1140,14 +1150,19 @@ impl SyscallDispatcher {
                 is_read_end,
                 status_flags,
             } => {
+                crate::dispatch::net::set_host_nonblocking(host_fd);
                 // A VFS-served (e.g. bind-mounted) REGULAR file must become a
                 // seekable HostFile, not a HostPipe — otherwise lseek/pread-at-
                 // offset and sendfile/splice reject it (EINVAL), since a pipe
                 // isn't seekable. Only genuine streams (devices, fifos) stay
                 // HostPipe. fstat the real fd to decide.
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                let is_regular = unsafe { libc::fstat(host_fd, &mut st) } == 0
-                    && (st.st_mode & libc::S_IFMT) == libc::S_IFREG;
+                let write_kind = if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
+                    HostWriteKind::from_host_mode(st.st_mode)
+                } else {
+                    HostWriteKind::Other
+                };
+                let is_regular = write_kind == HostWriteKind::RegularFile;
                 let description = if is_regular {
                     OpenDescription::HostFile {
                         host_fd,
@@ -1167,6 +1182,7 @@ impl SyscallDispatcher {
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: None,
                         bidirectional: false,
+                        write_kind,
                     }
                 };
                 let open_file = OpenFile::with_host_fd(
@@ -1208,6 +1224,7 @@ impl SyscallDispatcher {
                 is_master,
                 status_flags,
             } => {
+                crate::dispatch::net::set_host_nonblocking(host_fd);
                 let open_file = OpenFile::with_host_fd(
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd,
@@ -1221,6 +1238,7 @@ impl SyscallDispatcher {
                         }),
                         // pty bidirectionality is already expressed by `pty`.
                         bidirectional: false,
+                        write_kind: HostWriteKind::Other,
                     })),
                     linux_fd_flags_from_open_flags(flags),
                     host_fd,
@@ -1503,6 +1521,7 @@ impl SyscallDispatcher {
                         is_read_end,
                         pty,
                         bidirectional,
+                        write_kind,
                         ..
                     } => {
                         // pty ends and O_RDWR FIFOs are bidirectional; only real
@@ -1518,11 +1537,18 @@ impl SyscallDispatcher {
                         return if *is_read_end && pty.is_none() && !*bidirectional {
                             DispatchOutcome::errno(LINUX_EBADF)
                         } else {
-                            write_host_pipe(bytes, *host_fd, nonblocking, tid, false)
+                            write_host_pipe(bytes, *host_fd, nonblocking, *write_kind, tid, false)
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
-                        return write_host_pipe(bytes, *host_fd, nonblocking, tid, false);
+                        return write_host_pipe(
+                            bytes,
+                            *host_fd,
+                            nonblocking,
+                            HostWriteKind::SocketLike,
+                            tid,
+                            false,
+                        );
                     }
                     OpenDescription::HostFile {
                         base,
@@ -1536,7 +1562,14 @@ impl SyscallDispatcher {
                         if base.status_flags() & LINUX_O_APPEND != 0 {
                             unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                         }
-                        return write_host_pipe(bytes, *host_fd, nonblocking, tid, false);
+                        return write_host_pipe(
+                            bytes,
+                            *host_fd,
+                            nonblocking,
+                            HostWriteKind::RegularFile,
+                            tid,
+                            false,
+                        );
                     }
                     OpenDescription::File {
                         path,
@@ -2352,21 +2385,11 @@ impl SyscallDispatcher {
             // fails with EINVAL ("Failed to open new FD - fdopen") — apt's dpkg
             // status pipe hit exactly that.
             let nonblock = flags & LINUX_O_NONBLOCK;
-            // pipe2(2)'s O_NONBLOCK must take effect on the actual pipe ends.
-            // The read/write path does a raw libc::read/write on the host fd and
-            // relies on its blocking mode — `status_flags` is only bookkeeping
-            // for F_GETFL. Without applying it here a nonblocking read on an
-            // empty pipe blocks the supervisor forever (matches what
-            // fcntl(F_SETFL) already does for the apt http-method path).
-            if nonblock != 0 {
-                for hfd in [host_read, host_write] {
-                    unsafe {
-                        let cur = libc::fcntl(hfd, libc::F_GETFL, 0);
-                        if cur >= 0 {
-                            libc::fcntl(hfd, libc::F_SETFL, cur | libc::O_NONBLOCK);
-                        }
-                    }
-                }
+            // Keep host pipe ends non-blocking regardless of the guest-visible
+            // O_NONBLOCK bit. Blocking-mode guest calls park through WaitOnFds
+            // after a host EAGAIN instead of blocking under dispatcher locks.
+            for hfd in [host_read, host_write] {
+                crate::dispatch::net::set_host_nonblocking(hfd);
             }
             let fd_flags = linux_fd_flags_from_open_flags(flags);
             // Both ends share ONE capacity cell so F_SETPIPE_SZ on either end is
@@ -2386,6 +2409,7 @@ impl SyscallDispatcher {
                     base: read_base,
                     pty: None,
                     bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
                 })),
                 fd_flags,
                 host_read,
@@ -2397,6 +2421,7 @@ impl SyscallDispatcher {
                     base: write_base,
                     pty: None,
                     bidirectional: false,
+                    write_kind: HostWriteKind::PipeLike,
                 })),
                 fd_flags,
                 host_write,
@@ -2474,6 +2499,8 @@ impl SyscallDispatcher {
                     // and wrap it as a HostPipe so the write path picks it
                     // up before the bare-stdio fallback.
                     let duped = (unsafe { libc::dup(old_fd.0) }).host_syscall_errno()?;
+                    crate::dispatch::net::set_host_nonblocking(duped);
+                    let write_kind = HostWriteKind::for_host_fd(duped);
                     (
                         Arc::new(RwLock::new(OpenDescription::HostPipe {
                             host_fd: duped,
@@ -2481,6 +2508,7 @@ impl SyscallDispatcher {
                             base: OpenDescriptionBase::new(0),
                             pty: None,
                             bidirectional: false,
+                            write_kind,
                         })),
                         Some(HostFdRef::new(duped)),
                     )
@@ -2724,29 +2752,16 @@ impl SyscallDispatcher {
                     let open = open_file.description.read();
                     let next_flags =
                         (open.status_flags() & LINUX_O_ACCMODE) | (arg & LINUX_F_SETFL_MUTABLE);
-                    // Propagate O_NONBLOCK to the underlying host fd when one
-                    // exists. Without this, our libc::read still blocks even
-                    // after the guest set O_NONBLOCK — apt's http method
-                    // depends on this for the pselect6 wait pattern.
+                    // Host-backed descriptors stay O_NONBLOCK independent of
+                    // the Linux-visible status flag. Without this invariant,
+                    // clearing guest O_NONBLOCK would let a later read/write
+                    // block under dispatcher locks.
                     if let Some(host_fd) = match &*open {
                         OpenDescription::HostPipe { host_fd, .. }
                         | OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
                         _ => None,
                     } {
-                        let want_nonblock = next_flags & LINUX_O_NONBLOCK != 0;
-                        unsafe {
-                            let cur = libc::fcntl(host_fd, libc::F_GETFL, 0);
-                            if cur >= 0 {
-                                let next = if want_nonblock {
-                                    cur | libc::O_NONBLOCK
-                                } else {
-                                    cur & !libc::O_NONBLOCK
-                                };
-                                if next != cur {
-                                    libc::fcntl(host_fd, libc::F_SETFL, next);
-                                }
-                            }
-                        }
+                        crate::dispatch::net::set_host_nonblocking(host_fd);
                     }
                     drop(open);
                     open_file.description.write().set_status_flags(next_flags);
@@ -3110,9 +3125,9 @@ impl SyscallDispatcher {
                         // master. Linux returns 0 and toggles O_NONBLOCK on the open
                         // description; without this arm the pty fd hit the catch-all
                         // below and returned ENOTTY. Mirror the generic FIONBIO
-                        // handler: toggle O_NONBLOCK on the live host pty fd and keep
-                        // the open description's status flags coherent so a later
-                        // F_GETFL reflects the change.
+                        // handler: toggle Linux-visible O_NONBLOCK on the open
+                        // description while keeping the host fd non-blocking so
+                        // a later blocking-mode read still parks via WaitOnFds.
                         let Ok(bytes) = cx.memory.read_bytes(arg, 4) else {
                             return Ok(LINUX_EFAULT.into());
                         };
@@ -3128,18 +3143,7 @@ impl SyscallDispatcher {
                             }
                             open.set_status_flags(status_flags);
                         }
-                        // SAFETY: host_fd is our live pty fd.
-                        unsafe {
-                            let cur = libc::fcntl(host_fd, libc::F_GETFL, 0);
-                            if cur >= 0 {
-                                let next = if enable {
-                                    cur | libc::O_NONBLOCK
-                                } else {
-                                    cur & !libc::O_NONBLOCK
-                                };
-                                libc::fcntl(host_fd, libc::F_SETFL, next);
-                            }
-                        }
+                        crate::dispatch::net::set_host_nonblocking(host_fd);
                         DispatchOutcome::Returned { value: 0 }
                     }
                     // ── Line-discipline control (tcdrain/tcflush/tcflow/tcsendbreak) ──
@@ -3373,17 +3377,7 @@ impl SyscallDispatcher {
                             _ => None,
                         };
                         if let Some(host_fd) = host_fd {
-                            unsafe {
-                                let cur = libc::fcntl(host_fd, libc::F_GETFL, 0);
-                                if cur >= 0 {
-                                    let next = if enable {
-                                        cur | libc::O_NONBLOCK
-                                    } else {
-                                        cur & !libc::O_NONBLOCK
-                                    };
-                                    libc::fcntl(host_fd, libc::F_SETFL, next);
-                                }
-                            }
+                            crate::dispatch::net::set_host_nonblocking(host_fd);
                         }
                     }
                     DispatchOutcome::Returned { value: 0 }
@@ -4089,6 +4083,7 @@ impl SyscallDispatcher {
             // input from the user's terminal (or whatever the carrick host
             // process's stdin is — file, pipe, or terminal).
             if fd.0 == 0 && !this.fd_table_contains(0) {
+                crate::dispatch::net::set_host_nonblocking(0);
                 return Ok(read_host_pipe(memory, address, length, 0, nonblocking));
             }
             let Some(open_file) = this.open_file(fd.0) else {
@@ -5473,6 +5468,7 @@ impl SyscallDispatcher {
                             is_read_end,
                             pty,
                             bidirectional,
+                            write_kind,
                             ..
                         } => {
                             // pty ends and O_RDWR FIFOs are bidirectional; only
@@ -5492,8 +5488,14 @@ impl SyscallDispatcher {
                             }
                             // A broken pipe (read end closed) → EPIPE AND a
                             // SIGPIPE on the writer (write05).
-                            let out =
-                                write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid(), true);
+                            let out = write_host_pipe(
+                                &bytes,
+                                *host_fd,
+                                nonblocking,
+                                *write_kind,
+                                cx.tid(),
+                                true,
+                            );
                             return Ok(this.raise_sigpipe_on_epipe(cx, out));
                         }
                         OpenDescription::HostSocket { host_fd, .. } => {
@@ -5504,6 +5506,7 @@ impl SyscallDispatcher {
                                 &bytes,
                                 *host_fd,
                                 nonblocking,
+                                HostWriteKind::SocketLike,
                                 cx.tid(),
                                 false,
                             ));
@@ -5531,6 +5534,7 @@ impl SyscallDispatcher {
                                 &bytes,
                                 *host_fd,
                                 nonblocking,
+                                HostWriteKind::RegularFile,
                                 cx.tid(),
                                 false,
                             ));
@@ -5675,6 +5679,7 @@ impl SyscallDispatcher {
                                 is_read_end,
                                 pty,
                                 bidirectional,
+                                write_kind,
                                 ..
                             } => {
                                 // pty ends and O_RDWR FIFOs are bidirectional;
@@ -5682,13 +5687,25 @@ impl SyscallDispatcher {
                                 if *is_read_end && pty.is_none() && !*bidirectional {
                                     return Ok(LINUX_EBADF.into());
                                 }
-                                outcome =
-                                    write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid(), true);
+                                outcome = write_host_pipe(
+                                    &bytes,
+                                    *host_fd,
+                                    nonblocking,
+                                    *write_kind,
+                                    cx.tid(),
+                                    true,
+                                );
                                 writeback = FileWriteback::None;
                             }
                             OpenDescription::HostSocket { host_fd, .. } => {
-                                outcome =
-                                    write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid(), false);
+                                outcome = write_host_pipe(
+                                    &bytes,
+                                    *host_fd,
+                                    nonblocking,
+                                    HostWriteKind::SocketLike,
+                                    cx.tid(),
+                                    false,
+                                );
                                 writeback = FileWriteback::None;
                             }
                             OpenDescription::HostFile {
@@ -5707,8 +5724,14 @@ impl SyscallDispatcher {
                                 if base.status_flags() & LINUX_O_APPEND != 0 {
                                     unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                                 }
-                                outcome =
-                                    write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid(), false);
+                                outcome = write_host_pipe(
+                                    &bytes,
+                                    *host_fd,
+                                    nonblocking,
+                                    HostWriteKind::RegularFile,
+                                    cx.tid(),
+                                    false,
+                                );
                                 writeback = FileWriteback::None;
                             }
                             OpenDescription::File {

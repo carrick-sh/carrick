@@ -356,6 +356,34 @@ impl OpenDescriptionBase {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HostWriteKind {
+    PipeLike,
+    SocketLike,
+    RegularFile,
+    Other,
+}
+
+impl HostWriteKind {
+    pub(super) fn from_host_mode(mode: libc::mode_t) -> Self {
+        match mode & libc::S_IFMT {
+            libc::S_IFIFO => Self::PipeLike,
+            libc::S_IFSOCK => Self::SocketLike,
+            libc::S_IFREG => Self::RegularFile,
+            _ => Self::Other,
+        }
+    }
+
+    pub(super) fn for_host_fd(host_fd: i32) -> Self {
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
+            Self::from_host_mode(st.st_mode)
+        } else {
+            Self::Other
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum OpenDescription {
     File {
@@ -474,6 +502,9 @@ pub(super) enum OpenDescription {
         /// `is_read_end`); a `O_RDWR` FIFO is bidirectional like a pty but is
         /// NOT a tty, so it sets this flag instead of a fake `pty` role.
         bidirectional: bool,
+        /// Write behavior classified once when adopting the host fd. Only real
+        /// host FIFOs/pipes need Linux's blocking large-write completion loop.
+        write_kind: HostWriteKind,
     },
     /// Host BSD socket backed by a real macOS file descriptor.
     /// Survives `libc::fork(2)`; the `family`/`type_` fields capture

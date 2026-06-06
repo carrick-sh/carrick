@@ -753,6 +753,7 @@ impl SyscallDispatcher {
                 is_read_end: false,
                 pty: None,
                 bidirectional: true,
+                write_kind: HostWriteKind::PipeLike,
                 base: OpenDescriptionBase::new(0),
             }
         } else {
@@ -984,20 +985,9 @@ impl SyscallDispatcher {
         let socket_flags = LinuxSocketTypeFlags::from_bits_retain(accept4_flags);
         let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
-        // The accepted socket inherits the listen socket's non-blocking mode on
-        // macOS; set it to match the guest's intent (recv/send use MSG_DONTWAIT
-        // regardless, so this is for fidelity).
-        unsafe {
-            let fl = libc::fcntl(new_host, libc::F_GETFL);
-            if fl >= 0 {
-                let next = if nonblock {
-                    fl | libc::O_NONBLOCK
-                } else {
-                    fl & !libc::O_NONBLOCK
-                };
-                libc::fcntl(new_host, libc::F_SETFL, next);
-            }
-        }
+        // Keep the host socket non-blocking; Linux-visible blocking intent is
+        // carried by status_flags and serviced by WaitOnFds.
+        set_host_nonblocking(new_host);
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::with_host_fd(
