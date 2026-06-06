@@ -561,6 +561,18 @@ impl SyscallDispatcher {
                     });
                 }
 
+                if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    && !crate::memory::is_high_va(address)
+                {
+                    memory.set_no_access(address, length_usize, false);
+                    if in_arena && memory.protect_range(address, length_usize, prot).is_err() {
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                    return Ok(DispatchOutcome::Returned {
+                        value: address as i64,
+                    });
+                }
+
                 let mut bytes = vec![0; length_usize];
                 if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                     let Some(open_file) = this.open_file(fd.0) else {
@@ -1176,6 +1188,85 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct CountingMmapMemory {
+        base: u64,
+        bytes: Vec<u8>,
+        write_calls: Cell<usize>,
+        write_bytes_total: Cell<usize>,
+        zero_backing_calls: Cell<usize>,
+        protect_calls: Cell<usize>,
+    }
+
+    impl CountingMmapMemory {
+        fn new(base: u64, len: usize) -> Self {
+            Self {
+                base,
+                bytes: vec![0u8; len],
+                write_calls: Cell::new(0),
+                write_bytes_total: Cell::new(0),
+                zero_backing_calls: Cell::new(0),
+                protect_calls: Cell::new(0),
+            }
+        }
+
+        fn range_offset(&self, address: u64, length: usize) -> Result<usize, MemoryError> {
+            let offset = address
+                .checked_sub(self.base)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            let offset = usize::try_from(offset)
+                .map_err(|_| MemoryError::OutOfBounds { address, length })?;
+            let end = offset
+                .checked_add(length)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            if end > self.bytes.len() {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            Ok(offset)
+        }
+    }
+
+    impl GuestMemory for CountingMmapMemory {
+        fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let offset = self.range_offset(address, length)?;
+            Ok(self.bytes[offset..offset + length].to_vec())
+        }
+
+        fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            let offset = self.range_offset(address, bytes.len())?;
+            self.write_calls.set(self.write_calls.get() + 1);
+            self.write_bytes_total
+                .set(self.write_bytes_total.get() + bytes.len());
+            self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+
+        fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+            let offset = self.range_offset(address, len)?;
+            self.zero_backing_calls
+                .set(self.zero_backing_calls.get() + 1);
+            self.bytes[offset..offset + len].fill(0);
+            Ok(())
+        }
+
+        fn protect_range(
+            &mut self,
+            _address: u64,
+            _len: usize,
+            _prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.protect_calls.set(self.protect_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    fn returned(outcome: DispatchOutcome) -> i64 {
+        match outcome {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("expected Returned, got {other:?}"),
+        }
+    }
 
     #[test]
     fn free_regions_coalesce_adjacent() {
@@ -1211,5 +1302,97 @@ mod tests {
         assert_eq!(second, Some((freed + LINUX_PAGE_SIZE, true)));
 
         assert!(dispatcher.mem.lock().free_regions.is_empty());
+    }
+
+    #[test]
+    fn fresh_private_anonymous_mmap_skips_zero_write() {
+        const SYS_MMAP: u64 = 222;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+        let request = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                LINUX_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+
+        let outcome = dispatcher
+            .dispatch(request, &mut memory, &reporter)
+            .expect("mmap dispatch should succeed");
+
+        assert_eq!(returned(outcome), LINUX_MMAP_BASE as i64);
+        assert_eq!(
+            memory.write_calls.get(),
+            0,
+            "fresh anonymous mmap should rely on lazy-zero backing, not write a zero buffer"
+        );
+        assert_eq!(memory.write_bytes_total.get(), 0);
+        assert_eq!(memory.zero_backing_calls.get(), 0);
+        assert_eq!(
+            memory.protect_calls.get(),
+            1,
+            "fresh mapping should still install the requested guest protection"
+        );
+    }
+
+    #[test]
+    fn reused_private_anonymous_mmap_zeroes_backing_without_zero_write() {
+        const SYS_MMAP: u64 = 222;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        {
+            let mut mem = dispatcher.mem.lock();
+            free_regions_insert(&mut mem.free_regions, LINUX_MMAP_BASE, LINUX_PAGE_SIZE);
+        }
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        memory.bytes.fill(0x5a);
+        let reporter = CompatReporter::default();
+        let request = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                0,
+                LINUX_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+
+        let outcome = dispatcher
+            .dispatch(request, &mut memory, &reporter)
+            .expect("mmap dispatch should succeed");
+
+        assert_eq!(returned(outcome), LINUX_MMAP_BASE as i64);
+        assert_eq!(
+            memory.zero_backing_calls.get(),
+            1,
+            "reused anonymous mmap must scrub stale physical backing"
+        );
+        assert_eq!(
+            memory.write_calls.get(),
+            0,
+            "zero_backing should be the only scrub path for reused anonymous mmap"
+        );
+        assert!(
+            memory
+                .read_bytes(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0),
+            "stale bytes must not remain visible after reuse"
+        );
+        assert_eq!(
+            memory.protect_calls.get(),
+            1,
+            "reused mapping should still install the requested guest protection"
+        );
     }
 }
