@@ -295,6 +295,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "carrick-hal",
+ "carrick-host",
  "libc",
 ]
 
@@ -391,6 +392,7 @@ dependencies = [
  "applevisor",
  "applevisor-sys",
  "carrick-abi",
+ "carrick-bsd",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",

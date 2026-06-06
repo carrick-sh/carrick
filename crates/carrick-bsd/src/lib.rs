@@ -8,7 +8,13 @@
 pub mod errno;
 pub use errno::bsd_to_linux_errno;
 
-// Filled by the BSDIO section (EventMultiplexer / Sendfile / CrossProcessFutex):
-// pub mod kqueue;
-// pub mod sendfile;
-// pub mod futex;
+pub mod kqueue;
+pub use kqueue::{Kevent, Kqueue, duplicate_internal_fd, relocate_internal_fd};
+pub mod multiplexer;
+pub use multiplexer::KqueueMultiplexer;
+
+pub mod sendfile;
+pub use sendfile::BsdSendfile;
+
+pub mod futex;
+pub use futex::BsdFutex;

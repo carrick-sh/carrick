@@ -1,0 +1,190 @@
+//! macOS/FreeBSD EventMultiplexer implementation based on kqueue.
+
+use crate::kqueue::{EVFILT_EXCEPT, Kevent, Kqueue, NOTE_OOB};
+use carrick_hal::error::OsError;
+use carrick_hal::event::{
+    EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents,
+};
+use std::os::fd::RawFd;
+use std::time::Duration;
+
+pub struct KqueueMultiplexer {
+    kq: Kqueue,
+}
+
+impl KqueueMultiplexer {
+    pub fn new() -> Result<Self, OsError> {
+        let kq = Kqueue::new_internal().ok_or_else(|| OsError::last("KqueueMultiplexer::new"))?;
+        Ok(Self { kq })
+    }
+}
+
+impl EventMultiplexer for KqueueMultiplexer {
+    fn register_io(
+        &mut self,
+        fd: RawFd,
+        token: u64,
+        interest: Interest,
+        mode: TriggerMode,
+    ) -> Result<(), OsError> {
+        let edge: u16 = match mode {
+            TriggerMode::Edge => libc::EV_CLEAR,
+            TriggerMode::Level => 0,
+        };
+        let base = libc::EV_ADD | libc::EV_ENABLE | edge;
+
+        let mut changes = Vec::with_capacity(3);
+        if interest.read {
+            changes.push(Kevent::read(fd, base).with_udata_u64(token));
+        } else {
+            let _ = self.kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
+        }
+        if interest.write {
+            changes.push(Kevent::write(fd, base).with_udata_u64(token));
+        } else {
+            let _ = self.kq.apply(&[Kevent::write(fd, libc::EV_DELETE)]);
+        }
+        if interest.oob {
+            changes.push(Kevent::oob(fd, base).with_udata_u64(token));
+        } else {
+            let _ = self.kq.apply(&[Kevent::oob(fd, libc::EV_DELETE)]);
+        }
+
+        if !changes.is_empty() {
+            self.kq.apply(&changes).map_err(OsError::from_raw)?;
+        }
+        Ok(())
+    }
+
+    fn register_vnode(&mut self, fd: RawFd, token: u64, mask: VnodeEvents) -> Result<(), OsError> {
+        let note = mask.to_note();
+        let ev = Kevent::vnode(fd, note).with_udata_u64(token);
+        self.kq.apply(&[ev]).map_err(OsError::from_raw)
+    }
+
+    fn watch_process_exit(&mut self, pid: i32, token: u64) -> Result<(), OsError> {
+        let ev = Kevent::proc_exit(pid).with_udata_u64(token);
+        self.kq.apply(&[ev]).map_err(OsError::from_raw)
+    }
+
+    fn register_user(&mut self, ident: u64) -> Result<(), OsError> {
+        let ev = Kevent::user(ident as usize, libc::EV_ADD | libc::EV_CLEAR);
+        self.kq.apply(&[ev]).map_err(OsError::from_raw)
+    }
+
+    fn trigger_user(&self, ident: u64) -> Result<(), OsError> {
+        crate::kqueue::trigger_user(self.kq.raw_fd(), ident as usize).map_err(OsError::from_raw)
+    }
+
+    fn register_timer(
+        &mut self,
+        token: u64,
+        interval: Duration,
+        oneshot: bool,
+    ) -> Result<(), OsError> {
+        let flags = if oneshot {
+            libc::EV_ADD | libc::EV_ONESHOT
+        } else {
+            libc::EV_ADD
+        };
+        let interval_ns = interval.as_nanos() as i64;
+        let ev = Kevent::timer(token as usize, flags, interval_ns).with_udata_u64(token);
+        self.kq.apply(&[ev]).map_err(OsError::from_raw)
+    }
+
+    fn deregister(&mut self, fd: RawFd) -> Result<(), OsError> {
+        let _ = self.kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
+        let _ = self.kq.apply(&[Kevent::write(fd, libc::EV_DELETE)]);
+        let _ = self.kq.apply(&[Kevent::oob(fd, libc::EV_DELETE)]);
+        let _ = self.kq.apply(&[Kevent::vnode_delete(fd)]);
+        Ok(())
+    }
+
+    fn wait(
+        &mut self,
+        out: &mut Vec<PollEvent>,
+        timeout: Option<Duration>,
+    ) -> Result<usize, OsError> {
+        out.clear();
+        let mut events = [Kevent::empty(); 128];
+        let timeout_ts = timeout.map(|d| libc::timespec {
+            tv_sec: d.as_secs() as _,
+            tv_nsec: d.subsec_nanos() as _,
+        });
+
+        let n = self
+            .kq
+            .wait(&[], &mut events, timeout_ts.as_ref())
+            .map_err(OsError::from_raw)?;
+
+        for i in 0..n {
+            let ev = events[i];
+            let token = ev.udata_u64();
+            let filter = ev.filter();
+            let flags = ev.flags();
+            let fflags = ev.fflags();
+
+            let eof = flags & libc::EV_EOF != 0;
+
+            let error = if flags & libc::EV_ERROR != 0 {
+                Some(ev.data() as i32)
+            } else if eof && fflags != 0 {
+                Some(fflags as i32)
+            } else {
+                None
+            };
+
+            let mut readiness = Readiness::empty();
+            let mut is_eof = false;
+            let mut exit_status = None;
+
+            match filter {
+                libc::EVFILT_READ => {
+                    readiness.read = true;
+                    if eof {
+                        is_eof = true;
+                    }
+                }
+                libc::EVFILT_WRITE => {
+                    readiness.write = true;
+                    if eof {
+                        is_eof = true;
+                    }
+                }
+                f if f == EVFILT_EXCEPT => {
+                    if fflags & NOTE_OOB != 0 {
+                        readiness.oob = true;
+                    }
+                }
+                libc::EVFILT_VNODE => {
+                    readiness.read = true;
+                }
+                libc::EVFILT_PROC => {
+                    readiness.read = true;
+                    if fflags & libc::NOTE_EXIT != 0 {
+                        is_eof = true;
+                    }
+                    if fflags & libc::NOTE_EXITSTATUS != 0 {
+                        exit_status = Some(ev.data() as i32);
+                    }
+                }
+                libc::EVFILT_USER => {
+                    readiness.read = true;
+                }
+                libc::EVFILT_TIMER => {
+                    readiness.read = true;
+                }
+                _ => {}
+            }
+
+            out.push(PollEvent {
+                token,
+                readiness,
+                error,
+                eof: is_eof,
+                exit_status,
+            });
+        }
+        Ok(n)
+    }
+}

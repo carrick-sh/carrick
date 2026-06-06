@@ -1,0 +1,476 @@
+//! Thin safe wrapper around Darwin/FreeBSD `kqueue`/`kevent`.
+
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Darwin's exceptional-condition filter. The `libc` crate version used here
+/// does not expose this SDK constant.
+pub const EVFILT_EXCEPT: i16 = -15;
+/// `EVFILT_EXCEPT` hint for socket out-of-band data.
+pub const NOTE_OOB: u32 = 0x0000_0002;
+
+const HOST_INTERNAL_FD_MIN: i32 = 16 * 1024;
+const HOST_INTERNAL_FD_MIN_FALLBACK: i32 = 2048;
+const HOST_INTERNAL_FD_TARGET: libc::rlim_t = (HOST_INTERNAL_FD_MIN as libc::rlim_t) + 16;
+static NOFILE_RAISE_ATTEMPTED: AtomicU8 = AtomicU8::new(0);
+
+fn ensure_internal_fd_range() {
+    if NOFILE_RAISE_ATTEMPTED
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return;
+    }
+    let mut limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur >= HOST_INTERNAL_FD_TARGET {
+        return;
+    }
+    let desired = if limit.rlim_max == libc::RLIM_INFINITY {
+        HOST_INTERNAL_FD_TARGET
+    } else {
+        HOST_INTERNAL_FD_TARGET.min(limit.rlim_max)
+    };
+    if desired > limit.rlim_cur {
+        limit.rlim_cur = desired;
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
+pub fn duplicate_internal_fd(fd: i32) -> Option<i32> {
+    ensure_internal_fd_range();
+    // Prefer the high internal range. On a host whose RLIMIT_NOFILE cannot reach
+    // it, `F_DUPFD_CLOEXEC` returns EMFILE for every fd >= HOST_INTERNAL_FD_MIN;
+    // fall back to a lower floor that still clears the guest fd range, so carrick
+    // keeps working (and CI runners with a low fd cap stay green) instead of
+    // failing every internal-pipe allocation.
+    for floor in [HOST_INTERNAL_FD_MIN, HOST_INTERNAL_FD_MIN_FALLBACK] {
+        let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
+        if duped >= 0 {
+            return Some(duped);
+        }
+    }
+    None
+}
+
+pub fn relocate_internal_fd(fd: i32) -> i32 {
+    let Some(duped) = duplicate_internal_fd(fd) else {
+        return fd;
+    };
+    unsafe { libc::close(fd) };
+    duped
+}
+
+/// RAII owner for a Darwin/FreeBSD kqueue fd.
+#[derive(Debug)]
+pub struct Kqueue {
+    fd: RawFd,
+}
+
+impl Kqueue {
+    pub fn new_internal() -> Option<Self> {
+        let raw = unsafe { libc::kqueue() };
+        if raw < 0 {
+            return None;
+        }
+        let fd = relocate_internal_fd(raw);
+        Some(Self { fd })
+    }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Test/diagnostic hook: close the kqueue fd now and forget it, so a later
+    /// `kevent` on this wrapper returns EBADF (modelling the fork-storm race in
+    /// which an internal fd is closed out from under a blocked waiter) without a
+    /// double-close of a possibly-reused fd number when the wrapper is dropped.
+    /// Returns the fd that was closed (or -1). Not for production use.
+    #[doc(hidden)]
+    pub fn debug_close_and_invalidate(&mut self) -> RawFd {
+        let fd = self.fd;
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        self.fd = -1;
+        fd
+    }
+
+    pub fn apply(&self, changes: &[Kevent]) -> Result<(), i32> {
+        let rc = unsafe {
+            libc::kevent(
+                self.fd,
+                changes.as_ptr().cast::<libc::kevent>(),
+                changes.len() as libc::c_int,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn wait(
+        &self,
+        changes: &[Kevent],
+        events: &mut [Kevent],
+        timeout: Option<&libc::timespec>,
+    ) -> Result<usize, i32> {
+        let changes_ptr = if changes.is_empty() {
+            std::ptr::null()
+        } else {
+            changes.as_ptr().cast::<libc::kevent>()
+        };
+        let timeout_ptr = timeout.map_or(std::ptr::null(), |timeout| timeout as *const _);
+        let n = unsafe {
+            libc::kevent(
+                self.fd,
+                changes_ptr,
+                changes.len() as libc::c_int,
+                events.as_mut_ptr().cast::<libc::kevent>(),
+                events.len() as libc::c_int,
+                timeout_ptr,
+            )
+        };
+        if n < 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+impl Drop for Kqueue {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
+
+/// Opaque wrapper around Darwin's `struct kevent` so call sites do not build
+/// raw `libc::kevent` values themselves.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Kevent(libc::kevent);
+
+impl Kevent {
+    pub fn empty() -> Self {
+        Self(libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        })
+    }
+
+    pub fn read(fd: RawFd, flags: u16) -> Self {
+        Self::new(fd as usize, libc::EVFILT_READ, flags, 0)
+    }
+
+    pub fn write(fd: RawFd, flags: u16) -> Self {
+        Self::new(fd as usize, libc::EVFILT_WRITE, flags, 0)
+    }
+
+    pub fn oob(fd: RawFd, flags: u16) -> Self {
+        Self::new(fd as usize, EVFILT_EXCEPT, flags, NOTE_OOB)
+    }
+
+    /// Watch process `pid` for exit. The kqueue becomes read-ready (and a
+    /// `kevent` returns this event) when the process terminates — the macOS
+    /// kernel's native process-lifecycle tracking that backs a guest pidfd.
+    /// One-shot: fires once on exit.
+    ///
+    /// Armed with `NOTE_EXITSTATUS` as well as `NOTE_EXIT` so the returned
+    /// event's `data` field carries the exit status
+    /// ([`proc_exit_status`](Self::proc_exit_status)). Under plain `NOTE_EXIT`
+    /// macOS leaves `data` at 0; the NsSupervisor needs the real status to
+    /// harvest a namespace member's exit code before launchd reaps the host
+    /// zombie (after which `waitpid` is ECHILD). Detection-only callers
+    /// ([`proc_exit_ident`](Self::proc_exit_ident)) are unaffected by the extra
+    /// fflag.
+    pub fn proc_exit(pid: i32) -> Self {
+        Self::new(
+            pid as usize,
+            libc::EVFILT_PROC,
+            libc::EV_ADD | libc::EV_ONESHOT,
+            libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
+        )
+    }
+
+    /// Delete a previously-added `EVFILT_PROC`/`NOTE_EXIT` watch for `pid`.
+    /// `proc_exit` is `EV_ONESHOT` (auto-removed once it fires), so this is only
+    /// needed to drop a watch whose wait was interrupted before the exit fired.
+    pub fn proc_exit_delete(pid: i32) -> Self {
+        Self::new(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE, 0)
+    }
+
+    /// Stash a small integer (a guest fd) in `udata` so a returned event maps
+    /// straight back to its guest fd without a reverse lookup. Used by the
+    /// epoll-backing kqueue (`dispatch::net`).
+    pub fn with_udata(mut self, udata: i32) -> Self {
+        self.0.udata = udata as isize as *mut libc::c_void;
+        self
+    }
+
+    pub fn with_udata_u64(mut self, udata: u64) -> Self {
+        self.0.udata = udata as *mut libc::c_void;
+        self
+    }
+
+    /// The kqueue filter (`EVFILT_READ`/`EVFILT_WRITE`/`EVFILT_USER`/…).
+    pub fn filter(self) -> i16 {
+        self.0.filter
+    }
+
+    /// The event flags (`EV_EOF`, `EV_ERROR`, …) on a returned event.
+    pub fn flags(self) -> u16 {
+        self.0.flags
+    }
+
+    /// The filter-specific flags (`fflags`) — for `EV_EOF` this carries the
+    /// socket/pipe error code, which maps to `EPOLLERR`.
+    pub fn fflags(self) -> u32 {
+        self.0.fflags
+    }
+
+    pub fn data(self) -> i64 {
+        self.0.data as i64
+    }
+
+    /// The integer previously stashed via [`with_udata`](Self::with_udata) (the
+    /// guest fd).
+    pub fn udata_i32(self) -> i32 {
+        self.0.udata as isize as i32
+    }
+
+    pub fn udata_u64(self) -> u64 {
+        self.0.udata as u64
+    }
+
+    pub fn user(ident: usize, flags: u16) -> Self {
+        Self::new(ident, libc::EVFILT_USER, flags, 0)
+    }
+
+    /// If this returned event is an `EVFILT_PROC`/`NOTE_EXIT` firing (a watched
+    /// process exited), the pid that exited; else `None`. The signal pump uses
+    /// this to map a child exit back to the forking guest tid and publish
+    /// SIGCHLD. An `EV_ERROR` event (e.g. the pid was already gone) also carries
+    /// `EVFILT_PROC`, so the caller treats both as "the child is now reapable".
+    pub fn proc_exit_ident(self) -> Option<i32> {
+        if self.0.filter == libc::EVFILT_PROC {
+            Some(self.0.ident as i32)
+        } else {
+            None
+        }
+    }
+
+    /// For a returned `EVFILT_PROC`/`NOTE_EXIT` event, the exited process's
+    /// status in `waitpid(2)` out-parameter format (macOS carries it in the
+    /// `data` field, NOTE_EXITSTATUS). Used by the NsSupervisor to harvest a
+    /// namespace member's exit status at death — before launchd reaps the
+    /// host zombie, after which `waitpid` from any other process is ECHILD.
+    pub fn proc_exit_status(self) -> i32 {
+        self.0.data as i32
+    }
+
+    /// One-shot or periodic timer. `interval_ns` is the period in nanoseconds
+    /// (`NOTE_NSECONDS`); pass `EV_ADD | EV_ONESHOT` for a single fire or
+    /// `EV_ADD` for a repeating timer, and `EV_DELETE` (with `interval_ns` 0)
+    /// to disarm. The `ident` lives in the EVFILT_TIMER namespace, distinct
+    /// from EVFILT_READ fds and EVFILT_USER idents.
+    pub fn timer(ident: usize, flags: u16, interval_ns: i64) -> Self {
+        let mut ev = Self::new(ident, libc::EVFILT_TIMER, flags, libc::NOTE_NSECONDS);
+        ev.0.data = interval_ns as isize;
+        ev
+    }
+
+    fn trigger_user(ident: usize) -> Self {
+        Self::new(ident, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER)
+    }
+
+    /// Watch a vnode (open fd) for the given `NOTE_*` changes — the backing for
+    /// inotify watches. `EV_CLEAR` so each `kevent` returns only the changes
+    /// since the last read (edge-triggered, like inotify's event drain).
+    pub fn vnode(fd: RawFd, note: u32) -> Self {
+        Self::new(
+            fd as usize,
+            libc::EVFILT_VNODE,
+            libc::EV_ADD | libc::EV_CLEAR,
+            note,
+        )
+    }
+
+    /// Remove a previously-added `EVFILT_VNODE` watch for `fd`.
+    pub fn vnode_delete(fd: RawFd) -> Self {
+        Self::new(fd as usize, libc::EVFILT_VNODE, libc::EV_DELETE, 0)
+    }
+
+    /// The fd a returned `EVFILT_VNODE` event refers to (its `ident`).
+    pub fn vnode_ident(self) -> RawFd {
+        self.0.ident as RawFd
+    }
+
+    fn new(ident: usize, filter: i16, flags: u16, fflags: u32) -> Self {
+        Self(libc::kevent {
+            ident,
+            filter,
+            flags,
+            fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        })
+    }
+
+    pub fn is_read_for_fd(self, fd: RawFd) -> bool {
+        self.0.ident as RawFd == fd && self.0.filter == libc::EVFILT_READ
+    }
+
+    pub fn is_read(self) -> bool {
+        self.0.filter == libc::EVFILT_READ
+    }
+
+    /// If this event is an EVFILT_TIMER firing, its timer ident; else `None`.
+    pub fn timer_ident(self) -> Option<usize> {
+        if self.0.filter == libc::EVFILT_TIMER {
+            Some(self.0.ident)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_user(self, ident: usize) -> bool {
+        self.0.ident == ident && self.0.filter == libc::EVFILT_USER
+    }
+}
+
+pub fn trigger_user(kq: RawFd, ident: usize) -> Result<(), i32> {
+    let trigger = Kevent::trigger_user(ident);
+    let rc = unsafe {
+        libc::kevent(
+            kq,
+            std::ptr::from_ref(&trigger).cast::<libc::kevent>(),
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        Ok(())
+    }
+}
+
+/// Apply kevent changes to a kqueue identified by raw fd (no RAII owner).
+/// Used to register/disarm timers on the signal pump's published kqueue from
+/// a different thread, mirroring `trigger_user`.
+pub fn apply_changes(kq: RawFd, changes: &[Kevent]) -> Result<(), i32> {
+    let rc = unsafe {
+        libc::kevent(
+            kq,
+            changes.as_ptr().cast::<libc::kevent>(),
+            changes.len() as libc::c_int,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kqueue_closes_fd_on_drop() {
+        let mut observed_close = false;
+        for _ in 0..128 {
+            let kqueue = Kqueue::new_internal().expect("kqueue should open");
+            let fd = kqueue.raw_fd();
+            assert!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+                "fd must be live while the Kqueue is held"
+            );
+            drop(kqueue);
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF),
+                    "a closed fd must report EBADF"
+                );
+                observed_close = true;
+                break;
+            }
+        }
+        assert!(
+            observed_close,
+            "Kqueue::drop never closed its fd: F_GETFD never read back EBADF in 128 attempts"
+        );
+    }
+
+    #[test]
+    fn user_trigger_wakes_registered_kqueue() {
+        let kqueue = Kqueue::new_internal().expect("kqueue should open");
+        kqueue
+            .apply(&[Kevent::user(0, libc::EV_ADD | libc::EV_CLEAR)])
+            .expect("register user event");
+        trigger_user(kqueue.raw_fd(), 0).expect("trigger user event");
+
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut out = [Kevent::empty()];
+        let n = kqueue
+            .wait(&[], &mut out, Some(&timeout))
+            .expect("wait user event");
+        assert_eq!(n, 1);
+        assert!(out[0].is_user(0));
+    }
+
+    #[test]
+    fn oneshot_timer_fires_and_reports_ident() {
+        let kqueue = Kqueue::new_internal().expect("kqueue should open");
+        let ident = 0xC1_0000usize;
+        kqueue
+            .apply(&[Kevent::timer(
+                ident,
+                libc::EV_ADD | libc::EV_ONESHOT,
+                1_000_000,
+            )])
+            .expect("register timer");
+
+        let timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let mut out = [Kevent::empty()];
+        let n = kqueue
+            .wait(&[], &mut out, Some(&timeout))
+            .expect("wait timer");
+        assert_eq!(n, 1);
+        assert_eq!(out[0].timer_ident(), Some(ident));
+    }
+}

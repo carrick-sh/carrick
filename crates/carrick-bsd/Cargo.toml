@@ -14,4 +14,5 @@ workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
 carrick-hal = { path = "../carrick-hal" }
 carrick-abi = { path = "../carrick-abi" }
+carrick-host = { path = "../carrick-host" }
 libc.workspace = true
