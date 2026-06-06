@@ -60,8 +60,13 @@ Every optimization must answer:
 
 Branch: `codex/perf-mmap-lazy-zero`
 
-Latest relevant commits:
+Latest relevant implementation and decision commits, newest first. This list is
+intentionally limited to code, result, and decision commits; any later
+ledger-only refresh commit is excluded.
 
+- `7a9362e` - `docs(perf): close remaining plan decisions`
+- `1205ffd` - `docs(perf): define dynamic interposer boundary`
+- `e781e26` - `docs(perf): record dynamic overlay baseline`
 - `ba1afbf` - `perf(dynamic): add glibc overlay workload lane`
 - `f1ac789` - `docs(perf): record epoll and Mach COW findings`
 - `58d3ee6` - `perf(syscall): add epoll pipe loop workload`
@@ -535,7 +540,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
 - Modify if needed: `crates/carrick-runtime/src/dispatch/fs.rs`
 - Modify if needed: `crates/carrick-runtime/src/dispatch/fs/fd_helpers.rs`
 - Modify if needed: `crates/carrick-runtime/src/dispatch/fd_table.rs`
-- Modify: `goal.md`
+- Modify: `docs/perf-goal.md`
 - Append: `docs/perf-results/2026-06-06-disk.jsonl`
 
 **Steps:**
@@ -598,7 +603,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
 - [x] Commit only documentation/result files.
 
   ```sh
-  git add goal.md docs/perf-results/2026-06-06-disk.jsonl
+  git add docs/perf-goal.md docs/perf-results/2026-06-06-disk.jsonl
   git commit -m "docs(perf): record fd path result"
   ```
 
@@ -611,7 +616,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
 - Inspect: `conformance-probes/src/bin/perf_overlay_small_updates.rs`
 - Modify if dynamic coverage is needed: `conformance-probes/src/bin/`
 - Modify if perf registry coverage is needed: `crates/carrick-cli/tests/perf_runner.rs`
-- Modify: `goal.md`
+- Modify: `docs/perf-goal.md`
 
 **Decision rule:**
 
@@ -766,7 +771,7 @@ Rejected next steps:
 - Inspect: `crates/carrick-runtime/src/dispatch/mem.rs`
 - Inspect: memory/fork snapshot helpers under `crates/carrick-runtime/src`
 - Modify if measured: `docs/perf-results/*.jsonl`
-- Modify: `goal.md`
+- Modify: `docs/perf-goal.md`
 
 **Steps:**
 
@@ -1097,7 +1102,7 @@ Rejected next steps:
 - Modify if adding perf registry coverage:
   `crates/carrick-cli/tests/perf_support/cases.rs`
 - Modify if tracing host attribution: `scripts/dtrace/`
-- Modify: `goal.md`
+- Modify: `docs/perf-goal.md`
 
 **Steps:**
 
@@ -1234,11 +1239,20 @@ cargo test -p carrick-runtime <focused_test_name> -- --nocapture
 cargo test -p carrick-runtime --test integration proc -- --nocapture
 cargo test -p carrick-runtime --test integration rootfs_overlay -- --nocapture
 cargo test -p carrick-runtime --tests --no-run
+cargo test -p carrick-cli --test perf_runner registry_contains -- --nocapture
+cargo test -p carrick-cli --test perf_runner registered_perf_probes_have_sources -- --nocapture
+cargo test -p carrick-cli --test perf_runner injected_probe_snippet_exports_normalized_nproc -- --nocapture
+cargo test -p carrick-host cow_snapshot_isolates_source_and_clone_writes -- --nocapture
+cargo test -p carrick-runtime --test mach_cow_probe -- --nocapture
 cargo fmt --all -- --check
 git diff --check
 ./scripts/build-signed.sh
+./scripts/build-probes.sh
+scripts/build-dynamic-perf.sh
 jq -c empty docs/perf-results/2026-06-06-disk.jsonl
 jq -c empty docs/perf-results/2026-06-06-memory.jsonl
+jq -c empty docs/perf-results/2026-06-06-syscall.jsonl
+jq -c empty docs/perf-results/2026-06-06-dynamic.jsonl
 ```
 
 Trace and perf commands:
