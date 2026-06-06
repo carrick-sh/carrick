@@ -173,7 +173,6 @@ use crate::memory::AddressSpace;
 use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use serde::Serialize;
 
-
 mod sysreg;
 use sysreg::*;
 

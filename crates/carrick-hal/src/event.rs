@@ -24,9 +24,21 @@ impl Interest {
         (self.read || !other.read) && (self.write || !other.write) && (self.oob || !other.oob)
     }
 
-    pub const READ: Self = Self { read: true, write: false, oob: false };
-    pub const WRITE: Self = Self { read: false, write: true, oob: false };
-    pub const OOB: Self = Self { read: false, write: false, oob: true };
+    pub const READ: Self = Self {
+        read: true,
+        write: false,
+        oob: false,
+    };
+    pub const WRITE: Self = Self {
+        read: false,
+        write: true,
+        oob: false,
+    };
+    pub const OOB: Self = Self {
+        read: false,
+        write: false,
+        oob: true,
+    };
 }
 
 /// Edge- vs level-triggered delivery (`EPOLLET` ↔ `EV_CLEAR`).
@@ -49,16 +61,37 @@ pub struct VnodeEvents {
 }
 
 impl VnodeEvents {
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
     pub fn to_note(&self) -> u32 {
         let mut note = 0;
-        if self.delete { note |= libc::NOTE_DELETE; }
-        if self.write { note |= libc::NOTE_WRITE; }
-        if self.extend { note |= libc::NOTE_EXTEND; }
-        if self.attrib { note |= libc::NOTE_ATTRIB; }
-        if self.link { note |= libc::NOTE_LINK; }
-        if self.rename { note |= libc::NOTE_RENAME; }
-        if self.revoke { note |= libc::NOTE_REVOKE; }
+        if self.delete {
+            note |= libc::NOTE_DELETE;
+        }
+        if self.write {
+            note |= libc::NOTE_WRITE;
+        }
+        if self.extend {
+            note |= libc::NOTE_EXTEND;
+        }
+        if self.attrib {
+            note |= libc::NOTE_ATTRIB;
+        }
+        if self.link {
+            note |= libc::NOTE_LINK;
+        }
+        if self.rename {
+            note |= libc::NOTE_RENAME;
+        }
+        if self.revoke {
+            note |= libc::NOTE_REVOKE;
+        }
         note
     }
 }
@@ -84,9 +117,21 @@ impl Readiness {
         Self::default()
     }
 
-    pub const READ: Self = Self { read: true, write: false, oob: false };
-    pub const WRITE: Self = Self { read: false, write: true, oob: false };
-    pub const OOB: Self = Self { read: false, write: false, oob: true };
+    pub const READ: Self = Self {
+        read: true,
+        write: false,
+        oob: false,
+    };
+    pub const WRITE: Self = Self {
+        read: false,
+        write: true,
+        oob: false,
+    };
+    pub const OOB: Self = Self {
+        read: false,
+        write: false,
+        oob: true,
+    };
 }
 
 /// One ready event returned by [`EventMultiplexer::wait`].

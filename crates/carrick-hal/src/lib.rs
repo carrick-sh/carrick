@@ -13,14 +13,10 @@ pub use trap::{ForkOutcome, SyscallTrap, TrapError};
 pub mod hypervisor;
 pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod event;
-pub use event::{
-    EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents,
-};
-pub mod errno;
+pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
 pub mod futex;
 pub mod host_info;
 pub mod sendfile;
-pub use errno::host_to_linux_errno;
 pub use futex::CrossProcessFutex;
 pub use host_info::HostFacts;
 pub use sendfile::Sendfile;

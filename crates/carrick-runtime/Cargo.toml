@@ -69,6 +69,9 @@ carrick-spec = { path = "../carrick-spec" }
 applevisor.workspace = true
 applevisor-sys.workspace = true
 
+[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
+carrick-bsd = { path = "../carrick-bsd" }
+
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }
 tempfile.workspace = true

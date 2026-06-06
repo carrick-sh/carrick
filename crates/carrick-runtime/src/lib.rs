@@ -140,3 +140,11 @@ pub use execute::Runtime;
 pub(crate) const fn syscall_shim_enabled() -> bool {
     cfg!(feature = "syscall-shim")
 }
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub use carrick_bsd::bsd_to_linux_errno as host_to_linux_errno;
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+pub fn host_to_linux_errno(host: i32) -> i32 {
+    host
+}

@@ -290,6 +290,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-bsd"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-hal",
+ "libc",
+]
+
+[[package]]
 name = "carrick-cli"
 version = "0.1.0"
 dependencies = [
@@ -440,6 +449,7 @@ dependencies = [
  "camino",
  "cap-std",
  "carrick-abi",
+ "carrick-bsd",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
