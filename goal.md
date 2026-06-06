@@ -155,12 +155,16 @@ same synthetic table as `/proc/mounts` moves the targeted row to `MATCH` in
 ticked while the process was idle in a blocking sleep. The new
 `itimerprofidle` reducer now MATCHes Linux, and the existing `itimer` busy
 delivery probe still MATCHes after switching CPU timers to guest-CPU based
-one-shot rechecks that include in-flight `hv_vcpu_run` time. Current clean-HEAD
-targeted harness evidence is `conf-80013-c00`: the row is still `NEW`, carrick
-88/93 vs cached oracle 93/93. Remaining failures are the CPU profile magnitude
-aggregate (`TestCPUProfileMultithreadMagnitude` and the serial subtest in this
-run) plus the separate, still-flaky mapping crash surface (`TestMapping`,
-`tracebackGo+C`, and `tracebackGoOnly` in this run). A follow-up attempt to
+one-shot rechecks that include in-flight `hv_vcpu_run` time. The second was
+the `TestMapping` toolchain crash surface: Go's build driver touched more than
+eight distinct registered `MAP_SHARED` file aliases before another syscall,
+and an exec'd Go tool could inherit stale active signal-frame bookkeeping that
+made its first `sigaltstack()` reconfigure return `EPERM`. Both are now owned
+by focused unit tests, and a direct untraced `TestMapping` run passes.
+Current targeted harness evidence is `conf-76752-c00`: the row is still `NEW`,
+carrick 91/93 vs cached oracle 93/93. Remaining failures are only the CPU
+profile magnitude aggregate: `TestCPUProfileMultithreadMagnitude` and
+`TestCPUProfileMultithreadMagnitude/serial`. A follow-up attempt to
 thread-target CPU-timer delivery using the active/recent vCPU registry was
 rejected: it preserved the small timer probes only with a process-wide fallback
 and made the full row degrade to `carrick[None]` in `conf-65226-c00`.
@@ -175,7 +179,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `ltp-ptrace05` | LTP | MATCH 63/63 after `ptracesignalstop` | 63/63 | `PTRACE_TRACEME`, traced self-`SIGKILL`, `SIGCONT`, and Linux RT signal-delivery stops are now owned. |
 | `ltp-ptrace06` | LTP | MATCH 48/48 after `ptraceinvaliderrno` | 48/48 | Exec-stop setup and invalid PEEK/POKE request errno are now owned without claiming full debugger memory/register access. |
 | `go-os_exec` | Go | MATCH 86/86 in targeted rerun `conf-93241-c156` | 86/86 | Previously 0/0; current evidence shows process execution suite parity, so keep watching it as pressure coverage rather than the next reducer. |
-| `go-runtime_pprof` | Go | NEW 88/93 in clean-HEAD `conf-80013-c00` after `itimerprofidle` | 93/93 | CPU profiler pressure coverage. Idle `ITIMER_PROF` overdelivery is now owned; remaining work splits into aggregate CPU sample magnitude and Go+C mapping/toolchain crash behavior. |
+| `go-runtime_pprof` | Go | NEW 91/93 in `conf-76752-c00` after the mapping/toolchain crash fixes | 93/93 | CPU profiler pressure coverage. Idle `ITIMER_PROF` overdelivery and the `TestMapping` alias/sigaltstack crash paths are now owned; remaining work is the aggregate CPU sample magnitude serial case. |
 | `go-syscall` | Go | full row still `NEW` with result none in `conf-77884-c00`; isolated `TestExec` now passes under Carrick | 34/34 | Process-control `TestExec` blocker is fixed and owned by `execthreads`; remaining full-row stop is namespace/capability/file-mode fallout, currently around `TestUnshareMountNameSpaceChroot` after earlier userns/unshare failures. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
 | `cpython-concurrent_futures` | CPython | MATCH 20/20 in cache-backed `conf-35590-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 in refreshed Docker oracle `conf-28227-d00` | Runtime hangs and the stale oracle-id cache mismatch are cleared. |
