@@ -62,6 +62,26 @@ pub(crate) fn create_container(
     Ok(id)
 }
 
+/// Block until the container exits, returning its exit code. Polls the on-disk
+/// registry's reconciled status (no daemon push exists). Bounded by `timeout`.
+pub(crate) fn wait_container(id: &str, timeout: std::time::Duration) -> anyhow::Result<i32> {
+    let real = container::resolve(id).map_err(|e| anyhow::anyhow!(e))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let state = container::ContainerState::load(&real)?;
+        if matches!(
+            container::reconciled_status(&state),
+            container::ContainerStatus::Exited
+        ) {
+            return Ok(state.exit_code.unwrap_or(0));
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("wait timed out for {id}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Start a previously-created container by relaunching it: `carrick start <id>`.
 /// Resolves the server-facing id/name to carrick's internal id first.
 pub(crate) fn start_container(id: &str) -> anyhow::Result<()> {
