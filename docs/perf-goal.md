@@ -231,6 +231,13 @@ file.
   and `fstatat64=1029`. Filtered perf rows at
   `7149ae395cd7cb307d0f6eeebd2fea5712dcf9f5`: Carrick p50 `16837.375` us,
   p95 `17449.375` us; Docker p50 `339.959` us, p95 `343.792` us.
+- 2026-06-06: Read the remaining guest-`openat` path after the two VFS slices.
+  Another collapse is possible only with a deliberately designed fast host-open
+  path that preserves `resolve_at_path` parent containment, final symlink
+  handling, FIFO routing, VFS mount fallthrough, and host-fd sharing semantics.
+  Do not make that change opportunistically from the current count alone; move
+  to the `overlay_small_updates` gap next unless a RED test pins those open-path
+  invariants.
 
 ## Ranked Opportunities
 
@@ -281,10 +288,12 @@ Remaining VFS questions:
 - [x] Break down the remaining `large_meta` `fstatat64`, `flistxattr`, and
   `fgetxattr` counts by guest syscall class before choosing the next VFS
   change.
-- [ ] Decide whether the remaining guest-`openat` host work (`openat=1465`,
+- [x] Decide whether the remaining guest-`openat` host work (`openat=1465`,
   `close=1309`, `fcntl=724`, `fstatat64=582`, and `flistxattr`/`fgetxattr=432`
   in the attribution run) can be reduced without weakening symlink,
   containment, or fd-sharing semantics.
+- [ ] Design a separate fast host-open path only if it has RED coverage for
+  symlink, containment, FIFO, VFS mount, and fd-sharing invariants.
 - [ ] Identify whether the remaining `overlay_small_updates` gap is dominated by
   traps, VFS lookup/setup, memory-backend range maintenance, or host file setup.
 - [ ] Add byte-copy/allocation counters for the remaining VFS hot paths where
@@ -595,5 +604,7 @@ Profile remaining VFS metadata/open setup cost.
   repeated work.
 - [x] Attribute remaining stat/access xattr and `fstatat64` counts by guest
   syscall class before another VFS runtime change.
-- [ ] Decide whether the guest-`openat` path has another safe collapse point or
+- [x] Decide whether the guest-`openat` path has another safe collapse point or
   whether the next measured opportunity should move to `overlay_small_updates`.
+- [ ] Measure whether the remaining `overlay_small_updates` gap is trap count,
+  memory-fs range bookkeeping, or per-write VFS setup.
