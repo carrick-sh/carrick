@@ -422,11 +422,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             file,
             build_arg,
             no_cache,
+            cache,
+            cache_repo,
             platform,
             push,
             context,
         } => {
-            run_build(&store, tag, file, build_arg, no_cache, platform, push, context)?;
+            run_build(
+                &store, tag, file, build_arg, no_cache, cache, cache_repo, platform, push, context,
+            )?;
         }
         Commands::Run {
             image,
@@ -1017,6 +1021,8 @@ fn run_build(
     file: std::path::PathBuf,
     build_arg: Vec<String>,
     no_cache: bool,
+    cache: bool,
+    cache_repo: Option<String>,
     platform: Option<String>,
     push: bool,
     context: std::path::PathBuf,
@@ -1067,6 +1073,8 @@ fn run_build(
         &destination,
         &build_arg,
         no_cache,
+        cache,
+        cache_repo.as_deref(),
         platform.as_deref(),
     );
 
@@ -1118,6 +1126,10 @@ fn run_build(
 /// `out_dir` is `Some` for the `--no-push` path (kaniko writes `image.tar`
 /// there via a `/out` bind mount); `None` for `--push` (kaniko pushes directly,
 /// so there is no `/out` mount, no `--tar-path`, and no `--no-push`).
+///
+/// Cache flag priority: `no_cache` wins over `cache`. Only one of
+/// `--cache=false` or `--cache=true` is ever emitted. `cache_repo` is only
+/// meaningful (and only emitted) when `cache` is set and `no_cache` is not.
 #[allow(clippy::too_many_arguments)]
 fn kaniko_run_argv(
     carrick_bin: &str,
@@ -1127,6 +1139,8 @@ fn kaniko_run_argv(
     destination: &str,
     build_args: &[String],
     no_cache: bool,
+    cache: bool,
+    cache_repo: Option<&str>,
     platform: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec![
@@ -1168,7 +1182,15 @@ fn kaniko_run_argv(
         // kaniko has no `--no-cache` flag (that name errors with "unknown
         // flag"); its caching is opt-in via `--cache` (off by default). Express
         // "no cache" with the valid, explicit `--cache=false`.
+        // `--no-cache` wins over `--cache` when both are given.
         argv.push("--cache=false".to_owned());
+    } else if cache {
+        // Explicitly enable kaniko's registry-backed layer cache.
+        argv.push("--cache=true".to_owned());
+        if let Some(repo) = cache_repo {
+            argv.push("--cache-repo".to_owned());
+            argv.push(repo.to_owned());
+        }
     }
     if let Some(p) = platform {
         argv.push("--customPlatform".to_owned());
@@ -1191,6 +1213,8 @@ mod build_tests {
             "app",
             &["X=1".to_owned()],
             false,
+            false,
+            None,
             None,
         );
         assert_eq!(
@@ -1232,6 +1256,8 @@ mod build_tests {
             "registry.example.com/app:v2",
             &[],
             true,
+            false,
+            None,
             Some("linux/amd64"),
         );
         // No /out mount, no --no-push, no --tar-path on the push path.
@@ -1252,5 +1278,87 @@ mod build_tests {
         assert!(argv.windows(2).any(|w| w[0] == "--customPlatform" && w[1] == "linux/amd64"));
         // The kaniko image is always present.
         assert!(argv.iter().any(|a| a == KANIKO_IMAGE));
+    }
+
+    /// `--cache` (no repo) → `--cache=true` in argv; no `--cache-repo`; no
+    /// `--cache=false`.
+    #[test]
+    fn kaniko_argv_cache_no_repo() {
+        let argv = kaniko_run_argv(
+            "carrick",
+            "/ctx",
+            None,
+            "Dockerfile",
+            "app:latest",
+            &[],
+            false, // no_cache
+            true,  // cache
+            None,  // cache_repo
+            None,
+        );
+        assert!(argv.iter().any(|a| a == "--cache=true"), "expected --cache=true in {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--cache-repo"), "unexpected --cache-repo in {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--cache=false"), "unexpected --cache=false in {argv:?}");
+    }
+
+    /// `--cache --cache-repo localhost:5000/cache` → both `--cache=true` and
+    /// `--cache-repo localhost:5000/cache` appear in argv.
+    #[test]
+    fn kaniko_argv_cache_with_repo() {
+        let argv = kaniko_run_argv(
+            "carrick",
+            "/ctx",
+            None,
+            "Dockerfile",
+            "app:latest",
+            &[],
+            false,                     // no_cache
+            true,                      // cache
+            Some("localhost:5000/cache"), // cache_repo
+            None,
+        );
+        assert!(argv.iter().any(|a| a == "--cache=true"), "expected --cache=true in {argv:?}");
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--cache-repo" && w[1] == "localhost:5000/cache"),
+            "expected --cache-repo localhost:5000/cache in {argv:?}",
+        );
+        assert!(!argv.iter().any(|a| a == "--cache=false"), "unexpected --cache=false in {argv:?}");
+    }
+
+    /// `--no-cache --cache` (both) → `--cache=false` wins; no `--cache=true`.
+    #[test]
+    fn kaniko_argv_no_cache_wins_over_cache() {
+        let argv = kaniko_run_argv(
+            "carrick",
+            "/ctx",
+            None,
+            "Dockerfile",
+            "app:latest",
+            &[],
+            true, // no_cache
+            true, // cache
+            Some("localhost:5000/cache"),
+            None,
+        );
+        assert!(argv.iter().any(|a| a == "--cache=false"), "expected --cache=false in {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--cache=true"), "unexpected --cache=true in {argv:?}");
+    }
+
+    /// Default (no cache flags) → no `--cache=*` emitted at all.
+    #[test]
+    fn kaniko_argv_default_no_cache_flags() {
+        let argv = kaniko_run_argv(
+            "carrick",
+            "/ctx",
+            None,
+            "Dockerfile",
+            "app:latest",
+            &[],
+            false, // no_cache
+            false, // cache
+            None,
+            None,
+        );
+        assert!(!argv.iter().any(|a| a.starts_with("--cache")), "unexpected cache flag in {argv:?}");
     }
 }

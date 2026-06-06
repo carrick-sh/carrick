@@ -160,8 +160,18 @@ pub(crate) enum Commands {
         #[arg(long = "build-arg", value_name = "KEY=VALUE")]
         build_arg: Vec<String>,
         /// Do not use cache when building the image (kaniko `--no-cache`).
+        /// Takes precedence over `--cache` when both are given.
         #[arg(long = "no-cache")]
         no_cache: bool,
+        /// Enable kaniko's layer cache (kaniko `--cache=true`). Layers are
+        /// pulled from and pushed to the registry specified by `--cache-repo`.
+        /// Ignored when `--no-cache` is also given.
+        #[arg(long = "cache")]
+        cache: bool,
+        /// Registry repository kaniko uses to store and retrieve cached layers
+        /// (kaniko `--cache-repo`). Only meaningful when `--cache` is set.
+        #[arg(long = "cache-repo", value_name = "REF")]
+        cache_repo: Option<String>,
         /// Target platform for the build, e.g. `linux/amd64` (kaniko
         /// `--customPlatform`).
         #[arg(long, value_name = "OS/ARCH")]
