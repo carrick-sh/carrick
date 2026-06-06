@@ -94,6 +94,13 @@ pub struct RealStat {
     pub ctime: (i64, i64),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedFileContents {
+    pub base: Arc<[u8]>,
+    pub dirty: BTreeMap<usize, Vec<u8>>,
+    pub len: usize,
+}
+
 /// Trait every writable-layer backend implements. Methods are layer-
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
@@ -122,6 +129,12 @@ pub trait FsBackend: Send + Sync {
     /// Read the file bytes for `path`. `None` if the backend doesn't
     /// have a file at that path.
     fn file_contents(&self, path: &str) -> Option<Vec<u8>>;
+
+    /// Return a cheap shared snapshot for an in-memory file when the backend
+    /// can expose one without materializing the whole payload.
+    fn shared_file_contents(&self, _path: &str) -> Option<SharedFileContents> {
+        None
+    }
 
     /// `True` iff `path` is currently tombstoned.
     fn is_deleted(&self, path: &str) -> bool {
@@ -540,7 +553,7 @@ fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
 /// or `cargo test` wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MemoryFile {
-    Dense(Vec<u8>),
+    Dense(Arc<[u8]>),
     RootFsBacked {
         base: Arc<[u8]>,
         dirty: BTreeMap<usize, Vec<u8>>,
@@ -566,7 +579,7 @@ impl MemoryFile {
 
     fn to_vec(&self) -> Vec<u8> {
         match self {
-            Self::Dense(bytes) => bytes.clone(),
+            Self::Dense(bytes) => bytes.as_ref().to_vec(),
             Self::RootFsBacked {
                 base, dirty, len, ..
             } => {
@@ -585,6 +598,23 @@ impl MemoryFile {
         }
     }
 
+    fn shared_contents(&self) -> SharedFileContents {
+        match self {
+            Self::Dense(base) => SharedFileContents {
+                base: Arc::clone(base),
+                dirty: BTreeMap::new(),
+                len: base.len(),
+            },
+            Self::RootFsBacked {
+                base, dirty, len, ..
+            } => SharedFileContents {
+                base: Arc::clone(base),
+                dirty: dirty.clone(),
+                len: *len,
+            },
+        }
+    }
+
     fn write_range(
         &mut self,
         offset: usize,
@@ -598,9 +628,16 @@ impl MemoryFile {
             return Err(BackendError::Invalid);
         }
         match self {
-            Self::Dense(contents) => {
-                contents.resize(final_size, 0);
-                contents[offset..end].copy_from_slice(bytes);
+            Self::Dense(base) => {
+                let base = Arc::clone(base);
+                let mut dirty = BTreeMap::new();
+                insert_dirty_range(&mut dirty, offset, bytes)?;
+                *self = Self::RootFsBacked {
+                    base,
+                    dirty,
+                    len: final_size,
+                    mode: 0o644,
+                };
             }
             Self::RootFsBacked { dirty, len, .. } => {
                 *len = final_size;
@@ -781,6 +818,15 @@ impl FsBackend for MemoryBackend {
             .map(MemoryFile::to_vec)
     }
 
+    fn shared_file_contents(&self, path: &str) -> Option<SharedFileContents> {
+        let normalized = normalize(path)?;
+        self.inner
+            .read()
+            .files
+            .get(&normalized)
+            .map(MemoryFile::shared_contents)
+    }
+
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
@@ -796,7 +842,7 @@ impl FsBackend for MemoryBackend {
         inner
             .files
             .entry(normalized)
-            .or_insert_with(|| MemoryFile::Dense(Vec::new()));
+            .or_insert_with(|| MemoryFile::Dense(Arc::<[u8]>::from([])));
         Ok(())
     }
 
@@ -849,7 +895,9 @@ impl FsBackend for MemoryBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
-        inner.files.insert(normalized, MemoryFile::Dense(contents));
+        inner
+            .files
+            .insert(normalized, MemoryFile::Dense(Arc::from(contents)));
         Ok(())
     }
 
