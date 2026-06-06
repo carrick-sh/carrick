@@ -163,6 +163,7 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
             bin,
             root,
             &c_id,
+            &probe,
             &b64,
             case.mount_scratch,
             case.carrick_fs_mode,
@@ -248,12 +249,16 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
                 "carrick" => case.carrick_fs_mode.into(),
                 _ => "host".into(),
             },
-            image: if native {
-                "(native macos host)".into()
-            } else {
-                IMAGE.into()
+            image: match engine {
+                "macos" => "(native macos host)".into(),
+                "carrick" if case.carrick_fs_mode == "memory" => "(direct run-elf)".into(),
+                _ => IMAGE.into(),
             },
-            image_digest: if native { None } else { digest.clone() },
+            image_digest: if native || (engine == "carrick" && case.carrick_fs_mode == "memory") {
+                None
+            } else {
+                digest.clone()
+            },
             git_sha: sha.clone(),
             run_id: format!("cr-perf-{}", std::process::id()),
             host: host.clone(),
