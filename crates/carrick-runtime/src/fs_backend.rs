@@ -245,6 +245,19 @@ pub trait FsBackend: Send + Sync {
     /// the dispatcher keeps its in-memory File model there.
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
 
+    /// Open a REAL host file descriptor and return the metadata needed by the
+    /// dispatcher from the same open file. Backends that can answer this avoid a
+    /// separate metadata lookup before opening the fd.
+    fn open_raw_fd_with_metadata(
+        &self,
+        _path: &str,
+        _write: bool,
+        _create: bool,
+        _trunc: bool,
+    ) -> Option<(i32, RootFsMetadata)> {
+        None
+    }
+
     /// Open host vnode descriptors for inotify-style watches. Directory
     /// watches may include a host path so the inotify shim can snapshot/diff
     /// child names after a kqueue directory-write wakeup. Default:
@@ -2738,6 +2751,42 @@ impl FsBackend for HostFsBackend {
         // cap-std File without closing it, so the dispatcher owns the
         // fd lifetime (it closes it on guest close()).
         Some(file.into_std().into_raw_fd())
+    }
+
+    fn open_raw_fd_with_metadata(
+        &self,
+        path: &str,
+        write: bool,
+        create: bool,
+        trunc: bool,
+    ) -> Option<(i32, RootFsMetadata)> {
+        let fd = self.open_raw_fd(path, write, create, trunc)?;
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        if typ != libc::S_IFREG as u32 {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        let (override_mode, _uid, _gid, _is_socket) = fd_carrick_meta(fd);
+        let on_disk_mode = st.st_mode as u32 & 0o7777;
+        let mode = override_mode.unwrap_or(if on_disk_mode == 0 {
+            0o644
+        } else {
+            on_disk_mode
+        });
+        Some((
+            fd,
+            RootFsMetadata {
+                path: std::path::Path::new(path).to_path_buf(),
+                kind: RootFsEntryKind::File,
+                mode,
+                size: if trunc { 0 } else { st.st_size as usize },
+            },
+        ))
     }
 
     fn watch_fds(&self, path: &str) -> Result<Vec<crate::vfs::WatchFd>, i32> {

@@ -185,6 +185,18 @@ impl RootFsVfs {
                 if want_create && want_excl {
                     return Err(LINUX_EEXIST);
                 }
+                if let Some((host_fd, metadata)) = self.overlay.open_raw_fd_with_metadata(
+                    path,
+                    writable_request,
+                    false,
+                    want_trunc,
+                ) {
+                    return Ok(OpenDispatchResult::HostFile {
+                        host_fd,
+                        metadata,
+                        writable: writable_request,
+                    });
+                }
                 let backend_md = self.overlay.metadata(path);
                 let mode = backend_md.as_ref().map(|m| m.mode).unwrap_or(0o644);
                 // Disk-backed overlay (--fs host): hand back a REAL host
@@ -944,24 +956,50 @@ mod tests {
     struct MetadataOnlyBackend {
         host_path: std::path::PathBuf,
         lookup_payload_reads: Arc<AtomicUsize>,
+        metadata_calls: Arc<AtomicUsize>,
+        raw_open_calls: Arc<AtomicUsize>,
+        combined_open_calls: Arc<AtomicUsize>,
         size: usize,
+    }
+
+    struct MetadataOnlyBackendCounters {
+        payload_reads: Arc<AtomicUsize>,
+        metadata_calls: Arc<AtomicUsize>,
+        raw_open_calls: Arc<AtomicUsize>,
+        combined_open_calls: Arc<AtomicUsize>,
     }
 
     impl MetadataOnlyBackend {
         fn new(size: usize) -> (Self, Arc<AtomicUsize>) {
+            let (backend, counters) = Self::new_with_counters(size);
+            (backend, counters.payload_reads)
+        }
+
+        fn new_with_counters(size: usize) -> (Self, MetadataOnlyBackendCounters) {
             let host_path = std::env::temp_dir().join(format!(
                 "carrick-rootfs-metadata-only-{}-{size}",
                 std::process::id()
             ));
             std::fs::write(&host_path, b"x").unwrap();
             let lookup_payload_reads = Arc::new(AtomicUsize::new(0));
+            let metadata_calls = Arc::new(AtomicUsize::new(0));
+            let raw_open_calls = Arc::new(AtomicUsize::new(0));
+            let combined_open_calls = Arc::new(AtomicUsize::new(0));
             (
                 Self {
                     host_path,
                     lookup_payload_reads: Arc::clone(&lookup_payload_reads),
+                    metadata_calls: Arc::clone(&metadata_calls),
+                    raw_open_calls: Arc::clone(&raw_open_calls),
+                    combined_open_calls: Arc::clone(&combined_open_calls),
                     size,
                 },
-                lookup_payload_reads,
+                MetadataOnlyBackendCounters {
+                    payload_reads: lookup_payload_reads,
+                    metadata_calls,
+                    raw_open_calls,
+                    combined_open_calls,
+                },
             )
         }
     }
@@ -983,6 +1021,7 @@ mod tests {
         }
 
         fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
+            self.metadata_calls.fetch_add(1, Ordering::SeqCst);
             Some(RootFsMetadata {
                 path: std::path::Path::new(path).to_path_buf(),
                 kind: RootFsEntryKind::File,
@@ -1035,12 +1074,41 @@ mod tests {
             _create: bool,
             _trunc: bool,
         ) -> Option<i32> {
+            self.raw_open_calls.fetch_add(1, Ordering::SeqCst);
             let mut opts = std::fs::OpenOptions::new();
             opts.read(true);
             if write {
                 opts.write(true);
             }
             opts.open(&self.host_path).ok().map(IntoRawFd::into_raw_fd)
+        }
+
+        fn open_raw_fd_with_metadata(
+            &self,
+            path: &str,
+            write: bool,
+            _create: bool,
+            _trunc: bool,
+        ) -> Option<(i32, RootFsMetadata)> {
+            self.combined_open_calls.fetch_add(1, Ordering::SeqCst);
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            if write {
+                opts.write(true);
+            }
+            let fd = opts
+                .open(&self.host_path)
+                .ok()
+                .map(IntoRawFd::into_raw_fd)?;
+            Some((
+                fd,
+                RootFsMetadata {
+                    path: std::path::Path::new(path).to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: self.size,
+                },
+            ))
         }
     }
 
@@ -1082,6 +1150,41 @@ mod tests {
             "metadata lookup should not load file contents"
         );
         assert_eq!(md.size, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn open_for_dispatch_prefers_combined_host_fd_metadata() {
+        let (backend, counters) = MetadataOnlyBackend::new_with_counters(8 * 1024 * 1024);
+        let v = RootFsVfs {
+            rootfs: None,
+            overlay: Box::new(backend),
+        };
+
+        let opened = v
+            .open_for_dispatch("/large.bin", false, false, false, false)
+            .unwrap();
+
+        match opened {
+            OpenDispatchResult::HostFile {
+                host_fd, metadata, ..
+            } => {
+                assert_eq!(metadata.kind, RootFsEntryKind::File);
+                assert_eq!(metadata.size, 8 * 1024 * 1024);
+                unsafe { libc::close(host_fd) };
+            }
+            _ => panic!("expected host file"),
+        }
+        assert_eq!(counters.combined_open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counters.metadata_calls.load(Ordering::SeqCst),
+            0,
+            "combined open should provide metadata without a separate metadata lookup"
+        );
+        assert_eq!(
+            counters.raw_open_calls.load(Ordering::SeqCst),
+            0,
+            "combined open should replace the separate raw-fd open"
+        );
     }
 
     #[test]
