@@ -5639,6 +5639,7 @@ mod overlay_dispatch_tests {
         base: u64,
         bytes: Vec<u8>,
         reads: std::cell::Cell<usize>,
+        writes: std::cell::Cell<usize>,
         shared_futex_lookups: std::cell::Cell<usize>,
     }
 
@@ -5648,6 +5649,7 @@ mod overlay_dispatch_tests {
                 base,
                 bytes,
                 reads: std::cell::Cell::new(0),
+                writes: std::cell::Cell::new(0),
                 shared_futex_lookups: std::cell::Cell::new(0),
             }
         }
@@ -5671,6 +5673,7 @@ mod overlay_dispatch_tests {
         }
 
         fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.writes.set(self.writes.get() + 1);
             let offset = address
                 .checked_sub(self.base)
                 .ok_or(MemoryError::OutOfBounds {
@@ -5747,6 +5750,106 @@ mod overlay_dispatch_tests {
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(memory.shared_futex_lookups.get(), 1);
+    }
+
+    #[test]
+    fn fresh_shared_anon_mmap_skips_zero_write() {
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMemory::new(0x10000, vec![0u8; 0x1000]);
+
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([
+                        0,
+                        0x4000,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: crate::memory::LINUX_SHARED_FILE_BASE as i64
+            }
+        );
+        assert_eq!(
+            memory.writes.get(),
+            0,
+            "fresh MAP_SHARED|MAP_ANON should use the boot-zeroed shared aperture without materializing a zero buffer"
+        );
+        assert!(reporter.finish().unhandled_syscalls.is_empty());
+    }
+
+    #[test]
+    fn reused_shared_anon_mmap_zeroes_recycled_range() {
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMemory::new(0x10000, vec![0u8; 0x1000]);
+        let mmap_args = SyscallArgs::from([
+            0,
+            0x4000,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+            u64::MAX,
+            0,
+        ]);
+
+        assert_eq!(
+            dispatcher
+                .dispatch(SyscallRequest::new(222, mmap_args), &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned {
+                value: crate::memory::LINUX_SHARED_FILE_BASE as i64
+            }
+        );
+        memory.writes.set(0);
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        215,
+                        SyscallArgs::from([
+                            crate::memory::LINUX_SHARED_FILE_BASE,
+                            0x4000,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        memory.writes.set(0);
+
+        assert_eq!(
+            dispatcher
+                .dispatch(SyscallRequest::new(222, mmap_args), &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned {
+                value: crate::memory::LINUX_SHARED_FILE_BASE as i64
+            }
+        );
+        assert_eq!(
+            memory.writes.get(),
+            1,
+            "reused MAP_SHARED|MAP_ANON ranges must still be scrubbed before reuse"
+        );
+        assert!(reporter.finish().unhandled_syscalls.is_empty());
     }
 
     #[test]

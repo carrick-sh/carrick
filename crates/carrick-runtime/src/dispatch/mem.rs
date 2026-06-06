@@ -510,16 +510,21 @@ impl SyscallDispatcher {
                     && !map_flags.contains(LinuxMmapFlags::FIXED)
                 {
                     let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
-                    let addr = {
+                    let alloc = {
                         let mut mem = this.mem.lock();
                         mem.shared
-                            .alloc(map_len, crate::shared_aperture::BackingObject::SharedAnon)
+                            .alloc_sourced_with_reuse(
+                                map_len,
+                                crate::shared_aperture::BackingObject::SharedAnon,
+                                None,
+                            )
                     };
-                    if let Some(addr) = addr {
+                    if let Some((addr, reused)) = alloc {
                         let map_len_usize = usize::try_from(map_len)
                             .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
-                        let zeros = vec![0u8; map_len_usize];
-                        let _ = memory.write_bytes(addr, &zeros);
+                        if reused {
+                            let _ = memory.zero_backing(addr, map_len_usize);
+                        }
                         return Ok(DispatchOutcome::Returned { value: addr as i64 });
                     }
                     return Ok(LINUX_ENOMEM.into());
@@ -532,7 +537,9 @@ impl SyscallDispatcher {
                     }
                 };
 
-                if reused && !crate::memory::is_high_va(address) {
+                let fixed_anonymous = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    && map_flags.contains(LinuxMmapFlags::FIXED);
+                if (reused || fixed_anonymous) && !crate::memory::is_high_va(address) {
                     // Scrub the reused region's PHYSICAL backing. MUST bypass the
                     // guest-visible permission: a region just reclaimed from munmap
                     // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
@@ -540,6 +547,8 @@ impl SyscallDispatcher {
                     // and leaves the prior mapping's bytes — which then surface after
                     // the guest mprotects the region to RW (CPython multiprocessing
                     // Pool built on a freed 16 MiB b'X' buffer → 0x58.. ptr → SIGSEGV).
+                    // MAP_FIXED|ANON also overwrites a caller-selected range, so it
+                    // cannot rely on the bump allocator's pristine-tail invariant.
                     let _ = memory.zero_backing(address, length_usize);
                 }
 
