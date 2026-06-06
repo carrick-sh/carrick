@@ -35,15 +35,15 @@ Latest full-sweep refresh: 2026-06-06.
 Command:
 
 ```sh
-just conformance
+just conformance full --workers 8 --cpython-workers 4
 ```
 
 Result:
 
 ```text
 1222 rows
-1161 MATCH
-61 NEW
+1168 MATCH
+54 NEW
 0 regressions
 0 timeouts
 ```
@@ -59,6 +59,9 @@ The previous blocking rows are cleared:
   skipped 1 after exposing `/proc/self/mounts` as the per-process alias for
   the synthetic mount table. The owned `clone3args` probe already covered the
   clone3 validation surface; this row was blocked in LTP cgroup setup.
+- `ltp-kill10` / `ltp-kill12`: full rerun now `MATCH`, carrick 1/1 vs oracle
+  1/1, after refreshing stale oracle-cache entries that had totals but no
+  `summary` id. The current rows pair `summary` as `ok`/`ok`.
 
 This goal starts from a green regression gate. The target is to reduce NEW rows
 by fixing verified process-control gaps, not by blessing, quarantining, or
@@ -152,13 +155,23 @@ skipped both `test_no_leaking` assertions. The suite now caps Docker to
 `nofile=1024:1024`, matching Carrick's EMFILE path and preserving assertion
 coverage instead of marking the diff known.
 
-Latest full conformance refresh after the lazy child-exit pump fix completed
-all 1222 rows with `OK: no regressions`: 1161 `MATCH`, 61 `NEW`, and cached
-oracle phase (`conf-31721-*`). The remaining process-control-shaped NEW rows
-included `ltp-kill02`, `ltp-clone303`, `go-os_exec`, `go-runtime_pprof`, and
-`go-syscall`. A later targeted `go-syscall` rerun now completes instead of
-timing out: `conf-4038-c00` reports `NEW` with carrick 31/43 vs oracle 34/34.
-The process-control-shaped hang in `TestSetuidEtc` is fixed and passes in the
+Latest full conformance refresh after fast-forwarding the mmap/lazy-zero branch,
+refreshing stale kill-test oracle ids, and running the harness with bounded
+CPython suite concurrency completed all 1222 rows with `OK: no regressions`:
+1168 `MATCH`, 54 `NEW`, and a fully cached oracle phase (`conf-63608-*`).
+`cpython-concurrent_futures`, `cpython-subprocess`, `cpython-multiprocessing_fork`,
+`go-os_exec`, `go-os_signal`, `go-runtime_pprof`, `ltp-kill02`,
+`ltp-kill10`, `ltp-kill12`, `ltp-ptrace05`, `ltp-ptrace06`,
+`ltp-setpgid01`, `ltp-pause02`, and `ltp-sigaction01` are all `MATCH` in that
+run. Current remaining process-control-shaped NEW rows are `go-os`,
+`go-syscall`, `cpython-multiprocessing_forkserver`,
+`cpython-multiprocessing_spawn`, and `cpython-signal`; prior evidence still
+separates `go-syscall`'s remaining diffs into namespace, chmod/flock, prlimit,
+and socket credential fallout rather than the prior process-control timeout.
+
+A later targeted `go-syscall` rerun now completes instead of timing out:
+`conf-4038-c00` reports `NEW` with carrick 31/43 vs oracle 34/34. The
+process-control-shaped hang in `TestSetuidEtc` is fixed and passes in the
 direct reducer after preserving `SI_TKILL` siginfo for thread-directed setxid
 signals and rendering live uid/gid/group state in `/proc/self/status`; the
 remaining row differences are namespace, chmod/flock, prlimit, and socket
@@ -215,7 +228,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `ltp-clone303` | LTP | MATCH skipped 1 in `conf-53261-c00` | skipped 1 | Non-process setup blocker cleared: LTP's cgroup helper needs `/proc/self/mounts`; clone3 validation itself remains owned by `clone3args`. |
 | `ltp-setpgid01` | LTP | MATCH 1/2 in `conf-3259-c00` | 1/2 | PID-namespace session-leader rule is now owned; `setpgid(1, 1)` fails EPERM like Docker Linux while forked non-leader `setpgid(0, 0)` still succeeds. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
-| `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
+| `ltp-kill10` / `ltp-kill12` | LTP | MATCH 1/1 in `conf-63608-c857` / `conf-63608-c859` | 1/1 | Stale oracle-cache ids are refreshed; both rows now pair `summary` as `ok`/`ok`. |
 | `go-os_signal` | Go | MATCH 29/30 in fresh targeted rerun `conf-41403-c00` after the vfork identity, lazy signal-pump, and self-`tgkill` fixes | 29/30 | `TestDetectNohup` used vfork/exec and left the parent's fast-path getpid stamped with the child ns-pid, breaking later `kill(getpid(), sig)` delivery; fixed and owned by `vforkpid`. The later `TestAtomicStop` new diff is also cleared by keeping self-`tgkill` thread-directed; `TestTerminalSignal` still fails on both carrick and oracle. |
 | `ltp-sigaction01` | LTP | MATCH 4/4 after `sigactionresetinfo`, latest targeted rerun `conf-18439-c02` | 4/4 | Adjacent signal ABI row; SA_RESETHAND + SA_SIGINFO old-state preservation is now owned. |
 
@@ -448,8 +461,8 @@ Keep this section current as classifications and fixes land.
 | `ltp-setpgid01` | real under-enforcement after oracle refresh: Docker `conf-43101-d00` fails `setpgid(1, 1)` with `EPERM` and passes the forked-child `setpgid(0, 0)` leg. Carrick had reported both as TPASS because the harness starts Carrick in a fresh host process group but the same host session; PID namespace mapping recorded only the init host PGID, so guest `getsid(0)` / session-leader checks missed host SID values that differ from PGID. | `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid`, `setpgidparentgroup`, `proclife` | MATCH 1/2 vs oracle 1/2 in `conf-3259-c00`; process-group session-leader rule owned |
 | `ltp-clone303` | procfs/cgroup setup blocker, not clone3 syscall behavior: targeted run before the fix TBROKed on `/proc/self/mounts: ENOENT`, while Docker opened the mount table and TCONF-skipped because `/sys/fs/cgroup/ltp` is read-only. `clone3args` already proved Carrick's clone3 validation behavior matches the Linux/seccomp oracle shape. | `syscall_fs::synthetic_proc_surface_serves_common_process_and_system_files`; `clone3args` for clone3 validation | MATCH skipped 1 vs oracle skipped 1 in `conf-53261-c00`; setup blocker cleared |
 | `ltp-pause02` | signal interruption/restart bug when it reproduces: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; rerun `conf-71289-c01` matched, and later `conf-18439-c01` reproduced the same signature, but latest focused attempts and `pauseinterrupt2` are currently MATCH. | `pauseinterrupt2` or sharper interruption reducer if the row turns RED again | pressure coverage; no runtime fix without fresh RED |
-| `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
-| `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
+| `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` had `TPASS`, while the cached oracle had totals but no `summary` id, yielding `summary ok` vs absent. Refreshing the Docker oracle cache records `summary: ok`, and the full run now pairs `summary` as `ok`/`ok`. | refreshed `scripts/conformance/oracle-cache.jsonl` entry | MATCH 1/1 vs oracle 1/1 in `conf-63608-c857`; non-runtime oracle-cache fix |
+| `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` had `TPASS`, while the cached oracle had totals but no `summary` id, yielding `summary ok` vs absent. Refreshing the Docker oracle cache records `summary: ok`, and the full run now pairs `summary` as `ok`/`ok`. | refreshed `scripts/conformance/oracle-cache.jsonl` entry | MATCH 1/1 vs oracle 1/1 in `conf-63608-c859`; non-runtime oracle-cache fix |
 | `go-os_signal` | adjacent signal delivery/status mismatch split into three roots. Fresh runs `conf-30698-c00`/`conf-41653-c00` failed `TestStop`, `TestSIGCONT`, and `TestSignalTrace` because `TestDetectNohup`'s vfork/exec child stamped the shared EL1 identity page with the child ns-pid; later parent `kill(getpid(), sig)` used pid 4 and returned `ESRCH`. `vforkpid` owns that fix. Full row later improved to `conf-87864-c00` at 28/30 with only `TestAtomicStop` new vs oracle, then matched after default, unblocked child-exit SIGCHLD stopped forcing signal-pump/watch churn. `TestAtomicStop` was a self-`tgkill` contract bug: Carrick routed the signal through the process-directed pending slot, letting another Go thread consume it. Fresh targeted rerun `conf-41403-c00` remains MATCH at 29/30 after preserving self-`tgkill` as thread-directed. `TestTerminalSignal` remains an oracle-matching fail. | `vforkpid`; `signal::tests::child_exit_signal_pump_predicate_tracks_observable_dispositions`; `syscall_thread::tgkill_to_self_raises_locally`; `sigchld` / `cloneexitsig` | MATCH; keep as pressure coverage |
 | `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`; fixed by preserving SA_SIGINFO metadata in the reset SIG_DFL action for in-handler `sigaction(SIG, NULL, &old)`. | `sigactionresetinfo` + `signal::tests::sa_resethand_resets_disposition_to_default_on_handler_entry` | MATCH 4/4 vs oracle 4/4 in `conf-18439-c02` |
 
@@ -536,13 +549,13 @@ just conformance-probes
 
 ## Next autonomous slice
 
-1. Keep `go-syscall` as a non-process follow-up only if this goal expands:
-   `TestExec` is now fixed and owned, while the full row still stops around
-   namespace/chroot fallout (`TestUnshareMountNameSpaceChroot` in
-   `conf-77884-c00`) after user namespace, unshare, capability, and fd-flag
-   failures.
-2. Keep `go-os_signal` as pressure coverage: fresh targeted rerun
-   `conf-41403-c00` still matches 29/30 vs oracle, with only
-   `TestTerminalSignal` failing on both sides.
-3. Update this file and `docs/conformance-coverage.md`, then land a logical
-   commit with the validation commands in the body.
+2026-06-06 stop checkpoint: after recording the full-run artifacts and landing
+the logical commits for the oracle refresh and harness scheduler change, stop
+this goal instead of continuing into another autonomous reducer slice.
+
+If this goal is resumed later, keep `go-syscall` as a non-process follow-up
+only if the scope expands: `TestExec` is now fixed and owned, while the full row
+still stops around namespace/chroot fallout after user namespace, unshare,
+capability, and fd-flag failures. Keep `go-os_signal` as pressure coverage; the
+latest full run still matches 29/30 vs oracle, with only `TestTerminalSignal`
+failing on both sides.
