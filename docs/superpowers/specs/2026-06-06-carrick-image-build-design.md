@@ -271,16 +271,36 @@ is the ONLY mode that avoids the full-FS walk, hence the only one that produces 
 runnable multi-stage image. It preserves per-instruction layering (not collapsed
 like `--single-snapshot` would).
 
-**Known fidelity nuance of `--use-new-run` (narrow, documented):** its
-change-detection captures new files and modifications to files created within the
-same `RUN` correctly (verified: a single-stage `RUN echo one >/f; RUN echo two >>/f
-&& echo three >/new` yields f=one/two + new=three). But a `RUN` that modifies a
-file introduced by a *preceding `COPY`* in the same stage may not capture the
-in-place modification (observed: a `RUN … >> /artifact.txt` appended to a COPY'd
-`/artifact.txt` did not land — the image keeps the COPY'd version). The image is
-correct and runnable; this is an edge of kaniko's experimental `--use-new-run`
-change detection (COPY-then-RUN-modify of the same path), tracked as a minor
-follow-up. It does NOT reintroduce the `.wh.lib` breakage.
+**Known fidelity bug of `--use-new-run` under carrick (narrow; CONFIRMED
+carrick-specific via a Docker oracle; tracked):** a `RUN` that modifies a file
+introduced by a preceding `COPY --from=<stage>` may drop the in-place
+modification. Observed: a multi-stage `COPY --from=build /src/artifact.txt
+/artifact.txt` then `RUN echo X >> /artifact.txt` → the built image keeps only the
+COPY'd content (the `>>` append is lost). The image is runnable; it does NOT
+reintroduce the `.wh.lib` breakage. What the 2026-06-06 investigation established:
+- **It is carrick-specific, not a kaniko limitation.** The *identical* kaniko
+  v1.24.0 `--use-new-run` build under real Docker (linux/arm64) captures the
+  append correctly (the RUN layer's `/artifact.txt` has both lines); under carrick
+  it does not. So carrick is failing to present the RUN's modification to kaniko's
+  change detection.
+- **It is NOT a simple mtime/size bug.** carrick correctly bumps both mtime and
+  size on an in-place append, even to a file with an artificially-old mtime
+  (verified directly). So `--use-new-run`'s change detection is missing the change
+  for a subtler reason than stale metadata.
+- **`COPY --from` is the specific trigger.** A single-stage `COPY <ctx-file>` +
+  `RUN >>` DOES capture the append under carrick (verified) — so it is specific to
+  files placed by a cross-stage `COPY --from`, not COPY-then-modify in general.
+
+This and the `.wh.lib` whiteout are two faces of the same root issue: carrick's fs
+does not present kaniko's snapshot/change-detection the cross-stage signals it
+expects (directory visibility for the full-mode walk; the COPY-`--from`-then-RUN
+change signal for `--use-new-run`). The genuinely-correct fix is the deeper
+carrick-fs work below; `--use-new-run` ships runnable multi-stage images today with
+this one narrow content gap. **Next step:** `carrick trace` kaniko's fs+time
+syscalls on the COPY-`--from`'d path across the final RUN's `--use-new-run`
+change-detection window, comparing the carrick trace to the Docker-oracle behavior,
+to find which signal kaniko reads that carrick reports differently for a
+`COPY --from` file.
 
 The underlying carrick-fs divergence (kaniko's full-FS walk observing a
 being-reset `/lib` that Linux's walk does not) is documented below for the record;
