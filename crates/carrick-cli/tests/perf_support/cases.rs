@@ -149,6 +149,20 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency (lower better): fork/wait storm after reserving a large untouched
+    // private anonymous mmap. This measures fork snapshot overhead for lazy-zero
+    // VMAs without folding in page faults or copy-on-write dirtying.
+    PerfCase {
+        probe: "perf_fork_mmap_snapshot",
+        dimension: "memory",
+        workload: "fork_mmap_snapshot",
+        metric_key: "fork_mmap_snapshot_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): loopback request/response round-trip.
     PerfCase {
         probe: "perf_net_tcp_rr",
@@ -338,6 +352,11 @@ mod tests {
                 "shared_anon_churn",
                 "perf_shared_anon_churn",
                 "shared_anon_churn_total_us",
+            ),
+            (
+                "fork_mmap_snapshot",
+                "perf_fork_mmap_snapshot",
+                "fork_mmap_snapshot_total_us",
             ),
         ];
 
