@@ -313,6 +313,18 @@ pub(crate) enum Commands {
         #[arg(required = true)]
         containers: Vec<String>,
     },
+    /// Run an optional Docker Engine API server over a unix socket
+    /// (`DOCKER_HOST=unix://<host>`). Daemonless: a translator over the on-disk
+    /// container registry, not a resident owner of containers.
+    Serve {
+        /// Answer the Docker Engine HTTP API (required; reserved for future
+        /// protocols).
+        #[arg(long = "docker-api")]
+        docker_api: bool,
+        /// Unix socket path to listen on.
+        #[arg(long = "host", value_name = "PATH", default_value = "/tmp/carrick.sock")]
+        host: String,
+    },
     Shell {
         #[arg(default_value = "alpine:latest")]
         image: String,

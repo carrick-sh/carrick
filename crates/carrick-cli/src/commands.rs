@@ -691,6 +691,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Restart { time, containers } => {
             crate::lifecycle::restart(&store, time, &containers)?
         }
+        Commands::Serve { docker_api, host } => crate::serve::serve(docker_api, host)?,
         Commands::Exec {
             interactive,
             tty,
