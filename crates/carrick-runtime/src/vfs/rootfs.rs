@@ -38,7 +38,9 @@
 //! a correctness fork; the public fields and `open_for_dispatch` are the
 //! contract the dispatcher relies on.
 
-use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry, OverlayEntryKind};
+use crate::fs_backend::{
+    FsBackend, MemoryBackend, OverlayEntry, OverlayEntryKind, SharedFileContents,
+};
 use crate::linux_abi::{
     LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
     LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
@@ -74,7 +76,7 @@ pub enum OpenDispatchResult {
     },
     RootFsBackedFile {
         metadata: RootFsMetadata,
-        contents: Arc<[u8]>,
+        contents: SharedFileContents,
         writable: bool,
     },
     /// A regular file backed by a REAL host fd (disk-backed overlay,
@@ -222,6 +224,19 @@ impl RootFsVfs {
                         writable: writable_request,
                     });
                 }
+                if let Some(contents) = self.overlay.shared_file_contents(path) {
+                    let metadata = RootFsMetadata {
+                        path: std::path::Path::new(path).to_path_buf(),
+                        kind: RootFsEntryKind::File,
+                        mode,
+                        size: contents.len,
+                    };
+                    return Ok(OpenDispatchResult::RootFsBackedFile {
+                        metadata,
+                        contents,
+                        writable: writable_request,
+                    });
+                }
                 // open_raw_fd failed. `lookup` reports a symlink as a File whose
                 // "contents" are the link target (for readlink/content reads). A
                 // following open(2) must NOT see that — it follows the link, so a
@@ -366,7 +381,11 @@ impl RootFsVfs {
                             .map_err(|_| LINUX_EINVAL)?;
                         return Ok(OpenDispatchResult::RootFsBackedFile {
                             metadata,
-                            contents,
+                            contents: SharedFileContents {
+                                len: contents.len(),
+                                base: contents,
+                                dirty: std::collections::BTreeMap::new(),
+                            },
                             writable: true,
                         });
                     }
