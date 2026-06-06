@@ -180,6 +180,10 @@ impl FsBackend for CountingMemoryBackend {
         self.inner.create_file(path)
     }
 
+    fn may_have_fifo_nodes(&self) -> bool {
+        self.inner.may_have_fifo_nodes()
+    }
+
     fn create_file_from_rootfs(
         &self,
         path: &str,
@@ -267,6 +271,43 @@ fn memory_overlay_open_uses_single_backend_snapshot_for_shared_file() {
         0,
         "memory overlay file open should use one snapshot call instead of a separate shared-content lookup"
     );
+}
+
+#[test]
+fn memory_overlay_regular_open_skips_fifo_probe_when_backend_cannot_have_fifos() {
+    let backend = CountingMemoryBackend::new();
+    backend
+        .set_file_contents("/regular.bin", vec![0x41; 1024])
+        .unwrap();
+    backend.reset_counts();
+    let lookup_kind_calls = backend.lookup_kind_calls.clone();
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+
+    let calls = lookup_kind_calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        calls <= 1,
+        "memory overlay regular-file open should not run the FIFO metadata probe; lookup_kind calls={calls}"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]

@@ -801,7 +801,8 @@ impl SyscallDispatcher {
         // O_NONBLOCK returns immediately and the guest's blocking read/write
         // then parks on the kqueue WaitOnFds path (with the dispatcher lock
         // released). An O_RDWR FIFO is bidirectional (e.g. LTP select01).
-        if let Ok(md) = self.layered_metadata(&path)
+        if self.fs.rootfs_vfs.overlay.may_have_fifo_nodes()
+            && let Ok(md) = self.layered_metadata(&path)
             && md.kind == RootFsEntryKind::Fifo
         {
             // An existing FIFO + O_CREAT|O_EXCL must fail like the kernel.
