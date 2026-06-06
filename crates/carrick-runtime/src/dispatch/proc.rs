@@ -313,8 +313,8 @@ pub(super) struct ProcState {
     /// glibc's `alarm()` is `setitimer(ITIMER_REAL, …)` and returns the
     /// previous timer's remaining seconds. The matching expiry signal
     /// (SIGALRM/SIGVTALRM/SIGPROF) is delivered by an EVFILT_TIMER event on the
-    /// signal pump's kqueue (see crate::itimer). VIRTUAL/PROF are approximated
-    /// with a wall-clock timer (carrick has no per-process CPU-time accounting).
+    /// signal pump's kqueue (see crate::itimer). VIRTUAL/PROF are keyed to
+    /// guest CPU accounting and use wall-clock kqueue timers only as rechecks.
     pub itimers: [Option<ItimerState>; 3],
     /// CPU affinity mask, one bit per Linux-visible logical CPU (word 0 holds
     /// CPUs 0..64). Seeded to "all online CPUs" from `host_facts` so

@@ -33,6 +33,12 @@ pub const TIMER_IDENT_BASE: usize = 0x00C1_0000;
 /// Number of `setitimer` `which` slots: ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF.
 const WHICH_COUNT: usize = 3;
 
+/// Maximum wall-clock interval between CPU-timer rechecks while a CPU timer is
+/// armed. Delivery still depends on process guest CPU reaching `cpu_due_ns`,
+/// but bounded polling keeps timers from going late after an idle process
+/// resumes or when aggregate CPU advances faster than wall time.
+const CPU_TIMER_MAX_RECHECK_NS: u64 = 1_000_000;
+
 /// Per-`which` interval-timer state shared between `setitimer` and the pump.
 struct ItimerSlot {
     /// Monotonic generation bumped on every arm/disarm. Fallback timer threads
@@ -172,7 +178,7 @@ pub fn interval_ns(which: usize) -> u64 {
 }
 
 /// For CPU timers, decide whether enough guest CPU has elapsed for this timer
-/// to fire. If not, return the remaining CPU interval so the pump can replay a
+/// to fire. If not, return a wall-clock recheck delay so the pump can replay a
 /// one-shot wake instead of consuming the timer while the guest is idle.
 pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
     if !is_cpu_timer(which) {
@@ -186,7 +192,7 @@ pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
     let now_ns = crate::guest_cpu::total_ns_including_active();
     if now_ns < due_ns {
         return Some(CpuTimerDecision::Wait {
-            delay_ns: due_ns - now_ns,
+            delay_ns: cpu_timer_recheck_delay_ns(due_ns - now_ns),
         });
     }
     let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
@@ -197,6 +203,18 @@ pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
         slot.cpu_due_ns.store(0, Ordering::SeqCst);
     }
     Some(CpuTimerDecision::Fire)
+}
+
+/// Convert remaining aggregate guest CPU time into a wall-clock delay for the
+/// signal pump's next CPU-timer check.
+pub fn cpu_timer_recheck_delay_ns(remaining_cpu_ns: u64) -> u64 {
+    let active_vcpus = crate::guest_cpu::active_count() as u64;
+    let scaled = if active_vcpus > 1 {
+        remaining_cpu_ns.div_ceil(active_vcpus)
+    } else {
+        remaining_cpu_ns
+    };
+    scaled.clamp(1, CPU_TIMER_MAX_RECHECK_NS)
 }
 
 /// Current kqueue timer arm for `which`, if it is armed. This is used when a
@@ -220,10 +238,15 @@ pub fn current_arm(which: usize) -> Option<TimerArm> {
         } else {
             libc::EV_ADD | libc::EV_ONESHOT
         };
+    let delay_ns = if is_cpu_timer(which) {
+        cpu_timer_recheck_delay_ns(value_ns)
+    } else {
+        value_ns
+    };
     Some(TimerArm {
         ident: ident_for(which),
         flags,
-        delay_ns: i64::try_from(value_ns).unwrap_or(i64::MAX),
+        delay_ns: i64::try_from(delay_ns).unwrap_or(i64::MAX),
     })
 }
 
@@ -267,7 +290,7 @@ pub fn take_needs_periodic(which: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Barrier, Mutex};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -298,6 +321,43 @@ mod tests {
         assert!(is_cpu_timer(1));
         assert!(is_cpu_timer(2));
         assert!(!is_cpu_timer(3));
+    }
+
+    #[test]
+    fn cpu_timer_recheck_delay_is_bounded() {
+        assert_eq!(cpu_timer_recheck_delay_ns(0), 1);
+        assert_eq!(cpu_timer_recheck_delay_ns(500_000), 500_000);
+        assert_eq!(cpu_timer_recheck_delay_ns(10_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn cpu_timer_recheck_delay_scales_with_active_vcpus() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        crate::guest_cpu::reset();
+        let started = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    crate::guest_cpu::begin_active();
+                    started.wait();
+                    release.wait();
+                    crate::guest_cpu::finish_active(0);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        started.wait();
+        assert_eq!(cpu_timer_recheck_delay_ns(800_000), 400_000);
+        release.wait();
+        for handle in handles {
+            handle
+                .join()
+                .expect("active vCPU test thread should finish");
+        }
+        crate::guest_cpu::reset();
     }
 
     #[test]
@@ -379,7 +439,7 @@ mod tests {
             Some(TimerArm {
                 ident: ident_for(which),
                 flags: libc::EV_ADD | libc::EV_ONESHOT,
-                delay_ns: 25_000_000,
+                delay_ns: 1_000_000,
             })
         );
         disarm(which);

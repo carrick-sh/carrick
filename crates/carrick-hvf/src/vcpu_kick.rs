@@ -396,10 +396,12 @@ pub fn spawn_signal_pump(
                             if cpu_timer {
                                 let interval = crate::itimer::interval_ns(which);
                                 if interval > 0 {
+                                    let delay_ns =
+                                        crate::itimer::cpu_timer_recheck_delay_ns(interval);
                                     let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
                                         ident,
                                         libc::EV_ADD | libc::EV_ONESHOT,
-                                        i64::try_from(interval).unwrap_or(i64::MAX),
+                                        i64::try_from(delay_ns).unwrap_or(i64::MAX),
                                     )]);
                                 }
                                 continue;

@@ -6,7 +6,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-use carrick_runtime::linux_abi::LinuxSysinfo;
+use carrick_runtime::linux_abi::{LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_SIGPROF, LinuxSysinfo};
 use support::*;
 
 #[test]
@@ -442,6 +442,63 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
         "expected reason to mention SIGALRM, got {:?}",
         setitimer_partial.reason,
     );
+}
+
+#[test]
+fn timer_create_rejects_thread_cpu_sigev_thread_id() {
+    const LINUX_EINVAL: i32 = 22;
+    const LINUX_SIGEV_THREAD_ID: i32 = 4;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let mut sev = [0u8; 64];
+    sev[8..12].copy_from_slice(&LINUX_SIGPROF.to_le_bytes());
+    sev[12..16].copy_from_slice(&LINUX_SIGEV_THREAD_ID.to_le_bytes());
+    memory.write_bytes(0x4000, &sev).unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    107,
+                    SyscallArgs::from([LINUX_CLOCK_THREAD_CPUTIME_ID, 0x4000, 0x4080, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    107,
+                    SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0x4000, 0x4080, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let id = u64::from_le_bytes(memory.read_bytes(0x4080, 8).unwrap().try_into().unwrap());
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(111, SyscallArgs::from([id, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]
