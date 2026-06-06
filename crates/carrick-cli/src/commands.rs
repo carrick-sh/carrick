@@ -1165,7 +1165,10 @@ fn kaniko_run_argv(
         argv.push(ba.clone());
     }
     if no_cache {
-        argv.push("--no-cache".to_owned());
+        // kaniko has no `--no-cache` flag (that name errors with "unknown
+        // flag"); its caching is opt-in via `--cache` (off by default). Express
+        // "no cache" with the valid, explicit `--cache=false`.
+        argv.push("--cache=false".to_owned());
     }
     if let Some(p) = platform {
         argv.push("--customPlatform".to_owned());
@@ -1241,9 +1244,11 @@ mod build_tests {
             argv.windows(2)
                 .any(|w| w[0] == "--dockerfile" && w[1] == "/workspace/docker/Dockerfile.prod")
         );
-        // Destination, no-cache, and customPlatform all pass through.
+        // Destination, no-cache (kaniko's valid --cache=false, not the
+        // nonexistent --no-cache), and customPlatform all pass through.
         assert!(argv.windows(2).any(|w| w[0] == "--destination" && w[1] == "registry.example.com/app:v2"));
-        assert!(argv.iter().any(|a| a == "--no-cache"));
+        assert!(argv.iter().any(|a| a == "--cache=false"));
+        assert!(!argv.iter().any(|a| a == "--no-cache"));
         assert!(argv.windows(2).any(|w| w[0] == "--customPlatform" && w[1] == "linux/amd64"));
         // The kaniko image is always present.
         assert!(argv.iter().any(|a| a == KANIKO_IMAGE));
