@@ -19,6 +19,7 @@ Landed slices:
 - `14999846d766db29f7333fffa47d5d103914f26b` - `perf(mem): skip fresh anon mmap zero writes`
 - `306a359` - `docs(perf): record mmap churn result`
 - `d41e658` - `perf(io): stage pwritev buffers once`
+- `efd09cdb8115dd5895d13212e945886337fb5f9a` - `perf(io): use borrowed pwritev buffers`
 
 Measured branch evidence:
 
@@ -37,6 +38,11 @@ Measured branch evidence:
     - `cargo test -p carrick-runtime --test integration pwritev_host_file_reads_each_guest_iovec_once -- --nocapture`
     - `cargo test -p carrick-runtime --test integration pwritev_bootstrap_validates_iovecs_and_reports_stream_errors -- --nocapture`
     - `cargo fmt --all -- --check`
+- Borrowed `pwritev` host-file fast path:
+  - RED test `syscall_fs::pwritev_host_file_uses_guest_host_ptrs_without_payload_reads` initially observed two payload `read_bytes` calls and zero host-pointer hits.
+  - Commit `efd09cd` uses one host `libc::pwritev` when all non-empty guest iovecs expose `host_ptr_for_read`.
+  - Fallback tests cover mixed host-pointer/non-host-pointer iovecs and unreadable fallback payloads.
+  - Filtered `just bench quick` wrote `pwritev_burst` rows to `docs/perf-results/2026-06-05-syscall.jsonl`: Carrick p50 `20849.208` us, p95 `26075.417` us, marked noisy; Docker p50 `3478.459` us, p95 `3654.750` us.
 
 ## First-Principles Cost Model
 
@@ -138,16 +144,19 @@ Milestone 2A: borrowed `pwritev` host-file fast path.
   - `cargo test -p carrick-runtime --test integration pwritev -- --nocapture`
   - `cargo fmt --all -- --check`
   - `git diff --check`
-- [ ] Record before/after syscall-count or wall-time evidence for a multi-segment host-file `pwritev` workload.
-- [ ] Commit as `perf(io): use borrowed pwritev buffers` or a similarly scoped subject.
+- [x] Record removed-work evidence and wall-time evidence for a multi-segment host-file `pwritev` workload.
+- [x] Commit as `perf(io): use borrowed pwritev buffers` or a similarly scoped subject.
 
 Progress:
 
 - 2026-06-06: Added RED integration test `syscall_fs::pwritev_host_file_uses_guest_host_ptrs_without_payload_reads`; pre-fix behavior returned the correct file contents but read the two watched payloads through `read_bytes` and recorded zero host-pointer hits.
 - 2026-06-06: Added fallback coverage `syscall_fs::pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr` and validation coverage `syscall_fs::pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable`.
 - 2026-06-06: Implemented `prepare_pwritev_payloads` in `crates/carrick-runtime/src/dispatch/fs.rs`. Host-file `pwritev` now calls one `libc::pwritev` when all non-empty iovecs expose `host_ptr_for_read`; mixed or non-host-pointer memory falls back to one staged read per payload.
-- 2026-06-06: Added `conformance-probes/src/bin/perf_pwritev_burst.rs` and registered `pwritev_burst` in the perf case registry. A pre-commit smoke run proved the benchmark executes; clean post-commit rows are still pending so the JSONL `git_sha` points at the code commit being measured.
+- 2026-06-06: Added `conformance-probes/src/bin/perf_pwritev_burst.rs` and registered `pwritev_burst` in the perf case registry.
 - 2026-06-06: Pre-commit verification passed: `cargo test -p carrick-runtime --test integration pwritev -- --nocapture`, `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture`, `cargo fmt --all -- --check`, and `git diff --check`.
+- 2026-06-06: Committed runtime/test/probe slice as `efd09cdb8115dd5895d13212e945886337fb5f9a` (`perf(io): use borrowed pwritev buffers`).
+- 2026-06-06: Removed-work evidence is the RED/green integration test: payload `read_bytes` calls dropped from `2` to `0` and host-pointer hits rose from `0` to `2` for the borrowed host-file `pwritev` case.
+- 2026-06-06: Post-commit `CARRICK_PERF_FILTER=pwritev_burst CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 just bench quick` passed and wrote `docs/perf-results/2026-06-05-syscall.jsonl`; Carrick p50 `20849.208` us, p95 `26075.417` us, noisy; Docker p50 `3478.459` us, p95 `3654.750` us.
 
 Milestone 2B: borrowed `readv` and `preadv` host-file fast paths.
 
@@ -170,7 +179,7 @@ Milestone 2B: borrowed `readv` and `preadv` host-file fast paths.
   - `cargo test -p carrick-runtime --test integration preadv -- --nocapture`
   - `cargo fmt --all -- --check`
   - `git diff --check`
-- [ ] Record before/after evidence for multi-segment host-file reads.
+- [ ] Record removed-work evidence and wall-time evidence for multi-segment host-file reads.
 - [ ] Commit as a separate logical slice from `pwritev`.
 
 Milestone 2C: blocking write ownership and existing `writev` path cleanup.
@@ -307,11 +316,12 @@ Repo-local result artifacts:
 
 ## Immediate Next Slice
 
-Continue Milestone 2A.
+Continue Milestone 2B.
 
-- [ ] Add the RED borrowed-host-pointer `pwritev` tests in `crates/carrick-runtime/tests/integration/syscall_fs.rs`.
-- [ ] Implement borrowed `pwritev` preparation in `crates/carrick-runtime/src/dispatch/fs.rs`.
-- [ ] Keep staged fallback behavior from `d41e658`.
-- [ ] Run focused `pwritev` tests, formatting, and `git diff --check`.
-- [ ] Record syscall-count or wall-time evidence.
-- [ ] Commit the slice separately from read-side vector I/O.
+- [ ] Add RED borrowed-host-pointer `readv` and `preadv` tests in `crates/carrick-runtime/tests/integration/syscall_fs.rs`.
+- [ ] Implement writable borrowed-iovec preparation in `crates/carrick-runtime/src/dispatch/fs.rs`.
+- [ ] Convert safe host-file `readv` and `preadv` calls to `libc::readv` and `libc::preadv`.
+- [ ] Keep staged fallback behavior for mixed or non-host-pointer guest memory.
+- [ ] Run focused `readv`/`preadv` tests, formatting, and `git diff --check`.
+- [ ] Record removed-work evidence and wall-time evidence for multi-segment host-file reads.
+- [ ] Commit the read-side vector I/O slice separately from `pwritev`.
