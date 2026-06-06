@@ -132,18 +132,10 @@ pub(crate) mod seccomp;
 pub mod vfs;
 pub use execute::Runtime;
 
-/// Whether the EL1 guest-side syscall shim (the identity fast path) is enabled
-/// for this process. Opt-in via `CARRICK_SYSCALL_SHIM` (default off) while it
-/// rolls out: when off, the guest's EL1 vectors and address space are
-/// byte-identical to before, so the default path carries zero risk. Decided
-/// once per process (env is inherited verbatim across fork). See
-/// `docs/syscall-shim-design.md`.
-pub(crate) fn syscall_shim_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("CARRICK_SYSCALL_SHIM").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+/// Whether the EL1 guest-side syscall shim (the register-only identity fast
+/// path: getpid/get*id/gettid) is compiled in. Gated by the `syscall-shim`
+/// Cargo feature. carrick-cli enables it by default; build the binary with
+/// `--no-default-features` for the legacy trap-only path.
+pub(crate) const fn syscall_shim_enabled() -> bool {
+    cfg!(feature = "syscall-shim")
 }

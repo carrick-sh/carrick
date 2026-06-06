@@ -11,6 +11,13 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
+# purpose: the binary (carrick-cli) is the single control point. carrick-cli's
+# default enables it for normal builds; dependents that use carrick-runtime as a
+# library do not re-enable it through feature unification.
+syscall-shim = []
+
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
