@@ -5621,8 +5621,8 @@ impl SyscallDispatcher {
                             }
                             // A broken pipe (read end closed) → EPIPE AND a
                             // SIGPIPE on the writer (write05).
-                            let out = write_host_pipe(
-                                &bytes,
+                            let out = write_host_pipe_owned(
+                                bytes,
                                 *host_fd,
                                 nonblocking,
                                 *write_kind,
@@ -5635,8 +5635,8 @@ impl SyscallDispatcher {
                             // write(2) on a connected socket maps directly to a
                             // host write(2). Unconnected sockets will surface
                             // their own ENOTCONN via the host.
-                            return Ok(write_host_pipe(
-                                &bytes,
+                            return Ok(write_host_pipe_owned(
+                                bytes,
                                 *host_fd,
                                 nonblocking,
                                 HostWriteKind::SocketLike,
@@ -5663,8 +5663,8 @@ impl SyscallDispatcher {
                             }
                             // libc::write to the real fd: advances the
                             // kernel offset and is visible across fork.
-                            return Ok(write_host_pipe(
-                                &bytes,
+                            return Ok(write_host_pipe_owned(
+                                bytes,
                                 *host_fd,
                                 nonblocking,
                                 HostWriteKind::RegularFile,
@@ -5839,8 +5839,8 @@ impl SyscallDispatcher {
                 if target.append {
                     unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_END) };
                 }
-                let outcome = write_host_pipe(
-                    &bytes,
+                let outcome = write_host_pipe_owned(
+                    bytes,
                     target.host_fd,
                     nonblocking,
                     target.write_kind,
@@ -5902,8 +5902,8 @@ impl SyscallDispatcher {
                                 if *is_read_end && pty.is_none() && !*bidirectional {
                                     return Ok(LINUX_EBADF.into());
                                 }
-                                outcome = write_host_pipe(
-                                    &bytes,
+                                outcome = write_host_pipe_owned(
+                                    bytes,
                                     *host_fd,
                                     nonblocking,
                                     *write_kind,
@@ -5913,8 +5913,8 @@ impl SyscallDispatcher {
                                 writeback = FileWriteback::None;
                             }
                             OpenDescription::HostSocket { host_fd, .. } => {
-                                outcome = write_host_pipe(
-                                    &bytes,
+                                outcome = write_host_pipe_owned(
+                                    bytes,
                                     *host_fd,
                                     nonblocking,
                                     HostWriteKind::SocketLike,
@@ -5939,8 +5939,8 @@ impl SyscallDispatcher {
                                 if base.status_flags() & LINUX_O_APPEND != 0 {
                                     unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                                 }
-                                outcome = write_host_pipe(
-                                    &bytes,
+                                outcome = write_host_pipe_owned(
+                                    bytes,
                                     *host_fd,
                                     nonblocking,
                                     HostWriteKind::RegularFile,

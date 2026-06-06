@@ -204,12 +204,21 @@ Progress:
 
 Milestone 2C: blocking write ownership and existing `writev` path cleanup.
 
-- [ ] Add a test that forces the blocking-write handoff path and proves the buffer is not cloned when ownership can be moved.
-- [ ] Replace clone-on-handoff with ownership transfer for already-staged write buffers.
-- [ ] Confirm EINTR, EAGAIN, partial-write, and retry behavior are unchanged.
-- [ ] Run focused I/O tests and relevant conformance probes.
-- [ ] Record allocation or wall-time evidence for repeated small blocking writes.
+- [x] Add a test that forces the blocking-write handoff path and proves the buffer is not cloned when ownership can be moved.
+- [x] Replace clone-on-handoff with ownership transfer for already-staged write buffers.
+- [x] Confirm EINTR, EAGAIN, partial-write, and retry behavior are unchanged.
+- [x] Run focused I/O tests and relevant conformance probes.
+- [x] Record allocation or wall-time evidence for repeated small blocking writes.
 - [ ] Commit as a separate logical slice.
+
+Progress:
+
+- 2026-06-06: Added RED unit coverage `dispatch::overlay_dispatch_tests::blocking_host_write_from_owned_bytes_reuses_buffer_storage`; first run failed because `BlockingHostWrite::from_vec` did not exist, proving the handoff had no owned-buffer path.
+- 2026-06-06: Implemented `BlockingHostWrite::from_vec`, `HostWritePayload`, and `write_host_pipe_owned`. The write and writev host-backed paths now move already-staged `Vec<u8>` buffers into blocking-write continuations instead of cloning them on handoff.
+- 2026-06-06: Allocation evidence is direct pointer/capacity preservation in `blocking_host_write_from_owned_bytes_reuses_buffer_storage`; the continuation owns the same allocation that was staged by the syscall path.
+- 2026-06-06: Focused Rust checks passed: `cargo test -p carrick-runtime blocking_host_write_from_owned_bytes_reuses_buffer_storage -- --nocapture`, `cargo test -p carrick-runtime large_blocking_host_pipe_write_hands_off_after_partial_progress -- --nocapture`, and `cargo test -p carrick-runtime --test integration writev -- --nocapture`.
+- 2026-06-06: Pre-commit hygiene passed: `cargo fmt --all -- --check` and `git diff --check`.
+- 2026-06-06: Signed-build conformance probes matched Docker/Linux: `scripts/run-probe.sh blockingpipewrite`, `scripts/run-probe.sh writevpartial`, and `scripts/run-probe.sh sigpipewrite`.
 
 ### 3. VFS Streaming and Dirty-Range Writeback
 
