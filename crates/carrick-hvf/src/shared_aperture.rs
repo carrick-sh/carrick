@@ -110,7 +110,8 @@ impl SharedAperture {
     /// Reserve `len` bytes (rounded up to the granule). Returns the guest IPA,
     /// or `None` if the window is exhausted. Records the backing.
     pub fn alloc(&mut self, len: u64, backing: BackingObject) -> Option<u64> {
-        self.alloc_sourced(len, backing, None)
+        self.alloc_sourced_with_reuse(len, backing, None)
+            .map(|(addr, _reused)| addr)
     }
 
     /// Like [`alloc`](Self::alloc), but tags the slot with the shared-aperture
@@ -123,6 +124,18 @@ impl SharedAperture {
         backing: BackingObject,
         source: Option<u64>,
     ) -> Option<u64> {
+        self.alloc_sourced_with_reuse(len, backing, source)
+            .map(|(addr, _reused)| addr)
+    }
+
+    /// Like [`alloc_sourced`](Self::alloc_sourced), but also reports whether
+    /// the returned range came from the free list and may contain stale bytes.
+    pub fn alloc_sourced_with_reuse(
+        &mut self,
+        len: u64,
+        backing: BackingObject,
+        source: Option<u64>,
+    ) -> Option<(u64, bool)> {
         if len == 0 {
             return None;
         }
@@ -141,7 +154,7 @@ impl SharedAperture {
                 backing,
                 source,
             });
-            return Some(s);
+            return Some((s, true));
         }
         let addr = align_up_u64(self.next, GRANULE)?;
         let end = addr.checked_add(len)?;
@@ -155,7 +168,7 @@ impl SharedAperture {
             backing,
             source,
         });
-        Some(addr)
+        Some((addr, false))
     }
 
     /// The overlay slot (guest_addr) currently backing shared-aperture VA
