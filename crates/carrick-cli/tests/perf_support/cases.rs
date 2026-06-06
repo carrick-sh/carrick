@@ -74,6 +74,19 @@ pub const CASES: &[PerfCase] = &[
         mount_scratch: false,
         cross_boundary: false,
     },
+    // Latency (lower better): fresh private anonymous mmap churn without
+    // touching mapped pages. This exposes runtime zero-fill/page-dirtying that
+    // Linux avoids for untouched anonymous VMAs.
+    PerfCase {
+        probe: "perf_mmap_churn",
+        dimension: "memory",
+        workload: "mmap_churn",
+        metric_key: "mmap_churn_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: false,
+    },
     // Latency (lower better): loopback request/response round-trip.
     PerfCase {
         probe: "perf_net_tcp_rr",
@@ -198,6 +211,21 @@ mod tests {
             assert!(!case.mount_scratch);
             assert!(!case.cross_boundary);
         }
+    }
+
+    #[test]
+    fn registry_contains_memory_perf_surface() {
+        let case = CASES
+            .iter()
+            .find(|case| case.workload == "mmap_churn")
+            .expect("missing mmap_churn perf workload");
+        assert_eq!(case.dimension, "memory");
+        assert_eq!(case.probe, "perf_mmap_churn");
+        assert_eq!(case.metric_key, "mmap_churn_total_us");
+        assert_eq!(case.unit, "us");
+        assert!(!case.higher_is_better);
+        assert!(!case.mount_scratch);
+        assert!(!case.cross_boundary);
     }
 
     #[test]
