@@ -193,6 +193,32 @@ file.
   - `overlay_small_updates`: Carrick memory-fs p50 `19890.709` us,
     p95 `21616.875` us; Docker p50 `1500.292` us, p95 `2000.458` us, noisy;
     Carrick remains about `13.26x` slower.
+- 2026-06-06: Re-checked `large_meta` host work. Direct DTrace over one run
+  counted `openat=1814`, `close=1804`, `fstatat64=1173`, `fcntl=1055`,
+  `fgetxattr=867`, and `flistxattr=435`. `carrick trace` confirmed the guest
+  mix is the expected fixture shape: `newfstatat=289`, `openat=147`,
+  `fcntl=146`, `fstat=145`, `close=146`, and `faccessat=144`, so the gap is
+  host-side VFS amplification inside handlers rather than unexpected guest
+  traps. Disabling fast fs made the direct run `76294.083` us total; disabling
+  the stat cache made it `34109.917` us total; the default direct run was
+  `21535.875` us total.
+- 2026-06-06: Landed a narrow combined host open metadata path:
+  `FsBackend::open_raw_fd_with_metadata`, used by `RootFsVfs::open_for_dispatch`
+  for host-backed overlay files. `HostFsBackend` now derives open fd metadata
+  from the same fd that will back the guest descriptor, avoiding the separate
+  metadata-containment open, close, and `F_GETPATH` call for each guest open.
+  The RED test
+  `vfs::rootfs::tests::open_for_dispatch_prefers_combined_host_fd_metadata`
+  first failed with `combined_open_calls == 0`, then passed after the runtime
+  change.
+- 2026-06-06: Post-change DTrace counted `openat=1670`, `close=1661`, and
+  `fcntl=911`, down by about one open/close/F_GETPATH per guest `openat`.
+  `fstatat64`, `flistxattr`, and `fgetxattr` stayed effectively unchanged,
+  which means remaining `large_meta` work is now mostly stat/access
+  revalidation and xattr metadata reads. Filtered perf run appended rows at
+  `5a6be550d18c4db94f0986271c9d063cfde2a1be`: Carrick p50 `20539.542` us,
+  p95 `24166.958` us, noisy; Docker p50 `232.042` us, p95 `408.833` us,
+  noisy.
 
 ## Ranked Opportunities
 
@@ -238,8 +264,11 @@ Completed:
 
 Remaining VFS questions:
 
-- [ ] Re-check path/open setup cost in `large_meta`, since Carrick remains about
+- [x] Re-check path/open setup cost in `large_meta`, since Carrick remains about
   `46.84x` slower after payload-copy fixes.
+- [ ] Break down the remaining `large_meta` `fstatat64`, `flistxattr`, and
+  `fgetxattr` counts by guest syscall class before choosing the next VFS
+  change.
 - [ ] Identify whether the remaining `overlay_small_updates` gap is dominated by
   traps, VFS lookup/setup, memory-backend range maintenance, or host file setup.
 - [ ] Add byte-copy/allocation counters for the remaining VFS hot paths where
@@ -247,7 +276,8 @@ Remaining VFS questions:
 
 ### 2. Wait Path fd Pinning and kqueue Churn
 
-Status: retained fd pinning landed; transient kqueue setup remains.
+Status: retained fd pinning landed; persistent kqueue subscriptions are
+deferred until a workload shows the remaining setup dominates wall time.
 
 Repeated waits on stable descriptors should not pay repeated fd duplication,
 transient kqueue registration, and teardown when open-description lifetime is
@@ -277,7 +307,10 @@ Known current shape:
   lifetime is not yet anchored, still use the fail-closed per-wait `dup`
   fallback.
 - `HvfEventLoop` still waits through kqueue or poll fallback, and the kqueue
-  path still registers and deletes fd filters around each wait.
+  path still registers and deletes fd filters around each wait. That remaining
+  churn is measurable, but the retained-fd slice only moved the narrow
+  pipe-handoff p50 from `16.083` us to `15.542` us, so persistent
+  subscriptions are not justified without a broader event-loop workload.
 - Runtime dispatch has `WaitOnFds`, `WaitOnFdsSelect`, and `WaitOnFdsPoll`
   paths.
 - Existing probes cover many poll/epoll correctness cases, but there is no
@@ -312,7 +345,7 @@ Immediate measurement slice:
   shows the churn is still material.
 - [x] Keep fd duplication fallback where descriptor lifetime cannot be anchored
   safely.
-- [ ] Consider persistent kqueue subscriptions only with generation checks.
+- [x] Consider persistent kqueue subscriptions only with generation checks.
 - [x] Run wake-pipe, fd-reuse, poll, select, and epoll tests before claiming
   this retained-fd runtime behavior change.
 - [ ] Run signal and process-exit tests before claiming any future persistent
@@ -408,6 +441,14 @@ Progress:
   the same probe counted `close=61` and `kevent=14069`, with no `dup` entries in
   the aggregation. The retained-fd slice removed the per-wait `dup` churn and
   most matching close churn; transient kqueue registration/deletion remains.
+- 2026-06-06: DTrace shape count over the retained-fd runtime showed remaining
+  kqueue calls are almost entirely `kevent(nchanges=1, nevents=3)=6999` waits
+  and `kevent(nchanges=1, nevents=0)=7046` delete/apply calls, plus startup
+  noise. A persistent subscription design could remove the delete/apply half,
+  but it must carry retained fd guards or generation tokens across completed
+  waits and validate signal, process-exit, fork, and wake-pipe behavior. Given
+  the small p50 movement on `wait_pipe_pingpong`, this is deferred until a real
+  event-loop workload proves setup is the dominant cost.
 
 ### 3. Borrowed Guest-Memory I/O Follow-Through
 
@@ -527,14 +568,14 @@ Repo-local result artifacts:
 
 ## Immediate Next Slice
 
-Start wait-path fd pinning measurement.
+Profile remaining VFS metadata/open setup cost.
 
-- [x] Add `perf_wait_pipe_pingpong` and register it in the perf runner.
-- [x] Run focused registry/probe checks.
-- [x] Run one short Carrick-vs-Docker perf sample set.
-- [x] Attempt host syscall counts for `dup`, `close`, and `kevent`.
-- [x] Decide whether retained wait targets are justified by measured churn.
-- [x] If justified, implement the smallest retained-wait-target change with fd
-  close/reuse correctness coverage.
-- [ ] Decide whether persistent kqueue subscriptions are justified by the
-  remaining `kevent` count.
+- [x] Count host syscalls for `large_meta` with DTrace.
+- [x] Compare current fast-stat/cache behavior with `CARRICK_FAST_FS=0` and/or
+  `CARRICK_FS_STATCACHE=0` if useful.
+- [x] Identify whether the remaining gap is guest traps, path containment opens,
+  xattrs/stat cache misses, or open/access setup.
+- [x] Implement only a narrow VFS change if count evidence shows removable
+  repeated work.
+- [ ] Attribute remaining stat/access xattr and `fstatat64` counts by guest
+  syscall class before another VFS runtime change.
