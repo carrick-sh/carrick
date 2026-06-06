@@ -22,13 +22,13 @@ fn boxed(resp: Response<Full<Bytes>>) -> Response<ResponseBody> {
 
 /// Strip a leading `/v1.43`-style version segment, returning the bare path.
 fn strip_version(path: &str) -> &str {
-    if let Some(rest) = path.strip_prefix("/v") {
-        if let Some(slash) = rest.find('/') {
-            // Only strip if the segment looks like a version (digits/dots).
-            let (ver, tail) = rest.split_at(slash);
-            if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                return tail;
-            }
+    if let Some(rest) = path.strip_prefix("/v")
+        && let Some(slash) = rest.find('/')
+    {
+        // Only strip if the segment looks like a version (digits/dots).
+        let (ver, tail) = rest.split_at(slash);
+        if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return tail;
         }
     }
     path
