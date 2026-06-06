@@ -15,6 +15,7 @@ workspace = true
 carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
+carrick-abi = { path = "../carrick-abi" }
 libc.workspace = true
 
 # Linux-only KVM bindings: target-gated so the macOS workspace never resolves
