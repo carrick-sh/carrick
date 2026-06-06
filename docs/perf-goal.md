@@ -62,6 +62,7 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `57ad1f0` - `perf(memory): add fork mmap snapshot workload`
 - `bf9cb3b` - `perf(memory): add shared anon churn workload`
 - `68538ba` - `perf(mem): skip high-va anon alias payloads`
 - `d59d596` - `perf(mem): skip fresh shared anon zero writes`
@@ -87,7 +88,8 @@ Relevant result file:
   `overlay_small_updates` rows for `4bae00f`, `0a08b5f`, `0d9ee96`,
   `76d0aac`, `8a7659a`, and `229105b`.
 - `docs/perf-results/2026-06-06-memory.jsonl` contains a current
-  `mmap_churn` row at `120aab9` and `shared_anon_churn` rows at `bf9cb3b`.
+  `mmap_churn` row at `120aab9`, `shared_anon_churn` rows at `bf9cb3b`, and
+  `fork_mmap_snapshot` rows at `57ad1f0`.
 
 ## Current Evidence
 
@@ -125,8 +127,11 @@ Remaining:
 - `bf9cb3b` added `shared_anon_churn`, a dedicated
   `MAP_SHARED|MAP_ANONYMOUS` perf workload. Current rows: Carrick p50
   `156.625` us, p95 `158.125` us; Docker p50 `106.792` us, p95 `116.875` us.
-- A separate fork-heavy row is still useful to see whether lazy-zero reduced
-  snapshot cost.
+- `57ad1f0` added `fork_mmap_snapshot`, a fork/wait storm after reserving an
+  untouched 512 MiB private anonymous mapping. Current rows: Carrick p50
+  `2451309.750` us, p95 `2500369.916` us; Docker p50 `3494.833` us, p95
+  `3703.750` us. This exposes fork snapshot cost as the dominant remaining
+  mmap/fork issue.
 
 ### Borrowed Vector I/O
 
@@ -746,7 +751,63 @@ Rejected next steps:
   `src/lib.rs` with `expected i32, found i64`; the project build path
   `./scripts/build-probes.sh` succeeded and built the Linux-musl probe.
 
-  A separate fork-heavy row remains open for fork snapshot cost.
+- [x] Add a fork-heavy row for fork snapshot cost.
+
+  Added `perf_fork_mmap_snapshot` at `57ad1f0`.
+
+  Workload shape:
+
+  - Reserve one 512 MiB `MAP_PRIVATE|MAP_ANONYMOUS` mapping.
+  - Do not touch the mapping, so the workload measures fork snapshot cost for a
+    lazy-zero VMA without page faults, COW writes, or dirty-page copy work.
+  - Run 32 sequential `fork` plus `waitpid` cycles.
+  - Print total time and per-fork p50.
+
+  Build and smoke evidence:
+
+  ```sh
+  ./scripts/build-signed.sh
+  ./scripts/build-probes.sh
+  CARRICK_RUN_ID=perf-fork-mmap-snapshot-smoke-$$ \
+  target/release/carrick run-elf --raw --fs host \
+    conformance-probes/target/aarch64-unknown-linux-musl/release/perf_fork_mmap_snapshot
+  ```
+
+  Committed-sha smoke output: `fork_mmap_snapshot_total_us=1447894.959`,
+  `fork_mmap_snapshot_p50_us=45226.583`, `forks=32`, `bytes=536870912`,
+  `nproc=4`.
+
+  Perf row command:
+
+  ```sh
+  CARRICK_PERF_FILTER=fork_mmap_snapshot \
+  CARRICK_PERF_REPS=3 \
+  CARRICK_PERF_WARMUP=1 \
+  CARRICK_PERF_COOLDOWN_SECS=0 \
+  cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
+  ```
+
+  `docs/perf-results/2026-06-06-memory.jsonl` rows at
+  `57ad1f03ff3acb10623f8fb92cb0a8b03ead7530`:
+
+  - Carrick p50 `2451309.750` us, p95 `2500369.916` us, samples
+    `[2451309.750,2500369.916]`, not noisy.
+  - Docker p50 `3494.833` us, p95 `3703.750` us, samples
+    `[3703.750,3494.833]`, not noisy.
+
+  Registry RED/GREEN:
+
+  ```sh
+  cargo test -p carrick-cli --test perf_runner registry_contains_memory_perf_surface -- --nocapture
+  cargo test -p carrick-cli --test perf_runner registered_perf_probes_have_sources -- --nocapture
+  ```
+
+  The first command failed before the `PerfCase` was added with
+  `missing memory perf workload fork_mmap_snapshot`, then passed after the
+  workload and source landed.
+
+  Next fork direction: attribute the ~700x Carrick/Docker gap to the fork
+  snapshot implementation before changing COW or shared-memory behavior.
 - [x] Inspect high-VA alias paths for remaining eager zero/copy behavior.
 
   Result at `68538ba`:
