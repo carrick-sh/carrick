@@ -3756,6 +3756,7 @@ tier = "smoke"
 weight = "heavy"
 timeout_s = 300
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--ulimit", "nofile=1024:1024"]
 
 [[suite]]
 name = "cpython-sunau"

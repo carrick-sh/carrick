@@ -71,6 +71,16 @@ ltp-ptrace05  MATCH, carrick 63/63, oracle 63/63, run conf-51453-c00
 ltp-ptrace06  MATCH, carrick 48/48, oracle 48/48, run conf-51453-c01
 ```
 
+Latest smoke refresh after the profiler and subprocess oracle fixes:
+
+```text
+just conformance-quick
+23 rows
+23 MATCH
+0 NEW
+0 regressions
+```
+
 Earlier live refresh note: a full conformance refresh later stopped in
 `cpython-concurrent_futures` run `conf-42207-c75`, hanging in
 `ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_early_shutdown`.
@@ -132,6 +142,15 @@ known diffs. The refresh evidence was `conf-28227-c00` vs Docker
 submodules completed with `== Tests result: SUCCESS ==`, `All 8 tests OK`, and
 `run=255 skipped=18`.
 
+Latest `cpython-subprocess` harness refresh: `just conformance full --suite
+cpython-subprocess --refresh-oracle --no-image-refresh` now reports `MATCH`
+with carrick `280/280` vs Docker `280/280` in `conf-82809-c00` /
+`conf-82809-d00`. The previous count inversion was not a Carrick false pass:
+Docker's default nofile limit was so high that CPython never reached EMFILE and
+skipped both `test_no_leaking` assertions. The suite now caps Docker to
+`nofile=1024:1024`, matching Carrick's EMFILE path and preserving assertion
+coverage instead of marking the diff known.
+
 Latest full conformance refresh after the lazy child-exit pump fix completed
 all 1222 rows with `OK: no regressions`: 1161 `MATCH`, 61 `NEW`, and cached
 oracle phase (`conf-31721-*`). The remaining process-control-shaped NEW rows
@@ -182,7 +201,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `go-os_exec` | Go | MATCH 86/86 in targeted rerun `conf-93241-c156` | 86/86 | Previously 0/0; current evidence shows process execution suite parity, so keep watching it as pressure coverage rather than the next reducer. |
 | `go-runtime_pprof` | Go | MATCH 93/93 in targeted rerun `conf-39285-c00` | 93/93 | CPU profiler pressure coverage. Idle `ITIMER_PROF`, `TestMapping` alias/sigaltstack, and unsupported per-thread CPU timer over-sampling are now owned. |
 | `go-syscall` | Go | full row still `NEW` with result none in `conf-77884-c00`; isolated `TestExec` now passes under Carrick | 34/34 | Process-control `TestExec` blocker is fixed and owned by `execthreads`; remaining full-row stop is namespace/capability/file-mode fallout, currently around `TestUnshareMountNameSpaceChroot` after earlier userns/unshare failures. |
-| `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
+| `cpython-subprocess` | CPython | MATCH 280/280 in `conf-82809-c00` | 280/280 in refreshed Docker run `conf-82809-d00` | The old count inversion was a Docker oracle environment issue: Docker's default nofile limit was too high, so CPython skipped both `test_no_leaking` cases instead of exercising the EMFILE leak path Carrick already ran. The suite now caps Docker to `nofile=1024:1024` and assertion ids align. |
 | `cpython-concurrent_futures` | CPython | MATCH 20/20 in cache-backed `conf-35590-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 in refreshed Docker oracle `conf-28227-d00` | Runtime hangs and the stale oracle-id cache mismatch are cleared. |
 | `ltp-kill02` | LTP | MATCH 2/2 in targeted rerun after namespace-init `setpgrp()` fix | 2/2 | The parent process must be allowed to form its guest-visible process group before `kill(0, SIGUSR1)` broadcasts to child 1 and child A; explicit session-leader `setpgid(1, 1)` remains `EPERM`. |
 | `ltp-clone303` | LTP | MATCH skipped 1 in `conf-53261-c00` | skipped 1 | Non-process setup blocker cleared: LTP's cgroup helper needs `/proc/self/mounts`; clone3 validation itself remains owned by `clone3args`. |
@@ -413,7 +432,7 @@ Keep this section current as classifications and fixes land.
 | `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. After `ptracetraceme`, targeted rerun `conf-24123-c01` still emits no parseable stdout summary, only the root-user warning on stderr. After `ptracesigdeath` and `ptracesignalstop`, targeted rerun `conf-7738-c01` still emits no parseable stdout summary. After `traceexecstop`, targeted rerun `conf-31128-c01` emits 48 TFAIL lines, all `ENOSYS` where Linux expects `EIO` or `EFAULT` for invalid PEEK/POKE requests. After `ptraceinvaliderrno`, targeted rerun `conf-51453-c01` matches 48/48 vs oracle 48/48. | `traceexecstop` and `ptraceinvaliderrno` | MATCH; exec-stop setup and invalid ptrace request errno owned |
 | `go-os_exec` | previously process/wait workload exited without a parseable suite summary in `conf-42088-c593`; targeted rerun `conf-93241-c156` now matches 86/86 vs oracle 86/86 with assertion ids aligned. | keep as process-control pressure coverage; no reducer needed unless it regresses | MATCH |
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-39099-c00` reproduced the old `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, caused by `execve` rebuilding the HVF VM while sibling guest threads from the old thread group were still live. Docker passed isolated `TestExec`; Carrick now passes the same isolated filter, and `execthreads` proves the new image starts with `Threads: 1`. The full row remains `NEW` in `conf-77884-c00` because it stops before a package summary around namespace/chroot fallout after `TestSCMCredentials`, userns, unshare, and group-cleanup failures. | `execthreads`, `thread::tests::remove_all_except_keeps_exec_owner_live`; non-process rows split out | process-control subset fixed; full row still blocked by non-process syscall fallout |
-| `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
+| `cpython-subprocess` | fixed harness/oracle environment mismatch: Carrick opened until EMFILE around fd 1021 and passed both `test_no_leaking` poll modes, while Docker's default `RLIMIT_NOFILE=1048576` made CPython skip those assertions with `failed to reach the file descriptor limit (tried 1026)`. The suite now gives Docker `--ulimit nofile=1024:1024`, which forces the same EMFILE path and refreshed oracle ids. | `scripts/conformance/suites.toml` Docker nofile cap; generator keeps the stanza reproducible | MATCH 280/280 vs oracle 280/280 in `conf-82809-c00` / `conf-82809-d00`; no known gap or quarantine |
 | `cpython-concurrent_futures` | runtime hangs are fixed: the exact five-iteration early-shutdown reducer completes, `ProcessPoolForkserverProcessPoolExecutorTest` passes 21 tests, `ProcessPoolForkExecutorDeadlockTest` passes 16 tests, and refreshed harness run `conf-28227-c00` matches Docker oracle run `conf-28227-d00` at 20/20 with 239 paired assertion ids. The previous `conf-98558-c00` row was `NEW` only because the committed oracle cache had totals but no Docker per-test ids. | `futexsharedalias`, wake-pipe drain tests, `host_signal::tests::missed_child_exit_watch_*`, `blockingpipewrite`, `dispatch::overlay_dispatch_tests::large_blocking_host_pipe_write_hands_off_after_partial_progress`, refreshed oracle-cache entry | MATCH; keep as pressure coverage |
 | `ltp-setpgid01` | real under-enforcement after oracle refresh: Docker `conf-43101-d00` fails `setpgid(1, 1)` with `EPERM` and passes the forked-child `setpgid(0, 0)` leg. Carrick had reported both as TPASS because the harness starts Carrick in a fresh host process group but the same host session; PID namespace mapping recorded only the init host PGID, so guest `getsid(0)` / session-leader checks missed host SID values that differ from PGID. | `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid`, `setpgidparentgroup`, `proclife` | MATCH 1/2 vs oracle 1/2 in `conf-3259-c00`; process-group session-leader rule owned |
 | `ltp-clone303` | procfs/cgroup setup blocker, not clone3 syscall behavior: targeted run before the fix TBROKed on `/proc/self/mounts: ENOENT`, while Docker opened the mount table and TCONF-skipped because `/sys/fs/cgroup/ltp` is read-only. `clone3args` already proved Carrick's clone3 validation behavior matches the Linux/seccomp oracle shape. | `syscall_fs::synthetic_proc_surface_serves_common_process_and_system_files`; `clone3args` for clone3 validation | MATCH skipped 1 vs oracle skipped 1 in `conf-53261-c00`; setup blocker cleared |
