@@ -12,6 +12,9 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
+default = ["platform-macos"]
+platform-macos = ["carrick-runtime/platform-macos"]
+platform-linux = ["carrick-runtime/platform-linux"]
 # In-memory fs backend selection (default OFF; control point is carrick-cli).
 fs-memory = ["carrick-spec/fs-memory", "carrick-runtime/fs-memory"]
 
@@ -23,5 +26,5 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
 carrick-spec = { path = "../carrick-spec" }
 carrick-image = { path = "../carrick-image" }
-carrick-runtime = { path = "../carrick-runtime" }
+carrick-runtime = { path = "../carrick-runtime", default-features = false }
 anyhow = { workspace = true }
