@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
+const PROBE_SNIPPET: &str = "export BENCH_NPROC=4; base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
 const SAMPLE_DEADLINE: Duration = Duration::from_secs(60);
 const PLATFORM: &str = "linux/arm64";
 pub const IMAGE: &str = "docker.io/library/ubuntu:24.04";
@@ -228,4 +228,14 @@ pub fn run_docker(repo_root: &Path, run_id: &str, probe_b64: &[u8], mount: bool)
     feed_stdin(&mut child, probe_b64);
     // Docker side has no carrick guests to reap; run_id only labels the sample.
     drain_with_deadline(child, repo_root, run_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injected_probe_snippet_exports_normalized_nproc() {
+        assert!(PROBE_SNIPPET.contains("export BENCH_NPROC=4;"));
+    }
 }
