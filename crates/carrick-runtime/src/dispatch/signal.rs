@@ -467,8 +467,13 @@ impl SyscallDispatcher {
         // Keep only SIG_IGN dispositions; a caught handler → default (absent).
         s.handlers
             .retain(|_, a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN);
-        // execve disestablishes any alternate signal stack for the process.
+        // execve disestablishes any alternate signal stack for the process and
+        // discards active user signal frames from the old image. The blocked
+        // mask and pending sets survive, but handler-frame bookkeeping and
+        // temporary restore masks are tied to the replaced user stack.
         s.altstack.clear();
+        s.handler_frames.clear();
+        s.restore_masks.clear();
         drop(s);
         crate::host_signal::reset_routed_handlers_after_execve(ignored_mask);
     }
@@ -1939,6 +1944,11 @@ mod tests {
                     ss_size: 0x2000,
                 },
             );
+            // Active handler-frame and restore-mask state belongs to the old
+            // user image's signal frame; it must not poison the exec'd image's
+            // first sigaltstack() call.
+            s.handler_frames.insert(tid, vec![true]);
+            s.restore_masks.insert(tid, 0x1234);
         }
         // Pre-execve: the caught handler is live.
         assert!(
@@ -1958,6 +1968,9 @@ mod tests {
         assert!(d.signal_is_ignored(10));
         // The alternate signal stack is cleared.
         assert!(d.signal_altstack(tid).is_none());
+        let signal = d.signal.lock();
+        assert!(signal.handler_frames.is_empty());
+        assert!(signal.restore_masks.is_empty());
     }
 
     #[test]
