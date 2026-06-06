@@ -473,19 +473,21 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   - run `cr-perf-83343`: Carrick p50 `7175.000` us, p95 `7902.416` us,
     noisy; Docker p50 `815.166` us, p95 `1594.958` us, noisy.
 
-- [ ] Validate result JSON and docs diff.
+- [x] Validate result JSON and docs diff.
 
   ```sh
   jq -c empty docs/perf-results/2026-06-06-disk.jsonl
   git diff --check
   ```
 
-- [ ] Commit only documentation/result files.
+- [x] Commit only documentation/result files.
 
   ```sh
   git add goal.md docs/perf-results/2026-06-06-disk.jsonl
   git commit -m "docs(perf): record fd path result"
   ```
+
+  Committed as `2fc791b`.
 
 ## Task 3: Decide whether trap count is the real remaining bottleneck
 
@@ -503,6 +505,43 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   workload/interposer experiment.
 - If Task 1 shows fd/path work is not measurable, do not keep shaving open
   internals unless a new counter identifies a whole removable unit of work.
+
+Decision at `2fc791b`:
+
+- GO for designing a dynamic/glibc workload lane.
+- NO-GO for interposer implementation until that lane exists and has Carrick
+  and Docker rows without an interposer.
+- The current `conformance-probes` perf lane is
+  `aarch64-unknown-linux-musl` and injects static probe binaries, so it cannot
+  validate `LD_PRELOAD` behavior.
+- `perf_stdio_burst` is useful as a static "dynamic-style" syscall-shape
+  workload, but it still cannot prove a libc interposer.
+- `overlay_small_updates` remains dominated by the same guest trap sequence
+  after the fd path slice. Further open-handler shaving needs a new counter that
+  identifies a whole removable unit; otherwise the better next question is
+  whether a dynamic process can safely bypass or batch any traps.
+
+Recommended design for the next implementation slice:
+
+- Add a new perf-runner lane for dynamic Linux workloads, separate from the
+  existing static musl probe lane.
+- Build or materialize a small glibc-linked workload inside the Ubuntu guest
+  environment and time only the workload body, not compile/setup time.
+- First dynamic workload should mirror `overlay_small_updates` or
+  `stdio_burst`, print the same `key=value` metrics, and run under Carrick and
+  Docker with no interposer.
+- Only after baseline rows exist should an interposer variant be added. The
+  first acceptable interposer experiment must be narrow, opt-in, and measured;
+  it must not own fd allocation, close semantics, signal behavior, blocking, or
+  `/proc/self/fd` visibility.
+
+Rejected next steps:
+
+- Do not add an `LD_PRELOAD` library before a dynamic baseline lane exists.
+- Do not use the current static musl probe output as evidence for or against
+  interposition.
+- Do not cache `open` fds or fuse `lseek` plus `write`; those change visible fd
+  semantics unless proven through a much narrower design and oracle tests.
 
 **Steps:**
 
@@ -533,7 +572,7 @@ ordinary `/proc/self/fd/N` readlink/stat behavior?
   - `lseek`/`write` fusion that changes shared fd offset semantics
   - wrappers that need to emulate Linux fd, signal, or blocking correctness
 
-- [ ] Record a go/no-go decision in this file before writing interposer code.
+- [x] Record a go/no-go decision in this file before writing interposer code.
 
 ## Task 4: Revisit mmap and fork snapshot costs
 
