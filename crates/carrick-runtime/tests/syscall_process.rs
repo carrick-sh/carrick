@@ -123,13 +123,15 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    // Unsupported ptrace requests still report ENOSYS; the narrow TRACEME/CONT
-    // surface is exercised by ptracetraceme instead of this unit test because
-    // PTRACE_TRACEME mutates the current host process's debug state.
+    // An unimplemented ptrace request (PTRACE_ATTACH = 16) reports ENOSYS. We
+    // avoid PEEK/POKE here: those now do a target-existence check first and
+    // return ESRCH for a missing pid (pid 0). TRACEME/CONT are exercised by
+    // ptracetraceme instead, since PTRACE_TRACEME mutates the current host
+    // process's debug state.
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(117, SyscallArgs::from([2, 0, 0, 0, 0, 0])),
+                SyscallRequest::new(117, SyscallArgs::from([16, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )

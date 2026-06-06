@@ -1409,14 +1409,18 @@ mod tests {
         let result = v
             .open_for_dispatch("/etc/scratch", false, false, false, true)
             .unwrap();
+        // Memory-overlay opens return a shared, copy-on-write-style
+        // RootFsBackedFile (no eager byte clone). A freshly set file is all
+        // `base`, with no dirty write deltas yet.
         match result {
-            OpenDispatchResult::File {
+            OpenDispatchResult::RootFsBackedFile {
                 contents, writable, ..
             } => {
-                assert_eq!(String::from_utf8_lossy(&contents), "overlay\n");
+                assert_eq!(String::from_utf8_lossy(&contents.base), "overlay\n");
+                assert!(contents.dirty.is_empty());
                 assert!(writable);
             }
-            _ => panic!("expected File"),
+            _ => panic!("expected RootFsBackedFile"),
         }
     }
 
@@ -1426,9 +1430,12 @@ mod tests {
         let result = v
             .open_for_dispatch("/etc/hosts", false, false, false, true)
             .unwrap();
+        // A writable open of a rootfs file is promoted into the overlay, now
+        // as a RootFsBackedFile: the overlay entry shares the rootfs bytes
+        // (lazy copy-up) instead of eagerly cloning a Vec.
         match result {
-            OpenDispatchResult::File { writable, .. } => assert!(writable),
-            _ => panic!("expected File"),
+            OpenDispatchResult::RootFsBackedFile { writable, .. } => assert!(writable),
+            _ => panic!("expected RootFsBackedFile"),
         }
         // Promotion happened: the overlay now has /etc/hosts.
         assert!(matches!(
