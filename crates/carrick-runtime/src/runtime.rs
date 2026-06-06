@@ -2720,6 +2720,11 @@ impl ThreadRuntimeState {
                         // EINTR → re-poll on the remaining budget.
                     }
                     unsafe { libc::close(vf_read) };
+                    // The vfork child shared the parent's guest RAM until it
+                    // execve'd or exited. Its child-side identity stamp therefore
+                    // overwrote the shared EL1 shim identity page; restore the
+                    // parent's getpid/get*id fast-path values before resuming it.
+                    stamp_identity_page(engine, &kernel.dispatcher);
                 }
                 retval
             }
