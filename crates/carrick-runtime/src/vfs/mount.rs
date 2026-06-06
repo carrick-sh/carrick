@@ -10,7 +10,10 @@
 //! its own unit tests but is not yet consulted by the dispatcher.
 //! Step 2 (DevVfs) is the first real user.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+
+use parking_lot::RwLock;
 
 use super::Vfs;
 
@@ -20,6 +23,17 @@ use super::Vfs;
 /// [`mount`](Self::mount), which preserves the invariant.
 pub struct VfsMounts {
     entries: Vec<MountEntry>,
+    /// Canonicalised absolute guest paths whose synthetic mount has been
+    /// OVERRIDDEN by a guest mutation (unlink/write/rename of an
+    /// [`Vfs::overridable`] single-file injection like `/etc/services` or
+    /// `/etc/resolv.conf`). A path in this set is skipped during resolution so
+    /// it falls through to the writable rootfs/overlay everywhere — reads
+    /// included. Behind a lock for interior mutability: the mount table is
+    /// shared across vCPUs by `&self`, matching the rest of the fs path (the
+    /// overlay is likewise interior-mutable). The read-path check is a single
+    /// `HashSet` lookup on the already-canonicalised path, so the hot resolve
+    /// stays cheap.
+    overridden: RwLock<HashSet<String>>,
 }
 
 struct MountEntry {
@@ -37,6 +51,7 @@ impl VfsMounts {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            overridden: RwLock::new(HashSet::new()),
         }
     }
 
@@ -61,12 +76,37 @@ impl VfsMounts {
         self.entries.iter().any(|e| e.point == p)
     }
 
+    /// Record that `path` (resolved to its canonical absolute form) has been
+    /// OVERRIDDEN by a guest mutation: future resolution skips its synthetic
+    /// mount so the path falls through to the writable rootfs/overlay. A no-op
+    /// for a path that doesn't canonicalise (the caller has already resolved a
+    /// concrete path, so this only guards against malformed input).
+    pub fn override_path(&self, path: &str) {
+        if let Some(p) = canonicalise_path(path) {
+            self.overridden.write().insert(p);
+        }
+    }
+
+    /// True iff `path` (canonicalised) has been overridden by a guest mutation.
+    pub fn is_overridden(&self, path: &str) -> bool {
+        match canonicalise_path(path) {
+            Some(p) => self.overridden.read().contains(&p),
+            None => false,
+        }
+    }
+
     /// Resolve `path` to the mount that owns it. Returns the full
     /// absolute path back to the caller — most mounts (proc, sys)
     /// know their own mount point and already accept absolute paths,
     /// so stripping the prefix would just churn allocations.
+    ///
+    /// Returns `None` for an overridden path so it falls through to the
+    /// writable rootfs/overlay everywhere (reads included).
     pub fn resolve(&self, path: &str) -> Option<MountRef<'_>> {
         let path = canonicalise_path(path)?;
+        if self.overridden.read().contains(&path) {
+            return None;
+        }
         let idx = self
             .entries
             .iter()
@@ -78,9 +118,12 @@ impl VfsMounts {
     }
 
     /// Mutable variant of [`resolve`](Self::resolve) for ops that need
-    /// to write into the mount.
+    /// to write into the mount. Honours the override set like `resolve`.
     pub fn resolve_mut(&mut self, path: &str) -> Option<MountRefMut<'_>> {
         let path = canonicalise_path(path)?;
+        if self.overridden.read().contains(&path) {
+            return None;
+        }
         let idx = self
             .entries
             .iter()
@@ -371,6 +414,58 @@ mod tests {
         let r = m.resolve_relative("/etc/hosts").unwrap();
         assert_eq!(r.vfs.name(), "root");
         assert_eq!(r.relative, "etc/hosts");
+    }
+
+    #[test]
+    fn override_path_makes_resolution_fall_through() {
+        let mut m = VfsMounts::new();
+        m.mount("/etc/services", mount("etc_services"));
+        m.mount("/proc", mount("proc"));
+        m.mount("/", mount("root"));
+        // Before override, the synthetic mount owns the path.
+        assert_eq!(m.resolve("/etc/services").unwrap().vfs.name(), "etc_services");
+        assert!(!m.is_overridden("/etc/services"));
+
+        m.override_path("/etc/services");
+
+        // After override, the path falls through (resolve returns None — the
+        // dispatcher's rootfs/overlay branch then handles it).
+        assert!(m.is_overridden("/etc/services"));
+        assert!(m.resolve("/etc/services").is_none());
+        assert!(m.resolve_mut("/etc/services").is_none());
+        assert!(m.resolve_relative("/etc/services").is_none());
+
+        // A non-overridden path on a DIFFERENT mount is unaffected.
+        assert_eq!(m.resolve("/proc/cpuinfo").unwrap().vfs.name(), "proc");
+        // And an unrelated path that would route to root is unaffected.
+        assert_eq!(m.resolve("/etc/hosts").unwrap().vfs.name(), "root");
+    }
+
+    #[test]
+    fn override_is_canonicalised_for_store_and_lookup() {
+        let mut m = VfsMounts::new();
+        m.mount("/etc/services", mount("etc_services"));
+        m.mount("/", mount("root"));
+        // Store via a non-canonical form; lookup via the canonical form (and
+        // vice-versa) must agree.
+        m.override_path("/etc/./services");
+        assert!(m.is_overridden("/etc/services"));
+        assert!(m.resolve("/etc/foo/../services").is_none());
+        // A malformed path that doesn't canonicalise is simply not overridden.
+        assert!(!m.is_overridden("etc/services"));
+    }
+
+    #[test]
+    fn override_does_not_leak_to_a_subpath_or_sibling() {
+        let mut m = VfsMounts::new();
+        m.mount("/proc", mount("proc"));
+        m.mount("/", mount("root"));
+        m.override_path("/proc/cpuinfo");
+        // Only the exact path is overridden; siblings/subpaths on the same
+        // mount still resolve normally.
+        assert!(m.resolve("/proc/cpuinfo").is_none());
+        assert_eq!(m.resolve("/proc/meminfo").unwrap().vfs.name(), "proc");
+        assert_eq!(m.resolve("/proc").unwrap().vfs.name(), "proc");
     }
 
     #[test]

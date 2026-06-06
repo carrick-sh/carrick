@@ -347,6 +347,14 @@ pub trait Vfs: Send + Sync {
         Err(crate::linux_abi::LINUX_ENOSYS)
     }
 
+    /// True for single-file synthetic INJECTIONS that are merely defaults the
+    /// guest may override: a guest unlink/write/rename of the path detaches the
+    /// injection and falls through to the writable rootfs/overlay. Read-only
+    /// synthetic surfaces that are NOT guest-owned (/proc, /sys, /dev) return false.
+    fn overridable(&self) -> bool {
+        false
+    }
+
     fn watch_fd(&self, _path: &str) -> Result<i32, VfsError> {
         Err(crate::linux_abi::LINUX_ENOSYS)
     }
