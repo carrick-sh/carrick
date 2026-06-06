@@ -42,5 +42,8 @@ zerocopy.workspace = true
 applevisor.workspace = true
 applevisor-sys.workspace = true
 
+[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
+carrick-bsd = { path = "../carrick-bsd" }
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.build-dependencies]
 cc = "1"

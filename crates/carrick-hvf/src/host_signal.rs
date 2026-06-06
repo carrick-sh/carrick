@@ -85,22 +85,6 @@ use std::sync::{Arc, LazyLock};
 
 use crate::linux_abi::LINUX_SIGINT;
 
-/// Host fds at or above this value are reserved for Carrick internals. Guest
-/// Linux fds are capped at 1024 by the dispatcher, so putting the signal
-/// self-pipe here prevents fork reinitialization from closing a low host fd
-/// that the guest pipe/socket layer has reused.
-const HOST_INTERNAL_FD_MIN: i32 = 16 * 1024;
-/// Fallback floor used ONLY when the host's `RLIMIT_NOFILE` cannot reach
-/// [`HOST_INTERNAL_FD_MIN`] — e.g. a CI runner, or any host whose per-process fd
-/// cap is below 16K. 2048 still clears the guest fd range (the dispatcher caps
-/// guest fds at 1024) with margin, so internal fds keep out of the way of the
-/// host fds backing guest fds; we just can't reserve as wide a band on a
-/// constrained host. Normal hosts never reach this — they place internals at
-/// [`HOST_INTERNAL_FD_MIN`].
-const HOST_INTERNAL_FD_MIN_FALLBACK: i32 = 2048;
-const HOST_INTERNAL_FD_TARGET: libc::rlim_t = (HOST_INTERNAL_FD_MIN as libc::rlim_t) + 16;
-static NOFILE_RAISE_ATTEMPTED: AtomicU8 = AtomicU8::new(0);
-
 /// `(linux_signum, host_signum)` pairs that DIFFER between Linux and macOS.
 /// Signals not listed (HUP/INT/QUIT/ILL/TRAP/ABRT/FPE/KILL/SEGV/PIPE/ALRM/
 /// TERM/TTIN/TTOU/XCPU/XFSZ/VTALRM/PROF/WINCH) share the same number on both
@@ -788,58 +772,7 @@ fn close_raw_fds(fds: &[i32; 2]) {
     }
 }
 
-fn duplicate_internal_fd(fd: i32) -> Option<i32> {
-    ensure_internal_fd_range();
-    // Prefer the high internal range. On a host whose RLIMIT_NOFILE cannot reach
-    // it, `F_DUPFD_CLOEXEC` returns EMFILE for every fd >= HOST_INTERNAL_FD_MIN;
-    // fall back to a lower floor that still clears the guest fd range, so carrick
-    // keeps working (and CI runners with a low fd cap stay green) instead of
-    // failing every internal-pipe allocation.
-    for floor in [HOST_INTERNAL_FD_MIN, HOST_INTERNAL_FD_MIN_FALLBACK] {
-        let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
-        if duped >= 0 {
-            return Some(duped);
-        }
-    }
-    None
-}
-
-pub fn relocate_internal_fd(fd: i32) -> i32 {
-    let Some(duped) = duplicate_internal_fd(fd) else {
-        return fd;
-    };
-    unsafe { libc::close(fd) };
-    duped
-}
-
-fn ensure_internal_fd_range() {
-    if NOFILE_RAISE_ATTEMPTED
-        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
-        return;
-    }
-    let mut limit = unsafe { limit.assume_init() };
-    if limit.rlim_cur >= HOST_INTERNAL_FD_TARGET {
-        return;
-    }
-    let desired = if limit.rlim_max == libc::RLIM_INFINITY {
-        HOST_INTERNAL_FD_TARGET
-    } else {
-        HOST_INTERNAL_FD_TARGET.min(limit.rlim_max)
-    };
-    if desired > limit.rlim_cur {
-        limit.rlim_cur = desired;
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
-}
+pub use carrick_bsd::{duplicate_internal_fd, relocate_internal_fd};
 
 /// fork(2) does not inherit a kqueue, and the inherited self-pipe is shared
 /// with the parent (cross-process spurious wakes). Give the child a fresh
