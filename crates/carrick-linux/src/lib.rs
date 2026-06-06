@@ -10,9 +10,9 @@
 pub mod errno;
 
 #[cfg(target_os = "linux")]
-pub mod kvm;
-#[cfg(target_os = "linux")]
 pub mod guest_setup;
+#[cfg(target_os = "linux")]
+pub mod kvm;
 #[cfg(target_os = "linux")]
 pub mod trap_engine;
 

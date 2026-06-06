@@ -1,0 +1,149 @@
+//! KvmTrapEngine: drives a `KvmVcpu` to implement the `carrick-hal`
+//! `SyscallTrap` contract. `next_syscall` runs KVM_RUN until the EL1 vector's
+//! sentinel store surfaces as `VcpuExit::MmioWrite { gpa: SENTINEL_GPA, .. }`,
+//! reads x0..x5,x8 into an `Aarch64SyscallFrame`, and returns it.
+use carrick_abi::LinuxSiginfo;
+use carrick_guest_mem::Aarch64SyscallFrame;
+use carrick_hal::{ForkOutcome, HvVcpu, Reg, SyscallTrap, TrapError, VcpuExit};
+use carrick_mem::memory::AddressSpace;
+
+use crate::guest_setup::{BroughtUp, GuestRam, SENTINEL_GPA, bring_up};
+use crate::kvm::{KvmVcpu, KvmVm};
+
+/// AArch64 `svc #0` is 4 bytes; after the syscall the guest PC advances past it.
+const SVC_INSTR_LEN: u64 = 4;
+
+pub struct KvmTrapEngine {
+    _vm: KvmVm,
+    vcpu: KvmVcpu,
+    _ram: GuestRam,
+    /// ELR_EL1 captured at the trap, i.e. the EL0 PC just after the `svc`.
+    last_elr: u64,
+}
+
+impl KvmTrapEngine {
+    /// Bring up the guest from a freestanding ELF image and return an engine
+    /// parked at the EL1 trampoline (first `next_syscall` runs into EL0).
+    pub fn new(image: &AddressSpace) -> Result<Self, TrapError> {
+        let BroughtUp {
+            vm,
+            vcpu,
+            ram,
+            entry: _,
+        } = bring_up(image).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        Ok(Self {
+            _vm: vm,
+            vcpu,
+            _ram: ram,
+            last_elr: 0,
+        })
+    }
+}
+
+// NOTE: KvmTrapEngine implements SyscallTrap only. The runtime's SplitView
+// (carrick-runtime runtime.rs:3701) pairs it with a GuestMemory over the same
+// host-backed guest RAM so the trapped write(1,"ok\n",3) reads its buffer
+// through the existing dispatch — proving the seam, not a toy path.
+
+impl SyscallTrap for KvmTrapEngine {
+    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
+        loop {
+            match self
+                .vcpu
+                .run()
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?
+            {
+                VcpuExit::MmioWrite { gpa, .. } if gpa == SENTINEL_GPA => {
+                    // The EL0 `svc` re-entered EL1 and hit the sentinel store.
+                    // ELR_EL1 holds the EL0 PC just after the `svc`.
+                    self.last_elr = self
+                        .vcpu
+                        .elr_el1()
+                        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+                    return Ok(Some(self.read_frame()?));
+                }
+                VcpuExit::MmioWrite { gpa, data, len } => {
+                    return Err(TrapError::UnexpectedExit {
+                        reason: format!(
+                            "MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len}"
+                        ),
+                    });
+                }
+                VcpuExit::Halt => return Ok(None),
+                VcpuExit::Kicked => return Ok(None),
+                VcpuExit::Exception { syndrome, far } => {
+                    return Err(TrapError::UnexpectedException {
+                        syndrome,
+                        virtual_address: far,
+                        physical_address: far,
+                    });
+                }
+            }
+        }
+    }
+
+    fn current_pc(&self) -> Result<u64, TrapError> {
+        self.vcpu
+            .reg(Reg::Pc)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+    }
+
+    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+        self.vcpu
+            .set_reg(Reg::X(0), return_value as u64)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let resume = self.last_elr.wrapping_add(SVC_INSTR_LEN);
+        self.vcpu
+            .set_elr_el1(resume)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        Ok(())
+    }
+
+    fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inject_signal(
+        &mut self,
+        _signum: i32,
+        _handler: u64,
+        _sa_restorer: u64,
+        _pending_syscall_retval: Option<i64>,
+        _interrupted_pc: Option<u64>,
+        _altstack: Option<(u64, u64)>,
+        _saved_sigmask: u64,
+        _fault_siginfo: Option<(i32, u64)>,
+        _queued_siginfo: Option<LinuxSiginfo>,
+        _restart_syscall: bool,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+}
+
+impl KvmTrapEngine {
+    fn read_frame(&self) -> Result<Aarch64SyscallFrame, TrapError> {
+        let g = |n: u32| {
+            self.vcpu
+                .reg(Reg::X(n))
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        };
+        Ok(Aarch64SyscallFrame {
+            x0: g(0)?,
+            x1: g(1)?,
+            x2: g(2)?,
+            x3: g(3)?,
+            x4: g(4)?,
+            x5: g(5)?,
+            x8: g(8)?,
+        })
+    }
+}
