@@ -3,6 +3,7 @@
 //! which performs its own single-threaded fork — so the server's multi-thread
 //! tokio runtime never forks a guest in-process.
 
+use carrick_runtime::container;
 use std::process::Command;
 
 /// Persist a `Created` entry by invoking `carrick create --name <name> <image>
@@ -59,4 +60,19 @@ pub(crate) fn create_container(
         anyhow::bail!("carrick create produced no container id");
     }
     Ok(id)
+}
+
+/// Start a previously-created container by relaunching it: `carrick start <id>`.
+/// Resolves the server-facing id/name to carrick's internal id first.
+pub(crate) fn start_container(id: &str) -> anyhow::Result<()> {
+    let real = container::resolve(id).map_err(|e| anyhow::anyhow!(e))?;
+    // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
+    // itself (current_exe) with operator-controlled API inputs as separate argv
+    // entries, never a shell; a CLI that re-execs itself is expected here.
+    let exe = std::env::current_exe()?;
+    let out = Command::new(exe).arg("start").arg(&real).output()?;
+    if !out.status.success() {
+        anyhow::bail!("carrick start failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
 }
