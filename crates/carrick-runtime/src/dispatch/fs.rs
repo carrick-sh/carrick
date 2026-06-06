@@ -327,83 +327,6 @@ fn fd_open_path_inserts() -> usize {
     FD_OPEN_PATH_INSERTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-// TODO: this test module sits before the large `impl SyscallDispatcher`
-// below; relocate it to end-of-file and drop this allow (tracked follow-up).
-#[allow(clippy::items_after_test_module)]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vfs_open_fallthrough_does_not_build_open_context() {
-        fd_helpers::reset_open_fd_numbers_calls();
-
-        let dispatcher = SyscallDispatcher::new();
-        let outcome = dispatcher.try_vfs_open("/tmp/not-a-vfs-mount", LINUX_O_RDWR, 0, 0);
-
-        assert_eq!(outcome, VfsOpenAttempt::FallThrough);
-        assert_eq!(
-            fd_helpers::open_fd_numbers_calls(),
-            0,
-            "unmounted rootfs/overlay opens should fall through before building OpenContext"
-        );
-    }
-
-    #[test]
-    fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
-        reset_fd_open_path_inserts();
-
-        let backend = crate::fs_backend::MemoryBackend::new();
-        backend
-            .set_file_contents("/regular.bin", b"payload".to_vec())
-            .unwrap();
-        let reporter = CompatReporter::default();
-        let mut dispatcher = SyscallDispatcher::new();
-        dispatcher.set_fs_backend(Box::new(backend));
-        let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
-        memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
-
-        assert_eq!(
-            dispatcher
-                .dispatch(
-                    SyscallRequest::new(
-                        56,
-                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]),
-                    ),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 3 }
-        );
-
-        memory.write_bytes(0x4100, b"/proc/self/fd/3\0").unwrap();
-        assert_eq!(
-            dispatcher
-                .dispatch(
-                    SyscallRequest::new(
-                        78,
-                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4100, 0x4200, 64, 0, 0]),
-                    ),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 12 }
-        );
-        assert_eq!(
-            memory.read_bytes(0x4200, 12).unwrap(),
-            b"/regular.bin".to_vec()
-        );
-        assert_eq!(
-            fd_open_path_inserts(),
-            0,
-            "fd_open_paths insertions should be 0 for memory OpenDescription::File"
-        );
-        assert!(reporter.finish().unhandled_syscalls.is_empty());
-    }
-}
-
 fn proc_self_fd_number(path: &str) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
@@ -7433,5 +7356,79 @@ impl SyscallDispatcher {
 
         }
 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vfs_open_fallthrough_does_not_build_open_context() {
+        fd_helpers::reset_open_fd_numbers_calls();
+
+        let dispatcher = SyscallDispatcher::new();
+        let outcome = dispatcher.try_vfs_open("/tmp/not-a-vfs-mount", LINUX_O_RDWR, 0, 0);
+
+        assert_eq!(outcome, VfsOpenAttempt::FallThrough);
+        assert_eq!(
+            fd_helpers::open_fd_numbers_calls(),
+            0,
+            "unmounted rootfs/overlay opens should fall through before building OpenContext"
+        );
+    }
+
+    #[test]
+    fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
+        reset_fd_open_path_inserts();
+
+        let backend = crate::fs_backend::MemoryBackend::new();
+        backend
+            .set_file_contents("/regular.bin", b"payload".to_vec())
+            .unwrap();
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+        memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        56,
+                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 3 }
+        );
+
+        memory.write_bytes(0x4100, b"/proc/self/fd/3\0").unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        78,
+                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4100, 0x4200, 64, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 12 }
+        );
+        assert_eq!(
+            memory.read_bytes(0x4200, 12).unwrap(),
+            b"/regular.bin".to_vec()
+        );
+        assert_eq!(
+            fd_open_path_inserts(),
+            0,
+            "fd_open_paths insertions should be 0 for memory OpenDescription::File"
+        );
+        assert!(reporter.finish().unhandled_syscalls.is_empty());
     }
 }
