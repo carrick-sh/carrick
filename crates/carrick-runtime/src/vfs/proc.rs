@@ -95,6 +95,13 @@ pub struct SyntheticProcContext {
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     pub brk_current: u64,
     pub mmap_next: u64,
+    pub ruid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub rgid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub groups: Vec<u32>,
     /// Signal-disposition masks for `/proc/<pid>/status` (bit `signum-1`).
     pub sig_ignored: u64,
     pub sig_caught: u64,
@@ -1469,6 +1476,13 @@ impl Vfs for ProcVfs {
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
+            ruid: ctx.ruid,
+            euid: ctx.euid,
+            suid: ctx.suid,
+            rgid: ctx.rgid,
+            egid: ctx.egid,
+            sgid: ctx.sgid,
+            groups: ctx.groups.unwrap_or(&[]).to_vec(),
             sig_ignored: ctx.sig_ignored,
             sig_caught: ctx.sig_caught,
             sig_shdpnd: ctx.sig_shdpnd,
@@ -1812,6 +1826,15 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     } else {
         0
     };
+    let groups = if ctx.groups.is_empty() {
+        String::new()
+    } else {
+        ctx.groups
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     // Capabilities: report the modeled set (Docker default 00000000a80425fb,
     // or a full set inside a freshly-created user namespace), NOT the all-zero
     // set — capability-probing tools (apt/dpkg/setpriv) refuse to proceed if
@@ -1826,10 +1849,10 @@ Ngid:\t0\n\
 Pid:\t{pid}\n\
 PPid:\t{ppid}\n\
 TracerPid:\t0\n\
-Uid:\t0\t0\t0\t0\n\
-Gid:\t0\t0\t0\t0\n\
+Uid:\t{ruid}\t{euid}\t{suid}\t{fsuid}\n\
+Gid:\t{rgid}\t{egid}\t{sgid}\t{fsgid}\n\
 FDSize:\t256\n\
-Groups:\t\n\
+Groups:\t{groups}\n\
 VmPeak:\t{peak_kb:>8} kB\n\
 VmSize:\t{vsize_kb:>8} kB\n\
 VmLck:\t       0 kB\n\
@@ -1865,7 +1888,15 @@ Cpus_allowed_list:\t{cpus_list}\n\
 Mems_allowed:\t1\n\
 Mems_allowed_list:\t0\n\
 voluntary_ctxt_switches:\t0\n\
-nonvoluntary_ctxt_switches:\t0\n"
+nonvoluntary_ctxt_switches:\t0\n",
+        ruid = ctx.ruid,
+        euid = ctx.euid,
+        suid = ctx.suid,
+        fsuid = ctx.euid,
+        rgid = ctx.rgid,
+        egid = ctx.egid,
+        sgid = ctx.sgid,
+        fsgid = ctx.egid,
     )
 }
 
@@ -2597,6 +2628,7 @@ mod tests {
             sig_ignored: 0,
             sig_caught: 0,
             sig_shdpnd: 0,
+            ..SyntheticProcContext::default()
         };
         let maps = String::from_utf8(synthetic_file("/proc/self/maps", &ctx).unwrap()).unwrap();
         assert!(maps.contains("[heap]"));
@@ -2749,6 +2781,24 @@ mod tests {
             .parse()
             .unwrap();
         assert!(kb < 64 * 1024 * 1024, "VmSize should be sane, got {kb} kB");
+    }
+
+    #[test]
+    fn self_status_reflects_live_credentials_and_groups() {
+        let ctx = SyntheticProcContext {
+            ruid: 101,
+            euid: 102,
+            suid: 103,
+            rgid: 201,
+            egid: 202,
+            sgid: 203,
+            groups: vec![0, 1, 2, 3],
+            ..demo_ctx()
+        };
+        let s = String::from_utf8(synthetic_file("/proc/self/status", &ctx).unwrap()).unwrap();
+        assert!(s.contains("Uid:\t101\t102\t103\t102\n"), "status: {s}");
+        assert!(s.contains("Gid:\t201\t202\t203\t202\n"), "status: {s}");
+        assert!(s.contains("Groups:\t0 1 2 3\n"), "status: {s}");
     }
 
     #[test]
@@ -3160,6 +3210,7 @@ mod tests {
             sig_ignored: 0,
             sig_caught: 0,
             sig_shdpnd: 0,
+            ..SyntheticProcContext::default()
         }
     }
 

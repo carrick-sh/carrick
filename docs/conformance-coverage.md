@@ -124,6 +124,7 @@ underlying gap got fixed):
 | SIGCHLD delivered to a parent handler on child exit; reap still works; SIG_IGN auto-reaps | ✅ `sigchld` | (framework heartbeat; wait4) |
 | Cross-process signal (child→parent SIGUSR1) runs handler, not default; Linux↔macOS signum xlate | ✅ `xsignal` | tgkill01, tkill01/02, kill09 |
 | kill targeting: self / -pgid / 0 broadcasts to current pgrp; kill(bogus,0)→ESRCH; tkill/tgkill arg validation | ✅ `killtarget` | kill02/10/11/12, tkill02, tgkill02/03 |
+| **`tkill(2)`/`tgkill(2)` delivery queues `SI_TKILL` siginfo with sender pid/uid for the target thread, instead of synthesizing `SI_USER`; glibc's setxid rendezvous accepts the internal RT signal and runs the per-thread credential syscall** | 🧪 `syscall_thread::tgkill_to_sibling_queues_si_tkill_siginfo` | Go `syscall.TestSetuidEtc` |
 | PID-namespace init may call idempotent `setpgid(0,0)`/`setpgrp()` successfully while explicit `setpgid(1,1)` still fails `EPERM` for a session leader; the ns-pgid 1 host mapping refreshes after a successful init self-group change | 🧪 `proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid` | kill02, setpgid01 |
 | Cross-thread signal to a thread blocked in futex/join runs handler | ✅ `xthreadsig` | (Go async-preempt class) |
 | Per-thread `sigaltstack` storage (not clobbered across threads) | ✅ `altstacktid` | sigaltstack01 |
@@ -169,6 +170,7 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | **/proc/self/status Pid/Tgid agree with getpid()/gettid() (carrick hardcoded Pid:1 while getpid returned process::id())** | ✅ `procselfpid` | gettid01 |
+| **`/proc/self/status` renders live real/effective/saved/fs uid+gid and supplementary groups from Carrick's credential model, matching `getresuid`/`getresgid`/`getgroups` after set*id and setgroups transitions** | 🧪 `vfs::proc::tests::self_status_reflects_live_credentials_and_groups` | Go `syscall.TestSetuidEtc` |
 | **waitpid error edges: pid<-1 naming a nonexistent process group → ESRCH (carrick forwarded to the host which gives EINVAL); invalid options → EINVAL; no children → ECHILD** | ✅ `waitpgid` | waitpid04 |
 | **setpgid session-leader rule under PID namespace translation: a namespace-visible session leader, including pid 1 when the host SID differs from the host PGID, fails `setpgid()` with EPERM before Carrick delegates to Darwin; forked non-leader children can still create/join process groups** | 🧪 `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid` + ✅ `setpgidparentgroup` / `proclife` | setpgid01 |
 | **execve from a multithreaded process replaces the whole thread group: sibling guest threads are terminated before the HVF VM is rebuilt, and the new image starts with `Threads: 1`** | ✅ `execthreads` + 🧪 `thread::tests::remove_all_except_keeps_exec_owner_live` | Go `syscall.TestExec` |

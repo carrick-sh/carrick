@@ -630,6 +630,19 @@ impl SyscallDispatcher {
         front
     }
 
+    fn record_tkill_siginfo(&self, tid: crate::thread::ThreadId, signum: i32) {
+        if signum == 0 {
+            return;
+        }
+        let info = LinuxSiginfo::kill(
+            signum,
+            crate::linux_abi::LINUX_SI_TKILL,
+            crate::namespace::pid::self_ns_pid() as i32,
+            self.cred_snapshot().ruid,
+        );
+        self.record_pending_siginfo(tid, signum, info);
+    }
+
     /// Drain cross-process explicit signals queued for this host process into
     /// dispatcher pending state for `tid`, preserving siginfo payloads. Normal
     /// async delivery and synchronous waits (`rt_sigtimedwait`/sigwait) both use
@@ -1450,10 +1463,12 @@ impl SyscallDispatcher {
         let t = ctx.thread.as_ref()?;
         let target = tid as crate::thread::ThreadId;
         if i64::from(t.tid) == tid {
+            self.record_tkill_siginfo(t.tid, signum as i32);
             return Some(self.raise_self(t.tid, signum));
         }
         if t.registry.is_live(target) {
             let signum_i32 = signum as i32;
+            self.record_tkill_siginfo(target, signum_i32);
             if self.signal_blocked(target, signum_i32) {
                 self.mark_signal_pending(target, signum_i32);
                 return Some(DispatchOutcome::Returned { value: 0 });
