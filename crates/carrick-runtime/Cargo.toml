@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
+default = ["platform-macos"]
 # Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
 # purpose: the binary (carrick-cli) is the single control point. carrick-cli's
 # default enables it for normal builds; dependents that use carrick-runtime as a
@@ -31,11 +32,20 @@ trace-syscalls = ["carrick-hvf/trace-syscalls"]
 debug-stats = ["carrick-hvf/debug-stats"]
 trace-elf = ["carrick-mem/trace-elf"]
 
+# Platform backend selection (exactly one active at a time). carrick-cli's
+# `default` enables `platform-macos`; a `platform-linux` build links NO HVF.
+# The `dep:` syntax keeps the optional crates from auto-becoming implicit
+# features, so the only way to pull in carrick-hvf is via `platform-macos`.
+platform-macos = ["dep:carrick-hvf", "dep:carrick-bsd"]
+platform-linux = ["dep:carrick-linux"]
+
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
-carrick-hvf = { path = "../carrick-hvf" }
+carrick-hvf = { path = "../carrick-hvf", optional = true }
+carrick-bsd = { path = "../carrick-bsd", optional = true }
+carrick-linux = { path = "../carrick-linux", optional = true }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
 anyhow.workspace = true
@@ -69,8 +79,6 @@ carrick-spec = { path = "../carrick-spec" }
 applevisor.workspace = true
 applevisor-sys.workspace = true
 
-[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
-carrick-bsd = { path = "../carrick-bsd" }
 
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }

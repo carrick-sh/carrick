@@ -117,8 +117,7 @@ impl EventMultiplexer for KqueueMultiplexer {
             .wait(&[], &mut events, timeout_ts.as_ref())
             .map_err(OsError::from_raw)?;
 
-        for i in 0..n {
-            let ev = events[i];
+        for ev in events.iter().take(n).copied() {
             let token = ev.udata_u64();
             let filter = ev.filter();
             let flags = ev.flags();

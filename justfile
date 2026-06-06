@@ -83,3 +83,12 @@ sign:
 # `just bench` = quick profile; `just bench full` = full profile.
 bench PROFILE="quick":
     ./scripts/measure-perf.sh {{PROFILE}}
+
+# Cross-compile check for platform-linux target (L1 check).
+check-linux:
+    cargo check --no-default-features --features platform-linux --target aarch64-unknown-linux-gnu -p carrick-runtime
+    cargo check --no-default-features --target aarch64-unknown-linux-gnu -p carrick-linux
+
+# Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
+closure-linux:
+    ./scripts/assert-platform-linux-closure.sh
