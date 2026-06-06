@@ -252,11 +252,17 @@ Progress:
 - [ ] Add tests for split or invalid guest iovecs that must fall back or fail correctly.
 - [ ] Add a guest-memory borrowed-iovec API with explicit lifetime and permission checks.
 - [ ] Convert `readv`/`preadv`/`pwritev` host-file paths to use host vector syscalls when safe.
-- [ ] Remove double guest reads in `pwritev`.
+- [x] Remove double guest reads in `pwritev`.
 - [ ] Avoid the extra blocking-write clone where ownership can be transferred safely.
 - [ ] Run focused I/O tests and relevant conformance probes.
 - [ ] Record syscall-count and wall-time before/after evidence.
 - [ ] Commit as one or more logical slices.
+
+Progress:
+
+- 2026-06-06: Started Milestone 2 with the explicitly listed `pwritev` duplicate-read removal. Added RED integration test `syscall_fs::pwritev_host_file_reads_each_guest_iovec_once`; pre-fix behavior read the two watched payload iovecs four times total.
+- 2026-06-06: Implemented single-pass `pwritev` staging in `crates/carrick-runtime/src/dispatch/fs.rs`. The handler still validates guest iovecs before stream/open-description errors, but reuses the staged payload buffers for HostFile writes instead of rereading each segment.
+- 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime --test integration pwritev_host_file_reads_each_guest_iovec_once -- --nocapture`, `cargo test -p carrick-runtime --test integration pwritev_bootstrap_validates_iovecs_and_reports_stream_errors -- --nocapture`, and `cargo fmt --all -- --check`.
 
 ### Milestone 3: Replace Whole-File Hot Paths with Streaming or Dirty-Range Updates
 
