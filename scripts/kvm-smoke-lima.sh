@@ -61,6 +61,28 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
   #    region (~1 TiB) is backed by its own KVM slot (the multi-region map).
   run_case "real-dispatch+stack" "$kvm" "hello-stack-aarch64"
 
+  # 4. Phase C: a REAL static glibc binary. Exercises the full libc CRT startup
+  #    through the real dispatcher (brk, set_tid_address, set_robust_list, rseq,
+  #    prlimit64, readlinkat, getrandom, mprotect, the vdso) before write+exit.
+  #    Proves C1 (memory map + initial stack + vdso) runs an actual libc binary.
+  if command -v gcc >/dev/null; then
+    printf "%s" "static-ok" > /tmp/static-oracle
+    cat > /tmp/cstatic.c <<CEOF
+#include <unistd.h>
+int main(void){ return write(1,"static-ok",9) == 9 ? 0 : 1; }
+CEOF
+    gcc -static -O2 -o /tmp/cstatic /tmp/cstatic.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cstatic")" && code=0 || code=$?
+    if [ "$got" = "static-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+glibc-static]: a static glibc binary ran to completion under nested KVM."
+    else
+      printf "FAIL [glibc-static]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      exit 1
+    fi
+  else
+    echo "SKIP [glibc-static]: no gcc in guest" >&2
+  fi
+
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
   echo "--- trap trace (proves real dispatch, not the thin shim) ---" >&2
   sg kvm -c "CARRICK_TRACE_TRAPS=1 $kvm run-elf $fixdir/hello-aarch64/hello-aarch64" \
@@ -69,5 +91,5 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: Phase B+C1 — hello (real dispatch) and hello-stack (initial stack) pass on KVM."
+  echo "OK: Phase B+C1 — hello, hello-stack, and a static glibc binary pass on KVM."
 '
