@@ -223,8 +223,8 @@ Acceptance:
 - [x] Implement the fresh-anonymous fast path.
 - [x] Run the focused mmap tests.
 - [x] Run fork and mmap pressure probes.
-- [ ] Record before/after numbers in a repo-local perf result artifact.
-- [ ] Commit the test/probe and runtime fix as a logical slice.
+- [x] Record before/after numbers in a repo-local perf result artifact.
+- [x] Commit the test/probe and runtime fix as a logical slice.
 
 Progress:
 
@@ -234,6 +234,10 @@ Progress:
 - 2026-06-06: Added `dispatch::mem::tests::reused_private_anonymous_mmap_zeroes_backing_without_zero_write` and `conformance-probes/src/bin/perf_mmap_churn.rs`, then registered `mmap_churn` in the perf case registry.
 - 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime dispatch::mem::tests --lib -- --nocapture` (5 passed), `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture` (4 passed), `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin perf_mmap_churn`, and `cargo fmt --all -- --check`.
 - 2026-06-06: Pressure probes passed after `just build`: `scripts/run-probe.sh mmapzerofill` MATCH (`anon_mmap_is_zero_filled=true`), `scripts/run-probe.sh mmaprecl` MATCH (`churn_ok=true`, `reuse_zero=true`), and `scripts/run-probe.sh forkcow` MATCH (`mmap_isolated=true` plus data/bss/heap isolation).
+- 2026-06-06: Committed runtime/test/probe slice as `14999846d766db29f7333fffa47d5d103914f26b` (`perf(mem): skip fresh anon mmap zero writes`).
+- 2026-06-06: Before/after `perf_mmap_churn` evidence for 64 untouched 8 MiB private anonymous mappings:
+  - Before commit `be9d01a`: manual Carrick samples `54937.750`, `57827.458`, `55593.333` us.
+  - After commit `14999846`: `CARRICK_PERF_FILTER=mmap_churn CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 just bench quick` wrote `docs/perf-results/2026-06-05-memory.jsonl`; Carrick p50 `831.708` us, p95 `897.625` us; Docker p50 `60.667` us, p95 `197.750` us (Docker row marked noisy).
 
 ### Milestone 2: Add Borrowed Iovec Host I/O
 
