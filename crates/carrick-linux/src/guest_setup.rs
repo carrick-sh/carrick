@@ -148,7 +148,9 @@ impl GuestRam {
         let off = gpa
             .checked_sub(self.base)
             .filter(|o| (*o as usize).saturating_add(len) <= self.len)
-            .ok_or_else(|| OsError::new(format!("kvm: read gpa 0x{gpa:x}+{len} out of guest RAM")))?;
+            .ok_or_else(|| {
+                OsError::new(format!("kvm: read gpa 0x{gpa:x}+{len} out of guest RAM"))
+            })?;
         let mut out = vec![0u8; len];
         // SAFETY: bounds checked above; host points at `len` readable bytes.
         unsafe {
@@ -251,8 +253,7 @@ fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsErr
     // never reach stage-2 / KVM_EXIT_MMIO — wedging the first guest syscall.
     // The guest enters EL0 with PSTATE.PAN=0 (SPSR_EL1 below), so SPAN=1 keeps
     // PAN=0 through the svc trap and the sentinel store reaches the host.
-    let sctlr: u64 =
-        (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 23) | (1 << 26) | 1;
+    let sctlr: u64 = (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 23) | (1 << 26) | 1;
     vcpu.set_sys_reg(SysReg::Sctlr, sctlr)?;
 
     // FP/SIMD on (CPACR_EL1.FPEN = 0b11) so guest NEON memset doesn't trap.
