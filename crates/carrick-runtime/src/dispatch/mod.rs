@@ -2381,12 +2381,11 @@ impl SyscallDispatcher {
 /// whenever the payload is a Linux UAPI struct: that path is bound to
 /// `KernelAbi::ABI_SIZE` so it CAN'T accidentally over-write a caller's
 /// stack buffer the way an ad-hoc `&[u8]` from `as_bytes()` can.
-/// Apply `bytes` to a `Vec<u8>` file backing at `*offset`, growing the
-/// vector (zero-filled if there's a gap) and advancing the cursor. This
-/// is the in-memory mirror of `vfs_write`: it makes a writable
-/// overlay-backed File behave like a real tmpfs.
+/// Apply `bytes` to an in-memory file backing at `*offset`, growing it
+/// zero-filled if there's a gap and advancing the cursor. Dense files update
+/// their vector; rootfs-backed files update only their dirty ranges.
 fn write_into_file_contents(
-    contents: &mut Vec<u8>,
+    contents: &mut FileContents,
     offset: &mut usize,
     bytes: &[u8],
 ) -> Result<(), i32> {
@@ -2394,10 +2393,7 @@ fn write_into_file_contents(
     if end as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
         return Err(LINUX_EFBIG);
     }
-    if end > contents.len() {
-        contents.resize(end, 0);
-    }
-    contents[*offset..end].copy_from_slice(bytes);
+    contents.write_at(*offset, bytes)?;
     *offset = end;
     Ok(())
 }
@@ -3924,6 +3920,39 @@ fn read_from_contents_at(
             .write_bytes(iov_base, &remaining[..read_len])
             .is_err()
         {
+            return Ok(total);
+        }
+        offset += read_len;
+        total = total
+            .checked_add(read_len)
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        if read_len < iov_len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+fn read_from_file_contents_at(
+    memory: &mut impl GuestMemory,
+    contents: &FileContents,
+    mut offset: usize,
+    iovecs: &[LinuxIovec],
+) -> Result<usize, DispatchError> {
+    let mut total = 0usize;
+    for iovec in iovecs {
+        let iov_base = iovec.iov_base;
+        let iov_len = usize::try_from(iovec.iov_len)
+            .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+        if iov_len == 0 {
+            continue;
+        }
+        let bytes = contents.read_at(offset, iov_len);
+        let read_len = bytes.len();
+        if read_len == 0 {
+            break;
+        }
+        if memory.write_bytes(iov_base, &bytes).is_err() {
             return Ok(total);
         }
         offset += read_len;

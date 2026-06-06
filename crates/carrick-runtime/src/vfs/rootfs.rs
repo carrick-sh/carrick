@@ -44,6 +44,7 @@ use crate::linux_abi::{
     LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
 };
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
+use std::sync::Arc;
 
 use super::{
     DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, Vfs, VfsError,
@@ -69,6 +70,11 @@ pub enum OpenDispatchResult {
     File {
         metadata: RootFsMetadata,
         contents: Vec<u8>,
+        writable: bool,
+    },
+    RootFsBackedFile {
+        metadata: RootFsMetadata,
+        contents: Arc<[u8]>,
         writable: bool,
     },
     /// A regular file backed by a REAL host fd (disk-backed overlay,
@@ -319,30 +325,44 @@ impl RootFsVfs {
                     // INVARIANT: reaching this branch required reading metadata
                     // from self.rootfs above, so it is necessarily Some here.
                     #[allow(clippy::expect_used)]
-                    let mut contents = self
+                    let rootfs = self
                         .rootfs
                         .as_ref()
-                        .expect("rootfs metadata implies rootfs")
-                        .read(path)
-                        .map_err(crate::dispatch::rootfs_errno)?;
-                    // Write-promotion: if the caller asked for write
-                    // access, copy the rootfs file into the overlay so
-                    // subsequent writes land in mutable storage.
-                    let writable = if writable_request {
+                        .expect("rootfs metadata implies rootfs");
+                    if writable_request {
                         if want_trunc {
-                            contents.clear();
+                            self.overlay
+                                .set_file_contents(path, Vec::new())
+                                .map_err(|_| LINUX_EINVAL)?;
+                            let md = RootFsMetadata {
+                                path: metadata.path.clone(),
+                                kind: metadata.kind,
+                                mode: metadata.mode,
+                                size: 0,
+                            };
+                            return Ok(OpenDispatchResult::File {
+                                metadata: md,
+                                contents: Vec::new(),
+                                writable: true,
+                            });
                         }
+                        let contents = rootfs
+                            .read_shared(path)
+                            .map_err(crate::dispatch::rootfs_errno)?;
                         self.overlay
-                            .set_file_contents(path, contents.clone())
+                            .create_file_from_rootfs(path, Arc::clone(&contents), metadata.mode)
                             .map_err(|_| LINUX_EINVAL)?;
-                        true
-                    } else {
-                        false
-                    };
+                        return Ok(OpenDispatchResult::RootFsBackedFile {
+                            metadata,
+                            contents,
+                            writable: true,
+                        });
+                    }
+                    let contents = rootfs.read(path).map_err(crate::dispatch::rootfs_errno)?;
                     Ok(OpenDispatchResult::File {
                         metadata,
                         contents,
-                        writable,
+                        writable: false,
                     })
                 }
                 RootFsEntryKind::Directory => {

@@ -620,7 +620,7 @@ impl SyscallDispatcher {
                     mode: create_mode,
                     size: 0,
                 },
-                contents: Vec::new(),
+                contents: FileContents::dense(Vec::new()),
                 offset: 0,
                 base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                 writable: true,
@@ -876,6 +876,9 @@ impl SyscallDispatcher {
             Ok(crate::vfs::rootfs::OpenDispatchResult::File { contents, .. }) => {
                 crate::probes::path_open(&path, contents.len() as u64, 0);
             }
+            Ok(crate::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { metadata, .. }) => {
+                crate::probes::path_open(&path, metadata.size as u64, 0);
+            }
             Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { metadata, .. }) => {
                 crate::probes::path_open(&path, metadata.size as u64, 0);
             }
@@ -903,6 +906,9 @@ impl SyscallDispatcher {
                 Ok(crate::vfs::rootfs::OpenDispatchResult::File { .. }) => {
                     return Ok(LINUX_ENOTDIR.into());
                 }
+                Ok(crate::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { .. }) => {
+                    return Ok(LINUX_ENOTDIR.into());
+                }
                 _ => {}
             }
         }
@@ -918,7 +924,22 @@ impl SyscallDispatcher {
                 OpenDescription::File {
                     path,
                     metadata,
-                    contents,
+                    contents: FileContents::dense(contents),
+                    offset: 0,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                    writable,
+                },
+                None,
+            ),
+            Ok(crate::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
+                metadata,
+                contents,
+                writable,
+            }) => (
+                OpenDescription::File {
+                    path,
+                    metadata,
+                    contents: FileContents::rootfs_backed(contents),
                     offset: 0,
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable,
@@ -1036,7 +1057,7 @@ impl SyscallDispatcher {
                         OpenDescription::File {
                             path,
                             metadata,
-                            contents: Vec::new(),
+                            contents: FileContents::dense(Vec::new()),
                             offset: 0,
                             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                             // Guest writability follows the access mode, not
@@ -3654,7 +3675,7 @@ impl SyscallDispatcher {
                             return Ok(LINUX_EFBIG.into());
                         }
                         if new_size as usize > contents.len() {
-                            contents.resize(new_size as usize, 0);
+                            contents.resize(new_size as usize);
                             metadata.size = contents.len();
                         }
                         writeback = None;
@@ -3755,7 +3776,7 @@ impl SyscallDispatcher {
                         }
                         let new_len = length as usize;
                         if new_len > contents.len() {
-                            contents.resize(new_len, 0);
+                            contents.resize(new_len);
                         } else {
                             contents.truncate(new_len);
                             if *offset > new_len {
@@ -3763,7 +3784,7 @@ impl SyscallDispatcher {
                             }
                         }
                         metadata.size = contents.len();
-                        writeback = Some((path.clone(), contents.clone()));
+                        writeback = Some((path.clone(), contents.to_vec()));
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
                     OpenDescription::HostFile {
@@ -4091,8 +4112,8 @@ impl SyscallDispatcher {
             let (current, end) = match &*open {
                 OpenDescription::File {
                     contents, offset, ..
-                }
-                | OpenDescription::SyntheticFile {
+                } => (*offset as i64, contents.len() as i64),
+                OpenDescription::SyntheticFile {
                     contents, offset, ..
                 } => (*offset as i64, contents.len() as i64),
                 OpenDescription::Directory {
@@ -4204,13 +4225,24 @@ impl SyscallDispatcher {
             {
                 return Ok(LINUX_EBADF.into());
             }
-            let (contents, offset) = match &mut *open {
+            let (read_len, bytes) = match &mut *open {
                 OpenDescription::File {
                     contents, offset, ..
+                } => {
+                    let bytes = contents.read_at(*offset, length);
+                    let read_len = bytes.len();
+                    *offset += read_len;
+                    (read_len, bytes)
                 }
-                | OpenDescription::SyntheticFile {
+                OpenDescription::SyntheticFile {
                     contents, offset, ..
-                } => (contents, offset),
+                } => {
+                    let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
+                    let read_len = remaining.len().min(length);
+                    let bytes = remaining[..read_len].to_vec();
+                    *offset += read_len;
+                    (read_len, bytes)
+                }
                 OpenDescription::EventFd {
                     base,
                     state,
@@ -4325,14 +4357,7 @@ impl SyscallDispatcher {
                     ));
                 }
             };
-            // lseek may store *offset past EOF (Linux permits seeking beyond the
-            // end); a read there returns 0, never a slice-index panic. `.get`
-            // yields None -> empty slice for offset > len. Probe: readpasteof.
-            let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
-            let read_len = remaining.len().min(length);
-            let bytes = &remaining[..read_len];
-            memory.write_bytes(address, bytes)?;
-            *offset += read_len;
+            memory.write_bytes(address, &bytes)?;
             Ok(DispatchOutcome::Returned {
                 value: read_len as i64,
             })
@@ -4417,13 +4442,21 @@ impl SyscallDispatcher {
                 }
                 _ => {}
             }
-            let (contents, offset) = match &mut *open {
+            let read_len = match &mut *open {
                 OpenDescription::File {
                     contents, offset, ..
+                } => {
+                    let read_len = read_from_file_contents_at(memory, contents, *offset, &iovecs)?;
+                    *offset += read_len;
+                    read_len
                 }
-                | OpenDescription::SyntheticFile {
+                OpenDescription::SyntheticFile {
                     contents, offset, ..
-                } => (contents, offset),
+                } => {
+                    let read_len = read_from_contents_at(memory, contents, *offset, &iovecs)?;
+                    *offset += read_len;
+                    read_len
+                }
                 OpenDescription::HostFile { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -4447,8 +4480,6 @@ impl SyscallDispatcher {
                     return Ok(LINUX_EINVAL.into());
                 }
             };
-            let read_len = read_from_contents_at(memory, contents, *offset, &iovecs)?;
-            *offset += read_len;
             Ok(DispatchOutcome::Returned {
                 value: read_len as i64,
             })
@@ -4490,9 +4521,15 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: n as i64 });
             }
-            let contents = match &*open {
-                OpenDescription::File { contents, .. }
-                | OpenDescription::SyntheticFile { contents, .. } => contents,
+            let bytes = match &*open {
+                OpenDescription::File { contents, .. } => contents.read_at(offset, length),
+                OpenDescription::SyntheticFile { contents, .. } => contents
+                    .get(offset..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take(length)
+                    .copied()
+                    .collect(),
                 OpenDescription::HostFile { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -4515,14 +4552,10 @@ impl SyscallDispatcher {
                     return Ok(LINUX_ESPIPE.into());
                 }
             };
-
-            let read_len = if offset < contents.len() {
-                let bytes = &contents[offset..][..contents[offset..].len().min(length)];
-                memory.write_bytes(buffer, bytes)?;
-                bytes.len()
-            } else {
-                0
-            };
+            let read_len = bytes.len();
+            if read_len > 0 {
+                memory.write_bytes(buffer, &bytes)?;
+            }
             Ok(DispatchOutcome::Returned {
                 value: read_len as i64,
             })
@@ -4597,9 +4630,13 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
             }
-            let contents = match &*open {
-                OpenDescription::File { contents, .. }
-                | OpenDescription::SyntheticFile { contents, .. } => contents,
+            let read_len = match &*open {
+                OpenDescription::File { contents, .. } => {
+                    read_from_file_contents_at(memory, contents, offset, &iovecs)?
+                }
+                OpenDescription::SyntheticFile { contents, .. } => {
+                    read_from_contents_at(memory, contents, offset, &iovecs)?
+                }
                 OpenDescription::HostFile { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -4622,7 +4659,6 @@ impl SyscallDispatcher {
                     return Ok(LINUX_ESPIPE.into());
                 }
             };
-            let read_len = read_from_contents_at(memory, contents, offset, &iovecs)?;
             Ok(DispatchOutcome::Returned {
                 value: read_len as i64,
             })
@@ -5499,8 +5535,8 @@ impl SyscallDispatcher {
                         }
                         st.st_size.max(0) as u64
                     }
-                    OpenDescription::File { contents, .. }
-                    | OpenDescription::SyntheticFile { contents, .. } => contents.len() as u64,
+                    OpenDescription::File { contents, .. } => contents.len() as u64,
+                    OpenDescription::SyntheticFile { contents, .. } => contents.len() as u64,
                     // cachestat needs a page-cache-backed fd (regular file /
                     // shmem); anything else has no cache → EBADF.
                     _ => return Ok(LINUX_EBADF.into()),
@@ -6782,7 +6818,7 @@ impl SyscallDispatcher {
                     size: 0,
                 },
                 path,
-                contents: Vec::new(),
+                contents: FileContents::dense(Vec::new()),
                 offset: 0,
                 base: OpenDescriptionBase::new(0),
                 writable: true,
