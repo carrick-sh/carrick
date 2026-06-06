@@ -157,6 +157,8 @@ impl SyscallDispatcher {
     /// no `open_files` entry unless the guest reopened them, so they are unioned
     /// in (unless explicitly closed) to match what Linux lists.
     pub(in crate::dispatch) fn open_fd_numbers(&self) -> Vec<i32> {
+        #[cfg(test)]
+        OPEN_FD_NUMBERS_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut fds: std::collections::BTreeSet<i32> =
             self.io.open_files.read().keys().copied().collect();
         for stdio in 0..3 {
@@ -299,4 +301,18 @@ impl SyscallDispatcher {
             _ => Some(LINUX_EINVAL),
         }
     }
+}
+
+#[cfg(test)]
+static OPEN_FD_NUMBERS_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn reset_open_fd_numbers_calls() {
+    OPEN_FD_NUMBERS_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(super) fn open_fd_numbers_calls() -> usize {
+    OPEN_FD_NUMBERS_CALLS.load(std::sync::atomic::Ordering::SeqCst)
 }
