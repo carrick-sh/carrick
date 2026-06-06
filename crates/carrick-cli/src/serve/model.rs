@@ -48,6 +48,12 @@ pub(crate) struct CreateResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
+pub(crate) struct WaitResponse {
+    pub status_code: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub(crate) struct InfoResponse {
     pub id: String,
     pub name: String,
