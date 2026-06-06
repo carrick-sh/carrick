@@ -136,21 +136,25 @@ Milestone 1A: build-tool-like dirty-range workload.
   - `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin perf_overlay_small_updates`
   - `cargo fmt --all -- --check`
   - `git diff --check`
-- [ ] Record current wall-time evidence.
+- [x] Record current wall-time evidence.
   - `CARRICK_PERF_FILTER=overlay_small_updates CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 just bench quick`
   - Append rows to `docs/perf-results/2026-06-05-disk.jsonl`, the current disk result ledger on this branch.
 - [ ] Record before/after dirty-range evidence.
   - Preferred: build a temporary comparison Carrick binary from the commit immediately before `6e2ee14` and run the same probe under it.
   - If the old binary cannot run the new harness cleanly, keep wall-time before/after unchecked and rely only on byte-copy evidence until a comparable baseline is produced.
-- [ ] Commit as a logical docs/probe/harness slice if no runtime behavior changes are included.
+- [x] Commit as a logical docs/probe/harness slice if no runtime behavior changes are included.
 
 Progress:
 
 - 2026-06-06: Added RED registry coverage for `overlay_small_updates`; pre-fix `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests::registry_contains_disk_perf_surface -- --nocapture` failed with `missing disk perf workload overlay_small_updates`.
 - 2026-06-06: Added `PerfCase::carrick_fs_mode`, kept existing cases on `host`, registered `overlay_small_updates` with Carrick `--fs memory`, and changed perf result rows so Carrick reports the case fs mode while Docker continues to report `host`.
-- 2026-06-06: Added `conformance-probes/src/bin/perf_overlay_small_updates.rs`. The probe creates 16 sparse 1 MiB files under `BENCH_DIR` or `/tmp`, then performs 512 one-byte `pwrite` updates at rotating offsets with open/close around each update.
+- 2026-06-06: Added `conformance-probes/src/bin/perf_overlay_small_updates.rs`. The probe creates 16 sparse 1 MiB files under `BENCH_DIR` or `/tmp`, then performs 512 one-byte `lseek` plus `write` updates at rotating offsets with open/close around each update.
 - 2026-06-06: Focused checks passed: `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture`, `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin perf_overlay_small_updates`, `./scripts/build-probes.sh`, `cargo fmt --all -- --check`, and `git diff --check`.
-- 2026-06-06: Filtered benchmark is blocked by a pre-existing Carrick memory-fs stdin issue: `--fs memory` receives EOF from piped host stdin, so the perf runner's base64 injection creates a zero-byte `/tmp/p` and Carrick emits `/bin/sh: 1: /tmp/p: not found`. Docker runs the same injected probe and emits `overlay_small_updates_total_us`; Carrick `--fs host` also receives the injected bytes, confirming the probe is valid and the blocker is memory-fs stdin delivery.
+- 2026-06-06: Initial filtered benchmark exposed a pre-existing Carrick memory-fs stdin issue: `--fs memory` receives EOF from piped host stdin, so the perf runner's base64 injection created a zero-byte `/tmp/p` and Carrick emitted `/bin/sh: 1: /tmp/p: not found`. Docker ran the same injected probe and emitted `overlay_small_updates_total_us`; Carrick `--fs host` also received the injected bytes, confirming the probe was valid and the blocker was memory-fs stdin delivery.
+- 2026-06-06: Changed Carrick memory-fs perf cases to launch the static probe directly with `carrick run-elf --raw --fs memory <probe>` instead of stdin injection. This keeps host-fs cases on the existing image/injection path, keeps Docker as the injected image control, and prevents Carrick rows from claiming the Ubuntu image when they use direct `run-elf`.
+- 2026-06-06: Trace-guided probe adjustment: direct `run-elf --fs memory` showed `pwrite64` returning `EBADF` on in-memory regular files, while the dirty-range path implemented in `6e2ee14` covers direct `write`/`writev`. The probe now uses `lseek` plus `write` for each one-byte update.
+- 2026-06-06: Post-commit `CARRICK_PERF_FILTER=overlay_small_updates CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored` passed and appended rows to `docs/perf-results/2026-06-05-disk.jsonl`; Carrick memory-fs p50 `19734.125` us, p95 `20224.292` us; Docker p50 `1567.375` us, p95 `1788.542` us, noisy. Carrick remains about `12.59x` slower on this workload.
+- 2026-06-06: Current VFS ranking after `overlay_small_updates`: keep VFS as the active target. `large_meta` remains about `78.36x` slower than Docker after the metadata-open fix, and `overlay_small_updates` is about `12.59x` slower with memory-fs dirty-range writeback. Wait-path fd/kqueue churn still needs its own workload before it can outrank these measured VFS gaps.
 
 Milestone 1B: writable rootfs-to-overlay materialization.
 
@@ -307,6 +311,6 @@ Continue VFS dirty-range measurement with a memory-fs build-tool-like workload.
 - [x] Add `overlay_small_updates` registry coverage and Carrick memory-fs case support.
 - [x] Add `perf_overlay_small_updates` probe.
 - [x] Run focused perf registry/probe checks.
-- [ ] Run current filtered benchmark and append rows.
+- [x] Run current filtered benchmark and append rows.
 - [ ] Produce comparable before/after wall-time if an old binary can be run cleanly; otherwise leave wall-time baseline open and keep byte-copy evidence as the completed proof.
-- [ ] Re-rank VFS versus wait-path work after the new workload is measured.
+- [x] Re-rank VFS versus wait-path work after the new workload is measured.
