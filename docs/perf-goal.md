@@ -86,6 +86,7 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest committed runtime slices:
 
+- `0a08b5f` - `perf(fs): snapshot memory overlay opens`
 - `4bae00f` - `perf(fs): avoid cloning memory files on open`
 - `7149ae3` - `perf(fs): fast path root f_ok access`
 - `5a6be55` - `perf(fs): combine host open metadata`
@@ -101,9 +102,7 @@ Latest committed runtime slices:
 Documentation/result state:
 
 - `docs/perf-results/2026-06-06-disk.jsonl` has appended rows for
-  `overlay_small_updates` at `4bae00f`.
-- This `goal.md` replacement should be committed with the result rows as the
-  documentation slice.
+  `overlay_small_updates` at `4bae00f` and `0a08b5f`.
 
 ## Current Evidence
 
@@ -341,13 +340,59 @@ What disappeared:
 - The old open path cloned `4194304` bytes per open in the RED fixture; the
   fixed path shares the base payload and records only dirty ranges.
 
+Follow-up runtime slice at `0a08b5f`:
+
+- Post-`4bae00f` `carrick trace` still showed the same guest trap shape:
+  `openat=594`, `fcntl=593`, `close=593`, `write=583`, and `lseek=577`.
+- The remaining host attribution for the fixture was already effectively empty,
+  so the next runtime-local target was handler work inside the repeated
+  `openat` path.
+- RED coverage:
+  `memory_overlay_open_uses_single_backend_snapshot_for_shared_file` first
+  failed because a focused rootfs dispatch helper open still reached the old
+  backend passes (`lookup_kind`/metadata/shared-content lookups).
+- Added `SharedFileEntry` and `FsBackend::shared_file_entry`, overridden only by
+  `MemoryBackend`, so an in-memory file open can return metadata plus shared
+  contents in one normalized, locked snapshot.
+- `RootFsVfs::open_for_dispatch` now takes that shared-entry path before the
+  generic overlay-kind path when `O_CREAT|O_EXCL` is not asking for an
+  existence error.
+- Focused checks passed:
+  - `cargo test -p carrick-runtime --test integration memory_overlay_open_uses_single_backend_snapshot_for_shared_file -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration small_write_to_large_overlay_file_does_not_rewrite_whole_file -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration small_write_to_large_rootfs_file_does_not_copy_up_whole_file -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration truncate -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration fallocate -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration rootfs_overlay -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration copy_file_range_ -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds -- --nocapture`
+  - `cargo test -p carrick-runtime --tests --no-run`
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - `./scripts/build-signed.sh`
+- Direct post-change runs were noisy but showed p50 per update around
+  `9.4` us and totals around `4.9` to `5.1` ms on repeated direct runs.
+- Filtered perf rows at `0a08b5f` in
+  `docs/perf-results/2026-06-06-disk.jsonl`:
+  - Carrick memory-fs p50 `6063.542` us, p95 `6142.084` us.
+  - Docker p50 `794.542` us, p95 `818.208` us.
+  - Carrick remains about `7.63x` slower than Docker.
+
+What disappeared at `0a08b5f`:
+
+- Separate backend kind, metadata, and shared-content passes inside
+  `RootFsVfs::open_for_dispatch` for in-memory overlay files.
+- No guest traps disappeared; the traced syscall counts stayed unchanged.
+
 Remaining overlay decision:
 
 - [x] Identify whether the remaining `overlay_small_updates` gap is host kernel
   time, VFS setup, trap count, or memory-backend work.
 - [x] Remove the measured whole-file memory-file clone on open.
-- [ ] Attribute the post-`4bae00f` cost between syscall dispatch, open-fd setup,
-  descriptor table work, and memory-file range bookkeeping.
+- [x] Remove the measured repeated backend passes inside the memory overlay
+  `open_for_dispatch` helper.
+- [ ] Attribute the post-`0a08b5f` full guest-open cost between pre-rootfs path
+  routing, syscall dispatch, descriptor table work, and fd installation.
 - [ ] Decide whether the remaining repeated `openat`/`fcntl`/`lseek`/`write`/
   `close` trap shape can be reduced only by a dynamic interposer or by a safe
   runtime-local fast path.
@@ -401,7 +446,7 @@ Deferred:
 
 ## Immediate Next Slice
 
-The next slice should start from the post-`4bae00f` `overlay_small_updates`
+The next slice should start from the post-`0a08b5f` `overlay_small_updates`
 shape.
 
 Working theory:
@@ -409,8 +454,13 @@ Working theory:
 - Host VFS and macOS kernel time are no longer the meaningful cost for this
   fixture.
 - Whole-file memory overlay cloning on open is fixed.
+- Repeated backend passes inside `open_for_dispatch` for memory files are fixed.
+- The committed perf row stayed essentially flat, so the last handler cleanup
+  did not remove enough wall time to change the workload conclusion.
 - Remaining cost is the repeated guest syscall pattern plus in-process runtime
-  work for `openat`, `fcntl`, `lseek`, `write`, and `close`.
+  work before and after `open_for_dispatch`: path normalization/canonicalization,
+  VFS mount fallthrough, DAC/FIFO checks, fd-table installation, `fcntl`,
+  `lseek`, `write`, and `close`.
 - If the goal is to reduce traps rather than only reduce handler cost, the next
   candidate is a narrow dynamic interposer or guest-side batching workload, but
   it must be proven against a dynamic binary and must not become a correctness
@@ -418,11 +468,14 @@ Working theory:
 
 Tasks:
 
-- [ ] Re-run `carrick trace` for `overlay_small_updates` at `4bae00f` and record
+- [x] Re-run `carrick trace` for `overlay_small_updates` at `4bae00f` and record
   the post-fix guest syscall counts.
-- [ ] Add runtime-local counters or focused tracing to split post-fix cost among
-  syscall dispatch, descriptor table operations, memory-file range lookup, and
-  open/close setup.
+- [x] Add focused RED coverage for one repeated memory-file open setup cost and
+  remove it with a runtime-local fast path.
+- [ ] Add runtime-local counters or focused tracing around the full guest open
+  route before `open_for_dispatch`: trailing symlink canonicalization,
+  VFS-mount fallthrough, DAC/FIFO checks, fd-table installation, and path record
+  bookkeeping.
 - [ ] If open/close setup dominates without host kernel work, design a RED test
   for the smallest runtime-local fast path before changing behavior.
 - [ ] If trap count dominates and runtime-local work is small, add a dynamic
