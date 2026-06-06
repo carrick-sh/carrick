@@ -310,6 +310,24 @@ fn rewrite_dev_fd_alias(path: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+static FD_OPEN_PATH_INSERTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static FD_OPEN_PATH_LOOKUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn reset_fd_open_path_inserts() {
+    FD_OPEN_PATH_INSERTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    FD_OPEN_PATH_LOOKUPS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn fd_open_path_inserts() -> usize {
+    FD_OPEN_PATH_INSERTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -326,6 +344,60 @@ mod tests {
             0,
             "unmounted rootfs/overlay opens should fall through before building OpenContext"
         );
+    }
+
+    #[test]
+    fn memory_file_open_does_not_duplicate_path_record_for_proc_fd() {
+        reset_fd_open_path_inserts();
+
+        let backend = crate::fs_backend::MemoryBackend::new();
+        backend
+            .set_file_contents("/regular.bin", b"payload".to_vec())
+            .unwrap();
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+        memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        56,
+                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 3 }
+        );
+
+        memory.write_bytes(0x4100, b"/proc/self/fd/3\0").unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        78,
+                        SyscallArgs::from([LINUX_AT_FDCWD, 0x4100, 0x4200, 64, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 12 }
+        );
+        assert_eq!(
+            memory.read_bytes(0x4200, 12).unwrap(),
+            b"/regular.bin".to_vec()
+        );
+        assert_eq!(
+            fd_open_path_inserts(),
+            0,
+            "fd_open_paths insertions should be 0 for memory OpenDescription::File"
+        );
+        assert!(reporter.finish().unhandled_syscalls.is_empty());
     }
 }
 
@@ -408,6 +480,18 @@ fn reportable_status_flags(raw: u64) -> u64 {
 }
 
 impl SyscallDispatcher {
+    fn record_fd_open_path(&self, fd: i32, path: String) {
+        #[cfg(test)]
+        FD_OPEN_PATH_INSERTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io.fd_open_paths.write().insert(fd, path);
+    }
+
+    fn lookup_recorded_fd_open_path(&self, fd: i32) -> Option<String> {
+        #[cfg(test)]
+        FD_OPEN_PATH_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.io.fd_open_paths.read().get(&fd).cloned()
+    }
+
     pub fn register_mount(
         &mut self,
         point: impl Into<std::path::PathBuf>,
@@ -858,7 +942,7 @@ impl SyscallDispatcher {
                     let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
                         return Ok(linux_errno::EMFILE.into());
                     };
-                    self.io.fd_open_paths.write().insert(fd, path.clone());
+                    self.record_fd_open_path(fd, path.clone());
                     return Ok(DispatchOutcome::Returned { value: fd as i64 });
                 }
                 // The non-blocking open failed — most commonly O_WRONLY with no
@@ -1096,6 +1180,10 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(errno.into()),
         };
 
+        let needs_recorded_path = !matches!(
+            &description,
+            OpenDescription::File { .. } | OpenDescription::Directory { .. }
+        );
         let open_file = OpenFile {
             description: Arc::new(RwLock::new(description)),
             fd_flags: linux_fd_flags_from_open_flags(flags),
@@ -1104,7 +1192,9 @@ impl SyscallDispatcher {
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Ok(linux_errno::EMFILE.into());
         };
-        self.io.fd_open_paths.write().insert(fd, record_path);
+        if needs_recorded_path {
+            self.record_fd_open_path(fd, record_path);
+        }
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
 
@@ -1395,10 +1485,7 @@ impl SyscallDispatcher {
                 // Record the open path (/dev/ptmx or /dev/pts/N) so
                 // readlink(/proc/self/fd/<fd>) resolves it — glibc's ttyname_r
                 // needs this to reopen a pty slave.
-                self.io
-                    .fd_open_paths
-                    .write()
-                    .insert(new_fd, path.to_string());
+                self.record_fd_open_path(new_fd, path.to_string());
                 VfsOpenAttempt::Installed(new_fd)
             }
             crate::vfs::VfsHandle::Directory {
@@ -6221,15 +6308,10 @@ impl SyscallDispatcher {
                 // reads, so `tty(1)` and tty-name lookups resolve.
                 t
             } else if let Some(t) = proc_self_fd_number(&path).and_then(|n| {
-                this.io
-                    .fd_open_paths
-                    .read()
-                    .get(&n)
-                    .cloned()
-                    .or_else(|| {
-                        this.open_file(n)
-                            .and_then(|f| f.description.read().open_path().map(str::to_owned))
-                    })
+                this.lookup_recorded_fd_open_path(n).or_else(|| {
+                    this.open_file(n)
+                        .and_then(|f| f.description.read().open_path().map(str::to_owned))
+                })
             }) {
                 // /proc/self/fd/N → the path fd N was opened at. Rosetta readlinks
                 // its main-binary fd this way to recover the binary's path.
