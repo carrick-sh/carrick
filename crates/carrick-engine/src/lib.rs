@@ -280,7 +280,14 @@ impl Engine {
         Self { store }
     }
 
-    pub async fn run(&self, req: CliRunRequest) -> Result<RunResult, anyhow::Error> {
+    /// Resolve a run request to a `RunSpec`: parse the image ref, pull/resolve
+    /// the image for the target platform, and merge into a fully-specified spec.
+    /// This is the ONLY async part of a run — it does NOT execute, so no fork
+    /// happens here and it is safe to drive inside a tokio runtime. The caller
+    /// drops the runtime (joining its blocking pool in the parent) BEFORE
+    /// calling `carrick_runtime::Runtime::execute`, so tokio is never alive
+    /// across a fork. See docs/superpowers/specs/2026-06-06-tokio-fork-isolation.
+    pub async fn resolve(&self, req: CliRunRequest) -> Result<RunSpec, anyhow::Error> {
         let image_ref = carrick_spec::ImageReference::parse(&req.image_ref)
             .map_err(|e| anyhow::anyhow!("invalid image reference: {}", e))?;
 
@@ -299,10 +306,7 @@ impl Engine {
             .await
             .map_err(|e| anyhow::anyhow!("failed to resolve image: {}", e))?;
 
-        let run_spec = resolve_run_spec(req, resolved).map_err(anyhow::Error::msg)?;
-
-        let result = carrick_runtime::Runtime::execute(&run_spec)?;
-        Ok(result)
+        resolve_run_spec(req, resolved).map_err(anyhow::Error::msg)
     }
 }
 

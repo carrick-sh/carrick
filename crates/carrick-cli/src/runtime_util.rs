@@ -176,6 +176,30 @@ pub(crate) fn block_on_oci<F: std::future::Future>(fut: F) -> F::Output {
         .block_on(fut)
 }
 
+#[cfg(test)]
+mod fork_isolation_tests {
+    use super::block_on_oci;
+
+    /// The fork-safety invariant: `block_on_oci` builds, uses, and DROPS its
+    /// tokio runtime, so after it returns NO runtime is current. This is what
+    /// lets the caller fork (`Runtime::execute`) without a live tokio runtime —
+    /// forking with one deadlocks the child in `BlockingPool::shutdown`. See
+    /// docs/superpowers/specs/2026-06-06-tokio-fork-isolation.
+    #[test]
+    fn block_on_oci_leaves_no_live_runtime() {
+        // Sanity: nothing is current before.
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let out = block_on_oci(async { 6 * 7 });
+        assert_eq!(out, 42);
+        // After block_on_oci returns, no tokio runtime may be current.
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "a tokio runtime is still current after block_on_oci returned — \
+             forking after this would deadlock (tokio-fork-isolation invariant)"
+        );
+    }
+}
+
 pub(crate) fn register_dtrace_probes() {
     match carrick_runtime::probes::register_dtrace_probes() {
         Ok(()) => {
