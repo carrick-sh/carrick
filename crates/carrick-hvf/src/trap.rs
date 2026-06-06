@@ -633,6 +633,31 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
         .copied()
 }
 
+/// Bounds lazy alias remaps per backing IPA, not per guest-run interval.
+///
+/// Go's pprof mapping test can touch many distinct MAP_SHARED file aliases
+/// before issuing another syscall; a small global cap turns the ninth valid
+/// alias into SIGSEGV. Repeated faults on the same backing still terminate.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct AliasRemapLimiter {
+    attempts_by_ipa: std::collections::HashMap<u64, u32>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasRemapLimiter {
+    const MAX_ATTEMPTS_PER_IPA: u32 = 8;
+
+    fn allow(&mut self, ipa: u64) -> bool {
+        let attempts = self.attempts_by_ipa.entry(ipa).or_default();
+        if *attempts >= Self::MAX_ATTEMPTS_PER_IPA {
+            return false;
+        }
+        *attempts += 1;
+        true
+    }
+}
+
 /// Process-global count of live HVF vCPUs (created minus destroyed). Pure
 /// diagnostic: reported in the fork__quiesce phase-2 probe so a `carrick trace`
 /// shows exactly how many vCPUs are alive when the forker calls hv_vm_destroy.
@@ -2326,9 +2351,9 @@ impl HvfInner {
         // guest's user CPU time from this. (hv_vcpu_get_exec_time was measured
         // to under-report ~40× here, so it isn't used.) Accumulated lock-free
         // into this vCPU thread's slot; summed process-wide by `guest_cpu`.
-        // Bounds lazy re-mapping of a dropped guest_shared alias (below) so a
-        // genuinely-unmappable fault still terminates instead of spinning.
-        let mut alias_remap_attempts: u32 = 0;
+        // Bounds lazy re-mapping of dropped guest_shared aliases (below) so a
+        // genuinely-unmappable backing still terminates instead of spinning.
+        let mut alias_remap_limiter = AliasRemapLimiter::default();
         let exit = loop {
             let run_start = std::time::Instant::now();
             crate::guest_cpu::begin_active();
@@ -2378,7 +2403,6 @@ impl HvfInner {
             if exit.reason == ExitReason::EXCEPTION
                 && is_aarch64_el0_abort_exception(exit.exception.syndrome)
                 && crate::memory::is_high_va(exit.exception.virtual_address)
-                && alias_remap_attempts < 8
             {
                 let fault_ipa = if exit.exception.physical_address != 0 {
                     exit.exception.physical_address
@@ -2389,8 +2413,9 @@ impl HvfInner {
                         .wrapping_sub(crate::memory::LINUX_HIGH_VA_THRESHOLD)
                         .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE)
                 };
-                if let Some(b) = lookup_shared_alias(fault_ipa) {
-                    alias_remap_attempts += 1;
+                if let Some(b) = lookup_shared_alias(fault_ipa)
+                    && alias_remap_limiter.allow(b.ipa)
+                {
                     // SAFETY: `host_addr` is a live MAP_SHARED mmap (the alias
                     // backing) registered by map_host_alias; re-mapping the same
                     // host range to the same IPA in this VM is idempotent. A
@@ -4888,6 +4913,51 @@ fn signal_frame_stack_pointer(
         .checked_sub(aligned_len)
         .map(|sp| sp & !15u64)
         .ok_or_else(|| TrapError::Hypervisor("sigframe push underflowed stack".to_string()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+mod alias_remap_limiter_tests {
+    use super::*;
+
+    #[test]
+    fn caps_repeated_faults_on_one_alias_backing() {
+        let mut limiter = AliasRemapLimiter::default();
+        let ipa = crate::memory::LINUX_ALIAS_IPA_BASE + 0x20_0000;
+
+        for _ in 0..AliasRemapLimiter::MAX_ATTEMPTS_PER_IPA {
+            assert!(limiter.allow(ipa));
+        }
+        assert!(!limiter.allow(ipa));
+    }
+
+    #[test]
+    fn permits_many_distinct_alias_backings() {
+        let mut limiter = AliasRemapLimiter::default();
+
+        for i in 0..64 {
+            let ipa = crate::memory::LINUX_ALIAS_IPA_BASE + i * 0x20_0000;
+            assert!(
+                limiter.allow(ipa),
+                "alias backing {i} should not hit a global cap"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_alias_does_not_block_a_different_alias() {
+        let mut limiter = AliasRemapLimiter::default();
+        let first = crate::memory::LINUX_ALIAS_IPA_BASE;
+        let second = first + 0x20_0000;
+
+        for _ in 0..AliasRemapLimiter::MAX_ATTEMPTS_PER_IPA {
+            assert!(limiter.allow(first));
+        }
+
+        assert!(!limiter.allow(first));
+        assert!(limiter.allow(second));
+        assert!(!limiter.allow(first));
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
