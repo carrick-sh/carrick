@@ -1731,7 +1731,7 @@ impl SyscallDispatcher {
                 if idtype == LINUX_P_PIDFD
                     && let Some(host_fd) = this.host_fd_for_poll(id as i32) {
                         return Ok(DispatchOutcome::WaitOnPollFds {
-                            fds: vec![(host_fd, libc::POLLIN)],
+                            fds: WaitFds::raw_one(host_fd, libc::POLLIN),
                             timeout: None,
                             on_timeout: 0,
                             block_signals: 0,

@@ -6,7 +6,7 @@ fn kqueue_wait_still_observes_readable_socket_with_listener_write_interest() {
     use std::os::fd::AsRawFd;
     use std::time::Duration;
 
-    use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
+    use carrick_runtime::io_wait::{ThreadWaiter, WaitFd, WaitResult};
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     listener
@@ -29,8 +29,8 @@ fn kqueue_wait_still_observes_readable_socket_with_listener_write_interest() {
     let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
     let result = waiter.wait(
         &[
-            (server.as_raw_fd(), libc::POLLIN),
-            (listener.as_raw_fd(), libc::POLLIN | libc::POLLOUT),
+            WaitFd::raw(server.as_raw_fd(), libc::POLLIN),
+            WaitFd::raw(listener.as_raw_fd(), libc::POLLIN | libc::POLLOUT),
         ],
         Some(Duration::from_millis(100)),
         0,
@@ -47,7 +47,7 @@ fn kqueue_wait_wakes_when_peer_writes_after_registration() {
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::Duration;
 
-    use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
+    use carrick_runtime::io_wait::{ThreadWaiter, WaitFd, WaitResult};
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     listener
@@ -71,8 +71,8 @@ fn kqueue_wait_wakes_when_peer_writes_after_registration() {
         let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
         waiter.wait(
             &[
-                (server_fd, libc::POLLIN),
-                (listener_fd, libc::POLLIN | libc::POLLOUT),
+                WaitFd::raw(server_fd, libc::POLLIN),
+                WaitFd::raw(listener_fd, libc::POLLIN | libc::POLLOUT),
             ],
             Some(Duration::from_millis(500)),
             0,

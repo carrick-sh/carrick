@@ -354,7 +354,7 @@ impl SyscallDispatcher {
                     // return on_timeout = -EAGAIN, matching the Linux SO_*TIMEO
                     // recv/send result.
                     DispatchOutcome::WaitOnFds {
-                        fds: vec![(host_fd, dir.events())],
+                        fds: WaitFds::raw_one(host_fd, dir.events()),
                         timeout,
                         on_timeout: -(LINUX_EAGAIN as i64),
                         block_signals: 0,
@@ -1047,7 +1047,7 @@ impl SyscallDispatcher {
         }
         if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
             return DispatchOutcome::WaitOnFds {
-                fds: vec![(host_fd, libc::POLLOUT)],
+                fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
                 timeout: None,
                 on_timeout: -(LINUX_EINPROGRESS as i64),
                 block_signals: 0,
@@ -1689,7 +1689,7 @@ impl SyscallDispatcher {
                     // a real signal.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     return Ok(DispatchOutcome::WaitOnFds {
-                        fds: Vec::new(),
+                        fds: WaitFds::empty(),
                         timeout,
                         on_timeout: 0,
                         block_signals,
@@ -1702,7 +1702,7 @@ impl SyscallDispatcher {
                 // kevent() here it does not consume pending epoll events before the
                 // re-dispatched epoll_pwait can copy them out.
                 return Ok(DispatchOutcome::WaitOnPollFds {
-                    fds: vec![(kq_fd, libc::POLLIN)],
+                    fds: WaitFds::raw_one(kq_fd, libc::POLLIN),
                     timeout,
                     on_timeout: 0,
                     block_signals,
@@ -1879,7 +1879,7 @@ impl SyscallDispatcher {
                 let _ = request_number;
                 let _ = request_args;
                 return Ok(DispatchOutcome::WaitOnFds {
-                    fds: Vec::new(),
+                    fds: WaitFds::empty(),
                     timeout,
                     on_timeout: 0,
                     block_signals,
@@ -1936,7 +1936,7 @@ impl SyscallDispatcher {
                         clear_on_timeout.push((exceptfds_addr, s.len()));
                     }
                     return Ok(DispatchOutcome::WaitOnFdsSelect {
-                        fds: wait_fds,
+                        fds: WaitFds::raw(wait_fds),
                         timeout,
                         block_signals,
                         clear_on_timeout,
@@ -2218,7 +2218,7 @@ impl SyscallDispatcher {
                 let wait_fds: Vec<(i32, i16)> = sys_pollfds.iter().map(|p| (p.fd, p.events)).collect();
                 // poll/ppoll: a timeout means "no fds ready" → return 0.
                 return Ok(DispatchOutcome::WaitOnFds {
-                    fds: wait_fds,
+                    fds: WaitFds::raw(wait_fds),
                     timeout,
                     on_timeout: 0,
                     block_signals,
@@ -2641,7 +2641,7 @@ impl SyscallDispatcher {
                 // writable, then re-dispatch — connect then returns EISCONN or the
                 // real connect error.
                 return Ok(DispatchOutcome::WaitOnFds {
-                    fds: vec![(host_fd, libc::POLLOUT)],
+                    fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
                     timeout: None,
                     on_timeout: -(LINUX_EINPROGRESS as i64),
                     block_signals: 0,

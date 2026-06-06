@@ -1534,6 +1534,7 @@ impl SyscallDispatcher {
         memory: &mut M,
         iovecs: &[LinuxIovec],
         host_fd: i32,
+        host_fd_owner: Option<HostFdRef>,
         nonblocking: bool,
     ) -> DispatchOutcome {
         let mut total = 0i64;
@@ -1545,7 +1546,14 @@ impl SyscallDispatcher {
             if len == 0 {
                 continue;
             }
-            match read_host_pipe(memory, iov.iov_base, len, host_fd, nonblocking) {
+            match read_host_pipe(
+                memory,
+                iov.iov_base,
+                len,
+                host_fd,
+                host_fd_owner.clone(),
+                nonblocking,
+            ) {
                 DispatchOutcome::Returned { value } => {
                     total += value;
                     if value == 0 || (value as usize) < len {
@@ -1658,13 +1666,22 @@ impl SyscallDispatcher {
                         return if *is_read_end && pty.is_none() && !*bidirectional {
                             DispatchOutcome::errno(LINUX_EBADF)
                         } else {
-                            write_host_pipe(bytes, *host_fd, nonblocking, *write_kind, tid, false)
+                            write_host_pipe(
+                                bytes,
+                                *host_fd,
+                                open_file.host_fd_owner.clone(),
+                                nonblocking,
+                                *write_kind,
+                                tid,
+                                false,
+                            )
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
                         return write_host_pipe(
                             bytes,
                             *host_fd,
+                            open_file.host_fd_owner.clone(),
                             nonblocking,
                             HostWriteKind::SocketLike,
                             tid,
@@ -1686,6 +1703,7 @@ impl SyscallDispatcher {
                         return write_host_pipe(
                             bytes,
                             *host_fd,
+                            open_file.host_fd_owner.clone(),
                             nonblocking,
                             HostWriteKind::RegularFile,
                             tid,
@@ -4206,11 +4224,19 @@ impl SyscallDispatcher {
             // process's stdin is — file, pipe, or terminal).
             if fd.0 == 0 && !this.fd_table_contains(0) {
                 crate::dispatch::net::set_host_nonblocking(0);
-                return Ok(read_host_pipe(memory, address, length, 0, nonblocking));
+                return Ok(read_host_pipe(
+                    memory,
+                    address,
+                    length,
+                    0,
+                    None,
+                    nonblocking,
+                ));
             }
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(LINUX_EBADF.into());
             };
+            let host_fd_owner = open_file.host_fd_owner.clone();
             let mut open = open_file.description.write();
             // read() on a regular file opened write-only (O_WRONLY) → EBADF
             // (open09/creat01 read a creat()'d write-only fd). Only regular-file
@@ -4308,6 +4334,7 @@ impl SyscallDispatcher {
                         address,
                         length,
                         *host_fd,
+                        host_fd_owner,
                         nonblocking,
                     ));
                 }
@@ -4332,6 +4359,7 @@ impl SyscallDispatcher {
                         address,
                         length,
                         *host_fd,
+                        host_fd_owner,
                         nonblocking,
                     ));
                 }
@@ -4353,6 +4381,7 @@ impl SyscallDispatcher {
                         address,
                         length,
                         *host_fd,
+                        host_fd_owner,
                         nonblocking,
                     ));
                 }
@@ -4398,7 +4427,14 @@ impl SyscallDispatcher {
                     if len == 0 {
                         continue;
                     }
-                    match read_host_pipe(memory, iov.iov_base, len, hfd, /*nonblocking=*/ false) {
+                    match read_host_pipe(
+                        memory,
+                        iov.iov_base,
+                        len,
+                        hfd,
+                        None,
+                        /*nonblocking=*/ false,
+                    ) {
                         DispatchOutcome::Returned { value } => {
                             total += value;
                             if (value as usize) < len {
@@ -4422,21 +4458,25 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EBADF.into());
                     }
                     let hfd = *host_fd;
+                    let owner = open_file.host_fd_owner.clone();
                     drop(open);
                     return Ok(Self::read_host_pipe_iovecs(
                         memory,
                         &iovecs,
                         hfd,
+                        owner,
                         nonblocking,
                     ));
                 }
                 OpenDescription::HostSocket { host_fd, .. } => {
                     let hfd = *host_fd;
+                    let owner = open_file.host_fd_owner.clone();
                     drop(open);
                     return Ok(Self::read_host_pipe_iovecs(
                         memory,
                         &iovecs,
                         hfd,
+                        owner,
                         nonblocking,
                     ));
                 }
@@ -4904,7 +4944,7 @@ impl SyscallDispatcher {
                             DispatchOutcome::errno(LINUX_EAGAIN)
                         } else {
                             DispatchOutcome::WaitOnFds {
-                                fds: vec![(sock_fd, libc::POLLOUT)],
+                                fds: WaitFds::raw_one(sock_fd, libc::POLLOUT),
                                 timeout: None,
                                 on_timeout: -(LINUX_EAGAIN as i64),
                                 block_signals: 0,
@@ -5664,6 +5704,7 @@ impl SyscallDispatcher {
                             let out = write_host_pipe_owned(
                                 bytes,
                                 *host_fd,
+                                open_file.host_fd_owner.clone(),
                                 nonblocking,
                                 *write_kind,
                                 cx.tid(),
@@ -5678,6 +5719,7 @@ impl SyscallDispatcher {
                             return Ok(write_host_pipe_owned(
                                 bytes,
                                 *host_fd,
+                                open_file.host_fd_owner.clone(),
                                 nonblocking,
                                 HostWriteKind::SocketLike,
                                 cx.tid(),
@@ -5706,6 +5748,7 @@ impl SyscallDispatcher {
                             return Ok(write_host_pipe_owned(
                                 bytes,
                                 *host_fd,
+                                open_file.host_fd_owner.clone(),
                                 nonblocking,
                                 HostWriteKind::RegularFile,
                                 cx.tid(),
@@ -5824,6 +5867,7 @@ impl SyscallDispatcher {
 
             struct HostWritevTarget {
                 host_fd: i32,
+                host_fd_owner: Option<HostFdRef>,
                 write_kind: HostWriteKind,
                 sigpipe_on_epipe: bool,
                 append: bool,
@@ -5847,6 +5891,7 @@ impl SyscallDispatcher {
                         }
                         Some(HostWritevTarget {
                             host_fd: *host_fd,
+                            host_fd_owner: open_file.host_fd_owner.clone(),
                             write_kind: *write_kind,
                             sigpipe_on_epipe: true,
                             append: false,
@@ -5854,6 +5899,7 @@ impl SyscallDispatcher {
                     }
                     OpenDescription::HostSocket { host_fd, .. } => Some(HostWritevTarget {
                         host_fd: *host_fd,
+                        host_fd_owner: open_file.host_fd_owner.clone(),
                         write_kind: HostWriteKind::SocketLike,
                         sigpipe_on_epipe: false,
                         append: false,
@@ -5869,6 +5915,7 @@ impl SyscallDispatcher {
                         }
                         Some(HostWritevTarget {
                             host_fd: *host_fd,
+                            host_fd_owner: open_file.host_fd_owner.clone(),
                             write_kind: HostWriteKind::RegularFile,
                             sigpipe_on_epipe: false,
                             append: base.status_flags() & LINUX_O_APPEND != 0,
@@ -5892,6 +5939,7 @@ impl SyscallDispatcher {
                 let outcome = write_host_pipe_owned(
                     bytes,
                     target.host_fd,
+                    target.host_fd_owner.clone(),
                     nonblocking,
                     target.write_kind,
                     cx.tid(),
@@ -5959,6 +6007,7 @@ impl SyscallDispatcher {
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     *host_fd,
+                                    open_file.host_fd_owner.clone(),
                                     nonblocking,
                                     *write_kind,
                                     cx.tid(),
@@ -5970,6 +6019,7 @@ impl SyscallDispatcher {
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     *host_fd,
+                                    open_file.host_fd_owner.clone(),
                                     nonblocking,
                                     HostWriteKind::SocketLike,
                                     cx.tid(),
@@ -5996,6 +6046,7 @@ impl SyscallDispatcher {
                                 outcome = write_host_pipe_owned(
                                     bytes,
                                     *host_fd,
+                                    open_file.host_fd_owner.clone(),
                                     nonblocking,
                                     HostWriteKind::RegularFile,
                                     cx.tid(),
