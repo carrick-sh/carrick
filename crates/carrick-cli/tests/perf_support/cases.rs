@@ -30,6 +30,39 @@ pub struct PerfCase {
 /// conformance-probes/src/bin/. Network = thesis-core; disk metadata is the
 /// honest exception (carrick's documented cap-std amplification).
 pub const CASES: &[PerfCase] = &[
+    // Latency (lower better): raw guest syscall trap+dispatch floor.
+    PerfCase {
+        probe: "perf_trap_floor",
+        dimension: "syscall",
+        workload: "trap_floor",
+        metric_key: "trap_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: false,
+    },
+    // Latency (lower better): private futex wait/wake handoff.
+    PerfCase {
+        probe: "perf_futex_pingpong",
+        dimension: "syscall",
+        workload: "futex_pingpong",
+        metric_key: "futex_pingpong_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: false,
+    },
+    // Latency (lower better): many small dynamic-style writes to stdout.
+    PerfCase {
+        probe: "perf_stdio_burst",
+        dimension: "syscall",
+        workload: "stdio_burst",
+        metric_key: "stdio_burst_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: false,
+    },
     // Latency (lower better): loopback request/response round-trip.
     PerfCase {
         probe: "perf_net_tcp_rr",
@@ -125,6 +158,52 @@ mod tests {
         for c in CASES {
             assert!(!c.probe.is_empty());
             assert!(!c.metric_key.is_empty());
+        }
+    }
+
+    #[test]
+    fn registry_contains_syscall_perf_surface() {
+        let required = [
+            ("trap_floor", "perf_trap_floor", "trap_p50_us"),
+            (
+                "futex_pingpong",
+                "perf_futex_pingpong",
+                "futex_pingpong_p50_us",
+            ),
+            ("stdio_burst", "perf_stdio_burst", "stdio_burst_total_us"),
+        ];
+
+        for (workload, probe, metric_key) in required {
+            let case = CASES
+                .iter()
+                .find(|case| case.workload == workload)
+                .unwrap_or_else(|| panic!("missing perf workload {workload}"));
+            assert_eq!(case.dimension, "syscall");
+            assert_eq!(case.probe, probe);
+            assert_eq!(case.metric_key, metric_key);
+            assert_eq!(case.unit, "us");
+            assert!(!case.higher_is_better);
+            assert!(!case.mount_scratch);
+            assert!(!case.cross_boundary);
+        }
+    }
+
+    #[test]
+    fn registered_perf_probes_have_sources() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("carrick-cli lives under crates/");
+        for case in CASES {
+            let source = root
+                .join("conformance-probes/src/bin")
+                .join(format!("{}.rs", case.probe));
+            assert!(
+                source.exists(),
+                "missing source for registered perf probe {} at {}",
+                case.probe,
+                source.display()
+            );
         }
     }
 }

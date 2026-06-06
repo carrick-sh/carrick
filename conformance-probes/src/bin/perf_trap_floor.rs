@@ -8,11 +8,18 @@
 //!
 //! Raw `syscall(172)` (not `getpid()`) so glibc/musl's pid cache can't elide
 //! the trap. Output (key=value, parsed by the perf gate, NOT diffed):
-//!   trap_p50_us=<f>  trap_p95_us=<f>  trap_min_us=<f>  iters=<u>
+//!   trap_p50_us=<f>  trap_p95_us=<f>  trap_min_us=<f>  iters=<u>  nproc=<u>
+use std::thread;
 use std::time::Instant;
 
 const ITERS: usize = 20000;
 const WARMUP: usize = 2000;
+
+fn nproc() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
+}
 
 fn main() {
     // aarch64 Linux: __NR_getpid = 172. carrick answers from cached creds.
@@ -38,4 +45,5 @@ fn main() {
     println!("trap_p95_us={:.3}", pct(0.95));
     println!("trap_min_us={:.3}", samples_ns[0] as f64 / 1000.0);
     println!("iters={}", samples_ns.len());
+    println!("nproc={}", nproc());
 }
