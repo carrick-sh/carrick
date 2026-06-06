@@ -5450,25 +5450,19 @@ mod overlay_dispatch_tests {
         use crate::dispatch::HostSyscallResult;
         use carrick_bsd::errno::linux_errno;
 
-        unsafe {
-            carrick_portable::set_errno(libc::EINPROGRESS);
-        }
+        carrick_portable::set_errno(libc::EINPROGRESS);
         let err = (-1i32).host_syscall_result().unwrap_err();
         assert_eq!(err.raw_errno(), libc::EINPROGRESS);
         assert_eq!(err.linux_errno(), linux_errno::EINPROGRESS);
         assert_ne!(err.linux_errno(), libc::EINPROGRESS);
 
-        unsafe {
-            carrick_portable::set_errno(libc::EAGAIN);
-        }
+        carrick_portable::set_errno(libc::EAGAIN);
         assert_eq!(
             (-1isize).host_syscall_result().unwrap_err().linux_errno(),
             linux_errno::EAGAIN
         );
 
-        unsafe {
-            carrick_portable::set_errno(libc::ECONNREFUSED);
-        }
+        carrick_portable::set_errno(libc::ECONNREFUSED);
         assert_eq!(
             (-1i64).host_syscall_errno().unwrap_err(),
             linux_errno::ECONNREFUSED

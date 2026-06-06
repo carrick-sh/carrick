@@ -26,11 +26,7 @@ impl KvmTrapEngine {
             ram,
             entry: _,
         } = bring_up(image).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        Ok(Self {
-            _vm: vm,
-            vcpu,
-            ram,
-        })
+        Ok(Self { _vm: vm, vcpu, ram })
     }
 
     /// Read `len` bytes of live guest memory at guest-physical `gpa` (e.g. a
