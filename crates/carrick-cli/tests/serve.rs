@@ -74,3 +74,38 @@ async fn version_reports_carrick() {
     assert_eq!(v.os.as_deref(), Some("linux"));
     assert!(v.api_version.is_some());
 }
+
+#[tokio::test]
+async fn create_returns_id() {
+    // The container registry is a persistent on-disk store shared across runs,
+    // and DELETE /containers/{id} (the bollard cleanup below) is not wired up
+    // yet — so a prior run can leak the `m0create` name and make `carrick
+    // create` fail with a name conflict. Pre-clean it (best-effort) so the test
+    // is idempotent.
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0create"])
+        .output();
+    let (_server, sock, _dir) = spawn_server();
+    let docker = bollard::Docker::connect_with_unix(
+        &sock, 5, bollard::API_DEFAULT_VERSION,
+    ).unwrap();
+    // bollard 0.18 names the create body `container::Config<T>` (Docker's
+    // ContainerCreate request body); there is no `ContainerCreateBody` export.
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
+        ..Default::default()
+    };
+    let created = docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0create".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.id.len(), 64);
+    let _ = docker.remove_container("m0create", None).await;
+}

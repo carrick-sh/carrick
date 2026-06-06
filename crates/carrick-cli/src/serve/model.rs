@@ -2,6 +2,7 @@
 //! match Docker's JSON exactly (PascalCase) so strongly-typed clients (bollard,
 //! docker-java) deserialize without error.
 
+use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -26,6 +27,23 @@ impl Default for VersionResponse {
             kernel_version: "carrick".to_string(),
         }
     }
+}
+
+/// The subset of Docker's container-create body M0 consumes.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CreateBody {
+    pub image: Option<String>,
+    pub cmd: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub working_dir: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CreateResponse {
+    pub id: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Serialize)]

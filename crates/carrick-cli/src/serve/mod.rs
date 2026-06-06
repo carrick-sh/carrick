@@ -5,6 +5,7 @@
 mod handlers;
 mod model;
 mod router;
+mod spawn;
 
 use std::path::Path;
 
