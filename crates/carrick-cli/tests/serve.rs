@@ -208,3 +208,37 @@ async fn delete_removes_container() {
         Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
     ).await.unwrap();
 }
+
+#[tokio::test]
+async fn m0_full_lifecycle_echo_hi() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker = bollard::Docker::connect_with_unix(
+        &sock, 60, bollard::API_DEFAULT_VERSION,
+    ).unwrap();
+    assert_eq!(docker.ping().await.unwrap(), "OK");
+
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0e2e"]).output();
+
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
+        ..Default::default()
+    };
+    let created = docker.create_container(
+        Some(bollard::container::CreateContainerOptions { name: "m0e2e".to_string(), ..Default::default() }),
+        body,
+    ).await.unwrap();
+    assert_eq!(created.id.len(), 64);
+
+    docker.start_container("m0e2e", None::<bollard::container::StartContainerOptions<String>>).await.unwrap();
+
+    let mut waits = docker.wait_container("m0e2e", None::<bollard::container::WaitContainerOptions<String>>);
+    let result = waits.next().await.unwrap().unwrap();
+    assert_eq!(result.status_code, 0);
+
+    docker.remove_container(
+        "m0e2e",
+        Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
+    ).await.unwrap();
+}
