@@ -240,8 +240,19 @@ fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsErr
     vcpu.set_sys_reg(SysReg::Ttbr0, LINUX_PAGE_TABLES_BASE)?;
     vcpu.set_sys_reg(SysReg::Ttbr1, LINUX_PAGE_TABLES_BASE)?;
 
-    // SCTLR_EL1: C,I,UCI,UCT,DZE + M=1 (stage-1 on). Same bits as HVF plus the MMU-enable bit.
-    let sctlr: u64 = (1 << 2) | (1 << 12) | (1 << 26) | (1 << 15) | (1 << 14) | 1;
+    // SCTLR_EL1: C(2), I(12), DZE(14), UCT(15), SPAN(23), UCI(26) + M(0)=1 (stage-1 on).
+    //
+    // SPAN(bit 23)=1 is LOAD-BEARING for the MMIO sentinel: it means
+    // "PSTATE.PAN is left UNCHANGED on taking an exception to EL1". With SPAN=0
+    // (the architectural default) the hardware sets PSTATE.PAN=1 on every
+    // EL0-`svc` entry to EL1 (FEAT_PAN is mandatory ARMv8.1 and KVM-exposed);
+    // the EL1 sentinel vector's `str x8,[x9]` to the EL0-accessible (AP=01)
+    // sentinel page would then fault as a stage-1 PAN permission abort and
+    // never reach stage-2 / KVM_EXIT_MMIO — wedging the first guest syscall.
+    // The guest enters EL0 with PSTATE.PAN=0 (SPSR_EL1 below), so SPAN=1 keeps
+    // PAN=0 through the svc trap and the sentinel store reaches the host.
+    let sctlr: u64 =
+        (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 23) | (1 << 26) | 1;
     vcpu.set_sys_reg(SysReg::Sctlr, sctlr)?;
 
     // FP/SIMD on (CPACR_EL1.FPEN = 0b11) so guest NEON memset doesn't trap.
