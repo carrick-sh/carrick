@@ -1,7 +1,7 @@
 //! Perf probe: build-tool-like small updates over a larger file set.
 //!
 //! This creates a fixed set of sparse files, then repeatedly opens one file,
-//! writes one byte at a rotating offset, and closes it. Under Carrick `--fs
+//! seeks to a rotating offset, writes one byte, and closes it. Under Carrick `--fs
 //! memory`, this exercises overlay dirty-range writeback instead of raw host-fd
 //! paths.
 //!
@@ -55,14 +55,10 @@ fn update_once(paths: &[CString], iteration: usize) {
         std::process::exit(1);
     }
     let offset = ((iteration * 4099) % FILE_BYTES as usize) as libc::off_t;
-    let n = unsafe {
-        libc::pwrite(
-            fd,
-            WRITE_BYTES.as_ptr().cast::<libc::c_void>(),
-            WRITE_BYTES.len(),
-            offset,
-        )
-    };
+    if unsafe { libc::lseek(fd, offset, libc::SEEK_SET) } != offset {
+        std::process::exit(1);
+    }
+    let n = unsafe { libc::write(fd, WRITE_BYTES.as_ptr().cast::<libc::c_void>(), WRITE_BYTES.len()) };
     if n != WRITE_BYTES.len() as isize {
         std::process::exit(1);
     }

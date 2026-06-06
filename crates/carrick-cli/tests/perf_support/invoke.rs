@@ -110,6 +110,7 @@ pub fn run_carrick(
     bin: &PathBuf,
     repo_root: &Path,
     run_id: &str,
+    probe: &Path,
     probe_b64: &[u8],
     mount: bool,
     fs_mode: &str,
@@ -118,6 +119,20 @@ pub fn run_carrick(
         !mount || fs_mode == "host",
         "bind-mount perf cases require carrick --fs host"
     );
+    if fs_mode == "memory" {
+        let probe_path = probe.to_string_lossy().into_owned();
+        let child = Command::new(bin)
+            .args(["run-elf", "--raw", "--fs", "memory", &probe_path])
+            .env("CARRICK_RUN_ID", run_id)
+            .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn carrick run-elf");
+        return drain_with_deadline(child, repo_root, run_id);
+    }
+
     let snippet = if mount {
         mounted_snippet()
     } else {
