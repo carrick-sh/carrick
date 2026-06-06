@@ -199,9 +199,13 @@ impl SyscallDispatcher {
             buf.truncate(n as usize);
             return Ok(buf);
         }
-        let contents = match &*open {
-            OpenDescription::File { contents, .. }
-            | OpenDescription::SyntheticFile { contents, .. } => contents,
+        let bytes = match &*open {
+            OpenDescription::File { contents, .. } => contents.read_at(offset, count),
+            OpenDescription::SyntheticFile { contents, .. } => {
+                let available = contents.get(offset..).unwrap_or_default();
+                let write_len = available.len().min(count);
+                available[..write_len].to_vec()
+            }
             OpenDescription::HostFile { .. } => return Err(LINUX_EINVAL),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
@@ -216,8 +220,6 @@ impl SyscallDispatcher {
             | OpenDescription::SignalFd { .. }
             | OpenDescription::Netlink { .. } => return Err(LINUX_EINVAL),
         };
-        let available = contents.get(offset..).unwrap_or_default();
-        let write_len = available.len().min(count);
-        Ok(available[..write_len].to_vec())
+        Ok(bytes)
     }
 }

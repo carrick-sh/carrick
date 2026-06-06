@@ -30,9 +30,10 @@
 //! current shape is the minimum-risk version that still lets the host
 //! backend live behind the same trait.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
@@ -139,6 +140,19 @@ pub trait FsBackend: Send + Sync {
     /// Materialise an empty file at `path`. Used by `openat(..., O_CREAT)`
     /// when the file did not previously exist.
     fn create_file(&self, path: &str) -> Result<(), BackendError>;
+
+    /// Materialise a writable overlay entry backed by immutable rootfs bytes.
+    /// The default preserves the historical full-copy behavior; in-memory
+    /// backends can override this with a copy-on-write entry that stores only
+    /// dirty ranges.
+    fn create_file_from_rootfs(
+        &self,
+        path: &str,
+        contents: Arc<[u8]>,
+        _mode: u32,
+    ) -> Result<(), BackendError> {
+        self.set_file_contents(path, contents.as_ref().to_vec())
+    }
 
     /// Create a named pipe (FIFO) at `path` with permission bits `mode`
     /// (low 0o7777). Used by `mknod(2)`/`mkfifo(3)` for `S_IFIFO`. The host
@@ -511,10 +525,135 @@ fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
 /// In-memory FsBackend: directories and file contents live in maps,
 /// deletions are a tombstone set. Cheap, ephemeral, exactly what CI
 /// or `cargo test` wants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryFile {
+    Dense(Vec<u8>),
+    RootFsBacked {
+        base: Arc<[u8]>,
+        dirty: BTreeMap<usize, Vec<u8>>,
+        len: usize,
+        mode: u32,
+    },
+}
+
+impl MemoryFile {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(bytes) => bytes.len(),
+            Self::RootFsBacked { len, .. } => *len,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        match self {
+            Self::Dense(_) => 0o644,
+            Self::RootFsBacked { mode, .. } => *mode,
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u8> {
+        match self {
+            Self::Dense(bytes) => bytes.clone(),
+            Self::RootFsBacked {
+                base, dirty, len, ..
+            } => {
+                let mut out = vec![0; *len];
+                let copy_len = base.len().min(*len);
+                out[..copy_len].copy_from_slice(&base[..copy_len]);
+                for (&start, bytes) in dirty {
+                    if start >= *len {
+                        continue;
+                    }
+                    let write_len = bytes.len().min(*len - start);
+                    out[start..start + write_len].copy_from_slice(&bytes[..write_len]);
+                }
+                out
+            }
+        }
+    }
+
+    fn write_range(
+        &mut self,
+        offset: usize,
+        bytes: &[u8],
+        final_size: usize,
+    ) -> Result<(), BackendError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(BackendError::Invalid)?;
+        if final_size < end {
+            return Err(BackendError::Invalid);
+        }
+        match self {
+            Self::Dense(contents) => {
+                contents.resize(final_size, 0);
+                contents[offset..end].copy_from_slice(bytes);
+            }
+            Self::RootFsBacked { dirty, len, .. } => {
+                *len = final_size;
+                prune_dirty_ranges(dirty, final_size);
+                insert_dirty_range(dirty, offset, bytes)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prune_dirty_ranges(dirty: &mut BTreeMap<usize, Vec<u8>>, len: usize) {
+    let keys: Vec<usize> = dirty.range(len..).map(|(&start, _)| start).collect();
+    for key in keys {
+        dirty.remove(&key);
+    }
+    if let Some((&start, bytes)) = dirty.range(..len).next_back() {
+        let keep = len.saturating_sub(start);
+        if keep < bytes.len()
+            && let Some(bytes) = dirty.get_mut(&start)
+        {
+            bytes.truncate(keep);
+        }
+    }
+}
+
+fn insert_dirty_range(
+    dirty: &mut BTreeMap<usize, Vec<u8>>,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), BackendError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let end = offset
+        .checked_add(bytes.len())
+        .ok_or(BackendError::Invalid)?;
+    let overlapping: Vec<usize> = dirty
+        .range(..end)
+        .filter_map(|(&start, existing)| {
+            let existing_end = start.checked_add(existing.len())?;
+            (existing_end > offset).then_some(start)
+        })
+        .collect();
+    for start in overlapping {
+        let Some(existing) = dirty.remove(&start) else {
+            continue;
+        };
+        let existing_end = start
+            .checked_add(existing.len())
+            .ok_or(BackendError::Invalid)?;
+        if start < offset {
+            dirty.insert(start, existing[..offset - start].to_vec());
+        }
+        if existing_end > end {
+            dirty.insert(end, existing[end - start..].to_vec());
+        }
+    }
+    dirty.insert(offset, bytes.to_vec());
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct MemoryBackendState {
     dirs: HashSet<PathBuf>,
-    files: HashMap<PathBuf, Vec<u8>>,
+    files: HashMap<PathBuf, MemoryFile>,
     deletions: HashSet<PathBuf>,
     /// AF_UNIX socket nodes materialised by `bind(2)` (path → permission bits).
     /// Reported as `RootFsEntryKind::Socket` (S_IFSOCK) by `metadata`; present
@@ -563,8 +702,8 @@ impl FsBackend for MemoryBackend {
         if inner.dirs.contains(&normalized) {
             return Some(OverlayEntry::Dir);
         }
-        if let Some(bytes) = inner.files.get(&normalized) {
-            return Some(OverlayEntry::File(bytes.clone()));
+        if let Some(file) = inner.files.get(&normalized) {
+            return Some(OverlayEntry::File(file.to_vec()));
         }
         // An AF_UNIX socket node: present, but has no readable bytes. Report it
         // as an empty File-shaped entry so the layered lookup treats the path as
@@ -601,12 +740,12 @@ impl FsBackend for MemoryBackend {
                 size: 0,
             });
         }
-        if let Some(contents) = inner.files.get(&normalized) {
+        if let Some(file) = inner.files.get(&normalized) {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::File,
-                mode: 0o644,
-                size: contents.len(),
+                mode: file.mode(),
+                size: file.len(),
             });
         }
         if inner.dirs.contains(&normalized) {
@@ -622,7 +761,11 @@ impl FsBackend for MemoryBackend {
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
         let normalized = normalize(path)?;
-        self.inner.read().files.get(&normalized).cloned()
+        self.inner
+            .read()
+            .files
+            .get(&normalized)
+            .map(MemoryFile::to_vec)
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
@@ -637,7 +780,31 @@ impl FsBackend for MemoryBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
-        inner.files.entry(normalized).or_default();
+        inner
+            .files
+            .entry(normalized)
+            .or_insert_with(|| MemoryFile::Dense(Vec::new()));
+        Ok(())
+    }
+
+    fn create_file_from_rootfs(
+        &self,
+        path: &str,
+        contents: Arc<[u8]>,
+        mode: u32,
+    ) -> Result<(), BackendError> {
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let mut inner = self.inner.write();
+        inner.deletions.remove(&normalized);
+        inner.files.insert(
+            normalized,
+            MemoryFile::RootFsBacked {
+                len: contents.len(),
+                base: contents,
+                dirty: BTreeMap::new(),
+                mode: mode & 0o7777,
+            },
+        );
         Ok(())
     }
 
@@ -669,7 +836,7 @@ impl FsBackend for MemoryBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
-        inner.files.insert(normalized, contents);
+        inner.files.insert(normalized, MemoryFile::Dense(contents));
         Ok(())
     }
 
@@ -692,11 +859,10 @@ impl FsBackend for MemoryBackend {
             return Err(BackendError::Unsupported);
         }
         inner.deletions.remove(&normalized);
-        let contents = inner.files.get_mut(&normalized).expect("checked above");
-        if final_size > contents.len() {
-            contents.resize(final_size, 0);
-        }
-        contents[offset..end].copy_from_slice(bytes);
+        let Some(contents) = inner.files.get_mut(&normalized) else {
+            return Err(BackendError::Unsupported);
+        };
+        contents.write_range(offset, bytes, final_size)?;
         Ok(())
     }
 

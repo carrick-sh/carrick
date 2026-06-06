@@ -160,19 +160,25 @@ Progress:
 
 Milestone 1B: writable rootfs-to-overlay materialization.
 
-- [ ] Add a RED test for opening a large rootfs-backed regular file for a small write.
+- [x] Add a RED test for opening a large rootfs-backed regular file for a small write.
   - The test should fail if `RootFsVfs` loads full file contents before the first small mutation.
   - Count payload-bearing `lookup` or `file_contents` calls.
-- [ ] Add or reuse backend APIs that can materialize an overlay entry from metadata plus dirty ranges instead of full payload bytes.
-- [ ] Preserve fallback behavior for non-regular entries, unsupported backends, and operations requiring full contents.
-- [ ] Run focused open/write/stat/copy tests.
-  - `cargo test -p carrick-runtime --test integration openat -- --nocapture`
-  - `cargo test -p carrick-runtime --test integration write -- --nocapture`
-  - `cargo test -p carrick-runtime --test integration writev -- --nocapture`
-  - `cargo test -p carrick-runtime --test integration newfstatat -- --nocapture`
-  - `cargo test -p carrick-runtime --test integration statx -- --nocapture`
+- [x] Add or reuse backend APIs that can materialize an overlay entry from metadata plus dirty ranges instead of full payload bytes.
+- [x] Preserve fallback behavior for non-regular entries, unsupported backends, and operations requiring full contents.
+- [x] Run focused open/write/stat/copy tests.
+  - `cargo test -p carrick-runtime --test integration small_write_to_large -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration rootfs_overlay -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration copy_file_range_ -- --nocapture`
+  - `cargo test -p carrick-runtime --tests --no-run`
 - [ ] Re-run `large_meta` and `overlay_small_updates`.
-- [ ] Commit runtime/test slice separately from benchmark result docs.
+- [x] Commit runtime/test slice separately from benchmark result docs.
+
+Progress:
+
+- 2026-06-06: Added RED `small_write_to_large_rootfs_file_does_not_copy_up_whole_file`; before the fix it failed with `max writeback payload was 4194304`, proving writable open of a rootfs-backed 4 MiB file copied the whole payload into the overlay before the one-byte mutation.
+- 2026-06-06: Added rootfs shared payload handles (`Arc<[u8]>`), `FsBackend::create_file_from_rootfs`, sparse rootfs-backed entries in `MemoryBackend`, and descriptor-side `FileContents::RootFsBacked` dirty ranges. Writable non-truncating rootfs opens now install a COW overlay entry and update only dirty ranges on write; truncating opens, host-backed opens, synthetic files, and full-content operations keep dense/fallback behavior.
+- 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime --test integration small_write_to_large -- --nocapture`, `cargo test -p carrick-runtime --test integration rootfs_overlay -- --nocapture`, `cargo test -p carrick-runtime --test integration pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds -- --nocapture`, `cargo test -p carrick-runtime --test integration copy_file_range_ -- --nocapture`, `cargo test -p carrick-runtime --tests --no-run`, `cargo fmt --all -- --check`, and `git diff --check`.
 
 ### 2. Wait Path fd Pinning and kqueue Churn
 

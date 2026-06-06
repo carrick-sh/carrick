@@ -87,6 +87,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use serde::Serialize;
@@ -114,7 +115,7 @@ pub struct FileEntry {
     pub mode: u32,
     pub size: usize,
     #[serde(skip)]
-    contents: Vec<u8>,
+    contents: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -126,7 +127,7 @@ pub struct SymlinkEntry {
 
 impl FileEntry {
     pub fn contents(&self) -> &[u8] {
-        &self.contents
+        self.contents.as_ref()
     }
 }
 
@@ -425,7 +426,7 @@ impl RootFs {
                 dir.create_dir_all(parent)?;
             }
             let mut file = dir.create(path)?;
-            file.write_all(&entry.contents)?;
+            file.write_all(entry.contents.as_ref())?;
             drop(file);
             let _ = dir.set_permissions(path, cap_std::fs::Permissions::from_mode(entry.mode));
         }
@@ -465,6 +466,10 @@ impl RootFs {
     }
 
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, RootFsError> {
+        Ok(self.read_shared(path)?.as_ref().to_vec())
+    }
+
+    pub fn read_shared(&self, path: impl AsRef<Path>) -> Result<Arc<[u8]>, RootFsError> {
         let path = normalize_rootfs_path(path.as_ref())?;
         let path = self.resolve_symlink(&path, 0)?;
         self.files
@@ -617,7 +622,7 @@ impl RootFs {
                         path,
                         mode,
                         size: contents.len(),
-                        contents,
+                        contents: Arc::from(contents),
                     },
                 );
             }
