@@ -134,15 +134,17 @@ pub fn reset() {
     CHILD_SYS_US.store(0, Ordering::Relaxed);
 }
 
-// ---- Reaped-child CPU accounting (getrusage RUSAGE_CHILDREN, times cutime) ----
+// ---- Child metadata and CPU accounting (getrusage RUSAGE_CHILDREN, times cutime) ----
 //
 // A guest's child runs as a separate host process, so its guest CPU time lives
 // in the child's own `EXEC_NS` table and dies with it. Linux rolls a reaped
 // child's CPU into the parent's child-time totals; to match, an exiting child
 // publishes its guest CPU into a process-SHARED table (created before any fork
 // so the MAP_SHARED region is inherited), and the parent drains it at `wait4`
-// into its per-process child accumulators below. The host-side child CPU comes
-// from Darwin's own `wait4` rusage out-param (added by the caller).
+// into its per-process child accumulators below. The same live-child row also
+// carries low-volume wait metadata that the parent must observe before terminal
+// reap, such as pending ptrace signal-delivery stops. The host-side child CPU
+// comes from Darwin's own `wait4` rusage out-param (added by the caller).
 
 /// Per-process accumulated child CPU (microseconds), summed over reaped
 /// children. NOT shared across fork — each process tracks the children IT
@@ -162,6 +164,8 @@ struct ChildSlot {
     pid: AtomicU64,
     /// The child's total guest CPU nanoseconds.
     guest_ns: AtomicU64,
+    /// Non-zero while this child has an unreported ptrace signal-delivery stop.
+    ptrace_stop_pending: AtomicU64,
 }
 
 /// Create the shared child-exit table. MUST be called in the root guest before
@@ -201,10 +205,74 @@ fn child_slots() -> Option<&'static [ChildSlot]> {
     Some(unsafe { std::slice::from_raw_parts(p, CHILD_SLOTS) })
 }
 
+/// Register a live child so descendants can publish metadata before exit.
+pub fn register_child(pid: u32) {
+    let Some(slots) = child_slots() else { return };
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == pid as u64 {
+            return;
+        }
+    }
+    for slot in slots {
+        if slot
+            .pid
+            .compare_exchange(0, pid as u64, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            slot.guest_ns.store(0, Ordering::Relaxed);
+            slot.ptrace_stop_pending.store(0, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Mark the current process as having an unreported ptrace signal stop.
+pub fn mark_self_ptrace_stop_pending() {
+    let pid = std::process::id();
+    register_child(pid);
+    let Some(slots) = child_slots() else { return };
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == pid as u64 {
+            slot.ptrace_stop_pending.store(1, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Clear the pending ptrace signal-stop marker once wait4 reports it.
+pub fn clear_child_ptrace_stop_pending(pid: u32) {
+    let Some(slots) = child_slots() else { return };
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == pid as u64 {
+            slot.ptrace_stop_pending.store(0, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Whether `pid` has an unreported ptrace signal-delivery stop.
+pub fn child_has_ptrace_stop_pending(pid: u32) -> bool {
+    let Some(slots) = child_slots() else {
+        return false;
+    };
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == pid as u64 {
+            return slot.ptrace_stop_pending.load(Ordering::Acquire) != 0;
+        }
+    }
+    false
+}
+
 /// Publish an exiting child's total guest CPU (nanoseconds) for its parent to
 /// reap. Called from the forked-child exit path.
 pub fn record_child_exit(pid: u32, guest_ns: u64) {
     let Some(slots) = child_slots() else { return };
+    for slot in slots {
+        if slot.pid.load(Ordering::Acquire) == pid as u64 {
+            slot.guest_ns.store(guest_ns, Ordering::Release);
+            return;
+        }
+    }
     for slot in slots {
         if slot
             .pid
@@ -212,6 +280,7 @@ pub fn record_child_exit(pid: u32, guest_ns: u64) {
             .is_ok()
         {
             slot.guest_ns.store(guest_ns, Ordering::Release);
+            slot.ptrace_stop_pending.store(0, Ordering::Release);
             return;
         }
     }
@@ -225,6 +294,8 @@ pub fn reap_child_guest_ns(pid: u32) -> u64 {
     for slot in slots {
         if slot.pid.load(Ordering::Acquire) == pid as u64 {
             let ns = slot.guest_ns.load(Ordering::Acquire);
+            slot.guest_ns.store(0, Ordering::Relaxed);
+            slot.ptrace_stop_pending.store(0, Ordering::Release);
             slot.pid.store(0, Ordering::Release);
             return ns;
         }
@@ -279,5 +350,40 @@ mod tests {
         assert_eq!(active_count(), 0);
         assert_eq!(total_ns(), 1_000_000);
         reset();
+    }
+
+    #[test]
+    fn child_ptrace_stop_marker_lives_until_report_or_reap() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let pid = 424_242;
+
+        let _ = reap_child_guest_ns(pid);
+        register_child(pid);
+        assert!(!child_has_ptrace_stop_pending(pid));
+
+        let slots = child_slots().unwrap();
+        for slot in slots {
+            if slot.pid.load(Ordering::Acquire) == pid as u64 {
+                slot.ptrace_stop_pending.store(1, Ordering::Release);
+                break;
+            }
+        }
+        assert!(child_has_ptrace_stop_pending(pid));
+
+        clear_child_ptrace_stop_pending(pid);
+        assert!(!child_has_ptrace_stop_pending(pid));
+
+        for slot in child_slots().unwrap() {
+            if slot.pid.load(Ordering::Acquire) == pid as u64 {
+                slot.ptrace_stop_pending.store(1, Ordering::Release);
+                break;
+            }
+        }
+
+        record_child_exit(pid, 1234);
+        assert!(child_has_ptrace_stop_pending(pid));
+        assert_eq!(reap_child_guest_ns(pid), 1234);
+        assert!(!child_has_ptrace_stop_pending(pid));
     }
 }

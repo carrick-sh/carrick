@@ -1084,6 +1084,7 @@ where
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
+                        crate::guest_cpu::register_child(child_pid as u32);
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
                         // (parent) tid when it exits — without a host SIGCHLD
@@ -2657,6 +2658,7 @@ impl ThreadRuntimeState {
                     );
                 }
                 crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
+                crate::guest_cpu::register_child(child_pid as u32);
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its
                 // fd to the guest pidfd-out pointer. The child's pid mirrors a
                 // real host pid, so the pidfd watches it via EVFILT_PROC.

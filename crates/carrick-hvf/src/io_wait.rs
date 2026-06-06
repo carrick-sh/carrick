@@ -110,6 +110,9 @@ enum ProcExitWait {
 
 #[cfg(target_os = "macos")]
 fn child_status_ready(pid: i32) -> bool {
+    if pid > 0 && crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32) {
+        return true;
+    }
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::waitid(
