@@ -172,6 +172,13 @@ impl FsBackend for CountingMemoryBackend {
         self.inner.shared_file_entry(path, trunc)
     }
 
+    fn fast_nofollow_metadata(
+        &self,
+        path: &str,
+    ) -> Option<carrick_runtime::rootfs::RootFsMetadata> {
+        self.inner.fast_nofollow_metadata(path)
+    }
+
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
         self.inner.make_dir(path)
     }
@@ -306,6 +313,43 @@ fn memory_overlay_regular_open_skips_fifo_probe_when_backend_cannot_have_fifos()
     assert!(
         calls <= 1,
         "memory overlay regular-file open should not run the FIFO metadata probe; lookup_kind calls={calls}"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn memory_overlay_regular_open_skips_legacy_kind_lookups() {
+    let backend = CountingMemoryBackend::new();
+    backend
+        .set_file_contents("/regular.bin", vec![0x41; 1024])
+        .unwrap();
+    backend.reset_counts();
+    let lookup_kind_calls = backend.lookup_kind_calls.clone();
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/regular.bin\0").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+
+    let calls = lookup_kind_calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        calls, 0,
+        "memory overlay regular-file open should use fast no-follow metadata instead of legacy kind lookups; lookup_kind calls={calls}"
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
