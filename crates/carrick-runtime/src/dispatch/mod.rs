@@ -2680,7 +2680,11 @@ fn dispatch_threaded_futex(
     // inter-process rendezvous: route it through the host __ulock keyed on the
     // shared physical page so a waker in another carrick process is reached.
     // Private/anon futexes stay in the in-process parking-lot table.
-    let shared_host_addr = memory.shared_futex_host_addr(address);
+    let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+        None
+    } else {
+        memory.shared_futex_host_addr(address)
+    };
     crate::probes::futex_route(
         address,
         command as i32,
@@ -5294,6 +5298,7 @@ mod overlay_dispatch_tests {
         base: u64,
         bytes: Vec<u8>,
         reads: std::cell::Cell<usize>,
+        shared_futex_lookups: std::cell::Cell<usize>,
     }
 
     impl CountingMemory {
@@ -5302,6 +5307,7 @@ mod overlay_dispatch_tests {
                 base,
                 bytes,
                 reads: std::cell::Cell::new(0),
+                shared_futex_lookups: std::cell::Cell::new(0),
             }
         }
     }
@@ -5349,6 +5355,57 @@ mod overlay_dispatch_tests {
             self.bytes[offset..end].copy_from_slice(bytes);
             Ok(())
         }
+
+        fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+            self.shared_futex_lookups
+                .set(self.shared_futex_lookups.get() + 1);
+            None
+        }
+    }
+
+    #[test]
+    fn private_futex_wake_skips_shared_mapping_lookup() {
+        let mut memory = CountingMemory::new(0x10000, vec![0u8; 0x1000]);
+        memory.write_bytes(0x10800, &0u32.to_le_bytes()).unwrap();
+        let reporter = CompatReporter::default();
+        let futex = crate::thread::FutexTable::new();
+        let registry = crate::thread::ThreadRegistry::new(1000);
+        let request = SyscallRequest::new(
+            98,
+            SyscallArgs::from([
+                0x10800,
+                LINUX_FUTEX_WAKE | LinuxFutexFlags::PRIVATE.bits(),
+                1,
+                0,
+                0,
+                0,
+            ]),
+        );
+
+        let outcome =
+            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(memory.shared_futex_lookups.get(), 0);
+    }
+
+    #[test]
+    fn non_private_futex_wake_checks_shared_mapping_lookup() {
+        let mut memory = CountingMemory::new(0x10000, vec![0u8; 0x1000]);
+        memory.write_bytes(0x10800, &0u32.to_le_bytes()).unwrap();
+        let reporter = CompatReporter::default();
+        let futex = crate::thread::FutexTable::new();
+        let registry = crate::thread::ThreadRegistry::new(1000);
+        let request = SyscallRequest::new(
+            98,
+            SyscallArgs::from([0x10800, LINUX_FUTEX_WAKE, 1, 0, 0, 0]),
+        );
+
+        let outcome =
+            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(memory.shared_futex_lookups.get(), 1);
     }
 
     #[test]
