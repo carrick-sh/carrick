@@ -1,0 +1,27 @@
+#!/bin/sh
+# Carrick pre-commit hook: refuse to commit unformatted code.
+#
+# Formatting is sub-second, so it runs on every commit. The slower clippy
+# gate runs at push time (see .githooks/pre-push) to keep commits fast.
+# Install with `just install-hooks` (sets core.hooksPath to .githooks).
+#
+# Bypass in an emergency with `git commit --no-verify`.
+
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if command -v just >/dev/null 2>&1; then
+    fmt_check="just fmt-check"
+    fmt_fix="just fmt"
+else
+    fmt_check="cargo fmt --all -- --check"
+    fmt_fix="cargo fmt --all"
+fi
+
+printf 'pre-commit: checking formatting (%s)\n' "$fmt_check"
+if ! $fmt_check; then
+    printf '\npre-commit: formatting check failed. Run `%s` and re-stage.\n' "$fmt_fix" >&2
+    exit 1
+fi

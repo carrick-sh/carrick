@@ -1,0 +1,30 @@
+#!/bin/sh
+# Carrick pre-push hook: refuse to push clippy-unfriendly code.
+#
+# This mirrors the CI clippy gate (`cargo clippy --workspace --all-targets
+# -- -D warnings`, the no-panic gate). It runs at push — not per-commit —
+# because it recompiles the workspace and can take a while after edits.
+# Install with `just install-hooks` (sets core.hooksPath to .githooks).
+#
+# NOTE: CI tracks the latest stable Rust (dtolnay/rust-toolchain@stable),
+# so a freshly released stable can flag lints your local toolchain doesn't.
+# Keep local in sync with `rustup update stable`.
+#
+# Bypass in an emergency with `git push --no-verify`.
+
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if command -v just >/dev/null 2>&1; then
+    clippy="just clippy"
+else
+    clippy="cargo clippy --workspace --all-targets -- -D warnings"
+fi
+
+printf 'pre-push: running clippy gate (%s)\n' "$clippy"
+if ! $clippy; then
+    printf '\npre-push: clippy gate failed. Fix the warnings above before pushing.\n' >&2
+    exit 1
+fi

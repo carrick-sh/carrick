@@ -22,6 +22,11 @@ run *ARGS: build
 check *ARGS:
     cargo build {{ARGS}}
 
+# Install git hooks (.githooks/): fmt-check at commit, clippy gate at push.
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "Installed hooks: pre-commit (fmt-check), pre-push (clippy). Bypass with --no-verify."
+
 # No-panic lint gate (unwrap/expect/panic/todo denied) — matches CI.
 clippy *ARGS:
     cargo clippy --workspace --all-targets {{ARGS}} -- -D warnings
