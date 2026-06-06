@@ -107,10 +107,22 @@ closure-linux:
 build-linux:
     cargo build --release -p carrick-linux
 
+# ONE-TIME (Apple M3+/macOS 15+): create the lima `vz` nested-KVM Ubuntu VM that
+# serves as the local L2 lane. qemu's HVF backend can't provide nested virt;
+# Virtualization.framework (via lima vz) can. Mounts this repo into the guest.
+lima-up:
+    ./scripts/lima-up.sh
+
+# TURNKEY L2 (run on the macOS host): build carrick-linux natively inside the
+# lima nested-KVM guest and run hello-aarch64 against real /dev/kvm. This is the
+# MVP success gate on Apple Silicon. Run `just lima-up` once first.
+kvm-smoke-lima:
+    ./scripts/kvm-smoke-lima.sh
+
 # LOCAL (L2): run the freestanding hello-aarch64 under carrick-linux on real
-# /dev/kvm (M3-nested HVF lane) and diff stdout + exit code against the native
-# oracle. This is the MVP success gate. Requires `just build-linux` first and
-# /dev/kvm present (i.e. run inside the nested-KVM Linux VM).
+# /dev/kvm and diff stdout + exit code against the oracle. This is the MVP
+# success gate when you ALREADY have /dev/kvm (e.g. inside the nested-KVM VM, or
+# a native Linux/aarch64 host). On a macOS host use `just kvm-smoke-lima` instead.
 kvm-smoke: build-linux build-fixture
     #!/usr/bin/env bash
     set -euo pipefail
