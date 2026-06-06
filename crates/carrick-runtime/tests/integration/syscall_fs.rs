@@ -13,7 +13,7 @@ mod support;
 #[cfg(target_os = "macos")]
 use carrick_runtime::fs_backend::{FsBackend, HostFsBackend};
 use carrick_runtime::linux_abi::{
-    LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR, LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR,
+    LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR, LINUX_EFAULT, LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR,
 };
 use carrick_runtime::vfs::{BindVfs, MAX_IN_MEMORY_FILE_SIZE};
 use support::*;
@@ -6429,6 +6429,306 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
         DispatchOutcome::Errno { errno: 9 }
     );
 
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+struct HostPtrPayloadMemory {
+    base: u64,
+    bytes: Vec<u8>,
+    host_ptr_ranges: Vec<(u64, usize)>,
+    unreadable_ranges: Vec<(u64, usize)>,
+    watched_ranges: Vec<(u64, usize)>,
+    watched_reads: std::cell::Cell<usize>,
+    host_ptr_hits: std::cell::Cell<usize>,
+}
+
+#[cfg(target_os = "macos")]
+impl HostPtrPayloadMemory {
+    fn new(base: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            base,
+            bytes,
+            host_ptr_ranges: Vec::new(),
+            unreadable_ranges: Vec::new(),
+            watched_ranges: Vec::new(),
+            watched_reads: std::cell::Cell::new(0),
+            host_ptr_hits: std::cell::Cell::new(0),
+        }
+    }
+
+    fn offset(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<usize, carrick_runtime::dispatch::MemoryError> {
+        let offset = address
+            .checked_sub(self.base)
+            .ok_or(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length })?;
+        let offset = usize::try_from(offset)
+            .map_err(|_| carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length })?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length })?;
+        if end > self.bytes.len() {
+            return Err(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length });
+        }
+        Ok(offset)
+    }
+
+    fn expose_host_ptr(&mut self, address: u64, len: usize) {
+        self.host_ptr_ranges.push((address, len));
+    }
+
+    fn deny_read(&mut self, address: u64, len: usize) {
+        self.unreadable_ranges.push((address, len));
+    }
+
+    fn watch_payload_read(&mut self, address: u64, len: usize) {
+        self.watched_ranges.push((address, len));
+    }
+
+    fn reset_counts(&self) {
+        self.watched_reads.set(0);
+        self.host_ptr_hits.set(0);
+    }
+
+    fn watched_reads(&self) -> usize {
+        self.watched_reads.get()
+    }
+
+    fn host_ptr_hits(&self) -> usize {
+        self.host_ptr_hits.get()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl GuestMemory for HostPtrPayloadMemory {
+    fn read_bytes(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_runtime::dispatch::MemoryError> {
+        if self
+            .unreadable_ranges
+            .iter()
+            .any(|(base, len)| address == *base && length == *len)
+        {
+            return Err(carrick_runtime::dispatch::MemoryError::OutOfBounds { address, length });
+        }
+        if self
+            .watched_ranges
+            .iter()
+            .any(|(base, len)| address == *base && length == *len)
+        {
+            self.watched_reads.set(self.watched_reads.get() + 1);
+        }
+        let offset = self.offset(address, length)?;
+        Ok(self.bytes[offset..offset + length].to_vec())
+    }
+
+    fn write_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), carrick_runtime::dispatch::MemoryError> {
+        let offset = self.offset(address, bytes.len())?;
+        self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn read_into(
+        &self,
+        address: u64,
+        dst: &mut [u8],
+    ) -> Result<(), carrick_runtime::dispatch::MemoryError> {
+        let offset = self.offset(address, dst.len())?;
+        dst.copy_from_slice(&self.bytes[offset..offset + dst.len()]);
+        Ok(())
+    }
+
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        if !self
+            .host_ptr_ranges
+            .iter()
+            .any(|(base, range_len)| address == *base && len == *range_len)
+        {
+            return None;
+        }
+        let offset = self.offset(address, len).ok()?;
+        self.host_ptr_hits.set(self.host_ptr_hits.get() + 1);
+        Some(unsafe { self.bytes.as_ptr().add(offset) })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_host_out_file(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut impl GuestMemory,
+    reporter: &CompatReporter,
+) {
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        LINUX_O_CREAT | LINUX_O_RDWR,
+                        0o644,
+                        0,
+                        0,
+                    ]),
+                ),
+                memory,
+                reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pwritev_host_file_uses_guest_host_ptrs_without_payload_reads() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    let reporter = CompatReporter::default();
+    let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
+    memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
+    memory.write_bytes(0x4200, b"head").unwrap();
+    memory.write_bytes(0x4300, b"tailpiece").unwrap();
+    memory.expose_host_ptr(0x4200, 4);
+    memory.expose_host_ptr(0x4300, 9);
+    memory.watch_payload_read(0x4200, 4);
+    memory.watch_payload_read(0x4300, 9);
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 9)],
+    );
+
+    open_host_out_file(&mut dispatcher, &mut memory, &reporter);
+    memory.reset_counts();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 13 }
+    );
+    assert_eq!(
+        memory.watched_reads(),
+        0,
+        "borrowed pwritev should not copy payloads through read_bytes"
+    );
+    assert_eq!(
+        memory.host_ptr_hits(),
+        2,
+        "borrowed pwritev should resolve each non-empty payload to a host pointer"
+    );
+    assert_eq!(
+        std::fs::read(scratch.path().join("out.bin")).unwrap(),
+        b"headtailpiece"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    let reporter = CompatReporter::default();
+    let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
+    memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
+    memory.write_bytes(0x4200, b"head").unwrap();
+    memory.write_bytes(0x4300, b"tailpiece").unwrap();
+    memory.expose_host_ptr(0x4200, 4);
+    memory.watch_payload_read(0x4200, 4);
+    memory.watch_payload_read(0x4300, 9);
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 9)],
+    );
+
+    open_host_out_file(&mut dispatcher, &mut memory, &reporter);
+    memory.reset_counts();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 13 }
+    );
+    assert_eq!(
+        memory.watched_reads(),
+        2,
+        "fallback pwritev should stage each payload exactly once"
+    );
+    assert_eq!(
+        std::fs::read(scratch.path().join("out.bin")).unwrap(),
+        b"headtailpiece"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    let reporter = CompatReporter::default();
+    let mut memory = HostPtrPayloadMemory::new(0x4000, vec![0; 0x800]);
+    memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
+    memory.write_bytes(0x4200, b"head").unwrap();
+    memory.write_bytes(0x4300, b"tailpiece").unwrap();
+    memory.expose_host_ptr(0x4200, 4);
+    memory.deny_read(0x4300, 9);
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 9)],
+    );
+
+    open_host_out_file(&mut dispatcher, &mut memory, &reporter);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EFAULT
+        }
+    );
+    assert_eq!(
+        std::fs::read(scratch.path().join("out.bin")).unwrap(),
+        b"",
+        "invalid iovec validation must finish before any host write"
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 

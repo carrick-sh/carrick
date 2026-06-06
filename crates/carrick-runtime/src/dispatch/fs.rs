@@ -84,6 +84,52 @@ fn gather_bounded_iovec_bytes(
     Ok(Some(bytes))
 }
 
+enum PwritevPayloads {
+    Borrowed(Vec<libc::iovec>),
+    Staged(Vec<Vec<u8>>),
+}
+
+fn prepare_pwritev_payloads(
+    memory: &impl GuestMemory,
+    iovecs: &[LinuxIovec],
+) -> Result<PwritevPayloads, i32> {
+    let mut borrowed_iovecs = Vec::with_capacity(iovecs.len());
+    let mut all_borrowed = true;
+    for iovec in iovecs {
+        let iov_len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
+        if iov_len == 0 {
+            continue;
+        }
+        let Some(ptr) = memory.host_ptr_for_read(iovec.iov_base, iov_len) else {
+            all_borrowed = false;
+            break;
+        };
+        borrowed_iovecs.push(libc::iovec {
+            iov_base: ptr as *mut libc::c_void,
+            iov_len,
+        });
+    }
+    if all_borrowed {
+        return Ok(PwritevPayloads::Borrowed(borrowed_iovecs));
+    }
+
+    let mut staged_iovecs = Vec::with_capacity(iovecs.len());
+    for iovec in iovecs {
+        let iov_len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
+        // A zero-length iovec segment is permitted and must NOT fault, even
+        // with a NULL/invalid base.
+        let bytes = if iov_len == 0 {
+            Vec::new()
+        } else {
+            memory
+                .read_bytes(iovec.iov_base, iov_len)
+                .map_err(|_| LINUX_EFAULT)?
+        };
+        staged_iovecs.push(bytes);
+    }
+    Ok(PwritevPayloads::Staged(staged_iovecs))
+}
+
 /// If `path` is a `/proc/{self,thread-self,curproc,this}/fd/N` magic symlink,
 /// return the descriptor number N. Used to serve `open()` of these (Linux
 /// re-opens the file behind fd N); Apple Rosetta opens its main-binary fd this
@@ -4616,24 +4662,10 @@ impl SyscallDispatcher {
             if offset < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let mut staged_iovecs: Vec<Vec<u8>> = Vec::with_capacity(iovecs.len());
-            for iovec in &iovecs {
-                let iov_len = usize::try_from(iovec.iov_len)
-                    .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
-                // A zero-length iovec segment is permitted and must NOT fault,
-                // even with a NULL/invalid base (LTP pwritev01/pwritev201 pass
-                // `{NULL, 0}` as the second segment). Only validate non-empty
-                // segments.
-                let bytes = if iov_len == 0 {
-                    Vec::new()
-                } else {
-                    match memory.read_bytes(iovec.iov_base, iov_len) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return Ok(LINUX_EFAULT.into()),
-                    }
-                };
-                staged_iovecs.push(bytes);
-            }
+            let payloads = match prepare_pwritev_payloads(memory, &iovecs) {
+                Ok(payloads) => payloads,
+                Err(errno) => return Ok(errno.into()),
+            };
             if is_stdio_fd(fd.0) {
                 return Ok(LINUX_ESPIPE.into());
             }
@@ -4650,9 +4682,29 @@ impl SyscallDispatcher {
                     return Ok(LINUX_EBADF.into());
                 }
                 let hfd = *host_fd;
+                if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
+                    if borrowed_iovecs.is_empty() {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    let iovcnt =
+                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                    let n = unsafe {
+                        libc::pwritev(
+                            hfd,
+                            borrowed_iovecs.as_ptr(),
+                            iovcnt,
+                            offset as libc::off_t,
+                        )
+                    };
+                    let n = n.host_syscall_errno()?;
+                    return Ok(DispatchOutcome::Returned { value: n as i64 });
+                }
                 let mut total = 0i64;
                 let mut cur = offset;
-                for buf in &staged_iovecs {
+                let PwritevPayloads::Staged(staged_iovecs) = &payloads else {
+                    return Ok(LINUX_EINVAL.into());
+                };
+                for buf in staged_iovecs {
                     if buf.is_empty() {
                         continue;
                     }
