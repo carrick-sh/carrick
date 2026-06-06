@@ -1166,6 +1166,26 @@ fn kaniko_run_argv(
     argv.push("dir:///workspace".to_owned());
     argv.push("--dockerfile".to_owned());
     argv.push(format!("/workspace/{dockerfile_rel}"));
+    // Use kaniko's experimental run implementation, which detects per-RUN
+    // changes WITHOUT walking the whole filesystem. This is required for
+    // multi-stage builds to produce a *runnable* image under carrick.
+    //
+    // Why: between stages that share a base (e.g. two `FROM alpine`), kaniko
+    // resets the rootfs — it `rmdir`s `/lib` then re-`mkdir`s + re-unpacks it.
+    // kaniko's DEFAULT full-mode parallel filesystem snapshot walks `/` during
+    // that reset and observes `/lib` transiently absent (ENOENT in the window
+    // between the `rmdir` and the re-`mkdir`), so it emits a spurious `.wh.lib`
+    // whiteout into the final layer. That whiteout deletes `/lib` from the
+    // image → alpine busybox loses its musl interpreter
+    // (`/lib/ld-musl-*.so.1`) → `carrick run <img>` exits 127. Real Docker runs
+    // the same kaniko cleanly; the divergence is in carrick's fs concurrency
+    // ordering during the between-stage delete+reunpack, which is deep to fix.
+    // `--use-new-run` sidesteps the full-FS snapshot walk entirely, so the
+    // mid-reset `/lib` is never observed and no `.wh.lib` is emitted. It is
+    // safe and beneficial for single-stage builds too (faster, no full walk),
+    // so it is unconditional. (`--snapshot-mode=redo` was tried and still
+    // performs the full-FS walk → still emits `.wh.lib`; it does NOT fix this.)
+    argv.push("--use-new-run".to_owned());
     if out_dir.is_some() {
         // No-push: build to a tar that carrick then loads.
         argv.push("--no-push".to_owned());
@@ -1235,6 +1255,10 @@ mod build_tests {
                 "dir:///workspace",
                 "--dockerfile",
                 "/workspace/Dockerfile",
+                // --use-new-run: avoids kaniko's full-FS snapshot walk so
+                // multi-stage builds don't emit a spurious /lib whiteout under
+                // carrick (see kaniko_run_argv). Emitted unconditionally.
+                "--use-new-run",
                 "--no-push",
                 "--tar-path",
                 "/out/image.tar",
@@ -1278,6 +1302,47 @@ mod build_tests {
         assert!(argv.windows(2).any(|w| w[0] == "--customPlatform" && w[1] == "linux/amd64"));
         // The kaniko image is always present.
         assert!(argv.iter().any(|a| a == KANIKO_IMAGE));
+        // --use-new-run is emitted on the push path too.
+        assert!(argv.iter().any(|a| a == "--use-new-run"));
+    }
+
+    /// `--use-new-run` is ALWAYS emitted (push and no-push), and always after
+    /// the `--dockerfile <path>` pair. It is what makes multi-stage builds
+    /// produce a runnable image under carrick (no spurious `/lib` whiteout);
+    /// it is safe + beneficial for single-stage too, hence unconditional.
+    #[test]
+    fn kaniko_argv_always_uses_new_run() {
+        // no-push path
+        let no_push = kaniko_run_argv(
+            "carrick",
+            "/ctx",
+            Some("/tmp/out".to_owned()),
+            "Dockerfile",
+            "app",
+            &[],
+            false,
+            false,
+            None,
+            None,
+        );
+        // push path
+        let push = kaniko_run_argv(
+            "carrick", "/ctx", None, "Dockerfile", "app", &[], false, false, None, None,
+        );
+        for argv in [&no_push, &push] {
+            let run_idx = argv
+                .iter()
+                .position(|a| a == "--use-new-run")
+                .unwrap_or_else(|| panic!("expected --use-new-run in {argv:?}"));
+            let df_idx = argv
+                .iter()
+                .position(|a| a == "--dockerfile")
+                .unwrap_or_else(|| panic!("expected --dockerfile in {argv:?}"));
+            assert!(
+                run_idx > df_idx + 1,
+                "--use-new-run must come after the --dockerfile pair in {argv:?}",
+            );
+        }
     }
 
     /// `--cache` (no repo) → `--cache=true` in argv; no `--cache-repo`; no
