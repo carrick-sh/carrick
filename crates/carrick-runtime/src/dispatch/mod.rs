@@ -1306,6 +1306,11 @@ pub struct SyscallDispatcher {
     /// child inherits it via the memory copy and it survives `execve`
     /// (matching Linux — CPython subprocess `extra_groups=` sets it pre-exec).
     setgroups_override: Mutex<Option<Vec<u32>>>,
+    /// Set by syscall handlers that make process-directed async signal delivery
+    /// observable while guest userspace is spinning. The threaded runtime drains
+    /// this after completing the syscall and starts the signal pump before
+    /// re-entering guest code.
+    signal_pump_requested: std::sync::atomic::AtomicBool,
 }
 
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
@@ -1646,7 +1651,18 @@ impl SyscallDispatcher {
             seccomp: crate::seccomp::SeccompState::default(),
             sysv: Mutex::new(sysv::SysvShmState::new()),
             setgroups_override: Mutex::new(None),
+            signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn request_signal_pump(&self) {
+        self.signal_pump_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_signal_pump_request(&self) -> bool {
+        self.signal_pump_requested
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Capture the guest's `AddressSpace` region list so that

@@ -16,9 +16,9 @@ it parses this doc + the probe binaries on disk and fails CI if the doc cites
 a probe that doesn't exist):
 
 ```
-Owned invariant probes (on disk):  283
-Invariant rows with an owning test: 128/128 (100%)
-Distinct curated LTP tests owned:   501/501 (100%)
+Owned invariant probes (on disk):  288
+Invariant rows with an owning test: 134/134 (100%)
+Distinct curated LTP tests owned:   502/502 (100%)
 ```
 
 This is the number the project tracks INSTEAD of "LTP MATCH count": the probe
@@ -131,6 +131,7 @@ underlying gap got fixed):
 | **A blocking `waitpid(A)` is NOT interrupted by a sibling child B's default-ignore SIGCHLD (no handler → delivered-and-dropped → no EINTR); a SIGCHLD HANDLER without SA_RESTART DOES interrupt (EINTR). The dispatcher folds blocked + effectively-ignored signals into the wait's no-interrupt mask** | ✅ `waitsiblingsigchld` | futex_cmp_requeue01 / any multi-child SAFE_WAITPID reap |
 | **Internal signal wake pipes at EOF do not spin a waiter: drain reports EOF as a dead wake source, removes the kqueue read filter, and falls back to bounded polling instead of repeating `kevent -> read(0)` forever** | 🧪 `io_wait::tests::wake_pipe_at_eof_does_not_refire` + `host_signal::tests::drain_fd_reports_dead_on_eof` | CPython forkserver/process-pool diagnostic |
 | **A child that exits before Carrick can arm the signal pump's EVFILT_PROC watch still publishes the requested guest exit signal; clone(0) keeps the no-signal contract** | 🧪 `host_signal::tests::missed_child_exit_watch_publishes_exit_signal_once` + `host_signal::tests::missed_child_exit_watch_honors_zero_exit_signal` | CPython forkserver/process-pool max-task shutdown |
+| **Fork child-exit notifications allocate the signal pump/watch only when guest-observable: default unblocked SIGCHLD stays pump-free and leaves wait4/waitid to reap, while blocked/caught/non-ignored exit signals still request async delivery** | 🧪 `signal::tests::child_exit_signal_pump_predicate_tracks_observable_dispositions` + ✅ `sigchld` / `cloneexitsig` | `waitexitstorm` probe-gate sys-time pressure without weakening SIGCHLD or clone exit-signal semantics |
 | **execve resets caught handlers→SIG_DFL, keeps SIG_IGN, preserves mask + pending; sigaltstack is preserved (empirically, despite man-page wording)** | ✅ `execvereset` + 🧪 `signal::tests::execve_resets_…` | (shell-wrapped tests; pause/kill) |
 | **fork: child inherits blocked mask; child pending cleared; parent pending survives** | ✅ `maskfork` | (fork signal semantics) |
 | **death-by-signal → wait4 WIFSIGNALED/WTERMSIG; clean exit → WIFEXITED** | ✅ `signalexit` | kill03/06/09 |

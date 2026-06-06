@@ -32,6 +32,7 @@ pub struct ForkCoordinator {
 }
 
 pub struct PreparedHostFork {
+    had_signal_pump: bool,
     _private: (),
 }
 
@@ -59,37 +60,50 @@ impl ForkCoordinator {
     }
 
     pub fn prepare_host_fork(&self) -> PreparedHostFork {
-        if let Some(pump) = self.signal_pump.lock().take() {
+        let had_signal_pump = if let Some(pump) = self.signal_pump.lock().take() {
             pump.stop();
+            true
+        } else {
+            false
+        };
+        PreparedHostFork {
+            had_signal_pump,
+            _private: (),
         }
-        PreparedHostFork { _private: () }
     }
 
     pub fn restart_after_parent_fork(
         &self,
-        _prepared: PreparedHostFork,
+        prepared: PreparedHostFork,
         kicker: &Arc<VcpuKicker>,
         futex: &Arc<FutexTable>,
+        child_exit_needs_signal_pump: bool,
     ) {
-        self.start_signal_pump(kicker, futex);
+        if prepared.had_signal_pump || child_exit_needs_signal_pump {
+            self.start_signal_pump(kicker, futex);
+        }
     }
 
     pub fn restart_after_child_fork(
         &self,
-        _prepared: PreparedHostFork,
+        prepared: PreparedHostFork,
         kicker: &Arc<VcpuKicker>,
         futex: &Arc<FutexTable>,
     ) {
-        self.start_signal_pump(kicker, futex);
+        if prepared.had_signal_pump {
+            self.start_signal_pump(kicker, futex);
+        }
     }
 
     pub fn restart_after_fork_error(
         &self,
-        _prepared: PreparedHostFork,
+        prepared: PreparedHostFork,
         kicker: &Arc<VcpuKicker>,
         futex: &Arc<FutexTable>,
     ) {
-        self.start_signal_pump(kicker, futex);
+        if prepared.had_signal_pump {
+            self.start_signal_pump(kicker, futex);
+        }
     }
 
     #[cfg(test)]
@@ -118,10 +132,55 @@ mod tests {
             "signal pump host thread must be joined before host fork"
         );
 
-        coordinator.restart_after_parent_fork(prepared, &kicker, &futex);
+        coordinator.restart_after_parent_fork(prepared, &kicker, &futex, false);
         assert!(
             coordinator.has_signal_pump_for_tests(),
             "parent must restart the signal pump after host fork"
+        );
+    }
+
+    #[test]
+    fn parent_can_skip_absent_signal_pump_until_child_exit_needs_it() {
+        crate::host_signal::install_default_handlers();
+        let coordinator = ForkCoordinator::new();
+        let kicker = Arc::new(VcpuKicker::new());
+        let futex = Arc::new(FutexTable::new());
+
+        let prepared = coordinator.prepare_host_fork();
+        coordinator.restart_after_parent_fork(prepared, &kicker, &futex, false);
+        assert!(
+            !coordinator.has_signal_pump_for_tests(),
+            "parent with no preexisting pump and no async child-exit signal should stay pump-free"
+        );
+
+        let prepared = coordinator.prepare_host_fork();
+        coordinator.restart_after_parent_fork(prepared, &kicker, &futex, true);
+        assert!(
+            coordinator.has_signal_pump_for_tests(),
+            "caught or blocked child-exit signals still require the parent pump"
+        );
+    }
+
+    #[test]
+    fn child_restarts_only_inherited_signal_pump() {
+        crate::host_signal::install_default_handlers();
+        let coordinator = ForkCoordinator::new();
+        let kicker = Arc::new(VcpuKicker::new());
+        let futex = Arc::new(FutexTable::new());
+
+        let prepared = coordinator.prepare_host_fork();
+        coordinator.restart_after_child_fork(prepared, &kicker, &futex);
+        assert!(
+            !coordinator.has_signal_pump_for_tests(),
+            "fork children should not create a pump unless the parent needed one"
+        );
+
+        coordinator.start_signal_pump(&kicker, &futex);
+        let prepared = coordinator.prepare_host_fork();
+        coordinator.restart_after_child_fork(prepared, &kicker, &futex);
+        assert!(
+            coordinator.has_signal_pump_for_tests(),
+            "a child inheriting caught signal state must restart its pump"
         );
     }
 }
