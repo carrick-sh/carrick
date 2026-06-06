@@ -543,12 +543,14 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
 
 #[test]
 fn tgkill_to_self_raises_locally() {
+    carrick_runtime::host_signal::reset_after_supervisor_fork();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
     let registry = Arc::new(ThreadRegistry::new(1000));
     let futex = Arc::new(FutexTable::new());
-    // Targeting our own tid is a local raise, not a cross-thread kick.
+    // Targeting our own tid is a local raise, not a cross-thread kick and not
+    // process-directed: a sibling must not be able to drain it.
     let outcome = dispatcher
         .dispatch_threaded(
             SyscallRequest::new(131, SyscallArgs::from([1000, 1000, SIGUSR1, 0, 0, 0])),
@@ -560,6 +562,12 @@ fn tgkill_to_self_raises_locally() {
         )
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(carrick_runtime::host_signal::take_pending_for(2000), 0);
+    assert_eq!(
+        carrick_runtime::host_signal::take_pending_for(1000),
+        SIGUSR1 as i32
+    );
+    assert_eq!(carrick_runtime::host_signal::take_pending(), 0);
 }
 
 #[test]
