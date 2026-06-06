@@ -167,6 +167,30 @@ pub trait FsBackend: Send + Sync {
     /// ftruncate writeback and by rename-into-overlay.
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError>;
 
+    /// Apply a dirty byte range to `path`, growing the file to `final_size`
+    /// when needed. Backends with mutable storage should override this to avoid
+    /// whole-file replacement; the default preserves the old behavior.
+    fn write_file_range(
+        &self,
+        path: &str,
+        offset: usize,
+        bytes: &[u8],
+        final_size: usize,
+    ) -> Result<(), BackendError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(BackendError::Invalid)?;
+        if final_size < end {
+            return Err(BackendError::Invalid);
+        }
+        let mut contents = self.file_contents(path).ok_or(BackendError::Unsupported)?;
+        if final_size > contents.len() {
+            contents.resize(final_size, 0);
+        }
+        contents[offset..end].copy_from_slice(bytes);
+        self.set_file_contents(path, contents)
+    }
+
     /// Drop the backend's entry for `path` entirely. Returns true iff
     /// the backend was holding something there. Does NOT tombstone —
     /// caller pairs this with `mark_deleted` when the path also lives
@@ -646,6 +670,33 @@ impl FsBackend for MemoryBackend {
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
         inner.files.insert(normalized, contents);
+        Ok(())
+    }
+
+    fn write_file_range(
+        &self,
+        path: &str,
+        offset: usize,
+        bytes: &[u8],
+        final_size: usize,
+    ) -> Result<(), BackendError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(BackendError::Invalid)?;
+        if final_size < end {
+            return Err(BackendError::Invalid);
+        }
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let mut inner = self.inner.write();
+        if !inner.files.contains_key(&normalized) {
+            return Err(BackendError::Unsupported);
+        }
+        inner.deletions.remove(&normalized);
+        let contents = inner.files.get_mut(&normalized).expect("checked above");
+        if final_size > contents.len() {
+            contents.resize(final_size, 0);
+        }
+        contents[offset..end].copy_from_slice(bytes);
         Ok(())
     }
 
@@ -2304,6 +2355,64 @@ impl FsBackend for HostFsBackend {
             .map_err(|_| BackendError::Io)?;
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
         Ok(())
+    }
+
+    fn write_file_range(
+        &self,
+        path: &str,
+        offset: usize,
+        bytes: &[u8],
+        final_size: usize,
+    ) -> Result<(), BackendError> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(BackendError::Invalid)?;
+        if final_size < end {
+            return Err(BackendError::Invalid);
+        }
+        let host_fd = self
+            .open_raw_fd(path, true, false, false)
+            .ok_or(BackendError::Io)?;
+        let result = (|| {
+            let mut written = 0usize;
+            while written < bytes.len() {
+                let write_offset = offset.checked_add(written).ok_or(BackendError::Invalid)?;
+                let write_offset =
+                    i64::try_from(write_offset).map_err(|_| BackendError::Invalid)?;
+                let n = unsafe {
+                    libc::pwrite(
+                        host_fd,
+                        bytes[written..].as_ptr() as *const libc::c_void,
+                        bytes.len() - written,
+                        write_offset as libc::off_t,
+                    )
+                }
+                .host_syscall_errno()
+                .map_err(|_| BackendError::Io)?;
+                if n == 0 {
+                    return Err(BackendError::Io);
+                }
+                written = written
+                    .checked_add(n as usize)
+                    .ok_or(BackendError::Invalid)?;
+            }
+
+            let final_size_i64 = i64::try_from(final_size).map_err(|_| BackendError::Invalid)?;
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            unsafe { libc::fstat(host_fd, &mut st) }
+                .host_syscall_errno()
+                .map_err(|_| BackendError::Io)?;
+            if final_size_i64 > st.st_size {
+                unsafe { libc::ftruncate(host_fd, final_size_i64 as libc::off_t) }
+                    .host_syscall_errno()
+                    .map_err(|_| BackendError::Io)?;
+            }
+            Ok(())
+        })();
+        unsafe {
+            libc::close(host_fd);
+        }
+        result
     }
 
     fn remove_entry(&self, path: &str) -> bool {

@@ -229,7 +229,7 @@ Progress:
 
 ### 3. VFS Streaming and Dirty-Range Writeback
 
-Status: static opportunity.
+Status: in progress.
 
 The rootfs and overlay abstractions still encourage whole-file materialization for operations that should be metadata-only or fd/range-backed.
 
@@ -248,12 +248,24 @@ Key code:
 
 Milestone 3 tasks:
 
-- [ ] Add a large-file metadata probe that opens/stats/lookups a file without reading its contents.
-- [ ] Add a large-file small-write test that fails if the backend rewrites or clones the full file.
-- [ ] Add backend API support for range writes or fd-backed mutation on regular mutable files.
-- [ ] Keep whole-file behavior as fallback for in-memory files, symlinks, directories, and special files.
+- [x] Add a large-file metadata probe that opens/stats/lookups a file without reading its contents.
+- [x] Add a large-file small-write test that fails if the backend rewrites or clones the full file.
+- [x] Add backend API support for range writes or fd-backed mutation on regular mutable files.
+- [x] Keep whole-file behavior as fallback for unsupported backends and non-regular entries; regular mutable files in `MemoryBackend` and `HostFsBackend` now use range mutation.
 - [ ] Run focused filesystem tests and a build-tool-like workload with many small file updates.
 - [ ] Record before/after wall-time and byte-copy/writeback evidence.
+
+Progress:
+
+- 2026-06-06: Added RED perf registry coverage for `large_meta`; pre-fix `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests::registry_contains_disk_perf_surface -- --nocapture` failed with `missing disk perf workload large_meta`.
+- 2026-06-06: Added `conformance-probes/src/bin/perf_large_meta.rs`, a metadata/open/fstat/access storm against a 256 MiB sparse file, and registered it as disk workload `large_meta`.
+- 2026-06-06: Initial `perf_large_meta` settings (`WARMUP=128`, `ITERS=2048`) exceeded the perf runner's 60-second Carrick sample deadline. A bounded `carrick trace --script scripts/dtrace/trace-profile.d` run showed the probe was making progress but only completed roughly 75 metadata/open/access cycles in six seconds, so the probe was reduced to `WARMUP=16`, `ITERS=128` while keeping the 256 MiB sparse file.
+- 2026-06-06: Filtered metadata benchmark passed: `CARRICK_PERF_FILTER=large_meta CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 just bench quick`. Rows were written to `docs/perf-results/2026-06-05-disk.jsonl`; Carrick p50 `14185998.250` us and p95 `14564686.458` us, Docker p50 `291.208` us and p95 `441.125` us, Docker marked noisy. This is baseline evidence that large-file metadata remains a major bottleneck.
+- 2026-06-06: Added RED integration test `syscall_fs::small_write_to_large_overlay_file_does_not_rewrite_whole_file`; pre-fix behavior rewrote a 4 MiB file through `set_file_contents` for a one-byte write.
+- 2026-06-06: Added `FsBackend::write_file_range`. The default implementation preserves whole-file fallback; `MemoryBackend` mutates stored file bytes in place; `HostFsBackend` uses `pwrite` plus grow-only `ftruncate`.
+- 2026-06-06: Updated direct `write`, `writev`, and `write_output_fd` writeback to persist dirty ranges instead of cloning full `OpenDescription::File` contents.
+- 2026-06-06: Removed-work evidence is the RED/green integration test: max backend writeback payload dropped from `4194304` bytes to at most `1` byte for the one-byte write, and reopening the file reads the updated byte from the backend.
+- 2026-06-06: Focused verification passed: `cargo test -p carrick-runtime --test integration small_write_to_large_overlay_file_does_not_rewrite_whole_file -- --nocapture`, `cargo test -p carrick-runtime --test integration write -- --nocapture`, `cargo test -p carrick-runtime --test integration writev -- --nocapture`, `cargo test -p carrick-runtime --test integration sendfile -- --nocapture`, `cargo test -p carrick-runtime --test integration splice -- --nocapture`, `cargo test -p carrick-runtime --test integration copy_file_range -- --nocapture`, `cargo test -p carrick-runtime fs_backend -- --nocapture`, `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture`, `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin perf_large_meta`, and `cargo fmt --all -- --check`.
 
 ### 4. Wait Path fd Pinning and kqueue Churn
 
@@ -354,9 +366,7 @@ Repo-local result artifacts:
 
 Continue Milestone 3.
 
-- [ ] Add a large-file metadata probe that opens/stats/lookups a file without reading its contents.
-- [ ] Add a large-file small-write test that fails if the backend rewrites or clones the full file.
-- [ ] Add backend API support for range writes or fd-backed mutation on regular mutable files.
-- [ ] Keep whole-file behavior as fallback for in-memory files, symlinks, directories, and special files.
-- [ ] Run focused filesystem tests and a build-tool-like workload with many small file updates.
-- [ ] Record before/after wall-time and byte-copy/writeback evidence.
+- [ ] Add a build-tool-like workload with many small file updates over a large file set.
+- [ ] Record before/after wall-time for dirty-range writeback on that workload.
+- [ ] Use `large_meta` trace evidence to rank the next metadata-path fix; current baseline is Carrick p50 `14185998.250` us versus Docker p50 `291.208` us for 128 metadata/open/access cycles on a 256 MiB sparse file.
+- [ ] Decide whether the next VFS slice should target metadata lookup/open cost or rootfs-to-overlay materialization on writable opens.

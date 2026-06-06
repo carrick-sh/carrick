@@ -1611,7 +1611,7 @@ impl SyscallDispatcher {
             // regular file (off_out at the fd's current position) work, matching
             // real Linux (splice pipe->file).
             let outcome: DispatchOutcome;
-            let writeback: Option<(String, Vec<u8>)>;
+            let writeback: Option<(String, usize, usize)>;
             {
                 let mut open = open_file.description.write();
                 match &mut *open {
@@ -1682,6 +1682,7 @@ impl SyscallDispatcher {
                         if !*writable {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         }
+                        let write_offset = *offset;
                         if let Err(errno) = write_into_file_contents(contents, offset, bytes) {
                             return DispatchOutcome::errno(errno);
                         }
@@ -1689,17 +1690,17 @@ impl SyscallDispatcher {
                         outcome = DispatchOutcome::Returned {
                             value: bytes.len() as i64,
                         };
-                        writeback = Some((path.clone(), contents.clone()));
+                        writeback = Some((path.clone(), write_offset, contents.len()));
                     }
                     _ => return DispatchOutcome::errno(LINUX_EBADF),
                 }
             }
-            if let Some((path, contents)) = writeback {
+            if let Some((path, offset, final_size)) = writeback {
                 let _ = self
                     .fs
                     .rootfs_vfs
                     .overlay
-                    .set_file_contents(&path, contents);
+                    .write_file_range(&path, offset, bytes, final_size);
             }
             return outcome;
         }
@@ -5580,13 +5581,16 @@ impl SyscallDispatcher {
             if let Some(open_file) = this.open_file(fd) {
                 // Take an inner scope so the borrow on the description ends
                 // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
-                #[allow(dead_code)]
                 enum FileWriteback {
-                    None,
-                    Update { path: String, contents: Vec<u8> },
+                    Range {
+                        path: String,
+                        offset: usize,
+                        bytes: Vec<u8>,
+                        final_size: usize,
+                    },
                 }
                 let outcome: DispatchOutcome;
-                let writeback: FileWriteback;
+                let writeback: Option<FileWriteback>;
                 {
                     let mut open = open_file.description.write();
                     match &mut *open {
@@ -5683,17 +5687,21 @@ impl SyscallDispatcher {
                             if !*writable {
                                 return Ok(LINUX_EBADF.into());
                             }
+                            let write_offset = *offset;
                             if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
                                 return Ok(errno.into());
                             }
+                            let written = bytes.len();
                             metadata.size = contents.len();
                             outcome = DispatchOutcome::Returned {
-                                value: bytes.len() as i64,
+                                value: written as i64,
                             };
-                            writeback = FileWriteback::Update {
+                            writeback = Some(FileWriteback::Range {
                                 path: path.clone(),
-                                contents: contents.clone(),
-                            };
+                                offset: write_offset,
+                                bytes,
+                                final_size: contents.len(),
+                            });
                         }
                         OpenDescription::SyntheticFile { path, .. }
                             if crate::vfs::proc::is_userns_map_path(path) =>
@@ -5723,12 +5731,18 @@ impl SyscallDispatcher {
                         _ => return Ok(LINUX_EBADF.into()),
                     }
                 }
-                if let FileWriteback::Update { path, contents } = writeback {
+                if let Some(FileWriteback::Range {
+                    path,
+                    offset,
+                    bytes,
+                    final_size,
+                }) = writeback
+                {
                     let _ = this
                         .fs
                         .rootfs_vfs
                         .overlay
-                        .set_file_contents(&path, contents);
+                        .write_file_range(&path, offset, &bytes, final_size);
                 }
                 return Ok(outcome);
             }
@@ -5877,17 +5891,21 @@ impl SyscallDispatcher {
                 // built-in stdout buffer.
                 if let Some(open_file) = this.open_file(fd) {
                     enum FileWriteback {
-                        None,
-                        Update { path: String, contents: Vec<u8> },
+                        Range {
+                            path: String,
+                            offset: usize,
+                            bytes: Vec<u8>,
+                            final_size: usize,
+                        },
                     }
                     let outcome: DispatchOutcome;
-                    let writeback: FileWriteback;
+                    let writeback: Option<FileWriteback>;
                     {
                         let mut open = open_file.description.write();
                         match &mut *open {
                             OpenDescription::PipeWriter { pipe, .. } => {
                                 outcome = write_pipe(&bytes, pipe);
-                                writeback = FileWriteback::None;
+                                writeback = None;
                             }
                             OpenDescription::HostPipe {
                                 host_fd,
@@ -5910,7 +5928,7 @@ impl SyscallDispatcher {
                                     cx.tid(),
                                     true,
                                 );
-                                writeback = FileWriteback::None;
+                                writeback = None;
                             }
                             OpenDescription::HostSocket { host_fd, .. } => {
                                 outcome = write_host_pipe_owned(
@@ -5921,7 +5939,7 @@ impl SyscallDispatcher {
                                     cx.tid(),
                                     false,
                                 );
-                                writeback = FileWriteback::None;
+                                writeback = None;
                             }
                             OpenDescription::HostFile {
                                 base,
@@ -5947,7 +5965,7 @@ impl SyscallDispatcher {
                                     cx.tid(),
                                     false,
                                 );
-                                writeback = FileWriteback::None;
+                                writeback = None;
                             }
                             OpenDescription::File {
                                 path,
@@ -5960,27 +5978,37 @@ impl SyscallDispatcher {
                                 if !*writable {
                                     return Ok(LINUX_EBADF.into());
                                 }
+                                let write_offset = *offset;
                                 if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
                                     return Ok(errno.into());
                                 }
+                                let written = bytes.len();
                                 metadata.size = contents.len();
                                 outcome = DispatchOutcome::Returned {
-                                    value: bytes.len() as i64,
+                                    value: written as i64,
                                 };
-                                writeback = FileWriteback::Update {
+                                writeback = Some(FileWriteback::Range {
                                     path: path.clone(),
-                                    contents: contents.clone(),
-                                };
+                                    offset: write_offset,
+                                    bytes,
+                                    final_size: contents.len(),
+                                });
                             }
                             _ => return Ok(LINUX_EBADF.into()),
                         }
                     }
-                    if let FileWriteback::Update { path, contents } = writeback {
+                    if let Some(FileWriteback::Range {
+                        path,
+                        offset,
+                        bytes,
+                        final_size,
+                    }) = writeback
+                    {
                         let _ = this
                             .fs
                             .rootfs_vfs
                             .overlay
-                            .set_file_contents(&path, contents);
+                            .write_file_range(&path, offset, &bytes, final_size);
                     }
                     let DispatchOutcome::Returned { value } = outcome else {
                         // EAGAIN/EPIPE on this iovec. writev(2) is atomic across
