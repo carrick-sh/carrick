@@ -32,8 +32,40 @@ impl SyscallDispatcher {
             return Ok(self.fd_access(dirfd as i32, mode));
         }
 
+        if let Some(outcome) = self.fast_root_f_ok_absolute(dirfd, &path, mode, flags) {
+            return Ok(outcome);
+        }
+
         let path = self.resolve_at_path(dirfd, &path)?;
         Ok(self.access_resolved_path(&path, mode, flags))
+    }
+
+    fn fast_root_f_ok_absolute(
+        &self,
+        dirfd: u64,
+        path: &str,
+        mode: u64,
+        flags: u64,
+    ) -> Option<DispatchOutcome> {
+        if dirfd != LINUX_AT_FDCWD || mode != 0 || flags != 0 {
+            return None;
+        }
+        if !path.starts_with('/')
+            || path.starts_with("/proc")
+            || path.starts_with("/sys")
+            || path.split('/').any(|component| component == "..")
+            || self.fs.vfs_mounts.resolve(path).is_some()
+        {
+            return None;
+        }
+        if self.cred_snapshot().ruid != 0 {
+            return None;
+        }
+        self.fs
+            .rootfs_vfs
+            .overlay
+            .stat_cache_lookup(path)
+            .map(|_| DispatchOutcome::Returned { value: 0 })
     }
 
     fn access_resolved_path(&self, path: &str, mode: u64, flags: u64) -> DispatchOutcome {
