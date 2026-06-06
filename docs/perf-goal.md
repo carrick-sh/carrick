@@ -795,6 +795,33 @@ Rejected next steps:
   - Docker p50 `3494.833` us, p95 `3703.750` us, samples
     `[3703.750,3494.833]`, not noisy.
 
+  Fork attribution trace:
+
+  ```sh
+  CARRICK_RUN_ID=trace-fork-snapshot-labeled-$$ \
+  target/release/carrick trace \
+    --script scripts/dtrace/trace-fork-snapshot-cost.d \
+    --trace-out /tmp/carrick-fork-snapshot-cost-labeled.trace -- \
+    run-elf --raw --fs host \
+    conformance-probes/target/aarch64-unknown-linux-musl/release/perf_fork_mmap_snapshot
+  ```
+
+  Guest output under trace: `fork_mmap_snapshot_total_us=1509797.208`,
+  `fork_mmap_snapshot_p50_us=47079.500`, `forks=32`, `bytes=536870912`.
+
+  Trace aggregation:
+
+  - `sys_count fork=32`
+  - `sys_count mincore=416`, `sys_bytes mincore=90543095808`
+  - `sys_count mmap=501`, `sys_bytes mmap=1211683782656`
+  - `sys_count munmap=450`, `sys_bytes munmap=1172879212544`
+  - `hv_count hv_vm_map=462`, `hv_bytes hv_vm_map=1280393478144`
+
+  Interpretation: the gap is not just guest trap count. The fork path repeatedly
+  tears down and rebuilds HVF mappings and sparse child snapshots; even with the
+  mmap arena mincore scan bounded by high-water, this workload still drives
+  terabyte-scale host virtual mapping ranges across 32 fork/wait cycles.
+
   Registry RED/GREEN:
 
   ```sh
@@ -806,8 +833,8 @@ Rejected next steps:
   `missing memory perf workload fork_mmap_snapshot`, then passed after the
   workload and source landed.
 
-  Next fork direction: attribute the ~700x Carrick/Docker gap to the fork
-  snapshot implementation before changing COW or shared-memory behavior.
+  Next fork direction: reduce fork snapshot/rebuild host mapping work without
+  weakening private-memory COW isolation or guest `MAP_SHARED` fork coherence.
 - [x] Inspect high-VA alias paths for remaining eager zero/copy behavior.
 
   Result at `68538ba`:
