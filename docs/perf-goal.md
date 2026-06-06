@@ -160,27 +160,38 @@ Progress:
 
 Milestone 2B: borrowed `readv` and `preadv` host-file fast paths.
 
-- [ ] Add `syscall_fs::readv_host_file_uses_guest_host_ptrs_for_writable_iovecs`.
+- [x] Add `syscall_fs::readv_host_file_uses_guest_host_ptrs_for_writable_iovecs`.
   - Use a custom test memory that implements `host_ptr_for_write` for two exact writable payload ranges.
   - Expected RED on current branch: read succeeds through copied staging, but host-pointer write hits are `0`.
   - Expected PASS after implementation: host-pointer write hits match non-empty iovec count and the guest bytes are filled directly.
-- [ ] Add `syscall_fs::preadv_host_file_preserves_offset_with_borrowed_iovecs`.
+- [x] Add `syscall_fs::preadv_host_file_preserves_offset_with_borrowed_iovecs`.
   - File contains a known prefix and payload.
   - `preadv` reads from a non-zero offset into two borrowed guest ranges.
   - Expected result: guest memory receives exactly the offset slice and host file offset remains unchanged.
-- [ ] Add fallback coverage for a mixed borrowed/non-borrowed `readv` or `preadv` call.
+- [x] Add fallback coverage for a mixed borrowed/non-borrowed `readv` or `preadv` call.
   - Expected result: existing staging path is used, partial read behavior matches current semantics, and guest memory is updated only for bytes actually read.
-- [ ] Implement a writable borrowed-iovec helper using `GuestMemory::host_ptr_for_write`.
+- [x] Implement a writable borrowed-iovec helper using `GuestMemory::host_ptr_for_write`.
   - Use borrowed host vectors only when every non-empty target range is writable and contiguous.
   - Fall back to the existing staged read path otherwise.
-- [ ] Convert host-file `readv` and `preadv` paths to `libc::readv` and `libc::preadv` when safe.
-- [ ] Run:
+- [x] Convert host-file `readv` and `preadv` paths to `libc::readv` and `libc::preadv` when safe.
+- [x] Run:
   - `cargo test -p carrick-runtime --test integration readv -- --nocapture`
   - `cargo test -p carrick-runtime --test integration preadv -- --nocapture`
   - `cargo fmt --all -- --check`
   - `git diff --check`
 - [ ] Record removed-work evidence and wall-time evidence for multi-segment host-file reads.
 - [ ] Commit as a separate logical slice from `pwritev`.
+
+Progress:
+
+- 2026-06-06: Added RED integration test `syscall_fs::readv_host_file_uses_guest_host_ptrs_for_writable_iovecs`; pre-fix behavior filled both iovecs through `write_bytes` and recorded zero writable host-pointer hits.
+- 2026-06-06: Added borrowed `preadv` coverage with `syscall_fs::preadv_host_file_preserves_offset_with_borrowed_iovecs`, including a follow-up `read` proving the shared host file offset is unchanged.
+- 2026-06-06: Added fallback coverage `syscall_fs::readv_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr`; mixed host-pointer/non-host-pointer memory still uses the existing staged write path.
+- 2026-06-06: Implemented `prepare_readv_targets` in `crates/carrick-runtime/src/dispatch/fs.rs`. Host-file `readv` and `preadv` now call one host vector syscall when all non-empty iovecs expose `host_ptr_for_write`; mixed or non-host-pointer memory falls back to existing sequential copy behavior.
+- 2026-06-06: Added `conformance-probes/src/bin/perf_preadv_burst.rs` and registered `preadv_burst` in the perf case registry.
+- 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime --test integration readv -- --nocapture`, `cargo test -p carrick-runtime --test integration preadv -- --nocapture`, `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture`, and `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin perf_preadv_burst`.
+- 2026-06-06: Pre-commit hygiene passed: `cargo fmt --all -- --check` and `git diff --check`.
+- 2026-06-06: Removed-work evidence is the RED/green integration test: borrowed host-file `readv`/`preadv` writes guest payloads through host pointers, with watched `write_bytes` calls dropping from the RED count to `0` and writable host-pointer hits matching the non-empty iovec count.
 
 Milestone 2C: blocking write ownership and existing `writev` path cleanup.
 
