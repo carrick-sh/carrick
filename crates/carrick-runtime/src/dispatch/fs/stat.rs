@@ -83,7 +83,7 @@ impl SyscallDispatcher {
         let is_named_pipe = matches!(&*open, OpenDescription::HostPipe { pty: None, .. });
         drop(open);
         if is_named_pipe
-            && let Some(path) = self.io.fd_open_paths.read().get(&fd).cloned()
+            && let Some(path) = self.lookup_recorded_fd_open_path(fd)
             && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
             && real.kind == RootFsEntryKind::Fifo
         {
