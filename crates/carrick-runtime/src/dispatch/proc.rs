@@ -1306,7 +1306,11 @@ impl SyscallDispatcher {
             // `tst_checkpoint_wake … ETIMEDOUT`. Route shared addresses
             // through `__ulock` (the same path the multi-threaded
             // dispatcher uses) so the wakeup keys on the physical page.
-            let shared_host_addr = memory.shared_futex_host_addr(address.0);
+            let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+                None
+            } else {
+                memory.shared_futex_host_addr(address.0)
+            };
             crate::probes::futex_route(
                 address.0,
                 command as i32,
