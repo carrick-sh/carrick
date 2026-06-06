@@ -82,6 +82,22 @@ pub(crate) fn wait_container(id: &str, timeout: std::time::Duration) -> anyhow::
     }
 }
 
+/// Remove a container: `carrick rm -f <id>` (force-kills if running, then drops
+/// the registry entry). Reused rather than reimplemented so kill/grace/cleanup
+/// stay identical to the CLI.
+pub(crate) fn remove_container(id: &str) -> anyhow::Result<()> {
+    let real = container::resolve(id).map_err(|e| anyhow::anyhow!(e))?;
+    // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
+    // itself (current_exe) with operator-controlled API inputs as separate argv
+    // entries, never a shell; a CLI that re-execs itself is expected here.
+    let exe = std::env::current_exe()?;
+    let out = Command::new(exe).arg("rm").arg("-f").arg(&real).output()?;
+    if !out.status.success() {
+        anyhow::bail!("carrick rm failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
 /// Start a previously-created container by relaunching it: `carrick start <id>`.
 /// Resolves the server-facing id/name to carrick's internal id first.
 pub(crate) fn start_container(id: &str) -> anyhow::Result<()> {
