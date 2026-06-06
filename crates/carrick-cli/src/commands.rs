@@ -1056,6 +1056,27 @@ fn run_build(
 
     let me = std::env::current_exe().context("failed to resolve current carrick binary path")?;
 
+    // DATA-LOSS GUARD: never bind-mount the user's context directory directly.
+    //
+    // kaniko's between-stage filesystem reset calls `os.RemoveAll("/workspace")`
+    // which, through the bind mount, would delete the user's real source files
+    // on the host. Docker avoids this by sending the context as a tar stream (a
+    // copy, never the original). We mirror that by copying the context into a
+    // fresh temp dir and mounting the COPY — kaniko then deletes/mutates the
+    // copy, and the user's context is never touched.
+    //
+    // Keep the TempDir handle alive across the entire build so the copy isn't
+    // cleaned up until after the kaniko run and the image ingest both finish.
+    let context_tmp =
+        tempfile::tempdir().context("failed to create temp directory for build context copy")?;
+    let context_copy = context_tmp.path().join("context");
+    copy_dir_recursive(&context_abs, &context_copy).with_context(|| {
+        format!(
+            "failed to copy build context {} to temp dir",
+            context_abs.display()
+        )
+    })?;
+
     // The output dir for the built tar is only needed on the `--no-push` path.
     // Keep the TempDir alive for the duration of the build + ingest.
     let out_dir = if push {
@@ -1067,7 +1088,7 @@ fn run_build(
 
     let argv = kaniko_run_argv(
         &me.to_string_lossy(),
-        &context_abs.to_string_lossy(),
+        &context_copy.to_string_lossy(),
         out_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         &dockerfile_rel,
         &destination,
@@ -1114,6 +1135,66 @@ fn run_build(
     println!("Successfully built {destination}");
     for summary in &summaries {
         println!("Successfully tagged {}", summary.image);
+    }
+    Ok(())
+}
+
+/// Recursively copy `src` (a directory) to `dst` (which must not yet exist).
+///
+/// Files are copied byte-for-byte. Symlinks are reproduced as symlinks
+/// (pointing to the same target they did in the source tree) rather than
+/// followed — this preserves the context faithfully and avoids following a
+/// dangling or loop-creating link. Permissions on files and directories are
+/// preserved via `std::fs::copy` (which copies the permission bits on Unix).
+///
+/// This is intentionally simple: no `.dockerignore` filtering (kaniko applies
+/// its own ignore rules from the copy), no hardlink deduplication. The goal is
+/// a faithful, safe copy so kaniko's `os.RemoveAll("/workspace")` cannot touch
+/// the user's source tree.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create directory {}", dst.display()))?;
+
+    // `src` is a canonicalized directory the user explicitly supplied as their
+    // build context; `dst` is a fresh tempdir owned by this process.
+    // `entry.file_name()` is always a bare filename with no separators, so no
+    // traversal into the temp tree is possible.
+    for entry in std::fs::read_dir(src) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("failed to read directory {}", src.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", src.display()))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to get file type of {}", src_path.display()))?;
+
+        if file_type.is_symlink() {
+            // Reproduce the symlink rather than following it.
+            let target = std::fs::read_link(&src_path)
+                .with_context(|| format!("failed to read symlink {}", src_path.display()))?;
+            std::os::unix::fs::symlink(&target, &dst_path).with_context(|| {
+                format!(
+                    "failed to create symlink {} -> {}",
+                    dst_path.display(),
+                    target.display()
+                )
+            })?;
+        } else if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            // Regular file (or other non-symlink non-dir special file that
+            // std::fs::copy handles gracefully on the platforms we care about).
+            std::fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
     }
     Ok(())
 }
