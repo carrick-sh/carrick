@@ -140,6 +140,41 @@ pub(crate) enum Commands {
         /// New reference, e.g. `myapp:dev`.
         target: String,
     },
+    /// Build an image from a Dockerfile (like `docker build`). Runs the real
+    /// kaniko executor as a carrick guest (`carrick run --fs host`, traps
+    /// effectively uncapped) over the build context, then ingests the result
+    /// into the local store. By default kaniko writes a tar that carrick loads;
+    /// with `--push` kaniko pushes straight to the registry.
+    Build {
+        /// Name and optionally a tag for the built image (`name:tag`). Defaults
+        /// to `carrick-build:latest` — kaniko's `--destination` is required even
+        /// for a `--no-push` build.
+        #[arg(short = 't', long = "tag", value_name = "name:tag")]
+        tag: Option<String>,
+        /// Path to the Dockerfile, RELATIVE to the build context. Defaults to
+        /// `Dockerfile`.
+        #[arg(short = 'f', long = "file", value_name = "PATH", default_value = "Dockerfile")]
+        file: PathBuf,
+        /// Set a build-time variable (`KEY=VALUE`), passed through to kaniko as
+        /// `--build-arg KEY=VALUE`. May be repeated.
+        #[arg(long = "build-arg", value_name = "KEY=VALUE")]
+        build_arg: Vec<String>,
+        /// Do not use cache when building the image (kaniko `--no-cache`).
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+        /// Target platform for the build, e.g. `linux/amd64` (kaniko
+        /// `--customPlatform`).
+        #[arg(long, value_name = "OS/ARCH")]
+        platform: Option<String>,
+        /// Push the built image to the registry instead of loading it into the
+        /// local store. When set kaniko pushes to `--tag`'s registry; otherwise
+        /// the image is built to a tar and ingested locally.
+        #[arg(long = "push")]
+        push: bool,
+        /// The build context directory. Defaults to the current directory.
+        #[arg(default_value = ".")]
+        context: PathBuf,
+    },
     /// Show carrick disk usage / clean it up (like `docker system`).
     System {
         #[command(subcommand)]
