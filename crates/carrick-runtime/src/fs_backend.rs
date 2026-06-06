@@ -190,6 +190,12 @@ pub trait FsBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
+    /// Whether this backend can contain named FIFO nodes that need special
+    /// `open(2)` handling. The host backend can; the memory backend cannot.
+    fn may_have_fifo_nodes(&self) -> bool {
+        true
+    }
+
     /// Materialise an `AF_UNIX` socket node at the guest `path` with permission
     /// bits `mode` (low 0o7777). Called by `bind(2)` for a pathname socket so a
     /// subsequent `stat`/`os.path.exists`/`chmod`/`unlink` of the bound path
@@ -913,6 +919,10 @@ impl FsBackend for MemoryBackend {
             .entry(normalized)
             .or_insert_with(|| MemoryFile::Dense(Arc::<[u8]>::from([])));
         Ok(())
+    }
+
+    fn may_have_fifo_nodes(&self) -> bool {
+        false
     }
 
     fn create_file_from_rootfs(
