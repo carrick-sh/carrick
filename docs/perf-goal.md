@@ -62,6 +62,8 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `120aab9` - `docs(perf): decide dynamic workload gate`
+- `2fc791b` - `docs(perf): record fd path result`
 - `229105b` - `perf(fs): avoid duplicate fd path records`
 - `af1ee02` - `docs(perf): replace first-principles plan`
 - `04ffaa1` - `docs(perf): record vfs fallthrough result`
@@ -80,6 +82,8 @@ Relevant result file:
 - `docs/perf-results/2026-06-06-disk.jsonl` contains
   `overlay_small_updates` rows for `4bae00f`, `0a08b5f`, `0d9ee96`,
   `76d0aac`, `8a7659a`, and `229105b`.
+- `docs/perf-results/2026-06-06-memory.jsonl` contains a current
+  `mmap_churn` row at `120aab9`.
 
 ## Current Evidence
 
@@ -102,7 +106,12 @@ What disappeared:
 
 Remaining:
 
-- Count `hv_vm_map`/`hv_vm_unmap` on mmap-heavy workloads.
+- `120aab9` trace with `scripts/dtrace/trace-hv-map-count.d` counted
+  `guest mmap=69`, `guest munmap=68`, `host hv_vm_map=14`, and no
+  `hv_vm_unmap` entries for `perf_mmap_churn`. The 64 workload mmaps are not
+  causing one `hv_vm_map` each.
+- Current `120aab9` perf row: Carrick p50 `830.667` us, p95 `873.292` us;
+  Docker p50 `78.667` us, p95 `124.958` us, Docker noisy.
 - Add a fork-heavy row to see whether lazy-zero reduced snapshot cost.
 - Re-check shared anonymous and high-VA alias paths for equivalent eager zeroing.
 
@@ -585,7 +594,42 @@ Rejected next steps:
 
 **Steps:**
 
-- [ ] Count `hv_vm_map`/`hv_vm_unmap` for `perf_mmap_churn`.
+- [x] Count `hv_vm_map`/`hv_vm_unmap` for `perf_mmap_churn`.
+
+  Added reusable trace script:
+
+  ```sh
+  scripts/dtrace/trace-hv-map-count.d
+  ```
+
+  Trace command:
+
+  ```sh
+  CARRICK_RUN_ID=perf-mmap-hv-map-$$ \
+  target/release/carrick trace \
+    --script scripts/dtrace/trace-hv-map-count.d \
+    --trace-out /tmp/carrick-mmap-hv-map-count.trace -- \
+    run-elf --raw --fs host \
+    conformance-probes/target/aarch64-unknown-linux-musl/release/perf_mmap_churn
+  ```
+
+  Trace result: `guest mmap=69`, `guest munmap=68`, `host hv_vm_map=14`, and
+  no `host hv_vm_unmap` entries. The workload's 64 fresh anonymous mappings are
+  not producing one HVF map/unmap pair per guest mapping.
+
+  Current perf row:
+
+  ```sh
+  CARRICK_PERF_FILTER=mmap_churn \
+  CARRICK_PERF_REPS=3 \
+  CARRICK_PERF_WARMUP=1 \
+  CARRICK_PERF_COOLDOWN_SECS=0 \
+  cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
+  ```
+
+  `docs/perf-results/2026-06-06-memory.jsonl` rows at
+  `120aab9971dc10e9a4604b87da482152a42d70d8`: Carrick p50 `830.667` us,
+  p95 `873.292` us; Docker p50 `78.667` us, p95 `124.958` us, Docker noisy.
 - [ ] Add a fork-heavy workload row after lazy-zero.
 - [ ] Inspect shared anonymous and high-VA alias paths for remaining eager
   zero/copy behavior.
