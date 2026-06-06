@@ -2,9 +2,23 @@
 //! handler and renders the result as an HTTP response. The Docker API prefixes
 //! every path with an optional `/v1.NN` version segment, which we strip.
 
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
+
+/// The server's unified response body. Buffered endpoints wrap their
+/// `Full<Bytes>` via [`boxed`]; `/build` streams via `http_body_util::StreamBody`.
+/// Boxing both behind one type lets `route` return a single body type while
+/// still streaming where needed.
+pub(crate) type ResponseBody = BoxBody<Bytes, std::io::Error>;
+
+/// Wrap a buffered `Full<Bytes>` response as the boxed `ResponseBody`. `Full`'s
+/// error is `Infallible`, so the `map_err` arm is unreachable; this only adapts
+/// the error type to `io::Error` so it unifies with the streaming body.
+fn boxed(resp: Response<Full<Bytes>>) -> Response<ResponseBody> {
+    resp.map(|body| body.map_err(|never| match never {}).boxed())
+}
 
 /// Strip a leading `/v1.43`-style version segment, returning the bare path.
 fn strip_version(path: &str) -> &str {
@@ -52,13 +66,27 @@ fn json(status: StatusCode, body: String) -> Response<Full<Bytes>> {
 }
 
 /// The single service entry point. Infallible at the HTTP layer: every handler
-/// error becomes a response, never a panic (the no-panic gate).
+/// error becomes a response, never a panic (the no-panic gate). The response
+/// body is the boxed [`ResponseBody`]: buffered endpoints box their
+/// `Full<Bytes>`, while `/build` streams.
 pub(crate) async fn route(
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<Response<ResponseBody>, std::convert::Infallible> {
     let method = req.method().clone();
     let path = strip_version(req.uri().path()).to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+
+    // `/build`'s request body is a (potentially large) gzipped tar streamed
+    // back as NDJSON; it is the only streaming endpoint. Handle it before the
+    // buffered dispatch so its response body stays unboxed-but-streaming.
+    if method == Method::POST && path == "/build" {
+        let body_bytes = match BodyExt::collect(req.into_body()).await {
+            Ok(b) => b.to_bytes(),
+            Err(_) => Bytes::new(),
+        };
+        return Ok(crate::serve::build::build_response(&query, body_bytes));
+    }
+
     let body_bytes = match BodyExt::collect(req.into_body()).await {
         Ok(b) => b.to_bytes(),
         Err(_) => Bytes::new(),
@@ -105,5 +133,5 @@ pub(crate) async fn route(
         }
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };
-    Ok(resp)
+    Ok(boxed(resp))
 }
