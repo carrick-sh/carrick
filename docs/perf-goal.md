@@ -139,7 +139,7 @@ Milestone 1A: build-tool-like dirty-range workload.
 - [x] Record current wall-time evidence.
   - `CARRICK_PERF_FILTER=overlay_small_updates CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 just bench quick`
   - Append rows to `docs/perf-results/2026-06-05-disk.jsonl`, the current disk result ledger on this branch.
-- [ ] Record before/after dirty-range evidence.
+- [x] Record before/after dirty-range evidence.
   - Preferred: build a temporary comparison Carrick binary from the commit immediately before `6e2ee14` and run the same probe under it.
   - If the old binary cannot run the new harness cleanly, keep wall-time before/after unchecked and rely only on byte-copy evidence until a comparable baseline is produced.
 - [x] Commit as a logical docs/probe/harness slice if no runtime behavior changes are included.
@@ -155,6 +155,8 @@ Progress:
 - 2026-06-06: Trace-guided probe adjustment: direct `run-elf --fs memory` showed `pwrite64` returning `EBADF` on in-memory regular files, while the dirty-range path implemented in `6e2ee14` covers direct `write`/`writev`. The probe now uses `lseek` plus `write` for each one-byte update.
 - 2026-06-06: Post-commit `CARRICK_PERF_FILTER=overlay_small_updates CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored` passed and appended rows to `docs/perf-results/2026-06-05-disk.jsonl`; Carrick memory-fs p50 `19734.125` us, p95 `20224.292` us; Docker p50 `1567.375` us, p95 `1788.542` us, noisy. Carrick remains about `12.59x` slower on this workload.
 - 2026-06-06: Current VFS ranking after `overlay_small_updates`: keep VFS as the active target. `large_meta` remains about `78.36x` slower than Docker after the metadata-open fix, and `overlay_small_updates` is about `12.59x` slower with memory-fs dirty-range writeback. Wait-path fd/kqueue churn still needs its own workload before it can outrank these measured VFS gaps.
+- 2026-06-06: Built a signed comparison binary from `8e7288693149a854b6316ed794b325d9b3ca966c`, the commit immediately before dirty-range writeback landed. Both the old and current binaries had the hypervisor entitlement, and both ran the same current `perf_overlay_small_updates` static probe under `run-elf --raw --fs memory`.
+- 2026-06-06: Direct alternating before/after samples for `overlay_small_updates_total_us`: current totals `27720.709`, `13908.667`, `13440.042` us, p50 `13908.667` us; old pre-dirty-range totals `38911.459`, `35769.625`, `34081.042` us, p50 `35769.625` us. Dirty-range writeback therefore improves this workload by about `2.57x` versus the comparable old binary.
 
 Milestone 1B: writable rootfs-to-overlay materialization.
 
@@ -312,5 +314,5 @@ Continue VFS dirty-range measurement with a memory-fs build-tool-like workload.
 - [x] Add `perf_overlay_small_updates` probe.
 - [x] Run focused perf registry/probe checks.
 - [x] Run current filtered benchmark and append rows.
-- [ ] Produce comparable before/after wall-time if an old binary can be run cleanly; otherwise leave wall-time baseline open and keep byte-copy evidence as the completed proof.
+- [x] Produce comparable before/after wall-time if an old binary can be run cleanly; otherwise leave wall-time baseline open and keep byte-copy evidence as the completed proof.
 - [x] Re-rank VFS versus wait-path work after the new workload is measured.
