@@ -17,7 +17,7 @@ a probe that doesn't exist):
 
 ```
 Owned invariant probes (on disk):  289
-Invariant rows with an owning test: 137/137 (100%)
+Invariant rows with an owning test: 140/140 (100%)
 Distinct curated LTP tests owned:   502/502 (100%)
 ```
 
@@ -133,7 +133,7 @@ underlying gap got fixed):
 | **Internal signal wake pipes at EOF do not spin a waiter: drain reports EOF as a dead wake source, removes the kqueue read filter, and falls back to bounded polling instead of repeating `kevent -> read(0)` forever** | 🧪 `io_wait::tests::wake_pipe_at_eof_does_not_refire` + `host_signal::tests::drain_fd_reports_dead_on_eof` | CPython forkserver/process-pool diagnostic |
 | **A child that exits before Carrick can arm the signal pump's EVFILT_PROC watch still publishes the requested guest exit signal; clone(0) keeps the no-signal contract** | 🧪 `host_signal::tests::missed_child_exit_watch_publishes_exit_signal_once` + `host_signal::tests::missed_child_exit_watch_honors_zero_exit_signal` | CPython forkserver/process-pool max-task shutdown |
 | **Fork child-exit notifications allocate the signal pump/watch only when guest-observable: default unblocked SIGCHLD stays pump-free and leaves wait4/waitid to reap, while blocked/caught/non-ignored exit signals still request async delivery** | 🧪 `signal::tests::child_exit_signal_pump_predicate_tracks_observable_dispositions` + ✅ `sigchld` / `cloneexitsig` | `waitexitstorm` probe-gate sys-time pressure without weakening SIGCHLD or clone exit-signal semantics |
-| **execve resets caught handlers→SIG_DFL, keeps SIG_IGN, preserves mask + pending; sigaltstack is preserved (empirically, despite man-page wording)** | ✅ `execvereset` + 🧪 `signal::tests::execve_resets_…` | (shell-wrapped tests; pause/kill) |
+| **execve resets caught handlers→SIG_DFL, keeps SIG_IGN, preserves mask + pending, clears the old image's active signal-frame/restore-mask bookkeeping, and disestablishes sigaltstack** | ✅ `execvereset` + 🧪 `signal::tests::execve_resets_caught_handlers_preserves_sig_ign_and_clears_altstack` | Go runtime/pprof `TestMapping`; shell-wrapped tests; pause/kill |
 | **fork: child inherits blocked mask; child pending cleared; parent pending survives** | ✅ `maskfork` | (fork signal semantics) |
 | **death-by-signal → wait4 WIFSIGNALED/WTERMSIG; clean exit → WIFEXITED** | ✅ `signalexit` | kill03/06/09 |
 | **Pending on unblock: standard coalesces to 1, real-time queues N** | ✅ `pendingunblock` + 🧪 `rt_signals_queue_…` | (RT vs standard delivery) |
@@ -157,6 +157,8 @@ underlying gap got fixed):
 | **`WCOREDUMP(status)` set for core-dumping signals (SIGABRT/SIGSEGV/SIGQUIT/SIGILL/SIGTRAP/SIGBUS/SIGFPE/SIGXCPU/SIGXFSZ/SIGSYS), unset for non-core signals (SIGTERM/SIGKILL) — 0x80 bit synthesized through macOS's default RLIMIT_CORE=0** | ✅ `coredumpbit` | abort01 |
 | **signalfd4 (syscall 74, emulated — macOS has no signalfd): SFD_CLOEXEC→FD_CLOEXEC, SFD_NONBLOCK→O_NONBLOCK on the returned fd, unknown flag bit→EINVAL (fd-flag surface only; signal-read delivery is a tracked follow-up)** | ✅ `signalfd4` | signalfd4_01, signalfd4_02 |
 | **ITIMER_PROF does not tick while the process is idle in a blocking sleep; busy ITIMER_VIRTUAL/ITIMER_PROF delivery still works** | ✅ `itimerprofidle` + ✅ `itimer` | Go runtime/pprof CPU profile magnitude |
+| **Process-directed standard signals are consumed once across concurrently kicked vCPUs; multiple distinct pending process signals remain independently drainable** | 🧪 `host_signal::tests::process_directed_signal_is_consumed_once_under_concurrent_takers` + 🧪 `host_signal::tests::distinct_process_directed_signals_do_not_coalesce` | Go runtime/pprof SIGPROF sample magnitude |
+| **Unsupported Linux per-thread CPU POSIX profiler timers are rejected instead of being accepted as wall-clock process signal streams: `timer_create(CLOCK_THREAD_CPUTIME_ID, SIGEV_THREAD_ID, SIGPROF)` returns `EINVAL`, while supported SIGEV_SIGNAL timers still create normally** | 🧪 `syscall_time::timer_create_rejects_thread_cpu_sigev_thread_id` | Go runtime/pprof per-M profiler fallback to process `ITIMER_PROF` |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)
 - _(none — all signals-backlog rows are owned by probes)_
@@ -265,6 +267,7 @@ underlying gap got fixed):
 | mmap/mprotect/munmap/mremap/brk/sbrk/madvise/mlock/munlock/msync | ✅ `mem` | mmap01–18, mprotect01–05, munmap01–03, mremap01–05, brk01, madvise01–11, mlock01–05, msync01–04 |
 | MAP_SHARED file coherence + mremap-grow preservation (apt DynamicMMap path) | ✅ `memmap` | mmap-shared + apt DynamicMMap |
 | Multi-page MAP_SHARED-file alias mappings (16 KiB / 32 KiB) succeed where single-page does (HV_ERROR isolation) | ✅ `aliassize` | (carrick-specific: live file alias HV_ERROR repro) |
+| **Lazy MAP_SHARED alias remap limiting is per backing IPA, not a global per-run cap: repeated faults on one alias terminate, but many distinct shared-file aliases can be remapped before the next syscall** | 🧪 `alias_remap_limiter_tests::permits_many_distinct_alias_backings` + 🧪 `alias_remap_limiter_tests::caps_repeated_faults_on_one_alias_backing` + 🧪 `alias_remap_limiter_tests::exhausted_alias_does_not_block_a_different_alias` | Go runtime/pprof `TestMapping` |
 | Post-boot `hv_vm_map` via the MapHostAlias high-VA path works in a forked child (>= 1 TiB MAP_FIXED) | ✅ `forkhighva` | (carrick-specific: post-fork high-VA hv_vm_map) |
 | `mmap` arena reclaim — touch+free 800 × 64 MiB succeeds without exhausting the 32 GiB arena; reused regions read back zero | ✅ `mmaprecl` | (Go-heap-style arena reuse) |
 | MADV_HUGEPAGE / MADV_NOHUGEPAGE return 0 (advisory; allocators must not treat the hint as an error) | ✅ `hugepage` | madvise/THP-hint conformance |
