@@ -358,6 +358,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-hal"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-mem",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "carrick-host"
 version = "0.1.0"
 dependencies = [
@@ -372,6 +383,7 @@ dependencies = [
  "applevisor-sys",
  "carrick-abi",
  "carrick-guest-mem",
+ "carrick-hal",
  "carrick-host",
  "carrick-mem",
  "cc",
@@ -429,6 +441,7 @@ dependencies = [
  "cap-std",
  "carrick-abi",
  "carrick-guest-mem",
+ "carrick-hal",
  "carrick-host",
  "carrick-hvf",
  "carrick-image",

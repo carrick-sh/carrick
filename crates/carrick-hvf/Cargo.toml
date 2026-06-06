@@ -24,6 +24,7 @@ debug-stats = []
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
+carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
