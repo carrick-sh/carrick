@@ -1,430 +1,306 @@
-# `carrick build`: image building (the OCI produce side)
+# `carrick build`: image building by running a real builder as a guest
 
 **Status:** design approved; not yet executed. A gated extension to the
-ecosystem work — the carrick-serve spec
-([2026-06-05-carrick-serve-engine-api-design.md](2026-06-05-carrick-serve-engine-api-design.md))
-deferred image *build* as "its own gated goal." This is that goal. **Revised
-2026-06-06** after an adversarial code-grounded review (the original draft
-misread the `--fs host` scratch as an upper overlay; §5/§8 below are rewritten
-around a host-side diff instead).
+ecosystem work (the carrick-serve spec
+[2026-06-05-carrick-serve-engine-api-design.md](2026-06-05-carrick-serve-engine-api-design.md)
+deferred build). **Pivoted 2026-06-06** after a live spike: instead of a
+carrick-native Rust builder, `carrick build` **runs the real
+[kaniko](https://github.com/GoogleContainerTools/kaniko) builder as a carrick
+guest**, and carrick's job is to be a complete-enough Linux kernel for it. (The
+earlier native-builder draft — layer committer, store-write serializers,
+single-stage — is superseded; see [§5](#5-why-this-beats-a-native-builder).)
 
 **Date:** 2026-06-06.
 
-**Scope:** make carrick an OCI image **producer**. A `carrick build` CLI for
-**single-stage** Dockerfiles, the produce-side verbs (`push`/`save`/`load`/
-`history`/`tag`), and a legacy `POST /build` endpoint in `carrick serve`. **Not**
-in scope: BuildKit/buildx, multi-stage, `ADD`-from-URL, `RUN --mount`
-cache/secret/ssh, cross-arch build (see [Non-goals](#non-goals)).
+**Scope:** make carrick produce OCI images by running kaniko as a guest, plus a
+thin `carrick build` CLI wrapper, loading kaniko's output into carrick's store,
+and a legacy `POST /build` in `carrick serve`. The substantive work is **closing
+the carrick coverage gaps kaniko exercises**, starting with the one the spike
+found. **Not** in scope: a carrick-native builder; privileged builders
+(`buildkitd`/`buildah`/`dockerd`) that need `mount`/`pivot_root`/overlayfs; the
+BuildKit gRPC frontend (see [Non-goals](#non-goals)).
 
 ---
 
 ## 1. Goal
 
-Close the produce side of the container supply chain. Today carrick pulls and
-runs any OCI image but cannot make one — `build`/`push`/`save`/`load` are absent,
-so the inner loop "edit Dockerfile → build → run" is impossible. This goal ships
-a build engine: a Dockerfile drives a sequence of OCI layers, each produced by
-writing build-context files (`COPY`) or running a command in a carrick guest
-(`RUN`) and capturing the change, assembled into an image in carrick's
-already-OCI-shaped store and runnable immediately.
+Make `carrick build -t app .` build a Dockerfile into a real, portable OCI image
+— by **running kaniko as a guest**, not by reimplementing a builder. carrick
+already runs unmodified Linux binaries; kaniko is a Linux binary that builds
+images **without** privileged container setup (no `mount`/`pivot_root`/overlayfs
+— it execs each `RUN` in-process over its own root filesystem and snapshots
+changes in userspace). So the build engine is kaniko; carrick supplies the
+syscalls. carrick's deliverable is (a) close the gaps kaniko hits, (b) a thin
+`carrick build` wrapper, (c) load kaniko's output into the store so `carrick run
+<tag>` works, (d) `POST /build` so `docker build -H …` reaches it.
 
-## 2. Why this shape
+## 2. The spike (why this is the chosen design — validated, not hypothetical)
 
-Build was deferred (vs near-free `save`/`push`) because it needs a **net-new
-layer-diff/commit subsystem** AND it must **write** images into a store that today
-only ever *pulls* them. v1 is single-stage so the novel core (RUN-in-guest +
-host-side diff + the store write path) is proven before multi-stage/ADD. It
-couples to carrick-serve: `POST /build` is a milestone of *this* spec.
+A live spike on 2026-06-06 ran the kaniko executor under carrick:
 
-## 3. What exists today (grounded against the code)
+- **Boots & runs.** `carrick run gcr.io/kaniko-project/executor:latest version` →
+  `Kaniko version : v1.24.0`, exit 0. The (large, Go) builder binary runs.
+- **Pulls over the network from inside the guest.** Building `FROM alpine:3.20`,
+  kaniko retrieved the alpine manifest from `index.docker.io` over TLS from within
+  the guest — Go's registry/TLS client works under carrick.
+- **The build is correct (Docker oracle).** The *identical* kaniko invocation
+  under real Docker (`docker run … kaniko … --no-push --tar-path out.tar`)
+  succeeded end-to-end: unpacked alpine, ran both `RUN` steps (printed the proof
+  string, ran `apk add`), snapshotted the FS, applied `ENV`/`CMD`, and produced a
+  4.65 MB OCI image tar. So the invocation and kaniko itself are sound.
+- **One carrick blocker, root-caused.** Under carrick, kaniko fails at
+  `unlinkat /etc/services: read-only file system` during "Unpacking rootfs," before
+  the first `RUN`. Cause (confirmed): `/etc/services` is a **carrick synthetic VFS
+  injection** (`vfs/etc_services.rs` — injected so glibc/Go port lookups work under
+  the `--fs host` scratch), mounted read-only in `VfsMounts`; kaniko's `unlinkat`
+  to replace it with alpine's routes to the synthetic mount's mutator → `EROFS`,
+  instead of falling through to the writable overlay (`HostFsBackend::mark_deleted`,
+  which deletes *real* rootfs files fine). A guest cannot override an injected
+  `/etc/*` file. This is a **narrow, general carrick correctness gap** (§7), not a
+  dead end.
 
-- **No produce verbs** anywhere. **No production tar-layer writer** (the only
-  `tar::Builder` is test-only, `rootfs.rs:874`).
-- **The store is OCI-shaped but write-once-via-pull.**
-  ([`carrick-image/src/lib.rs`](../../../crates/carrick-image/src/lib.rs)):
-  `blobs/sha256/<hex>`, `manifest.json`, `config.json`, and a per-image
-  **`carrick-image.json`** (a `PullSummary`: ordered layer digests/sizes/paths +
-  image ref) which is the **key that `resolve`/`tag`/`list` read** (`lib.rs:577`,
-  `:810`, `:657`). `pull_image` is the **sole writer**, and it writes `config.json`
-  from **raw registry bytes**. There is **no `ImageConfig`→`config.json`
-  serializer, no manifest builder, no `PullSummary` writer** — building an image
-  needs all three (see §9).
-- **`resolve()` is lossy.** `OciImageConfigInner` parses only the runtime `Config`
-  block (user/env/entrypoint/cmd/workdir/labels/exposed_ports/stop_signal,
-  `lib.rs:527-537`); it **drops `rootfs.diff_ids`, `history`, `architecture`,
-  `os`, `created`** — all of which a built image must author itself.
-- **`rootfs.rs` is the read/apply side.** It *applies* `.wh.<name>` /
-  `.wh..wh..opq` whiteouts when stacking layers *down* (`apply_layer` (private)
-  `:546`, constants `:95-96`). The committer reuses the constants (module-private
-  → committer lives in `rootfs.rs` or gets a `pub(crate)` re-export) and the
-  public extract/compose API (`RootFs::from_layer_paths`, `:379`;
-  `extract_layer_paths_to_dir`, `:213`).
-- **`--fs host` is a MERGED rootfs, not an upper overlay** (the original draft's
-  fatal misread). `HostFsBackend::extract_layers` streams *every* layer into one
-  cap-std dir — "after this call, the backend **is** the rootfs"
-  (`fs_backend.rs:984-998`). `mark_deleted` does a real `remove_file`/`remove_dir`
-  and **records nothing**; `deleted_child_names` returns empty ("disk-authoritative:
-  deletions are real unlinks, no tombstones", `fs_backend.rs:2321-2330,2383-2388`).
-  The `OverlayEntry::Deleted` tombstone exists **only in `MemoryBackend`**, whose
-  `open_raw_fd → None` (`:728-733`) means it **cannot host a fork/exec'd guest**.
-  ⇒ A built layer **cannot** be recovered by "walking the upper scratch"; it must
-  be computed by **diffing** the post-step tree against the known pre-step tree
-  (§5).
-- **Guest-visible file metadata lives in xattrs.** carrick forces owner-rw on disk
-  and can't `chown` as non-root macOS, so the real guest mode/uid/gid are in
-  `user.carrick.mode|uid|gid` xattrs, read via `HostFsBackend::real_stat` /
-  `fd_carrick_meta` (`fs_backend.rs:1542-1570,1664,3062`). The committer reads
-  metadata through that xattr-aware path and **strips all `user.carrick.*`
-  xattrs** from emitted entries.
-- **`oci-client` 0.15 exposes push** (`push_blob`/`push_manifest`); zero push
-  wiring in carrick-image today. `auth::resolve_auth`'s `RegistryAuth::Basic`
-  feeds push unchanged → push is genuinely small.
-- **The trap guardrail is a loop bound, not a flag.** `max_traps` (default
-  `1_000_000`, `runtime.rs:277`) bounds the trap loop; exhaustion returns
-  `RunResult{exit_code:-1, trap_limit_hit:true}` / `TrapLimitExceeded`
-  (`runtime.rs:299-311`) — **not** a clean guest exit. Build sets `max_traps`
-  effectively unbounded (§7).
-- **serve handlers buffer; they do not stream.** `route()` returns
-  `Result<Response<Full<Bytes>>, Infallible>` and every handler returns one
-  buffered body (`router.rs:56-97`). `POST /build` needs a **net-new streaming
-  response path** (§10).
+**Conclusion:** kaniko-as-guest gets ~95% of the way on the first attempt, blocked
+by a single fixable VFS bug. The approach is viable; the work is gap-closing.
 
-## 4. Architecture: a layered build pipeline
+## 3. Architecture
 
 ```
-Dockerfile + context dir
-  → parse      (instructions; ARG/ENV ${VAR} substitution; .dockerignore filter)
-  → execute    (one OCI layer per filesystem-changing instruction, over a single
-                persistent build scratch; host-side diff per step)
-       FROM   → pull base; seed layer list + in-progress ImageConfig (carrying
-                base CMD/ENTRYPOINT/ENV/USER/WORKDIR through) ; extract base into
-                the build scratch; snapshot_0 = the seeded tree
-       COPY   → write context files into the scratch (host-side, NO guest);
-                the layer = exactly the written paths
-       RUN    → re-attach the scratch (CARRICK_EXEC_OVERLAY), run argv to
-                completion (no trap cap), then DIFF the scratch vs the prior
-                snapshot → layer
-       ENV/WORKDIR/USER/CMD/ENTRYPOINT/LABEL/EXPOSE/ARG → mutate in-progress
-                config (+ history entry, empty_layer:true; no file layer)
-  → assemble   (layers + config{diff_ids,history,arch,os,created} → manifest;
-                compute the image id = manifest digest)
-  → store&tag  (write blobs/sha256/* + config.json + manifest.json +
-                carrick-image.json; tag_image)
+carrick build -t app -f Dockerfile <context>
+  → resolve the kaniko executor image (pinned; pulled/cached in the store)
+  → carrick run --fs host  (writable overlay; max_traps unbounded)
+        -v <context>:/workspace
+        gcr.io/kaniko-project/executor:<pin>
+        --context dir:///workspace --dockerfile /workspace/<Dockerfile>
+        [--build-arg…] [--cache…] [--destination app | --no-push --tar-path …]
+     ⇒ KANIKO does everything: parse (incl. multi-stage), pull bases, exec each
+       RUN as a (nested) carrick guest, snapshot the FS in userspace, assemble
+       layers + config + manifest, and either PUSH to a registry or write a tar.
+  → if --no-push: carrick LOADS the output tar into its own store (so
+       `carrick run app` / `carrick serve` can use it).
 ```
 
-**Component boundaries** (each independently testable):
+**carrick's role is the kernel + a thin wrapper.** It does not parse Dockerfiles,
+diff layers, or write image metadata — kaniko does, exactly as it does under
+Docker. carrick: runs the guest (`--fs host`, uncapped traps), maps CLI flags to
+kaniko flags, bind-mounts the context, and on `--no-push` ingests kaniko's tar via
+the store's load path. RUN steps run as real carrick guests — the same emulation
+`carrick run` already provides.
 
-| Unit | Responsibility | Depends on |
-|---|---|---|
-| Dockerfile parser | text → ordered `Instruction`s; ARG/ENV substitution; `.dockerignore` | pure |
-| Tree differ + layer committer | (pre-snapshot, post-tree) → changed/added paths + `.wh.` for removed → a **deterministic** gzipped OCI layer + digest + diff_id | `rootfs.rs` whiteout consts + tar writer; `real_stat` |
-| Build executor | drive instructions over one persistent scratch; own layer list + in-progress config; call the runtime for `RUN`, the differ for `RUN`/`COPY` | parser, differ, runtime build-attach seam, `carrick-image` |
-| Image assembler + **store writer** | config.json + manifest.json + carrick-image.json serializers; manifest digest | `carrick-image` |
-| Build cache | content-addressed instruction→layer reuse | store, differ keys |
-| Produce verbs | `push`/`save`/`load`/`history`/`tag` | `carrick-image`, `oci-client` |
-| `POST /build` (+ streaming) | unpack context, spawn `carrick build`, **stream** output | `carrick serve`, CLI |
+**Two output modes:**
+- **`--push` / `--destination <ref>`** — kaniko pushes the built image directly to
+  a registry (it has its own registry client + auth; the spike proved guest-side
+  registry TLS works). carrick does nothing extra.
+- **`--no-push` (default for local builds)** — kaniko writes a `--tar-path` image
+  tarball; carrick **loads** it into the store (the `load` produce-verb, §6) and
+  applies the `-t` tag, so `carrick run app` works immediately.
 
-New crate `carrick-build` (parser + differ/committer + executor + assembler +
-cache); `carrick-cli` owns the `build` subcommand + produce verbs; `carrick
-serve` owns `POST /build`. Dependency direction stays `cli → build → {image,
-runtime} → spec`.
+## 4. The gap-closing program (the real work)
 
-## 5. The core: RUN execution + host-side layer diff
+The spike shows the design is gated by carrick coverage, not by missing builder
+code. So the bulk of this goal is a **conformance-driven loop**, the same shape as
+the existing LTP/language-runtime conformance work:
 
-Because `--fs host` gives a **merged** rootfs with **no tombstones** (§3), a layer
-is computed by **diffing**, not by harvesting an upper. The mechanism:
+1. Run kaniko under carrick on a build from the corpus.
+2. It fails on a syscall/VFS gap (the spike's was synthetic-`/etc` `EROFS`).
+3. Root-cause with `carrick trace`/the event ring; fix the gap in the runtime;
+   add an owning probe/test (per the project's conformance discipline).
+4. Re-run; advance to the next gap. Repeat until the corpus builds.
 
-1. **One persistent build scratch.** The executor creates a single scratch
-   (the detached-container style — persisted, *not* reaped on Drop; a plain
-   foreground `carrick run` reaps its `TempDir`, so build must use the persisted
-   path or a new `--build-scratch <dir>` mode) and seeds it from the base image
-   layers (the existing extract path). It records **`snapshot_0`** = a map of
-   `path → (kind, guest mode/uid/gid via real_stat, size, content hash)` for the
-   seeded tree, and the set of carrick **baseline-seed paths** (`/etc/hosts`,
-   `/etc/resolv.conf`, `/etc/passwd`-class, `/tmp` perms) that `seed_guest_baseline`
-   injects — these are **excluded** from every diff so they never pollute a layer.
-2. **Each RUN** re-attaches the same scratch via `CARRICK_EXEC_OVERLAY` (the
-   existing "re-attach an extracted overlay instead of re-extracting" path) and
-   runs `/bin/sh -c "<cmd>"` (shell form) or the exec-form argv to completion with
-   `max_traps` unbounded. The guest mutates the scratch in place.
-3. **Diff** the scratch against the prior snapshot: a path **new or changed**
-   (content hash or guest metadata differs) → a layer entry; a path **in the
-   snapshot but absent now** → a `.wh.<name>` whiteout in its parent. Update the
-   rolling snapshot to the current tree. (Opaque-whiteout synthesis — a dir whose
-   entire contents were replaced — is **best-effort/deferred**; emitting
-   per-child `.wh.` is correct, just larger.)
-4. **Each COPY** writes only the context files into the scratch (host-side, no
-   guest); the layer = exactly those written paths (no full diff needed). Update
-   the snapshot.
+The **first gap is known and designed in §7**. Subsequent gaps are discovered by
+running, not guessed — kaniko's heaviest surfaces are: full-filesystem snapshot
+each step (mass `stat`/`readdir`/xattr), exec of freshly-written base binaries,
+tar+gzip, and registry push (TLS). The spike already exercised most of these
+successfully up to the `/etc/services` unlink. The corpus + matrix (§9) make
+"which builds work" measurable, exactly like `support-matrix.md`.
 
-**The runtime "build-attach" seam** is therefore light: *create/seed a persistent
-scratch, and run a one-shot argv over it via `CARRICK_EXEC_OVERLAY` without
-reaping and without a trap cap.* Both pieces exist (detached scratch persistence;
-`CARRICK_EXEC_OVERLAY` re-attach) — the new work is the orchestration entry point
-plus a `--build-scratch`/no-reap knob, **not** a new overlay engine. The
-**execution** primitive (ELF-load, syscall dispatch, overlay attach, max-traps
-threading) is genuinely reused; only the **diff** is net-new, and it is pure
-host-side bookkeeping (`snapshot` walk + compare). The full-tree walk per RUN is
-accepted cost for experimental v1.
+## 5. Why this beats a native builder
 
-(Rejected alternative: build a `MemoryBackend`-style upper-with-tombstones overlay
-that can also host a fork/exec guest — true upper==diff semantics, but
-`MemoryBackend::open_raw_fd → None` means that's a deep net-new overlay engine.
-Deferred; the host-side diff needs no runtime overlay changes.)
+The pivot **resolves**, by delegation to kaniko, every hard problem the native
+draft wrestled with:
 
-## 6. Instruction handling (v1: single-stage)
+| Native-builder problem | Status under kaniko-as-guest |
+|---|---|
+| Net-new layer-committer (invert `rootfs.rs`; whiteouts; determinism) | **Gone** — kaniko produces layers + does its own userspace snapshot/diff. |
+| Net-new store-write serializers (`config.json`/manifest/`PullSummary`; `resolve()` is lossy) | **Gone for the produce path** — kaniko writes a standard image (tar/registry); carrick only needs the existing-style **load** to ingest a tar. |
+| Single-stage only | **Multi-stage comes free** — kaniko supports it natively. |
+| Portability (carry mode/uid/gid/xattrs so other runtimes extract right) | **Free** — kaniko emits standard OCI; the Docker-oracle tar is a normal image. Portability is kaniko's (battle-tested) concern. |
+| Build cache (hand-rolled, deterministic-digest correctness) | **Free** — kaniko has a mature `--cache` (registry/dir-backed layer cache). |
+| Matching exact Docker build semantics (`.dockerignore`, ARG order, shell/exec forms, base-config inheritance) | **Free** — it's the real builder. |
 
-Supported: `FROM`, `RUN`, `COPY`, `ENV`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`,
-`LABEL`, `ARG`, `EXPOSE`.
+What remains is carrick coverage (which benefits *every* guest, not just build) +
+a thin wrapper. This is strictly less reimplementation and strictly higher
+compatibility — and it is the purest expression of carrick's thesis.
 
-- **FROM `<ref>`** — pull via `carrick-image`; seed the layer list and the
-  in-progress `ImageConfig` from the base, **carrying base `CMD`/`ENTRYPOINT`/
-  `ENV`/`USER`/`WORKDIR` through** unless the Dockerfile overrides them
-  (`FROM` already seeds these into `ImageConfig`, `lib.rs:543-545`). Exactly one
-  `FROM`; a second is a clear "multi-stage not yet supported" error.
-- **RUN `<cmd>`** — shell form (`/bin/sh -c`) or exec-form argv via the §5 seam;
-  non-zero guest exit fails the build with captured output; a `trap_limit_hit`/
-  `TrapLimitExceeded` result is also a build failure (not silently "succeeded").
-- **COPY `<src>... <dest>`** — sources resolved against the context
-  (path-traversal-guarded; respects `.dockerignore`), honoring `WORKDIR`; default
-  ownership root:root. `--chown`/`--from` are v1 errors. **WORKDIR is
-  auto-`mkdir -p`'d** if absent (Docker semantics) and affects subsequent
-  COPY/RUN cwd.
-- **ENV / WORKDIR / USER / CMD / ENTRYPOINT / LABEL / EXPOSE** — mutate the
-  in-progress config (env last-wins; **a new `ENTRYPOINT`/`CMD` resets the
-  inherited base value**; CMD/ENTRYPOINT accept JSON (exec) or shell form). Emit a
-  history entry, `empty_layer:true`, no file layer.
-- **ARG** — build-time vars with `--build-arg` overrides; participate in `${VAR}`
-  substitution (incl. an `ARG` before `FROM` for the image ref); **not persisted**
-  to the image config (Docker semantics). Predefined proxy args accepted-and-ignored.
+## 6. `carrick build` CLI + produce verbs
 
-## 7. Experimental posture (no artificial cap)
+- **`carrick build [-t name[:tag]] [-f Dockerfile] [--build-arg K=V]…
+  [--no-cache] [--cache-repo R] [--push|--no-push] [--platform …] <context>`** —
+  the wrapper. Validates the context, resolves the pinned kaniko image, runs the
+  §3 guest invocation, maps flags to kaniko flags, and on `--no-push` loads the
+  output tar + tags it. Errors are kaniko's, surfaced verbatim; a non-zero kaniko
+  exit (or a carrick `trap_limit_hit`) fails the build.
+- **`carrick load -i <tar>`** — ingest a docker-archive/OCI-layout tar (kaniko's
+  output, or any `docker save` tar) into the store. **This is the one produce-side
+  serializer carrick must build** — and it is the *read/ingest* direction (write
+  blobs + `manifest.json`/`config.json`/`carrick-image.json` from the tar), which
+  the store's pull path already largely models. Used by `carrick build --no-push`.
+- **`carrick push <image> [<ref>]`** — still useful for pushing *stored*
+  (pulled or loaded) images carrick didn't build; wire `oci-client` push +
+  existing `Basic` auth. (A kaniko `--push` build pushes directly and needs none of
+  this.) Optional for this goal; include if cheap.
+- **`carrick save` / `history` / `tag`** — `tag` exists; `save`/`history` are nice
+  to have but **not required** (kaniko + `load` cover the build→run→push loop).
+  Deferred unless trivial.
 
-Build is **experimental** because carrick's syscall coverage is still maturing —
-**not** a designed limit:
+So the produce-side serializer burden collapses from "config/manifest/PullSummary
+writers + a layer committer" (native draft) to **just `load`** (ingest), because
+kaniko authors the image.
 
-- `RUN` runs with `max_traps` set effectively unbounded (e.g. `usize::MAX`), so a
-  long `apt-get`/compile is never killed by a trap-count limit. A **wall-clock
-  timeout** MAY bound a hung step (liveness guardrail). `trap_limit_hit` must
-  still be checked and mapped to a build failure.
-- A missing syscall behaves like the rest of carrick (ENOSYS-by-name; mostly
-  tolerated). A `RUN` that fails on a missing/incorrect syscall is a **tracked
-  carrick coverage bug**, not an accepted ceiling.
-- Success is defined against a **growing Dockerfile corpus** (§11), starting
-  simple. No claim that "every Hub Dockerfile builds."
+## 7. The first gap: guest override of synthetic `/etc/*` injections
 
-## 8. The differ + layer committer (the inverse of `rootfs.rs::apply`)
+The spike's blocker, designed as the first fix (general-purpose, not build-only):
 
-Input: a diff result — the set of added/changed paths (each with guest-visible
-metadata) + the set of removed paths. Output: a gzipped tar layer blob + its
-**registry digest** (over compressed bytes) + its **diff_id** (over the
-*uncompressed* tar, for `config.rootfs.diff_ids`).
+carrick injects synthetic read-only `/etc/services` (and `/etc/resolv.conf`, and
+seeds `/etc/hosts`/`passwd`/`group`/`nsswitch`) so name/port lookups work under the
+`--fs host` scratch (`vfs/etc_services.rs`, `vfs/mod.rs`, `fs_setup.rs`). Today a
+guest cannot `unlinkat`/overwrite an injected node — the synthetic VFS mount's
+mutator returns `EROFS` (`vfs/bind.rs`). **Fix: copy-up / override semantics** — a
+guest `unlink` or write of an injected `/etc/*` path **detaches the injection** and
+falls through to the writable overlay, so the guest's version wins (and a
+subsequent read sees the guest's file, not the injection). This matches Linux
+(these are just files a container may replace) and fixes a real, common gap beyond
+build: **many real workloads rewrite `/etc/resolv.conf`**, and today they'd hit the
+same `EROFS`. Owning probe: a guest that `unlink`s `/etc/services` then writes its
+own and reads it back; differential vs Docker.
 
-Rules (mirroring the OCI conventions `rootfs.rs` already applies):
-- Each added/changed file/dir/symlink → a tar entry. **Metadata is read via the
-  xattr-aware `real_stat`/`fd_carrick_meta`** (guest mode/uid/gid in
-  `user.carrick.*`), *not* the raw on-disk POSIX bits; **all `user.carrick.*`
-  xattrs are stripped** from emitted entries; `user.carrick.socket` markers are
-  skipped (as `rootfs.rs` skips special nodes).
-- Each removed path → a `.wh.<name>` whiteout entry (reuse `WHITEOUT_PREFIX`).
-- **Determinism (hard requirement for the cache, §9):** entries sorted by path;
-  **mtime normalized to a fixed constant (0)** — *not* the scratch's wall-clock
-  mtime, which would differ every run and break cache bit-identity; deterministic
-  uid/gid; no PAX time extensions; fixed gzip level. gzip-header determinism is
-  free with flate2's `GzEncoder` (mtime defaults 0, OS byte 255); the residual
-  risk is the **tar header**, which these rules pin.
-- A metadata-only step → an **empty layer** (`empty_layer:true` in history), like
-  Docker.
+(Subsequent gaps are handled by the §4 loop, not pre-designed.)
 
-**Round-trip test (M0), corrected:** commit a synthesized diff to a blob, then
-compose `RootFs::from_layer_paths([..base, committed_blob])` (the **public** API
-`rootfs.rs:379`; `apply_layer` is private) and assert the resulting tree matches.
-Fidelity ceiling: `RootFsMetadata` exposes only path/kind/mode/size
-(`rootfs.rs:166-172`), so the round-trip asserts **path/kind/contents/file-mode**.
-To verify **uid/gid/mtime/whiteout** fidelity, extract the blob via
-`extract_layer_paths_to_dir` into a cap-std dir and `real_stat` it. M0 also
-**defines the upper-scratch/diff data contract** (added set + removed set +
-per-entry metadata source) that M1's seam must emit.
+## 8. `POST /build` in `carrick serve`
 
-## 9. Store write path (net-new) + image assembler
+Legacy (non-BuildKit) builder protocol: gzipped context tar as the body
+(`?dockerfile=`/`?t=` (repeatable)/`?buildargs=` URL-encoded JSON/`?nocache=`/
+`?pull=`). The handler unpacks the context and **shells out to `carrick build`**
+(which runs kaniko) — the established server-as-translator pattern (no guest fork
+in the server's tokio runtime). It streams kaniko's progress as protocol NDJSON
+(`{"stream":…}`, `{"aux":{"ID":…}}`, `{"errorDetail":{"message":…}}`).
 
-Building an image requires three serializers the store lacks today (it only ever
-*pulls*):
-
-1. **`ImageConfig` → OCI `config.json`** (PascalCase) including
-   `rootfs.diff_ids`, `history`, `architecture` (guest arch), `os` (`linux`),
-   `created`, and the runtime `Config` block. (`resolve()` round-trips **none** of
-   the first five — §3.)
-2. **`OciImageManifest` builder** (schemaVersion 2, config descriptor + ordered
-   layer descriptors) + **manifest-digest computation** → the **image id**.
-3. **`PullSummary` (`carrick-image.json`) writer** — ordered layer digests/
-   sizes/paths + image digest + canonical ref — because `resolve`/`tag`/`list`
-   key on it; without it, `carrick run t1` (bare `-t t1` normalizes to
-   `docker.io/library/t1:latest`) would try to pull from docker.io.
-
-The assembler **always writes a full `manifest.json`** (config + layer
-descriptors), `config.json`, and `carrick-image.json`, plus the layer blobs (and
-the config blob — see §10 save), then `tag_image`. This is the same on-disk shape
-a pull produces, so a built image is immediately resolvable/runnable/taggable.
-
-## 10. Build cache + produce verbs
-
-**Build cache** (content-addressed): `key = sha256(parent_key ‖ instruction_text
-‖ extra)`; `extra` for COPY/ADD = content hash of the copied files (path+mode+
-bytes), for RUN = empty (Docker caches RUN on instruction text + parent only). On
-a hit, reuse the blob, print `---> Using cache`; the first miss busts the cache
-for all subsequent instructions. `--no-cache` disables lookups; `--pull` re-pulls
-the base. Cache **correctness depends on the deterministic committer (§8)** — a
-hit must produce a bit-identical layer to a miss. Cache blobs are ordinary store
-blobs, reclaimed by the existing `gc_blobs`/`system prune`.
-
-**Produce verbs:**
-- **`push`** — wire `oci-client` `push_blob`/`push_manifest`; reuse
-  `auth::resolve_auth` (`Basic` feeds push unchanged). Streams `Pushed`/`already
-  exists`.
-- **`save`/`load`** — docker-archive (`manifest.json`+`repositories`+per-layer
-  `layer.tar`, `RepoTags` from `PullSummary.image`) and OCI-layout
-  (`oci-layout`+`index.json`). Note: OCI-layout save must **materialize the config
-  as a content-addressed blob** in `blobs/sha256/` (today it's stored as the image
-  dir's `config.json`, `lib.rs:416`, not a blob) and synthesize `oci-layout`/
-  `index.json` (which carrick doesn't keep); docker-archive must translate the OCI
-  manifest into the docker-archive schema. A `save`/`push` of a *pulled* image
-  lacking `manifest.json` must recompute the config digest from `config.json`
-  bytes (`resolve` tolerates a missing manifest, `lib.rs:596`; built images always
-  have one per §9).
-- **`history`** — render from the **raw `config.json` bytes** (e.g.
-  `oci_client::config::ConfigFile`), **not** the `resolve()`-flattened
-  `ImageConfig` (which drops `history`). For carrick-built images, §9 ensures the
-  config carries a complete `history` array.
-- **`tag`** — exists (`tag_image`, `lib.rs:804`); ensure built images tag cleanly.
-
-## 11. `POST /build` in `carrick serve` (with net-new streaming)
-
-The legacy (pre-BuildKit) builder protocol: the request body is the gzipped
-context tar (Dockerfile inside, named via `?dockerfile=`; `?t=` may **repeat** for
-multiple tags; `?buildargs=`/`?labels=` arrive as **URL-encoded JSON**;
-`?nocache=`/`?pull=`). The handler unpacks the context to a temp dir and **shells
-out to `carrick build`** (the server-as-translator pattern; keeps the
-no-tokio-before-fork invariant — the build's guest forks happen in the spawned
-process). It streams the child's progress as protocol NDJSON: `{"stream":"..."}`,
-`{"aux":{"ID":"sha256:..."}}`, `{"errorDetail":{"message":"..."}}`.
-
-**Streaming is net-new in serve.** Today `route()` returns a single buffered
-`Full<Bytes>` (`router.rs:56-97`); `/build` must use a **streaming response body**
+**Streaming is net-new in serve** (today's handlers return a single buffered
+`Full<Bytes>`, `router.rs:56-97`): `/build` needs a streaming response body
 (`StreamBody`/`BoxBody` + a channel pumping the child's stdout, `Transfer-Encoding:
-chunked`). hyper 1.9 + http-body-util 0.1 support this; the route signature/body
-type changes for this endpoint. The **request** side is fine (`BodyExt::collect`
-already buffers the whole context tar). The **query parser** also needs its own
-handling — the existing `query_param` (`router.rs:32-37`) does a single
-`split_once('=')` with no URL-decoding and returns the first match only, so it
-can't handle repeated `?t=` or encoded JSON.
+chunked`; hyper 1.9 + http-body-util 0.1 support it) and its own query parser (the
+existing `query_param` can't do repeated `?t=` or URL-encoded JSON). Enables
+`DOCKER_BUILDKIT=0 docker -H unix://…/carrick.sock build` and compose `build:`.
 
-This makes `DOCKER_BUILDKIT=0 docker -H unix://…/carrick.sock build -t app .` and
-compose `build:` work for **legacy-builder** clients. BuildKit-default clients are
-out of scope.
+## 9. Experimental posture
 
-## 12. Milestones
+Build is **experimental** because it depends on carrick's still-maturing syscall
+coverage — surfaced and closed by the §4 loop, not an accepted ceiling. RUN steps
+(and kaniko itself) run with `max_traps` effectively unbounded (no syscall-count
+cap; a wall-clock timeout MAY bound a hung build; `trap_limit_hit` → build
+failure). Success is a **growing Dockerfile corpus** published as a matrix vs
+`docker build` (kaniko-under-Docker as oracle), starting from the spike's
+`FROM alpine + RUN + ENV/CMD` case.
 
-### M0 — Differ + layer committer (no guest)
-The host-side differ (snapshot vs post-tree → added/removed sets) + the
-deterministic committer (§8): added/changed entries + `.wh.` whiteouts, sorted,
-mtime=0, xattr-stripped. Define the diff data contract M1 emits.
-**Exit:** round-trip via `RootFs::from_layer_paths([..base, blob])` asserts
-path/kind/contents/file-mode; an `extract+real_stat` check asserts uid/gid + that
-a removed path becomes a `.wh.`; identical diffs yield **identical digests**
-(determinism).
+## 10. Milestones
 
-### M1 — `carrick build` single-stage engine
-Dockerfile parser (+ `.dockerignore`, ARG/ENV substitution, shell/exec forms);
-the §5 build-attach seam (persistent scratch seeded from base, per-RUN re-attach
-via `CARRICK_EXEC_OVERLAY`, no reap, `max_traps` unbounded, snapshot+diff);
-COPY/metadata first, then RUN; the §9 store write path (config/manifest/
-PullSummary serializers + manifest digest); `tag`.
-**Exit:** `carrick build -t t1 .` on a COPY+metadata Dockerfile (static
-`linux-aarch64-hello` fixture) → `carrick run t1` executes it; a `RUN`-bearing
-Dockerfile (`RUN echo hi > /f`; coreutils) builds, the new layer contains exactly
-`/f` (not the whole rootfs), and a `RUN rm <basefile>` produces a `.wh.`; a
-failing `RUN` (non-zero or trap-limit) fails the build with captured output.
+### M0 — First green build (fix the spike blocker)
+Implement §7 (guest override/copy-up of synthetic `/etc/*`); re-run the spike's
+Dockerfile under carrick.
+**Exit:** `carrick run --fs host … kaniko … --no-push --tar-path out.tar` on the
+spike Dockerfile produces a tar; its contents match the Docker-oracle build
+(same files, the `/proof.txt`); an owning probe covers the `/etc/*`-override
+behavior. (If a *next* gap appears before the tar is produced, M0 expands to fix
+it — M0 is "kaniko builds one trivial image under carrick.")
 
-### M2 — Produce verbs
-`push` (oci-client), `save`/`load` (docker-archive + OCI-layout incl. config-blob
-materialization), `history` (raw config bytes).
-**Exit:** `build → push` to a local registry then `pull`+`run`; `save`→`load`
-round-trips; `docker load` accepts a `carrick save` tarball (and vice-versa) for a
-simple image; `history` renders the built image's layers.
+### M1 — `carrick build` wrapper + load-into-store
+The `carrick build` CLI (flag→kaniko mapping, pinned kaniko image, `--fs host`,
+uncapped traps); `carrick load` ingesting the kaniko output tar + tagging.
+**Exit:** `carrick build -t t1 .` (no docker) builds the spike Dockerfile and
+`carrick run t1` executes it (`cat /proof.txt` → the proof string); a failing
+`RUN` fails the build with kaniko's captured output.
 
-### M3 — Build cache + `POST /build`
-Content-addressed cache (§10) with `--no-cache`; streaming `POST /build` in serve.
-**Exit:** a second `build` of an unchanged Dockerfile reuses cached layers (no
-`RUN` re-executed, bit-identical digests); `DOCKER_BUILDKIT=0 docker -H
-unix://…/carrick.sock build -t app .` builds a simple image end-to-end (streamed
-output); a small Dockerfile-corpus matrix (COPY+static-bin, RUN-coreutils,
-ENV/WORKDIR/USER/CMD, a delete→`.wh.` case) published green vs `docker build`.
+### M2 — Corpus + cache (gap-closing)
+Drive a Dockerfile corpus (multi-stage; `COPY`; `RUN` coreutils; `RUN apt-get`/
+`apk add`; `ENV`/`WORKDIR`/`USER`) through `carrick build`, closing each carrick
+gap the §4 loop surfaces with an owning probe; enable kaniko's `--cache`.
+**Exit:** the corpus builds under carrick (or each non-builder is a filed,
+tracked carrick coverage gap), published as a matrix vs `docker build`; a re-build
+hits kaniko's cache.
 
-## 13. Acceptance rules
+### M3 — `POST /build` (streaming)
+Streaming response body + query parser in serve; `POST /build` shelling to
+`carrick build`.
+**Exit:** `DOCKER_BUILDKIT=0 docker -H unix://…/carrick.sock build -t app .`
+builds a simple image end-to-end with streamed output.
 
-1. The committer is proven by **round-trip** (M0), not by eyeballing tar output;
-   the round-trip uses the **public** `from_layer_paths` and an `extract+real_stat`
-   check for uid/gid/whiteout (the in-memory `RootFsMetadata` alone can't verify
-   ownership/mtime).
-2. No `RUN` is killed by a syscall/trap cap; a `RUN` failure is a real non-zero
-   exit, a `trap_limit_hit`, or a **filed** carrick coverage bug — never hidden.
-3. Built images are byte-validated runnable (`carrick run` the result); where a
-   `docker build` oracle exists, the produced rootfs/layers are compared.
-4. Cache correctness before speed: a hit produces a **bit-identical** layer to a
-   miss (guaranteed by the deterministic committer, §8 — mtime=0, sorted, fixed
-   gzip).
-5. `POST /build` reuses the `carrick build` engine via subprocess (no second build
-   implementation, no guest fork in the server's tokio runtime), and adds a
-   streaming response body (a new serve capability, not a reuse of the buffered
-   handlers).
+## 11. Acceptance rules
 
-## 14. Non-goals
+1. Every carrick gap a build hits is closed with an **owning probe/test** and a
+   `docker`-oracle comparison (the project's conformance discipline) — not patched
+   ad hoc.
+2. No `RUN`/kaniko step is killed by a syscall/trap cap; failures are real
+   non-zero exits, `trap_limit_hit`, or filed coverage bugs.
+3. Built images are validated runnable (`carrick run` the result) and, where a
+   `docker build`/kaniko-under-Docker oracle exists, compared.
+4. `carrick build` runs the **real** kaniko (a pinned version) — no forked/
+   reimplemented builder; carrick's code is the wrapper + the coverage fixes + `load`.
+5. `POST /build` reuses `carrick build` via subprocess (no guest fork in the
+   server's tokio runtime) and adds the streaming body as a new serve capability.
 
-- **BuildKit / buildx / LLB** — v1 targets the legacy builder
-  (`DOCKER_BUILDKIT=0`) only. Permanent for this spec.
-- **Multi-stage** (`FROM … AS`, `COPY --from=`) — v2; a second `FROM` errors.
-- **`ADD` from URL / auto-extract, `COPY --chown`/`--from`, `RUN --mount`,
-  `ONBUILD`/`HEALTHCHECK`/`SHELL`/`VOLUME`/`STOPSIGNAL`** — v2+.
-- **Opaque-whiteout optimization** — v1 emits per-child `.wh.` (correct, larger).
-- **Cross-arch build** — produces an image for carrick's guest arch.
-- **Reproducible builds beyond deterministic layer digests** — best-effort. (Note:
-  deterministic *digests* are NOT best-effort; they are the §8/§13.4 hard
-  requirement the cache depends on.)
+## 12. Non-goals
 
-## 15. Risks & open questions
+- **A carrick-native Rust builder** — superseded by kaniko-as-guest. (If kaniko
+  ever proves unviable on some axis, the native design is the documented fallback,
+  but it is not the plan.)
+- **Privileged builders** (`buildkitd`, `buildah`, `dockerd`) as guests — they
+  need `mount`/`pivot_root`/overlayfs/full mount-namespaces (all **Deferred** in
+  carrick; explicitly scoped out by the namespaces design). kaniko is chosen
+  *precisely because* it is mount-free. Running the privileged stack is a separate,
+  much larger coverage north-star.
+- **BuildKit gRPC frontend / buildx** — modern `docker build` defaults to
+  BuildKit; v1 targets the legacy `POST /build` (`DOCKER_BUILDKIT=0`).
+- **Bundling a forked kaniko** — carrick runs upstream kaniko unmodified at a
+  pinned version.
 
-- **The §5 build-attach seam** is the load-bearing unknown — persisting the build
-  scratch across steps (no reap) and re-attaching it per RUN via
-  `CARRICK_EXEC_OVERLAY` without re-extraction. M1 spikes this first. It is
-  lighter than a new overlay engine (both pieces exist) but the no-reap +
-  one-shot-over-attached-scratch entry point is new.
-- **Diff cost & fidelity.** A full-tree snapshot+walk per RUN is O(tree); fine for
-  experimental v1. Fidelity: v1 handles mode + uid/gid (xattr-aware) + emits
-  mtime=0; **xattrs/hardlinks are best-effort**, flagged if a corpus image needs
-  them. Opaque whiteouts deferred (per-child `.wh.` instead).
-- **`RUN` coverage** — broad-syscall RUNs (apt/compilers) will surface coverage
-  bugs; expected, feeds the conformance backlog.
-- **`save`/`load` Docker interop** — docker-archive has version nuances; M2
-  validates cross-tool round-trip for a simple image and documents divergence.
-- **Cache-key parity with Docker** is explicitly **not** a goal — carrick's cache
-  is internally correct (deterministic), keys need not match Docker's.
+## 13. Risks & open questions
 
-## Appendix — code anchors (verified 2026-06-06)
+- **The next gap after `/etc/*` is unknown until we fix and re-run.** kaniko
+  snapshots the *full* filesystem each step (mass `stat`/`readdir`/`lstat`/xattr),
+  execs base binaries it just wrote, and does heavy tar/gzip — any could surface a
+  carrick gap. The §4 loop is built for exactly this; M0/M2 are scoped as
+  "close gaps until it builds," and the spike already cleared the path up to the
+  one known blocker. Honest framing: M2 is **open-ended** (bounded by the corpus),
+  so the corpus is kept small and representative.
+- **kaniko full-FS snapshot is slow** (it walks `/` per step). Acceptable for
+  experimental v1; kaniko's `--snapshot-mode=redo`/`time` and `--cache` mitigate.
+- **kaniko version pinning + distribution.** Pin a known-good tag; document how
+  `carrick build` resolves it (pull on first use into the store). A kaniko upgrade
+  could surface new gaps — pin and bump deliberately.
+- **`--push` auth from the guest.** kaniko reads Docker credential config; how
+  carrick surfaces host registry creds into the guest (env/`-v` the docker config)
+  needs a small design in M1. The spike used anonymous pull only.
+- **`load` fidelity.** Ingesting kaniko's tar must round-trip into a `carrick
+  run`-able store image; M0/M1 validate against the Docker-oracle tar. This is the
+  one serializer carrick still owns (ingest direction).
+- **Determinism/portability** are kaniko's, not carrick's — a strict improvement
+  over the native draft.
 
-- Store OCI-shaped, `PullSummary`/`carrick-image.json` is the resolve/tag/list key,
-  lossy `resolve`: `carrick-image/src/lib.rs:166,416-417,527-557,577-588,657,
-  698,753,804-828`. Push auth: `auth.rs` (`resolve_auth`→`Basic`). `oci-client`
-  0.15 push: unwired.
-- Whiteout consts (module-private) + apply (read) direction + public compose API +
-  test-only tar writer: `rootfs.rs:95-96,166-172,213,320-336,379,546,650,874`.
-- `--fs host` is a merged rootfs; no deletion tombstones; xattr metadata:
-  `fs_backend.rs:984-998,1403,1542-1570,1573,1664,2321-2330,2383-2388,3062`.
-  Memory-only tombstone + `open_raw_fd→None`: `fs_backend.rs:537,663-671,728-733`.
-- Trap guardrail (loop bound; `TrapLimitExceeded`): `runtime.rs:277,299-311`.
-- Detached scratch persistence + `CARRICK_EXEC_OVERLAY` re-attach:
-  `crates/carrick-cli/src/lifecycle.rs` (run_supervised_child / exec),
-  `execute.rs:203-223,236-242`.
-- serve buffers (no streaming) + `query_param` limits:
+## Appendix — spike evidence + anchors (2026-06-06)
+
+- Spike: `carrick run gcr.io/kaniko-project/executor:latest version` → `v1.24.0`,
+  exit 0. `carrick run --fs host -v /tmp/ctx:/workspace … executor --context
+  dir:///workspace --no-push --tar-path …` → `unlinkat /etc/services: read-only
+  file system` at "Unpacking rootfs." Identical `docker run … executor …` →
+  success, 4.65 MB `out.tar`.
+- Synthetic `/etc/services` injection: `crates/carrick-runtime/src/vfs/etc_services.rs`
+  (`ETC_SERVICES_PATH`), routed via `vfs/mod.rs` `VfsMounts`; read-only mutator
+  `EROFS`: `vfs/bind.rs:23,347…`. Real-rootfs delete works:
+  `HostFsBackend::mark_deleted` (`fs_backend.rs:2321`), test
+  `host_unlink_hides_rootfs_path` (`fs_backend.rs:3609`). `unlinkat` dispatch:
+  `dispatch/fs.rs:6670`. Other `/etc` seeds: `fs_setup.rs:151-203`.
+- Mount/pivot_root/chroot/setns **Deferred** (why privileged builders are out):
+  `crates/carrick-hvf/src/syscall.rs:209,210,220,436,503-506`; namespaces design
+  scopes mount out: `docs/namespaces-design.md:71`.
+- serve buffers (streaming is net-new) + `query_param` limits:
   `crates/carrick-cli/src/serve/router.rs:32-37,56-97`; subprocess pattern:
   `serve/spawn.rs`.
