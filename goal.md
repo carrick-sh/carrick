@@ -14,9 +14,10 @@ probe or focused unit test before we claim the behavior is done.
 ## Ambitious autonomous target
 
 Drive the current process-control cluster from classified NEW rows to owned,
-boring behavior without weakening the gate. The near-term push is to close the
-CPython forkserver/process-pool hang by reducing it to a deterministic
-process-wait, fd-readiness, or futex invariant, then use that sharper model to
+boring behavior without weakening the gate. The near-term push is to keep
+shrinking `cpython-concurrent_futures`: the forkserver process-pool max-task
+hang is now reduced and owned, and the live blocker has moved later in the
+module to the `test_deadlock` big-data crash case. Use each sharper model to
 keep the Go `os/exec`, CPython subprocess, and signal-interruption rows as
 comparable pressure workloads instead of letting them disappear mid-workload.
 
@@ -61,7 +62,7 @@ ltp-ptrace05  MATCH, carrick 63/63, oracle 63/63, run conf-51453-c00
 ltp-ptrace06  MATCH, carrick 48/48, oracle 48/48, run conf-51453-c01
 ```
 
-Latest live refresh note: a full conformance refresh later stopped in
+Earlier live refresh note: a full conformance refresh later stopped in
 `cpython-concurrent_futures` run `conf-42207-c75`, hanging in
 `ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_early_shutdown`.
 The exact single test passes under carrick, but the full forkserver class still
@@ -87,6 +88,28 @@ loop; they show a quiescent wait graph with the parent supervisor parked in
 and one worker in `shared_futex_wait`. The next reducer should target that
 blocked wait/reap/futex state, not the already-owned EOF spin.
 
+Update after missed child-exit watch handling: the exact early-shutdown reducer
+that previously timed out now completes five forkserver churn iterations under
+carrick, and the full
+`ProcessPoolForkserverProcessPoolExecutorTest` class passes 21 tests in
+15.723s (1 Windows-only skip). The root cause was a fast-exit child reaching
+the forkserver parent before Carrick successfully armed the pump's
+`EVFILT_PROC` watch; if `kevent` reports the child is already gone, Carrick now
+publishes the requested guest exit signal immediately instead of losing the
+only wakeup that makes CPython scan `waitpid(-1, WNOHANG)`. The focused unit
+owners are
+`host_signal::tests::missed_child_exit_watch_publishes_exit_signal_once` and
+`host_signal::tests::missed_child_exit_watch_honors_zero_exit_signal`.
+
+Latest `just` harness refresh: `just conformance full --suite
+cpython-concurrent_futures --no-image-refresh` wrote
+`target/conformance/results.jsonl` with `carrick_run_id=conf-22702-c00`. The
+row is still `NEW` because the broader module stops later, mid
+`test_deadlock.ProcessPoolForkExecutorDeadlockTest.test_crash_big_data`, with
+no parseable final regrtest summary. The raw output proves the fixed slice:
+`test_process_pool` ran 63 tests in 23.876s and passed, including all fork,
+forkserver, and spawn `max_tasks_*` cases.
+
 ## Primary target rows
 
 These are the first rows to investigate because they share process-control,
@@ -99,7 +122,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `go-os_exec` | Go | MATCH 86/86 in targeted rerun `conf-93241-c156` | 86/86 | Previously 0/0; current evidence shows process execution suite parity, so keep watching it as pressure coverage rather than the next reducer. |
 | `go-syscall` | Go | 0/0 | 34/34 | Broad syscall package fallout; inspect for process/wait/signal cases first. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
-| `cpython-concurrent_futures` | CPython | hangs in `test_max_tasks_early_shutdown` during forkserver class run | 20/20 | Process-pool/forkserver shutdown currently fails to produce a comparable result. Shared futex word aliasing is now probe-ruled-out; continue on process wait/fd readiness/forkserver cleanup. |
+| `cpython-concurrent_futures` | CPython | `test_process_pool` now passes 63 tests; broader module stops mid-`test_deadlock.ProcessPoolForkExecutorDeadlockTest.test_crash_big_data` in `conf-22702-c00` | 20/20 | Forkserver max-task shutdown is now owned; continue on the next process-control deadlock case without weakening the row. |
 | `ltp-setpgid01` | LTP | 2/2 | 1/2 | Inversion risk: may be under-enforcement rather than better behavior. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
@@ -236,10 +259,12 @@ Exit criteria:
 
 Use `go-os_exec`, `cpython-subprocess`, and `cpython-concurrent_futures` as the
 workload pressure tests. The current live target is
-`cpython-concurrent_futures`: CPython's forkserver process pool churns through
-semaphores, worker exits, epoll/select waits, and parent-side fd cleanup. The
-first-principles path is to keep shrinking that class hang until a bounded
-probe or focused unit test owns the exact host-wait/futex/fd invariant.
+`cpython-concurrent_futures`: CPython's process-pool and deadlock tests churn
+through semaphores, worker exits, pipe/socket transfer, epoll/select waits, and
+parent-side fd cleanup. The forkserver max-task race is now owned; the
+first-principles path is to keep shrinking the remaining `test_deadlock` hang
+until a bounded probe or focused unit test owns the exact host-wait, pipe/fd, or
+signal invariant.
 
 Exit criteria:
 
@@ -250,6 +275,10 @@ Exit criteria:
 - `host_signal::tests::drain_fd_forces_empty_pipe_nonblocking` owns the
   host-side invariant that draining an internal wake pipe must never turn into
   an unbounded blocking read if fd flags are disturbed by fork/fd churn.
+- `host_signal::tests::missed_child_exit_watch_publishes_exit_signal_once` owns
+  the fast-exit child race where a missed `EVFILT_PROC` watch must still publish
+  the requested guest exit signal. The zero-exit-signal companion test keeps
+  `clone(0)` semantics from gaining a spurious SIGCHLD.
 - The target language row changes from NEW to MATCH, or the remaining NEW
   difference is proven to be a separate assertion with its own follow-up.
 - `just conformance-probes` stays green.
@@ -308,7 +337,7 @@ Keep this section current as classifications and fixes land.
 | `go-os_exec` | previously process/wait workload exited without a parseable suite summary in `conf-42088-c593`; targeted rerun `conf-93241-c156` now matches 86/86 vs oracle 86/86 with assertion ids aligned. | keep as process-control pressure coverage; no reducer needed unless it regresses | MATCH |
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
-| `cpython-concurrent_futures` | process-pool/forkserver run starts and passes fork/forkserver cases, then stops mid-`ProcessPoolForkserverProcessPoolExecutorTest.test_max_tasks_early_shutdown` without a regrtest summary. Docker exact single test passes and carrick exact single test passes. The two-test reducer passed 5/5 after `drain_fd` was hardened against blocking on a disturbed wake pipe, but the full forkserver class still times out (`procgoal-cf-class-narrow-48477`, 10 leaked semaphores). `futexsharedalias` MATCHes Linux, so same-page shared futex word aliasing is no longer the leading fault. | `futexsharedalias`, `host_signal::tests::drain_fd_forces_empty_pipe_nonblocking`, then sharper CPython forkserver class reducer | current live RED target |
+| `cpython-concurrent_futures` | forkserver max-task shutdown is fixed: the exact five-iteration early-shutdown reducer completes, `ProcessPoolForkserverProcessPoolExecutorTest` passes 21 tests, and harness run `conf-22702-c00` shows `test_process_pool` passed 63 tests in 23.876s. The remaining row still reports `NEW` because the broader module stops later, mid-`test_deadlock.ProcessPoolForkExecutorDeadlockTest.test_crash_big_data`, with no parseable final regrtest summary. | `futexsharedalias`, wake-pipe drain tests, and `host_signal::tests::missed_child_exit_watch_*`; next owner should target `test_crash_big_data` | current live RED target moved to deadlock big-data case |
 | `ltp-setpgid01` | inversion risk: carrick reports both `setpgid(1, 1)` and `setpgid(0, 0)` pass, while cached oracle has one failure. This needs the Docker assertion refreshed before treating carrick as better or worse. | `setpgidrules` plus `--refresh-oracle --suite ltp-setpgid01` | classified; oracle assertion required before fix |
 | `ltp-pause02` | signal interruption/restart bug when it reproduces: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; rerun `conf-71289-c01` matched, and later `conf-18439-c01` reproduced the same signature, but latest focused attempts and `pauseinterrupt2` are currently MATCH. | `pauseinterrupt2` or sharper interruption reducer if the row turns RED again | pressure coverage; no runtime fix without fresh RED |
 | `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
@@ -368,15 +397,16 @@ just conformance-probes
    words in one `MAP_SHARED` page, starts the word-B waiter first, starts the
    word-A waiter second, wakes only word A once, and MATCHes Linux by leaving B
    blocked until explicit cleanup.
-2. Trace the remaining full forkserver class hang around
-   `test_max_tasks_early_shutdown`, focusing on epoll/select waits, wake-pipe
-   drain/fd lifetime, worker reap status, and semaphore cleanup rather than the
-   ruled-out same-page futex alias.
+2. Reduce `test_deadlock.ProcessPoolForkExecutorDeadlockTest.test_crash_big_data`
+   from `conf-22702-c00`. Start from a focused CPython unittest run, then sample
+   whether it is blocked in pipe/socket fd transfer, child exit/reap, or queue
+   feeder shutdown.
 3. Add the next bounded probe or focused unit test for the exact invariant that
-   explains the full-class hang before changing the runtime again.
+   explains the deadlock case before changing the runtime again.
 4. Validate the owned probe plus existing futex/process probes, then rerun the
-   CPython two-test forkserver reducer, the full forkserver process-pool class,
-   and `just conformance full --suite cpython-concurrent_futures --no-image-refresh`.
+   focused deadlock reducer, the full `test_process_pool` class as regression
+   coverage, and `just conformance full --suite cpython-concurrent_futures
+   --no-image-refresh`.
 5. Keep `ltp-pause02` and `go-os_signal` as adjacent pressure rows. Do not fix
    them from memory or stale output; wait for a fresh deterministic RED and then
    split a separate `pauseinterrupt2` or `atomicstop` reducer if needed.
