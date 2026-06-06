@@ -172,7 +172,7 @@ use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
 use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use serde::Serialize;
-use thiserror::Error;
+
 
 mod sysreg;
 use sysreg::*;
@@ -182,120 +182,11 @@ mod memprot;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use memprot::MemoryProtections;
 
-/// The trap-engine contract the runtime loop drives: run the vCPU until a
-/// syscall trap, complete/inject/restore around guest syscalls and signals,
-/// and fork/execve the guest address space. Implemented by [`HvfTrapEngine`]
-/// here and by the runtime's `SplitView` adapter. Lives in carrick-hvf (with
-/// `TrapError`/`ForkOutcome`) and is re-exported from carrick-runtime.
-pub trait SyscallTrap {
-    /// Run the vCPU until it traps. `Ok(Some(frame))` is a guest syscall;
-    /// `Ok(None)` means the vCPU was forced out of the guest by a cross-thread
-    /// kick (`hv_vcpus_exit`, [`crate::vcpu_kick`]) with no syscall pending —
-    /// the loop should run signal delivery and resume. `Err` is a real fault.
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError>;
-    /// The guest PC the vCPU is currently parked at. Used as the resume address
-    /// when injecting a signal on a non-syscall (kick) exit, where `ELR_EL1`
-    /// does not hold a meaningful return address.
-    fn current_pc(&self) -> Result<u64, TrapError>;
-    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError>;
-    /// Real macOS fork. Returns the child pid in the parent, 0 in the
-    /// child. After this returns, the trap engine in the child holds a
-    /// freshly rebuilt HVF context pointing at the same COW'd guest
-    /// memory; the runtime then writes the appropriate retval into the
-    /// guest's x0 via `complete_syscall`.
-    fn fork(&mut self) -> Result<ForkOutcome, TrapError>;
-    /// `execve(2)` — tear down the current guest address space and
-    /// re-initialise this engine with `new_image`. Does NOT advance
-    /// past a syscall (execve has no successful return); the next
-    /// `next_syscall` resumes at the new image's entry point.
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError>;
-    fn is_forked_child(&self) -> bool {
-        false
-    }
-    /// Inject a guest signal frame for `signum`. Writes a
-    /// `CarrickSigframe` to SP_EL0, points the guest's x30 at
-    /// `sa_restorer`, sets x0 to `signum`, and redirects the vCPU's
-    /// next resumed PC (`ELR_EL1`) to the user handler. The pre-signal
-    /// register state is preserved in the frame and recovered by
-    /// `restore_from_sigframe` on `rt_sigreturn`.
-    ///
-    /// `pending_syscall_retval` is the retval the dispatcher computed
-    /// for the syscall that was just trapped, since signals are
-    /// delivered between `complete_syscall` and the next vCPU run we
-    /// already wrote it into x0; the frame snapshots the post-retval
-    /// state so the handler-return path picks up where the caller left
-    /// off. Pass `None` when injecting outside a syscall completion
-    /// (e.g. when raising at the top of the trap loop before the first
-    /// syscall has run).
-    /// `interrupted_pc` is `Some(pc)` when injecting on a non-syscall kick exit
-    /// (the vCPU was mid-userspace; `pc` is where it should resume after the
-    /// handler returns and is redirected via `Reg::PC` rather than `ELR_EL1`).
-    /// `None` is the syscall-boundary case (resume via the post-svc `ELR_EL1`).
-    /// `altstack` is `Some((ss_sp, ss_size))` when the handler was registered
-    /// `SA_ONSTACK` and an alternate signal stack is installed — the frame is
-    /// pushed onto that stack instead of the interrupted SP_EL0. `None` keeps
-    /// the frame on the current stack.
-    #[allow(clippy::too_many_arguments)]
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        // Some((si_code, si_addr)) for a synchronous fault (SIGSEGV/SIGBUS),
-        // None for a SI_USER-shaped delivery.
-        fault_siginfo: Option<(i32, u64)>,
-        // Caller-supplied siginfo (rt_sigqueueinfo / sigqueue). When present
-        // it WINS over synthesis: the kernel rewrote si_signo, the rest of
-        // the struct (notably si_value.sival_int) is the caller's. fault_
-        // siginfo is mutually exclusive — synchronous faults can't carry a
-        // queued payload.
-        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-        // SA_RESTART: this handler interrupted a restartable syscall that
-        // returned EINTR. Resume at the `svc` (not after it) with the original
-        // arg0 restored, so the guest re-executes the syscall after the handler
-        // returns. Valid only on the syscall-boundary path (`interrupted_pc`
-        // is None); ignored otherwise.
-        restart_syscall: bool,
-    ) -> Result<(), TrapError>;
-    /// The Linux syscall number of the most recently dispatched `svc`, used to
-    /// decide whether an interrupted syscall is in the SA_RESTART-restartable
-    /// set. `None` before the first syscall / on traps with no vCPU.
-    fn last_syscall_nr(&self) -> Option<u64> {
-        None
-    }
-    /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
-    /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
-    /// past the syscall the way `complete_syscall` does — the restored
-    /// PC IS the next PC.
-    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError>;
-    /// Toggle the vCPU's memory-ordering model (`prctl(PR_SET_MEM_MODEL, …)`).
-    /// `tso == true` enables hardware x86_64 Total Store Ordering on this vCPU
-    /// (`ACTLR_EL1.EnTSO`), required for Rosetta-translated guests; `false`
-    /// restores AArch64's default weakly-ordered model. The default
-    /// implementation is a no-op (non-HVF / test traps have no vCPU register).
-    fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
-        let _ = tso;
-        Ok(())
-    }
-    /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): map host
-    /// memory at `ipa` and build the VA→IPA stage-1 path. Default no-op error
-    /// for non-HVF/test traps (they never emit the outcome).
-    fn map_host_alias(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-    ) -> Result<(), TrapError> {
-        let _ = (va, ipa, len, payload, file);
-        Err(TrapError::UnsupportedPlatform)
-    }
-}
+// SyscallTrap/TrapError/ForkOutcome moved down into the carrick-hal leaf crate
+// (the runtime↔engine contract is platform-agnostic). Re-export them here so
+// existing `crate::trap::…` paths in carrick-hvf and carrick-runtime are
+// unchanged. HvfTrapEngine below implements the trait from its new home.
+pub use carrick_hal::trap::{ForkOutcome, SyscallTrap, TrapError};
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
 // Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
@@ -310,85 +201,6 @@ const AARCH64_EXCEPTION_CLASS_MASK: u64 = 0x3f;
 #[serde(rename_all = "snake_case")]
 pub enum TrapBackend {
     HypervisorFramework,
-}
-
-#[derive(Debug, Error)]
-pub enum TrapError {
-    #[error("Hypervisor.framework syscall trapping is only available on macOS/aarch64")]
-    UnsupportedPlatform,
-    #[error("Hypervisor.framework operation failed: {0}")]
-    Hypervisor(String),
-    /// The signal frame could not be written to the guest's user stack (the
-    /// guest mprotect'd its own stack PROT_NONE, SP points at an unmapped page,
-    /// or the alt stack is unwritable). Linux force_sigsegv()s: the whole guest
-    /// thread-group dies by SIGSEGV (exit 139). Signal-delivery callers map this
-    /// to a term_signal=SIGSEGV termination instead of propagating a fatal
-    /// carrick error (and so a sibling thread terminates the group rather than
-    /// silently vanishing and deadlocking its peers). (audit M1b)
-    #[error("signal frame could not be delivered to the guest stack")]
-    SignalDeliveryFault,
-    #[error("guest mapping size {0} does not fit this host")]
-    MappingTooLarge(u64),
-    #[error("guest mapping at 0x{guest_start:x} with size {mapped_size} overflows")]
-    MappingOverflow { guest_start: u64, mapped_size: u64 },
-    #[error("Hypervisor.framework exited for an unexpected reason: {reason}")]
-    UnexpectedExit { reason: String },
-    #[error(
-        "guest exception is not an AArch64 SVC trap: syndrome=0x{syndrome:x}, virtual_address=0x{virtual_address:x}, physical_address=0x{physical_address:x}"
-    )]
-    UnexpectedException {
-        syndrome: u64,
-        virtual_address: u64,
-        physical_address: u64,
-    },
-    #[error("fork(2) failed: {0}")]
-    ForkFailed(String),
-    #[error(
-        "hv_vm_map(host=0x{host_addr:x}, guest=0x{guest_start:x}, size={size}) failed in child: 0x{code:x}"
-    )]
-    ChildMapFailed {
-        host_addr: u64,
-        guest_start: u64,
-        size: usize,
-        code: u32,
-    },
-    /// An EL0 sync exception other than `svc #0` reached the EL1 vector
-    /// trampoline (e.g. instruction abort at PC=0, data abort, undef).
-    /// Surfaces the original syndrome/ELR/FAR so the runtime can map it
-    /// to a Linux signal (typically SIGSEGV/SIGBUS/SIGILL).
-    #[error(
-        "EL0 fault not handled by trap path: esr=0x{syndrome:x} elr=0x{elr:x} far=0x{far:x} x16=0x{x16:x} x17=0x{x17:x} x29=0x{x29:x} x30=0x{x30:x} sp=0x{sp:x}"
-    )]
-    EL0Fault {
-        syndrome: u64,
-        elr: u64,
-        far: u64,
-        /// x16/x17 at the fault. For the PLT `ldr x17,[x16,#off]; br x17`
-        /// "PROT_REA" wild-PC crash, x16 is the GOT address the guest computed
-        /// (compare against the slot carrick's read sees) and x17 the value it
-        /// loaded — distinguishes a wrong-address fault from wrong page content.
-        x16: u64,
-        x17: u64,
-        /// x29(FP)/x30(LR)/SP_EL0 at the fault — a corrupt x30 with the PC
-        /// faulting at that address means a `ret` to a clobbered return slot.
-        x29: u64,
-        x30: u64,
-        sp: u64,
-        /// True when the abort surfaced DIRECTLY as an HVF EXCEPTION exit from
-        /// EL0 (no EL1 vector/HVC re-trap, so NO pending eret) — the runtime
-        /// must inject the signal by redirecting PC, not ELR_EL1. False for the
-        /// usual HVC-trampoline path (a pending eret to EL0).
-        from_el0_direct: bool,
-    },
-}
-
-/// Outcome of `HvfTrapEngine::fork`. The parent learns the child's PID;
-/// the child returns and continues executing with a freshly-rebuilt HVF
-/// VM that points at the same host buffers (Mach VM gives us COW for free).
-#[derive(Debug)]
-pub enum ForkOutcome {
-    Parent { child_pid: i32 },
-    Child,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
