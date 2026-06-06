@@ -438,6 +438,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/loginuid" | "/proc/self/sessionid" => Some(b"4294967295".to_vec()),
         "/proc/self/maps" => Some(synthetic_proc_maps(ctx).into_bytes()),
         "/proc/self/mountinfo" => Some(synthetic_proc_self_mountinfo().to_vec()),
+        "/proc/self/mounts" => Some(synthetic_proc_mounts().to_vec()),
         "/proc/self/mountstats" => Some(Vec::new()),
         // oom_score is volatile (0 is acceptable); the two adj knobs default 0.
         "/proc/self/oom_score" | "/proc/self/oom_score_adj" | "/proc/self/oom_adj" => {
@@ -1098,6 +1099,7 @@ const PROC_SELF_FILES: &[&str] = &[
     "loginuid",
     "maps",
     "mountinfo",
+    "mounts",
     "mountstats",
     "oom_adj",
     "oom_score",

@@ -55,6 +55,10 @@ The previous blocking rows are cleared:
 - `ltp-kill02`: targeted rerun now `MATCH`, carrick 2/2 vs oracle 2/2
   after allowing namespace init's idempotent `setpgrp()` while preserving
   explicit session-leader `setpgid(1, 1)` as `EPERM`.
+- `ltp-clone303`: targeted rerun now `MATCH`, carrick skipped 1 vs oracle
+  skipped 1 after exposing `/proc/self/mounts` as the per-process alias for
+  the synthetic mount table. The owned `clone3args` probe already covered the
+  clone3 validation surface; this row was blocked in LTP cgroup setup.
 
 This goal starts from a green regression gate. The target is to reduce NEW rows
 by fixing verified process-control gaps, not by blessing, quarantining, or
@@ -139,6 +143,13 @@ self-group operation. Linux/Docker lets this no-op succeed; with the fix,
 `just conformance full --suite ltp-kill02 --no-image-refresh` reports `MATCH`
 with carrick 2/2 vs oracle 2/2.
 
+`ltp-clone303` was then classified as a procfs/cgroup setup blocker rather
+than clone3 syscall fallout: Carrick had TBROKed on
+`/proc/self/mounts: ENOENT`, while Docker opened the mount table and skipped
+because `/sys/fs/cgroup/ltp` is read-only. Exposing `/proc/self/mounts` as the
+same synthetic table as `/proc/mounts` moves the targeted row to `MATCH` in
+`conf-53261-c00`, with carrick skipped 1 vs cached oracle skipped 1.
+
 ## Primary target rows
 
 These are the first rows to investigate because they share process-control,
@@ -153,6 +164,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
 | `cpython-concurrent_futures` | CPython | MATCH 20/20 in cache-backed `conf-35590-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 in refreshed Docker oracle `conf-28227-d00` | Runtime hangs and the stale oracle-id cache mismatch are cleared. |
 | `ltp-kill02` | LTP | MATCH 2/2 in targeted rerun after namespace-init `setpgrp()` fix | 2/2 | The parent process must be allowed to form its guest-visible process group before `kill(0, SIGUSR1)` broadcasts to child 1 and child A; explicit session-leader `setpgid(1, 1)` remains `EPERM`. |
+| `ltp-clone303` | LTP | MATCH skipped 1 in `conf-53261-c00` | skipped 1 | Non-process setup blocker cleared: LTP's cgroup helper needs `/proc/self/mounts`; clone3 validation itself remains owned by `clone3args`. |
 | `ltp-setpgid01` | LTP | MATCH 1/2 in `conf-3259-c00` | 1/2 | PID-namespace session-leader rule is now owned; `setpgid(1, 1)` fails EPERM like Docker Linux while forked non-leader `setpgid(0, 0)` still succeeds. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
@@ -383,6 +395,7 @@ Keep this section current as classifications and fixes land.
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
 | `cpython-concurrent_futures` | runtime hangs are fixed: the exact five-iteration early-shutdown reducer completes, `ProcessPoolForkserverProcessPoolExecutorTest` passes 21 tests, `ProcessPoolForkExecutorDeadlockTest` passes 16 tests, and refreshed harness run `conf-28227-c00` matches Docker oracle run `conf-28227-d00` at 20/20 with 239 paired assertion ids. The previous `conf-98558-c00` row was `NEW` only because the committed oracle cache had totals but no Docker per-test ids. | `futexsharedalias`, wake-pipe drain tests, `host_signal::tests::missed_child_exit_watch_*`, `blockingpipewrite`, `dispatch::overlay_dispatch_tests::large_blocking_host_pipe_write_hands_off_after_partial_progress`, refreshed oracle-cache entry | MATCH; keep as pressure coverage |
 | `ltp-setpgid01` | real under-enforcement after oracle refresh: Docker `conf-43101-d00` fails `setpgid(1, 1)` with `EPERM` and passes the forked-child `setpgid(0, 0)` leg. Carrick had reported both as TPASS because the harness starts Carrick in a fresh host process group but the same host session; PID namespace mapping recorded only the init host PGID, so guest `getsid(0)` / session-leader checks missed host SID values that differ from PGID. | `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid`, `setpgidparentgroup`, `proclife` | MATCH 1/2 vs oracle 1/2 in `conf-3259-c00`; process-group session-leader rule owned |
+| `ltp-clone303` | procfs/cgroup setup blocker, not clone3 syscall behavior: targeted run before the fix TBROKed on `/proc/self/mounts: ENOENT`, while Docker opened the mount table and TCONF-skipped because `/sys/fs/cgroup/ltp` is read-only. `clone3args` already proved Carrick's clone3 validation behavior matches the Linux/seccomp oracle shape. | `syscall_fs::synthetic_proc_surface_serves_common_process_and_system_files`; `clone3args` for clone3 validation | MATCH skipped 1 vs oracle skipped 1 in `conf-53261-c00`; setup blocker cleared |
 | `ltp-pause02` | signal interruption/restart bug when it reproduces: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; rerun `conf-71289-c01` matched, and later `conf-18439-c01` reproduced the same signature, but latest focused attempts and `pauseinterrupt2` are currently MATCH. | `pauseinterrupt2` or sharper interruption reducer if the row turns RED again | pressure coverage; no runtime fix without fresh RED |
 | `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
 | `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
