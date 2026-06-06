@@ -2,6 +2,7 @@
 //! unix socket. Server-as-translator — see
 //! docs/superpowers/specs/2026-06-05-carrick-serve-engine-api-design.md.
 
+mod build;
 mod handlers;
 mod model;
 mod router;

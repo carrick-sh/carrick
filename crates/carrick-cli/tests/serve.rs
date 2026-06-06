@@ -242,3 +242,81 @@ async fn m0_full_lifecycle_echo_hi() {
         Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
     ).await.unwrap();
 }
+
+/// Build a tiny gzipped-tar build context (the legacy `POST /build` request
+/// body): a single Dockerfile.
+fn gzip_tar_context(dockerfile: &str) -> Vec<u8> {
+    let mut tar_buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        let bytes = dockerfile.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, "Dockerfile", bytes).unwrap();
+        builder.finish().unwrap();
+    }
+    let mut gz = Vec::new();
+    {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+        enc.write_all(&tar_buf).unwrap();
+        enc.finish().unwrap();
+    }
+    gz
+}
+
+/// M3: drive a real legacy `POST /build` over the socket via bollard's
+/// `build_image` (non-BuildKit; bollard is built without the `buildkit`
+/// feature, so it uses the legacy streaming protocol). Asserts the streamed
+/// NDJSON ends in success (an `aux` ID and/or a "Successfully built" line) and
+/// never an `error` frame.
+///
+/// IGNORED by default: this BOOTS A GUEST (kaniko under HVF) and pulls the
+/// kaniko + alpine images over the network, so it is slow (~30-60s) and
+/// network-dependent — too heavy/flaky for the default suite. The streaming
+/// machinery, query parser, and BoxBody wiring are unit-tested in
+/// `src/serve/build.rs`; the buffered endpoints' BoxBody migration is covered by
+/// the other tests in this file. Run explicitly with:
+///   cargo test -p carrick-cli --test serve -- --ignored streams_build
+#[ignore = "boots a kaniko guest + network pull; ~30-60s, run explicitly"]
+#[tokio::test]
+async fn streams_build_over_socket() {
+    let (_server, sock, _dir) = spawn_server();
+    // Generous timeout: the build pulls images and runs kaniko as a guest.
+    let docker = bollard::Docker::connect_with_unix(
+        &sock, 600, bollard::API_DEFAULT_VERSION,
+    ).unwrap();
+
+    let context = gzip_tar_context(
+        "FROM alpine:3.20\nRUN echo hi > /b.txt\nCMD [\"cat\",\"/b.txt\"]\n",
+    );
+
+    let options = bollard::image::BuildImageOptions {
+        dockerfile: "Dockerfile".to_string(),
+        t: "svctest:latest".to_string(),
+        nocache: true,
+        ..Default::default()
+    };
+
+    let mut stream = docker.build_image(options, None, Some(context.into()));
+    let mut saw_stream = false;
+    let mut saw_success = false;
+    while let Some(item) = stream.next().await {
+        // bollard turns an `error:` frame into a DockerStreamError; surfacing it
+        // here fails the test with kaniko's captured message.
+        let info = item.expect("build stream yielded an error frame");
+        if let Some(s) = &info.stream {
+            saw_stream = true;
+            if s.contains("Successfully built") {
+                saw_success = true;
+            }
+        }
+        if info.aux.is_some() {
+            saw_success = true;
+        }
+    }
+    assert!(saw_stream, "expected at least one stream frame from the build");
+    assert!(saw_success, "expected a success (aux ID / Successfully built) frame");
+}
