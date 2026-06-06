@@ -153,7 +153,12 @@ pub(crate) enum Commands {
         tag: Option<String>,
         /// Path to the Dockerfile, RELATIVE to the build context. Defaults to
         /// `Dockerfile`.
-        #[arg(short = 'f', long = "file", value_name = "PATH", default_value = "Dockerfile")]
+        #[arg(
+            short = 'f',
+            long = "file",
+            value_name = "PATH",
+            default_value = "Dockerfile"
+        )]
         file: PathBuf,
         /// Set a build-time variable (`KEY=VALUE`), passed through to kaniko as
         /// `--build-arg KEY=VALUE`. May be repeated.
@@ -375,7 +380,11 @@ pub(crate) enum Commands {
         #[arg(long = "docker-api")]
         docker_api: bool,
         /// Unix socket path to listen on.
-        #[arg(long = "host", value_name = "PATH", default_value = "/tmp/carrick.sock")]
+        #[arg(
+            long = "host",
+            value_name = "PATH",
+            default_value = "/tmp/carrick.sock"
+        )]
         host: String,
     },
     Shell {
