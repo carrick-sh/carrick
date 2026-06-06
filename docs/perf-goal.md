@@ -62,6 +62,8 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `d59d596` - `perf(mem): skip fresh shared anon zero writes`
+- `95503e5` - `docs(perf): record mmap hv map counts`
 - `120aab9` - `docs(perf): decide dynamic workload gate`
 - `2fc791b` - `docs(perf): record fd path result`
 - `229105b` - `perf(fs): avoid duplicate fd path records`
@@ -112,8 +114,11 @@ Remaining:
   causing one `hv_vm_map` each.
 - Current `120aab9` perf row: Carrick p50 `830.667` us, p95 `873.292` us;
   Docker p50 `78.667` us, p95 `124.958` us, Docker noisy.
+- `d59d596` removed eager zero-buffer materialization for fresh non-fixed
+  `MAP_SHARED|MAP_ANONYMOUS` mappings in the boot-mapped shared aperture.
+  Recycled shared-anon ranges still scrub stale bytes with `zero_backing`.
 - Add a fork-heavy row to see whether lazy-zero reduced snapshot cost.
-- Re-check shared anonymous and high-VA alias paths for equivalent eager zeroing.
+- Re-check high-VA alias paths for equivalent eager zero/copy behavior.
 
 ### Borrowed Vector I/O
 
@@ -630,9 +635,51 @@ Rejected next steps:
   `docs/perf-results/2026-06-06-memory.jsonl` rows at
   `120aab9971dc10e9a4604b87da482152a42d70d8`: Carrick p50 `830.667` us,
   p95 `873.292` us; Docker p50 `78.667` us, p95 `124.958` us, Docker noisy.
-- [ ] Add a fork-heavy workload row after lazy-zero.
-- [ ] Inspect shared anonymous and high-VA alias paths for remaining eager
-  zero/copy behavior.
+- [x] Inspect shared anonymous paths for remaining eager zero/copy behavior.
+
+  Result at `d59d596`:
+
+  - Fresh non-fixed `MAP_SHARED|MAP_ANONYMOUS` now records whether the shared
+    aperture allocation came from the free list. Fresh bump allocations return
+    directly from the boot-zeroed shared aperture without materializing a zero
+    `Vec` or calling `write_bytes`.
+  - Recycled shared-anon allocations still call `zero_backing`, preserving
+    Linux's zero-fill invariant for stale shared-aperture ranges.
+  - While verifying the mmap surface, the existing integration test
+    `mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noops`
+    caught that `MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS` over dirty low memory also
+    needs explicit `zero_backing`; that path now scrubs because fixed mappings
+    overwrite a caller-selected range and cannot rely on the bump allocator's
+    pristine-tail invariant.
+
+  RED evidence:
+
+  ```sh
+  cargo test -p carrick-runtime fresh_shared_anon_mmap_skips_zero_write -- --nocapture
+  ```
+
+  Before the runtime change, this failed with `left: 1 right: 0` for the
+  expected fresh shared-anon write count.
+
+  GREEN and adjacent checks:
+
+  ```sh
+  cargo test -p carrick-runtime shared_anon_mmap -- --nocapture
+  cargo test -p carrick-runtime --test integration mmap -- --nocapture
+  cargo test -p carrick-runtime --test integration munmap -- --nocapture
+  cargo test -p carrick-runtime --test integration mremap -- --nocapture
+  cargo test -p carrick-runtime --tests --no-run
+  cargo fmt --all -- --check
+  git diff --check
+  ```
+
+  No JSONL perf row was added for this slice because the existing
+  `perf_mmap_churn` workload is private anonymous mmap churn and does not
+  exercise `MAP_SHARED|MAP_ANONYMOUS`. A shared-anon or fork-heavy workload is
+  required before claiming a measured benchmark win from `d59d596`.
+
+- [ ] Add a fork-heavy or shared-anon workload row after lazy-zero.
+- [ ] Inspect high-VA alias paths for remaining eager zero/copy behavior.
 - [ ] Add RED coverage before changing alias, COW, or shared-memory behavior.
 
 ## Task 5: Revisit wait-path kqueue churn only with a broader workload
@@ -669,6 +716,7 @@ cargo fmt --all -- --check
 git diff --check
 ./scripts/build-signed.sh
 jq -c empty docs/perf-results/2026-06-06-disk.jsonl
+jq -c empty docs/perf-results/2026-06-06-memory.jsonl
 ```
 
 Trace and perf commands:
