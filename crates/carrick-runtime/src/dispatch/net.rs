@@ -3331,7 +3331,7 @@ impl SyscallDispatcher {
                 let linux_err = if host_err == 0 {
                     0
                 } else {
-                    crate::dispatch::macos_to_linux_errno(host_err)
+                    crate::host_to_linux_errno(host_err)
                 };
                 // Honor the guest's optlen (it may pass <4); clamp like Linux.
                 return write_sockopt_value(

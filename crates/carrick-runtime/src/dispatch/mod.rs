@@ -797,7 +797,7 @@ impl PinnedHostFd {
             let host = std::io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or(libc::EMFILE);
-            return Err(macos_to_linux_errno(host));
+            return Err(crate::host_to_linux_errno(host));
         }
         Ok(Self { fd: duped })
     }
@@ -4408,12 +4408,16 @@ pub(crate) struct HostSyscallError {
 
 impl HostSyscallError {
     pub(crate) fn last() -> Self {
-        // SAFETY: `__errno_location` (Linux) and `__error` (macOS) both
-        // return a thread-local int pointer.
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         let raw_errno = unsafe { *libc::__error() };
+        #[cfg(target_os = "linux")]
+        let raw_errno = unsafe { *libc::__errno_location() };
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+        let raw_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
         Self {
             raw_errno,
-            linux_errno: macos_to_linux_errno(raw_errno),
+            linux_errno: crate::host_to_linux_errno(raw_errno),
         }
     }
 
@@ -4465,21 +4469,6 @@ impl HostSyscallResult for i64 {
         }
     }
 }
-
-/// Linux UAPI errno values. Sourced from
-/// `linux/include/uapi/asm-generic/errno-base.h` and `errno.h`.
-/// Hardcoded here so the translation is independent of whatever the
-/// host's libc decided to name (or number) these — when we run on
-/// macOS, `libc::EAGAIN` is 35, but Linux's EAGAIN is 11. We need
-/// constant Linux numbers regardless of host.
-/// Linux UAPI errno values, re-exported under their bare names from the
-/// canonical table in `crate::linux_abi`. Sourced originally from
-/// `linux/include/uapi/asm-generic/errno-base.h` and `errno.h`. The Linux
-/// numbers are hardcoded (in `linux_abi`) so the translation is independent
-/// of whatever the host's libc decided to name (or number) these — on macOS
-/// `libc::EAGAIN` is 35, but Linux's EAGAIN is 11. `macos_to_linux_errno`
-/// and its tests refer to these as `linux_errno::EFAULT`; the numbers live
-/// in exactly one place (linux_abi's `LINUX_E*`) so the two can't drift.
 #[allow(dead_code)]
 pub mod linux_errno {
     pub use crate::linux_abi::{
@@ -4513,81 +4502,6 @@ pub mod linux_errno {
         LINUX_EUCLEAN as EUCLEAN, LINUX_EXDEV as EXDEV,
     };
 }
-
-/// Robust, systematic macOS-errno → Linux-errno translation. Driven
-/// off the host's `libc::E*` constants on the macOS side so we don't
-/// hard-code macOS numeric values — if Apple ever renumbers something
-/// (they won't, but defensive coding) we pick up the new value
-/// automatically. Codes 1..=34 overlap between the two and pass
-/// through unchanged. Sources:
-/// - macOS: <sys/errno.h>
-/// - Linux: asm-generic/errno-base.h + asm-generic/errno.h
-pub fn macos_to_linux_errno(macos: i32) -> i32 {
-    use linux_errno::*;
-    #[cfg(target_os = "macos")]
-    {
-        match macos {
-            x if x == libc::EAGAIN => EAGAIN,
-            x if x == libc::EINPROGRESS => EINPROGRESS,
-            x if x == libc::EALREADY => EALREADY,
-            x if x == libc::ENOTSOCK => ENOTSOCK,
-            x if x == libc::EDESTADDRREQ => EDESTADDRREQ,
-            x if x == libc::EMSGSIZE => EMSGSIZE,
-            x if x == libc::EPROTOTYPE => EPROTOTYPE,
-            x if x == libc::ENOPROTOOPT => ENOPROTOOPT,
-            x if x == libc::EPROTONOSUPPORT => EPROTONOSUPPORT,
-            x if x == libc::ESOCKTNOSUPPORT => ESOCKTNOSUPPORT,
-            x if x == libc::EOPNOTSUPP => EOPNOTSUPP,
-            x if x == libc::EPFNOSUPPORT => EPFNOSUPPORT,
-            x if x == libc::EAFNOSUPPORT => EAFNOSUPPORT,
-            x if x == libc::EADDRINUSE => EADDRINUSE,
-            x if x == libc::EADDRNOTAVAIL => EADDRNOTAVAIL,
-            x if x == libc::ENETDOWN => ENETDOWN,
-            x if x == libc::ENETUNREACH => ENETUNREACH,
-            x if x == libc::ENETRESET => ENETRESET,
-            x if x == libc::ECONNABORTED => ECONNABORTED,
-            x if x == libc::ECONNRESET => ECONNRESET,
-            x if x == libc::ENOBUFS => ENOBUFS,
-            x if x == libc::EISCONN => EISCONN,
-            x if x == libc::ENOTCONN => ENOTCONN,
-            x if x == libc::ESHUTDOWN => ESHUTDOWN,
-            x if x == libc::ETOOMANYREFS => ETOOMANYREFS,
-            x if x == libc::ETIMEDOUT => ETIMEDOUT,
-            x if x == libc::ECONNREFUSED => ECONNREFUSED,
-            x if x == libc::ELOOP => ELOOP,
-            x if x == libc::ENAMETOOLONG => ENAMETOOLONG,
-            x if x == libc::EHOSTDOWN => EHOSTDOWN,
-            x if x == libc::EHOSTUNREACH => EHOSTUNREACH,
-            x if x == libc::ENOTEMPTY => ENOTEMPTY,
-            x if x == libc::EDQUOT => EDQUOT,
-            x if x == libc::ESTALE => ESTALE,
-            x if x == libc::EREMOTE => EREMOTE,
-            x if x == libc::ENOLCK => ENOLCK,
-            x if x == libc::ENOSYS => ENOSYS,
-            x if x == libc::EOVERFLOW => EOVERFLOW,
-            x if x == libc::ECANCELED => ECANCELED,
-            x if x == libc::EIDRM => EIDRM,
-            x if x == libc::ENOMSG => ENOMSG,
-            x if x == libc::EILSEQ => EILSEQ,
-            x if x == libc::EBADMSG => EBADMSG,
-            // macOS ENOATTR ("attribute not found", 93) is Linux ENODATA (61) —
-            // what getxattr/removexattr return for a missing xattr. Without
-            // this it collapsed to EIO and LTP getxattr01/removexattr* failed
-            // their ENODATA expectation.
-            x if x == libc::ENOATTR => crate::linux_abi::LINUX_ENODATA,
-            // Codes 1..=34 overlap; unmapped Darwin extension errnos above
-            // that range are not Linux numbers, so collapse them to EIO
-            // rather than leaking host-specific values to the guest.
-            other if (1..=34).contains(&other) => other,
-            _ => EIO,
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        macos
-    }
-}
-
 // ----- BSD socket translation helpers ------------------------------------
 
 // ----- AF_NETLINK (rtnetlink) synthesis -----------------------------------
@@ -5530,101 +5444,11 @@ mod overlay_dispatch_tests {
 
     const SYS_PIPE2: u64 = 59;
 
-    /// Systematic errno translation tests. Verifies every code where
-    /// macOS and Linux disagree maps correctly, plus that codes 1..=34
-    /// pass through unchanged. Pins the contract so a future libc
-    /// crate version that renumbers something fails CI rather than
-    /// silently producing wrong errnos for guest binaries.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn errno_translation_covers_every_divergent_code() {
-        use crate::dispatch::{linux_errno, macos_to_linux_errno};
-        // Overlap zone: 1..=34 must pass through.
-        for code in 1..=34 {
-            assert_eq!(
-                macos_to_linux_errno(code),
-                code,
-                "code {} should be identity in overlap zone",
-                code
-            );
-        }
-        // The divergence cases that bit us — apt's connect saw macOS
-        // EINPROGRESS=36 surface in the guest as ENAMETOOLONG=36.
-        assert_eq!(
-            macos_to_linux_errno(libc::EINPROGRESS),
-            linux_errno::EINPROGRESS
-        );
-        assert_ne!(
-            macos_to_linux_errno(libc::EINPROGRESS),
-            36,
-            "EINPROGRESS != Linux ENAMETOOLONG"
-        );
-        // Sample of network errnos that matter for apt's HTTP method.
-        assert_eq!(macos_to_linux_errno(libc::EAGAIN), linux_errno::EAGAIN);
-        assert_eq!(
-            macos_to_linux_errno(libc::ECONNREFUSED),
-            linux_errno::ECONNREFUSED
-        );
-        assert_eq!(
-            macos_to_linux_errno(libc::EHOSTUNREACH),
-            linux_errno::EHOSTUNREACH
-        );
-        assert_eq!(
-            macos_to_linux_errno(libc::ETIMEDOUT),
-            linux_errno::ETIMEDOUT
-        );
-        assert_eq!(macos_to_linux_errno(libc::ENOTCONN), linux_errno::ENOTCONN);
-        assert_eq!(
-            macos_to_linux_errno(libc::ECONNRESET),
-            linux_errno::ECONNRESET
-        );
-        assert_eq!(
-            macos_to_linux_errno(libc::EADDRINUSE),
-            linux_errno::EADDRINUSE
-        );
-        assert_eq!(
-            macos_to_linux_errno(libc::EAFNOSUPPORT),
-            linux_errno::EAFNOSUPPORT
-        );
-        // Filesystem errnos that diverge.
-        assert_eq!(
-            macos_to_linux_errno(libc::ENAMETOOLONG),
-            linux_errno::ENAMETOOLONG
-        );
-        assert_eq!(
-            macos_to_linux_errno(libc::ENOTEMPTY),
-            linux_errno::ENOTEMPTY
-        );
-        assert_eq!(macos_to_linux_errno(libc::ELOOP), linux_errno::ELOOP);
-        assert_eq!(macos_to_linux_errno(libc::ENOSYS), linux_errno::ENOSYS);
-        assert_eq!(macos_to_linux_errno(libc::ENOLCK), linux_errno::ENOLCK);
-        // Misc.
-        assert_eq!(macos_to_linux_errno(libc::EIDRM), linux_errno::EIDRM);
-        assert_eq!(macos_to_linux_errno(libc::EILSEQ), linux_errno::EILSEQ);
-        assert_eq!(
-            macos_to_linux_errno(libc::ECANCELED),
-            linux_errno::ECANCELED
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn errno_translation_maps_unknown_darwin_extensions_to_eio() {
-        use crate::dispatch::{linux_errno, macos_to_linux_errno};
-
-        // ENOATTR ("attribute not found") maps to Linux ENODATA, the errno
-        // getxattr/removexattr return for a missing xattr.
-        assert_eq!(
-            macos_to_linux_errno(libc::ENOATTR),
-            crate::linux_abi::LINUX_ENODATA
-        );
-        assert_eq!(macos_to_linux_errno(999), linux_errno::EIO);
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn host_syscall_result_translates_captured_host_errno() {
-        use crate::dispatch::{HostSyscallResult, linux_errno};
+        use crate::dispatch::HostSyscallResult;
+        use carrick_bsd::errno::linux_errno;
 
         unsafe {
             *libc::__error() = libc::EINPROGRESS;

@@ -57,6 +57,16 @@ mod xattr;
 use state::*;
 pub(super) use state::{FsState, IoState};
 
+fn get_last_error() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    let raw = unsafe { *libc::__error() };
+    #[cfg(target_os = "linux")]
+    let raw = unsafe { *libc::__errno_location() };
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+    let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    raw
+}
+
 fn gather_bounded_iovec_bytes(
     memory: &impl GuestMemory,
     iovecs: &[LinuxIovec],
@@ -1609,7 +1619,7 @@ impl SyscallDispatcher {
                 continue;
             }
             // SAFETY: reading the thread-local errno after a failed libc call.
-            let e = unsafe { *libc::__error() };
+            let e = get_last_error();
             if e == libc::EINTR {
                 continue;
             }
@@ -1627,7 +1637,7 @@ impl SyscallDispatcher {
             // Hard error: report it if nothing was written, else the partial
             // count (matching write(2)).
             if off == 0 {
-                return DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(e));
+                return DispatchOutcome::errno(crate::host_to_linux_errno(e));
             }
             break;
         }
@@ -3354,9 +3364,7 @@ impl SyscallDispatcher {
                                         );
                                         if r < 0 {
                                             DispatchOutcome::errno(
-                                                crate::dispatch::macos_to_linux_errno(unsafe {
-                                                    *libc::__error()
-                                                }),
+                                                crate::host_to_linux_errno(get_last_error()),
                                             )
                                         } else {
                                             DispatchOutcome::Returned { value: 0 }
@@ -3372,9 +3380,7 @@ impl SyscallDispatcher {
                         // SAFETY: host_fd is our live pty fd.
                         let pgrp = unsafe { libc::tcgetpgrp(host_fd) };
                         if pgrp < 0 {
-                            DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(unsafe {
-                                *libc::__error()
-                            }))
+                            DispatchOutcome::errno(crate::host_to_linux_errno(get_last_error()))
                         } else {
                             // The host pty's foreground pgrp is a HOST pgid;
                             // translate it to the value the guest's PID namespace
@@ -3407,9 +3413,7 @@ impl SyscallDispatcher {
                             libc::tcsetpgrp(host_fd, pgrp)
                         });
                         if r < 0 {
-                            DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(unsafe {
-                                *libc::__error()
-                            }))
+                            DispatchOutcome::errno(crate::host_to_linux_errno(get_last_error()))
                         } else {
                             DispatchOutcome::Returned { value: 0 }
                         }
@@ -3428,9 +3432,7 @@ impl SyscallDispatcher {
                         // SAFETY: host_fd is our live pty fd; &mut n is valid stack storage.
                         let rc = unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut n) };
                         if rc < 0 {
-                            DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(unsafe {
-                                *libc::__error()
-                            }))
+                            DispatchOutcome::errno(crate::host_to_linux_errno(get_last_error()))
                         } else {
                             write_packed(&mut *cx.memory, arg, &(n as i32).to_le_bytes())
                         }
@@ -3482,7 +3484,7 @@ impl SyscallDispatcher {
                         match res {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
                             Err(e) => DispatchOutcome::errno(
-                                crate::dispatch::macos_to_linux_errno(e),
+                                crate::host_to_linux_errno(e),
                             ),
                         }
                     }
@@ -3494,7 +3496,7 @@ impl SyscallDispatcher {
                         }) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
                             Err(e) => DispatchOutcome::errno(
-                                crate::dispatch::macos_to_linux_errno(e),
+                                crate::host_to_linux_errno(e),
                             ),
                         }
                     }
@@ -3505,7 +3507,7 @@ impl SyscallDispatcher {
                         match crate::host_tty::host_tty_tcflush(host_fd, arg as i64) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
                             Err(e) => DispatchOutcome::errno(
-                                crate::dispatch::macos_to_linux_errno(e),
+                                crate::host_to_linux_errno(e),
                             ),
                         }
                     }
@@ -3518,7 +3520,7 @@ impl SyscallDispatcher {
                         }) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
                             Err(e) => DispatchOutcome::errno(
-                                crate::dispatch::macos_to_linux_errno(e),
+                                crate::host_to_linux_errno(e),
                             ),
                         }
                     }
@@ -3632,7 +3634,7 @@ impl SyscallDispatcher {
                                     write_packed(&mut *cx.memory, arg, &ns_pgrp.to_le_bytes())
                                 }
                                 Err(raw_errno) => DispatchOutcome::errno(
-                                    crate::dispatch::macos_to_linux_errno(raw_errno),
+                                    crate::host_to_linux_errno(raw_errno),
                                 ),
                             }
                         } else {
@@ -3669,7 +3671,7 @@ impl SyscallDispatcher {
                             }) {
                                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                                 Err(raw_errno) => DispatchOutcome::errno(
-                                    crate::dispatch::macos_to_linux_errno(raw_errno),
+                                    crate::host_to_linux_errno(raw_errno),
                                 ),
                             }
                         } else {
@@ -3812,7 +3814,7 @@ impl SyscallDispatcher {
                             match crate::host_tty::host_tty_tcgetsid(fd.0) {
                                 Ok(sid) => write_packed(&mut *cx.memory, arg, &sid.to_le_bytes()),
                                 Err(raw_errno) => DispatchOutcome::errno(
-                                    crate::dispatch::macos_to_linux_errno(raw_errno),
+                                    crate::host_to_linux_errno(raw_errno),
                                 ),
                             }
                         } else {

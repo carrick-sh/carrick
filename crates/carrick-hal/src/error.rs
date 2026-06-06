@@ -5,7 +5,7 @@ use thiserror::Error;
 
 /// Uniform OS-operation error for HAL trait methods. Carries the raw host
 /// errno (already host-namespaced; translate to Linux via
-/// [`crate::host_to_linux_errno`]) plus a context string.
+/// `carrick_runtime::host_to_linux_errno`) plus a context string.
 #[derive(Debug, Error)]
 #[error("{context}: os error {errno}")]
 pub struct OsError {
@@ -21,11 +21,26 @@ impl OsError {
 
     /// Construct from the current `errno` with the given context.
     pub fn new(context: impl Into<String>) -> Self {
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
         let errno = unsafe { *libc::__error() };
         #[cfg(target_os = "linux")]
         let errno = unsafe { *libc::__errno_location() };
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd", target_os = "linux")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "linux"
+        )))]
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
 
         Self {

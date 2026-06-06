@@ -121,15 +121,21 @@ unsafe extern "C" {
     fn ptsname_r(fd: libc::c_int, buf: *mut libc::c_char, buflen: libc::size_t) -> libc::c_int;
 }
 
+fn last_error() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    let raw = unsafe { *libc::__error() };
+    #[cfg(target_os = "linux")]
+    let raw = unsafe { *libc::__errno_location() };
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+    let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    raw
+}
+
 fn ptsname_r_owned(master: i32) -> Result<String, i32> {
     let mut buf = [0 as libc::c_char; 128];
     let rc = unsafe { ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
     if rc != 0 {
-        let errno = if rc > 0 {
-            rc
-        } else {
-            unsafe { *libc::__error() }
-        };
+        let errno = if rc > 0 { rc } else { last_error() };
         return Err(errno);
     }
     let slave_name = unsafe { CStr::from_ptr(buf.as_ptr()) }
@@ -150,11 +156,11 @@ pub fn open_master(nonblock: bool) -> Result<(i32, String), i32> {
     // SAFETY: posix_openpt takes an int flag and returns an fd or -1.
     let master = unsafe { libc::posix_openpt(oflag) };
     if master < 0 {
-        return Err(unsafe { *libc::__error() });
+        return Err(last_error());
     }
     // SAFETY: master is a valid fd from posix_openpt.
     if unsafe { libc::grantpt(master) } != 0 || unsafe { libc::unlockpt(master) } != 0 {
-        let e = unsafe { *libc::__error() };
+        let e = last_error();
         unsafe { libc::close(master) };
         return Err(e);
     }
@@ -263,7 +269,7 @@ impl Vfs for DevptsVfs {
         if path == "/dev/pts/ptmx" {
             let mut table = self.pty_table.lock();
             let (master_fd, slave_name) =
-                open_master(flags.nonblock).map_err(crate::dispatch::macos_to_linux_errno)?;
+                open_master(flags.nonblock).map_err(crate::host_to_linux_errno)?;
             let index = table.insert(slave_name, std::process::id());
             let status_flags = if flags.nonblock {
                 crate::linux_abi::LINUX_O_NONBLOCK as u32

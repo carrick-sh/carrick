@@ -17,7 +17,7 @@
 //!   single-file bind works: joining an empty component would append a `/` and
 //!   make `open(2)` return `ENOTDIR` on a regular file.
 //! * **Errno** — every host failure is run through
-//!   [`crate::dispatch::macos_to_linux_errno`] so the guest sees Linux errno
+//!   [`crate::host_to_linux_errno`] so the guest sees Linux errno
 //!   numbers, not Darwin ones.
 //!
 //! `readonly` gates the mutators: a read-only bind returns `EROFS` from
@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use super::{
     DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle, WatchFd,
 };
-use crate::dispatch::macos_to_linux_errno;
+use crate::host_to_linux_errno;
 use crate::linux_abi::{LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
 
 pub struct BindVfs {
@@ -86,12 +86,17 @@ impl BindVfs {
 
 fn map_io_error(e: std::io::Error) -> VfsError {
     let raw = e.raw_os_error().unwrap_or(libc::EIO);
-    macos_to_linux_errno(raw)
+    host_to_linux_errno(raw)
 }
 
 fn host_open_errno() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let raw = unsafe { *libc::__error() };
-    macos_to_linux_errno(raw)
+    #[cfg(target_os = "linux")]
+    let raw = unsafe { *libc::__errno_location() };
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+    let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    host_to_linux_errno(raw)
 }
 
 fn open_watch_fd(host: &Path) -> Result<i32, VfsError> {

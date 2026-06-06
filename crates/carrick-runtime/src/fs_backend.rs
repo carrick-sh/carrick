@@ -534,7 +534,7 @@ fn cstring_from_osstr(os: &std::ffi::OsStr) -> Option<std::ffi::CString> {
 }
 
 fn io_error_to_linux_errno(error: std::io::Error) -> i32 {
-    crate::dispatch::macos_to_linux_errno(error.raw_os_error().unwrap_or(libc::EIO))
+    crate::host_to_linux_errno(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
 fn open_host_watch_fd(path: &Path) -> Result<i32, i32> {
@@ -549,7 +549,7 @@ fn open_host_watch_fd(path: &Path) -> Result<i32, i32> {
         let raw = std::io::Error::last_os_error()
             .raw_os_error()
             .unwrap_or(libc::EIO);
-        return Err(crate::dispatch::macos_to_linux_errno(raw));
+        return Err(crate::host_to_linux_errno(raw));
     }
     Ok(fd)
 }

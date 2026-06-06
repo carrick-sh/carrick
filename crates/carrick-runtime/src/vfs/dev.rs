@@ -143,7 +143,7 @@ impl Vfs for DevVfs {
             // Hold the table lock across open_master (ptsname isn't thread-safe).
             let mut table = self.pty_table.lock();
             let (master_fd, slave_name) =
-                open_master(flags.nonblock).map_err(crate::dispatch::macos_to_linux_errno)?;
+                open_master(flags.nonblock).map_err(crate::host_to_linux_errno)?;
             let index = table.insert(slave_name, std::process::id());
             let status_flags = if flags.nonblock {
                 crate::linux_abi::LINUX_O_NONBLOCK as u32
@@ -255,8 +255,13 @@ impl Vfs for DevVfs {
 }
 
 pub(crate) fn host_open_errno() -> i32 {
-    // SAFETY: __error returns a valid thread-local int*.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let raw = unsafe { *libc::__error() };
+    #[cfg(target_os = "linux")]
+    let raw = unsafe { *libc::__errno_location() };
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+    let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
     if raw == libc::ENOENT {
         LINUX_ENOENT
     } else if raw == libc::EACCES {
@@ -266,7 +271,7 @@ pub(crate) fn host_open_errno() -> i32 {
     } else {
         // Defer to the dispatcher's full translation table for
         // anything else.
-        crate::dispatch::macos_to_linux_errno(raw)
+        crate::host_to_linux_errno(raw)
     }
 }
 
