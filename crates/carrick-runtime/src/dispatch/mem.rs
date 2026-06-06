@@ -582,8 +582,10 @@ impl SyscallDispatcher {
                     });
                 }
 
-                let mut bytes = vec![0; length_usize];
-                if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                    Vec::new()
+                } else {
+                    let mut bytes = vec![0; length_usize];
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(LINUX_EBADF.into());
                     };
@@ -617,14 +619,16 @@ impl SyscallDispatcher {
                             return Ok(LINUX_EBADF.into());
                         }
                     }
-                }
+                    bytes
+                };
 
                 // A high guest VA (>= 1 TiB) can't be identity-mapped (HVF IPA is 40
                 // bits). Reserve a low alias IPA and hand the runtime a MapHostAlias
                 // outcome that hv_vm_maps it, builds the VA->IPA page-table path, and
-                // copies `bytes` (file content, or zeros for anon) in. Apple Rosetta
-                // maps both its anon translation arena (240 TiB) and the x86 binary
-                // this way.
+                // copies file-backed `bytes` in. Anonymous aliases carry no payload:
+                // the host anon alias mapping is already zeroed. Apple Rosetta maps
+                // both its anon translation arena (240 TiB) and the x86 binary this
+                // way.
                 if crate::memory::is_high_va(address) {
                     // Reject a genuinely non-canonical hint (bits 55:48 of the
                     // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
@@ -1406,5 +1410,51 @@ mod tests {
             1,
             "reused mapping should still install the requested guest protection"
         );
+    }
+
+    #[test]
+    fn high_va_private_anonymous_mmap_returns_empty_alias_payload() {
+        const SYS_MMAP: u64 = 222;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+        let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let request = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                va,
+                LINUX_PAGE_SIZE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_FIXED | LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+
+        let outcome = dispatcher
+            .dispatch(request, &mut memory, &reporter)
+            .expect("mmap dispatch should succeed");
+
+        let DispatchOutcome::MapHostAlias {
+            va: mapped_va,
+            len,
+            payload,
+            file,
+            ..
+        } = outcome
+        else {
+            panic!("expected high-VA alias outcome, got {outcome:?}");
+        };
+        assert_eq!(mapped_va, va);
+        assert_eq!(len, LINUX_PAGE_SIZE);
+        assert!(file.is_none(), "anonymous alias should not carry a file");
+        assert!(
+            payload.is_empty(),
+            "fresh high-VA anonymous mmap should use the zeroed host anon alias without carrying a zero payload"
+        );
+        assert_eq!(memory.write_calls.get(), 0);
+        assert_eq!(memory.zero_backing_calls.get(), 0);
+        assert_eq!(memory.protect_calls.get(), 0);
     }
 }
