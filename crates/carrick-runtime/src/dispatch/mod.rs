@@ -756,16 +756,16 @@ pub struct BlockingHostWrite {
 }
 
 impl BlockingHostWrite {
-    fn new(
+    fn from_vec(
         host_fd: i32,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         offset: usize,
         tid: crate::thread::ThreadId,
         sigpipe_on_epipe: bool,
     ) -> Result<Self, i32> {
         Ok(Self {
             host_fd: std::sync::Arc::new(PinnedHostFd::new(host_fd)?),
-            bytes: bytes.to_vec(),
+            bytes,
             offset,
             tid,
             sigpipe_on_epipe,
@@ -4522,6 +4522,27 @@ fn read_host_pipe(
     }
 }
 
+enum HostWritePayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl<'a> HostWritePayload<'a> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            HostWritePayload::Borrowed(bytes) => bytes,
+            HostWritePayload::Owned(bytes) => bytes,
+        }
+    }
+
+    fn into_owned(self) -> Vec<u8> {
+        match self {
+            HostWritePayload::Borrowed(bytes) => bytes.to_vec(),
+            HostWritePayload::Owned(bytes) => bytes,
+        }
+    }
+}
+
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
 fn write_host_pipe(
     bytes: &[u8],
@@ -4531,7 +4552,44 @@ fn write_host_pipe(
     tid: crate::thread::ThreadId,
     sigpipe_on_epipe: bool,
 ) -> DispatchOutcome {
-    if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
+    write_host_pipe_payload(
+        HostWritePayload::Borrowed(bytes),
+        host_fd,
+        nonblocking,
+        write_kind,
+        tid,
+        sigpipe_on_epipe,
+    )
+}
+
+fn write_host_pipe_owned(
+    bytes: Vec<u8>,
+    host_fd: i32,
+    nonblocking: bool,
+    write_kind: HostWriteKind,
+    tid: crate::thread::ThreadId,
+    sigpipe_on_epipe: bool,
+) -> DispatchOutcome {
+    write_host_pipe_payload(
+        HostWritePayload::Owned(bytes),
+        host_fd,
+        nonblocking,
+        write_kind,
+        tid,
+        sigpipe_on_epipe,
+    )
+}
+
+fn write_host_pipe_payload(
+    payload: HostWritePayload<'_>,
+    host_fd: i32,
+    nonblocking: bool,
+    write_kind: HostWriteKind,
+    tid: crate::thread::ThreadId,
+    sigpipe_on_epipe: bool,
+) -> DispatchOutcome {
+    if std::env::var_os("CARRICK_IO_DBG").is_some() && !payload.as_slice().is_empty() {
+        let bytes = payload.as_slice();
         eprintln!(
             "[IODBG] WRITE host_fd={host_fd} n={} bytes={:02x?}",
             bytes.len(),
@@ -4547,7 +4605,7 @@ fn write_host_pipe(
     let block_until_complete = !nonblocking && write_kind == HostWriteKind::PipeLike;
     let mut offset = 0usize;
     loop {
-        if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+        if std::env::var_os("CARRICK_TTY_DBG").is_some() && payload.as_slice().contains(&0x0a) {
             unsafe {
                 let isatty = libc::isatty(host_fd);
                 let mut t: libc::termios = core::mem::zeroed();
@@ -4560,7 +4618,7 @@ fn write_host_pipe(
                 let oflag = t.c_oflag;
                 let lflag = t.c_lflag;
                 let rdev = st.st_rdev;
-                let blen = bytes.len();
+                let blen = payload.as_slice().len();
                 eprintln!(
                     "[TTYDBG-PRE] host_fd={host_fd} isatty={isatty} tg={tg} oflag=0x{oflag:x} lflag=0x{lflag:x} outq={outq} flags=0x{fl:x} rdev={rdev} n={blen}"
                 );
@@ -4570,14 +4628,17 @@ fn write_host_pipe(
         // through would_block_outcome / wait_pipe_writable, which park with the
         // dispatcher lock released. BLOCKING-IO-OK: non-blocking by
         // construction, the lock is never held across a blocking write.
-        let n = unsafe {
-            libc::write(
-                host_fd,
-                bytes[offset..].as_ptr() as *const _,
-                bytes.len() - offset,
-            )
+        let n = {
+            let bytes = payload.as_slice();
+            unsafe {
+                libc::write(
+                    host_fd,
+                    bytes[offset..].as_ptr() as *const _,
+                    bytes.len() - offset,
+                )
+            }
         };
-        if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+        if std::env::var_os("CARRICK_TTY_DBG").is_some() && payload.as_slice().contains(&0x0a) {
             unsafe {
                 let mut outq: libc::c_int = -1;
                 libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
@@ -4597,9 +4658,9 @@ fn write_host_pipe(
                             value: offset as i64,
                         };
                     }
-                    return match BlockingHostWrite::new(
+                    return match BlockingHostWrite::from_vec(
                         host_fd,
-                        bytes,
+                        payload.into_owned(),
                         offset,
                         tid,
                         sigpipe_on_epipe,
@@ -4616,7 +4677,7 @@ fn write_host_pipe(
         }
         if block_until_complete {
             offset += n as usize;
-            if offset < bytes.len() {
+            if offset < payload.as_slice().len() {
                 // A signal that arrives mid-write interrupts it on Linux,
                 // returning the partial count; check between chunks so a long
                 // write doesn't ignore an armed alarm (or a pending quiesce).
@@ -4624,9 +4685,9 @@ fn write_host_pipe(
                     || crate::fork_quiesce::is_quiescing()
                 {
                     if crate::fork_quiesce::is_quiescing() {
-                        return match BlockingHostWrite::new(
+                        return match BlockingHostWrite::from_vec(
                             host_fd,
-                            bytes,
+                            payload.into_owned(),
                             offset,
                             tid,
                             sigpipe_on_epipe,
@@ -4644,7 +4705,7 @@ fn write_host_pipe(
                 continue;
             }
             return DispatchOutcome::Returned {
-                value: bytes.len() as i64,
+                value: payload.as_slice().len() as i64,
             };
         }
         return DispatchOutcome::Returned { value: n as i64 };
@@ -4846,6 +4907,32 @@ mod overlay_dispatch_tests {
             "expected a positive partial offset after filling the pipe, got {}",
             write.offset()
         );
+        assert!(write.sigpipe_on_epipe());
+    }
+
+    #[test]
+    fn blocking_host_write_from_owned_bytes_reuses_buffer_storage() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+        let bytes = vec![0x5A; 4096];
+        let expected_ptr = bytes.as_ptr();
+        let expected_capacity = bytes.capacity();
+        let write = BlockingHostWrite::from_vec(fds[1], bytes, 128, 0x7FFE_0102, true)
+            .expect("blocking write continuation should be created");
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        assert_eq!(
+            write.bytes.as_ptr(),
+            expected_ptr,
+            "owned handoff should move the staged write buffer without cloning it"
+        );
+        assert_eq!(write.bytes.capacity(), expected_capacity);
+        assert_eq!(write.offset(), 128);
         assert!(write.sigpipe_on_epipe());
     }
 
