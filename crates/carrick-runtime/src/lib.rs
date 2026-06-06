@@ -305,6 +305,13 @@ pub mod runtime {
         let argv0 = path.to_string_lossy().into_owned();
         let image = crate::memory::AddressSpace::load_elf(path)
             .map_err(|e| RuntimeError::Load(e.to_string()))?
+            // load_elf sets AT_SYSINFO_EHDR in the auxv, so a libc CRT reads the
+            // vdso ELF header at LINUX_VDSO_BASE. Materialise the vdso (+ vvar)
+            // regions — bring_up backs them as their own slots — or that read
+            // faults. Mirrors the macOS boot chain. Must precede the stack build
+            // (which serialises the auxv).
+            .with_vdso()
+            .map_err(|e| RuntimeError::Load(e.to_string()))?
             .with_linux_initial_stack(
                 [argv0.as_bytes()],
                 [
