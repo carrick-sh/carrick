@@ -10,9 +10,10 @@
 //! ident per dynamic timer and keeps the pump side untouched; we can
 //! upgrade to the pump path later if profiling shows the thread overhead.
 //!
-//! Only SIGEV_SIGNAL delivery is implemented (the LTP probes exercise this).
-//! SIGEV_THREAD and SIGEV_THREAD_ID would need a guest pthread we can't
-//! create from the host — left for the runtime ↔ guest thread sync work.
+//! Only SIGEV_SIGNAL-style process delivery is implemented (the LTP probes
+//! exercise this). SIGEV_THREAD and true SIGEV_THREAD_ID CPU-timer delivery
+//! would need guest-thread-specific routing/accounting — left for the runtime
+//! ↔ guest thread sync work.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

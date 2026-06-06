@@ -106,10 +106,18 @@ pub fn total_ns_including_active() -> u64 {
         .sum()
 }
 
+/// Number of vCPU threads currently inside `hv_vcpu_run`.
+pub fn active_count() -> usize {
+    ACTIVE_START_NS
+        .iter()
+        .filter(|start| start.load(Ordering::Acquire) != 0)
+        .count()
+}
+
 /// Process-wide guest CPU time in microseconds (the unit accounting surfaces
-/// use). Saturating.
+/// use), including in-flight vCPU runs. Saturating.
 pub fn total_us() -> u64 {
-    total_ns() / 1000
+    total_ns_including_active() / 1000
 }
 
 /// Clear per-process state in a freshly `fork`ed child: its vCPU starts a new
@@ -242,9 +250,13 @@ pub fn child_system_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn add_then_sum_accumulates() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         reset();
         add(1_000_000); // +1 ms
         add(2_000_000); // +2 ms (same test thread → same slot, accumulates)
@@ -256,11 +268,15 @@ mod tests {
 
     #[test]
     fn active_run_is_visible_before_commit() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         reset();
         begin_active();
+        assert_eq!(active_count(), 1);
         std::thread::sleep(std::time::Duration::from_millis(1));
         assert!(total_ns_including_active() > total_ns());
+        assert!(total_us() > 0);
         finish_active(1_000_000);
+        assert_eq!(active_count(), 0);
         assert_eq!(total_ns(), 1_000_000);
         reset();
     }

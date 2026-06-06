@@ -288,10 +288,15 @@ impl SyscallDispatcher {
                 } else {
                     let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
                     let arm_value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
-                    let value_ns = i64::try_from(value.as_nanos()).unwrap_or(i64::MAX);
+                    let cpu_timer = crate::itimer::is_cpu_timer(idx);
+                    let kqueue_value_ns = if cpu_timer {
+                        crate::itimer::cpu_timer_recheck_delay_ns(arm_value_ns)
+                    } else {
+                        arm_value_ns
+                    };
+                    let value_ns = i64::try_from(kqueue_value_ns).unwrap_or(i64::MAX);
                     let interval_value_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
-                    let periodic =
-                        !interval.is_zero() && value == interval && !crate::itimer::is_cpu_timer(idx);
+                    let periodic = !interval.is_zero() && value == interval && !cpu_timer;
                     let needs_periodic = !interval.is_zero() && value != interval;
                     let generation =
                         crate::itimer::arm(idx, arm_value_ns, interval_ns, needs_periodic);
@@ -365,11 +370,17 @@ impl SyscallDispatcher {
                 {
                     // SIGEV_THREAD_ID is the kernel's "deliver to a specific
                     // tid via _sigev_un.tid" variant — glibc compiles
-                    // SIGEV_THREAD down to SIGEV_THREAD_ID + an internal
-                    // helper thread. For our purposes the delivery still
-                    // routes through the posix_timer fallback-thread, which
-                    // raises against the process; the *test contract* the
-                    // LTP suites check is just that timer_create succeeds.
+                    // SIGEV_THREAD down to SIGEV_THREAD_ID + an internal helper
+                    // thread. Carrick does not yet have per-guest-thread CPU
+                    // timer accounting; accepting CLOCK_THREAD_CPUTIME_ID here
+                    // would turn Go's per-M profiler timers into wall-clock
+                    // process SIGPROF streams. Report unsupported so runtimes
+                    // use their process-timer fallback instead.
+                    if notify == LINUX_SIGEV_THREAD_ID
+                        && clock_id == LINUX_CLOCK_THREAD_CPUTIME_ID
+                    {
+                        return Ok(LINUX_EINVAL.into());
+                    }
                     if !(1..=64).contains(&signo) {
                         return Ok(LINUX_EINVAL.into());
                     }
