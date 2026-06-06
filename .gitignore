@@ -3,6 +3,7 @@
 /.serena/
 /fixtures/*/target/
 /conformance-probes/target/
+/perf-dynamic/target/
 /bench-native/target/
 .claude/
 /rust_out

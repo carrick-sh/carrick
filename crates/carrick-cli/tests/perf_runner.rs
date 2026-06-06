@@ -9,7 +9,7 @@
 
 mod perf_support;
 
-use perf_support::cases::{CASES, PerfCase};
+use perf_support::cases::{CASES, PerfArtifact, PerfCase};
 use perf_support::invoke::{self, CPU_PIN, IMAGE};
 use perf_support::metric::Metrics;
 use perf_support::provenance::{self, HostFacts, ResultRow};
@@ -34,10 +34,17 @@ fn carrick_bin(root: &Path) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-fn probe_path(root: &Path, name: &str) -> PathBuf {
-    root.join(format!(
-        "conformance-probes/target/aarch64-unknown-linux-musl/release/{name}"
-    ))
+fn probe_path(root: &Path, case: &PerfCase) -> PathBuf {
+    match case.artifact {
+        PerfArtifact::StaticMusl => root.join(format!(
+            "conformance-probes/target/aarch64-unknown-linux-musl/release/{}",
+            case.probe
+        )),
+        PerfArtifact::DynamicGlibc => root.join(format!(
+            "perf-dynamic/target/aarch64-linux-gnu/release/{}",
+            case.probe
+        )),
+    }
 }
 
 fn docker_ok() -> bool {
@@ -118,7 +125,7 @@ fn parse_sample(output: &str, metric_key: &str) -> Sample {
 
 fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     use base64::Engine as _;
-    let probe = probe_path(root, case.probe);
+    let probe = probe_path(root, case);
     let raw = std::fs::read(&probe).expect("read probe");
     let b64 = base64::engine::general_purpose::STANDARD
         .encode(&raw)
@@ -126,7 +133,7 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
 
     // Native (macOS host ceiling) build, if present — optional third engine.
     let native = native_probe_path(root, case.probe);
-    let has_native = native.exists();
+    let has_native = matches!(case.artifact, PerfArtifact::StaticMusl) && native.exists();
     // For bind-mount cases the native engine writes directly to the host scratch
     // dir (no /mnt); carrick/docker get the dir mounted at /mnt by invoke.
     let native_bench_dir: Option<String> = if case.mount_scratch {
@@ -386,10 +393,14 @@ fn perf_gate() {
     }
     // All probes built?
     for case in CASES {
-        if !probe_path(&root, case.probe).exists() {
+        if !probe_path(&root, case).exists() {
+            let build_hint = match case.artifact {
+                PerfArtifact::StaticMusl => "scripts/build-probes.sh",
+                PerfArtifact::DynamicGlibc => "scripts/build-dynamic-perf.sh",
+            };
             eprintln!(
-                "SKIP perf_gate: probe {} not built (run scripts/build-probes.sh)",
-                case.probe
+                "SKIP perf_gate: probe {} not built (run {build_hint})",
+                case.probe,
             );
             return;
         }
