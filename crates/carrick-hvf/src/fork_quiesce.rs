@@ -47,6 +47,7 @@
 // allow is module-scoped because every lock site shares the identical
 // invariant; a per-line allow would be pure noise.
 #![allow(clippy::unwrap_used)]
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -77,6 +78,30 @@ pub fn is_quiescing() -> bool {
 pub fn topology_lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(()))
+}
+
+fn exec_owner() -> &'static AtomicI32 {
+    static OWNER: AtomicI32 = AtomicI32::new(0);
+    &OWNER
+}
+
+/// Mark that `owner_tid` is replacing the thread group via execve(2).
+///
+/// Unlike fork quiesce, sibling threads do not park and rebuild: Linux exec
+/// terminates every other task in the thread group. Low-level wait paths use
+/// this marker as an interrupt predicate so they can return to the run-loop top
+/// and exit cooperatively before the execing thread destroys the HVF VM.
+pub fn begin_exec_replacement(owner_tid: i32) {
+    exec_owner().store(owner_tid, Ordering::SeqCst);
+}
+
+pub fn end_exec_replacement() {
+    exec_owner().store(0, Ordering::SeqCst);
+}
+
+pub fn exec_replacing_other_thread(tid: i32) -> bool {
+    let owner = exec_owner().load(Ordering::SeqCst);
+    owner != 0 && owner != tid
 }
 
 #[derive(Debug)]
