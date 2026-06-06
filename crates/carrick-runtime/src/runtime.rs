@@ -968,6 +968,7 @@ where
 
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
+            | DispatchOutcome::BlockingHostWrite(_)
             | DispatchOutcome::WaitOnFdsSelect { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. }
@@ -1257,6 +1258,37 @@ fn dispatch_with_panic_backstop(
     }
 }
 
+fn raise_sigpipe_for_blocking_write(
+    dispatcher: &SyscallDispatcher,
+    write: &crate::dispatch::BlockingHostWrite,
+    outcome: DispatchOutcome,
+) -> DispatchOutcome {
+    if write.sigpipe_on_epipe()
+        && matches!(
+            &outcome,
+            DispatchOutcome::Errno {
+                errno: crate::linux_abi::LINUX_EPIPE
+            }
+        )
+        && !dispatcher.signal_is_ignored(crate::linux_abi::LINUX_SIGPIPE)
+    {
+        dispatcher.mark_signal_pending(write.tid(), crate::linux_abi::LINUX_SIGPIPE);
+    }
+    outcome
+}
+
+fn partial_write_interrupt_outcome(write: &crate::dispatch::BlockingHostWrite) -> DispatchOutcome {
+    if write.offset() > 0 {
+        DispatchOutcome::Returned {
+            value: write.offset() as i64,
+        }
+    } else {
+        DispatchOutcome::Errno {
+            errno: crate::linux_abi::LINUX_EINTR,
+        }
+    }
+}
+
 fn dispatch_single_threaded_syscall<M: GuestMemory>(
     dispatcher: &mut SyscallDispatcher,
     request: SyscallRequest,
@@ -1278,6 +1310,39 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 dispatcher.dispatch(request, memory, reporter)
             })?;
         match outcome {
+            DispatchOutcome::BlockingHostWrite(mut write) => {
+                waiter.ensure_full();
+                loop {
+                    match crate::dispatch::drive_blocking_host_write(&mut write) {
+                        crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
+                            return Ok(raise_sigpipe_for_blocking_write(
+                                dispatcher, &write, outcome,
+                            ));
+                        }
+                        crate::dispatch::BlockingHostWriteStep::Wait => {
+                            match waiter.wait(&[(write.host_fd(), libc::POLLOUT)], None, 0) {
+                                WaitResult::Ready => continue,
+                                WaitResult::Interrupted => {
+                                    return Ok(partial_write_interrupt_outcome(&write));
+                                }
+                                WaitResult::TimedOut => {
+                                    return Ok(DispatchOutcome::Returned {
+                                        value: write.offset() as i64,
+                                    });
+                                }
+                                WaitResult::Errno(errno) => {
+                                    if write.offset() > 0 {
+                                        return Ok(DispatchOutcome::Returned {
+                                            value: write.offset() as i64,
+                                        });
+                                    }
+                                    return Ok(DispatchOutcome::Errno { errno });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             DispatchOutcome::WaitOnFds {
                 fds,
                 timeout,
@@ -1691,6 +1756,52 @@ impl ThreadRuntimeState {
                 )
             })?;
             match outcome {
+                DispatchOutcome::BlockingHostWrite(mut write) => {
+                    self.waiter.ensure_full();
+                    loop {
+                        if crate::fork_quiesce::is_quiescing() {
+                            self.release_and_park_vcpu_for_fork(engine)?;
+                            continue;
+                        }
+                        match crate::dispatch::drive_blocking_host_write(&mut write) {
+                            crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
+                                return Ok(raise_sigpipe_for_blocking_write(
+                                    &kernel.dispatcher,
+                                    &write,
+                                    outcome,
+                                ));
+                            }
+                            crate::dispatch::BlockingHostWriteStep::Wait => {
+                                match self
+                                    .waiter
+                                    .wait(&[(write.host_fd(), libc::POLLOUT)], None, 0)
+                                {
+                                    crate::io_wait::WaitResult::Ready => continue,
+                                    crate::io_wait::WaitResult::Interrupted => {
+                                        if crate::fork_quiesce::is_quiescing() {
+                                            self.release_and_park_vcpu_for_fork(engine)?;
+                                            continue;
+                                        }
+                                        return Ok(partial_write_interrupt_outcome(&write));
+                                    }
+                                    crate::io_wait::WaitResult::TimedOut => {
+                                        return Ok(DispatchOutcome::Returned {
+                                            value: write.offset() as i64,
+                                        });
+                                    }
+                                    crate::io_wait::WaitResult::Errno(errno) => {
+                                        if write.offset() > 0 {
+                                            return Ok(DispatchOutcome::Returned {
+                                                value: write.offset() as i64,
+                                            });
+                                        }
+                                        return Ok(DispatchOutcome::Errno { errno });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 DispatchOutcome::WaitOnFds {
                     fds,
                     timeout,
@@ -2749,6 +2860,7 @@ fn run_vcpu_until_exit(
 
             match outcome {
                 DispatchOutcome::WaitOnFds { .. }
+                | DispatchOutcome::BlockingHostWrite(_)
                 | DispatchOutcome::WaitOnFdsSelect { .. }
                 | DispatchOutcome::WaitOnPollFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. }
