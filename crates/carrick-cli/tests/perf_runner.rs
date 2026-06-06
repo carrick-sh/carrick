@@ -159,7 +159,14 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
         };
         // --- carrick sample ---
         let c_id = invoke::perf_run_id();
-        let c_out = invoke::run_carrick(bin, root, &c_id, &b64, case.mount_scratch);
+        let c_out = invoke::run_carrick(
+            bin,
+            root,
+            &c_id,
+            &b64,
+            case.mount_scratch,
+            case.carrick_fs_mode,
+        );
         std::thread::sleep(cooldown());
         // --- docker sample (serial, never concurrent with carrick) ---
         let d_id = invoke::perf_run_id();
@@ -236,10 +243,10 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
             // native is the unpinned host ceiling (macOS has no cpuset); cpu_pin=0
             // records that, while `nproc` carries the real host core count.
             cpu_pin: if native { 0 } else { CPU_PIN },
-            fs_mode: if native {
-                "native".into()
-            } else {
-                "host".into()
+            fs_mode: match engine {
+                "macos" => "native".into(),
+                "carrick" => case.carrick_fs_mode.into(),
+                _ => "host".into(),
             },
             image: if native {
                 "(native macos host)".into()
