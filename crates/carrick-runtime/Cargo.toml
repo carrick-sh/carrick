@@ -33,6 +33,7 @@ trace-elf = ["carrick-mem/trace-elf"]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
+carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-hvf = { path = "../carrick-hvf" }
 carrick-host = { path = "../carrick-host" }
