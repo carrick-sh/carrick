@@ -63,6 +63,17 @@ pub const CASES: &[PerfCase] = &[
         mount_scratch: false,
         cross_boundary: false,
     },
+    // Latency (lower better): many small dynamic-style writev calls to stdout.
+    PerfCase {
+        probe: "perf_writev_burst",
+        dimension: "syscall",
+        workload: "writev_burst",
+        metric_key: "writev_burst_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: false,
+    },
     // Latency (lower better): loopback request/response round-trip.
     PerfCase {
         probe: "perf_net_tcp_rr",
@@ -171,6 +182,7 @@ mod tests {
                 "futex_pingpong_p50_us",
             ),
             ("stdio_burst", "perf_stdio_burst", "stdio_burst_total_us"),
+            ("writev_burst", "perf_writev_burst", "writev_burst_total_us"),
         ];
 
         for (workload, probe, metric_key) in required {

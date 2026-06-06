@@ -57,6 +57,33 @@ mod xattr;
 use state::*;
 pub(super) use state::{FsState, IoState};
 
+fn gather_bounded_iovec_bytes(
+    memory: &impl GuestMemory,
+    iovecs: &[LinuxIovec],
+) -> Result<Option<Vec<u8>>, i32> {
+    let mut total = 0usize;
+    for iovec in iovecs {
+        let len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
+        total = total.checked_add(len).ok_or(LINUX_EINVAL)?;
+        if total > crate::dispatch::MAX_RW_COUNT {
+            return Ok(None);
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(total);
+    for iovec in iovecs {
+        let len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
+        if len == 0 {
+            continue;
+        }
+        let chunk = memory
+            .read_bytes(iovec.iov_base, len)
+            .map_err(|_| LINUX_EFAULT)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(bytes))
+}
+
 /// If `path` is a `/proc/{self,thread-self,curproc,this}/fd/N` magic symlink,
 /// return the descriptor number N. Used to serve `open()` of these (Linux
 /// re-opens the file behind fd N); Apple Rosetta opens its main-binary fd this
@@ -5638,6 +5665,88 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EBADF.into());
             }
             let nonblocking = this.io_is_nonblocking(fd, 0);
+
+            struct HostWritevTarget {
+                host_fd: i32,
+                write_kind: HostWriteKind,
+                sigpipe_on_epipe: bool,
+                append: bool,
+            }
+
+            let host_target = if let Some(open_file) = this.open_file(fd) {
+                let open = open_file.description.read();
+                match &*open {
+                    OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end,
+                        pty,
+                        bidirectional,
+                        write_kind,
+                        ..
+                    } => {
+                        // pty ends and O_RDWR FIFOs are bidirectional; only
+                        // real one-way pipe ends gate on is_read_end.
+                        if *is_read_end && pty.is_none() && !*bidirectional {
+                            return Ok(LINUX_EBADF.into());
+                        }
+                        Some(HostWritevTarget {
+                            host_fd: *host_fd,
+                            write_kind: *write_kind,
+                            sigpipe_on_epipe: true,
+                            append: false,
+                        })
+                    }
+                    OpenDescription::HostSocket { host_fd, .. } => Some(HostWritevTarget {
+                        host_fd: *host_fd,
+                        write_kind: HostWriteKind::SocketLike,
+                        sigpipe_on_epipe: false,
+                        append: false,
+                    }),
+                    OpenDescription::HostFile {
+                        base,
+                        host_fd,
+                        writable,
+                        ..
+                    } => {
+                        if !*writable {
+                            return Ok(LINUX_EBADF.into());
+                        }
+                        Some(HostWritevTarget {
+                            host_fd: *host_fd,
+                            write_kind: HostWriteKind::RegularFile,
+                            sigpipe_on_epipe: false,
+                            append: base.status_flags() & LINUX_O_APPEND != 0,
+                        })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(target) = host_target
+                && let Some(bytes) = gather_bounded_iovec_bytes(memory, &iovecs)?
+            {
+                if bytes.is_empty() {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if target.append {
+                    unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_END) };
+                }
+                let outcome = write_host_pipe(
+                    &bytes,
+                    target.host_fd,
+                    nonblocking,
+                    target.write_kind,
+                    cx.tid(),
+                    target.sigpipe_on_epipe,
+                );
+                return if target.sigpipe_on_epipe {
+                    Ok(this.raise_sigpipe_on_epipe(cx, outcome))
+                } else {
+                    Ok(outcome)
+                };
+            }
 
             let mut total = 0usize;
             for iovec in iovecs {
