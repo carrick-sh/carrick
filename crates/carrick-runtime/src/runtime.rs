@@ -2629,24 +2629,33 @@ impl ThreadRuntimeState {
                     fork_barrier().end_quiesce();
                 }
                 fork_barrier().end_fork();
-                kernel
-                    .fork
-                    .restart_after_parent_fork(prepared_fork, &self.kicker, &self.futex);
+                let child_exit_needs_signal_pump = kernel
+                    .dispatcher
+                    .child_exit_signal_needs_pump(self.this_tid, exit_signal);
+                kernel.fork.restart_after_parent_fork(
+                    prepared_fork,
+                    &self.kicker,
+                    &self.futex,
+                    child_exit_needs_signal_pump,
+                );
                 // engine.fork() rebuilt this thread's own vCPU, so its old
                 // kicker handle is stale. Re-register the new one (under the
                 // topology lock we still hold) — otherwise a later fork can't
                 // kick this thread out of the guest and it never quiesces.
                 self.register_vcpu(engine);
-                // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the signal
-                // pump delivers SIGCHLD to this (parent) tid when it exits —
-                // without a host SIGCHLD handler, which would break wait4's
-                // host-waitpid reap. The pump was just restarted above, so its
-                // kqueue exists (rearm covers the registration-before-pump race).
-                crate::host_signal::register_child_exit_watch(
-                    child_pid,
-                    self.this_tid,
-                    i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
-                );
+                if child_exit_needs_signal_pump {
+                    // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
+                    // signal pump delivers the requested signal to this
+                    // (parent) tid when it exits — without a host SIGCHLD
+                    // handler, which would break wait4's host-waitpid reap.
+                    // Default unblocked SIGCHLD skips this path; wait4/waitid
+                    // own the reap and no guest-visible notification is lost.
+                    crate::host_signal::register_child_exit_watch(
+                        child_pid,
+                        self.this_tid,
+                        i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
+                    );
+                }
                 crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its
                 // fd to the guest pidfd-out pointer. The child's pid mirrors a
@@ -2853,11 +2862,14 @@ fn run_threaded_hvf_loop(
     // Registry of live vCPUs so a signalling thread (tgkill) or the
     // process-directed signal pump can force a target out of `hv_vcpu_run`.
     let kicker = Arc::new(crate::vcpu_kick::VcpuKicker::new());
-    // Daemon that kicks in-guest vCPUs when a process-directed signal arrives
-    // (host SIGINT etc.), so a thread spinning in guest userspace delivers it
-    // promptly rather than only at its next syscall — and wakes futex-parked
-    // threads so they too deliver promptly (no 50ms poll latency).
-    kernel.fork.start_signal_pump(&kicker, &futex);
+    // Daemon that kicks in-guest vCPUs when process-directed async signals are
+    // observable. Non-interactive command runners start pump-free and request it
+    // lazily when a guest installs a real signal handler or forks a child whose
+    // exit signal is caught/blocked; interactive terminals keep prompt Ctrl-C
+    // delivery for busy guests that have not made another syscall.
+    if crate::host_tty::host_isatty(0) || crate::host_tty::host_isatty(1) {
+        kernel.fork.start_signal_pump(&kicker, &futex);
+    }
 
     let outcome = run_vcpu_until_exit(
         Arc::clone(&kernel),
@@ -3176,6 +3188,10 @@ fn run_vcpu_until_exit(
                     engine.map_host_alias(va, ipa, len, &payload, file)?;
                     last_syscall_retval = Some(state.complete_returned(&mut engine, va as i64)?);
                 }
+            }
+
+            if kernel.dispatcher.take_signal_pump_request() {
+                kernel.fork.start_signal_pump(&state.kicker, &state.futex);
             }
 
             state.trace_syscall_return(traps, last_syscall_retval);

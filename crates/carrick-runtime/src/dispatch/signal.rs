@@ -296,6 +296,37 @@ impl SyscallDispatcher {
         (ignored, caught, signal.process_pending)
     }
 
+    /// True when a fork-style child exit must be observed asynchronously by the
+    /// signal pump. A default, unblocked SIGCHLD is inert for signal delivery
+    /// and a later wait4/waitid can reap through its own wait path, so it does
+    /// not need a per-child EVFILT_PROC watch. Caught handlers, blocked signals
+    /// (sigtimedwait/sigwait), and non-ignored default dispositions do.
+    pub fn child_exit_signal_needs_pump(
+        &self,
+        tid: crate::thread::ThreadId,
+        exit_signal: u32,
+    ) -> bool {
+        let signum = if exit_signal == 0 {
+            return false;
+        } else if (1..=64).contains(&exit_signal) {
+            exit_signal as i32
+        } else {
+            crate::linux_abi::LINUX_SIGCHLD
+        };
+        let Some(bit) = sigmask_bit(signum) else {
+            return false;
+        };
+        let signal = self.signal.lock();
+        match signal.handlers.get(&signum).map(|a| a.sa_handler) {
+            Some(h) if h == crate::linux_abi::LINUX_SIG_IGN => false,
+            Some(h) if h == crate::linux_abi::LINUX_SIG_DFL => {
+                signal.mask_for(tid) & bit != 0 || !is_default_ignore_signum(signum)
+            }
+            Some(_) => true,
+            None => signal.mask_for(tid) & bit != 0 || !is_default_ignore_signum(signum),
+        }
+    }
+
     /// Bitmask (bit `signum-1`) of signals that must NOT interrupt a blocking,
     /// restartable syscall (wait4/waitid) for `tid`. On Linux a syscall is
     /// interrupted only by a signal that is both unblocked AND has an effect:
@@ -1223,6 +1254,7 @@ impl SyscallDispatcher {
                     h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN;
                 if real_handler {
                     crate::host_signal::ensure_host_handler(signum);
+                    this.request_signal_pump();
                 } else if h == crate::linux_abi::LINUX_SIG_IGN {
                     // Mirror SIG_IGN to the host disposition so a CROSS-PROCESS
                     // kill from a sibling guest process is dropped instead of
@@ -1832,6 +1864,55 @@ mod tests {
         assert_eq!(d.take_deliverable_pending(waiter), Some(34));
         assert_eq!(d.take_deliverable_pending(sender), Some(34));
         assert_eq!(d.take_deliverable_pending(waiter), None);
+    }
+
+    #[test]
+    fn child_exit_signal_pump_predicate_tracks_observable_dispositions() {
+        let d = SyscallDispatcher::new();
+        let tid: crate::thread::ThreadId = 7;
+
+        assert!(
+            !d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            "default unblocked SIGCHLD is inert; wait4 owns the reap path"
+        );
+        assert!(
+            d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGUSR1 as u32),
+            "non-ignored default exit signals can terminate the parent"
+        );
+
+        let chld_bit = sigmask_bit(crate::linux_abi::LINUX_SIGCHLD).unwrap();
+        d.signal.lock().masks.insert(tid, chld_bit);
+        assert!(
+            d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            "blocked SIGCHLD must become pending for sigwait/sigtimedwait"
+        );
+
+        let mut ign = LinuxSigaction::empty();
+        ign.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
+        d.signal
+            .lock()
+            .handlers
+            .insert(crate::linux_abi::LINUX_SIGCHLD, ign);
+        assert!(
+            !d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            "explicit SIG_IGN suppresses the async notification even if the mask contains SIGCHLD"
+        );
+
+        let mut caught = LinuxSigaction::empty();
+        caught.sa_handler = 0x4000;
+        d.signal
+            .lock()
+            .handlers
+            .insert(crate::linux_abi::LINUX_SIGCHLD, caught);
+        assert!(
+            d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
+            "caught SIGCHLD needs the pump so a spinning parent observes the handler"
+        );
+
+        assert!(
+            !d.child_exit_signal_needs_pump(tid, 0),
+            "clone exit_signal 0 requests no signal"
+        );
     }
 
     #[test]

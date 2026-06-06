@@ -141,7 +141,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `ltp-setpgid01` | LTP | MATCH 1/2 in `conf-3259-c00` | 1/2 | PID-namespace session-leader rule is now owned; `setpgid(1, 1)` fails EPERM like Docker Linux while forked non-leader `setpgid(0, 0)` still succeeds. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
-| `go-os_signal` | Go | fresh NEW 28/30 in `conf-87864-c00` after vfork identity fix; prior delivery cluster was 23/30 in `conf-41653-c00` | 29/30 | `TestDetectNohup` used vfork/exec and left the parent's fast-path getpid stamped with the child ns-pid, breaking later `kill(getpid(), sig)` delivery; fixed and owned by `vforkpid`. Remaining new diff is `TestAtomicStop`; `TestTerminalSignal` still fails on both carrick and oracle. |
+| `go-os_signal` | Go | MATCH 29/30 in `conf-23799-c00` after the vfork identity and lazy signal-pump fixes | 29/30 | `TestDetectNohup` used vfork/exec and left the parent's fast-path getpid stamped with the child ns-pid, breaking later `kill(getpid(), sig)` delivery; fixed and owned by `vforkpid`. The later `TestAtomicStop` new diff is also cleared; `TestTerminalSignal` still fails on both carrick and oracle. |
 | `ltp-sigaction01` | LTP | MATCH 4/4 after `sigactionresetinfo`, latest targeted rerun `conf-18439-c02` | 4/4 | Adjacent signal ABI row; SA_RESETHAND + SA_SIGINFO old-state preservation is now owned. |
 
 Rows outside this cluster can be fixed opportunistically if a reducer proves the
@@ -371,7 +371,7 @@ Keep this section current as classifications and fixes land.
 | `ltp-pause02` | signal interruption/restart bug when it reproduces: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; rerun `conf-71289-c01` matched, and later `conf-18439-c01` reproduced the same signature, but latest focused attempts and `pauseinterrupt2` are currently MATCH. | `pauseinterrupt2` or sharper interruption reducer if the row turns RED again | pressure coverage; no runtime fix without fresh RED |
 | `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
 | `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
-| `go-os_signal` | adjacent signal delivery/status mismatch split into two roots. Fresh runs `conf-30698-c00`/`conf-41653-c00` failed `TestStop`, `TestSIGCONT`, and `TestSignalTrace` because `TestDetectNohup`'s vfork/exec child stamped the shared EL1 identity page with the child ns-pid; later parent `kill(getpid(), sig)` used pid 4 and returned `ESRCH`. `vforkpid` owns the fix and the narrowed `TestDetectNohup|TestStop` filter now passes. Full row improved to `conf-87864-c00` at 28/30, with only `TestAtomicStop` new vs oracle; `TestTerminalSignal` remains an oracle-matching fail. | `vforkpid`; `atomicstop` reducer still needed | vfork delivery cluster fixed; AtomicStop remains RED |
+| `go-os_signal` | adjacent signal delivery/status mismatch split into two roots. Fresh runs `conf-30698-c00`/`conf-41653-c00` failed `TestStop`, `TestSIGCONT`, and `TestSignalTrace` because `TestDetectNohup`'s vfork/exec child stamped the shared EL1 identity page with the child ns-pid; later parent `kill(getpid(), sig)` used pid 4 and returned `ESRCH`. `vforkpid` owns that fix. Full row later improved to `conf-87864-c00` at 28/30 with only `TestAtomicStop` new vs oracle, and now matches in `conf-23799-c00` at 29/30 after default, unblocked child-exit SIGCHLD stopped forcing signal-pump/watch churn. `TestTerminalSignal` remains an oracle-matching fail. | `vforkpid`; `signal::tests::child_exit_signal_pump_predicate_tracks_observable_dispositions`; `sigchld` / `cloneexitsig` | MATCH; keep as pressure coverage |
 | `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`; fixed by preserving SA_SIGINFO metadata in the reset SIG_DFL action for in-handler `sigaction(SIG, NULL, &old)`. | `sigactionresetinfo` + `signal::tests::sa_resethand_resets_disposition_to_default_on_handler_entry` | MATCH 4/4 vs oracle 4/4 in `conf-18439-c02` |
 
 ### Probe-gate pressure
@@ -420,6 +420,31 @@ just conformance-probes
   test result: ok. 4 passed; 0 failed; finished in 255.84s
 ```
 
+2026-06-05 second follow-up: the final signed threaded probe path still had
+`waitexitstorm` close enough to the 60s helper deadline that host load could
+trip it again. A host syscall profile showed the process was not wedged; it was
+paying repeated signal-pump stop/start and child `EVFILT_PROC` watch setup for
+default, unblocked `SIGCHLD` children whose notification is guest-inert and
+whose reap is owned by the blocking wait path. The fork coordinator now carries
+whether a pump existed through `PreparedHostFork`, the threaded runtime starts
+non-interactive command runs pump-free, and fork restarts/registers the pump
+only when the exit signal is caught, blocked for sigwait/sigtimedwait, or has a
+non-ignored default disposition. Installing a real guest signal handler requests
+the pump before guest userspace resumes, preserving busy-wait signal delivery.
+
+Validation after the lazy-pump fix:
+
+```text
+/usr/bin/time -p scripts/run-probe.sh waitexitstorm
+  MATCH, real 51.84, sys 48.10
+scripts/run-probe.sh sigchld       MATCH
+scripts/run-probe.sh cloneexitsig  MATCH
+scripts/run-probe.sh killgroup     MATCH
+scripts/run-probe.sh itimer        MATCH
+just conformance-probes
+  test result: ok. 4 passed; 0 failed; finished in 346.86s
+```
+
 ## Next autonomous slice
 
 1. Keep `go-syscall` as a non-process follow-up only if this goal expands:
@@ -427,8 +452,7 @@ just conformance-probes
    namespace/chroot fallout (`TestUnshareMountNameSpaceChroot` in
    `conf-77884-c00`) after user namespace, unshare, capability, and fd-flag
    failures.
-2. Continue `go-os_signal` with a separate `atomicstop` reducer: the vfork
-   identity delivery cluster is fixed and owned by `vforkpid`, while
-   `conf-87864-c00` still has `TestAtomicStop` as the only new diff.
+2. Keep `go-os_signal` as pressure coverage: `conf-23799-c00` now matches
+   29/30 vs oracle, with only `TestTerminalSignal` failing on both sides.
 3. Update this file and `docs/conformance-coverage.md`, then land a logical
    commit with the validation commands in the body.
