@@ -340,6 +340,13 @@ impl SyscallDispatcher {
         }
         gids
     }
+
+    pub(super) fn current_groups(&self) -> Vec<u32> {
+        match self.setgroups_override.lock().clone() {
+            Some(groups) => groups,
+            None => self.supplementary_groups(),
+        }
+    }
 }
 
 impl SyscallDispatcher {
@@ -626,10 +633,7 @@ impl SyscallDispatcher {
             }
             // A prior setgroups(2) replaced the set verbatim; otherwise fall
             // back to the /etc/group-derived membership (id(1) compatibility).
-            let groups = match this.setgroups_override.lock().clone() {
-                Some(g) => g,
-                None => this.supplementary_groups(),
-            };
+            let groups = this.current_groups();
             // size == 0 is a pure query: return the count without writing.
             if size == 0 {
                 return Ok(DispatchOutcome::Returned {

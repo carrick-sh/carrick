@@ -283,8 +283,13 @@ pub struct OpenContext<'a> {
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,
     pub brk_current: u64,
     pub mmap_next: u64,
+    pub ruid: u32,
     pub euid: u32,
+    pub suid: u32,
+    pub rgid: u32,
     pub egid: u32,
+    pub sgid: u32,
+    pub groups: Option<&'a [u32]>,
     /// Signal-disposition masks for `/proc/<pid>/status` (bit `signum-1`):
     /// ignored (SigIgn), caught/handled (SigCgt), shared-pending (ShdPnd).
     pub sig_ignored: u64,

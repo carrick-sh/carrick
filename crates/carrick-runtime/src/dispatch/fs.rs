@@ -1127,6 +1127,7 @@ impl SyscallDispatcher {
         let open_fds = self.open_fd_numbers();
         let mem = self.mem_snapshot();
         let creds = self.cred_snapshot();
+        let groups = self.current_groups();
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
@@ -1137,8 +1138,13 @@ impl SyscallDispatcher {
             address_space_regions: mem.address_space_regions.as_deref(),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
+            ruid: creds.ruid,
             euid: creds.euid,
+            suid: creds.suid,
+            rgid: creds.rgid,
             egid: creds.egid,
+            sgid: creds.sgid,
+            groups: Some(groups.as_slice()),
             sig_ignored,
             sig_caught,
             sig_shdpnd,
