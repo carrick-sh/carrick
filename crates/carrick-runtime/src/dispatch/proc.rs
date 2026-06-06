@@ -88,8 +88,13 @@ fn translate_setpgid_args(pid: i32, pgid: i32) -> Result<(i32, i32), i32> {
     } else {
         pid as u32
     };
+    let idempotent_init_self_setpgid = pid == 0
+        && target_ns_pid == crate::namespace::pid::NS_INIT_PID
+        && (pgid == 0 || pgid as u32 == target_ns_pid);
     if crate::namespace::pid::ns_pid_is_session_leader(target_ns_pid) {
-        return Err(LINUX_EPERM);
+        if !idempotent_init_self_setpgid {
+            return Err(LINUX_EPERM);
+        }
     }
 
     let host_pid = if pid == 0 {
@@ -1594,6 +1599,12 @@ impl SyscallDispatcher {
             if let Err(errno) = (unsafe { libc::setpgid(hpid, hpgid) }).host_syscall_errno() {
                 return Ok(errno.into());
             }
+            if crate::namespace::pid::enabled()
+                && pid.0 == 0
+                && (pgid.0 == 0 || pgid.0 as u32 == crate::namespace::pid::NS_INIT_PID)
+            {
+                crate::namespace::pid::refresh_init_host_pgid();
+            }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -2280,7 +2291,9 @@ mod setpgid_tests {
                 && crate::namespace::pid::self_ns_pid() == crate::namespace::pid::NS_INIT_PID
                 && translate_setpgid_args(1, 1) == Err(LINUX_EPERM)
                 && translate_setpgid_args(1, 0) == Err(LINUX_EPERM)
-                && translate_setpgid_args(0, 0) == Err(LINUX_EPERM);
+                && translate_setpgid_args(0, 0) == Ok((0, 0))
+                && translate_setpgid_args(0, crate::namespace::pid::NS_INIT_PID as i32)
+                    == Ok((0, unsafe { libc::getpgrp() }));
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
 

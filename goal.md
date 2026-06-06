@@ -30,7 +30,7 @@ make measurable progress.
 
 ## Current baseline
 
-Baseline date: 2026-06-05.
+Latest full-sweep refresh: 2026-06-06.
 
 Command:
 
@@ -42,8 +42,8 @@ Result:
 
 ```text
 1222 rows
-1155 MATCH
-67 NEW
+1161 MATCH
+61 NEW
 0 regressions
 0 timeouts
 ```
@@ -52,6 +52,9 @@ The previous blocking rows are cleared:
 
 - `node-libuv`: `MATCH`, carrick failure matches oracle failure.
 - `go-runtime`: `MATCH`, 52/52 on carrick and oracle.
+- `ltp-kill02`: targeted rerun now `MATCH`, carrick 2/2 vs oracle 2/2
+  after allowing namespace init's idempotent `setpgrp()` while preserving
+  explicit session-leader `setpgid(1, 1)` as `EPERM`.
 
 This goal starts from a green regression gate. The target is to reduce NEW rows
 by fixing verified process-control gaps, not by blessing, quarantining, or
@@ -125,6 +128,17 @@ known diffs. The refresh evidence was `conf-28227-c00` vs Docker
 submodules completed with `== Tests result: SUCCESS ==`, `All 8 tests OK`, and
 `run=255 skipped=18`.
 
+Latest full conformance refresh after the lazy child-exit pump fix completed
+all 1222 rows with `OK: no regressions`: 1161 `MATCH`, 61 `NEW`, and cached
+oracle phase (`conf-31721-*`). The remaining process-control-shaped NEW rows
+included `ltp-kill02`, `ltp-clone303`, `go-os_exec`, `go-runtime_pprof`, and
+`go-syscall`. `ltp-kill02` was then reduced with `CARRICK_TRACE_SYSCALLS=1`:
+the LTP parent calls `setpgrp()` before forking, and Carrick returned `EPERM`
+because namespace init was treated as a session leader even for the idempotent
+self-group operation. Linux/Docker lets this no-op succeed; with the fix,
+`just conformance full --suite ltp-kill02 --no-image-refresh` reports `MATCH`
+with carrick 2/2 vs oracle 2/2.
+
 ## Primary target rows
 
 These are the first rows to investigate because they share process-control,
@@ -138,6 +152,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `go-syscall` | Go | full row still `NEW` with result none in `conf-77884-c00`; isolated `TestExec` now passes under Carrick | 34/34 | Process-control `TestExec` blocker is fixed and owned by `execthreads`; remaining full-row stop is namespace/capability/file-mode fallout, currently around `TestUnshareMountNameSpaceChroot` after earlier userns/unshare failures. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
 | `cpython-concurrent_futures` | CPython | MATCH 20/20 in cache-backed `conf-35590-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 in refreshed Docker oracle `conf-28227-d00` | Runtime hangs and the stale oracle-id cache mismatch are cleared. |
+| `ltp-kill02` | LTP | MATCH 2/2 in targeted rerun after namespace-init `setpgrp()` fix | 2/2 | The parent process must be allowed to form its guest-visible process group before `kill(0, SIGUSR1)` broadcasts to child 1 and child A; explicit session-leader `setpgid(1, 1)` remains `EPERM`. |
 | `ltp-setpgid01` | LTP | MATCH 1/2 in `conf-3259-c00` | 1/2 | PID-namespace session-leader rule is now owned; `setpgid(1, 1)` fails EPERM like Docker Linux while forked non-leader `setpgid(0, 0)` still succeeds. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
