@@ -4428,29 +4428,23 @@ const NLMSG_ALIGNTO: usize = 4;
 /// this clamp a huge guest count is an immediate multi-terabyte allocation that
 /// aborts the whole runtime (a one-syscall DoS). Probe: `bigread`.
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
+const SMALL_HOST_READ_BUF: usize = 8192;
 
 /// read(2) on a host-backed fd (pipe/socket/file). Host-backed descriptions are
 /// adopted non-blocking at creation time, so EAGAIN means a blocking-mode guest
 /// fd hands off to the runtime's lockless kqueue wait via WaitOnFds while a
 /// non-blocking guest fd gets EAGAIN. Never blocks under the dispatcher lock.
 /// `nonblocking` is the guest's intended mode (status_flags / O_NONBLOCK).
-fn read_host_pipe(
+fn read_host_pipe_into(
     memory: &mut impl GuestMemory,
     guest_addr: u64,
-    length: usize,
     host_fd: i32,
     nonblocking: bool,
+    buf: &mut [u8],
 ) -> DispatchOutcome {
-    if length == 0 {
-        return DispatchOutcome::Returned { value: 0 };
-    }
-    // Clamp to Linux's MAX_RW_COUNT before staging a host buffer; a huge guest
-    // count would otherwise be a one-syscall OOM-abort of the runtime.
-    let length = length.min(MAX_RW_COUNT);
-    let mut buf = vec![0u8; length];
     // BLOCKING-IO-OK: host-backed descriptions are made O_NONBLOCK at creation
     // or adoption sites; EAGAIN becomes WaitOnFds for blocking guest fds.
-    let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, length) };
+    let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
     #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if let Err(e) = n.host_syscall_errno() {
@@ -4479,6 +4473,28 @@ fn read_host_pipe(
         };
     }
     DispatchOutcome::Returned { value: n as i64 }
+}
+
+fn read_host_pipe(
+    memory: &mut impl GuestMemory,
+    guest_addr: u64,
+    length: usize,
+    host_fd: i32,
+    nonblocking: bool,
+) -> DispatchOutcome {
+    if length == 0 {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    // Clamp to Linux's MAX_RW_COUNT before staging a host buffer; a huge guest
+    // count would otherwise be a one-syscall OOM-abort of the runtime.
+    let length = length.min(MAX_RW_COUNT);
+    if length <= SMALL_HOST_READ_BUF {
+        let mut buf = [0u8; SMALL_HOST_READ_BUF];
+        read_host_pipe_into(memory, guest_addr, host_fd, nonblocking, &mut buf[..length])
+    } else {
+        let mut buf = vec![0u8; length];
+        read_host_pipe_into(memory, guest_addr, host_fd, nonblocking, &mut buf)
+    }
 }
 
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
