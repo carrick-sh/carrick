@@ -20,6 +20,10 @@ pub struct PerfCase {
     /// / docker `-v`) at /mnt and set `BENCH_DIR=/mnt`; native gets
     /// `BENCH_DIR=<abs .bench-scratch>`. The direct-host-FD-vs-virtiofs disk test.
     pub mount_scratch: bool,
+    /// Carrick filesystem backend for this case. Most workloads use `host`; the
+    /// overlay/dirty-range workload uses `memory` to exercise in-memory VFS
+    /// writeback instead of raw host-fd paths.
+    pub carrick_fs_mode: &'static str,
     /// true = the macOS-HOST-client ↔ guest-server CROSS-BOUNDARY test (carrick's
     /// native host socket vs docker's `-p`/vpnkit NAT). `probe` is the guest
     /// server; the host client is fixed. Dispatched to the `xboundary` module.
@@ -39,6 +43,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): private futex wait/wake handoff.
@@ -50,6 +55,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): many small dynamic-style writes to stdout.
@@ -61,6 +67,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): many small dynamic-style writev calls to stdout.
@@ -72,6 +79,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): many small positional host-file pwritev calls.
@@ -83,6 +91,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): many small positional host-file preadv calls.
@@ -94,6 +103,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): fresh private anonymous mmap churn without
@@ -107,6 +117,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): loopback request/response round-trip.
@@ -118,6 +129,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Throughput (higher better): loopback bulk stream — exercises carrick's
@@ -130,6 +142,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "MB/s",
         higher_is_better: true,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): deep-path stat storm — carrick's cap-std
@@ -142,6 +155,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Latency (lower better): metadata/open/access storm against a large sparse
@@ -154,6 +168,21 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
+    // Latency (lower better): build-tool-like small updates over a larger file
+    // set on the in-memory overlay path. This should exercise dirty-range
+    // writeback instead of host-fd paths.
+    PerfCase {
+        probe: "perf_overlay_small_updates",
+        dimension: "disk",
+        workload: "overlay_small_updates",
+        metric_key: "overlay_small_updates_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "memory",
         cross_boundary: false,
     },
     // Throughput (higher better): bulk WRITE over a bind mount — carrick's
@@ -167,6 +196,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "MB/s",
         higher_is_better: true,
         mount_scratch: true,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // Throughput (higher better): bulk READ over the same bind mount.
@@ -178,6 +208,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "MB/s",
         higher_is_better: true,
         mount_scratch: true,
+        carrick_fs_mode: "host",
         cross_boundary: false,
     },
     // CROSS-BOUNDARY latency (lower better): macOS-host client → guest echo
@@ -191,6 +222,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: true,
     },
     // CROSS-BOUNDARY throughput (higher better): host↔guest echo stream.
@@ -202,6 +234,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "MB/s",
         higher_is_better: true,
         mount_scratch: false,
+        carrick_fs_mode: "host",
         cross_boundary: true,
     },
 ];
@@ -216,6 +249,15 @@ mod tests {
         for c in CASES {
             assert!(!c.probe.is_empty());
             assert!(!c.metric_key.is_empty());
+            assert!(
+                matches!(c.carrick_fs_mode, "host" | "memory"),
+                "unexpected carrick fs mode {} for {}",
+                c.carrick_fs_mode,
+                c.workload
+            );
+            if c.mount_scratch {
+                assert_eq!(c.carrick_fs_mode, "host");
+            }
         }
     }
 
@@ -249,6 +291,7 @@ mod tests {
             assert_eq!(case.unit, "us");
             assert!(!case.higher_is_better);
             assert!(!case.mount_scratch);
+            assert_eq!(case.carrick_fs_mode, "host");
             assert!(!case.cross_boundary);
         }
     }
@@ -265,17 +308,29 @@ mod tests {
         assert_eq!(case.unit, "us");
         assert!(!case.higher_is_better);
         assert!(!case.mount_scratch);
+        assert_eq!(case.carrick_fs_mode, "host");
         assert!(!case.cross_boundary);
     }
 
     #[test]
     fn registry_contains_disk_perf_surface() {
         let required = [
-            ("stat_storm", "perf_disk_meta", "stat_p50_us"),
-            ("large_meta", "perf_large_meta", "large_meta_total_us"),
+            ("stat_storm", "perf_disk_meta", "stat_p50_us", "host"),
+            (
+                "large_meta",
+                "perf_large_meta",
+                "large_meta_total_us",
+                "host",
+            ),
+            (
+                "overlay_small_updates",
+                "perf_overlay_small_updates",
+                "overlay_small_updates_total_us",
+                "memory",
+            ),
         ];
 
-        for (workload, probe, metric_key) in required {
+        for (workload, probe, metric_key, carrick_fs_mode) in required {
             let case = CASES
                 .iter()
                 .find(|case| case.workload == workload)
@@ -285,6 +340,7 @@ mod tests {
             assert_eq!(case.metric_key, metric_key);
             assert_eq!(case.unit, "us");
             assert!(!case.higher_is_better);
+            assert_eq!(case.carrick_fs_mode, carrick_fs_mode);
             assert!(!case.cross_boundary);
         }
     }

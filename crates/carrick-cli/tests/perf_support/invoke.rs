@@ -112,7 +112,12 @@ pub fn run_carrick(
     run_id: &str,
     probe_b64: &[u8],
     mount: bool,
+    fs_mode: &str,
 ) -> String {
+    assert!(
+        !mount || fs_mode == "host",
+        "bind-mount perf cases require carrick --fs host"
+    );
     let snippet = if mount {
         mounted_snippet()
     } else {
@@ -124,7 +129,7 @@ pub fn run_carrick(
         PLATFORM.into(),
         "--raw".into(),
         "--fs".into(),
-        "host".into(),
+        fs_mode.into(),
     ];
     if mount {
         args.push("-v".into());
