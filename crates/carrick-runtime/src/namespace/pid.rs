@@ -397,6 +397,19 @@ pub fn ns_to_host_pgid(ns_pgid: u32) -> Option<u32> {
     }
 }
 
+/// Refresh the special ns-pgid 1 ↔ host-pgid mapping after the namespace init
+/// successfully changes its host process group.
+pub fn refresh_init_host_pgid() {
+    let Some(region) = region() else { return };
+    if self_ns_pid() != NS_INIT_PID {
+        return;
+    }
+    let pgid = unsafe { libc::getpgrp() };
+    if pgid > 0 {
+        region.init_host_pgid.store(pgid as u32, Ordering::Release);
+    }
+}
+
 /// Translate an ns-pid the guest supplied back to the host pid to operate on.
 /// Identity when namespaces are off. Returns `None` (→ `ESRCH`) for an ns-pid
 /// that names no member.
