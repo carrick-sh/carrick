@@ -85,6 +85,12 @@ pub struct NsSharedRegion {
     /// group (join succeeds) instead of the init's host pid (not a group leader
     /// → EPERM → glibc posix_spawn setpgroup aborts the child with 127).
     pub init_host_pgid: AtomicU32,
+    /// The init's host SESSION id. The conformance harness starts Carrick in a
+    /// fresh host process group while keeping the caller's session, so this can
+    /// differ from `init_host_pgid`; guest `getsid(0)` still has to report
+    /// ns-sid 1 for the namespace init so Linux's session-leader setpgid rule
+    /// fires before the host call.
+    pub init_host_sid: AtomicU32,
     /// Bitmask of signals the ns-init has installed a handler for (bit N =
     /// signal N). Published by the init's rt_sigaction; read by the kill path
     /// to enforce pid-1 protection: a signal sent to the init by another ns
@@ -288,6 +294,12 @@ pub fn set_init(init_host_pid: u32) {
             .init_host_pgid
             .store(init_host_pgid as u32, Ordering::Relaxed);
     }
+    let init_host_sid = unsafe { libc::getsid(0) };
+    if init_host_sid > 0 {
+        region
+            .init_host_sid
+            .store(init_host_sid as u32, Ordering::Relaxed);
+    }
     let init_slot = &region.members[0];
     init_slot.ns_pid.store(NS_INIT_PID, Ordering::Relaxed);
     init_slot.parent_host_pid.store(0, Ordering::Relaxed);
@@ -355,6 +367,10 @@ pub fn host_to_ns_pgid(host_pgid: u32) -> u32 {
             if init_pgid != 0 && host_pgid == init_pgid {
                 return NS_INIT_PID;
             }
+            let init_sid = r.init_host_sid.load(Ordering::Acquire);
+            if init_sid != 0 && host_pgid == init_sid {
+                return NS_INIT_PID;
+            }
             r.host_to_ns(host_pgid).unwrap_or(host_pgid)
         }
         None => host_pgid,
@@ -405,6 +421,21 @@ pub fn self_ns_pid() -> u32 {
         Some(r) => r.host_to_ns(host).unwrap_or(host),
         None => host,
     }
+}
+
+/// Whether the namespace-visible process `ns_pid` is the leader of its session.
+/// Linux rejects `setpgid()` for a session leader with `EPERM`; Darwin cannot
+/// answer that after pid-ns translation because the host process may not be a
+/// session leader even when the guest-visible pid/sid pair says it is.
+pub fn ns_pid_is_session_leader(ns_pid: u32) -> bool {
+    let Some(host_pid) = ns_to_host_or_self(ns_pid) else {
+        return false;
+    };
+    let sid = unsafe { libc::getsid(host_pid as i32) };
+    if sid <= 0 {
+        return false;
+    }
+    host_to_ns_pgid(sid as u32) == ns_pid
 }
 
 /// The current process's parent pid as its ns sees it — the value `getppid()`
