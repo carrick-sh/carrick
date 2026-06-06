@@ -1002,10 +1002,8 @@ pub(crate) fn drain_fd(fd: RawFd) -> DrainResult {
 /// populate the guest siginfo's si_pid instead of synthesising 0 — which made
 /// LTP kill10 loop forever on "received signal from 0". A single atomic store
 /// keeps it async-signal-safe. 0 = no sender recorded (default action / timer).
-static SENDER_PID: [std::sync::atomic::AtomicI32; 64] = {
-    const Z: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    [Z; 64]
-};
+static SENDER_PID: [std::sync::atomic::AtomicI32; 64] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; 64];
 
 /// Record `host_pid` as the sender of `signum`. Async-signal-safe (one atomic
 /// store); out-of-range signums and host deliveries with no real sender pid are

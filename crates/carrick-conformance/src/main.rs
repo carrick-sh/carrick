@@ -282,9 +282,9 @@ fn run() -> anyhow::Result<ExitCode> {
                 run_id: "<cached>".to_string(),
                 argv: engine::docker_dry_run(s, "<cached>"),
             },
-            None => fresh
-                .remove(&i)
-                .expect("every non-cached suite has a fresh docker side"),
+            None => fresh.remove(&i).ok_or_else(|| {
+                anyhow::anyhow!("every non-cached suite has a fresh docker side (suite {i})")
+            })?,
         };
         reports.push(build_report(s, cout, &docker, &baseline));
     }
@@ -450,7 +450,7 @@ fn bless(
 }
 
 /// Hand-rolled work-stealing pool (std only; mirrors conformance.rs::fan_out_indexed
-/// but returns Option<T> to stay clear of the no-panic gate). Each `f(i)` may
+/// but returns `Option<T>` to stay clear of the no-panic gate). Each `f(i)` may
 /// acquire the shared heavy-lock itself to serialize heavy suites within a phase.
 fn fan_out<T: Send>(n: usize, workers: usize, f: impl Fn(usize) -> T + Sync) -> Vec<Option<T>> {
     let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();

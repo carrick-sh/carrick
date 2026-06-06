@@ -378,17 +378,16 @@ pub fn spawn_signal_pump(
                                 continue;
                             }
                             let cpu_timer = crate::itimer::is_cpu_timer(which);
-                            if cpu_timer {
-                                if let Some(crate::itimer::CpuTimerDecision::Wait { delay_ns }) =
+                            if cpu_timer
+                                && let Some(crate::itimer::CpuTimerDecision::Wait { delay_ns }) =
                                     crate::itimer::cpu_timer_decision(which)
-                                {
-                                    let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
-                                        ident,
-                                        libc::EV_ADD | libc::EV_ONESHOT,
-                                        i64::try_from(delay_ns.max(1)).unwrap_or(i64::MAX),
-                                    )]);
-                                    continue;
-                                }
+                            {
+                                let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                                    ident,
+                                    libc::EV_ADD | libc::EV_ONESHOT,
+                                    i64::try_from(delay_ns.max(1)).unwrap_or(i64::MAX),
+                                )]);
+                                continue;
                             }
                             let signum = crate::itimer::signum_for(which);
                             crate::probes::itimer_fire(signum, 0);

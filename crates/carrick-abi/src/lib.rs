@@ -1948,6 +1948,15 @@ pub const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
 /// PI-futex owner-TID mask: the low 30 bits of the lock word hold the owner tid;
 /// the top two bits are FUTEX_WAITERS / FUTEX_OWNER_DIED.
 pub const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+/// `ptrace(2)` PEEK/POKE request numbers (`enum __ptrace_request` 1..=6).
+/// Declared in the shared ABI crate so dispatch modules import rather than
+/// redeclare them (the dispatch ABI-constant gate forbids local LINUX_* consts).
+pub const LINUX_PTRACE_PEEKTEXT: u64 = 1;
+pub const LINUX_PTRACE_PEEKDATA: u64 = 2;
+pub const LINUX_PTRACE_PEEKUSER: u64 = 3;
+pub const LINUX_PTRACE_POKETEXT: u64 = 4;
+pub const LINUX_PTRACE_POKEDATA: u64 = 5;
+pub const LINUX_PTRACE_POKEUSER: u64 = 6;
 pub const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
 pub const LINUX_TCGETS: u64 = 0x5401;
 pub const LINUX_TCSETS: u64 = 0x5402;

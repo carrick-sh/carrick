@@ -5070,6 +5070,8 @@ mod overlay_dispatch_tests {
             revents: 0,
         };
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 0);
+        // BLOCKING-IO-OK: test-only 1-byte write to a freshly created, empty pipe
+        // to make its read end readable; an empty pipe buffer cannot block here.
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
         assert_ne!(pollfd.revents & libc::POLLIN, 0);
@@ -5627,7 +5629,7 @@ mod overlay_dispatch_tests {
         }
         // Software read fails, but the shared host pointer yields the word.
         let mem = SharedOnly { word: 0x00C0_FFEE };
-        assert_eq!(read_futex_word(&mem, 0x1_0001_6000_00), Ok(0x00C0_FFEE));
+        assert_eq!(read_futex_word(&mem, 0x0100_0160_0000), Ok(0x00C0_FFEE));
 
         // No shared mapping -> EFAULT propagates unchanged (no regression for
         // a genuinely bad private/anon address).

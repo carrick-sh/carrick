@@ -2437,7 +2437,7 @@ impl HvfInner {
                         self.forked_no_exec as i32,
                     );
                     let n = ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n % 256 == 0 && std::env::var_os("CARRICK_REMAP_STATS").is_some() {
+                    if n.is_multiple_of(256) && std::env::var_os("CARRICK_REMAP_STATS").is_some() {
                         eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.ipa);
                     }
                     continue;
@@ -2807,7 +2807,7 @@ impl HvfInner {
         Ok(bytes)
     }
 
-    /// No-alloc core of [`read_guest_bytes`]: `volatile`-copy `dst.len()` bytes
+    /// No-alloc core of [`Self::read_guest_bytes`]: `volatile`-copy `dst.len()` bytes
     /// of guest memory at `address` straight into `dst`. Same checks, chunked
     /// mapping walk, and trace probes as the allocating form.
     fn read_guest_bytes_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
