@@ -20,6 +20,8 @@ Landed slices:
 - `306a359` - `docs(perf): record mmap churn result`
 - `d41e658` - `perf(io): stage pwritev buffers once`
 - `efd09cdb8115dd5895d13212e945886337fb5f9a` - `perf(io): use borrowed pwritev buffers`
+- `f820d05` - `docs(perf): record pwritev burst result`
+- `45086059c0ecb4a0a4dd6f03968a5bbf8f0b1d9d` - `perf(io): use borrowed readv buffers`
 
 Measured branch evidence:
 
@@ -43,6 +45,11 @@ Measured branch evidence:
   - Commit `efd09cd` uses one host `libc::pwritev` when all non-empty guest iovecs expose `host_ptr_for_read`.
   - Fallback tests cover mixed host-pointer/non-host-pointer iovecs and unreadable fallback payloads.
   - Filtered `just bench quick` wrote `pwritev_burst` rows to `docs/perf-results/2026-06-05-syscall.jsonl`: Carrick p50 `20849.208` us, p95 `26075.417` us, marked noisy; Docker p50 `3478.459` us, p95 `3654.750` us.
+- Borrowed `readv`/`preadv` host-file fast path:
+  - RED test `syscall_fs::readv_host_file_uses_guest_host_ptrs_for_writable_iovecs` initially observed copied payload writes instead of writable host-pointer hits.
+  - Commit `4508605` uses host `libc::readv`/`libc::preadv` when all non-empty guest iovecs expose `host_ptr_for_write`.
+  - Fallback coverage keeps mixed host-pointer/non-host-pointer reads on the existing staged path.
+  - Filtered `just bench quick` wrote `preadv_burst` rows to `docs/perf-results/2026-06-05-syscall.jsonl`: Carrick p50 `19852.375` us, p95 `22193.875` us, marked noisy; Docker p50 `2571.125` us, p95 `2902.375` us, marked noisy.
 
 ## First-Principles Cost Model
 
@@ -179,8 +186,8 @@ Milestone 2B: borrowed `readv` and `preadv` host-file fast paths.
   - `cargo test -p carrick-runtime --test integration preadv -- --nocapture`
   - `cargo fmt --all -- --check`
   - `git diff --check`
-- [ ] Record removed-work evidence and wall-time evidence for multi-segment host-file reads.
-- [ ] Commit as a separate logical slice from `pwritev`.
+- [x] Record removed-work evidence and wall-time evidence for multi-segment host-file reads.
+- [x] Commit as a separate logical slice from `pwritev`.
 
 Progress:
 
@@ -192,6 +199,8 @@ Progress:
 - 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime --test integration readv -- --nocapture`, `cargo test -p carrick-runtime --test integration preadv -- --nocapture`, `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture`, and `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin perf_preadv_burst`.
 - 2026-06-06: Pre-commit hygiene passed: `cargo fmt --all -- --check` and `git diff --check`.
 - 2026-06-06: Removed-work evidence is the RED/green integration test: borrowed host-file `readv`/`preadv` writes guest payloads through host pointers, with watched `write_bytes` calls dropping from the RED count to `0` and writable host-pointer hits matching the non-empty iovec count.
+- 2026-06-06: Committed runtime/test/probe slice as `45086059c0ecb4a0a4dd6f03968a5bbf8f0b1d9d` (`perf(io): use borrowed readv buffers`).
+- 2026-06-06: Post-commit `CARRICK_PERF_FILTER=preadv_burst CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 just bench quick` passed and wrote `docs/perf-results/2026-06-05-syscall.jsonl`; Carrick p50 `19852.375` us, p95 `22193.875` us, noisy; Docker p50 `2571.125` us, p95 `2902.375` us, noisy.
 
 Milestone 2C: blocking write ownership and existing `writev` path cleanup.
 
@@ -327,12 +336,11 @@ Repo-local result artifacts:
 
 ## Immediate Next Slice
 
-Continue Milestone 2B.
+Continue Milestone 2C.
 
-- [ ] Add RED borrowed-host-pointer `readv` and `preadv` tests in `crates/carrick-runtime/tests/integration/syscall_fs.rs`.
-- [ ] Implement writable borrowed-iovec preparation in `crates/carrick-runtime/src/dispatch/fs.rs`.
-- [ ] Convert safe host-file `readv` and `preadv` calls to `libc::readv` and `libc::preadv`.
-- [ ] Keep staged fallback behavior for mixed or non-host-pointer guest memory.
-- [ ] Run focused `readv`/`preadv` tests, formatting, and `git diff --check`.
-- [ ] Record removed-work evidence and wall-time evidence for multi-segment host-file reads.
-- [ ] Commit the read-side vector I/O slice separately from `pwritev`.
+- [ ] Add RED coverage for the blocking-write handoff path that proves an owned staged buffer is not cloned when it can be transferred.
+- [ ] Replace clone-on-handoff with ownership transfer for already-staged write buffers.
+- [ ] Confirm EINTR, EAGAIN, partial-write, and retry behavior are unchanged.
+- [ ] Run focused I/O tests and relevant conformance probes.
+- [ ] Record allocation or wall-time evidence for repeated small blocking writes.
+- [ ] Commit the blocking-write ownership slice separately from borrowed vector I/O.
