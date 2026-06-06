@@ -134,6 +134,21 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "host",
         cross_boundary: false,
     },
+    // Latency (lower better): fresh shared anonymous mmap churn without
+    // touching mapped pages. This specifically exercises the boot-mapped shared
+    // aperture path and catches duplicate zero-payload writes for
+    // MAP_SHARED|MAP_ANONYMOUS.
+    PerfCase {
+        probe: "perf_shared_anon_churn",
+        dimension: "memory",
+        workload: "shared_anon_churn",
+        metric_key: "shared_anon_churn_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Latency (lower better): loopback request/response round-trip.
     PerfCase {
         probe: "perf_net_tcp_rr",
@@ -317,18 +332,29 @@ mod tests {
 
     #[test]
     fn registry_contains_memory_perf_surface() {
-        let case = CASES
-            .iter()
-            .find(|case| case.workload == "mmap_churn")
-            .expect("missing mmap_churn perf workload");
-        assert_eq!(case.dimension, "memory");
-        assert_eq!(case.probe, "perf_mmap_churn");
-        assert_eq!(case.metric_key, "mmap_churn_total_us");
-        assert_eq!(case.unit, "us");
-        assert!(!case.higher_is_better);
-        assert!(!case.mount_scratch);
-        assert_eq!(case.carrick_fs_mode, "host");
-        assert!(!case.cross_boundary);
+        let required = [
+            ("mmap_churn", "perf_mmap_churn", "mmap_churn_total_us"),
+            (
+                "shared_anon_churn",
+                "perf_shared_anon_churn",
+                "shared_anon_churn_total_us",
+            ),
+        ];
+
+        for (workload, probe, metric_key) in required {
+            let case = CASES
+                .iter()
+                .find(|case| case.workload == workload)
+                .unwrap_or_else(|| panic!("missing memory perf workload {workload}"));
+            assert_eq!(case.dimension, "memory");
+            assert_eq!(case.probe, probe);
+            assert_eq!(case.metric_key, metric_key);
+            assert_eq!(case.unit, "us");
+            assert!(!case.higher_is_better);
+            assert!(!case.mount_scratch);
+            assert_eq!(case.carrick_fs_mode, "host");
+            assert!(!case.cross_boundary);
+        }
     }
 
     #[test]
