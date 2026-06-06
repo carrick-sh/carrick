@@ -17,7 +17,7 @@ a probe that doesn't exist):
 
 ```
 Owned invariant probes (on disk):  289
-Invariant rows with an owning test: 140/140 (100%)
+Invariant rows with an owning test: 143/143 (100%)
 Distinct curated LTP tests owned:   502/502 (100%)
 ```
 
@@ -152,7 +152,7 @@ underlying gap got fixed):
 | **Default-disposition death-by-signal: SIGTERM/SIGKILL kill child→WIFSIGNALED/WTERMSIG; abort() resets SIGABRT→SIG_DFL and re-raises** | ✅ `abortdeath` | kill05, kill07, abort01 |
 | **ptrace TRACEME stop/continue: traced child reports SIGSTOP through waitpid, PTRACE_CONT resumes it, and the final wait reaps normal exit** | ✅ `ptracetraceme` | ptrace05/06 TRACEME stop leg |
 | **ptrace signal delivery/death: traced self-`SIGKILL` is reaped as WIFSIGNALED/SIGKILL, while an otherwise default-ignored traced self-`SIGCHLD` still reports a ptrace stop and `PTRACE_CONT(..., 0)` resumes to normal exit** | ✅ `ptracesigdeath` | ptrace05 SIGKILL death leg and one nonfatal signal-delivery stop leg |
-| **ptrace nonfatal signal-delivery stops: traced self-`SIGTERM`, `SIGSTOP`, `SIGCONT`, and Linux RT signals report a waitable stop instead of falling through to normal exit; `PTRACE_CONT(..., 0)` resumes to normal exit** | ✅ `ptracesignalstop` | ptrace05 signal-delivery stop matrix |
+| **ptrace nonfatal signal-delivery stops: traced self-`SIGTERM`, `SIGSTOP`, `SIGCONT`, and Linux RT signals report a waitable stop instead of falling through to normal exit; both polling and blocking parent `waitpid()` calls observe the stop, including when the parent parks before the tracee publishes it; `PTRACE_CONT(..., 0)` resumes to normal exit** | ✅ `ptracesignalstop` | ptrace05 signal-delivery stop matrix |
 | **ptrace exec stop: a `PTRACE_TRACEME` child that successfully `execve`s reports a SIGTRAP stop to its parent before the new image runs; `PTRACE_CONT(..., 0)` resumes to normal exit** | ✅ `traceexecstop` | ptrace06 setup / exec-stop leg |
 | **ptrace invalid PEEK/POKE errno: invalid TEXT/DATA/USER PEEK/POKE requests against a stopped tracee fail with Linux-compatible `EIO`/`EFAULT`, not the generic unsupported-syscall `ENOSYS`** | ✅ `ptraceinvaliderrno` | ptrace06 invalid request errno matrix |
 | **SA_RESETHAND + SA_SIGINFO: a one-shot handler resets its disposition to SIG_DFL before the handler runs, but an in-handler `sigaction(SIG, NULL, &old)` query still reports SA_SIGINFO instead of an empty action** | ✅ `sigactionresetinfo` + 🧪 `signal::tests::sa_resethand_resets_disposition_to_default_on_handler_entry` | sigaction01 |
