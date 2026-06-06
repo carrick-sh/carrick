@@ -1330,7 +1330,8 @@ impl IoDir {
 /// non-blocking and emulates the guest's blocking mode itself via
 /// `blocking_io` + the runtime's lockless `WaitOnFds` wait, so a guest blocking
 /// syscall never blocks a vCPU thread inside libc while the dispatcher lock is
-/// held. Call at every host-fd creation site (socket/socketpair/accept/pipe).
+/// held. Call at every host-fd creation/adoption site (socket/socketpair/
+/// accept/pipe/open/dup/SCM_RIGHTS/VFS fd handoff).
 pub(in crate::dispatch) fn set_host_nonblocking(fd: i32) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);

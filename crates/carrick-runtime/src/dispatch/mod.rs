@@ -813,6 +813,8 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
                 value: write.bytes.len() as i64,
             });
         }
+        // BLOCKING-IO-OK: BlockingHostWrite pins a dup of a host fd that was
+        // adopted non-blocking before the handoff; EAGAIN returns Wait below.
         let n = unsafe {
             libc::write(
                 write.host_fd(),
@@ -4427,12 +4429,11 @@ const NLMSG_ALIGNTO: usize = 4;
 /// aborts the whole runtime (a one-syscall DoS). Probe: `bigread`.
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
 
-/// read(2) on a host-backed fd (pipe/socket/file). read has no per-call
-/// non-blocking flag, so we put the host fd non-blocking (idempotent; immaterial
-/// for files, which never block) and convert EAGAIN: a blocking-mode guest fd
-/// hands off to the runtime's lockless kqueue wait via WaitOnFds; a non-blocking
-/// guest fd gets EAGAIN. Never blocks under the dispatcher lock. `nonblocking` is
-/// the guest's intended mode (status_flags / O_NONBLOCK).
+/// read(2) on a host-backed fd (pipe/socket/file). Host-backed descriptions are
+/// adopted non-blocking at creation time, so EAGAIN means a blocking-mode guest
+/// fd hands off to the runtime's lockless kqueue wait via WaitOnFds while a
+/// non-blocking guest fd gets EAGAIN. Never blocks under the dispatcher lock.
+/// `nonblocking` is the guest's intended mode (status_flags / O_NONBLOCK).
 fn read_host_pipe(
     memory: &mut impl GuestMemory,
     guest_addr: u64,
@@ -4446,8 +4447,9 @@ fn read_host_pipe(
     // Clamp to Linux's MAX_RW_COUNT before staging a host buffer; a huge guest
     // count would otherwise be a one-syscall OOM-abort of the runtime.
     let length = length.min(MAX_RW_COUNT);
-    crate::dispatch::net::set_host_nonblocking(host_fd);
     let mut buf = vec![0u8; length];
+    // BLOCKING-IO-OK: host-backed descriptions are made O_NONBLOCK at creation
+    // or adoption sites; EAGAIN becomes WaitOnFds for blocking guest fds.
     let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, length) };
     #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
@@ -4484,6 +4486,7 @@ fn write_host_pipe(
     bytes: &[u8],
     host_fd: i32,
     nonblocking: bool,
+    write_kind: HostWriteKind,
     tid: crate::thread::ThreadId,
     sigpipe_on_epipe: bool,
 ) -> DispatchOutcome {
@@ -4494,18 +4497,13 @@ fn write_host_pipe(
             &bytes[..bytes.len().min(64)]
         );
     }
-    crate::dispatch::net::set_host_nonblocking(host_fd);
     // A blocking large pipe write may make partial progress before the host fd
     // reports EAGAIN. At that point we cannot re-dispatch the original syscall
     // (it would re-send the written prefix), but we also cannot park inside the
     // dispatcher because a sibling guest thread may be the reader/closer needed
     // to unblock this write. Hand the staged bytes to the runtime so it can wait
     // with dispatcher progress released.
-    let block_until_complete = !nonblocking && {
-        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        (unsafe { libc::fstat(host_fd, &mut st) }) == 0
-            && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO
-    };
+    let block_until_complete = !nonblocking && write_kind == HostWriteKind::PipeLike;
     let mut offset = 0usize;
     loop {
         if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
@@ -4527,9 +4525,9 @@ fn write_host_pipe(
                 );
             }
         }
-        // host_fd was forced O_NONBLOCK by set_host_nonblocking above; an EAGAIN
-        // here routes through would_block_outcome / wait_pipe_writable, which park
-        // with the dispatcher lock released. BLOCKING-IO-OK: non-blocking by
+        // host_fd was made O_NONBLOCK when adopted; an EAGAIN here routes
+        // through would_block_outcome / wait_pipe_writable, which park with the
+        // dispatcher lock released. BLOCKING-IO-OK: non-blocking by
         // construction, the lock is never held across a blocking write.
         let n = unsafe {
             libc::write(
@@ -4742,12 +4740,57 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn host_write_kind_classifies_common_host_fds() {
+        use std::os::fd::AsRawFd;
+
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        assert_eq!(
+            HostWriteKind::for_host_fd(pipe_fds[0]),
+            HostWriteKind::PipeLike
+        );
+
+        let mut socket_fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, socket_fds.as_mut_ptr())
+            },
+            0
+        );
+        assert_eq!(
+            HostWriteKind::for_host_fd(socket_fds[0]),
+            HostWriteKind::SocketLike
+        );
+
+        let file = tempfile::tempfile().expect("tempfile");
+        assert_eq!(
+            HostWriteKind::for_host_fd(file.as_raw_fd()),
+            HostWriteKind::RegularFile
+        );
+
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+            libc::close(socket_fds[0]);
+            libc::close(socket_fds[1]);
+        }
+    }
+
+    #[test]
     fn large_blocking_host_pipe_write_hands_off_after_partial_progress() {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        crate::dispatch::net::set_host_nonblocking(fds[1]);
 
         let bytes = vec![0xA5; 4 * 1024 * 1024];
-        let outcome = write_host_pipe(&bytes, fds[1], false, 0x7FFE_0101, true);
+        let outcome = write_host_pipe(
+            &bytes,
+            fds[1],
+            false,
+            HostWriteKind::PipeLike,
+            0x7FFE_0101,
+            true,
+        );
 
         unsafe {
             libc::close(fds[0]);
