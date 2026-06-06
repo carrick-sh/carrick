@@ -239,26 +239,39 @@ gap the §4 loop surfaces with an owning probe; enable kaniko's `--cache`.
 tracked carrick coverage gap), published as a matrix vs `docker build`; a re-build
 hits kaniko's cache.
 
-**Status 2026-06-06 (partial — one tracked gap remains, to be closed):**
+**Status 2026-06-06 (M2 multi-stage gap CLOSED via a kaniko snapshot flag):**
 
 | Corpus entry | build | run | notes |
 |---|---|---|---|
 | single-stage `FROM alpine + RUN + RUN` | ✅ | ✅ | `carrick build → carrick run` prints the artifact |
 | single-stage `FROM alpine + RUN apk add` (network-in-RUN) | ✅ | ✅ | `apk add jq` during RUN works |
-| **multi-stage** `FROM…AS` + `COPY --from` + `RUN` | ✅ | ❌ | **TRACKED GAP** — builds, but the image exits 127 on run; see below |
+| **multi-stage** `FROM…AS` + `COPY --from` + `RUN` | ✅ | ✅ | **FIXED** — `--use-new-run` avoids the full-FS snapshot; clean layers (no `.wh.lib`), runs, exit 0 |
 
 - **kaniko `--cache` / `--cache-repo` passthrough**: ✅ landed (`2b8e2cb`);
   `--no-cache` wins over `--cache`. (Registry-backed cache-hit validation needs a
   live registry; deferred — only the argv mapping is unit-tested.)
 - No data-loss: `carrick build <ctx>` preserves the context dir (verified).
 
-**TRACKED GAP — multi-stage builds produce a broken image (spurious `/lib`
-whiteout). MUST return to close.** A multi-stage build's final RUN layer contains
-a spurious `.wh.lib` whiteout (the real `/artifact.txt` write lands in its own
-layer; `.wh.lib` is the only entry of the small RUN layer) → `/lib` deleted →
-alpine busybox `/bin/sh` loses its musl interpreter
-(`/lib/ld-musl-aarch64.so.1`) → `carrick run <img>` exits **127**. Root cause
-(dtrace of the real build + a Docker oracle, after refuting two hypotheses):
+**FIX — `--use-new-run` (kaniko's experimental run) is now emitted
+unconditionally** by `kaniko_run_argv` (`commands.rs`), for every `carrick build`.
+It detects per-`RUN` changes WITHOUT kaniko's default full-mode parallel
+filesystem snapshot walk, so the mid-reset `/lib` (below) is never observed and no
+spurious `.wh.lib` is emitted. Verified: a multi-stage build's two layers contain
+the real `/lib` (`lib/ld-musl-aarch64.so.1`, `libc.musl-aarch64.so.1`) and
+`artifact.txt`, with **0 whiteouts**; `carrick run multistage:demo` prints the
+artifact and exits 0, and `... /bin/sh -c 'echo OK'` exits 0 (the musl interpreter
+resolves). Single-stage is unaffected (still ✅) and benefits from the faster
+change detection. (`--snapshot-mode=redo` was rejected: it still performs the
+full-FS walk → still emits `.wh.lib`. Layering is preserved — this is NOT
+`--single-snapshot`.)
+
+The underlying carrick-fs divergence (kaniko's full-FS walk observing a
+being-reset `/lib` that Linux's walk does not) is documented below for the record;
+`--use-new-run` sidesteps it entirely so the deep carrick-fs fix is no longer
+required to ship correct multi-stage builds.
+
+**Original root cause (dtrace of the real build + a Docker oracle, after refuting
+two hypotheses):**
 - **NOT** the directory stat fields: a 4-way toggle (override `nlink`, `size`,
   both, neither) showed the whiteout persists in all four — disproving the
   `nlink=2+subdirs`/`size=4096` theory. (That dir-stat normalization is a genuine
@@ -280,14 +293,13 @@ alpine busybox `/bin/sh` loses its musl interpreter
   the between-stage delete/reunpack. (`/lib` is the unique deleted-and-recreated
   dir that matters to exec.)
 
-**Next step to close it** (for whoever returns): determine *why* kaniko's parallel
-snapshot under carrick observes the mid-reset `/lib` when Linux does not — likely
-a syscall ordering / `getdents`/`fstatat` consistency difference during a
-concurrent rmdir+mkdir+readdir on the `--fs host` scratch — and make carrick
-present a being-reset directory to a concurrent walker the way Linux does. The
-repro + dtrace harness (the `TEMP-TRACE(m2-lib)` probes + the
-`/tmp/carrick-corpus/multistage` context) is in place. **Single-stage builds (the
-common case) are unaffected.**
+**Resolution:** rather than the deep carrick-fs fix, `carrick build` now passes
+kaniko `--use-new-run`, which does not perform the full-FS snapshot walk, so the
+mid-reset `/lib` is never observed. The deeper carrick-fs work (presenting a
+being-reset directory to a concurrent walker the way Linux does) remains a valid
+general correctness improvement but is no longer on the critical path for
+multi-stage builds. The repro context (`/tmp/carrick-corpus/multistage`) is in
+place. **Single-stage builds (the common case) are unaffected.**
 
 ### M3 — `POST /build` (streaming)
 Streaming response body + query parser in serve; `POST /build` shelling to
