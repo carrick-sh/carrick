@@ -1502,7 +1502,7 @@ impl SyscallDispatcher {
             let result = match request {
                 0 => unsafe {
                     libc::ptrace(
-                        libc::PT_TRACE_ME,
+                        carrick_portable::PT_TRACE_ME,
                         0,
                         std::ptr::null_mut::<libc::c_char>(),
                         0,
@@ -1511,7 +1511,7 @@ impl SyscallDispatcher {
                 7 => match host_pid(pid) {
                     Some(pid) => unsafe {
                         libc::ptrace(
-                            libc::PT_CONTINUE,
+                            carrick_portable::PT_CONTINUE,
                             pid.0,
                             std::ptr::without_provenance_mut::<libc::c_char>(1),
                             host_signal_data(),
@@ -1522,7 +1522,7 @@ impl SyscallDispatcher {
                 8 => match host_pid(pid) {
                     Some(pid) => unsafe {
                         libc::ptrace(
-                            libc::PT_KILL,
+                            carrick_portable::PT_KILL,
                             pid.0,
                             std::ptr::null_mut::<libc::c_char>(),
                             0,
@@ -1533,7 +1533,7 @@ impl SyscallDispatcher {
                 17 => match host_pid(pid) {
                     Some(pid) => unsafe {
                         libc::ptrace(
-                            libc::PT_DETACH,
+                            carrick_portable::PT_DETACH,
                             pid.0,
                             std::ptr::without_provenance_mut::<libc::c_char>(1),
                             host_signal_data(),
@@ -1735,7 +1735,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(errno));
             }
             clear_unrequested_waitid_state(&mut info, options);
-            let si_pid = info.si_pid;
+            let si_pid = carrick_portable::si_pid(&info);
             if si_pid == 0 && !guest_nohang {
                 if idtype == LINUX_P_PIDFD
                     && let Some(host_fd) = this.host_fd_for_poll(id as i32) {
@@ -1787,9 +1787,9 @@ impl SyscallDispatcher {
                 const CLD_KILLED: i32 = 2;
                 const CLD_DUMPED: i32 = 3;
                 let terminal = matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED);
-                if info.si_pid != 0 && options & LINUX_WNOWAIT == 0 && terminal {
+                if carrick_portable::si_pid(&info) != 0 && options & LINUX_WNOWAIT == 0 && terminal {
                     let child_guest_us =
-                        crate::guest_cpu::reap_child_guest_ns(info.si_pid as u32) / 1000;
+                        crate::guest_cpu::reap_child_guest_ns(carrick_portable::si_pid(&info) as u32) / 1000;
                     crate::guest_cpu::add_reaped_child(child_guest_us, 0);
                     true
                 } else {
@@ -1797,20 +1797,20 @@ impl SyscallDispatcher {
                 }
             };
             if infop_addr.0 != 0 {
-                let bytes = if info.si_pid == 0 {
+                let bytes = if carrick_portable::si_pid(&info) == 0 {
                     [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
                 } else {
                     // The reaped child's si_pid is a host pid; the guest must see
                     // its ns-local pid (§5.3). Identity when namespaces are off.
                     let ns_si_pid =
-                        crate::namespace::pid::host_to_ns_or_self(info.si_pid as u32) as i32;
-                    build_sigchld_siginfo(ns_si_pid, info.si_uid, info.si_code, info.si_status)
+                        crate::namespace::pid::host_to_ns_or_self(carrick_portable::si_pid(&info) as u32) as i32;
+                    build_sigchld_siginfo(ns_si_pid, carrick_portable::si_uid(&info), info.si_code, carrick_portable::si_status(&info))
                 };
                 let memory = &mut *cx.memory;
                 memory.write_bytes(infop_addr.0, &bytes)?;
             }
             if terminal_reap {
-                crate::namespace::pid::unregister_reaped(info.si_pid as u32);
+                crate::namespace::pid::unregister_reaped(carrick_portable::si_pid(&info) as u32);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1918,7 +1918,7 @@ impl SyscallDispatcher {
                 let host_sigkill = crate::host_signal::linux_to_host_signum(LINUX_SIGKILL);
                 let cont = unsafe {
                     libc::ptrace(
-                        libc::PT_CONTINUE,
+                        carrick_portable::PT_CONTINUE,
                         result,
                         std::ptr::without_provenance_mut::<libc::c_char>(1),
                         host_sigkill,
@@ -2241,7 +2241,7 @@ fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
 /// reports SIGCHLD states selected by the caller's W* bits, so filter the host
 /// siginfo before deciding whether a child is waitable.
 fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: u64) -> bool {
-    if info.si_pid == 0 || waitid_state_requested(info.si_code, options) {
+    if carrick_portable::si_pid(info) == 0 || waitid_state_requested(info.si_code, options) {
         return true;
     }
     *info = unsafe { std::mem::zeroed() };

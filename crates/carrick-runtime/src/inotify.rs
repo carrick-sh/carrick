@@ -63,7 +63,10 @@ fn linux_mask_to_note(mask: u32) -> u32 {
         note |= carrick_portable::NOTE_RENAME;
     }
     if note == 0 {
-        note = carrick_portable::NOTE_WRITE | carrick_portable::NOTE_EXTEND | carrick_portable::NOTE_ATTRIB | carrick_portable::NOTE_DELETE;
+        note = carrick_portable::NOTE_WRITE
+            | carrick_portable::NOTE_EXTEND
+            | carrick_portable::NOTE_ATTRIB
+            | carrick_portable::NOTE_DELETE;
     }
     note
 }
@@ -419,8 +422,14 @@ mod tests {
     fn mask_translation_round_trips_common_events() {
         assert!(linux_mask_to_note(IN_MODIFY) & carrick_portable::NOTE_WRITE != 0);
         assert!(linux_mask_to_note(IN_ATTRIB) & carrick_portable::NOTE_ATTRIB != 0);
-        assert_eq!(note_to_linux_mask(carrick_portable::NOTE_WRITE, IN_MODIFY), IN_MODIFY);
-        assert_eq!(note_to_linux_mask(carrick_portable::NOTE_ATTRIB, IN_MODIFY), 0);
+        assert_eq!(
+            note_to_linux_mask(carrick_portable::NOTE_WRITE, IN_MODIFY),
+            IN_MODIFY
+        );
+        assert_eq!(
+            note_to_linux_mask(carrick_portable::NOTE_ATTRIB, IN_MODIFY),
+            0
+        );
         // Self-delete is always surfaced even if not explicitly requested.
         assert_eq!(
             note_to_linux_mask(carrick_portable::NOTE_DELETE, IN_MODIFY),

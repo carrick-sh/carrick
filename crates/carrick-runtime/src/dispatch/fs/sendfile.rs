@@ -69,7 +69,6 @@ impl SyscallDispatcher {
         }
     }
 
-    #[cfg(target_os = "macos")]
     /// True iff `a` and `b` refer to the SAME underlying file — the same fd, or
     /// two host fds on the same `(st_dev, st_ino)`. Used by `copy_file_range` to
     /// reject an overlapping copy onto the same file (Linux returns EINVAL). A
@@ -100,6 +99,10 @@ impl SyscallDispatcher {
         Some((st.st_dev as i64, st.st_ino))
     }
 
+    // Only the Darwin copyfile/fclonefileat fast path (above, macOS-gated) uses
+    // this; HostFileCopyInfo is itself macOS-only. On Linux copy_file_range
+    // falls through to the portable buffer-copy path.
+    #[cfg(target_os = "macos")]
     fn host_file_copy_info(&self, fd: i32) -> Option<HostFileCopyInfo> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();

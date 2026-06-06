@@ -21,7 +21,6 @@
 //! (`fs_backend::sweep_orphans`, which only reaps lock-bearing dirs) leaves it
 //! alone — it is intentionally persistent.
 
-use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -181,17 +180,31 @@ fn same_device(a: &Path, b: &Path) -> Option<bool> {
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
 fn clonefile(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let csrc = CString::new(src.as_os_str().as_encoded_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let cdst = CString::new(dst.as_os_str().as_encoded_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: both pointers are valid NUL-terminated C strings. CLONE_NOFOLLOW
-    // clones a symlink child as a symlink instead of following it (see above).
-    let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), CLONE_NOFOLLOW) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        let csrc = CString::new(src.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let cdst = CString::new(dst.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: both pointers are valid NUL-terminated C strings. CLONE_NOFOLLOW
+        // clones a symlink child as a symlink instead of following it (see above).
+        let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), CLONE_NOFOLLOW) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    // Linux has no APFS `clonefile`. Report Unsupported so the caller takes its
+    // designed fallback (`clone_children_into` -> `Ok(false)` -> a clean direct
+    // extraction). The clone cache is a COW optimization, not a correctness
+    // requirement, so disabling it on Linux is fine. A reflink (FICLONE ioctl)
+    // on btrfs/XFS could re-enable the fast path later.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (src, dst);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 }
 

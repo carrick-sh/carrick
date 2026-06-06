@@ -100,7 +100,8 @@ fn net_interfaces() -> Vec<NetIface> {
     while !cur.is_null() {
         // SAFETY: cur is a non-null node in the getifaddrs list.
         let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null() && (unsafe { (*ifa.ifa_addr).sa_family } as i32) == carrick_portable::AF_LINK
+        if !ifa.ifa_addr.is_null()
+            && (unsafe { (*ifa.ifa_addr).sa_family } as i32) == carrick_portable::AF_LINK
         {
             // SAFETY: an AF_LINK ifa_addr is a sockaddr_dl.
             let sdl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
