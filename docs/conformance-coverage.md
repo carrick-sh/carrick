@@ -124,6 +124,7 @@ underlying gap got fixed):
 | SIGCHLD delivered to a parent handler on child exit; reap still works; SIG_IGN auto-reaps | ✅ `sigchld` | (framework heartbeat; wait4) |
 | Cross-process signal (child→parent SIGUSR1) runs handler, not default; Linux↔macOS signum xlate | ✅ `xsignal` | tgkill01, tkill01/02, kill09 |
 | kill targeting: self / -pgid / 0 broadcasts to current pgrp; kill(bogus,0)→ESRCH; tkill/tgkill arg validation | ✅ `killtarget` | kill02/10/11/12, tkill02, tgkill02/03 |
+| PID-namespace init may call idempotent `setpgid(0,0)`/`setpgrp()` successfully while explicit `setpgid(1,1)` still fails `EPERM` for a session leader; the ns-pgid 1 host mapping refreshes after a successful init self-group change | 🧪 `proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid` | kill02, setpgid01 |
 | Cross-thread signal to a thread blocked in futex/join runs handler | ✅ `xthreadsig` | (Go async-preempt class) |
 | Per-thread `sigaltstack` storage (not clobbered across threads) | ✅ `altstacktid` | sigaltstack01 |
 | SA_ONSTACK delivery on the alt stack | ✅ `signals`/`altstacktid` | sigaltstack01/02 |
