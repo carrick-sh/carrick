@@ -11,8 +11,16 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Guest-side syscall shim (forwarded to carrick-runtime). The base shim
+# (getpid/get*id/gettid, answered guest-side from the identity page / TPIDR_EL1)
+# is default ON. Build with `--no-default-features` for the legacy trap-only
+# vector path.
+default = ["syscall-shim"]
+syscall-shim = ["carrick-runtime/syscall-shim"]
+
 [dependencies]
-carrick-runtime = { path = "../carrick-runtime" }
+carrick-runtime = { path = "../carrick-runtime", default-features = false }
 carrick-spec = { path = "../carrick-spec", features = ["clap"] }
 carrick-image = { path = "../carrick-image" }
 carrick-engine = { path = "../carrick-engine" }
