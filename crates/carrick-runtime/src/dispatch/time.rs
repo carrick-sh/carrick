@@ -280,7 +280,7 @@ impl SyscallDispatcher {
                             kq,
                             &[crate::darwin_kqueue::Kevent::timer(
                                 ident,
-                                libc::EV_DELETE,
+                                carrick_portable::EV_DELETE,
                                 0,
                             )],
                         );
@@ -319,9 +319,9 @@ impl SyscallDispatcher {
                     let mut armed_on_kqueue = false;
                     if kq >= 0 {
                         let (flags, data) = if periodic {
-                            (libc::EV_ADD, interval_value_ns)
+                            (carrick_portable::EV_ADD, interval_value_ns)
                         } else {
-                            (libc::EV_ADD | libc::EV_ONESHOT, value_ns)
+                            (carrick_portable::EV_ADD | carrick_portable::EV_ONESHOT, value_ns)
                         };
                         armed_on_kqueue = crate::darwin_kqueue::apply_changes(
                             kq,

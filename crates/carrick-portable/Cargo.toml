@@ -1,0 +1,15 @@
+[package]
+name = "carrick-portable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_portable"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+libc.workspace = true

@@ -42,6 +42,7 @@ platform-linux = ["dep:carrick-linux"]
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }
+carrick-portable = { path = "../carrick-portable" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-hvf = { path = "../carrick-hvf", optional = true }
 carrick-bsd = { path = "../carrick-bsd", optional = true }

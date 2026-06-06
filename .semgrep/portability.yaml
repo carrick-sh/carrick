@@ -1,0 +1,40 @@
+rules:
+  - id: prefer-carrick-portable-over-libc
+    languages: [rust]
+    severity: WARNING
+    message: >
+      Use `carrick_portable::<X>` instead of `libc::<X>`. This symbol differs in
+      value/type or is absent across carrick's host platforms (Darwin vs Linux),
+      so a direct `libc::` use breaks the platform-linux build (and the future
+      FreeBSD port). The portability shim resolves it per `cfg(target_os)`.
+      See crates/carrick-portable. If you are adding a NEW divergent symbol, add
+      it to the shim first, then use it here.
+    paths:
+      include:
+        - crates/carrick-runtime/
+      exclude:
+        - crates/carrick-portable/
+    patterns:
+      - pattern-either:
+          # BSD errno accessor (read/write)
+          - pattern: libc::__error()
+          # kqueue flags / filters / fflags (BSD-only)
+          - pattern: libc::EV_ADD
+          - pattern: libc::EV_DELETE
+          - pattern: libc::EV_ENABLE
+          - pattern: libc::EV_ONESHOT
+          - pattern: libc::EV_CLEAR
+          - pattern: libc::EV_ERROR
+          - pattern: libc::EV_EOF
+          - pattern: libc::EVFILT_READ
+          - pattern: libc::EVFILT_WRITE
+          - pattern: libc::NOTE_DELETE
+          - pattern: libc::NOTE_WRITE
+          - pattern: libc::NOTE_EXTEND
+          - pattern: libc::NOTE_ATTRIB
+          - pattern: libc::NOTE_RENAME
+          # Darwin-named constants with Linux equivalents
+          - pattern: libc::CLOCK_UPTIME_RAW
+          - pattern: libc::TCP_NOPUSH
+          - pattern: libc::TCP_KEEPALIVE
+          - pattern: libc::AF_LINK
