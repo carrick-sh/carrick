@@ -78,6 +78,39 @@ const LINUX_PTRACE_POKETEXT: u64 = 4;
 const LINUX_PTRACE_POKEDATA: u64 = 5;
 const LINUX_PTRACE_POKEUSER: u64 = 6;
 
+fn translate_setpgid_args(pid: i32, pgid: i32) -> Result<(i32, i32), i32> {
+    if !crate::namespace::pid::enabled() {
+        return Ok((pid, pgid));
+    }
+
+    let target_ns_pid = if pid == 0 {
+        crate::namespace::pid::self_ns_pid()
+    } else {
+        pid as u32
+    };
+    if crate::namespace::pid::ns_pid_is_session_leader(target_ns_pid) {
+        return Err(LINUX_EPERM);
+    }
+
+    let host_pid = if pid == 0 {
+        0
+    } else {
+        match crate::namespace::pid::ns_to_host_or_self(pid as u32) {
+            Some(host_pid) => host_pid as i32,
+            None => return Err(LINUX_ESRCH),
+        }
+    };
+    let host_pgid = if pgid == 0 {
+        0
+    } else {
+        match crate::namespace::pid::ns_to_host_pgid(pgid as u32) {
+            Some(host_pgid) => host_pgid as i32,
+            None => return Err(LINUX_ESRCH),
+        }
+    };
+    Ok((host_pid, host_pgid))
+}
+
 /// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
 /// Build the [`DispatchOutcome::CloneThread`] for a thread-creating clone/clone3.
 /// Applies the SETTLS / PARENT_SETTID / (CHILD_SETTID|CHILD_CLEARTID) gates to
@@ -1554,30 +1587,9 @@ impl SyscallDispatcher {
             // pid 0 = "the calling process", pgid 0 = "same as pid" — both pass
             // through (0 means self to the host too). A non-zero ns-pid that
             // isn't a member is ESRCH. Identity when ns is off.
-            let (hpid, hpgid) = if crate::namespace::pid::enabled() {
-                let hp = if pid.0 == 0 {
-                    0
-                } else {
-                    match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                        Some(h) => h as i32,
-                        None => return Ok(LINUX_ESRCH.into()),
-                    }
-                };
-                let hg = if pgid.0 == 0 {
-                    0
-                } else {
-                    // A pgid is translated as a GROUP (ns-pgid 1 = the init's
-                    // existing host group), NOT as a pid — using ns_to_host_or_self
-                    // here mapped ns-pgid 1 to the init's host PID (not a group
-                    // leader) → setpgid EPERM → posix_spawn setpgroup child 127.
-                    match crate::namespace::pid::ns_to_host_pgid(pgid.0 as u32) {
-                        Some(h) => h as i32,
-                        None => return Ok(LINUX_ESRCH.into()),
-                    }
-                };
-                (hp, hg)
-            } else {
-                (pid.0, pgid.0)
+            let (hpid, hpgid) = match translate_setpgid_args(pid.0, pgid.0) {
+                Ok(args) => args,
+                Err(errno) => return Ok(errno.into()),
             };
             if let Err(errno) = (unsafe { libc::setpgid(hpid, hpgid) }).host_syscall_errno() {
                 return Ok(errno.into());
@@ -2251,6 +2263,35 @@ fn build_sigchld_siginfo(
     buf[20..24].copy_from_slice(&si_uid.to_ne_bytes());
     buf[24..28].copy_from_slice(&linux_status.to_ne_bytes());
     buf
+}
+
+#[cfg(test)]
+mod setpgid_tests {
+    use super::translate_setpgid_args;
+    use crate::linux_abi::LINUX_EPERM;
+
+    #[test]
+    fn namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid() {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork for isolated pid namespace test failed");
+        if child == 0 {
+            let ok = unsafe { libc::setpgid(0, 0) } >= 0
+                && crate::namespace::pid::init(std::process::id())
+                && crate::namespace::pid::self_ns_pid() == crate::namespace::pid::NS_INIT_PID
+                && translate_setpgid_args(1, 1) == Err(LINUX_EPERM)
+                && translate_setpgid_args(1, 0) == Err(LINUX_EPERM)
+                && translate_setpgid_args(0, 0) == Err(LINUX_EPERM);
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert_eq!(waited, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child status {status:#x}"
+        );
+    }
 }
 
 #[cfg(test)]

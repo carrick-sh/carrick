@@ -164,6 +164,7 @@ underlying gap got fixed):
 |---|---|---|
 | **/proc/self/status Pid/Tgid agree with getpid()/gettid() (carrick hardcoded Pid:1 while getpid returned process::id())** | ✅ `procselfpid` | gettid01 |
 | **waitpid error edges: pid<-1 naming a nonexistent process group → ESRCH (carrick forwarded to the host which gives EINVAL); invalid options → EINVAL; no children → ECHILD** | ✅ `waitpgid` | waitpid04 |
+| **setpgid session-leader rule under PID namespace translation: a namespace-visible session leader, including pid 1 when the host SID differs from the host PGID, fails `setpgid()` with EPERM before Carrick delegates to Darwin; forked non-leader children can still create/join process groups** | 🧪 `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid` + ✅ `setpgidparentgroup` / `proclife` | setpgid01 |
 | fork memory isolation (COW) across .data/.bss/heap/mmap | ✅ `forkcow` | (fork correctness) |
 | MAP_SHARED coherence across multi-level fork, both directions | ✅ `forkshared` | (tst_checkpoint shared mem) |
 | fork+wait4+SIGCHLD/SIGUSR1 + list-walk leaves heap intact; wait status correct | ✅ `forksigwalk` | (shell/framework fork+reap) |
