@@ -86,6 +86,7 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest committed runtime slices:
 
+- `8a7659a` - `perf(fs): skip vfs context on rootfs open`
 - `76d0aac` - `perf(fs): fast path memory nofollow metadata`
 - `0d9ee96` - `perf(fs): skip impossible memory fifo probe`
 - `0a08b5f` - `perf(fs): snapshot memory overlay opens`
@@ -104,7 +105,8 @@ Latest committed runtime slices:
 Documentation/result state:
 
 - `docs/perf-results/2026-06-06-disk.jsonl` has appended rows for
-  `overlay_small_updates` at `4bae00f`, `0a08b5f`, `0d9ee96`, and `76d0aac`.
+  `overlay_small_updates` at `4bae00f`, `0a08b5f`, `0d9ee96`, `76d0aac`, and
+  `8a7659a`.
 
 ## Current Evidence
 
@@ -467,6 +469,52 @@ What disappeared at `76d0aac`:
   no-follow canonicalization.
 - No guest traps disappeared; this was path-canonicalization handler work.
 
+Follow-up runtime slice at `8a7659a`:
+
+- Before the change, `try_vfs_open` built a full `OpenContext` before checking
+  whether `vfs_mounts.resolve(path)` matched anything. Rootfs/overlay opens
+  under `--fs memory` always fell through, so every regular-file open still
+  snapped proc argv/env, open fd numbers, memory state, credentials, and signal
+  masks for no VFS consumer.
+- RED coverage:
+  `dispatch::fs::tests::vfs_open_fallthrough_does_not_build_open_context`
+  first failed with `open_fd_numbers()` called once before fallthrough.
+- `try_vfs_open` now checks `vfs_mounts.resolve(path)` first and returns
+  `FallThrough` immediately for rootfs/overlay paths. VFS-mounted paths still
+  build `OpenContext` and receive the same `OpenFlags`.
+- Focused and adjacent checks passed:
+  - `cargo test -p carrick-runtime dispatch::fs::tests::vfs_open_fallthrough_does_not_build_open_context -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration memory_overlay_regular_open_skips_legacy_kind_lookups -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration memory_overlay_regular_open_skips_fifo_probe_when_backend_cannot_have_fifos -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration memory_overlay_open_uses_single_backend_snapshot_for_shared_file -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration rootfs_overlay -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration proc -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration dev -- --nocapture`
+  - `cargo test -p carrick-runtime --tests --no-run`
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - `./scripts/build-signed.sh`
+- Direct signed runs after the change were stable around `4202.875`,
+  `4274.958`, and `4190.166` us before the harness; later direct checks were
+  `5704.000`, `5016.000`, and `4716.125` us.
+- Post-change `carrick trace` still showed the same guest trap shape:
+  `openat=594`, `fcntl=593`, `close=593`, `write=583`, and `lseek=577`.
+- Filtered perf rows at `8a7659a` in
+  `docs/perf-results/2026-06-06-disk.jsonl` were noisy and higher than direct
+  runs:
+  - first row: Carrick p50 `8528.291` us, p95 `12149.959` us, noisy.
+  - second row: Carrick p50 `7645.750` us, p95 `7912.250` us.
+  - third row: Carrick p50 `7218.750` us, p95 `8522.166` us, noisy.
+  - Treat these as recorded noisy harness rows, not as evidence that the
+    context-skip made the workload slower; direct runs and the RED test are the
+    useful evidence for the removed handler work.
+
+What disappeared at `8a7659a`:
+
+- Proc/fd/memory/credential/signal snapshot construction for rootfs/overlay VFS
+  fallthrough opens.
+- No guest traps disappeared; this was pre-rootfs open-handler work.
+
 Remaining overlay decision:
 
 - [x] Identify whether the remaining `overlay_small_updates` gap is host kernel
@@ -478,9 +526,11 @@ Remaining overlay decision:
   opens.
 - [x] Remove the measured no-follow canonicalization legacy kind lookup for
   memory regular-file opens.
-- [ ] Attribute the post-`76d0aac` full guest-open cost between VFS mount
-  fallthrough/context construction, syscall dispatch, descriptor table work,
-  and fd installation.
+- [x] Remove the measured VFS `OpenContext` construction on rootfs/overlay
+  fallthrough opens.
+- [ ] Attribute the post-`8a7659a` full guest-open cost between syscall
+  dispatch, descriptor table work, path record bookkeeping, and fd
+  installation.
 - [ ] Decide whether the remaining repeated `openat`/`fcntl`/`lseek`/`write`/
   `close` trap shape can be reduced only by a dynamic interposer or by a safe
   runtime-local fast path.
@@ -534,7 +584,7 @@ Deferred:
 
 ## Immediate Next Slice
 
-The next slice should start from the post-`76d0aac` `overlay_small_updates`
+The next slice should start from the post-`8a7659a` `overlay_small_updates`
 shape.
 
 Working theory:
@@ -546,13 +596,15 @@ Working theory:
 - Impossible FIFO metadata probes for memory regular-file opens are fixed.
 - The no-follow canonicalization legacy kind lookup for memory regular-file
   opens is fixed.
+- VFS `OpenContext` construction for rootfs/overlay fallthrough opens is fixed.
 - Useful committed perf rows moved from Carrick p50 `6063.542` us at `0a08b5f`
   to `4823.792` us at `0d9ee96` and `4734.250` us on the clean `76d0aac`
-  rerun. The first `76d0aac` row was a high outlier and remains in the result
-  log.
+  rerun. Direct `8a7659a` runs were around `4.2` to `5.7` ms, but the harness
+  rows at that SHA were noisy/high and should not be treated as the primary
+  signal.
 - Remaining cost is the repeated guest syscall pattern plus in-process runtime
-  work before and after open dispatch: VFS mount fallthrough/context
-  construction, fd-table installation, `fcntl`, `lseek`, `write`, and `close`.
+  work after open dispatch: fd-table installation, path record bookkeeping,
+  `fcntl`, `lseek`, `write`, and `close`.
 - If the goal is to reduce traps rather than only reduce handler cost, the next
   candidate is a narrow dynamic interposer or guest-side batching workload, but
   it must be proven against a dynamic binary and must not become a correctness
@@ -568,9 +620,10 @@ Tasks:
   remove it with a conservative backend capability hook.
 - [x] Add focused RED coverage for the remaining no-follow canonicalization
   lookup and remove it with a metadata-only fast path.
+- [x] Add focused RED coverage for unneeded VFS `OpenContext` construction on
+  rootfs/overlay fallthrough and move mount resolution before snapshotting.
 - [ ] Add runtime-local counters or focused tracing around the remaining full
-  guest open route: VFS-mount fallthrough/context construction, fd-table
-  installation, and path record bookkeeping.
+  guest open route: fd-table installation and path record bookkeeping.
 - [ ] If open/close setup dominates without host kernel work, design a RED test
   for the smallest runtime-local fast path before changing behavior.
 - [ ] If trap count dominates and runtime-local work is small, add a dynamic
