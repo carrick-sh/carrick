@@ -2,7 +2,7 @@
 //! handler and renders the result as an HTTP response. The Docker API prefixes
 //! every path with an optional `/v1.NN` version segment, which we strip.
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 
@@ -18,6 +18,14 @@ fn strip_version(path: &str) -> &str {
         }
     }
     path
+}
+
+/// Pull a single `key=value` out of a raw query string (`a=1&b=2`).
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        if k == key { Some(v.to_string()) } else { None }
+    })
 }
 
 fn text(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
@@ -42,6 +50,11 @@ pub(crate) async fn route(
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let method = req.method().clone();
     let path = strip_version(req.uri().path()).to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let body_bytes = match BodyExt::collect(req.into_body()).await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => Bytes::new(),
+    };
 
     let resp = match (&method, path.as_str()) {
         (&Method::GET, "/_ping") => text(StatusCode::OK, "OK"),
@@ -50,6 +63,15 @@ pub(crate) async fn route(
         }
         (&Method::GET, "/info") => {
             json(StatusCode::OK, crate::serve::handlers::info_json())
+        }
+        (&Method::POST, "/containers/create") => {
+            let name = query_param(&query, "name");
+            let (status, body) =
+                crate::serve::handlers::create_container(&body_bytes, name.as_deref());
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
         }
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };

@@ -2,7 +2,7 @@
 //! and a JSON response body. Each returns the body bytes; the router wraps them
 //! in a response with the right status.
 
-use crate::serve::model::{InfoResponse, VersionResponse};
+use crate::serve::model::{CreateBody, CreateResponse, InfoResponse, VersionResponse};
 
 pub(crate) fn version_json() -> String {
     serde_json::to_string(&VersionResponse::default())
@@ -21,4 +21,46 @@ pub(crate) fn info_json() -> String {
         images: 0,
     };
     serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Returns (status, json). Reads the create body, persists a Created entry, and
+/// returns the new id. `name` is the optional `?name=` query value.
+pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String) {
+    let req: CreateBody = match serde_json::from_slice(body) {
+        Ok(b) => b,
+        Err(e) => return (400, error_json(&format!("invalid body: {e}"))),
+    };
+    let Some(image) = req.image else {
+        return (400, error_json("no image specified"));
+    };
+    let cmd = req.cmd.unwrap_or_default();
+    let env = req.env.unwrap_or_default();
+    match crate::serve::spawn::create_container(
+        name,
+        &image,
+        &cmd,
+        &env,
+        req.working_dir.as_deref(),
+    ) {
+        // `id` is the 64-hex container id `carrick create` generated; the Docker
+        // `Id` is always that id, not the (optional) name.
+        Ok(id) => {
+            let resp = CreateResponse {
+                id,
+                warnings: vec![],
+            };
+            (
+                201,
+                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string()),
+            )
+        }
+        Err(e) => (500, error_json(&e.to_string())),
+    }
+}
+
+pub(crate) fn error_json(msg: &str) -> String {
+    format!(
+        "{{\"message\":{}}}",
+        serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string())
+    )
 }
