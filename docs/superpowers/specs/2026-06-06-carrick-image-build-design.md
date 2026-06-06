@@ -261,9 +261,26 @@ the real `/lib` (`lib/ld-musl-aarch64.so.1`, `libc.musl-aarch64.so.1`) and
 `artifact.txt`, with **0 whiteouts**; `carrick run multistage:demo` prints the
 artifact and exits 0, and `... /bin/sh -c 'echo OK'` exits 0 (the musl interpreter
 resolves). Single-stage is unaffected (still ✅) and benefits from the faster
-change detection. (`--snapshot-mode=redo` was rejected: it still performs the
-full-FS walk → still emits `.wh.lib`. Layering is preserved — this is NOT
-`--single-snapshot`.)
+change detection.
+
+**Snapshot-mode matrix (why `--use-new-run` specifically):** every mode that
+performs kaniko's per-step full-FS snapshot still observes the being-reset `/lib`
+and emits `.wh.lib` — confirmed for the default (`full`), `--snapshot-mode=redo`,
+AND `--single-snapshot` (all three: `.wh.lib` present, image breaks). `--use-new-run`
+is the ONLY mode that avoids the full-FS walk, hence the only one that produces a
+runnable multi-stage image. It preserves per-instruction layering (not collapsed
+like `--single-snapshot` would).
+
+**Known fidelity nuance of `--use-new-run` (narrow, documented):** its
+change-detection captures new files and modifications to files created within the
+same `RUN` correctly (verified: a single-stage `RUN echo one >/f; RUN echo two >>/f
+&& echo three >/new` yields f=one/two + new=three). But a `RUN` that modifies a
+file introduced by a *preceding `COPY`* in the same stage may not capture the
+in-place modification (observed: a `RUN … >> /artifact.txt` appended to a COPY'd
+`/artifact.txt` did not land — the image keeps the COPY'd version). The image is
+correct and runnable; this is an edge of kaniko's experimental `--use-new-run`
+change detection (COPY-then-RUN-modify of the same path), tracked as a minor
+follow-up. It does NOT reintroduce the `.wh.lib` breakage.
 
 The underlying carrick-fs divergence (kaniko's full-FS walk observing a
 being-reset `/lib` that Linux's walk does not) is documented below for the record;
