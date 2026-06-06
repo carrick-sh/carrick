@@ -62,6 +62,10 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `58d3ee6` - `perf(syscall): add epoll pipe loop workload`
+- `a5de9e2` - `perf(memory): add Mach COW snapshot helper`
+- `324b5e0` - `docs(perf): attribute fork snapshot cost`
+- `3ee2ff0` - `docs(perf): record fork snapshot result`
 - `57ad1f0` - `perf(memory): add fork mmap snapshot workload`
 - `bf9cb3b` - `perf(memory): add shared anon churn workload`
 - `68538ba` - `perf(mem): skip high-va anon alias payloads`
@@ -90,6 +94,9 @@ Relevant result file:
 - `docs/perf-results/2026-06-06-memory.jsonl` contains a current
   `mmap_churn` row at `120aab9`, `shared_anon_churn` rows at `bf9cb3b`, and
   `fork_mmap_snapshot` rows at `57ad1f0`.
+- `docs/perf-results/2026-06-06-syscall.jsonl` contains
+  `wait_pipe_pingpong` rows at `2744261` and `db6d5cc`, plus
+  `epoll_pipe_loop` rows at `58d3ee6`.
 
 ## Current Evidence
 
@@ -132,6 +139,18 @@ Remaining:
   `2451309.750` us, p95 `2500369.916` us; Docker p50 `3494.833` us, p95
   `3703.750` us. This exposes fork snapshot cost as the dominant remaining
   mmap/fork issue.
+- Host-side `mach_vm_remap(copy=TRUE)` is now factored behind
+  `OwnedHostMapping::remap_copy` and passes a focused isolation test: source
+  writes after the snapshot do not leak into the clone, and clone writes do not
+  leak back into the source.
+- The existing `mach_cow_probe` now uses that host API. The committed-slice
+  verification run measured the Mach COW clone at `562625` ns versus
+  `2838334` ns for explicit sparse copy, about `5.04x` faster host-side.
+- Direct runtime adoption is not currently safe: wiring fork child snapshots to
+  `remap_copy` made `forkcow` fail before guest output with
+  `hv_vm_map(host=0x105990000, guest=0x2d00020000, size=1835008) failed in child:
+  0xfae94001`. The runtime call-site was reverted and `forkcow` matched again.
+  Treat Mach COW as a future HVF-coherence project, not a landed optimization.
 
 ### Borrowed Vector I/O
 
@@ -289,7 +308,7 @@ Remaining:
 
 ### Wait fd Pinning and kqueue Churn
 
-Workload: `wait_pipe_pingpong`.
+Workloads: `wait_pipe_pingpong`, `epoll_pipe_loop`.
 
 Evidence:
 
@@ -297,12 +316,38 @@ Evidence:
 - `db6d5cc` removed per-wait `dup` churn for anchored direct host-fd waits.
 - Post-change DTrace counted `close=61` and `kevent=14069`, with no `dup`
   entries in aggregation.
+- `perf_epoll_pipe_loop` adds a broader stable-descriptor event-loop workload:
+  one epoll fd, one pipe registration, repeated worker-triggered
+  `epoll_wait`/read cycles, and Docker control rows.
+- Registry RED/GREEN:
+  `registry_contains_syscall_perf_surface` failed with
+  `missing perf workload epoll_pipe_loop` before the `PerfCase` was added, then
+  passed together with `registered_perf_probes_have_sources`.
+- Direct Carrick smoke output:
+  `epoll_pipe_loop_p50_us=10.625`, `epoll_pipe_loop_p95_us=14.666`,
+  `epoll_pipe_loop_min_us=10.250`, `iters=2000`, `warmup=300`, `nproc=4`.
+- Perf gate after committing the workload at `58d3ee6` produced Carrick p50
+  `16.708` us, p95 `25.750` us and Docker p50 `24.458` us, p95 `25.916` us.
+  Carrick was noisy; Docker was not noisy. Carrick was about `1.46x` lower
+  latency.
+- `scripts/dtrace/trace-epoll-pipe-loop-cost.d` on the same probe produced
+  traced guest output `epoll_pipe_loop_p50_us=24.417`,
+  `epoll_pipe_loop_p95_us=51.792`, and `iters=2000`.
+- The scoped trace counted one `epoll_ctl` add, `epoll_wait_fd=133`,
+  `epoll_result kind=1=133`, `epoll_result kind=0=2300`, `kevent nchanges=4651`,
+  `kevent nevents=21509`, `kevent wall_ns=121841380`, and `kevent` returns
+  `ret=0 errno=0 count=2484`, `ret=1 errno=0 count=4614`.
 
 Remaining:
 
-- Persistent kqueue subscriptions could remove the delete/apply half, but this
-  needs retained fd guards or generation tokens across completed waits.
-- Add a broader event-loop workload before taking persistent subscription risk.
+- The stable epoll workload mostly returns immediately (`kind=0`) and already
+  beats Docker in the untraced perf gate, so persistent epoll subscriptions are
+  not the next high-confidence performance bet.
+- The trace still shows substantial generic `kevent` volume around the wait
+  machinery, but only `133` blocking epoll wait-fd handoffs. Persistent
+  subscriptions would need retained fd guards or generation tokens across
+  completed waits and must first prove signal, close, fork, and wake-pipe
+  invariants.
 
 ## Primary Near-Term Bet
 
@@ -874,6 +919,54 @@ Rejected next steps:
   No JSONL perf row was added for this slice. The removed unit of work is
   proven by the `MapHostAlias` payload assertion; an end-to-end Rosetta/high-VA
   workload row is still needed before claiming a benchmark win.
+- [x] Test whether Mach VM COW can replace explicit fork snapshots.
+
+  Host primitive result:
+
+  - Added `OwnedHostMapping::remap_copy` for macOS/aarch64, backed by
+    `mach_vm_remap(copy=TRUE)`.
+  - Focused host RED/GREEN:
+
+    ```sh
+    cargo test -p carrick-host cow_snapshot_isolates_source_and_clone_writes -- --nocapture
+    ```
+
+    Before adding the API, the test failed to compile because
+    `OwnedHostMapping::remap_copy` did not exist. After adding it, the test
+    passed and proved source writes after the snapshot do not leak into the
+    clone, and clone writes do not leak back to the source.
+
+  Probe refactor and measurement:
+
+  ```sh
+  cargo test -p carrick-runtime --test mach_cow_probe -- --nocapture
+  ```
+
+  Output from the passing run:
+
+  - explicit sparse copy: `2838334` ns
+  - `mach_vm_remap(copy=TRUE)`: `562625` ns
+  - write-isolation: isolated
+  - verdict: host-side Mach COW is about `5.04x` faster than explicit sparse
+    copy for this probe shape.
+
+  Live HVF adoption gate:
+
+  - Temporarily wiring `clone_region_for_child` to use `remap_copy` made
+    `scripts/run-probe.sh forkcow` fail before guest output.
+  - Manual reproduction failed with:
+
+    ```text
+    carrick: trap engine failed: hv_vm_map(host=0x105990000, guest=0x2d00020000, size=1835008) failed in child: 0xfae94001
+    rc=125
+    ```
+
+  - The runtime call-site was reverted, the signed binary was rebuilt, and
+    `scripts/run-probe.sh forkcow` returned `MATCH forkcow`.
+
+  Decision: keep `remap_copy` as a measured host primitive and keep the probe
+  using the shared API, but do not land Mach COW as the fork snapshot strategy
+  until the child `hv_vm_map` failure and HVF coherence gate are solved.
 - [ ] Add RED coverage before changing alias, COW, or shared-memory behavior.
 
 ## Task 5: Revisit wait-path kqueue churn only with a broader workload
@@ -882,15 +975,121 @@ Rejected next steps:
 
 - Inspect: wait and fd pinning code under `crates/carrick-runtime/src`
 - Modify if adding coverage: `conformance-probes/src/bin/`
-- Modify if adding perf registry coverage: `crates/carrick-cli/tests/perf_runner.rs`
+- Modify if adding perf registry coverage:
+  `crates/carrick-cli/tests/perf_support/cases.rs`
+- Modify if tracing host attribution: `scripts/dtrace/`
 - Modify: `goal.md`
 
 **Steps:**
 
-- [ ] Add a broader event-loop workload that performs repeated waits on stable
+- [x] Add a broader event-loop workload that performs repeated waits on stable
   descriptors and has Docker control rows.
-- [ ] Measure whether `kevent` delete/apply churn is material in that broader
+
+  Added `perf_epoll_pipe_loop`.
+
+  Workload shape:
+
+  - Create one epoll fd.
+  - Register one pipe read end once with `EPOLLIN`.
+  - Keep a worker thread blocked on a control pipe.
+  - For each iteration, signal the worker, block in `epoll_wait`, read one data
+    byte, and repeat.
+  - Use `WARMUP=300`, `ITERS=2000`, and `WORKER_SPIN=128`.
+
+  Registry RED/GREEN:
+
+  ```sh
+  cargo test -p carrick-cli --test perf_runner registry_contains_syscall_perf_surface -- --nocapture
+  cargo test -p carrick-cli --test perf_runner registered_perf_probes_have_sources -- --nocapture
+  ```
+
+  The first command failed before the `PerfCase` was added with
+  `missing perf workload epoll_pipe_loop`, then passed after the workload and
+  source landed. The source registry check also passed.
+
+  Build and smoke evidence:
+
+  ```sh
+  ./scripts/build-probes.sh
+  CARRICK_RUN_ID=perf-epoll-pipe-loop-smoke-$$ \
+  target/release/carrick run-elf --raw --fs host \
+    conformance-probes/target/aarch64-unknown-linux-musl/release/perf_epoll_pipe_loop
+  ```
+
+  Smoke output: `epoll_pipe_loop_p50_us=10.625`,
+  `epoll_pipe_loop_p95_us=14.666`, `epoll_pipe_loop_min_us=10.250`,
+  `iters=2000`, `warmup=300`, `nproc=4`.
+
+  Perf gate command:
+
+  ```sh
+  CARRICK_PERF_FILTER=epoll_pipe_loop \
+  CARRICK_PERF_REPS=3 \
+  CARRICK_PERF_WARMUP=1 \
+  CARRICK_PERF_COOLDOWN_SECS=0 \
+  cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
+  ```
+
+  `docs/perf-results/2026-06-06-syscall.jsonl` rows at
+  `58d3ee656c039d15ca24525d91ecfea3ec342a52`:
+
+  - Carrick p50 `16.708` us, p95 `25.750` us, samples `[16.708,25.750]`,
+    noisy.
+  - Docker p50 `24.458` us, p95 `25.916` us, samples `[24.458,25.916]`, not
+    noisy.
+  - Carrick was about `1.46x` lower latency.
+- [x] Measure whether `kevent` delete/apply churn is material in that broader
   workload.
+
+  Added scoped attribution script:
+
+  ```sh
+  scripts/dtrace/trace-epoll-pipe-loop-cost.d
+  ```
+
+  Trace command:
+
+  ```sh
+  CARRICK_RUN_ID=trace-epoll-loop-$$ \
+  target/release/carrick trace \
+    --script scripts/dtrace/trace-epoll-pipe-loop-cost.d \
+    --trace-out /tmp/carrick-epoll-pipe-loop.trace -- \
+    run-elf --raw --fs host \
+    conformance-probes/target/aarch64-unknown-linux-musl/release/perf_epoll_pipe_loop
+  ```
+
+  Broad first versions of the trace script caused DTrace buffer drops because
+  they counted global syscall-entry probes. The current script keeps the
+  question scoped to Carrick epoll USDT probes and the host `kevent` syscall.
+
+  Successful traced guest output:
+
+  - `epoll_pipe_loop_p50_us=24.417`
+  - `epoll_pipe_loop_p95_us=51.792`
+  - `epoll_pipe_loop_min_us=13.084`
+  - `iters=2000`, `warmup=300`, `nproc=4`
+
+  Trace aggregation:
+
+  - `epoll_ctl op=1 count=1`
+  - `epoll_wait_fd=133`
+  - `epoll_result kind=1 count=133`
+  - `epoll_result kind=0 count=2300`
+  - `epoll_result wait_count=1 count=133`
+  - `epoll_result wait_count=0 count=2300`
+  - `kevent nchanges=4651`
+  - `kevent nevents=21509`
+  - `kevent wall_ns=121841380`
+  - `kevent ret=0 errno=0 count=2484`
+  - `kevent ret=1 errno=0 count=4614`
+
+  Interpretation: this workload does exercise host `kevent` heavily under
+  trace, but only `133` epoll waits hand off a host fd to the blocking waiter;
+  `2300` epoll results return immediately. The untraced workload already beats
+  Docker, so persistent epoll subscriptions are not the next significant
+  performance bet. The remaining `kevent` volume is generic wait/wake machinery
+  and requires a broader wait design before changing correctness-sensitive
+  close, signal, fork, or wake-pipe behavior.
 - [ ] Only then design persistent kqueue subscriptions with retained fd guards
   or generation tokens.
 - [ ] Validate signal, process-exit, fork, wake-pipe, and descriptor-close
