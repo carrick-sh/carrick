@@ -809,10 +809,10 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Raise `signum` against the guest itself (kill/tkill/tgkill self
-    /// target). If the signal is blocked it is held pending; otherwise it
-    /// is handed to the runtime's delivery slot. signum 0 is the null
-    /// probe and a no-op success.
+    /// Raise a process-directed `signum` against the guest itself
+    /// (`kill(getpid(), sig)`). If the signal is blocked it is held pending;
+    /// otherwise it is handed to the runtime's process-directed delivery slot.
+    /// signum 0 is the null probe and a no-op success.
     fn raise_self(&self, tid: crate::thread::ThreadId, signum: u64) -> DispatchOutcome {
         if signum == 0 {
             return DispatchOutcome::Returned { value: 0 };
@@ -826,6 +826,31 @@ impl SyscallDispatcher {
             self.mark_signal_pending(tid, s);
         } else {
             crate::host_signal::raise_for_self(s);
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// Raise a thread-directed signal at the calling thread (`tkill/tgkill`
+    /// self). This must use the per-thread pending slot: publishing into the
+    /// process-directed slot lets a sibling consume the signal, which breaks
+    /// Linux's `tgkill(getpid(), gettid(), sig)` contract.
+    fn raise_thread_directed_self(
+        &self,
+        tid: crate::thread::ThreadId,
+        signum: u64,
+    ) -> DispatchOutcome {
+        if signum == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let s = signum as i32;
+        if s == LINUX_SIGSTOP {
+            stop_self_by_signal(s);
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if self.signal_blocked(tid, s) {
+            self.mark_signal_pending(tid, s);
+        } else {
+            crate::host_signal::publish_pending_for(tid, s);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -1464,7 +1489,7 @@ impl SyscallDispatcher {
         let target = tid as crate::thread::ThreadId;
         if i64::from(t.tid) == tid {
             self.record_tkill_siginfo(t.tid, signum as i32);
-            return Some(self.raise_self(t.tid, signum));
+            return Some(self.raise_thread_directed_self(t.tid, signum));
         }
         if t.registry.is_live(target) {
             let signum_i32 = signum as i32;
