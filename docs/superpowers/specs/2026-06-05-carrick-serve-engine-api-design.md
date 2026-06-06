@@ -271,6 +271,8 @@ oracle (the `bollard`-driven harness pattern already in `conformance.rs`).
 isolation is proven (the server forks via the lifecycle path, not a tokio
 worker).
 
+**Landed:** `carrick serve --docker-api` answers `/_ping`/`/version`/`/info` and the container create/start/wait/delete loop over a unix socket, reusing the daemonless on-disk registry + detached-fork lifecycle (the server shells out to the `carrick` binary, never forking a guest in its tokio process). Proven by `crates/carrick-cli/tests/serve.rs` (8 tests, incl. `m0_full_lifecycle_echo_hi` driving the full loop via bollard with a real HVF guest). Network model (syscall-NAT / honest-IP), labels, split-stream logs, exec, events, and Ryuk remain for M1+.
+
 ### M1 — testcontainers core
 Container labels plumbed end-to-end; split-stream `/logs` with stdcopy framing;
 `/containers/json` + `/{id}/json` extended to the real schema (incl.
