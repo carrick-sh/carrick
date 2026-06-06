@@ -40,8 +40,8 @@ use crate::linux_abi::{LinuxTermios, LinuxWinsize};
 const COMMON_IFLAG_MASK: u32 = 0x0000_49FF;
 const LINUX_IXON: u32 = 0x0400;
 const LINUX_IXOFF: u32 = 0x1000;
-const DARWIN_IXON: u64 = 0x0200;
-const DARWIN_IXOFF: u64 = 0x0400;
+const DARWIN_IXON: carrick_portable::TcFlag = 0x0200;
+const DARWIN_IXOFF: carrick_portable::TcFlag = 0x0400;
 
 /// POSIX `c_oflag` bits with matching values: OPOST 0x0001,
 /// ONLCR 0x0004 (Linux) — Darwin uses 0x0002 for ONLCR. To keep
@@ -49,9 +49,9 @@ const DARWIN_IXOFF: u64 = 0x0400;
 /// translated explicitly below.
 const COMMON_OFLAG_MASK: u32 = 0x0000_0001;
 const LINUX_ONLCR: u32 = 0x0004;
-const DARWIN_ONLCR: u64 = 0x0002;
+const DARWIN_ONLCR: carrick_portable::TcFlag = 0x0002;
 const LINUX_OCRNL: u32 = 0x0008;
-const DARWIN_OCRNL: u64 = 0x0010;
+const DARWIN_OCRNL: carrick_portable::TcFlag = 0x0010;
 
 /// c_cflag field values. Linux and Darwin use DIFFERENT bit positions for the
 /// CSIZE/CSTOPB/parity group, so each is translated per-field (not masked 1:1).
@@ -67,16 +67,16 @@ const LINUX_PARENB: u32 = 0x0100;
 const LINUX_PARODD: u32 = 0x0200;
 const LINUX_HUPCL: u32 = 0x0400;
 const LINUX_CLOCAL: u32 = 0x0800;
-const DARWIN_CSIZE: u64 = 0x0300;
-const DARWIN_CS6: u64 = 0x0100;
-const DARWIN_CS7: u64 = 0x0200;
-const DARWIN_CS8: u64 = 0x0300;
-const DARWIN_CSTOPB: u64 = 0x0400;
-const DARWIN_CREAD: u64 = 0x0800;
-const DARWIN_PARENB: u64 = 0x1000;
-const DARWIN_PARODD: u64 = 0x2000;
-const DARWIN_HUPCL: u64 = 0x4000;
-const DARWIN_CLOCAL: u64 = 0x8000;
+const DARWIN_CSIZE: carrick_portable::TcFlag = 0x0300;
+const DARWIN_CS6: carrick_portable::TcFlag = 0x0100;
+const DARWIN_CS7: carrick_portable::TcFlag = 0x0200;
+const DARWIN_CS8: carrick_portable::TcFlag = 0x0300;
+const DARWIN_CSTOPB: carrick_portable::TcFlag = 0x0400;
+const DARWIN_CREAD: carrick_portable::TcFlag = 0x0800;
+const DARWIN_PARENB: carrick_portable::TcFlag = 0x1000;
+const DARWIN_PARODD: carrick_portable::TcFlag = 0x2000;
+const DARWIN_HUPCL: carrick_portable::TcFlag = 0x4000;
+const DARWIN_CLOCAL: carrick_portable::TcFlag = 0x8000;
 
 /// POSIX `c_lflag` bits ISIG 0x01, ICANON 0x02, ECHO 0x08, ECHOE
 /// 0x10, ECHOK 0x20, ECHONL 0x40, NOFLSH 0x80, TOSTOP 0x100,
@@ -93,18 +93,18 @@ const LINUX_LFLAG_TOSTOP: u32 = 0x0000_0100;
 const LINUX_LFLAG_IEXTEN: u32 = 0x0000_8000;
 
 // Darwin values from <sys/termios.h>.
-const DARWIN_LFLAG_ECHOKE: u64 = 0x0000_0001; // unused on linux side; ignore inbound
-const DARWIN_LFLAG_ECHOE: u64 = 0x0000_0002;
-const DARWIN_LFLAG_ECHOK: u64 = 0x0000_0004;
-const DARWIN_LFLAG_ECHO: u64 = 0x0000_0008;
-const DARWIN_LFLAG_ECHONL: u64 = 0x0000_0010;
-const DARWIN_LFLAG_ECHOPRT: u64 = 0x0000_0020;
-const DARWIN_LFLAG_ECHOCTL: u64 = 0x0000_0040;
-const DARWIN_LFLAG_ISIG: u64 = 0x0000_0080;
-const DARWIN_LFLAG_ICANON: u64 = 0x0000_0100;
-const DARWIN_LFLAG_IEXTEN: u64 = 0x0000_0400;
-const DARWIN_LFLAG_NOFLSH: u64 = 0x8000_0000;
-const DARWIN_LFLAG_TOSTOP: u64 = 0x0040_0000;
+const DARWIN_LFLAG_ECHOKE: carrick_portable::TcFlag = 0x0000_0001; // unused on linux side; ignore inbound
+const DARWIN_LFLAG_ECHOE: carrick_portable::TcFlag = 0x0000_0002;
+const DARWIN_LFLAG_ECHOK: carrick_portable::TcFlag = 0x0000_0004;
+const DARWIN_LFLAG_ECHO: carrick_portable::TcFlag = 0x0000_0008;
+const DARWIN_LFLAG_ECHONL: carrick_portable::TcFlag = 0x0000_0010;
+const DARWIN_LFLAG_ECHOPRT: carrick_portable::TcFlag = 0x0000_0020;
+const DARWIN_LFLAG_ECHOCTL: carrick_portable::TcFlag = 0x0000_0040;
+const DARWIN_LFLAG_ISIG: carrick_portable::TcFlag = 0x0000_0080;
+const DARWIN_LFLAG_ICANON: carrick_portable::TcFlag = 0x0000_0100;
+const DARWIN_LFLAG_IEXTEN: carrick_portable::TcFlag = 0x0000_0400;
+const DARWIN_LFLAG_NOFLSH: carrick_portable::TcFlag = 0x8000_0000;
+const DARWIN_LFLAG_TOSTOP: carrick_portable::TcFlag = 0x0040_0000;
 
 // VINTR/VQUIT/VERASE/etc indices differ between Linux and Darwin.
 // Linux ordering (asm-generic/termbits.h):
@@ -316,8 +316,8 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
 
 fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
     // Preserve any host-specific bits outside the masks we translate.
-    let preserved_iflag = d.c_iflag & !((COMMON_IFLAG_MASK as u64) | DARWIN_IXON | DARWIN_IXOFF);
-    let preserved_oflag = d.c_oflag & !((COMMON_OFLAG_MASK as u64) | DARWIN_ONLCR | DARWIN_OCRNL);
+    let preserved_iflag = d.c_iflag & !((COMMON_IFLAG_MASK as carrick_portable::TcFlag) | DARWIN_IXON | DARWIN_IXOFF);
+    let preserved_oflag = d.c_oflag & !((COMMON_OFLAG_MASK as carrick_portable::TcFlag) | DARWIN_ONLCR | DARWIN_OCRNL);
     let preserved_cflag = d.c_cflag
         & !(DARWIN_CSIZE
             | DARWIN_CSTOPB
@@ -337,7 +337,7 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
             | DARWIN_LFLAG_TOSTOP
             | DARWIN_LFLAG_IEXTEN);
 
-    let mut iflag = preserved_iflag | (l.c_iflag as u64 & COMMON_IFLAG_MASK as u64);
+    let mut iflag = preserved_iflag | (l.c_iflag as carrick_portable::TcFlag & COMMON_IFLAG_MASK as carrick_portable::TcFlag);
     if l.c_iflag & LINUX_IXON != 0 {
         iflag |= DARWIN_IXON;
     }
@@ -345,7 +345,7 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
         iflag |= DARWIN_IXOFF;
     }
 
-    let mut oflag = preserved_oflag | (l.c_oflag as u64 & COMMON_OFLAG_MASK as u64);
+    let mut oflag = preserved_oflag | (l.c_oflag as carrick_portable::TcFlag & COMMON_OFLAG_MASK as carrick_portable::TcFlag);
     if l.c_oflag & LINUX_ONLCR != 0 {
         oflag |= DARWIN_ONLCR;
     }
@@ -535,13 +535,13 @@ pub fn set_host_termios_tracking(fd: i32, linux: &LinuxTermios) -> bool {
 /// This is the get-half used by the stdio TIOCGPGRP passthrough.
 pub fn host_tty_tcgetpgrp(fd: i32) -> Result<i32, i32> {
     if !host_isatty(fd) {
-        return Err(unsafe { *libc::__error() });
+        return Err(carrick_portable::errno());
     }
     // SAFETY: fd has been confirmed to be a tty; tcgetpgrp returns a pid_t
     // (i32 on macOS) or -1 on error.
     let pgrp = unsafe { libc::tcgetpgrp(fd) };
     if pgrp < 0 {
-        Err(unsafe { *libc::__error() })
+        Err(carrick_portable::errno())
     } else {
         Ok(pgrp)
     }
@@ -551,13 +551,13 @@ pub fn host_tty_tcgetpgrp(fd: i32) -> Result<i32, i32> {
 /// failure. This backs stdio `TIOCGSID` for interactive `-t` pty runs.
 pub fn host_tty_tcgetsid(fd: i32) -> Result<i32, i32> {
     if !host_isatty(fd) {
-        return Err(unsafe { *libc::__error() });
+        return Err(carrick_portable::errno());
     }
     // SAFETY: fd has been confirmed to be a tty; tcgetsid returns a pid_t
     // (i32 on macOS) or -1 on error.
     let sid = unsafe { libc::tcgetsid(fd) };
     if sid < 0 {
-        Err(unsafe { *libc::__error() })
+        Err(carrick_portable::errno())
     } else {
         Ok(sid)
     }
@@ -606,7 +606,7 @@ pub fn host_tty_tcsetpgrp(fd: i32, pgrp: i32) -> Result<(), i32> {
     // tcsetpgrp validates both; we propagate any error.
     let r = unsafe { libc::tcsetpgrp(fd, pgrp) };
     if r < 0 {
-        Err(unsafe { *libc::__error() })
+        Err(carrick_portable::errno())
     } else {
         Ok(())
     }
@@ -619,7 +619,7 @@ pub fn host_tty_tcdrain(fd: i32) -> Result<(), i32> {
     // SAFETY: fd is a raw descriptor; tcdrain validates it (ENOTTY for non-tty).
     let r = unsafe { libc::tcdrain(fd) };
     if r < 0 {
-        Err(unsafe { *libc::__error() })
+        Err(carrick_portable::errno())
     } else {
         Ok(())
     }
@@ -633,7 +633,7 @@ pub fn host_tty_tcsendbreak(fd: i32, duration: i32) -> Result<(), i32> {
     // SAFETY: fd is a raw descriptor; tcsendbreak validates it.
     let r = unsafe { libc::tcsendbreak(fd, duration) };
     if r < 0 {
-        Err(unsafe { *libc::__error() })
+        Err(carrick_portable::errno())
     } else {
         Ok(())
     }
@@ -655,7 +655,7 @@ pub fn host_tty_tcflush(fd: i32, linux_queue: i64) -> Result<(), i32> {
     // SAFETY: fd is a raw descriptor; darwin_queue is a validated selector.
     let r = unsafe { libc::tcflush(fd, darwin_queue) };
     if r < 0 {
-        Err(unsafe { *libc::__error() })
+        Err(carrick_portable::errno())
     } else {
         Ok(())
     }
@@ -676,7 +676,7 @@ pub fn host_tty_tcflow(fd: i32, linux_action: i64) -> Result<(), i32> {
     // SAFETY: fd is a raw descriptor; darwin_action is a validated selector.
     let r = unsafe { libc::tcflow(fd, darwin_action) };
     if r < 0 {
-        Err(unsafe { *libc::__error() })
+        Err(carrick_portable::errno())
     } else {
         Ok(())
     }
@@ -764,9 +764,9 @@ mod tests {
         // SAFETY: zero-initialised target termios.
         let mut d2: libc::termios = unsafe { core::mem::zeroed() };
         linux_to_darwin_termios(&l, &mut d2);
-        assert!(d2.c_lflag as u64 & DARWIN_LFLAG_ICANON != 0);
-        assert!(d2.c_lflag as u64 & DARWIN_LFLAG_ECHO != 0);
-        assert!(d2.c_lflag as u64 & DARWIN_LFLAG_ISIG != 0);
+        assert!(d2.c_lflag as carrick_portable::TcFlag & DARWIN_LFLAG_ICANON != 0);
+        assert!(d2.c_lflag as carrick_portable::TcFlag & DARWIN_LFLAG_ECHO != 0);
+        assert!(d2.c_lflag as carrick_portable::TcFlag & DARWIN_LFLAG_ISIG != 0);
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
             t
         };
         assert!(
-            before.c_lflag as u64 & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO) != 0,
+            before.c_lflag as carrick_portable::TcFlag & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO) != 0,
             "slave starts cooked (ICANON|ECHO must be set)"
         );
         make_raw(slave).unwrap();
@@ -819,7 +819,7 @@ mod tests {
             t
         };
         assert_eq!(
-            raw.c_lflag as u64 & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO),
+            raw.c_lflag as carrick_portable::TcFlag & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO),
             0,
             "raw clears ICANON|ECHO"
         );
@@ -852,7 +852,7 @@ mod tests {
             t
         };
         assert_eq!(
-            raw.c_lflag as u64 & DARWIN_LFLAG_ICANON,
+            raw.c_lflag as carrick_portable::TcFlag & DARWIN_LFLAG_ICANON,
             0,
             "raw clears ICANON"
         );
@@ -866,8 +866,8 @@ mod tests {
             t
         };
         assert_eq!(
-            restored.c_lflag as u64 & DARWIN_LFLAG_ICANON,
-            cooked.c_lflag as u64 & DARWIN_LFLAG_ICANON,
+            restored.c_lflag as carrick_portable::TcFlag & DARWIN_LFLAG_ICANON,
+            cooked.c_lflag as carrick_portable::TcFlag & DARWIN_LFLAG_ICANON,
             "ICANON is restored to original value"
         );
 

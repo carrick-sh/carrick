@@ -2678,7 +2678,7 @@ fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) ->
     let clock = if realtime {
         libc::CLOCK_REALTIME
     } else {
-        libc::CLOCK_UPTIME_RAW
+        carrick_portable::CLOCK_UPTIME_RAW
     };
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: clock_gettime writes a timespec for a valid clock id.
@@ -3354,7 +3354,7 @@ fn monotonic_duration() -> Duration {
     // On macOS that is CLOCK_UPTIME_RAW (mach_absolute_time) — NOT macOS
     // CLOCK_MONOTONIC, which (unlike Linux) keeps counting through sleep and
     // therefore corresponds to Linux CLOCK_BOOTTIME (see `boottime_duration`).
-    host_clock_duration(libc::CLOCK_UPTIME_RAW).unwrap_or(Duration::ZERO)
+    host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW).unwrap_or(Duration::ZERO)
 }
 
 fn boottime_duration() -> Duration {
@@ -4409,7 +4409,7 @@ pub(crate) struct HostSyscallError {
 impl HostSyscallError {
     pub(crate) fn last() -> Self {
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        let raw_errno = unsafe { *libc::__error() };
+        let raw_errno = carrick_portable::errno();
         #[cfg(target_os = "linux")]
         let raw_errno = unsafe { *libc::__errno_location() };
         #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
@@ -5451,7 +5451,7 @@ mod overlay_dispatch_tests {
         use carrick_bsd::errno::linux_errno;
 
         unsafe {
-            *libc::__error() = libc::EINPROGRESS;
+            carrick_portable::set_errno(libc::EINPROGRESS);
         }
         let err = (-1i32).host_syscall_result().unwrap_err();
         assert_eq!(err.raw_errno(), libc::EINPROGRESS);
@@ -5459,7 +5459,7 @@ mod overlay_dispatch_tests {
         assert_ne!(err.linux_errno(), libc::EINPROGRESS);
 
         unsafe {
-            *libc::__error() = libc::EAGAIN;
+            carrick_portable::set_errno(libc::EAGAIN);
         }
         assert_eq!(
             (-1isize).host_syscall_result().unwrap_err().linux_errno(),
@@ -5467,7 +5467,7 @@ mod overlay_dispatch_tests {
         );
 
         unsafe {
-            *libc::__error() = libc::ECONNREFUSED;
+            carrick_portable::set_errno(libc::ECONNREFUSED);
         }
         assert_eq!(
             (-1i64).host_syscall_errno().unwrap_err(),

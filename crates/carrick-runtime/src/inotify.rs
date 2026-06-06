@@ -51,19 +51,19 @@ const LINUX_ENOSPC: i32 = 28;
 fn linux_mask_to_note(mask: u32) -> u32 {
     let mut note = 0;
     if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS | IN_CREATE | IN_DELETE) != 0 {
-        note |= libc::NOTE_WRITE | libc::NOTE_EXTEND;
+        note |= carrick_portable::NOTE_WRITE | carrick_portable::NOTE_EXTEND;
     }
     if mask & IN_ATTRIB != 0 {
-        note |= libc::NOTE_ATTRIB;
+        note |= carrick_portable::NOTE_ATTRIB;
     }
     if mask & (IN_DELETE_SELF | IN_DELETE) != 0 {
-        note |= libc::NOTE_DELETE;
+        note |= carrick_portable::NOTE_DELETE;
     }
     if mask & (IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO) != 0 {
-        note |= libc::NOTE_RENAME;
+        note |= carrick_portable::NOTE_RENAME;
     }
     if note == 0 {
-        note = libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB | libc::NOTE_DELETE;
+        note = carrick_portable::NOTE_WRITE | carrick_portable::NOTE_EXTEND | carrick_portable::NOTE_ATTRIB | carrick_portable::NOTE_DELETE;
     }
     note
 }
@@ -72,16 +72,16 @@ fn linux_mask_to_note(mask: u32) -> u32 {
 /// inotify event mask, restricted to the bits the watch actually requested.
 fn note_to_linux_mask(fflags: u32, requested: u32) -> u32 {
     let mut mask = 0;
-    if fflags & (libc::NOTE_WRITE | libc::NOTE_EXTEND) != 0 {
+    if fflags & (carrick_portable::NOTE_WRITE | carrick_portable::NOTE_EXTEND) != 0 {
         mask |= IN_MODIFY;
     }
-    if fflags & libc::NOTE_ATTRIB != 0 {
+    if fflags & carrick_portable::NOTE_ATTRIB != 0 {
         mask |= IN_ATTRIB;
     }
-    if fflags & libc::NOTE_DELETE != 0 {
+    if fflags & carrick_portable::NOTE_DELETE != 0 {
         mask |= IN_DELETE_SELF;
     }
-    if fflags & libc::NOTE_RENAME != 0 {
+    if fflags & carrick_portable::NOTE_RENAME != 0 {
         mask |= IN_MOVE_SELF;
     }
     // Only surface bits the caller asked for, except the self-events Linux
@@ -417,13 +417,13 @@ mod tests {
 
     #[test]
     fn mask_translation_round_trips_common_events() {
-        assert!(linux_mask_to_note(IN_MODIFY) & libc::NOTE_WRITE != 0);
-        assert!(linux_mask_to_note(IN_ATTRIB) & libc::NOTE_ATTRIB != 0);
-        assert_eq!(note_to_linux_mask(libc::NOTE_WRITE, IN_MODIFY), IN_MODIFY);
-        assert_eq!(note_to_linux_mask(libc::NOTE_ATTRIB, IN_MODIFY), 0);
+        assert!(linux_mask_to_note(IN_MODIFY) & carrick_portable::NOTE_WRITE != 0);
+        assert!(linux_mask_to_note(IN_ATTRIB) & carrick_portable::NOTE_ATTRIB != 0);
+        assert_eq!(note_to_linux_mask(carrick_portable::NOTE_WRITE, IN_MODIFY), IN_MODIFY);
+        assert_eq!(note_to_linux_mask(carrick_portable::NOTE_ATTRIB, IN_MODIFY), 0);
         // Self-delete is always surfaced even if not explicitly requested.
         assert_eq!(
-            note_to_linux_mask(libc::NOTE_DELETE, IN_MODIFY),
+            note_to_linux_mask(carrick_portable::NOTE_DELETE, IN_MODIFY),
             IN_DELETE_SELF
         );
     }

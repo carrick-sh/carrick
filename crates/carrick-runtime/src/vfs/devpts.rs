@@ -123,7 +123,7 @@ unsafe extern "C" {
 
 fn last_error() -> i32 {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    let raw = unsafe { *libc::__error() };
+    let raw = carrick_portable::errno();
     #[cfg(target_os = "linux")]
     let raw = unsafe { *libc::__errno_location() };
     #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]

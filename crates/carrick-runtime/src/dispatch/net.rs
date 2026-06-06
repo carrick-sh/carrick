@@ -1216,7 +1216,7 @@ impl SyscallDispatcher {
             // thread blocked on this kqueue's fd re-checks in-memory interests.
             let _ = kqueue.apply(&[crate::darwin_kqueue::Kevent::user(
                 0,
-                libc::EV_ADD | libc::EV_CLEAR,
+                carrick_portable::EV_ADD | carrick_portable::EV_CLEAR,
             )]);
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
@@ -1632,9 +1632,9 @@ impl SyscallDispatcher {
             for fd in &oneshot_fds {
                 if let Some(host_fd) = this.host_fd_for_poll(*fd) {
                     let _ = kq.apply(&[
-                        crate::darwin_kqueue::Kevent::read(host_fd, libc::EV_DELETE),
-                        crate::darwin_kqueue::Kevent::write(host_fd, libc::EV_DELETE),
-                        crate::darwin_kqueue::Kevent::oob(host_fd, libc::EV_DELETE),
+                        crate::darwin_kqueue::Kevent::read(host_fd, carrick_portable::EV_DELETE),
+                        crate::darwin_kqueue::Kevent::write(host_fd, carrick_portable::EV_DELETE),
+                        crate::darwin_kqueue::Kevent::oob(host_fd, carrick_portable::EV_DELETE),
                     ]);
                 }
             }

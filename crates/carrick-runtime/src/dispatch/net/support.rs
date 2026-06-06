@@ -120,11 +120,11 @@ pub(super) fn epoll_kq_add_changes(
 ) -> Vec<crate::darwin_kqueue::Kevent> {
     use crate::darwin_kqueue::Kevent;
     let edge: u16 = if events & LINUX_EPOLLET != 0 {
-        libc::EV_CLEAR
+        carrick_portable::EV_CLEAR
     } else {
         0
     };
-    let base = libc::EV_ADD | libc::EV_ENABLE | edge;
+    let base = carrick_portable::EV_ADD | carrick_portable::EV_ENABLE | edge;
     let filters = epoll_kq_filters(events);
     let mut changes = Vec::with_capacity(3);
     if filters.read {
@@ -149,13 +149,13 @@ fn epoll_kq_removed_filter_changes(
     let new = epoll_kq_filters(new_events);
     let mut changes = Vec::with_capacity(3);
     if old.read && !new.read {
-        changes.push(Kevent::read(host_fd, libc::EV_DELETE));
+        changes.push(Kevent::read(host_fd, carrick_portable::EV_DELETE));
     }
     if old.write && !new.write {
-        changes.push(Kevent::write(host_fd, libc::EV_DELETE));
+        changes.push(Kevent::write(host_fd, carrick_portable::EV_DELETE));
     }
     if old.priority && !new.priority {
-        changes.push(Kevent::oob(host_fd, libc::EV_DELETE));
+        changes.push(Kevent::oob(host_fd, carrick_portable::EV_DELETE));
     }
     changes
 }
@@ -177,9 +177,9 @@ pub(super) fn epoll_kq_delete_removed_filters(
 /// entry without `EV_RECEIPT`).
 pub(super) fn epoll_kq_delete(kqueue: &crate::darwin_kqueue::Kqueue, host_fd: i32) {
     use crate::darwin_kqueue::Kevent;
-    let _ = kqueue.apply(&[Kevent::read(host_fd, libc::EV_DELETE)]);
-    let _ = kqueue.apply(&[Kevent::write(host_fd, libc::EV_DELETE)]);
-    let _ = kqueue.apply(&[Kevent::oob(host_fd, libc::EV_DELETE)]);
+    let _ = kqueue.apply(&[Kevent::read(host_fd, carrick_portable::EV_DELETE)]);
+    let _ = kqueue.apply(&[Kevent::write(host_fd, carrick_portable::EV_DELETE)]);
+    let _ = kqueue.apply(&[Kevent::oob(host_fd, carrick_portable::EV_DELETE)]);
 }
 
 pub(super) fn clear_pending_epoll_ready(
@@ -233,12 +233,12 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
 /// filters (EVFILT_USER), which the caller ignores.
 pub(super) fn kevent_to_epoll(ev: crate::darwin_kqueue::Kevent) -> u32 {
     let mut events = 0u32;
-    if ev.flags() & libc::EV_ERROR != 0 {
+    if ev.flags() & carrick_portable::EV_ERROR != 0 {
         events |= LINUX_EPOLLERR;
     }
-    let eof = ev.flags() & libc::EV_EOF != 0;
+    let eof = ev.flags() & carrick_portable::EV_EOF != 0;
     match ev.filter() {
-        libc::EVFILT_READ => {
+        carrick_portable::EVFILT_READ => {
             events |= LINUX_EPOLLIN;
             if eof {
                 events |= LINUX_EPOLLRDHUP;
@@ -247,7 +247,7 @@ pub(super) fn kevent_to_epoll(ev: crate::darwin_kqueue::Kevent) -> u32 {
                 }
             }
         }
-        libc::EVFILT_WRITE => {
+        carrick_portable::EVFILT_WRITE => {
             events |= LINUX_EPOLLOUT;
             if eof {
                 events |= LINUX_EPOLLHUP;
@@ -549,7 +549,7 @@ fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
         // SAFETY: ifa_addr points at a sockaddr whose sa_family selects the type.
         let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
         match family {
-            libc::AF_LINK => {
+            carrick_portable::AF_LINK => {
                 // One interface record per AF_LINK entry (carries the index + hw).
                 // SAFETY: AF_LINK sockaddr is a sockaddr_dl.
                 let dl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
@@ -895,8 +895,8 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
             let host_opt = match optname {
                 LINUX_TCP_NODELAY => libc::TCP_NODELAY,
                 LINUX_TCP_MAXSEG => libc::TCP_MAXSEG,
-                LINUX_TCP_CORK => libc::TCP_NOPUSH,
-                LINUX_TCP_KEEPIDLE => libc::TCP_KEEPALIVE,
+                LINUX_TCP_CORK => carrick_portable::TCP_NOPUSH,
+                LINUX_TCP_KEEPIDLE => carrick_portable::TCP_KEEPALIVE,
                 LINUX_TCP_KEEPINTVL => libc::TCP_KEEPINTVL,
                 LINUX_TCP_KEEPCNT => libc::TCP_KEEPCNT,
                 _ => return None,
@@ -1914,7 +1914,7 @@ mod tests {
     #[test]
     fn epoll_kqueue_changes_include_oob_filter_for_priority_events() {
         let changes = epoll_kq_add_changes(42, 7, LINUX_EPOLLPRI);
-        assert!(changes.iter().any(|ev| ev.filter() == libc::EVFILT_READ));
+        assert!(changes.iter().any(|ev| ev.filter() == carrick_portable::EVFILT_READ));
         assert!(
             changes
                 .iter()
@@ -1931,12 +1931,12 @@ mod tests {
         let removed =
             epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN | LINUX_EPOLLOUT, LINUX_EPOLLOUT);
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].filter(), libc::EVFILT_READ);
+        assert_eq!(removed[0].filter(), carrick_portable::EVFILT_READ);
 
         let removed =
             epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN | LINUX_EPOLLOUT, LINUX_EPOLLIN);
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].filter(), libc::EVFILT_WRITE);
+        assert_eq!(removed[0].filter(), carrick_portable::EVFILT_WRITE);
 
         let removed = epoll_kq_removed_filter_changes(42, LINUX_EPOLLPRI, LINUX_EPOLLIN);
         assert_eq!(removed.len(), 1);

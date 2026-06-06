@@ -464,6 +464,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-portable"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-runtime"
 version = "0.1.0"
 dependencies = [
@@ -482,6 +489,7 @@ dependencies = [
  "carrick-image",
  "carrick-linux",
  "carrick-mem",
+ "carrick-portable",
  "carrick-spec",
  "carrick-test-support",
  "clap",
