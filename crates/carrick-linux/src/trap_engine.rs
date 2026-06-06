@@ -13,7 +13,7 @@ use crate::kvm::{KvmVcpu, KvmVm};
 pub struct KvmTrapEngine {
     _vm: KvmVm,
     vcpu: KvmVcpu,
-    _ram: GuestRam,
+    ram: GuestRam,
 }
 
 impl KvmTrapEngine {
@@ -29,15 +29,26 @@ impl KvmTrapEngine {
         Ok(Self {
             _vm: vm,
             vcpu,
-            _ram: ram,
+            ram,
         })
+    }
+
+    /// Read `len` bytes of live guest memory at guest-physical `gpa` (e.g. a
+    /// `write(2)` buffer the guest passed). Backed by the same host RAM the
+    /// vCPU sees, so guest writes are visible.
+    pub fn read_guest(&self, gpa: u64, len: usize) -> Result<Vec<u8>, TrapError> {
+        self.ram
+            .read(gpa, len)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 }
 
-// NOTE: KvmTrapEngine implements SyscallTrap only. The runtime's SplitView
-// (carrick-runtime runtime.rs:3701) pairs it with a GuestMemory over the same
-// host-backed guest RAM so the trapped write(1,"ok\n",3) reads its buffer
-// through the existing dispatch — proving the seam, not a toy path.
+// NOTE: KvmTrapEngine implements the `carrick-hal` SyscallTrap contract; the
+// MVP drives it from `crate::run_elf`, reading the trapped write(2) buffer out
+// of the live guest RAM via `read_guest`. Pairing it with the full
+// carrick-runtime dispatcher (SplitView @ runtime.rs:3701) is the full-Linux-
+// backend spec's job — that path needs ~200 macOS-isms ported off the dispatch
+// layer first (see run_elf.rs).
 
 impl SyscallTrap for KvmTrapEngine {
     fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {

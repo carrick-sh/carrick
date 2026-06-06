@@ -140,6 +140,22 @@ impl GuestRam {
         }
         Ok(())
     }
+
+    /// Read `len` bytes of LIVE guest memory at guest-physical `gpa` (so guest
+    /// writes are visible). `gpa` must lie within this backed window — e.g. a
+    /// `write(2)` buffer the guest passed in `x1`.
+    pub fn read(&self, gpa: u64, len: usize) -> Result<Vec<u8>, OsError> {
+        let off = gpa
+            .checked_sub(self.base)
+            .filter(|o| (*o as usize).saturating_add(len) <= self.len)
+            .ok_or_else(|| OsError::new(format!("kvm: read gpa 0x{gpa:x}+{len} out of guest RAM")))?;
+        let mut out = vec![0u8; len];
+        // SAFETY: bounds checked above; host points at `len` readable bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.host.add(off as usize), out.as_mut_ptr(), len);
+        }
+        Ok(out)
+    }
 }
 
 /// Result of bring-up: a VM + a vCPU initialised to the EL1 trampoline, ready
