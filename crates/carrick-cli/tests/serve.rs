@@ -37,7 +37,13 @@ fn ensure_codesigned(bin: &std::path::Path) {
     static SIGNED: Once = Once::new();
     SIGNED.call_once(|| {
         let out = std::process::Command::new("codesign")
-            .args(["--force", "--sign", "-", "--entitlements", "scripts/entitlements.plist"])
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--entitlements",
+                "scripts/entitlements.plist",
+            ])
             .arg(bin)
             .output()
             .unwrap();
@@ -78,12 +84,8 @@ fn spawn_server() -> (ServerGuard, String, tempfile::TempDir) {
 #[tokio::test]
 async fn ping_returns_ok() {
     let (_server, sock, _dir) = spawn_server();
-    let docker = bollard::Docker::connect_with_unix(
-        &sock,
-        5,
-        bollard::API_DEFAULT_VERSION,
-    )
-    .unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 5, bollard::API_DEFAULT_VERSION).unwrap();
     let pong = docker.ping().await.unwrap();
     assert_eq!(pong, "OK");
 }
@@ -91,9 +93,8 @@ async fn ping_returns_ok() {
 #[tokio::test]
 async fn version_reports_carrick() {
     let (_server, sock, _dir) = spawn_server();
-    let docker = bollard::Docker::connect_with_unix(
-        &sock, 5, bollard::API_DEFAULT_VERSION,
-    ).unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 5, bollard::API_DEFAULT_VERSION).unwrap();
     let v = docker.version().await.unwrap();
     assert_eq!(v.os.as_deref(), Some("linux"));
     assert!(v.api_version.is_some());
@@ -110,9 +111,8 @@ async fn create_returns_id() {
         .args(["rm", "-f", "m0create"])
         .output();
     let (_server, sock, _dir) = spawn_server();
-    let docker = bollard::Docker::connect_with_unix(
-        &sock, 5, bollard::API_DEFAULT_VERSION,
-    ).unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 5, bollard::API_DEFAULT_VERSION).unwrap();
     // bollard 0.18 names the create body `container::Config<T>` (Docker's
     // ContainerCreate request body); there is no `ContainerCreateBody` export.
     let body = bollard::container::Config {
@@ -137,110 +137,170 @@ async fn create_returns_id() {
 #[tokio::test]
 async fn create_then_start_runs() {
     let (_server, sock, _dir) = spawn_server();
-    let docker = bollard::Docker::connect_with_unix(
-        &sock, 30, bollard::API_DEFAULT_VERSION,
-    ).unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
     // idempotency: the registry is persistent and DELETE isn't wired until Task 8.
     let _ = docker.remove_container("m0start", None).await;
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
-        .args(["rm", "-f", "m0start"]).output();
+        .args(["rm", "-f", "m0start"])
+        .output();
     let body = bollard::container::Config {
         image: Some("ubuntu:24.04".to_string()),
         cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
         ..Default::default()
     };
-    docker.create_container(
-        Some(bollard::container::CreateContainerOptions { name: "m0start".to_string(), ..Default::default() }),
-        body,
-    ).await.unwrap();
-    docker.start_container("m0start", None::<bollard::container::StartContainerOptions<String>>)
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0start".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            "m0start",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
         .await
         .unwrap();
     // best-effort cleanup (container runs `echo hi` and exits quickly)
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
-        .args(["rm", "-f", "m0start"]).output();
+        .args(["rm", "-f", "m0start"])
+        .output();
 }
 
 #[tokio::test]
 async fn wait_returns_exit_code() {
     let (_server, sock, _dir) = spawn_server();
-    let docker = bollard::Docker::connect_with_unix(
-        &sock, 30, bollard::API_DEFAULT_VERSION,
-    ).unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
-        .args(["rm", "-f", "m0wait"]).output();
+        .args(["rm", "-f", "m0wait"])
+        .output();
     let body = bollard::container::Config {
         image: Some("ubuntu:24.04".to_string()),
         cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
         ..Default::default()
     };
-    docker.create_container(
-        Some(bollard::container::CreateContainerOptions { name: "m0wait".to_string(), ..Default::default() }),
-        body,
-    ).await.unwrap();
-    docker.start_container("m0wait", None::<bollard::container::StartContainerOptions<String>>).await.unwrap();
-    let mut waits = docker.wait_container("m0wait", None::<bollard::container::WaitContainerOptions<String>>);
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0wait".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            "m0wait",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+    let mut waits = docker.wait_container(
+        "m0wait",
+        None::<bollard::container::WaitContainerOptions<String>>,
+    );
     let result = waits.next().await.unwrap().unwrap();
     assert_eq!(result.status_code, 0);
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
-        .args(["rm", "-f", "m0wait"]).output();
+        .args(["rm", "-f", "m0wait"])
+        .output();
 }
 
 #[tokio::test]
 async fn delete_removes_container() {
     let (_server, sock, _dir) = spawn_server();
-    let docker = bollard::Docker::connect_with_unix(
-        &sock, 30, bollard::API_DEFAULT_VERSION,
-    ).unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
-        .args(["rm", "-f", "m0del"]).output();
+        .args(["rm", "-f", "m0del"])
+        .output();
     let body = bollard::container::Config {
         image: Some("ubuntu:24.04".to_string()),
         cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
         ..Default::default()
     };
-    docker.create_container(
-        Some(bollard::container::CreateContainerOptions { name: "m0del".to_string(), ..Default::default() }),
-        body,
-    ).await.unwrap();
-    docker.remove_container(
-        "m0del",
-        Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
-    ).await.unwrap();
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0del".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    docker
+        .remove_container(
+            "m0del",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn m0_full_lifecycle_echo_hi() {
     let (_server, sock, _dir) = spawn_server();
-    let docker = bollard::Docker::connect_with_unix(
-        &sock, 60, bollard::API_DEFAULT_VERSION,
-    ).unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 60, bollard::API_DEFAULT_VERSION).unwrap();
     assert_eq!(docker.ping().await.unwrap(), "OK");
 
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
-        .args(["rm", "-f", "m0e2e"]).output();
+        .args(["rm", "-f", "m0e2e"])
+        .output();
 
     let body = bollard::container::Config {
         image: Some("ubuntu:24.04".to_string()),
         cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
         ..Default::default()
     };
-    let created = docker.create_container(
-        Some(bollard::container::CreateContainerOptions { name: "m0e2e".to_string(), ..Default::default() }),
-        body,
-    ).await.unwrap();
+    let created = docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0e2e".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
     assert_eq!(created.id.len(), 64);
 
-    docker.start_container("m0e2e", None::<bollard::container::StartContainerOptions<String>>).await.unwrap();
+    docker
+        .start_container(
+            "m0e2e",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
 
-    let mut waits = docker.wait_container("m0e2e", None::<bollard::container::WaitContainerOptions<String>>);
+    let mut waits = docker.wait_container(
+        "m0e2e",
+        None::<bollard::container::WaitContainerOptions<String>>,
+    );
     let result = waits.next().await.unwrap().unwrap();
     assert_eq!(result.status_code, 0);
 
-    docker.remove_container(
-        "m0e2e",
-        Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
-    ).await.unwrap();
+    docker
+        .remove_container(
+            "m0e2e",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 }
 
 /// Build a tiny gzipped-tar build context (the legacy `POST /build` request
@@ -254,7 +314,9 @@ fn gzip_tar_context(dockerfile: &str) -> Vec<u8> {
         header.set_size(bytes.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        builder.append_data(&mut header, "Dockerfile", bytes).unwrap();
+        builder
+            .append_data(&mut header, "Dockerfile", bytes)
+            .unwrap();
         builder.finish().unwrap();
     }
     let mut gz = Vec::new();
@@ -285,13 +347,11 @@ fn gzip_tar_context(dockerfile: &str) -> Vec<u8> {
 async fn streams_build_over_socket() {
     let (_server, sock, _dir) = spawn_server();
     // Generous timeout: the build pulls images and runs kaniko as a guest.
-    let docker = bollard::Docker::connect_with_unix(
-        &sock, 600, bollard::API_DEFAULT_VERSION,
-    ).unwrap();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 600, bollard::API_DEFAULT_VERSION).unwrap();
 
-    let context = gzip_tar_context(
-        "FROM alpine:3.20\nRUN echo hi > /b.txt\nCMD [\"cat\",\"/b.txt\"]\n",
-    );
+    let context =
+        gzip_tar_context("FROM alpine:3.20\nRUN echo hi > /b.txt\nCMD [\"cat\",\"/b.txt\"]\n");
 
     let options = bollard::image::BuildImageOptions {
         dockerfile: "Dockerfile".to_string(),
@@ -317,6 +377,12 @@ async fn streams_build_over_socket() {
             saw_success = true;
         }
     }
-    assert!(saw_stream, "expected at least one stream frame from the build");
-    assert!(saw_success, "expected a success (aux ID / Successfully built) frame");
+    assert!(
+        saw_stream,
+        "expected at least one stream frame from the build"
+    );
+    assert!(
+        saw_success,
+        "expected a success (aux ID / Successfully built) frame"
+    );
 }
