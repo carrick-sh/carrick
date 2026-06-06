@@ -219,6 +219,18 @@ file.
   `5a6be550d18c4db94f0986271c9d063cfde2a1be`: Carrick p50 `20539.542` us,
   p95 `24166.958` us, noisy; Docker p50 `232.042` us, p95 `408.833` us,
   noisy.
+- 2026-06-06: Attributed the remaining metadata/access counts by correlating
+  Carrick guest syscall USDT with host `syscall:::entry`. Guest `faccessat`
+  accounted for `openat=145`, `close=145`, `fcntl=144`, and `fstatat64=288`
+  before the access slice. Landed a conservative root-only absolute `F_OK`
+  fast path before `resolve_at_path`: `AT_FDCWD`, mode `F_OK`, no flags, real
+  uid `0`, no `/proc`/`/sys`, no VFS mount, no `..`, and only when the existing
+  host stat cache can prove the path. Post-change attribution removed the
+  `faccessat` `openat`/`close`/`fcntl` bucket and reduced its `fstatat64` count
+  to `144`. Broad host counts are now `openat=1525`, `close=1514`, `fcntl=767`,
+  and `fstatat64=1029`. Filtered perf rows at
+  `7149ae395cd7cb307d0f6eeebd2fea5712dcf9f5`: Carrick p50 `16837.375` us,
+  p95 `17449.375` us; Docker p50 `339.959` us, p95 `343.792` us.
 
 ## Ranked Opportunities
 
@@ -266,9 +278,13 @@ Remaining VFS questions:
 
 - [x] Re-check path/open setup cost in `large_meta`, since Carrick remains about
   `46.84x` slower after payload-copy fixes.
-- [ ] Break down the remaining `large_meta` `fstatat64`, `flistxattr`, and
+- [x] Break down the remaining `large_meta` `fstatat64`, `flistxattr`, and
   `fgetxattr` counts by guest syscall class before choosing the next VFS
   change.
+- [ ] Decide whether the remaining guest-`openat` host work (`openat=1465`,
+  `close=1309`, `fcntl=724`, `fstatat64=582`, and `flistxattr`/`fgetxattr=432`
+  in the attribution run) can be reduced without weakening symlink,
+  containment, or fd-sharing semantics.
 - [ ] Identify whether the remaining `overlay_small_updates` gap is dominated by
   traps, VFS lookup/setup, memory-backend range maintenance, or host file setup.
 - [ ] Add byte-copy/allocation counters for the remaining VFS hot paths where
@@ -577,5 +593,7 @@ Profile remaining VFS metadata/open setup cost.
   xattrs/stat cache misses, or open/access setup.
 - [x] Implement only a narrow VFS change if count evidence shows removable
   repeated work.
-- [ ] Attribute remaining stat/access xattr and `fstatat64` counts by guest
+- [x] Attribute remaining stat/access xattr and `fstatat64` counts by guest
   syscall class before another VFS runtime change.
+- [ ] Decide whether the guest-`openat` path has another safe collapse point or
+  whether the next measured opportunity should move to `overlay_small_updates`.
