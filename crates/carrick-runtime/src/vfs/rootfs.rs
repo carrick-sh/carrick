@@ -38,7 +38,7 @@
 //! a correctness fork; the public fields and `open_for_dispatch` are the
 //! contract the dispatcher relies on.
 
-use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
+use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry, OverlayEntryKind};
 use crate::linux_abi::{
     LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
     LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
@@ -172,21 +172,26 @@ impl RootFsVfs {
         // Overlay-first: tombstone short-circuits to ENOENT for the
         // non-create case (with O_CREAT we treat it as "no file in
         // the way" and let the caller create).
-        let overlay_view = self.overlay.lookup(path);
-        let overlay_deleted = matches!(overlay_view, Some(OverlayEntry::Deleted));
-        match overlay_view {
-            Some(OverlayEntry::File(mut contents)) => {
+        let overlay_kind = self.overlay.lookup_kind(path);
+        let overlay_deleted = matches!(overlay_kind, Some(OverlayEntryKind::Deleted));
+        match overlay_kind {
+            Some(OverlayEntryKind::File) => {
                 if want_create && want_excl {
                     return Err(LINUX_EEXIST);
                 }
-                let mode = self.overlay.metadata(path).map(|m| m.mode).unwrap_or(0o644);
+                let backend_md = self.overlay.metadata(path);
+                let mode = backend_md.as_ref().map(|m| m.mode).unwrap_or(0o644);
                 // Disk-backed overlay (--fs host): hand back a REAL host
                 // fd so reads/writes share the kernel file across fork.
                 if let Some(host_fd) =
                     self.overlay
                         .open_raw_fd(path, writable_request, false, want_trunc)
                 {
-                    let size = self.overlay.metadata(path).map(|m| m.size).unwrap_or(0);
+                    let size = if want_trunc {
+                        0
+                    } else {
+                        backend_md.as_ref().map(|m| m.size).unwrap_or(0)
+                    };
                     let metadata = RootFsMetadata {
                         path: std::path::Path::new(path).to_path_buf(),
                         kind: RootFsEntryKind::File,
@@ -206,13 +211,19 @@ impl RootFsVfs {
                 // not the lookup hack's target-string). Detect: this path is a
                 // symlink AND following it finds no target.
                 if matches!(
-                    self.overlay.metadata(path).map(|m| m.kind),
+                    backend_md.as_ref().map(|m| m.kind),
                     Some(RootFsEntryKind::Symlink)
                 ) && self.overlay.real_stat(path, true).is_none()
                 {
                     return Err(LINUX_ENOENT);
                 }
                 // In-memory overlay (MemoryBackend): cached-bytes File.
+                let mut contents = match self.overlay.lookup(path) {
+                    Some(OverlayEntry::File(contents)) => contents,
+                    Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
+                    Some(OverlayEntry::Dir) => return Err(LINUX_EISDIR),
+                    None => return Err(LINUX_ENOENT),
+                };
                 if want_trunc {
                     contents.clear();
                     self.overlay
@@ -231,7 +242,7 @@ impl RootFsVfs {
                     writable: writable_request,
                 });
             }
-            Some(OverlayEntry::Dir) => {
+            Some(OverlayEntryKind::Dir) => {
                 // O_EXCL "fail if it already exists" takes priority over EISDIR
                 // (Linux open(2)): tempfile.mkstemp relies on EEXIST to retry the
                 // next candidate name when it collides with an existing dir.
@@ -255,6 +266,7 @@ impl RootFsVfs {
                 };
                 return Ok(OpenDispatchResult::Directory { metadata, entries });
             }
+            Some(OverlayEntryKind::Deleted) => {}
             _ => {}
         }
         // Rootfs lookup. Tombstoned paths are treated as not-found
@@ -531,7 +543,7 @@ impl Vfs for RootFsVfs {
                 mtime_nanos: 0,
             });
         }
-        if let Some(entry) = self.overlay.lookup(path) {
+        if let Some(entry) = self.overlay.lookup_kind(path) {
             // Prefer the backend's own metadata (the host backend
             // reads real on-disk mode bits, so executables keep their
             // 0o111). Fall back to defaults only if the backend can't
@@ -559,8 +571,8 @@ impl Vfs for RootFsVfs {
                 });
             }
             match entry {
-                OverlayEntry::Deleted => return Err(LINUX_ENOENT),
-                OverlayEntry::Dir => {
+                OverlayEntryKind::Deleted => return Err(LINUX_ENOENT),
+                OverlayEntryKind::Dir => {
                     return Ok(Metadata {
                         kind: EntryKind::Directory,
                         mode: backend_md.map(|m| m.mode).unwrap_or(0o755),
@@ -571,11 +583,19 @@ impl Vfs for RootFsVfs {
                         mtime_nanos: 0,
                     });
                 }
-                OverlayEntry::File(bytes) => {
+                OverlayEntryKind::File => {
+                    let size = backend_md
+                        .as_ref()
+                        .map(|m| m.size as u64)
+                        .or_else(|| match self.overlay.lookup(path) {
+                            Some(OverlayEntry::File(bytes)) => Some(bytes.len() as u64),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
                     return Ok(Metadata {
                         kind: EntryKind::File,
                         mode: backend_md.map(|m| m.mode).unwrap_or(0o644),
-                        size: bytes.len() as u64,
+                        size,
                         uid: 0,
                         gid: 0,
                         mtime_secs: 0,
@@ -864,7 +884,11 @@ impl Vfs for RootFsVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs_backend::{BackendError, OverlayEntryKind};
     use crate::rootfs::LayerSource;
+    use std::os::fd::IntoRawFd;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tar::{Builder, EntryType, Header};
 
     fn rootfs_with_files() -> RootFs {
@@ -897,6 +921,109 @@ mod tests {
         RootFs::from_layers(std::iter::once(LayerSource::Tar(buf))).unwrap()
     }
 
+    struct MetadataOnlyBackend {
+        host_path: std::path::PathBuf,
+        lookup_payload_reads: Arc<AtomicUsize>,
+        size: usize,
+    }
+
+    impl MetadataOnlyBackend {
+        fn new(size: usize) -> (Self, Arc<AtomicUsize>) {
+            let host_path = std::env::temp_dir().join(format!(
+                "carrick-rootfs-metadata-only-{}-{size}",
+                std::process::id()
+            ));
+            std::fs::write(&host_path, b"x").unwrap();
+            let lookup_payload_reads = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    host_path,
+                    lookup_payload_reads: Arc::clone(&lookup_payload_reads),
+                    size,
+                },
+                lookup_payload_reads,
+            )
+        }
+    }
+
+    impl Drop for MetadataOnlyBackend {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.host_path);
+        }
+    }
+
+    impl FsBackend for MetadataOnlyBackend {
+        fn lookup(&self, _path: &str) -> Option<OverlayEntry> {
+            self.lookup_payload_reads.fetch_add(1, Ordering::SeqCst);
+            Some(OverlayEntry::File(b"payload".to_vec()))
+        }
+
+        fn lookup_kind(&self, _path: &str) -> Option<OverlayEntryKind> {
+            Some(OverlayEntryKind::File)
+        }
+
+        fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
+            Some(RootFsMetadata {
+                path: std::path::Path::new(path).to_path_buf(),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: self.size,
+            })
+        }
+
+        fn file_contents(&self, _path: &str) -> Option<Vec<u8>> {
+            self.lookup_payload_reads.fetch_add(1, Ordering::SeqCst);
+            Some(b"payload".to_vec())
+        }
+
+        fn make_dir(&self, _path: &str) -> Result<(), BackendError> {
+            Err(BackendError::Unsupported)
+        }
+
+        fn create_file(&self, _path: &str) -> Result<(), BackendError> {
+            Err(BackendError::Unsupported)
+        }
+
+        fn set_file_contents(&self, _path: &str, _contents: Vec<u8>) -> Result<(), BackendError> {
+            Err(BackendError::Unsupported)
+        }
+
+        fn remove_entry(&self, _path: &str) -> bool {
+            false
+        }
+
+        fn mark_deleted(&self, _path: &str) -> Result<(), BackendError> {
+            Err(BackendError::Unsupported)
+        }
+
+        fn child_names(&self, _dir: &str) -> Vec<(String, RootFsEntryKind)> {
+            Vec::new()
+        }
+
+        fn deleted_child_names(&self, _dir: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn rename_overlay_entry(&self, _from: &str, _to: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        fn open_raw_fd(
+            &self,
+            _path: &str,
+            write: bool,
+            _create: bool,
+            _trunc: bool,
+        ) -> Option<i32> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            if write {
+                opts.write(true);
+            }
+            opts.open(&self.host_path).ok().map(IntoRawFd::into_raw_fd)
+        }
+    }
+
     #[test]
     fn lookup_rootfs_file() {
         let v = RootFsVfs::with_rootfs(rootfs_with_files());
@@ -916,6 +1043,25 @@ mod tests {
     fn lookup_missing_is_enoent() {
         let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert_eq!(v.lookup("/no-such"), Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn lookup_overlay_file_uses_metadata_without_loading_contents() {
+        let (backend, payload_reads) = MetadataOnlyBackend::new(4 * 1024 * 1024);
+        let v = RootFsVfs {
+            rootfs: None,
+            overlay: Box::new(backend),
+        };
+
+        let md = v.lookup("/large.bin").unwrap();
+
+        assert_eq!(md.kind, EntryKind::File);
+        assert_eq!(
+            payload_reads.load(Ordering::SeqCst),
+            0,
+            "metadata lookup should not load file contents"
+        );
+        assert_eq!(md.size, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -1145,6 +1291,36 @@ mod tests {
             .open_for_dispatch("/etc/new", true, false, false, true)
             .unwrap();
         assert!(matches!(result, OpenDispatchResult::NotFoundCreate));
+    }
+
+    #[test]
+    fn open_for_dispatch_host_file_uses_raw_fd_without_loading_contents() {
+        let (backend, payload_reads) = MetadataOnlyBackend::new(4 * 1024 * 1024);
+        let v = RootFsVfs {
+            rootfs: None,
+            overlay: Box::new(backend),
+        };
+
+        let result = v
+            .open_for_dispatch("/large.bin", false, false, false, false)
+            .unwrap();
+
+        match result {
+            OpenDispatchResult::HostFile {
+                host_fd, metadata, ..
+            } => {
+                unsafe {
+                    libc::close(host_fd);
+                }
+                assert_eq!(metadata.size, 4 * 1024 * 1024);
+            }
+            _ => panic!("expected host-backed file"),
+        }
+        assert_eq!(
+            payload_reads.load(Ordering::SeqCst),
+            0,
+            "host-backed open should not load file contents before returning the raw fd"
+        );
     }
 
     #[test]
