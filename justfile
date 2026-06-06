@@ -84,11 +84,63 @@ sign:
 bench PROFILE="quick":
     ./scripts/measure-perf.sh {{PROFILE}}
 
-# Cross-compile check for platform-linux target (L1 check).
+# --- Linux / KVM aarch64 MVP (spec: hal-seam-kvm-mvp) ----------------------
+
+# Build the freestanding hello-aarch64 KVM-MVP fixture (Mac-native: clang + rust-lld).
+build-fixture:
+    ./crates/carrick-linux/fixtures/hello-aarch64/build.sh
+
+# L1 cross-check: our owned crates compile for aarch64-linux AND the
+# platform-linux closure links no HVF/applevisor (the C4-decouple proof).
+# Runs on the Mac (no nested VM needed) — matches the CI cross-check job.
 check-linux:
     cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-linux
-    ./scripts/assert-platform-linux-closure.sh
+    ./scripts/closure-assert-no-hvf.sh
 
 # Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
 closure-linux:
-    ./scripts/assert-platform-linux-closure.sh
+    ./scripts/closure-assert-no-hvf.sh
+
+# LOCAL: native release build of carrick-linux INSIDE the nested-KVM Linux VM.
+# The full CLI can't cross-compile from macOS (ring/oci-client need a C cross
+# toolchain), so the real Linux binary is built natively here.
+build-linux:
+    cargo build --release --no-default-features --features platform-linux \
+        -p carrick-linux
+
+# LOCAL (L2): run the freestanding hello-aarch64 under carrick-linux on real
+# /dev/kvm (M3-nested HVF lane) and diff stdout + exit code against the native
+# oracle. This is the MVP success gate. Requires `just build-linux` first and
+# /dev/kvm present (i.e. run inside the nested-KVM Linux VM).
+kvm-smoke: build-linux build-fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fix=crates/carrick-linux/fixtures/hello-aarch64
+    bin=target/release/carrick-linux
+    got="$("$bin" run-elf "$fix/hello-aarch64")"
+    code=$?
+    if [[ "$got" != "$(cat "$fix/oracle.expected")" ]]; then
+        echo "FAIL: output mismatch" >&2
+        echo "  expected: $(cat "$fix/oracle.expected" | xxd)" >&2
+        echo "  got:      $(printf '%s' "$got" | xxd)" >&2
+        exit 1
+    fi
+    if [[ "$code" -ne 0 ]]; then
+        echo "FAIL: exit code $code (expected 0)" >&2
+        exit 1
+    fi
+    echo "OK: hello-aarch64 printed 'ok' and exited 0 under KVM."
+
+# LOCAL, NON-GATING stretch: run a musl-static binary under carrick-linux and
+# RECORD the first syscall it dies on (scopes the full-Linux-backend spec).
+# Never a pass/fail — logs the failing __NR_* and always exits 0.
+musl-record BIN:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    bin=target/release/carrick-linux
+    echo "musl-record: running {{BIN}} under carrick-linux (non-gating)..."
+    RUST_LOG=carrick_linux=debug "$bin" run-elf "{{BIN}}" || true
+    echo "musl-record: see the last UnsupportedPlatform / ENOSYS syscall above."
+    echo "musl-record: this is informational only — recorded, never gating."
+    exit 0
+
