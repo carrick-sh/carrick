@@ -6,7 +6,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ## CPython
 
-438 suites — 425 MATCH · 13 NEW
+438 suites — 427 MATCH · 11 NEW
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
@@ -81,7 +81,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-compiler_assemble` | full | 1/1 | 1/1 | MATCH | 0 |
 | `cpython-compiler_codegen` | full | 2/2 | 2/2 | MATCH | 0 |
 | `cpython-complex` | full | 35/35 | 35/35 | MATCH | 0 |
-| `cpython-concurrent_futures` | full | CRASH | 20/20 | NEW | 0 |
+| `cpython-concurrent_futures` | full | 20/20 | 20/20 | MATCH | 0 |
 | `cpython-configparser` | full | 340/340 | 340/340 | MATCH | 0 |
 | `cpython-contains` | full | 4/4 | 4/4 | MATCH | 0 |
 | `cpython-context` | full | 43/43 | 43/43 | MATCH | 0 |
@@ -235,10 +235,10 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-monitoring` | full | 65/65 | 65/65 | MATCH | 0 |
 | `cpython-msilib` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `cpython-multibytecodec` | full | 35/35 | 35/35 | MATCH | 0 |
-| `cpython-multiprocessing_fork` | full | 300/318 | 317/317 | NEW | 0 known · 18 NEW |
-| `cpython-multiprocessing_forkserver` | full | 306/324 | 323/323 | NEW | 0 known · 18 NEW |
+| `cpython-multiprocessing_fork` | full | 317/317 | 317/317 | MATCH | 0 |
+| `cpython-multiprocessing_forkserver` | full | CRASH | 323/323 | NEW | 0 |
 | `cpython-multiprocessing_main_handling` | full | 39/39 | 39/39 | MATCH | 0 |
-| `cpython-multiprocessing_spawn` | full | 320/324 | 323/323 | NEW | 0 known · 4 NEW |
+| `cpython-multiprocessing_spawn` | full | CRASH | 323/323 | NEW | 0 |
 | `cpython-named_expressions` | full | 73/73 | 73/73 | MATCH | 0 |
 | `cpython-netrc` | full | 22/22 | 22/22 | MATCH | 0 |
 | `cpython-nis` | full | SUCCESS | SUCCESS | MATCH | 0 |
@@ -316,7 +316,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-shelve` | full | 350/350 | 350/350 | MATCH | 0 |
 | `cpython-shlex` | full | 5/5 | 5/5 | MATCH | 0 |
 | `cpython-shutil` | full | 150/151 | 148/148 | NEW | 0 known · 3 NEW |
-| `cpython-signal` | full | 49/49 | 49/49 | MATCH | 0 |
+| `cpython-signal` | full | 48/49 | 49/49 | NEW | 0 known · 1 NEW |
 | `cpython-site` | full | 29/29 | 29/29 | MATCH | 0 |
 | `cpython-slice` | full | 11/11 | 11/11 | MATCH | 0 |
 | `cpython-smtplib` | full | 82/82 | 82/82 | MATCH | 0 |
@@ -328,7 +328,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-source_encoding` | full | 43/43 | 43/43 | MATCH | 0 |
 | `cpython-spwd` | full | 2/2 | 2/2 | MATCH | 0 |
 | `cpython-sqlite3` | full | 436/436 | 436/436 | MATCH | 0 |
-| `cpython-ssl` | full | 95/97 | 99/99 | NEW | 0 known · 4 NEW |
+| `cpython-ssl` | full | 94/96 | 99/99 | NEW | 0 known · 5 NEW |
 | `cpython-stable_abi_ctypes` | full | 2/2 | 2/2 | MATCH | 0 |
 | `cpython-startfile` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `cpython-stat` | full | 14/14 | 14/14 | MATCH | 0 |
@@ -342,7 +342,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-struct` | full | 38/38 | 38/38 | MATCH | 0 |
 | `cpython-structseq` | full | 18/18 | 18/18 | MATCH | 0 |
 | `cpython-subclassinit` | full | 17/17 | 17/17 | MATCH | 0 |
-| `cpython-subprocess` | smoke | 280/280 | 278/278 | NEW | 0 known · 2 NEW |
+| `cpython-subprocess` | smoke | 280/280 | 280/280 | MATCH | 0 |
 | `cpython-sunau` | full | 105/105 | 105/105 | MATCH | 0 |
 | `cpython-sundry` | full | 1/1 | 1/1 | MATCH | 0 |
 | `cpython-super` | full | 34/34 | 34/34 | MATCH | 0 |
@@ -355,7 +355,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-sysconfig` | full | 26/26 | 26/26 | MATCH | 0 |
 | `cpython-syslog` | full | 11/11 | 11/11 | MATCH | 0 |
 | `cpython-tabnanny` | full | SUCCESS | SUCCESS | MATCH | 0 |
-| `cpython-tarfile` | full | 608/609 | 609/609 | NEW | 0 known · 1 NEW |
+| `cpython-tarfile` | full | CRASH | 609/609 | NEW | 0 |
 | `cpython-tcl` | full | 44/44 | 44/44 | MATCH | 0 |
 | `cpython-telnetlib` | full | 15/15 | 15/15 | MATCH | 0 |
 | `cpython-tempfile` | full | 107/107 | 107/107 | MATCH | 0 |
@@ -430,7 +430,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-winsound` | full | FAILURE | FAILURE | MATCH | 0 |
 | `cpython-with` | full | 51/51 | 51/51 | MATCH | 0 |
 | `cpython-wmi` | full | SUCCESS | SUCCESS | MATCH | 0 |
-| `cpython-wsgiref` | full | CRASH | 36/36 | NEW | 0 |
+| `cpython-wsgiref` | full | 36/36 | 36/36 | NEW | 0 known · 36 NEW |
 | `cpython-xdrlib` | full | 6/6 | 6/6 | MATCH | 0 |
 | `cpython-xml_dom_minicompat` | full | 11/11 | 11/11 | MATCH | 0 |
 | `cpython-xml_dom_xmlbuilder` | full | 4/4 | 4/4 | MATCH | 0 |
@@ -451,218 +451,214 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ## Go
 
-194 suites — 7 MATCH · 1 DIFF · 182 NEW · 4 ORACLE_FAIL
+190 suites — 179 MATCH · 11 NEW
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
 | `go-build` | smoke | SUCCESS | SUCCESS | MATCH | 0 |
-| `go-archive_tar` | full | EMPTY | 98/98 | NEW | 0 known · 98 NEW |
-| `go-archive_zip` | full | EMPTY | 88/88 | NEW | 0 known · 94 NEW |
-| `go-bufio` | full | EMPTY | 81/81 | NEW | 0 known · 81 NEW |
-| `go-bytes` | full | EMPTY | 93/93 | NEW | 0 known · 93 NEW |
-| `go-cmp` | full | EMPTY | 4/4 | NEW | 0 known · 4 NEW |
-| `go-compress_bzip2` | full | EMPTY | 4/4 | NEW | 0 known · 4 NEW |
-| `go-compress_flate` | full | EMPTY | 62/62 | NEW | 0 known · 64 NEW |
-| `go-compress_gzip` | full | EMPTY | 14/14 | NEW | 0 known · 15 NEW |
-| `go-compress_lzw` | full | EMPTY | 17/17 | NEW | 0 known · 17 NEW |
-| `go-compress_zlib` | full | EMPTY | 6/6 | NEW | 0 known · 6 NEW |
-| `go-container_heap` | full | EMPTY | 7/7 | NEW | 0 known · 7 NEW |
-| `go-container_list` | full | EMPTY | 10/10 | NEW | 0 known · 10 NEW |
-| `go-container_ring` | full | EMPTY | 8/8 | NEW | 0 known · 8 NEW |
+| `go-archive_tar` | full | 98/98 | 98/98 | MATCH | 0 |
+| `go-archive_zip` | full | 88/88 | 88/88 | MATCH | 0 |
+| `go-bufio` | full | 81/81 | 81/81 | MATCH | 0 |
+| `go-bytes` | full | 93/93 | 93/93 | MATCH | 0 |
+| `go-cmp` | full | 4/4 | 4/4 | MATCH | 0 |
+| `go-compress_bzip2` | full | 4/4 | 4/4 | MATCH | 0 |
+| `go-compress_flate` | full | 62/62 | 62/62 | MATCH | 0 |
+| `go-compress_gzip` | full | 14/14 | 14/14 | MATCH | 0 |
+| `go-compress_lzw` | full | 17/17 | 17/17 | MATCH | 0 |
+| `go-compress_zlib` | full | 6/6 | 6/6 | MATCH | 0 |
+| `go-container_heap` | full | 7/7 | 7/7 | MATCH | 0 |
+| `go-container_list` | full | 10/10 | 10/10 | MATCH | 0 |
+| `go-container_ring` | full | 8/8 | 8/8 | MATCH | 0 |
 | `go-context` | smoke | 58/58 | 58/58 | MATCH | 0 |
-| `go-crypto` | full | EMPTY | 6/6 | NEW | 0 known · 6 NEW |
-| `go-crypto_aes` | full | EMPTY | 117/117 | NEW | 0 known · 117 NEW |
-| `go-crypto_cipher` | full | EMPTY | 33108/33108 | NEW | 0 known · 33144 NEW |
-| `go-crypto_des` | full | EMPTY | 55/55 | NEW | 0 known · 55 NEW |
-| `go-crypto_dsa` | full | EMPTY | 3/3 | NEW | 0 known · 4 NEW |
-| `go-crypto_ecdh` | full | EMPTY | 46/46 | NEW | 0 known · 47 NEW |
-| `go-crypto_ecdsa` | full | EMPTY | 30/30 | NEW | 0 known · 30 NEW |
-| `go-crypto_ed25519` | full | EMPTY | 9/9 | NEW | 0 known · 10 NEW |
-| `go-crypto_elliptic` | full | EMPTY | 24/24 | NEW | 0 known · 25 NEW |
-| `go-crypto_hkdf` | full | EMPTY | 3/3 | NEW | 0 known · 3 NEW |
-| `go-crypto_hmac` | full | EMPTY | 172/172 | NEW | 0 known · 172 NEW |
-| `go-crypto_internal_boring` | full | EMPTY | 3/3 | NEW | 0 known · 3 NEW |
-| `go-crypto_internal_boring_bcache` | full | EMPTY | 1/1 | NEW | 0 known · 1 NEW |
-| `go-crypto_internal_fips140_aes` | full | EMPTY | 5/5 | NEW | 0 known · 5 NEW |
-| `go-crypto_internal_fips140_aes_gcm` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
-| `go-crypto_internal_fips140_bigmod` | full | EMPTY | 75/75 | NEW | 0 known · 79 NEW |
-| `go-crypto_internal_fips140_drbg` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
-| `go-crypto_internal_fips140_ecdh` | full | EMPTY | 1/1 | NEW | 0 known · 1 NEW |
-| `go-crypto_internal_fips140_ecdsa` | full | EMPTY | 10/10 | NEW | 0 known · 10 NEW |
-| `go-crypto_internal_fips140_edwards25519` | full | EMPTY | 54/54 | NEW | 0 known · 54 NEW |
-| `go-crypto_internal_fips140_edwards25519_field` | full | EMPTY | 16/16 | NEW | 0 known · 16 NEW |
-| `go-crypto_internal_fips140_mlkem` | full | EMPTY | 10/10 | NEW | 0 known · 10 NEW |
-| `go-crypto_internal_fips140_nistec` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-crypto_internal_fips140_nistec_fiat` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
-| `go-crypto_internal_fips140_rsa` | full | EMPTY | 92/92 | NEW | 0 known · 123 NEW |
-| `go-crypto_internal_fips140deps` | full | EMPTY | 1/1 | NEW | 0 known · 1 NEW |
-| `go-crypto_internal_fips140test` | full | EMPTY | 106/106 | NEW | 0 known · 107 NEW |
-| `go-crypto_internal_hpke` | full | EMPTY | 15/15 | NEW | 0 known · 19 NEW |
-| `go-crypto_internal_sysrand` | full | EMPTY | 4/4 | NEW | 0 known · 7 NEW |
-| `go-crypto_md5` | full | EMPTY | 12/12 | NEW | 0 known · 12 NEW |
-| `go-crypto_mlkem` | full | EMPTY | 8/8 | NEW | 0 known · 8 NEW |
-| `go-crypto_pbkdf2` | full | EMPTY | 5/5 | NEW | 0 known · 5 NEW |
-| `go-crypto_rand` | full | EMPTY | 312/312 | NEW | 0 known · 315 NEW |
-| `go-crypto_rc4` | full | EMPTY | 75/75 | NEW | 0 known · 75 NEW |
-| `go-crypto_rsa` | full | EMPTY | 37/37 | NEW | 0 known · 38 NEW |
-| `go-crypto_sha1` | full | EMPTY | 13/13 | NEW | 0 known · 13 NEW |
-| `go-crypto_sha256` | full | EMPTY | 43/43 | NEW | 0 known · 43 NEW |
-| `go-crypto_sha3` | full | EMPTY | 22/22 | NEW | 0 known · 23 NEW |
-| `go-crypto_sha512` | full | EMPTY | 72/72 | NEW | 0 known · 72 NEW |
-| `go-crypto_subtle` | full | EMPTY | 10/10 | NEW | 0 known · 10 NEW |
-| `go-crypto_tls` | full | EMPTY | 560/560 | NEW | 0 known · 571 NEW |
-| `go-crypto_x509` | full | EMPTY | 493/493 | NEW | 0 known · 500 NEW |
-| `go-database_sql` | full | EMPTY | 139/139 | NEW | 0 known · 142 NEW |
-| `go-database_sql_driver` | full | EMPTY | 1/1 | NEW | 0 known · 1 NEW |
-| `go-debug_buildinfo` | full | EMPTY | 187/187 | NEW | 0 known · 188 NEW |
-| `go-debug_dwarf` | full | EMPTY | 40/40 | NEW | 0 known · 40 NEW |
-| `go-debug_elf` | full | EMPTY | 31/31 | NEW | 0 known · 31 NEW |
-| `go-debug_gosym` | full | EMPTY | 6/6 | NEW | 0 known · 10 NEW |
-| `go-debug_macho` | full | EMPTY | 7/7 | NEW | 0 known · 7 NEW |
-| `go-debug_pe` | full | EMPTY | 6/6 | NEW | 0 known · 13 NEW |
-| `go-debug_plan9obj` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-embed` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
-| `go-embed_internal_embedtest` | full | EMPTY | 7/7 | NEW | 0 known · 7 NEW |
-| `go-encoding_ascii85` | full | EMPTY | 9/9 | NEW | 0 known · 9 NEW |
-| `go-encoding_asn1` | full | EMPTY | 40/40 | NEW | 0 known · 40 NEW |
-| `go-encoding_base32` | full | EMPTY | 26/26 | NEW | 0 known · 26 NEW |
-| `go-encoding_base64` | full | EMPTY | 17/17 | NEW | 0 known · 17 NEW |
-| `go-encoding_binary` | full | EMPTY | 146/146 | NEW | 0 known · 146 NEW |
-| `go-encoding_csv` | full | EMPTY | 71/71 | NEW | 0 known · 71 NEW |
-| `go-encoding_gob` | full | EMPTY | 101/101 | NEW | 0 known · 106 NEW |
-| `go-encoding_hex` | full | EMPTY | 12/12 | NEW | 0 known · 12 NEW |
-| `go-encoding_json` | full | EMPTY | 532/532 | NEW | 0 known · 532 NEW |
-| `go-encoding_pem` | full | EMPTY | 18/18 | NEW | 0 known · 18 NEW |
-| `go-encoding_xml` | full | EMPTY | 386/386 | NEW | 0 known · 387 NEW |
-| `go-errors` | full | EMPTY | 61/61 | NEW | 0 known · 61 NEW |
-| `go-expvar` | full | EMPTY | 11/11 | NEW | 0 known · 11 NEW |
-| `go-flag` | full | EMPTY | 24/24 | NEW | 0 known · 24 NEW |
-| `go-fmt` | full | EMPTY | 62/62 | NEW | 0 known · 63 NEW |
-| `go-go_ast` | full | EMPTY | 9/9 | NEW | 0 known · 9 NEW |
-| `go-go_ast_internal_tests` | full | EMPTY | 3/3 | NEW | 0 known · 3 NEW |
-| `go-go_build` | full | EMPTY | 58/58 | NEW | 0 known · 58 NEW |
-| `go-go_build_constraint` | full | EMPTY | 89/89 | NEW | 0 known · 89 NEW |
-| `go-go_constant` | full | EMPTY | 9/9 | NEW | 0 known · 9 NEW |
-| `go-go_doc` | full | EMPTY | 86/86 | NEW | 0 known · 86 NEW |
-| `go-go_doc_comment` | full | EMPTY | 10059/10059 | NEW | 0 known · 10059 NEW |
-| `go-go_format` | full | EMPTY | 4/4 | NEW | 0 known · 4 NEW |
-| `go-go_importer` | full | EMPTY | 2/2 | NEW | 0 known · 3 NEW |
-| `go-go_internal_gccgoimporter` | full | EMPTY | 2/2 | NEW | 0 known · 4 NEW |
-| `go-go_internal_gcimporter` | full | EMPTY | 15/15 | NEW | 0 known · 17 NEW |
-| `go-go_internal_srcimporter` | full | EMPTY | 6/6 | NEW | 0 known · 7 NEW |
-| `go-go_parser` | full | EMPTY | 89/89 | NEW | 0 known · 90 NEW |
-| `go-go_printer` | full | EMPTY | 45/45 | NEW | 0 known · 45 NEW |
-| `go-go_scanner` | full | EMPTY | 11/11 | NEW | 0 known · 11 NEW |
-| `go-go_token` | full | EMPTY | 31/31 | NEW | 0 known · 31 NEW |
-| `go-go_types` | full | EMPTY | 571/571 | NEW | 0 known · 574 NEW |
-| `go-go_version` | full | EMPTY | 3/3 | NEW | 0 known · 3 NEW |
-| `go-hash` | full | EMPTY | 18/18 | NEW | 0 known · 18 NEW |
-| `go-hash_adler32` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-hash_crc32` | full | EMPTY | 10/10 | NEW | 0 known · 10 NEW |
-| `go-hash_crc64` | full | EMPTY | 5/5 | NEW | 0 known · 5 NEW |
-| `go-hash_fnv` | full | EMPTY | 19/19 | NEW | 0 known · 19 NEW |
-| `go-hash_maphash` | full | EMPTY | 52/52 | NEW | 0 known · 59 NEW |
-| `go-html` | full | EMPTY | 3/3 | NEW | 0 known · 3 NEW |
-| `go-html_template` | full | EMPTY | 239/239 | NEW | 0 known · 242 NEW |
-| `go-image` | full | EMPTY | 8/8 | NEW | 0 known · 8 NEW |
-| `go-image_color` | full | EMPTY | 10/10 | NEW | 0 known · 10 NEW |
-| `go-image_draw` | full | EMPTY | 9/9 | NEW | 0 known · 9 NEW |
-| `go-image_gif` | full | EMPTY | 28/28 | NEW | 0 known · 28 NEW |
-| `go-image_jpeg` | full | EMPTY | 14/14 | NEW | 0 known · 14 NEW |
-| `go-image_png` | full | EMPTY | 27/27 | NEW | 0 known · 28 NEW |
-| `go-index_suffixarray` | full | EMPTY | 12/12 | NEW | 0 known · 12 NEW |
-| `go-io` | full | EMPTY | 61/61 | NEW | 0 known · 61 NEW |
-| `go-io_fs` | full | EMPTY | 18/18 | NEW | 0 known · 18 NEW |
-| `go-io_ioutil` | full | EMPTY | 27/27 | NEW | 0 known · 28 NEW |
-| `go-iter` | full | EMPTY | 28/28 | NEW | 0 known · 28 NEW |
-| `go-log` | full | EMPTY | 9/9 | NEW | 0 known · 9 NEW |
-| `go-log_slog` | full | EMPTY | 216/216 | NEW | 0 known · 216 NEW |
-| `go-log_slog_internal_benchmarks` | full | EMPTY | 3/3 | NEW | 0 known · 3 NEW |
-| `go-log_slog_internal_buffer` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-log_syslog` | full | EMPTY | 9/9 | NEW | 0 known · 12 NEW |
-| `go-maps` | full | EMPTY | 14/14 | NEW | 0 known · 14 NEW |
-| `go-math` | full | EMPTY | 76/76 | NEW | 0 known · 76 NEW |
-| `go-math_big` | full | EMPTY | 231/231 | NEW | 0 known · 232 NEW |
-| `go-math_bits` | full | EMPTY | 26/26 | NEW | 0 known · 26 NEW |
-| `go-math_cmplx` | full | EMPTY | 24/24 | NEW | 0 known · 24 NEW |
-| `go-math_rand` | full | EMPTY | 25/25 | NEW | 0 known · 26 NEW |
-| `go-math_rand_v2` | full | EMPTY | 23/23 | NEW | 0 known · 24 NEW |
-| `go-mime` | full | EMPTY | 19/19 | NEW | 0 known · 19 NEW |
-| `go-mime_multipart` | full | EMPTY | 51/51 | NEW | 0 known · 52 NEW |
-| `go-mime_quotedprintable` | full | EMPTY | 5/5 | NEW | 0 known · 5 NEW |
+| `go-crypto` | full | 6/6 | 6/6 | MATCH | 0 |
+| `go-crypto_aes` | full | 117/117 | 117/117 | MATCH | 0 |
+| `go-crypto_cipher` | full | 33108/33108 | 33108/33108 | MATCH | 0 |
+| `go-crypto_des` | full | 55/55 | 55/55 | MATCH | 0 |
+| `go-crypto_dsa` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-crypto_ecdh` | full | 46/46 | 46/46 | MATCH | 0 |
+| `go-crypto_ecdsa` | full | 30/30 | 30/30 | MATCH | 0 |
+| `go-crypto_ed25519` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-crypto_elliptic` | full | 24/24 | 24/24 | MATCH | 0 |
+| `go-crypto_hkdf` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-crypto_hmac` | full | 172/172 | 172/172 | MATCH | 0 |
+| `go-crypto_internal_boring` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-crypto_internal_boring_bcache` | full | 1/1 | 1/1 | MATCH | 0 |
+| `go-crypto_internal_fips140_aes` | full | 5/5 | 5/5 | MATCH | 0 |
+| `go-crypto_internal_fips140_bigmod` | full | 75/75 | 75/75 | MATCH | 0 |
+| `go-crypto_internal_fips140_ecdh` | full | 1/1 | 1/1 | MATCH | 0 |
+| `go-crypto_internal_fips140_ecdsa` | full | 10/10 | 10/10 | MATCH | 0 |
+| `go-crypto_internal_fips140_edwards25519` | full | 54/54 | 54/54 | MATCH | 0 |
+| `go-crypto_internal_fips140_edwards25519_field` | full | 16/16 | 16/16 | MATCH | 0 |
+| `go-crypto_internal_fips140_mlkem` | full | 10/10 | 10/10 | MATCH | 0 |
+| `go-crypto_internal_fips140_nistec` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-crypto_internal_fips140_rsa` | full | 92/92 | 92/92 | MATCH | 0 |
+| `go-crypto_internal_fips140deps` | full | 1/1 | 1/1 | MATCH | 0 |
+| `go-crypto_internal_fips140test` | full | 106/106 | 106/106 | MATCH | 0 |
+| `go-crypto_internal_hpke` | full | 15/15 | 15/15 | MATCH | 0 |
+| `go-crypto_internal_sysrand` | full | 4/4 | 4/4 | MATCH | 0 |
+| `go-crypto_md5` | full | 12/12 | 12/12 | MATCH | 0 |
+| `go-crypto_mlkem` | full | 8/8 | 8/8 | MATCH | 0 |
+| `go-crypto_pbkdf2` | full | 5/5 | 5/5 | MATCH | 0 |
+| `go-crypto_rand` | full | 312/312 | 312/312 | MATCH | 0 |
+| `go-crypto_rc4` | full | 75/75 | 75/75 | MATCH | 0 |
+| `go-crypto_rsa` | full | 37/37 | 37/37 | MATCH | 0 |
+| `go-crypto_sha1` | full | 13/13 | 13/13 | MATCH | 0 |
+| `go-crypto_sha256` | full | 43/43 | 43/43 | MATCH | 0 |
+| `go-crypto_sha3` | full | 22/22 | 22/22 | MATCH | 0 |
+| `go-crypto_sha512` | full | 42/42 | 72/72 | NEW | 0 known · 30 NEW |
+| `go-crypto_subtle` | full | 8/8 | 10/10 | NEW | 0 known · 2 NEW |
+| `go-crypto_tls` | full | 560/560 | 560/560 | MATCH | 0 |
+| `go-crypto_x509` | full | 493/493 | 493/493 | MATCH | 0 |
+| `go-database_sql` | full | 139/139 | 139/139 | MATCH | 0 |
+| `go-database_sql_driver` | full | 1/1 | 1/1 | MATCH | 0 |
+| `go-debug_buildinfo` | full | 187/187 | 187/187 | MATCH | 0 |
+| `go-debug_dwarf` | full | 40/40 | 40/40 | MATCH | 0 |
+| `go-debug_elf` | full | 31/31 | 31/31 | MATCH | 0 |
+| `go-debug_gosym` | full | 6/6 | 6/6 | MATCH | 0 |
+| `go-debug_macho` | full | 7/7 | 7/7 | MATCH | 0 |
+| `go-debug_pe` | full | 6/6 | 6/6 | MATCH | 0 |
+| `go-debug_plan9obj` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-embed_internal_embedtest` | full | 7/7 | 7/7 | MATCH | 0 |
+| `go-encoding_ascii85` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-encoding_asn1` | full | 40/40 | 40/40 | MATCH | 0 |
+| `go-encoding_base32` | full | 26/26 | 26/26 | MATCH | 0 |
+| `go-encoding_base64` | full | 17/17 | 17/17 | MATCH | 0 |
+| `go-encoding_binary` | full | 146/146 | 146/146 | MATCH | 0 |
+| `go-encoding_csv` | full | 71/71 | 71/71 | MATCH | 0 |
+| `go-encoding_gob` | full | 101/101 | 101/101 | MATCH | 0 |
+| `go-encoding_hex` | full | 12/12 | 12/12 | MATCH | 0 |
+| `go-encoding_json` | full | 532/532 | 532/532 | MATCH | 0 |
+| `go-encoding_pem` | full | 18/18 | 18/18 | MATCH | 0 |
+| `go-encoding_xml` | full | 386/386 | 386/386 | MATCH | 0 |
+| `go-errors` | full | 61/61 | 61/61 | NEW | 0 known · 20 NEW |
+| `go-expvar` | full | 11/11 | 11/11 | MATCH | 0 |
+| `go-flag` | full | 24/24 | 24/24 | MATCH | 0 |
+| `go-fmt` | full | 62/62 | 62/62 | MATCH | 0 |
+| `go-go_ast` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-go_ast_internal_tests` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-go_build` | full | 58/58 | 58/58 | MATCH | 0 |
+| `go-go_build_constraint` | full | 89/89 | 89/89 | MATCH | 0 |
+| `go-go_constant` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-go_doc` | full | 86/86 | 86/86 | MATCH | 0 |
+| `go-go_doc_comment` | full | 10059/10059 | 10059/10059 | MATCH | 0 |
+| `go-go_format` | full | 4/4 | 4/4 | MATCH | 0 |
+| `go-go_importer` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-go_internal_gccgoimporter` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-go_internal_gcimporter` | full | CRASH | 15/15 | NEW | 0 |
+| `go-go_internal_srcimporter` | full | 6/6 | 6/6 | MATCH | 0 |
+| `go-go_parser` | full | 89/89 | 89/89 | MATCH | 0 |
+| `go-go_printer` | full | 45/45 | 45/45 | MATCH | 0 |
+| `go-go_scanner` | full | 11/11 | 11/11 | MATCH | 0 |
+| `go-go_token` | full | 31/31 | 31/31 | MATCH | 0 |
+| `go-go_types` | full | CRASH | 571/571 | NEW | 0 |
+| `go-go_version` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-hash` | full | 18/18 | 18/18 | MATCH | 0 |
+| `go-hash_adler32` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-hash_crc32` | full | 10/10 | 10/10 | MATCH | 0 |
+| `go-hash_crc64` | full | 5/5 | 5/5 | MATCH | 0 |
+| `go-hash_fnv` | full | 19/19 | 19/19 | MATCH | 0 |
+| `go-hash_maphash` | full | 52/52 | 52/52 | MATCH | 0 |
+| `go-html` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-html_template` | full | 239/239 | 239/239 | MATCH | 0 |
+| `go-image` | full | 8/8 | 8/8 | MATCH | 0 |
+| `go-image_color` | full | 10/10 | 10/10 | MATCH | 0 |
+| `go-image_draw` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-image_gif` | full | 28/28 | 28/28 | MATCH | 0 |
+| `go-image_jpeg` | full | 14/14 | 14/14 | MATCH | 0 |
+| `go-image_png` | full | 27/27 | 27/27 | MATCH | 0 |
+| `go-index_suffixarray` | full | 12/12 | 12/12 | MATCH | 0 |
+| `go-io` | full | 61/61 | 61/61 | MATCH | 0 |
+| `go-io_fs` | full | 18/18 | 18/18 | MATCH | 0 |
+| `go-io_ioutil` | full | 27/27 | 27/27 | MATCH | 0 |
+| `go-iter` | full | 28/28 | 28/28 | MATCH | 0 |
+| `go-log` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-log_slog` | full | 216/216 | 216/216 | MATCH | 0 |
+| `go-log_slog_internal_benchmarks` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-log_slog_internal_buffer` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-log_syslog` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-maps` | full | 14/14 | 14/14 | MATCH | 0 |
+| `go-math` | full | 76/76 | 76/76 | MATCH | 0 |
+| `go-math_big` | full | 231/231 | 231/231 | MATCH | 0 |
+| `go-math_bits` | full | 26/26 | 26/26 | MATCH | 0 |
+| `go-math_cmplx` | full | 24/24 | 24/24 | MATCH | 0 |
+| `go-math_rand` | full | 25/25 | 25/25 | MATCH | 0 |
+| `go-math_rand_v2` | full | 23/23 | 23/23 | MATCH | 0 |
+| `go-mime` | full | 19/19 | 19/19 | MATCH | 0 |
+| `go-mime_multipart` | full | 51/51 | 51/51 | MATCH | 0 |
+| `go-mime_quotedprintable` | full | 5/5 | 5/5 | MATCH | 0 |
 | `go-net` | full | CRASH | 260/260 | NEW | 0 |
-| `go-net_http` | full | EMPTY | 1316/1316 | NEW | 0 known · 1388 NEW |
-| `go-net_http_cgi` | full | EMPTY | 39/39 | NEW | 0 known · 39 NEW |
-| `go-net_http_cookiejar` | full | EMPTY | 17/17 | NEW | 0 known · 17 NEW |
-| `go-net_http_fcgi` | full | EMPTY | 12/12 | NEW | 0 known · 12 NEW |
-| `go-net_http_httptest` | full | EMPTY | 55/55 | NEW | 0 known · 55 NEW |
-| `go-net_http_httptrace` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-net_http_httputil` | full | EMPTY | 53/53 | NEW | 0 known · 53 NEW |
-| `go-net_http_internal` | full | EMPTY | 14/14 | NEW | 0 known · 15 NEW |
-| `go-net_http_internal_ascii` | full | EMPTY | 13/13 | NEW | 0 known · 13 NEW |
-| `go-net_http_pprof` | full | EMPTY | 13/13 | NEW | 0 known · 15 NEW |
-| `go-net_internal_cgotest` | full | EMPTY | 1/1 | NEW | 0 known · 1 NEW |
-| `go-net_internal_socktest` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-net_mail` | full | EMPTY | 11/11 | NEW | 0 known · 11 NEW |
-| `go-net_netip` | full | EMPTY | 268/268 | NEW | 0 known · 268 NEW |
-| `go-net_rpc` | full | EMPTY | 13/13 | NEW | 0 known · 15 NEW |
-| `go-net_rpc_jsonrpc` | full | EMPTY | 9/9 | NEW | 0 known · 9 NEW |
-| `go-net_smtp` | full | EMPTY | 20/20 | NEW | 0 known · 20 NEW |
-| `go-net_textproto` | full | EMPTY | 26/26 | NEW | 0 known · 26 NEW |
-| `go-net_url` | full | EMPTY | 49/49 | NEW | 0 known · 49 NEW |
-| `go-os` | full | EMPTY | 104/104 | NEW | 0 known · 113 NEW |
+| `go-net_http` | full | CRASH | 1316/1316 | NEW | 0 |
+| `go-net_http_cgi` | full | 39/39 | 39/39 | MATCH | 0 |
+| `go-net_http_cookiejar` | full | 17/17 | 17/17 | MATCH | 0 |
+| `go-net_http_fcgi` | full | 12/12 | 12/12 | MATCH | 0 |
+| `go-net_http_httptest` | full | 55/55 | 55/55 | MATCH | 0 |
+| `go-net_http_httptrace` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-net_http_httputil` | full | 53/53 | 53/53 | MATCH | 0 |
+| `go-net_http_internal` | full | 14/14 | 14/14 | MATCH | 0 |
+| `go-net_http_internal_ascii` | full | 13/13 | 13/13 | MATCH | 0 |
+| `go-net_http_pprof` | full | 13/13 | 13/13 | MATCH | 0 |
+| `go-net_internal_cgotest` | full | 1/1 | 1/1 | MATCH | 0 |
+| `go-net_internal_socktest` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-net_mail` | full | 11/11 | 11/11 | MATCH | 0 |
+| `go-net_netip` | full | 268/268 | 268/268 | MATCH | 0 |
+| `go-net_rpc` | full | 13/13 | 13/13 | MATCH | 0 |
+| `go-net_rpc_jsonrpc` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-net_smtp` | full | 20/20 | 20/20 | MATCH | 0 |
+| `go-net_textproto` | full | 26/26 | 26/26 | MATCH | 0 |
+| `go-net_url` | full | 49/49 | 49/49 | MATCH | 0 |
+| `go-os` | full | CRASH | 104/104 | NEW | 0 |
 | `go-os_exec` | full | 86/86 | 86/86 | MATCH | 0 |
-| `go-os_exec_internal_fdtest` | full | EMPTY | 1/1 | NEW | 0 known · 1 NEW |
+| `go-os_exec_internal_fdtest` | full | 1/1 | 1/1 | MATCH | 0 |
 | `go-os_signal` | full | 29/30 | 29/30 | MATCH | 0 |
-| `go-os_user` | full | EMPTY | 6/6 | NEW | 0 known · 6 NEW |
-| `go-path` | full | EMPTY | 8/8 | NEW | 0 known · 9 NEW |
-| `go-path_filepath` | full | EMPTY | 50/50 | NEW | 0 known · 54 NEW |
-| `go-reflect` | full | EMPTY | 415/415 | NEW | 0 known · 419 NEW |
-| `go-regexp` | full | EMPTY | 44/44 | NEW | 0 known · 45 NEW |
-| `go-regexp_syntax` | full | EMPTY | 12/12 | NEW | 0 known · 12 NEW |
-| `go-runtime` | smoke | 836/983 | 984/984 | DIFF | 149 |
-| `go-runtime_cgo` | full | EMPTY | 4/4 | NEW | 0 known · 4 NEW |
-| `go-runtime_debug` | full | EMPTY | 9/9 | NEW | 0 known · 10 NEW |
-| `go-runtime_internal_wasitest` | full | EMPTY | SUCCESS | NEW | 0 known · 2 NEW |
-| `go-runtime_metrics` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-runtime_pprof` | full | EMPTY | 93/93 | NEW | 0 known · 93 NEW |
-| `go-runtime_trace` | full | EMPTY | 2/2 | NEW | 0 known · 2 NEW |
-| `go-slices` | full | EMPTY | 123/123 | NEW | 0 known · 123 NEW |
-| `go-sort` | full | EMPTY | 62/62 | NEW | 0 known · 63 NEW |
-| `go-strconv` | full | EMPTY | 65/65 | NEW | 0 known · 66 NEW |
-| `go-strings` | full | EMPTY | 73/73 | NEW | 0 known · 73 NEW |
+| `go-os_user` | full | 6/6 | 6/6 | MATCH | 0 |
+| `go-path` | full | 8/8 | 8/8 | MATCH | 0 |
+| `go-path_filepath` | full | 50/50 | 50/50 | MATCH | 0 |
+| `go-reflect` | full | 296/297 | 415/415 | NEW | 0 known · 119 NEW |
+| `go-regexp` | full | 44/44 | 44/44 | MATCH | 0 |
+| `go-regexp_syntax` | full | 12/12 | 12/12 | MATCH | 0 |
+| `go-runtime` | smoke | 52/52 | 52/52 | MATCH | 0 |
+| `go-runtime_cgo` | full | 4/4 | 4/4 | MATCH | 0 |
+| `go-runtime_debug` | full | 8/9 | 9/9 | NEW | 0 known · 1 NEW |
+| `go-runtime_internal_wasitest` | full | SUCCESS | SUCCESS | MATCH | 0 |
+| `go-runtime_metrics` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-runtime_pprof` | full | 93/93 | 93/93 | MATCH | 0 |
+| `go-runtime_trace` | full | 2/2 | 2/2 | MATCH | 0 |
+| `go-slices` | full | 123/123 | 123/123 | MATCH | 0 |
+| `go-sort` | full | 62/62 | 62/62 | MATCH | 0 |
+| `go-strconv` | full | 65/65 | 65/65 | MATCH | 0 |
+| `go-strings` | full | 73/73 | 73/73 | MATCH | 0 |
 | `go-sync` | smoke | 52/52 | 52/52 | MATCH | 0 |
 | `go-sync_atomic` | full | 107/107 | 107/107 | MATCH | 0 |
-| `go-syscall` | full | EMPTY | 34/34 | NEW | 0 known · 56 NEW |
-| `go-testing` | full | EMPTY | 161/162 | NEW | 0 known · 165 NEW |
-| `go-testing_fstest` | full | EMPTY | 7/7 | NEW | 0 known · 7 NEW |
-| `go-testing_iotest` | full | EMPTY | 18/18 | NEW | 0 known · 18 NEW |
-| `go-testing_quick` | full | EMPTY | 8/8 | NEW | 0 known · 8 NEW |
-| `go-testing_slogtest` | full | EMPTY | 17/17 | NEW | 0 known · 17 NEW |
-| `go-text_scanner` | full | EMPTY | 18/18 | NEW | 0 known · 18 NEW |
-| `go-text_tabwriter` | full | EMPTY | 3/3 | NEW | 0 known · 3 NEW |
-| `go-text_template` | full | EMPTY | 50/50 | NEW | 0 known · 52 NEW |
-| `go-text_template_parse` | full | EMPTY | 52/52 | NEW | 0 known · 52 NEW |
+| `go-syscall` | full | CRASH | 34/34 | NEW | 0 |
+| `go-testing` | full | 161/162 | 161/162 | MATCH | 0 |
+| `go-testing_fstest` | full | 7/7 | 7/7 | MATCH | 0 |
+| `go-testing_iotest` | full | 18/18 | 18/18 | MATCH | 0 |
+| `go-testing_quick` | full | 8/8 | 8/8 | MATCH | 0 |
+| `go-testing_slogtest` | full | 17/17 | 17/17 | MATCH | 0 |
+| `go-text_scanner` | full | 18/18 | 18/18 | MATCH | 0 |
+| `go-text_tabwriter` | full | 3/3 | 3/3 | MATCH | 0 |
+| `go-text_template` | full | 50/50 | 50/50 | MATCH | 0 |
+| `go-text_template_parse` | full | 52/52 | 52/52 | MATCH | 0 |
 | `go-time` | smoke | 170/170 | 170/170 | MATCH | 0 |
-| `go-unicode` | full | EMPTY | 28/28 | NEW | 0 known · 28 NEW |
-| `go-unicode_utf16` | full | EMPTY | 9/9 | NEW | 0 known · 9 NEW |
-| `go-unicode_utf8` | full | EMPTY | 15/15 | NEW | 0 known · 15 NEW |
-| `go-unique` | full | EMPTY | 22/22 | NEW | 0 known · 22 NEW |
-| `go-weak` | full | EMPTY | 5/5 | NEW | 0 known · 6 NEW |
+| `go-unicode` | full | 28/28 | 28/28 | MATCH | 0 |
+| `go-unicode_utf16` | full | 9/9 | 9/9 | MATCH | 0 |
+| `go-unicode_utf8` | full | 15/15 | 15/15 | MATCH | 0 |
+| `go-unique` | full | 22/22 | 22/22 | MATCH | 0 |
+| `go-weak` | full | 5/5 | 5/5 | MATCH | 0 |
 
 ## Node.js / libuv
 
-3 suites — 2 MATCH · 1 REGRESSION
+3 suites — 3 MATCH
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
 | `node-app-smoke` | smoke | SUCCESS | SUCCESS | MATCH | 0 |
 | `node-v8-smoke` | smoke | SUCCESS | SUCCESS | MATCH | 0 |
-| `node-libuv` | full | FAILURE | SUCCESS | REGRESSION | 0 known · 1 NEW |
+| `node-libuv` | full | FAILURE | FAILURE | MATCH | 0 |
 
 ## LTP
 
-593 suites — 545 MATCH · 36 NEW · 12 ORACLE_FAIL
+591 suites — 559 MATCH · 32 NEW
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
@@ -711,7 +707,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-clone09` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-clone301` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-clone302` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-clone303` | full | 0/1 | EMPTY | ORACLE_FAIL | 0 |
+| `ltp-clone303` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-close01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-close02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-connect01` | full | 6/7 | 7/7 | NEW | 0 known · 1 NEW |
@@ -785,7 +781,6 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-fchdir01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fchdir02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fchdir03` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-fcntl01` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
 | `ltp-fcntl02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fcntl03` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fcntl04` | full | 0/1 | 0/2 | MATCH | 0 |
@@ -794,17 +789,17 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-fcntl08` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fcntl09` | full | 4/4 | 4/4 | MATCH | 0 |
 | `ltp-fcntl10` | full | 4/4 | 4/4 | MATCH | 0 |
-| `ltp-fcntl11` | full | 0/19 | EMPTY | ORACLE_FAIL | 0 |
+| `ltp-fcntl11` | full | 0/19 | 1/1 | NEW | 0 known · 1 NEW |
 | `ltp-fcntl12` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fcntl13` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fcntl14` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fcntl15` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-fcntl16` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
+| `ltp-fcntl16` | full | 3/3 | 3/3 | MATCH | 0 |
 | `ltp-fcntl17` | full | 0/7 | 1/1 | NEW | 0 known · 1 NEW |
 | `ltp-fcntl18` | full | 3/3 | 3/3 | MATCH | 0 |
-| `ltp-fcntl19` | full | 0/8 | EMPTY | ORACLE_FAIL | 0 |
-| `ltp-fcntl20` | full | 0/8 | EMPTY | ORACLE_FAIL | 0 |
-| `ltp-fcntl21` | full | 0/21 | EMPTY | ORACLE_FAIL | 0 |
+| `ltp-fcntl19` | full | 0/8 | 7/7 | NEW | 0 known · 1 NEW |
+| `ltp-fcntl20` | full | 0/8 | 7/7 | NEW | 0 known · 1 NEW |
+| `ltp-fcntl21` | full | 0/21 | 11/11 | NEW | 0 known · 1 NEW |
 | `ltp-fcntl22` | full | 2/2 | 2/2 | MATCH | 0 |
 | `ltp-fcntl23` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-fcntl24` | full | 1/1 | 1/1 | MATCH | 0 |
@@ -833,7 +828,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-fork05` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-fork07` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fork08` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-fork09` | full | 1/1 | CRASH | ORACLE_FAIL | 0 |
+| `ltp-fork09` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-fork10` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-fork13` | full | 0/1 | 0/1 | MATCH | 0 |
 | `ltp-fork14` | full | 0/1 | 0/2 | MATCH | 0 |
@@ -877,7 +872,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-getrusage01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-getrusage02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-getrusage03` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-getrusage04` | full | 0/2 | 1/1 | NEW | 0 known · 1 NEW |
+| `ltp-getrusage04` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-getsid01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-getsid02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-getsockopt01` | full | 0/1 | 0/2 | MATCH | 0 |
@@ -886,16 +881,16 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-gettid02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-gettimeofday01` | smoke | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-gettimeofday02` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-kill02` | full | 1/2 | 2/2 | NEW | 0 known · 1 NEW |
+| `ltp-kill02` | full | 2/2 | 2/2 | MATCH | 0 |
 | `ltp-kill03` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-kill05` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-kill06` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-kill07` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-kill08` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-kill09` | full | 1/1 | 1/1 | MATCH | 0 |
-| `ltp-kill10` | full | CRASH | 1/1 | NEW | 0 |
+| `ltp-kill10` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-kill11` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-kill12` | full | CRASH | 1/1 | NEW | 0 |
+| `ltp-kill12` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-kill13` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-listen01` | full | 3/3 | 3/3 | MATCH | 0 |
 | `ltp-lseek01` | full | 0/1 | 0/2 | MATCH | 0 |
@@ -909,9 +904,9 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-madvise02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-madvise03` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-madvise05` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-madvise06` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
+| `ltp-madvise06` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-madvise07` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-madvise08` | full | EMPTY | EMPTY | ORACLE_FAIL | 0 |
+| `ltp-madvise08` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-madvise09` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-madvise10` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-madvise11` | full | SUCCESS | SUCCESS | MATCH | 0 |
@@ -934,13 +929,12 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-mmap001` | full | 4/4 | 4/4 | MATCH | 0 |
 | `ltp-mmap01` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-mmap02` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-mmap03` | full | 1/1 | EMPTY | ORACLE_FAIL | 0 |
 | `ltp-mmap04` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-mmap05` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-mmap06` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-mmap08` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-mmap09` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-mmap10` | full | 0/1 | EMPTY | ORACLE_FAIL | 0 |
+| `ltp-mmap10` | full | 0/1 | 1/1 | NEW | 0 known · 1 NEW |
 | `ltp-mmap11` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-mmap12` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-mmap13` | full | 0/1 | 0/2 | MATCH | 0 |
@@ -1047,8 +1041,8 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-ptrace02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-ptrace03` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-ptrace04` | full | SUCCESS | SUCCESS | MATCH | 0 |
-| `ltp-ptrace05` | full | 39/1143 | 63/63 | NEW | 0 known · 1 NEW |
-| `ltp-ptrace06` | full | 0/3 | 48/48 | NEW | 0 known · 1 NEW |
+| `ltp-ptrace05` | full | 63/63 | 63/63 | MATCH | 0 |
+| `ltp-ptrace06` | full | 48/48 | 48/48 | MATCH | 0 |
 | `ltp-ptrace07` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-ptrace08` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-ptrace09` | full | SUCCESS | SUCCESS | MATCH | 0 |
@@ -1113,7 +1107,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-setgid03` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-setitimer01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-setitimer02` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-setpgid01` | full | 2/2 | 1/2 | NEW | 0 known · 1 NEW |
+| `ltp-setpgid01` | full | 1/2 | 1/2 | MATCH | 0 |
 | `ltp-setpgid02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-setpgid03` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-setregid01` | full | 0/1 | 0/2 | MATCH | 0 |
@@ -1160,7 +1154,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-setuid04` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-shutdown01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-shutdown02` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-sigaction01` | full | 3/4 | 4/4 | NEW | 0 known · 1 NEW |
+| `ltp-sigaction01` | full | 4/4 | 4/4 | MATCH | 0 |
 | `ltp-sigaction02` | full | 3/3 | 3/3 | MATCH | 0 |
 | `ltp-sigaltstack01` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-sigaltstack02` | full | 0/1 | 0/2 | MATCH | 0 |
@@ -1175,7 +1169,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-signalfd02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sigpending02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sigprocmask01` | full | 1/1 | 1/1 | MATCH | 0 |
-| `ltp-sigrelse01` | full | 0/2 | 1/1 | NEW | 0 known · 1 NEW |
+| `ltp-sigrelse01` | full | 1/1 | 1/1 | MATCH | 0 |
 | `ltp-sigsuspend01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sigsuspend02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sigwait01` | full | 0/1 | 0/2 | MATCH | 0 |
