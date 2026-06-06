@@ -313,6 +313,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 println!("Status: Downloaded newer image for {}", image.canonical());
             }
         }
+        Commands::Load { input } => {
+            let summaries = store
+                .load_docker_archive(&input)
+                .with_context(|| format!("failed to load image from {}", input.display()))?;
+            // docker prints `Loaded image: <tag>` per tag loaded.
+            for summary in &summaries {
+                println!("Loaded image: {}", summary.image);
+            }
+        }
         Commands::Images { quiet } => {
             let images = store.list_images();
             if quiet {

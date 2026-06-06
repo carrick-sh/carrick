@@ -17,9 +17,12 @@ camino = { workspace = true, features = ["serde1"] }
 oci-client = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
 carrick-spec = { path = "../carrick-spec" }
 
 [dev-dependencies]
+flate2 = { workspace = true }
 tempfile = { workspace = true }

@@ -90,6 +90,8 @@ pub enum OciBootstrapError {
     Auth(String),
     #[error("invalid registry config: {0}")]
     Config(String),
+    #[error("malformed docker-archive: {0}")]
+    Archive(String),
 }
 
 /// A parsed, validated OCI image reference (registry / repository / tag or
