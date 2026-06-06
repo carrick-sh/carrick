@@ -2,343 +2,316 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Find and land significant Carrick performance wins by removing whole classes of runtime work: guest traps, host syscalls, guest/host copies, allocation churn, page dirtying, and HVF mapping pressure.
+**Goal:** Land significant Carrick performance wins by removing whole classes of runtime work: guest traps, host syscalls, guest/host copies, allocation churn, page dirtying, HVF mapping pressure, and macOS kernel wait/setup work.
 
-**Architecture:** Treat performance from first principles. Prefer changes that reduce the number of crossings or bytes touched over local dispatch micro-optimizations. Every claimed win needs a workload or probe that exposes the removed cost before and after the change.
+**Architecture:** Work from first principles. Prefer designs that reduce crossings, copies, dirty pages, mapping churn, and per-wait setup over local syscall-dispatch micro-optimizations. Treat preload/interposition as a narrow workload-specific optimization only after runtime-level batching and shim opportunities have been measured.
 
-**Tech Stack:** Rust, Carrick HVF runtime, Carrick syscall dispatcher, guest memory/page-table machinery, conformance and perf probe harnesses.
+**Tech Stack:** Rust, Carrick HVF runtime, Carrick syscall dispatcher, guest memory/page-table machinery, VFS backends, conformance probes, perf runner, macOS host syscalls and kqueue.
 
 ---
 
+## Current State
+
+Branch: `codex/perf-mmap-lazy-zero`
+
+Landed slices:
+
+- `14999846d766db29f7333fffa47d5d103914f26b` - `perf(mem): skip fresh anon mmap zero writes`
+- `306a359` - `docs(perf): record mmap churn result`
+- `d41e658` - `perf(io): stage pwritev buffers once`
+
+Measured branch evidence:
+
+- `perf_mmap_churn`, 64 untouched 8 MiB private anonymous mappings:
+  - Before commit `be9d01a`: Carrick manual samples `54937.750`, `57827.458`, `55593.333` us.
+  - After commit `14999846`: filtered `just bench quick` wrote `docs/perf-results/2026-06-05-memory.jsonl`; Carrick p50 `831.708` us and p95 `897.625` us.
+  - Docker control p50 `60.667` us and p95 `197.750` us, marked noisy.
+- Correctness pressure after the mmap change:
+  - `scripts/run-probe.sh mmapzerofill` MATCH, `anon_mmap_is_zero_filled=true`.
+  - `scripts/run-probe.sh mmaprecl` MATCH, `churn_ok=true`, `reuse_zero=true`.
+  - `scripts/run-probe.sh forkcow` MATCH, including `mmap_isolated=true`.
+- `pwritev` duplicate-read reduction:
+  - RED test `syscall_fs::pwritev_host_file_reads_each_guest_iovec_once` initially observed four payload reads for two guest iovecs.
+  - Commit `d41e658` stages each guest payload once during validation and reuses the staged buffers for host-file writes.
+  - Focused checks passed:
+    - `cargo test -p carrick-runtime --test integration pwritev_host_file_reads_each_guest_iovec_once -- --nocapture`
+    - `cargo test -p carrick-runtime --test integration pwritev_bootstrap_validates_iovecs_and_reports_stream_errors -- --nocapture`
+    - `cargo fmt --all -- --check`
+
 ## First-Principles Cost Model
 
-Performance work should be ranked by the amount of unavoidable work it removes:
+Rank work by the amount of unavoidable cost it removes:
 
 1. Guest traps and VM exits.
 2. Host syscalls, Mach calls, `kevent`, `hv_vm_map`, and TLB/page-table churn.
-3. Guest/host memory copies and temporary `Vec<u8>` allocation.
-4. Page dirtying that later expands fork snapshots, mincore scans, or writeback.
-5. VFS metadata/path walks and whole-file rootfs/overlay rewrites.
-6. Per-wait descriptor pinning, fd duplication, and transient kqueue registration.
+3. Guest/host memory copies and temporary allocation.
+4. Page dirtying that later expands fork snapshots, resident scans, and writeback.
+5. VFS metadata/path walks and whole-file rootfs or overlay rewrites.
+6. Per-wait descriptor pinning, fd duplication, transient kqueue registration, and wake bookkeeping.
 
-This goal is intentionally not a generic profiler sweep. The target is large structural wins, especially where current code shape does work proportional to bytes, iovecs, mappings, or waits that Linux would avoid.
+The useful question for every proposed optimization is: what whole unit of work disappears, and which probe proves it disappeared?
 
-## Current Static Findings
+## Design Position on Trap Reduction and Interposition
 
-No fresh benchmark was run for this review. These findings are code-shape opportunities that need measurement before a win is claimed.
+The original `LD_PRELOAD` idea is useful only for a narrow class of dynamic-libc workloads. It cannot help static Go or musl binaries, direct syscall users, or kernel-observable semantics that require the runtime to arbitrate fd state, blocking behavior, signals, futexes, or process metadata.
 
-### 1. Fresh Anonymous `mmap` Zeroing
+Preferred order:
 
-The generic mmap path appears to allocate a full zero-filled buffer and write it into guest memory for broad non-`PROT_NONE` mappings. That defeats the intended lazy-zero shape for fresh anonymous mappings and can make pages resident/dirty before the guest actually touches them.
+1. Keep identity and safe process-metadata syscalls in the EL1 shim where semantics are already local and stable.
+2. Collapse runtime work that happens after a trap, especially vector I/O, mmap zeroing, wait setup, and VFS writeback.
+3. Add a dynamic workload that proves trap count is still the dominant cost after the structural runtime work.
+4. If the workload proves it, add a narrow interposer for a specific semantic island, such as batching libc writes to a known pipe/socket or answering explicitly cached process metadata.
+5. Keep the syscall runtime authoritative. Interposition is a fast path, not a correctness layer.
 
-Primary evidence:
+Do not use ptrace as part of this performance plan.
 
-- `crates/carrick-runtime/src/dispatch/mem.rs`
-  - `mmap` creates `let mut bytes = vec![0; length_usize]`.
-  - Low-address mappings write those bytes into guest memory with `memory.write_bytes(address, &bytes)`.
-  - `MAP_SHARED | ANONYMOUS` subrange handling also stages a zero buffer before writing.
-- `crates/carrick-hvf/src/trap.rs`
-  - Fork snapshots still need to reason about resident/private pages; unnecessary zero writes increase the work available to copy/scan later.
+## Opportunity Ranking
 
-Expected impact:
+### 1. Anonymous mmap Lazy-Zero
 
-- High for allocator-heavy programs.
-- High for fork-heavy programs when zeroing increases resident/dirty pages.
-- Potentially broad because anonymous mmap is a common runtime primitive.
+Status: partially landed, with measured win.
 
-Implementation direction:
+The fresh private anonymous path no longer materializes and writes a full zero buffer into guest memory. This removed a large byte-proportional cost and avoided eager page dirtying for untouched mappings.
 
-- Split fresh anonymous mappings from reused mappings.
-- For fresh anonymous mappings, install the mapping metadata and protections without staging a full zero buffer.
-- Use existing backing-zeroing paths only when reusing an address/range that may contain stale data.
-- For shared aperture and private overlay allocations, add or reuse a backing-level zero operation instead of materializing a guest-sized zero `Vec`.
+Remaining follow-up:
 
-Acceptance:
-
-- A perf probe shows large anonymous mmap churn without proportional host allocation/copy.
-- A correctness probe proves reused mappings are still zero-filled when Linux requires it.
-- Fork-heavy pressure workloads do not regress.
+- [ ] Re-check shared anonymous subrange handling for any remaining full-size zero buffer staging.
+- [ ] Re-check high-VA and alias-backed mapping paths for equivalent fresh-range zero materialization.
+- [ ] Add a fork-heavy workload row after the lazy-zero change so fork benefit is measured directly, not inferred.
 
 ### 2. Borrowed Guest-Memory Iovec I/O
 
-Several host-fd I/O paths still loop over guest iovecs, allocate temporary buffers, copy between guest and host, and issue one host syscall per segment. `writev` has a host batching path, but the read and pwrite sides still leave substantial work on the table.
+Status: in progress.
 
-Primary evidence:
+This is the next highest-confidence structural win. The goal is to turn validated guest ranges into host `iovec` descriptors when the backend can safely expose contiguous host pointers, then call the host vector syscall once. The fallback remains the existing copy/staged path.
 
-- `crates/carrick-runtime/src/dispatch/fs.rs`
-  - `readv` loops over iovecs and calls the host read helper per segment.
-  - `preadv` allocates a buffer and calls `pread` per iovec.
-  - `pwritev` validates/reads iovecs and then reads them again for host `pwrite`.
-- `crates/carrick-runtime/src/dispatch/mod.rs`
-  - `read_iovecs` materializes guest iovec descriptors into a Rust `Vec`.
-  - Blocking write handoff owns a `Vec<u8>` and currently clones bytes into the pending operation.
+Expected removed work:
 
-Expected impact:
+- One host syscall per iovec becomes one vector syscall.
+- Guest payload copy into temporary `Vec<u8>` disappears on the fast path.
+- Repeated payload reads are avoided on fallback.
+- Blocking-write handoff can transfer an existing buffer instead of cloning it.
 
-- High for language runtimes and servers that use scatter/gather I/O.
-- High for pipes, sockets, and file workloads with many small buffers.
-- Potentially multiplicative because it reduces host syscalls and memory copies.
+Key code:
 
-Implementation direction:
-
-- Add a safe guest-memory API that converts validated contiguous guest ranges into borrowed host `iovec`/`IoSlice`/`IoSliceMut` descriptors.
-- Use real host `readv`, `writev`, `preadv`, and `pwritev` when every segment is representable and permissions are valid.
-- Fall back to the existing copy path for split mappings, non-contiguous ranges, or unsafe aliases.
-- Avoid double guest reads in `pwritev` by validating and building the borrowed vector once.
-- Avoid the extra blocking-write clone by transferring ownership of the already-staged buffer into the pending write.
-
-Acceptance:
-
-- A probe or benchmark demonstrates fewer host syscalls for multi-segment `readv`/`preadv`/`pwritev`.
-- Existing EINTR, partial-read, partial-write, and blocking semantics remain Linux-compatible.
-- Fallback behavior is covered by tests for split/invalid guest iovecs.
-
-### 3. Trap Count Reduction Through Targeted Interposition
-
-The EL1 syscall shim already handles safe identity syscalls such as `getpid`, uid/gid queries, and `gettid`. `read`, `write`, and `futex` still trap because correctness depends on host state, blocking behavior, and runtime coordination.
-
-Primary evidence:
-
-- `docs/syscall-shim-design.md`
-  - Identity syscall fast paths are already present.
-  - I/O and preload-based batching are explicitly deferred until a workload proves the value.
+- `crates/carrick-guest-mem/src/lib.rs`
+  - Existing `GuestMemory::host_ptr_for_read`
+  - Existing `GuestMemory::host_ptr_for_write`
 - `crates/carrick-hvf/src/trap.rs`
-  - The syscall trap path still pays the VM-exit and register/materialization cost for non-shimmed syscalls.
+  - HVF host-pointer implementation and permission checks
+- `crates/carrick-runtime/src/dispatch/fs.rs`
+  - `readv`
+  - `preadv`
+  - `pwritev`
+  - host-file write paths
+  - blocking write handoff
+- `crates/carrick-runtime/src/dispatch/mod.rs`
+  - `read_iovecs`
+- `crates/carrick-runtime/tests/integration/syscall_fs.rs`
+  - focused integration coverage
 
-Expected impact:
+Milestone 2A: borrowed `pwritev` host-file fast path.
 
-- Very high only when the workload is dynamic-libc-heavy and emits many small syscalls.
-- Low or zero for static Go/musl workloads that bypass `LD_PRELOAD`.
+- [x] Add `syscall_fs::pwritev_host_file_uses_guest_host_ptrs_without_payload_reads`.
+  - Use a custom test memory that implements `host_ptr_for_read` for two exact payload ranges.
+  - Count payload `read_bytes` calls.
+  - Expected RED on current branch: file contents are correct, but payload `read_bytes` count is `2` and host-pointer hits are `0`.
+  - Expected PASS after implementation: file contents are correct, payload `read_bytes` count is `0`, host-pointer hits are `2`, and one host `pwritev` is used when observable through syscall-count tooling.
+- [x] Add `syscall_fs::pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr`.
+  - First payload range returns a host pointer.
+  - Second payload range returns `None`.
+  - Expected result: write succeeds, file contents match, staged fallback reads each non-empty payload exactly once.
+- [x] Add `syscall_fs::pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable`.
+  - At least one non-empty payload has no host pointer and fails `read_bytes`.
+  - Expected result: Linux-compatible `EFAULT`; no partial host-file write for the invalid validation case.
+- [x] Implement a helper in `crates/carrick-runtime/src/dispatch/fs.rs` that prepares `pwritev` payloads in one of two shapes:
+  - `Borrowed(Vec<libc::iovec>)` when every non-empty segment has a valid `host_ptr_for_read`.
+  - `Staged(Vec<Vec<u8>>)` when any non-empty segment lacks a host pointer.
+- [x] Call `libc::pwritev` for host files when the helper returns `Borrowed`.
+  - Convert iovec count with a checked `i32::try_from`.
+  - Use `libc::iovec { iov_base: ptr as *mut libc::c_void, iov_len: len }` on macOS.
+  - Return the host syscall byte count directly, including partial success.
+- [x] Preserve current validation-before-stream/open-description errno behavior.
+  - Guest iovec descriptors and payload accessibility are checked before stdio stream and fd-open errors where current tests require it.
+- [x] Keep the staged fallback path from commit `d41e658` for non-host-pointer memory and tests using `LinearMemory`.
+- [x] Run:
+  - `cargo test -p carrick-runtime --test integration pwritev -- --nocapture`
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+- [ ] Record before/after syscall-count or wall-time evidence for a multi-segment host-file `pwritev` workload.
+- [ ] Commit as `perf(io): use borrowed pwritev buffers` or a similarly scoped subject.
 
-Implementation direction:
+Progress:
 
-- Do not start with a general LD_PRELOAD compatibility layer.
-- First build a dynamic pipe-backed benchmark that proves small libc writes or metadata calls dominate.
-- If the benchmark supports it, implement a narrow interposer that batches writes or answers explicitly cached process metadata.
-- Keep syscall semantics authoritative in the runtime; interposition is an optimization, not a correctness layer.
+- 2026-06-06: Added RED integration test `syscall_fs::pwritev_host_file_uses_guest_host_ptrs_without_payload_reads`; pre-fix behavior returned the correct file contents but read the two watched payloads through `read_bytes` and recorded zero host-pointer hits.
+- 2026-06-06: Added fallback coverage `syscall_fs::pwritev_host_file_falls_back_to_staging_when_any_iovec_lacks_host_ptr` and validation coverage `syscall_fs::pwritev_host_file_reports_efault_when_fallback_payload_is_unreadable`.
+- 2026-06-06: Implemented `prepare_pwritev_payloads` in `crates/carrick-runtime/src/dispatch/fs.rs`. Host-file `pwritev` now calls one `libc::pwritev` when all non-empty iovecs expose `host_ptr_for_read`; mixed or non-host-pointer memory falls back to one staged read per payload.
+- 2026-06-06: Added `conformance-probes/src/bin/perf_pwritev_burst.rs` and registered `pwritev_burst` in the perf case registry. A pre-commit smoke run proved the benchmark executes; clean post-commit rows are still pending so the JSONL `git_sha` points at the code commit being measured.
+- 2026-06-06: Pre-commit verification passed: `cargo test -p carrick-runtime --test integration pwritev -- --nocapture`, `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture`, `cargo fmt --all -- --check`, and `git diff --check`.
 
-Acceptance:
+Milestone 2B: borrowed `readv` and `preadv` host-file fast paths.
 
-- A dynamic workload shows trap-count reduction and wall-time improvement.
-- Static workloads are unaffected.
-- The optimization is disabled or bypassed when semantics cannot be preserved.
+- [ ] Add `syscall_fs::readv_host_file_uses_guest_host_ptrs_for_writable_iovecs`.
+  - Use a custom test memory that implements `host_ptr_for_write` for two exact writable payload ranges.
+  - Expected RED on current branch: read succeeds through copied staging, but host-pointer write hits are `0`.
+  - Expected PASS after implementation: host-pointer write hits match non-empty iovec count and the guest bytes are filled directly.
+- [ ] Add `syscall_fs::preadv_host_file_preserves_offset_with_borrowed_iovecs`.
+  - File contains a known prefix and payload.
+  - `preadv` reads from a non-zero offset into two borrowed guest ranges.
+  - Expected result: guest memory receives exactly the offset slice and host file offset remains unchanged.
+- [ ] Add fallback coverage for a mixed borrowed/non-borrowed `readv` or `preadv` call.
+  - Expected result: existing staging path is used, partial read behavior matches current semantics, and guest memory is updated only for bytes actually read.
+- [ ] Implement a writable borrowed-iovec helper using `GuestMemory::host_ptr_for_write`.
+  - Use borrowed host vectors only when every non-empty target range is writable and contiguous.
+  - Fall back to the existing staged read path otherwise.
+- [ ] Convert host-file `readv` and `preadv` paths to `libc::readv` and `libc::preadv` when safe.
+- [ ] Run:
+  - `cargo test -p carrick-runtime --test integration readv -- --nocapture`
+  - `cargo test -p carrick-runtime --test integration preadv -- --nocapture`
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+- [ ] Record before/after evidence for multi-segment host-file reads.
+- [ ] Commit as a separate logical slice from `pwritev`.
 
-### 4. Whole-File Rootfs and Overlay Copy/Rewrites
+Milestone 2C: blocking write ownership and existing `writev` path cleanup.
 
-The VFS/backend interfaces still encourage whole-file materialization for operations that should be metadata-only or fd-backed. Some write paths rewrite whole contents after local modifications.
+- [ ] Add a test that forces the blocking-write handoff path and proves the buffer is not cloned when ownership can be moved.
+- [ ] Replace clone-on-handoff with ownership transfer for already-staged write buffers.
+- [ ] Confirm EINTR, EAGAIN, partial-write, and retry behavior are unchanged.
+- [ ] Run focused I/O tests and relevant conformance probes.
+- [ ] Record allocation or wall-time evidence for repeated small blocking writes.
+- [ ] Commit as a separate logical slice.
 
-Primary evidence:
+### 3. VFS Streaming and Dirty-Range Writeback
+
+Status: static opportunity.
+
+The rootfs and overlay abstractions still encourage whole-file materialization for operations that should be metadata-only or fd/range-backed.
+
+Expected removed work:
+
+- Metadata-only operations stop reading file contents.
+- Small writes to large files stop cloning or rewriting the full file.
+- Host-backed regular files use fd streaming where the backend can safely expose a raw fd.
+
+Key code:
 
 - `crates/carrick-runtime/src/fs_backend.rs`
-  - `OverlayEntry::File(Vec<u8>)` carries whole file contents.
-  - `file_contents` returns owned `Vec<u8>`.
-  - `set_file_contents` accepts and writes owned `Vec<u8>`.
 - `crates/carrick-runtime/src/dispatch/fs.rs`
-  - In-memory file write paths can clone full contents for writeback.
+- `crates/carrick-runtime/src/rootfs.rs`
+- `crates/carrick-runtime/src/layer_cache.rs`
 
-Expected impact:
+Milestone 3 tasks:
 
-- High for build systems, package managers, and language tooling.
-- High when files are large or repeatedly updated in small ranges.
+- [ ] Add a large-file metadata probe that opens/stats/lookups a file without reading its contents.
+- [ ] Add a large-file small-write test that fails if the backend rewrites or clones the full file.
+- [ ] Add backend API support for range writes or fd-backed mutation on regular mutable files.
+- [ ] Keep whole-file behavior as fallback for in-memory files, symlinks, directories, and special files.
+- [ ] Run focused filesystem tests and a build-tool-like workload with many small file updates.
+- [ ] Record before/after wall-time and byte-copy/writeback evidence.
 
-Implementation direction:
+### 4. Wait Path fd Pinning and kqueue Churn
 
-- Move hot open/read/write paths toward fd-backed streaming when the host backend can supply a raw fd.
-- Add dirty-range writeback for in-memory or overlay files that cannot be fd-backed.
-- Avoid returning file contents from metadata-only lookup paths.
-- Keep the high-level backend abstraction, but add specialized fast paths for regular host files and mutable overlay files.
+Status: static opportunity.
 
-Acceptance:
+Repeated waits on stable descriptors currently pay setup costs that should be amortized or avoided when the open description lifetime is already anchored.
 
-- A file rewrite probe shows small writes no longer cause whole-file clone/rewrite.
-- Metadata-only operations do not read file contents.
-- Existing rootfs/overlay correctness tests continue to pass.
+Expected removed work:
 
-### 5. Wait Path fd Pinning and kqueue Churn
+- Fewer `dup` and close pairs per wait.
+- Fewer transient kqueue change/event/deletion allocations.
+- Less macOS kernel time for event-loop-heavy workloads.
 
-The wait path duplicates watched fds and builds transient wait state for each wait. This is correct but expensive for event loops or programs that repeatedly wait on stable descriptors.
-
-Primary evidence:
+Key code:
 
 - `crates/carrick-hvf/src/io_wait.rs`
-  - `PinnedWaitFds::new` duplicates watched fds.
-  - `wait` and `wait_poll` rebuild/pin wait state for each call.
+- `crates/carrick-runtime/src/dispatch/fs.rs`
+- fd/open-description ownership code
 
-Expected impact:
+Milestone 4 tasks:
 
-- Medium to high for event-loop workloads.
-- Lower than mmap and iovec work for general-purpose throughput unless a workload is wait-heavy.
+- [ ] Add a wait-heavy probe that repeatedly waits on stable fds.
+- [ ] Add a correctness test for fd close/reuse during or near a wait.
+- [ ] Introduce retained wait targets for open descriptions that can safely anchor host fd lifetime without `dup`.
+- [ ] Keep fd duplication fallback for descriptors whose lifetime cannot be anchored safely.
+- [ ] Consider persistent kqueue subscriptions only with generation checks.
+- [ ] Run wake-pipe, signal, process-exit, and fd-reuse tests.
+- [ ] Record duplicate-fd count, `kevent` setup count, and wall-time evidence.
 
-Implementation direction:
+### 5. Targeted Trap Reduction After Measurement
 
-- Introduce a retained wait target that holds the `OpenFile`/host-fd lifetime through the wait without `dup` when the open description is already stable.
-- Consider persistent kqueue subscriptions for stable fds with generation checks.
-- Keep the current duplication path as fallback for descriptors whose lifetime cannot be anchored safely.
+Status: deferred until a workload proves it.
 
-Acceptance:
+Trap reduction should not begin with a general preload layer. The near-term runtime work above removes costs for dynamic and static workloads. Interposition becomes worthwhile only if a dynamic workload still shows trap count as the leading bottleneck.
 
-- A poll/epoll/select-style probe shows fewer `dup`/close and `kevent` setup calls.
-- fd reuse races are covered by tests.
-- Signal wake and process-exit wake paths remain correct.
+Milestone 5 tasks:
 
-### 6. Fork Snapshot Cost
+- [ ] Build or select a dynamic-libc workload dominated by small writes or cacheable metadata calls.
+- [ ] Measure current trap count and wall time with the runtime work above applied.
+- [ ] Compare three designs:
+  - EL1 shim extension for safe identity-style syscalls.
+  - Runtime batching after trap.
+  - Narrow dynamic interposer for explicitly safe libc calls.
+- [ ] Implement only the smallest semantics-preserving optimization.
+- [ ] Document unsupported workloads, especially static binaries and direct syscall users.
+- [ ] Record trap-count and wall-time evidence.
 
-Fork currently snapshots runtime/HVF state, destroys/rebuilds HVF VM state, and maps regions again in the child. Existing high-water/mincore logic is already a meaningful optimization, but dirty/resident-page pressure still determines much of the cost.
+### 6. Fork Snapshot Follow-Up
 
-Primary evidence:
+Status: dependent on mmap and page-dirtying evidence.
+
+Fork cost is affected by resident and dirty page pressure. The lazy-zero work should reduce avoidable fork pressure before deeper fork architecture changes are attempted.
+
+Key code:
 
 - `crates/carrick-hvf/src/trap.rs`
-  - Fork snapshot and VM rebuild logic walks mappings and remaps regions.
-  - Region cloning uses resident-page scanning and copying.
+- mapping metadata and memory backing helpers
 
-Expected impact:
-
-- Very high for fork-heavy workloads.
-- High implementation risk compared with mmap zeroing and iovec batching.
-
-Implementation direction:
-
-- First reduce avoidable page dirtying through the mmap lazy-zero work.
-- Then measure remaining fork cost by mapping class: anonymous private, shared anonymous, host aliases, and stack.
-- Only after measurement, consider dirty-bit tracking, snapshot elision for clean ranges, or narrower child rebuild work.
-
-Acceptance:
-
-- A fork-heavy probe shows reduced resident/copy work after mmap zeroing.
-- Any deeper fork change has a narrow correctness probe for child visibility, private writes, and shared mappings.
-
-## Prioritized Milestones
-
-### Milestone 1: Measure and Fix Anonymous mmap Lazy-Zero
-
-**Files:**
-
-- Modify: `crates/carrick-runtime/src/dispatch/mem.rs`
-- Possibly modify: `crates/carrick-mem/src/memory.rs`
-- Test: existing mmap tests plus a new focused mmap-zero/reuse test
-- Probe/bench: add a small mmap churn perf probe if no existing probe covers it
-
-- [x] Add a test that maps a fresh anonymous range and verifies the runtime does not materialize or write a full zero buffer for the fresh case.
-- [x] Add a test that reuses a range and verifies stale bytes are not visible.
-- [x] Implement the fresh-anonymous fast path.
-- [x] Run the focused mmap tests.
-- [x] Run fork and mmap pressure probes.
-- [x] Record before/after numbers in a repo-local perf result artifact.
-- [x] Commit the test/probe and runtime fix as a logical slice.
-
-Progress:
-
-- 2026-06-06: Started Milestone 1 on branch `codex/perf-mmap-lazy-zero`. First target is a dispatcher unit test that proves fresh private anonymous `mmap` does not need a guest-visible zero write.
-- 2026-06-06: Added RED unit test `dispatch::mem::tests::fresh_private_anonymous_mmap_skips_zero_write`; current mainline behavior fails with one `write_bytes` call for a fresh anonymous page.
-- 2026-06-06: Implemented the low-VA anonymous mmap fast path in `crates/carrick-runtime/src/dispatch/mem.rs`. Fresh private anonymous mappings now return after restoring access/protection; reused private anonymous mappings still scrub via `zero_backing` and avoid the redundant guest-visible zero write.
-- 2026-06-06: Added `dispatch::mem::tests::reused_private_anonymous_mmap_zeroes_backing_without_zero_write` and `conformance-probes/src/bin/perf_mmap_churn.rs`, then registered `mmap_churn` in the perf case registry.
-- 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime dispatch::mem::tests --lib -- --nocapture` (5 passed), `cargo test -p carrick-cli --test perf_runner perf_support::cases::tests -- --nocapture` (4 passed), `cargo check --manifest-path conformance-probes/Cargo.toml --target aarch64-unknown-linux-musl --bin perf_mmap_churn`, and `cargo fmt --all -- --check`.
-- 2026-06-06: Pressure probes passed after `just build`: `scripts/run-probe.sh mmapzerofill` MATCH (`anon_mmap_is_zero_filled=true`), `scripts/run-probe.sh mmaprecl` MATCH (`churn_ok=true`, `reuse_zero=true`), and `scripts/run-probe.sh forkcow` MATCH (`mmap_isolated=true` plus data/bss/heap isolation).
-- 2026-06-06: Committed runtime/test/probe slice as `14999846d766db29f7333fffa47d5d103914f26b` (`perf(mem): skip fresh anon mmap zero writes`).
-- 2026-06-06: Before/after `perf_mmap_churn` evidence for 64 untouched 8 MiB private anonymous mappings:
-  - Before commit `be9d01a`: manual Carrick samples `54937.750`, `57827.458`, `55593.333` us.
-  - After commit `14999846`: `CARRICK_PERF_FILTER=mmap_churn CARRICK_PERF_REPS=3 CARRICK_PERF_WARMUP=1 CARRICK_PERF_COOLDOWN_SECS=0 just bench quick` wrote `docs/perf-results/2026-06-05-memory.jsonl`; Carrick p50 `831.708` us, p95 `897.625` us; Docker p50 `60.667` us, p95 `197.750` us (Docker row marked noisy).
-
-### Milestone 2: Add Borrowed Iovec Host I/O
-
-**Files:**
-
-- Modify: `crates/carrick-mem/src/memory.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/fs.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/mod.rs`
-- Test: focused readv/preadv/pwritev tests
-
-- [ ] Add tests for contiguous valid guest iovecs on host files.
-- [ ] Add tests for split or invalid guest iovecs that must fall back or fail correctly.
-- [ ] Add a guest-memory borrowed-iovec API with explicit lifetime and permission checks.
-- [ ] Convert `readv`/`preadv`/`pwritev` host-file paths to use host vector syscalls when safe.
-- [x] Remove double guest reads in `pwritev`.
-- [ ] Avoid the extra blocking-write clone where ownership can be transferred safely.
-- [ ] Run focused I/O tests and relevant conformance probes.
-- [ ] Record syscall-count and wall-time before/after evidence.
-- [ ] Commit as one or more logical slices.
-
-Progress:
-
-- 2026-06-06: Started Milestone 2 with the explicitly listed `pwritev` duplicate-read removal. Added RED integration test `syscall_fs::pwritev_host_file_reads_each_guest_iovec_once`; pre-fix behavior read the two watched payload iovecs four times total.
-- 2026-06-06: Implemented single-pass `pwritev` staging in `crates/carrick-runtime/src/dispatch/fs.rs`. The handler still validates guest iovecs before stream/open-description errors, but reuses the staged payload buffers for HostFile writes instead of rereading each segment.
-- 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime --test integration pwritev_host_file_reads_each_guest_iovec_once -- --nocapture`, `cargo test -p carrick-runtime --test integration pwritev_bootstrap_validates_iovecs_and_reports_stream_errors -- --nocapture`, and `cargo fmt --all -- --check`.
-
-### Milestone 3: Replace Whole-File Hot Paths with Streaming or Dirty-Range Updates
-
-**Files:**
-
-- Modify: `crates/carrick-runtime/src/fs_backend.rs`
-- Modify: `crates/carrick-runtime/src/dispatch/fs.rs`
-- Test: focused rootfs/overlay writeback tests
-
-- [ ] Identify hot lookup/open paths that only need metadata but currently materialize file contents.
-- [ ] Add tests proving metadata-only paths do not read whole files.
-- [ ] Add tests for small writes to large files that should not rewrite the full file.
-- [ ] Introduce fd-backed or dirty-range update paths for regular mutable files.
-- [ ] Preserve existing overlay/rootfs semantics for symlinks, directories, and special files.
-- [ ] Run focused fs tests and a build-tool-like file workload.
-- [ ] Record before/after evidence.
-
-### Milestone 4: Reduce Per-Wait Setup Costs
-
-**Files:**
-
-- Modify: `crates/carrick-hvf/src/io_wait.rs`
-- Possibly modify: fd/open-file ownership code in `crates/carrick-runtime/src/dispatch/fs.rs`
-- Test: focused wait/fd-reuse/signal wake tests
-
-- [ ] Add a wait-heavy benchmark or probe that repeatedly waits on stable fds.
-- [ ] Add a correctness test for fd close/reuse during or near a wait.
-- [ ] Add retained wait targets for open descriptions that can safely anchor host fd lifetime.
-- [ ] Keep fd duplication fallback for unsafe cases.
-- [ ] Measure duplicate-fd and kqueue setup reduction.
-- [ ] Run existing wake-pipe, signal, and process-exit wait tests.
-
-### Milestone 5: Revisit Targeted Interposition
-
-**Files:**
-
-- Modify only after measurement identifies the right integration point.
-- Likely candidates: syscall shim docs, runtime trap metrics, dynamic preload/interposer code if introduced.
-
-- [ ] Build or select a dynamic-libc workload that is dominated by small writes or cacheable metadata calls.
-- [ ] Measure current trap count and wall time.
-- [ ] Decide whether narrow interposition beats extending the EL1 shim or runtime batching.
-- [ ] Implement only the smallest semantics-preserving optimization.
-- [ ] Document unsupported/static workload boundaries.
-
-### Milestone 6: Fork Snapshot Follow-Up
-
-**Files:**
-
-- Modify only after mmap lazy-zero evidence is collected.
-- Likely candidates: `crates/carrick-hvf/src/trap.rs`, mapping metadata, and memory backing helpers.
+Milestone 6 tasks:
 
 - [ ] Re-measure fork-heavy workloads after Milestone 1.
-- [ ] Classify remaining fork cost by mapping type.
-- [ ] Add correctness probes for any snapshot-elision or dirty-tracking proposal.
-- [ ] Avoid deep fork architecture changes unless the measurement shows mmap/iovec/VFS work is no longer the larger bottleneck.
+- [ ] Classify remaining fork cost by mapping type:
+  - private anonymous
+  - shared anonymous
+  - host aliases
+  - stack
+  - file-backed regions
+- [ ] Add correctness probes before any snapshot-elision or dirty-tracking change.
+- [ ] Only pursue deeper fork changes if mmap, iovec, VFS, and wait work no longer dominate the profile.
+
+## Measurement Requirements
+
+Every landed performance change records:
+
+- Workload or probe name.
+- Before and after wall time.
+- Before and after trap count, host syscall count, allocation count, byte-copy count, or fd/kqueue setup count when available.
+- Code path whose work was removed.
+- Correctness tests or conformance probes run.
+- Workload classes that do not benefit.
+
+Repo-local result artifacts:
+
+- Use `docs/perf-results/*.jsonl` for benchmark rows.
+- Keep manual samples in `goal.md` only when the perf harness cannot yet represent the workload.
+- Mark noisy controls explicitly instead of hiding them.
 
 ## Non-Goals
 
 - Do not weaken conformance gates to improve benchmark appearance.
 - Do not claim runtime wins from static inspection alone.
-- Do not start with broad ptrace or debugger support.
-- Do not build a general LD_PRELOAD compatibility layer before a dynamic workload proves the trap count is the bottleneck.
-- Do not micro-optimize syscall dispatch before removing larger copies, traps, host syscalls, or page dirtying.
+- Do not pursue ptrace in this plan.
+- Do not build a general `LD_PRELOAD` compatibility layer before a dynamic workload proves trap count is still the bottleneck.
+- Do not optimize syscall dispatch mechanics before removing larger traps, host syscalls, copies, page dirtying, or kernel wait setup.
+- Do not take deep fork-snapshot architecture risk before lower-risk mmap, iovec, VFS, and wait-path work has been measured.
 
-## Reporting Requirements
+## Immediate Next Slice
 
-For every landed performance change, record:
+Continue Milestone 2A.
 
-- The workload/probe.
-- Before and after wall time.
-- Before and after trap count or host syscall count when available.
-- The code path whose work was removed.
-- Correctness tests or conformance probes run.
-- Any workload class that does not benefit.
-
-## Recommended First Slice
-
-Start with the fresh anonymous mmap lazy-zero work. It is the most promising first-principles target because it removes allocation, copy, page dirtying, and downstream fork work at the same time. The next best slice is borrowed guest-memory iovec I/O because it collapses repeated host syscalls and buffer copies in a common runtime path.
+- [ ] Add the RED borrowed-host-pointer `pwritev` tests in `crates/carrick-runtime/tests/integration/syscall_fs.rs`.
+- [ ] Implement borrowed `pwritev` preparation in `crates/carrick-runtime/src/dispatch/fs.rs`.
+- [ ] Keep staged fallback behavior from `d41e658`.
+- [ ] Run focused `pwritev` tests, formatting, and `git diff --check`.
+- [ ] Record syscall-count or wall-time evidence.
+- [ ] Commit the slice separately from read-side vector I/O.
