@@ -130,6 +130,27 @@ fn prepare_pwritev_payloads(
     Ok(PwritevPayloads::Staged(staged_iovecs))
 }
 
+fn prepare_readv_targets(
+    memory: &mut impl GuestMemory,
+    iovecs: &[LinuxIovec],
+) -> Result<Option<Vec<libc::iovec>>, i32> {
+    let mut borrowed_iovecs = Vec::with_capacity(iovecs.len());
+    for iovec in iovecs {
+        let iov_len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
+        if iov_len == 0 {
+            continue;
+        }
+        let Some(ptr) = memory.host_ptr_for_write(iovec.iov_base, iov_len) else {
+            return Ok(None);
+        };
+        borrowed_iovecs.push(libc::iovec {
+            iov_base: ptr as *mut libc::c_void,
+            iov_len,
+        });
+    }
+    Ok(Some(borrowed_iovecs))
+}
+
 /// If `path` is a `/proc/{self,thread-self,curproc,this}/fd/N` magic symlink,
 /// return the descriptor number N. Used to serve `open()` of these (Linux
 /// re-opens the file behind fd N); Apple Rosetta opens its main-binary fd this
@@ -4334,6 +4355,16 @@ impl SyscallDispatcher {
             // offset). Fill each iovec sequentially.
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = *host_fd;
+                if let Some(borrowed_iovecs) = prepare_readv_targets(memory, &iovecs)? {
+                    if borrowed_iovecs.is_empty() {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    let iovcnt =
+                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                    let n = unsafe { libc::readv(hfd, borrowed_iovecs.as_ptr(), iovcnt) };
+                    let n = n.host_syscall_errno()?;
+                    return Ok(DispatchOutcome::Returned { value: n as i64 });
+                }
                 let mut total = 0i64;
                 for iov in &iovecs {
                     let len = usize::try_from(iov.iov_len)
@@ -4521,6 +4552,23 @@ impl SyscallDispatcher {
             // (kernel offset untouched).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = *host_fd;
+                if let Some(borrowed_iovecs) = prepare_readv_targets(memory, &iovecs)? {
+                    if borrowed_iovecs.is_empty() {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    let iovcnt =
+                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                    let n = unsafe {
+                        libc::preadv(
+                            hfd,
+                            borrowed_iovecs.as_ptr(),
+                            iovcnt,
+                            offset as libc::off_t,
+                        )
+                    };
+                    let n = n.host_syscall_errno()?;
+                    return Ok(DispatchOutcome::Returned { value: n as i64 });
+                }
                 let mut total = 0i64;
                 let mut cur = offset;
                 for iov in &iovecs {
