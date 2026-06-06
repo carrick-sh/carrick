@@ -285,6 +285,35 @@ const FUTEX_SIGNAL_TOKEN: usize = 2;
 /// waking on its own futex word). Sharding by address spreads that contention.
 /// 64 shards keeps per-shard contention low for any realistic thread count.
 const FUTEX_SHARDS: usize = 64;
+const FUTEX_HALT_POLL_NS_UNSET: u64 = u64::MAX;
+static FUTEX_HALT_POLL_NS: AtomicU64 = AtomicU64::new(FUTEX_HALT_POLL_NS_UNSET);
+
+fn futex_halt_poll_ns() -> u64 {
+    let cached = FUTEX_HALT_POLL_NS.load(Ordering::Relaxed);
+    if cached != FUTEX_HALT_POLL_NS_UNSET {
+        return cached;
+    }
+
+    let parsed = std::env::var("CARRICK_FUTEX_HALT_POLL_NS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+        .min(FUTEX_HALT_POLL_NS_UNSET - 1);
+    match FUTEX_HALT_POLL_NS.compare_exchange(
+        FUTEX_HALT_POLL_NS_UNSET,
+        parsed,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        Ok(_) => parsed,
+        Err(value) => value,
+    }
+}
+
+#[cfg(test)]
+fn reset_futex_halt_poll_ns_for_tests() {
+    FUTEX_HALT_POLL_NS.store(FUTEX_HALT_POLL_NS_UNSET, Ordering::Relaxed);
+}
 
 /// Address-keyed futex wait queues. Each guest futex word is identified by a
 /// stable Carrick-owned bucket key derived from an `Arc<FutexBucket>`, not by
@@ -404,6 +433,25 @@ impl FutexTable {
                 && Instant::now() >= deadline
             {
                 return FutexWaitOutcome::TimedOut;
+            }
+
+            let poll_ns = futex_halt_poll_ns();
+            if poll_ns != 0 {
+                let poll_deadline = Instant::now() + std::time::Duration::from_nanos(poll_ns);
+                while Instant::now() < poll_deadline {
+                    if bucket.generation.load(Ordering::Acquire) != wait.generation {
+                        return FutexWaitOutcome::Woken;
+                    }
+                    if interrupted() {
+                        return FutexWaitOutcome::Interrupted;
+                    }
+                    if let Some(deadline) = deadline
+                        && Instant::now() >= deadline
+                    {
+                        return FutexWaitOutcome::TimedOut;
+                    }
+                    std::hint::spin_loop();
+                }
             }
 
             let registered = Cell::new(false);
@@ -667,8 +715,52 @@ impl Default for FutexTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::ffi::OsString;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
+
+    const FUTEX_HALT_POLL_ENV: &str = "CARRICK_FUTEX_HALT_POLL_NS";
+    static FUTEX_HALT_POLL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let lock = FUTEX_HALT_POLL_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let old = std::env::var_os(key);
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            reset_futex_halt_poll_ns_for_tests();
+            Self {
+                _lock: lock,
+                key,
+                old,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+            reset_futex_halt_poll_ns_for_tests();
+        }
+    }
 
     #[test]
     fn allocates_monotonic_tids_above_base() {
@@ -733,6 +825,79 @@ mod tests {
         );
 
         waker.join().unwrap();
+    }
+
+    #[test]
+    fn futex_halt_poll_default_zero_preserves_waiter_registration() {
+        let _env = EnvGuard::set(FUTEX_HALT_POLL_ENV, None);
+        let table = Arc::new(FutexTable::new());
+        let waiter_table = Arc::clone(&table);
+        let addr = 0xf00d_0000_u64;
+        let entered = Arc::new(AtomicBool::new(false));
+        let waiter_entered = Arc::clone(&entered);
+
+        let waiter = std::thread::spawn(move || {
+            let wait = waiter_table.prepare_wait(addr);
+            waiter_entered.store(true, Ordering::SeqCst);
+            waiter_table.wait_prepared(wait, Some(Duration::from_secs(1)), &|| false)
+        });
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let mut observed_park = false;
+        while std::time::Instant::now() < deadline {
+            if table.waiter_count(addr) != 0 {
+                observed_park = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let woke = table.wake(addr, 1);
+        let outcome = waiter.join().unwrap();
+        assert!(observed_park, "default zero poll should park normally");
+        assert_eq!(woke, 1);
+        assert_eq!(outcome, FutexWaitOutcome::Woken);
+    }
+
+    #[test]
+    fn futex_halt_poll_nonzero_delays_parking_until_window_expires() {
+        let _env = EnvGuard::set(FUTEX_HALT_POLL_ENV, Some("50000000"));
+        let table = Arc::new(FutexTable::new());
+        let waiter_table = Arc::clone(&table);
+        let addr = 0xf00d_1000_u64;
+        let entered = Arc::new(AtomicBool::new(false));
+        let waiter_entered = Arc::clone(&entered);
+
+        let waiter = std::thread::spawn(move || {
+            let wait = waiter_table.prepare_wait(addr);
+            waiter_entered.store(true, Ordering::SeqCst);
+            waiter_table.wait_prepared(wait, Some(Duration::from_secs(1)), &|| false)
+        });
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(20);
+        let mut observed_park = false;
+        while std::time::Instant::now() < deadline {
+            if table.waiter_count(addr) != 0 {
+                observed_park = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let woke = table.wake(addr, 1);
+        let outcome = waiter.join().unwrap();
+        assert!(
+            !observed_park,
+            "nonzero halt-poll window should avoid parking before the deadline"
+        );
+        assert_eq!(woke, 0, "waker should find no parking-lot waiter yet");
+        assert_eq!(outcome, FutexWaitOutcome::Woken);
     }
 
     #[test]
