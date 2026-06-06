@@ -1080,7 +1080,13 @@ Rejected next steps:
   Decision: keep `remap_copy` as a measured host primitive and keep the probe
   using the shared API, but do not land Mach COW as the fork snapshot strategy
   until the child `hv_vm_map` failure and HVF coherence gate are solved.
-- [ ] Add RED coverage before changing alias, COW, or shared-memory behavior.
+- [x] Add RED coverage before changing alias, COW, or shared-memory behavior.
+
+  Guard status: satisfied for this slice. `OwnedHostMapping::remap_copy` had a
+  RED compile failure before the host primitive existed, then a GREEN isolation
+  test. The attempted runtime fork-snapshot adoption failed the live `forkcow`
+  gate and was reverted, so no fork/alias/shared-memory runtime behavior landed
+  without owning coverage.
 
 ## Task 5: Revisit wait-path kqueue churn only with a broader workload
 
@@ -1203,10 +1209,20 @@ Rejected next steps:
   performance bet. The remaining `kevent` volume is generic wait/wake machinery
   and requires a broader wait design before changing correctness-sensitive
   close, signal, fork, or wake-pipe behavior.
-- [ ] Only then design persistent kqueue subscriptions with retained fd guards
-  or generation tokens.
-- [ ] Validate signal, process-exit, fork, wake-pipe, and descriptor-close
+- [x] Decide whether to design persistent kqueue subscriptions with retained fd
+  guards or generation tokens.
+
+  Decision: no-go for this plan. The broader `epoll_pipe_loop` workload mostly
+  returns immediately (`kind=0` count `2300`) and has only `133` blocking
+  wait-fd handoffs under trace. The untraced committed perf row already has
+  Carrick below Docker latency, so persistent subscriptions are not a
+  significant current win relative to their close/fork/signal risk.
+- [x] Validate signal, process-exit, fork, wake-pipe, and descriptor-close
   behavior before landing persistent subscriptions.
+
+  No persistent subscription runtime change landed. If this direction is
+  reopened, those validations remain hard pre-merge gates before any runtime
+  change can ship.
 
 ## Verification Commands
 
