@@ -63,3 +63,14 @@ async fn ping_returns_ok() {
     let pong = docker.ping().await.unwrap();
     assert_eq!(pong, "OK");
 }
+
+#[tokio::test]
+async fn version_reports_carrick() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker = bollard::Docker::connect_with_unix(
+        &sock, 5, bollard::API_DEFAULT_VERSION,
+    ).unwrap();
+    let v = docker.version().await.unwrap();
+    assert_eq!(v.os.as_deref(), Some("linux"));
+    assert!(v.api_version.is_some());
+}
