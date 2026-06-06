@@ -1379,7 +1379,11 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                             ));
                         }
                         crate::dispatch::BlockingHostWriteStep::Wait => {
-                            match waiter.wait(&[(write.host_fd(), libc::POLLOUT)], None, 0) {
+                            match waiter.wait(
+                                &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
+                                None,
+                                0,
+                            ) {
                                 WaitResult::Ready => continue,
                                 WaitResult::Interrupted => {
                                     return Ok(partial_write_interrupt_outcome(&write));
@@ -1843,10 +1847,11 @@ impl ThreadRuntimeState {
                                 ));
                             }
                             crate::dispatch::BlockingHostWriteStep::Wait => {
-                                match self
-                                    .waiter
-                                    .wait(&[(write.host_fd(), libc::POLLOUT)], None, 0)
-                                {
+                                match self.waiter.wait(
+                                    &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
+                                    None,
+                                    0,
+                                ) {
                                     crate::io_wait::WaitResult::Ready => continue,
                                     crate::io_wait::WaitResult::Interrupted => {
                                         if crate::fork_quiesce::is_quiescing() {
