@@ -246,7 +246,16 @@ fn run_supervised_child(
         }
     }
     let engine = carrick_engine::Engine::new(store);
-    match crate::runtime_util::block_on_oci(async { engine.run(req).await }) {
+    // Resolve under tokio, then drop the runtime before forking in execute (no
+    // tokio alive across the fork — see the tokio-fork-isolation spec).
+    let spec = match crate::runtime_util::block_on_oci(engine.resolve(req)) {
+        Ok(s) => s,
+        Err(_) => {
+            container::mark_exited(id, 1);
+            std::process::exit(1);
+        }
+    };
+    match carrick_runtime::Runtime::execute(&spec) {
         Ok(r) => std::process::exit(r.exit_code),
         Err(_) => {
             container::mark_exited(id, 1);
@@ -905,7 +914,16 @@ pub(crate) fn exec(
     };
 
     let engine = carrick_engine::Engine::new(store);
-    let result = match crate::runtime_util::block_on_oci(async { engine.run(req).await }) {
+    // Resolve under tokio, drop the runtime, then execute (fork) with no tokio
+    // alive — see the tokio-fork-isolation spec.
+    let spec = match crate::runtime_util::block_on_oci(engine.resolve(req)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("carrick: exec failed: {e:#}");
+            std::process::exit(126);
+        }
+    };
+    let result = match carrick_runtime::Runtime::execute(&spec) {
         Ok(r) => r,
         Err(e) => {
             // The command couldn't be started (e.g. not found / not executable

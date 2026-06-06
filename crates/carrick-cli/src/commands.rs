@@ -563,20 +563,31 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // start — image resolve/pull, an invalid reference, no command, or
             // VM setup. (The container's OWN exit code is the Ok path below;
             // 126/127 for a bad entrypoint are produced inside the runtime.)
-            let result = match block_on_oci(async { engine.run(req.clone()).await }) {
+            // Resolve (pull + build the spec) under the tokio runtime, then DROP
+            // the runtime before executing — so no tokio thread is alive across
+            // the fork in Runtime::execute. (Forking with a live tokio runtime
+            // deadlocks the child in BlockingPool::shutdown — see
+            // docs/superpowers/specs/2026-06-06-tokio-fork-isolation.)
+            let spec = match block_on_oci(engine.resolve(req.clone())) {
+                Ok(s) => s,
+                // resolve runs in the PARENT (no fork yet) → normal exit is safe.
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    std::process::exit(125);
+                }
+            };
+            let result = match carrick_runtime::Runtime::execute(&spec) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
-                    // This arm can run in the forked guest-init child (under
-                    // `--pid private` the supervisor fork happens inside
-                    // engine.run, and an HVF/setup failure surfaces here in the
-                    // child). `std::process::exit` runs atexit/Drop cleanup,
-                    // which is unsafe after fork and double-closes an inherited
-                    // fd (IO-safety abort → SIGABRT). `_exit` terminates without
-                    // that cleanup, like the runtime's other forked-child exits.
-                    // stderr is already flushed (eprintln is unbuffered).
-                    // SAFETY: _exit is async-signal-safe; no cleanup to skip on
-                    // this error path (no buffered stdout; the report isn't emitted).
+                    // execute() forks (interactive supervisor / `--pid private`
+                    // NsSupervisor); a setup failure can surface in the forked
+                    // guest-init child, where `std::process::exit`'s atexit/Drop
+                    // is unsafe after fork and double-closes an inherited fd
+                    // (IO-safety abort → SIGABRT). `_exit` terminates without that
+                    // cleanup, like the runtime's other forked-child exits.
+                    // SAFETY: _exit is async-signal-safe; stderr already flushed
+                    // (eprintln is unbuffered); no buffered stdout to lose.
                     unsafe { libc::_exit(125) };
                 }
             };
