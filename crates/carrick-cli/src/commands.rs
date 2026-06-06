@@ -18,8 +18,10 @@
 //! 2. **The two run pipelines.** There are deliberately two entry points to a
 //!    guest, and they share almost nothing:
 //!    - `Run`/`Create`/`Exec` build a [`carrick_engine::CliRunRequest`] and go
-//!      through `carrick_engine::Engine::run` — i.e. resolve+pull an OCI image,
-//!      compose its rootfs, then `Runtime::execute`. This is the docker path.
+//!      through `carrick_engine::Engine::resolve` — i.e. resolve+pull an OCI
+//!      image and compose its rootfs — then call `Runtime::execute` separately,
+//!      once the async pull is torn down (no tokio runtime live across the fork).
+//!      This is the docker path.
 //!    - `RunElf`/`DispatchSyscall` bypass the engine and the image store
 //!      entirely, loading a *host* ELF (or a single synthetic syscall) straight
 //!      through `carrick-runtime`. This is the fixture path used by Go/CPython/

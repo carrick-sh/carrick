@@ -55,11 +55,14 @@
 //! ## Platform and the image read-through
 //!
 //! [`request_platform`] canonicalises `--platform` (or the host default,
-//! arm64) into a [`Platform`]. [`Engine::run`] maps that to a
+//! arm64) into a [`Platform`]. [`Engine::resolve`] maps that to a
 //! [`carrick_image::PlatformTarget`] and calls `resolve_with_platform`, so an
 //! amd64 (Rosetta) run pulls and caches the amd64 manifest without disturbing
-//! the native arm64 cache (see the `carrick-image` BTS), then hands the merged
-//! spec to [`carrick_runtime::Runtime::execute`].
+//! the native arm64 cache (see the `carrick-image` BTS), then returns the merged
+//! [`RunSpec`] to the caller. Resolving the spec is deliberately kept separate
+//! from executing it: the CLI calls [`carrick_runtime::Runtime::execute`] only
+//! after `resolve` has returned and the async (tokio) image-pull machinery has
+//! been torn down, so no tokio runtime is ever live across the `execute` fork.
 //!
 //! ## What this layer does *not* own
 //!
