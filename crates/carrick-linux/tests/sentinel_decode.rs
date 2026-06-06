@@ -23,8 +23,9 @@ fn sentinel_slot_materialises_sentinel_gpa_and_stores() {
     );
     // a non-sync slot (slot 0) is a bare eret
     assert_eq!(op_at(&v, 0), 0xd69f_03e0, "slot 0 is eret");
-    // sanity: SENTINEL_GPA is the 4-MiB-aligned high address we chose
-    assert_eq!(SENTINEL_GPA, 0x40_0000_0000);
+    // sanity: SENTINEL_GPA is the stage-1-mapped hole we chose (320 GiB),
+    // in the gap between the heap (256 GiB) and the mmap arena (384 GiB).
+    assert_eq!(SENTINEL_GPA, 0x50_0000_0000);
 }
 
 use carrick_mem::memory::stage1_identity_page_tables;

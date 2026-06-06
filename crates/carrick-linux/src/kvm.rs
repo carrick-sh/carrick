@@ -12,28 +12,38 @@ fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
 }
 
-// KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE — core register file
-// (x0..x30, sp, pc, pstate) addressed by byte offset into `struct user_pt_regs`.
+// KVM aarch64 register-id field layout (Linux arch/arm64/include/uapi/asm/kvm.h):
+//   KVM_REG_ARM64           = 0x6000... (bits 60-61: arch tag)
+//   KVM_REG_SIZE_U64        = 0x0030... (bits 52-55: size, shift 52)
+//   KVM_REG_ARM_COPROC_SHIFT = 16  -> the coprocessor field is bits 16-27
+//   KVM_REG_ARM_CORE        = 0x0010 << 16  (the core register file)
+//   KVM_REG_ARM64_SYSREG    = 0x0013 << 16  (the sysreg demux)
 const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
 const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
-const KVM_REG_ARM_CORE: u64 = 0x0010_0000_0000_0000;
+const KVM_REG_ARM_COPROC_SHIFT: u64 = 16;
+const KVM_REG_ARM_CORE: u64 = 0x0010 << KVM_REG_ARM_COPROC_SHIFT;
+const KVM_REG_ARM64_SYSREG: u64 = 0x0013 << KVM_REG_ARM_COPROC_SHIFT;
 
-/// Core-reg id for `user_pt_regs.regs[idx]` (x0..x30); each entry is 8 bytes.
-fn core_reg_id(idx_offset_bytes: u64) -> u64 {
-    KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (idx_offset_bytes / 4)
+/// Core-reg id for a `struct kvm_regs` field at `byte_offset`. The low bits of
+/// a KVM_REG_ARM_CORE id are `offsetof(kvm_regs, field) / sizeof(__u32)`.
+fn core_reg_id(byte_offset: u64) -> u64 {
+    KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (byte_offset / 4)
 }
-fn x_reg_id(n: u64) -> u64 {
-    // offsetof(user_pt_regs, regs[n]) == n*8
-    core_reg_id(n * 8)
-}
-// pc and pstate live after regs[31] (regs) + sp + pc + pstate in user_pt_regs:
-//   regs[31] -> bytes 0..248, sp -> 248, pc -> 256, pstate -> 264.
-const USER_PT_REGS_SP: u64 = 31 * 8; // 248
-const USER_PT_REGS_PC: u64 = USER_PT_REGS_SP + 8; // 256
+
+// Byte offsets into `struct kvm_regs`:
+//   struct user_pt_regs regs;   // 0:  regs[31] (0..248), sp@248, pc@256, pstate@264 -> 272 bytes
+//   __u64 sp_el1;               // 272
+//   __u64 elr_el1;              // 280
+//   __u64 spsr[KVM_NR_SPSR];    // 288 (spsr[0] == SPSR_EL1)
+// `user_pt_regs.sp` is SP_EL0 (the EL0/user stack).
+const USER_PT_REGS_SP_EL0: u64 = 31 * 8; // 248
+const USER_PT_REGS_PC: u64 = USER_PT_REGS_SP_EL0 + 8; // 256
 const USER_PT_REGS_PSTATE: u64 = USER_PT_REGS_PC + 8; // 264
+const KVM_REGS_SP_EL1: u64 = 272;
+const KVM_REGS_ELR_EL1: u64 = 280;
+const KVM_REGS_SPSR_EL1: u64 = 288;
 
 // KVM_REG_ARM64_SYSREG: id = base | (op0<<14)|(op1<<11)|(crn<<7)|(crm<<3)|op2
-const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000_0000_0000;
 fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
     KVM_REG_ARM64
         | KVM_REG_SIZE_U64
@@ -46,11 +56,16 @@ fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
 }
 
 fn reg_to_id(r: Reg) -> u64 {
+    // All of these live in the CORE register file (`struct kvm_regs`), NOT the
+    // sysreg demux — including ELR_EL1 / SPSR_EL1 / SP_EL1 (see SysReg vs Reg).
     match r {
-        Reg::X(n) => x_reg_id(u64::from(n)),
+        Reg::X(n) => core_reg_id(u64::from(n) * 8), // offsetof(kvm_regs, regs.regs[n]) == n*8
+        Reg::Sp => core_reg_id(USER_PT_REGS_SP_EL0), // == SP_EL0
         Reg::Pc => core_reg_id(USER_PT_REGS_PC),
-        Reg::Sp => core_reg_id(USER_PT_REGS_SP),
         Reg::Pstate => core_reg_id(USER_PT_REGS_PSTATE),
+        Reg::SpEl1 => core_reg_id(KVM_REGS_SP_EL1),
+        Reg::ElrEl1 => core_reg_id(KVM_REGS_ELR_EL1),
+        Reg::SpsrEl1 => core_reg_id(KVM_REGS_SPSR_EL1),
     }
 }
 fn sysreg_to_id(r: SysReg) -> u64 {
@@ -63,7 +78,6 @@ fn sysreg_to_id(r: SysReg) -> u64 {
         SysReg::Mair => sysreg_id(3, 0, 10, 2, 0), // MAIR_EL1
         SysReg::Vbar => sysreg_id(3, 0, 12, 0, 0), // VBAR_EL1
         SysReg::Cpacr => sysreg_id(3, 0, 1, 0, 2), // CPACR_EL1
-        SysReg::SpEl1 => sysreg_id(3, 4, 4, 1, 0), // SP_EL1
     }
 }
 
@@ -187,34 +201,6 @@ impl HvVcpu for KvmVcpu {
         // (-> VcpuExit::Intr -> VcpuExit::Kicked). The MVP is single-threaded
         // (write+exit, no cross-thread wakeups), so this is exercised only by
         // the full backend; provide the mechanism, not a thread registry.
-        Ok(())
-    }
-}
-
-impl KvmVcpu {
-    fn elr_el1_id() -> u64 {
-        // ELR_EL1: op0=3, op1=0, CRn=4, CRm=0, op2=1
-        KVM_REG_ARM64
-            | KVM_REG_SIZE_U64
-            | KVM_REG_ARM64_SYSREG
-            | (3 << 14)
-            | (0 << 11)
-            | (4 << 7)
-            | (0 << 3)
-            | 1
-    }
-    pub fn elr_el1(&self) -> Result<u64, OsError> {
-        let mut bytes = [0u8; 8];
-        self.fd
-            .get_one_reg(Self::elr_el1_id(), &mut bytes)
-            .map_err(|e| os_err("KVM_GET_ONE_REG(ELR_EL1)", e))?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-    pub fn set_elr_el1(&mut self, v: u64) -> Result<(), OsError> {
-        let bytes = v.to_le_bytes();
-        self.fd
-            .set_one_reg(Self::elr_el1_id(), &bytes)
-            .map_err(|e| os_err("KVM_SET_ONE_REG(ELR_EL1)", e))?;
         Ok(())
     }
 }

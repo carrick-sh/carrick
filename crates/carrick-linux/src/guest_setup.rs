@@ -6,16 +6,28 @@
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_EL1_VECTORS_SIZE,
-    LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes, stage1_identity_page_tables,
+    LINUX_KERNEL_REGION_BASE, LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes,
+    stage1_identity_page_tables,
 };
 
 use crate::kvm::{KvmVcpu, KvmVm};
 
-/// Guest-physical address the EL1 vector stores to on an EL0 `svc`. It is left
-/// UNMAPPED in every KVM memory region, so the store faults out as
-/// `KVM_EXIT_MMIO { gpa: SENTINEL_GPA, .. }` — the trap vehicle. Chosen high,
-/// outside any region carrick maps, and distinct from the kernel hole.
-pub const SENTINEL_GPA: u64 = 0x40_0000_0000;
+/// Guest-physical address the EL1 vector stores to on an EL0 `svc`.
+///
+/// Requirements: it must be (a) **stage-1 identity-mapped** (so the EL1 store
+/// translates), yet (b) left UNMAPPED in every KVM memory region (so the access
+/// faults out as `KVM_EXIT_MMIO { gpa: SENTINEL_GPA, .. }` — the trap vehicle).
+///
+/// 320 GiB satisfies both: the stage-1 identity map covers 0..512 GiB with
+/// 1 GiB user blocks (`stage1_identity_page_tables`), and 320 GiB sits in the
+/// gap between the heap (`LINUX_HEAP_BASE` = 256 GiB, +128 MiB) and the mmap
+/// arena (`LINUX_MMAP_BASE` = 384 GiB), so it is never a real carrick region.
+/// It is also far above the backed RAM window (which ends at the kernel hole,
+/// ~180 GiB), so the store always faults to stage-2 / MMIO.
+///
+/// NOTE: it must NOT be `LINUX_HEAP_BASE` (256 GiB) — that collides with the
+/// guest heap region.
+pub const SENTINEL_GPA: u64 = 0x50_0000_0000; // 320 GiB
 
 // The aarch64 vector table layout (matches carrick-mem's el1_vectors_bytes):
 // 16 slots * 0x80 bytes; the lower-EL synchronous slot is at offset 0x400.
@@ -151,9 +163,21 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
     let len = KERNEL_HOLE_END as usize;
     let mut ram = GuestRam::new(0, len)?;
 
-    // 1. ELF segments (identity GPA == region.start).
+    // 1. ELF segments (identity GPA == region.start). `load_elf_bytes` also
+    //    appends the guest's high runtime reservations (sigreturn@192 GiB,
+    //    heap@256 GiB, mmap@384 GiB, ...) which live ABOVE the kernel hole and
+    //    outside the backed RAM window. Those are lazily-zero and untouched by
+    //    the freestanding MVP fixture, so we pre-load only the low ELF segments
+    //    (everything below the kernel region); writing the high reservations
+    //    would overflow the RAM window.
     for region in image.regions() {
-        ram.write_gpa(region.start, region.bytes())?;
+        if region.start >= LINUX_KERNEL_REGION_BASE {
+            continue;
+        }
+        let bytes = region.bytes();
+        if !bytes.is_empty() {
+            ram.write_gpa(region.start, bytes)?;
+        }
     }
     // 2. Architectural bring-up pages, reused verbatim from carrick-mem.
     ram.write_gpa(LINUX_EL0_TRAMPOLINE_BASE, &el0_trampoline_bytes())?;
@@ -212,17 +236,30 @@ fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsErr
 
     // THE PAN DIVERGENCE FROM HVF. Apple HVF forces PSTATE.PAN=1 and the
     // identity tables work around FEAT_PAN3 with AP=01+PXN=1 on user pages.
-    // On KVM the host controls PSTATE: start the vCPU at the EL1 trampoline in
-    // EL1h with PAN EXPLICITLY CLEARED (bit 22), DAIF masked. Bit layout of
-    // SPSR/PSTATE: M[3:0]=0b0101 (EL1h), DAIF=0b1111<<6, PAN(bit 22)=0.
-    const PSTATE_EL1H_DAIF_MASKED_PAN_CLEAR: u64 = 0b0101 | (0b1111 << 6);
-    vcpu.set_reg(Reg::Pstate, PSTATE_EL1H_DAIF_MASKED_PAN_CLEAR)?;
+    // On KVM the host controls PSTATE. The sentinel store is issued from EL1
+    // against an EL0-accessible (user) identity page, so PAN MUST be clear or
+    // it would fault as a permission abort instead of reaching stage-2 / MMIO.
+    const DAIF_MASKED: u64 = 0b1111 << 6;
+    const PSTATE_M_EL1H: u64 = 0b0101; // M[3:0] = EL1h
+    const PSTATE_M_EL0T: u64 = 0b0000; // M[3:0] = EL0t
+    // Current PSTATE: run the EL0 trampoline at EL1h, DAIF masked, PAN(bit22)=0.
+    vcpu.set_reg(Reg::Pstate, PSTATE_M_EL1H | DAIF_MASKED)?;
 
-    // Start at the EL0 trampoline (EL1h); it does TLBI/IC/ISB then `eret` to
-    // EL0 at the image entry. Seed SP and the EL0 entry.
+    // The trampoline ends in `eret`, which loads PC <- ELR_EL1 and
+    // PSTATE <- SPSR_EL1. Program both so the eret drops to EL0 at the image
+    // entry. (Mirrors the HVF path at carrick-hvf/src/trap.rs:1462-1476.)
+    vcpu.set_reg(Reg::SpsrEl1, PSTATE_M_EL0T | DAIF_MASKED)?;
+    vcpu.set_reg(Reg::ElrEl1, image.entry())?;
+
+    // Start the vCPU executing the EL0 trampoline (in EL1h).
     vcpu.set_reg(Reg::Pc, LINUX_EL0_TRAMPOLINE_BASE)?;
+
+    // The EL0 user stack lives in SP_EL0 (== Reg::Sp), NOT SP_EL1. The
+    // freestanding MVP binary has no initial stack (load_elf_bytes leaves it
+    // None) and never touches SP; a real image sets it via
+    // `AddressSpace::with_linux_initial_stack` before bring-up.
     if let Some(sp) = image.initial_stack_pointer() {
-        vcpu.set_sys_reg(SysReg::SpEl1, sp)?;
+        vcpu.set_reg(Reg::Sp, sp)?;
     }
     Ok(())
 }
