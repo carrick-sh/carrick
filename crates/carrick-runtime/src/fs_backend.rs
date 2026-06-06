@@ -2028,11 +2028,11 @@ pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
 /// node), so this collapses the typical 3–4 reads to one list + one read; a
 /// file with no carrick xattrs costs just the list. Falls back to direct reads
 /// if the name buffer is too small (a file with unusually many xattrs).
-#[cfg(target_os = "macos")]
 fn fd_carrick_meta(fd: std::os::fd::RawFd) -> (Option<u32>, Option<u32>, Option<u32>, bool) {
     let mut names = [0u8; 1024];
-    let n =
-        unsafe { libc::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len(), 0) };
+    let n = unsafe {
+        carrick_portable::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len())
+    };
     if n < 0 || n as usize > names.len() {
         // flistxattr error, or more names than the probe buffer holds: read each
         // attribute directly (correct, just not collapsed). Rare on scratch.
@@ -3298,12 +3298,11 @@ impl FsBackend for HostFsBackend {
             opts |= libc::XATTR_REPLACE;
         }
         let rc = unsafe {
-            libc::fsetxattr(
+            carrick_portable::fsetxattr(
                 host_fd,
                 cname.as_ptr(),
                 value.as_ptr() as *const libc::c_void,
                 value.len() as libc::size_t,
-                0,
                 opts,
             )
         };
@@ -3327,8 +3326,9 @@ impl FsBackend for HostFsBackend {
             }
         };
         // First call with size 0 to learn the value length.
-        let needed =
-            unsafe { libc::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+        let needed = unsafe {
+            carrick_portable::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0)
+        };
         let needed = match needed.host_syscall_errno() {
             Ok(needed) => needed,
             Err(err) => {
@@ -3338,13 +3338,11 @@ impl FsBackend for HostFsBackend {
         };
         let mut buf = vec![0u8; needed as usize];
         let n = unsafe {
-            libc::fgetxattr(
+            carrick_portable::fgetxattr(
                 host_fd,
                 cname.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len() as libc::size_t,
-                0,
-                0,
             )
         };
         let result = n.host_syscall_errno().map(|n| {
@@ -3360,7 +3358,7 @@ impl FsBackend for HostFsBackend {
             // macOS may surface its own attribute names (e.g. resource forks);
             // we read the full NUL-separated list then filter to `user.*` so the
             // result is exactly the Linux-conformant namespace the guest set.
-            let needed = unsafe { libc::flistxattr(host_fd, std::ptr::null_mut(), 0, 0) };
+            let needed = unsafe { carrick_portable::flistxattr(host_fd, std::ptr::null_mut(), 0) };
             let needed = match needed.host_syscall_errno() {
                 Ok(needed) => needed,
                 Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
@@ -3368,11 +3366,10 @@ impl FsBackend for HostFsBackend {
             };
             let mut buf = vec![0u8; needed as usize];
             let n = unsafe {
-                libc::flistxattr(
+                carrick_portable::flistxattr(
                     host_fd,
                     buf.as_mut_ptr() as *mut libc::c_char,
                     buf.len() as libc::size_t,
-                    0,
                 )
             };
             let n = match n.host_syscall_errno() {
@@ -3428,7 +3425,7 @@ impl FsBackend for HostFsBackend {
         };
         // macOS fremovexattr; ENOATTR (absent attribute) maps to Linux ENODATA
         // via host_syscall_errno (commit d9b1822).
-        let rc = unsafe { libc::fremovexattr(host_fd, cname.as_ptr(), 0) };
+        let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
         let err = rc.host_syscall_errno().map(|_| ());
         unsafe { libc::close(host_fd) };
         err

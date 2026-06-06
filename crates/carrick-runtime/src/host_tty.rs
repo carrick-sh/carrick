@@ -316,8 +316,10 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
 
 fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
     // Preserve any host-specific bits outside the masks we translate.
-    let preserved_iflag = d.c_iflag & !((COMMON_IFLAG_MASK as carrick_portable::TcFlag) | DARWIN_IXON | DARWIN_IXOFF);
-    let preserved_oflag = d.c_oflag & !((COMMON_OFLAG_MASK as carrick_portable::TcFlag) | DARWIN_ONLCR | DARWIN_OCRNL);
+    let preserved_iflag =
+        d.c_iflag & !((COMMON_IFLAG_MASK as carrick_portable::TcFlag) | DARWIN_IXON | DARWIN_IXOFF);
+    let preserved_oflag = d.c_oflag
+        & !((COMMON_OFLAG_MASK as carrick_portable::TcFlag) | DARWIN_ONLCR | DARWIN_OCRNL);
     let preserved_cflag = d.c_cflag
         & !(DARWIN_CSIZE
             | DARWIN_CSTOPB
@@ -337,7 +339,8 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
             | DARWIN_LFLAG_TOSTOP
             | DARWIN_LFLAG_IEXTEN);
 
-    let mut iflag = preserved_iflag | (l.c_iflag as carrick_portable::TcFlag & COMMON_IFLAG_MASK as carrick_portable::TcFlag);
+    let mut iflag = preserved_iflag
+        | (l.c_iflag as carrick_portable::TcFlag & COMMON_IFLAG_MASK as carrick_portable::TcFlag);
     if l.c_iflag & LINUX_IXON != 0 {
         iflag |= DARWIN_IXON;
     }
@@ -345,7 +348,8 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
         iflag |= DARWIN_IXOFF;
     }
 
-    let mut oflag = preserved_oflag | (l.c_oflag as carrick_portable::TcFlag & COMMON_OFLAG_MASK as carrick_portable::TcFlag);
+    let mut oflag = preserved_oflag
+        | (l.c_oflag as carrick_portable::TcFlag & COMMON_OFLAG_MASK as carrick_portable::TcFlag);
     if l.c_oflag & LINUX_ONLCR != 0 {
         oflag |= DARWIN_ONLCR;
     }
@@ -809,7 +813,8 @@ mod tests {
             t
         };
         assert!(
-            before.c_lflag as carrick_portable::TcFlag & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO) != 0,
+            before.c_lflag as carrick_portable::TcFlag & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO)
+                != 0,
             "slave starts cooked (ICANON|ECHO must be set)"
         );
         make_raw(slave).unwrap();

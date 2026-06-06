@@ -807,42 +807,7 @@ impl SyscallDispatcher {
     /// LOCAL_PEERPID (best-effort; 0 where unavailable). Used to synthesize the
     /// SCM_CREDENTIALS ancillary message for SO_PASSCRED. (audit M2)
     fn peer_ucred(&self, host_fd: i32) -> (u32, u32, u32) {
-        let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
-        let mut xlen = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
-        let (uid, gid) = if unsafe {
-            libc::getsockopt(
-                host_fd,
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERCRED,
-                (&mut xucred as *mut libc::xucred).cast(),
-                &mut xlen,
-            )
-        } == 0
-        {
-            (
-                xucred.cr_uid,
-                xucred.cr_groups.first().copied().unwrap_or(0),
-            )
-        } else {
-            (0, 0)
-        };
-        let mut peer_pid: libc::pid_t = 0;
-        let mut plen = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-        let pid = if unsafe {
-            libc::getsockopt(
-                host_fd,
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERPID,
-                (&mut peer_pid as *mut libc::pid_t).cast(),
-                &mut plen,
-            )
-        } == 0
-        {
-            peer_pid as u32
-        } else {
-            0
-        };
-        (pid, uid, gid)
+        carrick_portable::peer_ucred(host_fd)
     }
 
     /// The GUEST-requested socket type for `fd` (e.g. SOCK_SEQPACKET), which can
@@ -3264,41 +3229,13 @@ impl SyscallDispatcher {
             // because `linux_to_host_sockopt` has no Darwin opt to map it to.
             if level == LINUX_SOL_SOCKET && optname == crate::linux_abi::LINUX_SO_PEERCRED {
                 let (host_fd, _family) = this.host_socket_lookup(fd)?;
-                let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
-                let mut xlen = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
-                let cred_rc = unsafe {
-                    libc::getsockopt(
-                        host_fd,
-                        libc::SOL_LOCAL,
-                        libc::LOCAL_PEERCRED,
-                        (&mut xucred as *mut libc::xucred).cast(),
-                        &mut xlen,
-                    )
-                };
-                if let Err(errno) = cred_rc.host_syscall_errno() {
-                    return Ok(errno.into());
-                }
-                // Peer pid is a separate Darwin option; best-effort (0 if absent).
-                let mut peer_pid: libc::pid_t = 0;
-                let mut plen = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-                let pid: u32 = if unsafe {
-                    libc::getsockopt(
-                        host_fd,
-                        libc::SOL_LOCAL,
-                        libc::LOCAL_PEERPID,
-                        (&mut peer_pid as *mut libc::pid_t).cast(),
-                        &mut plen,
-                    )
-                } == 0
-                {
-                    peer_pid as u32
-                } else {
-                    0
-                };
-                let gid = xucred.cr_groups.first().copied().unwrap_or(0);
+                // Best-effort peer creds, resolved per host (Linux: SO_PEERCRED
+                // -> ucred; Darwin: LOCAL_PEERCRED + LOCAL_PEERPID). Returns 0s
+                // if the socket isn't connected, matching the guest's tolerance.
+                let (pid, uid, gid) = carrick_portable::peer_ucred(host_fd);
                 let mut ucred = [0u8; crate::linux_abi::LINUX_UCRED_SIZE];
                 ucred[0..4].copy_from_slice(&pid.to_ne_bytes());
-                ucred[4..8].copy_from_slice(&(xucred.cr_uid).to_ne_bytes());
+                ucred[4..8].copy_from_slice(&uid.to_ne_bytes());
                 ucred[8..12].copy_from_slice(&gid.to_ne_bytes());
                 // Honor the guest's optlen: write at most what it offered and
                 // report the bytes actually written (Linux clamps to the buffer).

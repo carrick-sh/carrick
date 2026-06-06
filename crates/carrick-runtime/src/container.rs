@@ -145,9 +145,14 @@ impl Default for RunConfig {
 /// The registry root: `<scratch>/containers` (per-user, case-sensitive). Each
 /// container lives in `<root>/<id>/`.
 pub fn registry_root() -> PathBuf {
-    crate::apfs::preferred_scratch_root()
-        .unwrap_or_else(|_| std::env::temp_dir().join("carrick"))
-        .join("containers")
+    // The APFS scratch root (a case-sensitive, fast-clone volume) is a macOS
+    // host concept; on Linux fall back to a tempdir-based root.
+    #[cfg(target_os = "macos")]
+    let base = crate::apfs::preferred_scratch_root()
+        .unwrap_or_else(|_| std::env::temp_dir().join("carrick"));
+    #[cfg(not(target_os = "macos"))]
+    let base = std::env::temp_dir().join("carrick");
+    base.join("containers")
 }
 
 /// A container id is a safe single path component iff it is non-empty and

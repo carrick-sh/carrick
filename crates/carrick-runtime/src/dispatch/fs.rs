@@ -205,10 +205,13 @@ fn forward_record_lock<M: GuestMemory>(
     if !(0..=2).contains(&l_whence) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
+    // struct flock.l_type is c_short (i16) on both OSes, but the libc F_*LCK
+    // constants are i16 on Darwin / i32 on Linux — narrow to the field width.
+    #[allow(clippy::unnecessary_cast)] // libc F_*LCK: i16 on Darwin, i32 on Linux
     let l_type_host: i16 = match l_type_linux {
-        LINUX_F_RDLCK => libc::F_RDLCK,
-        LINUX_F_WRLCK => libc::F_WRLCK,
-        LINUX_F_UNLCK => libc::F_UNLCK,
+        LINUX_F_RDLCK => libc::F_RDLCK as i16,
+        LINUX_F_WRLCK => libc::F_WRLCK as i16,
+        LINUX_F_UNLCK => libc::F_UNLCK as i16,
         _ => return DispatchOutcome::errno(LINUX_EINVAL),
     };
     let host_cmd: i32 = match linux_cmd {
@@ -5115,20 +5118,14 @@ impl SyscallDispatcher {
             if let (Some(file_fd), Some(sock_fd)) =
                 (this.regular_host_file_fd(in_fd.0), this.host_socket_fd(out_fd.0))
             {
-                let mut len: libc::off_t = count as libc::off_t;
-                // SAFETY: both are live host fds owned by these guest fds; `len`
-                // is in (bytes to send) / out (bytes sent); no header/trailer.
+                // SAFETY: both are live host fds owned by these guest fds. The
+                // portable wrapper hides the Darwin (6-arg, in/out len) vs Linux
+                // (4-arg, swapped fds) signature: returns bytes sent, or -1
+                // (errno set), so `host_syscall_errno()` below still works.
                 let rc = unsafe {
-                    libc::sendfile(
-                        file_fd,
-                        sock_fd,
-                        offset as libc::off_t,
-                        &mut len,
-                        std::ptr::null_mut(),
-                        0,
-                    )
+                    carrick_portable::sendfile_to_socket(file_fd, sock_fd, offset as i64, count)
                 };
-                let sent = len.max(0) as usize;
+                let sent = rc.max(0) as usize;
                 let advance_and_return = |offset: usize,
                                           sent: usize,
                                           memory: &mut dyn GuestMemory|

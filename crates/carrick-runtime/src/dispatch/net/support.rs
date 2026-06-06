@@ -550,22 +550,41 @@ fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
         let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
         match family {
             carrick_portable::AF_LINK => {
-                // One interface record per AF_LINK entry (carries the index + hw).
-                // SAFETY: AF_LINK sockaddr is a sockaddr_dl.
-                let dl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
-                let nlen = dl.sdl_nlen as usize;
-                let alen = dl.sdl_alen as usize;
-                let mut hw = Vec::new();
-                if alen > 0 && nlen + alen <= dl.sdl_data.len() {
-                    hw = dl.sdl_data[nlen..nlen + alen]
-                        .iter()
-                        .map(|&c| c as u8)
-                        .collect();
-                }
-                let idx = if index != 0 {
-                    index
-                } else {
-                    dl.sdl_index as u32
+                // One link-layer record per entry (carries the index + hw addr).
+                // The sockaddr shape differs: Darwin AF_LINK -> sockaddr_dl,
+                // Linux AF_PACKET -> sockaddr_ll.
+                #[cfg(target_os = "macos")]
+                let (hw, idx) = {
+                    // SAFETY: AF_LINK sockaddr is a sockaddr_dl.
+                    let dl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
+                    let nlen = dl.sdl_nlen as usize;
+                    let alen = dl.sdl_alen as usize;
+                    let mut hw = Vec::new();
+                    if alen > 0 && nlen + alen <= dl.sdl_data.len() {
+                        hw = dl.sdl_data[nlen..nlen + alen]
+                            .iter()
+                            .map(|&c| c as u8)
+                            .collect();
+                    }
+                    let idx = if index != 0 {
+                        index
+                    } else {
+                        dl.sdl_index as u32
+                    };
+                    (hw, idx)
+                };
+                #[cfg(not(target_os = "macos"))]
+                let (hw, idx) = {
+                    // SAFETY: AF_PACKET sockaddr is a sockaddr_ll.
+                    let ll = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_ll) };
+                    let alen = (ll.sll_halen as usize).min(ll.sll_addr.len());
+                    let hw = ll.sll_addr[..alen].to_vec();
+                    let idx = if index != 0 {
+                        index
+                    } else {
+                        ll.sll_ifindex as u32
+                    };
+                    (hw, idx)
                 };
                 ifaces.push(HostIface {
                     name,
@@ -1510,7 +1529,7 @@ pub(in crate::dispatch) fn build_host_ipv6_cmsgs(cmsgs: &[(i32, Vec<u8>)]) -> Ve
             if cmsg.is_null() {
                 break;
             }
-            (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as u32);
+            (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as _) as _;
             (*cmsg).cmsg_level = LINUX_IPPROTO_IPV6; // 41 on both
             (*cmsg).cmsg_type = *ctype;
             std::ptr::copy_nonoverlapping(data.as_ptr(), libc::CMSG_DATA(cmsg), data.len());
@@ -1600,7 +1619,7 @@ pub(in crate::dispatch) fn build_host_scm_rights(host_fds: &[i32]) -> Vec<u8> {
         // Lay down one cmsghdr at the buffer head via the libc accessor so the
         // macOS-specific alignment/len fields are exactly right.
         let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(data_len);
+        (*cmsg).cmsg_len = libc::CMSG_LEN(data_len as _) as _;
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         let data = libc::CMSG_DATA(cmsg) as *mut i32;
@@ -1914,7 +1933,11 @@ mod tests {
     #[test]
     fn epoll_kqueue_changes_include_oob_filter_for_priority_events() {
         let changes = epoll_kq_add_changes(42, 7, LINUX_EPOLLPRI);
-        assert!(changes.iter().any(|ev| ev.filter() == carrick_portable::EVFILT_READ));
+        assert!(
+            changes
+                .iter()
+                .any(|ev| ev.filter() == carrick_portable::EVFILT_READ)
+        );
         assert!(
             changes
                 .iter()

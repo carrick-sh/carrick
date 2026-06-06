@@ -123,7 +123,6 @@ pub(super) struct HostFileCopyInfo {
     pub(super) writable: bool,
 }
 
-#[cfg(target_os = "macos")]
 pub(super) fn host_fd_offset(host_fd: i32) -> Option<u64> {
     let offset = unsafe { libc::lseek(host_fd, 0, libc::SEEK_CUR) };
     if offset < 0 {
