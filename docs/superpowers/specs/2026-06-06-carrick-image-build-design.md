@@ -239,104 +239,67 @@ gap the §4 loop surfaces with an owning probe; enable kaniko's `--cache`.
 tracked carrick coverage gap), published as a matrix vs `docker build`; a re-build
 hits kaniko's cache.
 
-**Status 2026-06-06 (M2 multi-stage gap CLOSED via a kaniko snapshot flag):**
+**Status 2026-06-06 (M2 multi-stage gap CLOSED at the carrick-fs source; the
+`--use-new-run` workaround DROPPED):**
 
 | Corpus entry | build | run | notes |
 |---|---|---|---|
 | single-stage `FROM alpine + RUN + RUN` | ✅ | ✅ | `carrick build → carrick run` prints the artifact |
 | single-stage `FROM alpine + RUN apk add` (network-in-RUN) | ✅ | ✅ | `apk add jq` during RUN works |
-| **multi-stage** `FROM…AS` + `COPY --from` + `RUN` | ✅ | ✅ | **FIXED** — `--use-new-run` avoids the full-FS snapshot; clean layers (no `.wh.lib`), runs, exit 0 |
+| **multi-stage** `FROM…AS` + `COPY --from` + `RUN` | ✅ | ✅ | **FIXED** at the source: default full-FS snapshot, clean layers (no `.wh.lib`), runs, exit 0, and the `COPY --from`+RUN modification is captured (full fidelity) |
 
 - **kaniko `--cache` / `--cache-repo` passthrough**: ✅ landed (`2b8e2cb`);
   `--no-cache` wins over `--cache`. (Registry-backed cache-hit validation needs a
   live registry; deferred — only the argv mapping is unit-tested.)
-- No data-loss: `carrick build <ctx>` preserves the context dir (verified).
+- `carrick build` now passes kaniko in its DEFAULT full-filesystem snapshot mode
+  (no `--use-new-run`) — the most faithful mode, capturing every per-RUN change.
 
-**FIX — `--use-new-run` (kaniko's experimental run) is now emitted
-unconditionally** by `kaniko_run_argv` (`commands.rs`), for every `carrick build`.
-It detects per-`RUN` changes WITHOUT kaniko's default full-mode parallel
-filesystem snapshot walk, so the mid-reset `/lib` (below) is never observed and no
-spurious `.wh.lib` is emitted. Verified: a multi-stage build's two layers contain
-the real `/lib` (`lib/ld-musl-aarch64.so.1`, `libc.musl-aarch64.so.1`) and
-`artifact.txt`, with **0 whiteouts**; `carrick run multistage:demo` prints the
-artifact and exits 0, and `... /bin/sh -c 'echo OK'` exits 0 (the musl interpreter
-resolves). Single-stage is unaffected (still ✅) and benefits from the faster
-change detection.
+**ROOT CAUSE (carrick-trace of the real build, after REFUTING the leading
+hypothesis): a writable `-v` bind mount let the guest delete the host SOURCE dir.**
 
-**Snapshot-mode matrix (why `--use-new-run` specifically):** every mode that
-performs kaniko's per-step full-FS snapshot still observes the being-reset `/lib`
-and emits `.wh.lib` — confirmed for the default (`full`), `--snapshot-mode=redo`,
-AND `--single-snapshot` (all three: `.wh.lib` present, image breaks). `--use-new-run`
-is the ONLY mode that avoids the full-FS walk, hence the only one that produces a
-runnable multi-stage image. It preserves per-instruction layering (not collapsed
-like `--single-snapshot` would).
+The discriminating experiment (stage-1 WITH a RUN vs stage-1 with NO RUN, both
+DEFAULT snapshot) showed BOTH emit `.wh.lib` → the trigger is NOT a stage-1
+exec-copy-up of `/lib`; it is the stage-2 reset path. `carrick trace` of the
+post-final-RUN snapshot then showed the actual mechanism:
 
-**Known fidelity bug of `--use-new-run` under carrick (narrow; CONFIRMED
-carrick-specific via a Docker oracle; tracked):** a `RUN` that modifies a file
-introduced by a preceding `COPY --from=<stage>` may drop the in-place
-modification. Observed: a multi-stage `COPY --from=build /src/artifact.txt
-/artifact.txt` then `RUN echo X >> /artifact.txt` → the built image keeps only the
-COPY'd content (the `>>` append is lost). The image is runnable; it does NOT
-reintroduce the `.wh.lib` breakage. What the 2026-06-06 investigation established:
-- **It is carrick-specific, not a kaniko limitation.** The *identical* kaniko
-  v1.24.0 `--use-new-run` build under real Docker (linux/arm64) captures the
-  append correctly (the RUN layer's `/artifact.txt` has both lines); under carrick
-  it does not. So carrick is failing to present the RUN's modification to kaniko's
-  change detection.
-- **It is NOT a simple mtime/size bug.** carrick correctly bumps both mtime and
-  size on an in-place append, even to a file with an artificially-old mtime
-  (verified directly). So `--use-new-run`'s change detection is missing the change
-  for a subtler reason than stale metadata.
-- **`COPY --from` is the specific trigger.** A single-stage `COPY <ctx-file>` +
-  `RUN >>` DOES capture the append under carrick (verified) — so it is specific to
-  files placed by a cross-stage `COPY --from`, not COPY-then-modify in general.
+1. kaniko's between-stage "Deleting filesystem" runs `os.RemoveAll("/workspace")`
+   (delete the context's children, then `rmdir` the dir). `/workspace` is the
+   writable `-v` bind mount. `BindVfs`'s mutators mapped the mount POINT itself to
+   the host SOURCE directory and ran a real `remove_dir` on it — so this **deleted
+   the caller's host context directory**, leaving a dangling bind mount.
+2. The next snapshot is kaniko's DEFAULT **full-filesystem** walk (godirwalk over
+   `/`). godirwalk recurses into each root child; when it reached `/workspace` it
+   got **ENOENT** (the host source was gone). kaniko's `gowalkDir` calls
+   `godirwalk.Walk(...)` with **no ErrorCallback and no error check**, so the walk
+   **aborted silently** at `/workspace`. Every root entry after `/workspace` in the
+   getdents order (notably `/lib`) was never visited, so it stayed in godirwalk's
+   `deletedFiles` set while still present in the prior snapshot → kaniko recorded
+   it deleted and emitted `.wh.lib`. (`/lib` is the only un-walked root dir with
+   file content, so it is the only whiteout; the `COPY --from`+RUN `/x` change was
+   also lost because the truncated walk never re-hashed it.)
 
-This and the `.wh.lib` whiteout are two faces of the same root issue: carrick's fs
-does not present kaniko's snapshot/change-detection the cross-stage signals it
-expects (directory visibility for the full-mode walk; the COPY-`--from`-then-RUN
-change signal for `--use-new-run`). The genuinely-correct fix is the deeper
-carrick-fs work below; `--use-new-run` ships runnable multi-stage images today with
-this one narrow content gap. **Next step:** `carrick trace` kaniko's fs+time
-syscalls on the COPY-`--from`'d path across the final RUN's `--use-new-run`
-change-detection window, comparing the carrick trace to the Docker-oracle behavior,
-to find which signal kaniko reads that carrick reports differently for a
-`COPY --from` file.
+The carrick getdents/stat output for `/` was proven byte-for-byte correct
+(complete 22-entry buffer, valid `d_reclen`/`d_type`/`d_ino`, lib present) — the
+divergence was entirely the dangling mount, not snapshot timing or a stat-cache
+coherence gap. Under real Docker the identical kaniko builds cleanly because there
+`/workspace` is a plain dir kaniko can delete and the next stage re-creates; only
+carrick's bind mount let the delete reach the host source.
 
-The underlying carrick-fs divergence (kaniko's full-FS walk observing a
-being-reset `/lib` that Linux's walk does not) is documented below for the record;
-`--use-new-run` sidesteps it entirely so the deep carrick-fs fix is no longer
-required to ship correct multi-stage builds.
+**FIX (`crates/carrick-runtime/src/vfs/bind.rs`):** `BindVfs::unlink`/`rmdir` of
+the mount POINT itself is now a **no-op success** — the host source dir and the
+mount both survive, so the mount point stays a present, enumerable (now-empty)
+directory, exactly what kaniko sees for `/workspace` under Docker (and what keeps
+`os.RemoveAll` happy). `rename` of the mount point returns EBUSY (Linux). An owning
+unit test (`mount_point_cannot_be_removed_but_contents_can`) pins the invariant.
 
-**Original root cause (dtrace of the real build + a Docker oracle, after refuting
-two hypotheses):**
-- **NOT** the directory stat fields: a 4-way toggle (override `nlink`, `size`,
-  both, neither) showed the whiteout persists in all four — disproving the
-  `nlink=2+subdirs`/`size=4096` theory. (That dir-stat normalization is a genuine
-  Linux-faithfulness improvement and exists *uncommitted* in the working tree —
-  `fs_backend.rs`, intermingled with pre-existing `TEMP-TRACE(m2-lib)` probes —
-  but it is not the fix and was not committed.)
-- **NOT** simply the inode change: a Linux `rmdir`+`mkdir` of `/lib` also yields a
-  fresh inode, yet the identical Dockerfile + kaniko v1.24.0 under real Docker
-  (linux/arm64) produces a **clean** final RUN layer (`{/, artifact.txt}`, no
-  `.wh.lib`). So it is carrick-induced.
-- **Mechanism (dtrace):** between stages (stage2 shares the `alpine` base), kaniko
-  resets the rootfs — `unlink`s `/lib`'s children, `rmdir`s `/lib`, then
-  `mkdirat`s `/lib` and re-unpacks. During kaniko's **full-mode parallel snapshot
-  walk**, `/lib` is observed transiently **ENOENT** (cap-std `lstat` and raw
-  `fstatat` agree; `/lib` absent from `getdents("/")`) in the window between
-  `rmdir` and the re-`mkdir`. carrick faithfully reflects kaniko's *own* in-flight
-  delete — but on Linux kaniko's snapshot does not catch `/lib` in that window. So
-  it is a **kaniko-snapshot ↔ carrick-fs visibility/ordering divergence** around
-  the between-stage delete/reunpack. (`/lib` is the unique deleted-and-recreated
-  dir that matters to exec.)
-
-**Resolution:** rather than the deep carrick-fs fix, `carrick build` now passes
-kaniko `--use-new-run`, which does not perform the full-FS snapshot walk, so the
-mid-reset `/lib` is never observed. The deeper carrick-fs work (presenting a
-being-reset directory to a concurrent walker the way Linux does) remains a valid
-general correctness improvement but is no longer on the critical path for
-multi-stage builds. The repro context (`/tmp/carrick-corpus/multistage`) is in
-place. **Single-stage builds (the common case) are unaffected.**
+**Verified (DEFAULT snapshot, no `--use-new-run`):** both discriminating
+Dockerfiles build with EXIT 0, **0 whiteouts**, `lib/ld-musl-aarch64.so.1` present,
+and `/x` shows BOTH the COPY'd line and the RUN-appended line (full fidelity). Via
+the wrapper: `carrick build -t ms:demo <ctx>` then `carrick run ms:demo` prints
+both lines and exits 0; `carrick run ms:demo /bin/sh -c 'echo OK'` → `OK`, exit 0
+(musl interpreter resolves). Single-stage build+run unaffected (still ✅). The
+`--use-new-run` workaround — and its known `COPY --from`+RUN fidelity loss — is
+removed from `kaniko_run_argv`.
 
 ### M3 — `POST /build` (streaming)
 Streaming response body + query parser in serve; `POST /build` shelling to
