@@ -947,10 +947,15 @@ impl SyscallDispatcher {
                 let tid = Self::ctx_tid(cx);
                 if this.proc.lock().ptrace_traceme && signum != 0 {
                     if signum == LINUX_SIGKILL as u64 {
-                        return Ok(DispatchOutcome::SignalDeath {
-                            signum: LINUX_SIGKILL,
-                        });
+                        crate::guest_cpu::record_child_exit(
+                            std::process::id(),
+                            crate::guest_cpu::total_ns(),
+                        );
+                        crate::guest_cpu::mark_self_ptrace_stop_pending();
+                        stop_self_by_signal(LINUX_SIGKILL);
+                        return Ok(DispatchOutcome::Returned { value: 0 });
                     }
+                    crate::guest_cpu::mark_self_ptrace_stop_pending();
                     if signum == crate::linux_abi::LINUX_SIGCONT as u64
                         || is_rt_signal(signum as i32)
                     {

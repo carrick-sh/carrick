@@ -64,10 +64,11 @@ This goal starts from a green regression gate. The target is to reduce NEW rows
 by fixing verified process-control gaps, not by blessing, quarantining, or
 weakening the gate.
 
-Current targeted ptrace rerun after the `ptraceinvaliderrno` reducer:
+Current targeted ptrace rerun after the `ptraceinvaliderrno` reducer and the
+blocking ptrace signal-stop wakeup fix:
 
 ```text
-ltp-ptrace05  MATCH, carrick 63/63, oracle 63/63, run conf-51453-c00
+ltp-ptrace05  MATCH, carrick 63/63, oracle 63/63, run conf-43208-c00
 ltp-ptrace06  MATCH, carrick 48/48, oracle 48/48, run conf-51453-c01
 ```
 
@@ -203,7 +204,7 @@ wait-status, stop-state, or signal-interruption behavior:
 
 | Row | Ecosystem | Current carrick | Oracle | Why it belongs here |
 | --- | --- | --- | --- | --- |
-| `ltp-ptrace05` | LTP | MATCH 63/63 after `ptracesignalstop` | 63/63 | `PTRACE_TRACEME`, traced self-`SIGKILL`, `SIGCONT`, and Linux RT signal-delivery stops are now owned. |
+| `ltp-ptrace05` | LTP | MATCH 63/63 after `ptracesignalstop` blocking-wait coverage | 63/63 | `PTRACE_TRACEME`, traced self-`SIGKILL`, `SIGCONT`, Linux RT signal-delivery stops, and parent waits that park before the tracee stop is published are now owned. |
 | `ltp-ptrace06` | LTP | MATCH 48/48 after `ptraceinvaliderrno` | 48/48 | Exec-stop setup and invalid PEEK/POKE request errno are now owned without claiming full debugger memory/register access. |
 | `go-os_exec` | Go | MATCH 86/86 in targeted rerun `conf-93241-c156` | 86/86 | Previously 0/0; current evidence shows process execution suite parity, so keep watching it as pressure coverage rather than the next reducer. |
 | `go-runtime_pprof` | Go | MATCH 93/93 in targeted rerun `conf-39285-c00` | 93/93 | CPU profiler pressure coverage. Idle `ITIMER_PROF`, `TestMapping` alias/sigaltstack, and unsupported per-thread CPU timer over-sampling are now owned. |
@@ -215,7 +216,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `ltp-setpgid01` | LTP | MATCH 1/2 in `conf-3259-c00` | 1/2 | PID-namespace session-leader rule is now owned; `setpgid(1, 1)` fails EPERM like Docker Linux while forked non-leader `setpgid(0, 0)` still succeeds. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
-| `go-os_signal` | Go | MATCH 29/30 in `conf-23799-c00` after the vfork identity and lazy signal-pump fixes | 29/30 | `TestDetectNohup` used vfork/exec and left the parent's fast-path getpid stamped with the child ns-pid, breaking later `kill(getpid(), sig)` delivery; fixed and owned by `vforkpid`. The later `TestAtomicStop` new diff is also cleared; `TestTerminalSignal` still fails on both carrick and oracle. |
+| `go-os_signal` | Go | MATCH 29/30 in fresh targeted rerun `conf-41403-c00` after the vfork identity, lazy signal-pump, and self-`tgkill` fixes | 29/30 | `TestDetectNohup` used vfork/exec and left the parent's fast-path getpid stamped with the child ns-pid, breaking later `kill(getpid(), sig)` delivery; fixed and owned by `vforkpid`. The later `TestAtomicStop` new diff is also cleared by keeping self-`tgkill` thread-directed; `TestTerminalSignal` still fails on both carrick and oracle. |
 | `ltp-sigaction01` | LTP | MATCH 4/4 after `sigactionresetinfo`, latest targeted rerun `conf-18439-c02` | 4/4 | Adjacent signal ABI row; SA_RESETHAND + SA_SIGINFO old-state preservation is now owned. |
 
 Rows outside this cluster can be fixed opportunistically if a reducer proves the
@@ -324,8 +325,11 @@ Exit criteria:
   exit.
 - Probe matches Docker Linux. Landed 2026-06-05: `ptracesignalstop` owns
   `SIGTERM`, `SIGSTOP`, `SIGCONT`, `SIGRTMIN`, and `SIGRTMAX` stop/continue.
+- Follow-up 2026-06-06: `ptracesignalstop` also owns blocking parent
+  `waitpid(pid, 0)` cases, including a delayed child that publishes the traced
+  signal stop only after the parent has already parked.
 - `ltp-ptrace05` matches the cached Docker oracle: 63/63 vs 63/63 in
-  `conf-7738-c00`.
+  `conf-43208-c00`.
 - `traceexecstop` exists and fails on the current carrick before the runtime
   change.
 - Runtime reports a traced execve as a SIGTRAP stop before the new image runs,
@@ -407,7 +411,7 @@ Exit criteria:
 This goal is complete when all of the following are true:
 
 - `just conformance` has zero regressions and zero timeouts.
-- The total NEW count drops from 67 to 45 or lower, or every remaining
+- The total NEW count drops to 45 or lower, or every remaining
   process-control NEW row is proven to be a distinct non-process-control gap.
 - `ltp-ptrace05` and `ltp-ptrace06` no longer fail because `ptrace` returns
   `ENOSYS`, because `SIGKILL` is reported as a stop, or because tracee exec-stop
@@ -435,7 +439,7 @@ Keep this section current as classifications and fixes land.
 
 | Row | Classification | Owner/probe | Status |
 | --- | --- | --- | --- |
-| `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. After `ptracetraceme`, targeted rerun `conf-24123-c00` improves to 82/103 vs oracle 63/63. After `ptracesigdeath`, targeted rerun `conf-27543-c00` improves to 806/1184; `SIGKILL` now reports "Killed with SIGKILL, as expected". After `ptracesignalstop`, targeted rerun `conf-7738-c00` matches 63/63 vs oracle 63/63. | `ptracetraceme`, `ptracesigdeath`, and `ptracesignalstop` | MATCH; ptrace05 signal-death and signal-delivery stop matrix owned |
+| `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. After `ptracetraceme`, targeted rerun `conf-24123-c00` improves to 82/103 vs oracle 63/63. After `ptracesigdeath`, targeted rerun `conf-27543-c00` improves to 806/1184; `SIGKILL` now reports "Killed with SIGKILL, as expected". After `ptracesignalstop`, targeted rerun `conf-7738-c00` matches 63/63 vs oracle 63/63. A later blocking-wait regression showed that a parent parked in `waitpid(pid, 0)` could sleep past a traced signal-delivery stop; the shared child metadata wakeup now keeps targeted `conf-43208-c00` at 63/63 vs oracle 63/63. | `ptracetraceme`, `ptracesigdeath`, and `ptracesignalstop`; `guest_cpu::tests::child_ptrace_stop_marker_lives_until_report_or_reap` | MATCH; ptrace05 signal-death, signal-delivery stop matrix, and blocking wait readiness owned |
 | `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. After `ptracetraceme`, targeted rerun `conf-24123-c01` still emits no parseable stdout summary, only the root-user warning on stderr. After `ptracesigdeath` and `ptracesignalstop`, targeted rerun `conf-7738-c01` still emits no parseable stdout summary. After `traceexecstop`, targeted rerun `conf-31128-c01` emits 48 TFAIL lines, all `ENOSYS` where Linux expects `EIO` or `EFAULT` for invalid PEEK/POKE requests. After `ptraceinvaliderrno`, targeted rerun `conf-51453-c01` matches 48/48 vs oracle 48/48. | `traceexecstop` and `ptraceinvaliderrno` | MATCH; exec-stop setup and invalid ptrace request errno owned |
 | `go-os_exec` | previously process/wait workload exited without a parseable suite summary in `conf-42088-c593`; targeted rerun `conf-93241-c156` now matches 86/86 vs oracle 86/86 with assertion ids aligned. | keep as process-control pressure coverage; no reducer needed unless it regresses | MATCH |
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-39099-c00` reproduced the old `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, caused by `execve` rebuilding the HVF VM while sibling guest threads from the old thread group were still live. Docker passed isolated `TestExec`; Carrick now passes the same isolated filter, and `execthreads` proves the new image starts with `Threads: 1`. The later full row timed out in `TestSetuidEtc` because glibc's cgo setxid path sent RT signal 33 with `tgkill`, but Carrick delivered it with synthesized `SI_USER` siginfo; after fixing `SI_TKILL` delivery and `/proc/self/status` credential rendering, direct `TestSetuidEtc` passes and the full row completes as `NEW` 31/43 vs oracle 34/34 in `conf-4038-c00`. | `execthreads`, `thread::tests::remove_all_except_keeps_exec_owner_live`, `syscall_thread::tgkill_to_sibling_queues_si_tkill_siginfo`, `vfs::proc::tests::self_status_reflects_live_credentials_and_groups`; non-process rows split out | process-control subset fixed; full row still has non-process syscall fallout (`SCMCredentials`, userns/unshare helper paths, `Fchmodat`, `FcntlFlock`, `Prlimit*`) |
@@ -446,7 +450,7 @@ Keep this section current as classifications and fixes land.
 | `ltp-pause02` | signal interruption/restart bug when it reproduces: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; rerun `conf-71289-c01` matched, and later `conf-18439-c01` reproduced the same signature, but latest focused attempts and `pauseinterrupt2` are currently MATCH. | `pauseinterrupt2` or sharper interruption reducer if the row turns RED again | pressure coverage; no runtime fix without fresh RED |
 | `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
 | `ltp-kill12` | harness/oracle identity mismatch: carrick raw `conf-42088-c859` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
-| `go-os_signal` | adjacent signal delivery/status mismatch split into two roots. Fresh runs `conf-30698-c00`/`conf-41653-c00` failed `TestStop`, `TestSIGCONT`, and `TestSignalTrace` because `TestDetectNohup`'s vfork/exec child stamped the shared EL1 identity page with the child ns-pid; later parent `kill(getpid(), sig)` used pid 4 and returned `ESRCH`. `vforkpid` owns that fix. Full row later improved to `conf-87864-c00` at 28/30 with only `TestAtomicStop` new vs oracle, and now matches in `conf-23799-c00` at 29/30 after default, unblocked child-exit SIGCHLD stopped forcing signal-pump/watch churn. `TestTerminalSignal` remains an oracle-matching fail. | `vforkpid`; `signal::tests::child_exit_signal_pump_predicate_tracks_observable_dispositions`; `sigchld` / `cloneexitsig` | MATCH; keep as pressure coverage |
+| `go-os_signal` | adjacent signal delivery/status mismatch split into three roots. Fresh runs `conf-30698-c00`/`conf-41653-c00` failed `TestStop`, `TestSIGCONT`, and `TestSignalTrace` because `TestDetectNohup`'s vfork/exec child stamped the shared EL1 identity page with the child ns-pid; later parent `kill(getpid(), sig)` used pid 4 and returned `ESRCH`. `vforkpid` owns that fix. Full row later improved to `conf-87864-c00` at 28/30 with only `TestAtomicStop` new vs oracle, then matched after default, unblocked child-exit SIGCHLD stopped forcing signal-pump/watch churn. `TestAtomicStop` was a self-`tgkill` contract bug: Carrick routed the signal through the process-directed pending slot, letting another Go thread consume it. Fresh targeted rerun `conf-41403-c00` remains MATCH at 29/30 after preserving self-`tgkill` as thread-directed. `TestTerminalSignal` remains an oracle-matching fail. | `vforkpid`; `signal::tests::child_exit_signal_pump_predicate_tracks_observable_dispositions`; `syscall_thread::tgkill_to_self_raises_locally`; `sigchld` / `cloneexitsig` | MATCH; keep as pressure coverage |
 | `ltp-sigaction01` | signal ABI bug: raw `conf-42088-c1123` says `SA_RESETHAND should not cause SA_SIGINFO to be cleared, but it was`; fixed by preserving SA_SIGINFO metadata in the reset SIG_DFL action for in-handler `sigaction(SIG, NULL, &old)`. | `sigactionresetinfo` + `signal::tests::sa_resethand_resets_disposition_to_default_on_handler_entry` | MATCH 4/4 vs oracle 4/4 in `conf-18439-c02` |
 
 ### Probe-gate pressure
@@ -520,6 +524,16 @@ just conformance-probes
   test result: ok. 4 passed; 0 failed; finished in 346.86s
 ```
 
+2026-06-06 ptrace follow-up: the ptrace05 runtime fix extended
+`ptracesignalstop` with blocking `waitpid(pid, 0)` cases. The final probe gate
+still passed after the shared child ptrace-stop metadata and wait-readiness
+changes:
+
+```text
+just conformance-probes
+  test result: ok. 4 passed; 0 failed; finished in 165.69s
+```
+
 ## Next autonomous slice
 
 1. Keep `go-syscall` as a non-process follow-up only if this goal expands:
@@ -527,7 +541,8 @@ just conformance-probes
    namespace/chroot fallout (`TestUnshareMountNameSpaceChroot` in
    `conf-77884-c00`) after user namespace, unshare, capability, and fd-flag
    failures.
-2. Keep `go-os_signal` as pressure coverage: `conf-23799-c00` now matches
-   29/30 vs oracle, with only `TestTerminalSignal` failing on both sides.
+2. Keep `go-os_signal` as pressure coverage: fresh targeted rerun
+   `conf-41403-c00` still matches 29/30 vs oracle, with only
+   `TestTerminalSignal` failing on both sides.
 3. Update this file and `docs/conformance-coverage.md`, then land a logical
    commit with the validation commands in the body.

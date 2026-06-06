@@ -1836,10 +1836,14 @@ impl SyscallDispatcher {
             }
             let mut host_status: i32 = 0;
             let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
+            // A ptraced child can become waitable for a signal-delivery stop
+            // even without WUNTRACED. EVFILT_PROC/NOTE_EXIT would sleep past
+            // that stop, so let Darwin's wait4 observe a published pending stop.
             let can_park_on_proc_exit = pid.0 > 0
                 && host_options & libc::WNOHANG == 0
                 && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
-                    == 0;
+                    == 0
+                && !crate::guest_cpu::child_has_ptrace_stop_pending(pid.0 as u32);
             let result = if can_park_on_proc_exit {
                 let r = unsafe {
                     libc::wait4(
@@ -1901,6 +1905,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if host_wait_status_is_stopped_by(host_status, LINUX_SIGKILL) {
+                crate::guest_cpu::clear_child_ptrace_stop_pending(result as u32);
                 let host_sigkill = crate::host_signal::linux_to_host_signum(LINUX_SIGKILL);
                 let cont = unsafe {
                     libc::ptrace(
@@ -1930,6 +1935,9 @@ impl SyscallDispatcher {
                         }
                     }
                 }
+            }
+            if libc::WIFSTOPPED(host_status) {
+                crate::guest_cpu::clear_child_ptrace_stop_pending(result as u32);
             }
             // Terminal reap of a child (not a WUNTRACED/WCONTINUED state report):
             // CANCEL its async exit-signal watch. carrick's pump delivers a
