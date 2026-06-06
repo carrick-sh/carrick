@@ -20,13 +20,13 @@ mod oracle;
 mod parsers;
 mod verdict;
 
-use crate::manifest::{Manifest, Suite, Tier, Weight};
+use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
 use crate::verdict::{Baseline, SideSummary, SuiteReport, Verdict, classify};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 /// Runtime crates whose change should out-date the signed binary (the soft
 /// freshness backstop — §4.5). Deliberately NOT all of `crates/`.
@@ -72,6 +72,14 @@ struct Args {
     /// counts only and do not write.
     #[arg(long)]
     generate_suites: bool,
+    /// Total suite worker threads. Defaults to host parallelism minus two,
+    /// capped at eight for unattended runs; explicit values are honored.
+    #[arg(long, env = "CARRICK_CONFORMANCE_WORKERS")]
+    workers: Option<usize>,
+    /// Maximum concurrent CPython suites marked `weight = "heavy"`. Defaults
+    /// to min(workers, 4); other heavy ecosystems remain serialized.
+    #[arg(long, env = "CARRICK_CONFORMANCE_CPYTHON_WORKERS")]
+    cpython_workers: Option<usize>,
     #[arg(long, default_value = "target/release/carrick")]
     carrick_bin: PathBuf,
     /// Committed docker-oracle cache (parsed results, one JSONL line per suite).
@@ -180,17 +188,15 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 
     let n = selected.len();
-    let workers = std::thread::available_parallelism()
-        .map(|c| c.get().saturating_sub(2).clamp(1, 8))
-        .unwrap_or(4);
-    let heavy = Mutex::new(());
+    let workers = worker_count(args.workers);
+    let cpython_workers = cpython_worker_count(args.cpython_workers, workers);
+    let lanes = SchedulerLanes::new(cpython_workers);
 
     // ---- Phase 1: ALL carrick (weight-aware; never overlapping docker). ----
-    eprintln!("phase 1/3: {n} carrick runs (workers={workers})");
+    eprintln!("phase 1/3: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers})");
     let carrick_outs = fan_out(n, workers, |i| {
         let s = &selected[i];
-        let _g =
-            (s.weight == Weight::Heavy).then(|| heavy.lock().unwrap_or_else(|e| e.into_inner()));
+        let _lane = lanes.acquire(s);
         // Zero-pad the index so no run-id is a prefix of another (c01 vs c10);
         // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
         // collision-free id is defense in depth against any unanchored grep.
@@ -212,7 +218,7 @@ fn run() -> anyhow::Result<ExitCode> {
     };
     let need_docker: Vec<usize> = (0..n).filter(|&i| cached[i].is_none()).collect();
     eprintln!(
-        "phase 2/3: {} docker run(s), {} cached oracle(s){} (workers={workers})",
+        "phase 2/3: {} docker run(s), {} cached oracle(s){} (workers={workers}, cpython-workers={cpython_workers})",
         need_docker.len(),
         n - need_docker.len(),
         if args.refresh_oracle {
@@ -224,8 +230,7 @@ fn run() -> anyhow::Result<ExitCode> {
     let fresh_outs = fan_out(need_docker.len(), workers, |j| {
         let i = need_docker[j];
         let s = &selected[i];
-        let _g =
-            (s.weight == Weight::Heavy).then(|| heavy.lock().unwrap_or_else(|e| e.into_inner()));
+        let _lane = lanes.acquire(s);
         let run_id = format!("conf-{pid}-d{i:02}");
         let out = engine::run_docker(s, &run_id);
         eprintln!("  [docker]  {}", s.name);
@@ -470,6 +475,95 @@ fn fan_out<T: Send>(n: usize, workers: usize, f: impl Fn(usize) -> T + Sync) -> 
         .collect()
 }
 
+fn worker_count(configured: Option<usize>) -> usize {
+    configured.unwrap_or_else(default_worker_count).max(1)
+}
+
+fn default_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|c| c.get().saturating_sub(2).clamp(1, 8))
+        .unwrap_or(4)
+}
+
+fn cpython_worker_count(configured: Option<usize>, workers: usize) -> usize {
+    configured
+        .unwrap_or_else(|| workers.clamp(1, 4))
+        .min(workers.max(1))
+}
+
+struct SchedulerLanes {
+    generic_heavy: Semaphore,
+    cpython_heavy: Semaphore,
+}
+
+impl SchedulerLanes {
+    fn new(cpython_workers: usize) -> Self {
+        Self {
+            generic_heavy: Semaphore::new(1),
+            cpython_heavy: Semaphore::new(cpython_workers.max(1)),
+        }
+    }
+
+    fn acquire(&self, suite: &Suite) -> Option<SchedulerPermit<'_>> {
+        if suite.weight != Weight::Heavy {
+            return None;
+        }
+        let semaphore = if suite.ecosystem == Ecosystem::Cpython {
+            &self.cpython_heavy
+        } else {
+            &self.generic_heavy
+        };
+        Some(SchedulerPermit {
+            _permit: semaphore.acquire(),
+        })
+    }
+}
+
+struct SchedulerPermit<'a> {
+    _permit: SemaphorePermit<'a>,
+}
+
+struct Semaphore {
+    max: usize,
+    active: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl Semaphore {
+    fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            active: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> SemaphorePermit<'_> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= self.max {
+            active = self.changed.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        SemaphorePermit { semaphore: self }
+    }
+
+    fn release(&self) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        self.changed.notify_one();
+    }
+}
+
+struct SemaphorePermit<'a> {
+    semaphore: &'a Semaphore,
+}
+
+impl Drop for SemaphorePermit<'_> {
+    fn drop(&mut self) {
+        self.semaphore.release();
+    }
+}
+
 fn select(suites: &[Suite], tier: Tier, ecos: &[String], names: &[String]) -> Vec<Suite> {
     suites
         .iter()
@@ -633,6 +727,96 @@ fn walk_newest(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
             && newest.is_none_or(|n| t > n)
         {
             *newest = Some(t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn args_accept_explicit_worker_controls() {
+        let args = Args::try_parse_from([
+            "carrick-conformance",
+            "--workers",
+            "6",
+            "--cpython-workers",
+            "3",
+        ])
+        .expect("worker controls should parse");
+
+        assert_eq!(args.workers, Some(6));
+        assert_eq!(args.cpython_workers, Some(3));
+    }
+
+    #[test]
+    fn explicit_worker_count_is_not_auto_clamped() {
+        assert_eq!(worker_count(Some(12)), 12);
+    }
+
+    #[test]
+    fn cpython_workers_default_to_bounded_worker_subset() {
+        assert_eq!(cpython_worker_count(None, 2), 2);
+        assert_eq!(cpython_worker_count(None, 8), 4);
+        assert_eq!(cpython_worker_count(Some(9), 4), 4);
+    }
+
+    #[test]
+    fn cpython_heavy_suites_use_bounded_parallel_lanes() {
+        let lanes = SchedulerLanes::new(2);
+        let suites: Vec<Suite> = (0..4)
+            .map(|i| suite(&format!("cpython-{i}"), Ecosystem::Cpython, Weight::Heavy))
+            .collect();
+
+        assert_eq!(max_observed_concurrency(&suites, &lanes, 4), 2);
+    }
+
+    #[test]
+    fn non_cpython_heavy_suites_remain_serialized() {
+        let lanes = SchedulerLanes::new(4);
+        let suites: Vec<Suite> = (0..4)
+            .map(|i| suite(&format!("go-{i}"), Ecosystem::Go, Weight::Heavy))
+            .collect();
+
+        assert_eq!(max_observed_concurrency(&suites, &lanes, 4), 1);
+    }
+
+    fn max_observed_concurrency(suites: &[Suite], lanes: &SchedulerLanes, workers: usize) -> usize {
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+
+        let _ = fan_out(suites.len(), workers, |i| {
+            let _lane = lanes.acquire(&suites[i]);
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        max_active.load(Ordering::SeqCst)
+    }
+
+    fn suite(name: &str, ecosystem: Ecosystem, weight: Weight) -> Suite {
+        Suite {
+            name: name.to_string(),
+            ecosystem,
+            image: "localhost:5050/test:latest".to_string(),
+            cmd: vec!["/bin/true".to_string()],
+            verdict: crate::manifest::VerdictKind::Shell,
+            tier: Tier::Full,
+            weight,
+            timeout_s: 1,
+            known_gaps: Vec::new(),
+            carrick_flags: Vec::new(),
+            docker_flags: Vec::new(),
+            bind_mounts: Vec::new(),
+            env: Vec::new(),
+            env_carrick: Vec::new(),
+            env_docker: Vec::new(),
+            workdir: None,
+            entrypoint: None,
         }
     }
 }
