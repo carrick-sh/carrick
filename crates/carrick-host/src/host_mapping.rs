@@ -1,5 +1,29 @@
 //! RAII ownership for host mmap regions that back HVF guest mappings.
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VM_FLAGS_ANYWHERE: libc::c_int = 0x0001;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VM_INHERIT_NONE: libc::vm_inherit_t = 2;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const KERN_SUCCESS: libc::kern_return_t = 0;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn mach_vm_remap(
+        target_task: libc::vm_map_t,
+        target_address: *mut libc::mach_vm_address_t,
+        size: libc::mach_vm_size_t,
+        mask: libc::mach_vm_offset_t,
+        flags: libc::c_int,
+        src_task: libc::vm_map_t,
+        src_address: libc::mach_vm_address_t,
+        copy: libc::boolean_t,
+        cur_protection: *mut libc::vm_prot_t,
+        max_protection: *mut libc::vm_prot_t,
+        inheritance: libc::vm_inherit_t,
+    ) -> libc::kern_return_t;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostMappingKind {
     PrivateAnon,
@@ -41,6 +65,62 @@ impl OwnedHostMapping {
             )
         };
         Self::from_mmap_result(host, len, kind)
+    }
+
+    /// Create a copy-on-write clone of an existing host mapping using Mach VM.
+    ///
+    /// Carrick private guest RAM is host `MAP_SHARED` for HVF coherence, so a
+    /// normal host `fork(2)` keeps parent and child sharing the same object. A
+    /// `mach_vm_remap(copy=TRUE)` clone gives the child a private COW object
+    /// without eagerly walking/copying each resident page. If the call fails,
+    /// callers should fall back to an explicit sparse copy.
+    ///
+    /// # Safety
+    ///
+    /// `src` must name a live mapping in this process covering `len` bytes.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(deprecated)] // libc exposes mach_task_self_ as the stable task port here.
+    pub unsafe fn remap_copy(
+        src: *mut u8,
+        len: usize,
+        kind: HostMappingKind,
+    ) -> Result<Self, std::io::Error> {
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot remap zero-length host mapping",
+            ));
+        }
+
+        let task = unsafe { libc::mach_task_self_ };
+        let mut target: libc::mach_vm_address_t = 0;
+        let mut cur: libc::vm_prot_t = 0;
+        let mut max: libc::vm_prot_t = 0;
+        let kr = unsafe {
+            mach_vm_remap(
+                task,
+                &mut target,
+                len as libc::mach_vm_size_t,
+                0,
+                VM_FLAGS_ANYWHERE,
+                task,
+                src as libc::mach_vm_address_t,
+                1,
+                &mut cur,
+                &mut max,
+                VM_INHERIT_NONE,
+            )
+        };
+        if kr != KERN_SUCCESS {
+            return Err(std::io::Error::other(format!(
+                "mach_vm_remap(copy=TRUE) failed: {kr}"
+            )));
+        }
+        Ok(Self {
+            ptr: target as *mut u8,
+            len,
+            kind,
+        })
     }
 
     /// `MAP_SHARED` a host file region. The resulting mapping is coherent with
@@ -133,6 +213,54 @@ mod tests {
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ENOMEM)
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn cow_snapshot_isolates_source_and_clone_writes() {
+        let len = 4 * 16 * 1024;
+        let source = OwnedHostMapping::map_shared_anon(len, HostMappingKind::PrivateAnon)
+            .expect("source mapping");
+        unsafe {
+            source.as_ptr().write_volatile(0x41);
+            source.as_ptr().add(16 * 1024).write_volatile(0x42);
+        }
+
+        let snapshot = unsafe {
+            OwnedHostMapping::remap_copy(
+                source.as_ptr(),
+                len,
+                HostMappingKind::ChildPrivateSnapshot,
+            )
+        }
+        .expect("cow snapshot");
+
+        assert_eq!(snapshot.len(), len);
+        assert!(
+            !snapshot.guest_shared(),
+            "child private snapshots must not be treated as guest-shared"
+        );
+        assert_eq!(unsafe { snapshot.as_ptr().read_volatile() }, 0x41);
+        assert_eq!(
+            unsafe { snapshot.as_ptr().add(16 * 1024).read_volatile() },
+            0x42
+        );
+
+        unsafe {
+            source.as_ptr().write_volatile(0x51);
+            snapshot.as_ptr().add(16 * 1024).write_volatile(0x62);
+        }
+
+        assert_eq!(
+            unsafe { snapshot.as_ptr().read_volatile() },
+            0x41,
+            "source writes after the snapshot must not leak into the child copy"
+        );
+        assert_eq!(
+            unsafe { source.as_ptr().add(16 * 1024).read_volatile() },
+            0x42,
+            "snapshot writes must not leak back into the source"
         );
     }
 }

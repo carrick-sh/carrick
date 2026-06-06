@@ -18,29 +18,8 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use std::ffi::c_int;
+use carrick_host::host_mapping::{HostMappingKind, OwnedHostMapping};
 use std::time::Instant;
-
-// mach_vm_remap is in libSystem; libc exposes the Mach types but not this fn.
-unsafe extern "C" {
-    fn mach_vm_remap(
-        target_task: libc::vm_map_t,
-        target_address: *mut libc::mach_vm_address_t,
-        size: libc::mach_vm_size_t,
-        mask: libc::mach_vm_offset_t,
-        flags: c_int,
-        src_task: libc::vm_map_t,
-        src_address: libc::mach_vm_address_t,
-        copy: libc::boolean_t,
-        cur_protection: *mut libc::vm_prot_t,
-        max_protection: *mut libc::vm_prot_t,
-        inheritance: libc::vm_inherit_t,
-    ) -> libc::kern_return_t;
-}
-
-const VM_FLAGS_ANYWHERE: c_int = 0x0001;
-const VM_INHERIT_NONE: libc::vm_inherit_t = 2;
-const KERN_SUCCESS: libc::kern_return_t = 0;
 const PAGE: usize = 16 * 1024; // HVF granule
 
 /// A guest-region-like host buffer: MAP_ANON|MAP_SHARED|MAP_NORESERVE, exactly
@@ -80,34 +59,16 @@ fn explicit_sparse_copy(src: *mut u8, len: usize) -> *mut u8 {
 }
 
 /// mach_vm_remap with copy=TRUE: a (claimed COW) clone of the source.
-#[allow(deprecated)] // mach_task_self_ static; mach2 dep is overkill for a probe
-fn mach_remap_copy(src: *mut u8, len: usize) -> Option<*mut u8> {
-    let mut target: libc::mach_vm_address_t = 0;
-    let mut cur: libc::vm_prot_t = 0;
-    let mut max: libc::vm_prot_t = 0;
-    // Read the constant self-task port directly (the `mach_task_self()` wrapper
-    // is libc-deprecated; the static is the same value).
-    let task = unsafe { libc::mach_task_self_ };
-    let kr = unsafe {
-        mach_vm_remap(
-            task,
-            &mut target,
-            len as libc::mach_vm_size_t,
-            0,
-            VM_FLAGS_ANYWHERE,
-            task,
-            src as libc::mach_vm_address_t,
-            1, // copy = TRUE
-            &mut cur,
-            &mut max,
-            VM_INHERIT_NONE,
-        )
-    };
-    if kr != KERN_SUCCESS {
-        eprintln!("mach_vm_remap failed: kr={kr}");
-        return None;
+fn mach_remap_copy(src: *mut u8, len: usize) -> Option<OwnedHostMapping> {
+    let snapshot =
+        unsafe { OwnedHostMapping::remap_copy(src, len, HostMappingKind::ChildPrivateSnapshot) };
+    match snapshot {
+        Ok(mapping) => Some(mapping),
+        Err(error) => {
+            eprintln!("mach_vm_remap failed: {error}");
+            None
+        }
     }
-    Some(target as *mut u8)
 }
 
 #[test]
@@ -146,10 +107,11 @@ fn mach_cow_vs_explicit_snapshot_probe() {
         }
         Some(b) => {
             println!("PROBE mach_vm_remap(copy):    {b_ns} ns");
+            let b_ptr = b.as_ptr();
             // Clone must reflect the source's current contents.
             for i in (0..pages).step_by(8) {
                 assert_eq!(
-                    unsafe { b.add(i * PAGE).read_volatile() },
+                    unsafe { b_ptr.add(i * PAGE).read_volatile() },
                     (i & 0xff) as u8,
                     "remap clone saw source dirty page {i}"
                 );
@@ -161,7 +123,7 @@ fn mach_cow_vs_explicit_snapshot_probe() {
             let probe_page = 0usize;
             unsafe { src.add(probe_page * PAGE).write_volatile(0xAB) };
             let clone_sees_source_write =
-                unsafe { b.add(probe_page * PAGE).read_volatile() } == 0xAB;
+                unsafe { b_ptr.add(probe_page * PAGE).read_volatile() } == 0xAB;
             println!(
                 "PROBE write-isolation: source mutation {} into clone (isolated={})",
                 if clone_sees_source_write {
@@ -188,7 +150,6 @@ fn mach_cow_vs_explicit_snapshot_probe() {
                     "inf".to_string()
                 },
             );
-            unsafe { libc::munmap(b.cast(), len) };
         }
     }
 
