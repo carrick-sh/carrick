@@ -181,6 +181,22 @@ impl ThreadRegistry {
         self.inner.lock().contains_key(&tid)
     }
 
+    /// Remove every live thread entry except `keep_tid`.
+    ///
+    /// Linux `execve(2)` replaces the whole thread group: all sibling threads
+    /// disappear, and the new image starts with just the execing task. Carrick's
+    /// exec path uses this after sibling vCPUs have drained so any thread that
+    /// had a guest tid but had not yet built its vCPU can notice that its stale
+    /// pre-exec thread spec is no longer live and exit without creating one.
+    pub fn remove_all_except(&self, keep_tid: ThreadId) -> Vec<ThreadId> {
+        let mut map = self.inner.lock();
+        let removed: Vec<ThreadId> = map.keys().copied().filter(|tid| *tid != keep_tid).collect();
+        for tid in &removed {
+            map.remove(tid);
+        }
+        removed
+    }
+
     /// Every live thread id of this process. Unlike `thread_states`, this does
     /// NOT query the kernel for run state — it's the cheap enumeration used to
     /// route a process-directed signal (`kill(getpid(), sig)`) to a thread that
@@ -770,6 +786,22 @@ mod tests {
         assert!(t > 1000);
         assert_eq!(reg.live_count(), 2);
         assert_eq!(reg.clear_child_tid(t), Some(0x4000));
+    }
+
+    #[test]
+    fn remove_all_except_keeps_exec_owner_live() {
+        let reg = ThreadRegistry::new(/*main_tid=*/ 1000);
+        let a = reg.register_child(0);
+        let b = reg.register_child(0);
+
+        let mut removed = reg.remove_all_except(a);
+        removed.sort_unstable();
+
+        assert_eq!(removed, vec![1000, b]);
+        assert!(!reg.is_live(1000));
+        assert!(reg.is_live(a));
+        assert!(!reg.is_live(b));
+        assert_eq!(reg.live_count(), 1);
     }
 
     #[test]
