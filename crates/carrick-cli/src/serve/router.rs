@@ -12,7 +12,7 @@ fn strip_version(path: &str) -> &str {
         if let Some(slash) = rest.find('/') {
             // Only strip if the segment looks like a version (digits/dots).
             let (ver, tail) = rest.split_at(slash);
-            if ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
                 return tail;
             }
         }
