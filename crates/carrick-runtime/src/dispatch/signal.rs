@@ -199,7 +199,11 @@ fn cross_process_needs_xsig(signum: i32) -> bool {
 }
 
 fn namespace_member_standard_kill_needs_xsig(signum: i32) -> bool {
-    (1..32).contains(&signum) && !matches!(signum, LINUX_SIGKILL | LINUX_SIGSTOP)
+    (1..32).contains(&signum)
+        && !matches!(
+            signum,
+            LINUX_SIGKILL | crate::linux_abi::LINUX_SIGCONT | LINUX_SIGSTOP
+        )
 }
 
 fn stop_self_by_signal(signum: i32) {
@@ -1790,6 +1794,9 @@ mod tests {
         assert!(namespace_member_standard_kill_needs_xsig(15));
         assert!(!namespace_member_standard_kill_needs_xsig(0));
         assert!(!namespace_member_standard_kill_needs_xsig(LINUX_SIGKILL));
+        assert!(!namespace_member_standard_kill_needs_xsig(
+            crate::linux_abi::LINUX_SIGCONT
+        ));
         assert!(!namespace_member_standard_kill_needs_xsig(LINUX_SIGSTOP));
         assert!(!namespace_member_standard_kill_needs_xsig(34));
         assert!(!namespace_member_standard_kill_needs_xsig(65));
