@@ -308,8 +308,11 @@ dependencies = [
  "base64 0.22.1",
  "bollard",
  "camino",
+ "carrick-bsd",
  "carrick-engine",
+ "carrick-hvf",
  "carrick-image",
+ "carrick-linux",
  "carrick-runtime",
  "carrick-spec",
  "carrick-test-support",
@@ -428,6 +431,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-linux"
+version = "0.1.0"
+dependencies = [
+ "carrick-hal",
+]
+
+[[package]]
 name = "carrick-mem"
 version = "0.1.0"
 dependencies = [
@@ -457,6 +467,7 @@ dependencies = [
  "carrick-host",
  "carrick-hvf",
  "carrick-image",
+ "carrick-linux",
  "carrick-mem",
  "carrick-spec",
  "carrick-test-support",

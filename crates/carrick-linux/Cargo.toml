@@ -1,0 +1,15 @@
+[package]
+name = "carrick-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_linux"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-hal = { path = "../carrick-hal" }

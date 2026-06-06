@@ -1,3 +1,9 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_is_multiple_of,
+    rustdoc::broken_intra_doc_links
+)]
+
 //! HVF vCPU / exec-engine leaf crate for the carrick runtime.
 //!
 //! This crate holds the dispatch-free vCPU cluster: the Hypervisor.framework
