@@ -212,6 +212,18 @@ spike Dockerfile produces a tar; its contents match the Docker-oracle build
 behavior. (If a *next* gap appears before the tar is produced, M0 expands to fix
 it — M0 is "kaniko builds one trivial image under carrick.")
 
+**Landed 2026-06-06.** The `Vfs::overridable()` override fix
+(`fix(vfs): let guests override synthetic /etc/services and /etc/resolv.conf`,
+commit `3eb9415`) was the *whole* blocker — no next gap surfaced. kaniko builds
+the spike Dockerfile under carrick to a complete docker-archive (`4,652,544 B`
+vs the Docker oracle's `4,652,032 B`): valid `manifest.json` (config + RepoTags
++ 3 gz layers), `/proof.txt` = `built-by-kaniko-under-carrick` in the RUN layer,
+and alpine's real `/etc/services` in the base layer (proving the override
+end-to-end). Owning test:
+`crates/carrick-runtime/tests/integration/syscall_fs.rs::guest_can_override_synthetic_etc_services_via_unlink_then_recreate`
+plus `VfsMounts` override-set unit tests. `apk add` (network during RUN) also
+worked.
+
 ### M1 — `carrick build` wrapper + load-into-store
 The `carrick build` CLI (flag→kaniko mapping, pinned kaniko image, `--fs host`,
 uncapped traps); `carrick load` ingesting the kaniko output tar + tagging.
