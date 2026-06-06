@@ -6432,6 +6432,123 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn pwritev_host_file_reads_each_guest_iovec_once() {
+    use carrick_runtime::dispatch::MemoryError;
+    use std::cell::Cell;
+
+    struct CountingPayloadMemory {
+        inner: LinearMemory,
+        watched_ranges: Vec<(u64, usize)>,
+        watched_reads: Cell<usize>,
+    }
+
+    impl CountingPayloadMemory {
+        fn new(inner: LinearMemory) -> Self {
+            Self {
+                inner,
+                watched_ranges: Vec::new(),
+                watched_reads: Cell::new(0),
+            }
+        }
+
+        fn watch(&mut self, address: u64, len: usize) {
+            self.watched_ranges.push((address, len));
+        }
+
+        fn reset_watched_reads(&mut self) {
+            self.watched_reads.set(0);
+        }
+
+        fn watched_reads(&self) -> usize {
+            self.watched_reads.get()
+        }
+    }
+
+    impl GuestMemory for CountingPayloadMemory {
+        fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if self
+                .watched_ranges
+                .iter()
+                .any(|(base, len)| address == *base && length == *len)
+            {
+                self.watched_reads.set(self.watched_reads.get() + 1);
+            }
+            self.inner.read_bytes(address, length)
+        }
+
+        fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes(address, bytes)
+        }
+
+        fn read_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+            self.inner.read_into(address, dst)
+        }
+    }
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    let reporter = CompatReporter::default();
+    let mut memory = CountingPayloadMemory::new(LinearMemory::new(0x4000, vec![0; 0x800]));
+    memory.write_bytes(0x4000, b"/out.bin\0").unwrap();
+    memory.write_bytes(0x4200, b"head").unwrap();
+    memory.write_bytes(0x4300, b"tailpiece").unwrap();
+    memory.watch(0x4200, 4);
+    memory.watch(0x4300, 9);
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 9)],
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        LINUX_O_CREAT | LINUX_O_RDWR,
+                        0o644,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    memory.reset_watched_reads();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 13 }
+    );
+    assert_eq!(
+        memory.watched_reads(),
+        2,
+        "pwritev should stage each guest payload once, not reread for validation"
+    );
+    assert_eq!(
+        std::fs::read(scratch.path().join("out.bin")).unwrap(),
+        b"headtailpiece"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
 #[test]
 fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(

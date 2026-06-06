@@ -4616,6 +4616,7 @@ impl SyscallDispatcher {
             if offset < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
+            let mut staged_iovecs: Vec<Vec<u8>> = Vec::with_capacity(iovecs.len());
             for iovec in &iovecs {
                 let iov_len = usize::try_from(iovec.iov_len)
                     .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
@@ -4623,9 +4624,15 @@ impl SyscallDispatcher {
                 // even with a NULL/invalid base (LTP pwritev01/pwritev201 pass
                 // `{NULL, 0}` as the second segment). Only validate non-empty
                 // segments.
-                if iov_len != 0 && memory.read_bytes(iovec.iov_base, iov_len).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                let bytes = if iov_len == 0 {
+                    Vec::new()
+                } else {
+                    match memory.read_bytes(iovec.iov_base, iov_len) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return Ok(LINUX_EFAULT.into()),
+                    }
+                };
+                staged_iovecs.push(bytes);
             }
             if is_stdio_fd(fd.0) {
                 return Ok(LINUX_ESPIPE.into());
@@ -4645,18 +4652,11 @@ impl SyscallDispatcher {
                 let hfd = *host_fd;
                 let mut total = 0i64;
                 let mut cur = offset;
-                for iov in &iovecs {
-                    let len = usize::try_from(iov.iov_len)
-                        .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
-                    if len == 0 {
+                for buf in &staged_iovecs {
+                    if buf.is_empty() {
                         continue;
                     }
-                    let buf = match memory.read_bytes(iov.iov_base, len) {
-                        Ok(b) => b,
-                        Err(_) => {
-                            return Ok(LINUX_EFAULT.into());
-                        }
-                    };
+                    let len = buf.len();
                     let n =
                         unsafe { libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t) };
                     let n = n.host_syscall_errno()?;
