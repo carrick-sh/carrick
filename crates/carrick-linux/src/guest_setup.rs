@@ -129,7 +129,10 @@ impl GuestRam {
     }
 
     /// Copy `data` to guest-physical `gpa` (must lie within this window).
-    fn write_gpa(&mut self, gpa: u64, data: &[u8]) -> Result<(), OsError> {
+    /// `pub(crate)` so the `GuestMemory` impl on [`crate::trap_engine::KvmTrapEngine`]
+    /// can service guest `write_bytes` through the same bounds-checked path
+    /// bring-up uses; the guest VA is identity-mapped to this GPA.
+    pub(crate) fn write_gpa(&mut self, gpa: u64, data: &[u8]) -> Result<(), OsError> {
         let off = gpa
             .checked_sub(self.base)
             .filter(|o| (*o as usize).saturating_add(data.len()) <= self.len)

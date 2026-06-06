@@ -159,6 +159,10 @@ fn env_exposed_cpus() -> Option<usize> {
     raw.parse::<usize>().ok().filter(|n| *n >= 1)
 }
 
+// Only the macOS `query_logical_cpus` (and the unit tests) call this; on a
+// non-macOS host the linux `query_logical_cpus` uses `available_parallelism`
+// directly, so compile this only where it is actually used.
+#[cfg(any(target_os = "macos", test))]
 fn select_exposed_cpu_count(
     performance_logical: Option<usize>,
     host_logical: Option<usize>,
