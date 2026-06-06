@@ -939,7 +939,11 @@ impl SyscallDispatcher {
                 OpenDescription::File {
                     path,
                     metadata,
-                    contents: FileContents::rootfs_backed(contents),
+                    contents: FileContents::shared_backed(
+                        contents.base,
+                        contents.dirty,
+                        contents.len,
+                    ),
                     offset: 0,
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable,

@@ -64,6 +64,7 @@ fn write_syscall_rejects_bad_guest_pointer_with_efault() {
 #[derive(Default)]
 struct CountingMemoryBackend {
     inner: MemoryBackend,
+    max_lookup_payload_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     max_writeback_payload_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -73,13 +74,35 @@ impl CountingMemoryBackend {
     }
 
     fn reset_counts(&self) {
+        self.max_lookup_payload_len
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.max_writeback_payload_len
             .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn max_lookup_payload_len(&self) -> usize {
+        self.max_lookup_payload_len
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn max_writeback_payload_len(&self) -> usize {
         self.max_writeback_payload_len
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn bump_max_lookup_payload_len(&self, len: usize) {
+        let mut current = self.max_lookup_payload_len();
+        while len > current {
+            match self.max_lookup_payload_len.compare_exchange(
+                current,
+                len,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
     }
 
     fn bump_max_writeback_payload_len(&self, len: usize) {
@@ -100,7 +123,11 @@ impl CountingMemoryBackend {
 
 impl FsBackend for CountingMemoryBackend {
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
-        self.inner.lookup(path)
+        let entry = self.inner.lookup(path);
+        if let Some(OverlayEntry::File(bytes)) = &entry {
+            self.bump_max_lookup_payload_len(bytes.len());
+        }
+        entry
     }
 
     fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
@@ -113,6 +140,13 @@ impl FsBackend for CountingMemoryBackend {
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
         self.inner.file_contents(path)
+    }
+
+    fn shared_file_contents(
+        &self,
+        path: &str,
+    ) -> Option<carrick_runtime::fs_backend::SharedFileContents> {
+        self.inner.shared_file_contents(path)
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
@@ -182,6 +216,7 @@ fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
         .set_file_contents("/large.bin", vec![0x41; LARGE_FILE_LEN])
         .unwrap();
     backend.reset_counts();
+    let lookup_counts = backend.max_lookup_payload_len.clone();
     let counts = backend.max_writeback_payload_len.clone();
 
     let reporter = CompatReporter::default();
@@ -236,7 +271,12 @@ fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
     );
     assert_eq!(memory.read_bytes(0x4200, 1).unwrap(), b"Z");
 
+    let max_lookup = lookup_counts.load(std::sync::atomic::Ordering::SeqCst);
     let max_rewrite = counts.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        max_lookup <= 1,
+        "one-byte write should not clone the whole {LARGE_FILE_LEN}-byte file on open; max lookup payload was {max_lookup}"
+    );
     assert!(
         max_rewrite <= 1,
         "one-byte write should not rewrite or clone the whole {LARGE_FILE_LEN}-byte file; max writeback payload was {max_rewrite}"

@@ -399,12 +399,12 @@ impl FileContents {
         Self::Dense(bytes)
     }
 
-    pub(super) fn rootfs_backed(base: Arc<[u8]>) -> Self {
-        Self::RootFsBacked {
-            len: base.len(),
-            base,
-            dirty: BTreeMap::new(),
-        }
+    pub(super) fn shared_backed(
+        base: Arc<[u8]>,
+        dirty: BTreeMap<usize, Vec<u8>>,
+        len: usize,
+    ) -> Self {
+        Self::RootFsBacked { base, dirty, len }
     }
 
     pub(super) fn len(&self) -> usize {
