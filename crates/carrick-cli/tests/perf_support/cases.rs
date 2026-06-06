@@ -3,10 +3,18 @@
 //! the probe path from `probe`, runs it under both engines, and pulls
 //! `metric_key` out of each engine's parsed output as the per-rep value.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerfArtifact {
+    StaticMusl,
+    DynamicGlibc,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PerfCase {
     /// Probe binary name in conformance-probes/.../release/ (no extension).
     pub probe: &'static str,
+    /// Build/runtime artifact family for the guest binary.
+    pub artifact: PerfArtifact,
     pub dimension: &'static str,
     pub workload: &'static str,
     /// Key the probe prints whose value is the per-rep metric.
@@ -37,6 +45,7 @@ pub const CASES: &[PerfCase] = &[
     // Latency (lower better): raw guest syscall trap+dispatch floor.
     PerfCase {
         probe: "perf_trap_floor",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "trap_floor",
         metric_key: "trap_p50_us",
@@ -49,6 +58,7 @@ pub const CASES: &[PerfCase] = &[
     // Latency (lower better): private futex wait/wake handoff.
     PerfCase {
         probe: "perf_futex_pingpong",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "futex_pingpong",
         metric_key: "futex_pingpong_p50_us",
@@ -63,6 +73,7 @@ pub const CASES: &[PerfCase] = &[
     // from explicit timeout sleep.
     PerfCase {
         probe: "perf_wait_pipe_pingpong",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "wait_pipe_pingpong",
         metric_key: "wait_pipe_pingpong_p50_us",
@@ -77,6 +88,7 @@ pub const CASES: &[PerfCase] = &[
     // read and separates steady-state waits from epoll_ctl churn.
     PerfCase {
         probe: "perf_epoll_pipe_loop",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "epoll_pipe_loop",
         metric_key: "epoll_pipe_loop_p50_us",
@@ -89,6 +101,7 @@ pub const CASES: &[PerfCase] = &[
     // Latency (lower better): many small dynamic-style writes to stdout.
     PerfCase {
         probe: "perf_stdio_burst",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "stdio_burst",
         metric_key: "stdio_burst_total_us",
@@ -101,6 +114,7 @@ pub const CASES: &[PerfCase] = &[
     // Latency (lower better): many small dynamic-style writev calls to stdout.
     PerfCase {
         probe: "perf_writev_burst",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "writev_burst",
         metric_key: "writev_burst_total_us",
@@ -113,6 +127,7 @@ pub const CASES: &[PerfCase] = &[
     // Latency (lower better): many small positional host-file pwritev calls.
     PerfCase {
         probe: "perf_pwritev_burst",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "pwritev_burst",
         metric_key: "pwritev_burst_total_us",
@@ -125,6 +140,7 @@ pub const CASES: &[PerfCase] = &[
     // Latency (lower better): many small positional host-file preadv calls.
     PerfCase {
         probe: "perf_preadv_burst",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "syscall",
         workload: "preadv_burst",
         metric_key: "preadv_burst_total_us",
@@ -139,6 +155,7 @@ pub const CASES: &[PerfCase] = &[
     // Linux avoids for untouched anonymous VMAs.
     PerfCase {
         probe: "perf_mmap_churn",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "memory",
         workload: "mmap_churn",
         metric_key: "mmap_churn_total_us",
@@ -154,6 +171,7 @@ pub const CASES: &[PerfCase] = &[
     // MAP_SHARED|MAP_ANONYMOUS.
     PerfCase {
         probe: "perf_shared_anon_churn",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "memory",
         workload: "shared_anon_churn",
         metric_key: "shared_anon_churn_total_us",
@@ -168,6 +186,7 @@ pub const CASES: &[PerfCase] = &[
     // VMAs without folding in page faults or copy-on-write dirtying.
     PerfCase {
         probe: "perf_fork_mmap_snapshot",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "memory",
         workload: "fork_mmap_snapshot",
         metric_key: "fork_mmap_snapshot_total_us",
@@ -180,6 +199,7 @@ pub const CASES: &[PerfCase] = &[
     // Latency (lower better): loopback request/response round-trip.
     PerfCase {
         probe: "perf_net_tcp_rr",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "tcp_rr",
         metric_key: "tcp_rr_p50_us",
@@ -193,6 +213,7 @@ pub const CASES: &[PerfCase] = &[
     // per-call bounce-buffer memcpy vs docker's in-kernel loopback.
     PerfCase {
         probe: "perf_net_tcp_stream",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "tcp_stream",
         metric_key: "tcp_stream_mbps",
@@ -206,6 +227,7 @@ pub const CASES: &[PerfCase] = &[
     // per-component openat re-walk vs docker's single in-kernel VFS walk.
     PerfCase {
         probe: "perf_disk_meta",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "stat_storm",
         metric_key: "stat_p50_us",
@@ -219,6 +241,7 @@ pub const CASES: &[PerfCase] = &[
     // file. This verifies the metadata path stays payload-size independent.
     PerfCase {
         probe: "perf_large_meta",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "large_meta",
         metric_key: "large_meta_total_us",
@@ -233,6 +256,7 @@ pub const CASES: &[PerfCase] = &[
     // writeback instead of host-fd paths.
     PerfCase {
         probe: "perf_overlay_small_updates",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "overlay_small_updates",
         metric_key: "overlay_small_updates_total_us",
@@ -242,11 +266,28 @@ pub const CASES: &[PerfCase] = &[
         carrick_fs_mode: "memory",
         cross_boundary: false,
     },
+    // Latency (lower better): glibc-linked open/lseek/write/close loop that
+    // mirrors overlay_small_updates closely enough to baseline an eventual
+    // LD_PRELOAD/interposer experiment. Runs through the Ubuntu dynamic loader,
+    // not run-elf's static musl fixture path.
+    PerfCase {
+        probe: "perf_dynamic_overlay_small_updates",
+        artifact: PerfArtifact::DynamicGlibc,
+        dimension: "dynamic",
+        workload: "dynamic_overlay_small_updates",
+        metric_key: "dynamic_overlay_small_updates_total_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        carrick_fs_mode: "host",
+        cross_boundary: false,
+    },
     // Throughput (higher better): bulk WRITE over a bind mount — carrick's
     // direct host FD (--fs host -v) vs docker's virtiofs VM-boundary round-trip.
     // The sharpest test of the "no virtiofs abstraction" disk thesis.
     PerfCase {
         probe: "perf_disk_vol",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "vol_write",
         metric_key: "disk_vol_write_mbps",
@@ -259,6 +300,7 @@ pub const CASES: &[PerfCase] = &[
     // Throughput (higher better): bulk READ over the same bind mount.
     PerfCase {
         probe: "perf_disk_vol",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "disk",
         workload: "vol_read",
         metric_key: "disk_vol_read_mbps",
@@ -273,6 +315,7 @@ pub const CASES: &[PerfCase] = &[
     // reachable); docker reaches it only via -p/vpnkit NAT. The "reach" thesis.
     PerfCase {
         probe: "perf_net_xserver",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "xboundary_rtt",
         metric_key: "xrtt_p50_us",
@@ -285,6 +328,7 @@ pub const CASES: &[PerfCase] = &[
     // CROSS-BOUNDARY throughput (higher better): host↔guest echo stream.
     PerfCase {
         probe: "perf_net_xserver",
+        artifact: PerfArtifact::StaticMusl,
         dimension: "network",
         workload: "xboundary_stream",
         metric_key: "xstream_mbps",
@@ -429,15 +473,37 @@ mod tests {
     }
 
     #[test]
+    fn registry_contains_dynamic_perf_surface() {
+        let case = CASES
+            .iter()
+            .find(|case| case.workload == "dynamic_overlay_small_updates")
+            .expect("missing dynamic perf workload dynamic_overlay_small_updates");
+        assert_eq!(case.dimension, "dynamic");
+        assert_eq!(case.probe, "perf_dynamic_overlay_small_updates");
+        assert_eq!(case.metric_key, "dynamic_overlay_small_updates_total_us");
+        assert_eq!(case.unit, "us");
+        assert_eq!(case.artifact, PerfArtifact::DynamicGlibc);
+        assert!(!case.higher_is_better);
+        assert!(!case.mount_scratch);
+        assert_eq!(case.carrick_fs_mode, "host");
+        assert!(!case.cross_boundary);
+    }
+
+    #[test]
     fn registered_perf_probes_have_sources() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|path| path.parent())
             .expect("carrick-cli lives under crates/");
         for case in CASES {
-            let source = root
-                .join("conformance-probes/src/bin")
-                .join(format!("{}.rs", case.probe));
+            let source = match case.artifact {
+                PerfArtifact::StaticMusl => root
+                    .join("conformance-probes/src/bin")
+                    .join(format!("{}.rs", case.probe)),
+                PerfArtifact::DynamicGlibc => root
+                    .join("perf-dynamic/src")
+                    .join(format!("{}.c", case.probe)),
+            };
             assert!(
                 source.exists(),
                 "missing source for registered perf probe {} at {}",
