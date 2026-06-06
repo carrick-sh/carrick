@@ -8,6 +8,14 @@ license.workspace = true
 name = "carrick_runtime"
 path = "src/lib.rs"
 
+# Phase B real-dispatch KVM driver: runs an aarch64 ELF under KVM through the
+# FULL dispatcher (vs the thin `carrick-linux` shim). Only built in the
+# platform-linux configuration; on macOS the default build skips it.
+[[bin]]
+name = "carrick-kvm"
+path = "src/bin/carrick-kvm.rs"
+required-features = ["platform-linux"]
+
 [lints]
 workspace = true
 

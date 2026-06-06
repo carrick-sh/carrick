@@ -164,11 +164,144 @@ pub mod execute {
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod runtime {
+    //! Linux (KVM) run path. The full macOS run loop lives in `runtime.rs`
+    //! (`cfg(platform-macos)`); on Linux we drive `carrick_linux::KvmTrapEngine`
+    //! through the REAL `SyscallDispatcher` with a single-threaded loop that
+    //! mirrors the macOS loop's non-blocking outcome handling
+    //! (`Returned`/`Errno`/`Exit`). Blocking I/O (the epoll waiter), futex, and
+    //! fork/exec/signal-injection are the full-backend spec's Phase C/D work and
+    //! deliberately surface here as `RuntimeError::Unsupported` for now.
+    use carrick_guest_mem::GuestMemory;
+    use carrick_hal::SyscallTrap;
+
+    use crate::compat::CompatReporter;
+    use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
+
     pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
     pub(crate) const ROSETTA_INTERPRETER: &str =
         "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
     pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
         None
+    }
+
+    /// What a finished guest run produced. The KVM backend buffers the guest's
+    /// stdout/stderr in the dispatcher (fd 1/2); the driver flushes them to the
+    /// host after the loop returns.
+    #[derive(Debug)]
+    pub struct RunResult {
+        pub exit_code: i32,
+        pub stdout: Vec<u8>,
+        pub stderr: Vec<u8>,
+        pub traps: usize,
+    }
+
+    /// Why the Linux run loop stopped short of a clean guest exit.
+    #[derive(Debug)]
+    pub enum RuntimeError {
+        /// ELF load / address-space construction failed.
+        Load(String),
+        /// The trap engine (KVM bring-up, `KVM_RUN`, register I/O) failed.
+        Trap(String),
+        /// A syscall dispatch returned a hard error.
+        Dispatch(String),
+        /// The guest hit an outcome the Phase-B loop cannot service yet
+        /// (blocking I/O / futex / fork / signal injection — Phase C/D).
+        Unsupported(String),
+        /// The guest ran past `max_traps` syscalls without exiting.
+        TrapLimit,
+    }
+
+    impl std::fmt::Display for RuntimeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                RuntimeError::Load(m) => write!(f, "load: {m}"),
+                RuntimeError::Trap(m) => write!(f, "trap: {m}"),
+                RuntimeError::Dispatch(m) => write!(f, "dispatch: {m}"),
+                RuntimeError::Unsupported(m) => write!(f, "unsupported in linux MVP loop: {m}"),
+                RuntimeError::TrapLimit => write!(f, "guest exceeded max_traps without exiting"),
+            }
+        }
+    }
+    impl std::error::Error for RuntimeError {}
+
+    /// Single-threaded real-dispatch loop for the KVM backend. Generic over the
+    /// engine, which must be BOTH the guest memory (`GuestMemory`) and the trap
+    /// vehicle (`SyscallTrap`) — `KvmTrapEngine` is both, so there is no
+    /// `SplitView`. `next_syscall`, `dispatch`, and `complete_syscall` are
+    /// called sequentially, so the single `&mut runtime` is never aliased.
+    pub fn run_combined_syscall_loop_linux<R>(
+        runtime: &mut R,
+        mut dispatcher: SyscallDispatcher,
+        max_traps: usize,
+    ) -> Result<RunResult, RuntimeError>
+    where
+        R: GuestMemory + SyscallTrap,
+    {
+        let reporter = CompatReporter::default();
+        let trace_traps = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
+        for traps in 1..=max_traps {
+            let frame = match runtime
+                .next_syscall()
+                .map_err(|e| RuntimeError::Trap(e.to_string()))?
+            {
+                Some(f) => f,
+                // A bare kick/halt with no pending syscall. Phase B has no
+                // process-directed signals, so there is nothing to deliver.
+                None => continue,
+            };
+            if trace_traps {
+                eprintln!(
+                    "trap#{traps}: x8={} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}",
+                    frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5
+                );
+            }
+            let outcome = dispatcher
+                .dispatch(
+                    SyscallRequest::from_aarch64_frame(frame),
+                    runtime,
+                    &reporter,
+                )
+                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+            match outcome {
+                DispatchOutcome::Returned { value } => {
+                    runtime
+                        .complete_syscall(value)
+                        .map_err(|e| RuntimeError::Trap(e.to_string()))?;
+                }
+                DispatchOutcome::Errno { errno } => {
+                    runtime
+                        .complete_syscall(-(errno as i64))
+                        .map_err(|e| RuntimeError::Trap(e.to_string()))?;
+                }
+                DispatchOutcome::Exit { code } => {
+                    return Ok(RunResult {
+                        exit_code: code,
+                        stdout: dispatcher.stdout().to_vec(),
+                        stderr: dispatcher.stderr().to_vec(),
+                        traps,
+                    });
+                }
+                other => {
+                    // Blocking I/O / futex / fork / clone-thread / signals:
+                    // Phase C/D. Surface clearly rather than silently mis-handle.
+                    return Err(RuntimeError::Unsupported(format!("{other:?}")));
+                }
+            }
+        }
+        Err(RuntimeError::TrapLimit)
+    }
+
+    /// Phase B entry: boot a freestanding/static aarch64 ELF under KVM and run
+    /// it through the REAL dispatcher — the `cfg(platform-linux)` sibling of the
+    /// macOS `HvfTrapEngine` run path. `KvmTrapEngine` satisfies the loop's
+    /// `GuestMemory + SyscallTrap` bound directly.
+    #[cfg(feature = "platform-linux")]
+    pub fn run_elf_real_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
+        let image = crate::memory::AddressSpace::load_elf(path)
+            .map_err(|e| RuntimeError::Load(e.to_string()))?;
+        let mut engine = carrick_linux::KvmTrapEngine::new(&image)
+            .map_err(|e| RuntimeError::Trap(e.to_string()))?;
+        run_combined_syscall_loop_linux(&mut engine, SyscallDispatcher::new(), DEFAULT_MAX_TRAPS)
     }
 }
 

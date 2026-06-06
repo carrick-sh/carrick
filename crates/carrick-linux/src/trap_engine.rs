@@ -3,7 +3,7 @@
 //! sentinel store surfaces as `VcpuExit::MmioWrite { gpa: SENTINEL_GPA, .. }`,
 //! reads x0..x5,x8 into an `Aarch64SyscallFrame`, and returns it.
 use carrick_abi::LinuxSiginfo;
-use carrick_guest_mem::Aarch64SyscallFrame;
+use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use carrick_hal::{ForkOutcome, HvVcpu, Reg, SyscallTrap, TrapError, VcpuExit};
 use carrick_mem::memory::AddressSpace;
 
@@ -45,6 +45,34 @@ impl KvmTrapEngine {
 // carrick-runtime dispatcher (SplitView @ runtime.rs:3701) is the full-Linux-
 // backend spec's job — that path needs ~200 macOS-isms ported off the dispatch
 // layer first (see run_elf.rs).
+
+/// `GuestMemory` over the KVM guest RAM. The guest is **identity-mapped** (the
+/// stage-1 tables map VA == IPA, and the single KVM memory slot maps IPA == GPA
+/// at host-mmap offset), so a syscall's guest *virtual* pointer is numerically
+/// the same as its guest-physical address and indexes straight into the host
+/// backing. The real dispatcher reads/writes its syscall buffers through this.
+///
+/// Only `read_bytes`/`write_bytes` are implemented for the MVP: the guest has a
+/// flat, protection-less single window, so the trait's default no-op bodies are
+/// correct for `set_no_access`/`protect_range`/`unmap_range`/`repoint_private`
+/// and the zero-copy/`shared_futex_host_addr` hooks (`None`). Real
+/// stage-1/protection methods are the full-backend spec's mmap/mprotect work.
+impl GuestMemory for KvmTrapEngine {
+    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.ram
+            .read(address, length)
+            .map_err(|_| MemoryError::OutOfBounds { address, length })
+    }
+
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.ram
+            .write_gpa(address, bytes)
+            .map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            })
+    }
+}
 
 impl SyscallTrap for KvmTrapEngine {
     fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
