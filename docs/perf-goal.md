@@ -62,6 +62,8 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `ba1afbf` - `perf(dynamic): add glibc overlay workload lane`
+- `f1ac789` - `docs(perf): record epoll and Mach COW findings`
 - `58d3ee6` - `perf(syscall): add epoll pipe loop workload`
 - `a5de9e2` - `perf(memory): add Mach COW snapshot helper`
 - `324b5e0` - `docs(perf): attribute fork snapshot cost`
@@ -97,6 +99,8 @@ Relevant result file:
 - `docs/perf-results/2026-06-06-syscall.jsonl` contains
   `wait_pipe_pingpong` rows at `2744261` and `db6d5cc`, plus
   `epoll_pipe_loop` rows at `58d3ee6`.
+- `docs/perf-results/2026-06-06-dynamic.jsonl` contains
+  `dynamic_overlay_small_updates` baseline rows at `ba1afbf`.
 
 ## Current Evidence
 
@@ -348,6 +352,45 @@ Remaining:
   subscriptions would need retained fd guards or generation tokens across
   completed waits and must first prove signal, close, fork, and wake-pipe
   invariants.
+
+### Dynamic Glibc Baseline
+
+Workload: `dynamic_overlay_small_updates`.
+
+Evidence:
+
+- `ba1afbf` added a separate dynamic artifact family to the perf registry.
+  Static musl cases still resolve under `conformance-probes/target`, while
+  dynamic glibc cases resolve under
+  `perf-dynamic/target/aarch64-linux-gnu/release/`.
+- `scripts/build-dynamic-perf.sh` builds glibc-linked aarch64 workloads with
+  `gcc:14`, intentionally separate from the static musl probe build.
+- The first dynamic workload is `perf_dynamic_overlay_small_updates`, a normal
+  glibc-linked ELF using the Ubuntu dynamic loader at
+  `/lib/ld-linux-aarch64.so.1`.
+- The workload mirrors `overlay_small_updates`: create 16 sparse 1 MiB files,
+  warm up 64 updates, then time 512 open/lseek/write/close updates.
+- The perf harness exports `BENCH_NPROC=4` before launching injected probes so
+  dynamic glibc workloads report the same normalized CPU count as static Rust
+  probes. Without this, glibc `sysconf(_SC_NPROCESSORS_ONLN)` reported the
+  host's 10 CPUs under Docker despite `--cpuset-cpus 0-3`.
+- Direct Docker smoke after rebuild: `dynamic_overlay_small_updates_p50_us`
+  about `1.084`, `dynamic_overlay_small_updates_total_us=694.292`,
+  `nproc=4`.
+- Direct Carrick smoke: `dynamic_overlay_small_updates_p50_us=142.167`,
+  `dynamic_overlay_small_updates_total_us=112731.750`, `nproc=4`.
+- Perf gate at `ba1afbf`: Carrick p50 `87326.292` us, p95 `125758.292` us,
+  samples `[87326.292,125758.292]`, noisy; Docker p50 `699.708` us, p95
+  `740.167` us, samples `[699.708,740.167]`, not noisy. Docker wins by about
+  `124.80x` latency.
+
+Remaining:
+
+- This proves the dynamic baseline lane exists and the gap is real. It does not
+  prove that an `LD_PRELOAD` optimization is safe.
+- Do not build an interposer for the open/lseek/write/close sequence until a
+  design preserves fd allocation, close semantics, shared offsets, blocking,
+  signals, and `/proc/self/fd` visibility.
 
 ## Primary Near-Term Bet
 
@@ -617,7 +660,7 @@ Rejected next steps:
 
 **Steps:**
 
-- [ ] Add or select a dynamic binary workload that mirrors
+- [x] Add or select a dynamic binary workload that mirrors
   `overlay_small_updates` closely enough to test an interposer.
 
   Requirements:
@@ -626,7 +669,51 @@ Rejected next steps:
   - same repeated open/update/close shape
   - Docker/Linux control row
   - Carrick row without an interposer
-  - Carrick row with any proposed interposer
+  - Carrick row with any proposed interposer, once a proposed interposer exists
+
+  Added `perf_dynamic_overlay_small_updates` at `ba1afbf`.
+
+  Build command:
+
+  ```sh
+  scripts/build-dynamic-perf.sh
+  ```
+
+  Focused RED/GREEN:
+
+  ```sh
+  cargo test -p carrick-cli --test perf_runner registry_contains_dynamic_perf_surface -- --nocapture
+  cargo test -p carrick-cli --test perf_runner registered_perf_probes_have_sources -- --nocapture
+  cargo test -p carrick-cli --test perf_runner injected_probe_snippet_exports_normalized_nproc -- --nocapture
+  ```
+
+  Initial RED failed because `PerfCase` had no dynamic artifact concept. The
+  final GREEN verifies the dynamic workload registry entry, dynamic C source
+  discovery, and normalized `BENCH_NPROC` injection.
+
+  Smoke evidence:
+
+  - Docker: `dynamic_overlay_small_updates_total_us=694.292`, `nproc=4`.
+  - Carrick: `dynamic_overlay_small_updates_total_us=112731.750`, `nproc=4`.
+
+  Perf row command:
+
+  ```sh
+  CARRICK_PERF_FILTER=dynamic_overlay_small_updates \
+  CARRICK_PERF_REPS=3 \
+  CARRICK_PERF_WARMUP=1 \
+  CARRICK_PERF_COOLDOWN_SECS=0 \
+  cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
+  ```
+
+  `docs/perf-results/2026-06-06-dynamic.jsonl` rows at
+  `ba1afbfce17e5d8671af7c50d34b4a6e7bb24915`:
+
+  - Carrick p50 `87326.292` us, p95 `125758.292` us, samples
+    `[87326.292,125758.292]`, noisy.
+  - Docker p50 `699.708` us, p95 `740.167` us, samples `[699.708,740.167]`,
+    not noisy.
+  - Docker wins by about `124.80x` latency.
 
 - [ ] Define an interposer experiment as a measured optimization only.
 
