@@ -97,8 +97,9 @@ use std::path::{Path, PathBuf};
 use oci_client::Client;
 use oci_client::client::{ClientConfig, ImageLayer};
 use oci_client::manifest::{
-    IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
-    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry, OciImageManifest,
+    IMAGE_CONFIG_MEDIA_TYPE, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
+    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry, OciDescriptor,
+    OciImageManifest,
 };
 use oci_client::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
@@ -828,6 +829,218 @@ impl ImageStore {
     }
 }
 
+/// One image entry from a docker-archive `manifest.json` (`docker save` /
+/// kaniko `--tar-path`). `config` and `layers` are *entry paths inside the
+/// tar*, attacker-influenced; they are matched against tar entry names but
+/// never used as host paths.
+#[derive(Debug, Clone, Deserialize)]
+struct DockerArchiveManifestEntry {
+    #[serde(rename = "Config")]
+    config: String,
+    #[serde(rename = "RepoTags", default)]
+    repo_tags: Vec<String>,
+    #[serde(rename = "Layers", default)]
+    layers: Vec<String>,
+}
+
+impl ImageStore {
+    /// Ingest a docker-archive image tarball (`docker save` / kaniko
+    /// `--tar-path`) into the store, returning one [`PullSummary`] per
+    /// `RepoTag`. This is the read/ingest counterpart to
+    /// [`pull_image_with_platform`]: it performs the exact same store writes —
+    /// content-addressed layer blobs under `blobs/sha256/<hex>`, the OCI
+    /// `config.json` / `manifest.json` and carrick's `carrick-image.json`
+    /// summary into each tag's per-platform image dir — but sources the bytes
+    /// from a local tar instead of a registry pull. Once written, `carrick run
+    /// <tag>` resolves WITHOUT a network round-trip ([`Self::resolve`] reads
+    /// `carrick-image.json` first). Used by `carrick load` and `carrick build
+    /// --no-push` to ingest kaniko's output.
+    ///
+    /// Tags are written for the host-native default platform (the docker-archive
+    /// format carries no platform descriptor; the bytes are whatever the
+    /// producer built). v1 supports the first image entry of the archive; every
+    /// `RepoTag` on that entry is tagged (blobs are shared, only the per-tag
+    /// metadata dir differs).
+    ///
+    /// # Security
+    ///
+    /// The `Config`/`Layers` strings from the archive's `manifest.json` are
+    /// attacker-influenced. They are used ONLY to match tar entry names (string
+    /// equality) and never joined onto a host path. Every host write goes
+    /// through [`Self::blob_path`] (which validates the *computed* digest is
+    /// `sha256:`+hex) or a fixed file name inside the validated image dir.
+    pub fn load_docker_archive(
+        &self,
+        tar_path: &Path,
+    ) -> Result<Vec<PullSummary>, OciBootstrapError> {
+        let target = PlatformTarget::default_target();
+
+        // Pass 1: index every entry name -> bytes for the entries the manifest
+        // names. A docker-archive is small relative to a registry pull and the
+        // `tar` crate is single-pass forward-only, so we buffer what we need.
+        // (We do not know which entries we need until we've parsed manifest.json,
+        // and manifest.json may appear last — so buffer everything once.)
+        let file = std::fs::File::open(tar_path)?;
+        let mut archive = tar::Archive::new(file);
+        let mut entries_by_name: HashMap<String, Vec<u8>> = HashMap::new();
+        let archive_entries = archive
+            .entries()
+            .map_err(|e| OciBootstrapError::Archive(format!("reading tar entries: {e}")))?;
+        for entry in archive_entries {
+            let mut entry =
+                entry.map_err(|e| OciBootstrapError::Archive(format!("reading tar entry: {e}")))?;
+            // The entry path is only ever compared (string equality) to a
+            // manifest-supplied name; it is never used as a host path.
+            let name = match entry.path() {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => continue,
+            };
+            // Only buffer regular files; skip directory/symlink/hardlink entries
+            // (a manifest blob is always a regular file).
+            if entry.header().entry_type().is_dir() {
+                continue;
+            }
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf)
+                .map_err(|e| OciBootstrapError::Archive(format!("reading entry {name:?}: {e}")))?;
+            entries_by_name.insert(name, buf);
+        }
+
+        let manifest_bytes = entries_by_name.get("manifest.json").ok_or_else(|| {
+            OciBootstrapError::Archive("archive has no manifest.json".to_string())
+        })?;
+        let archive_manifest: Vec<DockerArchiveManifestEntry> =
+            serde_json::from_slice(manifest_bytes).map_err(|e| {
+                OciBootstrapError::Archive(format!("parsing manifest.json: {e}"))
+            })?;
+        let image_entry = archive_manifest.first().ok_or_else(|| {
+            OciBootstrapError::Archive("manifest.json has no image entries".to_string())
+        })?;
+
+        // Layer blobs: compute the content digest over the bytes (the archive
+        // file names are NOT digests we trust — kaniko names them `<hex>.tar.gz`
+        // where `<hex>` is the *uncompressed* diff id, not the blob digest), then
+        // write each to its content-addressed blob path, mirroring the pull.
+        std::fs::create_dir_all(self.root.join("blobs").join("sha256"))?;
+        let mut layers = Vec::with_capacity(image_entry.layers.len());
+        for layer_name in &image_entry.layers {
+            let bytes = entries_by_name.get(layer_name).ok_or_else(|| {
+                OciBootstrapError::Archive(format!(
+                    "manifest referenced missing layer entry {layer_name:?}"
+                ))
+            })?;
+            let digest = sha256_digest(bytes);
+            let path = self.blob_path(&digest)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, bytes)?;
+            layers.push(LayerSummary {
+                media_type: layer_media_type(layer_name, bytes).to_string(),
+                digest,
+                size: bytes.len(),
+                path,
+            });
+        }
+
+        // Config blob: same content-addressing. The `Config` entry name may be
+        // `sha256:<hex>` (kaniko) or `<hex>.json` (docker save); either way we
+        // re-derive the digest from the bytes.
+        let config_bytes = entries_by_name.get(&image_entry.config).ok_or_else(|| {
+            OciBootstrapError::Archive(format!(
+                "manifest referenced missing config entry {:?}",
+                image_entry.config
+            ))
+        })?;
+        let config_size = config_bytes.len();
+        let config_digest = sha256_digest(config_bytes);
+
+        // Build the OCI image manifest (schemaVersion 2) from the descriptors,
+        // matching what the pull path persists, so `resolve` re-orders layers
+        // against it identically.
+        let manifest = OciImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: OciDescriptor {
+                media_type: IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+                digest: config_digest,
+                size: config_size as i64,
+                ..OciDescriptor::default()
+            },
+            layers: layers
+                .iter()
+                .map(|l| OciDescriptor {
+                    media_type: l.media_type.clone(),
+                    digest: l.digest.clone(),
+                    size: l.size as i64,
+                    ..OciDescriptor::default()
+                })
+                .collect(),
+            subject: None,
+            artifact_type: None,
+            annotations: None,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        // The image id is the digest of the manifest JSON bytes (matches the OCI
+        // notion of an image's manifest digest and the pull path's `digest`).
+        let image_id = sha256_digest(&manifest_bytes);
+
+        // No RepoTags is unusual for `load`; docker errors. Treat it the same.
+        if image_entry.repo_tags.is_empty() {
+            return Err(OciBootstrapError::Archive(
+                "image has no RepoTags to load".to_string(),
+            ));
+        }
+
+        // Write the per-tag metadata. Blobs are shared (content-addressed); only
+        // the image dir differs per tag, exactly like `tag_image`.
+        let mut summaries = Vec::with_capacity(image_entry.repo_tags.len());
+        for tag in &image_entry.repo_tags {
+            let image = ImageReference::parse(tag)?;
+            let image_dir = self.image_dir_for(&image, &target);
+            std::fs::create_dir_all(&image_dir)?;
+            std::fs::write(image_dir.join("config.json"), config_bytes)?;
+            std::fs::write(image_dir.join("manifest.json"), &manifest_bytes)?;
+            let summary = PullSummary {
+                image: image.canonical(),
+                digest: Some(image_id.clone()),
+                image_dir,
+                config_size,
+                layers: layers.clone(),
+            };
+            std::fs::write(
+                summary.image_dir.join("carrick-image.json"),
+                serde_json::to_vec_pretty(&summary)?,
+            )?;
+            summaries.push(summary);
+        }
+
+        Ok(summaries)
+    }
+}
+
+/// `sha256:<lowercase-hex>` over `bytes`, the digest form the store's blob
+/// paths and OCI descriptors use.
+fn sha256_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Pick the OCI layer media type for a docker-archive layer blob. The archive
+/// carries no per-layer media type, so we infer gzip from the gzip magic bytes
+/// (`1f 8b`) — falling back to the file extension — and otherwise treat it as a
+/// plain tar.
+fn layer_media_type(name: &str, bytes: &[u8]) -> &'static str {
+    let gzip = bytes.starts_with(&[0x1f, 0x8b]) || name.ends_with(".gz") || name.ends_with(".tgz");
+    if gzip {
+        IMAGE_LAYER_GZIP_MEDIA_TYPE
+    } else {
+        IMAGE_LAYER_MEDIA_TYPE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1236,5 +1449,231 @@ mod tests {
 
         // Unknown.
         assert_eq!(store.remove_image_by_spec("nope:latest").unwrap(), None);
+    }
+
+    /// gzip a single-file tar, the layer-blob shape a docker-archive carries.
+    fn gzip_layer(path: &str, contents: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, contents).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Build a minimal docker-archive tar in-process: `manifest.json`, a config
+    /// blob entry, and one gzipped layer. `config_entry`/`layer_entry` are the
+    /// entry *names* recorded in `manifest.json` (so we can exercise both the
+    /// kaniko `sha256:<hex>` and `docker save` `<hex>.json` naming).
+    fn docker_archive(
+        repo_tags: &[&str],
+        config_entry: &str,
+        config_bytes: &[u8],
+        layer_entry: &str,
+        layer_bytes: &[u8],
+    ) -> Vec<u8> {
+        let manifest = serde_json::json!([{
+            "Config": config_entry,
+            "RepoTags": repo_tags,
+            "Layers": [layer_entry],
+        }]);
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (name, data) in [
+                ("manifest.json", manifest_bytes.as_slice()),
+                (config_entry, config_bytes),
+                (layer_entry, layer_bytes),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        tar_bytes
+    }
+
+    #[test]
+    fn load_docker_archive_ingests_blobs_and_summary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+
+        let layer = gzip_layer("hello.txt", b"hello from the layer");
+        let config = br#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/bin/sh"]}}"#;
+        // kaniko-style naming: Config is `sha256:<hex>`, layer is `<hex>.tar.gz`.
+        let layer_hex = "3f26bc2dec0b515f1c2818f6e13a8f1da1f88179a008445d4e587233386bff78";
+        let archive = docker_archive(
+            &["trivial:latest"],
+            "sha256:1e30add214cb8e39df246287c1ab81d6b8fcb7ba210822086c04078df9d1144a",
+            config,
+            &format!("{layer_hex}.tar.gz"),
+            &layer,
+        );
+        let tar_path = tmp.path().join("out.tar");
+        std::fs::write(&tar_path, &archive).unwrap();
+
+        let summaries = store.load_docker_archive(&tar_path).unwrap();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.image, "docker.io/library/trivial:latest");
+        assert_eq!(summary.config_size, config.len());
+        assert_eq!(summary.layers.len(), 1);
+
+        // The layer blob is content-addressed: its digest is the sha256 of the
+        // gzip bytes, and it lives at blob_path(digest).
+        let expected_digest = sha256_digest(&layer);
+        assert_eq!(summary.layers[0].digest, expected_digest);
+        assert_eq!(
+            summary.layers[0].media_type,
+            IMAGE_LAYER_GZIP_MEDIA_TYPE,
+            "gzip magic bytes => gzip media type"
+        );
+        let blob_path = store.blob_path(&expected_digest).unwrap();
+        assert!(blob_path.exists(), "layer blob written to blob_path");
+        assert_eq!(std::fs::read(&blob_path).unwrap(), layer);
+
+        // The image id is the sha256 of the persisted manifest bytes.
+        assert!(
+            summary
+                .digest
+                .as_deref()
+                .is_some_and(|d| d.starts_with("sha256:"))
+        );
+
+        // carrick-image.json parses back to the same summary; config.json and
+        // manifest.json sit beside it.
+        let image = ImageReference::parse("trivial:latest").unwrap();
+        let summary_path = store.image_summary_path(&image);
+        assert!(summary_path.exists());
+        let reloaded: PullSummary =
+            serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
+        assert_eq!(&reloaded, summary);
+        let image_dir = store.image_dir(&image);
+        assert_eq!(std::fs::read(image_dir.join("config.json")).unwrap(), config);
+        assert!(image_dir.join("manifest.json").exists());
+
+        // The store now resolves the tag with no further work, and the layer
+        // ordering re-derived from manifest.json matches.
+        assert_eq!(store.list_images().len(), 1);
+    }
+
+    #[test]
+    fn load_docker_archive_tags_every_repo_tag() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+
+        let layer = gzip_layer("f", b"x");
+        let config = br#"{"config":{}}"#;
+        // docker-save-style config naming: `<hex>.json`.
+        let archive = docker_archive(
+            &["myapp:latest", "myapp:1.0"],
+            "abc123.json",
+            config,
+            "abc123/layer.tar.gz",
+            &layer,
+        );
+        let tar_path = tmp.path().join("save.tar");
+        std::fs::write(&tar_path, &archive).unwrap();
+
+        let summaries = store.load_docker_archive(&tar_path).unwrap();
+        assert_eq!(summaries.len(), 2);
+        // Both tags share the same image id (one set of content-addressed blobs).
+        assert_eq!(summaries[0].digest, summaries[1].digest);
+        let imgs = store.list_images();
+        assert_eq!(imgs.len(), 2);
+        assert!(imgs.iter().any(|i| i.tag == "latest"));
+        assert!(imgs.iter().any(|i| i.tag == "1.0"));
+        // The shared layer blob is referenced by both tags, so GC keeps it.
+        let (count, _) = store.gc_blobs();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn load_docker_archive_plain_tar_layer_gets_tar_media_type() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+
+        // A plain (un-gzipped) tar layer — no gzip magic, no `.gz` suffix.
+        let mut plain_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut plain_tar);
+            let mut header = tar::Header::new_gnu();
+            let contents = b"plain";
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, "f", &contents[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let archive = docker_archive(
+            &["plain:latest"],
+            "cfg.json",
+            br#"{"config":{}}"#,
+            "layer.tar",
+            &plain_tar,
+        );
+        let tar_path = tmp.path().join("plain.tar");
+        std::fs::write(&tar_path, &archive).unwrap();
+
+        let summaries = store.load_docker_archive(&tar_path).unwrap();
+        assert_eq!(summaries[0].layers[0].media_type, IMAGE_LAYER_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn load_docker_archive_missing_manifest_is_an_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+        // A tar with no manifest.json.
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(3);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, "junk", &b"abc"[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let tar_path = tmp.path().join("bad.tar");
+        std::fs::write(&tar_path, &bytes).unwrap();
+        let err = store.load_docker_archive(&tar_path).unwrap_err();
+        assert!(matches!(err, OciBootstrapError::Archive(_)), "got {err:?}");
+    }
+
+    /// Real fixture: a kaniko-built docker-archive at the spike path, if present.
+    /// Guarded on existence so CI (where it is absent) skips it.
+    #[test]
+    fn load_real_kaniko_archive_if_present() {
+        let path = Path::new("/tmp/carrick-kaniko-spike/out.tar");
+        if !path.exists() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+        let summaries = store.load_docker_archive(path).unwrap();
+        // RepoTags `trivial:latest`, 3 gz layers.
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.image, "docker.io/library/trivial:latest");
+        assert_eq!(summary.layers.len(), 3, "kaniko built 3 layers");
+        for layer in &summary.layers {
+            assert!(store.blob_path(&layer.digest).unwrap().exists());
+        }
+        assert!(summary.config_size > 0);
+        assert!(summary.digest.as_deref().is_some_and(|d| d.starts_with("sha256:")));
     }
 }

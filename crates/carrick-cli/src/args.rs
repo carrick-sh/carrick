@@ -109,6 +109,14 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "OS/ARCH")]
         platform: Option<String>,
     },
+    /// Load an image from a docker-archive tarball into the local store (like
+    /// `docker load`). Ingests a `docker save` / kaniko `--tar-path` archive so
+    /// the tagged image resolves and runs locally without a registry pull.
+    Load {
+        /// Read the archive from a tar file instead of STDIN.
+        #[arg(short = 'i', long = "input", value_name = "FILE")]
+        input: PathBuf,
+    },
     /// List images in the local store (like `docker images`).
     Images {
         /// Only show numeric image ids.
