@@ -140,9 +140,11 @@ fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
     crate::fork_quiesce::pt_barrier()
 }
 use crate::trap::{HvfTrapEngine, TrapError};
-// `SyscallTrap` moved to carrick-hvf (`crate::trap`); re-export it from this
-// module so the original `carrick_runtime::runtime::SyscallTrap` path (used by
-// the runtime_loop tests and the engine crate) is unchanged.
+// `SyscallTrap`/`TrapError`/`ForkOutcome` live in the carrick-hal leaf crate
+// and are re-exported through `carrick_hvf::trap` (re-exported here as
+// `crate::trap`). Re-export `SyscallTrap` from this module too so the original
+// `carrick_runtime::runtime::SyscallTrap` path (used by the runtime_loop tests
+// and the engine crate) is unchanged.
 pub use crate::trap::SyscallTrap;
 use serde::Serialize;
 use thiserror::Error;
