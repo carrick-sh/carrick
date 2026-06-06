@@ -64,6 +64,9 @@ fn write_syscall_rejects_bad_guest_pointer_with_efault() {
 #[derive(Default)]
 struct CountingMemoryBackend {
     inner: MemoryBackend,
+    lookup_kind_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    metadata_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    shared_file_contents_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     max_lookup_payload_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     max_writeback_payload_len: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -74,6 +77,12 @@ impl CountingMemoryBackend {
     }
 
     fn reset_counts(&self) {
+        self.lookup_kind_calls
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.metadata_calls
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.shared_file_contents_calls
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.max_lookup_payload_len
             .store(0, std::sync::atomic::Ordering::SeqCst);
         self.max_writeback_payload_len
@@ -131,10 +140,14 @@ impl FsBackend for CountingMemoryBackend {
     }
 
     fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
+        self.lookup_kind_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.lookup_kind(path)
     }
 
     fn metadata(&self, path: &str) -> Option<carrick_runtime::rootfs::RootFsMetadata> {
+        self.metadata_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.metadata(path)
     }
 
@@ -146,7 +159,17 @@ impl FsBackend for CountingMemoryBackend {
         &self,
         path: &str,
     ) -> Option<carrick_runtime::fs_backend::SharedFileContents> {
+        self.shared_file_contents_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.shared_file_contents(path)
+    }
+
+    fn shared_file_entry(
+        &self,
+        path: &str,
+        trunc: bool,
+    ) -> Option<carrick_runtime::fs_backend::SharedFileEntry> {
+        self.inner.shared_file_entry(path, trunc)
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
@@ -205,6 +228,45 @@ impl FsBackend for CountingMemoryBackend {
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
         self.inner.open_raw_fd(path, write, create, trunc)
     }
+}
+
+#[test]
+fn memory_overlay_open_uses_single_backend_snapshot_for_shared_file() {
+    let backend = CountingMemoryBackend::new();
+    backend
+        .set_file_contents("/large.bin", vec![0x41; 1024 * 1024])
+        .unwrap();
+    backend.reset_counts();
+    let lookup_kind_calls = backend.lookup_kind_calls.clone();
+    let metadata_calls = backend.metadata_calls.clone();
+    let shared_file_contents_calls = backend.shared_file_contents_calls.clone();
+
+    let mut vfs = carrick_runtime::vfs::RootFsVfs::new();
+    vfs.set_overlay(Box::new(backend));
+
+    let result = vfs
+        .open_for_dispatch("/large.bin", false, false, false, true)
+        .unwrap();
+    assert!(matches!(
+        result,
+        carrick_runtime::vfs::rootfs::OpenDispatchResult::RootFsBackedFile { .. }
+    ));
+
+    assert_eq!(
+        lookup_kind_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "memory overlay file open should avoid a separate kind lookup"
+    );
+    assert_eq!(
+        metadata_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "memory overlay file open should avoid a separate metadata lookup"
+    );
+    assert_eq!(
+        shared_file_contents_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "memory overlay file open should use one snapshot call instead of a separate shared-content lookup"
+    );
 }
 
 #[test]

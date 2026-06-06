@@ -101,6 +101,12 @@ pub struct SharedFileContents {
     pub len: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedFileEntry {
+    pub metadata: RootFsMetadata,
+    pub contents: SharedFileContents,
+}
+
 /// Trait every writable-layer backend implements. Methods are layer-
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
@@ -133,6 +139,13 @@ pub trait FsBackend: Send + Sync {
     /// Return a cheap shared snapshot for an in-memory file when the backend
     /// can expose one without materializing the whole payload.
     fn shared_file_contents(&self, _path: &str) -> Option<SharedFileContents> {
+        None
+    }
+
+    /// Return metadata plus a cheap shared contents snapshot for a file when the
+    /// backend can answer both in one pass. `trunc` applies O_TRUNC before the
+    /// snapshot is returned.
+    fn shared_file_entry(&self, _path: &str, _trunc: bool) -> Option<SharedFileEntry> {
         None
     }
 
@@ -647,6 +660,16 @@ impl MemoryFile {
         }
         Ok(())
     }
+
+    fn truncate_to_zero(&mut self) {
+        let mode = self.mode();
+        *self = Self::RootFsBacked {
+            base: Arc::<[u8]>::from([]),
+            dirty: BTreeMap::new(),
+            len: 0,
+            mode,
+        };
+    }
 }
 
 fn prune_dirty_ranges(dirty: &mut BTreeMap<usize, Vec<u8>>, len: usize) {
@@ -825,6 +848,52 @@ impl FsBackend for MemoryBackend {
             .files
             .get(&normalized)
             .map(MemoryFile::shared_contents)
+    }
+
+    fn shared_file_entry(&self, path: &str, trunc: bool) -> Option<SharedFileEntry> {
+        let normalized = normalize(path)?;
+        if trunc {
+            let mut inner = self.inner.write();
+            if inner.deletions.contains(&normalized)
+                || inner.dirs.contains(&normalized)
+                || inner.sockets.contains_key(&normalized)
+            {
+                return None;
+            }
+            let file = inner.files.get_mut(&normalized)?;
+            file.truncate_to_zero();
+            let mode = file.mode();
+            let contents = file.shared_contents();
+            return Some(SharedFileEntry {
+                metadata: RootFsMetadata {
+                    path: normalized,
+                    kind: RootFsEntryKind::File,
+                    mode,
+                    size: contents.len,
+                },
+                contents,
+            });
+        }
+
+        let inner = self.inner.read();
+        if inner.deletions.contains(&normalized)
+            || inner.dirs.contains(&normalized)
+            || inner.sockets.contains_key(&normalized)
+        {
+            return None;
+        }
+        let file = inner.files.get(&normalized)?;
+        let mode = file.mode();
+        let contents = file.shared_contents();
+        Some(SharedFileEntry {
+            metadata: RootFsMetadata {
+                path: normalized,
+                kind: RootFsEntryKind::File,
+                mode,
+                size: contents.len,
+            },
+            contents,
+        })
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
