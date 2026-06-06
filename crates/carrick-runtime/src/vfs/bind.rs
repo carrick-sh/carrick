@@ -37,7 +37,7 @@ use super::{
     DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle, WatchFd,
 };
 use crate::dispatch::macos_to_linux_errno;
-use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
+use crate::linux_abi::{LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
 
 pub struct BindVfs {
     mount_point: String,
@@ -56,6 +56,14 @@ impl BindVfs {
             host_path: host_path.into(),
             readonly,
         }
+    }
+
+    /// `true` iff `guest_path` names the mount POINT itself (the directory the
+    /// mount is attached at), not something underneath it. A trailing slash is
+    /// tolerated so `rmdir("/workspace/")` is recognised too.
+    fn is_mount_point(&self, guest_path: &str) -> bool {
+        guest_path == self.mount_point
+            || guest_path.trim_end_matches('/') == self.mount_point.trim_end_matches('/')
     }
 
     fn to_host(&self, guest_path: &str) -> Result<PathBuf, VfsError> {
@@ -448,6 +456,26 @@ impl Vfs for BindVfs {
         if self.readonly {
             return Err(LINUX_EROFS);
         }
+        // The mount POINT itself is not an ordinary entry: it's the attachment
+        // point of a mount. `to_host` maps it to the `-v` host SOURCE directory,
+        // so a literal `remove_file`/`remove_dir` here would erase the caller's
+        // real source dir. Instead treat removing the mount point as a no-op
+        // SUCCESS: the source dir (and the mount) stay, so the mount point
+        // remains a present, enumerable (now-empty) directory.
+        //
+        // Why success and not EBUSY: kaniko's between-stage "Deleting
+        // filesystem" does `os.RemoveAll("/workspace")` (delete the children,
+        // then rmdir the dir). Returning EBUSY for that rmdir makes RemoveAll —
+        // and the whole `DeleteFilesystem` walk — fail, aborting the build. A
+        // no-op success matches what kaniko sees under Docker (where /workspace
+        // is a plain dir it can remove and the next stage re-creates) AND keeps
+        // the host source intact. Previously the host dir WAS deleted, which
+        // left a dangling mount: the next full-FS snapshot walk hit ENOENT at
+        // /workspace, kaniko's walker aborted silently, and everything after it
+        // (notably /lib) was recorded deleted → a spurious `.wh.lib` whiteout.
+        if self.is_mount_point(path) {
+            return Ok(());
+        }
         let host = self.to_host(path)?;
         std::fs::remove_file(&host).map_err(map_io_error)
     }
@@ -456,6 +484,13 @@ impl Vfs for BindVfs {
         if self.readonly {
             return Err(LINUX_EROFS);
         }
+        // See `unlink`: removing the mount point is a no-op success (the `-v`
+        // host source dir and the mount both survive, so the mount point stays a
+        // present, enumerable empty directory — matching what kaniko sees for
+        // /workspace under Docker).
+        if self.is_mount_point(path) {
+            return Ok(());
+        }
         let host = self.to_host(path)?;
         std::fs::remove_dir(&host).map_err(map_io_error)
     }
@@ -463,6 +498,12 @@ impl Vfs for BindVfs {
     fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
         if self.readonly {
             return Err(LINUX_EROFS);
+        }
+        // Renaming the mount point itself (either direction) would move/replace
+        // the host source path — same hazard as unlink/rmdir. Linux returns
+        // EBUSY when a rename source or target is a mount point.
+        if self.is_mount_point(from) || self.is_mount_point(to) {
+            return Err(LINUX_EBUSY);
         }
         let host_from = self.to_host(from)?;
         let host_to = self.to_host(to)?;
@@ -589,5 +630,72 @@ impl Vfs for BindVfs {
 
     fn name(&self) -> &'static str {
         "bind"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linux_abi::LINUX_EBUSY;
+
+    /// A read-write bind mount must let the guest delete the mount's CONTENTS
+    /// but must NOT delete the mount POINT itself — that maps to the caller's
+    /// real `-v` host source directory. Removing the mount point is a no-op
+    /// success (the source dir survives and the now-empty mount point stays
+    /// enumerable); a rename of the mount point is EBUSY like Linux.
+    ///
+    /// This is the invariant behind the multi-stage `carrick build` whiteout
+    /// bug: kaniko's between-stage "Deleting filesystem" rmdir'd `/workspace`,
+    /// which used to delete the host context dir; the dangling mount then made
+    /// kaniko's next full-FS snapshot walk abort at `/workspace` (ENOENT) and
+    /// emit a spurious `.wh.lib`.
+    #[test]
+    fn mount_point_cannot_be_removed_but_contents_can() {
+        let src = std::env::temp_dir().join(format!("carrick-bind-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(src.join("Dockerfile"), b"FROM scratch\n").expect("write child");
+
+        let vfs = BindVfs::new("/workspace", src.clone(), false);
+
+        // The child is an ordinary entry: it can be deleted, and that hits the
+        // real host file.
+        assert!(src.join("Dockerfile").exists());
+        vfs.unlink("/workspace/Dockerfile").expect("unlink child ok");
+        assert!(
+            !src.join("Dockerfile").exists(),
+            "child unlink should remove the host file"
+        );
+
+        // The mount point itself: unlink AND rmdir succeed as a no-op (so
+        // kaniko's os.RemoveAll(/workspace) doesn't fail the build), and the
+        // host source directory must still exist afterwards. Every spelling of
+        // the mount point, including a trailing slash.
+        for p in ["/workspace", "/workspace/"] {
+            assert_eq!(vfs.unlink(p), Ok(()), "unlink({p}) must be no-op success");
+            assert_eq!(vfs.rmdir(p), Ok(()), "rmdir({p}) must be no-op success");
+        }
+        // Renaming the mount point (as source or target) is refused (Linux EBUSY).
+        assert_eq!(vfs.rename("/workspace", "/elsewhere"), Err(LINUX_EBUSY));
+
+        assert!(
+            src.is_dir(),
+            "host source dir must survive guest deletion of the mount point"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// A read-only bind reports EROFS before the mount-point guard even runs —
+    /// the guard must not change the read-only contract.
+    #[test]
+    fn readonly_bind_still_erofs() {
+        let src = std::env::temp_dir().join(format!("carrick-bind-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).expect("create src");
+        let vfs = BindVfs::new("/workspace", src.clone(), true);
+        assert_eq!(vfs.rmdir("/workspace"), Err(LINUX_EROFS));
+        assert_eq!(vfs.unlink("/workspace/x"), Err(LINUX_EROFS));
+        let _ = std::fs::remove_dir_all(&src);
     }
 }
