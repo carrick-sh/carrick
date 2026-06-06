@@ -327,6 +327,9 @@ fn fd_open_path_inserts() -> usize {
     FD_OPEN_PATH_INSERTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+// TODO: this test module sits before the large `impl SyscallDispatcher`
+// below; relocate it to end-of-file and drop this allow (tracked follow-up).
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
