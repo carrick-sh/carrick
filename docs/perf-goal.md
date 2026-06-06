@@ -62,6 +62,7 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `68538ba` - `perf(mem): skip high-va anon alias payloads`
 - `d59d596` - `perf(mem): skip fresh shared anon zero writes`
 - `95503e5` - `docs(perf): record mmap hv map counts`
 - `120aab9` - `docs(perf): decide dynamic workload gate`
@@ -117,8 +118,10 @@ Remaining:
 - `d59d596` removed eager zero-buffer materialization for fresh non-fixed
   `MAP_SHARED|MAP_ANONYMOUS` mappings in the boot-mapped shared aperture.
   Recycled shared-anon ranges still scrub stale bytes with `zero_backing`.
+- `68538ba` removed zero-payload allocation/copy setup for high-VA private
+  anonymous aliases; file-backed high-VA aliases still carry the file-content
+  payload.
 - Add a fork-heavy row to see whether lazy-zero reduced snapshot cost.
-- Re-check high-VA alias paths for equivalent eager zero/copy behavior.
 
 ### Borrowed Vector I/O
 
@@ -679,7 +682,45 @@ Rejected next steps:
   required before claiming a measured benchmark win from `d59d596`.
 
 - [ ] Add a fork-heavy or shared-anon workload row after lazy-zero.
-- [ ] Inspect high-VA alias paths for remaining eager zero/copy behavior.
+- [x] Inspect high-VA alias paths for remaining eager zero/copy behavior.
+
+  Result at `68538ba`:
+
+  - High-VA private anonymous mappings now return `MapHostAlias` with an empty
+    payload. `HvfInner::map_host_alias` already maps anonymous aliases with a
+    zero-filled host anonymous mapping, so carrying a zero-filled payload was
+    duplicate allocation and copy setup.
+  - File-backed high-VA aliases still allocate and carry a zero-padded payload
+    containing file bytes, preserving sparse/EOF zero-fill behavior for private
+    file mappings.
+  - Live `MAP_SHARED` file aliases were already on the separate fd-backed
+    `MapHostAlias { file: Some(..), payload: Vec::new() }` path and were not
+    changed.
+
+  RED evidence:
+
+  ```sh
+  cargo test -p carrick-runtime high_va_private_anonymous_mmap_returns_empty_alias_payload -- --nocapture
+  ```
+
+  Before the runtime change, this failed because the alias payload was non-empty
+  for a fresh high-VA private anonymous mmap.
+
+  GREEN and adjacent checks:
+
+  ```sh
+  cargo test -p carrick-runtime high_va_private_anonymous_mmap_returns_empty_alias_payload -- --nocapture
+  cargo test -p carrick-runtime private_anonymous_mmap -- --nocapture
+  cargo test -p carrick-runtime --test integration mmap -- --nocapture
+  cargo test -p carrick-hvf high_va -- --nocapture
+  cargo test -p carrick-runtime --tests --no-run
+  cargo fmt --all -- --check
+  git diff --check
+  ```
+
+  No JSONL perf row was added for this slice. The removed unit of work is
+  proven by the `MapHostAlias` payload assertion; an end-to-end Rosetta/high-VA
+  workload row is still needed before claiming a benchmark win.
 - [ ] Add RED coverage before changing alias, COW, or shared-memory behavior.
 
 ## Task 5: Revisit wait-path kqueue churn only with a broader workload
