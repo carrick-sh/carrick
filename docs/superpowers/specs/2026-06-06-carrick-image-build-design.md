@@ -239,6 +239,56 @@ gap the §4 loop surfaces with an owning probe; enable kaniko's `--cache`.
 tracked carrick coverage gap), published as a matrix vs `docker build`; a re-build
 hits kaniko's cache.
 
+**Status 2026-06-06 (partial — one tracked gap remains, to be closed):**
+
+| Corpus entry | build | run | notes |
+|---|---|---|---|
+| single-stage `FROM alpine + RUN + RUN` | ✅ | ✅ | `carrick build → carrick run` prints the artifact |
+| single-stage `FROM alpine + RUN apk add` (network-in-RUN) | ✅ | ✅ | `apk add jq` during RUN works |
+| **multi-stage** `FROM…AS` + `COPY --from` + `RUN` | ✅ | ❌ | **TRACKED GAP** — builds, but the image exits 127 on run; see below |
+
+- **kaniko `--cache` / `--cache-repo` passthrough**: ✅ landed (`2b8e2cb`);
+  `--no-cache` wins over `--cache`. (Registry-backed cache-hit validation needs a
+  live registry; deferred — only the argv mapping is unit-tested.)
+- No data-loss: `carrick build <ctx>` preserves the context dir (verified).
+
+**TRACKED GAP — multi-stage builds produce a broken image (spurious `/lib`
+whiteout). MUST return to close.** A multi-stage build's final RUN layer contains
+a spurious `.wh.lib` whiteout (the real `/artifact.txt` write lands in its own
+layer; `.wh.lib` is the only entry of the small RUN layer) → `/lib` deleted →
+alpine busybox `/bin/sh` loses its musl interpreter
+(`/lib/ld-musl-aarch64.so.1`) → `carrick run <img>` exits **127**. Root cause
+(dtrace of the real build + a Docker oracle, after refuting two hypotheses):
+- **NOT** the directory stat fields: a 4-way toggle (override `nlink`, `size`,
+  both, neither) showed the whiteout persists in all four — disproving the
+  `nlink=2+subdirs`/`size=4096` theory. (That dir-stat normalization is a genuine
+  Linux-faithfulness improvement and exists *uncommitted* in the working tree —
+  `fs_backend.rs`, intermingled with pre-existing `TEMP-TRACE(m2-lib)` probes —
+  but it is not the fix and was not committed.)
+- **NOT** simply the inode change: a Linux `rmdir`+`mkdir` of `/lib` also yields a
+  fresh inode, yet the identical Dockerfile + kaniko v1.24.0 under real Docker
+  (linux/arm64) produces a **clean** final RUN layer (`{/, artifact.txt}`, no
+  `.wh.lib`). So it is carrick-induced.
+- **Mechanism (dtrace):** between stages (stage2 shares the `alpine` base), kaniko
+  resets the rootfs — `unlink`s `/lib`'s children, `rmdir`s `/lib`, then
+  `mkdirat`s `/lib` and re-unpacks. During kaniko's **full-mode parallel snapshot
+  walk**, `/lib` is observed transiently **ENOENT** (cap-std `lstat` and raw
+  `fstatat` agree; `/lib` absent from `getdents("/")`) in the window between
+  `rmdir` and the re-`mkdir`. carrick faithfully reflects kaniko's *own* in-flight
+  delete — but on Linux kaniko's snapshot does not catch `/lib` in that window. So
+  it is a **kaniko-snapshot ↔ carrick-fs visibility/ordering divergence** around
+  the between-stage delete/reunpack. (`/lib` is the unique deleted-and-recreated
+  dir that matters to exec.)
+
+**Next step to close it** (for whoever returns): determine *why* kaniko's parallel
+snapshot under carrick observes the mid-reset `/lib` when Linux does not — likely
+a syscall ordering / `getdents`/`fstatat` consistency difference during a
+concurrent rmdir+mkdir+readdir on the `--fs host` scratch — and make carrick
+present a being-reset directory to a concurrent walker the way Linux does. The
+repro + dtrace harness (the `TEMP-TRACE(m2-lib)` probes + the
+`/tmp/carrick-corpus/multistage` context) is in place. **Single-stage builds (the
+common case) are unaffected.**
+
 ### M3 — `POST /build` (streaming)
 Streaming response body + query parser in serve; `POST /build` shelling to
 `carrick build`.
