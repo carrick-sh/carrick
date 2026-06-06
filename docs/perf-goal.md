@@ -171,7 +171,7 @@ Milestone 1B: writable rootfs-to-overlay materialization.
   - `cargo test -p carrick-runtime --test integration pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds -- --nocapture`
   - `cargo test -p carrick-runtime --test integration copy_file_range_ -- --nocapture`
   - `cargo test -p carrick-runtime --tests --no-run`
-- [ ] Re-run `large_meta` and `overlay_small_updates`.
+- [x] Re-run `large_meta` and `overlay_small_updates`.
 - [x] Commit runtime/test slice separately from benchmark result docs.
 
 Progress:
@@ -179,6 +179,7 @@ Progress:
 - 2026-06-06: Added RED `small_write_to_large_rootfs_file_does_not_copy_up_whole_file`; before the fix it failed with `max writeback payload was 4194304`, proving writable open of a rootfs-backed 4 MiB file copied the whole payload into the overlay before the one-byte mutation.
 - 2026-06-06: Added rootfs shared payload handles (`Arc<[u8]>`), `FsBackend::create_file_from_rootfs`, sparse rootfs-backed entries in `MemoryBackend`, and descriptor-side `FileContents::RootFsBacked` dirty ranges. Writable non-truncating rootfs opens now install a COW overlay entry and update only dirty ranges on write; truncating opens, host-backed opens, synthetic files, and full-content operations keep dense/fallback behavior.
 - 2026-06-06: Focused checks passed: `cargo test -p carrick-runtime --test integration small_write_to_large -- --nocapture`, `cargo test -p carrick-runtime --test integration rootfs_overlay -- --nocapture`, `cargo test -p carrick-runtime --test integration pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds -- --nocapture`, `cargo test -p carrick-runtime --test integration copy_file_range_ -- --nocapture`, `cargo test -p carrick-runtime --tests --no-run`, `cargo fmt --all -- --check`, and `git diff --check`.
+- 2026-06-06: Post-runtime-slice benchmark rerun appended rows to `docs/perf-results/2026-06-06-disk.jsonl` at `4430ac2be443757468915c00309a43b2ed7b9bee`. `large_meta`: Carrick p50 `25647.500` us, p95 `28589.333` us, noisy; Docker p50 `547.584` us, p95 `673.958` us, noisy; Carrick remains about `46.84x` slower. `overlay_small_updates`: Carrick memory-fs p50 `19890.709` us, p95 `21616.875` us; Docker p50 `1500.292` us, p95 `2000.458` us, noisy; Carrick remains about `13.26x` slower.
 
 ### 2. Wait Path fd Pinning and kqueue Churn
 
@@ -314,11 +315,9 @@ Repo-local result artifacts:
 
 ## Immediate Next Slice
 
-Continue VFS dirty-range measurement with a memory-fs build-tool-like workload.
+Start wait-path fd pinning measurement.
 
-- [x] Add `overlay_small_updates` registry coverage and Carrick memory-fs case support.
-- [x] Add `perf_overlay_small_updates` probe.
-- [x] Run focused perf registry/probe checks.
-- [x] Run current filtered benchmark and append rows.
-- [x] Produce comparable before/after wall-time if an old binary can be run cleanly; otherwise leave wall-time baseline open and keep byte-copy evidence as the completed proof.
-- [x] Re-rank VFS versus wait-path work after the new workload is measured.
+- [ ] Add a wait-heavy perf probe that repeatedly waits on stable fds.
+- [ ] Add correctness coverage for fd close/reuse during or near a wait.
+- [ ] Count current `dup`, close, and `kevent` setup cost with `carrick trace` or DTrace.
+- [ ] Implement the smallest retained-wait-target change only if the count evidence shows it is still material.
