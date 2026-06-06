@@ -185,3 +185,26 @@ async fn wait_returns_exit_code() {
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
         .args(["rm", "-f", "m0wait"]).output();
 }
+
+#[tokio::test]
+async fn delete_removes_container() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker = bollard::Docker::connect_with_unix(
+        &sock, 30, bollard::API_DEFAULT_VERSION,
+    ).unwrap();
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0del"]).output();
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
+        ..Default::default()
+    };
+    docker.create_container(
+        Some(bollard::container::CreateContainerOptions { name: "m0del".to_string(), ..Default::default() }),
+        body,
+    ).await.unwrap();
+    docker.remove_container(
+        "m0del",
+        Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
+    ).await.unwrap();
+}

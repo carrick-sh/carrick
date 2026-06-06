@@ -95,6 +95,14 @@ pub(crate) async fn route(
             .unwrap_or((500, crate::serve::handlers::error_json("wait task panicked")));
             json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
         }
+        (&Method::DELETE, p)
+            if p.strip_prefix("/containers/")
+                .is_some_and(|s| !s.is_empty() && !s.contains('/')) =>
+        {
+            let id = p.strip_prefix("/containers/").unwrap_or_default();
+            let (status, body) = crate::serve::handlers::remove_container(id);
+            json(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body)
+        }
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };
     Ok(resp)
