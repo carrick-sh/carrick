@@ -6,8 +6,7 @@
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_EL1_VECTORS_SIZE,
-    LINUX_KERNEL_REGION_BASE, LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes,
-    stage1_identity_page_tables,
+    LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes, stage1_identity_page_tables,
 };
 
 use crate::kvm::{KvmVcpu, KvmVm};
@@ -28,6 +27,23 @@ use crate::kvm::{KvmVcpu, KvmVm};
 /// NOTE: it must NOT be `LINUX_HEAP_BASE` (256 GiB) — that collides with the
 /// guest heap region.
 pub const SENTINEL_GPA: u64 = 0x50_0000_0000; // 320 GiB
+
+/// KVM memory-slot alignment. `KVM_SET_USER_MEMORY_REGION` requires the
+/// guest-physical base and size to be a multiple of the HOST page size; 64 KiB
+/// covers every aarch64 host granule (4K/16K/64K). The high guest regions are
+/// already ≥ 64 KiB-aligned, so this only rounds the (16 KiB) sigreturn window
+/// up — harmless extra lazy backing.
+const KVM_SLOT_ALIGN: u64 = 0x10000;
+
+fn align_down_slot(addr: u64) -> u64 {
+    addr & !(KVM_SLOT_ALIGN - 1)
+}
+
+fn align_up_slot(addr: u64) -> Result<u64, OsError> {
+    addr.checked_add(KVM_SLOT_ALIGN - 1)
+        .map(|a| a & !(KVM_SLOT_ALIGN - 1))
+        .ok_or_else(|| OsError::new(format!("kvm: region end 0x{addr:x} overflows on align")))
+}
 
 // The aarch64 vector table layout (matches carrick-mem's el1_vectors_bytes):
 // 16 slots * 0x80 bytes; the lower-EL synchronous slot is at offset 0x400.
@@ -95,18 +111,50 @@ pub fn el1_vectors_sentinel_bytes() -> Vec<u8> {
     bytes
 }
 
-/// One contiguous host-backed guest RAM window. MVP: MAP_PRIVATE (no fork, so
-/// the host-MAP_SHARED + host-VA-futex fork-coherence model is deferred — see
-/// the MVP non-goals). Spans [base, base+len) of guest-physical space.
-pub struct GuestRam {
+/// One host-backed guest-physical window: [base, base+len) of guest-physical
+/// space backed by a single host `mmap`. Each becomes one
+/// `KVM_SET_USER_MEMORY_REGION` slot.
+struct Window {
     base: u64,
     host: *mut u8,
     len: usize,
 }
 
+/// Multi-window host-backed guest RAM. The MVP used a single low window; a real
+/// binary additionally needs the high runtime regions (stack near 1 TiB,
+/// heap @ 256 GiB, mmap arena @ 384 GiB, sigreturn @ 192 GiB), which sit far
+/// above the low window and at sparse, huge GPAs. Each is its own `MAP_NORESERVE`
+/// window (lazily committed) and its own KVM slot — discrete windows, NOT one
+/// giant slot, so the SENTINEL gpa stays UNMAPPED (the MMIO trap vehicle relies
+/// on it faulting to stage-2). All windows are MAP_PRIVATE for now (no fork; the
+/// host-MAP_SHARED fork-coherence model is the full-backend Phase D work).
+pub struct GuestRam {
+    windows: Vec<Window>,
+}
+
 impl GuestRam {
-    /// mmap `len` bytes of host RAM to back guest-physical [base, base+len).
-    fn new(base: u64, len: usize) -> Result<Self, OsError> {
+    fn new() -> Self {
+        Self {
+            windows: Vec::new(),
+        }
+    }
+
+    /// mmap `len` bytes (lazy, `MAP_NORESERVE`) to back guest-physical
+    /// [base, base+len) and record the window. Refuses any window that would
+    /// cover [`SENTINEL_GPA`] — that page MUST stay unmapped so the EL1 vector's
+    /// sentinel store faults out as `KVM_EXIT_MMIO` (the syscall trap vehicle).
+    fn add_window(&mut self, base: u64, len: usize) -> Result<(), OsError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = base
+            .checked_add(len as u64)
+            .ok_or_else(|| OsError::new(format!("kvm: window 0x{base:x}+{len} overflows")))?;
+        if base <= SENTINEL_GPA && SENTINEL_GPA < end {
+            return Err(OsError::new(format!(
+                "kvm: window 0x{base:x}..0x{end:x} would back the sentinel gpa 0x{SENTINEL_GPA:x}"
+            )));
+        }
         // SAFETY: standard anonymous private mapping; we own it for the VM's life.
         let host = unsafe {
             libc::mmap(
@@ -119,45 +167,56 @@ impl GuestRam {
             )
         };
         if host == libc::MAP_FAILED {
-            return Err(OsError::new("kvm: guest RAM mmap failed".to_string()));
+            return Err(OsError::new(format!(
+                "kvm: guest RAM mmap failed for 0x{base:x}+{len}"
+            )));
         }
-        Ok(Self {
+        self.windows.push(Window {
             base,
             host: host.cast::<u8>(),
             len,
+        });
+        Ok(())
+    }
+
+    /// The window whose [base, base+len) wholly contains [gpa, gpa+len), with
+    /// the host offset of `gpa` within it.
+    fn locate(&self, gpa: u64, len: usize) -> Option<(&Window, usize)> {
+        self.windows.iter().find_map(|w| {
+            let off = gpa.checked_sub(w.base)?;
+            ((off as usize).checked_add(len)? <= w.len).then_some((w, off as usize))
         })
     }
 
-    /// Copy `data` to guest-physical `gpa` (must lie within this window).
+    /// Copy `data` to guest-physical `gpa` (must lie wholly within one window).
     /// `pub(crate)` so the `GuestMemory` impl on [`crate::trap_engine::KvmTrapEngine`]
     /// can service guest `write_bytes` through the same bounds-checked path
     /// bring-up uses; the guest VA is identity-mapped to this GPA.
     pub(crate) fn write_gpa(&mut self, gpa: u64, data: &[u8]) -> Result<(), OsError> {
-        let off = gpa
-            .checked_sub(self.base)
-            .filter(|o| (*o as usize).saturating_add(data.len()) <= self.len)
-            .ok_or_else(|| OsError::new(format!("kvm: gpa 0x{gpa:x} out of guest RAM")))?;
-        // SAFETY: bounds checked above; host points at `len` writable bytes.
+        let (host, off) = {
+            let (w, off) = self.locate(gpa, data.len()).ok_or_else(|| {
+                OsError::new(format!("kvm: write gpa 0x{gpa:x} out of guest RAM"))
+            })?;
+            (w.host, off)
+        };
+        // SAFETY: bounds checked by `locate`; host points at `len` writable bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.host.add(off as usize), data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), host.add(off), data.len());
         }
         Ok(())
     }
 
     /// Read `len` bytes of LIVE guest memory at guest-physical `gpa` (so guest
-    /// writes are visible). `gpa` must lie within this backed window — e.g. a
-    /// `write(2)` buffer the guest passed in `x1`.
+    /// writes are visible). `gpa` must lie wholly within one backed window — e.g.
+    /// a `write(2)` buffer the guest passed in `x1`.
     pub fn read(&self, gpa: u64, len: usize) -> Result<Vec<u8>, OsError> {
-        let off = gpa
-            .checked_sub(self.base)
-            .filter(|o| (*o as usize).saturating_add(len) <= self.len)
-            .ok_or_else(|| {
-                OsError::new(format!("kvm: read gpa 0x{gpa:x}+{len} out of guest RAM"))
-            })?;
+        let (w, off) = self.locate(gpa, len).ok_or_else(|| {
+            OsError::new(format!("kvm: read gpa 0x{gpa:x}+{len} out of guest RAM"))
+        })?;
         let mut out = vec![0u8; len];
-        // SAFETY: bounds checked above; host points at `len` readable bytes.
+        // SAFETY: bounds checked by `locate`; host points at `len` readable bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.host.add(off as usize), out.as_mut_ptr(), len);
+            std::ptr::copy_nonoverlapping(w.host.add(off), out.as_mut_ptr(), len);
         }
         Ok(out)
     }
@@ -177,38 +236,46 @@ pub struct BroughtUp {
 /// EL1 trampoline. Reuses carrick-mem's architectural builders; does NOT use
 /// the FEAT_PAN3 workaround (see `program_sysregs`).
 pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
-    // One window covering both the user image and the kernel hole. The kernel
-    // hole sits at 0x2D_0000_0000 (2 MiB); the freestanding test ELF loads low
-    // (<= a few MiB). Size the window to span [0, kernel_hole_end).
+    // The low window covers the user image's low segments AND the kernel region
+    // (EL0 trampoline / EL1 vectors / stage-1 page tables) at 180 GiB.
     const KERNEL_HOLE_END: u64 = 0x2D_0020_0000; // LINUX_KERNEL_REGION_BASE + 2 MiB
-    let len = KERNEL_HOLE_END as usize;
-    let mut ram = GuestRam::new(0, len)?;
+    let mut ram = GuestRam::new();
+    ram.add_window(0, KERNEL_HOLE_END as usize)?;
 
-    // 1. ELF segments (identity GPA == region.start). `load_elf_bytes` also
-    //    appends the guest's high runtime reservations (sigreturn@192 GiB,
-    //    heap@256 GiB, mmap@384 GiB, ...) which live ABOVE the kernel hole and
-    //    outside the backed RAM window. Those are lazily-zero and untouched by
-    //    the freestanding MVP fixture, so we pre-load only the low ELF segments
-    //    (everything below the kernel region); writing the high reservations
-    //    would overflow the RAM window.
+    // 1. ELF + runtime regions (identity GPA == region.start). `load_elf` also
+    //    appends the guest's high runtime reservations (sigreturn @ 192 GiB,
+    //    heap @ 256 GiB, mmap arena @ 384 GiB), and `with_linux_initial_stack`
+    //    appends the stack near 1 TiB. Low regions land in the low window; each
+    //    HIGH region (>= KERNEL_HOLE_END) gets its own MAP_NORESERVE window +
+    //    KVM slot, page-aligned and lazily committed. (`add_window` refuses any
+    //    window that would back the unmapped SENTINEL gpa.)
     for region in image.regions() {
-        if region.start >= LINUX_KERNEL_REGION_BASE {
+        if region.start < KERNEL_HOLE_END {
+            let bytes = region.bytes();
+            if !bytes.is_empty() {
+                ram.write_gpa(region.start, bytes)?;
+            }
             continue;
         }
+        let base = align_down_slot(region.start);
+        let end = align_up_slot(region.end)?;
+        ram.add_window(base, (end - base) as usize)?;
         let bytes = region.bytes();
         if !bytes.is_empty() {
             ram.write_gpa(region.start, bytes)?;
         }
     }
-    // 2. Architectural bring-up pages, reused verbatim from carrick-mem.
+    // 2. Architectural bring-up pages (low window), reused from carrick-mem.
     ram.write_gpa(LINUX_EL0_TRAMPOLINE_BASE, &el0_trampoline_bytes())?;
     ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
     // 3. Our sentinel vector (NOT carrick-mem's hvc #2 variant).
     ram.write_gpa(LINUX_EL1_VECTORS_BASE, &el1_vectors_sentinel_bytes())?;
 
-    // 4. Create VM + map the whole window as one region.
+    // 4. Create VM + publish every window as its own KVM memory slot.
     let mut vm = KvmVm::create(image)?;
-    vm.map_memory(0, ram.host, ram.len, MemPerms::ReadWriteExec)?;
+    for w in &ram.windows {
+        vm.map_memory(w.base, w.host, w.len, MemPerms::ReadWriteExec)?;
+    }
     let mut vcpu = vm.add_vcpu()?;
 
     // 5. Program registers (sys regs + entry/SP/PC), NO FEAT_PAN3 workaround.

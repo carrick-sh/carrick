@@ -297,7 +297,22 @@ pub mod runtime {
     /// `GuestMemory + SyscallTrap` bound directly.
     #[cfg(feature = "platform-linux")]
     pub fn run_elf_real_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
+        // Build the full guest image WITH a Linux initial stack: argc/argv/envp
+        // and the auxv (AT_RANDOM/AT_PLATFORM/AT_EXECFN) a real binary's CRT
+        // reads before main. A freestanding fixture that ignores SP is
+        // unaffected; a libc binary needs it. argv[0] is the path; a minimal
+        // env keeps the CRT happy.
+        let argv0 = path.to_string_lossy().into_owned();
         let image = crate::memory::AddressSpace::load_elf(path)
+            .map_err(|e| RuntimeError::Load(e.to_string()))?
+            .with_linux_initial_stack(
+                [argv0.as_bytes()],
+                [
+                    b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".as_slice(),
+                    b"HOME=/".as_slice(),
+                    b"TERM=dumb".as_slice(),
+                ],
+            )
             .map_err(|e| RuntimeError::Load(e.to_string()))?;
         let mut engine = carrick_linux::KvmTrapEngine::new(&image)
             .map_err(|e| RuntimeError::Trap(e.to_string()))?;
