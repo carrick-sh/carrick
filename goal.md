@@ -14,14 +14,14 @@ probe or focused unit test before we claim the behavior is done.
 ## Ambitious autonomous target
 
 Drive the current process-control cluster from classified NEW rows to owned,
-boring behavior without weakening the gate. The near-term push has shrunk
-`cpython-concurrent_futures` from runtime hangs to a harness/oracle
-classification problem: forkserver max-task shutdown and the later
-`test_deadlock` big-data crash case are now both owned by focused tests, and
-the suite reaches a successful CPython regrtest summary under carrick. Use each
-sharper model to keep the Go `os/exec`, CPython subprocess, and
-signal-interruption rows as comparable pressure workloads instead of letting
-them disappear mid-workload.
+boring behavior without weakening the gate. The near-term push cleared
+`cpython-concurrent_futures` from runtime hangs and then from its stale
+oracle-cache classification problem: forkserver max-task shutdown and the later
+`test_deadlock` big-data crash case are both owned by focused tests, and the
+suite now MATCHes the refreshed Docker oracle. Use each sharper model to keep
+the Go `os/exec`, CPython subprocess, process-group, and signal-interruption
+rows as comparable pressure workloads instead of letting them disappear
+mid-workload.
 
 This is autonomous because every step has a current raw row, a Linux oracle, a
 focused reducer path, and a first-principles kernel primitive to compare against.
@@ -115,13 +115,15 @@ with `blockingpipewrite` preserving the Linux oracle that the guest-visible
 short count appears only after a signal interrupts the blocked write.
 
 Latest `just` harness refresh: `just conformance full --suite
-cpython-concurrent_futures --no-image-refresh` wrote
-`target/conformance/results.jsonl` with `carrick_run_id=conf-98558-c00`. The
-row is still `NEW`, but no longer for a runtime hang: carrick and the cached
-oracle both report 20/20, while the JSONL row carries many assertion pairs where
-carrick has per-test ids and the cached oracle side is `absent`. The raw output
-proves the runtime result: all eight CPython submodules completed with
-`== Tests result: SUCCESS ==`, `All 8 tests OK`, and `run=255 skipped=18`.
+cpython-concurrent_futures --refresh-oracle --no-image-refresh` rewrote the
+stale Docker oracle cache entry that had totals but no per-test ids. The
+current `target/conformance/results.jsonl` row has
+`carrick_run_id=conf-35590-c00`, `docker_run_id=<cached>`, and reports `MATCH`
+with carrick 20/20 vs oracle 20/20, 239 paired assertion ids, and no new or
+known diffs. The refresh evidence was `conf-28227-c00` vs Docker
+`conf-28227-d00`; the raw output proves the runtime result: all eight CPython
+submodules completed with `== Tests result: SUCCESS ==`, `All 8 tests OK`, and
+`run=255 skipped=18`.
 
 ## Primary target rows
 
@@ -135,7 +137,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `go-os_exec` | Go | MATCH 86/86 in targeted rerun `conf-93241-c156` | 86/86 | Previously 0/0; current evidence shows process execution suite parity, so keep watching it as pressure coverage rather than the next reducer. |
 | `go-syscall` | Go | 0/0 | 34/34 | Broad syscall package fallout; inspect for process/wait/signal cases first. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
-| `cpython-concurrent_futures` | CPython | 20/20 in `conf-98558-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 | Runtime hangs are cleared; remaining `NEW` classification is an oracle/assertion-id cache mismatch that needs audit or refresh, not a quarantine. |
+| `cpython-concurrent_futures` | CPython | MATCH 20/20 in cache-backed `conf-35590-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 in refreshed Docker oracle `conf-28227-d00` | Runtime hangs and the stale oracle-id cache mismatch are cleared. |
 | `ltp-setpgid01` | LTP | 2/2 | 1/2 | Inversion risk: may be under-enforcement rather than better behavior. |
 | `ltp-pause02` | LTP | unstable historically; latest targeted attempts currently MATCH | 1/1 | Signal interruption/restart behavior around sleeping processes; keep as pressure coverage until it produces a fresh RED. |
 | `ltp-kill10` / `ltp-kill12` | LTP | 1/1 | 1/1 | Count match but assertion identity must be checked before relying on it. |
@@ -275,9 +277,9 @@ workload pressure tests. The current live target is
 `cpython-concurrent_futures`: CPython's process-pool and deadlock tests churn
 through semaphores, worker exits, pipe/socket transfer, epoll/select waits, and
 parent-side fd cleanup. The forkserver max-task race and the big-data
-process-pool cleanup deadlock are now owned; the first-principles path is to
-audit the remaining `NEW` row at the assertion/cache layer before claiming a
-MATCH or moving the runtime target to the next process-control pressure row.
+process-pool cleanup deadlock are now owned, and the refreshed oracle cache
+makes the row MATCH. Keep it as pressure coverage while moving active runtime
+work to the next process-control row.
 
 Exit criteria:
 
@@ -296,8 +298,10 @@ Exit criteria:
   owns the big-data broken process-pool cleanup path where a large host-pipe
   write must hand off a pinned continuation after filling the pipe instead of
   parking inside the dispatcher and blocking sibling fd cleanup.
-- The target language row changes from NEW to MATCH, or the remaining NEW
-  difference is proven to be a separate assertion with its own follow-up.
+- The target language row changes from NEW to MATCH. Landed 2026-06-05:
+  refreshing the stale CPython Docker oracle entry records 239 per-test ids and
+  makes `cpython-concurrent_futures` MATCH 20/20 vs 20/20 without blessing a
+  baseline.
 - `just conformance-probes` stays green.
 
 ### Milestone 4: Process groups and signal interruption
@@ -355,7 +359,7 @@ Keep this section current as classifications and fixes land.
 | `go-os_exec` | previously process/wait workload exited without a parseable suite summary in `conf-42088-c593`; targeted rerun `conf-93241-c156` now matches 86/86 vs oracle 86/86 with assertion ids aligned. | keep as process-control pressure coverage; no reducer needed unless it regresses | MATCH |
 | `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
-| `cpython-concurrent_futures` | runtime hangs are fixed: the exact five-iteration early-shutdown reducer completes, `ProcessPoolForkserverProcessPoolExecutorTest` passes 21 tests, `ProcessPoolForkExecutorDeadlockTest` passes 16 tests, and harness run `conf-98558-c00` reaches CPython regrtest success with carrick 20/20 vs oracle 20/20. The row still reports `NEW` because JSONL assertion pairs have carrick per-test ids while the cached oracle side is `absent`. | `futexsharedalias`, wake-pipe drain tests, `host_signal::tests::missed_child_exit_watch_*`, `blockingpipewrite`, and `dispatch::overlay_dispatch_tests::large_blocking_host_pipe_write_hands_off_after_partial_progress` | runtime green; next work is oracle/assertion-cache audit before MATCH |
+| `cpython-concurrent_futures` | runtime hangs are fixed: the exact five-iteration early-shutdown reducer completes, `ProcessPoolForkserverProcessPoolExecutorTest` passes 21 tests, `ProcessPoolForkExecutorDeadlockTest` passes 16 tests, and refreshed harness run `conf-28227-c00` matches Docker oracle run `conf-28227-d00` at 20/20 with 239 paired assertion ids. The previous `conf-98558-c00` row was `NEW` only because the committed oracle cache had totals but no Docker per-test ids. | `futexsharedalias`, wake-pipe drain tests, `host_signal::tests::missed_child_exit_watch_*`, `blockingpipewrite`, `dispatch::overlay_dispatch_tests::large_blocking_host_pipe_write_hands_off_after_partial_progress`, refreshed oracle-cache entry | MATCH; keep as pressure coverage |
 | `ltp-setpgid01` | inversion risk: carrick reports both `setpgid(1, 1)` and `setpgid(0, 0)` pass, while cached oracle has one failure. This needs the Docker assertion refreshed before treating carrick as better or worse. | `setpgidrules` plus `--refresh-oracle --suite ltp-setpgid01` | classified; oracle assertion required before fix |
 | `ltp-pause02` | signal interruption/restart bug when it reproduces: raw `conf-42088-c959` reported unexpected `SIGINT`, then `pause was interrupted but the retval and/or errno was wrong`; rerun `conf-71289-c01` matched, and later `conf-18439-c01` reproduced the same signature, but latest focused attempts and `pauseinterrupt2` are currently MATCH. | `pauseinterrupt2` or sharper interruption reducer if the row turns RED again | pressure coverage; no runtime fix without fresh RED |
 | `ltp-kill10` | harness/oracle identity mismatch: carrick raw `conf-42088-c857` has `TPASS`, cached oracle has totals but no `summary` id, yielding `summary ok` vs absent. | LTP parser/oracle-cache audit | classified; non-runtime until parser/oracle evidence changes |
@@ -411,21 +415,17 @@ just conformance-probes
 
 ## Next autonomous slice
 
-1. Audit `target/conformance/results.jsonl` and the cached oracle for
-   `cpython-concurrent_futures`: prove why `conf-98558-c00` is still classified
-   `NEW` despite carrick 20/20 vs oracle 20/20 and a successful CPython raw
-   summary.
-2. Refresh or fix the assertion-id cache/parser only if the mismatch is proven
-   to be harness truth, then rerun `just conformance full --suite
-   cpython-concurrent_futures --no-image-refresh` or the equivalent oracle
-   refresh path needed by the evidence.
-3. If the row is still not a clean MATCH after the assertion audit, document the
-   exact remaining assertion owner here before changing runtime behavior again.
-4. Move the next runtime reducer to the highest-signal process-control pressure
-   row, likely `go-syscall` `TestExec` or `ltp-setpgid01` after oracle refresh
-   evidence, rather than continuing to chase stale CPython hang output.
-5. Keep `ltp-pause02` and `go-os_signal` as adjacent pressure rows. Do not fix
+1. Refresh `ltp-setpgid01` against Docker before changing runtime behavior: the
+   current row is an inversion risk, and we need the live Linux assertion line
+   for `setpgid(1, 1)` / `setpgid(0, 0)` before deciding whether Carrick is
+   under-enforcing a process-group rule or the cached oracle was stale.
+2. If the refreshed row still diverges, reduce the exact process-group rule into
+   `setpgidrules` or a focused unit test before editing runtime state.
+3. Keep `go-syscall` `TestExec` as the next language-runtime pressure row after
+   the process-group audit, especially if `ltp-setpgid01` proves to be oracle
+   staleness rather than a Carrick bug.
+4. Keep `ltp-pause02` and `go-os_signal` as adjacent pressure rows. Do not fix
    them from memory or stale output; wait for a fresh deterministic RED and then
    split a separate `pauseinterrupt2` or `atomicstop` reducer if needed.
-6. Update this file and `docs/conformance-coverage.md`, then land a logical
+5. Update this file and `docs/conformance-coverage.md`, then land a logical
    commit with the validation commands in the body.
