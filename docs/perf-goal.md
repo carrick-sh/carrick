@@ -715,7 +715,7 @@ Rejected next steps:
     not noisy.
   - Docker wins by about `124.80x` latency.
 
-- [ ] Define an interposer experiment as a measured optimization only.
+- [x] Define an interposer experiment as a measured optimization only.
 
   Allowed experiments:
 
@@ -730,6 +730,32 @@ Rejected next steps:
   - fd caching that changes allocation, close, or `/proc/self/fd` visibility
   - `lseek`/`write` fusion that changes shared fd offset semantics
   - wrappers that need to emulate Linux fd, signal, or blocking correctness
+
+  Decision after the dynamic baseline:
+
+  - Do not build a transparent `LD_PRELOAD` fd cache for
+    `dynamic_overlay_small_updates`. The workload's visible sequence returns an
+    fd from `open`, mutates the fd offset with `lseek`, writes through that fd,
+    and closes it. A transparent shim cannot remove the `open`/`lseek`/`write`/
+    `close` traps without owning fd identity, `/proc/self/fd`, dup/fcntl
+    interactions, close timing, shared offsets, and error timing.
+  - The acceptable experiment is an opt-in batching transport, not a POSIX
+    correctness layer. An `LD_PRELOAD` library may provide or intercept only a
+    deliberately narrow API whose operation list is handed to Carrick runtime in
+    one runtime-owned batch. The runtime, not the shim, must allocate/check
+    descriptors, perform path containment, apply writes, and return Linux-shaped
+    errors.
+  - The first implementation candidate should be a separate dynamic workload
+    variant with a non-transparent batch boundary, for example
+    `dynamic_overlay_small_updates_batch`. The non-interposed binary must fall
+    back to the ordinary POSIX loop; the interposed run may replace that explicit
+    batch boundary with a runtime batch call.
+  - Acceptance requires Docker baseline, Carrick baseline, and Carrick
+    interposed rows in `docs/perf-results`, plus oracle tests covering at least:
+    missing path, permission/open error, short/failed write propagation,
+    close/fsync visibility, signal interruption behavior at the batch boundary,
+    and proof that ordinary fd allocation and `/proc/self/fd` visibility are
+    not claimed for synthetic fds.
 
 - [x] Record a go/no-go decision in this file before writing interposer code.
 
