@@ -62,6 +62,7 @@ Branch: `codex/perf-mmap-lazy-zero`
 
 Latest relevant commits:
 
+- `bf9cb3b` - `perf(memory): add shared anon churn workload`
 - `68538ba` - `perf(mem): skip high-va anon alias payloads`
 - `d59d596` - `perf(mem): skip fresh shared anon zero writes`
 - `95503e5` - `docs(perf): record mmap hv map counts`
@@ -86,7 +87,7 @@ Relevant result file:
   `overlay_small_updates` rows for `4bae00f`, `0a08b5f`, `0d9ee96`,
   `76d0aac`, `8a7659a`, and `229105b`.
 - `docs/perf-results/2026-06-06-memory.jsonl` contains a current
-  `mmap_churn` row at `120aab9`.
+  `mmap_churn` row at `120aab9` and `shared_anon_churn` rows at `bf9cb3b`.
 
 ## Current Evidence
 
@@ -121,7 +122,11 @@ Remaining:
 - `68538ba` removed zero-payload allocation/copy setup for high-VA private
   anonymous aliases; file-backed high-VA aliases still carry the file-content
   payload.
-- Add a fork-heavy row to see whether lazy-zero reduced snapshot cost.
+- `bf9cb3b` added `shared_anon_churn`, a dedicated
+  `MAP_SHARED|MAP_ANONYMOUS` perf workload. Current rows: Carrick p50
+  `156.625` us, p95 `158.125` us; Docker p50 `106.792` us, p95 `116.875` us.
+- A separate fork-heavy row is still useful to see whether lazy-zero reduced
+  snapshot cost.
 
 ### Borrowed Vector I/O
 
@@ -681,7 +686,67 @@ Rejected next steps:
   exercise `MAP_SHARED|MAP_ANONYMOUS`. A shared-anon or fork-heavy workload is
   required before claiming a measured benchmark win from `d59d596`.
 
-- [ ] Add a fork-heavy or shared-anon workload row after lazy-zero.
+- [x] Add a fork-heavy or shared-anon workload row after lazy-zero.
+
+  Added `perf_shared_anon_churn` at `bf9cb3b`.
+
+  Workload shape:
+
+  - 64 fresh `MAP_SHARED|MAP_ANONYMOUS` mappings.
+  - 8 MiB per mapping, 512 MiB total virtual size.
+  - No guest touches to the mapped pages.
+  - Mappings stay live until the teardown loop, so the timed allocation phase
+    exercises fresh shared-aperture bump allocations rather than free-list reuse.
+
+  Build and smoke evidence:
+
+  ```sh
+  ./scripts/build-signed.sh
+  ./scripts/build-probes.sh
+  CARRICK_RUN_ID=perf-shared-anon-smoke-$$ \
+  target/release/carrick run-elf --raw --fs host \
+    conformance-probes/target/aarch64-unknown-linux-musl/release/perf_shared_anon_churn
+  ```
+
+  Smoke output: `shared_anon_churn_total_us=287.250`, `mappings=64`,
+  `bytes=536870912`, `nproc=4`.
+
+  Perf row command:
+
+  ```sh
+  CARRICK_PERF_FILTER=shared_anon_churn \
+  CARRICK_PERF_REPS=3 \
+  CARRICK_PERF_WARMUP=1 \
+  CARRICK_PERF_COOLDOWN_SECS=0 \
+  cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
+  ```
+
+  `docs/perf-results/2026-06-06-memory.jsonl` rows at
+  `bf9cb3bb8264ae48f0b716bf4131f2cd040316b5`:
+
+  - Carrick p50 `156.625` us, p95 `158.125` us, samples
+    `[158.125,156.625]`, not noisy.
+  - Docker p50 `106.792` us, p95 `116.875` us, samples
+    `[116.875,106.792]`, not noisy.
+
+  Registry RED/GREEN:
+
+  ```sh
+  cargo test -p carrick-cli --test perf_runner registry_contains_memory_perf_surface -- --nocapture
+  cargo test -p carrick-cli --test perf_runner registered_perf_probes_have_sources -- --nocapture
+  ```
+
+  The first command failed before the `PerfCase` was added with
+  `missing memory perf workload shared_anon_churn`, then passed after the
+  workload and source landed.
+
+  Host `cargo test --manifest-path conformance-probes/Cargo.toml --bin
+  perf_shared_anon_churn --no-run` is not usable as a local verification path
+  today because the existing `conformance-probes` host lib compile fails in
+  `src/lib.rs` with `expected i32, found i64`; the project build path
+  `./scripts/build-probes.sh` succeeded and built the Linux-musl probe.
+
+  A separate fork-heavy row remains open for fork snapshot cost.
 - [x] Inspect high-VA alias paths for remaining eager zero/copy behavior.
 
   Result at `68538ba`:
