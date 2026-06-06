@@ -582,8 +582,11 @@ impl SyscallDispatcher {
                     let offset_usize =
                         usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                     match &*open {
-                        OpenDescription::File { contents, .. }
-                        | OpenDescription::SyntheticFile { contents, .. } => {
+                        OpenDescription::File { contents, .. } => {
+                            let available = contents.read_at(offset_usize, length_usize);
+                            bytes[..available.len()].copy_from_slice(&available);
+                        }
+                        OpenDescription::SyntheticFile { contents, .. } => {
                             if offset_usize < contents.len() {
                                 let available = &contents[offset_usize..];
                                 let copy_len = available.len().min(length_usize);

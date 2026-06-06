@@ -42,7 +42,7 @@
 //! cannot be lost (Go's `netpollBreak` depends on this). The in-memory state is
 //! the source of truth; the host pipe is the wakeup channel.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,7 +50,7 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::linux_abi::{
-    LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxEpollEvent,
+    LINUX_EFBIG, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxEpollEvent,
 };
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
@@ -385,12 +385,174 @@ impl HostWriteKind {
 }
 
 #[derive(Debug, Clone)]
+pub(super) enum FileContents {
+    Dense(Vec<u8>),
+    RootFsBacked {
+        base: Arc<[u8]>,
+        dirty: BTreeMap<usize, Vec<u8>>,
+        len: usize,
+    },
+}
+
+impl FileContents {
+    pub(super) fn dense(bytes: Vec<u8>) -> Self {
+        Self::Dense(bytes)
+    }
+
+    pub(super) fn rootfs_backed(base: Arc<[u8]>) -> Self {
+        Self::RootFsBacked {
+            len: base.len(),
+            base,
+            dirty: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Dense(bytes) => bytes.len(),
+            Self::RootFsBacked { len, .. } => *len,
+        }
+    }
+
+    pub(super) fn read_at(&self, offset: usize, length: usize) -> Vec<u8> {
+        match self {
+            Self::Dense(bytes) => bytes
+                .get(offset..)
+                .unwrap_or_default()
+                .iter()
+                .take(length)
+                .copied()
+                .collect(),
+            Self::RootFsBacked { base, dirty, len } => {
+                if offset >= *len || length == 0 {
+                    return Vec::new();
+                }
+                let read_len = length.min(*len - offset);
+                let mut out = vec![0; read_len];
+                if offset < base.len() {
+                    let base_len = read_len.min(base.len() - offset);
+                    out[..base_len].copy_from_slice(&base[offset..offset + base_len]);
+                }
+                let end = offset + read_len;
+                for (&start, bytes) in dirty.range(..end) {
+                    let dirty_end = start.saturating_add(bytes.len());
+                    if dirty_end <= offset {
+                        continue;
+                    }
+                    let copy_start = start.max(offset);
+                    let copy_end = dirty_end.min(end);
+                    let dst_start = copy_start - offset;
+                    let src_start = copy_start - start;
+                    let copy_len = copy_end - copy_start;
+                    out[dst_start..dst_start + copy_len]
+                        .copy_from_slice(&bytes[src_start..src_start + copy_len]);
+                }
+                out
+            }
+        }
+    }
+
+    pub(super) fn to_vec(&self) -> Vec<u8> {
+        self.read_at(0, self.len())
+    }
+
+    pub(super) fn resize(&mut self, new_len: usize) {
+        match self {
+            Self::Dense(bytes) => bytes.resize(new_len, 0),
+            Self::RootFsBacked { dirty, len, .. } => {
+                *len = new_len;
+                prune_dirty_ranges(dirty, new_len);
+            }
+        }
+    }
+
+    pub(super) fn truncate(&mut self, new_len: usize) {
+        match self {
+            Self::Dense(bytes) => bytes.truncate(new_len),
+            Self::RootFsBacked { dirty, len, .. } => {
+                *len = (*len).min(new_len);
+                prune_dirty_ranges(dirty, *len);
+            }
+        }
+    }
+
+    pub(super) fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), i32> {
+        let end = offset.checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
+        if end as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+            return Err(crate::linux_abi::LINUX_EFBIG);
+        }
+        match self {
+            Self::Dense(contents) => {
+                if end > contents.len() {
+                    contents.resize(end, 0);
+                }
+                contents[offset..end].copy_from_slice(bytes);
+            }
+            Self::RootFsBacked { dirty, len, .. } => {
+                if end > *len {
+                    *len = end;
+                }
+                insert_dirty_range(dirty, offset, bytes)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prune_dirty_ranges(dirty: &mut BTreeMap<usize, Vec<u8>>, len: usize) {
+    let keys: Vec<usize> = dirty.range(len..).map(|(&start, _)| start).collect();
+    for key in keys {
+        dirty.remove(&key);
+    }
+    if let Some((&start, bytes)) = dirty.range(..len).next_back() {
+        let keep = len.saturating_sub(start);
+        if keep < bytes.len()
+            && let Some(bytes) = dirty.get_mut(&start)
+        {
+            bytes.truncate(keep);
+        }
+    }
+}
+
+fn insert_dirty_range(
+    dirty: &mut BTreeMap<usize, Vec<u8>>,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), i32> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let end = offset.checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
+    let overlapping: Vec<usize> = dirty
+        .range(..end)
+        .filter_map(|(&start, existing)| {
+            let existing_end = start.checked_add(existing.len())?;
+            (existing_end > offset).then_some(start)
+        })
+        .collect();
+    for start in overlapping {
+        let Some(existing) = dirty.remove(&start) else {
+            continue;
+        };
+        let existing_end = start.checked_add(existing.len()).ok_or(LINUX_EFBIG)?;
+        if start < offset {
+            dirty.insert(start, existing[..offset - start].to_vec());
+        }
+        if existing_end > end {
+            dirty.insert(end, existing[end - start..].to_vec());
+        }
+    }
+    dirty.insert(offset, bytes.to_vec());
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum OpenDescription {
     File {
         base: OpenDescriptionBase,
         path: String,
         metadata: RootFsMetadata,
-        contents: Vec<u8>,
+        contents: FileContents,
         offset: usize,
         /// True iff this fd targets the writable overlay. Writes
         /// to a writable=false File are still RO (return EROFS).

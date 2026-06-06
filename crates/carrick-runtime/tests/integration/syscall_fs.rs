@@ -123,6 +123,15 @@ impl FsBackend for CountingMemoryBackend {
         self.inner.create_file(path)
     }
 
+    fn create_file_from_rootfs(
+        &self,
+        path: &str,
+        contents: std::sync::Arc<[u8]>,
+        mode: u32,
+    ) -> Result<(), BackendError> {
+        self.inner.create_file_from_rootfs(path, contents, mode)
+    }
+
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
         self.bump_max_writeback_payload_len(contents.len());
         self.inner.set_file_contents(path, contents)
@@ -231,6 +240,69 @@ fn small_write_to_large_overlay_file_does_not_rewrite_whole_file() {
     assert!(
         max_rewrite <= 1,
         "one-byte write should not rewrite or clone the whole {LARGE_FILE_LEN}-byte file; max writeback payload was {max_rewrite}"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn small_write_to_large_rootfs_file_does_not_copy_up_whole_file() {
+    const LARGE_FILE_LEN: usize = 4 * 1024 * 1024;
+
+    let large = vec![0x41; LARGE_FILE_LEN];
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "large.bin",
+        large.as_slice(),
+    )]))])
+    .unwrap();
+    let backend = CountingMemoryBackend::new();
+    let counts = backend.max_writeback_payload_len.clone();
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    dispatcher.set_fs_backend(Box::new(backend));
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/large.bin\0").unwrap();
+    memory.write_bytes(0x4100, b"Z").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([3, 0x4100, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(67, SyscallArgs::from([3, 0x4200, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 2 }
+    );
+    assert_eq!(memory.read_bytes(0x4200, 2).unwrap(), b"ZA");
+
+    let max_rewrite = counts.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        max_rewrite <= 1,
+        "one-byte rootfs write should not copy up the whole {LARGE_FILE_LEN}-byte file; max writeback payload was {max_rewrite}"
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
