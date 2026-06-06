@@ -436,17 +436,27 @@ pub fn is_tracked_child(child_pid: i32) -> bool {
 
 /// Pop the lowest pending process-directed signum from `PROC_PENDING` whose bit
 /// is also set in `wait_set` (pass `!0` to accept any). Returns `0` if none.
-/// `take_pending_for` is the single point of consumption (under the dispatcher
-/// lock), so a `load` + targeted `fetch_and(!bit)` is race-free against the only
-/// other writers (async handlers, which only ever SET bits via `fetch_or`).
+/// `take_pending_for` can run concurrently on every vCPU kicked for one
+/// process-directed signal, so draining the bit must be compare/exchange based:
+/// a `load` + `fetch_and(!bit)` lets multiple threads observe and deliver the
+/// same pending bit.
 fn take_proc_pending_in(wait_set: u64) -> i32 {
-    let candidates = PROC_PENDING.load(Ordering::SeqCst) & wait_set;
-    if candidates == 0 {
-        return NO_PENDING_SIGNAL;
+    loop {
+        let mask = PROC_PENDING.load(Ordering::SeqCst);
+        let candidates = mask & wait_set;
+        if candidates == 0 {
+            return NO_PENDING_SIGNAL;
+        }
+        let signum = lowest_pending_signum(candidates);
+        let bit = thread_pending_bit(signum);
+        let next = mask & !bit;
+        if PROC_PENDING
+            .compare_exchange(mask, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return signum;
+        }
     }
-    let signum = lowest_pending_signum(candidates);
-    PROC_PENDING.fetch_and(!(1u64 << (signum - 1)), Ordering::SeqCst);
-    signum
 }
 
 /// Drain the signal deliverable to `tid`: a thread-directed one for this tid
@@ -1825,6 +1835,36 @@ mod tests {
         publish_pending(10);
         assert_eq!(take_pending_for(tid), 10);
         assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+        drain_pending_pipe();
+        drain_pump_pipe();
+    }
+
+    #[test]
+    fn process_directed_signal_is_consumed_once_under_concurrent_takers() {
+        let _g = TEST_LOCK.lock();
+        reset_after_supervisor_fork();
+        PROC_PENDING.store(0, Ordering::SeqCst);
+
+        publish_pending(10); // SIGUSR1
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let handles = (0..4)
+            .map(|i| {
+                let ready = std::sync::Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    ready.wait();
+                    take_pending_for(901_000 + i)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        ready.wait();
+        let delivered = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("taker thread should finish"))
+            .filter(|&signum| signum == 10)
+            .count();
+        assert_eq!(delivered, 1);
+        assert_eq!(take_pending_for(901_100), NO_PENDING_SIGNAL);
         drain_pending_pipe();
         drain_pump_pipe();
     }
