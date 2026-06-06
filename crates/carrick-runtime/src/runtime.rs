@@ -1599,6 +1599,18 @@ impl KernelState {
             fork: crate::fork_coord::ForkCoordinator::new(),
         }
     }
+
+    fn begin_exec_replacement(&self, owner: ThreadId) {
+        crate::fork_quiesce::begin_exec_replacement(owner);
+    }
+
+    fn end_exec_replacement(&self) {
+        crate::fork_quiesce::end_exec_replacement();
+    }
+
+    fn exec_replacing_other_thread(&self, tid: ThreadId) -> bool {
+        crate::fork_quiesce::exec_replacing_other_thread(tid)
+    }
 }
 
 type Kernel = Arc<KernelState>;
@@ -1996,6 +2008,11 @@ impl ThreadRuntimeState {
                             if crate::fork_quiesce::is_quiescing() {
                                 self.release_and_park_vcpu_for_fork(engine)?;
                             }
+                            if crate::fork_quiesce::exec_replacing_other_thread(self.this_tid) {
+                                break Ok(DispatchOutcome::Errno {
+                                    errno: crate::linux_abi::LINUX_EINTR,
+                                });
+                            }
                             continue;
                         }
                         // WaitOnSignals waits over an EMPTY fd slice, so new()
@@ -2073,6 +2090,7 @@ impl ThreadRuntimeState {
                     .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
                         crate::host_signal::has_pending_for(self.this_tid)
                             || crate::fork_quiesce::is_quiescing()
+                            || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
                     }) {
                     FutexWaitOutcome::Woken => 0,
                     FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
@@ -2174,6 +2192,13 @@ impl ThreadRuntimeState {
                 let topo = crate::fork_quiesce::topology_lock()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                if !child_registry.is_live(tid) {
+                    drop(topo);
+                    child_kicker.unregister(tid);
+                    crate::host_signal::forget_thread(tid);
+                    child_kernel.dispatcher.forget_thread_signal_state(tid);
+                    return;
+                }
                 match HvfTrapEngine::from_thread_spec(spec) {
                     Ok(child_engine) => {
                         child_kicker.register(tid, child_engine.vcpu_kick_handle());
@@ -2287,6 +2312,54 @@ impl ThreadRuntimeState {
         }
     }
 
+    fn terminate_siblings_for_exec(
+        &self,
+        kernel: &Kernel,
+        _engine: &mut HvfTrapEngine,
+    ) -> Result<(), RuntimeError> {
+        // Linux execve replaces the whole thread group. Carrick's execve path
+        // destroys and recreates the process-wide HVF VM, so every sibling vCPU
+        // must be gone before `execve_into` runs. Hold the topology lock for the
+        // whole drain so a newly-created guest thread cannot build a vCPU from a
+        // stale pre-exec ThreadSpec while the VM is being replaced.
+        let _topology = crate::fork_quiesce::topology_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        kernel.begin_exec_replacement(self.this_tid);
+        self.kicker.kick_all_except(self.this_tid);
+        self.futex.notify_signal_pending();
+        crate::host_signal::wake_all_waiters();
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while crate::trap::VCPU_LIVE.load(SeqCst) > 1 {
+                if std::time::Instant::now() >= deadline {
+                    kernel.end_exec_replacement();
+                    return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
+                        "execve thread-group teardown timed out: vcpu_live={} kicker={}",
+                        crate::trap::VCPU_LIVE.load(SeqCst),
+                        self.kicker.count()
+                    ))));
+                }
+                self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
+                crate::host_signal::wake_all_waiters();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+
+        let removed = self.registry.remove_all_except(self.this_tid);
+        for tid in removed {
+            self.kicker.unregister(tid);
+            crate::host_signal::forget_thread(tid);
+            kernel.dispatcher.forget_thread_signal_state(tid);
+        }
+        kernel.end_exec_replacement();
+        Ok(())
+    }
+
     fn handle_execve(
         &mut self,
         kernel: &Kernel,
@@ -2319,6 +2392,9 @@ impl ThreadRuntimeState {
                 // Refresh /proc/self/maps + /proc/self/auxv for the new image.
                 apply_image_proc_state(&kernel.dispatcher, &img);
                 kernel.dispatcher.close_cloexec_fds();
+                if self.registry.live_count() > 1 {
+                    self.terminate_siblings_for_exec(kernel, engine)?;
+                }
                 engine.execve_into(&img)?;
                 // execve_into rebuilt a fresh vCPU: re-stamp the identity page
                 // (zeroed) and TPIDR_EL1 (reset) for the same thread/tid.
@@ -2834,6 +2910,9 @@ fn run_vcpu_until_exit(
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
     let result: Result<VcpuLoopOutcome, RuntimeError> = (|| {
         for traps in 1..=state.max_traps {
+            if kernel.exec_replacing_other_thread(state.this_tid) {
+                return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
+            }
             // Lock-safe point: no carrick lock is held here (each iteration acquires
             // and releases its syscall's locks within the iteration). If another
             // thread is forking a multithreaded guest, release this vCPU (so the
@@ -3406,7 +3485,10 @@ fn shared_futex_wait(
     let host_value = unsafe { (host_addr as *const u32).read() };
     crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
     loop {
-        if crate::host_signal::has_pending_for(this_tid) || crate::fork_quiesce::is_quiescing() {
+        if crate::host_signal::has_pending_for(this_tid)
+            || crate::fork_quiesce::is_quiescing()
+            || crate::fork_quiesce::exec_replacing_other_thread(this_tid)
+        {
             return -(crate::linux_abi::LINUX_EINTR as i64);
         }
         // Slice the kernel wait so a pending guest signal (whose cross-thread

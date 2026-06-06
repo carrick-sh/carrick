@@ -249,6 +249,12 @@ impl ThreadWaiter {
         self.wake_pipe_dead.store(true, Ordering::SeqCst);
     }
 
+    fn should_interrupt(&self, block_mask: u64) -> bool {
+        crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+            || crate::fork_quiesce::is_quiescing()
+            || crate::fork_quiesce::exec_replacing_other_thread(self.tid)
+    }
+
     #[cfg(target_os = "macos")]
     fn drain_process_wake_pipe(&self, kq: &Kqueue) -> crate::host_signal::DrainResult {
         if self.process_pipe_read < 0 {
@@ -314,9 +320,7 @@ impl ThreadWaiter {
         );
         // A signal that arrived just before we parked must not be missed
         // (unless it's blocked by this wait's sigmask).
-        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-            || crate::fork_quiesce::is_quiescing()
-        {
+        if self.should_interrupt(block_mask) {
             crate::probes::io_wait_end(
                 self.tid,
                 wait_result_code(WaitResult::Interrupted),
@@ -394,9 +398,7 @@ impl ThreadWaiter {
             events0,
             fd1,
         );
-        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-            || crate::fork_quiesce::is_quiescing()
-        {
+        if self.should_interrupt(block_mask) {
             crate::probes::io_wait_end(
                 self.tid,
                 wait_result_code(WaitResult::Interrupted),
@@ -441,9 +443,7 @@ impl ThreadWaiter {
     /// `libc::waitid`. The runtime re-dispatches the waitid on `Ready` to reap.
     #[cfg(target_os = "macos")]
     pub fn wait_proc_exit(&self, pid: i32, block_mask: u64) -> WaitResult {
-        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-            || crate::fork_quiesce::is_quiescing()
-        {
+        if self.should_interrupt(block_mask) {
             return WaitResult::Interrupted;
         }
         // Fork/wait storms commonly reach this point after the child has already
@@ -489,9 +489,7 @@ impl ThreadWaiter {
             let n = match kq.wait(&changes, &mut events_out, ts.as_ref()) {
                 Ok(n) => n,
                 Err(e) => {
-                    if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                        || crate::fork_quiesce::is_quiescing()
-                    {
+                    if self.should_interrupt(block_mask) {
                         break WaitResult::Interrupted;
                     }
                     // EINTR: a signal raced into kevent — retry. Any other error
@@ -551,9 +549,7 @@ impl ThreadWaiter {
             if child_status_ready(pid) {
                 break WaitResult::Ready;
             }
-            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                || crate::fork_quiesce::is_quiescing()
-            {
+            if self.should_interrupt(block_mask) {
                 break WaitResult::Interrupted;
             }
         };
@@ -581,9 +577,7 @@ impl ThreadWaiter {
     #[cfg(target_os = "macos")]
     fn wait_proc_exit_fallback(&self, pid: i32, block_mask: u64) -> WaitResult {
         loop {
-            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                || crate::fork_quiesce::is_quiescing()
-            {
+            if self.should_interrupt(block_mask) {
                 return WaitResult::Interrupted;
             }
             if child_status_ready(pid) {
@@ -655,9 +649,7 @@ impl ThreadWaiter {
             let n = match n {
                 Ok(n) => n,
                 Err(e) => {
-                    if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                        || crate::fork_quiesce::is_quiescing()
-                    {
+                    if self.should_interrupt(block_mask) {
                         break WaitResult::Interrupted;
                     }
                     // EINTR (a signal raced in) — re-check the pending flag and
@@ -704,9 +696,7 @@ impl ThreadWaiter {
                 self.clear_fd_registrations(kq, fds);
                 return self.fallback_poll(fds, remaining_timeout(deadline), block_mask);
             }
-            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                || crate::fork_quiesce::is_quiescing()
-            {
+            if self.should_interrupt(block_mask) {
                 break WaitResult::Interrupted;
             }
             // Spurious wake or fallback slice elapsed — re-park (the deadline
@@ -794,9 +784,7 @@ impl ThreadWaiter {
             None
         };
         loop {
-            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                || crate::fork_quiesce::is_quiescing()
-            {
+            if self.should_interrupt(block_mask) {
                 return WaitResult::Interrupted;
             }
             for pfd in &mut pollfds {
@@ -866,17 +854,12 @@ impl ThreadWaiter {
                         }
                     }
                 }
-                if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                    || crate::fork_quiesce::is_quiescing()
-                {
+                if self.should_interrupt(block_mask) {
                     return WaitResult::Interrupted;
                 }
             } else if n < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
-                if errno == Some(libc::EINTR)
-                    && (crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
-                        || crate::fork_quiesce::is_quiescing())
-                {
+                if errno == Some(libc::EINTR) && self.should_interrupt(block_mask) {
                     return WaitResult::Interrupted;
                 }
             }

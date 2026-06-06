@@ -135,7 +135,7 @@ wait-status, stop-state, or signal-interruption behavior:
 | `ltp-ptrace05` | LTP | MATCH 63/63 after `ptracesignalstop` | 63/63 | `PTRACE_TRACEME`, traced self-`SIGKILL`, `SIGCONT`, and Linux RT signal-delivery stops are now owned. |
 | `ltp-ptrace06` | LTP | MATCH 48/48 after `ptraceinvaliderrno` | 48/48 | Exec-stop setup and invalid PEEK/POKE request errno are now owned without claiming full debugger memory/register access. |
 | `go-os_exec` | Go | MATCH 86/86 in targeted rerun `conf-93241-c156` | 86/86 | Previously 0/0; current evidence shows process execution suite parity, so keep watching it as pressure coverage rather than the next reducer. |
-| `go-syscall` | Go | 0/0 | 34/34 | Broad syscall package fallout; inspect for process/wait/signal cases first. |
+| `go-syscall` | Go | full row still `NEW` with result none in `conf-77884-c00`; isolated `TestExec` now passes under Carrick | 34/34 | Process-control `TestExec` blocker is fixed and owned by `execthreads`; remaining full-row stop is namespace/capability/file-mode fallout, currently around `TestUnshareMountNameSpaceChroot` after earlier userns/unshare failures. |
 | `cpython-subprocess` | CPython | 280/280 | 278/278 | Count inversion needs assertion-level audit; do not treat as a win without proof. |
 | `cpython-concurrent_futures` | CPython | MATCH 20/20 in cache-backed `conf-35590-c00`; raw output shows all 8 CPython submodules succeeded | 20/20 in refreshed Docker oracle `conf-28227-d00` | Runtime hangs and the stale oracle-id cache mismatch are cleared. |
 | `ltp-setpgid01` | LTP | MATCH 1/2 in `conf-3259-c00` | 1/2 | PID-namespace session-leader rule is now owned; `setpgid(1, 1)` fails EPERM like Docker Linux while forked non-leader `setpgid(0, 0)` still succeeds. |
@@ -178,6 +178,7 @@ points to a sharper invariant.
 | `setpgidrules` | `setpgid` validates session/process-group constraints, races, and self/child cases like Linux. |
 | `pauseinterrupt2` | A sleeping child interrupted by the relevant signal returns `EINTR` or restarts exactly when Linux does. |
 | `subprocesspipes` | Fork/exec with stdio pipes closes, EOFs, and reaps consistently under parent-side waits. |
+| `execthreads` | `execve` from a multithreaded process terminates sibling threads before the VM/address-space replacement and starts the new image single-threaded. |
 | `futexsharedalias` | Two distinct futex words in the same `MAP_SHARED` page remain distinct host wait keys; waking word A cannot consume the waiter for word B. |
 
 Each probe must be validated with:
@@ -298,6 +299,9 @@ Exit criteria:
   owns the big-data broken process-pool cleanup path where a large host-pipe
   write must hand off a pinned continuation after filling the pipe instead of
   parking inside the dispatcher and blocking sibling fd cleanup.
+- `execthreads` owns the Go `syscall.TestExec` shape: one thread execs while
+  sibling runtime threads are live, and the new image must start with
+  `Threads: 1`.
 - The target language row changes from NEW to MATCH. Landed 2026-06-05:
   refreshing the stale CPython Docker oracle entry records 239 per-test ids and
   makes `cpython-concurrent_futures` MATCH 20/20 vs 20/20 without blessing a
@@ -360,7 +364,7 @@ Keep this section current as classifications and fixes land.
 | `ltp-ptrace05` | missing syscall plus wrong traced-child stop/status path: raw `conf-42088-c1010` shows `ptrace(PTRACE_TRACEME)` returning `ENOSYS`, then repeated "Didn't stop as expected" and live child cleanup. After `ptracetraceme`, targeted rerun `conf-24123-c00` improves to 82/103 vs oracle 63/63. After `ptracesigdeath`, targeted rerun `conf-27543-c00` improves to 806/1184; `SIGKILL` now reports "Killed with SIGKILL, as expected". After `ptracesignalstop`, targeted rerun `conf-7738-c00` matches 63/63 vs oracle 63/63. | `ptracetraceme`, `ptracesigdeath`, and `ptracesignalstop` | MATCH; ptrace05 signal-death and signal-delivery stop matrix owned |
 | `ltp-ptrace06` | same ptrace tracee-state surface: raw `conf-42088-c1011` has `PTRACE_TRACEME failed` and `child status not stopped: 0x100`. After `ptracetraceme`, targeted rerun `conf-24123-c01` still emits no parseable stdout summary, only the root-user warning on stderr. After `ptracesigdeath` and `ptracesignalstop`, targeted rerun `conf-7738-c01` still emits no parseable stdout summary. After `traceexecstop`, targeted rerun `conf-31128-c01` emits 48 TFAIL lines, all `ENOSYS` where Linux expects `EIO` or `EFAULT` for invalid PEEK/POKE requests. After `ptraceinvaliderrno`, targeted rerun `conf-51453-c01` matches 48/48 vs oracle 48/48. | `traceexecstop` and `ptraceinvaliderrno` | MATCH; exec-stop setup and invalid ptrace request errno owned |
 | `go-os_exec` | previously process/wait workload exited without a parseable suite summary in `conf-42088-c593`; targeted rerun `conf-93241-c156` now matches 86/86 vs oracle 86/86 with assertion ids aligned. | keep as process-control pressure coverage; no reducer needed unless it regresses | MATCH |
-| `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-42088-c615` includes `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, plus namespace/capability/file-mode failures. | `subprocesspipes` only for `TestExec`; split non-process rows out | classified; process-control subset only |
+| `go-syscall` | mixed process-control and unrelated syscall fallout: raw `conf-39099-c00` reproduced the old `TestExec` runtime `netpoll failed` after `epollwait on fd 3 failed with 9`, caused by `execve` rebuilding the HVF VM while sibling guest threads from the old thread group were still live. Docker passed isolated `TestExec`; Carrick now passes the same isolated filter, and `execthreads` proves the new image starts with `Threads: 1`. The full row remains `NEW` in `conf-77884-c00` because it stops before a package summary around namespace/chroot fallout after `TestSCMCredentials`, userns, unshare, and group-cleanup failures. | `execthreads`, `thread::tests::remove_all_except_keeps_exec_owner_live`; non-process rows split out | process-control subset fixed; full row still blocked by non-process syscall fallout |
 | `cpython-subprocess` | harness/oracle assertion mismatch, not a failure: carrick passes `test_no_leaking` in both poll modes while cached oracle marks both skipped. | oracle refresh/assertion audit | classified; do not bless count inversion as proof |
 | `cpython-concurrent_futures` | runtime hangs are fixed: the exact five-iteration early-shutdown reducer completes, `ProcessPoolForkserverProcessPoolExecutorTest` passes 21 tests, `ProcessPoolForkExecutorDeadlockTest` passes 16 tests, and refreshed harness run `conf-28227-c00` matches Docker oracle run `conf-28227-d00` at 20/20 with 239 paired assertion ids. The previous `conf-98558-c00` row was `NEW` only because the committed oracle cache had totals but no Docker per-test ids. | `futexsharedalias`, wake-pipe drain tests, `host_signal::tests::missed_child_exit_watch_*`, `blockingpipewrite`, `dispatch::overlay_dispatch_tests::large_blocking_host_pipe_write_hands_off_after_partial_progress`, refreshed oracle-cache entry | MATCH; keep as pressure coverage |
 | `ltp-setpgid01` | real under-enforcement after oracle refresh: Docker `conf-43101-d00` fails `setpgid(1, 1)` with `EPERM` and passes the forked-child `setpgid(0, 0)` leg. Carrick had reported both as TPASS because the harness starts Carrick in a fresh host process group but the same host session; PID namespace mapping recorded only the init host PGID, so guest `getsid(0)` / session-leader checks missed host SID values that differ from PGID. | `dispatch::proc::setpgid_tests::namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid`, `setpgidparentgroup`, `proclife` | MATCH 1/2 vs oracle 1/2 in `conf-3259-c00`; process-group session-leader rule owned |
@@ -418,10 +422,13 @@ just conformance-probes
 
 ## Next autonomous slice
 
-1. Move the next runtime reducer to `go-syscall` `TestExec`: refresh or rerun
-   the row, then split the process-control failure from unrelated namespace,
-   capability, and file-mode fallout before changing runtime behavior.
-2. Keep `ltp-pause02` and `go-os_signal` as adjacent pressure rows. Do not fix
+1. Keep `go-syscall` as a non-process follow-up only if this goal expands:
+   `TestExec` is now fixed and owned, while the full row still stops around
+   namespace/chroot fallout (`TestUnshareMountNameSpaceChroot` in
+   `conf-77884-c00`) after user namespace, unshare, capability, and fd-flag
+   failures.
+2. Return process-control focus to `ltp-pause02` and `go-os_signal` as adjacent
+   pressure rows. Do not fix
    them from memory or stale output; wait for a fresh deterministic RED and then
    split a separate `pauseinterrupt2` or `atomicstop` reducer if needed.
 3. Update this file and `docs/conformance-coverage.md`, then land a logical
