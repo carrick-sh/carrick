@@ -444,7 +444,7 @@ impl SyscallDispatcher {
                         write_ring_u32(memory, ring + layout.sq_off.head as u64, sq_head);
                         write_ring_u32(memory, ring + layout.cq_off.tail as u64, cq_tail);
                         return DispatchOutcome::WaitOnFds {
-                            fds: vec![(host_fd, events)],
+                            fds: WaitFds::raw_one(host_fd, events),
                             timeout: None,
                             on_timeout: 0,
                             block_signals: 0,
@@ -718,7 +718,7 @@ impl SyscallDispatcher {
                     }
                     DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(-errno),
                     DispatchOutcome::WaitOnFds { fds, .. } => match fds.first() {
-                        Some(&(h, e)) => AsyncOutcome::Block(h, e),
+                        Some((h, e)) => AsyncOutcome::Block(h, e),
                         None => AsyncOutcome::Ready(-LINUX_EAGAIN),
                     },
                     _ => AsyncOutcome::Ready(-LINUX_EINVAL),
@@ -731,7 +731,7 @@ impl SyscallDispatcher {
                     DispatchOutcome::Returned { value } => AsyncOutcome::Ready(value as i32),
                     DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(-errno),
                     DispatchOutcome::WaitOnFds { fds, .. } => match fds.first() {
-                        Some(&(h, e)) => AsyncOutcome::Block(h, e),
+                        Some((h, e)) => AsyncOutcome::Block(h, e),
                         None => AsyncOutcome::Ready(-LINUX_EINVAL),
                     },
                     _ => AsyncOutcome::Ready(-LINUX_EINVAL),

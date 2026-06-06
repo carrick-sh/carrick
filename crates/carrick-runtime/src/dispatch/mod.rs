@@ -603,6 +603,80 @@ pub use crate::vfs::ProcMapsEntry;
 pub use abi_args::{Fd, GuestLen, GuestPtr, Pid, Signal};
 use fd_table::*;
 
+#[derive(Debug, Clone)]
+pub struct WaitFdGuard(#[allow(dead_code)] HostFdRef);
+
+#[derive(Debug, Clone, Default)]
+pub struct WaitFds {
+    fds: Vec<crate::io_wait::WaitFd>,
+    #[allow(dead_code)]
+    guards: Vec<WaitFdGuard>,
+}
+
+impl WaitFds {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn raw(fds: Vec<(i32, i16)>) -> Self {
+        Self {
+            fds: fds
+                .into_iter()
+                .map(|(fd, events)| crate::io_wait::WaitFd::raw(fd, events))
+                .collect(),
+            guards: Vec::new(),
+        }
+    }
+
+    pub fn raw_one(fd: i32, events: i16) -> Self {
+        Self::raw(vec![(fd, events)])
+    }
+
+    pub(in crate::dispatch) fn anchored_one(
+        fd: i32,
+        events: i16,
+        owner: Option<HostFdRef>,
+    ) -> Self {
+        match owner {
+            Some(owner) => Self {
+                fds: vec![crate::io_wait::WaitFd::anchored(fd, events)],
+                guards: vec![WaitFdGuard(owner)],
+            },
+            None => Self::raw_one(fd, events),
+        }
+    }
+
+    pub fn first(&self) -> Option<(i32, i16)> {
+        self.fds.first().map(|fd| (fd.fd(), fd.events()))
+    }
+}
+
+impl PartialEq for WaitFds {
+    fn eq(&self, other: &Self) -> bool {
+        self.fds == other.fds
+    }
+}
+
+impl Eq for WaitFds {}
+
+impl Serialize for WaitFds {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let fds: Vec<(i32, i16)> = self.fds.iter().map(|fd| (fd.fd(), fd.events())).collect();
+        fds.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for WaitFds {
+    type Target = [crate::io_wait::WaitFd];
+
+    fn deref(&self) -> &Self::Target {
+        &self.fds
+    }
+}
+
 #[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
 
@@ -1013,7 +1087,7 @@ pub enum DispatchOutcome {
     /// completion needs no further writes.
     WaitOnFds {
         /// (host_fd, poll events) pairs to wait on.
-        fds: Vec<(i32, i16)>,
+        fds: WaitFds,
         /// `None` = wait forever (signal-interruptible).
         timeout: Option<Duration>,
         /// Value to complete the syscall with if the wait times out: `0` for
@@ -1051,7 +1125,7 @@ pub enum DispatchOutcome {
     /// `on_timeout` is implicitly 0 (a select timeout means "no fds ready").
     WaitOnFdsSelect {
         /// (host_fd, poll events) pairs to wait on.
-        fds: Vec<(i32, i16)>,
+        fds: WaitFds,
         /// `None` = wait forever (signal-interruptible).
         timeout: Option<Duration>,
         /// Temporarily-blocked sigmask for the wait (pselect6); `0` = none.
@@ -1067,7 +1141,7 @@ pub enum DispatchOutcome {
     /// drain the epoll instance kqueue normally.
     WaitOnPollFds {
         /// (host_fd, poll events) pairs to wait on.
-        fds: Vec<(i32, i16)>,
+        fds: WaitFds,
         /// `None` = wait forever (signal-interruptible).
         timeout: Option<Duration>,
         /// Value to complete the syscall with if the wait times out.
@@ -4493,6 +4567,7 @@ fn read_host_pipe_into(
     memory: &mut impl GuestMemory,
     guest_addr: u64,
     host_fd: i32,
+    host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     buf: &mut [u8],
 ) -> DispatchOutcome {
@@ -4510,7 +4585,7 @@ fn read_host_pipe_into(
         // guest signal is actually pending (has_pending_for). Same discipline as
         // host_sleep_interruptible.
         if e == LINUX_EAGAIN || e == LINUX_EINTR {
-            return would_block_outcome(host_fd, libc::POLLIN, nonblocking);
+            return would_block_outcome(host_fd, libc::POLLIN, nonblocking, host_fd_owner);
         }
         return DispatchOutcome::Errno { errno: e };
     }
@@ -4534,6 +4609,7 @@ fn read_host_pipe(
     guest_addr: u64,
     length: usize,
     host_fd: i32,
+    host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
 ) -> DispatchOutcome {
     if length == 0 {
@@ -4544,10 +4620,24 @@ fn read_host_pipe(
     let length = length.min(MAX_RW_COUNT);
     if length <= SMALL_HOST_READ_BUF {
         let mut buf = [0u8; SMALL_HOST_READ_BUF];
-        read_host_pipe_into(memory, guest_addr, host_fd, nonblocking, &mut buf[..length])
+        read_host_pipe_into(
+            memory,
+            guest_addr,
+            host_fd,
+            host_fd_owner,
+            nonblocking,
+            &mut buf[..length],
+        )
     } else {
         let mut buf = vec![0u8; length];
-        read_host_pipe_into(memory, guest_addr, host_fd, nonblocking, &mut buf)
+        read_host_pipe_into(
+            memory,
+            guest_addr,
+            host_fd,
+            host_fd_owner,
+            nonblocking,
+            &mut buf,
+        )
     }
 }
 
@@ -4576,6 +4666,7 @@ impl<'a> HostWritePayload<'a> {
 fn write_host_pipe(
     bytes: &[u8],
     host_fd: i32,
+    host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     write_kind: HostWriteKind,
     tid: crate::thread::ThreadId,
@@ -4584,6 +4675,7 @@ fn write_host_pipe(
     write_host_pipe_payload(
         HostWritePayload::Borrowed(bytes),
         host_fd,
+        host_fd_owner,
         nonblocking,
         write_kind,
         tid,
@@ -4594,6 +4686,7 @@ fn write_host_pipe(
 fn write_host_pipe_owned(
     bytes: Vec<u8>,
     host_fd: i32,
+    host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     write_kind: HostWriteKind,
     tid: crate::thread::ThreadId,
@@ -4602,6 +4695,7 @@ fn write_host_pipe_owned(
     write_host_pipe_payload(
         HostWritePayload::Owned(bytes),
         host_fd,
+        host_fd_owner,
         nonblocking,
         write_kind,
         tid,
@@ -4612,6 +4706,7 @@ fn write_host_pipe_owned(
 fn write_host_pipe_payload(
     payload: HostWritePayload<'_>,
     host_fd: i32,
+    host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     write_kind: HostWriteKind,
     tid: crate::thread::ThreadId,
@@ -4700,7 +4795,12 @@ fn write_host_pipe_payload(
                         },
                     };
                 }
-                return would_block_outcome(host_fd, libc::POLLOUT, nonblocking);
+                return would_block_outcome(
+                    host_fd,
+                    libc::POLLOUT,
+                    nonblocking,
+                    host_fd_owner.clone(),
+                );
             }
             return DispatchOutcome::Errno { errno: e };
         }
@@ -4744,14 +4844,19 @@ fn write_host_pipe_payload(
 /// A host op returned EAGAIN: a non-blocking guest fd gets EAGAIN; a blocking
 /// one gets a WaitOnFds hand-off so the runtime waits on readiness with the
 /// dispatcher lock RELEASED (per-thread kqueue), then re-dispatches.
-fn would_block_outcome(host_fd: i32, events: i16, nonblocking: bool) -> DispatchOutcome {
+fn would_block_outcome(
+    host_fd: i32,
+    events: i16,
+    nonblocking: bool,
+    host_fd_owner: Option<HostFdRef>,
+) -> DispatchOutcome {
     if nonblocking {
         DispatchOutcome::Errno {
             errno: LINUX_EAGAIN,
         }
     } else {
         DispatchOutcome::WaitOnFds {
-            fds: vec![(host_fd, events)],
+            fds: WaitFds::anchored_one(host_fd, events, host_fd_owner),
             timeout: None,
             on_timeout: -(LINUX_EAGAIN as i64),
             block_signals: 0,
@@ -4917,6 +5022,7 @@ mod overlay_dispatch_tests {
         let outcome = write_host_pipe(
             &bytes,
             fds[1],
+            None,
             false,
             HostWriteKind::PipeLike,
             0x7FFE_0101,
@@ -4937,6 +5043,41 @@ mod overlay_dispatch_tests {
             write.offset()
         );
         assert!(write.sigpipe_on_epipe());
+    }
+
+    #[test]
+    fn anchored_wait_fds_keep_host_fd_live_after_open_file_drop() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let open_file = OpenFile::with_host_fd(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                base: OpenDescriptionBase::new(0),
+                host_fd: fds[0],
+                is_read_end: true,
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+            fds[0],
+        );
+        let wait_fds = WaitFds::anchored_one(fds[0], libc::POLLIN, open_file.host_fd_owner.clone());
+        drop(open_file);
+
+        let mut pollfd = libc::pollfd {
+            fd: wait_fds[0].fd(),
+            events: wait_fds[0].events(),
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 0);
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+
+        drop(wait_fds);
+        unsafe {
+            libc::close(fds[1]);
+        }
     }
 
     #[test]

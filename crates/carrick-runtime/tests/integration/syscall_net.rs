@@ -13,6 +13,8 @@ mod support;
 use support::*;
 
 #[cfg(target_os = "macos")]
+use carrick_runtime::dispatch::WaitFds;
+#[cfg(target_os = "macos")]
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_AT_FDCWD, LINUX_EADDRINUSE, LINUX_ECONNREFUSED, LINUX_EINTR, LINUX_ENOENT,
@@ -2118,8 +2120,8 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
         panic!("expected timed epoll wait handoff, got {outcome:?}");
     };
     assert_eq!(fds.len(), 1);
-    assert!(fds[0].0 >= 0);
-    assert_eq!(fds[0].1 & libc::POLLIN, libc::POLLIN);
+    assert!(fds[0].fd() >= 0);
+    assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
     assert_eq!(block_signals, 0);
@@ -2195,8 +2197,8 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
         panic!("expected epoll wait handoff, got {outcome:?}");
     };
     assert_eq!(fds.len(), 1);
-    assert!(fds[0].0 >= 0);
-    assert_eq!(fds[0].1 & libc::POLLIN, libc::POLLIN);
+    assert!(fds[0].fd() >= 0);
+    assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
     assert_eq!(block_signals, 0);
@@ -2586,11 +2588,7 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
     let wait_fds = wait_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("epoll_pwait should hand off to a host-fd wait before the peer writes");
-    assert!(
-        wait_fds
-            .iter()
-            .any(|(_, events)| events & libc::POLLIN != 0)
-    );
+    assert!(wait_fds.iter().any(|fd| fd.events() & libc::POLLIN != 0));
 
     {
         let mut memory = memory.lock().unwrap();
@@ -2852,7 +2850,7 @@ fn dispatch_threaded_with_wait_notify(
     memory: &Arc<Mutex<LinearMemory>>,
     tid: i32,
     request: SyscallRequest,
-    mut wait_notify: Option<mpsc::Sender<Vec<(i32, i16)>>>,
+    mut wait_notify: Option<mpsc::Sender<WaitFds>>,
 ) -> DispatchOutcome {
     loop {
         let outcome = dispatch_threaded_once(threaded, memory, tid, request);

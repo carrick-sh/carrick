@@ -23,6 +23,43 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use crate::darwin_kqueue::{Kevent, Kqueue};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitFd {
+    fd: RawFd,
+    events: i16,
+    anchored: bool,
+}
+
+impl WaitFd {
+    pub fn raw(fd: RawFd, events: i16) -> Self {
+        Self {
+            fd,
+            events,
+            anchored: false,
+        }
+    }
+
+    pub fn anchored(fd: RawFd, events: i16) -> Self {
+        Self {
+            fd,
+            events,
+            anchored: true,
+        }
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    pub fn events(&self) -> i16 {
+        self.events
+    }
+
+    fn is_anchored(&self) -> bool {
+        self.anchored
+    }
+}
+
 /// Result of a blocking-I/O wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitResult {
@@ -64,10 +101,16 @@ impl PinnedWaitFds {
     /// errno — never fall back to parking on the raw, unowned guest fd (the
     /// exact fd-reuse race this dup is meant to prevent). The partially-duped
     /// set is dropped via PinnedWaitFd::Drop (RAII rollback).
-    fn new(fds: &[(RawFd, i16)]) -> Result<Self, i32> {
+    fn new(fds: &[WaitFd]) -> Result<Self, i32> {
         let mut wait_fds = Vec::with_capacity(fds.len());
         let mut pinned = Vec::with_capacity(fds.len());
-        for &(fd, events) in fds {
+        for wait_fd in fds {
+            let fd = wait_fd.fd();
+            let events = wait_fd.events();
+            if wait_fd.is_anchored() {
+                wait_fds.push((fd, events));
+                continue;
+            }
             let duped = unsafe { libc::dup(fd) };
             if duped < 0 {
                 // Read errno IMMEDIATELY (before any other libc call clobbers it).
@@ -306,15 +349,10 @@ impl ThreadWaiter {
     /// temporarily blocks (an `epoll_pwait`/`ppoll`/`pselect6` sigmask); a signal
     /// blocked by it does not interrupt the wait (it stays pending for delivery
     /// after the syscall, per the persistent mask). `0` = no extra blocking.
-    pub fn wait(
-        &self,
-        fds: &[(i32, i16)],
-        timeout: Option<Duration>,
-        block_mask: u64,
-    ) -> WaitResult {
-        let fd0 = fds.first().map_or(-1, |(fd, _)| *fd);
-        let events0 = fds.first().map_or(0, |(_, events)| i32::from(*events));
-        let fd1 = fds.get(1).map_or(-1, |(fd, _)| *fd);
+    pub fn wait(&self, fds: &[WaitFd], timeout: Option<Duration>, block_mask: u64) -> WaitResult {
+        let fd0 = fds.first().map_or(-1, WaitFd::fd);
+        let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
+        let fd1 = fds.get(1).map_or(-1, WaitFd::fd);
         crate::probes::io_wait_begin(
             self.tid,
             fds.len() as i32,
@@ -334,7 +372,7 @@ impl ThreadWaiter {
                 fds.len() as i32,
                 fd0,
                 fd1,
-                fds.get(2).map_or(-1, |(fd, _)| *fd),
+                fds.get(2).map_or(-1, WaitFd::fd),
             );
             return WaitResult::Interrupted;
         }
@@ -347,7 +385,7 @@ impl ThreadWaiter {
                     fds.len() as i32,
                     fd0,
                     fd1,
-                    fds.get(2).map_or(-1, |(fd, _)| *fd),
+                    fds.get(2).map_or(-1, WaitFd::fd),
                 );
                 return WaitResult::Errno(errno);
             }
@@ -366,7 +404,7 @@ impl ThreadWaiter {
                     fds.len() as i32,
                     fd0,
                     fd1,
-                    fds.get(2).map_or(-1, |(fd, _)| *fd),
+                    fds.get(2).map_or(-1, WaitFd::fd),
                 );
                 return result;
             }
@@ -378,7 +416,7 @@ impl ThreadWaiter {
             fds.len() as i32,
             fd0,
             fd1,
-            fds.get(2).map_or(-1, |(fd, _)| *fd),
+            fds.get(2).map_or(-1, WaitFd::fd),
         );
         result
     }
@@ -388,13 +426,13 @@ impl ThreadWaiter {
     /// the queued events.
     pub fn wait_poll(
         &self,
-        fds: &[(i32, i16)],
+        fds: &[WaitFd],
         timeout: Option<Duration>,
         block_mask: u64,
     ) -> WaitResult {
-        let fd0 = fds.first().map_or(-1, |(fd, _)| *fd);
-        let events0 = fds.first().map_or(0, |(_, events)| i32::from(*events));
-        let fd1 = fds.get(1).map_or(-1, |(fd, _)| *fd);
+        let fd0 = fds.first().map_or(-1, WaitFd::fd);
+        let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
+        let fd1 = fds.get(1).map_or(-1, WaitFd::fd);
         crate::probes::io_wait_begin(
             self.tid,
             fds.len() as i32,
@@ -412,7 +450,7 @@ impl ThreadWaiter {
                 fds.len() as i32,
                 fd0,
                 fd1,
-                fds.get(2).map_or(-1, |(fd, _)| *fd),
+                fds.get(2).map_or(-1, WaitFd::fd),
             );
             return WaitResult::Interrupted;
         }
@@ -425,7 +463,7 @@ impl ThreadWaiter {
                     fds.len() as i32,
                     fd0,
                     fd1,
-                    fds.get(2).map_or(-1, |(fd, _)| *fd),
+                    fds.get(2).map_or(-1, WaitFd::fd),
                 );
                 return WaitResult::Errno(errno);
             }
@@ -437,7 +475,7 @@ impl ThreadWaiter {
             fds.len() as i32,
             fd0,
             fd1,
-            fds.get(2).map_or(-1, |(fd, _)| *fd),
+            fds.get(2).map_or(-1, WaitFd::fd),
         );
         result
     }
@@ -910,7 +948,7 @@ mod tests {
     fn pinned_wait_fd_survives_original_close() {
         let mut fds = [-1, -1];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let pinned = super::PinnedWaitFds::new(&[(fds[0], libc::POLLIN)])
+        let pinned = super::PinnedWaitFds::new(&[super::WaitFd::raw(fds[0], libc::POLLIN)])
             .expect("dup should succeed in test");
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
@@ -930,7 +968,28 @@ mod tests {
         // dup() of a closed/invalid fd fails (EBADF) deterministically, no
         // rlimit perturbation. new() must return Err, not park on the raw fd.
         let bad = 100_000; // not an open fd in the test process
-        assert!(super::PinnedWaitFds::new(&[(bad, libc::POLLIN)]).is_err());
+        assert!(super::PinnedWaitFds::new(&[super::WaitFd::raw(bad, libc::POLLIN)]).is_err());
+    }
+
+    #[test]
+    fn anchored_wait_fd_uses_original_fd_without_closing_it() {
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pinned = super::PinnedWaitFds::new(&[super::WaitFd::anchored(fds[0], libc::POLLIN)])
+            .expect("anchored fd should not need dup");
+        assert_eq!(pinned.as_wait_fds()[0].0, fds[0]);
+        drop(pinned);
+
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+        let mut pollfd = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
 
     #[cfg(target_os = "macos")]
