@@ -76,22 +76,39 @@ impl MemPerms {
     };
 }
 
-/// General-purpose / control registers addressable through
-/// [`crate::hypervisor::HvVcpu::reg`] / `set_reg`. `X(n)` is `x0..x30`
-/// (`n` in `0..=30`). System registers are NOT here — see [`SysReg`].
+/// Registers that live in KVM's **core** register file (`struct kvm_regs`),
+/// addressed through [`crate::hypervisor::HvVcpu::reg`] / `set_reg`.
+///
+/// On aarch64 KVM, `kvm_regs` holds the `user_pt_regs` (x0..x30, `sp`, `pc`,
+/// `pstate`) *plus* the EL1 exception-return state (`sp_el1`, `elr_el1`,
+/// `spsr[]`). These are NOT in the sysreg "demux" interface — they must be set
+/// via the core-register byte offsets, not [`SysReg`]. Note `Sp` is
+/// `user_pt_regs.sp`, i.e. **SP_EL0** (the EL0/user stack).
+///
+/// `X(n)` is `x0..x30` (`n` in `0..=30`). True system registers (SCTLR, TTBR,
+/// …) are in [`SysReg`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reg {
     X(u32),
+    /// `user_pt_regs.sp` == SP_EL0 (the EL0/user stack pointer).
     Sp,
     Pc,
     Pstate,
+    /// `kvm_regs.sp_el1` — the EL1 stack pointer.
+    SpEl1,
+    /// `kvm_regs.elr_el1` — exception link register (eret target PC).
+    ElrEl1,
+    /// `kvm_regs.spsr[0]` == SPSR_EL1 — saved PSTATE (eret target PSTATE).
+    SpsrEl1,
 }
 
-/// AArch64 system registers programmed during guest bring-up
-/// (stage-1 MMU + vector table + EL1 state). Set via
-/// [`crate::hypervisor::HvVcpu::set_sys_reg`]. Short names (no `_EL1`
-/// suffix); this is the canonical superset the KVM bring-up (`carrick-linux`)
-/// programs — see reconciliation R5.
+/// AArch64 **system** registers reached through KVM's `KVM_REG_ARM64_SYSREG`
+/// demux (op0/op1/CRn/CRm/op2 encoded), set via
+/// [`crate::hypervisor::HvVcpu::set_sys_reg`]. These are the stage-1 MMU +
+/// vector-table control registers programmed during guest bring-up.
+///
+/// EL1 exception-return state (ELR/SPSR/SP_EL1) is deliberately NOT here — on
+/// KVM those are core-file registers; see [`Reg`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysReg {
     Sctlr,
@@ -101,5 +118,4 @@ pub enum SysReg {
     Mair,
     Vbar,
     Cpacr,
-    SpEl1,
 }

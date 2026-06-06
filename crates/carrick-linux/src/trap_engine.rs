@@ -10,15 +10,10 @@ use carrick_mem::memory::AddressSpace;
 use crate::guest_setup::{BroughtUp, GuestRam, SENTINEL_GPA, bring_up};
 use crate::kvm::{KvmVcpu, KvmVm};
 
-/// AArch64 `svc #0` is 4 bytes; after the syscall the guest PC advances past it.
-const SVC_INSTR_LEN: u64 = 4;
-
 pub struct KvmTrapEngine {
     _vm: KvmVm,
     vcpu: KvmVcpu,
     _ram: GuestRam,
-    /// ELR_EL1 captured at the trap, i.e. the EL0 PC just after the `svc`.
-    last_elr: u64,
 }
 
 impl KvmTrapEngine {
@@ -35,7 +30,6 @@ impl KvmTrapEngine {
             _vm: vm,
             vcpu,
             _ram: ram,
-            last_elr: 0,
         })
     }
 }
@@ -47,38 +41,32 @@ impl KvmTrapEngine {
 
 impl SyscallTrap for KvmTrapEngine {
     fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
-        loop {
-            match self
-                .vcpu
-                .run()
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?
-            {
-                VcpuExit::MmioWrite { gpa, .. } if gpa == SENTINEL_GPA => {
-                    // The EL0 `svc` re-entered EL1 and hit the sentinel store.
-                    // ELR_EL1 holds the EL0 PC just after the `svc`.
-                    self.last_elr = self
-                        .vcpu
-                        .elr_el1()
-                        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-                    return Ok(Some(self.read_frame()?));
-                }
-                VcpuExit::MmioWrite { gpa, data, len } => {
-                    return Err(TrapError::UnexpectedExit {
-                        reason: format!(
-                            "MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len}"
-                        ),
-                    });
-                }
-                VcpuExit::Halt => return Ok(None),
-                VcpuExit::Kicked => return Ok(None),
-                VcpuExit::Exception { syndrome, far } => {
-                    return Err(TrapError::UnexpectedException {
-                        syndrome,
-                        virtual_address: far,
-                        physical_address: far,
-                    });
-                }
+        // One KVM_RUN per call; the outer run loop calls `next_syscall`
+        // repeatedly. Classify the exit and return.
+        match self
+            .vcpu
+            .run()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?
+        {
+            VcpuExit::MmioWrite { gpa, .. } if gpa == SENTINEL_GPA => {
+                // The EL0 `svc` re-entered EL1 and hit the sentinel store.
+                // The hardware already set ELR_EL1 = (svc addr + 4) on the
+                // exception, and the EL1 vector's own `eret` (after the
+                // sentinel store) consumes it — so we do NOT touch the PC
+                // here; we just read the syscall frame.
+                Ok(Some(self.read_frame()?))
             }
+            VcpuExit::MmioWrite { gpa, data, len } => Err(TrapError::UnexpectedExit {
+                reason: format!("MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len}"),
+            }),
+            // A bare kick or halt with no pending syscall: the contract is to
+            // return `None` so the run loop can run signal delivery and resume.
+            VcpuExit::Halt | VcpuExit::Kicked => Ok(None),
+            VcpuExit::Exception { syndrome, far } => Err(TrapError::UnexpectedException {
+                syndrome,
+                virtual_address: far,
+                physical_address: far,
+            }),
         }
     }
 
@@ -89,14 +77,13 @@ impl SyscallTrap for KvmTrapEngine {
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+        // Write the syscall result into x0. The guest resume PC is already
+        // correct: ELR_EL1 (= svc+4) was latched by the exception and is
+        // restored by the EL1 vector's `eret`. We must NOT advance it again,
+        // or the instruction after the `svc` would be skipped.
         self.vcpu
             .set_reg(Reg::X(0), return_value as u64)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        let resume = self.last_elr.wrapping_add(SVC_INSTR_LEN);
-        self.vcpu
-            .set_elr_el1(resume)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        Ok(())
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
     fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
