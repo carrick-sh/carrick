@@ -19,7 +19,9 @@
 //! the child) — so each process reports only its own guest threads, matching
 //! Linux's per-process CPU accounting.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Per-vCPU accumulated guest execution nanoseconds, one atomic slot per vCPU
 /// thread. `add` is called on EVERY vCPU run (every guest syscall), so it must
@@ -34,12 +36,30 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 const MAX_VCPUS: usize = 512;
 #[allow(clippy::declare_interior_mutable_const)]
 static EXEC_SLOTS: [AtomicU64; MAX_VCPUS] = [const { AtomicU64::new(0) }; MAX_VCPUS];
+static ACTIVE_START_NS: [AtomicU64; MAX_VCPUS] = [const { AtomicU64::new(0) }; MAX_VCPUS];
 static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// This vCPU thread's slot index, claimed once. Capped at the last slot if
     /// somehow exceeded (degrades to shared accounting rather than UB).
     static MY_SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed).min(MAX_VCPUS - 1);
+}
+
+fn monotonic_ns() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
+/// Mark this vCPU thread as actively executing guest code. Called immediately
+/// before `hv_vcpu_run` so readers can include the in-flight run before it traps
+/// back and is committed to `EXEC_SLOTS`.
+pub fn begin_active() {
+    MY_SLOT.with(|&slot| {
+        ACTIVE_START_NS[slot].store(monotonic_ns().max(1), Ordering::Release);
+    });
 }
 
 /// Add `delta_ns` of guest execution to this vCPU's running total. Called from
@@ -54,9 +74,36 @@ pub fn add(delta_ns: u64) {
     });
 }
 
+/// Commit a completed `hv_vcpu_run` and clear this thread's in-flight marker.
+pub fn finish_active(delta_ns: u64) {
+    add(delta_ns);
+    MY_SLOT.with(|&slot| {
+        ACTIVE_START_NS[slot].store(0, Ordering::Release);
+    });
+}
+
 /// Process-wide guest CPU time (nanoseconds): the sum across all vCPU slots.
 pub fn total_ns() -> u64 {
     EXEC_SLOTS.iter().map(|s| s.load(Ordering::Relaxed)).sum()
+}
+
+/// Process-wide guest CPU time including active `hv_vcpu_run` calls that have
+/// not trapped back to the runtime yet.
+pub fn total_ns_including_active() -> u64 {
+    let now = monotonic_ns();
+    EXEC_SLOTS
+        .iter()
+        .zip(ACTIVE_START_NS.iter())
+        .map(|(total, active_start)| {
+            let committed = total.load(Ordering::Relaxed);
+            let start = active_start.load(Ordering::Acquire);
+            if start == 0 {
+                committed
+            } else {
+                committed.saturating_add(now.saturating_sub(start))
+            }
+        })
+        .sum()
 }
 
 /// Process-wide guest CPU time in microseconds (the unit accounting surfaces
@@ -70,6 +117,9 @@ pub fn total_us() -> u64 {
 /// shared child-exit table is process-shared and intentionally NOT cleared.)
 pub fn reset() {
     for slot in &EXEC_SLOTS {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in &ACTIVE_START_NS {
         slot.store(0, Ordering::Relaxed);
     }
     CHILD_USER_US.store(0, Ordering::Relaxed);
@@ -202,5 +252,16 @@ mod tests {
         assert_eq!(total_us(), 3000);
         reset();
         assert_eq!(total_ns(), 0);
+    }
+
+    #[test]
+    fn active_run_is_visible_before_commit() {
+        reset();
+        begin_active();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(total_ns_including_active() > total_ns());
+        finish_active(1_000_000);
+        assert_eq!(total_ns(), 1_000_000);
+        reset();
     }
 }

@@ -290,7 +290,8 @@ impl SyscallDispatcher {
                     let arm_value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
                     let value_ns = i64::try_from(value.as_nanos()).unwrap_or(i64::MAX);
                     let interval_value_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
-                    let periodic = !interval.is_zero() && value == interval;
+                    let periodic =
+                        !interval.is_zero() && value == interval && !crate::itimer::is_cpu_timer(idx);
                     let needs_periodic = !interval.is_zero() && value != interval;
                     let generation =
                         crate::itimer::arm(idx, arm_value_ns, interval_ns, needs_periodic);

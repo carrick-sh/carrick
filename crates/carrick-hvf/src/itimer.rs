@@ -50,6 +50,9 @@ struct ItimerSlot {
     /// repeat afterwards (`it_value != it_interval`). Consumed by the pump on
     /// the first fire, which then arms the periodic timer exactly once.
     needs_periodic: AtomicBool,
+    /// Guest CPU-time total at which a CPU timer should next fire. Wall-time
+    /// `ITIMER_REAL` leaves this zero.
+    cpu_due_ns: AtomicU64,
 }
 
 impl ItimerSlot {
@@ -60,6 +63,7 @@ impl ItimerSlot {
             interval_ns: AtomicU64::new(0),
             armed: AtomicBool::new(false),
             needs_periodic: AtomicBool::new(false),
+            cpu_due_ns: AtomicU64::new(0),
         }
     }
 }
@@ -87,6 +91,18 @@ pub fn signum_for(which: usize) -> i32 {
     }
 }
 
+/// Whether `which` is a CPU-time timer (`ITIMER_VIRTUAL`/`ITIMER_PROF`) rather
+/// than wall-time `ITIMER_REAL`.
+pub fn is_cpu_timer(which: usize) -> bool {
+    which == 1 || which == 2
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuTimerDecision {
+    Fire,
+    Wait { delay_ns: u64 },
+}
+
 /// Complete EVFILT_TIMER arm state for an armed interval timer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerArm {
@@ -107,6 +123,12 @@ pub fn arm(which: usize, value_ns: u64, interval_ns: u64, needs_periodic: bool) 
         slot.value_ns.store(value_ns, Ordering::SeqCst);
         slot.interval_ns.store(interval_ns, Ordering::SeqCst);
         slot.needs_periodic.store(needs_periodic, Ordering::SeqCst);
+        let cpu_due_ns = if is_cpu_timer(which) {
+            crate::guest_cpu::total_ns_including_active().saturating_add(value_ns)
+        } else {
+            0
+        };
+        slot.cpu_due_ns.store(cpu_due_ns, Ordering::SeqCst);
         // Publish `armed` last so a pump fire that observes `armed` also sees
         // the interval/needs_periodic written above.
         slot.armed.store(true, Ordering::SeqCst);
@@ -125,6 +147,7 @@ pub fn disarm(which: usize) {
         slot.value_ns.store(0, Ordering::SeqCst);
         slot.interval_ns.store(0, Ordering::SeqCst);
         slot.needs_periodic.store(false, Ordering::SeqCst);
+        slot.cpu_due_ns.store(0, Ordering::SeqCst);
     }
 }
 
@@ -148,6 +171,34 @@ pub fn interval_ns(which: usize) -> u64 {
         .map_or(0, |slot| slot.interval_ns.load(Ordering::SeqCst))
 }
 
+/// For CPU timers, decide whether enough guest CPU has elapsed for this timer
+/// to fire. If not, return the remaining CPU interval so the pump can replay a
+/// one-shot wake instead of consuming the timer while the guest is idle.
+pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
+    if !is_cpu_timer(which) {
+        return None;
+    }
+    let slot = SLOTS.get(which)?;
+    let due_ns = slot.cpu_due_ns.load(Ordering::SeqCst);
+    if due_ns == 0 {
+        return Some(CpuTimerDecision::Fire);
+    }
+    let now_ns = crate::guest_cpu::total_ns_including_active();
+    if now_ns < due_ns {
+        return Some(CpuTimerDecision::Wait {
+            delay_ns: due_ns - now_ns,
+        });
+    }
+    let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
+    if interval_ns > 0 {
+        slot.cpu_due_ns
+            .store(now_ns.saturating_add(interval_ns), Ordering::SeqCst);
+    } else {
+        slot.cpu_due_ns.store(0, Ordering::SeqCst);
+    }
+    Some(CpuTimerDecision::Fire)
+}
+
 /// Current kqueue timer arm for `which`, if it is armed. This is used when a
 /// freshly forked process starts its signal pump after `setitimer` has already
 /// run; without replaying the arm, the timer state says "armed" but no kqueue
@@ -163,11 +214,12 @@ pub fn current_arm(which: usize) -> Option<TimerArm> {
     if value_ns == 0 {
         return None;
     }
-    let flags = if interval_ns != 0 && !needs_periodic && value_ns == interval_ns {
-        libc::EV_ADD
-    } else {
-        libc::EV_ADD | libc::EV_ONESHOT
-    };
+    let flags =
+        if interval_ns != 0 && !needs_periodic && value_ns == interval_ns && !is_cpu_timer(which) {
+            libc::EV_ADD
+        } else {
+            libc::EV_ADD | libc::EV_ONESHOT
+        };
     Some(TimerArm {
         ident: ident_for(which),
         flags,
@@ -241,6 +293,14 @@ mod tests {
     }
 
     #[test]
+    fn cpu_timer_classification_excludes_real_timer() {
+        assert!(!is_cpu_timer(0));
+        assert!(is_cpu_timer(1));
+        assert!(is_cpu_timer(2));
+        assert!(!is_cpu_timer(3));
+    }
+
+    #[test]
     fn arm_disarm_round_trip() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // Use which=2 (PROF) to avoid colliding with other tests' slots.
@@ -294,7 +354,7 @@ mod tests {
     #[test]
     fn current_arm_reconstructs_periodic_timer() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let which = 1; // VIRTUAL
+        let which = 0; // REAL
         disarm(which);
         arm(which, 25_000_000, 25_000_000, false);
         assert_eq!(
@@ -302,6 +362,23 @@ mod tests {
             Some(TimerArm {
                 ident: ident_for(which),
                 flags: libc::EV_ADD,
+                delay_ns: 25_000_000,
+            })
+        );
+        disarm(which);
+    }
+
+    #[test]
+    fn current_arm_replays_cpu_periodic_timer_as_one_shot() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let which = 1; // VIRTUAL
+        disarm(which);
+        arm(which, 25_000_000, 25_000_000, false);
+        assert_eq!(
+            current_arm(which),
+            Some(TimerArm {
+                ident: ident_for(which),
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
                 delay_ns: 25_000_000,
             })
         );
