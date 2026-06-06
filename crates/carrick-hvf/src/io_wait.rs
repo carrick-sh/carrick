@@ -120,9 +120,13 @@ fn child_status_ready(pid: i32) -> bool {
         )
     };
     if rc == 0 {
-        // si_pid != 0 means the child has exited. WNOWAIT leaves it reapable
-        // for the caller's re-dispatched wait4/waitid.
-        info.si_pid != 0
+        // Darwin can report stopped/continued children even for the WEXITED-only
+        // probe above. Only terminal CLD_* states are exit-ready; WNOWAIT leaves
+        // that zombie reapable for the caller's re-dispatched wait4/waitid.
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
+        const CLD_DUMPED: i32 = 3;
+        info.si_pid != 0 && matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED)
     } else {
         // Already reaped (or never ours). Report ready so the caller surfaces
         // the real status/ECHILD exactly as it would without this backstop.
@@ -924,6 +928,54 @@ mod tests {
         // rlimit perturbation. new() must return Err, not park on the raw fd.
         let bad = 100_000; // not an open fd in the test process
         assert!(super::PinnedWaitFds::new(&[(bad, libc::POLLIN)]).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_status_ready_ignores_stopped_child() {
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            loop {
+                unsafe {
+                    libc::pause();
+                }
+            }
+        }
+
+        unsafe {
+            assert_eq!(libc::kill(child, libc::SIGSTOP), 0);
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            for _ in 0..100 {
+                assert_eq!(
+                    libc::waitid(
+                        libc::P_PID,
+                        child as libc::id_t,
+                        &mut info,
+                        libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+                    ),
+                    0
+                );
+                if info.si_pid == child {
+                    break;
+                }
+                libc::usleep(10_000);
+            }
+            assert_eq!(info.si_pid, child, "child did not report stopped state");
+        }
+
+        let ready = super::child_status_ready(child);
+
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+        }
+
+        assert!(
+            !ready,
+            "a stopped child is not exit-ready for a WEXITED-only waiter"
+        );
     }
 
     /// A wake pipe whose write end is closed (EOF) must not re-fire its
