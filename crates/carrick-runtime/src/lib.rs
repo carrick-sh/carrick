@@ -75,6 +75,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod apfs;
+pub mod binfmt;
 pub mod container;
 pub mod cred_ipc;
 #[cfg(target_os = "macos")]

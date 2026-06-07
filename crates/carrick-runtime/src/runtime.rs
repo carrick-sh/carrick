@@ -478,8 +478,12 @@ where
         match maybe_redirect_to_rosetta(&path_str, &file, &argv) {
             None => (file, argv.into_iter().map(String::into_bytes).collect()),
             Some(Ok(redirect)) => {
+                // Faithful binfmt: keep the target's identity (/proc/self/exe
+                // stays the program); flag binfmt-interpreted (uname → x86_64) and
+                // record the stack argv so /proc/self/cmdline survives Rosetta's
+                // argv-skip. (redirect.argv is consumed for the stack below.)
                 needs_at_base = redirect.target_is_dynamic;
-                dispatcher.set_executable_path(ROSETTA_INTERPRETER);
+                dispatcher.enter_binfmt(&redirect.argv);
                 (redirect.interpreter_bytes, redirect.argv)
             }
             Some(Err(errno)) => return Err(rosetta_unavailable(errno, &path_str)),
@@ -595,10 +599,12 @@ where
         match maybe_redirect_to_rosetta(path, &bytes, &argv) {
             None => (bytes, argv),
             Some(Ok(redirect)) => {
-                // /proc/self/exe should resolve to the interpreter that's actually
-                // loaded (Rosetta opens it during its startup handshake).
+                // Faithful binfmt: /proc/self/exe stays the target (the redirect
+                // is transparent on real Linux; Rosetta finds itself without it).
+                // Flag the guest (uname → x86_64) and record the stack argv so
+                // /proc/self/cmdline survives Rosetta's argv-skip.
                 needs_at_base = redirect.target_is_dynamic;
-                dispatcher.set_executable_path(ROSETTA_INTERPRETER);
+                dispatcher.enter_binfmt(&redirect.argv);
                 (redirect.interpreter_bytes, redirect.argv)
             }
             Some(Err(errno)) => return Err(rosetta_unavailable(errno, path)),
@@ -3690,13 +3696,11 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
     // or Vec<u8> (execve) and always return the byte form.
     argv: &[A],
 ) -> Option<Result<RosettaRedirect, i32>> {
-    use crate::elf::{Machine, inspect_elf_bytes};
     use crate::linux_abi::LINUX_ENOENT;
 
-    let meta = inspect_elf_bytes(target_bytes).ok()?;
-    if meta.machine != Machine::X86_64 {
-        return None;
-    }
+    // Consult the binfmt_misc registry (magic/mask). A native (aarch64) or
+    // non-ELF binary matches nothing and runs directly.
+    let _registration = crate::binfmt::match_registration(target_bytes)?;
 
     crate::probes::execve_argv("rosetta-redirect", &[target_path.as_bytes().to_vec()]);
 
@@ -3705,13 +3709,19 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
         None => return Some(Err(LINUX_ENOENT)),
     };
 
+    // A PT_INTERP means the x86 target is dynamically linked and needs an AT_BASE
+    // slot in the auxv carrick hands Rosetta (see ROSETTA_AT_BASE_PLACEHOLDER).
+    let target_is_dynamic = crate::elf::inspect_elf_bytes(target_bytes)
+        .ok()
+        .is_some_and(|m| m.interpreter.is_some());
+
     let orig_argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_ref().to_vec()).collect();
     Some(Ok(RosettaRedirect {
         interpreter_bytes: rosetta_bytes,
+        // The registration is `P` (preserve argv[0]); `rosetta_argv` builds the
+        // form Apple's rosetta requires (argv[0] passed through, target at argv[1]).
         argv: rosetta_argv(target_path, &orig_argv),
-        // A PT_INTERP means the x86 target is dynamically linked and needs AT_BASE
-        // in the auxv carrick hands Rosetta (see ROSETTA_AT_BASE_PLACEHOLDER).
-        target_is_dynamic: meta.interpreter.is_some(),
+        target_is_dynamic,
     }))
 }
 
