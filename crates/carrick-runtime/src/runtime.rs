@@ -3671,15 +3671,32 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
         None => return Some(Err(LINUX_ENOENT)),
     };
 
-    // binfmt_misc interpreter calling convention: argv[0] = interpreter path,
-    // argv[1] = the foreign binary, argv[2..] = the original arguments (the
-    // original argv[0] is dropped).
-    let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(argv.len() + 1);
-    new_argv.push(ROSETTA_INTERPRETER.as_bytes().to_vec());
-    new_argv.push(target_path.as_bytes().to_vec());
-    new_argv.extend(argv.iter().skip(1).map(|a| a.as_ref().to_vec()));
+    let orig_argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_ref().to_vec()).collect();
+    Some(Ok((rosetta_bytes, rosetta_argv(target_path, &orig_argv))))
+}
 
-    Some(Ok((rosetta_bytes, new_argv)))
+/// Build the argv carrick hands the loaded Apple Rosetta interpreter for an
+/// x86_64 target. Apple's `rosetta` consumes `argv[1]` as the binary to
+/// translate and presents the program with `argv = [argv[0], argv[2..]]` — i.e.
+/// it passes OUR `argv[0]` straight through as the *program's* `argv[0]`. So
+/// `argv[0]` MUST be the program's original `argv[0]`, not the interpreter path:
+/// a multi-call binary (coreutils/busybox, which dispatch on `argv[0]`) otherwise
+/// sees "rosetta" and fails ("coreutils: unknown program 'rosetta'"). Standalone
+/// binaries ignore `argv[0]`, which is why glibc programs worked regardless.
+///
+/// Layout: `[<orig argv[0]>, <target>, <orig argv[1..]>]`. With no original argv
+/// (should not happen for an execve), fall back to the target path as `argv[0]`.
+fn rosetta_argv(target_path: &str, orig_argv: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(orig_argv.len() + 1);
+    new_argv.push(
+        orig_argv
+            .first()
+            .cloned()
+            .unwrap_or_else(|| target_path.as_bytes().to_vec()),
+    );
+    new_argv.push(target_path.as_bytes().to_vec());
+    new_argv.extend(orig_argv.iter().skip(1).cloned());
+    new_argv
 }
 
 /// Build the `RuntimeError` for "this is an x86_64 binary but Rosetta 2 is not
@@ -4053,18 +4070,43 @@ mod rosetta_tests {
     }
 
     #[test]
-    fn x86_64_binary_redirects_to_rosetta_with_binfmt_argv() {
+    fn rosetta_argv_passes_program_argv0_through_not_the_interpreter() {
+        // Pure argv construction — no Rosetta install needed, so the assertion
+        // always runs. bash exec'ing a coreutils multi-call symlink resolves the
+        // target to the real binary (/usr/bin/coreutils) but passes argv[0]="ls".
+        // Apple's `rosetta` consumes argv[1] as the binary and presents the
+        // program with argv = [argv[0], argv[2..]], so argv[0] MUST be "ls" — not
+        // the interpreter — or the multi-call binary dispatches on "rosetta" and
+        // errors ("coreutils: unknown program 'rosetta'"). Regression for that.
+        let got = rosetta_argv("/usr/bin/coreutils", &[b"ls".to_vec(), b"-l".to_vec()]);
+        assert_eq!(
+            got,
+            vec![
+                b"ls".to_vec(),                 // program argv[0], passed through
+                b"/usr/bin/coreutils".to_vec(), // the x86 binary for Rosetta (argv[1])
+                b"-l".to_vec(),                 // program argv[1..]
+            ]
+        );
+        assert_ne!(
+            got[0],
+            ROSETTA_INTERPRETER.as_bytes(),
+            "argv[0] must be the program's argv0, never the interpreter path"
+        );
+    }
+
+    #[test]
+    fn x86_64_binary_redirects_to_rosetta_preserving_program_argv0() {
         let elf = synthetic_elf(EM_X86_64);
-        let argv = vec!["/usr/bin/uname".to_string(), "-m".to_string()];
+        let argv = vec!["uname".to_string(), "-m".to_string()];
         match maybe_redirect_to_rosetta("/usr/bin/uname", &elf, &argv) {
-            // Rosetta installed: the load is rewritten to Rosetta + binfmt argv.
+            // Rosetta installed: load is rewritten to Rosetta; argv[0] preserved.
             Some(Ok((rosetta_bytes, new_argv))) => {
                 assert!(rosetta_bytes.starts_with(b"\x7fELF"));
                 assert_eq!(
                     new_argv,
                     vec![
-                        ROSETTA_INTERPRETER.as_bytes().to_vec(),
-                        b"/usr/bin/uname".to_vec(),
+                        b"uname".to_vec(),          // program argv[0] (NOT the interpreter)
+                        b"/usr/bin/uname".to_vec(), // x86 binary for Rosetta
                         b"-m".to_vec(),
                     ]
                 );
