@@ -303,6 +303,7 @@ dependencies = [
  "carrick-runtime",
  "carrick-spec",
  "carrick-test-support",
+ "chrono",
  "clap",
  "flate2",
  "futures-util",
