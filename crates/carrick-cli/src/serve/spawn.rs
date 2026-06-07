@@ -11,12 +11,22 @@ use std::process::Command;
 /// stdout. The id (not the name) is the Docker-API `Id`; the name is stored as a
 /// label so the container is later resolvable by either, via
 /// `carrick_runtime::container::resolve`.
+/// Options for `create_container` beyond the required `image` and `cmd`.
+pub(crate) struct CreateContainerOpts<'a> {
+    pub name: Option<&'a str>,
+    pub env: &'a [String],
+    pub workdir: Option<&'a str>,
+    pub tty: bool,
+    pub interactive: bool,
+    pub user: Option<&'a str>,
+    pub entrypoint: Option<&'a [String]>,
+    pub binds: &'a [String],
+}
+
 pub(crate) fn create_container(
-    name: Option<&str>,
     image: &str,
     cmd: &[String],
-    env: &[String],
-    workdir: Option<&str>,
+    opts: &CreateContainerOpts<'_>,
 ) -> anyhow::Result<String> {
     // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
     // itself (current_exe) with operator-controlled API inputs as separate argv
@@ -24,21 +34,40 @@ pub(crate) fn create_container(
     let exe = std::env::current_exe()?;
     let mut c = Command::new(exe);
     c.arg("create");
+    c.arg("--fs").arg("host");
     // No `?name=` → omit `--name`, letting `carrick create` auto-name (matching
     // Docker, which auto-generates a name when none is supplied).
-    if let Some(n) = name {
+    if let Some(n) = opts.name {
         c.arg("--name").arg(n);
     }
-    for e in env {
+    for e in opts.env {
         c.arg("-e").arg(e);
     }
-    if let Some(w) = workdir {
+    if let Some(w) = opts.workdir {
         c.arg("-w").arg(w);
+    }
+    if opts.tty {
+        c.arg("-t");
+    }
+    if opts.interactive {
+        c.arg("-i");
+    }
+    if let Some(u) = opts.user {
+        c.arg("-u").arg(u);
+    }
+    if let Some(ep) = opts.entrypoint
+        && let Some(first) = ep.first()
+    {
+        c.arg("--entrypoint").arg(first);
+    }
+    for b in opts.binds {
+        c.arg("-v").arg(b);
     }
     c.arg(image);
     for a in cmd {
         c.arg(a);
     }
+
     let out = c.output()?;
     if !out.status.success() {
         anyhow::bail!(
