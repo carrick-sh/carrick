@@ -410,11 +410,22 @@ impl SyscallTrap for KvmTrapEngine {
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
         use carrick_hal::RegAccess;
-        // KVM's guest is ALWAYS at EL0, so the interrupted PSTATE is always the
-        // EL0t value latched in SPSR_EL1 — no HVF-style kick-path/CPSR branch.
-        let pstate_source = self
-            .get_reg(Reg::SpsrEl1)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // The interrupted PSTATE to save into the sigframe. Which register holds
+        // it depends on HOW we left EL0 — NOT on the EL (KVM is always EL0; the
+        // HVF EL1-trampoline discrimination is what does NOT apply here):
+        //   * SYSCALL path (`interrupted_pc.is_none()`): the `svc` exception
+        //     latched the EL0 PSTATE into SPSR_EL1, so read `Reg::SpsrEl1`.
+        //   * KICK path (`interrupted_pc.is_some()`): a host signal EINTR'd
+        //     `KVM_RUN` mid-EL0 with NO exception taken, so SPSR_EL1 is stale
+        //     (frozen at the last eret-into-EL0). The LIVE EL0 PSTATE is in
+        //     `user_pt_regs.pstate` (`Reg::Pstate`) — the same place the loop
+        //     read the live PC for `interrupted_pc`. Mirrors HVF (trap.rs:1319).
+        let pstate_source = if interrupted_pc.is_some() {
+            self.get_reg(Reg::Pstate)
+        } else {
+            self.get_reg(Reg::SpsrEl1)
+        }
+        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         let params = carrick_hal::sigframe::InjectParams {
             signum,
             handler,

@@ -510,14 +510,18 @@ CEOF
       exit 1
     fi
 
-    # 16. Phase 4: FP/SIMD save/restore across an ASYNC cross-thread signal -- and
-    #     the kick-inject-at-EL0 path. A worker busy-spins (NO syscalls) holding a
-    #     sentinel in v16; the main thread tgkill()s it. The KvmKicker forces the
-    #     worker KVM_RUN to return (EINTR -> VcpuExit::Kicked), the loop injects
-    #     the handler AT the interrupted EL0 PC (interrupted_pc=Some), the handler
-    #     clobbers v16, and rt_sigreturn must restore it (fpsimd_enabled=true). The
-    #     spin loop verifies v16 == sentinel before and after, entirely in asm so
-    #     the compiler never reallocates it. REQUIRED gate.
+    # 16. Phase 4: FP/SIMD + PSTATE save/restore across an ASYNC cross-thread
+    #     signal -- and the kick-inject-at-EL0 path. A worker busy-spins (NO
+    #     syscalls) holding a sentinel in v16 AND a sentinel in NZCV; the main
+    #     thread tgkill()s it. The KvmKicker forces the worker KVM_RUN to return
+    #     (EINTR -> VcpuExit::Kicked), the loop injects the handler AT the
+    #     interrupted EL0 PC (interrupted_pc=Some) using the LIVE PSTATE
+    #     (Reg::Pstate, not the stale SPSR_EL1), the handler clobbers v16+NZCV,
+    #     and rt_sigreturn must restore BOTH (fpsimd_enabled=true; saved_spsr =
+    #     live pstate). The spin loop reads NZCV via mrs and v16 via umov before
+    #     any flag-setting cmp, entirely in asm so the compiler never reallocates
+    #     them. Catches both a broken FP save/restore and the kick-path PSTATE
+    #     bug (stale SPSR_EL1). REQUIRED gate.
     cat > /tmp/csig_fpsimd.c <<CEOF
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -527,23 +531,28 @@ CEOF
 #include <stdint.h>
 static volatile sig_atomic_t fired; static volatile int ready, ok=1; static pid_t wtid;
 static void h(int s){ (void)s; fired=1;
-  uint64_t junk=0xDEADBEEFCAFEF00DUL; __asm__ volatile("dup v16.2d, %0"::"r"(junk):"v16"); }
+  uint64_t junk=0xDEADBEEFCAFEF00DUL; __asm__ volatile("dup v16.2d, %0"::"r"(junk):"v16");
+  __asm__ volatile("msr nzcv, xzr":::"cc"); /* clobber the interrupted NZCV */ }
 static void *worker(void *a){ (void)a; wtid=(pid_t)syscall(SYS_gettid);
   __atomic_store_n(&ready,1,__ATOMIC_SEQ_CST);
-  uint64_t sentinel=0x0102030405060708UL; int bad=0;
+  uint64_t vsent=0x0102030405060708UL; int bad=0;
   __asm__ volatile(
-    "dup v16.2d, %2\n"
-    "1: ldr w3,[%1]\n"
+    "dup v16.2d, %2\n"          /* v16 = FP sentinel */
+    "mov x5, #0xA0000000\n"     /* NZCV sentinel: N=1,C=1 */
+    "msr nzcv, x5\n"
+    "1: ldr w3,[%1]\n"          /* w3 = fired */
+    "   cbz w3,1b\n"            /* spin (cbz preserves NZCV) until the handler ran */
+    "   mrs x6, nzcv\n"         /* capture restored NZCV BEFORE any flag-setting op */
     "   umov x4, v16.d[0]\n"
-    "   cmp x4,%2\n"
+    "   cmp x4,%2\n"            /* v16 preserved? (clobbers NZCV, x6 already read) */
     "   b.ne 2f\n"
-    "   cbz w3,1b\n"
-    "   umov x4, v16.d[0]\n"
-    "   cmp x4,%2\n"
-    "   b.eq 3f\n"
+    "   mov x5, #0xA0000000\n"
+    "   cmp x6, x5\n"           /* NZCV preserved? */
+    "   b.ne 2f\n"
+    "   b 3f\n"
     "2: mov %w0,#1\n"
     "3:\n"
-    : "+r"(bad) : "r"(&fired), "r"(sentinel) : "x3","x4","v16","memory","cc");
+    : "+r"(bad) : "r"(&fired), "r"(vsent) : "x3","x4","x5","x6","v16","memory","cc");
   if(bad) ok=0; return 0; }
 int main(void){
   struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h;
