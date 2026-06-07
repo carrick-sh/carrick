@@ -8170,6 +8170,118 @@ fn closing_ptmx_master_removes_pts_entry() {
 }
 
 #[test]
+fn tiocswinsz_on_pty_master_succeeds_via_slave() {
+    // Linux honours TIOCGWINSZ/TIOCSWINSZ on a pty *master* (forkpty/openpty +
+    // TIOCSWINSZ(master) is the standard way to size a pty). macOS rejects them
+    // on the master with ENOTTY — the winsize lives on the slave tty — so a
+    // guest program doing this otherwise fails with "Setting TIOCSWINSZ for
+    // master fd N failed!". carrick must redirect a master's winsize ioctls to
+    // the slave. (musl/glibc both issue raw TIOCSWINSZ here, so this is libc-
+    // independent.)
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0u8; 0x400]);
+    memory.write_bytes(0x4000, b"/dev/ptmx\0").unwrap();
+    memory.write_bytes(0x4040, b"/dev/pts/0\0").unwrap();
+    let reporter = CompatReporter::default();
+
+    // open /dev/ptmx (O_RDWR=2) -> master fd.
+    let master = match dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/ptmx failed: {:?}", o),
+    };
+
+    // Unlock + open the slave /dev/pts/0 (kept open). This is the persistent
+    // slave the child uses; the master's winsize ioctls retarget it (macOS
+    // resets a pts winsize when its last slave fd closes, so a child needs the
+    // slave already open — exactly the forkpty(3) order: openpty, then set size).
+    memory.write_bytes(0x4100, &0i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([master, LINUX_TIOCSPTLCK, 0x4100, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let _slave = match dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/pts/0 failed: {:?}", o),
+    };
+
+    // TIOCSWINSZ on the MASTER: 40 rows x 120 cols. Pre-fix this returned ENOTTY.
+    let ws_ptr = 0x4100u64;
+    let ws: [u8; 8] = [40, 0, 120, 0, 0, 0, 0, 0]; // row=40, col=120, xpixel=0, ypixel=0
+    memory.write_bytes(ws_ptr, &ws).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([master, LINUX_TIOCSWINSZ, ws_ptr, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "TIOCSWINSZ on a pty master must succeed (redirected to the slave)"
+    );
+
+    // TIOCGWINSZ on the MASTER reads it back through the same slave.
+    let got_ptr = 0x4200u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([master, LINUX_TIOCGWINSZ, got_ptr, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "TIOCGWINSZ on a pty master must succeed"
+    );
+    let got = memory.read_bytes(got_ptr, 4).unwrap();
+    assert_eq!(
+        (
+            u16::from_le_bytes([got[0], got[1]]),
+            u16::from_le_bytes([got[2], got[3]])
+        ),
+        (40, 120),
+        "winsize set on the master must read back from the slave"
+    );
+
+    assert!(reporter.finish().unhandled_ioctls.is_empty());
+}
+
+#[test]
 fn pty_master_slave_data_roundtrip() {
     // Prove that pty fds are bidirectional: a write(slave, …) is
     // readable on the master.  Direction chosen: slave→master avoids

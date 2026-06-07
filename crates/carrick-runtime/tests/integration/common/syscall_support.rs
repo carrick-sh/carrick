@@ -86,6 +86,7 @@ pub const LINUX_TIOCSCTTY: u64 = 0x540E;
 pub const LINUX_TIOCGPGRP: u64 = 0x540F;
 pub const LINUX_TIOCSPGRP: u64 = 0x5410;
 pub const LINUX_TIOCGWINSZ: u64 = 0x5413;
+pub const LINUX_TIOCSWINSZ: u64 = 0x5414;
 pub const LINUX_FIONREAD: u64 = 0x541B;
 pub const LINUX_FIONBIO: u64 = 0x5421;
 pub const LINUX_TIOCNOTTY: u64 = 0x5422;
