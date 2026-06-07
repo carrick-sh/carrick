@@ -11,6 +11,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod errno;
+pub mod fork;
 pub mod guest_setup;
 pub mod kvm;
 pub mod run_elf;
