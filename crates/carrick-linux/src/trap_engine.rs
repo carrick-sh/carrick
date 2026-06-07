@@ -52,24 +52,58 @@ impl KvmTrapEngine {
 /// the same as its guest-physical address and indexes straight into the host
 /// backing. The real dispatcher reads/writes its syscall buffers through this.
 ///
-/// Only `read_bytes`/`write_bytes` are implemented for the MVP: the guest has a
-/// flat, protection-less single window, so the trait's default no-op bodies are
-/// correct for `set_no_access`/`protect_range`/`unmap_range`/`repoint_private`
-/// and the zero-copy/`shared_futex_host_addr` hooks (`None`). Real
-/// stage-1/protection methods are the full-backend spec's mmap/mprotect work.
+/// `read_bytes`/`write_bytes` move syscall buffers; `set_no_access`/
+/// `zero_backing` implement the HOST-SIDE PROT_NONE check (a bad syscall
+/// buffer faults with EFAULT). The trait's default no-op bodies stand for the
+/// GUEST-fault methods (`protect_range`/`unmap_range`/`unmap_alias_range`/
+/// `repoint_private`) and the zero-copy / `shared_futex_host_addr` hooks
+/// (`None`): making the guest's own EL0 access fault needs stage-1 edits + a
+/// SIGSEGV the engine can't yet inject (Phase D).
 impl GuestMemory for KvmTrapEngine {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        // A syscall buffer overlapping a PROT_NONE range faults with EFAULT,
+        // even though the host backing is accessible (C2 host-side check).
+        if self.ram.range_no_access(address, length) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         self.ram
             .read(address, length)
             .map_err(|_| MemoryError::OutOfBounds { address, length })
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if self.ram.range_no_access(address, bytes.len()) {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
         self.ram
             .write_gpa(address, bytes)
             .map_err(|_| MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
+            })
+    }
+
+    /// Record/clear a PROT_NONE range so syscall buffers there fault (EFAULT).
+    /// HOST-SIDE only — the guest's own EL0 accesses still hit the accessible
+    /// backing (making those fault needs stage-1 edits + signal injection,
+    /// Phase D), so `protect_range`/`unmap_range` keep their no-op defaults.
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        self.ram.set_no_access(address, len, no_access);
+    }
+
+    /// Scrub the physical backing of `[address, address+len)`, BYPASSING the
+    /// PROT_NONE check — used to clear a reused/`munmap`'d region whose stale
+    /// bytes must never resurface after a later `mprotect` makes it readable.
+    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        let zeros = vec![0u8; len];
+        self.ram
+            .write_gpa(address, &zeros)
+            .map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: len,
             })
     }
 }
