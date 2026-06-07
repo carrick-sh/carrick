@@ -567,16 +567,10 @@ where
     // Docker accepts a bare entrypoint command (`carrick run alpine ls`); resolve
     // it against $PATH like runc/execvp before loading. A name with '/' is left
     // as-is. Guest execve(2) is unaffected (it keeps full-path semantics).
-    // Identity for /proc/self/{exe,cmdline} reflects the entrypoint the user
-    // asked for (before shebang/Rosetta rewriting).
-    dispatcher.set_executable_identity(
-        path.to_owned(),
-        argv.clone(),
-        env.iter().map(|s| s.as_bytes().to_vec()).collect(),
-    );
     // PATH-resolve a bare command AND resolve `#!` shebang scripts to their
     // interpreter (Docker / execve(2) semantics) before loading, so a script
     // entrypoint runs instead of failing "not an ELF binary".
+    let argv_for_cmdline = argv.clone();
     let argv_bytes: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
     let (resolved, argv) = resolve_entrypoint_program(path, &env, argv_bytes, &dispatcher)
         .map_err(|_| {
@@ -585,6 +579,18 @@ where
                 path.to_owned(),
             )))
         })?;
+    // /proc/self/cmdline reflects the user's argv, but /proc/self/exe MUST be the
+    // RESOLVED absolute binary path — real Linux always stores the resolved path.
+    // A bare `uname` would otherwise absolutize to `/uname` (cwd-relative) and
+    // break anything that opens /proc/self/exe: Apple Rosetta opens it to find its
+    // x86 target ("rosetta error: Unable to open /proc/self/exe"), and uutils-
+    // coreutils (Ubuntu 26.04) derives its locale dir from it. Identity is set
+    // AFTER resolution so the recorded exe is the real binary, not the bare name.
+    dispatcher.set_executable_identity(
+        resolved.clone(),
+        argv_for_cmdline,
+        env.iter().map(|s| s.as_bytes().to_vec()).collect(),
+    );
     let path: &str = &resolved;
     let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
         RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(

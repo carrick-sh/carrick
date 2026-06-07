@@ -855,6 +855,7 @@ impl AddressSpace {
             regions,
             initial_stack_pointer,
             linux_auxv,
+            linux_auxv_image,
             el1_vectors_base,
             stage1_page_tables_base,
             ..
@@ -862,6 +863,10 @@ impl AddressSpace {
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
+        // Preserve the serialized auxv image (/proc/self/auxv); `..` above drops
+        // it, and on the boot path this runs after with_linux_initial_stack built
+        // it (Ubuntu 26.04 uutils read /proc/self/auxv and NULL-deref'd on empty).
+        image.linux_auxv_image = linux_auxv_image;
         image.el0_trampoline_entry = Some(LINUX_EL0_TRAMPOLINE_BASE);
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
@@ -916,6 +921,7 @@ impl AddressSpace {
             regions,
             initial_stack_pointer,
             linux_auxv,
+            linux_auxv_image,
             el0_trampoline_entry,
             stage1_page_tables_base,
             ..
@@ -923,6 +929,7 @@ impl AddressSpace {
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image; // preserve /proc/self/auxv (`..` drops it)
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = Some(LINUX_EL1_VECTORS_BASE);
         image.stage1_page_tables_base = stage1_page_tables_base;
@@ -968,6 +975,7 @@ impl AddressSpace {
             regions,
             initial_stack_pointer,
             linux_auxv,
+            linux_auxv_image,
             el0_trampoline_entry,
             el1_vectors_base,
             stage1_page_tables_base,
@@ -976,6 +984,7 @@ impl AddressSpace {
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image; // preserve /proc/self/auxv (`..` drops it)
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
@@ -1027,6 +1036,7 @@ impl AddressSpace {
             regions,
             initial_stack_pointer,
             linux_auxv,
+            linux_auxv_image,
             el0_trampoline_entry,
             el1_vectors_base,
             ..
@@ -1035,6 +1045,7 @@ impl AddressSpace {
             Self::from_regions(entry, regions.into_iter().chain([region, maint]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image; // preserve /proc/self/auxv (`..` drops it)
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = Some(LINUX_PAGE_TABLES_BASE);
@@ -2836,6 +2847,50 @@ mod el1_shim_tests {
             )],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn boot_builders_preserve_linux_auxv_image() {
+        // Regression (Ubuntu 26.04 uutils SIGSEGV): the boot-path builders
+        // destructure `self` with `..`, which silently drops `linux_auxv_image`
+        // (the serialized /proc/self/auxv) while restoring `linux_auxv` (the
+        // entries). They run AFTER with_linux_initial_stack on the boot path, so
+        // they wiped the auxv -> /proc/self/auxv served empty -> uutils-coreutils
+        // (which reads that file at startup) NULL-deref'd. execve skips these
+        // builders, so only the boot/run path was affected.
+        let image = minimal_image()
+            .with_linux_initial_stack(vec!["prog".to_string()], Vec::<String>::new())
+            .expect("initial stack");
+        let n = image.linux_auxv_image().len();
+        assert!(
+            n > 0,
+            "with_linux_initial_stack must serialize a non-empty auxv"
+        );
+
+        let image = image.with_el0_trampoline().expect("el0 trampoline");
+        assert_eq!(
+            image.linux_auxv_image().len(),
+            n,
+            "with_el0_trampoline dropped linux_auxv_image"
+        );
+        let image = image.with_el1_vectors().expect("el1 vectors");
+        assert_eq!(
+            image.linux_auxv_image().len(),
+            n,
+            "with_el1_vectors dropped linux_auxv_image"
+        );
+        let image = image.with_stage1_page_tables().expect("stage1 page tables");
+        assert_eq!(
+            image.linux_auxv_image().len(),
+            n,
+            "with_stage1_page_tables dropped linux_auxv_image"
+        );
+        let image = image.with_identity_page().expect("identity page");
+        assert_eq!(
+            image.linux_auxv_image().len(),
+            n,
+            "with_identity_page dropped linux_auxv_image"
+        );
     }
 
     /// `with_el1_vectors_shim` installs the vector region with the dispatcher at
