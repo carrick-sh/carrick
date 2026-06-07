@@ -43,13 +43,17 @@ impl carrick_hal::VcpuKick for VcpuKickHandle {
     #[inline]
     fn target_in_guest(&self) -> bool {
         // VcpuKickHandle does not own the in-guest flag itself; the flag lives
-        // in VcpuKicker::in_guest (an Arc<AtomicBool> keyed by tid).  Because
-        // the trait is only consumed by the shared threaded engine (Task 8+)
-        // and not yet called from anywhere, we return false as a safe default.
-        // When the shared loop is wired up in Task 8 it will use
-        // VcpuRegistry::set_in_guest / any_other_in_guest on the kicker
-        // directly rather than polling individual handles.
+        // in VcpuKicker::in_guest (an Arc<AtomicBool> keyed by tid).  The shared
+        // loop tracks in-guest state via VcpuRegistry::set_in_guest /
+        // any_other_in_guest on the kicker, not per-handle, so this stays false.
         false
+    }
+
+    #[inline]
+    fn raw_vcpu_id(&self) -> Option<u64> {
+        // The live vCPU id for the bulk hv_vcpus_exit path, or None once the
+        // vCPU is gone (valid_id is the existing liveness-checked extractor).
+        valid_id(self)
     }
 }
 
@@ -80,18 +84,18 @@ impl VcpuKickHandle {
 /// Process-wide registry mapping each live guest tid to a handle that can kick
 /// its vCPU. Shared across all guest threads behind an `Arc`.
 pub struct VcpuKicker {
-    handles: Mutex<HashMap<ThreadId, VcpuKickHandle>>,
+    /// The per-tid kick handles, stored object-safe so the shared threaded
+    /// engine drives the kicker through `carrick_hal::VcpuRegistry` without
+    /// naming `VcpuKickHandle`. The bulk-kick paths (`kick_all`/`kick_all_except`)
+    /// collect each handle's `raw_vcpu_id()` and issue ONE `hv_vcpus_exit(ids)`,
+    /// exactly as the old concrete-handle path did.
+    handles: Mutex<HashMap<ThreadId, Box<dyn carrick_hal::VcpuKickDyn>>>,
     /// Per-vCPU "currently inside hv_vcpu_run (walking guest memory)" flag. The
     /// page-table-edit Pause-Modify-Resume coordinator waits until every OTHER
     /// vCPU has this false (out of guest) before editing the shared stage-1
     /// tables — siblings blocked in host syscalls have it false and need no
     /// wake, which avoids the spurious-signal/blocking-wait deadlock.
     in_guest: Mutex<HashMap<ThreadId, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
-    /// Boxed-dyn handles for the `VcpuRegistry` trait impl.  Stored alongside
-    /// the concrete `handles` map so the shared threaded engine (Task 8+) can
-    /// call `VcpuRegistry::kick(tid)` without naming `VcpuKickHandle`.  The
-    /// existing bulk-kick path (`kick_ids`) continues to use the concrete map.
-    dyn_handles: Mutex<HashMap<ThreadId, Box<dyn carrick_hal::VcpuKickDyn>>>,
 }
 
 impl Default for VcpuKicker {
@@ -99,7 +103,6 @@ impl Default for VcpuKicker {
         Self {
             handles: Mutex::new(HashMap::new()),
             in_guest: Mutex::new(HashMap::new()),
-            dyn_handles: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -136,7 +139,7 @@ impl VcpuKicker {
     /// when a vCPU thread begins running, on its owning thread.
     pub fn register(&self, tid: ThreadId, handle: VcpuKickHandle) {
         #[allow(clippy::expect_used)]
-        self.handles.lock().insert(tid, handle);
+        self.handles.lock().insert(tid, Box::new(handle));
     }
 
     /// Number of threads with a registered (live) vCPU. The fork quiesce uses
@@ -164,7 +167,10 @@ impl VcpuKicker {
         #[allow(clippy::expect_used)]
         let ids: Vec<u64> = {
             let map = self.handles.lock();
-            map.get(&tid).into_iter().filter_map(valid_id).collect()
+            map.get(&tid)
+                .into_iter()
+                .filter_map(|h| h.raw_vcpu_id())
+                .collect()
         };
         kick_ids(&ids);
     }
@@ -179,7 +185,7 @@ impl VcpuKicker {
             let map = self.handles.lock();
             map.iter()
                 .filter(|(tid, _)| **tid != except)
-                .filter_map(|(_, h)| valid_id(h))
+                .filter_map(|(_, h)| h.raw_vcpu_id())
                 .collect()
         };
         kick_ids(&ids);
@@ -201,7 +207,7 @@ impl VcpuKicker {
         #[allow(clippy::expect_used)]
         let ids: Vec<u64> = {
             let map = self.handles.lock();
-            map.values().filter_map(valid_id).collect()
+            map.values().filter_map(|h| h.raw_vcpu_id()).collect()
         };
         kick_ids(&ids);
     }
@@ -239,34 +245,33 @@ fn kick_ids(_ids: &[u64]) {}
 impl carrick_hal::VcpuRegistry for VcpuKicker {
     /// Register a new vCPU handle for `tid`.
     ///
-    /// The trait accepts a `Box<dyn VcpuKickDyn>` so the shared loop can be
-    /// backend-agnostic.  On HVF the caller will always pass a boxed
-    /// `VcpuKickHandle`; here we store that alongside the existing concrete
-    /// handle map (which the efficient bulk-kick paths still use).  The boxed
-    /// handle is used when the shared loop calls `VcpuRegistry::kick(tid)`.
-    ///
-    /// NOTE: this method does NOT call the existing `VcpuKicker::register`
-    /// because that takes a concrete `VcpuKickHandle` and we cannot move out of
-    /// a `Box<dyn VcpuKickDyn>`.  The concrete map is populated by the existing
-    /// `VcpuKicker::register` call that the run loop already makes; this impl is
-    /// the forwarding seam for future callers that use only the trait.
+    /// The shared threaded loop registers each vCPU through this trait method,
+    /// passing the boxed `VcpuKickHandle` the engine produced. It is stored in
+    /// the single `handles` map the bulk-kick paths (`kick_all`/`kick_all_except`,
+    /// via `raw_vcpu_id`) and `count` read — so trait-driven registration and the
+    /// concrete `VcpuKicker::register` populate the same source of truth.
     fn register(&self, tid: ThreadId, handle: Box<dyn carrick_hal::VcpuKickDyn>) {
-        // Store the boxed dyn for trait-level kick(tid) calls.  The existing
-        // concrete handles map (used by kick_ids / kick_all_except etc.) is
-        // populated separately via VcpuKicker::register(tid, VcpuKickHandle).
-        self.dyn_handles.lock().insert(tid, handle);
+        self.handles.lock().insert(tid, handle);
+    }
+
+    fn register_in_guest(
+        &self,
+        tid: ThreadId,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        VcpuKicker::register_in_guest(self, tid)
     }
 
     fn unregister(&self, tid: ThreadId) {
-        // Forward to the existing method which cleans both the concrete handles
-        // map and the in_guest map.
         VcpuKicker::unregister(self, tid);
-        // Also remove from the dyn_handles map.
-        self.dyn_handles.lock().remove(&tid);
     }
 
     fn kick(&self, tid: ThreadId) {
         VcpuKicker::kick(self, tid);
+    }
+
+    #[inline]
+    fn kick_all(&self) {
+        VcpuKicker::kick_all(self);
     }
 
     fn kick_all_except(&self, except: ThreadId) {
