@@ -78,6 +78,11 @@ impl PlatformFutex for HvfFutex {
         interrupted: &dyn Fn() -> bool,
     ) -> i64 {
         let deadline = timeout.map(|d| std::time::Instant::now() + d);
+        // Pre-wait peek probe: mirror the single-threaded shared_futex_wait
+        // in runtime.rs (~line 1551-1552). Reads the current value at host_addr
+        // so carrick-trace can see the word before any wait commences.
+        let host_value = unsafe { (host_addr as *const u32).read() };
+        crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
         loop {
             if interrupted() {
                 // Translate: EINTR is -4 on both macOS and Linux.
@@ -98,7 +103,9 @@ impl PlatformFutex for HvfFutex {
                 }
                 None => SHARED_FUTEX_MAX_SLICE_US,
             };
+            crate::probes::ulock_wait(host_addr as u64, value, slice_us, 0, 0);
             let r = carrick_host::ulock::wait(host_addr, value, slice_us);
+            crate::probes::ulock_wait(host_addr as u64, value, slice_us, 1, r);
             if r >= 0 {
                 // Woken or value already differed — caller re-checks its
                 // condition.  Linux FUTEX_WAIT returns 0.

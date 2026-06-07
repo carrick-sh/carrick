@@ -831,7 +831,7 @@ fn finish_and_run_image(
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 
-// `apply_image_proc_state`, `stamp_identity_page`, `stamp_guest_tid`, and
+// `apply_image_proc_state`, `stamp_identity_page`, and
 // `proc_maps_from_address_space` were hoisted into `crate::vcpu_loop` (shared
 // with the threaded loop); imported above and called unchanged here.
 

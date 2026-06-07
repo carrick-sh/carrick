@@ -160,13 +160,14 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         Ok(())
     }
     fn destroy_vcpu_on_thread_exit(&mut self) {}
-    /// Construct a FRESH per-process fork context — a new vCPU registry and a
-    /// new private-futex backend — for the CHILD side of a guest `fork(2)`.
-    /// `libc::fork` replicates only the calling thread, so the child must drop
-    /// the parent's kicker / futex table (no phantom siblings, no stale waiters)
-    /// and start over with empty ones. Returned as the object-safe trait types
-    /// the shared loop holds so the core never names the concrete kicker / table.
-    fn fresh_fork_context(&self) -> (Arc<dyn VcpuRegistry>, Arc<dyn PlatformFutex>);
+    /// Construct a FRESH vCPU-kick registry for the CHILD side of a guest
+    /// `fork(2)`. `libc::fork` replicates only the calling thread, so the child
+    /// must drop the parent's kicker (no phantom siblings). Returned as the
+    /// object-safe trait type the shared loop holds so the core never names the
+    /// concrete kicker. The child rebuilds its private-futex backend separately
+    /// via the `PlatformFutexFactory` (over a fresh `FutexTable`) so the two
+    /// stay over the SAME table (the notify-signal-pending consistency invariant).
+    fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry>;
 }
 
 /// A token produced by [`HostForkCoordinator::prepare_host_fork`] and traded

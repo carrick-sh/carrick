@@ -1523,13 +1523,13 @@ where
                 // replicated only the calling thread). Drop their stale bookkeeping:
                 // a fresh futex table (no phantom waiters), a fresh kicker (only
                 // this vCPU is registered below), and an empty thread-handle vec.
-                // The fresh kicker comes from `fresh_fork_context()` (object-safe,
+                // The fresh kicker comes from `fresh_fork_kicker()` (object-safe,
                 // so the loop never names the concrete kicker); the fresh concrete
                 // private-futex table is built here and the matching `PlatformFutex`
                 // is derived from it via the threaded-through factory, so the two
                 // stay over the SAME table (the notify-signal-pending consistency
                 // invariant) without naming the backend.
-                let (fresh_kicker, _fresh_platform_futex) = engine.fresh_fork_context();
+                let fresh_kicker = engine.fresh_fork_kicker();
                 self.kicker = fresh_kicker;
                 self.futex = Arc::new(crate::thread::FutexTable::new());
                 self.platform_futex = (self.platform_futex_factory)(Arc::clone(&self.futex));
