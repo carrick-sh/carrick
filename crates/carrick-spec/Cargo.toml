@@ -14,6 +14,10 @@ workspace = true
 [features]
 default = []
 clap = ["dep:clap"]
+# In-memory filesystem backend selection (`--fs memory` / FsBackendKind::Memory).
+# Default OFF: a stock build runs only on the host-APFS backend, which is the
+# only fork-coherent option (see docs/superpowers/specs/2026-06-07-fs-memory-feature-gate-design.md).
+fs-memory = []
 
 [dependencies]
 camino = { workspace = true, features = ["serde1"] }
