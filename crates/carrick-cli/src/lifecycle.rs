@@ -371,6 +371,10 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
             container::short_id(&id)
         );
     }
+    // A memory-backed container is not joinable/startable. When the fs-memory
+    // feature is off, the variant cannot exist, so the guard is vacuous and is
+    // compiled out.
+    #[cfg(feature = "fs-memory")]
     if matches!(state.config.fs, Some(carrick_spec::FsBackendKind::Memory)) {
         bail!("start requires a container created with --fs host");
     }
