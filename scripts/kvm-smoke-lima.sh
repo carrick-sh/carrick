@@ -259,8 +259,58 @@ CEOF
       printf "FAIL [signals]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 10. Phase 2 / Task 5: threads — clone(CLONE_THREAD) sibling vCPUs.
+    #
+    #     XFAIL-UNTIL-TASK-7. This case is NON-FATAL on purpose. Task 5 delivers
+    #     the host-verifiable threading pieces only: the KvmKicker (cross-thread
+    #     pthread_kill -> KVM_RUN EINTR), the RegAccess/ThreadedEngine trait impls
+    #     on KvmTrapEngine, and build_sibling_spec/materialize_sibling (new vCPU on
+    #     the SAME VM). But the GENERIC threaded run loop (vcpu_loop.rs
+    #     `spawn_clone_thread`, which actually spawns a host thread per guest thread
+    #     and calls materialize_sibling) is NOT wired to the KVM run path until
+    #     Task 7 (`run_threaded_kvm_loop`). The single-threaded thin shim/dispatch
+    #     used by `run-elf` here does NOT spawn threads, so a multi-threaded guest
+    #     cannot complete yet. We therefore build + run the fixture and REPORT the
+    #     result, but never `exit 1`. Task 7 flips this to a required case.
+    #
+    #     Fixture: 4 pthreads each do 1000 mutex-guarded increments of a shared
+    #     counter -> 4000; join all; print "counter=4000"; exit 0.
+    cat > /tmp/cthr.c <<CEOF
+#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+#define NTHREADS 4
+#define NITERS   1000
+static long counter;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static void *worker(void *arg){
+  (void)arg;
+  for(int i=0;i<NITERS;i++){
+    pthread_mutex_lock(&lock);
+    counter++;
+    pthread_mutex_unlock(&lock);
+  }
+  return 0;
+}
+int main(void){
+  pthread_t t[NTHREADS];
+  for(int i=0;i<NTHREADS;i++) if(pthread_create(&t[i],0,worker,0)) return 2;
+  for(int i=0;i<NTHREADS;i++) if(pthread_join(t[i],0)) return 3;
+  char buf[32]; int n=snprintf(buf,sizeof buf,"counter=%ld",counter);
+  if(n<=0) return 4;
+  return write(1,buf,(size_t)n)==n ? (counter==(long)NTHREADS*NITERS?0:5) : 6;
+}
+CEOF
+    gcc -static -O2 -pthread -o /tmp/cthr /tmp/cthr.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cthr" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "counter=4000" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+threads]: 4 pthreads x 1000 mutex-guarded increments = counter=4000."
+    else
+      printf "XFAIL [threads] (expected until Task 7 wires run_threaded_kvm_loop): stdout=[%s] exit=%s\n" "$got" "$code" >&2
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).

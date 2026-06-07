@@ -2,13 +2,22 @@
 //! `SyscallTrap` contract. `next_syscall` runs KVM_RUN until the EL1 vector's
 //! sentinel store surfaces as `VcpuExit::MmioWrite { gpa: SENTINEL_GPA, .. }`,
 //! reads x0..x5,x8 into an `Aarch64SyscallFrame`, and returns it.
+use std::sync::Arc;
+
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
-use carrick_hal::{ForkOutcome, HvVcpu, HvVm, MemPerms, Reg, SyscallTrap, TrapError, VcpuExit};
+use carrick_hal::{
+    ForkOutcome, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, SyscallTrap, TrapError, VcpuExit,
+};
 use carrick_mem::memory::AddressSpace;
+use kvm_ioctls::VmFd;
 
-use crate::guest_setup::{BroughtUp, GuestRam, SENTINEL_GPA, bring_up, program_sysregs};
+use crate::fork::{VcpuSnapshot, seed_sibling_snapshot};
+use crate::guest_setup::{
+    BroughtUp, GuestRam, SENTINEL_GPA, WindowDesc, bring_up, program_sysregs,
+};
 use crate::kvm::{KvmVcpu, KvmVm};
+use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
 
 pub struct KvmTrapEngine {
     /// The live VM. Held (not `_`-prefixed) because `fork` swaps in a freshly
@@ -379,6 +388,177 @@ impl KvmTrapEngine {
             x8: g(8)?,
         })
     }
+}
+
+// SAFETY: `KvmTrapEngine` holds a `KvmVm` (`Arc<VmFd>` + `Option<Kvm>` — `File`s,
+// all `Send + Sync`), a `KvmVcpu` (`VcpuFd` — `Send + Sync` in kvm-ioctls), and a
+// `GuestRam` whose only non-`Send` members are the window mmaps' raw `*mut u8`.
+// Those host pointers are valid in EVERY thread of the process (threads share
+// the address space; no fork is involved on the sibling path), and the KVM fds
+// are usable from any thread, so moving the engine to its owning sibling thread
+// is sound. Mirrors `unsafe impl Send for HvfTrapEngine`.
+unsafe impl Send for KvmTrapEngine {}
+
+/// The `Send` payload [`carrick_hal::ThreadedEngine::build_sibling_spec`] hands
+/// to a freshly spawned host thread, which turns it into a sibling engine via
+/// [`carrick_hal::ThreadedEngine::materialize_sibling`]. It carries a SHARED
+/// handle to the parent's VM (`Arc<VmFd>` — `VmFd` is `Send + Sync`) plus the
+/// seeded register snapshot and the parent's window descriptors so the new vCPU
+/// runs in the SAME guest address space on the SAME VM. Unlike the `fork` child,
+/// NO new VM is built and NO memory is re-registered — the sibling shares every
+/// slot by construction.
+pub struct KvmSiblingSpec {
+    /// Shared handle to the SAME `VmFd` the parent runs on (Task 5 unknown #1).
+    vm: Arc<VmFd>,
+    /// `Send`-safe descriptors of the parent's host windows (raw `*mut u8`
+    /// carried as `usize`; same VA in the sibling thread — no fork). The sibling
+    /// builds a NON-OWNING `GuestRam` view over these (Task 5 unknown #2).
+    windows: Vec<WindowDesc>,
+    /// The parent's register file, already seeded for the new thread
+    /// (x0=0, sp_el0=child stack, tpidr_el0=tls, pc=post-svc).
+    snapshot: VcpuSnapshot,
+}
+
+impl carrick_hal::RegAccess for KvmTrapEngine {
+    fn get_reg(&self, r: Reg) -> Result<u64, OsError> {
+        self.vcpu.reg(r)
+    }
+    fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), OsError> {
+        self.vcpu.set_reg(r, v)
+    }
+    fn get_sys_reg(&self, r: SysReg) -> Result<u64, OsError> {
+        self.vcpu.get_sys_reg(r)
+    }
+    fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError> {
+        self.vcpu.set_sys_reg(r, v)
+    }
+    // FP/SIMD register access is Phase 4 (the sigframe builder is not yet wired
+    // on KVM). Return ENOSYS for now, mirroring the HVF non-aarch64 zero-stub.
+    fn get_vreg(&self, _n: u32) -> Result<u128, OsError> {
+        Err(OsError::from_raw(libc::ENOSYS))
+    }
+    fn set_vreg(&mut self, _n: u32, _v: u128) -> Result<(), OsError> {
+        Err(OsError::from_raw(libc::ENOSYS))
+    }
+    fn get_fpcr(&self) -> Result<u64, OsError> {
+        Err(OsError::from_raw(libc::ENOSYS))
+    }
+    fn set_fpcr(&mut self, _v: u64) -> Result<(), OsError> {
+        Err(OsError::from_raw(libc::ENOSYS))
+    }
+    fn get_fpsr(&self) -> Result<u64, OsError> {
+        Err(OsError::from_raw(libc::ENOSYS))
+    }
+    fn set_fpsr(&mut self, _v: u64) -> Result<(), OsError> {
+        Err(OsError::from_raw(libc::ENOSYS))
+    }
+}
+
+impl carrick_hal::ThreadedEngine for KvmTrapEngine {
+    type KickHandle = KvmKickHandle;
+    type SiblingSpec = KvmSiblingSpec;
+
+    fn kick_handle(&self) -> Self::KickHandle {
+        // Built on (and returning) the CURRENT vCPU thread's pthread id, so a
+        // cross-thread `pthread_kill(tid, SIGRTMIN)` forces this vCPU out of
+        // KVM_RUN. (The shared loop calls this on the owning vCPU thread.)
+        KvmKickHandle::for_current_thread()
+    }
+
+    fn wait_for_vcpu_slot() {
+        // NO-OP for KVM: there is no Apple-HVF-style concurrent-vCPU cap (HVF
+        // limits ~64 concurrent vCPUs; KVM has no such admission gate), so a
+        // sibling never has to wait for a slot before KVM_CREATE_VCPU.
+    }
+
+    fn build_sibling_spec(&self, stack: u64, tls: u64) -> Result<Self::SiblingSpec, TrapError> {
+        // Snapshot the parent vCPU (taken while it is suspended at the trapped
+        // `clone` syscall — atomic, race-free), then seed it for the new thread
+        // (x0=0, sp_el0=stack, tpidr_el0=tls, pc=parent.elr_el1 = post-svc).
+        let parent = self
+            .vcpu
+            .snapshot()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let snapshot = seed_sibling_snapshot(&parent, stack, tls);
+        // Share the SAME VM (Arc<VmFd>) + the parent's window descriptors so the
+        // sibling vCPU runs in the SAME address space on the SAME VM.
+        Ok(KvmSiblingSpec {
+            vm: self.vm.vm_handle(),
+            windows: self.ram.window_descriptors(),
+            snapshot,
+        })
+    }
+
+    fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
+    where
+        Self: Sized,
+    {
+        // Create a NEW vCPU on the SAME VM (siblings share all slots — no
+        // re-registration, unlike the fork child which rebuilds a fresh VM).
+        let vm = KvmVm::from_shared_vm(spec.vm);
+        let mut vcpu = vm
+            .add_sibling_vcpu()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Restore the seeded register file onto the new vCPU. Unlike the fork
+        // child, the PC is already the post-svc address (seed_sibling_snapshot
+        // set pc = parent.elr_el1), so there is NO sentinel-store replay to skip.
+        vcpu.restore(&spec.snapshot)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // A NON-OWNING view over the parent's host windows: the sibling reads/
+        // writes syscall buffers through the SAME backing but NEVER munmaps it
+        // (the owning parent frees it at process exit).
+        let ram = GuestRam::from_shared_windows(&spec.windows);
+        Ok(Self {
+            vm,
+            vcpu,
+            ram,
+            // A clone(CLONE_THREAD) sibling is NOT a forked child — it shares the
+            // parent's process and exits via the normal thread-exit path.
+            is_forked_child: false,
+        })
+    }
+
+    fn program_counter(&self) -> Result<u64, TrapError> {
+        self.vcpu
+            .reg(Reg::Pc)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+    }
+
+    fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
+        // SP_EL0 is `Reg::Sp` (the EL0/user stack), NOT a sysreg. `&self` write
+        // via the shared (`&self`) KVM_SET_ONE_REG path.
+        self.vcpu
+            .set_reg_shared(Reg::Sp, sp)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+    }
+
+    fn set_guest_thread_id(&self, _tid: u64) -> Result<(), TrapError> {
+        // No-op: KVM has no in-guest gettid fast path (that needs the syscall
+        // shim, which the KVM backend does not run). The guest reads its tid via
+        // the trapped `gettid` syscall, serviced by the dispatcher. Mirrors the
+        // HVF no-shim path.
+        Ok(())
+    }
+
+    fn destroy_vcpu_on_thread_exit(&mut self) {
+        // No explicit KVM teardown is required on a sibling thread exit: dropping
+        // `self.vcpu` (a `VcpuFd`) closes the vCPU fd, and the sibling's
+        // non-owning `GuestRam` view drops without munmapping the shared windows.
+        // The shared VM stays alive via the parent's (and other siblings') Arc.
+    }
+
+    fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
+        // CHILD side of a guest fork: libc::fork replicated only the calling
+        // thread, so the child drops the parent's kicker and starts over with an
+        // empty one (no phantom siblings). The child rebuilds its private-futex
+        // backend via the PlatformFutexFactory in the run loop (Task 7).
+        Arc::new(KvmKicker::new())
+    }
+
+    // The fork-lifecycle hooks (fork_vfork / release_vcpu_for_fork /
+    // rebuild_vcpu_after_fork / publish_vm_for_siblings) keep their trait-default
+    // no-ops: KVM's fork() rebuilds a fresh VM in the child directly (Task 2),
+    // and siblings share the live VM without any HVF-style publish step.
 }
 
 #[cfg(test)]

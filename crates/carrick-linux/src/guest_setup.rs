@@ -169,6 +169,14 @@ pub struct GuestRam {
     /// stage-1 edits + signal injection (Phase D), so `protect_range`/
     /// `unmap_range` stay no-ops for now.
     no_access: Vec<(u64, u64)>,
+    /// Whether this `GuestRam` OWNS its window mmaps (and must `munmap` them on
+    /// drop). `true` for the initial / fork-child / execve RAM. `false` for a
+    /// `clone(CLONE_THREAD)` sibling's view (see [`Self::from_shared_windows`]):
+    /// a sibling shares the SAME host mmaps as the parent thread (threads share
+    /// the address space, no fork), so it must NEVER `munmap` them — the parent
+    /// engine owns them and frees them at process exit. Double-`munmap` (or a
+    /// sibling freeing pages a live parent vCPU still uses) would be UB.
+    owns_windows: bool,
 }
 
 /// `munmap` the host backing of every window when the `GuestRam` is dropped.
@@ -185,6 +193,11 @@ pub struct GuestRam {
 /// so no live vCPU references the pages being unmapped.
 impl Drop for GuestRam {
     fn drop(&mut self) {
+        // A non-owning sibling VIEW (`clone(CLONE_THREAD)`) must NOT free the
+        // shared host mmaps — the owning parent does, at process exit.
+        if !self.owns_windows {
+            return;
+        }
         for w in &self.windows {
             // SAFETY: `host`..`host+len` is the mmap this window owns (created in
             // `add_window`); it is unmapped exactly once, on drop. KVM slots over
@@ -201,6 +214,7 @@ impl GuestRam {
         Self {
             windows: Vec::new(),
             no_access: Vec::new(),
+            owns_windows: true,
         }
     }
 
@@ -479,6 +493,61 @@ impl GuestRam {
     pub(crate) fn window_count(&self) -> usize {
         self.windows.len()
     }
+
+    /// `Send`-safe descriptors of this RAM's host-backed windows, for handing a
+    /// `clone(CLONE_THREAD)` sibling a VIEW of the SAME backing on another host
+    /// thread. The host pointer is carried as a `usize` (raw `*mut u8` is not
+    /// `Send`) — valid because threads share the address space (no fork), so the
+    /// host VA is the same in the sibling thread. Reconstituted by
+    /// [`Self::from_shared_windows`].
+    pub(crate) fn window_descriptors(&self) -> Vec<WindowDesc> {
+        self.windows
+            .iter()
+            .map(|w| WindowDesc {
+                base: w.base,
+                host: w.host as usize,
+                len: w.len,
+                kind: w.kind,
+            })
+            .collect()
+    }
+
+    /// Build a NON-OWNING `GuestRam` view over windows another thread owns (a
+    /// `clone(CLONE_THREAD)` sibling). The windows alias the SAME host mmaps the
+    /// parent engine owns; this view records them so the sibling's `read`/`write`
+    /// syscall-buffer path works, but its `Drop` is a NO-OP (`owns_windows =
+    /// false`) — only the owning parent `munmap`s, at process exit. `no_access`
+    /// starts empty: the sibling shares the parent's address space, but the
+    /// HOST-SIDE PROT_NONE bookkeeping is per-engine (a future Phase-4 concern);
+    /// the MVP threads fixture touches no PROT_NONE buffers.
+    pub(crate) fn from_shared_windows(descs: &[WindowDesc]) -> Self {
+        let windows = descs
+            .iter()
+            .map(|d| Window {
+                base: d.base,
+                host: d.host as *mut u8,
+                len: d.len,
+                kind: d.kind,
+            })
+            .collect();
+        Self {
+            windows,
+            no_access: Vec::new(),
+            owns_windows: false,
+        }
+    }
+}
+
+/// A `Send` descriptor of one host-backed guest window, used to hand a
+/// `clone(CLONE_THREAD)` sibling a view of the SAME backing across host threads.
+/// `host` is a `usize` (not `*mut u8`) so the enclosing sibling-spec is `Send`;
+/// it is the same host VA in every thread of the process (no fork involved).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WindowDesc {
+    pub base: u64,
+    pub host: usize,
+    pub len: usize,
+    pub kind: WindowKind,
 }
 
 /// Load `image` (a freestanding aarch64 ELF), build the stage-1 identity map +

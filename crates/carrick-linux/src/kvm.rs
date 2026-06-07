@@ -3,10 +3,13 @@
 //! KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT; guest RAM via
 //! KVM_SET_USER_MEMORY_REGION over a host mmap; registers via
 //! KVM_GET/SET_ONE_REG; run via KVM_RUN. kick() is a signal-based vCPU exit.
+use std::sync::Arc;
+
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;
 use kvm_bindings::{KVM_ARM_VCPU_PSCI_0_2, KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit as KvmExit, VcpuFd, VmFd};
+use libc;
 
 use crate::fork::VcpuSnapshot;
 
@@ -85,8 +88,20 @@ fn sysreg_to_id(r: SysReg) -> u64 {
 }
 
 pub struct KvmVm {
-    _kvm: Kvm,
-    vm: VmFd,
+    /// `Some` for a VM this engine OWNS (it opened `/dev/kvm` itself, via
+    /// [`Self::create_empty`]); `None` for a SIBLING vCPU's VM handle, which
+    /// shares the parent's already-open `/dev/kvm` through `vm: Arc<VmFd>` and
+    /// must NOT carry a second `Kvm` (`fork`'s child rebuilds a fresh VM; a
+    /// `clone(CLONE_THREAD)` sibling re-uses the SAME `VmFd`). The field keeps
+    /// the owner's `/dev/kvm` fd alive for the VM's lifetime.
+    _kvm: Option<Kvm>,
+    /// The VM fd, `Arc`-shared so a `clone(CLONE_THREAD)` sibling can create a
+    /// NEW vCPU (`KVM_CREATE_VCPU`) on the SAME VM — `kvm_ioctls::VmFd` is
+    /// `Send + Sync` (its fields are `File` + `usize`) and `create_vcpu` /
+    /// `set_user_memory_region` / `get_preferred_target` all take `&self`, so a
+    /// shared `&VmFd` suffices for both vCPU creation and (fork-child) memory
+    /// registration. See Task 5 unknown #1.
+    vm: Arc<VmFd>,
     next_slot: u32,
 }
 pub struct KvmVcpu {
@@ -103,10 +118,58 @@ impl KvmVm {
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
         let vm = kvm.create_vm().map_err(|e| os_err("KVM_CREATE_VM", e))?;
         Ok(Self {
-            _kvm: kvm,
-            vm,
+            _kvm: Some(kvm),
+            vm: Arc::new(vm),
             next_slot: 0,
         })
+    }
+
+    /// A cloneable handle to the SAME underlying `VmFd`, for a
+    /// `clone(CLONE_THREAD)` sibling vCPU. The sibling's [`KvmVm`] is built from
+    /// this via [`Self::from_shared_vm`] and creates a NEW vCPU on it — siblings
+    /// share every memory slot by construction (same VM), so there is NO
+    /// re-registration. `Send` because `VmFd` is `Send + Sync`.
+    pub(crate) fn vm_handle(&self) -> Arc<VmFd> {
+        Arc::clone(&self.vm)
+    }
+
+    /// Build a sibling [`KvmVm`] that SHARES the parent's `VmFd` (a
+    /// `clone(CLONE_THREAD)` thread). It owns no `Kvm` handle (the parent keeps
+    /// `/dev/kvm` open) and registers no memory (the slots already exist on the
+    /// shared VM); `next_slot` is irrelevant for a sibling and starts at 0.
+    pub(crate) fn from_shared_vm(vm: Arc<VmFd>) -> Self {
+        Self {
+            _kvm: None,
+            vm,
+            next_slot: 0,
+        }
+    }
+
+    /// Create a NEW vCPU on this (shared) VM. Used by `materialize_sibling`:
+    /// a `clone(CLONE_THREAD)` sibling adds a vCPU to the SAME VM the parent
+    /// runs on. Delegates to [`HvVm::add_vcpu`] (`KVM_CREATE_VCPU` + preferred-
+    /// target init); the vCPU is returned UNPROGRAMMED for the caller to restore
+    /// the seeded [`VcpuSnapshot`] onto.
+    pub(crate) fn add_sibling_vcpu(&self) -> Result<KvmVcpu, OsError> {
+        self.create_vcpu_on_shared_vm()
+    }
+
+    /// `KVM_CREATE_VCPU` + preferred-target init on the shared `VmFd` (`&self`
+    /// — no `next_slot` mutation, unlike [`HvVm::add_vcpu`]). Factored so both
+    /// the owning and sibling paths share one vCPU-init sequence.
+    fn create_vcpu_on_shared_vm(&self) -> Result<KvmVcpu, OsError> {
+        let fd = self
+            .vm
+            .create_vcpu(0)
+            .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
+        let mut kvi = kvm_bindings::kvm_vcpu_init::default();
+        self.vm
+            .get_preferred_target(&mut kvi)
+            .map_err(|e| os_err("KVM_ARM_PREFERRED_TARGET", e))?;
+        kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+        fd.vcpu_init(&kvi)
+            .map_err(|e| os_err("KVM_ARM_VCPU_INIT", e))?;
+        Ok(KvmVcpu { fd })
     }
 
     /// Unregister a previously-mapped memory slot by re-issuing
@@ -179,21 +242,10 @@ impl HvVm for KvmVm {
     }
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, OsError> {
-        let fd = self
-            .vm
-            .create_vcpu(0)
-            .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
-        // aarch64: ask the kernel for its preferred CPU target, then init.
-        let mut kvi = kvm_bindings::kvm_vcpu_init::default();
-        self.vm
-            .get_preferred_target(&mut kvi)
-            .map_err(|e| os_err("KVM_ARM_PREFERRED_TARGET", e))?;
-        // PSCI 0.2 so a future PSCI SYSTEM_OFF / smoke path is available; the
-        // MVP exits via exit_group, but the bit is harmless and standard.
-        kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
-        fd.vcpu_init(&kvi)
-            .map_err(|e| os_err("KVM_ARM_VCPU_INIT", e))?;
-        Ok(KvmVcpu { fd })
+        // aarch64: KVM_CREATE_VCPU + preferred-target init. Shared with the
+        // sibling path ([`Self::add_sibling_vcpu`]) so the feature bits
+        // (PSCI 0.2) cannot drift between bring-up and clone(CLONE_THREAD).
+        self.create_vcpu_on_shared_vm()
     }
 
     fn destroy(self) -> Result<(), OsError> {
@@ -204,7 +256,14 @@ impl HvVm for KvmVm {
 
 impl HvVcpu for KvmVcpu {
     fn run(&mut self) -> Result<VcpuExit, OsError> {
-        match self.fd.run().map_err(|e| os_err("KVM_RUN", e))? {
+        // EINTR from the ioctl means a signal (KICK_SIGNAL via pthread_kill) interrupted
+        // KVM_RUN before any guest exit — this is the cross-thread kick path.
+        let exit = match self.fd.run() {
+            Ok(e) => e,
+            Err(e) if e.errno() == libc::EINTR => return Ok(VcpuExit::Kicked),
+            Err(e) => return Err(os_err("KVM_RUN", e)),
+        };
+        match exit {
             KvmExit::MmioWrite(gpa, data) => {
                 // KVM hands us the bytes written and the length via the slice.
                 let len = data.len() as u8;
@@ -255,6 +314,27 @@ impl HvVcpu for KvmVcpu {
 }
 
 impl KvmVcpu {
+    /// Write a core register through `&self` (not `&mut self`). `KVM_SET_ONE_REG`
+    /// is a `&self` ioctl on `VcpuFd`, so this needs no exclusive borrow — used
+    /// by the `&self` [`carrick_hal::ThreadedEngine::set_guest_sp_el0`] (a clone
+    /// child's `child_stack` write) where the shared loop holds only `&E`.
+    pub fn set_reg_shared(&self, r: Reg, v: u64) -> Result<(), OsError> {
+        let bytes = v.to_le_bytes();
+        self.fd
+            .set_one_reg(reg_to_id(r), &bytes)
+            .map_err(|e| os_err("KVM_SET_ONE_REG", e))?;
+        Ok(())
+    }
+
+    /// Write a system register through `&self` (see [`Self::set_reg_shared`]).
+    pub fn set_sys_reg_shared(&self, r: SysReg, v: u64) -> Result<(), OsError> {
+        let bytes = v.to_le_bytes();
+        self.fd
+            .set_one_reg(sysreg_to_id(r), &bytes)
+            .map_err(|e| os_err("KVM_SET_ONE_REG(sysreg)", e))?;
+        Ok(())
+    }
+
     /// Read a system register through `KVM_GET_ONE_REG` + the sysreg demux
     /// (`sysreg_to_id`). Symmetric to [`HvVcpu::set_sys_reg`]; used by
     /// [`Self::snapshot`] to capture the stage-1 MMU + thread-pointer registers
