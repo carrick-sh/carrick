@@ -102,11 +102,8 @@ async fn version_reports_carrick() {
 
 #[tokio::test]
 async fn create_returns_id() {
-    // The container registry is a persistent on-disk store shared across runs,
-    // and DELETE /containers/{id} (the bollard cleanup below) is not wired up
-    // yet — so a prior run can leak the `m0create` name and make `carrick
-    // create` fail with a name conflict. Pre-clean it (best-effort) so the test
-    // is idempotent.
+    // The container registry is a persistent on-disk store shared across runs;
+    // pre-clean so the test is idempotent.
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
         .args(["rm", "-f", "m0create"])
         .output();
@@ -139,7 +136,7 @@ async fn create_then_start_runs() {
     let (_server, sock, _dir) = spawn_server();
     let docker =
         bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
-    // idempotency: the registry is persistent and DELETE isn't wired until Task 8.
+    // Pre-clean: the registry is persistent across runs.
     let _ = docker.remove_container("m0start", None).await;
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
         .args(["rm", "-f", "m0start"])
@@ -385,4 +382,355 @@ async fn streams_build_over_socket() {
         saw_success,
         "expected a success (aux ID / Successfully built) frame"
     );
+}
+
+#[tokio::test]
+async fn list_containers_shows_running() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0list"])
+        .output();
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/sleep".to_string(), "10".to_string()]),
+        ..Default::default()
+    };
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0list".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            "m0list",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+
+    let list = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    let found = list.iter().any(|c| {
+        c.names
+            .as_ref()
+            .is_some_and(|n| n.contains(&"/m0list".to_string()))
+    });
+    assert!(found, "expected container m0list in the list");
+
+    // Clean up
+    let _ = docker
+        .remove_container(
+            "m0list",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn stop_and_restart_lifecycle() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0stopres"])
+        .output();
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/sleep".to_string(), "30".to_string()]),
+        ..Default::default()
+    };
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0stopres".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            "m0stopres",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+
+    // Inspect: should be running (poll to wait for startup)
+    let mut running = false;
+    for _ in 0..150 {
+        let inspect = docker.inspect_container("m0stopres", None).await.unwrap();
+        if inspect.state.unwrap().running.unwrap() {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(running, "container should be running after start");
+
+    // Stop it
+    docker.stop_container("m0stopres", None).await.unwrap();
+
+    // Inspect: should be stopped
+    let inspect = docker.inspect_container("m0stopres", None).await.unwrap();
+    assert!(!inspect.state.unwrap().running.unwrap());
+
+    // Restart it
+    docker.restart_container("m0stopres", None).await.unwrap();
+
+    // Inspect: should be running again (poll to wait for startup)
+    let mut running_again = false;
+    for _ in 0..150 {
+        let inspect = docker.inspect_container("m0stopres", None).await.unwrap();
+        if inspect.state.unwrap().running.unwrap() {
+            running_again = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(running_again, "container should be running after restart");
+
+    // Clean up
+    let _ = docker
+        .remove_container(
+            "m0stopres",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn logs_collect_output() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0logs"])
+        .output();
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec![
+            "/bin/echo".to_string(),
+            "hello_serve_logs".to_string(),
+        ]),
+        ..Default::default()
+    };
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0logs".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            "m0logs",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+
+    // Wait for it to exit
+    let mut waits = docker.wait_container(
+        "m0logs",
+        None::<bollard::container::WaitContainerOptions<String>>,
+    );
+    let _ = waits.next().await.unwrap().unwrap();
+
+    // Collect logs
+    let mut logs_stream = docker.logs(
+        "m0logs",
+        Some(bollard::container::LogsOptions::<String> {
+            stdout: true,
+            ..Default::default()
+        }),
+    );
+    let mut output = String::new();
+    while let Some(log) = logs_stream.next().await {
+        let log = log.unwrap();
+        output.push_str(&log.to_string());
+    }
+    assert!(
+        output.contains("hello_serve_logs"),
+        "logs did not contain expected output: {:?}",
+        output
+    );
+
+    // Clean up
+    let _ = docker
+        .remove_container(
+            "m0logs",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn list_and_pull_and_remove_images() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+
+    // Pull alpine:3.20
+    let mut pull_stream = docker.create_image(
+        Some(bollard::image::CreateImageOptions {
+            from_image: "alpine:3.20",
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    let mut saw_pull_progress = false;
+    while let Some(item) = pull_stream.next().await {
+        let item = item.unwrap();
+        if item.status.is_some() {
+            saw_pull_progress = true;
+        }
+    }
+    assert!(saw_pull_progress, "expected pull progress frames");
+
+    // List images: check if alpine:3.20 is present
+    let images = docker
+        .list_images(None::<bollard::image::ListImagesOptions<String>>)
+        .await
+        .unwrap();
+    let found = images
+        .iter()
+        .any(|img| img.repo_tags.iter().any(|tag| tag.contains("alpine:3.20")));
+    assert!(found, "expected alpine:3.20 image in the list");
+
+    // Remove the image
+    let _ = docker
+        .remove_image("alpine:3.20", None, None)
+        .await
+        .unwrap();
+
+    // List images again: check it was removed
+    let images = docker
+        .list_images(None::<bollard::image::ListImagesOptions<String>>)
+        .await
+        .unwrap();
+    let found_after = images
+        .iter()
+        .any(|img| img.repo_tags.iter().any(|tag| tag.contains("alpine:3.20")));
+    assert!(!found_after, "expected alpine:3.20 image to be removed");
+}
+
+#[tokio::test]
+async fn exec_attached_collects_output() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0exec"])
+        .output();
+
+    let body = bollard::container::Config {
+        image: Some("ubuntu:24.04".to_string()),
+        cmd: Some(vec!["/bin/sleep".to_string(), "60".to_string()]),
+        ..Default::default()
+    };
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0exec".to_string(),
+                ..Default::default()
+            }),
+            body,
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            "m0exec",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+
+    // Poll to wait for it to become running
+    let mut running = false;
+    for _ in 0..150 {
+        let inspect = docker.inspect_container("m0exec", None).await.unwrap();
+        if inspect.state.unwrap().running.unwrap() {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(running, "container should be running");
+
+    // Create exec
+    let exec_create = docker
+        .create_exec(
+            "m0exec",
+            bollard::exec::CreateExecOptions {
+                cmd: Some(vec![
+                    "/bin/echo".to_string(),
+                    "hello_exec_output".to_string(),
+                ]),
+                attach_stdout: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Start exec (attached, collecting logs)
+    let start_exec_res = docker.start_exec(&exec_create.id, None).await.unwrap();
+    let mut output = String::new();
+    if let bollard::exec::StartExecResults::Attached {
+        output: mut stream, ..
+    } = start_exec_res
+    {
+        while let Some(log) = stream.next().await {
+            let log = log.unwrap();
+            output.push_str(&log.to_string());
+        }
+    } else {
+        panic!("expected attached start_exec results");
+    }
+
+    assert!(
+        output.contains("hello_exec_output"),
+        "exec output was incorrect: {:?}",
+        output
+    );
+
+    // Clean up
+    let _ = docker
+        .remove_container(
+            "m0exec",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
 }

@@ -45,7 +45,7 @@ fn container_action(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Pull a single `key=value` out of a raw query string (`a=1&b=2`).
-fn query_param(query: &str, key: &str) -> Option<String> {
+pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
         if k == key { Some(v.to_string()) } else { None }
@@ -89,15 +89,54 @@ pub(crate) async fn route(
         return Ok(crate::serve::build::build_response(&query, body_bytes));
     }
 
+    if method == Method::GET && container_action(&path).map(|(_, a)| a) == Some("logs") {
+        let id = container_action(&path)
+            .map(|(id, _)| id)
+            .unwrap_or_default()
+            .to_string();
+        let follow = query_param(&query, "follow").is_some_and(|v| v == "true" || v == "1");
+        let tail = query_param(&query, "tail").and_then(|v| v.parse::<usize>().ok());
+        return Ok(crate::serve::handlers::logs_container(id, follow, tail));
+    }
+
+    if method == Method::POST && path == "/images/create" {
+        return Ok(crate::serve::handlers::pull_image(&query));
+    }
+
+    if method == Method::POST && path.starts_with("/exec/") && path.ends_with("/start") {
+        let exec_id = path
+            .strip_prefix("/exec/")
+            .and_then(|s| s.strip_suffix("/start"))
+            .unwrap_or_default()
+            .to_string();
+        return Ok(crate::serve::handlers::start_exec_route(exec_id, req).await);
+    }
+
     let body_bytes = match BodyExt::collect(req.into_body()).await {
         Ok(b) => b.to_bytes(),
         Err(_) => Bytes::new(),
     };
 
     let resp = match (&method, path.as_str()) {
-        (&Method::GET, "/_ping") => text(StatusCode::OK, "OK"),
+        (&Method::GET, "/_ping") | (&Method::HEAD, "/_ping") => text(StatusCode::OK, "OK"),
         (&Method::GET, "/version") => json(StatusCode::OK, crate::serve::handlers::version_json()),
         (&Method::GET, "/info") => json(StatusCode::OK, crate::serve::handlers::info_json()),
+        (&Method::GET, "/containers/json") => {
+            let all = query_param(&query, "all").is_some_and(|v| v == "true" || v == "1");
+            let (status, body) = crate::serve::handlers::list_containers(all);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, p) if container_action(p).map(|(_, a)| a) == Some("json") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let (status, body) = crate::serve::handlers::inspect_container(id);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
         (&Method::POST, "/containers/create") => {
             let name = query_param(&query, "name");
             let (status, body) =
@@ -110,6 +149,33 @@ pub(crate) async fn route(
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("start") => {
             let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
             let (status, body) = crate::serve::handlers::start_container(id);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("stop") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let t = query_param(&query, "t").and_then(|v| v.parse::<u64>().ok());
+            let (status, body) = crate::serve::handlers::stop_container(id, t);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("kill") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let signal = query_param(&query, "signal");
+            let (status, body) = crate::serve::handlers::kill_container(id, signal.as_deref());
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("restart") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let t = query_param(&query, "t").and_then(|v| v.parse::<u64>().ok());
+            let (status, body) = crate::serve::handlers::restart_container(id, t);
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -138,6 +204,83 @@ pub(crate) async fn route(
         {
             let id = p.strip_prefix("/containers/").unwrap_or_default();
             let (status, body) = crate::serve::handlers::remove_container(id);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, "/images/json") => {
+            let (status, body) = crate::serve::handlers::list_images();
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, p)
+            if p.starts_with("/images/") && p.ends_with("/json") && p != "/images/json" =>
+        {
+            let name = p
+                .strip_prefix("/images/")
+                .and_then(|s| s.strip_suffix("/json"))
+                .unwrap_or_default();
+            let (status, body) = crate::serve::handlers::inspect_image(name);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if p.starts_with("/images/") && p.ends_with("/tag") => {
+            let name = p
+                .strip_prefix("/images/")
+                .and_then(|s| s.strip_suffix("/tag"))
+                .unwrap_or_default();
+            let repo = query_param(&query, "repo").unwrap_or_default();
+            let tag = query_param(&query, "tag").unwrap_or_default();
+            let (status, body) = crate::serve::handlers::tag_image(name, &repo, &tag);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::DELETE, p) if p.strip_prefix("/images/").is_some_and(|s| !s.is_empty()) => {
+            let name = p.strip_prefix("/images/").unwrap_or_default();
+            let (status, body) = crate::serve::handlers::remove_image(name);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, p) if p.starts_with("/exec/") && p.ends_with("/json") => {
+            let exec_id = p
+                .strip_prefix("/exec/")
+                .and_then(|s| s.strip_suffix("/json"))
+                .unwrap_or_default();
+            let (status, body) = crate::serve::handlers::inspect_exec(exec_id);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("exec") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let (status, body) = crate::serve::handlers::create_exec(&body_bytes, id);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("rename") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let new_name = query_param(&query, "name").unwrap_or_default();
+            let (status, body) = crate::serve::handlers::rename_container(id, &new_name);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, p) if container_action(p).map(|(_, a)| a) == Some("top") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let (status, body) = crate::serve::handlers::top_container(id);
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
