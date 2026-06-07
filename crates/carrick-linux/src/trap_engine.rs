@@ -448,25 +448,23 @@ impl carrick_hal::RegAccess for KvmTrapEngine {
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError> {
         self.vcpu.set_sys_reg(r, v)
     }
-    // FP/SIMD register access is Phase 4 (the sigframe builder is not yet wired
-    // on KVM). Return ENOSYS for now, mirroring the HVF non-aarch64 zero-stub.
-    fn get_vreg(&self, _n: u32) -> Result<u128, OsError> {
-        Err(OsError::from_raw(libc::ENOSYS))
+    fn get_vreg(&self, n: u32) -> Result<u128, OsError> {
+        self.vcpu.get_vreg(n)
     }
-    fn set_vreg(&mut self, _n: u32, _v: u128) -> Result<(), OsError> {
-        Err(OsError::from_raw(libc::ENOSYS))
+    fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), OsError> {
+        self.vcpu.set_vreg(n, v)
     }
     fn get_fpcr(&self) -> Result<u64, OsError> {
-        Err(OsError::from_raw(libc::ENOSYS))
+        Ok(u64::from(self.vcpu.get_fpcr()?))
     }
-    fn set_fpcr(&mut self, _v: u64) -> Result<(), OsError> {
-        Err(OsError::from_raw(libc::ENOSYS))
+    fn set_fpcr(&mut self, v: u64) -> Result<(), OsError> {
+        self.vcpu.set_fpcr(v as u32)
     }
     fn get_fpsr(&self) -> Result<u64, OsError> {
-        Err(OsError::from_raw(libc::ENOSYS))
+        Ok(u64::from(self.vcpu.get_fpsr()?))
     }
-    fn set_fpsr(&mut self, _v: u64) -> Result<(), OsError> {
-        Err(OsError::from_raw(libc::ENOSYS))
+    fn set_fpsr(&mut self, v: u64) -> Result<(), OsError> {
+        self.vcpu.set_fpsr(v as u32)
     }
 }
 
@@ -733,5 +731,25 @@ mod execve_tests {
             new_entry,
             "ELR_EL1 must hold the new image's entry"
         );
+    }
+
+    #[test]
+    fn kvm_fpsimd_roundtrip() {
+        use carrick_hal::RegAccess;
+        if !kvm_available() {
+            eprintln!("SKIP kvm_fpsimd_roundtrip: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        // Distinct u128 patterns into V0..V3, known u32s into FPSR/FPCR, read back.
+        for n in 0..4u32 {
+            let v = (0x1111_1111_0000_0000u128 << (n as u128)) | (u128::from(n) + 1);
+            engine.set_vreg(n, v).unwrap();
+            assert_eq!(engine.get_vreg(n).unwrap(), v, "V{n} must round-trip");
+        }
+        engine.set_fpsr(0x0000_0010).unwrap();
+        engine.set_fpcr(0x0040_0000).unwrap();
+        assert_eq!(engine.get_fpsr().unwrap(), 0x0000_0010, "FPSR round-trips");
+        assert_eq!(engine.get_fpcr().unwrap(), 0x0040_0000, "FPCR round-trips");
     }
 }

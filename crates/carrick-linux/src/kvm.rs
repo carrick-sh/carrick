@@ -26,9 +26,7 @@ fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
 //   KVM_REG_ARM64_SYSREG    = 0x0013 << 16  (the sysreg demux)
 const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
 const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
-#[allow(dead_code)]
 const KVM_REG_SIZE_U128: u64 = 0x0040_0000_0000_0000;
-#[allow(dead_code)]
 const KVM_REG_SIZE_U32: u64 = 0x0020_0000_0000_0000;
 const KVM_REG_ARM_COPROC_SHIFT: u64 = 16;
 const KVM_REG_ARM_CORE: u64 = 0x0010 << KVM_REG_ARM_COPROC_SHIFT;
@@ -56,11 +54,8 @@ const KVM_REGS_SPSR_EL1: u64 = 288;
 // after `spsr[KVM_NR_SPSR]` (288 + 5*8 = 328). Its first member `vregs[32]` is
 // 16-byte aligned, so fp_regs is padded to offset 336. Within it: vregs[n]@16*n,
 // fpsr@512, fpcr@516.
-#[allow(dead_code)]
 const KVM_REGS_FP_REGS: u64 = 336;
-#[allow(dead_code)]
 const KVM_REGS_FP_FPSR: u64 = KVM_REGS_FP_REGS + 512; // 848
-#[allow(dead_code)]
 const KVM_REGS_FP_FPCR: u64 = KVM_REGS_FP_REGS + 516; // 852
 
 // KVM_REG_ARM64_SYSREG: id = base | (op0<<14)|(op1<<11)|(crn<<7)|(crm<<3)|op2
@@ -78,16 +73,13 @@ fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
 /// Core-reg id for the 128-bit SIMD/FP vector register V`n` (n in 0..32). The
 /// FP/SIMD regs live in `fp_regs`, the trailing CORE field of `struct kvm_regs`,
 /// so they are addressed by byte-offset just like `core_reg_id`.
-#[allow(dead_code)]
 fn vreg_id(n: u32) -> u64 {
     assert!(n < 32, "vreg index {n} out of range");
     KVM_REG_ARM64 | KVM_REG_SIZE_U128 | KVM_REG_ARM_CORE | ((KVM_REGS_FP_REGS + u64::from(n) * 16) / 4)
 }
-#[allow(dead_code)]
 fn fpsr_id() -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | (KVM_REGS_FP_FPSR / 4)
 }
-#[allow(dead_code)]
 fn fpcr_id() -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | (KVM_REGS_FP_FPCR / 4)
 }
@@ -413,6 +405,51 @@ impl KvmVcpu {
             .get_one_reg(sysreg_to_id(r), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(sysreg)", e))?;
         Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// Read the 128-bit SIMD/FP vector register V`n` (n in 0..32) via
+    /// `KVM_GET_ONE_REG`. Little-endian; a non-16-byte slice yields EINVAL.
+    pub fn get_vreg(&self, n: u32) -> Result<u128, OsError> {
+        let mut bytes = [0u8; 16];
+        self.fd
+            .get_one_reg(vreg_id(n), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(vreg)", e))?;
+        Ok(u128::from_le_bytes(bytes))
+    }
+    pub fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), OsError> {
+        let bytes = v.to_le_bytes();
+        self.fd
+            .set_one_reg(vreg_id(n), &bytes)
+            .map_err(|e| os_err("KVM_SET_ONE_REG(vreg)", e))?;
+        Ok(())
+    }
+    pub fn get_fpsr(&self) -> Result<u32, OsError> {
+        let mut bytes = [0u8; 4];
+        self.fd
+            .get_one_reg(fpsr_id(), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(fpsr)", e))?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+    pub fn set_fpsr(&mut self, v: u32) -> Result<(), OsError> {
+        let bytes = v.to_le_bytes();
+        self.fd
+            .set_one_reg(fpsr_id(), &bytes)
+            .map_err(|e| os_err("KVM_SET_ONE_REG(fpsr)", e))?;
+        Ok(())
+    }
+    pub fn get_fpcr(&self) -> Result<u32, OsError> {
+        let mut bytes = [0u8; 4];
+        self.fd
+            .get_one_reg(fpcr_id(), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(fpcr)", e))?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+    pub fn set_fpcr(&mut self, v: u32) -> Result<(), OsError> {
+        let bytes = v.to_le_bytes();
+        self.fd
+            .set_one_reg(fpcr_id(), &bytes)
+            .map_err(|e| os_err("KVM_SET_ONE_REG(fpcr)", e))?;
+        Ok(())
     }
 
     /// Capture the parent vCPU's architectural register file before `fork(2)`
