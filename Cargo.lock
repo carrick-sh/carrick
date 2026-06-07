@@ -457,6 +457,7 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-mem",
+ "carrick-thread",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",

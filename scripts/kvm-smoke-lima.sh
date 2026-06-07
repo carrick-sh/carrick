@@ -309,8 +309,99 @@ CEOF
     else
       printf "XFAIL [threads] (expected until Task 7 wires run_threaded_kvm_loop): stdout=[%s] exit=%s\n" "$got" "$code" >&2
     fi
+
+    # 11. Phase 2 / Task 6: condvar-requeue — the PRIVATE (in-process, cross-
+    #     thread) futex path exercised by a pthread condvar: glibc lowers
+    #     pthread_cond_wait/signal/broadcast onto FUTEX_WAIT / FUTEX_WAKE /
+    #     FUTEX_CMP_REQUEUE, which the dispatcher routes to the KvmFutex
+    #     private_wait/private_wake/requeue methods (delegated to the in-process
+    #     FutexTable). KvmFutex (Task 6) is COMPLETE and host-unit-tested
+    #     (`cargo test -p carrick-linux kvm_futex`), but driving a condvar needs
+    #     MULTIPLE vCPU threads, i.e. the generic threaded run loop — which is not
+    #     wired to KVM until Task 7 (run_threaded_kvm_loop). So like case 10 this
+    #     is XFAIL-UNTIL-TASK-7 and NON-FATAL. Task 7 flips it to required.
+    cat > /tmp/ccv.c <<CEOF
+#include <pthread.h>
+#include <unistd.h>
+static pthread_mutex_t m=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  c=PTHREAD_COND_INITIALIZER;
+static int ready, done;
+#define NW 3
+static void *waiter(void *a){
+  (void)a;
+  pthread_mutex_lock(&m);
+  while(!ready) pthread_cond_wait(&c,&m); /* FUTEX_WAIT (+ CMP_REQUEUE on signal) */
+  done++;
+  pthread_mutex_unlock(&m);
+  return 0;
+}
+int main(void){
+  pthread_t t[NW];
+  for(int i=0;i<NW;i++) if(pthread_create(&t[i],0,waiter,0)) return 2;
+  usleep(50*1000);
+  pthread_mutex_lock(&m);
+  ready=1;
+  pthread_cond_broadcast(&c);            /* FUTEX_WAKE / CMP_REQUEUE all waiters */
+  pthread_mutex_unlock(&m);
+  for(int i=0;i<NW;i++) if(pthread_join(t[i],0)) return 3;
+  return write(1,"condvar-ok",10)==10 ? (done==NW?0:4) : 5;
+}
+CEOF
+    gcc -static -O2 -pthread -o /tmp/ccv /tmp/ccv.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/ccv" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "condvar-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+condvar-requeue]: pthread cond_wait/broadcast (FUTEX_WAIT/WAKE/CMP_REQUEUE) via KvmFutex private path."
+    else
+      printf "XFAIL [condvar-requeue] (expected until Task 7 wires run_threaded_kvm_loop): stdout=[%s] exit=%s\n" "$got" "$code" >&2
+    fi
+
+    # 12. Phase 2 / Task 6: shared-futex-fork — the SHARED (cross-PROCESS,
+    #     MAP_SHARED) futex path exercised across a fork: a glibc binary mmaps a
+    #     MAP_SHARED|MAP_ANONYMOUS futex word, forks, the child FUTEX_WAITs on it
+    #     and the parent writes the word + FUTEX_WAKEs. The dispatcher routes the
+    #     shared-aperture address to KvmFutex::shared_wait/shared_wake (bare host
+    #     SYS_futex on the inherited shared page). KvmFutex (Task 6) is COMPLETE
+    #     and host-unit-tested for this round-trip (the cross-THREAD analogue runs
+    #     in `cargo test -p carrick-linux kvm_futex`). Driving it end-to-end
+    #     through the GUEST needs the full dispatcher shared_futex_host_addr
+    #     GPA->host translation on the live VM AND the threaded run loop blocking
+    #     futex re-dispatch — both Task 7 (run_threaded_kvm_loop). The thin shim
+    #     used by `run-elf` here neither wires shared_futex_host_addr on
+    #     KvmTrapEngine nor blocks/re-dispatches a guest futex, so this is
+    #     XFAIL-UNTIL-TASK-7 and NON-FATAL. Task 7 flips it to required.
+    cat > /tmp/csf.c <<CEOF
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <linux/futex.h>
+#include <unistd.h>
+#include <stdint.h>
+static int fwait(uint32_t *a,uint32_t v){ return syscall(SYS_futex,a,FUTEX_WAIT,v,0,0,0); }
+static int fwake(uint32_t *a,int n){ return syscall(SYS_futex,a,FUTEX_WAKE,n,0,0,0); }
+int main(void){
+  uint32_t *w=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+  if(w==MAP_FAILED) return 2;
+  *w=0;
+  pid_t pid=fork();
+  if(pid<0) return 3;
+  if(pid==0){ while(__atomic_load_n(w,__ATOMIC_SEQ_CST)==0) fwait(w,0); _exit(7); }
+  usleep(50*1000);
+  __atomic_store_n(w,1,__ATOMIC_SEQ_CST);
+  fwake(w,1);
+  int st; if(waitpid(pid,&st,0)!=pid) return 4;
+  if(!WIFEXITED(st)||WEXITSTATUS(st)!=7) return 5;
+  return write(1,"sharedfutex-ok",14)==14?0:6;
+}
+CEOF
+    gcc -static -O2 -o /tmp/csf /tmp/csf.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/csf" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "sharedfutex-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+shared-futex-fork]: cross-process MAP_SHARED FUTEX_WAIT/WAKE via KvmFutex shared path."
+    else
+      printf "XFAIL [shared-futex-fork] (expected until Task 7 wires run_threaded_kvm_loop): stdout=[%s] exit=%s\n" "$got" "$code" >&2
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
