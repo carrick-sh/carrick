@@ -85,6 +85,78 @@ mod imp {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// Extract the guest task name carrick stamped into a process's proctitle
+    /// (`argv[0]`): `carrick:<run-id>: <name>` or `carrick: <name>` (see
+    /// `carrick_runtime::dispatch::proctitle::proc_label`). Returns `<name>` —
+    /// the part after the last `": "` — truncated to Linux's 15-byte comm, or
+    /// `None` when the title carries no guest name. carrick does not host-exec,
+    /// so the macOS `pbi_comm` is always "carrick"; the proctitle is the only
+    /// cross-process channel that carries a sibling guest's real command, so a
+    /// `/proc/<pid>/comm` read can show "sleep"/"bash" instead of "carrick".
+    pub(super) fn parse_proctitle_name(argv0: &str) -> Option<String> {
+        if !argv0.contains(": ") {
+            return None;
+        }
+        let name = argv0.rsplit(": ").next()?.trim();
+        if name.is_empty() || name == "carrick" {
+            return None;
+        }
+        Some(name.chars().take(15).collect())
+    }
+
+    /// Read `pid`'s `argv[0]` (the proctitle) via `KERN_PROCARGS2` and pull the
+    /// guest task name from it. Same-user processes (all carrick guests) are
+    /// readable. `None` on any failure or unexpected layout.
+    fn proctitle_comm(pid: u32) -> Option<String> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let mut size: libc::size_t = 0;
+        // SAFETY: size query with a null oldp is the documented sysctl idiom.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+            || size < 4
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        // SAFETY: buf holds `size` bytes; sysctl writes at most that many.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return None;
+        }
+        buf.truncate(size);
+        // Layout: [argc:i32][exec_path\0][\0…padding][argv0\0][argv1\0]…[envp…].
+        let mut i = 4usize;
+        while i < buf.len() && buf[i] != 0 {
+            i += 1; // skip exec_path
+        }
+        while i < buf.len() && buf[i] == 0 {
+            i += 1; // skip padding NULs before argv[0]
+        }
+        let start = i;
+        while i < buf.len() && buf[i] != 0 {
+            i += 1; // argv[0] (the proctitle)
+        }
+        let argv0 = std::str::from_utf8(buf.get(start..i)?).ok()?;
+        parse_proctitle_name(argv0)
+    }
+
     /// Fetch a pid's BSD info via `proc_pidinfo(PROC_PIDTBSDINFO)`. `None` if the
     /// pid doesn't exist or isn't inspectable.
     fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
@@ -214,7 +286,10 @@ mod imp {
             pgid: info.pbi_pgid,
             uid: info.pbi_uid,
             gid: info.pbi_gid,
-            comm: comm_from(&info.pbi_comm),
+            // Prefer the guest task name carrick stamped into the proctitle
+            // ("sleep"/"bash"); the macOS pbi_comm is always the host binary
+            // ("carrick") since carrick never host-execs the guest program.
+            comm: proctitle_comm(pid).unwrap_or_else(|| comm_from(&info.pbi_comm)),
         })
     }
 
@@ -348,6 +423,43 @@ mod imp {
         }
         let to_us = |t: libc::time_value_t| t.seconds as u64 * 1_000_000 + t.microseconds as u64;
         Some((to_us(info.user_time), to_us(info.system_time)))
+    }
+
+    #[cfg(test)]
+    mod proctitle_tests {
+        use super::parse_proctitle_name;
+
+        #[test]
+        fn extracts_guest_name_after_last_colon_space() {
+            // The two proctitle shapes carrick stamps (with / without a run id).
+            assert_eq!(
+                parse_proctitle_name("carrick:ctrlz-85929: sleep").as_deref(),
+                Some("sleep")
+            );
+            assert_eq!(
+                parse_proctitle_name("carrick: bash").as_deref(),
+                Some("bash")
+            );
+        }
+
+        #[test]
+        fn declines_titles_with_no_guest_name() {
+            // No ": " delimiter, or the name is just the host binary → fall back
+            // to pbi_comm (None here) instead of reporting a bogus "carrick".
+            assert_eq!(parse_proctitle_name("carrick"), None);
+            assert_eq!(parse_proctitle_name("carrick:run-1: carrick"), None);
+            assert_eq!(parse_proctitle_name("carrick:run-1: "), None);
+        }
+
+        #[test]
+        fn truncates_to_linux_comm_length() {
+            let got = parse_proctitle_name("carrick:x: averylongprocessname1234567").unwrap();
+            assert!(
+                got.chars().count() <= 15,
+                "comm must fit Linux TASK_COMM_LEN"
+            );
+            assert!("averylongprocessname1234567".starts_with(&got));
+        }
     }
 }
 
