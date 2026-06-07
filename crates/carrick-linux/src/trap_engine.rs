@@ -29,6 +29,16 @@ pub struct KvmTrapEngine {
     /// later `execve` (Task 4) so exit-reporting can distinguish a forked child;
     /// mirrors the HVF backend's `is_forked_child`. Default `false`.
     is_forked_child: bool,
+    /// Linux syscall number (x8) of the most recent trapped `svc`. Feeds the
+    /// shared loop's SA_RESTART decision (`vcpu_loop.rs` calls `last_syscall_nr()`,
+    /// whose trait default is `None` — so SA_RESTART is inert until this is set).
+    /// `None` before the first syscall. Mirrors HVF's inner field.
+    last_syscall_nr: Option<u64>,
+    /// Original x0 of the most recent trapped `svc` (the SA_RESTART path needs the
+    /// pre-syscall x0). Supplies `InjectParams::orig_x0` (Task 5).
+    last_syscall_orig_x0: u64,
+    /// ESR of the most recent synchronous exception. Supplies `InjectParams::fault_esr` (Task 5).
+    last_fault_esr: u64,
 }
 
 impl KvmTrapEngine {
@@ -46,6 +56,9 @@ impl KvmTrapEngine {
             vcpu,
             ram,
             is_forked_child: false,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            last_fault_esr: 0,
         })
     }
 
@@ -157,7 +170,10 @@ impl SyscallTrap for KvmTrapEngine {
                 // exception, and the EL1 vector's own `eret` (after the
                 // sentinel store) consumes it — so we do NOT touch the PC
                 // here; we just read the syscall frame.
-                Ok(Some(self.read_frame()?))
+                let frame = self.read_frame()?;
+                self.last_syscall_nr = Some(frame.x8);
+                self.last_syscall_orig_x0 = frame.x0;
+                Ok(Some(frame))
             }
             VcpuExit::MmioWrite { gpa, data, len } => Err(TrapError::UnexpectedExit {
                 reason: format!("MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len}"),
@@ -165,12 +181,19 @@ impl SyscallTrap for KvmTrapEngine {
             // A bare kick or halt with no pending syscall: the contract is to
             // return `None` so the run loop can run signal delivery and resume.
             VcpuExit::Halt | VcpuExit::Kicked => Ok(None),
-            VcpuExit::Exception { syndrome, far } => Err(TrapError::UnexpectedException {
-                syndrome,
-                virtual_address: far,
-                physical_address: far,
-            }),
+            VcpuExit::Exception { syndrome, far } => {
+                self.last_fault_esr = syndrome;
+                Err(TrapError::UnexpectedException {
+                    syndrome,
+                    virtual_address: far,
+                    physical_address: far,
+                })
+            }
         }
+    }
+
+    fn last_syscall_nr(&self) -> Option<u64> {
+        self.last_syscall_nr
     }
 
     fn current_pc(&self) -> Result<u64, TrapError> {
@@ -281,6 +304,11 @@ impl SyscallTrap for KvmTrapEngine {
         self.vm = new_vm;
         self.vcpu = new_vcpu;
         self.is_forked_child = true;
+        // The child resumes mid-clone; clear stale parent syscall/fault state so
+        // a signal arriving before the child's first svc cannot read parent values.
+        self.last_syscall_nr = None;
+        self.last_syscall_orig_x0 = 0;
+        self.last_fault_esr = 0;
         Ok(ForkOutcome::Child)
     }
 
@@ -358,6 +386,11 @@ impl SyscallTrap for KvmTrapEngine {
         //    the remap above — so this is a no-op assertion of intent, kept
         //    explicit for the contract.
         // (self.is_forked_child is intentionally left unchanged.)
+
+        // A fresh image has no in-flight syscall or fault.
+        self.last_syscall_nr = None;
+        self.last_syscall_orig_x0 = 0;
+        self.last_fault_esr = 0;
 
         Ok(())
     }
@@ -529,6 +562,9 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             // A clone(CLONE_THREAD) sibling is NOT a forked child — it shares the
             // parent's process and exits via the normal thread-exit path.
             is_forked_child: false,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            last_fault_esr: 0,
         })
     }
 
@@ -772,5 +808,37 @@ mod execve_tests {
         engine.vcpu.restore(&snap).unwrap();
         assert_eq!(engine.get_vreg(0).unwrap(), 0xABCD_0000_0000_1234u128, "restore recovers V0");
         assert_eq!(engine.get_fpsr().unwrap(), 0x0000_0008, "restore recovers FPSR");
+    }
+
+    #[test]
+    fn kvm_orig_x0_and_nr_captured_on_syscall() {
+        if !kvm_available() {
+            eprintln!("SKIP kvm_orig_x0_and_nr_captured_on_syscall: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        let frame = engine
+            .next_syscall()
+            .expect("run to first svc")
+            .expect("a syscall frame");
+        assert_eq!(engine.last_syscall_orig_x0, frame.x0, "orig_x0 latched from frame.x0");
+        assert_eq!(engine.last_syscall_nr(), Some(frame.x8), "last_syscall_nr latched from frame.x8");
+    }
+
+    #[test]
+    fn kvm_tracking_fields_reset_across_execve() {
+        if !kvm_available() {
+            eprintln!("SKIP kvm_tracking_fields_reset_across_execve: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        engine.last_fault_esr = 0xDEAD;
+        engine.last_syscall_orig_x0 = 0xBEEF;
+        engine.last_syscall_nr = Some(99);
+        let new_image = AddressSpace::load_elf_bytes(TARGET_ELF).expect("load target ELF");
+        engine.execve_into(&new_image).expect("execve_into");
+        assert_eq!(engine.last_fault_esr, 0, "fault_esr reset across execve");
+        assert_eq!(engine.last_syscall_orig_x0, 0, "orig_x0 reset across execve");
+        assert_eq!(engine.last_syscall_nr, None, "last_syscall_nr reset across execve");
     }
 }
