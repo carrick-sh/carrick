@@ -445,7 +445,79 @@ pub mod runtime {
             .map_err(|e| RuntimeError::Load(e.to_string()))?;
         let mut engine = carrick_linux::KvmTrapEngine::new(&image)
             .map_err(|e| RuntimeError::Trap(e.to_string()))?;
-        run_combined_syscall_loop_linux(&mut engine, SyscallDispatcher::new(), DEFAULT_MAX_TRAPS)
+        run_combined_syscall_loop_linux(&mut engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+    }
+
+    /// Build the dispatcher for the bare KVM ELF runner with a real, writable
+    /// guest filesystem. A bare ELF has no OCI rootfs, so a fresh
+    /// `SyscallDispatcher` has an empty VFS and every guest `open` fails. We root
+    /// the guest at a private, cap-std-sandboxed scratch directory
+    /// (`HostFsBackend`) — so `open`/`read`/`write` flow to real host syscalls —
+    /// and seed a minimal Linux baseline (`/tmp`, `/etc/{passwd,group,hosts,…}`),
+    /// mirroring carrick-cli's `--fs host`. If the backend can't be created the
+    /// guest simply has no filesystem (the runner still works for fs-free code).
+    #[cfg(feature = "platform-linux")]
+    fn make_linux_dispatcher() -> SyscallDispatcher {
+        use crate::fs_backend::{FsBackend, HostFsBackend};
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let scratch_root = std::env::temp_dir().join("carrick-kvm-scratch");
+        match HostFsBackend::new_in(&scratch_root) {
+            Ok(host) => {
+                let mut backend: Box<dyn FsBackend> = Box::new(host);
+                seed_linux_baseline(&mut *backend);
+                let _ = dispatcher.set_fs_backend(backend);
+            }
+            Err(e) => {
+                eprintln!(
+                    "carrick-kvm: host fs backend unavailable ({e}); guest filesystem is empty"
+                );
+            }
+        }
+        dispatcher
+    }
+
+    /// Pre-create the standard Linux directories and a few `/etc` databases a
+    /// raw static binary assumes exist (it has no OCI rootfs to supply them).
+    #[cfg(feature = "platform-linux")]
+    fn seed_linux_baseline(backend: &mut dyn crate::fs_backend::FsBackend) {
+        for dir in [
+            "/tmp",
+            "/var",
+            "/var/tmp",
+            "/root",
+            "/etc",
+            "/dev",
+            "/run",
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/local",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+        ] {
+            let _ = backend.make_dir(dir);
+        }
+        let _ = backend.set_mode("/tmp", 0o1777);
+        let _ = backend.set_mode("/var/tmp", 0o1777);
+        let _ = backend.set_file_contents(
+            "/etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+                .to_vec(),
+        );
+        let _ = backend.set_file_contents("/etc/group", b"root:x:0:\nnogroup:x:65534:\n".to_vec());
+        let _ = backend.set_file_contents(
+            "/etc/nsswitch.conf",
+            b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec(),
+        );
+        let host = crate::execute::guest_hostname();
+        let hosts = format!(
+            "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t{host}\n"
+        );
+        let _ = backend.set_file_contents("/etc/hosts", hosts.into_bytes());
+        let _ = backend.set_file_contents("/etc/hostname", format!("{host}\n").into_bytes());
     }
 }
 
