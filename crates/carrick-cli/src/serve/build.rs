@@ -42,7 +42,7 @@ pub(crate) struct BuildQuery {
 /// literal. Lenient — a malformed `%` escape is passed through verbatim rather
 /// than erroring (Docker clients send well-formed escapes; we never want to
 /// reject a build over a stray `%`).
-fn url_decode(s: &str) -> String {
+pub(crate) fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -345,8 +345,8 @@ async fn run_build_streaming(
 
 /// Minimal `Stream` adapter over an mpsc receiver — avoids a `tokio-stream`
 /// dependency. Yields each received frame result until the channel closes.
-struct ReceiverStream {
-    rx: mpsc::Receiver<Result<Frame<Bytes>, std::io::Error>>,
+pub(crate) struct ReceiverStream {
+    pub(crate) rx: mpsc::Receiver<Result<Frame<Bytes>, std::io::Error>>,
 }
 
 impl Stream for ReceiverStream {

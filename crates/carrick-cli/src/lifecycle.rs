@@ -697,7 +697,7 @@ pub(crate) fn stop(time: Option<u64>, containers: &[String]) -> anyhow::Result<(
     )
 }
 
-fn stop_one(spec: &str, time: Option<u64>) -> anyhow::Result<String> {
+pub(crate) fn stop_one(spec: &str, time: Option<u64>) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
     let state = ContainerState::load(&id)?;
     if !state.init_alive() {
@@ -740,7 +740,7 @@ pub(crate) fn kill(signal: &str, containers: &[String]) -> anyhow::Result<()> {
     )
 }
 
-fn kill_one(spec: &str, signum: i32) -> anyhow::Result<String> {
+pub(crate) fn kill_one(spec: &str, signum: i32) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
     let state = ContainerState::load(&id)?;
     if !state.init_alive() {
@@ -1024,7 +1024,7 @@ pub(crate) fn inspect(format: Option<&str>, containers: &[String]) -> anyhow::Re
 /// Build the docker-shaped inspect object for a container. A subset of docker's
 /// schema covering the commonly-scripted fields (`.Id`, `.Name`, `.Image`,
 /// `.State.{Status,Running,Pid,ExitCode}`, `.Path`, `.Args`, `.Config.Cmd`).
-fn container_to_json(c: &ContainerState, status: ContainerStatus) -> serde_json::Value {
+pub(crate) fn container_to_json(c: &ContainerState, status: ContainerStatus) -> serde_json::Value {
     let running = status == ContainerStatus::Running;
     let status_str = match status {
         ContainerStatus::Created => "created",
@@ -1040,7 +1040,9 @@ fn container_to_json(c: &ContainerState, status: ContainerStatus) -> serde_json:
         "Id": c.id,
         "Name": format!("/{}", c.name.as_deref().unwrap_or("")),
         "Image": c.image,
-        "Created": c.created_secs,
+        "Created": chrono::DateTime::from_timestamp(c.created_secs as i64, 0)
+            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+            .unwrap_or_default(),
         "Path": path,
         "Args": args,
         "State": {
@@ -1167,7 +1169,7 @@ fn emit_appended(path: &std::path::Path, offset: u64, out: &mut impl Write) -> a
 /// Return the suffix of `data` covering its last `tail` newline-delimited lines
 /// (`None` ⇒ all of it, `Some(0)` ⇒ empty). A final line without a trailing
 /// newline still counts. Mirrors `docker logs --tail N`.
-fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
+pub(crate) fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
     let Some(n) = tail else {
         return data;
     };
