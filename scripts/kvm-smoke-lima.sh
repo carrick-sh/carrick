@@ -62,6 +62,15 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
   #     1) — the full-dispatcher fork loop is wired up later (Task 7).
   run_case "thin-shim+fork" "$shim" "fork-wait4"
 
+  # 1c. Phase 2 / Task 3: pipe2 + fork(2) + read/write/close across the fork
+  #     boundary. The freestanding pipe-fork fixture issues pipe2(59)/clone(220)/
+  #     close(57)/write(64)/read(63)/wait4(260)/exit_group(94) — all serviced by
+  #     the thin shim. This proves fd inheritance across KvmTrapEngine::fork():
+  #     the child receives the real host pipe fd and reads 2 bytes the parent
+  #     wrote; the child exits 42; the parent asserts WEXITSTATUS==42 and prints
+  #     "pipe-ok". No generic loop needed (that is Task 7).
+  run_case "thin-shim+pipe-fork" "$shim" "pipe-fork"
+
   # 2. Real dispatch (Phase B): the full dispatcher, no HVF in the closure.
   cargo build --release -p carrick-runtime --no-default-features \
     --features platform-linux --bin carrick-kvm --target-dir "$HOME/ct" --locked
@@ -245,5 +254,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork — 10 cases (hello, fork, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork — 11 cases (hello, fork, pipe-fork, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
 '
