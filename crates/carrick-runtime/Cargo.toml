@@ -17,6 +17,8 @@ workspace = true
 # default enables it for normal builds; dependents that use carrick-runtime as a
 # library do not re-enable it through feature unification.
 syscall-shim = []
+# In-memory fs backend selection (default OFF; control point is carrick-cli).
+fs-memory = ["carrick-spec/fs-memory"]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

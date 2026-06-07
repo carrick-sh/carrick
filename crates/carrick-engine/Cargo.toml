@@ -11,6 +11,10 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# In-memory fs backend selection (default OFF; control point is carrick-cli).
+fs-memory = ["carrick-spec/fs-memory", "carrick-runtime/fs-memory"]
+
 [dependencies]
 camino = { workspace = true, features = ["serde1"] }
 serde = { workspace = true, features = ["derive"] }
