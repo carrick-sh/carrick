@@ -1393,6 +1393,40 @@ pub fn set_host_ignore(linux_signum: i32) {
     INSTALLED_MASK.fetch_and(!(1u64 << linux_signum), Ordering::SeqCst);
 }
 
+/// Reset a guest-mirrorable signal's HOST disposition back to `SIG_DFL` — the
+/// companion of [`set_host_ignore`]/[`ensure_host_handler`]. When the guest sets
+/// `SIG_DFL`, any host `SIG_IGN` or routed handler that was mirrored earlier (and
+/// INHERITED across fork) must be cleared, or the host swallows the signal.
+///
+/// This is what makes job control work: a job-control shell sets SIGTSTP/SIGTTIN/
+/// SIGTTOU to `SIG_IGN` for itself, which carrick mirrors to the host; each forked
+/// child then resets those to `SIG_DFL` BEFORE `execve` so the controlling pty's
+/// ^Z/^C act on the job. Without this reset the child inherits the host `SIG_IGN`
+/// and the pty's SIGTSTP is *discarded* — Ctrl-Z does nothing. Same exclusions as
+/// [`set_host_ignore`]: carrick-managed / synchronous-fault signals keep their
+/// host routing (resetting them to default would let a host-delivered instance
+/// take the lethal default action or break carrick's fault handling).
+pub fn set_host_default(linux_signum: i32) {
+    if !(1..=63).contains(&linux_signum)
+        || matches!(linux_signum, 2 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 17 | 19)
+    {
+        return;
+    }
+    let host = linux_to_host_signum(linux_signum);
+    // SAFETY: zero-initialised sigaction with SIG_DFL is the documented
+    // "default action, no flags, empty mask" form.
+    unsafe {
+        let mut action: libc::sigaction = core::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(host, &action, std::ptr::null_mut());
+    }
+    // No longer overridden on the host; clear the routed-handler bookkeeping so a
+    // later ensure_host_handler re-installs handle_routed instead of skipping.
+    INSTALLED_MASK.fetch_and(!(1u64 << linux_signum), Ordering::SeqCst);
+}
+
 /// Reset host signal dispositions that were installed only to route guest
 /// caught-signal handlers. Guest `execve(2)` resets caught dispositions to
 /// default while preserving `SIG_IGN`; because Carrick does not host-exec, the

@@ -1314,6 +1314,16 @@ impl SyscallDispatcher {
                     // SIGUSR2=SIG_IGN + child kill → parent died -12; probe
                     // xprocsigign). Excludes faults/carrick-managed signals.
                     crate::host_signal::set_host_ignore(signum);
+                } else {
+                    // h == SIG_DFL: the guest reset the disposition to default.
+                    // Clear any host SIG_IGN / routed handler that was mirrored
+                    // earlier and possibly INHERITED across fork, so the host no
+                    // longer swallows the signal. This is what makes Ctrl-Z work:
+                    // a job-control shell sets SIGTSTP=SIG_IGN for itself, then
+                    // each forked child resets SIGTSTP to SIG_DFL before exec; the
+                    // pty's ^Z (host SIGTSTP) must then actually stop the job
+                    // instead of being discarded by the inherited host SIG_IGN.
+                    crate::host_signal::set_host_default(signum);
                 }
                 // pid-1 protection (§5.4): if WE are the ns-init, publish whether
                 // we now handle this signal so the kill path knows not to drop a
