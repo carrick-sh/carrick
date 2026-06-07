@@ -622,6 +622,33 @@ impl RootFs {
                 continue;
             }
 
+            if entry_type.is_hard_link() {
+                // A tar hardlink entry is another name for an already-archived
+                // regular file (Ubuntu 26.04 uutils-coreutils: ~115 applets are
+                // hardlinks to one multi-call ELF). The in-memory store has no
+                // inode aliasing, so point the new path at the target's bytes —
+                // `contents` is an Arc, so this shares the (10 MB) body, not copies
+                // it. Mirrors the host backend's `dir.hard_link` (see
+                // `apply_tar_to_dir`). Well-formed layers emit the target first; a
+                // dangling target (out-of-order / cross-kind) is left unresolved
+                // rather than aborting the whole rootfs.
+                let link_name = entry
+                    .link_name()?
+                    .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
+                    .into_owned();
+                let target = normalize_layer_path(&link_name)?;
+                if let Some(src) = self.files.get(&target) {
+                    let entry = FileEntry {
+                        path: path.clone(),
+                        mode: src.mode,
+                        size: src.size,
+                        contents: Arc::clone(&src.contents),
+                    };
+                    self.files.insert(path, entry);
+                }
+                continue;
+            }
+
             if entry_type.is_file() {
                 let mut contents = Vec::new();
                 entry.read_to_end(&mut contents)?;
@@ -975,5 +1002,59 @@ mod tests {
             .read("/lib/ld-linux-aarch64.so.1")
             .expect("walk parent symlink");
         assert_eq!(bytes, b"FAKE-LD");
+    }
+
+    #[test]
+    fn resolve_reads_hardlinked_applet() {
+        // Ubuntu 26.04 uutils-coreutils: /usr/bin/uname -> symlink ->
+        // ../lib/cargo/bin/coreutils/uname, and that applet is a HARDLINK to the
+        // one multi-call binary (the first applet is the regular-file entry; the
+        // other ~114 applets are tar hardlink entries pointing at it). The
+        // in-memory backend must materialize hardlinks or every non-first applet
+        // is dropped -> NotFound at boot ("failed to run rootfs ELF").
+        use tar::{Builder, EntryType, Header};
+        let body: &[u8] = b"\x7fELF-coreutils-multicall-binary";
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut b = Builder::new(&mut buf);
+            // The regular file (first applet, alphabetically `arch`).
+            let mut h = Header::new_gnu();
+            h.set_path("usr/lib/cargo/bin/coreutils/arch").unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append(&h, body).unwrap();
+            // The `uname` applet: a hardlink to the regular file above.
+            let mut h = Header::new_gnu();
+            h.set_path("usr/lib/cargo/bin/coreutils/uname").unwrap();
+            h.set_entry_type(EntryType::Link);
+            h.set_size(0);
+            h.set_link_name("usr/lib/cargo/bin/coreutils/arch").unwrap();
+            h.set_cksum();
+            b.append(&h, std::io::empty()).unwrap();
+            // /usr/bin/uname -> ../lib/cargo/bin/coreutils/uname (relative symlink).
+            let mut h = Header::new_gnu();
+            h.set_path("usr/bin/uname").unwrap();
+            h.set_entry_type(EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_link_name("../lib/cargo/bin/coreutils/uname").unwrap();
+            h.set_cksum();
+            b.append(&h, std::io::empty()).unwrap();
+            b.finish().unwrap();
+        }
+        let fs = RootFs::from_layers(std::iter::once(LayerSource::Tar(buf))).unwrap();
+        // The hardlinked applet itself reads as the multi-call binary.
+        assert_eq!(
+            fs.read("/usr/lib/cargo/bin/coreutils/uname").unwrap(),
+            body,
+            "hardlink applet must materialize"
+        );
+        // And the full chain a bare `uname` entrypoint walks: symlink -> hardlink.
+        assert_eq!(
+            fs.read("/usr/bin/uname").unwrap(),
+            body,
+            "symlink -> hardlink chain must resolve"
+        );
     }
 }
