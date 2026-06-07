@@ -4,7 +4,7 @@
 //! forked_child_die_by_signal helpers. Free functions reached via `use super::*`.
 use super::*;
 
-pub(super) fn load_execve_image(
+pub(crate) fn load_execve_image(
     dispatcher: &SyscallDispatcher,
     path: &str,
     // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
@@ -155,7 +155,7 @@ fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
 /// `_exit(2)` to bypass Rust's normal Drop chain. Without this, the
 /// rebuilt HVF context in the child would trigger an `applevisor::Vcpu`
 /// Drop panic ("no VM or vCPU available") during shutdown.
-pub(super) fn forked_child_exit(
+pub(crate) fn forked_child_exit(
     code: i32,
     stdout_buf: impl AsRef<[u8]>,
     stderr_buf: impl AsRef<[u8]>,
@@ -182,7 +182,7 @@ pub(super) fn forked_child_exit(
 /// guest reads them back as a Linux signal number. Falls back to `_exit` if
 /// the signal somehow doesn't terminate the host process (a few Linux signal
 /// numbers map to default-ignore dispositions on macOS).
-pub(super) fn forked_child_die_by_signal(
+pub(crate) fn forked_child_die_by_signal(
     signum: i32,
     stdout_buf: impl AsRef<[u8]>,
     stderr_buf: impl AsRef<[u8]>,
@@ -212,7 +212,7 @@ pub(super) fn forked_child_die_by_signal(
     }
 }
 
-pub(super) fn stop_by_signal(signum: i32) {
+pub(crate) fn stop_by_signal(signum: i32) {
     let host_signum = crate::host_signal::linux_to_host_signum(signum);
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -228,7 +228,7 @@ pub(super) fn stop_by_signal(signum: i32) {
     }
 }
 
-pub(super) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
+pub(crate) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
     if dispatcher.is_ptrace_traceme() {
         stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);
     }
