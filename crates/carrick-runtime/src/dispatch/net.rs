@@ -1173,8 +1173,15 @@ impl SyscallDispatcher {
             if flags & !LINUX_EPOLL_CLOEXEC != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let Some(kqueue) = crate::darwin_kqueue::Kqueue::new_internal() else {
-                return Ok(crate::linux_abi::LINUX_EMFILE.into());
+            let kqueue = match crate::darwin_kqueue::Kqueue::new_internal() {
+                Some(k) => k,
+                // macOS: a real kqueue couldn't be allocated (fd table full).
+                #[cfg(feature = "platform-macos")]
+                None => return Ok(crate::linux_abi::LINUX_EMFILE.into()),
+                // Linux: there is no kqueue; epoll_pwait services this instance
+                // from the interest map + ppoll, so a dummy backing is fine.
+                #[cfg(not(feature = "platform-macos"))]
+                None => crate::darwin_kqueue::Kqueue::dummy(),
             };
             // EVFILT_USER(0) is the in-memory wake channel: `notify_inmem_epoll`
             // NOTE_TRIGGERs it when an eventfd/pipe/timerfd readiness changes, so a
@@ -1397,6 +1404,133 @@ impl SyscallDispatcher {
                 return write_epoll_events(memory, events_address, &ready);
             }
 
+            // Linux: no kqueue. Compute readiness directly from the interest map
+            // (`epoll_ready_events` handles in-memory eventfd/pipe/timerfd AND
+            // host-backed sockets/pipes via a non-blocking `poll`), apply the
+            // EPOLLET edge latch + EPOLLONESHOT disarm, and — when nothing is
+            // ready — block on the interest fds' host fds via `ppoll`
+            // (WaitOnPollFds), re-dispatching on readiness. Single-threaded: the
+            // kqueue's only extra role (a sibling thread's ADD seen by a blocked
+            // waiter) does not arise. (A timerfd with no host fd that expires
+            // mid-wait is bounded by the epoll timeout — full sub-timeout
+            // precision for that case is a follow-up.)
+            #[cfg(not(feature = "platform-macos"))]
+            {
+                let interests: Vec<(i32, EpollInterest)> = {
+                    let open = open_file.description.read();
+                    let OpenDescription::Epoll { interest, .. } = &*open else {
+                        return Ok(LINUX_EINVAL.into());
+                    };
+                    interest.iter().map(|(fd, i)| (*fd, i.clone())).collect()
+                };
+
+                let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
+                let mut ready_updates: Vec<(i32, u32)> = Vec::new();
+                for (fd, intr) in &interests {
+                    let requested = intr.event.events;
+                    let raw_ready = this.epoll_ready_events(*fd, requested);
+                    ready_updates.push((*fd, raw_ready));
+                    let ready_events = if requested & LINUX_EPOLLET != 0 {
+                        raw_ready & !intr.last_ready
+                    } else {
+                        raw_ready
+                    };
+                    if ready_events != 0 {
+                        acc.entry(*fd).or_insert((0, intr.event.data)).0 |= ready_events;
+                    }
+                }
+
+                let oneshot_fds: Vec<i32> = acc
+                    .keys()
+                    .copied()
+                    .filter(|fd| {
+                        interests.iter().any(|(ifd, s)| {
+                            ifd == fd && s.event.events & LINUX_EPOLLONESHOT != 0
+                        })
+                    })
+                    .collect();
+
+                if !ready_updates.is_empty() || !oneshot_fds.is_empty() {
+                    let mut open = open_file.description.write();
+                    if let OpenDescription::Epoll { interest, .. } = &mut *open {
+                        for (fd, raw) in &ready_updates {
+                            if let Some(slot) = interest.get_mut(fd) {
+                                slot.last_ready = *raw;
+                            }
+                        }
+                        for fd in &oneshot_fds {
+                            if let Some(slot) = interest.get_mut(fd) {
+                                slot.event.events = 0;
+                            }
+                        }
+                    }
+                }
+
+                let mut ready_tagged: Vec<(i32, LinuxEpollEvent)> = acc
+                    .into_iter()
+                    .map(|(fd, (events, data))| {
+                        (
+                            fd,
+                            LinuxEpollEvent {
+                                events,
+                                _pad: 0,
+                                data,
+                            },
+                        )
+                    })
+                    .collect();
+                if ready_tagged.len() > max_events {
+                    let overflow = ready_tagged.split_off(max_events);
+                    let mut open = open_file.description.write();
+                    if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {
+                        pending_ready.extend(overflow);
+                    }
+                }
+                let ready: Vec<LinuxEpollEvent> =
+                    ready_tagged.into_iter().map(|(_, e)| e).collect();
+                if !ready.is_empty() {
+                    return write_epoll_events(memory, events_address, &ready);
+                }
+                if timeout_ms == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                let timeout = if timeout_ms < 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(timeout_ms as u64))
+                };
+                // Block on the host fds backing the interest set; in-memory fds
+                // (no host fd) are simply re-checked when the wait returns.
+                let pollfds: Vec<(i32, i16)> = interests
+                    .iter()
+                    .filter_map(|(fd, intr)| {
+                        this.host_fd_for_poll(*fd).map(|hfd| {
+                            let mut ev: i16 = 0;
+                            if intr.event.events & LINUX_EPOLLIN != 0 {
+                                ev |= libc::POLLIN;
+                            }
+                            if intr.event.events & LINUX_EPOLLOUT != 0 {
+                                ev |= libc::POLLOUT;
+                            }
+                            if intr.event.events & LINUX_EPOLLPRI != 0 {
+                                ev |= libc::POLLPRI;
+                            }
+                            (hfd, ev)
+                        })
+                    })
+                    .collect();
+                return Ok(DispatchOutcome::WaitOnPollFds {
+                    fds: WaitFds::raw(pollfds),
+                    timeout,
+                    on_timeout: 0,
+                    block_signals,
+                });
+            }
+
+            // macOS: kqueue-backed readiness (the original implementation). The
+            // Linux path above always returns, so this is macOS-only.
+            #[cfg(feature = "platform-macos")]
+            {
             // Snapshot interest metadata and the persistent instance kqueue. The
             // kqueue is the authoritative readiness source for host-backed fds
             // (sockets/pipes/ptys) — crucially, it monitors fds registered by OTHER
@@ -1676,6 +1810,7 @@ impl SyscallDispatcher {
 
             crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
             write_epoll_events(memory, events_address, &ready)
+            }
 
         }
 
