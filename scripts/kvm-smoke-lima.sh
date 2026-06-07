@@ -260,19 +260,18 @@ CEOF
       exit 1
     fi
 
-    # 10. Phase 2 / Task 5: threads — clone(CLONE_THREAD) sibling vCPUs.
+    # 10. Phase 2 / Task 7: threads — clone(CLONE_THREAD) sibling vCPUs. REQUIRED.
     #
-    #     XFAIL-UNTIL-TASK-7. This case is NON-FATAL on purpose. Task 5 delivers
-    #     the host-verifiable threading pieces only: the KvmKicker (cross-thread
-    #     pthread_kill -> KVM_RUN EINTR), the RegAccess/ThreadedEngine trait impls
-    #     on KvmTrapEngine, and build_sibling_spec/materialize_sibling (new vCPU on
-    #     the SAME VM). But the GENERIC threaded run loop (vcpu_loop.rs
-    #     `spawn_clone_thread`, which actually spawns a host thread per guest thread
-    #     and calls materialize_sibling) is NOT wired to the KVM run path until
-    #     Task 7 (`run_threaded_kvm_loop`). The single-threaded thin shim/dispatch
-    #     used by `run-elf` here does NOT spawn threads, so a multi-threaded guest
-    #     cannot complete yet. We therefore build + run the fixture and REPORT the
-    #     result, but never `exit 1`. Task 7 flips this to a required case.
+    #     Task 7 wired the generic threaded run loop (run_threaded_kvm_loop ->
+    #     vcpu_loop::run_vcpu_until_exit) to the KVM run path, so a multi-threaded
+    #     guest now spawns one host thread + one KVM vCPU per guest thread, all on
+    #     the SAME VM, with the private FUTEX_WAIT/WAKE (the pthread mutex) routed
+    #     through the shared FutexTable and cross-thread kicks via the KvmKicker.
+    #     The capstone deadlock was a DUPLICATE KVM vcpu_id: every sibling
+    #     KVM_CREATE_VCPU used id 0 (the main vCPU id) -> EEXIST -> no sibling
+    #     ever ran -> the main thread pthread_join futex never woke. Fixed by a
+    #     shared atomic vcpu-id allocator (main vCPU 0; siblings 1,2,3,...), so
+    #     this is now a REQUIRED gate (fatal on failure), no longer xfail.
     #
     #     Fixture: 4 pthreads each do 1000 mutex-guarded increments of a shared
     #     counter -> 4000; join all; print "counter=4000"; exit 0.
@@ -303,11 +302,14 @@ int main(void){
 }
 CEOF
     gcc -static -O2 -pthread -o /tmp/cthr /tmp/cthr.c
-    got="$(sg kvm -c "$kvm run-elf /tmp/cthr" 2>/dev/null)" && code=0 || code=$?
+    # `timeout 30` so a hung threaded run fails-fast (reported as a timeout) and
+    # never wedges the whole smoke for 600s. exit 124 == GNU timeout fired.
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/cthr" 2>/dev/null)" && code=0 || code=$?
     if [ "$got" = "counter=4000" ] && [ "$code" -eq 0 ]; then
       echo "OK [real-dispatch+threads]: 4 pthreads x 1000 mutex-guarded increments = counter=4000."
     else
-      printf "XFAIL [threads] (expected until Task 7 wires run_threaded_kvm_loop): stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      printf "FAIL [threads]: stdout=[%s] exit=%s oracle=[counter=4000]\n" "$got" "$code" >&2
+      exit 1
     fi
 
     # 11. Phase 2 / Task 6: condvar-requeue — the PRIVATE (in-process, cross-
@@ -348,7 +350,7 @@ int main(void){
 }
 CEOF
     gcc -static -O2 -pthread -o /tmp/ccv /tmp/ccv.c
-    got="$(sg kvm -c "$kvm run-elf /tmp/ccv" 2>/dev/null)" && code=0 || code=$?
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/ccv" 2>/dev/null)" && code=0 || code=$?
     if [ "$got" = "condvar-ok" ] && [ "$code" -eq 0 ]; then
       echo "OK [real-dispatch+condvar-requeue]: pthread cond_wait/broadcast (FUTEX_WAIT/WAKE/CMP_REQUEUE) via KvmFutex private path."
     else
@@ -394,7 +396,7 @@ int main(void){
 }
 CEOF
     gcc -static -O2 -o /tmp/csf /tmp/csf.c
-    got="$(sg kvm -c "$kvm run-elf /tmp/csf" 2>/dev/null)" && code=0 || code=$?
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/csf" 2>/dev/null)" && code=0 || code=$?
     if [ "$got" = "sharedfutex-ok" ] && [ "$code" -eq 0 ]; then
       echo "OK [real-dispatch+shared-futex-fork]: cross-process MAP_SHARED FUTEX_WAIT/WAKE via KvmFutex shared path."
     else
@@ -412,5 +414,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve — 13 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads — 14 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter) pass on KVM; condvar-requeue + shared-futex-fork remain non-fatal xfail."
 '
