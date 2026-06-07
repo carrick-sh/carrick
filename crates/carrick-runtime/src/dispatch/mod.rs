@@ -460,6 +460,7 @@ use crate::linux_abi::{
     LINUX_TASK_COMM_LEN,
     LINUX_TCFLSH,
     LINUX_TCGETS,
+    LINUX_TCGETS2,
     LINUX_TCP_CORK,
     LINUX_TCP_KEEPCNT,
     LINUX_TCP_KEEPIDLE,
@@ -469,10 +470,14 @@ use crate::linux_abi::{
     LINUX_TCSBRK,
     LINUX_TCSBRKP,
     LINUX_TCSETS,
+    LINUX_TCSETS2,
     LINUX_TCSETSF,
+    LINUX_TCSETSF2,
     LINUX_TCSETSW,
+    LINUX_TCSETSW2,
     LINUX_TCXONC,
     LINUX_TERMIOS_KERNEL_SIZE,
+    LINUX_TERMIOS2_SIZE,
     LINUX_TFD_CLOEXEC,
     LINUX_TFD_NONBLOCK,
     LINUX_TIMER_ABSTIME,
@@ -2982,6 +2987,19 @@ fn write_kernel_struct<T: KernelAbi>(
     value: &T,
 ) -> DispatchOutcome {
     write_packed(memory, address, value.abi_bytes())
+}
+
+/// Write a [`LinuxTermios`] as the full 44-byte `struct termios2` (TCGETS2),
+/// i.e. including the `c_ispeed`/`c_ospeed` tail. [`write_kernel_struct`] would
+/// truncate to the 36-byte legacy `struct termios` (the `KernelAbi::ABI_SIZE`),
+/// which is correct for TCGETS but 8 bytes short for the termios2 buffer that
+/// glibc-aarch64 hands to TCGETS2.
+fn write_termios2(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    value: &LinuxTermios,
+) -> DispatchOutcome {
+    write_packed(memory, address, zerocopy::IntoBytes::as_bytes(value))
 }
 
 /// Lower-level form of [`write_kernel_struct`] for sites that already

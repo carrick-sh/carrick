@@ -654,6 +654,83 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
 }
 
 #[test]
+fn ioctl_tcgets2_is_recognized_and_mirrors_tcgets() {
+    // glibc-aarch64 implements tcgetattr/tcsetattr — and therefore isatty(3),
+    // which goes through tcgetattr — via the termios2 ioctls TCGETS2/TCSETS2,
+    // NOT the legacy 36-byte TCGETS. (musl still uses TCGETS, which is why the
+    // musl-only probe suite never caught this.) Before carrick recognized
+    // TCGETS2, glibc `bash` got ENOTTY from its isatty() and ran NON-interactive
+    // — no PS1. carrick must treat TCGETS2 exactly like TCGETS for the tty/
+    // non-tty decision, and must never record it as an *unhandled* ioctl.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // 1. TCGETS2 on fd 0 mirrors TCGETS: a real backing tty → success, a
+    //    pipe/file (e.g. `cargo test` under CI) → ENOTTY. Either way it is a
+    //    *recognized* request.
+    let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCGETS2, 0x4000, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    if stdin_is_tty {
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        // The full 44-byte termios2 is written, including the c_ispeed/c_ospeed
+        // tail at bytes 36..44 that legacy TCGETS (36 bytes) leaves untouched.
+        let tail = memory.read_bytes(0x4000 + 36, 8).unwrap();
+        assert_eq!(tail.len(), 8);
+    } else {
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+    }
+
+    // 2. TCGETS2 on a bogus fd → EBADF (recognized, validated before tty-ness).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([99, LINUX_TCGETS2, 0x4080, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+
+    // 3. TCSETS2 on fd 0 mirrors TCSETS (success on a tty, ENOTTY otherwise).
+    memory
+        .write_bytes(0x4000, LinuxTermios::default_cooked().as_bytes())
+        .unwrap();
+    let set_outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS2, 0x4000, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    if stdin_is_tty {
+        assert_eq!(set_outcome, DispatchOutcome::Returned { value: 0 });
+    } else {
+        assert_eq!(set_outcome, DispatchOutcome::Errno { errno: 25 });
+    }
+
+    // The regression guard, robust whether or not CI gives us a tty: TCGETS2 /
+    // TCSETS2 are KNOWN requests and must never fall through to the unhandled
+    // catch-all. Pre-fix this set contained 0x802c_542a.
+    let report = reporter.finish();
+    assert!(
+        report
+            .unhandled_ioctls
+            .iter()
+            .all(|u| u.request != LINUX_TCGETS2 && u.request != LINUX_TCSETS2),
+        "TCGETS2/TCSETS2 must be recognized, not unhandled: {:?}",
+        report.unhandled_ioctls
+    );
+}
+
+#[test]
 fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
