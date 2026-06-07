@@ -191,8 +191,38 @@ CEOF
       printf "FAIL [prot-none]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 9. Phase C / C6: signal masking + sigtimedwait. sigprocmask(BLOCK) then a
+    #    sigtimedwait that BLOCKS (no pending signal) -> EAGAIN (the WaitOnSignals
+    #    path), then kill(self)+sigwait dequeues the now-pending signal. No signal
+    #    handler invocation (injection is Phase D).
+    cat > /tmp/cstw.c <<CEOF
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
+int main(void){
+  sigset_t set; sigemptyset(&set); sigaddset(&set,SIGUSR1);
+  sigprocmask(SIG_BLOCK,&set,0);
+  struct timespec ts={0,30*1000*1000};
+  errno=0;
+  if(sigtimedwait(&set,0,&ts)!=-1 || errno!=EAGAIN) return 2;
+  kill(getpid(),SIGUSR1);
+  int s; if(sigwait(&set,&s)) return 3;
+  if(s!=SIGUSR1) return 4;
+  return write(1,"sigtw-ok",8)==8?0:5;
+}
+CEOF
+    gcc -static -O2 -o /tmp/cstw /tmp/cstw.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cstw")" && code=0 || code=$?
+    if [ "$got" = "sigtw-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+signals]: sigprocmask + blocking sigtimedwait (EAGAIN) + kill/sigwait."
+    else
+      printf "FAIL [signals]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -203,5 +233,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+fs — hello, stack, static glibc, blocking-IO, file-IO, epoll, prot-none pass on KVM."
+  echo "OK: B+C1+C2+C3+C5+C6+fs — 9 cases (hello, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
 '

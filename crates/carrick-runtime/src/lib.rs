@@ -406,8 +406,41 @@ pub mod runtime {
                         }
                     }
                 },
+                DispatchOutcome::WaitOnSignals { wait_set, timeout } => {
+                    // rt_sigtimedwait/sigwait blocking: a signal already pending
+                    // in wait_set was dequeued before this outcome, so we reach
+                    // here only to wait. Sleep for the timeout, re-dispatching on
+                    // wake to re-check pending (a host signal mapped to the guest,
+                    // or — once cross-process signals land — another process's
+                    // kill). A finite timeout with nothing pending → EAGAIN, the
+                    // sigtimedwait timeout return. Single-threaded: no in-process
+                    // async source, so a finite timeout is deterministic.
+                    match waiter.wait(&[], timeout, !wait_set) {
+                        WaitResult::Ready | WaitResult::Interrupted => continue,
+                        WaitResult::TimedOut => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EAGAIN,
+                            });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
+                }
+                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                    // wait4/waitid on a child. The single-vCPU backend has no
+                    // guest children yet (fork/clone is Phase D), so this is a
+                    // clean ECHILD rather than a hang.
+                    match waiter.wait_proc_exit(pid, block_signals) {
+                        WaitResult::Ready => continue,
+                        WaitResult::Interrupted | WaitResult::TimedOut => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_ECHILD,
+                            });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
+                }
                 // Terminal (Returned/Errno/Exit/...) and not-yet-serviced
-                // (WaitOnSignals/WaitOnProcExit/futex/fork/...) outcomes.
+                // (futex/fork/clone-thread/...) outcomes.
                 terminal => return Ok(terminal),
             }
         }
