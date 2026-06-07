@@ -473,20 +473,25 @@ where
     let path_str = path.to_string_lossy();
     // argv normalises to opaque bytes (Linux ABI) past this point so the rosetta
     // and non-rosetta arms share a type; with_linux_initial_stack accepts bytes.
+    let mut needs_at_base = false;
     let (file, argv): (Vec<u8>, Vec<Vec<u8>>) =
         match maybe_redirect_to_rosetta(&path_str, &file, &argv) {
             None => (file, argv.into_iter().map(String::into_bytes).collect()),
-            Some(Ok((rosetta_bytes, new_argv))) => {
+            Some(Ok(redirect)) => {
+                needs_at_base = redirect.target_is_dynamic;
                 dispatcher.set_executable_path(ROSETTA_INTERPRETER);
-                (rosetta_bytes, new_argv)
+                (redirect.interpreter_bytes, redirect.argv)
             }
             Some(Err(errno)) => return Err(rosetta_unavailable(errno, &path_str)),
         };
-    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
+    let mut image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
         rootfs.read(p).ok().or_else(|| std::fs::read(p).ok())
     })?
-    .with_vdso_auxv(vdso_enabled_for_debug())
-    .with_linux_initial_stack(argv, env)?;
+    .with_vdso_auxv(vdso_enabled_for_debug());
+    if needs_at_base {
+        image = image.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
+    }
+    let image = image.with_linux_initial_stack(argv, env)?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
@@ -585,21 +590,26 @@ where
     })?;
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv is
     // already opaque bytes (Linux ABI).
+    let mut needs_at_base = false;
     let (bytes, argv): (Vec<u8>, Vec<Vec<u8>>) =
         match maybe_redirect_to_rosetta(path, &bytes, &argv) {
             None => (bytes, argv),
-            Some(Ok((rosetta_bytes, new_argv))) => {
+            Some(Ok(redirect)) => {
                 // /proc/self/exe should resolve to the interpreter that's actually
                 // loaded (Rosetta opens it during its startup handshake).
+                needs_at_base = redirect.target_is_dynamic;
                 dispatcher.set_executable_path(ROSETTA_INTERPRETER);
-                (rosetta_bytes, new_argv)
+                (redirect.interpreter_bytes, redirect.argv)
             }
             Some(Err(errno)) => return Err(rosetta_unavailable(errno, path)),
         };
-    let image =
+    let mut image =
         AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))?
-            .with_vdso_auxv(vdso_enabled_for_debug())
-            .with_linux_initial_stack(argv, env)?;
+            .with_vdso_auxv(vdso_enabled_for_debug());
+    if needs_at_base {
+        image = image.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
+    }
+    let image = image.with_linux_initial_stack(argv, env)?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
@@ -3600,6 +3610,16 @@ fn service_signals_threaded(
 /// AArch64 binary that JIT-translates an x86_64 Linux guest in user space.
 pub(crate) const ROSETTA_INTERPRETER: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
 
+/// Placeholder `AT_BASE` value for a Rosetta-redirected *dynamic* x86_64 target.
+/// carrick loads the static `rosetta` interpreter as the image, so the auxv it
+/// builds has no AT_BASE. A *dynamic* x86 target needs one present so Apple's
+/// Rosetta emits AT_BASE in the inner x86 auxv — filled with the real
+/// ld-musl/ld-linux base Rosetta maps (carrick can't know that address; Rosetta
+/// chooses it and overwrites this value). It only needs to be a present,
+/// non-zero, page-aligned slot. Without it, musl's dynamic linker null-derefs at
+/// startup (glibc's self-locates, so glibc-dynamic tolerated the gap).
+pub(crate) const ROSETTA_AT_BASE_PLACEHOLDER: u64 = 0x10_0000_0000;
+
 /// The installed Rosetta interpreter's bytes, read once and cached. `None` when
 /// Rosetta isn't installed for Linux. Both the ELF-load redirect and the ioctl
 /// handshake source data from this single read.
@@ -3648,14 +3668,28 @@ pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
 ///
 /// Rosetta itself is statically linked, so the AddressSpace loader never needs
 /// to resolve a PT_INTERP for it from the guest VFS.
-#[allow(clippy::type_complexity)]
+/// Outcome of redirecting an x86_64 target through Apple's Rosetta interpreter.
+pub(crate) struct RosettaRedirect {
+    /// Bytes of the `rosetta` interpreter to load as the guest image.
+    pub interpreter_bytes: Vec<u8>,
+    /// argv to hand the interpreter: `[program argv0, target, args…]`.
+    pub argv: Vec<Vec<u8>>,
+    /// Whether the x86_64 target is dynamically linked (has a `PT_INTERP`). A
+    /// dynamic target needs an `AT_BASE` auxv entry in the auxv carrick hands
+    /// Rosetta, so Rosetta emits AT_BASE — filled with the real ld-musl/ld-linux
+    /// base it maps — in the inner x86 auxv. Without it musl's dynamic linker
+    /// null-derefs (glibc's self-locates, so it tolerated the gap). A static
+    /// target must NOT get AT_BASE, matching Linux. See `with_auxv_base`.
+    pub target_is_dynamic: bool,
+}
+
 pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
     target_path: &str,
     target_bytes: &[u8],
     // argv items are opaque bytes (Linux ABI); accept String (initial entry)
     // or Vec<u8> (execve) and always return the byte form.
     argv: &[A],
-) -> Option<Result<(Vec<u8>, Vec<Vec<u8>>), i32>> {
+) -> Option<Result<RosettaRedirect, i32>> {
     use crate::elf::{Machine, inspect_elf_bytes};
     use crate::linux_abi::LINUX_ENOENT;
 
@@ -3672,7 +3706,13 @@ pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
     };
 
     let orig_argv: Vec<Vec<u8>> = argv.iter().map(|a| a.as_ref().to_vec()).collect();
-    Some(Ok((rosetta_bytes, rosetta_argv(target_path, &orig_argv))))
+    Some(Ok(RosettaRedirect {
+        interpreter_bytes: rosetta_bytes,
+        argv: rosetta_argv(target_path, &orig_argv),
+        // A PT_INTERP means the x86 target is dynamically linked and needs AT_BASE
+        // in the auxv carrick hands Rosetta (see ROSETTA_AT_BASE_PLACEHOLDER).
+        target_is_dynamic: meta.interpreter.is_some(),
+    }))
 }
 
 /// Build the argv carrick hands the loaded Apple Rosetta interpreter for an
@@ -4052,6 +4092,34 @@ mod rosetta_tests {
         elf
     }
 
+    /// Synthetic *dynamic* x86_64 ELF: a 64-byte header plus one `PT_INTERP`
+    /// program header pointing at an interpreter string, so `inspect_elf_bytes`
+    /// reports `interpreter.is_some()` (the signal a target needs `AT_BASE`).
+    fn synthetic_dynamic_x86_elf() -> Vec<u8> {
+        const PT_INTERP: u32 = 3;
+        let interp = b"/lib/ld-musl-x86_64.so.1\0";
+        let ph_off = 64u64; // program headers immediately follow the ELF header
+        let interp_off = 64 + 56; // one 56-byte phdr, then the interp string
+        let mut elf = vec![0u8; interp_off + interp.len()];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN (PIE)
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // version
+        elf[32..40].copy_from_slice(&ph_off.to_le_bytes()); // e_phoff
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let ph = ph_off as usize;
+        elf[ph..ph + 4].copy_from_slice(&PT_INTERP.to_le_bytes()); // p_type
+        elf[ph + 8..ph + 16].copy_from_slice(&(interp_off as u64).to_le_bytes()); // p_offset
+        elf[ph + 32..ph + 40].copy_from_slice(&(interp.len() as u64).to_le_bytes()); // p_filesz
+        elf[interp_off..].copy_from_slice(interp);
+        elf
+    }
+
     const EM_AARCH64: u16 = 183;
     const EM_X86_64: u16 = 62;
 
@@ -4100,10 +4168,10 @@ mod rosetta_tests {
         let argv = vec!["uname".to_string(), "-m".to_string()];
         match maybe_redirect_to_rosetta("/usr/bin/uname", &elf, &argv) {
             // Rosetta installed: load is rewritten to Rosetta; argv[0] preserved.
-            Some(Ok((rosetta_bytes, new_argv))) => {
-                assert!(rosetta_bytes.starts_with(b"\x7fELF"));
+            Some(Ok(redirect)) => {
+                assert!(redirect.interpreter_bytes.starts_with(b"\x7fELF"));
                 assert_eq!(
-                    new_argv,
+                    redirect.argv,
                     vec![
                         b"uname".to_vec(),          // program argv[0] (NOT the interpreter)
                         b"/usr/bin/uname".to_vec(), // x86 binary for Rosetta
@@ -4112,6 +4180,44 @@ mod rosetta_tests {
                 );
             }
             // No Rosetta on this host: detected as x86_64 but unavailable.
+            Some(Err(errno)) => assert_eq!(errno, crate::linux_abi::LINUX_ENOENT),
+            None => panic!("x86_64 ELF must be detected for redirect"),
+        }
+    }
+
+    #[test]
+    fn dynamic_x86_64_target_is_flagged_so_rosetta_gets_at_base() {
+        // A dynamic x86_64 target (has PT_INTERP) must be reported as dynamic so
+        // the loader adds AT_BASE to the auxv it hands Rosetta. Without AT_BASE,
+        // Rosetta omits it from the inner x86 auxv and musl's dynamic linker
+        // null-derefs at startup (alpine `/bin/uname` exited 139 / SIGSEGV).
+        // glibc's ld self-locates, which is why glibc-dynamic targets worked.
+        let dynamic = synthetic_dynamic_x86_elf();
+        let argv = vec!["uname".to_string()];
+        match maybe_redirect_to_rosetta("/bin/uname", &dynamic, &argv) {
+            Some(Ok(redirect)) => assert!(
+                redirect.target_is_dynamic,
+                "a PT_INTERP x86_64 target must be flagged dynamic so AT_BASE is added"
+            ),
+            // No Rosetta installed: detection still ran (it precedes the rosetta
+            // read), but the redirect short-circuits to ENOENT before the flag.
+            Some(Err(errno)) => assert_eq!(errno, crate::linux_abi::LINUX_ENOENT),
+            None => panic!("x86_64 ELF must be detected for redirect"),
+        }
+    }
+
+    #[test]
+    fn static_x86_64_target_is_not_flagged_dynamic() {
+        // A static x86_64 target (no PT_INTERP) must NOT be flagged: Linux omits
+        // AT_BASE for static binaries, and a bogus AT_BASE with no interpreter to
+        // overwrite it would mislead the translated program.
+        let static_elf = synthetic_elf(EM_X86_64);
+        let argv = vec!["prog".to_string()];
+        match maybe_redirect_to_rosetta("/bin/prog", &static_elf, &argv) {
+            Some(Ok(redirect)) => assert!(
+                !redirect.target_is_dynamic,
+                "a static x86_64 target must NOT be flagged dynamic"
+            ),
             Some(Err(errno)) => assert_eq!(errno, crate::linux_abi::LINUX_ENOENT),
             None => panic!("x86_64 ELF must be detected for redirect"),
         }
