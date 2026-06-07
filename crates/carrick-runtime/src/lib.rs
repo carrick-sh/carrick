@@ -930,10 +930,14 @@ pub mod host_signal {
     pub fn pump_kqueue() -> i32 {
         0
     }
-    // Additional stubs the unconditional `vcpu_loop` references. The threaded
-    // loop is never instantiated on the KVM backend (the Linux run path is the
-    // single-threaded loop in `crate::runtime`), so these are inert — present
-    // only so the unconditional module name-resolves on Linux.
+    // The generic threaded loop IS instantiated on the KVM backend
+    // (`run_threaded_kvm_loop` -> `run_vcpu_until_exit::<KvmTrapEngine>`), so the
+    // per-thread signal-pending functions below (`forget_thread`,
+    // `has_pending_for`, `take_pending_for`) are REAL — they back the unblocked
+    // async-signal-delivery path (Phase 4). The few still-stubbed names below
+    // (`last_sender_for`, `register_child_exit_watch`, `reinit_after_fork`,
+    // `take_pending_in_for`, ...) are macOS host-signal-pump mechanisms with no
+    // Linux analogue, or paths the dispatcher already covers; they remain inert.
     pub fn forget_thread(tid: i32) {
         lock_pending().remove(&tid);
     }
