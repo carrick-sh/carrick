@@ -610,8 +610,54 @@ CEOF
       printf "FAIL [signal-sibling]: stdout=[%s] exit=%s oracle=[csig-sibling-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 18. Phase 4: SA_RESTART end-to-end. A worker thread fork()s a child (sleeps
+    #     150ms then _exit(42)) and blocks in wait4(child); the main thread tgkill()s
+    #     the worker mid-wait with an SA_RESTART SIGUSR1 handler. The kick interrupts
+    #     the WaitOnProcExit (-> EINTR), the handler runs, and because wait4(260) is
+    #     in is_restartable_syscall the loop RESTARTS the syscall (rather than
+    #     surfacing EINTR), so the worker still reaps the child and sees
+    #     WEXITSTATUS==42. The reaper IS the forker (worker), so no cross-thread
+    #     reap is involved. Asserts BOTH handler-ran AND the restarted wait4 reaped
+    #     status 42. REQUIRED gate. (Validated to FAIL without SA_RESTART: wait4
+    #     then returns EINTR and the child is not reaped.)
+    cat > /tmp/csig_restart.c <<CEOF
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+static volatile sig_atomic_t fired; static volatile int ready, wok; static pid_t wtid;
+static void h(int s){ (void)s; fired=1; }
+static void *worker(void *a){ (void)a; wtid=(pid_t)syscall(SYS_gettid);
+  pid_t c=fork(); if(c==0){ usleep(150*1000); _exit(42); }
+  __atomic_store_n(&ready,1,__ATOMIC_SEQ_CST);
+  int st; pid_t r=wait4(c,&st,0,0);  /* blocks ~150ms; SIGUSR1(SA_RESTART) at ~50ms must restart */
+  if(r==c && WIFEXITED(st) && WEXITSTATUS(st)==42) wok=1; return 0; }
+int main(void){
+  struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h; sa.sa_flags=SA_RESTART;
+  if(sigaction(SIGUSR1,&sa,0)) return 2;
+  pthread_t t; if(pthread_create(&t,0,worker,0)) return 3;
+  while(!__atomic_load_n(&ready,__ATOMIC_SEQ_CST)) usleep(1000);
+  usleep(50*1000); /* worker is now blocked in wait4 (child sleeps 150ms) */
+  if(syscall(SYS_tgkill,getpid(),wtid,SIGUSR1)) return 4;
+  if(pthread_join(t,0)) return 5;
+  if(!fired) return 6;
+  if(!wok) return 7;
+  return write(1,"csig-restart-ok",15)==15 ? 0 : 8;
+}
+CEOF
+    gcc -static -O2 -pthread -o /tmp/csig_restart /tmp/csig_restart.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/csig_restart" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "csig-restart-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+sa-restart]: a wait4 interrupted by an SA_RESTART handler restarted and reaped status 42."
+    else
+      printf "FAIL [sa-restart]: stdout=[%s] exit=%s oracle=[csig-restart-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -622,5 +668,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection — all 20 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection — all 21 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart) pass on KVM; ZERO xfail."
 '
