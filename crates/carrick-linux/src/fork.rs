@@ -45,3 +45,120 @@ pub struct VcpuSnapshot {
     /// FPCR. Phase 4; zero-stubbed in Phase 2.
     pub fpcr: u32,
 }
+
+/// Seed a fresh sibling vCPU's register file for a `clone(CLONE_THREAD)` thread
+/// (Task 5). Starts from the parent's [`VcpuSnapshot`] — so the new thread
+/// inherits the same stage-1 MMU sysregs (TTBR0/1, TCR, SCTLR, MAIR, VBAR,
+/// CPACR) and runs in the SAME guest address space — then applies the four
+/// thread-entry deltas Linux `clone` establishes for the new thread:
+///
+/// - `gprs[0] = 0` — the child's `clone`/`syscall` return value (it returns 0,
+///   like the child side of `fork`).
+/// - `sp_el0 = stack` — the new thread's user stack (`child_stack` arg to
+///   `clone`). Uses [`carrick_hal::Reg::Sp`] semantics (SP_EL0), NOT a sysreg.
+/// - `tpidr_el0 = tls` — the new thread's TLS base (the `tls` arg to `clone`,
+///   set when `CLONE_SETTLS` is requested; glibc always passes it for threads).
+/// - `pc = parent.elr_el1` — the guest PC just past the trapped `clone` `svc`.
+///   At the trap the parent vCPU is suspended on the EL1 vector's sentinel
+///   store with `ELR_EL1` already latched to (svc + 4); the sibling's PC is
+///   seeded to that post-svc address.
+///
+/// **IMPORTANT — PSTATE is NOT yet fixed up.** This snapshot inherits
+/// `parent.pstate`, which is the EL1h trap-time PSTATE (the exception-level
+/// at which the vCPU is suspended on the sentinel store), NOT the EL0t resume
+/// PSTATE the sibling needs to re-enter user code. The architecturally-correct
+/// EL0t PSTATE is in `parent.spsr_el1` (the SPSR latched on the `svc` trap).
+/// The four register deltas above are necessary but not sufficient: before the
+/// sibling can run, `materialize_sibling` / the run-loop must also establish a
+/// correct EL0-resume state — either set PSTATE = `spsr_el1` and start directly
+/// at EL0, or route the sibling's first run through an EL1 vector `eret` (as
+/// `fork`'s child does). This is invisible in Task 5 (no sibling actually runs;
+/// the threads-counter fixture is xfail).
+///
+/// // TODO(Phase 2 Task 7): establish EL0-resume PSTATE from spsr_el1 — see spec §D.
+///
+/// FP/SIMD (`vregs`/`fpsr`/`fpcr`) is carried verbatim (`.fpsr` stays FPSR,
+/// `.fpcr` stays FPCR — do NOT swap); it is zero-stubbed until Phase 4.
+pub fn seed_sibling_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> VcpuSnapshot {
+    let mut snap = parent.clone();
+    snap.gprs[0] = 0;
+    snap.sp_el0 = stack;
+    snap.tpidr_el0 = tls;
+    snap.pc = parent.elr_el1;
+    snap
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    fn sample() -> VcpuSnapshot {
+        VcpuSnapshot {
+            gprs: [0xAA; 31],
+            pc: 0x1000,
+            pstate: 0x3c0,
+            sp_el0: 0xDEAD,
+            sp_el1: 0xBEEF,
+            elr_el1: 0x4000_0000,
+            spsr_el1: 0x5,
+            ttbr0: 0x100,
+            ttbr1: 0x100,
+            tcr: 0x200,
+            sctlr: 0x300,
+            mair: 0xFF,
+            vbar: 0x400,
+            cpacr: 0x3 << 20,
+            tpidr_el0: 0x1234,
+            vregs: [0; 32],
+            fpsr: 0x11,
+            fpcr: 0x22,
+        }
+    }
+
+    /// The four thread-entry deltas are applied and nothing else drifts: the
+    /// stage-1 MMU sysregs are inherited verbatim (same address space) and the
+    /// FPSR/FPCR fields are carried WITHOUT being swapped.
+    #[test]
+    fn seed_applies_thread_entry_deltas() {
+        let parent = sample();
+        let child = seed_sibling_snapshot(&parent, 0x7FFF_0000, 0xCAFE_0000);
+
+        // The four deltas.
+        assert_eq!(child.gprs[0], 0, "x0 (clone return value) must be 0");
+        assert_eq!(child.sp_el0, 0x7FFF_0000, "sp_el0 must be the child stack");
+        assert_eq!(
+            child.tpidr_el0, 0xCAFE_0000,
+            "tpidr_el0 must be the tls arg"
+        );
+        assert_eq!(
+            child.pc, parent.elr_el1,
+            "pc must be the post-svc address (parent.elr_el1)"
+        );
+
+        // Inherited verbatim (same guest address space).
+        assert_eq!(child.ttbr0, parent.ttbr0);
+        assert_eq!(child.ttbr1, parent.ttbr1);
+        assert_eq!(child.tcr, parent.tcr);
+        assert_eq!(child.sctlr, parent.sctlr);
+        assert_eq!(child.mair, parent.mair);
+        assert_eq!(child.vbar, parent.vbar);
+        assert_eq!(child.cpacr, parent.cpacr);
+        assert_eq!(child.pstate, parent.pstate);
+        assert_eq!(child.spsr_el1, parent.spsr_el1);
+
+        // The other GPRs are inherited (x1..x30 unchanged).
+        for n in 1..31 {
+            assert_eq!(child.gprs[n], parent.gprs[n], "x{n} must be inherited");
+        }
+
+        // FPSR/FPCR carried, NOT swapped.
+        assert_eq!(
+            child.fpsr, parent.fpsr,
+            "fpsr must NOT be swapped with fpcr"
+        );
+        assert_eq!(
+            child.fpcr, parent.fpcr,
+            "fpcr must NOT be swapped with fpsr"
+        );
+    }
+}

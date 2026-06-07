@@ -14,9 +14,11 @@ pub mod errno;
 pub mod fork;
 pub mod guest_setup;
 pub mod kvm;
+pub mod kvm_kicker;
 pub mod run_elf;
 pub mod trap_engine;
 
 pub use kvm::{KvmVcpu, KvmVm};
+pub use kvm_kicker::{KvmKickHandle, KvmKicker, install_kvm_kick_handler};
 pub use run_elf::run_elf_kvm;
 pub use trap_engine::KvmTrapEngine;
