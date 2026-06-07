@@ -729,6 +729,7 @@ pub mod host_signal {
     }
     pub fn ensure_host_handler(_sig: i32) {}
     pub fn set_host_ignore(_sig: i32) {}
+    pub fn set_host_default(_linux_signum: i32) {}
     pub fn take_pending_in_for(_tid: i32, _wait_set: u64) -> i32 {
         0
     }
