@@ -49,8 +49,9 @@
 //! (Linux rootfs paths collide otherwise), so when `--fs` is not given,
 //! [`resolve_run_spec`] probes the preferred scratch root for case sensitivity
 //! and picks [`FsBackendKind::Host`] only if the probe passes, falling back to
-//! [`FsBackendKind::Memory`]. This is the one place the function touches the
-//! filesystem.
+//! the in-memory backend (only when the default-off `fs-memory` feature is
+//! compiled in; otherwise host is the only choice). This is the one place the
+//! function touches the filesystem.
 //!
 //! ## Platform and the image read-through
 //!
@@ -347,7 +348,7 @@ mod tests {
             name: None,
             max_traps: 100,
             debug_state_path: None,
-            fs: Some(FsBackendKind::Memory),
+            fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             stop_signal: None,
             stop_timeout: None,
@@ -435,7 +436,7 @@ mod tests {
             name: None,
             max_traps: 100,
             debug_state_path: None,
-            fs: Some(FsBackendKind::Memory),
+            fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             stop_signal: None,
             stop_timeout: None,
@@ -468,7 +469,7 @@ mod tests {
             name: None,
             max_traps: 100,
             debug_state_path: None,
-            fs: Some(FsBackendKind::Memory),
+            fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             stop_signal: None,
             stop_timeout: None,
@@ -500,7 +501,7 @@ mod tests {
             name: None,
             max_traps: 100,
             debug_state_path: None,
-            fs: Some(FsBackendKind::Memory),
+            fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             stop_signal: None,
             stop_timeout: None,
@@ -532,7 +533,7 @@ mod tests {
             name: None,
             max_traps: 100,
             debug_state_path: None,
-            fs: Some(FsBackendKind::Memory),
+            fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             stop_signal: None,
             stop_timeout: None,
@@ -573,7 +574,7 @@ mod tests {
             name: None,
             max_traps: 100,
             debug_state_path: None,
-            fs: Some(FsBackendKind::Memory),
+            fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             stop_signal: None,
             stop_timeout: None,
