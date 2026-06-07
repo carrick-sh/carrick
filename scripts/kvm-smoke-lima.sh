@@ -108,8 +108,35 @@ CEOF
       printf "FAIL [blocking-io]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 6. Real FILE I/O against the host fs backend (the runner roots the guest at
+    #    a sandboxed scratch dir + seeds a Linux baseline). open/write/lseek/
+    #    read/close round-trip a real file.
+    cat > /tmp/cfio.c <<CEOF
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+int main(void){
+  int fd=open("/tmp/carrick-fio.txt",O_RDWR|O_CREAT|O_TRUNC,0644);
+  if(fd<0) return 2;
+  if(write(fd,"file-data",9)!=9) return 3;
+  lseek(fd,0,SEEK_SET);
+  char b[16]={0}; int n=read(fd,b,16);
+  close(fd);
+  if(n!=9||memcmp(b,"file-data",9)) return 4;
+  return write(1,"fio-ok",6)==6?0:5;
+}
+CEOF
+    gcc -static -O2 -o /tmp/cfio /tmp/cfio.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cfio")" && code=0 || code=$?
+    if [ "$got" = "fio-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+file-io]: open/write/lseek/read/close round-trip on the host fs backend."
+    else
+      printf "FAIL [file-io]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -120,5 +147,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: Phase B+C1+C3 — hello, hello-stack, static glibc, and blocking-I/O pass on KVM."
+  echo "OK: B+C1+C3+fs — hello, stack, static glibc, blocking-I/O, and file-I/O pass on KVM."
 '
