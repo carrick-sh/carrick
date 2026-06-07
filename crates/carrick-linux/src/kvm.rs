@@ -26,6 +26,10 @@ fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
 //   KVM_REG_ARM64_SYSREG    = 0x0013 << 16  (the sysreg demux)
 const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
 const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+#[allow(dead_code)]
+const KVM_REG_SIZE_U128: u64 = 0x0040_0000_0000_0000;
+#[allow(dead_code)]
+const KVM_REG_SIZE_U32: u64 = 0x0020_0000_0000_0000;
 const KVM_REG_ARM_COPROC_SHIFT: u64 = 16;
 const KVM_REG_ARM_CORE: u64 = 0x0010 << KVM_REG_ARM_COPROC_SHIFT;
 const KVM_REG_ARM64_SYSREG: u64 = 0x0013 << KVM_REG_ARM_COPROC_SHIFT;
@@ -48,6 +52,16 @@ const USER_PT_REGS_PSTATE: u64 = USER_PT_REGS_PC + 8; // 264
 const KVM_REGS_SP_EL1: u64 = 272;
 const KVM_REGS_ELR_EL1: u64 = 280;
 const KVM_REGS_SPSR_EL1: u64 = 288;
+// `struct user_fpsimd_state fp_regs` is the trailing field of `struct kvm_regs`,
+// after `spsr[KVM_NR_SPSR]` (288 + 5*8 = 328). Its first member `vregs[32]` is
+// 16-byte aligned, so fp_regs is padded to offset 336. Within it: vregs[n]@16*n,
+// fpsr@512, fpcr@516.
+#[allow(dead_code)]
+const KVM_REGS_FP_REGS: u64 = 336;
+#[allow(dead_code)]
+const KVM_REGS_FP_FPSR: u64 = KVM_REGS_FP_REGS + 512; // 848
+#[allow(dead_code)]
+const KVM_REGS_FP_FPCR: u64 = KVM_REGS_FP_REGS + 516; // 852
 
 // KVM_REG_ARM64_SYSREG: id = base | (op0<<14)|(op1<<11)|(crn<<7)|(crm<<3)|op2
 fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
@@ -59,6 +73,23 @@ fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
         | (crn << 7)
         | (crm << 3)
         | op2
+}
+
+/// Core-reg id for the 128-bit SIMD/FP vector register V`n` (n in 0..32). The
+/// FP/SIMD regs live in `fp_regs`, the trailing CORE field of `struct kvm_regs`,
+/// so they are addressed by byte-offset just like `core_reg_id`.
+#[allow(dead_code)]
+fn vreg_id(n: u32) -> u64 {
+    assert!(n < 32, "vreg index {n} out of range");
+    KVM_REG_ARM64 | KVM_REG_SIZE_U128 | KVM_REG_ARM_CORE | ((KVM_REGS_FP_REGS + u64::from(n) * 16) / 4)
+}
+#[allow(dead_code)]
+fn fpsr_id() -> u64 {
+    KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | (KVM_REGS_FP_FPSR / 4)
+}
+#[allow(dead_code)]
+fn fpcr_id() -> u64 {
+    KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | (KVM_REGS_FP_FPCR / 4)
 }
 
 fn reg_to_id(r: Reg) -> u64 {
@@ -441,5 +472,27 @@ impl KvmVcpu {
         self.set_sys_reg(SysReg::TpidrEl0, snap.tpidr_el0)?;
         // Phase 4: restore vregs/fpsr/fpcr. Skipped while zero-stubbed.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fp_reg_id_tests {
+    use super::*;
+
+    #[test]
+    fn vreg_id_encodes_per_kernel_abi() {
+        // fp_regs @ offset 336 in struct kvm_regs; vregs[0] index = 336/4 = 0x54.
+        assert_eq!(vreg_id(0), 0x6040_0000_0010_0054);
+        // vregs[31] @ 336 + 31*16 = 832; index = 832/4 = 0xD0.
+        assert_eq!(vreg_id(31), 0x6040_0000_0010_00D0);
+        // fpsr @ 848; index = 0xD4 (U32-sized). fpcr @ 852; index = 0xD5.
+        assert_eq!(fpsr_id(), 0x6020_0000_0010_00D4);
+        assert_eq!(fpcr_id(), 0x6020_0000_0010_00D5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn vreg_id_rejects_out_of_range() {
+        let _ = vreg_id(32);
     }
 }
