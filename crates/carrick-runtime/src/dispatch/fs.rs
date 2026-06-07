@@ -1190,6 +1190,60 @@ impl SyscallDispatcher {
     /// to drop inherited fds in O(1) syscalls instead of an O(N) fcntl
     /// or close loop. Without this, apt walks fd 3..NR_OPEN issuing a
     /// fcntl per fd and burns 100k+ traps before exec.
+    /// When the guest dups a *bare stdio* fd that is the `-t` controlling pty
+    /// slave, the duplicate must keep its tty identity. bash's
+    /// `initialize_job_control` does `dup(fileno(stderr))`, moves it to a high
+    /// fd, and runs `tcgetpgrp`/`tcsetpgrp` on *that* fd — so if the duplicate
+    /// lands as a plain (`pty: None`) HostPipe it is classified `TtyFdKind::Other`
+    /// and every tty ioctl returns ENOTTY; `tcgetpgrp` then returns -1 and bash
+    /// prints "cannot set terminal process group (-1)" / "no job control". Tag it
+    /// with the controlling slave role so it flows through the pty passthrough
+    /// (TCGETS2 / TIOCGPGRP / TIOCSPGRP / TIOCGWINSZ) to the duplicated host fd.
+    /// Non-tty stdio (a pipe/file redirect) returns `None` and stays a plain pipe.
+    fn dup_stdio_pty_role(&self, old_fd: i32) -> Option<crate::vfs::PtyRole> {
+        if crate::host_tty::host_isatty(old_fd) {
+            let index = self.pty_table().lock().controlling().unwrap_or(0);
+            Some(crate::vfs::PtyRole {
+                index,
+                is_master: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the host fd a winsize ioctl should target for a pty end. macOS
+    /// rejects `TIOCGWINSZ`/`TIOCSWINSZ` on a pty MASTER with ENOTTY — the
+    /// winsize is a property of the slave tty — whereas Linux honours them on
+    /// the master (a `forkpty`/`openpty` + `TIOCSWINSZ(master)` is the standard
+    /// way to size a pty, and a guest program doing so otherwise fails with
+    /// "Setting TIOCSWINSZ for master fd N failed!"). For a master role, target
+    /// the guest's already-open SLAVE fd for the same pts (the one the child
+    /// uses): macOS resets a pts's winsize when its last slave fd closes, so a
+    /// transient open could not hold it — only the persistent slave the child
+    /// shares (via fork) carries the size. Returns the slave host fd, or `None`
+    /// when no slave is open yet (caller treats a set as a best-effort no-op so
+    /// the guest does not see a spurious ENOTTY). A slave role targets `host_fd`.
+    fn pty_winsize_target(&self, role: crate::vfs::PtyRole, host_fd: i32) -> Option<i32> {
+        if !role.is_master {
+            return Some(host_fd);
+        }
+        let table = self.io.open_files.read();
+        for of in table.values() {
+            if let OpenDescription::HostPipe {
+                host_fd: slave_host_fd,
+                pty: Some(slave_role),
+                ..
+            } = &*of.description.read()
+                && !slave_role.is_master
+                && slave_role.index == role.index
+            {
+                return Some(*slave_host_fd);
+            }
+        }
+        None
+    }
+
     fn duplicate_fd(&self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
         let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
             Some(open_file) => (
@@ -1215,12 +1269,13 @@ impl SyscallDispatcher {
                 };
                 crate::dispatch::net::set_host_nonblocking(duped);
                 let write_kind = HostWriteKind::for_host_fd(duped);
+                let pty = self.dup_stdio_pty_role(old_fd);
                 (
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
                         is_read_end: old_fd == 0,
                         base: OpenDescriptionBase::new(0),
-                        pty: None,
+                        pty,
                         bidirectional: false,
                         write_kind,
                     })),
@@ -2700,12 +2755,13 @@ impl SyscallDispatcher {
                     let duped = (unsafe { libc::dup(old_fd.0) }).host_syscall_errno()?;
                     crate::dispatch::net::set_host_nonblocking(duped);
                     let write_kind = HostWriteKind::for_host_fd(duped);
+                    let pty = this.dup_stdio_pty_role(old_fd.0);
                     (
                         Arc::new(RwLock::new(OpenDescription::HostPipe {
                             host_fd: duped,
                             is_read_end: old_fd.0 == 0,
                             base: OpenDescriptionBase::new(0),
-                            pty: None,
+                            pty,
                             bidirectional: false,
                             write_kind,
                         })),
@@ -3258,8 +3314,14 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCGWINSZ => {
-                        let ws = crate::host_tty::get_host_winsize(host_fd)
-                            .unwrap_or_else(LinuxWinsize::terminal_80x24);
+                        // macOS rejects winsize ioctls on a master; read from the
+                        // guest's open slave fd for a master role (see
+                        // pty_winsize_target). No slave open yet → 80x24 stub.
+                        let ws = match this.pty_winsize_target(role, host_fd) {
+                            Some(ws_fd) => crate::host_tty::get_host_winsize(ws_fd)
+                                .unwrap_or_else(LinuxWinsize::terminal_80x24),
+                            None => LinuxWinsize::terminal_80x24(),
+                        };
                         write_kernel_struct(&mut *cx.memory, arg, &ws)
                     }
                     LINUX_TIOCSWINSZ => {
@@ -3270,16 +3332,35 @@ impl SyscallDispatcher {
                                 ws.ws_col = u16::from_le_bytes([b[2], b[3]]);
                                 ws.ws_xpixel = u16::from_le_bytes([b[4], b[5]]);
                                 ws.ws_ypixel = u16::from_le_bytes([b[6], b[7]]);
-                                // SAFETY: host_fd is our live pty fd; &ws is valid.
-                                let r = crate::host_tty::with_sigttou_blocked(block_ttou, || unsafe {
-                                    libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws)
-                                });
-                                if r < 0 {
-                                    DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(
-                                        unsafe { *libc::__error() },
-                                    ))
-                                } else {
-                                    DispatchOutcome::Returned { value: 0 }
+                                // macOS rejects TIOCSWINSZ on a master (ENOTTY);
+                                // apply it to the guest's open slave fd for a
+                                // master role. If no slave is open yet, succeed as
+                                // a no-op rather than hand the guest a spurious
+                                // ENOTTY (Linux always accepts it on the master).
+                                match this.pty_winsize_target(role, host_fd) {
+                                    Some(ws_fd) => {
+                                        // SAFETY: ws_fd is a live pty fd; &ws is valid.
+                                        let r = crate::host_tty::with_sigttou_blocked(
+                                            block_ttou,
+                                            || unsafe {
+                                                libc::ioctl(
+                                                    ws_fd,
+                                                    libc::TIOCSWINSZ as libc::c_ulong,
+                                                    &ws,
+                                                )
+                                            },
+                                        );
+                                        if r < 0 {
+                                            DispatchOutcome::errno(
+                                                crate::dispatch::macos_to_linux_errno(unsafe {
+                                                    *libc::__error()
+                                                }),
+                                            )
+                                        } else {
+                                            DispatchOutcome::Returned { value: 0 }
+                                        }
+                                    }
+                                    None => DispatchOutcome::Returned { value: 0 },
                                 }
                             }
                             Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
@@ -3293,7 +3374,14 @@ impl SyscallDispatcher {
                                 *libc::__error()
                             }))
                         } else {
-                            write_packed(&mut *cx.memory, arg, &(pgrp as i32).to_le_bytes())
+                            // The host pty's foreground pgrp is a HOST pgid;
+                            // translate it to the value the guest's PID namespace
+                            // sees, so a shell's `tcgetpgrp() == getpgrp()`
+                            // foreground check holds (else it SIGTTIN-stops
+                            // itself). Identity when namespaces are off.
+                            let ns_pgrp =
+                                crate::namespace::pid::host_to_ns_pgid(pgrp as u32) as i32;
+                            write_packed(&mut *cx.memory, arg, &ns_pgrp.to_le_bytes())
                         }
                     }
                     LINUX_TIOCSPGRP => {
@@ -3304,7 +3392,14 @@ impl SyscallDispatcher {
                                 return Ok(LINUX_EFAULT.into());
                             }
                         }
-                        let pgrp = i32::from_le_bytes(buf);
+                        let ns_pgrp = i32::from_le_bytes(buf);
+                        // The guest names a pgrp in its OWN namespace; map it back
+                        // to the host pgid before handing it to the host pty.
+                        let Some(pgrp) = crate::namespace::pid::ns_to_host_pgid(ns_pgrp as u32)
+                        else {
+                            return Ok(LINUX_EPERM.into());
+                        };
+                        let pgrp = pgrp as i32;
                         // SAFETY: host_fd is our live pty fd.
                         let r = crate::host_tty::with_sigttou_blocked(block_ttou, || unsafe {
                             libc::tcsetpgrp(host_fd, pgrp)
@@ -3523,10 +3618,17 @@ impl SyscallDispatcher {
                     Ok(TtyFdKind::Stdio) => {
                         // Under `-t` fd 0/1/2 is a real pty slave: pass through to
                         // the host line discipline so job control works correctly.
-                        // Guest pgrps are real macOS pgrps in carrick.
                         if crate::host_tty::host_isatty(fd.0) {
                             match crate::host_tty::host_tty_tcgetpgrp(fd.0) {
-                                Ok(pgrp) => write_packed(&mut *cx.memory, arg, &pgrp.to_le_bytes()),
+                                // Translate the HOST foreground pgid into the value
+                                // the guest's PID namespace sees, so a shell's
+                                // `tcgetpgrp() == getpgrp()` foreground check holds
+                                // (else it SIGTTIN-stops itself). Identity when off.
+                                Ok(pgrp) => {
+                                    let ns_pgrp =
+                                        crate::namespace::pid::host_to_ns_pgid(pgrp as u32) as i32;
+                                    write_packed(&mut *cx.memory, arg, &ns_pgrp.to_le_bytes())
+                                }
                                 Err(raw_errno) => DispatchOutcome::errno(
                                     crate::dispatch::macos_to_linux_errno(raw_errno),
                                 ),
@@ -3548,11 +3650,18 @@ impl SyscallDispatcher {
                                 return Ok(LINUX_EFAULT.into());
                             }
                         }
-                        let pgid = i32::from_le_bytes(buf);
+                        let ns_pgid = i32::from_le_bytes(buf);
                         // Under `-t` fd 0/1/2 is a real pty slave: pass through so
                         // the host line discipline tracks the foreground pgrp, enabling
-                        // Ctrl-C → SIGINT delivery to the correct guest pgrp.
+                        // Ctrl-C → SIGINT delivery to the correct guest pgrp. The guest
+                        // names the pgrp in its OWN namespace; map it to the host pgid.
                         if crate::host_tty::host_isatty(fd.0) {
+                            let Some(pgid) =
+                                crate::namespace::pid::ns_to_host_pgid(ns_pgid as u32)
+                            else {
+                                return Ok(LINUX_EPERM.into());
+                            };
+                            let pgid = pgid as i32;
                             match crate::host_tty::with_sigttou_blocked(block_ttou, || {
                                 crate::host_tty::host_tty_tcsetpgrp(fd.0, pgid)
                             }) {
@@ -3563,7 +3672,7 @@ impl SyscallDispatcher {
                             }
                         } else {
                             // Headless fallback: accept the bootstrap pgid, EPERM others.
-                            if pgid == LINUX_BOOTSTRAP_PGID {
+                            if ns_pgid == LINUX_BOOTSTRAP_PGID {
                                 DispatchOutcome::Returned { value: 0 }
                             } else {
                                 DispatchOutcome::errno(LINUX_EPERM)
