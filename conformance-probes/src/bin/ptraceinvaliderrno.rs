@@ -76,7 +76,7 @@ unsafe fn spawn_stopped_tracee() -> i32 {
 unsafe fn run_ptrace_case(pid: i32, case: PtraceCase) -> PtraceResult {
     *libc::__errno_location() = 0;
     let ret = libc::ptrace(
-        case.request,
+        case.request as _,
         pid,
         case.addr as *mut libc::c_void,
         case.data,
@@ -108,18 +108,14 @@ fn main() {
         let stopped = stop.rc == pid && libc::WIFSTOPPED(stop.status);
         if !stopped {
             cleanup(pid);
-            report!(
-                fork_ok = true,
-                tracee_stopped = false,
-                tracee_stopsig = 0,
-            );
+            report!(fork_ok = true, tracee_stopped = false, tracee_stopsig = 0,);
             return;
         }
 
         let peekdata = run_ptrace_case(
             pid,
             PtraceCase {
-                request: libc::PTRACE_PEEKDATA,
+                request: libc::PTRACE_PEEKDATA as _,
                 addr: 0,
                 data: 0,
             },
@@ -127,7 +123,7 @@ fn main() {
         let peektext = run_ptrace_case(
             pid,
             PtraceCase {
-                request: libc::PTRACE_PEEKTEXT,
+                request: libc::PTRACE_PEEKTEXT as _,
                 addr: -1,
                 data: 0,
             },
@@ -135,7 +131,7 @@ fn main() {
         let peekuser = run_ptrace_case(
             pid,
             PtraceCase {
-                request: libc::PTRACE_PEEKUSER,
+                request: libc::PTRACE_PEEKUSER as _,
                 addr: 4097,
                 data: 0,
             },
@@ -143,7 +139,7 @@ fn main() {
         let pokedata = run_ptrace_case(
             pid,
             PtraceCase {
-                request: libc::PTRACE_POKEDATA,
+                request: libc::PTRACE_POKEDATA as _,
                 addr: 0,
                 data: 0,
             },
@@ -151,7 +147,7 @@ fn main() {
         let poketext = run_ptrace_case(
             pid,
             PtraceCase {
-                request: libc::PTRACE_POKETEXT,
+                request: libc::PTRACE_POKETEXT as _,
                 addr: -1,
                 data: 0,
             },
@@ -159,7 +155,7 @@ fn main() {
         let pokeuser = run_ptrace_case(
             pid,
             PtraceCase {
-                request: libc::PTRACE_POKEUSER,
+                request: libc::PTRACE_POKEUSER as _,
                 addr: 4097,
                 data: 0,
             },
