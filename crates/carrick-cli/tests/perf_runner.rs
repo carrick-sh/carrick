@@ -21,6 +21,12 @@ use std::time::Duration;
 
 static PERF_LOCK: Mutex<()> = Mutex::new(());
 
+/// The in-memory fs backend is opt-in (`--features fs-memory`); skip perf cases
+/// that require it on a default build so the harness never invokes `--fs memory`.
+fn case_runnable(case: &PerfCase) -> bool {
+    cfg!(feature = "fs-memory") || case.carrick_fs_mode != "memory"
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -393,6 +399,9 @@ fn perf_gate() {
     }
     // All probes built?
     for case in CASES {
+        if !case_runnable(case) {
+            continue;
+        }
         if !probe_path(&root, case).exists() {
             let build_hint = match case.artifact {
                 PerfArtifact::StaticMusl => "scripts/build-probes.sh",
@@ -411,6 +420,9 @@ fn perf_gate() {
     let filter = std::env::var("CARRICK_PERF_FILTER").ok();
     let date = today_string();
     for case in CASES {
+        if !case_runnable(case) {
+            continue;
+        }
         if let Some(f) = &filter
             && !case.workload.contains(f.as_str())
         {
