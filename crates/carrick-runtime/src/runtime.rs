@@ -35,7 +35,7 @@
 //!   workloads (Go, CPython, Node, apt/dpkg) take.
 //!
 //! Both loops produce a [`RunResult`] (exit code + captured stdio + the
-//! [`CompatReport`]).
+//! [`CompatReport`](crate::compat::CompatReport)).
 //!
 //! # The fork/clone model (the hard part)
 //!
@@ -110,7 +110,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::compat::{CompatReport, CompatReporter};
+use crate::compat::CompatReporter;
 use crate::dispatch::{
     Aarch64SyscallFrame, DispatchError, DispatchOutcome, GuestMemory, MemoryError, ProcMapsEntry,
     SyscallDispatcher, SyscallRequest,
@@ -127,6 +127,25 @@ use exec::{
     forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_after_traced_exec,
     stop_by_signal,
 };
+
+/// Adapt the HVF-concrete `Arc<VcpuKicker>` + `Arc<FutexTable>` into the
+/// object-safe `Arc<dyn VcpuRegistry>` + `Arc<dyn PlatformFutex>` the
+/// `HostForkCoordinator` trait takes. The signal-pump lifecycle is the only
+/// place the threaded loop crosses the coordinator seam, so the (cheap) dyn
+/// wrap is confined to these call sites; the dispatcher futex path keeps the
+/// concrete `FutexTable`.
+fn fork_coord_views(
+    kicker: &Arc<crate::vcpu_kick::VcpuKicker>,
+    futex: &Arc<FutexTable>,
+) -> (
+    Arc<dyn carrick_hal::VcpuRegistry>,
+    Arc<dyn carrick_hal::PlatformFutex>,
+) {
+    let registry: Arc<dyn carrick_hal::VcpuRegistry> = kicker.clone();
+    let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
+        Arc::new(crate::threaded_impl::HvfFutex(Arc::clone(futex)));
+    (registry, platform_futex)
+}
 
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
 /// wait predicates can reach the same instance).
@@ -147,7 +166,11 @@ use crate::trap::{HvfTrapEngine, TrapError};
 // and the engine crate) is unchanged.
 pub use crate::trap::SyscallTrap;
 use serde::Serialize;
-use thiserror::Error;
+// The fork-coordinator methods moved to the object-safe
+// `carrick_hal::HostForkCoordinator` trait (the cross-platform seam). Bring it
+// into scope so `kernel.fork.{start_signal_pump, prepare_host_fork,
+// restart_after_*}` resolve on the concrete `ForkCoordinator`.
+use carrick_hal::HostForkCoordinator as _;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 
@@ -283,35 +306,11 @@ pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
 // from `crate::trap`; imported here via the `use crate::trap::{…}` below so
 // `SplitView`/`HvfTrapEngine` impls and the loop bounds are unchanged.
 
-#[derive(Debug, Error)]
-pub enum RuntimeError {
-    #[error("failed to load ELF image: {0}")]
-    AddressSpace(#[from] AddressSpaceError),
-    // Reading a rootfs-backed ELF (main binary / PT_INTERP) lives at the runtime
-    // layer now that AddressSpace loading is rootfs-agnostic (closure reader) —
-    // this is what decoupled `memory` from `rootfs` (build-graph A2.5).
-    #[error("failed to read rootfs-backed ELF: {0}")]
-    RootFs(#[from] crate::rootfs::RootFsError),
-    #[error("trap engine failed: {0}")]
-    Trap(#[from] TrapError),
-    #[error("syscall dispatch failed: {0}")]
-    Dispatch(#[from] DispatchError),
-    #[error("filesystem backend error: {0}")]
-    FsBackend(anyhow::Error),
-    #[error("guest did not exit after {max_traps} traps")]
-    TrapLimitExceeded { max_traps: usize },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RunResult {
-    pub exit_code: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub traps: usize,
-    pub report: CompatReport,
-    #[serde(default)]
-    pub trap_limit_hit: bool,
-}
+// `RunResult` / `RuntimeError` are now defined cross-platform in
+// `crate::run_result` (unified with the Linux KVM loop). Re-export them under
+// the original `carrick_runtime::runtime::{RunResult, RuntimeError}` paths so
+// every call site (carrick-engine, carrick-cli, the runtime tests) is unchanged.
+pub use crate::run_result::{RunResult, RuntimeError};
 
 pub fn run_static_elf_with_hvf(
     path: impl AsRef<Path>,
@@ -2637,9 +2636,10 @@ impl ThreadRuntimeState {
                     fork_barrier().end_quiesce();
                 }
                 fork_barrier().end_fork();
+                let (reg, fut) = fork_coord_views(&self.kicker, &self.futex);
                 kernel
                     .fork
-                    .restart_after_fork_error(prepared_fork, &self.kicker, &self.futex);
+                    .restart_after_fork_error(prepared_fork, &reg, &fut);
                 return Err(RuntimeError::Trap(error));
             }
         };
@@ -2656,10 +2656,11 @@ impl ThreadRuntimeState {
                 let child_exit_needs_signal_pump = kernel
                     .dispatcher
                     .child_exit_signal_needs_pump(self.this_tid, exit_signal);
+                let (reg, fut) = fork_coord_views(&self.kicker, &self.futex);
                 kernel.fork.restart_after_parent_fork(
                     prepared_fork,
-                    &self.kicker,
-                    &self.futex,
+                    &reg,
+                    &fut,
                     child_exit_needs_signal_pump,
                 );
                 // engine.fork() rebuilt this thread's own vCPU, so its old
@@ -2835,9 +2836,10 @@ impl ThreadRuntimeState {
                     .register(self.this_tid, engine.vcpu_kick_handle());
                 self.registry
                     .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+                let (reg, fut) = fork_coord_views(&self.kicker, &self.futex);
                 kernel
                     .fork
-                    .restart_after_child_fork(prepared_fork, &self.kicker, &self.futex);
+                    .restart_after_child_fork(prepared_fork, &reg, &fut);
                 0
             }
         };
@@ -2892,7 +2894,8 @@ fn run_threaded_hvf_loop(
     // exit signal is caught/blocked; interactive terminals keep prompt Ctrl-C
     // delivery for busy guests that have not made another syscall.
     if crate::host_tty::host_isatty(0) || crate::host_tty::host_isatty(1) {
-        kernel.fork.start_signal_pump(&kicker, &futex);
+        let (reg, fut) = fork_coord_views(&kicker, &futex);
+        kernel.fork.start_signal_pump(&reg, &fut);
     }
 
     let outcome = run_vcpu_until_exit(
@@ -3216,7 +3219,8 @@ fn run_vcpu_until_exit(
             }
 
             if kernel.dispatcher.take_signal_pump_request() {
-                kernel.fork.start_signal_pump(&state.kicker, &state.futex);
+                let (reg, fut) = fork_coord_views(&state.kicker, &state.futex);
+                kernel.fork.start_signal_pump(&reg, &fut);
             }
 
             #[cfg(feature = "trace-traps")]

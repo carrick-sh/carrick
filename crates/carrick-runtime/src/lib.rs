@@ -128,7 +128,7 @@ pub use carrick_hvf::darwin_kqueue;
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::{
     compat, fork_coord, host_signal, io_wait, itimer, posix_timer, probes, shared_aperture,
-    syscall, trap, vcpu_kick,
+    syscall, threaded_impl, trap, vcpu_kick,
 };
 // thread (ThreadRegistry/FutexTable) + fork_quiesce barriers are
 // hypervisor-agnostic; both backends use the real carrick-thread impls.
@@ -156,9 +156,37 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
 pub mod trap {
     pub use carrick_hal::{ForkOutcome, SyscallTrap, TrapError};
     pub const HVF_PAGE_SIZE: u64 = 0x4000;
+
+    // Cross-process VM-topology bookkeeping the shared threaded loop references
+    // around a guest fork. On HVF these coordinate the stop-the-world VM
+    // teardown/rebuild (carrick-hvf::trap); the Linux KVM backend has no such
+    // host-side VM surgery, so they are inert stubs — same no-op pattern as the
+    // `host_signal` / `probes` Linux stubs below. The vcpu_loop fork path that
+    // uses them is itself gated to the HVF run loop, so these are never hit on
+    // Linux; they exist only so the unconditional `vcpu_loop` module compiles.
+
+    /// Count of live vCPUs — the fork/exec quiesce invariant on HVF. Always 0 on
+    /// Linux (the fork quiesce is HVF-only).
+    pub static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    /// Clear any VM republished by a previous fork. No-op on Linux.
+    pub fn clear_rebuilt_vm_for_fork() {}
+
+    /// Publish the guest arena high-water so a child snapshot's mincore scan is
+    /// bounded. No-op on Linux (no host-side CoW snapshot).
+    pub fn set_guest_arena_high_water(_addr: u64) {}
+
+    /// Dump cross-thread kick statistics at process exit. No-op on Linux.
+    pub fn dump_kick_stats() {}
 }
 pub mod overlay;
 pub mod pathcodec;
+
+// Cross-platform run-loop result/error + kernel-half state. Single home for
+// `RunResult` / `RuntimeError` / `KernelState` / `Kernel` / `VcpuLoopOutcome`,
+// shared by the HVF threaded loop (`vcpu_loop`) and the KVM single-threaded
+// loop (the Linux `runtime` module below).
+pub mod run_result;
 
 #[cfg(feature = "platform-macos")]
 pub mod execute;
@@ -192,6 +220,9 @@ pub mod runtime {
 
     use crate::compat::CompatReporter;
     use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
+    // The run-loop result/error types are now cross-platform (unified with the
+    // macOS HVF loop) so both backends return the same `Result<RunResult, _>`.
+    pub use crate::run_result::{RunResult, RuntimeError};
 
     pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
     pub(crate) const ROSETTA_INTERPRETER: &str =
@@ -199,46 +230,6 @@ pub mod runtime {
     pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
         None
     }
-
-    /// What a finished guest run produced. The KVM backend buffers the guest's
-    /// stdout/stderr in the dispatcher (fd 1/2); the driver flushes them to the
-    /// host after the loop returns.
-    #[derive(Debug)]
-    pub struct RunResult {
-        pub exit_code: i32,
-        pub stdout: Vec<u8>,
-        pub stderr: Vec<u8>,
-        pub traps: usize,
-    }
-
-    /// Why the Linux run loop stopped short of a clean guest exit.
-    #[derive(Debug)]
-    pub enum RuntimeError {
-        /// ELF load / address-space construction failed.
-        Load(String),
-        /// The trap engine (KVM bring-up, `KVM_RUN`, register I/O) failed.
-        Trap(String),
-        /// A syscall dispatch returned a hard error.
-        Dispatch(String),
-        /// The guest hit an outcome the Phase-B loop cannot service yet
-        /// (blocking I/O / futex / fork / signal injection — Phase C/D).
-        Unsupported(String),
-        /// The guest ran past `max_traps` syscalls without exiting.
-        TrapLimit,
-    }
-
-    impl std::fmt::Display for RuntimeError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                RuntimeError::Load(m) => write!(f, "load: {m}"),
-                RuntimeError::Trap(m) => write!(f, "trap: {m}"),
-                RuntimeError::Dispatch(m) => write!(f, "dispatch: {m}"),
-                RuntimeError::Unsupported(m) => write!(f, "unsupported in linux MVP loop: {m}"),
-                RuntimeError::TrapLimit => write!(f, "guest exceeded max_traps without exiting"),
-            }
-        }
-    }
-    impl std::error::Error for RuntimeError {}
 
     /// Single-threaded real-dispatch loop for the KVM backend. Generic over the
     /// engine, which must be BOTH the guest memory (`GuestMemory`) and the trap
@@ -258,10 +249,9 @@ pub mod runtime {
             crate::io_wait::ThreadWaiter::new(std::process::id() as crate::thread::ThreadId);
         let trace_traps = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
         for traps in 1..=max_traps {
-            let frame = match runtime
-                .next_syscall()
-                .map_err(|e| RuntimeError::Trap(e.to_string()))?
-            {
+            // `next_syscall` returns `TrapError`, which the unified RuntimeError
+            // absorbs via `#[from]` — so `?` carries it through directly.
+            let frame = match runtime.next_syscall()? {
                 Some(f) => f,
                 // A bare kick/halt with no pending syscall. Phase B has no
                 // process-directed signals, so there is nothing to deliver.
@@ -284,14 +274,10 @@ pub mod runtime {
             )?;
             match outcome {
                 DispatchOutcome::Returned { value } => {
-                    runtime
-                        .complete_syscall(value)
-                        .map_err(|e| RuntimeError::Trap(e.to_string()))?;
+                    runtime.complete_syscall(value)?;
                 }
                 DispatchOutcome::Errno { errno } => {
-                    runtime
-                        .complete_syscall(-(errno as i64))
-                        .map_err(|e| RuntimeError::Trap(e.to_string()))?;
+                    runtime.complete_syscall(-(errno as i64))?;
                 }
                 DispatchOutcome::Exit { code } => {
                     return Ok(RunResult {
@@ -299,6 +285,8 @@ pub mod runtime {
                         stdout: dispatcher.stdout().to_vec(),
                         stderr: dispatcher.stderr().to_vec(),
                         traps,
+                        report: reporter.snapshot(),
+                        trap_limit_hit: false,
                     });
                 }
                 other => {
@@ -308,7 +296,7 @@ pub mod runtime {
                 }
             }
         }
-        Err(RuntimeError::TrapLimit)
+        Err(RuntimeError::TrapLimitExceeded { max_traps })
     }
 
     /// Dispatch one syscall, servicing any blocking-I/O outcome inline via the
@@ -328,9 +316,8 @@ pub mod runtime {
         use crate::io_wait::{WaitFd, WaitResult};
         const EINTR: i32 = crate::linux_abi::LINUX_EINTR;
         loop {
-            let outcome = dispatcher
-                .dispatch(request, memory, reporter)
-                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+            // `dispatch` returns `DispatchError`, absorbed via `#[from]`.
+            let outcome = dispatcher.dispatch(request, memory, reporter)?;
             match outcome {
                 DispatchOutcome::WaitOnFds {
                     fds,
@@ -474,15 +461,15 @@ pub mod runtime {
         // unaffected; a libc binary needs it. argv[0] is the path; a minimal
         // env keeps the CRT happy.
         let argv0 = path.to_string_lossy().into_owned();
-        let image = crate::memory::AddressSpace::load_elf(path)
-            .map_err(|e| RuntimeError::Load(e.to_string()))?
+        // `AddressSpaceError` and `TrapError` are absorbed by the unified
+        // RuntimeError via `#[from]`, so `?` carries each through directly.
+        let image = crate::memory::AddressSpace::load_elf(path)?
             // load_elf sets AT_SYSINFO_EHDR in the auxv, so a libc CRT reads the
             // vdso ELF header at LINUX_VDSO_BASE. Materialise the vdso (+ vvar)
             // regions — bring_up backs them as their own slots — or that read
             // faults. Mirrors the macOS boot chain. Must precede the stack build
             // (which serialises the auxv).
-            .with_vdso()
-            .map_err(|e| RuntimeError::Load(e.to_string()))?
+            .with_vdso()?
             .with_linux_initial_stack(
                 [argv0.as_bytes()],
                 [
@@ -490,10 +477,8 @@ pub mod runtime {
                     b"HOME=/".as_slice(),
                     b"TERM=dumb".as_slice(),
                 ],
-            )
-            .map_err(|e| RuntimeError::Load(e.to_string()))?;
-        let mut engine = carrick_linux::KvmTrapEngine::new(&image)
-            .map_err(|e| RuntimeError::Trap(e.to_string()))?;
+            )?;
+        let mut engine = carrick_linux::KvmTrapEngine::new(&image)?;
         run_combined_syscall_loop_linux(&mut engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
     }
 
@@ -1158,6 +1143,11 @@ pub mod compat {
     pub struct CompatReporter;
     impl CompatReporter {
         pub fn record(&self, _event: CompatEvent) {}
+        /// Snapshot the (empty) compat report. The KVM MVP loop builds a
+        /// `RunResult` with this; full compat reporting is a later slice.
+        pub fn snapshot(&self) -> CompatReport {
+            CompatReport::default()
+        }
     }
     impl Default for CompatReporter {
         fn default() -> Self {
@@ -1165,7 +1155,15 @@ pub mod compat {
         }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// JSON-serialisable compatibility report. The macOS reporter records guest
+    /// syscall coverage; the Linux KVM MVP carries an empty report so the
+    /// cross-platform `RunResult` has a single shape on both backends.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CompatReport {
+        pub events: Vec<CompatEvent>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub enum CompatEvent {
         SyscallEntry {
             number: u64,
