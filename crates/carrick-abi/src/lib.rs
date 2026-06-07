@@ -1962,6 +1962,21 @@ pub const LINUX_TCGETS: u64 = 0x5401;
 pub const LINUX_TCSETS: u64 = 0x5402;
 pub const LINUX_TCSETSW: u64 = 0x5403;
 pub const LINUX_TCSETSF: u64 = 0x5404;
+// termios2 variants. glibc-aarch64 implements tcgetattr/tcsetattr (and thus
+// isatty(3), which goes through tcgetattr) via these — NOT the legacy
+// TCGETS/TCSETS above — so it can carry an arbitrary baud rate (BOTHER) in the
+// c_ispeed/c_ospeed tail. musl still uses the legacy 36-byte TCGETS, which is
+// why a musl-only probe suite never exercised these. The request codes encode a
+// 44-byte payload (`_IOR/_IOW('T', 0x2A..0x2D, struct termios2)`); the struct is
+// [`LinuxTermios`] in full (44 bytes), vs the 36-byte [`LINUX_TERMIOS_KERNEL_SIZE`]
+// prefix used by TCGETS.
+pub const LINUX_TCGETS2: u64 = 0x802c_542a;
+pub const LINUX_TCSETS2: u64 = 0x402c_542b;
+pub const LINUX_TCSETSW2: u64 = 0x402c_542c;
+pub const LINUX_TCSETSF2: u64 = 0x402c_542d;
+/// Size of the Linux kernel-ABI `struct termios2` (TCGETS2/TCSETS2): the full
+/// [`LinuxTermios`] including the `c_ispeed`/`c_ospeed` tail = **44 bytes**.
+pub const LINUX_TERMIOS2_SIZE: usize = 44;
 // Line-discipline control ioctls (tty_ioctl(4)). glibc maps the tc* helpers
 // onto these: tcdrain → TCSBRK(arg=1), tcsendbreak(dur!=0) → TCSBRKP,
 // tcflush → TCFLSH(queue), tcflow → TCXONC(action).

@@ -3214,16 +3214,35 @@ impl SyscallDispatcher {
                         this.pty_table().lock().set_locked(role.index, lock);
                         DispatchOutcome::Returned { value: 0 }
                     }
-                    LINUX_TCGETS => {
+                    LINUX_TCGETS | LINUX_TCGETS2 => {
                         let termios = crate::host_tty::get_host_termios(host_fd)
                             .unwrap_or_else(LinuxTermios::default_cooked);
-                        write_kernel_struct(&mut *cx.memory, arg, &termios)
+                        // glibc-aarch64 tcgetattr on a pty slave uses TCGETS2
+                        // (the full 44-byte termios2); musl uses 36-byte TCGETS.
+                        if ioctl_request == LINUX_TCGETS2 {
+                            write_termios2(&mut *cx.memory, arg, &termios)
+                        } else {
+                            write_kernel_struct(&mut *cx.memory, arg, &termios)
+                        }
                     }
-                    LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => {
-                        match cx.memory.read_bytes(arg, LINUX_TERMIOS_KERNEL_SIZE) {
+                    LINUX_TCSETS
+                    | LINUX_TCSETSW
+                    | LINUX_TCSETSF
+                    | LINUX_TCSETS2
+                    | LINUX_TCSETSW2
+                    | LINUX_TCSETSF2 => {
+                        let want = if matches!(
+                            ioctl_request,
+                            LINUX_TCSETS2 | LINUX_TCSETSW2 | LINUX_TCSETSF2
+                        ) {
+                            LINUX_TERMIOS2_SIZE
+                        } else {
+                            LINUX_TERMIOS_KERNEL_SIZE
+                        };
+                        match cx.memory.read_bytes(arg, want) {
                             Ok(bytes) => {
                                 let mut padded = [0u8; core::mem::size_of::<LinuxTermios>()];
-                                padded[..LINUX_TERMIOS_KERNEL_SIZE].copy_from_slice(&bytes);
+                                padded[..want].copy_from_slice(&bytes);
                                 match LinuxTermios::read_from_bytes(&padded) {
                                     Ok(t) => {
                                         let _ = crate::host_tty::with_sigttou_blocked(
@@ -3429,7 +3448,7 @@ impl SyscallDispatcher {
                     write_kernel_struct(&mut *cx.memory, arg, &winsize)
                 }
                 LINUX_TIOCGWINSZ => DispatchOutcome::errno(LINUX_ENOTTY),
-                LINUX_TCGETS if fd_is_tty(&this.io.open_files.read(), fd.0) => {
+                LINUX_TCGETS | LINUX_TCGETS2 if fd_is_tty(&this.io.open_files.read(), fd.0) => {
                     // Mirror the live host terminal modes when available so
                     // `less`, `vi`, and an interactive shell see the actual
                     // ICANON/ECHO state the user has configured.
@@ -3439,26 +3458,45 @@ impl SyscallDispatcher {
                     } else {
                         LinuxTermios::default_cooked()
                     };
-                    // KernelAbi for LinuxTermios pins this at 36 bytes —
-                    // the kernel-ABI termios size, NOT our 44-byte Rust
-                    // struct (which includes the termios2-only ispeed/ospeed
-                    // tail). Going past 36 here is what blew glibc's
-                    // tcgetattr canary and crashed ls/dpkg.
-                    write_kernel_struct(&mut *cx.memory, arg, &termios)
+                    // TCGETS writes the 36-byte legacy `struct termios`
+                    // (KernelAbi::ABI_SIZE). Writing the 44-byte termios2 there
+                    // overran glibc's tcgetattr canary and crashed ls/dpkg.
+                    // TCGETS2 — what glibc-aarch64 actually uses for tcgetattr/
+                    // isatty — expects the full 44-byte `struct termios2`
+                    // (the c_ispeed/c_ospeed tail). musl uses TCGETS, so a
+                    // musl-only probe suite never exercised this path.
+                    if ioctl_request == LINUX_TCGETS2 {
+                        write_termios2(&mut *cx.memory, arg, &termios)
+                    } else {
+                        write_kernel_struct(&mut *cx.memory, arg, &termios)
+                    }
                 }
-                LINUX_TCGETS => DispatchOutcome::errno(LINUX_ENOTTY),
-                LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF
+                LINUX_TCGETS | LINUX_TCGETS2 => DispatchOutcome::errno(LINUX_ENOTTY),
+                LINUX_TCSETS
+                | LINUX_TCSETSW
+                | LINUX_TCSETSF
+                | LINUX_TCSETS2
+                | LINUX_TCSETSW2
+                | LINUX_TCSETSF2
                     if fd_is_tty(&this.io.open_files.read(), fd.0) =>
                 {
-                    // Read 36 bytes (kernel termios), then pad to the
-                    // 44-byte zerocopy struct so we can parse it. The guest
-                    // only provided a 36-byte buffer; reading 44 would
-                    // EFAULT at the boundary of a stack-page allocation.
-                    match cx.memory.read_bytes(arg, LINUX_TERMIOS_KERNEL_SIZE) {
+                    // Read exactly what the guest provided: 36 bytes for the
+                    // legacy TCSETS*, 44 for the termios2 variants. Reading more
+                    // than the guest's buffer would EFAULT at a stack-page
+                    // boundary. Then pad to the 44-byte zerocopy struct to parse.
+                    let want = if matches!(
+                        ioctl_request,
+                        LINUX_TCSETS2 | LINUX_TCSETSW2 | LINUX_TCSETSF2
+                    ) {
+                        LINUX_TERMIOS2_SIZE
+                    } else {
+                        LINUX_TERMIOS_KERNEL_SIZE
+                    };
+                    match cx.memory.read_bytes(arg, want) {
                         Ok(bytes) => {
                             if crate::host_tty::host_isatty(fd.0) {
                                 let mut padded = [0u8; core::mem::size_of::<LinuxTermios>()];
-                                padded[..LINUX_TERMIOS_KERNEL_SIZE].copy_from_slice(&bytes);
+                                padded[..want].copy_from_slice(&bytes);
                                 if let Ok(t) = LinuxTermios::read_from_bytes(&padded) {
                                     let _ = crate::host_tty::with_sigttou_blocked(block_ttou, || {
                                         crate::host_tty::set_host_termios_tracking(fd.0, &t)
@@ -3470,7 +3508,12 @@ impl SyscallDispatcher {
                         Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
                     }
                 }
-                LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => DispatchOutcome::errno(LINUX_ENOTTY),
+                LINUX_TCSETS
+                | LINUX_TCSETSW
+                | LINUX_TCSETSF
+                | LINUX_TCSETS2
+                | LINUX_TCSETSW2
+                | LINUX_TCSETSF2 => DispatchOutcome::errno(LINUX_ENOTTY),
                 LINUX_TIOCSCTTY => match this.tty_ioctl_fd_kind(fd.0) {
                     Ok(TtyFdKind::Stdio) => DispatchOutcome::Returned { value: 0 },
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
