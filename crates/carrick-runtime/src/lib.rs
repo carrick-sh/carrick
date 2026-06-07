@@ -825,12 +825,56 @@ pub mod darwin_kqueue {
 pub mod host_signal {
     pub const NO_PENDING_SIGNAL: i32 = 0;
 
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    // Per-guest-thread pending UNBLOCKED-signal bitmask (bit `signum-1`),
+    // mirroring the macOS `THREAD_PENDING`. A guest `tgkill`/`tkill` (raise,
+    // pthread_kill) or a sibling-directed send of an UNBLOCKED signal is
+    // published here by `publish_pending_for`; the TARGET thread's run loop
+    // consumes it via `take_pending_for` (in `vcpu_loop::deliver_pending_signal`)
+    // and injects the handler. BLOCKED signals do NOT come here — they go to the
+    // dispatcher's own per-thread pending set (`mark_signal_pending`, the
+    // sigwait/sigtimedwait path), which is why blocked-signal delivery already
+    // worked while this module was stubbed. Linux has no host-signal pump, so
+    // there is no process-directed `PROC_PENDING` analogue: a guest
+    // process-directed send is already routed to a concrete thread (or to the
+    // dispatcher's shared pending set) before it would reach here.
+    fn thread_pending() -> &'static Mutex<HashMap<i32, u64>> {
+        static T: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    /// Lock the pending table, recovering the guard if a panicking thread
+    /// poisoned the mutex (the contents are a plain bitmask, never left in a
+    /// half-updated state — and a poisoned signal table must not crash delivery).
+    fn lock_pending() -> std::sync::MutexGuard<'static, HashMap<i32, u64>> {
+        thread_pending()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// `THREAD_PENDING` bit for `signum` (bit `signum-1`), or 0 if out of range.
+    fn pending_bit(signum: i32) -> u64 {
+        if (1..=64).contains(&signum) {
+            1u64 << (signum - 1)
+        } else {
+            0
+        }
+    }
+
     pub fn relocate_internal_fd(fd: i32) -> i32 {
         fd
     }
     pub fn reset_after_supervisor_fork() {}
-    pub fn has_unblocked_pending_for(_tid: i32, _mask: u64) -> bool {
-        false
+    /// Is a deliverable (unblocked) signal pending for `tid`? A signal whose bit
+    /// is in `block_mask` does not count (it stays pending until unblocked), but
+    /// SIGKILL/SIGSTOP always count. Used by a blocking wait (ppoll/epoll_pwait)
+    /// to decide whether to break so the loop can run delivery.
+    pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
+        let always = pending_bit(crate::linux_abi::LINUX_SIGKILL)
+            | pending_bit(crate::linux_abi::LINUX_SIGSTOP);
+        lock_pending()
+            .get(&tid)
+            .is_some_and(|&mask| mask & (!block_mask | always) != 0)
     }
     pub fn linux_to_host_signum(sig: i32) -> i32 {
         sig
@@ -852,7 +896,18 @@ pub mod host_signal {
         Vec::new()
     }
     pub fn raise_for_self(_sig: i32) {}
-    pub fn publish_pending_for(_tid: i32, _sig: i32) {}
+    /// Publish an UNBLOCKED thread-directed signal at guest `tid`. The target's
+    /// run loop consumes it via `take_pending_for` and injects the handler. The
+    /// caller is responsible for any cross-thread wakeup (the runtime kicks the
+    /// target vCPU right after, for the sibling path); for a self-raise the
+    /// publishing thread reaches `deliver_pending_signal` itself on the next
+    /// loop iteration.
+    pub fn publish_pending_for(tid: i32, sig: i32) {
+        let bit = pending_bit(sig);
+        if bit != 0 {
+            *lock_pending().entry(tid).or_insert(0) |= bit;
+        }
+    }
     pub fn take_pending() -> i32 {
         0
     }
@@ -879,17 +934,33 @@ pub mod host_signal {
     // loop is never instantiated on the KVM backend (the Linux run path is the
     // single-threaded loop in `crate::runtime`), so these are inert — present
     // only so the unconditional module name-resolves on Linux.
-    pub fn forget_thread(_tid: i32) {}
-    pub fn has_pending_for(_tid: i32) -> bool {
-        false
+    pub fn forget_thread(tid: i32) {
+        lock_pending().remove(&tid);
+    }
+    pub fn has_pending_for(tid: i32) -> bool {
+        lock_pending().get(&tid).is_some_and(|&mask| mask != 0)
     }
     pub fn last_sender_for(_signum: i32) -> i32 {
         0
     }
     pub fn register_child_exit_watch(_child_pid: i32, _parent_tid: i32, _exit_signal: i32) {}
     pub fn reinit_after_fork() {}
-    pub fn take_pending_for(_tid: i32) -> i32 {
-        0
+    /// Pop the lowest-numbered pending signal for `tid` (clearing its bit), or
+    /// `0` if none. The single point of consumption in
+    /// `vcpu_loop::deliver_pending_signal`.
+    pub fn take_pending_for(tid: i32) -> i32 {
+        let mut guard = lock_pending();
+        if let Some(mask) = guard.get_mut(&tid)
+            && *mask != 0
+        {
+            let signum = mask.trailing_zeros() as i32 + 1;
+            *mask &= *mask - 1; // clear the lowest set bit
+            if *mask == 0 {
+                guard.remove(&tid);
+            }
+            return signum;
+        }
+        NO_PENDING_SIGNAL
     }
     pub fn wake_all_waiters() {}
 }
