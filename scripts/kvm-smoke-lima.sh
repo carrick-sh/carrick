@@ -407,8 +407,48 @@ CEOF
       printf "FAIL [shared-futex-fork]: stdout=[%s] exit=%s oracle=[sharedfutex-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 13. Phase 2 / Task 3+7: vfork-exec -- the vfork(2) + execve(2) handshake on
+    #     the generic threaded KVM loop. A glibc binary vfork()s; the CHILD
+    #     execve()s a tiny static target while the PARENT is SUSPENDED (the
+    #     handle_fork vfork-pipe poll); a successful child execve writes the
+    #     release byte, resuming the parent, which wait4()s the target -> status 0.
+    #     This exercises (a) the generic loop vfork parent-suspend and (b) the
+    #     KVM execve path NEW Linux load_execve_image (Task 7d: the macOS image
+    #     builder is HVF-only, so the non-macOS helper module now builds a
+    #     KVM-flavored AddressSpace -- ELF + vdso + initial stack -- that
+    #     KvmTrapEngine::execve_into remaps in place). REQUIRED gate.
+    cat > /tmp/cvf-target.c <<CEOF
+int main(void){ return 0; }
+CEOF
+    gcc -static -O2 -o /tmp/carrick-vfork-target /tmp/cvf-target.c
+    cat > /tmp/cvf.c <<CEOF
+#include <unistd.h>
+#include <sys/wait.h>
+extern char **environ;
+int main(void){
+  pid_t pid=vfork();
+  if(pid<0) return 2;
+  if(pid==0){
+    char *argv[]={"/tmp/carrick-vfork-target",0};
+    execve("/tmp/carrick-vfork-target",argv,environ);
+    _exit(127); /* execve failed -> parent sees 127, fixture fails */
+  }
+  int st; if(waitpid(pid,&st,0)!=pid) return 3;
+  if(!WIFEXITED(st)||WEXITSTATUS(st)!=0) return 4;
+  return write(1,"vfork-exec-ok",13)==13?0:5;
+}
+CEOF
+    gcc -static -O2 -o /tmp/cvf /tmp/cvf.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/cvf" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "vfork-exec-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+vfork-exec]: vfork + child execve + parent wait4 (status 0) via the threaded loop + KVM load_execve_image."
+    else
+      printf "FAIL [vfork-exec]: stdout=[%s] exit=%s oracle=[vfork-exec-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -419,5 +459,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex — all 15 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex — all 16 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec) pass on KVM; ZERO xfail."
 '
