@@ -5401,6 +5401,339 @@ impl SyscallTrap for HvfTrapEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// carrick-hal trait impls: RegAccess + ThreadedEngine
+//
+// These are forwarding impls only.  Every method delegates to an existing
+// HvfTrapEngine / HvfInner method verbatim.  No behaviour is changed.
+//
+// The HAL Reg/SysReg enums were designed for KVM's register naming; we map
+// each variant to the equivalent applevisor register below.
+//
+// HypervisorError does not carry a POSIX errno.  We map any HVF error to
+// EIO (5) — a generic I/O error the caller can distinguish from EINVAL/ENOSYS.
+// ---------------------------------------------------------------------------
+
+/// Convert an applevisor error to a HAL OsError, using EIO as the errno.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+fn hvf_os_error(_e: applevisor::error::HypervisorError) -> carrick_hal::OsError {
+    carrick_hal::OsError::from_raw(libc::EIO)
+}
+
+/// Map a HAL [`carrick_hal::Reg`] to the corresponding applevisor value and
+/// read it from `vcpu`.  On non-HVF targets returns ENOSYS (never called).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hvf_get_reg(
+    vcpu: &applevisor::vcpu::Vcpu,
+    r: carrick_hal::Reg,
+) -> Result<u64, carrick_hal::OsError> {
+    // `applevisor::prelude::*` brings `Reg`/`SysReg`; we locally shadow the
+    // HAL types only inside the `match r` arm patterns.
+    use applevisor::prelude::*;
+    let hal_r = r;
+    match hal_r {
+        carrick_hal::Reg::X(n) if (n as usize) < GPR_TABLE.len() => {
+            vcpu.get_reg(GPR_TABLE[n as usize]).map_err(hvf_os_error)
+        }
+        carrick_hal::Reg::Sp => vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_os_error),
+        carrick_hal::Reg::Pc => vcpu.get_reg(Reg::PC).map_err(hvf_os_error),
+        carrick_hal::Reg::Pstate => vcpu.get_reg(Reg::CPSR).map_err(hvf_os_error),
+        carrick_hal::Reg::SpEl1 => vcpu.get_sys_reg(SysReg::SP_EL1).map_err(hvf_os_error),
+        carrick_hal::Reg::ElrEl1 => vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_os_error),
+        carrick_hal::Reg::SpsrEl1 => vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_os_error),
+        _ => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn hvf_get_reg(_vcpu: &HvfInner, _r: carrick_hal::Reg) -> Result<u64, carrick_hal::OsError> {
+    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hvf_set_reg(
+    vcpu: &applevisor::vcpu::Vcpu,
+    r: carrick_hal::Reg,
+    v: u64,
+) -> Result<(), carrick_hal::OsError> {
+    use applevisor::prelude::*;
+    let hal_r = r;
+    match hal_r {
+        carrick_hal::Reg::X(n) if (n as usize) < GPR_TABLE.len() => {
+            vcpu.set_reg(GPR_TABLE[n as usize], v).map_err(hvf_os_error)
+        }
+        carrick_hal::Reg::Sp => vcpu.set_sys_reg(SysReg::SP_EL0, v).map_err(hvf_os_error),
+        carrick_hal::Reg::Pc => vcpu.set_reg(Reg::PC, v).map_err(hvf_os_error),
+        carrick_hal::Reg::Pstate => vcpu.set_reg(Reg::CPSR, v).map_err(hvf_os_error),
+        carrick_hal::Reg::SpEl1 => vcpu.set_sys_reg(SysReg::SP_EL1, v).map_err(hvf_os_error),
+        carrick_hal::Reg::ElrEl1 => vcpu.set_sys_reg(SysReg::ELR_EL1, v).map_err(hvf_os_error),
+        carrick_hal::Reg::SpsrEl1 => vcpu.set_sys_reg(SysReg::SPSR_EL1, v).map_err(hvf_os_error),
+        _ => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn hvf_set_reg(
+    _vcpu: &HvfInner,
+    _r: carrick_hal::Reg,
+    _v: u64,
+) -> Result<(), carrick_hal::OsError> {
+    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hvf_get_sys_reg(
+    vcpu: &applevisor::vcpu::Vcpu,
+    r: carrick_hal::SysReg,
+) -> Result<u64, carrick_hal::OsError> {
+    use applevisor::prelude::*;
+    let hvf_reg = match r {
+        carrick_hal::SysReg::Sctlr => SysReg::SCTLR_EL1,
+        carrick_hal::SysReg::Ttbr0 => SysReg::TTBR0_EL1,
+        carrick_hal::SysReg::Ttbr1 => SysReg::TTBR1_EL1,
+        carrick_hal::SysReg::Tcr => SysReg::TCR_EL1,
+        carrick_hal::SysReg::Mair => SysReg::MAIR_EL1,
+        carrick_hal::SysReg::Vbar => SysReg::VBAR_EL1,
+        carrick_hal::SysReg::Cpacr => SysReg::CPACR_EL1,
+    };
+    vcpu.get_sys_reg(hvf_reg).map_err(hvf_os_error)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn hvf_get_sys_reg(_vcpu: &HvfInner, _r: carrick_hal::SysReg) -> Result<u64, carrick_hal::OsError> {
+    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hvf_set_sys_reg(
+    vcpu: &applevisor::vcpu::Vcpu,
+    r: carrick_hal::SysReg,
+    v: u64,
+) -> Result<(), carrick_hal::OsError> {
+    use applevisor::prelude::*;
+    let hvf_reg = match r {
+        carrick_hal::SysReg::Sctlr => SysReg::SCTLR_EL1,
+        carrick_hal::SysReg::Ttbr0 => SysReg::TTBR0_EL1,
+        carrick_hal::SysReg::Ttbr1 => SysReg::TTBR1_EL1,
+        carrick_hal::SysReg::Tcr => SysReg::TCR_EL1,
+        carrick_hal::SysReg::Mair => SysReg::MAIR_EL1,
+        carrick_hal::SysReg::Vbar => SysReg::VBAR_EL1,
+        carrick_hal::SysReg::Cpacr => SysReg::CPACR_EL1,
+    };
+    vcpu.set_sys_reg(hvf_reg, v).map_err(hvf_os_error)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn hvf_set_sys_reg(
+    _vcpu: &HvfInner,
+    _r: carrick_hal::SysReg,
+    _v: u64,
+) -> Result<(), carrick_hal::OsError> {
+    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+}
+
+impl carrick_hal::RegAccess for HvfTrapEngine {
+    fn get_reg(&self, r: carrick_hal::Reg) -> Result<u64, carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            hvf_get_reg(&self.inner.vcpu, r)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = r;
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+
+    fn set_reg(&mut self, r: carrick_hal::Reg, v: u64) -> Result<(), carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            hvf_set_reg(&self.inner.vcpu, r, v)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (r, v);
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+
+    fn get_sys_reg(&self, r: carrick_hal::SysReg) -> Result<u64, carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            hvf_get_sys_reg(&self.inner.vcpu, r)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = r;
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+
+    fn set_sys_reg(&mut self, r: carrick_hal::SysReg, v: u64) -> Result<(), carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            hvf_set_sys_reg(&self.inner.vcpu, r, v)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (r, v);
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+
+    fn get_vreg(&self, n: u32) -> Result<u128, carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let idx = n as usize;
+            if idx >= SIMD_FP_TABLE.len() {
+                return Err(carrick_hal::OsError::from_raw(libc::EINVAL));
+            }
+            self.inner
+                .vcpu
+                .get_simd_fp_reg(SIMD_FP_TABLE[idx])
+                .map_err(hvf_os_error)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = n;
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+
+    fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let idx = n as usize;
+            if idx >= SIMD_FP_TABLE.len() {
+                return Err(carrick_hal::OsError::from_raw(libc::EINVAL));
+            }
+            let vcpu_id = self.inner.vcpu.id();
+            let rc = set_simd_fp_reg_v(vcpu_id, SIMD_FP_TABLE[idx], v);
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(carrick_hal::OsError::from_raw(libc::EIO))
+            }
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (n, v);
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+
+    fn get_fpcr(&self) -> Result<u64, carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use applevisor::prelude::*;
+            self.inner.vcpu.get_reg(Reg::FPCR).map_err(hvf_os_error)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+    }
+
+    fn set_fpcr(&mut self, v: u64) -> Result<(), carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use applevisor::prelude::*;
+            self.inner.vcpu.set_reg(Reg::FPCR, v).map_err(hvf_os_error)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = v;
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+
+    fn get_fpsr(&self) -> Result<u64, carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use applevisor::prelude::*;
+            self.inner.vcpu.get_reg(Reg::FPSR).map_err(hvf_os_error)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+    }
+
+    fn set_fpsr(&mut self, v: u64) -> Result<(), carrick_hal::OsError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use applevisor::prelude::*;
+            self.inner.vcpu.set_reg(Reg::FPSR, v).map_err(hvf_os_error)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = v;
+            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
+        }
+    }
+}
+
+// SAFETY: HvfTrapEngine wraps a ManuallyDrop<HvfInner> containing
+// applevisor::Vcpu (non-Send due to raw pointers). The `Send` impl is
+// required because the `carrick_hal::ThreadedEngine` trait declares a `Send`
+// supertrait bound that the generic shared run-loop relies on. Soundness
+// holds because each Vcpu is owned by exactly one HvfTrapEngine confined to a
+// single thread: a thread-creating clone moves a `ThreadSpec` (itself
+// `unsafe impl Send`, see above) across the boundary and the destination
+// thread builds its own engine via `from_thread_spec` — the engine is never
+// shared or concurrently mutated across threads. It is the spec that crosses
+// the thread boundary, not the engine.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for HvfTrapEngine {}
+
+impl carrick_hal::ThreadedEngine for HvfTrapEngine {
+    type KickHandle = crate::vcpu_kick::VcpuKickHandle;
+    type SiblingSpec = ThreadSpec;
+
+    fn kick_handle(&self) -> Self::KickHandle {
+        // Forward to the existing `vcpu_kick_handle()` method.
+        self.vcpu_kick_handle()
+    }
+
+    fn wait_for_vcpu_slot() {
+        // Forward to the existing static slot gate (the 64-vCPU cap admission
+        // gate in the private `vcpu_gate` module).
+        HvfTrapEngine::wait_for_vcpu_slot();
+    }
+
+    /// Build a [`ThreadSpec`] for a thread-creating clone.
+    ///
+    /// The trait signature matches the existing `build_thread_spec(stack, tls)`
+    /// method exactly — no adaptation needed.
+    fn build_sibling_spec(&self, stack: u64, tls: u64) -> Result<Self::SiblingSpec, TrapError> {
+        self.build_thread_spec(stack, tls)
+    }
+
+    /// Materialise a thread sibling on the current host thread from a
+    /// [`ThreadSpec`].  Forwards to the existing `from_thread_spec` static
+    /// constructor.
+    fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
+    where
+        Self: Sized,
+    {
+        HvfTrapEngine::from_thread_spec(spec)
+    }
+
+    fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
+        HvfTrapEngine::release_vcpu_for_fork(self)
+    }
+
+    fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
+        HvfTrapEngine::rebuild_vcpu_after_fork(self)
+    }
+
+    fn publish_vm_for_siblings(&mut self) -> Result<(), TrapError> {
+        HvfTrapEngine::publish_vm_for_siblings(self);
+        Ok(())
+    }
+
+    fn destroy_vcpu_on_thread_exit(&mut self) {
+        HvfTrapEngine::destroy_vcpu_on_thread_exit(self);
+    }
+}
+
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests {
     use super::strip_pointer_tag;
