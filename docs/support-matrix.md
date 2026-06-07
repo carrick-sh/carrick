@@ -6,7 +6,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ## CPython
 
-438 suites — 427 MATCH · 11 NEW
+438 suites — 426 MATCH · 12 NEW
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
@@ -235,10 +235,10 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `cpython-monitoring` | full | 65/65 | 65/65 | MATCH | 0 |
 | `cpython-msilib` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `cpython-multibytecodec` | full | 35/35 | 35/35 | MATCH | 0 |
-| `cpython-multiprocessing_fork` | full | 317/317 | 317/317 | MATCH | 0 |
+| `cpython-multiprocessing_fork` | full | 316/317 | 317/317 | NEW | 0 known · 1 NEW |
 | `cpython-multiprocessing_forkserver` | full | CRASH | 323/323 | NEW | 0 |
-| `cpython-multiprocessing_main_handling` | full | 39/39 | 39/39 | MATCH | 0 |
-| `cpython-multiprocessing_spawn` | full | CRASH | 323/323 | NEW | 0 |
+| `cpython-multiprocessing_main_handling` | full | CRASH | 39/39 | NEW | 0 |
+| `cpython-multiprocessing_spawn` | full | 323/323 | 323/323 | MATCH | 0 |
 | `cpython-named_expressions` | full | 73/73 | 73/73 | MATCH | 0 |
 | `cpython-netrc` | full | 22/22 | 22/22 | MATCH | 0 |
 | `cpython-nis` | full | SUCCESS | SUCCESS | MATCH | 0 |
@@ -451,7 +451,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ## Go
 
-190 suites — 179 MATCH · 11 NEW
+190 suites — 177 MATCH · 13 NEW
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
@@ -544,7 +544,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `go-go_format` | full | 4/4 | 4/4 | MATCH | 0 |
 | `go-go_importer` | full | 2/2 | 2/2 | MATCH | 0 |
 | `go-go_internal_gccgoimporter` | full | 2/2 | 2/2 | MATCH | 0 |
-| `go-go_internal_gcimporter` | full | CRASH | 15/15 | NEW | 0 |
+| `go-go_internal_gcimporter` | full | 15/15 | 15/15 | MATCH | 0 |
 | `go-go_internal_srcimporter` | full | 6/6 | 6/6 | MATCH | 0 |
 | `go-go_parser` | full | 89/89 | 89/89 | MATCH | 0 |
 | `go-go_printer` | full | 45/45 | 45/45 | MATCH | 0 |
@@ -593,7 +593,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `go-net_http_fcgi` | full | 12/12 | 12/12 | MATCH | 0 |
 | `go-net_http_httptest` | full | 55/55 | 55/55 | MATCH | 0 |
 | `go-net_http_httptrace` | full | 2/2 | 2/2 | MATCH | 0 |
-| `go-net_http_httputil` | full | 53/53 | 53/53 | MATCH | 0 |
+| `go-net_http_httputil` | full | 51/53 | 53/53 | NEW | 0 known · 2 NEW |
 | `go-net_http_internal` | full | 14/14 | 14/14 | MATCH | 0 |
 | `go-net_http_internal_ascii` | full | 13/13 | 13/13 | MATCH | 0 |
 | `go-net_http_pprof` | full | 13/13 | 13/13 | MATCH | 0 |
@@ -606,10 +606,10 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `go-net_smtp` | full | 20/20 | 20/20 | MATCH | 0 |
 | `go-net_textproto` | full | 26/26 | 26/26 | MATCH | 0 |
 | `go-net_url` | full | 49/49 | 49/49 | MATCH | 0 |
-| `go-os` | full | CRASH | 104/104 | NEW | 0 |
+| `go-os` | full | 713/727 | 104/104 | NEW | 0 known · 634 NEW |
 | `go-os_exec` | full | 86/86 | 86/86 | MATCH | 0 |
 | `go-os_exec_internal_fdtest` | full | 1/1 | 1/1 | MATCH | 0 |
-| `go-os_signal` | full | 29/30 | 29/30 | MATCH | 0 |
+| `go-os_signal` | full | 30/30 | 29/30 | NEW | 0 known · 1 NEW |
 | `go-os_user` | full | 6/6 | 6/6 | MATCH | 0 |
 | `go-path` | full | 8/8 | 8/8 | MATCH | 0 |
 | `go-path_filepath` | full | 50/50 | 50/50 | MATCH | 0 |
@@ -621,7 +621,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `go-runtime_debug` | full | 8/9 | 9/9 | NEW | 0 known · 1 NEW |
 | `go-runtime_internal_wasitest` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `go-runtime_metrics` | full | 2/2 | 2/2 | MATCH | 0 |
-| `go-runtime_pprof` | full | 93/93 | 93/93 | MATCH | 0 |
+| `go-runtime_pprof` | full | CRASH | 93/93 | NEW | 0 |
 | `go-runtime_trace` | full | 2/2 | 2/2 | MATCH | 0 |
 | `go-slices` | full | 123/123 | 123/123 | MATCH | 0 |
 | `go-sort` | full | 62/62 | 62/62 | MATCH | 0 |
@@ -658,7 +658,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ## LTP
 
-591 suites — 559 MATCH · 32 NEW
+591 suites — 556 MATCH · 35 NEW
 
 | Suite | tier | carrick | oracle | verdict | gaps |
 |---|---|---|---|---|---|
@@ -1041,7 +1041,7 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-ptrace02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-ptrace03` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-ptrace04` | full | SUCCESS | SUCCESS | MATCH | 0 |
-| `ltp-ptrace05` | full | 63/63 | 63/63 | MATCH | 0 |
+| `ltp-ptrace05` | full | 61/63 | 63/63 | NEW | 0 known · 1 NEW |
 | `ltp-ptrace06` | full | 48/48 | 48/48 | MATCH | 0 |
 | `ltp-ptrace07` | full | SUCCESS | SUCCESS | MATCH | 0 |
 | `ltp-ptrace08` | full | SUCCESS | SUCCESS | MATCH | 0 |
@@ -1079,8 +1079,8 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 | `ltp-sched_get_priority_max01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sched_get_priority_max02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sched_getaffinity01` | smoke | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-sched_getparam01` | full | 0/1 | 0/2 | MATCH | 0 |
-| `ltp-sched_getparam03` | full | 0/1 | 0/2 | MATCH | 0 |
+| `ltp-sched_getparam01` | full | EMPTY | 0/2 | NEW | 0 known · 1 NEW |
+| `ltp-sched_getparam03` | full | EMPTY | 0/2 | NEW | 0 known · 1 NEW |
 | `ltp-sched_getscheduler01` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sched_getscheduler02` | full | 0/1 | 0/2 | MATCH | 0 |
 | `ltp-sched_setaffinity01` | full | 0/1 | 0/2 | MATCH | 0 |
