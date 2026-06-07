@@ -656,8 +656,97 @@ CEOF
       printf "FAIL [sa-restart]: stdout=[%s] exit=%s oracle=[csig-restart-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 19. Phase 4 follow-up: WALL-CLOCK timer signals. setitimer(ITIMER_REAL) ->
+    #     SIGALRM. The Linux backend has no kqueue pump, so the itimer fallback
+    #     timer thread sleeps to the deadline then publishes SIGALRM to the main
+    #     tid + kicks its vCPU (KVM_RUN EINTR) so the generic loop injects the
+    #     handler. (alarm(2) lowers to setitimer(ITIMER_REAL), so this covers it.)
+    cat > /tmp/t_setitimer.c <<CEOF
+#include <signal.h>
+#include <sys/time.h>
+#include <unistd.h>
+static volatile sig_atomic_t fired;
+static void h(int s){ (void)s; fired=1; }
+int main(void){ struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h;
+  if(sigaction(SIGALRM,&sa,0)) return 2;
+  struct itimerval it; it.it_interval.tv_sec=0; it.it_interval.tv_usec=0;
+  it.it_value.tv_sec=0; it.it_value.tv_usec=50000;
+  if(setitimer(ITIMER_REAL,&it,0)) return 3;
+  for(int i=0;i<3000 && !fired;i++) usleep(1000);
+  if(!fired) return 4;
+  return write(1,"setitimer-ok",12)==12 ? 0 : 5; }
+CEOF
+    gcc -static -O2 -o /tmp/t_setitimer /tmp/t_setitimer.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/t_setitimer" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "setitimer-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+timer-setitimer]: setitimer(ITIMER_REAL) delivered SIGALRM via the fallback timer thread."
+    else
+      printf "FAIL [timer-setitimer]: stdout=[%s] exit=%s oracle=[setitimer-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 20. Phase 4 follow-up: REPEATING interval timer. setitimer with it_interval
+    #     fires SIGALRM every 30ms; the handler counts and the program disarms
+    #     after >=3 fires (exercises the firing thread interval loop + generation
+    #     disarm).
+    cat > /tmp/t_interval.c <<CEOF
+#include <signal.h>
+#include <sys/time.h>
+#include <unistd.h>
+static volatile sig_atomic_t cnt;
+static void h(int s){ (void)s; cnt++; }
+int main(void){ struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h;
+  if(sigaction(SIGALRM,&sa,0)) return 2;
+  struct itimerval it; it.it_interval.tv_sec=0; it.it_interval.tv_usec=30000;
+  it.it_value.tv_sec=0; it.it_value.tv_usec=30000;
+  if(setitimer(ITIMER_REAL,&it,0)) return 3;
+  for(int i=0;i<5000 && cnt<3;i++) usleep(1000);
+  struct itimerval z; __builtin_memset(&z,0,sizeof z); setitimer(ITIMER_REAL,&z,0);
+  if(cnt<3) return 4;
+  return write(1,"interval-ok",11)==11 ? 0 : 5; }
+CEOF
+    gcc -static -O2 -o /tmp/t_interval /tmp/t_interval.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/t_interval" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "interval-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+timer-interval]: a repeating ITIMER_REAL fired SIGALRM 3+ times; disarm stopped it."
+    else
+      printf "FAIL [timer-interval]: stdout=[%s] exit=%s oracle=[interval-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 21. Phase 4 follow-up: POSIX per-process timer. timer_create(CLOCK_MONOTONIC,
+    #     SIGEV_SIGNAL=SIGALRM) + timer_settime -> a posix_timer fallback thread
+    #     delivers the signal. Exercises the timer_create/settime path (distinct
+    #     from the itimer path: timer_settime spawns the firing thread directly).
+    cat > /tmp/t_posix.c <<CEOF
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
+static volatile sig_atomic_t fired;
+static void h(int s){ (void)s; fired=1; }
+int main(void){ struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h;
+  if(sigaction(SIGALRM,&sa,0)) return 2;
+  timer_t tid; struct sigevent sev; __builtin_memset(&sev,0,sizeof sev);
+  sev.sigev_notify=SIGEV_SIGNAL; sev.sigev_signo=SIGALRM;
+  if(timer_create(CLOCK_MONOTONIC,&sev,&tid)) return 3;
+  struct itimerspec its; __builtin_memset(&its,0,sizeof its);
+  its.it_value.tv_sec=0; its.it_value.tv_nsec=50*1000*1000;
+  if(timer_settime(tid,0,&its,0)) return 4;
+  for(int i=0;i<3000 && !fired;i++) usleep(1000);
+  if(!fired) return 5;
+  return write(1,"posixtimer-ok",13)==13 ? 0 : 6; }
+CEOF
+    gcc -static -O2 -o /tmp/t_posix /tmp/t_posix.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/t_posix" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "posixtimer-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+timer-posix]: timer_create+timer_settime(CLOCK_MONOTONIC) delivered SIGALRM."
+    else
+      printf "FAIL [timer-posix]: stdout=[%s] exit=%s oracle=[posixtimer-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -668,5 +757,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection — all 21 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers — all 24 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix) pass on KVM; ZERO xfail."
 '

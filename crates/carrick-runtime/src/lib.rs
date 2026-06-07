@@ -390,6 +390,11 @@ pub mod runtime {
         // wrapper's `start_signal_pump` call site.)
         kernel.fork.start_signal_pump(&kicker, &platform_futex);
 
+        // Wire wall-clock timer signals (setitimer/alarm/timer_settime): a
+        // fallback timer thread publishes the timer signal to `main_tid` and
+        // kicks it through this same `VcpuRegistry`.
+        crate::timer_delivery::register(Arc::clone(&kicker), main_tid);
+
         let outcome = run_vcpu_until_exit(
             Arc::clone(&kernel),
             engine,
@@ -927,8 +932,11 @@ pub mod host_signal {
         false
     }
     pub fn xsig_nudge(_target_host: i32) {}
+    /// No kqueue signal pump on Linux. Returning -1 makes the `setitimer`
+    /// dispatch path (the only caller) skip the EVFILT_TIMER arming and use the
+    /// wall-clock fallback timer thread (`itimer::spawn_fallback_timer`) instead.
     pub fn pump_kqueue() -> i32 {
-        0
+        -1
     }
     // The generic threaded loop IS instantiated on the KVM backend
     // (`run_threaded_kvm_loop` -> `run_vcpu_until_exit::<KvmTrapEngine>`), so the
@@ -1183,44 +1191,179 @@ pub mod io_wait {
     }
 }
 
+// Wall-clock timer-signal delivery for the non-macOS (KVM/Linux) backend. Where
+// macOS arms an EVFILT_TIMER on the kqueue signal pump, the Linux backend has no
+// pump: a fallback timer THREAD (spawned by `itimer`/`posix_timer` below) sleeps
+// to the deadline and then PUBLISHES the timer signal into the per-thread pending
+// table and KICKS the target vCPU so the generic loop runs delivery. The target
+// is registered once when the run loop starts (`register`).
+#[cfg(not(feature = "platform-macos"))]
+pub mod timer_delivery {
+    use crate::thread::ThreadId;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    struct Delivery {
+        kicker: Arc<dyn carrick_hal::VcpuRegistry>,
+        // Wall-clock interval timers are process-directed; deliver to the main
+        // thread (the common single-threaded timer case). A blocked-main /
+        // multi-thread fan-out is a future refinement.
+        main_tid: ThreadId,
+    }
+
+    fn cell() -> &'static Mutex<Option<Delivery>> {
+        static C: OnceLock<Mutex<Option<Delivery>>> = OnceLock::new();
+        C.get_or_init(|| Mutex::new(None))
+    }
+    fn lock() -> std::sync::MutexGuard<'static, Option<Delivery>> {
+        cell()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Install the kicker + target tid. Called once at run-loop startup.
+    pub fn register(kicker: Arc<dyn carrick_hal::VcpuRegistry>, main_tid: ThreadId) {
+        *lock() = Some(Delivery { kicker, main_tid });
+    }
+
+    /// Publish `signum` to the target thread and kick its vCPU. No-op if no run
+    /// loop has registered (e.g. a unit test exercising arm/disarm only).
+    pub fn deliver(signum: i32) {
+        if let Some(d) = lock().as_ref() {
+            crate::host_signal::publish_pending_for(d.main_tid, signum);
+            d.kicker.kick(d.main_tid);
+        }
+    }
+}
+
 #[cfg(not(feature = "platform-macos"))]
 pub mod itimer {
-    pub fn ident_for(_which: usize) -> usize {
-        0
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    struct Slot {
+        generation: AtomicU64,
+        interval_ns: AtomicU64,
+        armed: AtomicBool,
     }
-    pub fn which_for_ident(_ident: usize) -> Option<usize> {
-        None
+    impl Slot {
+        fn new() -> Self {
+            Self {
+                generation: AtomicU64::new(0),
+                interval_ns: AtomicU64::new(0),
+                armed: AtomicBool::new(false),
+            }
+        }
     }
-    pub fn signum_for(_which: usize) -> i32 {
-        0
+    // ITIMER_REAL / ITIMER_VIRTUAL / ITIMER_PROF.
+    fn slots() -> &'static [Slot; 3] {
+        static S: OnceLock<[Slot; 3]> = OnceLock::new();
+        S.get_or_init(|| [Slot::new(), Slot::new(), Slot::new()])
     }
-    pub fn is_cpu_timer(_which: usize) -> bool {
-        false
+
+    pub fn ident_for(which: usize) -> usize {
+        which
     }
-    pub fn arm(_which: usize, _value_ns: u64, _interval_ns: u64, _needs_periodic: bool) -> u64 {
-        0
+    pub fn which_for_ident(ident: usize) -> Option<usize> {
+        (ident < 3).then_some(ident)
     }
-    pub fn disarm(_which: usize) {}
-    pub fn is_armed(_which: usize) -> bool {
-        false
+    pub fn signum_for(which: usize) -> i32 {
+        match which {
+            1 => crate::linux_abi::LINUX_SIGVTALRM, // ITIMER_VIRTUAL
+            2 => crate::linux_abi::LINUX_SIGPROF,   // ITIMER_PROF
+            _ => crate::linux_abi::LINUX_SIGALRM,   // ITIMER_REAL
+        }
     }
-    pub fn interval_ns(_which: usize) -> u64 {
-        0
+    /// ITIMER_VIRTUAL/ITIMER_PROF measure GUEST CPU time, which carrick does not
+    /// account here — they are tracked (getitimer reports them) but NOT fired.
+    pub fn is_cpu_timer(which: usize) -> bool {
+        which == 1 || which == 2
     }
-    pub fn cpu_timer_recheck_delay_ns(_remaining_cpu_ns: u64) -> u64 {
-        0
+    pub fn arm(which: usize, _value_ns: u64, interval_ns: u64, _needs_periodic: bool) -> u64 {
+        match slots().get(which) {
+            Some(slot) => {
+                let generation = slot
+                    .generation
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                slot.interval_ns.store(interval_ns, Ordering::SeqCst);
+                slot.armed.store(true, Ordering::SeqCst);
+                generation
+            }
+            None => 0,
+        }
     }
+    pub fn disarm(which: usize) {
+        if let Some(slot) = slots().get(which) {
+            slot.generation.fetch_add(1, Ordering::SeqCst);
+            slot.armed.store(false, Ordering::SeqCst);
+            slot.interval_ns.store(0, Ordering::SeqCst);
+        }
+    }
+    pub fn is_armed(which: usize) -> bool {
+        slots()
+            .get(which)
+            .is_some_and(|s| s.armed.load(Ordering::SeqCst))
+    }
+    pub fn interval_ns(which: usize) -> u64 {
+        slots()
+            .get(which)
+            .map_or(0, |s| s.interval_ns.load(Ordering::SeqCst))
+    }
+    pub fn cpu_timer_recheck_delay_ns(remaining_cpu_ns: u64) -> u64 {
+        remaining_cpu_ns
+    }
+    fn generation_matches(which: usize, generation: u64) -> bool {
+        slots()
+            .get(which)
+            .is_some_and(|s| s.generation.load(Ordering::SeqCst) == generation)
+    }
+
+    /// Spawn the wall-clock fallback timer thread for `which`. It sleeps to the
+    /// first deadline, then (if still armed with this `generation`) publishes the
+    /// signal + kicks via `timer_delivery`, repeating every `interval` until the
+    /// timer is disarmed or re-armed (generation bump). CPU-time timers are not
+    /// fired (no guest-CPU accounting). At most one thread per `which` is live —
+    /// a disarm/re-arm bumps the generation so the old thread exits.
     pub fn spawn_fallback_timer(
-        _which: usize,
-        _generation: u64,
-        _value: std::time::Duration,
-        _interval: std::time::Duration,
+        which: usize,
+        generation: u64,
+        value: Duration,
+        interval: Duration,
     ) {
+        if is_cpu_timer(which) {
+            return;
+        }
+        let signum = signum_for(which);
+        let _ = std::thread::Builder::new()
+            .name(format!("carrick-itimer-{which}"))
+            .spawn(move || {
+                std::thread::sleep(value);
+                if !generation_matches(which, generation) {
+                    return;
+                }
+                crate::timer_delivery::deliver(signum);
+                if interval.is_zero() {
+                    return;
+                }
+                loop {
+                    std::thread::sleep(interval);
+                    if !generation_matches(which, generation) {
+                        return;
+                    }
+                    crate::timer_delivery::deliver(signum);
+                }
+            });
     }
 }
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod posix_timer {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct TimerSpec {
         pub signum: i32,
@@ -1228,28 +1371,146 @@ pub mod posix_timer {
         pub interval_ns: u64,
     }
 
-    pub fn create(_clock_id: i32, _signum: i32) -> i32 {
-        0
+    struct Slot {
+        clock_id: i32,
+        signum: i32,
+        generation: u64,
+        value_ns: u64,
+        interval_ns: u64,
+        armed_at: Option<Instant>,
     }
-    pub fn arm(_id: i32, _value_ns: u64, _interval_ns: u64) -> Option<TimerSpec> {
-        None
+
+    fn timers() -> &'static Mutex<HashMap<i32, Slot>> {
+        static T: OnceLock<Mutex<HashMap<i32, Slot>>> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(HashMap::new()))
     }
-    pub fn remaining(_id: i32) -> Option<(u64, u64)> {
-        None
+    fn lock() -> std::sync::MutexGuard<'static, HashMap<i32, Slot>> {
+        timers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    pub fn delete(_id: i32) -> bool {
-        false
+    fn next_id() -> i32 {
+        static N: AtomicI32 = AtomicI32::new(1);
+        N.fetch_add(1, Ordering::SeqCst)
     }
-    pub fn getoverrun(_id: i32) -> Option<u32> {
-        None
+
+    pub fn create(clock_id: i32, signum: i32) -> i32 {
+        let id = next_id();
+        lock().insert(
+            id,
+            Slot {
+                clock_id,
+                signum,
+                generation: 0,
+                value_ns: 0,
+                interval_ns: 0,
+                armed_at: None,
+            },
+        );
+        id
     }
-    pub fn exists(_id: i32) -> bool {
-        false
+
+    /// (Re-)arm timer `id`. Returns the PREVIOUS spec (for `timer_settime`'s
+    /// old_value). A `value_ns == 0` disarms. A non-zero value spawns a wall-clock
+    /// firing thread that delivers `signum` after `value` then every `interval`,
+    /// until the timer is re-armed or deleted (generation bump).
+    pub fn arm(id: i32, value_ns: u64, interval_ns: u64) -> Option<TimerSpec> {
+        let (prev, generation, signum) = {
+            let mut g = lock();
+            let slot = g.get_mut(&id)?;
+            let prev = TimerSpec {
+                signum: slot.signum,
+                value_ns: slot.value_ns,
+                interval_ns: slot.interval_ns,
+            };
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.value_ns = value_ns;
+            slot.interval_ns = interval_ns;
+            slot.armed_at = (value_ns > 0).then(Instant::now);
+            (prev, slot.generation, slot.signum)
+        };
+        if value_ns > 0 {
+            spawn_timer(
+                id,
+                generation,
+                signum,
+                Duration::from_nanos(value_ns),
+                Duration::from_nanos(interval_ns),
+            );
+        }
+        Some(prev)
     }
-    pub fn clock_id(_id: i32) -> i32 {
-        0
+
+    fn generation_matches(id: i32, generation: u64) -> bool {
+        lock().get(&id).is_some_and(|s| s.generation == generation)
     }
-    pub fn clear() {}
+
+    fn spawn_timer(id: i32, generation: u64, signum: i32, value: Duration, interval: Duration) {
+        let _ = std::thread::Builder::new()
+            .name(format!("carrick-ptimer-{id}"))
+            .spawn(move || {
+                std::thread::sleep(value);
+                if !generation_matches(id, generation) {
+                    return;
+                }
+                crate::timer_delivery::deliver(signum);
+                if interval.is_zero() {
+                    return;
+                }
+                loop {
+                    std::thread::sleep(interval);
+                    if !generation_matches(id, generation) {
+                        return;
+                    }
+                    crate::timer_delivery::deliver(signum);
+                }
+            });
+    }
+
+    /// `timer_gettime`: time until the next expiration + the reload interval.
+    /// One-shot remaining counts down from arm; an already-fired one-shot is 0.
+    pub fn remaining(id: i32) -> Option<(u64, u64)> {
+        let g = lock();
+        let slot = g.get(&id)?;
+        let value = match (slot.armed_at, slot.value_ns) {
+            (Some(at), v) if v > 0 => {
+                let elapsed = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if elapsed >= v && slot.interval_ns == 0 {
+                    0
+                } else if slot.interval_ns > 0 {
+                    // After the first fire, the next expiry is `interval` phased.
+                    let into = elapsed.saturating_sub(v) % slot.interval_ns;
+                    if elapsed < v {
+                        v - elapsed
+                    } else {
+                        slot.interval_ns - into
+                    }
+                } else {
+                    v - elapsed
+                }
+            }
+            _ => 0,
+        };
+        Some((value, slot.interval_ns))
+    }
+
+    pub fn delete(id: i32) -> bool {
+        // Removing the slot makes `generation_matches` false, so any live firing
+        // thread exits at its next deadline.
+        lock().remove(&id).is_some()
+    }
+    pub fn getoverrun(id: i32) -> Option<u32> {
+        lock().contains_key(&id).then_some(0)
+    }
+    pub fn exists(id: i32) -> bool {
+        lock().contains_key(&id)
+    }
+    pub fn clock_id(id: i32) -> i32 {
+        lock().get(&id).map_or(0, |s| s.clock_id)
+    }
+    pub fn clear() {
+        lock().clear();
+    }
 }
 
 #[cfg(not(feature = "platform-macos"))]
