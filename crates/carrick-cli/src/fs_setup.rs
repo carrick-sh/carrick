@@ -52,8 +52,27 @@
 
 use anyhow::Result;
 use carrick_runtime::dispatch::SyscallDispatcher;
-use carrick_runtime::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
+#[cfg(feature = "fs-memory")]
+use carrick_runtime::fs_backend::MemoryBackend;
+use carrick_runtime::fs_backend::{FsBackend, HostFsBackend};
 use carrick_spec::FsBackendKind;
+
+/// On a `--fs host` failure, fall back to the in-memory backend when the
+/// `fs-memory` feature is compiled in, or hard-error with an actionable message
+/// when it isn't (the "host, then error" rule).
+#[cfg(feature = "fs-memory")]
+fn host_failure_fallback(reason: &str) -> Result<(Box<dyn FsBackend>, FsBackendKind)> {
+    tracing::warn!("carrick: {reason}; falling back to in-memory backend");
+    Ok((Box::new(MemoryBackend::new()), FsBackendKind::Memory))
+}
+
+#[cfg(not(feature = "fs-memory"))]
+fn host_failure_fallback(reason: &str) -> Result<(Box<dyn FsBackend>, FsBackendKind)> {
+    anyhow::bail!(
+        "carrick: {reason}; the in-memory fallback is not compiled in. \
+         Rebuild with `--features fs-memory`, or run on a writable case-sensitive scratch volume."
+    )
+}
 
 /// Resolve `--fs <memory|host>` into a concrete `Box<dyn FsBackend>`
 /// and install it on the dispatcher. When the user did not pass an
@@ -74,41 +93,28 @@ pub(crate) fn install_fs_backend(
     // dropped (the disk overlay is authoritative for every read).
     let mut host_seeded = false;
     let mut backend: Box<dyn FsBackend> = match kind {
+        #[cfg(feature = "fs-memory")]
         FsBackendKind::Memory => Box::new(MemoryBackend::new()),
         FsBackendKind::Host => match HostFsBackend::new() {
             Ok(mut host) => {
-                // SEED THE BACKEND WITH THE FULL ROOTFS.
-                //
-                // This is the "rootfs as APFS, throw away when done"
-                // architecture: instead of layering the writable
-                // overlay on top of the in-memory tar, materialise
-                // every rootfs file/dir/symlink onto the cap-std-
-                // sandboxed scratch directory. After this point, all
-                // fs syscalls flow through real host syscalls
-                // (openat/renameat/symlinkat/...) against a real
-                // filesystem - which fixes apt's downstream chain
-                // (symlinkat EROFS, SplitClearSignedFile, atomic
-                // rename) by giving it real Linux fs semantics.
+                // SEED THE BACKEND WITH THE FULL ROOTFS. ("rootfs as APFS, throw
+                // away when done": materialise every rootfs file/dir/symlink onto
+                // the cap-std scratch dir so all fs syscalls flow through real
+                // host syscalls against a real filesystem.)
                 if let Some(rootfs) = dispatcher.rootfs() {
                     if let Err(err) = host.seed_from_rootfs(rootfs) {
-                        tracing::warn!(
-                            "carrick: --fs host seed-from-rootfs failed ({err}); falling back to in-memory backend"
-                        );
-                        let mut mem: Box<dyn FsBackend> = Box::new(MemoryBackend::new());
+                        let (mut mem, kind) = host_failure_fallback(&format!(
+                            "--fs host seed-from-rootfs failed ({err})"
+                        ))?;
                         seed_guest_baseline(&mut *mem);
                         let _ = dispatcher.set_fs_backend(mem);
-                        return Ok(FsBackendKind::Memory);
+                        return Ok(kind);
                     }
                     host_seeded = true;
                 }
                 Box::new(host)
             }
-            Err(err) => {
-                tracing::warn!(
-                    "carrick: --fs host failed ({err}); falling back to in-memory backend"
-                );
-                Box::new(MemoryBackend::new())
-            }
+            Err(err) => host_failure_fallback(&format!("--fs host failed ({err})"))?.0,
         },
     };
     seed_guest_baseline(&mut *backend);

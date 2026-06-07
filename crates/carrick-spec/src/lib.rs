@@ -220,7 +220,13 @@ impl Default for NamespaceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum FsBackendKind {
+    /// In-memory writable overlay. Gated behind the default-off `fs-memory`
+    /// feature: silently incoherent across guest `fork` (separate host
+    /// processes get private copy-on-write copies), so it is opt-in only.
+    #[cfg(feature = "fs-memory")]
     Memory,
+    /// Host-APFS passthrough via cap-std: the kernel is the single fork-coherent
+    /// source of truth. The only backend in a default build.
     Host,
 }
 

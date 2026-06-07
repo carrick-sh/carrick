@@ -2,12 +2,13 @@
 //! dispatcher-backed guest execution.
 
 use crate::dispatch::SyscallDispatcher;
-use crate::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
+#[cfg(feature = "fs-memory")]
+use crate::fs_backend::MemoryBackend;
+use crate::fs_backend::{FsBackend, HostFsBackend};
 use crate::rootfs::RootFs;
-use crate::runtime::{
-    RunResult, RuntimeError, run_elf_from_dispatcher_debug,
-    run_rootfs_elf_with_hvf_args_and_dispatcher_debug,
-};
+#[cfg(feature = "fs-memory")]
+use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
+use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
 use carrick_spec::{FsBackendKind, PidMode, Platform, RunSpec};
@@ -328,6 +329,7 @@ impl Runtime {
                     }
                 }
             }
+            #[cfg(feature = "fs-memory")]
             FsBackendKind::Memory => {
                 let layer_paths: Vec<PathBuf> = spec
                     .rootfs_layers
@@ -423,12 +425,26 @@ impl Runtime {
     }
 }
 
+/// On a `--fs host` failure, fall back to the in-memory backend. Only compiled
+/// with the `fs-memory` feature, because `install_fs_backend` (its only caller)
+/// is reachable solely through the feature-gated `FsBackendKind::Memory` arm.
+#[cfg(feature = "fs-memory")]
+fn host_failure_fallback(reason: &str) -> anyhow::Result<Box<dyn FsBackend>> {
+    eprintln!("carrick: {reason}; falling back to in-memory backend");
+    Ok(Box::new(MemoryBackend::new()))
+}
+
+/// Build and install a fs backend for the `run-elf`/memory fixture path. Only
+/// reachable from the `fs-memory`-gated `FsBackendKind::Memory` arm above, so it
+/// is compiled only when that feature is on.
+#[cfg(feature = "fs-memory")]
 fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
     kind: FsBackendKind,
 ) -> anyhow::Result<()> {
     let mut host_seeded = false;
     let mut backend: Box<dyn FsBackend> = match kind {
+        #[cfg(feature = "fs-memory")]
         FsBackendKind::Memory => Box::new(MemoryBackend::new()),
         FsBackendKind::Host => match HostFsBackend::new() {
             Ok(mut host) => {
@@ -438,10 +454,7 @@ fn install_fs_backend(
                 }
                 Box::new(host)
             }
-            Err(err) => {
-                eprintln!("carrick: --fs host failed ({err}); falling back to in-memory backend");
-                Box::new(MemoryBackend::new())
-            }
+            Err(err) => host_failure_fallback(&format!("--fs host failed ({err})"))?,
         },
     };
     seed_guest_baseline(&mut *backend, dispatcher.rootfs());
