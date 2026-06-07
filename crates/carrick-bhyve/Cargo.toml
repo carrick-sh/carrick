@@ -1,0 +1,25 @@
+[package]
+name = "carrick-bhyve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_bhyve"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# The FreeBSD/bhyve HAL backend (the third platform, after macOS/HVF and
+# Linux/KVM). The whole crate is `#![cfg(target_os = "freebsd")]`; on any other
+# host the lib is empty, so the workspace still builds on macOS/Linux. It FFIs
+# to the system `libvmmapi` (linked via `#[link(name = "vmmapi")]`) and, like
+# carrick-linux, depends only on the leaf crates (NOT carrick-runtime), so it
+# cross-compiles for aarch64-freebsd independently of the dispatch layer.
+[dependencies]
+carrick-hal = { path = "../carrick-hal" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-mem = { path = "../carrick-mem" }
+carrick-abi = { path = "../carrick-abi" }
+libc.workspace = true

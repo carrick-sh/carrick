@@ -296,6 +296,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-bhyve"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-mem",
+ "libc",
+]
+
+[[package]]
 name = "carrick-bsd"
 version = "0.1.0"
 dependencies = [
@@ -481,6 +492,7 @@ dependencies = [
  "camino",
  "cap-std",
  "carrick-abi",
+ "carrick-bhyve",
  "carrick-bsd",
  "carrick-guest-mem",
  "carrick-hal",
