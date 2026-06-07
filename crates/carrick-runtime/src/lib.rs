@@ -308,6 +308,116 @@ pub mod runtime {
         Err(RuntimeError::TrapLimitExceeded { max_traps })
     }
 
+    /// Multi-threaded KVM run loop (Phase 2 Task 7) — the Linux analog of the
+    /// macOS `run_threaded_hvf_loop` (`runtime.rs`). Constructs the KVM trait
+    /// objects (the concrete private `FutexTable`, the `KvmFutex` as
+    /// `Arc<dyn PlatformFutex>`, the `PlatformFutexFactory` that rebuilds that
+    /// pairing on the fork-child side, the `KvmKicker` as `Arc<dyn VcpuRegistry>`,
+    /// and the `KvmForkCoordinator` as `Box<dyn HostForkCoordinator>`) and drives
+    /// the generic `vcpu_loop::run_vcpu_until_exit::<KvmTrapEngine>`. THIS is what
+    /// makes the KVM backend multi-process / multi-threaded: `handle_fork` (real
+    /// `libc::fork` + child VM rebuild), `spawn_clone_thread` (sibling vCPUs on
+    /// the same VM), and the private/shared futex paths all flow through here,
+    /// byte-matching Docker.
+    ///
+    /// Unlike HVF, KVM needs NO signal-pump daemon thread: a host signal
+    /// delivered to a vCPU thread blocked in `KVM_RUN` returns `EINTR` natively
+    /// (`VcpuExit::Kicked`), so async process-directed signals interrupt the
+    /// in-guest vCPU without a pump. The coordinator installs only the
+    /// kick-signal handler (idempotently). The blocking-I/O / proc-exit / sleep /
+    /// signal-wait arms use the `ppoll`/`waitid`-backed Linux `ThreadWaiter`
+    /// (`crate::io_wait`, the same one the single-threaded loop used).
+    #[cfg(feature = "platform-linux")]
+    pub fn run_threaded_kvm_loop(
+        engine: carrick_linux::KvmTrapEngine,
+        dispatcher: SyscallDispatcher,
+        max_traps: usize,
+    ) -> Result<RunResult, RuntimeError> {
+        use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
+        use crate::vcpu_loop::{
+            KernelState, PlatformFutexFactory, VcpuLoopOutcome, run_vcpu_until_exit,
+        };
+        use std::sync::Arc;
+
+        let main_tid: ThreadId = std::process::id() as ThreadId;
+        let registry = Arc::new(ThreadRegistry::new(main_tid));
+        // Publish for /proc/<tid>/stat + /proc/<pid>/task/ synthesis (no-op on
+        // the bare run-elf path, but kept parallel to HVF for the container path).
+        crate::thread::set_current_registry(Arc::clone(&registry));
+        // Root guest pid (before any fork) so /proc/<pid>/ can tell a guest
+        // descendant from a host process.
+        crate::host_proc::set_root_guest_pid(std::process::id());
+        // Shared reaped-child CPU table, allocated before any fork so every guest
+        // descendant inherits the same MAP_SHARED region.
+        crate::guest_cpu::init_child_table();
+
+        // The CONCRETE process-private futex table, threaded UNCHANGED through the
+        // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
+        // protocol stays byte-identical). The object-safe `KvmFutex` wraps the
+        // SAME table for the SHARED-futex / notify-signal-pending ops; the factory
+        // rebuilds that pairing over a fresh table on the fork CHILD side
+        // (`vcpu_loop::handle_fork`) without the generic loop naming `KvmFutex`.
+        let futex = Arc::new(FutexTable::new());
+        let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
+            Arc::new(carrick_linux::KvmFutex(Arc::clone(&futex)));
+        let platform_futex_factory: PlatformFutexFactory = Arc::new(
+            |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
+                Arc::new(carrick_linux::KvmFutex(table))
+            },
+        );
+        // The KVM host-fork coordinator (lean — no pump thread), boxed object-safe.
+        let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
+            Box::new(carrick_linux::KvmForkCoordinator::new());
+        let kernel = Arc::new(KernelState::new(dispatcher, fork_coordinator));
+        // Track spawned sibling threads so the process doesn't tear down while a
+        // worker is mid-flight; joined after the main thread finishes.
+        let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // The KVM kicker (registry of live vCPUs). Held object-safe as the
+        // `VcpuRegistry` the generic loop drives. Constructing it installs the
+        // kick-signal handler (idempotent) so a cross-thread `pthread_kill` forces
+        // a target vCPU out of `KVM_RUN` (→ `EINTR` → `VcpuExit::Kicked`).
+        let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(carrick_linux::KvmKicker::new());
+        // Install the kick-signal handler up front via the coordinator, so a
+        // process-directed signal turns an in-flight `KVM_RUN` into `EINTR`
+        // regardless of whether a guest has forked yet. (KvmKicker::new already
+        // installs it; this makes the dependency explicit and matches the HVF
+        // wrapper's `start_signal_pump` call site.)
+        kernel.fork.start_signal_pump(&kicker, &platform_futex);
+
+        let outcome = run_vcpu_until_exit(
+            Arc::clone(&kernel),
+            engine,
+            Arc::clone(&registry),
+            Arc::clone(&futex),
+            Arc::clone(&platform_futex),
+            Arc::clone(&platform_futex_factory),
+            main_tid,
+            Arc::clone(&threads),
+            Arc::clone(&kicker),
+            max_traps,
+        )?;
+
+        let result = match outcome {
+            VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
+            VcpuLoopOutcome::ThreadDone => {
+                // The main thread ran exit(2) while siblings were alive. Assemble
+                // a result from the shared kernel buffers (run-to-completion CLI).
+                let report = kernel.reporter.snapshot();
+                RunResult {
+                    exit_code: 0,
+                    stdout: kernel.dispatcher.stdout(),
+                    stderr: kernel.dispatcher.stderr(),
+                    traps: 0,
+                    report,
+                    trap_limit_hit: false,
+                }
+            }
+        };
+
+        Ok(result)
+    }
+
     /// Dispatch one syscall, servicing any blocking-I/O outcome inline via the
     /// `ppoll` waiter (then re-dispatching the SAME syscall on readiness), and
     /// return the TERMINAL outcome. Mirrors the macOS `dispatch_single_threaded_
@@ -488,7 +598,21 @@ pub mod runtime {
                 ],
             )?;
         let mut engine = carrick_linux::KvmTrapEngine::new(&image)?;
-        run_combined_syscall_loop_linux(&mut engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+        // Phase 2 Task 7: drive the generic MULTI-THREADED loop by default so
+        // fork/execve/threads/futex guests run (handle_fork, sibling vCPUs, the
+        // private/shared futex paths). The single-threaded thin loop
+        // (`run_combined_syscall_loop_linux`) stays reachable as a `--no-threads`
+        // fallback via `CARRICK_NO_THREADS` for A/B debugging — it surfaces
+        // `Unsupported` on any fork/clone/futex outcome, so it is only useful for
+        // the simple write+exit cases the MVP validated.
+        if std::env::var_os("CARRICK_NO_THREADS").is_some() {
+            return run_combined_syscall_loop_linux(
+                &mut engine,
+                make_linux_dispatcher(),
+                DEFAULT_MAX_TRAPS,
+            );
+        }
+        run_threaded_kvm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
     }
 
     /// Build the dispatcher for the bare KVM ELF runner with a real, writable
@@ -852,11 +976,74 @@ pub mod io_wait {
             ppoll_wait(fds, timeout, block_mask)
         }
 
-        /// Wait for a child process to exit. The single-vCPU KVM backend has no
-        /// guest children yet (fork/clone is a later, Phase-D slice), so this is
-        /// a clean `ECHILD` rather than a hang.
-        pub fn wait_proc_exit(&self, _pid: i32, _block_mask: u64) -> WaitResult {
-            WaitResult::Errno(crate::linux_abi::LINUX_ECHILD)
+        /// Wait for a guest child process to become reapable (Phase 2 Task 7).
+        ///
+        /// carrick's guest children are REAL host processes (the generic loop's
+        /// `handle_fork` runs `libc::fork`), so the parent's blocking `wait4` /
+        /// `waitid` parks here until the host child exits, then the run loop
+        /// re-dispatches the wait to reap it. We poll the child with
+        /// `waitid(WEXITED | WNOWAIT | WNOHANG)` — `WNOWAIT` PEEKS and leaves the
+        /// zombie reapable for the caller's re-dispatched `wait4` to consume —
+        /// sleeping between polls in an interruptible `ppoll` slice so a pending
+        /// host signal (a kick) or a fork quiesce surfaces promptly as
+        /// `Interrupted` rather than wedging the parent. `pid > 0` watches that
+        /// specific child; `pid <= 0` watches ANY child (`P_ALL`), matching the
+        /// guest `wait4(-1, …)` / `wait4(0, …)` "any child" forms.
+        pub fn wait_proc_exit(&self, pid: i32, _block_mask: u64) -> WaitResult {
+            loop {
+                if child_status_ready(pid) {
+                    return WaitResult::Ready;
+                }
+                // Still running. Park briefly (≤50 ms) in an empty `ppoll` so a
+                // delivered signal returns `Interrupted` (the loop maps that to
+                // EINTR / a fork-quiesce park), then re-poll the child. Not a busy
+                // spin — each idle slice sleeps in `ppoll`.
+                match ppoll_wait(&[], Some(Duration::from_millis(50)), 0) {
+                    WaitResult::Interrupted => return WaitResult::Interrupted,
+                    // TimedOut (slice elapsed) or a spurious Ready: re-poll the
+                    // child at the loop top.
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// True when `pid` is a terminally-exited (CLD_EXITED/KILLED/DUMPED)
+    /// reapable child, WITHOUT consuming it (`WNOWAIT` leaves the zombie for the
+    /// caller's re-dispatched `wait4`/`waitid` to reap). `pid > 0` probes that
+    /// child (`P_PID`); `pid <= 0` probes any child (`P_ALL`). On `ECHILD` (the
+    /// child was already reaped, or is not ours) we report ready so the caller
+    /// surfaces the real status / `ECHILD` exactly as it would without this
+    /// backstop.
+    fn child_status_ready(pid: i32) -> bool {
+        let (idtype, id) = if pid > 0 {
+            (libc::P_PID, pid as libc::id_t)
+        } else {
+            (libc::P_ALL, 0 as libc::id_t)
+        };
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                idtype,
+                id,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 {
+            // si_signo/si_code are zeroed by us before the call; a real reapable
+            // child sets si_pid != 0 and a terminal CLD_* code. (WNOHANG with no
+            // ready child returns 0 with si_pid == 0 on Linux.)
+            const CLD_EXITED: i32 = 1;
+            const CLD_KILLED: i32 = 2;
+            const CLD_DUMPED: i32 = 3;
+            let si_pid = carrick_portable::si_pid(&info);
+            si_pid != 0 && matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED)
+        } else {
+            // ECHILD: already reaped (or never ours) → ready, so the caller's
+            // re-dispatched wait surfaces the real status/ECHILD. Any other errno
+            // (EINVAL etc.) → not ready, re-poll.
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
         }
     }
 

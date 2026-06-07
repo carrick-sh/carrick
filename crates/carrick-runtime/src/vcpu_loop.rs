@@ -1791,6 +1791,16 @@ where
                         timeout,
                     )?);
                 }
+                DispatchOutcome::SharedFutexWake { host_addr, count } => {
+                    // Cross-process futex wake (MAP_SHARED): route through the
+                    // SAME `PlatformFutex` the wait side uses so the wake reaches
+                    // a waiter parked in another carrick process. Non-blocking, so
+                    // we complete the syscall inline with the count woken (clamped
+                    // to non-negative; a negative kernel return surfaces as 0
+                    // woken, matching the prior inline ulock loop's `break`).
+                    let woke = state.platform_futex.shared_wake(host_addr, count);
+                    last_syscall_retval = Some(state.complete_returned(&mut engine, woke.max(0))?);
+                }
                 DispatchOutcome::CloneThread {
                     stack,
                     tls,

@@ -62,20 +62,17 @@ pub struct VcpuSnapshot {
 ///   At the trap the parent vCPU is suspended on the EL1 vector's sentinel
 ///   store with `ELR_EL1` already latched to (svc + 4); the sibling's PC is
 ///   seeded to that post-svc address.
-///
-/// **IMPORTANT — PSTATE is NOT yet fixed up.** This snapshot inherits
-/// `parent.pstate`, which is the EL1h trap-time PSTATE (the exception-level
-/// at which the vCPU is suspended on the sentinel store), NOT the EL0t resume
-/// PSTATE the sibling needs to re-enter user code. The architecturally-correct
-/// EL0t PSTATE is in `parent.spsr_el1` (the SPSR latched on the `svc` trap).
-/// The four register deltas above are necessary but not sufficient: before the
-/// sibling can run, `materialize_sibling` / the run-loop must also establish a
-/// correct EL0-resume state — either set PSTATE = `spsr_el1` and start directly
-/// at EL0, or route the sibling's first run through an EL1 vector `eret` (as
-/// `fork`'s child does). This is invisible in Task 5 (no sibling actually runs;
-/// the threads-counter fixture is xfail).
-///
-/// // TODO(Phase 2 Task 7): establish EL0-resume PSTATE from spsr_el1 — see spec §D.
+/// - `pstate = parent.spsr_el1` — the EL0t resume PSTATE (Phase 2 Task 7 carry,
+///   spec §D). The parent snapshot's `pstate` is the EL1h **trap-time** PSTATE
+///   (the exception level at which the vCPU is suspended on the sentinel store),
+///   so a sibling restored with it would re-enter at EL1, not EL0. The
+///   architecturally-correct EL0t PSTATE was latched into `SPSR_EL1` by the
+///   hardware on the `svc` exception; copying it into the sibling's `pstate`
+///   makes the new vCPU resume directly at EL0 (mode `0b0000` = EL0t) with the
+///   right DAIF/condition flags — exactly where the parent's guest thread is
+///   about to resume after its `eret`. (We start the sibling at EL0 directly
+///   rather than routing through an EL1-vector `eret`; both are valid, this is
+///   simpler since the sibling has no pending-MMIO sentinel store to replay.)
 ///
 /// FP/SIMD (`vregs`/`fpsr`/`fpcr`) is carried verbatim (`.fpsr` stays FPSR,
 /// `.fpcr` stays FPCR — do NOT swap); it is zero-stubbed until Phase 4.
@@ -85,6 +82,10 @@ pub fn seed_sibling_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> Vcp
     snap.sp_el0 = stack;
     snap.tpidr_el0 = tls;
     snap.pc = parent.elr_el1;
+    // EL0-resume PSTATE: the SPSR latched on the parent's `svc` trap IS the EL0t
+    // PSTATE the new thread must run with. Without this the sibling restores the
+    // EL1h trap-time PSTATE and re-enters at the wrong exception level (spec §D).
+    snap.pstate = parent.spsr_el1;
     snap
 }
 
@@ -143,8 +144,14 @@ mod seed_tests {
         assert_eq!(child.mair, parent.mair);
         assert_eq!(child.vbar, parent.vbar);
         assert_eq!(child.cpacr, parent.cpacr);
-        assert_eq!(child.pstate, parent.pstate);
         assert_eq!(child.spsr_el1, parent.spsr_el1);
+        // EL0-resume PSTATE (Task 7 fix): the sibling's pstate is seeded from the
+        // parent's SPSR_EL1 (the EL0t PSTATE), NOT the parent's EL1h trap-time
+        // pstate — so the new vCPU resumes at EL0.
+        assert_eq!(
+            child.pstate, parent.spsr_el1,
+            "sibling pstate must be the EL0t SPSR_EL1, not the EL1h trap pstate"
+        );
 
         // The other GPRs are inherited (x1..x30 unchanged).
         for n in 1..31 {

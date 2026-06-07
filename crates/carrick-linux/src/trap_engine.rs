@@ -127,6 +127,20 @@ impl GuestMemory for KvmTrapEngine {
                 length: len,
             })
     }
+
+    /// Host VA of a guest futex word IFF it lives in the `MAP_SHARED` aperture —
+    /// the hook (Task 7 fix #3) that lets the dispatcher route a guest
+    /// cross-process (`MAP_SHARED`) futex through `KvmFutex::shared_{wait,wake}`
+    /// (bare host `SYS_futex` on the same physical page, inherited across
+    /// `fork(2)`). For a 4-byte futex word: the guest is identity-mapped, so the
+    /// guest VA == GPA indexes straight into the shared window's host backing.
+    /// Returns `None` for a word in a private/COW window — those stay in-process
+    /// via the parking-lot `FutexTable` (the default trait impl returned `None`
+    /// unconditionally, which is why shared guest futexes never reached the
+    /// shared path before this override).
+    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
+        self.ram.shared_futex_host_addr(guest_addr, 4)
+    }
 }
 
 impl SyscallTrap for KvmTrapEngine {

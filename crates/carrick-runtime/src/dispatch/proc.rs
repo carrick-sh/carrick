@@ -1367,21 +1367,15 @@ impl SyscallDispatcher {
             Ok(match command {
                 LINUX_FUTEX_WAKE => {
                     if let Some(host_addr) = shared_host_addr {
-                        // See dispatch/mod.rs futex_threaded — sched_yield
-                        // between iterations is the cure for macOS's
-                        // wake_by_address_any reporting spurious successes
-                        // when called back-to-back on a SHARED address.
-                        let mut woke = 0i64;
-                        for i in 0..value {
-                            let rc = crate::ulock::wake(host_addr, false);
-                            crate::probes::ulock_wake(host_addr as u64, i as i32, rc);
-                            if rc < 0 {
-                                break;
-                            }
-                            woke += 1;
-                            unsafe { libc::sched_yield(); }
-                        }
-                        return Ok(DispatchOutcome::Returned { value: woke });
+                        // Cross-process (MAP_SHARED) wake: route through the
+                        // `PlatformFutex::shared_wake` seam (the wake counterpart
+                        // of `SharedFutexWait`) so HVF's __ulock (one-at-a-time +
+                        // sched_yield) or KVM's host SYS_futex is reached
+                        // uniformly. The loop completes with the count woken.
+                        return Ok(DispatchOutcome::SharedFutexWake {
+                            host_addr,
+                            count: value,
+                        });
                     }
                     let n = thread.futex.wake(address.0, value);
                     DispatchOutcome::Returned {
@@ -1436,20 +1430,15 @@ impl SyscallDispatcher {
                     }
                     if let Some(host_addr) = shared_host_addr {
                         // Shared path: no native requeue → wake nr_wake+nr_requeue
-                        // (correct per the spurious-wake-tolerant futex contract).
-                        let total = (nr_wake as u64).saturating_add(nr_requeue as u64);
-                        let mut woke = 0i64;
-                        let mut i = 0u64;
-                        while i < total {
-                            let rc = crate::ulock::wake(host_addr, false);
-                            if rc < 0 {
-                                break;
-                            }
-                            woke += 1;
-                            unsafe { libc::sched_yield() };
-                            i += 1;
-                        }
-                        return Ok(DispatchOutcome::Returned { value: woke });
+                        // (correct per the spurious-wake-tolerant futex contract),
+                        // routed through the `PlatformFutex::shared_wake` seam.
+                        let total = (nr_wake as u64)
+                            .saturating_add(nr_requeue as u64)
+                            .min(u32::MAX as u64) as u32;
+                        return Ok(DispatchOutcome::SharedFutexWake {
+                            host_addr,
+                            count: total,
+                        });
                     }
                     let (woken, requeued) =
                         thread.futex.requeue(address.0, uaddr2, nr_wake, nr_requeue);

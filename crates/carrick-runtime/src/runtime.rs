@@ -1154,6 +1154,14 @@ where
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
+            DispatchOutcome::SharedFutexWake { host_addr, count } => {
+                // Cross-process MAP_SHARED futex wake from a single-threaded
+                // guest (LTP tst_checkpoint_wake). Same __ulock one-at-a-time +
+                // sched_yield as the threaded loop's PlatformFutex::shared_wake.
+                let retval = shared_futex_wake(host_addr, count);
+                runtime.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
+            }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
             | DispatchOutcome::SignalThread { .. }
@@ -1603,6 +1611,29 @@ fn shared_futex_wait(
         }
         return -i64::from(host_errno);
     }
+}
+
+/// Wake up to `count` waiters on a cross-process (`MAP_SHARED`) futex from a
+/// SINGLE-THREADED guest (an LTP test binary that forks + `tst_checkpoint_wake`s
+/// a child). The macOS `__ulock` analog of the threaded loop's
+/// `PlatformFutex::shared_wake`: wake ONE waiter per `__ulock_wake` call with a
+/// `sched_yield` between iterations (the cure for macOS `wake_by_address_any`
+/// reporting spurious back-to-back successes on a SHARED address). Returns the
+/// count actually woken. Byte-identical to the dispatcher's prior inline loop and
+/// to `HvfFutex::shared_wake`, so the `SharedFutexWake` outcome change preserves
+/// the single-threaded HVF behavior exactly.
+fn shared_futex_wake(host_addr: usize, count: u32) -> i64 {
+    let mut woke = 0i64;
+    for i in 0..count {
+        let rc = crate::ulock::wake(host_addr, false);
+        crate::probes::ulock_wake(host_addr as u64, i as i32, rc);
+        if rc < 0 {
+            break;
+        }
+        woke += 1;
+        unsafe { libc::sched_yield() };
+    }
+    woke
 }
 
 /// Absolute host path to Apple's Rosetta 2 Linux ELF interpreter. This is an
