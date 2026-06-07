@@ -456,9 +456,9 @@ impl KvmVcpu {
     /// so the rebuilt child vCPU can resume exactly where the parent left off
     /// (inside the trapped `clone`/`fork` syscall).
     ///
-    /// FP/SIMD state (`vregs`/`fpsr`/`fpcr`) is STUBBED to zero in Phase 2 — full
-    /// FP capture is Phase 4. The fields are kept on [`VcpuSnapshot`] so Task 5
-    /// (threads) can reuse the struct without an ABI change.
+    /// Captures all GPRs, special EL1 registers, system registers, and the full
+    /// FP/SIMD state (`vregs`/`fpsr`/`fpcr`) so fork-children and execve inherit
+    /// correct floating-point context (Phase 4).
     pub fn snapshot(&self) -> Result<VcpuSnapshot, OsError> {
         let mut gprs = [0u64; 31];
         for (n, g) in gprs.iter_mut().enumerate() {
@@ -480,15 +480,23 @@ impl KvmVcpu {
             vbar: self.get_sys_reg(SysReg::Vbar)?,
             cpacr: self.get_sys_reg(SysReg::Cpacr)?,
             tpidr_el0: self.get_sys_reg(SysReg::TpidrEl0)?,
-            // Phase 4: real FP/SIMD capture. Zero-stubbed for now.
-            vregs: [0; 32],
-            fpsr: 0,
-            fpcr: 0,
+            // Real FP/SIMD capture via the inherent accessors (Phase 4).
+            vregs: {
+                let mut v = [0u128; 32];
+                for (n, slot) in v.iter_mut().enumerate() {
+                    *slot = self.get_vreg(n as u32)?;
+                }
+                v
+            },
+            fpsr: self.get_fpsr()?,
+            fpcr: self.get_fpcr()?,
         })
     }
 
     /// Restore a [`VcpuSnapshot`] onto this (freshly created) vCPU. The mirror of
-    /// [`Self::snapshot`]; FP/SIMD fields are skipped in Phase 2 (zero-stubbed).
+    /// [`Self::snapshot`]; restores GPRs, EL1/system registers, and the full
+    /// FP/SIMD state (`vregs`/`fpsr`/`fpcr`) so fork-children and execve inherit
+    /// correct floating-point context (Phase 4).
     pub fn restore(&mut self, snap: &VcpuSnapshot) -> Result<(), OsError> {
         for (n, g) in snap.gprs.iter().enumerate() {
             self.set_reg(Reg::X(n as u32), *g)?;
@@ -507,7 +515,11 @@ impl KvmVcpu {
         self.set_sys_reg(SysReg::Vbar, snap.vbar)?;
         self.set_sys_reg(SysReg::Cpacr, snap.cpacr)?;
         self.set_sys_reg(SysReg::TpidrEl0, snap.tpidr_el0)?;
-        // Phase 4: restore vregs/fpsr/fpcr. Skipped while zero-stubbed.
+        for (n, v) in snap.vregs.iter().enumerate() {
+            self.set_vreg(n as u32, *v)?;
+        }
+        self.set_fpsr(snap.fpsr)?;
+        self.set_fpcr(snap.fpcr)?;
         Ok(())
     }
 }

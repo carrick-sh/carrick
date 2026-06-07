@@ -752,4 +752,25 @@ mod execve_tests {
         assert_eq!(engine.get_fpsr().unwrap(), 0x0000_0010, "FPSR round-trips");
         assert_eq!(engine.get_fpcr().unwrap(), 0x0040_0000, "FPCR round-trips");
     }
+
+    #[test]
+    fn kvm_fpsimd_snapshot_restore() {
+        use carrick_hal::RegAccess;
+        if !kvm_available() {
+            eprintln!("SKIP kvm_fpsimd_snapshot_restore: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        engine.set_vreg(0, 0xABCD_0000_0000_1234u128).unwrap();
+        engine.set_fpsr(0x0000_0008).unwrap();
+        let snap = engine.vcpu.snapshot().unwrap();
+        assert_eq!(snap.vregs[0], 0xABCD_0000_0000_1234u128, "snapshot captures V0");
+        assert_eq!(snap.fpsr, 0x0000_0008, "snapshot captures FPSR");
+        // Trash live state, then restore from the snapshot.
+        engine.set_vreg(0, 0).unwrap();
+        engine.set_fpsr(0).unwrap();
+        engine.vcpu.restore(&snap).unwrap();
+        assert_eq!(engine.get_vreg(0).unwrap(), 0xABCD_0000_0000_1234u128, "restore recovers V0");
+        assert_eq!(engine.get_fpsr().unwrap(), 0x0000_0008, "restore recovers FPSR");
+    }
 }
