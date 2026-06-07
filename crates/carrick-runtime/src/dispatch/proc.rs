@@ -263,6 +263,13 @@ pub(super) struct ProcState {
     /// Current guest argv, surfaced as NUL-separated bytes through
     /// `/proc/self/cmdline`.
     pub argv: Vec<String>,
+    /// Set when this guest is a foreign-arch binary running through a
+    /// `binfmt_misc` interpreter (Apple's Rosetta). The redirect keeps the
+    /// program's own identity (`executable_path`/`argv` stay the target, as on
+    /// real Linux), so arch-dependent syscalls that must reflect the *translated*
+    /// program — `uname(2)` reporting `x86_64` — key off this flag instead of
+    /// inspecting `executable_path`.
+    pub binfmt_interpreted: bool,
     /// Current guest environment (`KEY=VALUE` entries) as OPAQUE BYTES, surfaced
     /// as NUL-separated bytes through `/proc/self/environ`. Kept as raw bytes —
     /// env values are not required to be UTF-8, and a lossy String round-trip
@@ -430,6 +437,7 @@ impl ProcState {
         Self {
             executable_path: "/proc/self/exe".to_owned(),
             argv: vec!["/proc/self/exe".to_owned()],
+            binfmt_interpreted: false,
             env: Vec::new(),
             personality: 0,
             dumpable: 1,
@@ -1458,12 +1466,13 @@ impl SyscallDispatcher {
             // nodename is the runtime-resolved guest hostname (the macOS host's
             // short name under --net=host; `carrick` fallback) so uname(2) agrees
             // with /proc/sys/kernel/hostname and the /etc/hosts self-mapping.
-            // Under Rosetta translation the guest is x86_64 — report that machine
-            // (we know it's Rosetta because the loaded executable is the
-            // interpreter); otherwise report native aarch64. Both carry the
-            // resolved nodename.
+            // A binfmt-interpreted guest (x86_64 under Rosetta) reports x86_64;
+            // otherwise native aarch64. The flag — not executable_path — is the
+            // signal, because a faithful binfmt redirect keeps the program's own
+            // identity (executable_path stays the target, as on real Linux). Both
+            // carry the resolved nodename.
             let nodename = crate::execute::guest_hostname();
-            let uts = if this.proc.lock().executable_path == crate::runtime::ROSETTA_INTERPRETER {
+            let uts = if this.proc.lock().binfmt_interpreted {
                 LinuxUtsname::carrick_x86_64_with_nodename(nodename)
             } else {
                 LinuxUtsname::carrick_aarch64_with_nodename(nodename)

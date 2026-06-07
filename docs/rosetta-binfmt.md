@@ -208,6 +208,36 @@ Keep the current model but defend the one fragile assumption:
   exact failure classes the placeholder approach is exposed to.
 - Keep the placeholder, documented as Rosetta-overwritten.
 
+## 5b. Implemented (2026-06-07): the faithful binfmt *mechanism*
+
+Option A's "carrick provides the mapping" is dead (§linchpin), so the faithful
+work landed as the *mechanism*, in `crates/carrick-runtime/src/binfmt.rs` plus
+the redirect glue:
+
+- **A binfmt_misc registry.** `BinfmtRegistration { offset, magic, mask,
+  interpreter, flags }` with kernel-style masked magic matching
+  (`(file[i] & mask[i]) == (magic[i] & mask[i])`). The sole entry is the x86_64
+  ELF → Rosetta `POCF` registration (the same magic/mask Docker uses; the masked
+  e_type bit matches both ET_EXEC and ET_DYN). `maybe_redirect_to_rosetta` now
+  detects via `match_registration` instead of a hardcoded machine check, so
+  adding a foreign arch is one table entry.
+- **Transparent program identity.** The redirect no longer overwrites
+  `/proc/self/exe`/argv with the interpreter (it used to report `rosetta`).
+  `/proc/self/exe` now resolves to the **target** (matches Docker: `/bin/busybox`,
+  `/usr/bin/<tool>`). `uname(2)` → x86_64 is gated on a new
+  `ProcState.binfmt_interpreted` flag (reset on every exec, set by the redirect)
+  rather than on `executable_path == ROSETTA_INTERPRETER`.
+- **Faithful `/proc/self/cmdline`.** Rosetta serves the guest's cmdline by
+  applying its argv-skip to the argv carrick put on the stack
+  (`[argv0, target, args…]`). `proc.argv` is set to that *stack* form
+  (`enter_binfmt`), so after Rosetta's skip the cmdline is the program's real
+  argv — byte-for-byte equal to Docker (previously the skip ate the program's
+  `argv[0]`). The program's own `argv[0]` (e.g. `$0`) was already correct.
+
+Verified vs Docker: `uname -m`=x86_64, `/proc/self/exe`=target, `$0`=target,
+`/proc/self/cmdline` parity, busybox multi-call dispatch; arm64-native and
+glibc-dynamic unaffected. The `AT_BASE` placeholder remains (intrinsic, §linchpin).
+
 ## 6. Recommendation
 
 The post-fix auxv already matches Docker, so **Option B first** (cheap insurance:

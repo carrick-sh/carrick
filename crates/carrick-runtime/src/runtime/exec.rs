@@ -44,7 +44,11 @@ pub(super) fn load_execve_image(
     let (raw_bytes, argv) = match maybe_redirect_to_rosetta(&path, &raw_bytes, &argv) {
         None => (raw_bytes, argv),
         Some(Ok(redirect)) => {
+            // Faithful binfmt: the execve target keeps its own identity; flag the
+            // guest (uname → x86_64) and record the stack argv so
+            // /proc/self/cmdline survives Rosetta's argv-skip.
             needs_at_base = redirect.target_is_dynamic;
+            dispatcher.enter_binfmt(&redirect.argv);
             (redirect.interpreter_bytes, redirect.argv)
         }
         Some(Err(errno)) => return Err(errno),
