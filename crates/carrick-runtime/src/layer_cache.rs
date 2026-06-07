@@ -170,14 +170,24 @@ fn same_device(a: &Path, b: &Path) -> Option<bool> {
     Some(da == db)
 }
 
+/// `CLONE_NOFOLLOW` (`sys/clonefile.h`): clone a symlink SOURCE as a symlink
+/// rather than following it. Without it, `clonefile(flags=0)` on a top-level
+/// symlink child — e.g. merged-/usr's `bin -> usr/bin` — FOLLOWS the link and
+/// clones the target directory, materialising `/bin` as a real directory in the
+/// scratch. That breaks the guest's merged-/usr view: `base-files`' preinst
+/// aborts ("/bin is a directory, but should be a symbolic link"), so `apt
+/// full-upgrade` fails. NOFOLLOW is a no-op for directory sources (they clone
+/// recursively with their inner symlinks preserved either way).
+const CLONE_NOFOLLOW: u32 = 0x0001;
+
 fn clonefile(src: &Path, dst: &Path) -> std::io::Result<()> {
     let csrc = CString::new(src.as_os_str().as_encoded_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let cdst = CString::new(dst.as_os_str().as_encoded_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: both pointers are valid NUL-terminated C strings; flags=0 is the
-    // documented default (recursive COW clone, follow nothing special).
-    let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), 0) };
+    // SAFETY: both pointers are valid NUL-terminated C strings. CLONE_NOFOLLOW
+    // clones a symlink child as a symlink instead of following it (see above).
+    let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), CLONE_NOFOLLOW) };
     if rc == 0 {
         Ok(())
     } else {
@@ -227,5 +237,38 @@ mod tests {
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(&b).unwrap();
         assert_eq!(same_device(&a, &b), Some(true));
+    }
+
+    #[test]
+    fn clone_children_preserves_top_level_symlink() {
+        // Regression: merged-/usr ships `bin -> usr/bin` as a SYMLINK. Seeding
+        // the scratch with clonefile(flags=0) FOLLOWED it and materialised /bin
+        // as a directory, so base-files' preinst aborted ("/bin is a directory,
+        // but should be a symbolic link") and `apt full-upgrade` failed. The
+        // clone must reproduce the symlink verbatim.
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = tmp.path().join("entry");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir(&entry).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::create_dir(entry.join("usrbin")).unwrap();
+        std::fs::write(entry.join("usrbin/a"), b"a").unwrap();
+        std::os::unix::fs::symlink("usrbin", entry.join("bin")).unwrap();
+
+        if !clone_children_into(&entry, &scratch).unwrap() {
+            // clonefile unsupported on this temp volume — nothing to assert.
+            eprintln!("skip: clonefile unavailable on the temp volume");
+            return;
+        }
+        let meta = std::fs::symlink_metadata(scratch.join("bin")).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "scratch/bin must stay a symlink (got {:?}); merged-/usr would break",
+            meta.file_type()
+        );
+        assert_eq!(
+            std::fs::read_link(scratch.join("bin")).unwrap(),
+            std::path::Path::new("usrbin")
+        );
     }
 }
