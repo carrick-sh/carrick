@@ -447,8 +447,162 @@ CEOF
       printf "FAIL [vfork-exec]: stdout=[%s] exit=%s oracle=[vfork-exec-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 14. Phase 4: in-guest signal-HANDLER injection. sigaction(SIGUSR1)+raise():
+    #     glibc lowers raise() to tgkill(self); the dispatcher publishes the
+    #     UNBLOCKED signal into the per-thread pending table (the Phase-4 Linux
+    #     host_signal fix) and, on the syscall return, the generic loop
+    #     deliver_pending_signal calls KvmTrapEngine::inject_signal -> the shared
+    #     carrick_hal::sigframe builder (handler entry on ELR_EL1, x0=signum, frame
+    #     pushed on SP_EL0). The handler sets a flag and returns via the restorer
+    #     trampoline -> rt_sigreturn(139) -> restore_from_sigframe. REQUIRED gate.
+    cat > /tmp/csig_basic.c <<CEOF
+#include <signal.h>
+#include <unistd.h>
+static volatile sig_atomic_t ran;
+static void h(int s){ (void)s; ran = 1; }
+int main(void){
+  struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler = h;
+  if(sigaction(SIGUSR1,&sa,0)) return 2;
+  raise(SIGUSR1);
+  if(!ran) return 3;
+  return write(1,"csig-basic-ok",13)==13 ? 0 : 4;
+}
+CEOF
+    gcc -static -O2 -o /tmp/csig_basic /tmp/csig_basic.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/csig_basic" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "csig-basic-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+signal-handler]: sigaction+raise ran the in-guest handler (sigframe inject + rt_sigreturn)."
+    else
+      printf "FAIL [signal-handler]: stdout=[%s] exit=%s oracle=[csig-basic-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 15. Phase 4: SA_ONSTACK. The handler must run on the sigaltstack the program
+    #     installed (the builder honors InjectParams::altstack). The handler probes
+    #     its own SP and asserts it lies inside altbuf.
+    cat > /tmp/csig_onstack.c <<CEOF
+#include <signal.h>
+#include <unistd.h>
+#include <stdint.h>
+static char altbuf[65536];
+static volatile sig_atomic_t on_alt;
+static void h(int s){
+  (void)s; int probe; uintptr_t sp=(uintptr_t)&probe;
+  on_alt = (sp >= (uintptr_t)altbuf && sp < (uintptr_t)altbuf + sizeof altbuf);
+}
+int main(void){
+  stack_t ss; ss.ss_sp=altbuf; ss.ss_size=sizeof altbuf; ss.ss_flags=0;
+  if(sigaltstack(&ss,0)) return 2;
+  struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h; sa.sa_flags=SA_ONSTACK;
+  if(sigaction(SIGUSR1,&sa,0)) return 3;
+  raise(SIGUSR1);
+  if(!on_alt) return 4;
+  return write(1,"csig-onstack-ok",15)==15 ? 0 : 5;
+}
+CEOF
+    gcc -static -O2 -o /tmp/csig_onstack /tmp/csig_onstack.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/csig_onstack" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "csig-onstack-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+sa-onstack]: SA_ONSTACK handler ran on the installed sigaltstack."
+    else
+      printf "FAIL [sa-onstack]: stdout=[%s] exit=%s oracle=[csig-onstack-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 16. Phase 4: FP/SIMD save/restore across an ASYNC cross-thread signal -- and
+    #     the kick-inject-at-EL0 path. A worker busy-spins (NO syscalls) holding a
+    #     sentinel in v16; the main thread tgkill()s it. The KvmKicker forces the
+    #     worker KVM_RUN to return (EINTR -> VcpuExit::Kicked), the loop injects
+    #     the handler AT the interrupted EL0 PC (interrupted_pc=Some), the handler
+    #     clobbers v16, and rt_sigreturn must restore it (fpsimd_enabled=true). The
+    #     spin loop verifies v16 == sentinel before and after, entirely in asm so
+    #     the compiler never reallocates it. REQUIRED gate.
+    cat > /tmp/csig_fpsimd.c <<CEOF
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <stdint.h>
+static volatile sig_atomic_t fired; static volatile int ready, ok=1; static pid_t wtid;
+static void h(int s){ (void)s; fired=1;
+  uint64_t junk=0xDEADBEEFCAFEF00DUL; __asm__ volatile("dup v16.2d, %0"::"r"(junk):"v16"); }
+static void *worker(void *a){ (void)a; wtid=(pid_t)syscall(SYS_gettid);
+  __atomic_store_n(&ready,1,__ATOMIC_SEQ_CST);
+  uint64_t sentinel=0x0102030405060708UL; int bad=0;
+  __asm__ volatile(
+    "dup v16.2d, %2\n"
+    "1: ldr w3,[%1]\n"
+    "   umov x4, v16.d[0]\n"
+    "   cmp x4,%2\n"
+    "   b.ne 2f\n"
+    "   cbz w3,1b\n"
+    "   umov x4, v16.d[0]\n"
+    "   cmp x4,%2\n"
+    "   b.eq 3f\n"
+    "2: mov %w0,#1\n"
+    "3:\n"
+    : "+r"(bad) : "r"(&fired), "r"(sentinel) : "x3","x4","v16","memory","cc");
+  if(bad) ok=0; return 0; }
+int main(void){
+  struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h;
+  if(sigaction(SIGUSR1,&sa,0)) return 2;
+  pthread_t t; if(pthread_create(&t,0,worker,0)) return 3;
+  while(!__atomic_load_n(&ready,__ATOMIC_SEQ_CST)) usleep(1000);
+  usleep(20000); /* let the worker enter its busy spin */
+  if(syscall(SYS_tgkill,getpid(),wtid,SIGUSR1)) return 4;
+  if(pthread_join(t,0)) return 5;
+  if(!fired) return 6;
+  if(!ok) return 7;
+  return write(1,"csig-fpsimd-ok",14)==14 ? 0 : 8;
+}
+CEOF
+    gcc -static -O2 -pthread -o /tmp/csig_fpsimd /tmp/csig_fpsimd.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/csig_fpsimd" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "csig-fpsimd-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+fpsimd-signal]: v16 sentinel survived an async cross-thread handler (kick-inject-at-EL0 + sigframe FP save/restore)."
+    else
+      printf "FAIL [fpsimd-signal]: stdout=[%s] exit=%s oracle=[csig-fpsimd-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 17. Phase 4: signal delivery to a SPECIFIC sibling thread. The main thread
+    #     tgkill()s a worker tid with SIGUSR1; the kick must steer the in-guest
+    #     handler onto the WORKER vCPU, not main. The handler checks gettid() ==
+    #     worker_tid. (Here the worker is parked in usleep -- delivery at a syscall
+    #     boundary -- complementing case 16 busy-spin EL0 delivery.) REQUIRED.
+    cat > /tmp/csig_sibling.c <<CEOF
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+static volatile sig_atomic_t on_worker; static volatile int ready; static pid_t wtid;
+static void h(int s){ (void)s; if((pid_t)syscall(SYS_gettid)==wtid) on_worker=1; }
+static void *worker(void *a){ (void)a; wtid=(pid_t)syscall(SYS_gettid);
+  __atomic_store_n(&ready,1,__ATOMIC_SEQ_CST); while(!on_worker) usleep(1000); return 0; }
+int main(void){
+  struct sigaction sa; __builtin_memset(&sa,0,sizeof sa); sa.sa_handler=h;
+  if(sigaction(SIGUSR1,&sa,0)) return 2;
+  pthread_t t; if(pthread_create(&t,0,worker,0)) return 3;
+  while(!__atomic_load_n(&ready,__ATOMIC_SEQ_CST)) usleep(1000);
+  if(syscall(SYS_tgkill,getpid(),wtid,SIGUSR1)) return 4;
+  if(pthread_join(t,0)) return 5;
+  if(!on_worker) return 6;
+  return write(1,"csig-sibling-ok",15)==15 ? 0 : 7;
+}
+CEOF
+    gcc -static -O2 -pthread -o /tmp/csig_sibling /tmp/csig_sibling.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/csig_sibling" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "csig-sibling-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+signal-sibling]: tgkill delivered SIGUSR1 to the worker thread (handler ran on the worker vCPU)."
+    else
+      printf "FAIL [signal-sibling]: stdout=[%s] exit=%s oracle=[csig-sibling-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -459,5 +613,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex — all 16 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection — all 20 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling) pass on KVM; ZERO xfail."
 '
