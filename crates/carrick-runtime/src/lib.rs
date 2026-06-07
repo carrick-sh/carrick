@@ -85,6 +85,10 @@ pub mod apfs;
 pub mod binfmt;
 pub mod container;
 pub mod cred_ipc;
+// Cross-platform forked-child exit helpers and shebang resolution, hoisted out
+// of the per-platform copies in `runtime/exec.rs` (macOS) and
+// `vcpu_loop::macos_helper_stubs` (Linux). No cfg gate: the functions are
+// portable libc + `crate::...` path helpers that resolve per-platform.
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
 pub mod deadlock_watchdog;
@@ -92,6 +96,7 @@ pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;
 pub mod event_ring;
+pub(crate) mod exec_helpers;
 pub mod fs_backend;
 pub mod host_tty;
 pub(crate) mod inotify;

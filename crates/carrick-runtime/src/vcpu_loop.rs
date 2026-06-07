@@ -118,10 +118,12 @@ mod macos_helper_stubs {
             argv
         };
         // Absolutize a relative target against the guest cwd, then resolve any
-        // `#!` shebang to its interpreter. (The macOS twin shares
-        // `crate::runtime::exec::resolve_shebang`, but that module is
-        // `cfg(platform-macos)`; replicate the portable logic here.)
-        let (path, argv) = resolve_shebang(dispatcher, dispatcher.resolve_exec_path(path), argv)?;
+        // `#!` shebang to its interpreter via the shared cross-platform helper.
+        let (path, argv) = crate::exec_helpers::resolve_shebang(
+            dispatcher,
+            dispatcher.resolve_exec_path(path),
+            argv,
+        )?;
         // Read the binary overlay-first, falling back to the host fs (a bare
         // run-elf target lives on the host, not in any rootfs layer).
         let raw_bytes = dispatcher
@@ -149,129 +151,13 @@ mod macos_helper_stubs {
         Ok(image)
     }
 
-    /// Resolve `#!` shebang scripts the way the Linux kernel does, up to
-    /// `BINPRM_MAX_RECURSION` (4) levels. A non-script passes through unchanged.
-    /// Portable twin of `crate::runtime::exec::resolve_shebang`.
-    fn resolve_shebang(
-        dispatcher: &SyscallDispatcher,
-        mut path: String,
-        mut argv: Vec<Vec<u8>>,
-    ) -> Result<(String, Vec<Vec<u8>>), i32> {
-        for _ in 0..4 {
-            let Some(head) = dispatcher.read_exec_file(&path) else {
-                break;
-            };
-            if !head.starts_with(b"#!") {
-                break;
-            }
-            let Some((interp, optarg)) = parse_shebang(&head) else {
-                return Err(crate::linux_abi::LINUX_ENOENT);
-            };
-            let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(argv.len() + 3);
-            new_argv.push(interp.clone().into_bytes());
-            if let Some(arg) = optarg {
-                new_argv.push(arg.into_bytes());
-            }
-            new_argv.push(path.clone().into_bytes());
-            new_argv.extend(argv.into_iter().skip(1));
-            argv = new_argv;
-            path = interp;
-        }
-        Ok((path, argv))
-    }
-
-    /// Parse a `#!` line into (interpreter, optional single arg), matching Linux.
-    /// Portable twin of `crate::runtime::exec::parse_shebang`.
-    fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
-        let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
-        let line = &head[2..line_end.min(256)];
-        let line = std::str::from_utf8(line).ok()?;
-        let line = line.trim_start_matches([' ', '\t']);
-        let mut parts = line.splitn(2, [' ', '\t']);
-        let interp = parts.next()?.to_string();
-        if interp.is_empty() {
-            return None;
-        }
-        let optarg = parts
-            .next()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        Some((interp, optarg))
-    }
-
-    /// Forked child hits `exit_group`: flush the guest's buffered stdout/stderr
-    /// to the inherited host fds, publish guest CPU for the parent's wait4
-    /// child-time accounting, then `_exit(2)` to bypass Rust Drops (the rebuilt
-    /// KVM vCPU/VM in the child must not run its Drop chain on the exit path).
-    /// Portable twin of `crate::runtime::exec::forked_child_exit`.
-    pub(super) fn forked_child_exit(
-        code: i32,
-        stdout_buf: impl AsRef<[u8]>,
-        stderr_buf: impl AsRef<[u8]>,
-    ) -> ! {
-        crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
-        let stdout_buf = stdout_buf.as_ref();
-        let stderr_buf = stderr_buf.as_ref();
-        let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
-        let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
-        unsafe { libc::_exit(code) };
-    }
-
-    /// Forked child must die by a default-action signal (no handler installed):
-    /// flush stdio, reset the disposition to default + unblock the signal, then
-    /// `raise` it so the parent's wait4 reports `WIFSIGNALED(signum)`. On Linux
-    /// the guest signal number IS the host number (no cross-OS translation), but
-    /// route through `linux_to_host_signum` (identity on Linux) to match the
-    /// macOS twin. Falls back to `_exit(128+signum)` if the signal didn't kill us.
-    pub(super) fn forked_child_die_by_signal(
-        signum: i32,
-        stdout_buf: impl AsRef<[u8]>,
-        stderr_buf: impl AsRef<[u8]>,
-    ) -> ! {
-        crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
-        let stdout_buf = stdout_buf.as_ref();
-        let stderr_buf = stderr_buf.as_ref();
-        let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
-        let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
-        let host_signum = crate::host_signal::linux_to_host_signum(signum);
-        unsafe {
-            libc::signal(host_signum, libc::SIG_DFL);
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigaddset(&mut set, host_signum);
-            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-            libc::raise(host_signum);
-            libc::_exit(128 + signum)
-        }
-    }
-
-    /// Stop THIS process by `signum` (job control / ptrace stop): reset the
-    /// disposition to default, unblock, and `raise`. Portable twin of
-    /// `crate::runtime::exec::stop_by_signal`.
-    pub(super) fn stop_by_signal(signum: i32) {
-        let host_signum = crate::host_signal::linux_to_host_signum(signum);
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = libc::SIG_DFL;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(host_signum, &action, std::ptr::null_mut());
-
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigaddset(&mut set, host_signum);
-            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-            libc::raise(host_signum);
-        }
-    }
-
-    /// After a `PTRACE_TRACEME`d exec, stop with SIGTRAP so a tracer sees the
-    /// exec stop. Portable twin of `crate::runtime::exec::stop_after_traced_exec`.
-    pub(super) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
-        if dispatcher.is_ptrace_traceme() {
-            stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);
-        }
-    }
+    // The 5 forked-child/signal-stop helpers and the shebang pair are now in the
+    // cross-platform `exec_helpers` module. Re-export them here under `pub(super)`
+    // so the `use macos_helper_stubs::{…}` import at the bottom of this module
+    // (line ~281) continues to resolve without change.
+    pub(super) use crate::exec_helpers::{
+        forked_child_die_by_signal, forked_child_exit, stop_after_traced_exec, stop_by_signal,
+    };
 
     pub(super) fn hardware_tso_for_debug(_requested: bool) -> bool {
         unreachable!("Apple-Silicon hardware TSO toggle is HVF-only; KVM has no Rosetta TSO")
