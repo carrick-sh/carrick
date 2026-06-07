@@ -158,6 +158,45 @@ we're robust even if we get an x86 detail slightly wrong.
   base / ASLR policy, GNU_RELRO, bss zero-fill, the SysV initial-stack layout for
   x86). More code than the current ~30-line redirect.
 
+### Linchpin experiment result (2026-06-07): Option A is INFEASIBLE for Rosetta
+
+Prototyped Option A behind `CARRICK_BINFMT_FAITHFUL`: carrick mapped the x86
+target + its `PT_INTERP`, built a target-describing auxv, overlaid the rosetta
+image, and entered at rosetta's entry — with `argv` = the *program's* argv (no
+ELF path), the way a kernel-pre-loaded program looks. Result:
+
+```
+rosetta error: failed to open elf at -m
+```
+
+Rosetta started (faulted in its own text at `0x800000088d14`) and tried to
+**`open(argv[1])` as the ELF to translate** (`argv[1]` was `-m`). So:
+
+> **Rosetta always loads the target itself from `argv[1]` (the standalone
+> `Usage: rosetta <elf>` contract). It does NOT consume a pre-mapped target.**
+
+Therefore carrick cannot "act as the kernel, map everything, and have Rosetta
+translate in place." Pre-mapping is at best ignored (Rosetta re-`open`s and
+re-maps at addresses *it* chooses) and at worst a double-map conflict. And since
+Rosetta picks the target/interp load addresses itself, it **must** overwrite
+`AT_PHDR`/`AT_ENTRY`/`AT_BASE` regardless — so even a "real" `AT_BASE` carrick
+computed would be discarded. The placeholder-`AT_BASE` (committed fix) is not a
+hack to remove; it is the *correct* way to interface with Rosetta's
+auxv-forwarding when Rosetta owns the load.
+
+A possible (untested) exception is the binfmt **O** flag: Docker passes the
+target as an *fd* and the kernel pre-maps it, and Rosetta references
+`/proc/self/fd/%d` in its strings. Whether the fd path makes Rosetta reuse a
+pre-mapping (vs re-`open`) is unverified and would need a separate experiment.
+Given the path-mode result, it is not pursued here.
+
+**Consequence for "faithful binfmt":** it cannot mean "carrick provides the
+mapping." It means a faithful *mechanism*: a binfmt_misc registry, flag-driven
+argv/fd/creds, and a redirect transparent to the program (`/proc/self/exe` =
+target — carrick currently mis-reports the interpreter — clean argv, target
+auxv). The auxv-template + `AT_BASE` slot approach stays, because that is how
+Rosetta actually consumes the auxv.
+
 ## 5. Option B — harden the standalone model (incremental, low-risk)
 
 Keep the current model but defend the one fragile assumption:
