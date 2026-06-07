@@ -238,6 +238,8 @@ pub mod runtime {
         R: GuestMemory + SyscallTrap,
     {
         let reporter = CompatReporter::default();
+        let mut waiter =
+            crate::io_wait::ThreadWaiter::new(std::process::id() as crate::thread::ThreadId);
         let trace_traps = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
         for traps in 1..=max_traps {
             let frame = match runtime
@@ -255,13 +257,15 @@ pub mod runtime {
                     frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5
                 );
             }
-            let outcome = dispatcher
-                .dispatch(
-                    SyscallRequest::from_aarch64_frame(frame),
-                    runtime,
-                    &reporter,
-                )
-                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+            // Dispatch, servicing any blocking-I/O wait inline (ppoll) and
+            // re-dispatching on readiness, so the returned outcome is terminal.
+            let outcome = service_syscall(
+                &mut dispatcher,
+                SyscallRequest::from_aarch64_frame(frame),
+                runtime,
+                &reporter,
+                &mut waiter,
+            )?;
             match outcome {
                 DispatchOutcome::Returned { value } => {
                     runtime
@@ -289,6 +293,124 @@ pub mod runtime {
             }
         }
         Err(RuntimeError::TrapLimit)
+    }
+
+    /// Dispatch one syscall, servicing any blocking-I/O outcome inline via the
+    /// `ppoll` waiter (then re-dispatching the SAME syscall on readiness), and
+    /// return the TERMINAL outcome. Mirrors the macOS `dispatch_single_threaded_
+    /// syscall` for the fd-wait / select / poll / sleep / blocking-write arms.
+    /// Signal-wait, proc-exit, futex, fork, and clone-thread outcomes are not
+    /// serviced here yet (later slices) — they fall through to the caller, which
+    /// surfaces `RuntimeError::Unsupported`.
+    fn service_syscall<M: GuestMemory>(
+        dispatcher: &mut SyscallDispatcher,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        waiter: &mut crate::io_wait::ThreadWaiter,
+    ) -> Result<DispatchOutcome, RuntimeError> {
+        use crate::io_wait::{WaitFd, WaitResult};
+        const EINTR: i32 = crate::linux_abi::LINUX_EINTR;
+        loop {
+            let outcome = dispatcher
+                .dispatch(request, memory, reporter)
+                .map_err(|e| RuntimeError::Dispatch(e.to_string()))?;
+            match outcome {
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    block_signals,
+                } => match waiter.wait(&fds, timeout, block_signals) {
+                    WaitResult::Ready => continue,
+                    WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno { errno: EINTR });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                },
+                DispatchOutcome::WaitOnPollFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    block_signals,
+                } => match waiter.wait_poll(&fds, timeout, block_signals) {
+                    WaitResult::Ready => continue,
+                    WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno { errno: EINTR });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                },
+                DispatchOutcome::WaitOnFdsSelect {
+                    fds,
+                    timeout,
+                    block_signals,
+                    clear_on_timeout,
+                } => match waiter.wait(&fds, timeout, block_signals) {
+                    WaitResult::Ready => continue,
+                    WaitResult::TimedOut => {
+                        // select returns 0 with the fd-sets zeroed; the handler
+                        // left them intact, so zero them here.
+                        for (addr, len) in &clear_on_timeout {
+                            let _ = memory.write_bytes(*addr, &vec![0u8; *len]);
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno { errno: EINTR });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                },
+                DispatchOutcome::WaitOnSleep { duration } => {
+                    match waiter.wait(&[], Some(duration), 0) {
+                        // Empty fd set: only TimedOut (sleep elapsed) is expected.
+                        WaitResult::Ready | WaitResult::TimedOut => {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        WaitResult::Interrupted => {
+                            return Ok(DispatchOutcome::Errno { errno: EINTR });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
+                }
+                DispatchOutcome::BlockingHostWrite(mut write) => loop {
+                    match crate::dispatch::drive_blocking_host_write(&mut write) {
+                        // (SIGPIPE-on-EPIPE raise is deferred with signal delivery.)
+                        crate::dispatch::BlockingHostWriteStep::Done(o) => return Ok(o),
+                        crate::dispatch::BlockingHostWriteStep::Wait => {
+                            match waiter.wait(
+                                &[WaitFd::raw(write.host_fd(), libc::POLLOUT)],
+                                None,
+                                0,
+                            ) {
+                                WaitResult::Ready => continue,
+                                WaitResult::Interrupted | WaitResult::TimedOut => {
+                                    return Ok(DispatchOutcome::Returned {
+                                        value: write.offset() as i64,
+                                    });
+                                }
+                                WaitResult::Errno(errno) => {
+                                    if write.offset() > 0 {
+                                        return Ok(DispatchOutcome::Returned {
+                                            value: write.offset() as i64,
+                                        });
+                                    }
+                                    return Ok(DispatchOutcome::Errno { errno });
+                                }
+                            }
+                        }
+                    }
+                },
+                // Terminal (Returned/Errno/Exit/...) and not-yet-serviced
+                // (WaitOnSignals/WaitOnProcExit/futex/fork/...) outcomes.
+                terminal => return Ok(terminal),
+            }
+        }
     }
 
     /// Phase B entry: boot a freestanding/static aarch64 ELF under KVM and run
@@ -564,6 +686,7 @@ pub mod host_signal {
 #[cfg(not(feature = "platform-macos"))]
 pub mod io_wait {
     use std::os::fd::RawFd;
+    use std::time::{Duration, Instant};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct WaitFd {
@@ -603,7 +726,112 @@ pub mod io_wait {
         Errno(i32),
     }
 
+    /// The Linux per-thread blocking-I/O waiter (Phase C). Where the macOS
+    /// waiter owns a kqueue, the Linux waiter is a stateless `ppoll(2)`: the run
+    /// loop hands it the host fds the dispatcher wants to block on (plus an
+    /// optional timeout), and it polls them in one call. That matches the
+    /// run-loop contract exactly — wait, then re-dispatch the same syscall on
+    /// readiness — without persistent fd registration (a persistent epoll is for
+    /// guest *epoll-fd emulation*, a later slice).
+    ///
+    /// `block_mask` (the guest's atomically-blocked sigmask for ppoll/pselect)
+    /// is ignored for now: carrick does not yet deliver guest signals as host
+    /// signals, so there is nothing to block. Spurious HOST signals are absorbed
+    /// by retrying `ppoll` for the remaining time (no guest `EINTR` is fabricated
+    /// — real signal delivery is the later signal slice).
     pub struct ThreadWaiter;
+
+    impl ThreadWaiter {
+        pub fn new(_tid: crate::thread::ThreadId) -> Self {
+            Self
+        }
+
+        /// No-op: `ppoll` needs no per-wait setup (the macOS waiter lazily
+        /// creates its kqueue here).
+        pub fn ensure_full(&mut self) {}
+
+        pub fn wait(
+            &self,
+            fds: &[WaitFd],
+            timeout: Option<Duration>,
+            block_mask: u64,
+        ) -> WaitResult {
+            ppoll_wait(fds, timeout, block_mask)
+        }
+
+        /// `poll(2)`-flavoured wait. On Linux this is the same `ppoll` as
+        /// [`wait`](Self::wait) — both take pollfd-style (fd, events) pairs.
+        pub fn wait_poll(
+            &self,
+            fds: &[WaitFd],
+            timeout: Option<Duration>,
+            block_mask: u64,
+        ) -> WaitResult {
+            ppoll_wait(fds, timeout, block_mask)
+        }
+
+        /// Wait for a child process to exit. The single-vCPU KVM backend has no
+        /// guest children yet (fork/clone is a later, Phase-D slice), so this is
+        /// a clean `ECHILD` rather than a hang.
+        pub fn wait_proc_exit(&self, _pid: i32, _block_mask: u64) -> WaitResult {
+            WaitResult::Errno(crate::linux_abi::LINUX_ECHILD)
+        }
+    }
+
+    fn ppoll_wait(fds: &[WaitFd], timeout: Option<Duration>, _block_mask: u64) -> WaitResult {
+        let mut pollfds: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|w| libc::pollfd {
+                fd: w.fd(),
+                events: w.events(),
+                revents: 0,
+            })
+            .collect();
+        // Re-arm with the REMAINING time across spurious host-EINTR so a signal
+        // storm can't extend the wait past the deadline.
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            let ts = match deadline {
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        return WaitResult::TimedOut;
+                    }
+                    let rem = dl - now;
+                    Some(libc::timespec {
+                        tv_sec: rem.as_secs().min(i64::MAX as u64) as libc::time_t,
+                        tv_nsec: rem.subsec_nanos() as libc::c_long,
+                    })
+                }
+                None => None,
+            };
+            let tsp = ts
+                .as_ref()
+                .map_or(std::ptr::null(), |t| t as *const libc::timespec);
+            // SAFETY: `pollfds` is a valid array of `pollfds.len()` entries; `tsp`
+            // is NULL or a valid timespec; NULL sigmask (no atomic mask swap).
+            let n = unsafe {
+                libc::ppoll(
+                    pollfds.as_mut_ptr(),
+                    pollfds.len() as libc::nfds_t,
+                    tsp,
+                    std::ptr::null(),
+                )
+            };
+            if n > 0 {
+                return WaitResult::Ready;
+            }
+            if n == 0 {
+                return WaitResult::TimedOut;
+            }
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EINTR {
+                // Spurious host signal; no guest signal delivery yet — retry.
+                continue;
+            }
+            return WaitResult::Errno(crate::host_to_linux_errno(err));
+        }
+    }
 }
 
 #[cfg(not(feature = "platform-macos"))]

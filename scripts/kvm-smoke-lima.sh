@@ -79,8 +79,37 @@ CEOF
       printf "FAIL [glibc-static]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 5. Phase C / C3: BLOCKING I/O. clock_nanosleep (WaitOnSleep) + poll with a
+    #    timeout (WaitOnPollFds TimedOut) + poll on a ready fd (Ready) + a pipe
+    #    read/write — all serviced by the ppoll-backed ThreadWaiter, re-dispatched
+    #    on readiness. Single-threaded (no fork/threads).
+    cat > /tmp/cio.c <<CEOF
+#include <poll.h>
+#include <time.h>
+#include <unistd.h>
+int main(void){
+  struct timespec ts={0,20*1000*1000};
+  if(nanosleep(&ts,0)!=0) return 11;
+  int fds[2]; if(pipe(fds)) return 12;
+  struct pollfd po={fds[1],POLLOUT,0}; if(poll(&po,1,100)!=1) return 13;
+  struct pollfd pr={fds[0],POLLIN,0}; if(poll(&pr,1,20)!=0) return 14;
+  if(write(fds[1],"x",1)!=1) return 15;
+  if(poll(&pr,1,100)!=1) return 16;
+  char c; if(read(fds[0],&c,1)!=1) return 17;
+  return write(1,"io-ok",5)==5 ? 0 : 18;
+}
+CEOF
+    gcc -static -O2 -o /tmp/cio /tmp/cio.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cio")" && code=0 || code=$?
+    if [ "$got" = "io-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+blocking-io]: nanosleep + poll + pipe I/O ran to completion under nested KVM."
+    else
+      printf "FAIL [blocking-io]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -91,5 +120,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: Phase B+C1 — hello, hello-stack, and a static glibc binary pass on KVM."
+  echo "OK: Phase B+C1+C3 — hello, hello-stack, static glibc, and blocking-I/O pass on KVM."
 '
