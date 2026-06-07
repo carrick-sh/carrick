@@ -39,3 +39,20 @@ fn run_with_fs_memory_is_a_usage_error() {
         .failure()
         .code(2);
 }
+
+/// With the feature on, `--fs memory` is offered again (parity with pre-gate
+/// behavior). This test only compiles/runs under `--features fs-memory`.
+#[cfg(feature = "fs-memory")]
+#[test]
+fn run_help_offers_fs_memory_with_feature() {
+    let out = assert_cmd::Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Possible values:") && stdout.contains("memory"),
+        "--fs should offer 'memory' when fs-memory is on; help was:\n{stdout}"
+    );
+}
