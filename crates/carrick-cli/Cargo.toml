@@ -18,6 +18,9 @@ workspace = true
 # vector path.
 default = ["syscall-shim"]
 syscall-shim = ["carrick-runtime/syscall-shim"]
+# In-memory fs backend selection (`--fs memory`). Default OFF on purpose; opt in
+# with `cargo build -p carrick-cli --features fs-memory`.
+fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runtime/fs-memory"]
 
 [dependencies]
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
