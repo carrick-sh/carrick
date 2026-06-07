@@ -157,37 +157,65 @@ impl GuestMemory for KvmTrapEngine {
 
 impl SyscallTrap for KvmTrapEngine {
     fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
-        // One KVM_RUN per call; the outer run loop calls `next_syscall`
-        // repeatedly. Classify the exit and return.
-        match self
-            .vcpu
-            .run()
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?
-        {
-            VcpuExit::MmioWrite { gpa, .. } if gpa == SENTINEL_GPA => {
-                // The EL0 `svc` re-entered EL1 and hit the sentinel store.
-                // The hardware already set ELR_EL1 = (svc addr + 4) on the
-                // exception, and the EL1 vector's own `eret` (after the
-                // sentinel store) consumes it — so we do NOT touch the PC
-                // here; we just read the syscall frame.
-                let frame = self.read_frame()?;
-                self.last_syscall_nr = Some(frame.x8);
-                self.last_syscall_orig_x0 = frame.x0;
-                Ok(Some(frame))
-            }
-            VcpuExit::MmioWrite { gpa, data, len } => Err(TrapError::UnexpectedExit {
-                reason: format!("MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len}"),
-            }),
-            // A bare kick or halt with no pending syscall: the contract is to
-            // return `None` so the run loop can run signal delivery and resume.
-            VcpuExit::Halt | VcpuExit::Kicked => Ok(None),
-            VcpuExit::Exception { syndrome, far } => {
-                self.last_fault_esr = syndrome;
-                Err(TrapError::UnexpectedException {
-                    syndrome,
-                    virtual_address: far,
-                    physical_address: far,
-                })
+        // One KVM_RUN per call. The loop exists ONLY to re-enter the guest when a
+        // kick lands mid-syscall-trap (the `Kicked` arm); every other exit returns.
+        loop {
+            match self
+                .vcpu
+                .run()
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?
+            {
+                VcpuExit::MmioWrite { gpa, .. } if gpa == SENTINEL_GPA => {
+                    // The EL0 `svc` re-entered EL1 and hit the sentinel store.
+                    // The hardware already set ELR_EL1 = (svc addr + 4) on the
+                    // exception, and the EL1 vector's own `eret` (after the
+                    // sentinel store) consumes it — so we do NOT touch the PC
+                    // here; we just read the syscall frame.
+                    let frame = self.read_frame()?;
+                    self.last_syscall_nr = Some(frame.x8);
+                    self.last_syscall_orig_x0 = frame.x0;
+                    return Ok(Some(frame));
+                }
+                VcpuExit::MmioWrite { gpa, data, len } => {
+                    return Err(TrapError::UnexpectedExit {
+                        reason: format!(
+                            "MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len}"
+                        ),
+                    });
+                }
+                // A WFI/halt with no pending syscall: report `None` so the run
+                // loop can run signal delivery and resume.
+                VcpuExit::Halt => return Ok(None),
+                VcpuExit::Kicked => {
+                    // A cross-thread kick (host signal → KVM_RUN EINTR, e.g. a
+                    // timer or `tgkill`) can land while the guest is MID-SYSCALL-
+                    // TRAP: the EL0 `svc` has already re-entered EL1 and the vCPU
+                    // PC is inside carrick's EL1 vector, with the sentinel-store
+                    // MMIO not yet surfaced. Reporting that as a deliverable kick
+                    // (→ the loop injects a signal at the EL1-vector PC) corrupts
+                    // the in-flight syscall and wedges the guest in an EL0 spin.
+                    // Mirror HVF (trap.rs:1305): if the PC is in the EL1 vector,
+                    // swallow the kick and re-enter the guest so the syscall
+                    // completes; the pending signal is delivered cleanly on the
+                    // syscall return. Only a kick taken in genuine guest EL0 code
+                    // is reported (`Ok(None)`).
+                    let pc = self
+                        .vcpu
+                        .reg(Reg::Pc)
+                        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+                    if carrick_mem::memory::is_carrick_el1_vector_va(pc) {
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                VcpuExit::Exception { syndrome, far } => {
+                    self.last_fault_esr = syndrome;
+                    return Err(TrapError::UnexpectedException {
+                        syndrome,
+                        virtual_address: far,
+                        physical_address: far,
+                    });
+                }
             }
         }
     }
