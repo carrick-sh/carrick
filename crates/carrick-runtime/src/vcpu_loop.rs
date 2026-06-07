@@ -95,13 +95,109 @@ use crate::runtime::hardware_tso_for_debug;
 mod macos_helper_stubs {
     use super::{AddressSpace, SyscallDispatcher};
 
+    /// KVM execve image builder — the Linux twin of `crate::runtime::exec::
+    /// load_execve_image`. It resolves the target through the dispatcher's
+    /// exec-file reader (overlay/rootfs first, then the host fs) and shebangs,
+    /// then builds a KVM-flavored `AddressSpace`: ELF segments + vdso/auxv +
+    /// the Linux initial stack, but NO syscall shim, NO Rosetta redirect, and NO
+    /// EL0 trampoline / stage-1 tables / EL1 vectors (KVM's `execve_into` →
+    /// `GuestRam::build_for_image` adds the sentinel-vector bring-up pages
+    /// itself, mirroring `run_elf_real_dispatch`'s boot image). Returns `-errno`
+    /// (as a positive `i32` Linux errno) on any load failure, exactly like the
+    /// macOS twin, so the dispatcher reports the same execve(2) error to the guest.
     pub(super) fn load_execve_image(
-        _dispatcher: &SyscallDispatcher,
-        _path: &str,
-        _argv: Vec<Vec<u8>>,
-        _env: Vec<Vec<u8>>,
+        dispatcher: &SyscallDispatcher,
+        path: &str,
+        argv: Vec<Vec<u8>>,
+        env: Vec<Vec<u8>>,
     ) -> Result<AddressSpace, i32> {
-        unreachable!("load_execve_image is the HVF image builder; the KVM execve path builds its own (Task 7d)")
+        use crate::linux_abi::LINUX_ENOENT;
+        let argv = if argv.is_empty() {
+            vec![path.as_bytes().to_vec()]
+        } else {
+            argv
+        };
+        // Absolutize a relative target against the guest cwd, then resolve any
+        // `#!` shebang to its interpreter. (The macOS twin shares
+        // `crate::runtime::exec::resolve_shebang`, but that module is
+        // `cfg(platform-macos)`; replicate the portable logic here.)
+        let (path, argv) = resolve_shebang(dispatcher, dispatcher.resolve_exec_path(path), argv)?;
+        // Read the binary overlay-first, falling back to the host fs (a bare
+        // run-elf target lives on the host, not in any rootfs layer).
+        let raw_bytes = dispatcher
+            .read_exec_file(&path)
+            .or_else(|| std::fs::read(&path).ok())
+            .ok_or(LINUX_ENOENT)?;
+        // Load the ELF, resolving a dynamic interpreter through the same reader.
+        let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
+            dispatcher
+                .read_exec_file(p)
+                .or_else(|| std::fs::read(p).ok())
+        })
+        .map_err(|_| LINUX_ENOENT)?;
+        // KVM boot-image shape: vdso (so AT_SYSINFO_EHDR resolves) + the Linux
+        // initial stack (argc/argv/envp/auxv). `build_for_image` adds the
+        // trampoline / page-tables / sentinel vectors. Matches the boot chain in
+        // `run_elf_real_dispatch`.
+        let image = raw
+            .with_vdso()
+            .and_then(|a| a.with_linux_initial_stack(argv, env))
+            .map_err(|_| LINUX_ENOENT)?;
+        // execve point of no return: reset CAUGHT handlers to SIG_DFL (the kernel
+        // does this; SIG_IGN/mask/pending are preserved).
+        dispatcher.reset_signal_handlers_on_execve();
+        Ok(image)
+    }
+
+    /// Resolve `#!` shebang scripts the way the Linux kernel does, up to
+    /// `BINPRM_MAX_RECURSION` (4) levels. A non-script passes through unchanged.
+    /// Portable twin of `crate::runtime::exec::resolve_shebang`.
+    fn resolve_shebang(
+        dispatcher: &SyscallDispatcher,
+        mut path: String,
+        mut argv: Vec<Vec<u8>>,
+    ) -> Result<(String, Vec<Vec<u8>>), i32> {
+        for _ in 0..4 {
+            let Some(head) = dispatcher.read_exec_file(&path) else {
+                break;
+            };
+            if !head.starts_with(b"#!") {
+                break;
+            }
+            let Some((interp, optarg)) = parse_shebang(&head) else {
+                return Err(crate::linux_abi::LINUX_ENOENT);
+            };
+            let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(argv.len() + 3);
+            new_argv.push(interp.clone().into_bytes());
+            if let Some(arg) = optarg {
+                new_argv.push(arg.into_bytes());
+            }
+            new_argv.push(path.clone().into_bytes());
+            new_argv.extend(argv.into_iter().skip(1));
+            argv = new_argv;
+            path = interp;
+        }
+        Ok((path, argv))
+    }
+
+    /// Parse a `#!` line into (interpreter, optional single arg), matching Linux.
+    /// Portable twin of `crate::runtime::exec::parse_shebang`.
+    fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
+        let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+        let line = &head[2..line_end.min(256)];
+        let line = std::str::from_utf8(line).ok()?;
+        let line = line.trim_start_matches([' ', '\t']);
+        let mut parts = line.splitn(2, [' ', '\t']);
+        let interp = parts.next()?.to_string();
+        if interp.is_empty() {
+            return None;
+        }
+        let optarg = parts
+            .next()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        Some((interp, optarg))
     }
 
     /// Forked child hits `exit_group`: flush the guest's buffered stdout/stderr
