@@ -254,10 +254,7 @@ impl carrick_hal::VcpuRegistry for VcpuKicker {
         self.handles.lock().insert(tid, handle);
     }
 
-    fn register_in_guest(
-        &self,
-        tid: ThreadId,
-    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    fn register_in_guest(&self, tid: ThreadId) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         VcpuKicker::register_in_guest(self, tid)
     }
 
@@ -597,6 +594,7 @@ mod tests {
 
     #[test]
     fn signal_pump_handle_stops_without_live_vcpus() {
+        let _g = crate::host_signal::pump_state_test_guard();
         crate::host_signal::install_default_handlers();
         let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
             std::sync::Arc::new(VcpuKicker::new());
@@ -617,6 +615,7 @@ mod tests {
     #[test]
     fn signal_pump_stop_is_bounded_when_wake_is_lost() {
         use std::sync::atomic::{AtomicBool, Ordering};
+        let _g = crate::host_signal::pump_state_test_guard();
         crate::host_signal::install_default_handlers();
         let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
             std::sync::Arc::new(VcpuKicker::new());
@@ -646,5 +645,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let _ = h.join();
+        // `debug_break_pump_wake` severed the global pump pipe (PUMP_PIPE_WRITE)
+        // and kqueue (both set to -1). Reinstall a fresh pump pipe so the NEXT
+        // test (held off until now by the shared lock) sees a usable pump pipe
+        // rather than a -1 write fd. PUMP_KQUEUE is left at -1, which is the
+        // benign "no pump registered" sentinel every pump-assertion test resets
+        // it to anyway.
+        let _ = crate::host_signal::pump_install_pipe();
     }
 }

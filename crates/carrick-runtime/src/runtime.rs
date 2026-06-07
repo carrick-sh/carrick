@@ -128,14 +128,14 @@ use crate::rootfs::RootFs;
 // forked-child / execve helpers in `exec`, so that submodule stays here; it is
 // `pub(crate)` so `vcpu_loop` can reach the same helpers.
 pub(crate) mod exec;
-use exec::{
-    forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_after_traced_exec,
-    stop_by_signal,
-};
 use crate::vcpu_loop::{
     apply_image_proc_state, deliver_pending_signal, dispatch_with_panic_backstop,
     partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_wait_expired,
     signal_wait_slice, stamp_identity_page,
+};
+use exec::{
+    forked_child_die_by_signal, forked_child_exit, load_execve_image, stop_after_traced_exec,
+    stop_by_signal,
 };
 
 use crate::trap::{HvfTrapEngine, TrapError};
@@ -1490,10 +1490,11 @@ fn run_threaded_hvf_loop(
     let futex = Arc::new(FutexTable::new());
     let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
         Arc::new(crate::threaded_impl::HvfFutex(Arc::clone(&futex)));
-    let platform_futex_factory: PlatformFutexFactory =
-        Arc::new(|table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
+    let platform_futex_factory: PlatformFutexFactory = Arc::new(
+        |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
             Arc::new(crate::threaded_impl::HvfFutex(table))
-        });
+        },
+    );
     // The HVF host-fork coordinator, boxed object-safe so the cross-platform
     // `KernelState` never names the concrete `ForkCoordinator`.
     let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
@@ -2016,7 +2017,6 @@ mod tests {
         assert!(!hardware_tso_for_debug_from_env(false, None));
         assert!(!hardware_tso_for_debug_from_env(false, Some("1")));
     }
-
 }
 
 #[cfg(test)]

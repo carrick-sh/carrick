@@ -10,7 +10,7 @@
 //!
 //! bhyve is hardware-assisted, so an aarch64 carrick guest needs an **aarch64
 //! FreeBSD host**; the provided VM is amd64 (compile-gate only). This crate is
-//! the verifiable hypervisor layer ([`vmm`]); the guest bring-up has a real
+//! the verifiable hypervisor layer (the `vmm` module); the guest bring-up has a real
 //! architectural divergence from KVM that is deferred to the aarch64 host:
 //!
 //! bhyve's aarch64 register set (`enum vm_reg_name`) exposes X0–X30, SP, PC,

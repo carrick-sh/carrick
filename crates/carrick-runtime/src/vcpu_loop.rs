@@ -180,7 +180,10 @@ pub(crate) enum VcpuLoopOutcome {
     TrapLimit(Box<RunResult>),
 }
 
-pub(crate) fn signal_wait_slice(deadline: &mut Option<Instant>, timeout: Option<Duration>) -> Option<Duration> {
+pub(crate) fn signal_wait_slice(
+    deadline: &mut Option<Instant>,
+    timeout: Option<Duration>,
+) -> Option<Duration> {
     if let Some(timeout) = timeout {
         let target = deadline.get_or_insert_with(|| Instant::now() + timeout);
         let now = Instant::now();
@@ -625,9 +628,15 @@ where
         if (-4095..0).contains(&ret) {
             let e = (-ret) as u32;
             let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
-            eprintln!("tid#{} trap#{traps}:   -> errno={e} ({ename})", self.this_tid);
+            eprintln!(
+                "tid#{} trap#{traps}:   -> errno={e} ({ename})",
+                self.this_tid
+            );
         } else {
-            eprintln!("tid#{} trap#{traps}:   -> ret={ret:#x} ({ret})", self.this_tid);
+            eprintln!(
+                "tid#{} trap#{traps}:   -> ret={ret:#x} ({ret})",
+                self.this_tid
+            );
         }
     }
 
@@ -936,9 +945,9 @@ where
                 || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
         };
         let retval = loop {
-            let retval =
-                self.platform_futex
-                    .shared_wait(host_addr, value, timeout, &interrupted);
+            let retval = self
+                .platform_futex
+                .shared_wait(host_addr, value, timeout, &interrupted);
             if retval == -(crate::linux_abi::LINUX_EINTR as i64)
                 && crate::fork_quiesce::is_quiescing()
             {
@@ -1059,7 +1068,8 @@ where
                                 };
                                 unsafe { libc::_exit(result.exit_code) };
                             }
-                            Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {}
+                            Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {
+                            }
                             Err(e) => {
                                 tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
                                 cleanup_registry.exit(tid);
@@ -1376,9 +1386,11 @@ where
                     fork_barrier().end_quiesce();
                 }
                 fork_barrier().end_fork();
-                kernel
-                    .fork
-                    .restart_after_fork_error(prepared_fork, &self.kicker, &self.platform_futex);
+                kernel.fork.restart_after_fork_error(
+                    prepared_fork,
+                    &self.kicker,
+                    &self.platform_futex,
+                );
                 return Err(RuntimeError::Trap(error));
             }
         };
@@ -1552,9 +1564,11 @@ where
                 self.kicker.register(self.this_tid, handle);
                 self.registry
                     .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
-                kernel
-                    .fork
-                    .restart_after_child_fork(prepared_fork, &self.kicker, &self.platform_futex);
+                kernel.fork.restart_after_child_fork(
+                    prepared_fork,
+                    &self.kicker,
+                    &self.platform_futex,
+                );
                 0
             }
         };
@@ -2163,4 +2177,5 @@ mod tests {
         assert_eq!(el0_debug_signal(esr(0x20)), None); // instruction abort
         assert_eq!(el0_debug_signal(esr(0x24)), None); // data abort
         assert_eq!(el0_debug_signal(esr(0x00)), None); // unknown
-    }}
+    }
+}
