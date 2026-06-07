@@ -278,6 +278,7 @@ impl carrick_hal::VcpuRegistry for VcpuKicker {
         VcpuKicker::kick_all_except(self, except);
     }
 
+    #[inline]
     fn any_other_in_guest(&self, except: ThreadId) -> bool {
         VcpuKicker::any_other_in_guest(self, except)
     }
