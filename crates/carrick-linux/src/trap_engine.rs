@@ -10,13 +10,12 @@ use carrick_hal::{
     ForkOutcome, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, SyscallTrap, TrapError, VcpuExit,
 };
 use carrick_mem::memory::AddressSpace;
-use kvm_ioctls::VmFd;
 
 use crate::fork::{VcpuSnapshot, seed_sibling_snapshot};
 use crate::guest_setup::{
     BroughtUp, GuestRam, SENTINEL_GPA, WindowDesc, bring_up, program_sysregs,
 };
-use crate::kvm::{KvmVcpu, KvmVm};
+use crate::kvm::{KvmVcpu, KvmVm, SharedVmHandle};
 use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
 
 pub struct KvmTrapEngine {
@@ -422,8 +421,11 @@ unsafe impl Send for KvmTrapEngine {}
 /// NO new VM is built and NO memory is re-registered — the sibling shares every
 /// slot by construction.
 pub struct KvmSiblingSpec {
-    /// Shared handle to the SAME `VmFd` the parent runs on (Task 5 unknown #1).
-    vm: Arc<VmFd>,
+    /// Shared handle to the SAME VM the parent runs on — the `VmFd` AND the
+    /// shared vcpu-id allocator, so the sibling's `KVM_CREATE_VCPU` draws a
+    /// UNIQUE id (1, 2, 3, …) instead of colliding with the main vCPU's id 0
+    /// (the EEXIST that deadlocked the threaded loop). (Task 5 unknown #1.)
+    vm: SharedVmHandle,
     /// `Send`-safe descriptors of the parent's host windows (raw `*mut u8`
     /// carried as `usize`; same VA in the sibling thread — no fork). The sibling
     /// builds a NON-OWNING `GuestRam` view over these (Task 5 unknown #2).

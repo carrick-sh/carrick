@@ -4,6 +4,7 @@
 //! KVM_SET_USER_MEMORY_REGION over a host mmap; registers via
 //! KVM_GET/SET_ONE_REG; run via KVM_RUN. kick() is a signal-based vCPU exit.
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;
@@ -102,7 +103,28 @@ pub struct KvmVm {
     /// shared `&VmFd` suffices for both vCPU creation and (fork-child) memory
     /// registration. See Task 5 unknown #1.
     vm: Arc<VmFd>,
+    /// The next `KVM_CREATE_VCPU` vcpu_id to hand out, shared across every
+    /// `KvmVm` handle that targets the SAME VM (the main engine + all
+    /// `clone(CLONE_THREAD)` siblings). `KVM_CREATE_VCPU` REQUIRES a unique
+    /// vcpu_id per VM — creating a second vCPU with the same id returns
+    /// `EEXIST`, which is exactly what deadlocked the threaded loop (every
+    /// sibling tried id 0, the main vCPU's id, so no sibling ever ran). The
+    /// owning VM starts this at 0 (the main vCPU takes 0); each sibling
+    /// fetch-adds to get 1, 2, 3, … . A fork CHILD rebuilds a fresh VM via
+    /// `create_empty`, which starts its own counter at 0 (correct — the child's
+    /// VM has only the one vCPU until it spawns its own threads).
+    next_vcpu_id: Arc<AtomicU64>,
     next_slot: u32,
+}
+
+/// A `Send`-safe handle to the SHARED VM state a `clone(CLONE_THREAD)` sibling
+/// needs to add its own vCPU: the `VmFd` (vCPU creation + memory ops are
+/// `&self`) AND the shared vcpu-id allocator (so the sibling gets a UNIQUE
+/// `KVM_CREATE_VCPU` id, not a duplicate of the main vCPU's id 0).
+#[derive(Clone)]
+pub(crate) struct SharedVmHandle {
+    vm: Arc<VmFd>,
+    next_vcpu_id: Arc<AtomicU64>,
 }
 pub struct KvmVcpu {
     fd: VcpuFd,
@@ -120,27 +142,36 @@ impl KvmVm {
         Ok(Self {
             _kvm: Some(kvm),
             vm: Arc::new(vm),
+            // The owning VM's main vCPU takes id 0; siblings fetch-add from here.
+            next_vcpu_id: Arc::new(AtomicU64::new(0)),
             next_slot: 0,
         })
     }
 
-    /// A cloneable handle to the SAME underlying `VmFd`, for a
-    /// `clone(CLONE_THREAD)` sibling vCPU. The sibling's [`KvmVm`] is built from
-    /// this via [`Self::from_shared_vm`] and creates a NEW vCPU on it — siblings
-    /// share every memory slot by construction (same VM), so there is NO
-    /// re-registration. `Send` because `VmFd` is `Send + Sync`.
-    pub(crate) fn vm_handle(&self) -> Arc<VmFd> {
-        Arc::clone(&self.vm)
+    /// A cloneable handle to the SAME underlying VM (the `VmFd` AND the shared
+    /// vcpu-id allocator), for a `clone(CLONE_THREAD)` sibling vCPU. The
+    /// sibling's [`KvmVm`] is built from this via [`Self::from_shared_vm`] and
+    /// creates a NEW vCPU on it with a UNIQUE id — siblings share every memory
+    /// slot by construction (same VM), so there is NO re-registration. `Send`
+    /// because `VmFd` is `Send + Sync` and `Arc<AtomicU64>` is `Send + Sync`.
+    pub(crate) fn vm_handle(&self) -> SharedVmHandle {
+        SharedVmHandle {
+            vm: Arc::clone(&self.vm),
+            next_vcpu_id: Arc::clone(&self.next_vcpu_id),
+        }
     }
 
-    /// Build a sibling [`KvmVm`] that SHARES the parent's `VmFd` (a
+    /// Build a sibling [`KvmVm`] that SHARES the parent's VM (a
     /// `clone(CLONE_THREAD)` thread). It owns no `Kvm` handle (the parent keeps
     /// `/dev/kvm` open) and registers no memory (the slots already exist on the
-    /// shared VM); `next_slot` is irrelevant for a sibling and starts at 0.
-    pub(crate) fn from_shared_vm(vm: Arc<VmFd>) -> Self {
+    /// shared VM); `next_slot` is irrelevant for a sibling and starts at 0. It
+    /// SHARES the parent's `next_vcpu_id` allocator so its `KVM_CREATE_VCPU`
+    /// draws a unique id (1, 2, 3, …), never colliding with the main vCPU's 0.
+    pub(crate) fn from_shared_vm(handle: SharedVmHandle) -> Self {
         Self {
             _kvm: None,
-            vm,
+            vm: handle.vm,
+            next_vcpu_id: handle.next_vcpu_id,
             next_slot: 0,
         }
     }
@@ -158,9 +189,15 @@ impl KvmVm {
     /// — no `next_slot` mutation, unlike [`HvVm::add_vcpu`]). Factored so both
     /// the owning and sibling paths share one vCPU-init sequence.
     fn create_vcpu_on_shared_vm(&self) -> Result<KvmVcpu, OsError> {
+        // Draw a UNIQUE vcpu_id from the shared allocator. The owning VM's main
+        // vCPU gets 0; every `clone(CLONE_THREAD)` sibling gets the next id
+        // (1, 2, 3, …). `KVM_CREATE_VCPU` REQUIRES distinct ids per VM —
+        // reusing id 0 returns EEXIST, the bug that deadlocked the threaded loop
+        // (no sibling ever materialised, so `pthread_join`'s futex never woke).
+        let vcpu_id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
         let fd = self
             .vm
-            .create_vcpu(0)
+            .create_vcpu(vcpu_id)
             .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
         let mut kvi = kvm_bindings::kvm_vcpu_init::default();
         self.vm
