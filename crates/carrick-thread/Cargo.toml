@@ -1,0 +1,23 @@
+[package]
+name = "carrick-thread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_thread"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Per-process thread registry + private futex table + fork/page-table quiesce
+# barriers. Hypervisor-AGNOSTIC (compiles on macOS/Linux/FreeBSD); depends only
+# on the lowest leaf crates so both carrick-hvf and carrick-linux can use it
+# without depending on each other.
+[dependencies]
+carrick-hal = { path = "../carrick-hal" }
+carrick-abi = { path = "../carrick-abi" }
+libc.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
