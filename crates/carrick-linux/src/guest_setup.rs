@@ -136,8 +136,10 @@ struct Window {
     base: u64,
     host: *mut u8,
     len: usize,
-    /// Host mmap kind for this window. Retained for clarity and the
-    /// test/debug-assert cross-check; the field is not read in production code.
+    /// Host mmap kind for this window. Read by
+    /// [`GuestRam::shared_futex_host_addr`] (Task 7) to decide whether a guest
+    /// futex word is a cross-process `MAP_SHARED` rendezvous (→ bare host
+    /// `SYS_futex`) or a private in-process one (→ the parking-lot table).
     ///
     /// `rebuild_vm_for_child` (Task 2) re-registers ALL windows uniformly via
     /// `map_memory` — it does NOT branch on `kind`.  This is correct: `libc::fork`
@@ -146,7 +148,6 @@ struct Window {
     /// the MAP_SHARED aperture continues to alias the same host pages.  Both
     /// simply reuse the inherited host VA that the parent's `Window::host` recorded
     /// — no re-mmap is needed.
-    #[allow(dead_code)]
     kind: WindowKind,
 }
 
@@ -394,6 +395,25 @@ impl GuestRam {
             std::ptr::copy_nonoverlapping(w.host.add(off), out.as_mut_ptr(), len);
         }
         Ok(out)
+    }
+
+    /// Host virtual address of the `len`-byte word at guest-physical `gpa`, but
+    /// ONLY when it lies wholly within a [`WindowKind::Shared`] window (the
+    /// boot-mapped `MAP_SHARED|MAP_ANONYMOUS` aperture). That backing is the SAME
+    /// physical page in parent and child across `fork(2)`, so it is a valid
+    /// target for a bare host `SYS_futex` cross-process rendezvous (see
+    /// [`crate::kvm_futex::KvmFutex::shared_wait`]). Returns `None` for a word in
+    /// a `Private` (COW) window — those futexes stay in-process via the parking-
+    /// lot [`carrick_thread::thread::FutexTable`]. The guest is identity-mapped
+    /// (VA == GPA), so the dispatcher passes the guest futex VA straight in.
+    pub fn shared_futex_host_addr(&self, gpa: u64, len: usize) -> Option<usize> {
+        let (w, off) = self.locate(gpa, len)?;
+        if w.kind != WindowKind::Shared {
+            return None;
+        }
+        // SAFETY: `locate` proved [gpa, gpa+len) ⊆ this window, so `host + off`
+        // points at `len` valid bytes of the shared aperture backing.
+        Some(unsafe { w.host.add(off) } as usize)
     }
 }
 

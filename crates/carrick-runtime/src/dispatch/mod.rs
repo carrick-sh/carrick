@@ -1079,6 +1079,20 @@ pub enum DispatchOutcome {
         value: u32,
         timeout: Option<Duration>,
     },
+    /// A `FUTEX_WAKE` on a genuine `MAP_SHARED` mapping — the cross-PROCESS wake
+    /// counterpart of [`DispatchOutcome::SharedFutexWait`]. The wake must reach a
+    /// waiter parked in ANOTHER carrick process on the same physical page, so it
+    /// is routed through the `PlatformFutex::shared_wake` seam (HVF → `__ulock`
+    /// one-at-a-time with `sched_yield`; KVM → host `SYS_futex(FUTEX_WAKE)`).
+    /// The handler returns this outcome (instead of calling the backend wake
+    /// inline) so the loop reaches the same `PlatformFutex` the `SharedFutexWait`
+    /// side uses, keeping the wait/wake pair on ONE seam. `count` is the guest's
+    /// requested wake count (`FUTEX_WAKE`'s `val`); the loop completes the syscall
+    /// with the number actually woken.
+    SharedFutexWake {
+        host_addr: usize,
+        count: u32,
+    },
     /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
     /// or — later — recvfrom/accept/read that would block) needs to wait for
     /// host-fd readiness. Like `FutexWait`, the handler MUST NOT block while
@@ -1213,6 +1227,7 @@ impl DispatchOutcome {
             DispatchOutcome::SignalThread { .. } => (0, None),
             DispatchOutcome::FutexWait { .. } => (0, None),
             DispatchOutcome::SharedFutexWait { .. } => (0, None),
+            DispatchOutcome::SharedFutexWake { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
             DispatchOutcome::BlockingHostWrite(_) => (0, None),
             DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),
@@ -2814,36 +2829,17 @@ fn dispatch_threaded_futex(
     match command {
         LINUX_FUTEX_WAKE => {
             if let Some(host_addr) = shared_host_addr {
-                // Linux FUTEX_WAKE wakes EXACTLY up to `value` waiters and
-                // returns the count. __ulock_wake only does wake-one or
-                // wake-all, so wake one at a time up to `value`, counting real
-                // wakes until none remain (-ENOENT). (LTP futex_wake03 wakes
-                // children incrementally and checks each count.)
-                // Linux FUTEX_WAKE wakes up to `value` waiters and returns
-                // the count actually woken. macOS wake_by_address_any wakes
-                // ONE per call, returning 0/-ENOENT — but called in a tight
-                // back-to-back loop on a SHARED address it has a quirk: the
-                // kernel keeps the lock structure live for ~µs after a wake,
-                // so the next call still finds it and reports success even
-                // with no parked thread (we reproduced 7 wakes for 1 waiter
-                // in pure libSystem C). A `sched_yield()` between iterations
-                // lets the kernel invalidate the structure, after which a
-                // second call correctly returns ENOENT — verified accurate
-                // for N ∈ {1, 2, 5, 10} waiters. Required for LTP
-                // futex_wake03 which checks `FUTEX_WAKE == nr_children`.
-                let mut woke = 0i64;
-                for i in 0..value {
-                    let rc = crate::ulock::wake(host_addr, false);
-                    crate::probes::ulock_wake(host_addr as u64, i as i32, rc);
-                    if rc < 0 {
-                        break;
-                    }
-                    woke += 1;
-                    unsafe {
-                        libc::sched_yield();
-                    }
-                }
-                return DispatchOutcome::Returned { value: woke };
+                // Cross-PROCESS (MAP_SHARED) wake: route through the
+                // `PlatformFutex::shared_wake` seam (the wake counterpart of the
+                // `SharedFutexWait` outcome) so the wake reaches a waiter parked
+                // in another carrick process via the SAME backend the wait uses —
+                // HVF's __ulock (one-at-a-time + sched_yield, the macOS spurious-
+                // success cure) or KVM's host `SYS_futex(FUTEX_WAKE)`. The loop
+                // completes the syscall with the count woken.
+                return DispatchOutcome::SharedFutexWake {
+                    host_addr,
+                    count: value,
+                };
             }
             let n = futex.wake(address, value);
             DispatchOutcome::Returned {
@@ -2950,19 +2946,17 @@ fn dispatch_threaded_futex(
             // musl condvars and LTP futex_cmp_requeue01 actually live — take the
             // real parking-lot requeue below.
             if let Some(host_addr) = shared_host_addr {
-                let total = (nr_wake as u64).saturating_add(nr_requeue as u64);
-                let mut woke = 0i64;
-                let mut i = 0u64;
-                while i < total {
-                    let rc = crate::ulock::wake(host_addr, false);
-                    if rc < 0 {
-                        break;
-                    }
-                    woke += 1;
-                    unsafe { libc::sched_yield() };
-                    i += 1;
-                }
-                return DispatchOutcome::Returned { value: woke };
+                // Degrade the shared requeue to a wake of nr_wake + nr_requeue
+                // waiters (spurious-wakeup-safe; the woken guest re-checks and
+                // re-waits on uaddr2 itself). Route through the same
+                // `PlatformFutex::shared_wake` seam as a plain shared FUTEX_WAKE.
+                let total = (nr_wake as u64)
+                    .saturating_add(nr_requeue as u64)
+                    .min(u32::MAX as u64) as u32;
+                return DispatchOutcome::SharedFutexWake {
+                    host_addr,
+                    count: total,
+                };
             }
 
             // Private/anon: real requeue via parking_lot_core::unpark_requeue.
@@ -5620,6 +5614,57 @@ mod overlay_dispatch_tests {
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(memory.shared_futex_lookups.get(), 1);
+    }
+
+    /// Task 7 fix #4: a non-private `FUTEX_WAKE` whose word lives in a genuine
+    /// `MAP_SHARED` mapping (`shared_futex_host_addr` → `Some`) must be routed
+    /// through the `PlatformFutex::shared_wake` seam — i.e. returned as a
+    /// `DispatchOutcome::SharedFutexWake`, NOT a `Returned` from an inline
+    /// `ulock::wake`. The loop then drives the backend wake (HVF __ulock / KVM
+    /// SYS_futex), keeping the shared wait+wake pair on ONE seam. (Before the fix
+    /// the dispatcher called `ulock::wake` directly, so `KvmFutex::shared_wake`
+    /// was never reached on Linux.)
+    #[test]
+    fn shared_futex_wake_routes_through_platform_seam() {
+        struct SharedWord {
+            word: u32,
+        }
+        impl GuestMemory for SharedWord {
+            fn read_bytes(&self, _address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                Ok(self.word.to_le_bytes()[..length.min(4)].to_vec())
+            }
+            fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                })
+            }
+            fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+                Some(&self.word as *const u32 as usize)
+            }
+        }
+        let mut memory = SharedWord { word: 0 };
+        let host_addr = &memory.word as *const u32 as usize;
+        let reporter = CompatReporter::default();
+        let futex = crate::thread::FutexTable::new();
+        let registry = crate::thread::ThreadRegistry::new(1000);
+        // Non-private FUTEX_WAKE (no PRIVATE flag) of up to 3 waiters.
+        let request = SyscallRequest::new(
+            98,
+            SyscallArgs::from([0x10800, LINUX_FUTEX_WAKE, 3, 0, 0, 0]),
+        );
+
+        let outcome =
+            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::SharedFutexWake {
+                host_addr,
+                count: 3,
+            },
+            "a shared FUTEX_WAKE must defer to the PlatformFutex::shared_wake seam"
+        );
     }
 
     #[test]
