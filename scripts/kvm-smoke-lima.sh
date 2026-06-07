@@ -745,8 +745,40 @@ CEOF
       printf "FAIL [timer-posix]: stdout=[%s] exit=%s oracle=[posixtimer-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 22. Phase 4 follow-up: a BLOCKED timer signal dequeued synchronously. The
+    #     program blocks SIGALRM, arms setitimer, then rt_sigtimedwait(SIGALRM).
+    #     The timer publishes SIGALRM into the per-thread host_signal table (the
+    #     UNBLOCKED async slot); because the program also awaits it synchronously,
+    #     rt_sigtimedwait must look there too (host_signal::take_pending_in_for,
+    #     real on Linux) -- else the wait would hang to timeout. Guards both the
+    #     take_pending_in_for fix and the timer/sigtimedwait interaction.
+    cat > /tmp/t_sigwait.c <<CEOF
+#include <signal.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <time.h>
+int main(void){
+  sigset_t set; sigemptyset(&set); sigaddset(&set,SIGALRM);
+  sigprocmask(SIG_BLOCK,&set,0);
+  struct itimerval it; it.it_interval.tv_sec=0; it.it_interval.tv_usec=0;
+  it.it_value.tv_sec=0; it.it_value.tv_usec=50000;
+  if(setitimer(ITIMER_REAL,&it,0)) return 2;
+  struct timespec ts={2,0};
+  int s=sigtimedwait(&set,0,&ts);
+  if(s!=SIGALRM) return 3;
+  return write(1,"sigwait-timer-ok",16)==16 ? 0 : 4; }
+CEOF
+    gcc -static -O2 -o /tmp/t_sigwait /tmp/t_sigwait.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/t_sigwait" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "sigwait-timer-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+timer-sigwait]: a blocked SIGALRM timer was dequeued by rt_sigtimedwait (take_pending_in_for)."
+    else
+      printf "FAIL [timer-sigwait]: stdout=[%s] exit=%s oracle=[sigwait-timer-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -757,5 +789,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers — all 24 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers — all 25 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait) pass on KVM; ZERO xfail."
 '
