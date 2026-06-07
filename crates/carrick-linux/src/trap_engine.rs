@@ -440,7 +440,10 @@ impl SyscallTrap for KvmTrapEngine {
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
+        // fpsimd_enabled MUST match inject_signal (true on KVM). Returns the
+        // SAVED SIGMASK — not saved_pc — mirroring HVF.
+        let r = carrick_hal::sigframe::restore_sigframe(self, true)?;
+        Ok(r.sigmask)
     }
 }
 
@@ -903,5 +906,34 @@ mod execve_tests {
         assert_eq!(engine.get_reg(Reg::ElrEl1).unwrap(), handler, "handler entry on ELR_EL1");
         assert_eq!(engine.get_reg(Reg::X(0)).unwrap(), libc::SIGUSR1 as u64, "x0 = signum");
         assert!(engine.get_reg(Reg::Sp).unwrap() < sp_before, "frame pushed: SP_EL0 moved down");
+    }
+
+    #[test]
+    fn kvm_inject_then_restore_roundtrips() {
+        use carrick_hal::RegAccess;
+        if !kvm_available() {
+            eprintln!("SKIP kvm_inject_then_restore_roundtrips: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for_with_stack(INITIAL_ELF);
+        engine.next_syscall().expect("first svc").expect("a syscall frame");
+
+        let saved_elr = engine.get_reg(Reg::ElrEl1).unwrap(); // pre-signal resume PC
+        let saved_sp = engine.get_reg(Reg::Sp).unwrap();
+        engine.set_vreg(0, 0x0BAD_F00D_0000_1234u128).unwrap();
+        let v0_before = engine.get_vreg(0).unwrap();
+        let sigmask = 0x0000_0000_0000_FF00u64;
+
+        engine
+            .inject_signal(libc::SIGUSR1, 0x4_0000, 0, None, None, None, sigmask, None, None, false)
+            .expect("inject_signal");
+        // Simulate the handler clobbering V0 before rt_sigreturn.
+        engine.set_vreg(0, 0).unwrap();
+
+        let got_mask = engine.restore_from_sigframe().expect("restore_from_sigframe");
+        assert_eq!(got_mask, sigmask, "restore returns the SAVED SIGMASK (not saved_pc)");
+        assert_eq!(engine.get_reg(Reg::ElrEl1).unwrap(), saved_elr, "resume PC restored");
+        assert_eq!(engine.get_reg(Reg::Sp).unwrap(), saved_sp, "SP_EL0 restored");
+        assert_eq!(engine.get_vreg(0).unwrap(), v0_before, "V0 restored from the frame");
     }
 }
