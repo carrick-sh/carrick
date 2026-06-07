@@ -396,6 +396,7 @@ dependencies = [
  "carrick-mem",
  "libc",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]

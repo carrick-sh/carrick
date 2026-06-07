@@ -17,3 +17,4 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
 thiserror.workspace = true
 libc.workspace = true
+zerocopy.workspace = true

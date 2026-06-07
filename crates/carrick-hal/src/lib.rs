@@ -25,3 +25,4 @@ pub use threaded::{
     FutexOutcome, PlatformFutex, RegAccess, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn,
     VcpuRegistry,
 };
+pub mod sigframe;

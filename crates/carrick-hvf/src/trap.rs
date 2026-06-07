@@ -1295,7 +1295,33 @@ impl HvfTrapEngine {
         queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
-        self.inner.inject_signal(
+        use carrick_hal::RegAccess;
+
+        // HVF-only kick-path tripwire. Invariant: a kick-path resume PC is
+        // genuine guest EL0 code, never carrick's EL1 trampoline —
+        // `run_until_syscall` resumes EL1-window kicks rather than reporting
+        // them. If this fires, that guard regressed and we're about to corrupt
+        // an in-flight syscall. Tripwire (release) + assert (debug).
+        if let Some(pc) = interrupted_pc {
+            KICK_PATH_INJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::memory::is_carrick_el1_vector_va(pc) {
+                INJECT_AT_EL1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug_assert!(
+                    false,
+                    "signal injection at EL1 trampoline PC 0x{pc:x} (carrick space, not guest)"
+                );
+            }
+        }
+
+        // Engine-supplied values the shared builder must not recompute. PSTATE
+        // source: kick path → live CPSR (Reg::Pstate); syscall path →
+        // SPSR_EL1, where the `svc` exception latched the EL0 PSTATE.
+        let pstate_source = if interrupted_pc.is_some() {
+            self.get_reg(carrick_hal::Reg::Pstate)?
+        } else {
+            self.get_reg(carrick_hal::Reg::SpsrEl1)?
+        };
+        let params = carrick_hal::sigframe::InjectParams {
             signum,
             handler,
             sa_restorer,
@@ -1306,7 +1332,30 @@ impl HvfTrapEngine {
             fault_siginfo,
             queued_siginfo,
             restart_syscall,
-        )
+            pstate_source,
+            orig_x0: self.inner.last_syscall_orig_x0,
+            fault_esr: self.inner.last_fault_esr,
+            fpsimd_enabled: fpsimd_save_enabled(),
+            sigreturn_trampoline_base: crate::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        };
+        let info = carrick_hal::sigframe::build_sigframe(self, params)?;
+        crate::probes::signal_inject(signum, info.saved_pc, info.new_sp, handler);
+
+        // Signal-injection trap: x8 sentinel marks "not a syscall",
+        // x0 carries the signum. PC is the handler entry; FP/SP aren't
+        // meaningful mid-injection so leave them 0.
+        crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+            pc: handler,
+            sp: 0,
+            fp: 0,
+            lr: 0,
+            x8: 0xffff_ffff_ffff_ffff,
+            x0: signum as u64,
+            stack_guest_base: 0,
+            stack_host_base: 0,
+            stack_guest_end: 0,
+        });
+        Ok(())
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1331,7 +1380,9 @@ impl HvfTrapEngine {
     /// signal register state. Used by `rt_sigreturn(2)`.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        self.inner.restore_from_sigframe()
+        let r = carrick_hal::sigframe::restore_sigframe(self, fpsimd_save_enabled())?;
+        crate::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
+        Ok(r.sigmask)
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -3319,423 +3370,6 @@ impl HvfInner {
         Ok(())
     }
 
-    /// Synthesise a Linux signal delivery: push a Carrick sigframe onto
-    /// SP_EL0, set x0 = signum, x30 = sa_restorer, and point ELR_EL1 at
-    /// the user handler so the next `eret` from EL1 lands on the
-    /// handler in EL0t. Returns Ok(()) on success; the runtime then
-    /// resumes the vCPU.
-    ///
-    /// `pending_syscall_retval` is the value the dispatcher computed
-    /// for the syscall that just trapped. If it's `Some`, x0 in the
-    /// snapshotted frame is replaced by this retval so the handler-
-    /// return path resumes the caller as if the syscall completed
-    /// normally; if it's `None`, the current x0 is preserved (used for
-    /// the rare case where a signal is delivered before the first
-    /// syscall has run).
-    #[allow(clippy::too_many_arguments)]
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        fault_siginfo: Option<(i32, u64)>,
-        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-        restart_syscall: bool,
-    ) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        use zerocopy::IntoBytes;
-
-        let mut frame = crate::linux_abi::CarrickSigframe::empty();
-        frame.signum = signum as u32;
-        for (i, reg) in GPR_TABLE.iter().enumerate() {
-            frame.saved_x[i] = self.vcpu.get_reg(*reg).map_err(hvf_error)?;
-        }
-        // x0 was just overwritten by `complete_syscall` with the
-        // syscall's retval. Snapshot that value (not the pre-syscall
-        // arg0) so the handler-return path resumes with the right
-        // retval visible.
-        //
-        // SA_RESTART (restart_syscall): the interrupted syscall returned EINTR
-        // and its handler is restartable. Restore the ORIGINAL arg0 instead so
-        // that, after rt_sigreturn rewinds PC to the `svc` (below), the guest
-        // re-executes the syscall with its real arguments (x8=sysno is
-        // untouched by complete_syscall; x1..x5 were never clobbered).
-        if restart_syscall {
-            frame.saved_x[0] = self.last_syscall_orig_x0;
-        } else if let Some(retval) = pending_syscall_retval {
-            frame.saved_x[0] = retval as u64;
-        }
-        // Resume address after the handler returns. On a syscall-boundary
-        // injection HVF set ELR_EL1 to the instruction after the `svc`; on a
-        // kick (CANCELED) exit there was no exception, so ELR_EL1 is stale and
-        // the caller passes the live guest PC instead.
-        frame.saved_pc = match interrupted_pc {
-            Some(pc) => {
-                KICK_PATH_INJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Invariant: a kick-path resume PC is genuine guest EL0 code,
-                // never carrick's EL1 trampoline — `run_until_syscall` resumes
-                // EL1-window kicks rather than reporting them. If this fires,
-                // that guard regressed and we're about to corrupt an in-flight
-                // syscall. Tripwire (release) + assert (debug).
-                if crate::memory::is_carrick_el1_vector_va(pc) {
-                    INJECT_AT_EL1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug_assert!(
-                        false,
-                        "signal injection at EL1 trampoline PC 0x{pc:x} (carrick space, not guest)"
-                    );
-                }
-                pc
-            }
-            None => self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
-        };
-        // SA_RESTART: rewind PC by one instruction (4 bytes) so it points back
-        // at the `svc` rather than the instruction after it. After the handler
-        // returns via rt_sigreturn the guest re-executes the syscall (the
-        // kernel's ERESTARTSYS). Only valid on the syscall-boundary path
-        // (caller guarantees restart_syscall ⇒ interrupted_pc is None).
-        if restart_syscall {
-            frame.saved_pc = frame.saved_pc.wrapping_sub(4);
-        }
-        frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
-        // Snapshot the interrupted code's PSTATE (incl. NZCV condition flags),
-        // restored verbatim by rt_sigreturn → eret. The correct source differs
-        // by injection path:
-        //   * syscall-boundary (interrupted_pc == None): the guest `svc` took a
-        //     synchronous exception to EL1, so the hardware latched the EL0
-        //     PSTATE into SPSR_EL1. CPSR now reads the EL1 trampoline's state.
-        //     SPSR_EL1 is authoritative.
-        //   * kick (interrupted_pc == Some): a cross-thread hv_vcpus_exit forced
-        //     a CANCELED exit while the guest was live at EL0 — NO exception was
-        //     taken, so SPSR_EL1 is stale (it holds whatever the *previous*
-        //     syscall latched). The live EL0 PSTATE is in CPSR. Reading SPSR_EL1
-        //     here resumes the preempted routine with stale NZCV — conditional
-        //     branches go the wrong way (memory intact, computation wrong),
-        //     which is exactly Go's async-preemption (SIGURG) corruption.
-        frame.saved_spsr = match interrupted_pc {
-            Some(_) => self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
-            None => self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
-        };
-
-        // A queued siginfo (rt_sigqueueinfo / sigqueue) wins over synthesis: it
-        // carries the caller's si_value payload and the kernel-set si_code
-        // (SI_QUEUE etc.). A synchronous fault carries the kernel-style
-        // si_code (SEGV_MAPERR/SEGV_ACCERR/BUS_ADRALN) and si_addr=faulting
-        // address so a handler (Go's sigpanic) sees the real cause.
-        // Otherwise it's a SI_USER-shaped delivery (tkill/sysmon preempt).
-        let mut siginfo = match (queued_siginfo, fault_siginfo) {
-            (Some(q), _) => q,
-            (None, Some((si_code, si_addr))) => {
-                let mut s = crate::linux_abi::LinuxSiginfo::empty();
-                s.si_code = si_code;
-                s.si_addr = si_addr;
-                s
-            }
-            (None, None) => {
-                let mut s = crate::linux_abi::LinuxSiginfo::empty();
-                s.si_code = crate::linux_abi::LINUX_SI_USER;
-                s
-            }
-        };
-        // The kernel re-stamps si_signo to the actually-delivered signum even
-        // when a queued siginfo carried a stale field.
-        siginfo.si_signo = signum;
-        frame.siginfo = siginfo;
-
-        let mut mcontext = crate::linux_abi::LinuxSignalContext::empty();
-        mcontext.regs = frame.saved_x;
-        mcontext.sp = frame.saved_sp;
-        mcontext.pc = frame.saved_pc;
-        mcontext.pstate = frame.saved_spsr;
-        // The arm64 kernel records the faulting VA in sigcontext.fault_address for
-        // a synchronous memory fault (SIGSEGV/SIGBUS). Linux fault handlers read it
-        // there, NOT from siginfo.si_addr — Go's `sigctxt.fault()` returns
-        // `c.regs().fault_address`, and the `addr=0x..` in its crash report comes
-        // from it. Leaving it 0 made every guest SIGSEGV look like a nil deref.
-        // Mirror si_addr (= the faulting VA) here; non-fault signals leave it 0.
-        if let Some((_, si_addr)) = fault_siginfo {
-            mcontext.fault_address = si_addr;
-        }
-        // Save V0–V31 + FPSR/FPCR as a Linux fpsimd_context at the start of
-        // sigcontext.__reserved, so the handler can't leak SIMD state into the
-        // interrupted thread (aarch64 memcpy/memset use V registers) and so a
-        // handler inspecting the ucontext sees real FP state.
-        self.save_fpsimd_into(&mut mcontext)?;
-        // For a synchronous fault, the arm64 kernel also records an esr_context
-        // (the fault ESR) in __reserved after the fpsimd record. Apple Rosetta's
-        // signal handler requires it. The zero-filled tail is the terminating
-        // null record.
-        if fault_siginfo.is_some() {
-            const ESR_MAGIC: u32 = 0x4553_5201; // 'ESR\x01'
-            let off = if fpsimd_save_enabled() {
-                core::mem::size_of::<crate::linux_abi::LinuxFpsimdContext>()
-            } else {
-                0
-            };
-            if off + 16 <= mcontext.__reserved.len() {
-                mcontext.__reserved[off..off + 4].copy_from_slice(&ESR_MAGIC.to_le_bytes());
-                mcontext.__reserved[off + 4..off + 8].copy_from_slice(&16u32.to_le_bytes());
-                mcontext.__reserved[off + 8..off + 16]
-                    .copy_from_slice(&self.last_fault_esr.to_le_bytes());
-            }
-        }
-        let mut ucontext = crate::linux_abi::LinuxUcontext::empty();
-        ucontext.uc_sigmask = saved_sigmask;
-        ucontext.uc_mcontext = mcontext;
-        // When delivering on the alternate signal stack (SA_ONSTACK), the
-        // ucontext's uc_stack describes that stack with SS_ONSTACK set, so a
-        // handler querying sigaltstack(NULL, &old) sees it's running on it.
-        if let Some((ss_sp, ss_size)) = altstack {
-            ucontext.uc_stack = crate::linux_abi::LinuxSignalStack {
-                ss_sp,
-                ss_flags: crate::linux_abi::LINUX_SS_ONSTACK as i32,
-                _pad0: 0,
-                ss_size,
-            };
-        }
-        frame.ucontext = ucontext;
-
-        // Reserve space on the target stack, rounded down to 16-byte alignment
-        // (AArch64 stack alignment requirement at function-call boundaries).
-        // For SA_ONSTACK the frame is pushed from the TOP of the alt stack
-        // (ss_sp + ss_size); otherwise from the interrupted SP_EL0. The alt
-        // stack is what lets a handler run when the main stack is unusable
-        // (LTP sigaltstack01 deliberately exercises that).
-        let frame_bytes = frame.as_bytes();
-        let new_sp = signal_frame_stack_pointer(frame.saved_sp, altstack, frame_bytes.len())?;
-        if altstack.is_some() && !self.guest_range_is_writable(new_sp, frame_bytes.len()) {
-            // Unwritable alt stack: Linux force_sigsegv -> terminate the
-            // thread-group by SIGSEGV, not a fatal carrick error.
-            return Err(TrapError::SignalDeliveryFault);
-        }
-
-        // Write the frame into guest memory at the new SP. An unwritable/
-        // unmapped stack is Linux force_sigsegv territory: terminate the
-        // thread-group by SIGSEGV rather than crashing carrick.
-        self.write_guest_bytes(new_sp, frame_bytes)
-            .map_err(|_| TrapError::SignalDeliveryFault)?;
-
-        // Adjust SP_EL0 to point past the freshly-written frame.
-        self.vcpu
-            .set_sys_reg(SysReg::SP_EL0, new_sp)
-            .map_err(hvf_error)?;
-
-        // First handler argument is the signum.
-        self.vcpu
-            .set_reg(Reg::X0, signum as u64)
-            .map_err(hvf_error)?;
-        // x1/x2 carry siginfo* / ucontext* on SA_SIGINFO. Handlers may inspect
-        // or mutate the saved PC/SP before rt_sigreturn, so keep the embedded
-        // Linux-shaped context authoritative.
-        let siginfo_addr =
-            new_sp + core::mem::offset_of!(crate::linux_abi::CarrickSigframe, siginfo) as u64;
-        let ucontext_addr =
-            new_sp + core::mem::offset_of!(crate::linux_abi::CarrickSigframe, ucontext) as u64;
-        self.vcpu
-            .set_reg(Reg::X1, siginfo_addr)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_reg(Reg::X2, ucontext_addr)
-            .map_err(hvf_error)?;
-
-        // LR = the restorer the handler `ret`s to, which must invoke
-        // `rt_sigreturn(2)`. musl/x86-style libcs pass an explicit
-        // `sa_restorer`; glibc on aarch64 passes 0 and relies on the kernel's
-        // VDSO sigreturn trampoline (the aarch64 kernel ABI has no
-        // sa_restorer). Use Carrick's fixed executable user trampoline rather
-        // than writing code into the guest signal stack: stack-resident code is
-        // vulnerable to I-cache coherency and frame-clobber timing at Go's
-        // SIGURG preemption rate.
-        let restorer = if sa_restorer != 0 {
-            sa_restorer
-        } else {
-            crate::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE
-        };
-        self.vcpu.set_reg(Reg::X30, restorer).map_err(hvf_error)?;
-        crate::probes::signal_inject(signum, frame.saved_pc, new_sp, handler);
-
-        // Redirect to the handler entry. On a syscall-boundary injection the
-        // guest is mid-`eret` from the EL1 vector, so the resume PC is ELR_EL1
-        // (previously "instruction after the SVC"); we steal it for the handler
-        // and frame.saved_pc holds the original until rt_sigreturn. On a kick
-        // (CANCELED) injection there is no pending eret — the vCPU resumes
-        // directly at Reg::PC — so redirect PC instead and leave ELR_EL1 alone.
-        // Either way the handler later returns via the rt_sigreturn `svc`, whose
-        // completion restores ELR_EL1 = saved_pc and erets to it.
-        if interrupted_pc.is_some() {
-            self.vcpu.set_reg(Reg::PC, handler).map_err(hvf_error)?;
-        } else {
-            self.vcpu
-                .set_sys_reg(SysReg::ELR_EL1, handler)
-                .map_err(hvf_error)?;
-        }
-
-        // Preserve the SPSR_EL1 we snapshotted — we want to return to
-        // EL0t with the same DAIF state, and the EL1 vector path
-        // already set SPSR_EL1 to "EL0t, DAIF masked" when entering
-        // this trap. Nothing to write here; SPSR_EL1 is already
-        // correct for "return to EL0t".
-
-        // Signal-injection trap: x8 sentinel marks "not a syscall",
-        // x0 carries the signum. PC is the handler entry; FP/SP aren't
-        // meaningful mid-injection so leave them 0.
-        crate::probes::vcpu_trap(&crate::compat::GuestRegs {
-            pc: handler,
-            sp: 0,
-            fp: 0,
-            lr: 0,
-            x8: 0xffff_ffff_ffff_ffff,
-            x0: signum as u64,
-            stack_guest_base: 0,
-            stack_host_base: 0,
-            stack_guest_end: 0,
-        });
-        Ok(())
-    }
-
-    /// Snapshot the guest V0–V31 + FPSR/FPCR into the Linux `fpsimd_context`
-    /// at the start of `mcontext.__reserved`. Mirrors what the arm64 kernel
-    /// writes at signal entry (`preserve_fpsimd_context`).
-    fn save_fpsimd_into(
-        &self,
-        mcontext: &mut crate::linux_abi::LinuxSignalContext,
-    ) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        use zerocopy::IntoBytes;
-
-        if !fpsimd_save_enabled() {
-            return Ok(());
-        }
-        let mut fp = crate::linux_abi::LinuxFpsimdContext::empty();
-        let mut vregs = [0u128; 32];
-        for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
-            vregs[i] = self.vcpu.get_simd_fp_reg(*reg).map_err(hvf_error)?;
-        }
-        fp.vregs = vregs;
-        fp.fpsr = self.vcpu.get_reg(Reg::FPSR).map_err(hvf_error)? as u32;
-        fp.fpcr = self.vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
-        let bytes = fp.as_bytes();
-        mcontext.__reserved[..bytes.len()].copy_from_slice(bytes);
-        Ok(())
-    }
-
-    /// Restore V0–V31 + FPSR/FPCR from the `fpsimd_context` saved in
-    /// `mcontext.__reserved`. A missing/!FPSIMD_MAGIC record is left alone
-    /// (vector registers keep their current values rather than taking garbage).
-    fn restore_fpsimd_from(
-        &self,
-        mcontext: &crate::linux_abi::LinuxSignalContext,
-    ) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        use zerocopy::FromBytes;
-
-        if !fpsimd_save_enabled() {
-            return Ok(());
-        }
-        let reserved = mcontext.__reserved;
-        let size = core::mem::size_of::<crate::linux_abi::LinuxFpsimdContext>();
-        let Ok(fp) = crate::linux_abi::LinuxFpsimdContext::read_from_bytes(&reserved[..size])
-        else {
-            return Ok(());
-        };
-        if fp.magic != crate::linux_abi::LINUX_FPSIMD_MAGIC {
-            return Ok(());
-        }
-        let vregs = fp.vregs;
-        let vcpu_id = self.vcpu.id();
-        for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
-            // NB: route through the C shim, NOT applevisor's set_simd_fp_reg —
-            // its u128 by-value param uses the wrong (GP) register class for
-            // Apple's vector-typed API and silently zeroes the register. See
-            // `set_simd_fp_reg_v`.
-            let rc = set_simd_fp_reg_v(vcpu_id, *reg, vregs[i]);
-            if rc != 0 {
-                return Err(TrapError::Hypervisor(format!(
-                    "hv_vcpu_set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
-                )));
-            }
-        }
-        let (fpsr, fpcr) = (fp.fpsr, fp.fpcr);
-        self.vcpu
-            .set_reg(Reg::FPSR, u64::from(fpsr))
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_reg(Reg::FPCR, u64::from(fpcr))
-            .map_err(hvf_error)?;
-        Ok(())
-    }
-
-    /// Pop the Carrick sigframe at SP_EL0 (placed there by
-    /// `inject_signal`) and restore the pre-signal register state.
-    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        use applevisor::prelude::*;
-        use zerocopy::FromBytes;
-
-        let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
-        let frame_size = core::mem::size_of::<crate::linux_abi::CarrickSigframe>();
-        // rt_sigreturn restores from the rt_sigframe the handler is returning
-        // through, which the AArch64 kernel ABI places at SP (siginfo@0,
-        // ucontext next). For a native guest this is carrick's own frame, with
-        // the private magic intact. Apple Rosetta runs the x86 handler out of
-        // carrick's frame, then rebuilds a FRESH, standard rt_sigframe at a new
-        // SP and rt_sigreturns through THAT — it carries a valid AArch64
-        // ucontext but NOT carrick's private magic (and the original frame is
-        // overwritten). Either way the authoritative resume state is
-        // ucontext.uc_mcontext at SP, exactly as the Linux kernel restores it;
-        // we no longer require the private magic, which cannot survive Rosetta.
-        let bytes = self
-            .read_guest_bytes(sp, frame_size)
-            .map_err(|e| TrapError::Hypervisor(format!("sigframe read failed: {e}")))?;
-        let frame = crate::linux_abi::CarrickSigframe::read_from_bytes(&bytes)
-            .map_err(|_| TrapError::Hypervisor("sigframe decode failed".to_string()))?;
-        let magic = frame.magic;
-
-        // `frame` is `#[repr(C, packed)]` so we cannot borrow individual
-        // fields. Copy out the Linux ucontext first; SA_SIGINFO handlers may
-        // mutate it before invoking rt_sigreturn.
-        let ucontext = frame.ucontext;
-        let restored_sigmask = ucontext.uc_sigmask;
-        let mcontext = ucontext.uc_mcontext;
-        // Linux validates the regs before applying them (`valid_user_regs`); the
-        // load-bearing invariant is that the resume PSTATE targets EL0. A bogus
-        // SP (rt_sigreturn called outside a handler, or a corrupt frame) would
-        // yield a non-EL0 / garbage PSTATE — refuse rather than wedge the vCPU.
-        // This replaces the private-magic gate, which Rosetta's reconstructed
-        // frame legitimately lacks.
-        let resume_pstate = mcontext.pstate;
-        if resume_pstate & 0b1111 != 0 {
-            return Err(TrapError::Hypervisor(format!(
-                "rt_sigreturn: frame at SP_EL0=0x{sp:x} has non-EL0 PSTATE 0x{resume_pstate:x} (magic 0x{magic:x})"
-            )));
-        }
-        let saved_x = mcontext.regs;
-        for (reg, value) in GPR_TABLE.iter().zip(saved_x.iter()) {
-            self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
-        }
-        // Restore V0–V31 + FPSR/FPCR from the fpsimd_context the matching
-        // inject_signal stored (a handler may have mutated it). Skip silently if
-        // the record's magic is absent (older/foreign frame) — never restore
-        // garbage over the vector registers.
-        self.restore_fpsimd_from(&mcontext)?;
-        let saved_pc = mcontext.pc;
-        let saved_sp = mcontext.sp;
-        let saved_spsr = mcontext.pstate;
-        crate::probes::signal_restore(saved_pc, sp, magic);
-        self.vcpu
-            .set_sys_reg(SysReg::ELR_EL1, saved_pc)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::SP_EL0, saved_sp)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::SPSR_EL1, saved_spsr)
-            .map_err(hvf_error)?;
-        Ok(restored_sigmask)
-    }
-
     fn fork(&mut self, share_vm: bool) -> Result<ForkOutcome, TrapError> {
         use applevisor::prelude::*;
 
@@ -4355,6 +3989,10 @@ impl GuestMemory for HvfTrapEngine {
         self.inner.write_guest_bytes_checked(address, bytes)
     }
 
+    fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.inner.write_guest_bytes(address, bytes)
+    }
+
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
         self.inner.host_ptr_for_read(address, len)
     }
@@ -4397,6 +4035,10 @@ impl GuestMemory for HvfTrapEngine {
 
     fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
         self.inner.shared_futex_host_addr(address)
+    }
+
+    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+        self.inner.guest_range_is_writable(address, length)
     }
 }
 
@@ -4697,45 +4339,6 @@ fn seed_child_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> VcpuSnaps
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn signal_frame_stack_pointer(
-    saved_sp: u64,
-    altstack: Option<(u64, u64)>,
-    frame_len: usize,
-) -> Result<u64, TrapError> {
-    let frame_len = u64::try_from(frame_len)
-        .map_err(|_| TrapError::Hypervisor("sigframe length does not fit u64".to_string()))?;
-    let aligned_len = frame_len
-        .checked_add(15)
-        .map(|len| len & !15u64)
-        .ok_or_else(|| TrapError::Hypervisor("sigframe length overflowed".to_string()))?;
-    let stack_base = match altstack {
-        Some((ss_sp, ss_size)) => {
-            let top = ss_sp.checked_add(ss_size).ok_or_else(|| {
-                TrapError::Hypervisor("signal alt stack top overflowed".to_string())
-            })?;
-            // If the interrupted code is ALREADY running on the alternate
-            // signal stack, a nested SA_ONSTACK delivery must continue DOWN
-            // from the current SP — not reset to the top, which would push the
-            // new frame on top of the live parent handler's frame and clobber
-            // it (glibc's `*** stack smashing detected ***`). This is exactly
-            // the kernel's `on_sig_stack()` check. CPython faulthandler's
-            // SA_NODEFER|SA_ONSTACK handler re-enters itself via chain=True, so
-            // the second frame lands here.
-            if saved_sp > ss_sp && saved_sp <= top {
-                saved_sp
-            } else {
-                top
-            }
-        }
-        None => saved_sp,
-    };
-    stack_base
-        .checked_sub(aligned_len)
-        .map(|sp| sp & !15u64)
-        .ok_or_else(|| TrapError::Hypervisor("sigframe push underflowed stack".to_string()))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
 mod alias_remap_limiter_tests {
     use super::*;
@@ -4833,50 +4436,6 @@ mod memory_protection_tests {
         );
         assert!(!protections.range_no_access(0x2000, 0x800));
         assert!(protections.range_no_access(0x2800, 1));
-    }
-
-    #[test]
-    fn signal_frame_stack_pointer_uses_checked_altstack_bounds() {
-        let sp = signal_frame_stack_pointer(0x8000, Some((0x4000, 0x2000)), 0x123).unwrap();
-        assert_eq!(sp & 15, 0);
-        assert!(sp >= 0x4000);
-        assert!(sp < 0x6000);
-
-        let err = signal_frame_stack_pointer(0x8000, Some((u64::MAX - 8, 16)), 0x100).unwrap_err();
-        assert!(
-            err.to_string().contains("alt stack top overflowed"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn nested_altstack_frame_continues_down_from_current_sp() {
-        // alt stack [0x4000, 0x6000). A first (outer) delivery while NOT on the
-        // alt stack (saved_sp outside the range) pushes from the TOP.
-        let outer = signal_frame_stack_pointer(0x8000, Some((0x4000, 0x2000)), 0x100).unwrap();
-        assert!((0x4000..0x6000).contains(&outer));
-
-        // A NESTED delivery while ALREADY on the alt stack (saved_sp inside the
-        // range, simulating the outer handler's live SP) must push BELOW that
-        // SP — not reset to the top, which would clobber the outer frame
-        // (glibc "stack smashing detected"). This is the SA_NODEFER re-entry
-        // / faulthandler chain=True case.
-        let nested = signal_frame_stack_pointer(outer, Some((0x4000, 0x2000)), 0x100).unwrap();
-        assert!(
-            nested < outer,
-            "nested {nested:#x} must be below outer {outer:#x}"
-        );
-        assert!(
-            nested >= 0x4000,
-            "nested {nested:#x} underflowed the alt stack"
-        );
-        assert_eq!(nested & 15, 0);
-
-        // saved_sp exactly at the alt-stack base is treated as NOT on the stack
-        // (the kernel's on_sig_stack uses sp > base), so it resets to the top.
-        let at_base = signal_frame_stack_pointer(0x4000, Some((0x4000, 0x2000)), 0x100).unwrap();
-        assert!((0x4000..0x6000).contains(&at_base));
-        assert_eq!(at_base, outer);
     }
 }
 
