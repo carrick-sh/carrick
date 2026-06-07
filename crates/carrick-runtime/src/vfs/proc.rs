@@ -1007,7 +1007,7 @@ fn synthetic_proc_net_igmp6() -> Vec<u8> {
 /// Directory entries (tid names) for `/proc/<pid>/task/`, or `None` if `pid`
 /// isn't a guest we expose.
 pub(crate) fn synthetic_task_dir(pid: u32) -> Option<Vec<String>> {
-    let own = crate::thread::current_thread_states();
+    let own = crate::current_thread_states();
     if own.iter().any(|(t, _)| *t as u32 == pid) {
         return Some(own.iter().map(|(t, _)| t.to_string()).collect());
     }
@@ -1794,7 +1794,7 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     // whether os.fork() must emit the multi-threaded-fork DeprecationWarning
     // (test_threading.test_*_after_fork). Was hardcoded 1, so a guest with live
     // worker threads looked single-threaded and the warning never fired.
-    let nthreads = crate::thread::current_thread_states().len().max(1);
+    let nthreads = crate::current_thread_states().len().max(1);
     let ncpu = crate::host_facts::logical_cpu_count();
     let cpus_hex = cpus_allowed_hex(ncpu);
     let cpus_list = cpus_allowed_list(ncpu);
@@ -1937,7 +1937,7 @@ fn synthetic_proc_self_stat(executable_path: &str) -> String {
     let comm = process_short_name(executable_path);
     let pid = std::process::id();
     let ppid = unsafe { libc::getppid() } as u32;
-    let nthreads = crate::thread::current_thread_states().len().max(1);
+    let nthreads = crate::current_thread_states().len().max(1);
     proc_stat_line(pid, &comm, 'R', ppid, pid, pid, nthreads)
 }
 
@@ -1975,7 +1975,7 @@ fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<
         return None;
     }
 
-    let own_threads = crate::thread::current_thread_states();
+    let own_threads = crate::current_thread_states();
     // Worker threads are addressed by their (untranslated) registry tid, but the
     // MAIN thread is addressed by its ns-pid (== tgid) under a PID namespace,
     // which the registry keys by the host id instead. Match either so a

@@ -127,9 +127,25 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 pub use carrick_hvf::darwin_kqueue;
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::{
-    compat, fork_coord, fork_quiesce, host_signal, io_wait, itimer, posix_timer, probes,
-    shared_aperture, syscall, thread, trap, vcpu_kick,
+    compat, fork_coord, host_signal, io_wait, itimer, posix_timer, probes, shared_aperture,
+    syscall, trap, vcpu_kick,
 };
+// thread (ThreadRegistry/FutexTable) + fork_quiesce barriers are
+// hypervisor-agnostic; both backends use the real carrick-thread impls.
+pub use carrick_thread::{fork_quiesce, thread};
+// `current_thread_states` queries the kernel for per-thread run-state via the
+// Mach port recorded by each vCPU thread. On macOS the real implementation
+// (in carrick-hvf::thread) issues `thread_info`; on Linux there are no Mach
+// ports, so we return every registered thread with state 'R' (running).
+#[cfg(feature = "platform-macos")]
+pub use carrick_hvf::thread::current_thread_states;
+#[cfg(not(feature = "platform-macos"))]
+pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
+    thread::current_thread_ports()
+        .into_iter()
+        .map(|(tid, _port)| (tid, 'R'))
+        .collect()
+}
 
 // Under platform-linux there is no carrick-hvf to re-export `trap` from; the
 // SyscallTrap/TrapError/ForkOutcome contract lives in carrick-hal (section
@@ -683,64 +699,6 @@ pub mod darwin_kqueue {
 }
 
 #[cfg(not(feature = "platform-macos"))]
-pub mod thread {
-    pub type ThreadId = i32;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-    pub struct FutexWait {
-        pub addr: u64,
-        generation: u64,
-    }
-
-    pub struct FutexTable;
-    impl FutexTable {
-        pub fn new() -> Self {
-            Self
-        }
-        pub fn wake(&self, _addr: u64, _n: u32) -> u32 {
-            0
-        }
-        pub fn prepare_wait(&self, addr: u64) -> FutexWait {
-            FutexWait {
-                addr,
-                generation: 0,
-            }
-        }
-        pub fn requeue(&self, _from: u64, _to: u64, _nr_wake: u32, _nr_requeue: u32) -> (u32, u32) {
-            (0, 0)
-        }
-    }
-
-    pub struct ThreadRegistry;
-    impl ThreadRegistry {
-        pub fn live_count(&self) -> usize {
-            1
-        }
-        pub fn is_live(&self, _tid: ThreadId) -> bool {
-            true
-        }
-        pub fn set_clear_child_tid(&self, _tid: ThreadId, _addr: u64) {}
-        pub fn set_thread_name(&self, _tid: ThreadId, _name: &[u8]) {}
-        pub fn thread_name(&self, _tid: ThreadId) -> Option<[u8; 16]> {
-            None
-        }
-        pub fn live_tids(&self) -> Vec<ThreadId> {
-            Vec::new()
-        }
-    }
-
-    pub fn current_thread_states() -> Vec<(ThreadId, char)> {
-        Vec::new()
-    }
-
-    pub fn current_thread_name(_tid: ThreadId) -> Option<[u8; 16]> {
-        None
-    }
-
-    pub fn set_current_registry(_registry: std::sync::Arc<ThreadRegistry>) {}
-}
-
-#[cfg(not(feature = "platform-macos"))]
 pub mod host_signal {
     pub const NO_PENDING_SIGNAL: i32 = 0;
 
@@ -943,13 +901,6 @@ pub mod io_wait {
             }
             return WaitResult::Errno(crate::host_to_linux_errno(err));
         }
-    }
-}
-
-#[cfg(not(feature = "platform-macos"))]
-pub mod fork_quiesce {
-    pub fn is_quiescing() -> bool {
-        false
     }
 }
 
