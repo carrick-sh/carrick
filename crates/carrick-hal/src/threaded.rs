@@ -58,6 +58,7 @@ pub trait PlatformFutex: Send + Sync {
         &self,
         addr: u64,
         val: u32,
+        tid: ThreadId,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> FutexOutcome;

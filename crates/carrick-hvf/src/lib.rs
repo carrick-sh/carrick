@@ -46,5 +46,6 @@ pub mod probes;
 pub mod shared_aperture;
 pub mod syscall;
 pub mod thread;
+pub mod threaded_impl;
 pub mod trap;
 pub mod vcpu_kick;

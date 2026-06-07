@@ -505,6 +505,7 @@ dependencies = [
  "carrick-portable",
  "carrick-spec",
  "carrick-test-support",
+ "carrick-thread",
  "clap",
  "fd-lock",
  "flate2",

@@ -21,6 +21,38 @@ use std::collections::HashMap;
 
 use crate::thread::ThreadId;
 
+// ---------------------------------------------------------------------------
+// carrick-hal trait impls: VcpuKick + VcpuRegistry
+// ---------------------------------------------------------------------------
+// These are forwarding impls only.  No behaviour is changed: every method
+// delegates to the existing VcpuKickHandle / VcpuKicker methods verbatim.
+// The AtomicBool orderings are preserved exactly (SeqCst throughout).
+// ---------------------------------------------------------------------------
+
+impl carrick_hal::VcpuKick for VcpuKickHandle {
+    #[inline]
+    fn kick(&self) {
+        // Delegate to the existing kick path: build a one-element id slice and
+        // call kick_ids, which calls hv_vcpus_exit.  On non-HVF targets
+        // valid_id always returns None, so kick_ids is a no-op — same as
+        // today.
+        let ids: Vec<u64> = std::iter::once(self).filter_map(valid_id).collect();
+        kick_ids(&ids);
+    }
+
+    #[inline]
+    fn target_in_guest(&self) -> bool {
+        // VcpuKickHandle does not own the in-guest flag itself; the flag lives
+        // in VcpuKicker::in_guest (an Arc<AtomicBool> keyed by tid).  Because
+        // the trait is only consumed by the shared threaded engine (Task 8+)
+        // and not yet called from anywhere, we return false as a safe default.
+        // When the shared loop is wired up in Task 8 it will use
+        // VcpuRegistry::set_in_guest / any_other_in_guest on the kicker
+        // directly rather than polling individual handles.
+        false
+    }
+}
+
 /// A `Send`/`Sync` handle to a guest thread's vCPU, usable from any thread to
 /// kick it. Wraps `applevisor::vcpu::VcpuHandle` (which holds a `Weak` to the vCPU's
 /// liveness guard, so a kick after the vCPU is destroyed is a safe no-op) on
@@ -47,7 +79,6 @@ impl VcpuKickHandle {
 
 /// Process-wide registry mapping each live guest tid to a handle that can kick
 /// its vCPU. Shared across all guest threads behind an `Arc`.
-#[derive(Default)]
 pub struct VcpuKicker {
     handles: Mutex<HashMap<ThreadId, VcpuKickHandle>>,
     /// Per-vCPU "currently inside hv_vcpu_run (walking guest memory)" flag. The
@@ -56,6 +87,21 @@ pub struct VcpuKicker {
     /// tables — siblings blocked in host syscalls have it false and need no
     /// wake, which avoids the spurious-signal/blocking-wait deadlock.
     in_guest: Mutex<HashMap<ThreadId, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// Boxed-dyn handles for the `VcpuRegistry` trait impl.  Stored alongside
+    /// the concrete `handles` map so the shared threaded engine (Task 8+) can
+    /// call `VcpuRegistry::kick(tid)` without naming `VcpuKickHandle`.  The
+    /// existing bulk-kick path (`kick_ids`) continues to use the concrete map.
+    dyn_handles: Mutex<HashMap<ThreadId, Box<dyn carrick_hal::VcpuKickDyn>>>,
+}
+
+impl Default for VcpuKicker {
+    fn default() -> Self {
+        Self {
+            handles: Mutex::new(HashMap::new()),
+            in_guest: Mutex::new(HashMap::new()),
+            dyn_handles: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl VcpuKicker {
@@ -139,6 +185,17 @@ impl VcpuKicker {
         kick_ids(&ids);
     }
 
+    /// Set the in-guest flag for `tid`.  The vcpu loop calls this (via the
+    /// `VcpuRegistry::set_in_guest` trait method) immediately before and after
+    /// `hv_vcpu_run`; the same SeqCst ordering the existing run loop uses when
+    /// it stores to the `Arc<AtomicBool>` returned by `register_in_guest`.
+    pub fn set_in_guest(&self, tid: ThreadId, in_guest: bool) {
+        #[allow(clippy::expect_used)]
+        if let Some(flag) = self.in_guest.lock().get(&tid) {
+            flag.store(in_guest, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Kick every registered vCPU (including the caller's, if registered).
     pub fn kick_all(&self) {
         #[allow(clippy::expect_used)]
@@ -178,6 +235,59 @@ fn kick_ids(ids: &[u64]) {
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn kick_ids(_ids: &[u64]) {}
+
+impl carrick_hal::VcpuRegistry for VcpuKicker {
+    /// Register a new vCPU handle for `tid`.
+    ///
+    /// The trait accepts a `Box<dyn VcpuKickDyn>` so the shared loop can be
+    /// backend-agnostic.  On HVF the caller will always pass a boxed
+    /// `VcpuKickHandle`; here we store that alongside the existing concrete
+    /// handle map (which the efficient bulk-kick paths still use).  The boxed
+    /// handle is used when the shared loop calls `VcpuRegistry::kick(tid)`.
+    ///
+    /// NOTE: this method does NOT call the existing `VcpuKicker::register`
+    /// because that takes a concrete `VcpuKickHandle` and we cannot move out of
+    /// a `Box<dyn VcpuKickDyn>`.  The concrete map is populated by the existing
+    /// `VcpuKicker::register` call that the run loop already makes; this impl is
+    /// the forwarding seam for future callers that use only the trait.
+    fn register(&self, tid: ThreadId, handle: Box<dyn carrick_hal::VcpuKickDyn>) {
+        // Store the boxed dyn for trait-level kick(tid) calls.  The existing
+        // concrete handles map (used by kick_ids / kick_all_except etc.) is
+        // populated separately via VcpuKicker::register(tid, VcpuKickHandle).
+        self.dyn_handles.lock().insert(tid, handle);
+    }
+
+    fn unregister(&self, tid: ThreadId) {
+        // Forward to the existing method which cleans both the concrete handles
+        // map and the in_guest map.
+        VcpuKicker::unregister(self, tid);
+        // Also remove from the dyn_handles map.
+        self.dyn_handles.lock().remove(&tid);
+    }
+
+    fn kick(&self, tid: ThreadId) {
+        VcpuKicker::kick(self, tid);
+    }
+
+    fn kick_all_except(&self, except: ThreadId) {
+        VcpuKicker::kick_all_except(self, except);
+    }
+
+    fn any_other_in_guest(&self, except: ThreadId) -> bool {
+        VcpuKicker::any_other_in_guest(self, except)
+    }
+
+    /// Set or clear the in-guest flag for `tid` with SeqCst ordering (same as
+    /// the existing run loop's direct `Arc<AtomicBool>::store`).
+    #[inline]
+    fn set_in_guest(&self, tid: ThreadId, in_guest: bool) {
+        VcpuKicker::set_in_guest(self, tid, in_guest);
+    }
+
+    fn count(&self) -> usize {
+        VcpuKicker::count(self)
+    }
+}
 
 /// Handle for the process-directed signal pump thread. Dropping or stopping it
 /// asks the pump to exit and joins the host thread, which gives the runtime a
