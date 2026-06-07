@@ -4,10 +4,10 @@
 //! reads x0..x5,x8 into an `Aarch64SyscallFrame`, and returns it.
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
-use carrick_hal::{ForkOutcome, HvVcpu, Reg, SyscallTrap, TrapError, VcpuExit};
+use carrick_hal::{ForkOutcome, HvVcpu, HvVm, MemPerms, Reg, SyscallTrap, TrapError, VcpuExit};
 use carrick_mem::memory::AddressSpace;
 
-use crate::guest_setup::{BroughtUp, GuestRam, SENTINEL_GPA, bring_up};
+use crate::guest_setup::{BroughtUp, GuestRam, SENTINEL_GPA, bring_up, program_sysregs};
 use crate::kvm::{KvmVcpu, KvmVm};
 
 pub struct KvmTrapEngine {
@@ -266,8 +266,78 @@ impl SyscallTrap for KvmTrapEngine {
         self.is_forked_child
     }
 
-    fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
+    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+        // In-place image replacement on the LIVE VM (no teardown, unlike HVF
+        // which rebuilds the VM). Mirrors the HVF structure
+        // (carrick-hvf/src/trap.rs:3764-3913): build the new layout up front,
+        // remap the slots, reprogram the registers, preserve is_forked_child.
+        //
+        // 1. Build the new image's guest RAM (fresh host mmaps + image segments +
+        //    the EL0 trampoline / stage-1 identity tables / EL1 sentinel vector)
+        //    FIRST, so any image/window error surfaces BEFORE we tear down the
+        //    live slots (Linux execve semantics: on failure the caller keeps
+        //    running its old image). `build_for_image` refuses any window that
+        //    would back the unmapped SENTINEL_GPA (the guard in `add_window` is
+        //    not weakened), so the sentinel hole stays a stage-2 MMIO fault.
+        let new_ram = GuestRam::build_for_image(new_image)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // 2. Unregister EVERY currently-registered KVM memory slot on the LIVE VM
+        //    (`KVM_SET_USER_MEMORY_REGION` with memory_size = 0). The old slots
+        //    were registered from slot 0 in window order, so slot ids are
+        //    `0..old window_count`.
+        let old_slot_count = self.ram.window_count() as u32;
+        for slot in 0..old_slot_count {
+            self.vm
+                .unmap_memory_slot(slot)
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        }
+        // Reset the slot allocator so the new windows re-register from slot 0
+        // (same ids/order a fresh VM would use), then publish them on the LIVE
+        // VM. The SENTINEL_GPA hole stays unmapped.
+        self.vm.reset_slot_counter();
+        for (base, host, len) in new_ram.windows_for_kvm() {
+            self.vm
+                .map_memory(base, host, len, MemPerms::ReadWriteExec)
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        }
+
+        // 3. Swap in the new RAM. The OLD GuestRam drops here, `munmap`ing its
+        //    host windows — safe because their KVM slots were just deleted, so no
+        //    live vCPU references them. `no_access` is dropped with it: execve
+        //    replaces the address space, so any prior PROT_NONE ranges are gone
+        //    (the new image starts with none until it mmaps them).
+        self.ram = new_ram;
+
+        // 4. Reprogram the system + core registers for the new image (MAIR=0xFF,
+        //    TCR bootstrap, TTBR0/1 = LINUX_PAGE_TABLES_BASE, SCTLR, CPACR,
+        //    VBAR = LINUX_EL1_VECTORS_BASE, TPIDR_EL0 = 0, PSTATE/SPSR/ELR/PC +
+        //    SP from the new image's entry/initial stack). Reuses the SAME
+        //    builder bring-up uses, so the sysreg values cannot drift between
+        //    the two paths.
+        program_sysregs(&mut self.vcpu, new_image)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // 5. Zero x0..x30. Linux's execve contract starts the new program with
+        //    all GPRs clear (except SP/PC, set by `program_sysregs`). Without
+        //    this the new image's _start inherits the old image's x8, which can
+        //    decode as a bogus syscall number on its first `svc`. (`program_sysregs`
+        //    deliberately leaves the GPRs to us — it sets only SP/PC/PSTATE.)
+        for n in 0..=30u32 {
+            self.vcpu
+                .set_reg(Reg::X(n), 0)
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        }
+
+        // 6. PRESERVE is_forked_child across execve (Task 2 flag): a descendant
+        //    of a forked child keeps the `_exit`-without-report shutdown path
+        //    even after it execve's into a different image (mirrors HVF
+        //    trap.rs:3795). The flag is a plain field on `self`, untouched by
+        //    the remap above — so this is a no-op assertion of intent, kept
+        //    explicit for the contract.
+        // (self.is_forked_child is intentionally left unchanged.)
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -308,5 +378,164 @@ impl KvmTrapEngine {
             x5: g(5)?,
             x8: g(8)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod execve_tests {
+    //! `execve_into` unit tests. These build a REAL `KvmTrapEngine` (needing
+    //! `/dev/kvm`) and assert the post-execve vCPU state directly — no full guest
+    //! run. They therefore execute only where `/dev/kvm` is present (the lima L2
+    //! lane / a native aarch64 Linux host); on a host without KVM they SKIP (the
+    //! crate itself is `cfg(target_os = "linux")`, so macOS never compiles them).
+    use super::*;
+    use carrick_hal::SysReg;
+    use carrick_mem::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE, LINUX_PAGE_TABLES_BASE};
+
+    // Two freestanding static aarch64 ELFs committed under fixtures/: the
+    // fork-wait4 driver (initial image) and the exit0 execve target (new image).
+    // Both are valid ELFs `AddressSpace::load_elf_bytes` can parse.
+    const INITIAL_ELF: &[u8] = include_bytes!("../fixtures/fork-wait4/fork-wait4");
+    const TARGET_ELF: &[u8] = include_bytes!("../fixtures/exec-target-exit0/exec-target-exit0");
+
+    /// True when `/dev/kvm` is usable; tests SKIP (return early) otherwise so the
+    /// suite is green on KVM-less hosts.
+    fn kvm_available() -> bool {
+        std::path::Path::new("/dev/kvm").exists()
+    }
+
+    fn engine_for(bytes: &[u8]) -> KvmTrapEngine {
+        let image = AddressSpace::load_elf_bytes(bytes).expect("load test ELF");
+        KvmTrapEngine::new(&image).expect("bring up test engine")
+    }
+
+    /// After `execve_into`, the stage-1 MMU sysregs point at the canonical
+    /// carrick page-table / vector bases and MAIR is the Normal-WB value — i.e.
+    /// the new image is correctly re-bootstrapped on the LIVE vCPU.
+    #[test]
+    fn execve_into_reprograms_sysregs() {
+        if !kvm_available() {
+            eprintln!("SKIP execve_into_reprograms_sysregs: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        let new_image = AddressSpace::load_elf_bytes(TARGET_ELF).expect("load target ELF");
+        engine.execve_into(&new_image).expect("execve_into");
+
+        let v = &engine.vcpu;
+        assert_eq!(
+            v.get_sys_reg(SysReg::Ttbr0).unwrap(),
+            LINUX_PAGE_TABLES_BASE,
+            "TTBR0 must point at the stage-1 identity tables"
+        );
+        assert_eq!(
+            v.get_sys_reg(SysReg::Ttbr1).unwrap(),
+            LINUX_PAGE_TABLES_BASE,
+            "TTBR1 shares the stage-1 root"
+        );
+        assert_eq!(
+            v.get_sys_reg(SysReg::Vbar).unwrap(),
+            LINUX_EL1_VECTORS_BASE,
+            "VBAR must point at the sentinel EL1 vectors"
+        );
+        assert_eq!(
+            v.get_sys_reg(SysReg::Mair).unwrap(),
+            0xFF,
+            "MAIR slot 0 = Normal Inner/Outer WB"
+        );
+        // Stage-1 on (SCTLR_EL1.M = bit 0).
+        assert_eq!(
+            v.get_sys_reg(SysReg::Sctlr).unwrap() & 1,
+            1,
+            "SCTLR_EL1.M must be set (stage-1 MMU on)"
+        );
+        // execve resets the EL0 thread pointer.
+        assert_eq!(
+            v.get_sys_reg(SysReg::TpidrEl0).unwrap(),
+            0,
+            "TPIDR_EL0 must be reset to 0 across execve"
+        );
+    }
+
+    /// Linux execve starts the new program with x0..x30 clear. Dirty every GPR
+    /// before execve and assert they are all zero afterwards.
+    #[test]
+    fn execve_into_clears_gprs() {
+        if !kvm_available() {
+            eprintln!("SKIP execve_into_clears_gprs: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        // Dirty all GPRs to a non-zero pattern.
+        for n in 0..=30u32 {
+            engine
+                .vcpu
+                .set_reg(Reg::X(n), 0xDEAD_0000 | u64::from(n))
+                .unwrap();
+        }
+        let new_image = AddressSpace::load_elf_bytes(TARGET_ELF).expect("load target ELF");
+        engine.execve_into(&new_image).expect("execve_into");
+        for n in 0..=30u32 {
+            assert_eq!(
+                engine.vcpu.reg(Reg::X(n)).unwrap(),
+                0,
+                "x{n} must be cleared by execve"
+            );
+        }
+    }
+
+    /// `is_forked_child` must survive execve (a forked-then-execve'd descendant
+    /// keeps the `_exit`-without-report shutdown path).
+    #[test]
+    fn execve_into_preserves_is_forked_child() {
+        if !kvm_available() {
+            eprintln!("SKIP execve_into_preserves_is_forked_child: no /dev/kvm");
+            return;
+        }
+        let new_image = AddressSpace::load_elf_bytes(TARGET_ELF).expect("load target ELF");
+
+        // Case A: a NON-forked engine stays non-forked across execve.
+        let mut e0 = engine_for(INITIAL_ELF);
+        assert!(!e0.is_forked_child());
+        e0.execve_into(&new_image)
+            .expect("execve_into (non-forked)");
+        assert!(
+            !e0.is_forked_child(),
+            "execve must not spuriously set is_forked_child"
+        );
+
+        // Case B: a forked engine stays forked across execve.
+        let mut e1 = engine_for(INITIAL_ELF);
+        e1.is_forked_child = true;
+        e1.execve_into(&new_image).expect("execve_into (forked)");
+        assert!(
+            e1.is_forked_child(),
+            "execve must preserve is_forked_child = true"
+        );
+    }
+
+    /// PC after execve is the EL0 trampoline base (the vCPU restarts in EL1h and
+    /// `eret`s into the new image's entry), and ELR_EL1 holds the new entry.
+    #[test]
+    fn execve_into_repositions_pc_to_new_entry() {
+        if !kvm_available() {
+            eprintln!("SKIP execve_into_repositions_pc_to_new_entry: no /dev/kvm");
+            return;
+        }
+        use carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE;
+        let mut engine = engine_for(INITIAL_ELF);
+        let new_image = AddressSpace::load_elf_bytes(TARGET_ELF).expect("load target ELF");
+        let new_entry = new_image.entry();
+        engine.execve_into(&new_image).expect("execve_into");
+        assert_eq!(
+            engine.vcpu.reg(Reg::Pc).unwrap(),
+            LINUX_EL0_TRAMPOLINE_BASE,
+            "PC must be the EL0 trampoline so the eret drops to EL0 at the new entry"
+        );
+        assert_eq!(
+            engine.vcpu.reg(Reg::ElrEl1).unwrap(),
+            new_entry,
+            "ELR_EL1 must hold the new image's entry"
+        );
     }
 }

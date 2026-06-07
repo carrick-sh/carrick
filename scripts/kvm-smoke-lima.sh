@@ -71,6 +71,23 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
   #     "pipe-ok". No generic loop needed (that is Task 7).
   run_case "thin-shim+pipe-fork" "$shim" "pipe-fork"
 
+  # 1d. Phase 2 / Task 4: execve_into — in-place memory-slot remap on the LIVE
+  #     VM (no teardown). The freestanding fork-execve-{true,false} drivers
+  #     issue clone(220) then, in the child, execve(221) of a SECOND freestanding
+  #     ELF passed by absolute host path; the thin shim reads that path out of
+  #     guest RAM, loads it with AddressSpace::load_elf, and calls
+  #     engine.execve_into(&new_image) — which unregisters every old KVM slot,
+  #     re-registers the new-image windows, re-materializes the EL1 vector +
+  #     stage-1 page tables, reprograms the system registers, zeroes x0..x30, and
+  #     PRESERVES is_forked_child. The replaced child resumes at the target
+  #     _start and exit_group(0)/exit_group(1); the parent host wait4 reaps it
+  #     and asserts WEXITSTATUS, then prints "execve-ok". The execve targets are
+  #     staged at the absolute paths baked into the drivers.
+  cp -f "$fixdir/exec-target-exit0/exec-target-exit0" /tmp/carrick-exec-target-true
+  cp -f "$fixdir/exec-target-exit1/exec-target-exit1" /tmp/carrick-exec-target-false
+  run_case "thin-shim+execve-true" "$shim" "fork-execve-true"
+  run_case "thin-shim+execve-false" "$shim" "fork-execve-false"
+
   # 2. Real dispatch (Phase B): the full dispatcher, no HVF in the closure.
   cargo build --release -p carrick-runtime --no-default-features \
     --features platform-linux --bin carrick-kvm --target-dir "$HOME/ct" --locked
@@ -254,5 +271,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork — 11 cases (hello, fork, pipe-fork, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve — 13 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
 '
