@@ -417,6 +417,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-thread",
  "cc",
  "clap",
  "libc",
@@ -544,6 +545,18 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "tar",
+]
+
+[[package]]
+name = "carrick-thread"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-hal",
+ "libc",
+ "parking_lot",
+ "parking_lot_core",
+ "serde",
 ]
 
 [[package]]
