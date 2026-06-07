@@ -5275,6 +5275,22 @@ impl carrick_hal::ThreadedEngine for HvfTrapEngine {
         HvfTrapEngine::from_thread_spec(spec)
     }
 
+    fn program_counter(&self) -> Result<u64, TrapError> {
+        HvfTrapEngine::program_counter(self)
+    }
+
+    fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
+        HvfTrapEngine::set_guest_sp_el0(self, sp)
+    }
+
+    fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
+        HvfTrapEngine::set_guest_thread_id(self, tid)
+    }
+
+    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
+        HvfTrapEngine::fork_vfork(self)
+    }
+
     fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
         HvfTrapEngine::release_vcpu_for_fork(self)
     }

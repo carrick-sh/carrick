@@ -138,4 +138,14 @@ impl PlatformFutex for HvfFutex {
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
         self.0.requeue(from, to, wake, requeue)
     }
+
+    #[inline]
+    fn notify_signal_pending(&self) {
+        self.0.notify_signal_pending();
+    }
+
+    #[inline]
+    fn notify_signal_pending_for(&self, tid: ThreadId) {
+        self.0.notify_signal_pending_for(tid);
+    }
 }

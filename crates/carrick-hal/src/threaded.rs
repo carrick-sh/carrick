@@ -1,10 +1,14 @@
 //! The minimal hypervisor-specific surface the shared threaded run-loop drives.
 //! `SyscallTrap` (per-syscall) stays separate; this carries the per-thread /
 //! fork / kick / futex lifecycle so single-threaded backends are unaffected.
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use carrick_guest_mem::GuestMemory;
+
 use crate::error::{OsError, Reg, SysReg};
-use crate::trap::{SyscallTrap, TrapError};
+use crate::trap::{ForkOutcome, SyscallTrap, TrapError};
 
 pub type ThreadId = i32;
 
@@ -15,6 +19,13 @@ pub trait VcpuKick: Send + Sync + Clone {
     /// Whether the target vCPU is currently inside guest execution (the
     /// `in_guest` SeqCst flag the run loop maintains around `next_syscall`).
     fn target_in_guest(&self) -> bool;
+    /// The backend's raw vCPU id if the vCPU is still live, for bulk-kick paths
+    /// that force several vCPUs out at once (HVF `hv_vcpus_exit(ids, count)`).
+    /// `None` once the vCPU is destroyed (a stale id is then skipped). Backends
+    /// with no bulk-kick primitive return `None` and rely on per-handle `kick`.
+    fn raw_vcpu_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Object-safe `VcpuKick` for storage in the registry (the `Clone` bound on
@@ -22,6 +33,7 @@ pub trait VcpuKick: Send + Sync + Clone {
 pub trait VcpuKickDyn: Send + Sync {
     fn kick(&self);
     fn target_in_guest(&self) -> bool;
+    fn raw_vcpu_id(&self) -> Option<u64>;
 }
 impl<T: VcpuKick> VcpuKickDyn for T {
     fn kick(&self) {
@@ -30,14 +42,27 @@ impl<T: VcpuKick> VcpuKickDyn for T {
     fn target_in_guest(&self) -> bool {
         VcpuKick::target_in_guest(self)
     }
+    fn raw_vcpu_id(&self) -> Option<u64> {
+        VcpuKick::raw_vcpu_id(self)
+    }
 }
 
 /// The process-wide registry of live vCPUs the run loop kicks/counts. Held as
 /// `Arc<dyn VcpuRegistry>` so the shared loop never names a concrete kicker.
 pub trait VcpuRegistry: Send + Sync {
     fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>);
+    /// Register (and return) this thread's "currently in `hv_vcpu_run`" flag.
+    /// The shared loop sets it true immediately before entering the guest and
+    /// false immediately after, forming a Dekker handshake with the fork /
+    /// page-table-edit coordinators (which set their quiesce flag and read this
+    /// — SeqCst on both sides guarantees at least one observes the other).
+    fn register_in_guest(&self, tid: ThreadId) -> Arc<AtomicBool>;
     fn unregister(&self, tid: ThreadId);
     fn kick(&self, tid: ThreadId);
+    /// Kick every registered vCPU (including the caller's, if registered). The
+    /// process-directed signal pump uses this to nudge every in-guest thread to
+    /// re-check pending at its next safe point.
+    fn kick_all(&self);
     fn kick_all_except(&self, except: ThreadId);
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
     fn set_in_guest(&self, tid: ThreadId, in_guest: bool);
@@ -72,6 +97,13 @@ pub trait PlatformFutex: Send + Sync {
     ) -> i64;
     fn shared_wake(&self, host_addr: usize, n: u32) -> i64;
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32);
+    /// Wake every private-futex waiter so it re-checks its interrupt predicate
+    /// (a process-directed signal became pending, or a fork/exec quiesce was
+    /// requested). Does not consume the futex word; a spurious wake just costs a
+    /// re-check.
+    fn notify_signal_pending(&self);
+    /// Wake the private-futex waiter parked for `tid` (a thread-directed signal).
+    fn notify_signal_pending_for(&self, tid: ThreadId);
 }
 
 /// Get/set the registers + V-regs the sigframe builder needs. Each engine
@@ -90,8 +122,10 @@ pub trait RegAccess {
 }
 
 /// The bound the shared threaded loop is generic over. A backend is its own
-/// trap vehicle + register access + per-thread/fork lifecycle.
-pub trait ThreadedEngine: SyscallTrap + RegAccess + Send {
+/// trap vehicle + register access + guest memory + per-thread/fork lifecycle.
+/// `GuestMemory` is a supertrait so the shared loop can `write_bytes` to the
+/// guest (tid stamps, clone parent/child-tid writes) through the engine.
+pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     type KickHandle: VcpuKick + 'static;
     type SiblingSpec: Send;
 
@@ -101,6 +135,21 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + Send {
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
     where
         Self: Sized;
+    /// The guest PC of a freshly materialized sibling vCPU (trace diagnostics).
+    fn program_counter(&self) -> Result<u64, TrapError>;
+    /// Set the guest user stack pointer (`SP_EL0`) on a vfork child that was
+    /// given an explicit `child_stack` by `clone`.
+    fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError>;
+    /// Stamp the running guest thread's guest-visible tid into the vCPU (the
+    /// EL1 `gettid` fast path). No-op unless the syscall shim is enabled.
+    fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError>;
+    /// `vfork(2)` variant of [`SyscallTrap::fork`]: the child SHARES the
+    /// parent's guest RAM (`CLONE_VM`) and the parent is suspended until the
+    /// child execve's/exits. Defaults to a plain `fork` for backends without a
+    /// distinct shared-RAM path.
+    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
+        self.fork()
+    }
     fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
         Ok(())
     }
