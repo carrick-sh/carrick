@@ -48,7 +48,19 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
 
   # 1. Thin shim (existing MVP path): freestanding hello, no dispatcher.
   cargo build --release -p carrick-linux --target-dir "$HOME/ct" --locked
-  run_case "thin-shim" "$HOME/ct/release/carrick-linux" "hello-aarch64"
+  shim="$HOME/ct/release/carrick-linux"
+  run_case "thin-shim" "$shim" "hello-aarch64"
+
+  # 1b. Phase 2 / Task 2: fork(2) — the load-bearing fork primitive, on the THIN
+  #     SHIM. The freestanding fork-wait4 fixture issues raw clone(SIGCHLD) /
+  #     wait4 / write / exit_group syscalls (no glibc CRT), so the shim drives
+  #     KvmTrapEngine::fork() directly: fork() runs libc::fork, the CHILD rebuilds
+  #     a brand-new KvmVm over the COW-inherited host mmaps and resumes (x0=0),
+  #     the PARENT keeps its live VM (x0=child pid). The child exit_group(42); the
+  #     parent host-wait4 reaps it, asserts WEXITSTATUS==42, prints "fork-ok".
+  #     The committed fixture needs no gcc, so it runs unconditionally (like case
+  #     1) — the full-dispatcher fork loop is wired up later (Task 7).
+  run_case "thin-shim+fork" "$shim" "fork-wait4"
 
   # 2. Real dispatch (Phase B): the full dispatcher, no HVF in the closure.
   cargo build --release -p carrick-runtime --no-default-features \
@@ -233,5 +245,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs — 9 cases (hello, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork — 10 cases (hello, fork, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals) pass on KVM."
 '

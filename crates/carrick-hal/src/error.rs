@@ -118,4 +118,9 @@ pub enum SysReg {
     Mair,
     Vbar,
     Cpacr,
+    /// `TPIDR_EL0` — the EL0 thread pointer (musl/glibc TLS base). Captured and
+    /// restored across `fork(2)` so the child resumes with the correct thread
+    /// pointer; otherwise the child's libc post-clone path computes thread-struct
+    /// offsets from a bogus base. (KVM sysreg demux: op0=3,op1=3,CRn=13,CRm=0,op2=2.)
+    TpidrEl0,
 }

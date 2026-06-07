@@ -120,15 +120,16 @@ fn reg_id(r: Reg) -> Result<c_int, OsError> {
 }
 
 /// The bhyve register id for a carrick-hal `SysReg`. bhyve exposes the MMU
-/// regs (SCTLR/TTBR0/TTBR1/TCR) but NOT `MAIR_EL1`/`VBAR_EL1`/`CPACR_EL1`; those
-/// are set by the guest-side EL1 init stub (memory attrs / vector base / FP).
+/// regs (SCTLR/TTBR0/TTBR1/TCR) but NOT `MAIR_EL1`/`VBAR_EL1`/`CPACR_EL1`/
+/// `TPIDR_EL0`; those are set by the guest-side EL1 init stub (memory attrs /
+/// vector base / FP) or handled elsewhere.
 fn sysreg_id(r: SysReg) -> Result<c_int, OsError> {
     Ok(match r {
         SysReg::Sctlr => VM_REG_GUEST_SCTLR_EL1,
         SysReg::Ttbr0 => VM_REG_GUEST_TTBR0_EL1,
         SysReg::Ttbr1 => VM_REG_GUEST_TTBR1_EL1,
         SysReg::Tcr => VM_REG_GUEST_TCR_EL1,
-        SysReg::Mair | SysReg::Vbar | SysReg::Cpacr => {
+        SysReg::Mair | SysReg::Vbar | SysReg::Cpacr | SysReg::TpidrEl0 => {
             return Err(OsError::new(format!(
                 "bhyve: {r:?} is not exposed by the aarch64 vmmapi; the guest-side \
                  EL1 init stub programs it"

@@ -11,9 +11,16 @@ use crate::guest_setup::{BroughtUp, GuestRam, SENTINEL_GPA, bring_up};
 use crate::kvm::{KvmVcpu, KvmVm};
 
 pub struct KvmTrapEngine {
-    _vm: KvmVm,
+    /// The live VM. Held (not `_`-prefixed) because `fork` swaps in a freshly
+    /// rebuilt VM on the child side; the field's host-mmap-backed slots must
+    /// stay alive for the new vCPU to run.
+    vm: KvmVm,
     vcpu: KvmVcpu,
     ram: GuestRam,
+    /// Set `true` on the child side of a guest `fork(2)`. Preserved across a
+    /// later `execve` (Task 4) so exit-reporting can distinguish a forked child;
+    /// mirrors the HVF backend's `is_forked_child`. Default `false`.
+    is_forked_child: bool,
 }
 
 impl KvmTrapEngine {
@@ -26,7 +33,12 @@ impl KvmTrapEngine {
             ram,
             entry: _,
         } = bring_up(image).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        Ok(Self { _vm: vm, vcpu, ram })
+        Ok(Self {
+            vm,
+            vcpu,
+            ram,
+            is_forked_child: false,
+        })
     }
 
     /// Read `len` bytes of live guest memory at guest-physical `gpa` (e.g. a
@@ -156,7 +168,102 @@ impl SyscallTrap for KvmTrapEngine {
     }
 
     fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
+        // Approach A — lean on Linux COW. KVM's VM/vCPU fds are per-process and
+        // are NOT usefully inherited across `libc::fork` (the inherited fds point
+        // at the parent's kernel VM), so the CHILD rebuilds a brand-new KvmVm
+        // over the COW-inherited host mmaps while the PARENT keeps its live VM.
+        //
+        // Because the guest RAM windows are MAP_PRIVATE|MAP_ANONYMOUS (except the
+        // MAP_SHARED aperture), Linux COW gives correct POSIX fork divergence for
+        // free — no `mincore` snapshot and no per-region clone (unlike HVF, whose
+        // RAM is MAP_SHARED). The HVF-only lifecycle hooks
+        // (publish_vm_for_siblings / rebuild_vcpu_after_fork /
+        // release_vcpu_for_fork) stay default no-ops on KVM.
+
+        // 1. Snapshot the parent vCPU register file BEFORE forking, so both sides
+        //    resume inside the same trapped syscall site. (Taken while the vCPU is
+        //    suspended at the syscall trap — atomic, race-free.)
+        let snap = self
+            .vcpu
+            .snapshot()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // 2. Real host fork.
+        //
+        // SAFETY: the carrick-linux thin-shim run loop spawns no threads, so the
+        // process is SINGLE-THREADED at this point.  That is the load-bearing
+        // invariant: because no other thread exists, no other thread can be
+        // holding the malloc lock (or any other process-global lock) at fork
+        // time, so the child inherits a consistent allocator state and may
+        // safely allocate during `rebuild_vm_for_child`.
+        //
+        // NOTE (Task 7): the threaded-capstone run loop breaks this invariant —
+        // when `KvmForkCoordinator::fork_from_threaded_context` is implemented,
+        // this path will need re-examination (quiesce-all-threads protocol or
+        // async-signal-safe-only child path).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(TrapError::ForkFailed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+
+        if pid > 0 {
+            // 3. PARENT: the live VM is untouched (its KVM fds are still valid;
+            //    its private RAM is unchanged by the child's COW writes). Return
+            //    the child pid so the runtime writes it into the guest's x0.
+            return Ok(ForkOutcome::Parent { child_pid: pid });
+        }
+
+        // 4. CHILD: build a brand-new KvmVm over the COW-inherited host mmaps:
+        //    open /dev/kvm -> KVM_CREATE_VM -> re-register every window in the
+        //    SAME order/GPA/slot id (the SENTINEL_GPA hole stays unmapped) ->
+        //    KVM_CREATE_VCPU. PRIVATE windows are the Linux-COW copies; the
+        //    MAP_SHARED aperture re-registers the SAME inherited host pages.
+        let (new_vm, mut new_vcpu) = self
+            .ram
+            .rebuild_vm_for_child()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // Restore the parent's register file onto the child's fresh vCPU, then
+        // set x0 = 0 (the child's fork(2) return value). The child resumes inside
+        // the same trapped clone/fork syscall, just like the parent.
+        new_vcpu
+            .restore(&snap)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        new_vcpu
+            .set_reg(Reg::X(0), 0)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // CRITICAL: advance the child PC past the EL1 vector's sentinel store.
+        //
+        // At the trap, the vCPU is suspended ON the `str x8,[x9]` sentinel store
+        // (snap.pc points AT it). On the PARENT's ORIGINAL vCPU, KVM remembers the
+        // MMIO is being completed and auto-advances PC by 4 on the next KVM_RUN,
+        // so it resumes at the vector's `eret`. The CHILD's vCPU is BRAND-NEW with
+        // no pending-MMIO state, so a plain restore would RE-EXECUTE the sentinel
+        // store → another MMIO exit → re-trap the SAME (clone) frame → fork bomb.
+        // We replicate KVM's post-MMIO advance ourselves: PC = snap.pc + 4 lands
+        // on the vector's `eret`, which loads PC←ELR_EL1 (= the guest svc+4) and
+        // PSTATE←SPSR_EL1 (= EL0t), dropping the child back into EL0 just past its
+        // clone — exactly where the parent resumes.
+        const SENTINEL_STR_WIDTH: u64 = 4; // one A64 instruction (the sentinel `str x8,[x9]`)
+        new_vcpu
+            .set_reg(Reg::Pc, snap.pc.wrapping_add(SENTINEL_STR_WIDTH))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // Swap the rebuilt VM/vCPU into `self`. The old (inherited, now-useless)
+        // KvmVm/KvmVcpu drop here, closing their stale fds. `ram` is unchanged —
+        // the host mmaps it tracks are exactly the COW-inherited pages the new
+        // slots point at.
+        self.vm = new_vm;
+        self.vcpu = new_vcpu;
+        self.is_forked_child = true;
+        Ok(ForkOutcome::Child)
+    }
+
+    fn is_forked_child(&self) -> bool {
+        self.is_forked_child
     }
 
     fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {

@@ -8,6 +8,8 @@ use carrick_mem::memory::AddressSpace;
 use kvm_bindings::{KVM_ARM_VCPU_PSCI_0_2, KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit as KvmExit, VcpuFd, VmFd};
 
+use crate::fork::VcpuSnapshot;
+
 fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
 }
@@ -71,13 +73,14 @@ fn reg_to_id(r: Reg) -> u64 {
 fn sysreg_to_id(r: SysReg) -> u64 {
     // Architectural (op0,op1,CRn,CRm,op2) encodings (ARM ARM, AArch64-sysreg).
     match r {
-        SysReg::Sctlr => sysreg_id(3, 0, 1, 0, 0), // SCTLR_EL1
-        SysReg::Ttbr0 => sysreg_id(3, 0, 2, 0, 0), // TTBR0_EL1
-        SysReg::Ttbr1 => sysreg_id(3, 0, 2, 0, 1), // TTBR1_EL1
-        SysReg::Tcr => sysreg_id(3, 0, 2, 0, 2),   // TCR_EL1
-        SysReg::Mair => sysreg_id(3, 0, 10, 2, 0), // MAIR_EL1
-        SysReg::Vbar => sysreg_id(3, 0, 12, 0, 0), // VBAR_EL1
-        SysReg::Cpacr => sysreg_id(3, 0, 1, 0, 2), // CPACR_EL1
+        SysReg::Sctlr => sysreg_id(3, 0, 1, 0, 0),     // SCTLR_EL1
+        SysReg::Ttbr0 => sysreg_id(3, 0, 2, 0, 0),     // TTBR0_EL1
+        SysReg::Ttbr1 => sysreg_id(3, 0, 2, 0, 1),     // TTBR1_EL1
+        SysReg::Tcr => sysreg_id(3, 0, 2, 0, 2),       // TCR_EL1
+        SysReg::Mair => sysreg_id(3, 0, 10, 2, 0),     // MAIR_EL1
+        SysReg::Vbar => sysreg_id(3, 0, 12, 0, 0),     // VBAR_EL1
+        SysReg::Cpacr => sysreg_id(3, 0, 1, 0, 2),     // CPACR_EL1
+        SysReg::TpidrEl0 => sysreg_id(3, 3, 13, 0, 2), // TPIDR_EL0 (EL0 thread pointer)
     }
 }
 
@@ -90,10 +93,13 @@ pub struct KvmVcpu {
     fd: VcpuFd,
 }
 
-impl HvVm for KvmVm {
-    type Vcpu = KvmVcpu;
-
-    fn create(_mem: &AddressSpace) -> Result<Self, OsError> {
+impl KvmVm {
+    /// Open `/dev/kvm` and `KVM_CREATE_VM` with no address space — the child
+    /// side of `fork(2)` rebuilds its VM over the parent's already-built
+    /// `GuestRam` windows, so there is no `AddressSpace` to thread through.
+    /// (`HvVm::create` ignores its `&AddressSpace` argument; this is the same
+    /// bring-up without the unused parameter.)
+    pub(crate) fn create_empty() -> Result<Self, OsError> {
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
         let vm = kvm.create_vm().map_err(|e| os_err("KVM_CREATE_VM", e))?;
         Ok(Self {
@@ -101,6 +107,14 @@ impl HvVm for KvmVm {
             vm,
             next_slot: 0,
         })
+    }
+}
+
+impl HvVm for KvmVm {
+    type Vcpu = KvmVcpu;
+
+    fn create(_mem: &AddressSpace) -> Result<Self, OsError> {
+        Self::create_empty()
     }
 
     fn map_memory(
@@ -201,6 +215,79 @@ impl HvVcpu for KvmVcpu {
         // (-> VcpuExit::Intr -> VcpuExit::Kicked). The MVP is single-threaded
         // (write+exit, no cross-thread wakeups), so this is exercised only by
         // the full backend; provide the mechanism, not a thread registry.
+        Ok(())
+    }
+}
+
+impl KvmVcpu {
+    /// Read a system register through `KVM_GET_ONE_REG` + the sysreg demux
+    /// (`sysreg_to_id`). Symmetric to [`HvVcpu::set_sys_reg`]; used by
+    /// [`Self::snapshot`] to capture the stage-1 MMU + thread-pointer registers
+    /// across `fork(2)`.
+    pub fn get_sys_reg(&self, r: SysReg) -> Result<u64, OsError> {
+        let mut bytes = [0u8; 8];
+        self.fd
+            .get_one_reg(sysreg_to_id(r), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(sysreg)", e))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// Capture the parent vCPU's architectural register file before `fork(2)`
+    /// so the rebuilt child vCPU can resume exactly where the parent left off
+    /// (inside the trapped `clone`/`fork` syscall).
+    ///
+    /// FP/SIMD state (`vregs`/`fpsr`/`fpcr`) is STUBBED to zero in Phase 2 — full
+    /// FP capture is Phase 4. The fields are kept on [`VcpuSnapshot`] so Task 5
+    /// (threads) can reuse the struct without an ABI change.
+    pub fn snapshot(&self) -> Result<VcpuSnapshot, OsError> {
+        let mut gprs = [0u64; 31];
+        for (n, g) in gprs.iter_mut().enumerate() {
+            *g = self.reg(Reg::X(n as u32))?;
+        }
+        Ok(VcpuSnapshot {
+            gprs,
+            pc: self.reg(Reg::Pc)?,
+            pstate: self.reg(Reg::Pstate)?,
+            sp_el0: self.reg(Reg::Sp)?, // user_pt_regs.sp == SP_EL0
+            sp_el1: self.reg(Reg::SpEl1)?,
+            elr_el1: self.reg(Reg::ElrEl1)?,
+            spsr_el1: self.reg(Reg::SpsrEl1)?,
+            ttbr0: self.get_sys_reg(SysReg::Ttbr0)?,
+            ttbr1: self.get_sys_reg(SysReg::Ttbr1)?,
+            tcr: self.get_sys_reg(SysReg::Tcr)?,
+            sctlr: self.get_sys_reg(SysReg::Sctlr)?,
+            mair: self.get_sys_reg(SysReg::Mair)?,
+            vbar: self.get_sys_reg(SysReg::Vbar)?,
+            cpacr: self.get_sys_reg(SysReg::Cpacr)?,
+            tpidr_el0: self.get_sys_reg(SysReg::TpidrEl0)?,
+            // Phase 4: real FP/SIMD capture. Zero-stubbed for now.
+            vregs: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+        })
+    }
+
+    /// Restore a [`VcpuSnapshot`] onto this (freshly created) vCPU. The mirror of
+    /// [`Self::snapshot`]; FP/SIMD fields are skipped in Phase 2 (zero-stubbed).
+    pub fn restore(&mut self, snap: &VcpuSnapshot) -> Result<(), OsError> {
+        for (n, g) in snap.gprs.iter().enumerate() {
+            self.set_reg(Reg::X(n as u32), *g)?;
+        }
+        self.set_reg(Reg::Pc, snap.pc)?;
+        self.set_reg(Reg::Pstate, snap.pstate)?;
+        self.set_reg(Reg::Sp, snap.sp_el0)?; // SP_EL0
+        self.set_reg(Reg::SpEl1, snap.sp_el1)?;
+        self.set_reg(Reg::ElrEl1, snap.elr_el1)?;
+        self.set_reg(Reg::SpsrEl1, snap.spsr_el1)?;
+        self.set_sys_reg(SysReg::Ttbr0, snap.ttbr0)?;
+        self.set_sys_reg(SysReg::Ttbr1, snap.ttbr1)?;
+        self.set_sys_reg(SysReg::Tcr, snap.tcr)?;
+        self.set_sys_reg(SysReg::Sctlr, snap.sctlr)?;
+        self.set_sys_reg(SysReg::Mair, snap.mair)?;
+        self.set_sys_reg(SysReg::Vbar, snap.vbar)?;
+        self.set_sys_reg(SysReg::Cpacr, snap.cpacr)?;
+        self.set_sys_reg(SysReg::TpidrEl0, snap.tpidr_el0)?;
+        // Phase 4: restore vregs/fpsr/fpcr. Skipped while zero-stubbed.
         Ok(())
     }
 }

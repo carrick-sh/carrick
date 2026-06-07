@@ -5055,6 +5055,7 @@ fn hvf_get_sys_reg(
         carrick_hal::SysReg::Mair => SysReg::MAIR_EL1,
         carrick_hal::SysReg::Vbar => SysReg::VBAR_EL1,
         carrick_hal::SysReg::Cpacr => SysReg::CPACR_EL1,
+        carrick_hal::SysReg::TpidrEl0 => SysReg::TPIDR_EL0,
     };
     vcpu.get_sys_reg(hvf_reg).map_err(hvf_os_error)
 }
@@ -5079,6 +5080,7 @@ fn hvf_set_sys_reg(
         carrick_hal::SysReg::Mair => SysReg::MAIR_EL1,
         carrick_hal::SysReg::Vbar => SysReg::VBAR_EL1,
         carrick_hal::SysReg::Cpacr => SysReg::CPACR_EL1,
+        carrick_hal::SysReg::TpidrEl0 => SysReg::TPIDR_EL0,
     };
     vcpu.set_sys_reg(hvf_reg, v).map_err(hvf_os_error)
 }

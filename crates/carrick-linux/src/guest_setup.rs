@@ -136,11 +136,16 @@ struct Window {
     base: u64,
     host: *mut u8,
     len: usize,
-    /// Host mmap kind for this window. Not yet read in production code — it will
-    /// be used by Task 2 (`KvmTrapEngine::fork`) when rebuilding the child's KVM
-    /// slots after `fork(2)`: shared windows are re-mapped as-is (same host
-    /// address, MAP_SHARED backing already shared), private windows get fresh
-    /// MAP_PRIVATE mmaps. Suppressed until then to keep -D warnings clean.
+    /// Host mmap kind for this window. Retained for clarity and the
+    /// test/debug-assert cross-check; the field is not read in production code.
+    ///
+    /// `rebuild_vm_for_child` (Task 2) re-registers ALL windows uniformly via
+    /// `map_memory` — it does NOT branch on `kind`.  This is correct: `libc::fork`
+    /// has already settled the memory semantics before `rebuild_vm_for_child` runs.
+    /// Private (`MAP_PRIVATE|MAP_ANONYMOUS`) windows become Linux COW copies;
+    /// the MAP_SHARED aperture continues to alias the same host pages.  Both
+    /// simply reuse the inherited host VA that the parent's `Window::host` recorded
+    /// — no re-mmap is needed.
     #[allow(dead_code)]
     kind: WindowKind,
 }
@@ -314,6 +319,27 @@ impl GuestRam {
             std::ptr::copy_nonoverlapping(data.as_ptr(), host.add(off), data.len());
         }
         Ok(())
+    }
+
+    /// Rebuild a fresh `KvmVm` + `KvmVcpu` over THIS `GuestRam`'s existing host
+    /// mmaps — the child side of [`crate::trap_engine::KvmTrapEngine::fork`].
+    ///
+    /// After `libc::fork`, the child's inherited KVM fds point at the PARENT's
+    /// kernel VM and are useless, so the child opens `/dev/kvm` afresh
+    /// (`KVM_CREATE_VM`), re-registers EVERY window in the SAME order / GPA /
+    /// slot id over the COW-inherited host VAs (the `SENTINEL_GPA` hole stays
+    /// unmapped), and creates a vCPU (`KVM_CREATE_VCPU` + preferred-target init,
+    /// via [`KvmVm::add_vcpu`]). PRIVATE windows are the Linux-COW copies; the
+    /// `MAP_SHARED` aperture re-registers the SAME (inherited) host pages, so its
+    /// writes stay coherent across the fork. The vCPU is returned UNPROGRAMMED;
+    /// the caller restores the parent's [`VcpuSnapshot`] onto it.
+    pub(crate) fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
+        let mut vm = KvmVm::create_empty()?;
+        for w in &self.windows {
+            vm.map_memory(w.base, w.host, w.len, MemPerms::ReadWriteExec)?;
+        }
+        let vcpu = vm.add_vcpu()?;
+        Ok((vm, vcpu))
     }
 
     /// Read `len` bytes of LIVE guest memory at guest-physical `gpa` (so guest
