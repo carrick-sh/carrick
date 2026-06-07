@@ -625,6 +625,13 @@ pub mod darwin_kqueue {
         pub fn new_internal() -> Option<Self> {
             None
         }
+        /// A do-nothing kqueue for the Linux epoll instance. Linux `epoll_pwait`
+        /// computes readiness directly from the interest map and blocks via
+        /// `ppoll` (see net.rs), so the kqueue is never driven — but the
+        /// `OpenDescription::Epoll` struct still needs one to construct.
+        pub fn dummy() -> Self {
+            Self
+        }
         pub fn apply(&self, _changes: &[Kevent]) -> Result<(), i32> {
             Ok(())
         }

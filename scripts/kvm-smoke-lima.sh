@@ -135,8 +135,37 @@ CEOF
       printf "FAIL [file-io]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 7. Phase C / C5: epoll. epoll_create1 + epoll_ctl(ADD) + epoll_wait that
+    #    TIMES OUT on an empty pipe, then RETURNS the ready fd after a write —
+    #    serviced from the interest map + the ppoll waiter (no kqueue).
+    cat > /tmp/cep.c <<CEOF
+#include <sys/epoll.h>
+#include <unistd.h>
+#include <string.h>
+int main(void){
+  int ep=epoll_create1(0); if(ep<0) return 2;
+  int fds[2]; if(pipe(fds)) return 3;
+  struct epoll_event ev; memset(&ev,0,sizeof ev); ev.events=EPOLLIN; ev.data.fd=fds[0];
+  if(epoll_ctl(ep,EPOLL_CTL_ADD,fds[0],&ev)) return 4;
+  struct epoll_event out[4];
+  if(epoll_wait(ep,out,4,50)!=0) return 5;
+  if(write(fds[1],"y",1)!=1) return 6;
+  if(epoll_wait(ep,out,4,1000)!=1 || out[0].data.fd!=fds[0]) return 7;
+  char c; if(read(fds[0],&c,1)!=1) return 8;
+  return write(1,"epoll-ok",8)==8?0:9;
+}
+CEOF
+    gcc -static -O2 -o /tmp/cep /tmp/cep.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cep")" && code=0 || code=$?
+    if [ "$got" = "epoll-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+epoll]: epoll_create1/ctl/wait (timeout + ready) on the interest-map+ppoll path."
+    else
+      printf "FAIL [epoll]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -147,5 +176,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C3+fs — hello, stack, static glibc, blocking-I/O, and file-I/O pass on KVM."
+  echo "OK: B+C1+C3+C5+fs — hello, stack, static glibc, blocking-I/O, file-I/O, epoll pass on KVM."
 '
