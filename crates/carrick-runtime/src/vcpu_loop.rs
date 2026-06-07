@@ -56,17 +56,17 @@ use crate::trap::{SyscallTrap, TrapError};
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
-// macOS-only, NON-engine helpers the generic loop calls.
+// NON-engine helpers the generic loop calls.
 //
-// These build/redirect the HVF AddressSpace (`load_execve_image`) or run the
-// no-unwind forked-child death paths; they touch only cross-platform types in
-// their SIGNATURES but their BODIES are macOS-coupled (HVF page tables, host
-// signals), so they live in `crate::runtime::exec` (macOS) and the generic loop
-// reaches them through this thin shim. On Linux the generic `run_vcpu_until_exit`
-// is never instantiated (the KVM run path is single-threaded in
-// `crate::runtime`), so the Linux arm is `unreachable!()` — present only so the
-// unconditional module name-resolves. Same pattern as the `host_signal` /
-// `probes` Linux stubs in lib.rs.
+// On macOS these live in `crate::runtime::exec`: `load_execve_image` builds the
+// HVF AddressSpace, and the no-unwind forked-child death paths flush stdio +
+// `_exit`/`raise`. The generic loop reaches them through this thin shim.
+//
+// On the non-macOS (Linux/KVM) build the generic `run_vcpu_until_exit` IS now
+// instantiated (`run_threaded_kvm_loop`, Task 7), so the child-shutdown /
+// signal-death helpers below are REAL portable-libc implementations — NOT
+// `unreachable!()`. Only `load_execve_image` (HVF image builder) and
+// `hardware_tso_for_debug` (Apple TSO) remain macOS-only stubs.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "platform-macos")]
 use crate::runtime::exec::{
@@ -76,6 +76,20 @@ use crate::runtime::exec::{
 #[cfg(feature = "platform-macos")]
 use crate::runtime::hardware_tso_for_debug;
 
+// On the non-macOS (Linux/KVM) build the generic `run_vcpu_until_exit` IS now
+// instantiated — `run_threaded_kvm_loop` (Phase 2 Task 7) drives it for
+// fork/execve/threads/futex guests. So the forked-child shutdown and
+// default-signal-death helpers must be REAL here, not `unreachable!()`: their
+// bodies are portable libc (`_exit`, `raise`, `sigprocmask`) plus the
+// cross-platform `crate::guest_cpu` / `crate::host_signal` shims, identical to
+// the macOS versions in `crate::runtime::exec`. Without them a forked child that
+// runs `exit_group`/dies-by-signal panics instead of `_exit`ing with the guest's
+// code (the `shared-futex-fork` exit-5 bug: the child reached `_exit(7)` but the
+// stub panicked, so the parent's `wait4` saw the wrong status).
+//
+// `load_execve_image` (HVF AddressSpace builder) and `hardware_tso_for_debug`
+// (Apple TSO) stay genuinely macOS-only stubs — the KVM execve path builds its
+// own image (Task 7d) and KVM has no Rosetta TSO toggle.
 #[cfg(not(feature = "platform-macos"))]
 #[allow(unused_variables, clippy::needless_pass_by_value)]
 mod macos_helper_stubs {
@@ -87,30 +101,84 @@ mod macos_helper_stubs {
         _argv: Vec<Vec<u8>>,
         _env: Vec<Vec<u8>>,
     ) -> Result<AddressSpace, i32> {
-        unreachable!("threaded vcpu_loop is not instantiated on the KVM backend")
+        unreachable!("load_execve_image is the HVF image builder; the KVM execve path builds its own (Task 7d)")
     }
+
+    /// Forked child hits `exit_group`: flush the guest's buffered stdout/stderr
+    /// to the inherited host fds, publish guest CPU for the parent's wait4
+    /// child-time accounting, then `_exit(2)` to bypass Rust Drops (the rebuilt
+    /// KVM vCPU/VM in the child must not run its Drop chain on the exit path).
+    /// Portable twin of `crate::runtime::exec::forked_child_exit`.
     pub(super) fn forked_child_exit(
-        _code: i32,
-        _stdout_buf: impl AsRef<[u8]>,
-        _stderr_buf: impl AsRef<[u8]>,
+        code: i32,
+        stdout_buf: impl AsRef<[u8]>,
+        stderr_buf: impl AsRef<[u8]>,
     ) -> ! {
-        unreachable!("threaded vcpu_loop is not instantiated on the KVM backend")
+        crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
+        let stdout_buf = stdout_buf.as_ref();
+        let stderr_buf = stderr_buf.as_ref();
+        let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
+        let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
+        unsafe { libc::_exit(code) };
     }
+
+    /// Forked child must die by a default-action signal (no handler installed):
+    /// flush stdio, reset the disposition to default + unblock the signal, then
+    /// `raise` it so the parent's wait4 reports `WIFSIGNALED(signum)`. On Linux
+    /// the guest signal number IS the host number (no cross-OS translation), but
+    /// route through `linux_to_host_signum` (identity on Linux) to match the
+    /// macOS twin. Falls back to `_exit(128+signum)` if the signal didn't kill us.
     pub(super) fn forked_child_die_by_signal(
-        _signum: i32,
-        _stdout_buf: impl AsRef<[u8]>,
-        _stderr_buf: impl AsRef<[u8]>,
+        signum: i32,
+        stdout_buf: impl AsRef<[u8]>,
+        stderr_buf: impl AsRef<[u8]>,
     ) -> ! {
-        unreachable!("threaded vcpu_loop is not instantiated on the KVM backend")
+        crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
+        let stdout_buf = stdout_buf.as_ref();
+        let stderr_buf = stderr_buf.as_ref();
+        let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
+        let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
+        let host_signum = crate::host_signal::linux_to_host_signum(signum);
+        unsafe {
+            libc::signal(host_signum, libc::SIG_DFL);
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, host_signum);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::raise(host_signum);
+            libc::_exit(128 + signum)
+        }
     }
-    pub(super) fn stop_by_signal(_signum: i32) {
-        unreachable!("threaded vcpu_loop is not instantiated on the KVM backend")
+
+    /// Stop THIS process by `signum` (job control / ptrace stop): reset the
+    /// disposition to default, unblock, and `raise`. Portable twin of
+    /// `crate::runtime::exec::stop_by_signal`.
+    pub(super) fn stop_by_signal(signum: i32) {
+        let host_signum = crate::host_signal::linux_to_host_signum(signum);
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(host_signum, &action, std::ptr::null_mut());
+
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, host_signum);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::raise(host_signum);
+        }
     }
-    pub(super) fn stop_after_traced_exec(_dispatcher: &SyscallDispatcher) {
-        unreachable!("threaded vcpu_loop is not instantiated on the KVM backend")
+
+    /// After a `PTRACE_TRACEME`d exec, stop with SIGTRAP so a tracer sees the
+    /// exec stop. Portable twin of `crate::runtime::exec::stop_after_traced_exec`.
+    pub(super) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
+        if dispatcher.is_ptrace_traceme() {
+            stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);
+        }
     }
+
     pub(super) fn hardware_tso_for_debug(_requested: bool) -> bool {
-        unreachable!("threaded vcpu_loop is not instantiated on the KVM backend")
+        unreachable!("Apple-Silicon hardware TSO toggle is HVF-only; KVM has no Rosetta TSO")
     }
 }
 #[cfg(not(feature = "platform-macos"))]

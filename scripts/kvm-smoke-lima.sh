@@ -318,10 +318,9 @@ CEOF
     #     FUTEX_CMP_REQUEUE, which the dispatcher routes to the KvmFutex
     #     private_wait/private_wake/requeue methods (delegated to the in-process
     #     FutexTable). KvmFutex (Task 6) is COMPLETE and host-unit-tested
-    #     (`cargo test -p carrick-linux kvm_futex`), but driving a condvar needs
-    #     MULTIPLE vCPU threads, i.e. the generic threaded run loop — which is not
-    #     wired to KVM until Task 7 (run_threaded_kvm_loop). So like case 10 this
-    #     is XFAIL-UNTIL-TASK-7 and NON-FATAL. Task 7 flips it to required.
+    #     (`cargo test -p carrick-linux kvm_futex`); driving a condvar needs
+    #     MULTIPLE vCPU threads (the generic threaded run loop), wired to KVM in
+    #     Task 7 (run_threaded_kvm_loop). Now a REQUIRED gate (fatal on failure).
     cat > /tmp/ccv.c <<CEOF
 #include <pthread.h>
 #include <unistd.h>
@@ -354,7 +353,8 @@ CEOF
     if [ "$got" = "condvar-ok" ] && [ "$code" -eq 0 ]; then
       echo "OK [real-dispatch+condvar-requeue]: pthread cond_wait/broadcast (FUTEX_WAIT/WAKE/CMP_REQUEUE) via KvmFutex private path."
     else
-      printf "XFAIL [condvar-requeue] (expected until Task 7 wires run_threaded_kvm_loop): stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      printf "FAIL [condvar-requeue]: stdout=[%s] exit=%s oracle=[condvar-ok]\n" "$got" "$code" >&2
+      exit 1
     fi
 
     # 12. Phase 2 / Task 6: shared-futex-fork — the SHARED (cross-PROCESS,
@@ -367,10 +367,14 @@ CEOF
     #     in `cargo test -p carrick-linux kvm_futex`). Driving it end-to-end
     #     through the GUEST needs the full dispatcher shared_futex_host_addr
     #     GPA->host translation on the live VM AND the threaded run loop blocking
-    #     futex re-dispatch — both Task 7 (run_threaded_kvm_loop). The thin shim
-    #     used by `run-elf` here neither wires shared_futex_host_addr on
-    #     KvmTrapEngine nor blocks/re-dispatches a guest futex, so this is
-    #     XFAIL-UNTIL-TASK-7 and NON-FATAL. Task 7 flips it to required.
+    #     futex re-dispatch -- both Task 7 (run_threaded_kvm_loop). The parent and
+    #     child genuinely rendezvous on the SAME inherited MAP_SHARED physical
+    #     page via host SYS_futex; the child reaches _exit(7) and the parent
+    #     wait4 reads WEXITSTATUS==7. (Task 7c fixed the final defect: the forked
+    #     child exit path was an unreachable!() stub in the generic loop non-macOS
+    #     helper module, so the child PANICKED instead of _exit(7) -- the parent
+    #     then saw the wrong status and the fixture returned 5.)
+    #     Now a REQUIRED gate (fatal on failure).
     cat > /tmp/csf.c <<CEOF
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -400,7 +404,8 @@ CEOF
     if [ "$got" = "sharedfutex-ok" ] && [ "$code" -eq 0 ]; then
       echo "OK [real-dispatch+shared-futex-fork]: cross-process MAP_SHARED FUTEX_WAIT/WAKE via KvmFutex shared path."
     else
-      printf "XFAIL [shared-futex-fork] (expected until Task 7 wires run_threaded_kvm_loop): stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      printf "FAIL [shared-futex-fork]: stdout=[%s] exit=%s oracle=[sharedfutex-ok]\n" "$got" "$code" >&2
+      exit 1
     fi
   else
     echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex]: no gcc in guest" >&2
@@ -414,5 +419,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads — 14 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter) pass on KVM; condvar-requeue + shared-futex-fork remain non-fatal xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex — all 15 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork) pass on KVM; ZERO xfail."
 '
