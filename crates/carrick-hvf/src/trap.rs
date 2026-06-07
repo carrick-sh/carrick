@@ -5307,6 +5307,24 @@ impl carrick_hal::ThreadedEngine for HvfTrapEngine {
     fn destroy_vcpu_on_thread_exit(&mut self) {
         HvfTrapEngine::destroy_vcpu_on_thread_exit(self);
     }
+
+    fn fresh_fork_context(
+        &self,
+    ) -> (
+        std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+        std::sync::Arc<dyn carrick_hal::PlatformFutex>,
+    ) {
+        // The CHILD side of a guest fork: libc::fork replicated only the calling
+        // thread, so drop the parent's kicker / futex table and start over with
+        // empty ones (no phantom siblings, no stale waiters). Mirrors the
+        // Arc::new(VcpuKicker::new()) / Arc::new(FutexTable::new()) the old
+        // in-runtime Child arm built.
+        let registry = std::sync::Arc::new(crate::vcpu_kick::VcpuKicker::new());
+        let futex = std::sync::Arc::new(crate::threaded_impl::HvfFutex(std::sync::Arc::new(
+            crate::thread::FutexTable::new(),
+        )));
+        (registry, futex)
+    }
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]

@@ -369,8 +369,8 @@ impl Drop for SignalPump {
 /// it holds only an `Arc` clone of the kicker).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn spawn_signal_pump(
-    kicker: std::sync::Arc<VcpuKicker>,
-    futex: std::sync::Arc<crate::thread::FutexTable>,
+    kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+    futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -570,8 +570,8 @@ pub fn spawn_signal_pump(
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn spawn_signal_pump(
-    _kicker: std::sync::Arc<VcpuKicker>,
-    _futex: std::sync::Arc<crate::thread::FutexTable>,
+    _kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+    _futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
 ) -> SignalPump {
     SignalPump {}
 }
@@ -597,10 +597,12 @@ mod tests {
     #[test]
     fn signal_pump_handle_stops_without_live_vcpus() {
         crate::host_signal::install_default_handlers();
-        let pump = spawn_signal_pump(
-            std::sync::Arc::new(VcpuKicker::new()),
-            std::sync::Arc::new(crate::thread::FutexTable::new()),
+        let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
+            std::sync::Arc::new(VcpuKicker::new());
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
+            crate::threaded_impl::HvfFutex(std::sync::Arc::new(crate::thread::FutexTable::new())),
         );
+        let pump = spawn_signal_pump(registry, futex);
         pump.stop();
     }
 
@@ -615,10 +617,12 @@ mod tests {
     fn signal_pump_stop_is_bounded_when_wake_is_lost() {
         use std::sync::atomic::{AtomicBool, Ordering};
         crate::host_signal::install_default_handlers();
-        let pump = spawn_signal_pump(
-            std::sync::Arc::new(VcpuKicker::new()),
-            std::sync::Arc::new(crate::thread::FutexTable::new()),
+        let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
+            std::sync::Arc::new(VcpuKicker::new());
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
+            crate::threaded_impl::HvfFutex(std::sync::Arc::new(crate::thread::FutexTable::new())),
         );
+        let pump = spawn_signal_pump(registry, futex);
         // Let the pump finish setting up and park in kevent().
         std::thread::sleep(std::time::Duration::from_millis(150));
         // Sever BOTH wake channels so the pump can never observe the stop flag.
