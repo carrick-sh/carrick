@@ -108,31 +108,58 @@ use bollard::container::{
 use bollard::image::CreateImageOptions;
 use futures_util::StreamExt;
 
+/// One libc flavour of the probe suite for a lane. The SAME probe sources are
+/// cross-compiled per libc (scripts/build-probes.sh) and run, base64-injected,
+/// inside the lane's glibc image under both carrick and Docker. Running both
+/// `musl` and `gnu` is the whole point of the matrix: glibc issues ABIs musl
+/// never does (e.g. tcgetattr/isatty via TCGETS2), so a musl-only suite is
+/// blind to glibc-only divergences — exactly how the TCGETS2 gap shipped.
+#[derive(Clone, Copy)]
+struct ProbeSet {
+    /// Display tag in the qualified result name (`{lane}:{libc}:{probe}`).
+    libc: &'static str,
+    /// Cargo target triple → `conformance-probes/target/{target}/release`.
+    target: &'static str,
+    /// When true a DIFF vs Linux fails the test. The gnu lane starts
+    /// NON-gating (report-only) so newly-surfaced glibc-path gaps are visible
+    /// without flipping the gate red before each is triaged into a gap list or
+    /// fixed; flip to gating once the gnu set is clean.
+    gating: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Lane {
     label: &'static str,
     platform: &'static str,
     image: &'static str,
-    probe_target: &'static str,
-    run_static_musl_probes: bool,
+    probe_sets: &'static [ProbeSet],
 }
 
 const ARM64: Lane = Lane {
     label: "arm64",
     platform: "linux/arm64",
     image: "docker.io/library/ubuntu:24.04",
-    probe_target: "aarch64-unknown-linux-musl",
-    run_static_musl_probes: true,
+    probe_sets: &[
+        ProbeSet {
+            libc: "musl",
+            target: "aarch64-unknown-linux-musl",
+            gating: true,
+        },
+        ProbeSet {
+            libc: "gnu",
+            target: "aarch64-unknown-linux-gnu",
+            gating: false,
+        },
+    ],
 };
 
 const AMD64: Lane = Lane {
     label: "amd64-rosetta",
     platform: "linux/amd64",
     image: "docker.io/library/ubuntu:24.04",
-    probe_target: "x86_64-unknown-linux-musl",
-    // Apple's Linux Rosetta path does not run the static-musl probe binaries
-    // yet; the amd64 shell lane is glibc-dynamic and exercises supported scope.
-    run_static_musl_probes: false,
+    // Apple's Linux Rosetta path does not run the standalone probe binaries yet;
+    // the amd64 shell lane is glibc-dynamic and exercises supported scope.
+    probe_sets: &[],
 };
 
 const LANES: &[Lane] = &[ARM64, AMD64];
@@ -806,12 +833,9 @@ fn conformance_default_run_contract() {
 /// stdin, so the same snippet works under carrick and Docker.
 const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
 
-/// Directory holding the compiled probe executables, if built.
-fn probes_dir(lane: Lane) -> PathBuf {
-    repo_path(&format!(
-        "conformance-probes/target/{}/release",
-        lane.probe_target
-    ))
+/// Directory holding the compiled probe executables for a target triple, if built.
+fn probes_dir(target: &str) -> PathBuf {
+    repo_path(&format!("conformance-probes/target/{target}/release"))
 }
 
 fn probe_source_names() -> BTreeSet<String> {
@@ -836,8 +860,8 @@ fn probe_source_names() -> BTreeSet<String> {
 /// Enumerate built probe executables with matching `src/bin/*.rs` sources.
 /// Cargo leaves deleted binaries in `target/.../release`; filtering through the
 /// source list keeps stale artifacts out of the line-exact gate.
-fn probe_binaries(lane: Lane) -> Vec<PathBuf> {
-    let dir = probes_dir(lane);
+fn probe_binaries(target: &str) -> Vec<PathBuf> {
+    let dir = probes_dir(target);
     let source_names = probe_source_names();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1201,14 +1225,8 @@ fn conformance_probes() {
     let mut failures = Vec::new();
     let mut fixed_gaps = Vec::new();
 
+    let mut nongating_diffs: Vec<String> = Vec::new();
     for lane in LANES {
-        if !lane.run_static_musl_probes {
-            eprintln!(
-                "SKIP conformance_probes[{}]: static-musl x86_64 probes are outside current Rosetta scope",
-                lane.label
-            );
-            continue;
-        }
         if !lane_available(*lane) {
             eprintln!(
                 "SKIP conformance_probes[{}]: Rosetta for Linux not installed",
@@ -1216,136 +1234,178 @@ fn conformance_probes() {
             );
             continue;
         }
-        let dir = probes_dir(*lane);
-        if !dir.exists() {
-            eprintln!(
-                "SKIP conformance_probes[{}]: probes not built ({})",
-                lane.label,
-                dir.display()
-            );
-            continue;
-        }
+        // Each lane runs its probe suite once per libc flavour (musl, gnu): the
+        // matrix. The gnu set is report-only (non-gating) until its glibc-path
+        // gaps are triaged; the musl set gates as before.
+        for set in lane.probe_sets {
+            let dir = probes_dir(set.target);
+            if !dir.exists() {
+                eprintln!(
+                    "SKIP conformance_probes[{}:{}]: probes not built ({})",
+                    lane.label,
+                    set.libc,
+                    dir.display()
+                );
+                continue;
+            }
 
-        let probes: Vec<PathBuf> = probe_binaries(*lane)
-            .into_iter()
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    // Exclude gate-skip probes AND the perf_* benchmark probes:
-                    // perf_* print non-deterministic timing (MB/s, us) consumed
-                    // by the perf gate (tests/perf_runner.rs); they live in
-                    // src/bin/ only to share build-probes.sh and have no place in
-                    // a differential CORRECTNESS diff (their output never matches).
-                    .map(|n| !GATE_SKIP_PROBES.contains(&n) && !n.starts_with("perf_"))
-                    .unwrap_or(true)
-            })
-            .collect();
-        if probes.is_empty() {
-            eprintln!(
-                "SKIP conformance_probes[{}]: no probe binaries in {}",
-                lane.label,
-                dir.display()
-            );
-            continue;
-        }
+            let probes: Vec<PathBuf> = probe_binaries(set.target)
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        // Exclude gate-skip probes AND the perf_* benchmark probes:
+                        // perf_* print non-deterministic timing (MB/s, us) consumed
+                        // by the perf gate (tests/perf_runner.rs); they live in
+                        // src/bin/ only to share build-probes.sh and have no place in
+                        // a differential CORRECTNESS diff (their output never matches).
+                        .map(|n| !GATE_SKIP_PROBES.contains(&n) && !n.starts_with("perf_"))
+                        .unwrap_or(true)
+                })
+                .collect();
+            if probes.is_empty() {
+                eprintln!(
+                    "SKIP conformance_probes[{}:{}]: no probe binaries in {}",
+                    lane.label,
+                    set.libc,
+                    dir.display()
+                );
+                continue;
+            }
 
-        // Fan the probes out across a bounded worker pool — each case is now
-        // hermetic (own run id + own host-fs scratch), so the only shared resources
-        // are the Docker daemon and the host CPUs. Cap at min(cores-2, 8) to avoid
-        // saturating the Docker LinuxKit VM. Timing-sensitive probes are quarantined
-        // to a serial tail to keep them off the contended path.
-        let (quarantine, parallel): (Vec<PathBuf>, Vec<PathBuf>) =
-            probes.into_iter().partition(|p| is_timing_sensitive(p));
+            // Fan the probes out across a bounded worker pool — each case is now
+            // hermetic (own run id + own host-fs scratch), so the only shared resources
+            // are the Docker daemon and the host CPUs. Cap at min(cores-2, 8) to avoid
+            // saturating the Docker LinuxKit VM. Timing-sensitive probes are quarantined
+            // to a serial tail to keep them off the contended path.
+            let (quarantine, parallel): (Vec<PathBuf>, Vec<PathBuf>) =
+                probes.into_iter().partition(|p| is_timing_sensitive(p));
 
-        let n_workers = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).clamp(1, 8))
-            .unwrap_or(4);
+            let n_workers = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).clamp(1, 8))
+                .unwrap_or(4);
 
-        // TWO PHASES so the HVF runtime under test NEVER runs concurrently with
-        // the Docker LinuxKit VM (the oracle): mixing them starves both and skews
-        // timing-sensitive probe results. Phase 1 fans out ALL carrick runs
-        // (carrick||carrick is fine — that's the gate's speed win); phase 2 then
-        // fans out ALL Docker runs (docker||docker, same VM cap); phase 3 is pure
-        // classification. carrick and docker are thus disjoint in time.
-        use base64::Engine as _;
-        let engine = base64::engine::general_purpose::STANDARD;
-        let jobs: Vec<(String, std::io::Result<Vec<u8>>)> = parallel
-            .iter()
-            .map(|p| {
-                let name = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("<unknown>")
-                    .to_string();
-                (
-                    name,
-                    std::fs::read(p).map(|raw| engine.encode(&raw).into_bytes()),
-                )
-            })
-            .collect();
+            // TWO PHASES so the HVF runtime under test NEVER runs concurrently with
+            // the Docker LinuxKit VM (the oracle): mixing them starves both and skews
+            // timing-sensitive probe results. Phase 1 fans out ALL carrick runs
+            // (carrick||carrick is fine — that's the gate's speed win); phase 2 then
+            // fans out ALL Docker runs (docker||docker, same VM cap); phase 3 is pure
+            // classification. carrick and docker are thus disjoint in time.
+            use base64::Engine as _;
+            let engine = base64::engine::general_purpose::STANDARD;
+            let jobs: Vec<(String, std::io::Result<Vec<u8>>)> = parallel
+                .iter()
+                .map(|p| {
+                    let name = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                    (
+                        name,
+                        std::fs::read(p).map(|raw| engine.encode(&raw).into_bytes()),
+                    )
+                })
+                .collect();
 
-        // Phase 1 — carrick only.
-        let carrick_outs: Vec<Option<String>> = fan_out_indexed(jobs.len(), n_workers, |i| {
-            jobs[i]
-                .1
-                .as_ref()
-                .ok()
-                .map(|enc| run_carrick_probe(&bin, *lane, enc))
-        });
-        // Phase 2 — Docker oracle only, strictly after phase 1.
-        let docker_outs: Vec<Option<std::io::Result<String>>> =
-            fan_out_indexed(jobs.len(), n_workers, |i| {
+            // Phase 1 — carrick only.
+            let carrick_outs: Vec<Option<String>> = fan_out_indexed(jobs.len(), n_workers, |i| {
                 jobs[i]
                     .1
                     .as_ref()
                     .ok()
-                    .map(|enc| run_docker_probe(*lane, enc))
+                    .map(|enc| run_carrick_probe(&bin, *lane, enc))
             });
-        // Phase 3 — classify (runs nothing).
-        let mut results: Vec<(String, ProbeOutcome)> = Vec::new();
-        for ((name, enc), (carrick_out, docker_out)) in jobs
-            .into_iter()
-            .zip(carrick_outs.into_iter().zip(docker_outs))
-        {
-            let outcome = match enc {
-                Err(e) => (name, ProbeOutcome::Error(format!("read probe: {e}"))),
-                Ok(_) => classify_probe(
-                    name,
-                    &carrick_out.unwrap_or_default(),
-                    docker_out.unwrap_or_else(|| Ok(String::new())),
-                ),
-            };
-            results.push(outcome);
-        }
+            // Phase 2 — Docker oracle only, strictly after phase 1.
+            let docker_outs: Vec<Option<std::io::Result<String>>> =
+                fan_out_indexed(jobs.len(), n_workers, |i| {
+                    jobs[i]
+                        .1
+                        .as_ref()
+                        .ok()
+                        .map(|enc| run_docker_probe(*lane, enc))
+                });
+            // Phase 3 — classify (runs nothing).
+            let mut results: Vec<(String, ProbeOutcome)> = Vec::new();
+            for ((name, enc), (carrick_out, docker_out)) in jobs
+                .into_iter()
+                .zip(carrick_outs.into_iter().zip(docker_outs))
+            {
+                let outcome = match enc {
+                    Err(e) => (name, ProbeOutcome::Error(format!("read probe: {e}"))),
+                    Ok(_) => classify_probe(
+                        name,
+                        &carrick_out.unwrap_or_default(),
+                        docker_out.unwrap_or_else(|| Ok(String::new())),
+                    ),
+                };
+                results.push(outcome);
+            }
 
-        // Quarantined (timing-sensitive) probes: serial, after the fan-out — each
-        // is carrick THEN docker, one at a time, so already non-overlapping.
-        for probe in &quarantine {
-            results.push(run_one_probe(&bin, *lane, probe));
-        }
-        results.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic report order
+            // Quarantined (timing-sensitive) probes: serial, after the fan-out — each
+            // is carrick THEN docker, one at a time, so already non-overlapping.
+            for probe in &quarantine {
+                results.push(run_one_probe(&bin, *lane, probe));
+            }
+            results.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic report order
 
-        for (name, outcome) in &results {
-            let qualified = format!("{}:{name}", lane.label);
-            match outcome {
-                ProbeOutcome::Pass => eprintln!("PASS {qualified}"),
-                ProbeOutcome::UnexpectedPass => {
-                    // A known-gap probe started passing → the gap is fixed. Fail
-                    // loudly so the entry gets removed from KNOWN_PROBE_GAPS.
-                    eprintln!("UNEXPECTED PASS {qualified} (remove from KNOWN_PROBE_GAPS)");
-                    fixed_gaps.push(qualified);
-                }
-                ProbeOutcome::Fail(diff) => {
-                    eprintln!("FAIL {qualified}\n{diff}");
-                    failures.push(qualified);
-                }
-                ProbeOutcome::Xfail(diff) => eprintln!("XFAIL {qualified} (known gap)\n{diff}"),
-                ProbeOutcome::Error(e) => {
-                    eprintln!("FAIL {qualified} ({e})");
-                    failures.push(qualified);
+            let mut set_diffs = 0usize;
+            for (name, outcome) in &results {
+                let qualified = format!("{}:{}:{name}", lane.label, set.libc);
+                match outcome {
+                    ProbeOutcome::Pass => eprintln!("PASS {qualified}"),
+                    ProbeOutcome::UnexpectedPass => {
+                        // A known-gap probe started passing → the gap is fixed.
+                        // Only the GATING (musl) set asserts: remove it from
+                        // KNOWN_PROBE_GAPS. (gnu is report-only.)
+                        eprintln!("UNEXPECTED PASS {qualified} (remove from KNOWN_PROBE_GAPS)");
+                        if set.gating {
+                            fixed_gaps.push(qualified);
+                        }
+                    }
+                    ProbeOutcome::Fail(diff) => {
+                        if set.gating {
+                            eprintln!("FAIL {qualified}\n{diff}");
+                            failures.push(qualified);
+                        } else {
+                            // Non-gating (gnu) DIFF: surface it as a glibc-path
+                            // gap to triage, but do NOT fail the gate yet.
+                            set_diffs += 1;
+                            eprintln!(
+                                "DIFF {qualified} (gnu report-only — glibc gap to triage)\n{diff}"
+                            );
+                            nongating_diffs.push(qualified);
+                        }
+                    }
+                    ProbeOutcome::Xfail(diff) => eprintln!("XFAIL {qualified} (known gap)\n{diff}"),
+                    ProbeOutcome::Error(e) => {
+                        if set.gating {
+                            eprintln!("FAIL {qualified} ({e})");
+                            failures.push(qualified);
+                        } else {
+                            set_diffs += 1;
+                            eprintln!("DIFF {qualified} (gnu report-only — error: {e})");
+                            nongating_diffs.push(qualified);
+                        }
+                    }
                 }
             }
+            if !set.gating {
+                eprintln!(
+                    "SUMMARY {}:{} (report-only): {}/{} probes DIFF from Linux",
+                    lane.label,
+                    set.libc,
+                    set_diffs,
+                    results.len()
+                );
+            }
         }
+    }
+    if !nongating_diffs.is_empty() {
+        eprintln!(
+            "NOTE {} report-only (gnu) probe DIFFs — glibc-path gaps to triage (non-gating): {nongating_diffs:?}",
+            nongating_diffs.len()
+        );
     }
     assert!(
         fixed_gaps.is_empty(),

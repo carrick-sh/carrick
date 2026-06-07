@@ -39,16 +39,12 @@ const L_ENOTTY: i32 = 25;
 /// failed specifically with ENOTTY, None on any other (unexpected) error.
 unsafe fn tcgets_ok(fd: i32) -> Option<bool> {
     let mut t: libc::termios = core::mem::zeroed();
-    let rc = libc::ioctl(fd, L_TCGETS, &mut t as *mut libc::termios);
+    let rc = libc::ioctl(fd, L_TCGETS as _, &mut t as *mut libc::termios);
     if rc == 0 {
         Some(true)
     } else {
         let e = conformance_probes::errno();
-        if e == L_ENOTTY {
-            Some(false)
-        } else {
-            None
-        }
+        if e == L_ENOTTY { Some(false) } else { None }
     }
 }
 
