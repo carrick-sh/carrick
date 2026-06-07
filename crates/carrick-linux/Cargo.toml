@@ -23,6 +23,11 @@ carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-abi = { path = "../carrick-abi" }
+# The hypervisor-agnostic private-futex parking table. `KvmFutex` wraps the SAME
+# `carrick_thread::thread::FutexTable` `HvfFutex` does (the private/cross-thread
+# path); only the shared (cross-process MAP_SHARED) path differs (host SYS_futex
+# vs the macOS os_sync API). carrick-thread compiles on every host (leaf deps).
+carrick-thread = { path = "../carrick-thread" }
 libc.workspace = true
 
 # Linux-only KVM bindings: target-gated so the macOS workspace never resolves
