@@ -8,10 +8,12 @@
 #[cfg(not(feature = "fs-memory"))]
 use assert_cmd::Command;
 
-/// `carrick run --help` lists the `--fs` possible values. Without the
-/// `fs-memory` feature, `memory` must not appear among them. Uses `--help`
-/// (no guest boot) so it is fast and deterministic in both the red and green
-/// phases.
+/// `carrick run --help` lists the `--fs` possible values as a clap
+/// `Possible values:` section with one `- <value>: <doc>` bullet per variant.
+/// Without the `fs-memory` feature, the `- memory:` bullet must not appear.
+/// We match the value bullet specifically (not the bare word "memory", which
+/// also occurs in the `--fs` doc text) so the assertion actually discriminates.
+/// Uses `--help` (no guest boot) so it is fast and deterministic.
 #[cfg(not(feature = "fs-memory"))]
 #[test]
 fn run_help_does_not_offer_fs_memory() {
@@ -22,8 +24,8 @@ fn run_help_does_not_offer_fs_memory() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("possible values: memory"),
-        "--fs must not offer 'memory' when fs-memory is off; help was:\n{stdout}"
+        !stdout.contains("- memory:"),
+        "--fs must not offer the 'memory' value when fs-memory is off; help was:\n{stdout}"
     );
 }
 
@@ -52,7 +54,7 @@ fn run_help_offers_fs_memory_with_feature() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Possible values:") && stdout.contains("memory"),
-        "--fs should offer 'memory' when fs-memory is on; help was:\n{stdout}"
+        stdout.contains("- memory:"),
+        "--fs should offer the 'memory' value when fs-memory is on; help was:\n{stdout}"
     );
 }
