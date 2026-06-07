@@ -20,3 +20,8 @@ pub mod sendfile;
 pub use futex::CrossProcessFutex;
 pub use host_info::HostFacts;
 pub use sendfile::Sendfile;
+pub mod threaded;
+pub use threaded::{
+    FutexOutcome, PlatformFutex, RegAccess, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn,
+    VcpuRegistry,
+};
