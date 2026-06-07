@@ -20,4 +20,5 @@ carrick-hal = { path = "../carrick-hal" }
 carrick-abi = { path = "../carrick-abi" }
 libc.workspace = true
 parking_lot.workspace = true
+parking_lot_core.workspace = true
 serde.workspace = true
