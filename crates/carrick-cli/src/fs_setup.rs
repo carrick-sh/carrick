@@ -27,8 +27,9 @@
 //!
 //! Linux paths assume a case-sensitive filesystem; the stock macOS boot volume
 //! is case-INsensitive. `host` is the secure-by-default, real-semantics choice,
-//! so the default (`default_fs_backend_kind`) probes the *exact* scratch root
-//! the host backend will use — `apfs::preferred_scratch_root`, which prefers the
+//! so the default (`carrick_runtime::apfs::default_writable_backend_kind`) probes
+//! the *exact* scratch root the host backend will use —
+//! `apfs::preferred_scratch_root`, which prefers the
 //! dedicated case-sensitive `/Volumes/carrick` volume — and chooses `host` iff
 //! that root is case-sensitive, else falls back to `memory` with a warning.
 //! Probing the real root (not a hardcoded `~/.carrick`) matters: the dedicated
@@ -67,7 +68,7 @@ pub(crate) fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
     fs: Option<FsBackendKind>,
 ) -> Result<FsBackendKind> {
-    let kind = fs.unwrap_or_else(default_fs_backend_kind);
+    let kind = fs.unwrap_or_else(carrick_runtime::apfs::default_writable_backend_kind);
     // Set once the host backend has materialised the COMPLETE rootfs onto
     // disk - after which the in-memory rootfs layer is redundant and gets
     // dropped (the disk overlay is authoritative for every read).
@@ -203,32 +204,4 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend) {
         "/etc/hostname",
         format!("{}\n", carrick_runtime::execute::guest_hostname()).into_bytes(),
     );
-}
-
-/// Default backend choice: prefer `host` because that's the secure-
-/// by-default option, but quietly fall back to `memory` when the
-/// scratch root sits on a case-insensitive filesystem (a common
-/// macOS default that breaks anything assuming Linux semantics).
-fn default_fs_backend_kind() -> FsBackendKind {
-    // Probe the SAME scratch root the host backend will actually use
-    // (`preferred_scratch_root` prefers the dedicated case-sensitive
-    // `/Volumes/carrick` volume), not a hardcoded `~/.carrick/scratch`.
-    // Otherwise the decision and the real scratch location disagree: the
-    // dedicated volume can be case-sensitive while `~/.carrick` is not, and we
-    // would wrongly fall back to the in-memory backend.
-    let probe = carrick_runtime::apfs::preferred_scratch_root()
-        .unwrap_or_else(|_| std::env::temp_dir().join("carrick-scratch"));
-    if std::fs::create_dir_all(&probe).is_err() {
-        return FsBackendKind::Memory;
-    }
-    if carrick_runtime::apfs::probe_case_sensitive(&probe) {
-        FsBackendKind::Host
-    } else {
-        tracing::warn!(
-            "carrick: {} is case-insensitive; defaulting --fs to memory. \
-             Pass `--fs host` to force the cap-std backend (some Linux tools may misbehave).",
-            probe.display()
-        );
-        FsBackendKind::Memory
-    }
 }
