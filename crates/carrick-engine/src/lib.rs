@@ -222,18 +222,11 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         },
     };
 
-    // 5. Select fs backend (fall back to case sensitivity probe)
-    let fs_backend = req.fs.unwrap_or_else(|| {
-        let probe = carrick_runtime::apfs::preferred_scratch_root()
-            .unwrap_or_else(|_| std::env::temp_dir().join("carrick-scratch"));
-        if std::fs::create_dir_all(&probe).is_err() {
-            FsBackendKind::Memory
-        } else if carrick_runtime::apfs::probe_case_sensitive(&probe) {
-            FsBackendKind::Host
-        } else {
-            FsBackendKind::Memory
-        }
-    });
+    // 5. Select fs backend: caller's `--fs`, else the shared default
+    //    (host-only unless the fs-memory feature is compiled in).
+    let fs_backend = req
+        .fs
+        .unwrap_or_else(carrick_runtime::apfs::default_writable_backend_kind);
 
     let debug_state_path = req.debug_state_path.map(Utf8PathBuf::from);
 

@@ -313,6 +313,38 @@ fn resolve_scratch_root() -> PathBuf {
     home.join("scratch")
 }
 
+/// The default writable-layer backend when the user passes no `--fs`.
+///
+/// With the `fs-memory` feature enabled, prefer `Host` on case-sensitive
+/// volumes (where Linux fs semantics survive) and fall back to the in-memory
+/// backend on case-insensitive ones. Without the feature, always `Host` — the
+/// in-memory backend is not selectable and is silently incoherent across guest
+/// `fork` anyway (see the fs-memory design spec).
+pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
+    #[cfg(not(feature = "fs-memory"))]
+    {
+        carrick_spec::FsBackendKind::Host
+    }
+    #[cfg(feature = "fs-memory")]
+    {
+        let probe = preferred_scratch_root()
+            .unwrap_or_else(|_| std::env::temp_dir().join("carrick-scratch"));
+        if std::fs::create_dir_all(&probe).is_err() {
+            return carrick_spec::FsBackendKind::Memory;
+        }
+        if probe_case_sensitive(&probe) {
+            carrick_spec::FsBackendKind::Host
+        } else {
+            tracing::warn!(
+                "carrick: {} is case-insensitive; defaulting --fs to memory. \
+                 Pass `--fs host` to force the cap-std backend (some Linux tools may misbehave).",
+                probe.display()
+            );
+            carrick_spec::FsBackendKind::Memory
+        }
+    }
+}
+
 /// Probe whether `path` resides on a case-sensitive filesystem.
 /// Tries to round-trip a sentinel file through opposite case spellings;
 /// on a case-insensitive volume the two open the same inode. Returns
@@ -328,6 +360,23 @@ pub fn probe_case_sensitive(path: &Path) -> bool {
     // On case-sensitive: upper doesn't exist → Err.
     // On case-insensitive: upper opens the same inode as lower → Ok.
     metadata_upper.is_err()
+}
+
+#[cfg(test)]
+mod fs_default_tests {
+    use super::*;
+
+    #[test]
+    fn default_backend_is_host_without_feature() {
+        // With the fs-memory feature off (the default build), the default
+        // writable backend is always Host regardless of volume case-sensitivity.
+        if cfg!(not(feature = "fs-memory")) {
+            assert_eq!(
+                default_writable_backend_kind(),
+                carrick_spec::FsBackendKind::Host
+            );
+        }
+    }
 }
 
 #[cfg(test)]
