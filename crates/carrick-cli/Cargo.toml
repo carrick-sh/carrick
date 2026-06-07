@@ -25,6 +25,7 @@ carrick-spec = { path = "../carrick-spec", features = ["clap"] }
 carrick-image = { path = "../carrick-image" }
 carrick-engine = { path = "../carrick-engine" }
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 tempfile.workspace = true
 camino.workspace = true

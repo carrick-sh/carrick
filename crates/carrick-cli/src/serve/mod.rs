@@ -47,6 +47,7 @@ async fn serve_loop(host: &str) -> anyhow::Result<()> {
         tokio::spawn(async move {
             if let Err(e) = http1::Builder::new()
                 .serve_connection(io, service_fn(router::route))
+                .with_upgrades()
                 .await
             {
                 tracing::debug!("serve connection ended: {e}");
