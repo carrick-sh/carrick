@@ -46,6 +46,84 @@ fn rt_signal_stubs_zero_old_state() {
 }
 
 #[test]
+fn rt_sigaction_sig_dfl_resets_host_disposition_for_job_control() {
+    // Ctrl-Z / SIGTSTP job control. A job-control shell sets SIGTSTP=SIG_IGN for
+    // ITSELF (so ^Z never stops the shell); carrick mirrors that to the host
+    // (set_host_ignore). Each forked child then resets SIGTSTP to SIG_DFL BEFORE
+    // exec so the pty's ^Z actually stops the job. If carrick mirrors the IGN but
+    // never resets the host back to SIG_DFL, the host SIG_IGN — inherited across
+    // fork — DISCARDS the pty-generated SIGTSTP and the job never stops (Ctrl-Z
+    // does nothing). The host disposition must follow the guest's IGN -> DFL.
+    const RT_SIGACTION: u64 = 134;
+    const LINUX_SIGTSTP: u64 = 20; // macOS SIGTSTP == libc::SIGTSTP (18)
+    const SA_HANDLER_IGN: u64 = 1; // LINUX_SIG_IGN
+    const SA_HANDLER_DFL: u64 = 0; // LINUX_SIG_DFL
+    let host_sig = libc::SIGTSTP;
+
+    // Save the test process's real SIGTSTP disposition; restore before asserting.
+    // SAFETY: standard sigaction query/restore on a benign job-control signal.
+    let mut saved: libc::sigaction = unsafe { core::mem::zeroed() };
+    unsafe { libc::sigaction(host_sig, core::ptr::null(), &mut saved) };
+    let read_host = || -> usize {
+        let mut cur: libc::sigaction = unsafe { core::mem::zeroed() };
+        unsafe { libc::sigaction(host_sig, core::ptr::null(), &mut cur) };
+        cur.sa_sigaction
+    };
+
+    let mut memory = LinearMemory::new(0x4000, vec![0u8; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // 1. guest SIGTSTP = SIG_IGN -> host mirrors IGN (sa_handler is at offset 0).
+    memory
+        .write_bytes(0x4000, &SA_HANDLER_IGN.to_le_bytes())
+        .unwrap();
+    dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                RT_SIGACTION,
+                SyscallArgs::from([LINUX_SIGTSTP, 0x4000, 0, 8, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let after_ign = read_host();
+
+    // 2. guest SIGTSTP = SIG_DFL -> host MUST reset to SIG_DFL (the fix).
+    memory
+        .write_bytes(0x4000, &SA_HANDLER_DFL.to_le_bytes())
+        .unwrap();
+    dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                RT_SIGACTION,
+                SyscallArgs::from([LINUX_SIGTSTP, 0x4000, 0, 8, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let after_dfl = read_host();
+
+    // Restore the real disposition before any assertion can unwind the test.
+    unsafe { libc::sigaction(host_sig, &saved, core::ptr::null_mut()) };
+
+    assert_eq!(
+        after_ign,
+        libc::SIG_IGN,
+        "guest SIG_IGN must mirror to the host disposition"
+    );
+    assert_eq!(
+        after_dfl,
+        libc::SIG_DFL,
+        "guest SIG_DFL must reset the host disposition to SIG_DFL, else the pty's \
+         ^Z (host SIGTSTP) is discarded by an inherited host SIG_IGN and the job \
+         never stops (no Ctrl-Z)"
+    );
+}
+
+#[test]
 fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     const LINUX_EINTR: i32 = 4;
     const LINUX_EAGAIN: i32 = 11;
