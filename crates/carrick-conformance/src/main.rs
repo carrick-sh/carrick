@@ -565,13 +565,33 @@ impl Drop for SemaphorePermit<'_> {
 }
 
 fn select(suites: &[Suite], tier: Tier, ecos: &[String], names: &[String]) -> Vec<Suite> {
-    suites
+    let mut out: Vec<Suite> = suites
         .iter()
         .filter(|s| tier == Tier::Full || s.tier == Tier::Smoke)
         .filter(|s| ecos.is_empty() || ecos.iter().any(|e| e == s.ecosystem.as_str()))
         .filter(|s| names.is_empty() || names.iter().any(|nm| nm == &s.name))
         .cloned()
-        .collect()
+        .collect();
+    // Dispatch order = list order (fan_out hands out ascending indices), so sort
+    // by ecosystem run-priority to control which suites START first. LTP (light,
+    // ~40s, the syscall oracle we want feedback on first) leads; CPython (heavy,
+    // ~300s, noisy) trails. A STABLE sort preserves the manifest's within-
+    // ecosystem order so matrix rows / oracle-cache keys never churn. The
+    // generated suites.toml stays untouched — this is the single authority on run
+    // order, so it survives `--generate-suites` regeneration.
+    out.sort_by_key(|s| eco_run_priority(s.ecosystem));
+    out
+}
+
+/// Run-order rank for an ecosystem: lower dispatches first. LTP first, CPython
+/// last (the user-requested ordering); go/node fill the middle.
+fn eco_run_priority(eco: Ecosystem) -> u8 {
+    match eco {
+        Ecosystem::Ltp => 0,
+        Ecosystem::Go => 1,
+        Ecosystem::Node => 2,
+        Ecosystem::Cpython => 3,
+    }
 }
 
 fn parse_tier(s: &str) -> anyhow::Result<Tier> {
@@ -735,6 +755,47 @@ fn walk_newest(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn select_dispatches_ltp_first_cpython_last() {
+        use Ecosystem::*;
+        // Deliberately interleaved input — the manifest's natural order is
+        // go-build/node/cpython/go/ltp, which we must NOT inherit.
+        let suites = vec![
+            suite("cpython-a", Cpython, Weight::Heavy),
+            suite("go-a", Go, Weight::Heavy),
+            suite("ltp-a", Ltp, Weight::Light),
+            suite("node-a", Node, Weight::Heavy),
+            suite("cpython-b", Cpython, Weight::Heavy),
+            suite("ltp-b", Ltp, Weight::Light),
+            suite("go-b", Go, Weight::Heavy),
+        ];
+        let out = select(&suites, Tier::Full, &[], &[]);
+
+        // LTP dispatched first, CPython last; ecosystem blocks are contiguous
+        // and in run-priority order (ltp < go < node < cpython).
+        let order: Vec<&str> = out.iter().map(|s| s.ecosystem.as_str()).collect();
+        assert_eq!(
+            order,
+            ["ltp", "ltp", "go", "go", "node", "cpython", "cpython"]
+        );
+
+        // The sort is STABLE: within an ecosystem the manifest order survives
+        // (so the matrix rows and oracle-cache keys do not churn).
+        let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "ltp-a",
+                "ltp-b",
+                "go-a",
+                "go-b",
+                "node-a",
+                "cpython-a",
+                "cpython-b"
+            ]
+        );
+    }
 
     #[test]
     fn args_accept_explicit_worker_controls() {
