@@ -35,6 +35,10 @@ and JSONL perf rows under `docs/perf-results/`.
   for benchmark rows.
 - Keep the next runtime commit separate from the next documentation/results
   commit.
+- Shell commands in this document that use `--fs memory` require a build with
+  the `fs-memory` Cargo feature enabled. On a stock `carrick` build `--fs
+  memory` is rejected at parse time. Rebuild with `--features fs-memory`:
+  `./scripts/build-signed.sh --features fs-memory`.
 
 ## Cost Model
 

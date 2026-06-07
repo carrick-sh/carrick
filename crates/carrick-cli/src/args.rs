@@ -78,9 +78,9 @@ pub(crate) enum Commands {
         /// Makes carrick feel like a normal command runner.
         #[arg(long)]
         raw: bool,
-        /// Which writable-layer backend to use. Defaults to `host` on
-        /// case-sensitive volumes (APFS scratch dir + cap-std sandbox)
-        /// and `memory` elsewhere (in-memory tmpfs).
+        /// Which writable-layer backend to use. Defaults to `host`. The
+        /// in-memory backend (`memory`) is opt-in: build with
+        /// `--features fs-memory`. It is incoherent across guest `fork`.
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
         /// Bind-mount a host directory/file into the guest:
@@ -248,8 +248,8 @@ pub(crate) enum Commands {
         /// manage it with `carrick ps|stop|kill|rm`.
         #[arg(short = 'd', long = "detach", conflicts_with_all = ["tty", "interactive"])]
         detach: bool,
-        /// Which writable-layer backend to use. Defaults to `host` on
-        /// case-sensitive volumes and `memory` elsewhere.
+        /// Which writable-layer backend to use. Defaults to `host`. The
+        /// in-memory backend (`memory`) is opt-in (`--features fs-memory`).
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
         /// PID namespace mode (like `docker run --pid`). `private` (default)
@@ -317,6 +317,8 @@ pub(crate) enum Commands {
         image: String,
         #[arg(long, value_name = "OS/ARCH")]
         platform: Option<String>,
+        /// Which writable-layer backend to use. Defaults to `host`. The
+        /// in-memory backend (`memory`) is opt-in (`--features fs-memory`).
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
