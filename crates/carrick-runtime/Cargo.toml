@@ -55,6 +55,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-portable = { path = "../carrick-portable" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-thread = { path = "../carrick-thread" }
 carrick-hvf = { path = "../carrick-hvf", optional = true }
 carrick-bsd = { path = "../carrick-bsd", optional = true }
 carrick-linux = { path = "../carrick-linux", optional = true }
