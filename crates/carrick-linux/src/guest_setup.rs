@@ -7,6 +7,7 @@ use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_EL1_VECTORS_SIZE,
     LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes, stage1_identity_page_tables,
+    va_in_shared_aperture,
 };
 
 use crate::kvm::{KvmVcpu, KvmVm};
@@ -111,6 +112,23 @@ pub fn el1_vectors_sentinel_bytes() -> Vec<u8> {
     bytes
 }
 
+/// Whether the host `mmap` backing a guest-physical window is shared across
+/// `fork(2)` (`MAP_SHARED`) or copy-on-write snapshotted (`MAP_PRIVATE`).
+///
+/// The KVM slot `flags` field is always `0` in both cases — KVM does not
+/// distinguish; only the HOST mmap flags change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowKind {
+    /// `MAP_PRIVATE`: copy-on-write on fork (image, heap, stack, page-tables,
+    /// vectors, trampoline, private overlay).
+    Private,
+    /// `MAP_SHARED`: writes are visible across `fork(2)` — used for the
+    /// boot-mapped shared aperture `[LINUX_SHARED_FILE_BASE,
+    /// LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE)` so that guest
+    /// `MAP_SHARED` futex words survive the fork used by `clone(2)`.
+    Shared,
+}
+
 /// One host-backed guest-physical window: [base, base+len) of guest-physical
 /// space backed by a single host `mmap`. Each becomes one
 /// `KVM_SET_USER_MEMORY_REGION` slot.
@@ -118,6 +136,13 @@ struct Window {
     base: u64,
     host: *mut u8,
     len: usize,
+    /// Host mmap kind for this window. Not yet read in production code — it will
+    /// be used by Task 2 (`KvmTrapEngine::fork`) when rebuilding the child's KVM
+    /// slots after `fork(2)`: shared windows are re-mapped as-is (same host
+    /// address, MAP_SHARED backing already shared), private windows get fresh
+    /// MAP_PRIVATE mmaps. Suppressed until then to keep -D warnings clean.
+    #[allow(dead_code)]
+    kind: WindowKind,
 }
 
 /// Multi-window host-backed guest RAM. The MVP used a single low window; a real
@@ -211,7 +236,16 @@ impl GuestRam {
     /// [base, base+len) and record the window. Refuses any window that would
     /// cover [`SENTINEL_GPA`] — that page MUST stay unmapped so the EL1 vector's
     /// sentinel store faults out as `KVM_EXIT_MMIO` (the syscall trap vehicle).
-    fn add_window(&mut self, base: u64, len: usize) -> Result<(), OsError> {
+    ///
+    /// `kind` selects the host mmap flags:
+    /// - [`WindowKind::Private`] → `MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE`
+    ///   (copy-on-write on fork; used for image/heap/stack/page-tables/vectors).
+    /// - [`WindowKind::Shared`] → `MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE`
+    ///   (writes survive fork; used for the shared aperture so guest `MAP_SHARED`
+    ///   futex words remain coherent across the `fork` used by `clone(2)`).
+    ///
+    /// The KVM slot `flags` field is always `0` regardless of `kind`.
+    fn add_window(&mut self, base: u64, len: usize, kind: WindowKind) -> Result<(), OsError> {
         if len == 0 {
             return Ok(());
         }
@@ -223,13 +257,20 @@ impl GuestRam {
                 "kvm: window 0x{base:x}..0x{end:x} would back the sentinel gpa 0x{SENTINEL_GPA:x}"
             )));
         }
-        // SAFETY: standard anonymous private mapping; we own it for the VM's life.
+        let mmap_flags = match kind {
+            WindowKind::Private => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            WindowKind::Shared => libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        };
+        // SAFETY: anonymous mapping (no fd); we own it for the VM's life.
+        // MAP_SHARED|MAP_ANONYMOUS is used for the shared aperture so that guest
+        // MAP_SHARED futex words remain coherent across fork(2)/clone(2); KVM
+        // slot flags stay 0 in both cases — only the host mmap flags change.
         let host = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                mmap_flags,
                 -1,
                 0,
             )
@@ -243,6 +284,7 @@ impl GuestRam {
             base,
             host: host.cast::<u8>(),
             len,
+            kind,
         });
         Ok(())
     }
@@ -308,15 +350,23 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
     // (EL0 trampoline / EL1 vectors / stage-1 page tables) at 180 GiB.
     const KERNEL_HOLE_END: u64 = 0x2D_0020_0000; // LINUX_KERNEL_REGION_BASE + 2 MiB
     let mut ram = GuestRam::new();
-    ram.add_window(0, KERNEL_HOLE_END as usize)?;
+    // Low window covers image segments + kernel-region pages; always private
+    // (image text/data/bss are per-process, not shared across fork).
+    ram.add_window(0, KERNEL_HOLE_END as usize, WindowKind::Private)?;
 
     // 1. ELF + runtime regions (identity GPA == region.start). `load_elf` also
     //    appends the guest's high runtime reservations (sigreturn @ 192 GiB,
-    //    heap @ 256 GiB, mmap arena @ 384 GiB), and `with_linux_initial_stack`
-    //    appends the stack near 1 TiB. Low regions land in the low window; each
-    //    HIGH region (>= KERNEL_HOLE_END) gets its own MAP_NORESERVE window +
-    //    KVM slot, page-aligned and lazily committed. (`add_window` refuses any
-    //    window that would back the unmapped SENTINEL gpa.)
+    //    heap @ 256 GiB, mmap arena @ 384 GiB, shared aperture @ 576 GiB,
+    //    private overlay @ 608 GiB), and `with_linux_initial_stack` appends the
+    //    stack near 1 TiB. Low regions land in the low window; each HIGH region
+    //    (>= KERNEL_HOLE_END) gets its own MAP_NORESERVE window + KVM slot,
+    //    page-aligned and lazily committed. (`add_window` refuses any window that
+    //    would back the unmapped SENTINEL gpa.)
+    //
+    //    WindowKind is derived from the MemoryRegion's `shared` flag:
+    //    - `shared: true`  → MAP_SHARED (the boot-mapped shared aperture)
+    //    - `shared: false` → MAP_PRIVATE (all other regions)
+    //    The KVM slot `flags` field stays 0 in both cases.
     for region in image.regions() {
         if region.start < KERNEL_HOLE_END {
             let bytes = region.bytes();
@@ -327,7 +377,20 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
         }
         let base = align_down_slot(region.start);
         let end = align_up_slot(region.end)?;
-        ram.add_window(base, (end - base) as usize)?;
+        // Derive kind from carrick-mem's `shared` flag, cross-checked against
+        // the shared-aperture address range. Both must agree: if a region is
+        // marked shared it must lie in the shared aperture, and vice versa.
+        debug_assert_eq!(
+            region.shared,
+            va_in_shared_aperture(base, end - base),
+            "region.shared / shared-aperture address mismatch at 0x{base:x}"
+        );
+        let kind = if region.shared {
+            WindowKind::Shared
+        } else {
+            WindowKind::Private
+        };
+        ram.add_window(base, (end - base) as usize, kind)?;
         let bytes = region.bytes();
         if !bytes.is_empty() {
             ram.write_gpa(region.start, bytes)?;
@@ -428,4 +491,161 @@ fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsErr
         vcpu.set_reg(Reg::Sp, sp)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod window_kind_tests {
+    use super::*;
+    use carrick_mem::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
+
+    /// Verify that `add_window` stores the correct `WindowKind` on each window:
+    /// the shared-aperture range gets `Shared`, all others get `Private`.
+    #[test]
+    fn shared_aperture_window_tagged_shared() {
+        let mut ram = GuestRam::new();
+        // Low window (private).
+        ram.add_window(0, 0x10000, WindowKind::Private)
+            .expect("low window");
+        // Shared aperture window — uses real constants from carrick-mem.
+        ram.add_window(
+            LINUX_SHARED_FILE_BASE,
+            LINUX_SHARED_FILE_SIZE as usize,
+            WindowKind::Shared,
+        )
+        .expect("shared aperture window");
+        // Another private high window (e.g. stack).
+        ram.add_window(0xC0_0000_0000, 0x10000, WindowKind::Private)
+            .expect("high private window");
+
+        let kinds: Vec<WindowKind> = ram.windows.iter().map(|w| w.kind).collect();
+        assert_eq!(kinds[0], WindowKind::Private, "low window must be Private");
+        assert_eq!(
+            kinds[1],
+            WindowKind::Shared,
+            "shared-aperture window must be Shared"
+        );
+        assert_eq!(
+            kinds[2],
+            WindowKind::Private,
+            "high private window must be Private"
+        );
+    }
+
+    /// COW probe: validates the OS-level mmap semantics that the `Shared` window
+    /// path relies on, independent of carrick.
+    ///
+    /// Strategy: parent writes sentinel bytes into both a MAP_SHARED and a
+    /// MAP_PRIVATE page BEFORE `fork`.  After `fork`, the parent overwrites only
+    /// the MAP_SHARED page.  The child, signalled to read after the parent write,
+    /// must observe the new value through the shared page (MAP_SHARED writes are
+    /// immediately visible across the fork) and the old value through the private
+    /// page (MAP_PRIVATE COW-snapshotted the page at fork time).
+    #[test]
+    fn cow_probe_shared_vs_private() {
+        use std::os::unix::io::RawFd;
+
+        const PAGE: usize = 4096;
+        const BEFORE: u8 = 0xAB;
+        const AFTER: u8 = 0xCD;
+
+        // Allocate one shared and one private page, write BEFORE into both.
+        let shared_pg = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(shared_pg, libc::MAP_FAILED, "shared mmap failed");
+
+        let private_pg = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(private_pg, libc::MAP_FAILED, "private mmap failed");
+
+        unsafe { *(shared_pg as *mut u8) = BEFORE };
+        unsafe { *(private_pg as *mut u8) = BEFORE };
+
+        // Two pipes for coordination:
+        //   p2c: parent sends one "go" byte to child after writing AFTER.
+        //   c2p: child sends two result bytes back to parent.
+        let mut p2c: [RawFd; 2] = [-1; 2];
+        let mut c2p: [RawFd; 2] = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(p2c.as_mut_ptr()) }, 0, "pipe p2c");
+        assert_eq!(unsafe { libc::pipe(c2p.as_mut_ptr()) }, 0, "pipe c2p");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            // ── child ──────────────────────────────────────────────────────────
+            unsafe {
+                libc::close(p2c[1]); // close parent-write end
+                libc::close(c2p[0]); // close child-read end
+            }
+            // Block until parent signals "go" (after writing AFTER to shared_pg).
+            let mut go = [0u8; 1];
+            unsafe { libc::read(p2c[0], go.as_mut_ptr() as *mut _, 1) };
+            unsafe { libc::close(p2c[0]) };
+
+            let sv = unsafe { *(shared_pg as *const u8) };
+            let pv = unsafe { *(private_pg as *const u8) };
+            let results = [sv, pv];
+            unsafe { libc::write(c2p[1], results.as_ptr() as *const libc::c_void, 2) };
+            unsafe { libc::close(c2p[1]) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // ── parent ─────────────────────────────────────────────────────────────
+        unsafe {
+            libc::close(p2c[0]); // close child-read end
+            libc::close(c2p[1]); // close child-write end
+        }
+
+        // Overwrite only the MAP_SHARED page AFTER fork.
+        unsafe { *(shared_pg as *mut u8) = AFTER };
+        // MAP_PRIVATE page intentionally unchanged (stays BEFORE in child's snapshot).
+
+        // Signal child to proceed.
+        let go = [1u8];
+        unsafe { libc::write(p2c[1], go.as_ptr() as *const libc::c_void, 1) };
+        unsafe { libc::close(p2c[1]) };
+
+        // Read child's observations.
+        let mut results = [0u8; 2];
+        let n = unsafe { libc::read(c2p[0], results.as_mut_ptr() as *mut libc::c_void, 2) };
+        assert_eq!(n, 2, "expected 2 result bytes from child");
+        unsafe { libc::close(c2p[0]) };
+
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        unsafe {
+            libc::munmap(shared_pg, PAGE);
+            libc::munmap(private_pg, PAGE);
+        }
+
+        assert_eq!(
+            results[0], AFTER,
+            "child must observe parent's post-fork write through MAP_SHARED \
+             (expected 0x{AFTER:02x}, got 0x{:02x})",
+            results[0]
+        );
+        assert_eq!(
+            results[1], BEFORE,
+            "child must NOT observe parent's post-fork write through MAP_PRIVATE \
+             (expected 0x{BEFORE:02x}, got 0x{:02x})",
+            results[1]
+        );
+    }
 }
