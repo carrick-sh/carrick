@@ -164,8 +164,35 @@ CEOF
       printf "FAIL [epoll]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 8. Phase C / C2: PROT_NONE enforcement. A PROT_NONE buffer passed to a
+    #    syscall must fault with EFAULT (host-side set_no_access check); mprotect
+    #    back to RW clears it. (Guest-side SIGSEGV on direct access is Phase D.)
+    cat > /tmp/cpn.c <<CEOF
+#include <sys/mman.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+int main(void){
+  void *p=mmap(0,4096,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(p==MAP_FAILED) return 2;
+  errno=0;
+  if(write(1,p,16)!=-1 || errno!=EFAULT) return 3;
+  if(mprotect(p,4096,PROT_READ|PROT_WRITE)) return 4;
+  memcpy(p,"prot-ok",7);
+  return write(1,p,7)==7?0:5;
+}
+CEOF
+    gcc -static -O2 -o /tmp/cpn /tmp/cpn.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cpn")" && code=0 || code=$?
+    if [ "$got" = "prot-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+prot-none]: a PROT_NONE syscall buffer faults EFAULT; mprotect RW clears it."
+    else
+      printf "FAIL [prot-none]: stdout=[%s] exit=%s\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -176,5 +203,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C3+C5+fs — hello, stack, static glibc, blocking-I/O, file-I/O, epoll pass on KVM."
+  echo "OK: B+C1+C2+C3+C5+fs — hello, stack, static glibc, blocking-IO, file-IO, epoll, prot-none pass on KVM."
 '

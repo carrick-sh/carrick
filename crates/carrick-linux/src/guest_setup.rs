@@ -130,13 +130,81 @@ struct Window {
 /// host-MAP_SHARED fork-coherence model is the full-backend Phase D work).
 pub struct GuestRam {
     windows: Vec<Window>,
+    /// Sorted, merged guest-physical ranges the guest has made PROT_NONE
+    /// (mmap(PROT_NONE)/mprotect/munmap). carrick backs the whole arena with
+    /// accessible host memory, so a PROT_NONE buffer is otherwise readable on
+    /// the syscall path — a guest passing such a buffer to a syscall must
+    /// instead see EFAULT. This is the HOST-SIDE syscall-read check only
+    /// (cheap, no page tables); making the GUEST itself fault mid-EL0 needs
+    /// stage-1 edits + signal injection (Phase D), so `protect_range`/
+    /// `unmap_range` stay no-ops for now.
+    no_access: Vec<(u64, u64)>,
 }
 
 impl GuestRam {
     fn new() -> Self {
         Self {
             windows: Vec::new(),
+            no_access: Vec::new(),
         }
+    }
+
+    /// Whether [gpa, gpa+len) overlaps any PROT_NONE range (so a syscall buffer
+    /// there must fault with EFAULT). Mirrors carrick-hvf's `range_no_access`.
+    pub(crate) fn range_no_access(&self, gpa: u64, len: usize) -> bool {
+        let end = gpa.saturating_add(len as u64);
+        if end <= gpa {
+            return false;
+        }
+        let idx = self.no_access.partition_point(|&(_, e)| e <= gpa);
+        self.no_access
+            .get(idx)
+            .is_some_and(|&(s, e)| gpa < e && s < end)
+    }
+
+    /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range, keeping
+    /// `no_access` sorted and merged. Add merges adjacent/overlapping ranges;
+    /// clear subtracts the interval (splitting a straddled range). Mirrors
+    /// carrick-hvf's `MemoryProtections::set_no_access`.
+    pub(crate) fn set_no_access(&mut self, gpa: u64, len: usize, no_access: bool) {
+        let end = gpa.saturating_add(len as u64);
+        if end <= gpa {
+            return;
+        }
+        if no_access {
+            self.no_access.push((gpa, end));
+            self.no_access.sort_by_key(|&(s, _)| s);
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.no_access.len());
+            for (s, e) in std::mem::take(&mut self.no_access) {
+                if let Some((_, last_end)) = merged.last_mut()
+                    && s <= *last_end
+                {
+                    *last_end = (*last_end).max(e);
+                    continue;
+                }
+                merged.push((s, e));
+            }
+            self.no_access = merged;
+            return;
+        }
+        let mut next = Vec::with_capacity(self.no_access.len());
+        for (s, e) in std::mem::take(&mut self.no_access) {
+            if gpa <= s && end >= e {
+                continue; // fully cleared
+            }
+            if end <= s || gpa >= e {
+                next.push((s, e)); // disjoint
+                continue;
+            }
+            if s < gpa {
+                next.push((s, gpa)); // left remainder
+            }
+            if end < e {
+                next.push((end, e)); // right remainder
+            }
+        }
+        next.sort_by_key(|&(s, _)| s);
+        self.no_access = next;
     }
 
     /// mmap `len` bytes (lazy, `MAP_NORESERVE`) to back guest-physical
