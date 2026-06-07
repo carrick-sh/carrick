@@ -188,6 +188,15 @@ pub mod pathcodec;
 // loop (the Linux `runtime` module below).
 pub mod run_result;
 
+// The multi-threaded vCPU run loop, generic over `carrick_hal::ThreadedEngine`.
+// Unconditional (compiles on both platforms); the generic `run_vcpu_until_exit`
+// is instantiated only by the macOS HVF setup wrapper in `runtime`, so on Linux
+// the whole module is dead code (the KVM run path is the single-threaded loop in
+// the `runtime` shim below) — allow `dead_code` there so the Linux cross-check
+// stays warning-clean without `#[allow]` peppered on every item.
+#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+pub mod vcpu_loop;
+
 #[cfg(feature = "platform-macos")]
 pub mod execute;
 pub mod pty_relay;
@@ -736,6 +745,23 @@ pub mod host_signal {
     pub fn pump_kqueue() -> i32 {
         0
     }
+    // Additional stubs the unconditional `vcpu_loop` references. The threaded
+    // loop is never instantiated on the KVM backend (the Linux run path is the
+    // single-threaded loop in `crate::runtime`), so these are inert — present
+    // only so the unconditional module name-resolves on Linux.
+    pub fn forget_thread(_tid: i32) {}
+    pub fn has_pending_for(_tid: i32) -> bool {
+        false
+    }
+    pub fn last_sender_for(_signum: i32) -> i32 {
+        0
+    }
+    pub fn register_child_exit_watch(_child_pid: i32, _parent_tid: i32, _exit_signal: i32) {}
+    pub fn reinit_after_fork() {}
+    pub fn take_pending_for(_tid: i32) -> i32 {
+        0
+    }
+    pub fn wake_all_waiters() {}
 }
 
 #[cfg(not(feature = "platform-macos"))]
