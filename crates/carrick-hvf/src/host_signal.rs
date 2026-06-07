@@ -1460,14 +1460,31 @@ pub fn raise_for_self(signum: i32) {
     publish_pending(signum);
 }
 
+/// Crate-test-shared lock serialising every test that touches process-global
+/// pump-pipe / kqueue / `PENDING` state. It lives at module scope (not inside
+/// `mod tests`) so sibling test modules — `vcpu_kick::tests`,
+/// `fork_coord::tests` — that spawn or sever the signal pump can acquire the
+/// SAME lock and never race the pump-assertion tests here. Acquire it via
+/// `pump_state_test_guard()`.
+#[cfg(test)]
+pub(crate) static PUMP_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the crate-test-shared pump-state lock. `parking_lot::Mutex` does not
+/// poison, so this simply blocks until the guard is available.
+#[cfg(test)]
+pub(crate) fn pump_state_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    PUMP_STATE_TEST_LOCK.lock()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // These tests touch process-global state (the single `PENDING` slot), so a
-    // shared lock serialises them; each drains `PENDING` on entry. The
-    // THREAD_PENDING map is keyed by disjoint high tids per test.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    // These tests touch process-global state (the single `PENDING` slot) plus
+    // the global pump pipe/kqueue, so a shared lock serialises them; each drains
+    // `PENDING` on entry. The THREAD_PENDING map is keyed by disjoint high tids
+    // per test. This is the SAME lock the vcpu_kick/fork_coord pump tests take.
+    use super::PUMP_STATE_TEST_LOCK as TEST_LOCK;
 
     /// Open a fresh pump wake pipe for a unit test. The pump pipe is normally
     /// created by the signal-pump thread (`pump_install_pipe`), which does not

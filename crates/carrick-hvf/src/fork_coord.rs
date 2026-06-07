@@ -57,11 +57,7 @@ impl ForkCoordinator {
 }
 
 impl HostForkCoordinator for ForkCoordinator {
-    fn start_signal_pump(
-        &self,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-    ) {
+    fn start_signal_pump(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>) {
         let mut pump = self.signal_pump.lock();
         if pump.is_none() {
             *pump = Some(crate::vcpu_kick::spawn_signal_pump(
@@ -131,6 +127,7 @@ mod tests {
 
     #[test]
     fn host_fork_preparation_stops_and_restarts_signal_pump() {
+        let _g = crate::host_signal::pump_state_test_guard();
         crate::host_signal::install_default_handlers();
         let coordinator = ForkCoordinator::new();
         let (registry, futex) = dyn_context();
@@ -153,6 +150,7 @@ mod tests {
 
     #[test]
     fn parent_can_skip_absent_signal_pump_until_child_exit_needs_it() {
+        let _g = crate::host_signal::pump_state_test_guard();
         crate::host_signal::install_default_handlers();
         let coordinator = ForkCoordinator::new();
         let (registry, futex) = dyn_context();
@@ -174,6 +172,7 @@ mod tests {
 
     #[test]
     fn child_restarts_only_inherited_signal_pump() {
+        let _g = crate::host_signal::pump_state_test_guard();
         crate::host_signal::install_default_handlers();
         let coordinator = ForkCoordinator::new();
         let (registry, futex) = dyn_context();
