@@ -1817,6 +1817,24 @@ impl SyscallDispatcher {
         proc.argv = vec![path];
     }
 
+    /// Enter a `binfmt_misc` redirect (Apple's Rosetta). `executable_path` stays
+    /// the target (a binfmt redirect is transparent on real Linux), so this:
+    ///  - flags the guest binfmt-interpreted, so `uname(2)` reports x86_64; and
+    ///  - sets `/proc/self/cmdline` to `stack_argv` — the argv carrick puts on the
+    ///    guest stack for Rosetta (`[argv0, target, args…]`). Rosetta serves the
+    ///    guest's cmdline by applying its argv-skip to what it received on the
+    ///    stack; if `proc.argv` instead held the bare program argv (no target
+    ///    entry), that skip would strip the program's real `argv[0]`. Matching the
+    ///    stack form makes the post-skip cmdline the faithful program argv.
+    pub fn enter_binfmt(&self, stack_argv: &[Vec<u8>]) {
+        let mut proc = self.proc.lock();
+        proc.binfmt_interpreted = true;
+        proc.argv = stack_argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+    }
+
     /// Seed the guest's initial credentials (`docker run --user` / image `USER`).
     /// Applied once before the guest starts; defaults to (0, 0) = root.
     pub fn set_credentials(&self, uid: u32, gid: u32) {
@@ -1848,6 +1866,11 @@ impl SyscallDispatcher {
         proc.executable_path = abs.clone();
         proc.argv = if argv.is_empty() { vec![abs] } else { argv };
         proc.env = env;
+        // A fresh image identity: clear the binfmt flag. The binfmt redirect
+        // re-sets it (via set_binfmt_interpreted) iff THIS image is foreign-arch,
+        // so the flag tracks the current image across execve (x86 -> native and
+        // native -> x86).
+        proc.binfmt_interpreted = false;
     }
 
     /// Name of the currently-installed backend (for logging / debug).
