@@ -75,7 +75,10 @@ fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
 /// so they are addressed by byte-offset just like `core_reg_id`.
 fn vreg_id(n: u32) -> u64 {
     assert!(n < 32, "vreg index {n} out of range");
-    KVM_REG_ARM64 | KVM_REG_SIZE_U128 | KVM_REG_ARM_CORE | ((KVM_REGS_FP_REGS + u64::from(n) * 16) / 4)
+    KVM_REG_ARM64
+        | KVM_REG_SIZE_U128
+        | KVM_REG_ARM_CORE
+        | ((KVM_REGS_FP_REGS + u64::from(n) * 16) / 4)
 }
 fn fpsr_id() -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | (KVM_REGS_FP_FPSR / 4)
