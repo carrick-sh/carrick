@@ -99,6 +99,17 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Write `bytes` at `address` WITHOUT enforcing the guest-visible write
+    /// permission (`guest_writable`). For carrick-INTERNAL frames the guest must
+    /// receive even into a guest-read-only mapping (vdso vvar, the signal frame,
+    /// bootstrap): the host backing page is writable; only the guest-visible
+    /// permission is bypassed. Default: the permission-checked `write_bytes` (the
+    /// in-memory backend and the KVM backend model no such distinction). The HVF
+    /// backend overrides this to its unchecked writer.
+    fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.write_bytes(address, bytes)
+    }
+
     /// Zero `[address, address+len)` in the PHYSICAL backing, bypassing the
     /// guest-visible protection (`set_no_access` / a non-writable mapping).
     /// Used to scrub a reused anon region whose stale content must never reach
@@ -110,6 +121,14 @@ pub trait GuestMemory {
     /// writes); the HVF backend overrides this to write the host backing raw.
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.write_bytes(address, &vec![0u8; len])
+    }
+
+    /// Whether every byte of `[address, address+length)` is currently guest-WRITABLE
+    /// (used by signal delivery to detect an unwritable SA_ONSTACK alt-stack →
+    /// Linux force_sigsegv). Default: `true` (the in-memory backend models no
+    /// protection). The HVF backend overrides this.
+    fn guest_range_is_writable(&self, _address: u64, _length: usize) -> bool {
+        true
     }
 
     /// Mark a guest range `PROT_NONE` (`no_access=true`) or accessible again

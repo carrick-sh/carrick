@@ -14,6 +14,17 @@ use carrick_guest_mem::Aarch64SyscallFrame;
 use carrick_mem::memory::AddressSpace;
 use thiserror::Error;
 
+use crate::error::OsError;
+
+/// A register/V-reg access through [`crate::RegAccess`] failed mid-sigframe
+/// build/restore. The shared builder reports it as a hypervisor error so it can
+/// use `?` on `RegAccess` calls (which return [`OsError`]) directly.
+impl From<OsError> for TrapError {
+    fn from(e: OsError) -> Self {
+        TrapError::Hypervisor(format!("sigframe register access: {e}"))
+    }
+}
+
 /// The trap-engine contract the runtime loop drives: run the vCPU until a
 /// syscall trap, complete/inject/restore around guest syscalls and signals,
 /// and fork/execve the guest address space. Implemented by `HvfTrapEngine`
