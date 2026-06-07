@@ -398,18 +398,45 @@ impl SyscallTrap for KvmTrapEngine {
     #[allow(clippy::too_many_arguments)]
     fn inject_signal(
         &mut self,
-        _signum: i32,
-        _handler: u64,
-        _sa_restorer: u64,
-        _pending_syscall_retval: Option<i64>,
-        _interrupted_pc: Option<u64>,
-        _altstack: Option<(u64, u64)>,
-        _saved_sigmask: u64,
-        _fault_siginfo: Option<(i32, u64)>,
-        _queued_siginfo: Option<LinuxSiginfo>,
-        _restart_syscall: bool,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<LinuxSiginfo>,
+        restart_syscall: bool,
     ) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
+        use carrick_hal::RegAccess;
+        // KVM's guest is ALWAYS at EL0, so the interrupted PSTATE is always the
+        // EL0t value latched in SPSR_EL1 — no HVF-style kick-path/CPSR branch.
+        let pstate_source = self
+            .get_reg(Reg::SpsrEl1)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let params = carrick_hal::sigframe::InjectParams {
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+            altstack,
+            saved_sigmask,
+            fault_siginfo,
+            queued_siginfo,
+            restart_syscall,
+            pstate_source,
+            orig_x0: self.last_syscall_orig_x0,
+            fault_esr: self.last_fault_esr,
+            fpsimd_enabled: true,
+            sigreturn_trampoline_base: carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        };
+        carrick_hal::sigframe::build_sigframe(self, params)?;
+        // The fault ESR is only valid between fault and delivery; clear it so a
+        // later async signal doesn't reuse a stale synchronous-fault syndrome.
+        self.last_fault_esr = 0;
+        Ok(())
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
@@ -639,6 +666,18 @@ mod execve_tests {
         KvmTrapEngine::new(&image).expect("bring up test engine")
     }
 
+    /// Like `engine_for`, but gives the guest a real Linux initial stack (8 MiB at
+    /// `LINUX_STACK_TOP`) so signal-frame pushes have writable headroom. The committed
+    /// freestanding fixtures (e.g. fork-wait4) deliberately set up no stack of their own.
+    fn engine_for_with_stack(bytes: &[u8]) -> KvmTrapEngine {
+        let no_env: [&str; 0] = [];
+        let image = AddressSpace::load_elf_bytes(bytes)
+            .expect("load test ELF")
+            .with_linux_initial_stack(["prog"], no_env)
+            .expect("attach initial stack");
+        KvmTrapEngine::new(&image).expect("bring up test engine")
+    }
+
     /// After `execve_into`, the stage-1 MMU sysregs point at the canonical
     /// carrick page-table / vector bases and MAIR is the Normal-WB value — i.e.
     /// the new image is correctly re-bootstrapped on the LIVE vCPU.
@@ -840,5 +879,29 @@ mod execve_tests {
         assert_eq!(engine.last_fault_esr, 0, "fault_esr reset across execve");
         assert_eq!(engine.last_syscall_orig_x0, 0, "orig_x0 reset across execve");
         assert_eq!(engine.last_syscall_nr, None, "last_syscall_nr reset across execve");
+    }
+
+    #[test]
+    fn kvm_inject_signal_redirects_to_handler() {
+        use carrick_hal::RegAccess;
+        if !kvm_available() {
+            eprintln!("SKIP kvm_inject_signal_redirects_to_handler: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for_with_stack(INITIAL_ELF);
+        // Run to the guest's first svc so the engine is in a post-syscall state
+        // (ELR_EL1 = svc+4, SPSR_EL1 = EL0t, tracking fields populated).
+        engine.next_syscall().expect("first svc").expect("a syscall frame");
+
+        let handler = 0x4_0000u64;
+        let sp_before = engine.get_reg(Reg::Sp).unwrap();
+        engine
+            .inject_signal(libc::SIGUSR1, handler, 0, None, None, None, 0, None, None, false)
+            .expect("inject_signal");
+
+        // Syscall path (interrupted_pc = None) redirects ELR_EL1, not live PC.
+        assert_eq!(engine.get_reg(Reg::ElrEl1).unwrap(), handler, "handler entry on ELR_EL1");
+        assert_eq!(engine.get_reg(Reg::X(0)).unwrap(), libc::SIGUSR1 as u64, "x0 = signum");
+        assert!(engine.get_reg(Reg::Sp).unwrap() < sp_before, "frame pushed: SP_EL0 moved down");
     }
 }
