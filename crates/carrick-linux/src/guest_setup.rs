@@ -171,6 +171,31 @@ pub struct GuestRam {
     no_access: Vec<(u64, u64)>,
 }
 
+/// `munmap` the host backing of every window when the `GuestRam` is dropped.
+///
+/// For the long-lived initial / forked-child RAM this never fires in practice
+/// (the engine lives for the process). It matters for
+/// [`crate::trap_engine::KvmTrapEngine::execve_into`], which REPLACES `self.ram`
+/// with a fresh `GuestRam` for the new image: the OLD `GuestRam` drops here and
+/// must release its host mmaps, or repeated execve would leak the prior image's
+/// windows (heap/mmap-arena/stack near 1 TiB are huge VA reservations).
+///
+/// The caller MUST have unregistered the KVM slots backed by these windows
+/// before the drop (execve does: `unmap_memory_slot` for each old slot first),
+/// so no live vCPU references the pages being unmapped.
+impl Drop for GuestRam {
+    fn drop(&mut self) {
+        for w in &self.windows {
+            // SAFETY: `host`..`host+len` is the mmap this window owns (created in
+            // `add_window`); it is unmapped exactly once, on drop. KVM slots over
+            // it were already deleted by the execve caller.
+            unsafe {
+                libc::munmap(w.host.cast::<libc::c_void>(), w.len);
+            }
+        }
+    }
+}
+
 impl GuestRam {
     fn new() -> Self {
         Self {
@@ -367,71 +392,108 @@ pub struct BroughtUp {
     pub entry: u64,
 }
 
+/// The low window covers the user image's low segments AND the kernel region
+/// (EL0 trampoline / EL1 vectors / stage-1 page tables) at 180 GiB.
+const KERNEL_HOLE_END: u64 = 0x2D_0020_0000; // LINUX_KERNEL_REGION_BASE + 2 MiB
+
+impl GuestRam {
+    /// Build a fresh `GuestRam` over a freshly-`mmap`'d set of host windows for
+    /// `image`, and write the image segments + the architectural bring-up pages
+    /// (EL0 trampoline / stage-1 identity tables / EL1 sentinel vectors) into
+    /// them. This is the shared "lay out the guest physical RAM for an image"
+    /// step used by BOTH the initial [`bring_up`] and
+    /// [`crate::trap_engine::KvmTrapEngine::execve_into`] — execve replaces the
+    /// guest image in place by building a new `GuestRam` here and re-registering
+    /// its windows on the LIVE VM (the slots having first been unmapped).
+    ///
+    /// It does NOT touch any KVM object (no slot registration, no vCPU
+    /// programming) — those steps differ between bring-up (fresh VM) and execve
+    /// (live VM remap), so the caller drives them via [`Self::windows_for_kvm`]
+    /// and [`program_sysregs`].
+    pub(crate) fn build_for_image(image: &AddressSpace) -> Result<Self, OsError> {
+        let mut ram = GuestRam::new();
+        // Low window covers image segments + kernel-region pages; always private
+        // (image text/data/bss are per-process, not shared across fork).
+        ram.add_window(0, KERNEL_HOLE_END as usize, WindowKind::Private)?;
+
+        // 1. ELF + runtime regions (identity GPA == region.start). `load_elf`
+        //    also appends the guest's high runtime reservations (sigreturn @
+        //    192 GiB, heap @ 256 GiB, mmap arena @ 384 GiB, shared aperture @
+        //    576 GiB, private overlay @ 608 GiB), and `with_linux_initial_stack`
+        //    appends the stack near 1 TiB. Low regions land in the low window;
+        //    each HIGH region (>= KERNEL_HOLE_END) gets its own MAP_NORESERVE
+        //    window + KVM slot, page-aligned and lazily committed. (`add_window`
+        //    refuses any window that would back the unmapped SENTINEL gpa.)
+        //
+        //    WindowKind is derived from the MemoryRegion's `shared` flag:
+        //    - `shared: true`  → MAP_SHARED (the boot-mapped shared aperture)
+        //    - `shared: false` → MAP_PRIVATE (all other regions)
+        //    The KVM slot `flags` field stays 0 in both cases.
+        for region in image.regions() {
+            if region.start < KERNEL_HOLE_END {
+                let bytes = region.bytes();
+                if !bytes.is_empty() {
+                    ram.write_gpa(region.start, bytes)?;
+                }
+                continue;
+            }
+            let base = align_down_slot(region.start);
+            let end = align_up_slot(region.end)?;
+            // Derive kind from carrick-mem's `shared` flag, cross-checked against
+            // the shared-aperture address range. Both must agree: if a region is
+            // marked shared it must lie in the shared aperture, and vice versa.
+            debug_assert_eq!(
+                region.shared,
+                va_in_shared_aperture(base, end - base),
+                "region.shared / shared-aperture address mismatch at 0x{base:x}"
+            );
+            let kind = if region.shared {
+                WindowKind::Shared
+            } else {
+                WindowKind::Private
+            };
+            ram.add_window(base, (end - base) as usize, kind)?;
+            let bytes = region.bytes();
+            if !bytes.is_empty() {
+                ram.write_gpa(region.start, bytes)?;
+            }
+        }
+        // 2. Architectural bring-up pages (low window), reused from carrick-mem.
+        ram.write_gpa(LINUX_EL0_TRAMPOLINE_BASE, &el0_trampoline_bytes())?;
+        ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
+        // 3. Our sentinel vector (NOT carrick-mem's hvc #2 variant).
+        ram.write_gpa(LINUX_EL1_VECTORS_BASE, &el1_vectors_sentinel_bytes())?;
+        Ok(ram)
+    }
+
+    /// Iterate every window as `(base, host, len)` for `KVM_SET_USER_MEMORY_REGION`
+    /// registration, in slot order. Used by both bring-up and execve to publish
+    /// the windows onto a (fresh or live) VM via [`KvmVm::map_memory`].
+    pub(crate) fn windows_for_kvm(&self) -> impl Iterator<Item = (u64, *mut u8, usize)> + '_ {
+        self.windows.iter().map(|w| (w.base, w.host, w.len))
+    }
+
+    /// Number of registered windows (== the number of KVM slots in use). Used by
+    /// execve to know how many slots to unregister before remapping the new
+    /// image.
+    pub(crate) fn window_count(&self) -> usize {
+        self.windows.len()
+    }
+}
+
 /// Load `image` (a freestanding aarch64 ELF), build the stage-1 identity map +
 /// trampoline + sentinel vector, program the vCPU, and return it parked at the
 /// EL1 trampoline. Reuses carrick-mem's architectural builders; does NOT use
 /// the FEAT_PAN3 workaround (see `program_sysregs`).
 pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
-    // The low window covers the user image's low segments AND the kernel region
-    // (EL0 trampoline / EL1 vectors / stage-1 page tables) at 180 GiB.
-    const KERNEL_HOLE_END: u64 = 0x2D_0020_0000; // LINUX_KERNEL_REGION_BASE + 2 MiB
-    let mut ram = GuestRam::new();
-    // Low window covers image segments + kernel-region pages; always private
-    // (image text/data/bss are per-process, not shared across fork).
-    ram.add_window(0, KERNEL_HOLE_END as usize, WindowKind::Private)?;
-
-    // 1. ELF + runtime regions (identity GPA == region.start). `load_elf` also
-    //    appends the guest's high runtime reservations (sigreturn @ 192 GiB,
-    //    heap @ 256 GiB, mmap arena @ 384 GiB, shared aperture @ 576 GiB,
-    //    private overlay @ 608 GiB), and `with_linux_initial_stack` appends the
-    //    stack near 1 TiB. Low regions land in the low window; each HIGH region
-    //    (>= KERNEL_HOLE_END) gets its own MAP_NORESERVE window + KVM slot,
-    //    page-aligned and lazily committed. (`add_window` refuses any window that
-    //    would back the unmapped SENTINEL gpa.)
-    //
-    //    WindowKind is derived from the MemoryRegion's `shared` flag:
-    //    - `shared: true`  → MAP_SHARED (the boot-mapped shared aperture)
-    //    - `shared: false` → MAP_PRIVATE (all other regions)
-    //    The KVM slot `flags` field stays 0 in both cases.
-    for region in image.regions() {
-        if region.start < KERNEL_HOLE_END {
-            let bytes = region.bytes();
-            if !bytes.is_empty() {
-                ram.write_gpa(region.start, bytes)?;
-            }
-            continue;
-        }
-        let base = align_down_slot(region.start);
-        let end = align_up_slot(region.end)?;
-        // Derive kind from carrick-mem's `shared` flag, cross-checked against
-        // the shared-aperture address range. Both must agree: if a region is
-        // marked shared it must lie in the shared aperture, and vice versa.
-        debug_assert_eq!(
-            region.shared,
-            va_in_shared_aperture(base, end - base),
-            "region.shared / shared-aperture address mismatch at 0x{base:x}"
-        );
-        let kind = if region.shared {
-            WindowKind::Shared
-        } else {
-            WindowKind::Private
-        };
-        ram.add_window(base, (end - base) as usize, kind)?;
-        let bytes = region.bytes();
-        if !bytes.is_empty() {
-            ram.write_gpa(region.start, bytes)?;
-        }
-    }
-    // 2. Architectural bring-up pages (low window), reused from carrick-mem.
-    ram.write_gpa(LINUX_EL0_TRAMPOLINE_BASE, &el0_trampoline_bytes())?;
-    ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
-    // 3. Our sentinel vector (NOT carrick-mem's hvc #2 variant).
-    ram.write_gpa(LINUX_EL1_VECTORS_BASE, &el1_vectors_sentinel_bytes())?;
+    // 1-3. Lay out guest physical RAM: windows + image segments + the
+    //       architectural bring-up pages (shared with execve_into).
+    let ram = GuestRam::build_for_image(image)?;
 
     // 4. Create VM + publish every window as its own KVM memory slot.
     let mut vm = KvmVm::create(image)?;
-    for w in &ram.windows {
-        vm.map_memory(w.base, w.host, w.len, MemPerms::ReadWriteExec)?;
+    for (base, host, len) in ram.windows_for_kvm() {
+        vm.map_memory(base, host, len, MemPerms::ReadWriteExec)?;
     }
     let mut vcpu = vm.add_vcpu()?;
 
@@ -446,7 +508,17 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
     })
 }
 
-fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsError> {
+/// Program the vCPU's system + core registers for `image`: MAIR/TCR/TTBR0/1/
+/// SCTLR/CPACR/VBAR + PSTATE/SPSR/ELR/PC/SP, with NO FEAT_PAN3 workaround (KVM
+/// controls PSTATE, so PAN stays clear so the EL1 sentinel store reaches MMIO).
+///
+/// Shared by both [`bring_up`] (initial image) and
+/// [`crate::trap_engine::KvmTrapEngine::execve_into`] (in-place image
+/// replacement). `execve_into` additionally zeroes x0..x30 before calling this
+/// (Linux execve clears the GPRs); this routine sets only SP/PC/PSTATE among the
+/// core registers, leaving x0..x30 to the caller's zeroing — and resets
+/// TPIDR_EL0 = 0 so the new image's libc re-initialises its thread pointer.
+pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsError> {
     // MAIR_EL1 slot 0 = Normal Inner/Outer WB cacheable (0xFF), as HVF.
     vcpu.set_sys_reg(SysReg::Mair, 0xFF)?;
     // TCR_EL1: identical bootstrap value to the HVF path. T0SZ=
@@ -488,6 +560,13 @@ fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsErr
 
     // VBAR_EL1 -> our sentinel vector page.
     vcpu.set_sys_reg(SysReg::Vbar, LINUX_EL1_VECTORS_BASE)?;
+
+    // TPIDR_EL0 = 0: the EL0 thread pointer starts cleared. On a fresh vCPU
+    // (bring-up) this is already 0; on an execve-into-a-live-vCPU it RESETS a
+    // value the prior image's libc may have installed (Linux execve clears the
+    // thread pointer; the new image's libc re-initialises it via
+    // set_thread_area). Mirrors the HVF execve path (trap.rs:3899-3903).
+    vcpu.set_sys_reg(SysReg::TpidrEl0, 0)?;
 
     // THE PAN DIVERGENCE FROM HVF. Apple HVF forces PSTATE.PAN=1 and the
     // identity tables work around FEAT_PAN3 with AP=01+PXN=1 on user pages.

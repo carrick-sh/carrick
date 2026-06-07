@@ -108,6 +108,41 @@ impl KvmVm {
             next_slot: 0,
         })
     }
+
+    /// Unregister a previously-mapped memory slot by re-issuing
+    /// `KVM_SET_USER_MEMORY_REGION` with `memory_size = 0` — KVM's idiom for
+    /// deleting a slot. Used by
+    /// [`crate::trap_engine::KvmTrapEngine::execve_into`] to tear down the old
+    /// image's slots on the LIVE VM before re-registering the new image's
+    /// windows (in-place remap, no VM teardown).
+    ///
+    /// Does NOT touch `next_slot`; the execve path unmaps all old slots, then
+    /// [`Self::reset_slot_counter`]s and re-registers the new windows from slot 0.
+    pub(crate) fn unmap_memory_slot(&mut self, slot: u32) -> Result<(), OsError> {
+        let region = kvm_userspace_memory_region {
+            slot,
+            guest_phys_addr: 0,
+            memory_size: 0, // size 0 => KVM deletes this slot
+            userspace_addr: 0,
+            flags: 0,
+        };
+        // SAFETY: deleting a slot references no host memory (memory_size = 0);
+        // KVM only validates the slot id and tears down its bookkeeping.
+        unsafe {
+            self.vm
+                .set_user_memory_region(region)
+                .map_err(|e| os_err("KVM_SET_USER_MEMORY_REGION(delete)", e))?;
+        }
+        Ok(())
+    }
+
+    /// Reset the slot allocator to 0 so the next [`HvVm::map_memory`] calls
+    /// re-register from slot 0. Called by `execve_into` after unmapping every
+    /// old slot, so the new image's windows reuse the same slot ids/order the
+    /// fresh VM would have used.
+    pub(crate) fn reset_slot_counter(&mut self) {
+        self.next_slot = 0;
+    }
 }
 
 impl HvVm for KvmVm {

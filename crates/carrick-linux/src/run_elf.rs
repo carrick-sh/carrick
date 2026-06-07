@@ -27,7 +27,10 @@ const SYS_WRITEV: u64 = 66;
 const SYS_EXIT: u64 = 93;
 const SYS_EXIT_GROUP: u64 = 94;
 const SYS_CLONE: u64 = 220; // aarch64 has no `fork`; libc `fork()` -> clone(SIGCHLD)
+const SYS_EXECVE: u64 = 221;
 const SYS_WAIT4: u64 = 260;
+/// `-ENOENT` (Linux). Returned when an `execve` target can't be loaded.
+const NEG_ENOENT: i64 = -2;
 /// `-ENOSYS` (Linux). Returned for any syscall the MVP doesn't service.
 const NEG_ENOSYS: i64 = -38;
 /// `CLONE_VM` — set in `clone`'s flags for thread/vfork creation. The thin shim
@@ -58,6 +61,23 @@ pub fn run_elf_kvm(path: impl AsRef<Path>) -> Result<i32, String> {
                 frame.x1,
                 frame.x2
             );
+        }
+        // execve is special: on SUCCESS the new image must run from its entry,
+        // so the engine repositions the vCPU itself and we must NOT
+        // complete_syscall (that would write x0 and resume past the old svc).
+        // On FAILURE execve returns -errno into x0 like any other syscall.
+        if frame.x8 == SYS_EXECVE {
+            match sys_execve(&mut engine, &frame)? {
+                // Success: image replaced; loop straight back into the new image
+                // (no complete_syscall — there is nothing to return to).
+                None => continue,
+                Some(err) => {
+                    engine
+                        .complete_syscall(err)
+                        .map_err(|e| format!("complete_syscall: {e}"))?;
+                    continue;
+                }
+            }
         }
         let ret: i64 = match frame.x8 {
             SYS_CLOSE => sys_close(&frame),
@@ -103,6 +123,76 @@ fn sys_clone(engine: &mut KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<
         // x0 is already 0 in the child; report 0 so complete_syscall keeps it 0.
         ForkOutcome::Child => Ok(0),
     }
+}
+
+/// `execve(path, argv, envp)` — in-place image replacement (Phase 2, Task 4).
+///
+/// The thin shim runs a single freestanding ELF, so there is no dispatcher /
+/// rootfs to resolve the target through (`carrick-runtime`'s `load_execve_image`
+/// is unavailable here by design — `run_elf.rs` has no `carrick-runtime` dep).
+/// Instead the target is named by an ABSOLUTE HOST PATH the fixture passes in
+/// `x0`: the shim reads that NUL-terminated string out of the (identity-mapped)
+/// guest RAM, loads the second ELF straight off the host filesystem with
+/// `AddressSpace::load_elf`, and calls `engine.execve_into(&new_image)`, which
+/// remaps the live VM's memory slots + reprograms the registers in place.
+///
+/// argv/envp (`x1`/`x2`) are ignored: the freestanding execve targets take no
+/// arguments, and the thin shim builds no Linux initial stack for them (mirrors
+/// the freestanding fixtures the shim already runs, whose `initial_stack_pointer`
+/// is `None`). The full dispatcher path (Task 7) constructs argv/envp/auxv via
+/// the shared `load_execve_image`.
+///
+/// Returns `Ok(None)` on SUCCESS (image replaced; the caller loops straight into
+/// the new image without completing the syscall), or `Ok(Some(-errno))` on
+/// FAILURE (Linux execve semantics: the old image keeps running, x0 = -errno).
+fn sys_execve(
+    engine: &mut KvmTrapEngine,
+    frame: &Aarch64SyscallFrame,
+) -> Result<Option<i64>, String> {
+    let path = match read_guest_cstr(engine, frame.x0) {
+        Ok(p) => p,
+        // A bad path pointer surfaces as EFAULT-ish ENOENT to the guest; the old
+        // image keeps running.
+        Err(_) => return Ok(Some(NEG_ENOENT)),
+    };
+    let new_image = match AddressSpace::load_elf(&path) {
+        Ok(img) => img,
+        // Target missing / not an ELF: Linux execve returns -ENOENT (or ENOEXEC),
+        // and the CALLER keeps running. Report -ENOENT and let the loop resume
+        // the old image past the svc.
+        Err(_) => return Ok(Some(NEG_ENOENT)),
+    };
+    engine
+        .execve_into(&new_image)
+        .map_err(|e| format!("execve_into: {e}"))?;
+    Ok(None)
+}
+
+/// Read a NUL-terminated C string from identity-mapped guest memory starting at
+/// guest-physical `gpa`. Reads in bounded chunks so we don't depend on a known
+/// length, stopping at the first NUL (or a sane cap).
+fn read_guest_cstr(engine: &KvmTrapEngine, gpa: u64) -> Result<String, String> {
+    const CHUNK: usize = 256;
+    const MAX_LEN: usize = 4096; // PATH_MAX; bound the scan
+    let mut bytes = Vec::new();
+    let mut addr = gpa;
+    loop {
+        let chunk = engine
+            .read_guest(addr, CHUNK)
+            .map_err(|e| format!("execve path read: {e}"))?;
+        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..nul]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() >= MAX_LEN {
+            return Err("execve path too long / unterminated".into());
+        }
+        addr = addr
+            .checked_add(CHUNK as u64)
+            .ok_or_else(|| "execve path address overflow".to_string())?;
+    }
+    String::from_utf8(bytes).map_err(|_| "execve path not utf-8".to_string())
 }
 
 /// `close(fd)` — close a host fd.
