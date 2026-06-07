@@ -842,14 +842,25 @@ mod execve_tests {
         engine.set_vreg(0, 0xABCD_0000_0000_1234u128).unwrap();
         engine.set_fpsr(0x0000_0008).unwrap();
         let snap = engine.vcpu.snapshot().unwrap();
-        assert_eq!(snap.vregs[0], 0xABCD_0000_0000_1234u128, "snapshot captures V0");
+        assert_eq!(
+            snap.vregs[0], 0xABCD_0000_0000_1234u128,
+            "snapshot captures V0"
+        );
         assert_eq!(snap.fpsr, 0x0000_0008, "snapshot captures FPSR");
         // Trash live state, then restore from the snapshot.
         engine.set_vreg(0, 0).unwrap();
         engine.set_fpsr(0).unwrap();
         engine.vcpu.restore(&snap).unwrap();
-        assert_eq!(engine.get_vreg(0).unwrap(), 0xABCD_0000_0000_1234u128, "restore recovers V0");
-        assert_eq!(engine.get_fpsr().unwrap(), 0x0000_0008, "restore recovers FPSR");
+        assert_eq!(
+            engine.get_vreg(0).unwrap(),
+            0xABCD_0000_0000_1234u128,
+            "restore recovers V0"
+        );
+        assert_eq!(
+            engine.get_fpsr().unwrap(),
+            0x0000_0008,
+            "restore recovers FPSR"
+        );
     }
 
     #[test]
@@ -863,8 +874,15 @@ mod execve_tests {
             .next_syscall()
             .expect("run to first svc")
             .expect("a syscall frame");
-        assert_eq!(engine.last_syscall_orig_x0, frame.x0, "orig_x0 latched from frame.x0");
-        assert_eq!(engine.last_syscall_nr(), Some(frame.x8), "last_syscall_nr latched from frame.x8");
+        assert_eq!(
+            engine.last_syscall_orig_x0, frame.x0,
+            "orig_x0 latched from frame.x0"
+        );
+        assert_eq!(
+            engine.last_syscall_nr(),
+            Some(frame.x8),
+            "last_syscall_nr latched from frame.x8"
+        );
     }
 
     #[test]
@@ -880,8 +898,14 @@ mod execve_tests {
         let new_image = AddressSpace::load_elf_bytes(TARGET_ELF).expect("load target ELF");
         engine.execve_into(&new_image).expect("execve_into");
         assert_eq!(engine.last_fault_esr, 0, "fault_esr reset across execve");
-        assert_eq!(engine.last_syscall_orig_x0, 0, "orig_x0 reset across execve");
-        assert_eq!(engine.last_syscall_nr, None, "last_syscall_nr reset across execve");
+        assert_eq!(
+            engine.last_syscall_orig_x0, 0,
+            "orig_x0 reset across execve"
+        );
+        assert_eq!(
+            engine.last_syscall_nr, None,
+            "last_syscall_nr reset across execve"
+        );
     }
 
     #[test]
@@ -894,18 +918,43 @@ mod execve_tests {
         let mut engine = engine_for_with_stack(INITIAL_ELF);
         // Run to the guest's first svc so the engine is in a post-syscall state
         // (ELR_EL1 = svc+4, SPSR_EL1 = EL0t, tracking fields populated).
-        engine.next_syscall().expect("first svc").expect("a syscall frame");
+        engine
+            .next_syscall()
+            .expect("first svc")
+            .expect("a syscall frame");
 
         let handler = 0x4_0000u64;
         let sp_before = engine.get_reg(Reg::Sp).unwrap();
         engine
-            .inject_signal(libc::SIGUSR1, handler, 0, None, None, None, 0, None, None, false)
+            .inject_signal(
+                libc::SIGUSR1,
+                handler,
+                0,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                false,
+            )
             .expect("inject_signal");
 
         // Syscall path (interrupted_pc = None) redirects ELR_EL1, not live PC.
-        assert_eq!(engine.get_reg(Reg::ElrEl1).unwrap(), handler, "handler entry on ELR_EL1");
-        assert_eq!(engine.get_reg(Reg::X(0)).unwrap(), libc::SIGUSR1 as u64, "x0 = signum");
-        assert!(engine.get_reg(Reg::Sp).unwrap() < sp_before, "frame pushed: SP_EL0 moved down");
+        assert_eq!(
+            engine.get_reg(Reg::ElrEl1).unwrap(),
+            handler,
+            "handler entry on ELR_EL1"
+        );
+        assert_eq!(
+            engine.get_reg(Reg::X(0)).unwrap(),
+            libc::SIGUSR1 as u64,
+            "x0 = signum"
+        );
+        assert!(
+            engine.get_reg(Reg::Sp).unwrap() < sp_before,
+            "frame pushed: SP_EL0 moved down"
+        );
     }
 
     #[test]
@@ -916,7 +965,10 @@ mod execve_tests {
             return;
         }
         let mut engine = engine_for_with_stack(INITIAL_ELF);
-        engine.next_syscall().expect("first svc").expect("a syscall frame");
+        engine
+            .next_syscall()
+            .expect("first svc")
+            .expect("a syscall frame");
 
         let saved_elr = engine.get_reg(Reg::ElrEl1).unwrap(); // pre-signal resume PC
         let saved_sp = engine.get_reg(Reg::Sp).unwrap();
@@ -925,15 +977,43 @@ mod execve_tests {
         let sigmask = 0x0000_0000_0000_FF00u64;
 
         engine
-            .inject_signal(libc::SIGUSR1, 0x4_0000, 0, None, None, None, sigmask, None, None, false)
+            .inject_signal(
+                libc::SIGUSR1,
+                0x4_0000,
+                0,
+                None,
+                None,
+                None,
+                sigmask,
+                None,
+                None,
+                false,
+            )
             .expect("inject_signal");
         // Simulate the handler clobbering V0 before rt_sigreturn.
         engine.set_vreg(0, 0).unwrap();
 
-        let got_mask = engine.restore_from_sigframe().expect("restore_from_sigframe");
-        assert_eq!(got_mask, sigmask, "restore returns the SAVED SIGMASK (not saved_pc)");
-        assert_eq!(engine.get_reg(Reg::ElrEl1).unwrap(), saved_elr, "resume PC restored");
-        assert_eq!(engine.get_reg(Reg::Sp).unwrap(), saved_sp, "SP_EL0 restored");
-        assert_eq!(engine.get_vreg(0).unwrap(), v0_before, "V0 restored from the frame");
+        let got_mask = engine
+            .restore_from_sigframe()
+            .expect("restore_from_sigframe");
+        assert_eq!(
+            got_mask, sigmask,
+            "restore returns the SAVED SIGMASK (not saved_pc)"
+        );
+        assert_eq!(
+            engine.get_reg(Reg::ElrEl1).unwrap(),
+            saved_elr,
+            "resume PC restored"
+        );
+        assert_eq!(
+            engine.get_reg(Reg::Sp).unwrap(),
+            saved_sp,
+            "SP_EL0 restored"
+        );
+        assert_eq!(
+            engine.get_vreg(0).unwrap(),
+            v0_before,
+            "V0 restored from the frame"
+        );
     }
 }
