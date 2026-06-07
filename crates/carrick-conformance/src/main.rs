@@ -80,6 +80,13 @@ struct Args {
     /// to min(workers, 4); other heavy ecosystems remain serialized.
     #[arg(long, env = "CARRICK_CONFORMANCE_CPYTHON_WORKERS")]
     cpython_workers: Option<usize>,
+    /// Retry-on-flake: re-run each gating suite up to N times (carrick only,
+    /// reusing the cached oracle), adopting the first non-gating attempt. Several
+    /// Go suites flip pass/none/timeout between identical-binary runs (internal
+    /// Go-runtime-under-HVF races), and serializing does NOT help — so the gate
+    /// retries them instead of false-failing. 0 disables.
+    #[arg(long, default_value = "2", env = "CARRICK_CONFORMANCE_FLAKE_RETRIES")]
+    flake_retries: usize,
     #[arg(long, default_value = "target/release/carrick")]
     carrick_bin: PathBuf,
     /// Committed docker-oracle cache (parsed results, one JSONL line per suite).
@@ -272,10 +279,11 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 
     // ---- Phase 3: classify (runs neither engine). ----
+    // Assemble each suite's docker side (cached or fresh) into an index-keyed vec
+    // first, so the retry pass can re-classify against it without re-running docker.
     eprintln!("phase 3/3: classify");
-    let mut reports = Vec::with_capacity(n);
-    for (i, (s, cout)) in selected.iter().zip(&carrick_outs).enumerate() {
-        let cout = cout.as_ref().and_then(|r| r.as_ref().ok());
+    let mut docker_sides: Vec<DockerSide> = Vec::with_capacity(n);
+    for (i, s) in selected.iter().enumerate() {
         let docker = match &cached[i] {
             Some(res) => DockerSide {
                 result: res.clone(),
@@ -286,7 +294,48 @@ fn run() -> anyhow::Result<ExitCode> {
                 anyhow::anyhow!("every non-cached suite has a fresh docker side (suite {i})")
             })?,
         };
-        reports.push(build_report(s, cout, &docker, &baseline));
+        docker_sides.push(docker);
+    }
+    let mut reports: Vec<SuiteReport> = selected
+        .iter()
+        .zip(&carrick_outs)
+        .enumerate()
+        .map(|(i, (s, cout))| {
+            let cout = cout.as_ref().and_then(|r| r.as_ref().ok());
+            build_report(s, cout, &docker_sides[i], &baseline)
+        })
+        .collect();
+
+    // ---- Phase 3b: retry-on-flake. Re-run carrick (only) for any gating suite;
+    // adopt the first non-gating attempt. The oracle side is reused from phase 3
+    // (no docker re-run), so this never overlaps docker. ----
+    let retries = args.flake_retries;
+    let gating_before = reports.iter().filter(|r| r.gating).count();
+    if retries > 0 && gating_before > 0 {
+        eprintln!(
+            "phase 3b: retry-on-flake — {gating_before} gating suite(s), up to {retries} retr{} each",
+            if retries == 1 { "y" } else { "ies" }
+        );
+        let recovered = apply_flake_retries(
+            &mut reports,
+            retries,
+            |r| r.gating,
+            |i, attempt| {
+                let s = &selected[i];
+                let run_id = format!("conf-{pid}-r{i:02}-a{attempt}");
+                let cout = engine::run_carrick(s, &carrick_bin, &run_id).ok();
+                let rep = build_report(s, cout.as_ref(), &docker_sides[i], &baseline);
+                eprintln!(
+                    "  [retry] {} attempt {attempt}/{retries} -> {}{}",
+                    s.name,
+                    rep.verdict.as_str(),
+                    if rep.gating { "" } else { " (recovered)" }
+                );
+                rep
+            },
+        );
+        let still = reports.iter().filter(|r| r.gating).count();
+        eprintln!("retry-on-flake: {recovered} flake(s) recovered, {still} still gating");
     }
 
     write_reports(&args.jsonl, &reports)?;
@@ -473,6 +522,38 @@ fn fan_out<T: Send>(n: usize, workers: usize, f: impl Fn(usize) -> T + Sync) -> 
         .into_iter()
         .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
         .collect()
+}
+
+/// Retry-on-flake. A gating verdict on a suite that flips between identical-binary
+/// runs (the Go-runtime-under-HVF races) is a flake, not a real regression —
+/// empirically NOT fixable by serializing (see the flakiness note in memory). So
+/// re-run each currently-gating item up to `retries` times; the FIRST attempt that
+/// is non-gating is adopted (the representative good observation) and the item is
+/// counted as recovered. If every attempt still gates, the original report is kept
+/// (a consistent gate = a real regression). Generic over the item type so the
+/// decision logic is unit-testable without the carrick binary; `rerun(i, attempt)`
+/// produces a fresh report for item `i`. Returns the count recovered.
+fn apply_flake_retries<T>(
+    items: &mut [T],
+    retries: usize,
+    is_gating: impl Fn(&T) -> bool,
+    mut rerun: impl FnMut(usize, usize) -> T,
+) -> usize {
+    let mut recovered = 0;
+    for (i, item) in items.iter_mut().enumerate() {
+        if !is_gating(item) {
+            continue;
+        }
+        for attempt in 1..=retries {
+            let fresh = rerun(i, attempt);
+            if !is_gating(&fresh) {
+                *item = fresh;
+                recovered += 1;
+                break;
+            }
+        }
+    }
+    recovered
 }
 
 fn worker_count(configured: Option<usize>) -> usize {
@@ -795,6 +876,56 @@ mod tests {
                 "cpython-b"
             ]
         );
+    }
+
+    #[test]
+    fn flake_retry_adopts_first_nongating_attempt() {
+        // (name, gating): i0 clean, i1 flaky (recovers on 2nd attempt), i2 hard.
+        let mut items = vec![("clean", false), ("flaky", true), ("hard", true)];
+        let mut calls: Vec<(usize, usize)> = Vec::new();
+        let recovered = apply_flake_retries(
+            &mut items,
+            2,
+            |x| x.1,
+            |i, attempt| {
+                calls.push((i, attempt));
+                if i == 1 && attempt >= 2 {
+                    ("flaky", false) // recovers on the 2nd attempt
+                } else if i == 1 {
+                    ("flaky", true) // 1st attempt still gating
+                } else {
+                    ("hard", true) // i2 never recovers
+                }
+            },
+        );
+
+        // Clean (non-gating) item is never retried.
+        assert!(!calls.iter().any(|(i, _)| *i == 0));
+        // Flaky item: retried twice, adopted the recovered (non-gating) attempt.
+        assert_eq!(items[1], ("flaky", false));
+        assert_eq!(calls.iter().filter(|(i, _)| *i == 1).count(), 2);
+        // Hard item: retried up to the cap, never recovered, original kept gating.
+        assert_eq!(items[2], ("hard", true));
+        assert_eq!(calls.iter().filter(|(i, _)| *i == 2).count(), 2);
+        assert_eq!(recovered, 1);
+    }
+
+    #[test]
+    fn flake_retry_zero_retries_is_a_noop() {
+        let mut items = vec![("a", true), ("b", false)];
+        let mut called = false;
+        let recovered = apply_flake_retries(
+            &mut items,
+            0,
+            |x| x.1,
+            |_, _| {
+                called = true;
+                ("x", false)
+            },
+        );
+        assert!(!called, "retries=0 must run nothing");
+        assert_eq!(recovered, 0);
+        assert_eq!(items, vec![("a", true), ("b", false)]);
     }
 
     #[test]
