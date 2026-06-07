@@ -769,6 +769,28 @@ impl AddressSpace {
         self
     }
 
+    /// Ensure an `AT_BASE` auxv entry is present (replacing any existing one).
+    ///
+    /// Used for the Rosetta redirect of a *dynamic* x86_64 target: carrick loads
+    /// Apple's static `rosetta` interpreter as the image, so the auxv it builds
+    /// describes a static binary and omits AT_BASE. Apple's Rosetta then builds
+    /// the inner x86 auxv for the translated program by *forwarding* its own
+    /// auxv's entry set — overwriting the AT_BASE *value* with the real load base
+    /// of the x86 dynamic linker (ld-musl / ld-linux) it maps, but only EMITTING
+    /// the entry at all when one is present to forward. Without AT_BASE musl's
+    /// dynamic linker takes its "invoked as a command" path and dereferences a
+    /// null pointer (glibc's ld self-locates, so it tolerated the gap — which is
+    /// why glibc-dynamic worked but musl-dynamic crashed). The `base` value here
+    /// is a placeholder that Rosetta overwrites; it only needs the slot present.
+    pub fn with_auxv_base(mut self, base: u64) -> Self {
+        self.linux_auxv
+            .retain(|entry| entry.a_type != crate::linux_abi::LINUX_AT_BASE);
+        self.linux_auxv
+            .push(LinuxAuxvEntry::new(crate::linux_abi::LINUX_AT_BASE, base));
+        self.linux_auxv_image.clear();
+        self
+    }
+
     pub fn entry(&self) -> u64 {
         self.entry
     }
