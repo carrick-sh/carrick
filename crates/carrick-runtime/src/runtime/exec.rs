@@ -40,9 +40,13 @@ pub(super) fn load_execve_image(
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style), so a guest
     // `execve` of a further x86_64 image (a child process, a shell spawning a
     // tool) is translated too — not just the initial container entrypoint.
+    let mut needs_at_base = false;
     let (raw_bytes, argv) = match maybe_redirect_to_rosetta(&path, &raw_bytes, &argv) {
         None => (raw_bytes, argv),
-        Some(Ok((rosetta_bytes, new_argv))) => (rosetta_bytes, new_argv),
+        Some(Ok(redirect)) => {
+            needs_at_base = redirect.target_is_dynamic;
+            (redirect.interpreter_bytes, redirect.argv)
+        }
         Some(Err(errno)) => return Err(errno),
     };
     let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
@@ -60,8 +64,11 @@ pub(super) fn load_execve_image(
             a.with_el1_vectors()
         }
     };
-    let image = raw
-        .with_vdso_auxv(vdso_enabled_for_debug())
+    let mut staged = raw.with_vdso_auxv(vdso_enabled_for_debug());
+    if needs_at_base {
+        staged = staged.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
+    }
+    let image = staged
         .with_el0_trampoline()
         .and_then(vectors_and_id)
         .and_then(|a| a.with_stage1_page_tables())
