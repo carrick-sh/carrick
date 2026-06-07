@@ -1469,10 +1469,20 @@ mod tests {
     // THREAD_PENDING map is keyed by disjoint high tids per test.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Open a fresh pump wake pipe for a unit test. The pump pipe is normally
+    /// created by the signal-pump thread (`pump_install_pipe`), which does not
+    /// run in unit tests, so tests that assert on pump-pipe readability must
+    /// open it themselves rather than depend on another test having done so
+    /// (libtest collection order is not stable).
+    fn ensure_pump_pipe_for_test() {
+        let _ = pump_install_pipe();
+    }
+
     #[test]
     fn waiter_and_pump_signal_pipes_are_distinct() {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
+        ensure_pump_pipe_for_test();
         let waiter_read = pending_pipe_read_fd();
         let pump_read = pump_pipe_read_fd();
 
@@ -1564,6 +1574,7 @@ mod tests {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
         PROC_PENDING.store(0, Ordering::SeqCst);
+        ensure_pump_pipe_for_test();
 
         publish_pending(LINUX_SIGINT);
         assert!(pipe_is_readable(pending_pipe_read_fd()));
@@ -1631,6 +1642,7 @@ mod tests {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
         PROC_PENDING.store(0, Ordering::SeqCst);
+        ensure_pump_pipe_for_test();
 
         let target_tid = 900_010;
         let other_tid = 900_011;
