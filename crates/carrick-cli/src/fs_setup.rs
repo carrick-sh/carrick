@@ -23,22 +23,23 @@
 //!   rootfs layer is dropped (`drop_rootfs_layer`) so reads, `execve`, and the
 //!   ELF interpreter loader all resolve against the authoritative disk overlay.
 //!
-//! ## Default selection: case-sensitivity is the deciding fact
+//! ## Default selection: `host` is the default
 //!
-//! Linux paths assume a case-sensitive filesystem; the stock macOS boot volume
-//! is case-INsensitive. `host` is the secure-by-default, real-semantics choice,
-//! so the default (`carrick_runtime::apfs::default_writable_backend_kind`) probes
-//! the *exact* scratch root the host backend will use —
-//! `apfs::preferred_scratch_root`, which prefers the
-//! dedicated case-sensitive `/Volumes/carrick` volume — and chooses `host` iff
-//! that root is case-sensitive, else falls back to `memory` with a warning.
-//! Probing the real root (not a hardcoded `~/.carrick`) matters: the dedicated
-//! volume can be case-sensitive while `$HOME` is not, and probing the wrong path
-//! would wrongly downgrade to memory.
+//! `host` is the secure-by-default, real-semantics choice. The default
+//! (`carrick_runtime::apfs::default_writable_backend_kind`) returns `host`
+//! unconditionally on stock builds. The `memory` backend is opt-in: compile
+//! with `--features fs-memory` to enable it. On a `fs-memory`-enabled build the
+//! default probes the *exact* scratch root the host backend will use —
+//! `apfs::preferred_scratch_root`, which prefers the dedicated case-sensitive
+//! `/Volumes/carrick` volume — and chooses `host` iff that root is
+//! case-sensitive, else falls back to `memory` with a warning. On a default
+//! (feature-off) build `host` is always the default and `--fs memory` is
+//! rejected at parse time.
 //!
-//! Both fall-back paths are non-fatal by design: a failed `--fs host` seed, or
-//! an unconstructable scratch dir, degrades to the in-memory backend with a
-//! warning rather than failing the run.
+//! Fall-back behaviour for a failed `--fs host` seed or an unconstructable
+//! scratch dir depends on the feature flag: with `fs-memory`, it degrades to
+//! the in-memory backend with a warning; without it (the default) it fails with
+//! an actionable error ("host, then error").
 //!
 //! ## Guest baseline seeding
 //!
@@ -76,13 +77,15 @@ fn host_failure_fallback(reason: &str) -> Result<(Box<dyn FsBackend>, FsBackendK
 
 /// Resolve `--fs <memory|host>` into a concrete `Box<dyn FsBackend>`
 /// and install it on the dispatcher. When the user did not pass an
-/// explicit `--fs`, the default is `host` iff the scratch root sits
-/// on a case-sensitive volume (the only place Linux semantics survive
-/// intact) and `memory` otherwise, with a stderr warning.
+/// explicit `--fs`, the default is `host` (always, on stock builds;
+/// on `fs-memory`-enabled builds it falls back to `memory` on
+/// case-insensitive volumes with a stderr warning).
 ///
 /// If `--fs host` is requested but the cap-std scratch directory
-/// cannot be constructed (e.g. `HOME` is unwritable) we fall back to
-/// the in-memory backend with a warning rather than failing the run.
+/// cannot be constructed (e.g. `HOME` is unwritable): with the
+/// `fs-memory` feature we fall back to the in-memory backend with a
+/// warning; without it (the default) we fail with an actionable error
+/// ("host, then error").
 pub(crate) fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
     fs: Option<FsBackendKind>,
