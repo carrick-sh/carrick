@@ -919,8 +919,28 @@ pub mod host_signal {
     pub fn ensure_host_handler(_sig: i32) {}
     pub fn set_host_ignore(_sig: i32) {}
     pub fn set_host_default(_linux_signum: i32) {}
-    pub fn take_pending_in_for(_tid: i32, _wait_set: u64) -> i32 {
-        0
+    /// Drain a pending signal for `tid` that intersects `wait_set` (bit
+    /// `signum-1`), clearing only the lowest matching bit and leaving the rest
+    /// pending. Consulted by `rt_sigtimedwait`/`sigwait` (`dispatch/signal.rs`)
+    /// after the dispatcher's own pending store: an UNBLOCKED async-published
+    /// signal (e.g. a wall-clock timer's SIGALRM that the program also blocks +
+    /// awaits synchronously) lands in this per-thread table, not the dispatcher's,
+    /// so the synchronous wait must look here too. Returns `NO_PENDING_SIGNAL`
+    /// (0) if nothing in the table matches `wait_set`.
+    pub fn take_pending_in_for(tid: i32, wait_set: u64) -> i32 {
+        let mut guard = lock_pending();
+        if let Some(mask) = guard.get_mut(&tid) {
+            let in_set = *mask & wait_set;
+            if in_set != 0 {
+                let signum = in_set.trailing_zeros() as i32 + 1;
+                *mask &= !pending_bit(signum);
+                if *mask == 0 {
+                    guard.remove(&tid);
+                }
+                return signum;
+            }
+        }
+        NO_PENDING_SIGNAL
     }
     pub fn xsig_enqueue(
         _target_host: i32,
