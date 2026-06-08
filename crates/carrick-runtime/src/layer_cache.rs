@@ -177,6 +177,9 @@ fn same_device(a: &Path, b: &Path) -> Option<bool> {
 /// aborts ("/bin is a directory, but should be a symbolic link"), so `apt
 /// full-upgrade` fails. NOFOLLOW is a no-op for directory sources (they clone
 /// recursively with their inner symlinks preserved either way).
+// `clonefile(2)` is macOS-only; the sole consumer below is `#[cfg(macos)]`, so
+// this flag is dead on other targets.
+#[allow(dead_code)]
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
 fn clonefile(src: &Path, dst: &Path) -> std::io::Result<()> {

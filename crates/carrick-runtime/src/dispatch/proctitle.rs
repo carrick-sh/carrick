@@ -21,6 +21,13 @@
 //! talking to `launchservicesd` over Mach, wedging the guest's vCPU. The
 //! argv/environ stack overwrite is fork-safe (the heap copy survives fork;
 //! the stack bytes are private per process after fork).
+//
+// On non-macOS targets `init`/`set_host_process_name` are inert stubs, so the
+// label machinery (`RUN_ID`, `run_id`, `proc_label`) has no caller in the built
+// binary and clippy flags it as dead. It is exercised on macOS (and by the unit
+// tests on every platform), so allow dead_code module-wide rather than removing
+// or cfg-gating the still-tested helpers.
+#![allow(dead_code)]
 
 use std::sync::OnceLock;
 
