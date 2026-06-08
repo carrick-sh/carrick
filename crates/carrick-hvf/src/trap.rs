@@ -176,10 +176,11 @@ use serde::Serialize;
 mod sysreg;
 use sysreg::*;
 
+// Process-wide PROT_NONE bookkeeping is a neutral-core abstraction shared with
+// every other backend (KVM included) — see carrick_mem::protections. Both hold
+// it as `Arc<MemoryProtections>` and clone it into each sibling vCPU thread.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod memprot;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use memprot::MemoryProtections;
+use carrick_mem::protections::MemoryProtections;
 
 // SyscallTrap/TrapError/ForkOutcome moved down into the carrick-hal leaf crate
 // (the runtime↔engine contract is platform-agnostic). Re-export them here so

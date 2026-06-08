@@ -3,12 +3,15 @@
 //! tiny EL1 vector whose lower-EL-sync slot STORES TO A SENTINEL gpa (the MMIO
 //! trap vehicle) instead of HVF's `hvc #2`, and program the system registers
 //! WITHOUT the Apple-Silicon FEAT_PAN3 / PSTATE.PAN=1 workaround.
+use std::sync::Arc;
+
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_EL1_VECTORS_SIZE,
     LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes, stage1_identity_page_tables,
     va_in_shared_aperture,
 };
+use carrick_mem::protections::MemoryProtections;
 
 use crate::kvm::{KvmVcpu, KvmVm};
 
@@ -234,15 +237,24 @@ struct Window {
 /// host-MAP_SHARED fork-coherence model is the full-backend Phase D work).
 pub struct GuestRam {
     windows: Vec<Window>,
-    /// Sorted, merged guest-physical ranges the guest has made PROT_NONE
-    /// (mmap(PROT_NONE)/mprotect/munmap). carrick backs the whole arena with
-    /// accessible host memory, so a PROT_NONE buffer is otherwise readable on
-    /// the syscall path — a guest passing such a buffer to a syscall must
-    /// instead see EFAULT. This is the HOST-SIDE syscall-read check only
-    /// (cheap, no page tables); making the GUEST itself fault mid-EL0 needs
-    /// stage-1 edits + signal injection (Phase D), so `protect_range`/
-    /// `unmap_range` stay no-ops for now.
-    no_access: Vec<(u64, u64)>,
+    /// Guest-physical ranges the guest has made PROT_NONE (mmap(PROT_NONE)/
+    /// mprotect/munmap). carrick backs the whole arena with accessible host
+    /// memory, so a PROT_NONE buffer is otherwise readable on the syscall path —
+    /// a guest passing such a buffer to a syscall must instead see EFAULT. This
+    /// is the HOST-SIDE syscall-read check only (cheap, no page tables); making
+    /// the GUEST itself fault mid-EL0 needs stage-1 edits + signal injection
+    /// (Phase D), so `protect_range`/`unmap_range` stay no-ops for now.
+    ///
+    /// SHARED (`Arc`) with every sibling vCPU thread's `GuestRam`, exactly like
+    /// HVF: a `clone(CLONE_VM)` thread group runs on one VM, so a `mprotect`
+    /// made by any thread MUST be observed by every other thread's syscall-path
+    /// checks. A per-thread copy diverges — one thread reserves a region
+    /// PROT_NONE, another commits it, and the first then wrongly EFAULTs a valid
+    /// buffer there (the Go-on-KVM `futexwakeup … EFAULT` crash). A `fork(2)`
+    /// child gets an INDEPENDENT copy (the COW of the whole process duplicates
+    /// the `Arc`'s target); `execve` starts fresh. The neutral-core type is
+    /// shared with HVF: [`carrick_mem::protections::MemoryProtections`].
+    protections: Arc<MemoryProtections>,
     /// Whether this `GuestRam` OWNS its window mmaps (and must `munmap` them on
     /// drop). `true` for the initial / fork-child / execve RAM. `false` for a
     /// `clone(CLONE_THREAD)` sibling's view (see [`Self::from_shared_windows`]):
@@ -287,67 +299,29 @@ impl GuestRam {
     fn new() -> Self {
         Self {
             windows: Vec::new(),
-            no_access: Vec::new(),
+            protections: Arc::new(MemoryProtections::default()),
             owns_windows: true,
         }
     }
 
-    /// Whether [gpa, gpa+len) overlaps any PROT_NONE range (so a syscall buffer
-    /// there must fault with EFAULT). Mirrors carrick-hvf's `range_no_access`.
-    pub(crate) fn range_no_access(&self, gpa: u64, len: usize) -> bool {
-        let end = gpa.saturating_add(len as u64);
-        if end <= gpa {
-            return false;
-        }
-        let idx = self.no_access.partition_point(|&(_, e)| e <= gpa);
-        self.no_access
-            .get(idx)
-            .is_some_and(|&(s, e)| gpa < e && s < end)
+    /// The shared PROT_NONE bookkeeping handle, cloned into a `clone(CLONE_VM)`
+    /// sibling so it observes this thread's `mprotect`s (and vice versa).
+    pub(crate) fn shared_protections(&self) -> Arc<MemoryProtections> {
+        Arc::clone(&self.protections)
     }
 
-    /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range, keeping
-    /// `no_access` sorted and merged. Add merges adjacent/overlapping ranges;
-    /// clear subtracts the interval (splitting a straddled range). Mirrors
-    /// carrick-hvf's `MemoryProtections::set_no_access`.
-    pub(crate) fn set_no_access(&mut self, gpa: u64, len: usize, no_access: bool) {
-        let end = gpa.saturating_add(len as u64);
-        if end <= gpa {
-            return;
-        }
-        if no_access {
-            self.no_access.push((gpa, end));
-            self.no_access.sort_by_key(|&(s, _)| s);
-            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.no_access.len());
-            for (s, e) in std::mem::take(&mut self.no_access) {
-                if let Some((_, last_end)) = merged.last_mut()
-                    && s <= *last_end
-                {
-                    *last_end = (*last_end).max(e);
-                    continue;
-                }
-                merged.push((s, e));
-            }
-            self.no_access = merged;
-            return;
-        }
-        let mut next = Vec::with_capacity(self.no_access.len());
-        for (s, e) in std::mem::take(&mut self.no_access) {
-            if gpa <= s && end >= e {
-                continue; // fully cleared
-            }
-            if end <= s || gpa >= e {
-                next.push((s, e)); // disjoint
-                continue;
-            }
-            if s < gpa {
-                next.push((s, gpa)); // left remainder
-            }
-            if end < e {
-                next.push((end, e)); // right remainder
-            }
-        }
-        next.sort_by_key(|&(s, _)| s);
-        self.no_access = next;
+    /// Whether [gpa, gpa+len) overlaps any PROT_NONE range (so a syscall buffer
+    /// there must fault with EFAULT). Delegates to the SHARED, process-wide
+    /// [`MemoryProtections`] so a sibling thread's `mprotect` is visible here.
+    pub(crate) fn range_no_access(&self, gpa: u64, len: usize) -> bool {
+        self.protections.range_no_access(gpa, len)
+    }
+
+    /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range on the
+    /// SHARED bookkeeping (interior-mutable, so `&self`): the change is observed
+    /// by every sibling vCPU thread's syscall-path access checks.
+    pub(crate) fn set_no_access(&self, gpa: u64, len: usize, no_access: bool) {
+        self.protections.set_no_access(gpa, len, no_access);
     }
 
     /// mmap `len` bytes (lazy, `MAP_NORESERVE`) to back guest-physical
@@ -566,6 +540,50 @@ impl GuestRam {
         Ok(out)
     }
 
+    /// Diagnostic: describe why an access at `[gpa, gpa+len)` would (not) resolve
+    /// — the located window or the nearest windows, plus no_access state. Gated
+    /// callers only (CARRICK_MEM_DEBUG); allocates, so never on the hot path.
+    pub(crate) fn debug_access(&self, gpa: u64, len: usize) -> String {
+        let located = self.locate(gpa, len).is_some();
+        let no_access = self.range_no_access(gpa, len);
+        // The PROT_NONE intervals straddling (or within ~16 MiB of) the access,
+        // so a stale-reserve vs genuine-uncommitted range is distinguishable.
+        let near: Vec<String> = self
+            .protections
+            .snapshot()
+            .into_iter()
+            .filter(|&(s, e)| e > gpa.saturating_sub(0x100_0000) && s < gpa.saturating_add(0x100_0000))
+            .map(|(s, e)| format!("[0x{s:x}..0x{e:x})"))
+            .collect();
+        let mut wins: Vec<String> = self
+            .windows
+            .iter()
+            .map(|w| {
+                format!(
+                    "[0x{:x}..0x{:x} {:?}{}]",
+                    w.base,
+                    w.base + w.len as u64,
+                    w.kind,
+                    w.slot_gpa
+                        .map(|g| format!(" slot_gpa=0x{g:x}"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        wins.sort();
+        format!(
+            "gpa=0x{gpa:x} len={len} located={located} no_access={no_access} \
+             no_access_ranges_near={} windows({})={}",
+            if near.is_empty() {
+                "(none)".to_string()
+            } else {
+                near.join(" ")
+            },
+            self.windows.len(),
+            wins.join(" ")
+        )
+    }
+
     /// Host virtual address of the `len`-byte span at guest-physical `gpa`,
     /// regardless of window kind, or `None` if it does not lie wholly within one
     /// backed window. Used by the live stage-1 page-table editor to `sync_to_host`
@@ -727,7 +745,15 @@ impl GuestRam {
     /// starts empty: the sibling shares the parent's address space, but the
     /// HOST-SIDE PROT_NONE bookkeeping is per-engine (a future Phase-4 concern);
     /// the MVP threads fixture touches no PROT_NONE buffers.
-    pub(crate) fn from_shared_windows(descs: &[WindowDesc]) -> Self {
+    /// Build a NON-OWNING sibling view over the parent's window descriptors,
+    /// SHARING the parent's PROT_NONE bookkeeping (`protections`) so the sibling
+    /// observes the parent's (and every other sibling's) `mprotect`s — and they
+    /// observe its. A fresh per-thread set would diverge (the Go-on-KVM EFAULT
+    /// crash); see [`MemoryProtections`]'s sharing contract.
+    pub(crate) fn from_shared_windows(
+        descs: &[WindowDesc],
+        protections: Arc<MemoryProtections>,
+    ) -> Self {
         let windows = descs
             .iter()
             .map(|d| Window {
@@ -740,7 +766,7 @@ impl GuestRam {
             .collect();
         Self {
             windows,
-            no_access: Vec::new(),
+            protections,
             owns_windows: false,
         }
     }

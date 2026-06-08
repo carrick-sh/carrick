@@ -472,6 +472,7 @@ dependencies = [
  "carrick-guest-mem",
  "goblin",
  "libc",
+ "parking_lot",
  "serde",
  "thiserror",
  "zerocopy",

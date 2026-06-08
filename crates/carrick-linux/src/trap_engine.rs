@@ -10,6 +10,7 @@ use carrick_hal::{
     ForkOutcome, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, SyscallTrap, TrapError, VcpuExit,
 };
 use carrick_mem::memory::AddressSpace;
+use carrick_mem::protections::MemoryProtections;
 
 use crate::fork::{VcpuSnapshot, seed_sibling_snapshot};
 use crate::guest_setup::{
@@ -177,31 +178,47 @@ impl KvmTrapEngine {
 /// yet wired: `repoint_private` (the MAP_FIXED|MAP_PRIVATE overlay), and a
 /// stage-1 TLB flush so re-protecting an ALREADY-accessed page takes effect
 /// (the EL1-vector TLBI is the remaining Phase-D piece — fresh pages need none).
+/// Gated (CARRICK_MEM_DEBUG) diagnostic for a failed syscall-path guest access:
+/// prints the address, length, and the calling thread's window view so a
+/// cross-thread translation miss (a stale per-sibling `GuestRam` snapshot) is
+/// visible. No-op unless the env var is set, so it never costs the hot path.
+fn mem_debug(op: &str, ram: &GuestRam, address: u64, length: usize) {
+    if std::env::var_os("CARRICK_MEM_DEBUG").is_some() {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        eprintln!(
+            "[MEMDBG tid={tid} {op} FAIL] {}",
+            ram.debug_access(address, length)
+        );
+    }
+}
+
 impl GuestMemory for KvmTrapEngine {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         // A syscall buffer overlapping a PROT_NONE range faults with EFAULT,
         // even though the host backing is accessible (C2 host-side check).
         if self.ram.range_no_access(address, length) {
+            mem_debug("read", &self.ram, address, length);
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        self.ram
-            .read(address, length)
-            .map_err(|_| MemoryError::OutOfBounds { address, length })
+        self.ram.read(address, length).map_err(|_| {
+            mem_debug("read", &self.ram, address, length);
+            MemoryError::OutOfBounds { address, length }
+        })
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         if self.ram.range_no_access(address, bytes.len()) {
+            mem_debug("write", &self.ram, address, bytes.len());
             return Err(MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
             });
         }
-        self.ram
-            .write_gpa(address, bytes)
-            .map_err(|_| MemoryError::OutOfBounds {
-                address,
-                length: bytes.len(),
-            })
+        let len = bytes.len();
+        self.ram.write_gpa(address, bytes).map_err(|_| {
+            mem_debug("write", &self.ram, address, len);
+            MemoryError::OutOfBounds { address, length: len }
+        })
     }
 
     /// Record/clear a PROT_NONE range so syscall buffers there fault (EFAULT).
@@ -814,6 +831,11 @@ pub struct KvmSiblingSpec {
     /// otherwise two managers over one backing would diverge (each holds its own
     /// in-memory descriptor copy). Mirrors HVF sharing the `page_tables` Arc.
     page_tables: Arc<Mutex<Option<carrick_mem::page_table::PageTableManager>>>,
+    /// The parent's PROT_NONE bookkeeping, SHARED (Arc clone) so the sibling's
+    /// syscall-path access checks observe the parent's (and every sibling's)
+    /// `mprotect(PROT_NONE)`. Mirrors HVF sharing its `protections` Arc. Carried
+    /// into the sibling's `GuestRam` via `from_shared_windows`.
+    protections: Arc<MemoryProtections>,
 }
 
 impl carrick_hal::RegAccess for KvmTrapEngine {
@@ -884,6 +906,9 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             // Share the SAME page-table editor (Arc clone): the sibling edits the
             // SAME backing through the SAME manager.
             page_tables: Arc::clone(&self.page_tables),
+            // Share the SAME PROT_NONE bookkeeping so the sibling observes the
+            // parent's mprotect(PROT_NONE) (and vice versa) on the syscall path.
+            protections: self.ram.shared_protections(),
         })
     }
 
@@ -904,8 +929,9 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         // A NON-OWNING view over the parent's host windows: the sibling reads/
         // writes syscall buffers through the SAME backing but NEVER munmaps it
-        // (the owning parent frees it at process exit).
-        let ram = GuestRam::from_shared_windows(&spec.windows);
+        // (the owning parent frees it at process exit). It SHARES the parent's
+        // PROT_NONE bookkeeping so cross-thread mprotect is coherent.
+        let ram = GuestRam::from_shared_windows(&spec.windows, Arc::clone(&spec.protections));
         Ok(Self {
             vm,
             vcpu,
@@ -916,7 +942,8 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
-            // Share the parent's page-table editor (same VM, same backing).
+            // Share the parent's page-table editor (same VM, same backing). The
+            // PROT_NONE bookkeeping is shared via `ram`'s protections (above).
             page_tables: spec.page_tables,
         })
     }
