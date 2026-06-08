@@ -14,7 +14,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use carrick_abi::LINUX_ETIMEDOUT;
 use carrick_hal::{FutexOutcome, PlatformFutex, ThreadId};
 use carrick_thread::thread::{FutexTable, FutexWaitOutcome};
 
@@ -77,49 +76,35 @@ impl PlatformFutex for HvfFutex {
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64 {
-        let deadline = timeout.map(|d| std::time::Instant::now() + d);
-        // Pre-wait peek probe: mirror the single-threaded shared_futex_wait
-        // in runtime.rs (~line 1551-1552). Reads the current value at host_addr
-        // so carrick-trace can see the word before any wait commences.
+        // Pre-wait peek probe: mirror the single-threaded shared_futex_wait in
+        // runtime.rs. Reads the current value at host_addr so carrick-trace can
+        // see the word before any wait commences. (Once, before the loop.)
         let host_value = unsafe { (host_addr as *const u32).read() };
         crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
-        loop {
-            if interrupted() {
-                // Translate: EINTR is -4 on both macOS and Linux.
-                return -(libc::EINTR as i64);
-            }
-            let slice_us: u32 = match deadline {
-                Some(dl) => {
-                    let now = std::time::Instant::now();
-                    if now >= dl {
-                        return -(LINUX_ETIMEDOUT as i64);
-                    }
-                    u32::try_from(
-                        (dl - now)
-                            .as_micros()
-                            .min(SHARED_FUTEX_MAX_SLICE_US as u128),
-                    )
-                    .unwrap_or(SHARED_FUTEX_MAX_SLICE_US)
-                }
-                None => SHARED_FUTEX_MAX_SLICE_US,
-            };
+        // The deadline/slice/interrupt loop is shared (carrick_hal); only the
+        // single `os_sync` wait + its macOS-errno classification is HVF-specific.
+        carrick_hal::shared_wait_sliced(timeout, interrupted, &|slice_ns| {
+            let slice_us = u32::try_from(
+                (slice_ns / 1_000).min(i64::from(SHARED_FUTEX_MAX_SLICE_US)),
+            )
+            .unwrap_or(SHARED_FUTEX_MAX_SLICE_US);
             crate::probes::ulock_wait(host_addr as u64, value, slice_us, 0, 0);
             let r = carrick_host::ulock::wait(host_addr, value, slice_us);
             crate::probes::ulock_wait(host_addr as u64, value, slice_us, 1, r);
             if r >= 0 {
-                // Woken or value already differed — caller re-checks its
-                // condition.  Linux FUTEX_WAIT returns 0.
-                return 0;
+                // Woken or value already differed — caller re-checks. Linux
+                // FUTEX_WAIT returns 0.
+                return carrick_hal::SharedWaitStep::Woken;
             }
             let host_errno = (-r) as i32;
             if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
-                // Slice expired or signal nudge — re-check at loop top.
-                continue;
+                // Slice expired or signal nudge — re-check at the loop top.
+                return carrick_hal::SharedWaitStep::Retry;
             }
             // Any other error (e.g. EFAULT) is returned directly; errno values
             // happen to agree between macOS and Linux for EFAULT (14).
-            return r;
-        }
+            carrick_hal::SharedWaitStep::Error(r)
+        })
     }
 
     fn shared_wake(&self, host_addr: usize, n: u32) -> i64 {

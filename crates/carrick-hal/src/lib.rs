@@ -23,7 +23,7 @@ pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, V
 pub mod futex;
 pub mod host_info;
 pub mod sendfile;
-pub use futex::CrossProcessFutex;
+pub use futex::{CrossProcessFutex, SHARED_FUTEX_MAX_SLICE_NS, SharedWaitStep, shared_wait_sliced};
 pub use host_info::HostFacts;
 pub use sendfile::Sendfile;
 pub mod threaded;
