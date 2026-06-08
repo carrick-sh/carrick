@@ -2228,6 +2228,7 @@ impl SyscallDispatcher {
             args: request.args,
         });
 
+        #[cfg(feature = "watchpoint")]
         if let Some(addr) = watch_addr()
             && let Ok(bytes) = memory.read_bytes(addr, 8)
         {
@@ -2399,9 +2400,11 @@ impl SyscallDispatcher {
             return Ok(outcome);
         }
 
-        // Reusable guest-memory watchpoint (CARRICK_WATCH_ADDR=<hex>): fire a
-        // probe with the current u64 at the watched address before each
-        // syscall, so a trace can bracket which syscall changes it.
+        // Reusable guest-memory watchpoint (`watchpoint` feature +
+        // CARRICK_WATCH_ADDR=<hex>): fire a probe with the current u64 at the
+        // watched address before each syscall, so a trace can bracket which
+        // syscall changes it.
+        #[cfg(feature = "watchpoint")]
         if let Some(addr) = watch_addr()
             && let Ok(bytes) = memory.read_bytes(addr, 8)
         {
@@ -4094,7 +4097,9 @@ fn linux_mode(metadata: &RootFsMetadata) -> u32 {
 }
 
 /// Parse `CARRICK_WATCH_ADDR` (hex, optional `0x`) once. `None` disables the
-/// guest-memory watchpoint (the common, zero-cost case).
+/// guest-memory watchpoint. Compile-gated behind `watchpoint`; the whole
+/// facility (env read + per-syscall probe) is absent from a stock build.
+#[cfg(feature = "watchpoint")]
 fn watch_addr() -> Option<u64> {
     static WATCH_ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *WATCH_ADDR.get_or_init(|| {
@@ -4631,7 +4636,8 @@ fn read_host_pipe_into(
         return DispatchOutcome::Errno { errno: e };
     }
     let n_usize = n as usize;
-    if std::env::var_os("CARRICK_IO_DBG").is_some() && n_usize > 0 {
+    #[cfg(feature = "trace-io")]
+    if n_usize > 0 {
         eprintln!(
             "[IODBG] READ host_fd={host_fd} n={n_usize} bytes={:02x?}",
             &buf[..n_usize.min(64)]
@@ -4753,7 +4759,8 @@ fn write_host_pipe_payload(
     tid: crate::thread::ThreadId,
     sigpipe_on_epipe: bool,
 ) -> DispatchOutcome {
-    if std::env::var_os("CARRICK_IO_DBG").is_some() && !payload.as_slice().is_empty() {
+    #[cfg(feature = "trace-io")]
+    if !payload.as_slice().is_empty() {
         let bytes = payload.as_slice();
         eprintln!(
             "[IODBG] WRITE host_fd={host_fd} n={} bytes={:02x?}",
@@ -4770,7 +4777,8 @@ fn write_host_pipe_payload(
     let block_until_complete = !nonblocking && write_kind == HostWriteKind::PipeLike;
     let mut offset = 0usize;
     loop {
-        if std::env::var_os("CARRICK_TTY_DBG").is_some() && payload.as_slice().contains(&0x0a) {
+        #[cfg(feature = "trace-tty")]
+        if payload.as_slice().contains(&0x0a) {
             unsafe {
                 let isatty = libc::isatty(host_fd);
                 let mut t: libc::termios = core::mem::zeroed();
@@ -4803,7 +4811,8 @@ fn write_host_pipe_payload(
                 )
             }
         };
-        if std::env::var_os("CARRICK_TTY_DBG").is_some() && payload.as_slice().contains(&0x0a) {
+        #[cfg(feature = "trace-tty")]
+        if payload.as_slice().contains(&0x0a) {
             unsafe {
                 let mut outq: libc::c_int = -1;
                 libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);

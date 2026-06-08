@@ -7,9 +7,8 @@
 //! [`CompatReporter::record`]. That single funnel does three things, in order of
 //! cost: it fires the matching USDT probe (gated on a DTrace consumer, so
 //! near-free when none is attached), optionally emits a verbose stderr line
-//! (opt-in via `CARRICK_TRACE_SYSCALLS`, the env check cached once at
-//! construction so it is not re-read per syscall), and then AGGREGATES the event
-//! inline.
+//! (opt-in at compile time via the `trace-syscalls` feature, absent from a
+//! stock build), and then AGGREGATES the event inline.
 //!
 //! The aggregation design is the load-bearing decision. An earlier version
 //! stored one `CompatEvent` per syscall in a `Vec` and allocated a `String` name
@@ -207,7 +206,7 @@ impl CompatEvent {
 /// rare-event maps directly, so a syscall-heavy run costs a few integer
 /// increments instead of a heap push. The detailed report stays
 /// always-on (the aggregate maps are cheap); only the verbose
-/// per-event stderr trace is opt-in via `CARRICK_TRACE_SYSCALLS`.
+/// per-event stderr trace is opt-in via the `trace-syscalls` feature.
 #[derive(Debug)]
 pub struct CompatReporter {
     syscall_entries: AtomicU64,
@@ -220,8 +219,6 @@ pub struct CompatReporter {
     sys_read_unimplemented: Mutex<HashMap<String, u64>>,
     unsupported_signals: Mutex<HashMap<(i32, String), u64>>,
     unknown_syscall_flags: Mutex<HashMap<(u64, String, u32, u64), u64>>,
-    /// Cached once at construction so we don't `getenv` per syscall.
-    trace_syscalls: bool,
 }
 
 impl Default for CompatReporter {
@@ -237,7 +234,6 @@ impl Default for CompatReporter {
             sys_read_unimplemented: Mutex::new(HashMap::new()),
             unsupported_signals: Mutex::new(HashMap::new()),
             unknown_syscall_flags: Mutex::new(HashMap::new()),
-            trace_syscalls: std::env::var_os("CARRICK_TRACE_SYSCALLS").is_some(),
         }
     }
 }
@@ -247,10 +243,9 @@ impl CompatReporter {
         // USDT probe first — usdt gates the closure on is_enabled, so
         // this is near-free when no DTrace consumer is attached.
         crate::probes::fire(&event);
-        // Opt-in verbose stderr trace (cached env check, not per-call).
-        if self.trace_syscalls
-            && let Ok(line) = serde_json::to_string(&event)
-        {
+        // Verbose per-event stderr trace, compile-gated behind `trace-syscalls`.
+        #[cfg(feature = "trace-syscalls")]
+        if let Ok(line) = serde_json::to_string(&event) {
             eprintln!("[carrick-syscall] {line}");
         }
         // Aggregate inline. Common events (entry/return) are pure

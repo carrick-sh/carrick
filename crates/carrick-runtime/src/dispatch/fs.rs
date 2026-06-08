@@ -1759,7 +1759,8 @@ impl SyscallDispatcher {
                     } => {
                         // pty ends and O_RDWR FIFOs are bidirectional; only real
                         // one-way pipe ends are gated by is_read_end.
-                        if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+                        #[cfg(feature = "trace-tty")]
+                        if bytes.contains(&0x0a) {
                             let hf = *host_fd;
                             let tt = unsafe { libc::isatty(hf) };
                             eprintln!(
@@ -1851,7 +1852,8 @@ impl SyscallDispatcher {
             // BLOCKING-IO-OK: streamed write to the inherited stdout/stderr
             // (the user's tty/pipe). Blocking here is the correct backpressure
             // and isn't a guest socket on the server path.
-            if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
+            #[cfg(feature = "trace-io")]
+            if !bytes.is_empty() {
                 eprintln!(
                     "[IODBG] STREAMWRITE fd={fd} n={} bytes={:02x?}",
                     bytes.len(),
@@ -5852,7 +5854,8 @@ impl SyscallDispatcher {
 
             let nonblocking = this.io_is_nonblocking(fd, 0);
 
-            if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
+            #[cfg(feature = "trace-io")]
+            if !bytes.is_empty() {
                 let has = this.open_file(fd).is_some();
                 eprintln!(
                     "[WRDBG] guest_fd={fd} in_table={has} n={} bytes={:02x?}",
@@ -5897,9 +5900,8 @@ impl SyscallDispatcher {
                         } => {
                             // pty ends and O_RDWR FIFOs are bidirectional; only
                             // real one-way pipe ends are gated by is_read_end.
-                            if std::env::var_os("CARRICK_TTY_DBG").is_some()
-                                && bytes.contains(&0x0a)
-                            {
+                            #[cfg(feature = "trace-tty")]
+                            if bytes.contains(&0x0a) {
                                 let hf = *host_fd;
                                 let tt = unsafe { libc::isatty(hf) };
                                 eprintln!(

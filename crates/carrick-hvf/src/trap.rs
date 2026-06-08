@@ -607,7 +607,7 @@ fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
     CELL.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
-/// Diagnostic: lazy-alias re-map count (CARRICK_REMAP_STATS logs every 256th).
+/// Diagnostic: lazy-alias re-map count (the `debug-stats` feature logs every 256th).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -874,7 +874,8 @@ impl ExecLevel {
 
 /// Full-speed diagnostic counters (the dtrace consumer perturbs the
 /// SIGURG-vs-futex race away, so observe with cheap atomics instead). Dumped at
-/// process teardown when `CARRICK_KICK_STATS` is set.
+/// process teardown when built with the `debug-stats` feature (the USDT probe
+/// fires always; only the stderr dump is gated).
 pub static EL1_KICK_RESUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static INJECT_AT_EL1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static KICK_PATH_INJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -922,12 +923,11 @@ pub fn dump_kick_stats() {
     // Surface the cumulative totals through one cheap USDT fire at exit, so a
     // trace can read them without the per-event `kick-in-kernel` probe cost.
     crate::probes::kick_stats(el1, inject, at_el1);
-    if std::env::var_os("CARRICK_KICK_STATS").is_some() {
-        eprintln!(
-            "[kick_stats pid={}] el1_kick_resumed={el1} kick_path_inject={inject} inject_at_el1={at_el1}",
-            unsafe { libc::getpid() },
-        );
-    }
+    #[cfg(feature = "debug-stats")]
+    eprintln!(
+        "[kick_stats pid={}] el1_kick_resumed={el1} kick_path_inject={inject} inject_at_el1={at_el1}",
+        unsafe { libc::getpid() },
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1613,17 +1613,16 @@ impl HvfTrapEngine {
         use applevisor::prelude::*;
 
         for mapping in &plan.mappings {
-            if std::env::var_os("CARRICK_TRACE_MAPS").is_some() {
-                eprintln!(
-                    "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
-                    mapping.guest_start,
-                    mapping.mapped_size,
-                    mapping.payload_size,
-                    if mapping.perms.read { '+' } else { '-' },
-                    if mapping.perms.write { '+' } else { '-' },
-                    if mapping.perms.execute { '+' } else { '-' },
-                );
-            }
+            #[cfg(feature = "trace-hvf")]
+            eprintln!(
+                "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
+                mapping.guest_start,
+                mapping.mapped_size,
+                mapping.payload_size,
+                if mapping.perms.read { '+' } else { '-' },
+                if mapping.perms.write { '+' } else { '-' },
+                if mapping.perms.execute { '+' } else { '-' },
+            );
             let region = map_region_raw(mapping)?;
             self.inner.mappings.push(region);
         }
@@ -2436,9 +2435,15 @@ impl HvfInner {
                         0,
                         self.forked_no_exec as i32,
                     );
-                    let n = ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n.is_multiple_of(256) && std::env::var_os("CARRICK_REMAP_STATS").is_some() {
-                        eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.ipa);
+                    // Diagnostic-only alias-remap counter+dump, gated behind
+                    // `debug-stats` (no other consumer reads the counter).
+                    #[cfg(feature = "debug-stats")]
+                    {
+                        let n =
+                            ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n.is_multiple_of(256) {
+                            eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.ipa);
+                        }
                     }
                     continue;
                 }
@@ -2463,8 +2468,10 @@ impl HvfInner {
             // exit (exception.virtual_address + guest Reg::PC) next to the EL1
             // sysregs (ELR_EL1/FAR_EL1), which are STALE on this direct exit (the
             // guest's EL1 vector never ran), plus the full GPR set so the register
-            // holding the bad pointer is visible. Diagnostic only; off by default.
-            if std::env::var_os("CARRICK_TRACE_FAULT").is_some() {
+            // holding the bad pointer is visible. Diagnostic only; off by
+            // default (compile-gated behind `trace-hvf`).
+            #[cfg(feature = "trace-hvf")]
+            {
                 let pc = self.vcpu.get_reg(Reg::PC).unwrap_or(0);
                 let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
                 let far_reg = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
@@ -2628,7 +2635,8 @@ impl HvfInner {
         }
         self.last_exit_class = aarch64_exception_class(exception.syndrome);
 
-        if std::env::var_os("CARRICK_TRACE_REGS").is_some() {
+        #[cfg(feature = "trace-hvf")]
+        {
             let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
             let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
             let spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
@@ -2716,7 +2724,8 @@ impl HvfInner {
         self.vcpu
             .set_reg(Reg::X0, return_value as u64)
             .map_err(hvf_error)?;
-        if std::env::var_os("CARRICK_TRACE_REGS").is_some() {
+        #[cfg(feature = "trace-hvf")]
+        {
             let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
             let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
             eprintln!(

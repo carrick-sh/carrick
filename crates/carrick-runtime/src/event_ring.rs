@@ -13,15 +13,18 @@
 //! the lldb plugin: `lldb -c <core> target/release/carrick` then
 //! `carrick eventring` (works on a live `lldb -p <pid>` too).
 //!
-//! Only the perturbing, autonomous FILE dump is opt-in: set `CARRICK_EVENTRING`
-//! to a directory and a 1 Hz watchdog thread (OFF the vCPU thread, so guest
-//! syscall timing is intact) writes `<dir>/carrick-ring.<pid>`.
+//! Only the perturbing, autonomous FILE dump is opt-in: build with the
+//! `event-ring-dump` feature and set `CARRICK_EVENTRING` to a directory; a 1 Hz
+//! watchdog thread (OFF the vCPU thread, so guest syscall timing is intact)
+//! writes `<dir>/carrick-ring.<pid>`. Without the feature, only the in-memory
+//! ring (above) exists — read it from a core or a live process via lldb.
 //!
 //! Each carrick process is one guest process, so the ring is per-process. On a
 //! guest fork the child inherits the parent's ring memory but only the forking
 //! thread survives, so [`reinit_after_fork`] resets the index + re-arms the
 //! watchdog for the child.
 
+#[cfg(feature = "event-ring-dump")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -55,6 +58,7 @@ pub const EPWAIT: u8 = 6;
 pub const FORK: u8 = 7;
 pub const EXEC: u8 = 8;
 
+#[cfg(feature = "event-ring-dump")]
 fn dir() -> Option<&'static str> {
     static DIR: OnceLock<Option<String>> = OnceLock::new();
     DIR.get_or_init(|| std::env::var("CARRICK_EVENTRING").ok())
@@ -66,7 +70,7 @@ fn dir() -> Option<&'static str> {
 /// run, with no env pre-armed. That is the point: an intermittent Heisenbug you
 /// can't predict still leaves its fork/socket/epoll history in the ring, readable
 /// post-mortem via `lldb ... carrick eventring`. Only the perturbing FILE dump
-/// (the 1 Hz watchdog) is gated on `CARRICK_EVENTRING`.
+/// (the 1 Hz watchdog) is gated, behind the `event-ring-dump` feature.
 #[inline]
 pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
     let lo = (a as u32 as u64) | ((b as u32 as u64) << 32);
@@ -76,6 +80,7 @@ pub fn rec(kind: u8, a: i32, b: i32, c: i32) {
     // a good chance of also seeing the matching lo.
     RING[i].lo.store(lo, Ordering::Relaxed);
     RING[i].hi.store(hi, Ordering::Relaxed);
+    #[cfg(feature = "event-ring-dump")]
     maybe_start_watchdog();
 }
 
@@ -99,9 +104,11 @@ pub fn reinit_after_fork() {
     WATCHDOG.store(false, Ordering::SeqCst);
 }
 
-/// Spawn the (gated) 1 Hz file-dump watchdog once per process. Cheap no-op on
-/// the hot path: a relaxed load, and — unless `CARRICK_EVENTRING` is set — never
-/// spawns anything. The recording itself is unconditional (see `rec`).
+/// Spawn the 1 Hz file-dump watchdog once per process (only compiled in under
+/// the `event-ring-dump` feature). Cheap no-op on the hot path: a relaxed load,
+/// and — unless `CARRICK_EVENTRING` names a dir — never spawns anything. The
+/// recording itself is unconditional (see `rec`).
+#[cfg(feature = "event-ring-dump")]
 fn maybe_start_watchdog() {
     if WATCHDOG.load(Ordering::Relaxed) {
         return;
@@ -126,6 +133,7 @@ fn maybe_start_watchdog() {
         });
 }
 
+#[cfg(feature = "event-ring-dump")]
 fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
     match kind {
         BIND => format!("BIND     gfd={a} hfd={b} pathhash={c:#010x}"),
@@ -140,6 +148,7 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
     }
 }
 
+#[cfg(feature = "event-ring-dump")]
 fn dump(path: &str) {
     use std::io::Write;
     let total = IDX.load(Ordering::SeqCst);

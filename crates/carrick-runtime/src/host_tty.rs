@@ -180,7 +180,8 @@ pub fn set_host_termios(fd: i32, linux: &LinuxTermios) -> bool {
         // bits like Darwin's ECHOKE.
         let _ = libc::tcgetattr(fd, &mut darwin);
         linux_to_darwin_termios(linux, &mut darwin);
-        if std::env::var_os("CARRICK_IO_DBG").is_some() {
+        #[cfg(feature = "trace-io")]
+        {
             let (li, lo, ll) = (linux.c_iflag, linux.c_oflag, linux.c_lflag);
             let (di, do_, dl) = (darwin.c_iflag, darwin.c_oflag, darwin.c_lflag);
             eprintln!(
