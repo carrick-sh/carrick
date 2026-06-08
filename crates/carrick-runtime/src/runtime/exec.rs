@@ -33,12 +33,22 @@ pub(crate) fn load_execve_image(
     // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
     // `read_exec_file`, so execve works for guest-created/overlay binaries
     // (downloaded/extracted ELF, /tmp/p, dpkg-unpacked binary) and needs no
-    // in-memory rootfs layer (which `--fs host` drops after seeding). When
-    // there's no overlay/rootfs at all (e.g. a bare RunElf test), fall back
-    // to reading the main binary straight off the host filesystem.
+    // in-memory rootfs layer (which `--fs host` drops after seeding). The
+    // host-fs fallback (reading the literal absolute path straight off the
+    // host) is ON only for a bare RunElf boot; a container run keeps it OFF so
+    // an execve target absent from the container fs ENOENTs instead of escaping
+    // to the matching HOST binary. See `SyscallDispatcher::exec_host_fs_fallback`.
+    let host_fallback = dispatcher.exec_host_fs_fallback();
+    let host_read = |p: &str| -> Option<Vec<u8>> {
+        if host_fallback {
+            std::fs::read(p).ok()
+        } else {
+            None
+        }
+    };
     let raw_bytes = dispatcher
         .read_exec_file(&path)
-        .or_else(|| std::fs::read(&path).ok())
+        .or_else(|| host_read(&path))
         .ok_or(LINUX_ENOENT)?;
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style), so a guest
     // `execve` of a further x86_64 image (a child process, a shell spawning a
@@ -57,9 +67,7 @@ pub(crate) fn load_execve_image(
         Some(Err(errno)) => return Err(errno),
     };
     let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
-        dispatcher
-            .read_exec_file(p)
-            .or_else(|| std::fs::read(p).ok())
+        dispatcher.read_exec_file(p).or_else(|| host_read(p))
     })
     .map_err(|_| LINUX_ENOENT)?;
     // Mirror the boot builder: the syscall shim installs the identity-fast-path

@@ -828,8 +828,12 @@ pub mod runtime {
             .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("extract OCI layers: {e}")))?;
         seed_linux_baseline_gaps(&mut host);
 
-        // 2. Build the dispatcher rooted at the extracted rootfs.
+        // 2. Build the dispatcher rooted at the extracted rootfs. This is a
+        //    sandboxed container fs (extracted OCI layers on a cap-std overlay):
+        //    forbid the execve host-fs fallback so a target absent from the
+        //    rootfs ENOENTs instead of escaping to the host binary.
         let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.sandbox_exec_to_container();
         dispatcher.set_executable_path(spec.executable.clone());
         if let Some(cwd) = &spec.cwd {
             dispatcher.set_cwd(cwd.as_str());

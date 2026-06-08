@@ -124,17 +124,27 @@ mod macos_helper_stubs {
             dispatcher.resolve_exec_path(path),
             argv,
         )?;
-        // Read the binary overlay-first, falling back to the host fs (a bare
-        // run-elf target lives on the host, not in any rootfs layer).
+        // Read the binary overlay-first. Fall back to the literal host fs ONLY
+        // for a bare run-elf boot (host-staged target, no container fs). In a
+        // container run the fallback is OFF, so a target absent from the rootfs
+        // ENOENTs instead of silently loading the matching HOST binary (the
+        // containment hole that loaded host glibc `/usr/bin/echo` into a musl
+        // rootfs mid-execvp PATH search).
+        let host_fallback = dispatcher.exec_host_fs_fallback();
+        let host_read = |p: &str| -> Option<Vec<u8>> {
+            if host_fallback {
+                std::fs::read(p).ok()
+            } else {
+                None
+            }
+        };
         let raw_bytes = dispatcher
             .read_exec_file(&path)
-            .or_else(|| std::fs::read(&path).ok())
+            .or_else(|| host_read(&path))
             .ok_or(LINUX_ENOENT)?;
         // Load the ELF, resolving a dynamic interpreter through the same reader.
         let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
-            dispatcher
-                .read_exec_file(p)
-                .or_else(|| std::fs::read(p).ok())
+            dispatcher.read_exec_file(p).or_else(|| host_read(p))
         })
         .map_err(|_| LINUX_ENOENT)?;
         // KVM boot-image shape: vdso (so AT_SYSINFO_EHDR resolves) + the Linux
