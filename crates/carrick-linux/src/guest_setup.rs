@@ -434,6 +434,19 @@ impl GuestRam {
         Ok(out)
     }
 
+    /// Host virtual address of the `len`-byte span at guest-physical `gpa`,
+    /// regardless of window kind, or `None` if it does not lie wholly within one
+    /// backed window. Used by the live stage-1 page-table editor to `sync_to_host`
+    /// changed descriptors straight into the guest's page-table backing (at
+    /// `LINUX_PAGE_TABLES_BASE`, in the low window). Unlike
+    /// [`Self::shared_futex_host_addr`], this does NOT require a `Shared` window.
+    pub(crate) fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
+        let (w, off) = self.locate(gpa, len)?;
+        // SAFETY: `locate` proved [gpa, gpa+len) ⊆ this window, so `host + off`
+        // points at `len` valid bytes of that window's backing.
+        Some(unsafe { w.host.add(off) })
+    }
+
     /// Host virtual address of the `len`-byte word at guest-physical `gpa`, but
     /// ONLY when it lies wholly within a [`WindowKind::Shared`] window (the
     /// boot-mapped `MAP_SHARED|MAP_ANONYMOUS` aperture). That backing is the SAME

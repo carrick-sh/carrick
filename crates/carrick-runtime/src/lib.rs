@@ -832,6 +832,20 @@ pub mod runtime {
             true,
             None,
         )?;
+        // Materialise the vvar+vDSO regions so the auxv's AT_SYSINFO_EHDR
+        // (= LINUX_VDSO_BASE, set by load_elf and kept by build_run_image's
+        // with_vdso_auxv(true)) resolves to real KVM-backed slots. A STATIC CRT
+        // can skip AT_SYSINFO_EHDR, but a DYNAMIC loader (ld-musl/ld-linux)
+        // ALWAYS dereferences it to bind vDSO symbols — without the region that
+        // read stage-2-faults to KVM_EXIT_MMIO at LINUX_VDSO_BASE (the busybox
+        // MmioRead at 0x2E_0001_0020). `build_for_image` backs each high region
+        // as its own slot. The macOS/HVF run path adds these regions later in
+        // `finish_and_run_image`; the KVM run-elf/execve paths add them inline
+        // (lib.rs:601, vcpu_loop.rs:144) — run_oci was the last KVM path missing
+        // it. `with_vdso` preserves the already-serialised stack + auxv image, so
+        // adding it after `with_linux_initial_stack` is equivalent to the run-elf
+        // vdso-then-stack order.
+        let image = image.with_vdso()?;
 
         // 4. Run on KVM through the same generic threaded loop as run-elf.
         let engine = carrick_linux::KvmTrapEngine::new(&image)?;
