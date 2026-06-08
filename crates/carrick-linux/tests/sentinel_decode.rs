@@ -11,20 +11,21 @@ fn sentinel_slot_materialises_sentinel_gpa_and_stores() {
     let v = el1_vectors_sentinel_bytes();
     assert_eq!(v.len(), 0x4000, "vector page is one 16 KiB page");
     let s = 0x400; // lower-EL sync slot
-    // The slot now opens with the ESR.EC discriminator: `mrs x9, esr_el1` (dst x9)
-    // at s+0, then ubfx/cmp/b.ne; on the SVC path it re-materialises SENTINEL_GPA
-    // into x9 (s+16..s+28) and stores at s+32. (See `lower_el_sync_slot_
-    // discriminates_svc_vs_fault` in guest_setup for the full byte-level assertion.)
+    // The slot opens with `msr tpidr_el1, x9` (saves the guest's live x9, dst x9)
+    // at s+0, then the ESR.EC discriminator (mrs/ubfx/cmp/b.ne); on the SVC path it
+    // re-materialises SENTINEL_GPA into x9 (s+20..s+32) and stores at s+36. (See
+    // `lower_el_sync_slot_discriminates_svc_vs_fault` in guest_setup for the full
+    // byte-level assertion.)
     assert_eq!(
         op_at(&v, s) & 0x1F,
         9,
-        "first instr (mrs x9, esr_el1) targets x9"
+        "first instr (msr tpidr_el1, x9) targets x9"
     );
-    // str x8, [x9] at slot+32 (after the 4-instr discriminator + 4-instr re-materialize)
-    assert_eq!(op_at(&v, s + 32), 0xf900_0128, "str x8,[x9] (SVC path)");
-    // eret closes the SVC path at slot+36
+    // str x8, [x9] at slot+36 (save + 4-instr discriminator + 4-instr re-materialize)
+    assert_eq!(op_at(&v, s + 36), 0xf900_0128, "str x8,[x9] (SVC path)");
+    // eret closes the SVC path at slot+40
     assert_eq!(
-        op_at(&v, s + 36),
+        op_at(&v, s + 40),
         0xd69f_03e0,
         "eret after the sentinel store"
     );
