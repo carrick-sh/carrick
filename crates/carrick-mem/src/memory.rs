@@ -424,7 +424,7 @@ pub const LINUX_ALIAS_IPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB of alias space
 // `go` parent maps its telemetry counter and reads/writes EVERY counter
 // coherently — yet `go build` still crashes, in the multithreaded toolchain, via
 // a genuine guest nil-deref surfaced at a syscall boundary (a carrick trap-path
-// bug, not file-mapping coherence). See docs/go-build-shared-file-coherence-gap.md.
+// bug, not file-mapping coherence).
 
 const ALIAS_IPA_BLOCK: u64 = 1 << 21; // 2 MiB — one stage-1 block per file mapping
 
@@ -1533,7 +1533,7 @@ fn region_from_load_segments(
 /// the load/store-exclusive instructions (`ldaxr`/`stlxr`) that musl, glibc and
 /// Go rely on for their lock primitives actually work. Run MMU-off, ARMv8
 /// treats every access as Device-nGnRnE and exclusives are architecturally
-/// prohibited — the original stage-2 wall (see `docs/tier-b-wall.md`).
+/// prohibited — the original stage-2 wall.
 ///
 /// THE FEAT_PAN3 WORKAROUND. On Apple Silicon HVF the vCPU starts with
 /// `PSTATE.PAN=1` regardless of what the host writes to CPSR via `set_reg`.
