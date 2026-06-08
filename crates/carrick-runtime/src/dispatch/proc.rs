@@ -1305,7 +1305,27 @@ impl SyscallDispatcher {
             if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let word = read_futex_word(memory, address.0)?;
+            // Only WAIT / CMP_REQUEUE / PI ops consult the futex VALUE; WAKE and
+            // plain REQUEUE are address-keyed (Linux FUTEX_WAKE computes only the
+            // hash key — it never reads the word). Surfacing the read's EFAULT for
+            // a value-independent op spuriously fails a wake whenever the caller's
+            // `GuestMemory` view can't translate the page (e.g. a cross-thread
+            // waker over a per-sibling window snapshot), crashing guests like Go
+            // whose `futexwakeup` treats EFAULT as fatal. Mirror
+            // `dispatch_threaded_futex`: make the read non-fatal for WAKE/REQUEUE.
+            let needs_word = matches!(
+                command,
+                LINUX_FUTEX_WAIT
+                    | LINUX_FUTEX_LOCK_PI
+                    | LINUX_FUTEX_TRYLOCK_PI
+                    | LINUX_FUTEX_UNLOCK_PI
+                    | LINUX_FUTEX_CMP_REQUEUE
+            );
+            let word = match read_futex_word(memory, address.0) {
+                Ok(word) => word,
+                Err(errno) if needs_word => return Ok(DispatchOutcome::Errno { errno }),
+                Err(_) => 0,
+            };
 
             if matches!(
                 command,
