@@ -232,6 +232,15 @@ impl KvmVm {
         kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
         fd.vcpu_init(&kvi)
             .map_err(|e| os_err("KVM_ARM_VCPU_INIT", e))?;
+        // Enable EL0 reads of CNTVCT_EL0/CNTFRQ_EL0 (CNTKCTL_EL1.EL0VCTEN|EL0PCTEN)
+        // so the vDSO clock fast path (`mrs cntvct_el0`) does NOT trap at EL0 (EC
+        // 0x18 — which alpine/musl `ls` hit via the vDSO clock and died on). MUST
+        // be on EVERY vCPU; this is the single shared create path (initial +
+        // clone-siblings + fork-child rebuild via add_vcpu). Mirrors HVF's
+        // `enable_el0_counter_access`. CNTKCTL_EL1 = S3_0_C14_C1_0. Best-effort
+        // (like HVF): if a kernel rejects the write the vDSO clock just traps and
+        // we lose the fast path — never a reason to fail vCPU creation.
+        let _ = fd.set_one_reg(sysreg_id(3, 0, 14, 1, 0), &0x3u64.to_le_bytes());
         Ok(KvmVcpu { fd })
     }
 
@@ -402,6 +411,18 @@ impl KvmVcpu {
         self.fd
             .get_one_reg(sysreg_id(3, 0, 6, 0, 0), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(FAR_EL1)", e))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// Read the guest's virtual counter — `KVM_REG_ARM_TIMER_CNT` (encoded as
+    /// `ARM64_SYS_REG(3,3,14,3,2)`), the SAME value the vDSO clock reads as
+    /// `CNTVCT_EL0` at EL0. Used once at boot/execve to calibrate the vvar
+    /// realtime offset (`realtime_off = unix_ns - cnt/freq*1e9`).
+    pub fn get_timer_cnt(&self) -> Result<u64, OsError> {
+        let mut bytes = [0u8; 8];
+        self.fd
+            .get_one_reg(sysreg_id(3, 3, 14, 3, 2), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(TIMER_CNT)", e))?;
         Ok(u64::from_le_bytes(bytes))
     }
 

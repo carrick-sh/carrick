@@ -646,7 +646,9 @@ pub mod runtime {
             // vdso ELF header at LINUX_VDSO_BASE. Materialise the vdso (+ vvar)
             // regions — bring_up backs them as their own slots — or that read
             // faults. Mirrors the macOS boot chain. Must precede the stack build
-            // (which serialises the auxv).
+            // (which serialises the auxv). The vDSO clock fast path reads
+            // `cntvct_el0` at EL0; bring_up enables it (CNTKCTL_EL1) + fills the
+            // vvar so the read is correct.
             .with_vdso()?
             .with_linux_initial_stack(
                 [argv0.as_bytes()],
@@ -893,7 +895,9 @@ pub mod runtime {
         // (lib.rs:601, vcpu_loop.rs:144) — run_oci was the last KVM path missing
         // it. `with_vdso` preserves the already-serialised stack + auxv image, so
         // adding it after `with_linux_initial_stack` is equivalent to the run-elf
-        // vdso-then-stack order.
+        // vdso-then-stack order. The vDSO clock fast path reads `cntvct_el0` at
+        // EL0; `bring_up` enables that (CNTKCTL_EL1) and fills the vvar with the
+        // freq + realtime offset so the read is correct (see `populate_vdso_vvar`).
         let image = image.with_vdso()?;
 
         // 4. Run on KVM through the same generic threaded loop as run-elf.
