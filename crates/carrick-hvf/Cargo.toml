@@ -11,6 +11,17 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Debug-only tracing / stat dumps (compile-gated, default OFF). A stock build
+# compiles these out entirely; build with the feature for the stderr output.
+# HVF trap-handler dumps: guest regs (REGS), stage-2 maps (MAPS), EL0 faults.
+trace-hvf = []
+# Verbose per-syscall stderr line from the always-on compat reporter.
+trace-syscalls = []
+# Alias-remap + signal-kick stat dumps to stderr. The atomic counters and the
+# USDT probes stay always-on; only the stderr dump is gated.
+debug-stats = []
+
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }

@@ -19,6 +19,17 @@ workspace = true
 syscall-shim = []
 # In-memory fs backend selection (default OFF; control point is carrick-cli).
 fs-memory = ["carrick-spec/fs-memory"]
+# Debug-only tracing (compile-gated, default OFF). Own gates plus passthroughs
+# to the leaf crates, so carrick-cli can enable any of them through this crate.
+trace-tty = []
+trace-io = []
+trace-traps = []
+watchpoint = []
+event-ring-dump = []
+trace-hvf = ["carrick-hvf/trace-hvf"]
+trace-syscalls = ["carrick-hvf/trace-syscalls"]
+debug-stats = ["carrick-hvf/debug-stats"]
+trace-elf = ["carrick-mem/trace-elf"]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

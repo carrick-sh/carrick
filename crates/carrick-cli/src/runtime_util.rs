@@ -203,12 +203,11 @@ mod fork_isolation_tests {
 pub(crate) fn register_dtrace_probes() {
     match carrick_runtime::probes::register_dtrace_probes() {
         Ok(()) => {
-            if std::env::var_os("CARRICK_DTRACE_DEBUG").is_some() {
-                tracing::warn!(
-                    "carrick: dtrace probes registered (pid={})",
-                    std::process::id()
-                );
-            }
+            #[cfg(feature = "trace-dtrace")]
+            tracing::warn!(
+                "carrick: dtrace probes registered (pid={})",
+                std::process::id()
+            );
         }
         Err(err) => {
             // Always surface registration failures: silent failure here is
