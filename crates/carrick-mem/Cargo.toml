@@ -21,6 +21,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 goblin.workspace = true
 libc.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 zerocopy = { workspace = true, features = ["derive"] }

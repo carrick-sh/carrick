@@ -304,9 +304,21 @@ impl HvVm for KvmVm {
         // SAFETY: `host`..`host+len` is a live mmap owned by guest_setup for the
         // lifetime of the VM; KVM only accesses it while the vCPU runs.
         unsafe {
-            self.vm
-                .set_user_memory_region(region)
-                .map_err(|e| os_err("KVM_SET_USER_MEMORY_REGION", e))?;
+            self.vm.set_user_memory_region(region).map_err(|e| {
+                // Rich diagnostic: a bare "Bad address" (EFAULT) hides WHICH slot
+                // KVM rejected. EFAULT here is `access_ok(userspace_addr,
+                // memory_size)` failing in the kernel; EINVAL is usually a
+                // misaligned gpa/size or a slot-count/overlap problem. Capture the
+                // full region so the failure is actionable.
+                os_err(
+                    &format!(
+                        "KVM_SET_USER_MEMORY_REGION(slot={} gpa=0x{gpa:x} \
+                         userspace_addr=0x{:x} size=0x{len:x})",
+                        self.next_slot, host as u64
+                    ),
+                    e,
+                )
+            })?;
         }
         self.next_slot += 1;
         let _ = KVM_MEM_LOG_DIRTY_PAGES; // keep import meaningful; unused in MVP
