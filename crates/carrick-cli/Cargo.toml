@@ -21,6 +21,30 @@ syscall-shim = ["carrick-runtime/syscall-shim"]
 # In-memory fs backend selection (`--fs memory`). Default OFF on purpose; opt in
 # with `cargo build -p carrick-cli --features fs-memory`.
 fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runtime/fs-memory"]
+# Debug-only tracing (compile-gated, default OFF). Each forwards to the owning
+# crate; `debug-all` turns the lot on. e.g. `cargo build --features trace-tty`.
+trace-tty = ["carrick-runtime/trace-tty"]
+trace-io = ["carrick-runtime/trace-io"]
+trace-traps = ["carrick-runtime/trace-traps"]
+watchpoint = ["carrick-runtime/watchpoint"]
+event-ring-dump = ["carrick-runtime/event-ring-dump"]
+trace-hvf = ["carrick-runtime/trace-hvf"]
+trace-syscalls = ["carrick-runtime/trace-syscalls"]
+debug-stats = ["carrick-runtime/debug-stats"]
+trace-elf = ["carrick-runtime/trace-elf"]
+trace-dtrace = []
+debug-all = [
+    "trace-tty",
+    "trace-io",
+    "trace-traps",
+    "watchpoint",
+    "event-ring-dump",
+    "trace-hvf",
+    "trace-syscalls",
+    "debug-stats",
+    "trace-elf",
+    "trace-dtrace",
+]
 
 [dependencies]
 carrick-runtime = { path = "../carrick-runtime", default-features = false }

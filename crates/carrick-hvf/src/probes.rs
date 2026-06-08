@@ -226,11 +226,12 @@ mod carrick_usdt {
     /// EL1 trampoline), `kick_inject` (EL0 kick-path signal injections),
     /// `inject_at_el1` (carrick-vs-guest invariant violations — must be 0).
     fn kick__stats(_: u64, _: u64, _: u64) {}
-    /// Reusable guest-memory watchpoint. When `CARRICK_WATCH_ADDR=<hex>` is
-    /// set, fires before EVERY syscall with (`syscall_nr`, `addr`, the current
-    /// little-endian u64 at `addr`). Lets a trace bracket exactly which
-    /// syscall a guest address changes across — e.g. which operation corrupts
-    /// a GOT slot. Zero-cost (and not even read) when the env var is unset.
+    /// Reusable guest-memory watchpoint (compiled in only under the `watchpoint`
+    /// feature). When that build has `CARRICK_WATCH_ADDR=<hex>` set, fires before
+    /// EVERY syscall with (`syscall_nr`, `addr`, the current little-endian u64 at
+    /// `addr`). Lets a trace bracket exactly which syscall a guest address changes
+    /// across — e.g. which operation corrupts a GOT slot. Absent from a stock
+    /// build; zero-cost (and not even read) when the env var is unset.
     fn mem__watch(_: u64, _: u64, _: u64) {}
     /// Fires in rt_sigaction with the first four u64 words the guest passed in
     /// its `struct sigaction` (offsets 0/8/16/24). Lets a trace see the exact

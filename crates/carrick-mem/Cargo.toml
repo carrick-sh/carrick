@@ -11,6 +11,11 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Debug-only ELF segment-load dump to stderr (compile-gated, default OFF). A
+# stock build compiles it out; build `--features trace-elf` to get the dump.
+trace-elf = []
+
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }

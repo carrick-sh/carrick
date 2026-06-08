@@ -986,7 +986,6 @@ where
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
     let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
-    let trace_traps = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
     for traps in 1..=max_traps {
         let frame = match runtime.next_syscall()? {
             Some(f) => f,
@@ -1022,7 +1021,8 @@ where
                 continue;
             }
         };
-        if trace_traps {
+        #[cfg(feature = "trace-traps")]
+        {
             let name = crate::syscall::lookup_aarch64(frame.x8)
                 .map(|s| s.name)
                 .unwrap_or("<unknown>");
@@ -1264,7 +1264,8 @@ where
             }
         }
 
-        if trace_traps && let Some(ret) = last_syscall_retval {
+        #[cfg(feature = "trace-traps")]
+        if let Some(ret) = last_syscall_retval {
             // Return-side companion to the entry line above: shows what carrick
             // returned to the guest. A negative value in [-4095, -1] is -errno
             // (decode it), otherwise it's a plain return. This makes the trap
@@ -1666,7 +1667,6 @@ struct ThreadRuntimeState {
     in_guest: Arc<std::sync::atomic::AtomicBool>,
     waiter: crate::io_wait::ThreadWaiter,
     max_traps: usize,
-    trace: bool,
     /// Set on a vfork (`CLONE_VM|CLONE_VFORK`) CHILD: the write end of the pipe
     /// whose read end the suspended PARENT blocks on. The child writes one byte
     /// (then closes it) at its first `execve` to release the parent; any other
@@ -1694,7 +1694,6 @@ impl ThreadRuntimeState {
             in_guest,
             waiter: crate::io_wait::ThreadWaiter::new(this_tid),
             max_traps,
-            trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
             vfork_release_fd: None,
         }
     }
@@ -1782,10 +1781,8 @@ impl ThreadRuntimeState {
         Ok(())
     }
 
+    #[cfg(feature = "trace-traps")]
     fn trace_syscall(&self, traps: usize, frame: Aarch64SyscallFrame) {
-        if !self.trace {
-            return;
-        }
         let name = crate::syscall::lookup_aarch64(frame.x8)
             .map(|s| s.name)
             .unwrap_or("<unknown>");
@@ -1800,10 +1797,8 @@ impl ThreadRuntimeState {
     /// a plain return. Pairs with the entry line so the trap stream is a full
     /// request+result log — the reducer aligns it against the Docker oracle to
     /// localise a wrong-errno divergence or the last syscall before a hang.
+    #[cfg(feature = "trace-traps")]
     fn trace_syscall_return(&self, traps: usize, ret: Option<i64>) {
-        if !self.trace {
-            return;
-        }
         let Some(ret) = ret else { return };
         if (-4095..0).contains(&ret) {
             let e = (-ret) as u32;
@@ -2192,13 +2187,11 @@ impl ThreadRuntimeState {
         let cleanup_kicker = Arc::clone(&self.kicker);
         let cleanup_kernel = Arc::clone(kernel);
         let max_traps = self.max_traps;
-        let trace = self.trace;
         let handle = std::thread::Builder::new()
             .name(format!("guest-tid-{tid}"))
             .spawn(move || {
-                if trace {
-                    eprintln!("[sibling tid#{tid}] thread started, building vCPU");
-                }
+                #[cfg(feature = "trace-traps")]
+                eprintln!("[sibling tid#{tid}] thread started, building vCPU");
                 // Wait (if necessary) for room under the HVF concurrent-vCPU cap
                 // BEFORE taking the topology lock. carrick binds one vCPU per
                 // guest thread for its whole lifetime; HVF caps concurrent vCPUs
@@ -2231,7 +2224,8 @@ impl ThreadRuntimeState {
                     Ok(child_engine) => {
                         child_kicker.register(tid, child_engine.vcpu_kick_handle());
                         drop(topo);
-                        if trace {
+                        #[cfg(feature = "trace-traps")]
+                        {
                             let pc = child_engine.program_counter().unwrap_or(0);
                             eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
                         }
@@ -3040,6 +3034,7 @@ fn run_vcpu_until_exit(
                 }
                 Err(e) => return Err(e.into()),
             };
+            #[cfg(feature = "trace-traps")]
             state.trace_syscall(traps, frame);
 
             // ---- syscall service: no dispatcher-wide lock held ----
@@ -3222,6 +3217,7 @@ fn run_vcpu_until_exit(
                 kernel.fork.start_signal_pump(&state.kicker, &state.futex);
             }
 
+            #[cfg(feature = "trace-traps")]
             state.trace_syscall_return(traps, last_syscall_retval);
 
             // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
