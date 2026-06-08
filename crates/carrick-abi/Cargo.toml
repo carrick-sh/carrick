@@ -13,4 +13,5 @@ workspace = true
 
 [dependencies]
 bitflags.workspace = true
+serde = { workspace = true, features = ["derive"] }
 zerocopy.workspace = true

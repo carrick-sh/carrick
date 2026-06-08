@@ -160,9 +160,14 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 pub use carrick_hvf::darwin_kqueue;
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::{
-    compat, fork_coord, host_signal, io_wait, itimer, posix_timer, probes, syscall, threaded_impl,
-    trap, vcpu_kick,
+    compat, fork_coord, host_signal, io_wait, itimer, posix_timer, probes, threaded_impl, trap,
+    vcpu_kick,
 };
+// AArch64 syscall metadata is platform-neutral ABI data, hoisted to carrick-abi
+// so every backend shares ONE table (the Linux/KVM arm was a `lookup → None`
+// stub; bhyve would have inherited it). Re-exported at `crate::syscall` so the
+// dispatcher / CLI / compat reporter call sites are unchanged on both platforms.
+pub use carrick_abi::syscall;
 // The shared-aperture sub-allocator is platform-NEUTRAL host-memory bookkeeping
 // (the stage-2 REGISTRATION of the window is the per-backend glue, not this
 // carver). It lives in carrick-mem so every backend — HVF, KVM, and bhyve —
@@ -1903,19 +1908,6 @@ pub mod compat {
     }
 }
 
-#[cfg(not(feature = "platform-macos"))]
-pub mod syscall {
-    /// `Serialize` so the CLI's `carrick syscalls <n>` per-number lookup works on
-    /// Linux (the macOS `carrick_hvf::syscall::Syscall` is serializable too). The
-    /// full-table dump (`aarch64_table`) stays macOS-only.
-    #[derive(serde::Serialize)]
-    pub struct Syscall {
-        pub name: &'static str,
-    }
-    pub fn lookup_aarch64(_number: u64) -> Option<&'static Syscall> {
-        None
-    }
-}
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod probes {

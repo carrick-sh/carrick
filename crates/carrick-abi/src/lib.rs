@@ -102,6 +102,12 @@
 use bitflags::bitflags;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+/// Static AArch64 syscall metadata (number → name/subsystem/support-level). Pure
+/// compile-time ABI data shared by every backend's compat reporter + the CLI's
+/// `syscalls` command; was carrick-hvf-private (so the Linux/KVM arm only had a
+/// `lookup → None` stub). See `syscall` module docs.
+pub mod syscall;
+
 pub const LINUX_S_IFMT: u32 = 0o170000;
 pub const LINUX_S_IFDIR: u32 = 0o040000;
 pub const LINUX_S_IFREG: u32 = 0o100000;
