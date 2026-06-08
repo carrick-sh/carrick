@@ -2819,9 +2819,31 @@ fn dispatch_threaded_futex(
         };
     }
 
+    // Only WAIT / CMP_REQUEUE / PI ops consult the futex VALUE; WAKE and plain
+    // REQUEUE are keyed purely on the guest address (the parking-lot table keys
+    // on the VA, which is identical across the shared guest address space). Real
+    // Linux FUTEX_WAKE likewise computes only the hash key — it never reads the
+    // word. So reading the word for a WAKE is unnecessary, and surfacing its
+    // EFAULT is actively harmful: a cross-thread waker whose per-thread
+    // `GuestMemory` view can't translate the *waiter's* futex page (the syscall
+    // path uses a per-sibling window snapshot, unlike the coherent whole-RAM
+    // view HVF exposes) would spuriously fail the wake. Go's
+    // `runtime.futexwakeup` treats any unexpected errno (incl. EFAULT) as fatal
+    // and self-crashes (SIGSEGV at 0x1006), which is exactly the intermittent
+    // Go-on-KVM failure. Make the read non-fatal for value-independent ops.
+    let needs_word = matches!(
+        command,
+        LINUX_FUTEX_WAIT
+            | LINUX_FUTEX_LOCK_PI
+            | LINUX_FUTEX_TRYLOCK_PI
+            | LINUX_FUTEX_UNLOCK_PI
+            | LINUX_FUTEX_CMP_REQUEUE
+    );
     let word = match read_futex_word(memory, address) {
         Ok(word) => word,
-        Err(errno) => return DispatchOutcome::Errno { errno },
+        Err(errno) if needs_word => return DispatchOutcome::Errno { errno },
+        // WAKE / plain REQUEUE: the value is unused; proceed address-keyed.
+        Err(_) => 0,
     };
 
     if matches!(
