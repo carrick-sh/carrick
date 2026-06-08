@@ -13,7 +13,8 @@ use carrick_mem::memory::AddressSpace;
 
 use crate::fork::{VcpuSnapshot, seed_sibling_snapshot};
 use crate::guest_setup::{
-    BroughtUp, FAULT_SENTINEL_GPA, GuestRam, SENTINEL_GPA, WindowDesc, bring_up, program_sysregs,
+    BroughtUp, FAULT_SENTINEL_GPA, GuestRam, SENTINEL_GPA, WindowDesc, bring_up,
+    populate_vdso_vvar, program_sysregs,
 };
 use crate::kvm::{KvmVcpu, KvmVm, SharedVmHandle};
 use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
@@ -523,6 +524,11 @@ impl SyscallTrap for KvmTrapEngine {
         // windows), so it must rebuild its OWN manager lazily from that copy —
         // not keep editing through the Arc the parent's siblings still share.
         self.page_tables = Arc::new(Mutex::new(None));
+        // Re-calibrate the vDSO clock against the CHILD's counter: the child runs
+        // on a brand-new KvmVm, so its guest counter basis differs from the
+        // parent's, and the COW-inherited vvar's realtime_off no longer matches.
+        // (CNTKCTL is set on the child's vCPU via the shared add_vcpu create path.)
+        let _ = populate_vdso_vvar(&self.vcpu, &mut self.ram);
         Ok(ForkOutcome::Child)
     }
 
@@ -581,6 +587,9 @@ impl SyscallTrap for KvmTrapEngine {
         //    the two paths.
         program_sysregs(&mut self.vcpu, new_image)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Re-calibrate the vDSO clock for the new image's vvar (same vCPU, so
+        // CNTKCTL is still set; best-effort like bring_up).
+        let _ = populate_vdso_vvar(&self.vcpu, &mut self.ram);
 
         // 5. Zero x0..x30. Linux's execve contract starts the new program with
         //    all GPRs clear (except SP/PC, set by `program_sysregs`). Without

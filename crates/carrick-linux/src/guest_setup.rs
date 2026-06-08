@@ -784,7 +784,7 @@ pub(crate) enum AliasBacking<'a> {
 pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
     // 1-3. Lay out guest physical RAM: windows + image segments + the
     //       architectural bring-up pages (shared with execve_into).
-    let ram = GuestRam::build_for_image(image)?;
+    let mut ram = GuestRam::build_for_image(image)?;
 
     // 4. Create VM + publish every window as its own KVM memory slot.
     let mut vm = KvmVm::create(image)?;
@@ -796,12 +796,68 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
     // 5. Program registers (sys regs + entry/SP/PC), NO FEAT_PAN3 workaround.
     program_sysregs(&mut vcpu, image)?;
 
+    // 6. Calibrate the vDSO clock so its `cntvct_el0` fast path returns correct
+    //    wall-clock time (EL0 counter access is enabled per-vCPU in the vCPU
+    //    create path). Best-effort: a calibration failure leaves the vvar zeroed
+    //    (realtime reads as boot-relative) rather than aborting bring-up.
+    let _ = populate_vdso_vvar(&vcpu, &mut ram);
+
     Ok(BroughtUp {
         vm,
         vcpu,
         ram,
         entry: image.entry(),
     })
+}
+
+/// Calibrate the vDSO clock data page (vvar). The vDSO computes
+/// `realtime_ns = CNTVCT_EL0/CNTFRQ_EL0*1e9 + realtime_off`, reading CNTVCT/CNTFRQ
+/// directly at EL0 (enabled per-vCPU via CNTKCTL_EL1 in the vCPU create path) and
+/// `realtime_off` from the vvar. So write `realtime_off = unix_ns - cnt/freq*1e9`
+/// measured here against the GUEST's counter (KVM_REG_ARM_TIMER_CNT — the value
+/// the guest's `mrs cntvct_el0` returns) and the CNTFRQ_EL0 the vDSO reads. The
+/// offset is constant; as the guest counter advances, the vDSO tracks real time.
+/// (The vDSO reads the freq from the sysreg, not the vvar, so only offset 16 is
+/// filled.) Mirrors HVF's `populate_vdso_data_page`, calibrated to the guest's own
+/// counter rather than macOS CLOCK_UPTIME_RAW. Re-run on execve (new image RAM)
+/// and on the fork child (new VM = new counter basis).
+/// Read the host's `CNTFRQ_EL0` (timer frequency, Hz). Unconditionally
+/// EL0-readable on aarch64, and equal to the KVM guest's CNTFRQ_EL0 (the same
+/// physical counter) — which KVM does not surface through `KVM_GET_ONE_REG`.
+fn host_cntfrq_el0() -> u64 {
+    let freq: u64;
+    // SAFETY: `cntfrq_el0` is an unprivileged read on aarch64 Linux.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack));
+    }
+    freq
+}
+
+pub(crate) fn populate_vdso_vvar(vcpu: &KvmVcpu, ram: &mut GuestRam) -> Result<(), OsError> {
+    use carrick_mem::vdso::{LINUX_VVAR_BASE, VVAR_OFF_REALTIME_OFF_NS};
+    // KVM does NOT expose CNTFRQ_EL0 via KVM_GET_ONE_REG (ENOENT), but the guest's
+    // CNTFRQ_EL0 (what the vDSO reads) is the SAME physical timer frequency the
+    // host sees — and CNTFRQ_EL0 is unconditionally EL0-readable on aarch64 Linux,
+    // so read it directly from the host. The COUNTER, however, must come from the
+    // guest (KVM_REG_ARM_TIMER_CNT) — it has the guest's CNTVOFF baked in.
+    let freq = host_cntfrq_el0();
+    let cnt = vcpu.get_timer_cnt()?;
+    if std::env::var_os("CARRICK_VDSO_DEBUG").is_some() {
+        eprintln!("[VDSODBG] host_cntfrq={freq} guest_timer_cnt={cnt}");
+    }
+    if freq == 0 {
+        return Ok(()); // no counter — the vDSO clock falls back to syscalls
+    }
+    let mono_ns = ((cnt as u128) * 1_000_000_000u128 / (freq as u128)) as u64;
+    let unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let realtime_off = unix_ns.wrapping_sub(mono_ns);
+    ram.write_gpa(
+        LINUX_VVAR_BASE + VVAR_OFF_REALTIME_OFF_NS as u64,
+        &realtime_off.to_le_bytes(),
+    )
 }
 
 /// Program the vCPU's system + core registers for `image`: MAIR/TCR/TTBR0/1/

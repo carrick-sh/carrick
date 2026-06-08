@@ -454,6 +454,12 @@ fn deliver_fault_signal<E: ThreadedEngine>(
     } else if let Some((signum, si_code)) = el0_fault_signal(esr) {
         (signum, si_code, far)
     } else {
+        if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+            eprintln!(
+                "[FAULTDBG tid={this_tid:?}] UNCLASSIFIED EL0 fault esr={esr:#x} ec={:#x} elr={elr:#x} far={far:#x} -> SIGSEGV terminate",
+                (esr >> 26) & 0x3f
+            );
+        }
         return terminate(11);
     };
     if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
