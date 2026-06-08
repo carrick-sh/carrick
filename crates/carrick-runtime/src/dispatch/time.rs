@@ -567,11 +567,19 @@ impl SyscallDispatcher {
                 .ok()
                 .and_then(|s| s.checked_mul(LINUX_CLK_TCK))
                 .unwrap_or(i64::MAX);
-            let host = crate::host_proc::self_resource_usage().unwrap_or_default();
+            // On macOS, `self_resource_usage` sources guest CPU from
+            // `proc_pid_rusage` + HVF exec-time correction (see host_proc.rs).
+            // On Linux/KVM, it returns `None` because Darwin libproc is
+            // unavailable; fall back to the cross-platform
+            // `guest_cpu::total_us()` table that is now populated by the
+            // `begin_active`/`finish_active` wrap around KVM_RUN.
+            let (user_us, system_us) = crate::host_proc::self_resource_usage()
+                .map(|h| (h.user_us, h.system_us))
+                .unwrap_or_else(|| (crate::guest_cpu::total_us(), 0));
             let to_ticks = |us: u64| (us as i64).saturating_mul(LINUX_CLK_TCK) / 1_000_000;
             let tms = LinuxTms {
-                tms_utime: to_ticks(host.user_us),
-                tms_stime: to_ticks(host.system_us),
+                tms_utime: to_ticks(user_us),
+                tms_stime: to_ticks(system_us),
                 tms_cutime: to_ticks(crate::guest_cpu::child_user_us()),
                 tms_cstime: to_ticks(crate::guest_cpu::child_system_us()),
             };
@@ -594,6 +602,14 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EFAULT.into());
             }
             let host = crate::host_proc::self_resource_usage().unwrap_or_default();
+            // On Linux/KVM, `self_resource_usage` is a no-op stub; source the
+            // guest's user CPU from the cross-platform `guest_cpu` table instead
+            // (populated by begin_active/finish_active around KVM_RUN).
+            let self_user_us = if host.user_us > 0 {
+                host.user_us
+            } else {
+                crate::guest_cpu::total_us()
+            };
             let rusage = match who {
                 LINUX_RUSAGE_THREAD => {
                     let (user_us, system_us) = crate::host_proc::self_thread_cpu_us().unwrap_or((0, 0));
@@ -605,7 +621,7 @@ impl SyscallDispatcher {
                     host.maxrss_bytes,
                     0,
                 ),
-                _ => rusage_from(host.user_us, host.system_us, host.maxrss_bytes, host.majflt),
+                _ => rusage_from(self_user_us, host.system_us, host.maxrss_bytes, host.majflt),
             };
             memory.write_bytes(usage.0, rusage.abi_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })

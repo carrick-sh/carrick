@@ -33,6 +33,7 @@ libc.workspace = true
 # Linux-only KVM bindings: target-gated so the macOS workspace never resolves
 # them (kvm-ioctls/kvm-bindings are cfg(target_os = "linux") only).
 [target.'cfg(target_os = "linux")'.dependencies]
+carrick-host = { path = "../carrick-host" }
 kvm-ioctls = "0.22.1"
 kvm-bindings = "0.12.1"
 vmm-sys-util = "0.15.0"

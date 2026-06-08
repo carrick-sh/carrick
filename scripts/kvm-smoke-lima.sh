@@ -910,8 +910,23 @@ CEOF
       printf "FAIL [si-pid]: stdout=[%s] exit=%s oracle=[*sender-pid-ok*]\n" "$got" "$code" >&2
       exit 1
     fi
+    # 27. Task 3 (timer/signal refactor): guest CPU time accounting on KVM.
+    #     KvmTrapEngine::next_syscall now wraps KVM_RUN with
+    #     carrick_host::guest_cpu::begin_active / finish_active, mirroring HVF.
+    #     The fixture busy-spins ~100ms then calls times(2); if tms_utime > 0
+    #     the KVM run loop is correctly accruing guest execution time into the
+    #     shared EXEC_SLOTS table (source of truth for getrusage/times on KVM).
+    cpu_time_src="$fixdir/cpu-time/cpu-time.c"
+    gcc -static -O2 -o /tmp/cpu_time "$cpu_time_src"
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/cpu_time" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "cpu-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+cpu-time]: times(2) reported non-zero CPU after a busy-spin (guest_cpu::begin/finish_active wired on KVM)."
+    else
+      printf "FAIL [cpu-time]: stdout=[%s] exit=%s oracle=[cpu-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -922,5 +937,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid — all 30 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time — all 31 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time) pass on KVM; ZERO xfail."
 '
