@@ -13,7 +13,7 @@ use carrick_mem::memory::AddressSpace;
 
 use crate::fork::{VcpuSnapshot, seed_sibling_snapshot};
 use crate::guest_setup::{
-    BroughtUp, GuestRam, SENTINEL_GPA, WindowDesc, bring_up, program_sysregs,
+    BroughtUp, FAULT_SENTINEL_GPA, GuestRam, SENTINEL_GPA, WindowDesc, bring_up, program_sysregs,
 };
 use crate::kvm::{KvmVcpu, KvmVm, SharedVmHandle};
 use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
@@ -175,6 +175,45 @@ impl SyscallTrap for KvmTrapEngine {
                     self.last_syscall_nr = Some(frame.x8);
                     self.last_syscall_orig_x0 = frame.x0;
                     return Ok(Some(frame));
+                }
+                VcpuExit::MmioWrite { gpa, .. } if gpa == FAULT_SENTINEL_GPA => {
+                    // An EL0 SYNCHRONOUS FAULT (data/instruction abort, alignment)
+                    // vectored into the EL1 sentinel slot, which read ESR.EC, saw
+                    // it was not an `svc`, and stored to FAULT_SENTINEL_GPA. (A
+                    // bare EL0 abort is NOT a KVM_RUN exit — KVM steers it to the
+                    // guest's own VBAR_EL1 — so this is the ONLY way it reaches the
+                    // host.) Capture the still-pristine EL0 fault state (the vector
+                    // clobbered only x9) and return EL0Fault; the shared loop's
+                    // deliver_fault_signal maps ESR.EC -> SIGSEGV/SIGBUS and injects
+                    // the handler (or terminates). `from_el0_direct = false`: the
+                    // EL1 vector latched ELR_EL1, and inject_signal redirects
+                    // ELR_EL1 (the syscall-path mechanism) which the vector's
+                    // `eret` then consumes — exactly like a syscall return.
+                    let syndrome = self
+                        .vcpu
+                        .get_esr_el1()
+                        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+                    let far = self
+                        .vcpu
+                        .get_far_el1()
+                        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+                    let g = |r: Reg| {
+                        self.vcpu
+                            .reg(r)
+                            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+                    };
+                    self.last_fault_esr = syndrome;
+                    return Err(TrapError::EL0Fault {
+                        syndrome,
+                        elr: g(Reg::ElrEl1)?,
+                        far,
+                        x16: g(Reg::X(16))?,
+                        x17: g(Reg::X(17))?,
+                        x29: g(Reg::X(29))?,
+                        x30: g(Reg::X(30))?,
+                        sp: g(Reg::Sp)?,
+                        from_el0_direct: false,
+                    });
                 }
                 VcpuExit::MmioWrite { gpa, data, len } => {
                     return Err(TrapError::UnexpectedExit {
