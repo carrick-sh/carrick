@@ -24,22 +24,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+// The shared_wait loop now returns these via carrick_hal::shared_wait_sliced;
+// only the tests still name them (to assert the interrupt/timeout returns).
+#[cfg(test)]
 use carrick_abi::{LINUX_EINTR, LINUX_ETIMEDOUT};
 use carrick_hal::{FutexOutcome, PlatformFutex, ThreadId};
 use carrick_thread::thread::{FutexTable, FutexWaitOutcome};
 
-// ---------------------------------------------------------------------------
-// The shared-futex (MAP_SHARED, cross-process) slice cap.
-//
-// `shared_wait` slices each kernel `FUTEX_WAIT` to ≤20 ms so a pending guest
-// signal (delivered as a `kick` that flips the `interrupted()` predicate) is
-// observed promptly: the kick cannot interrupt a blocked `FUTEX_WAIT` on this
-// thread (the run loop's kick targets the *vCPU* thread inside KVM_RUN, not a
-// thread parked in `SYS_futex`), so we wake every ≤20 ms to re-check. Mirrors
-// the HVF `SHARED_FUTEX_MAX_SLICE_US` and the single-threaded `shared_futex_wait`
-// loop in runtime.rs.
-// ---------------------------------------------------------------------------
-const SHARED_FUTEX_MAX_SLICE_NS: i64 = 20_000_000; // 20 ms
+// The ≤20 ms shared-futex slice cap + the deadline/slice/interrupt loop now live
+// in `carrick_hal::shared_wait_sliced` (shared with HVF/bhyve); see `shared_wait`.
 
 /// Wait on a cross-process futex via the host `SYS_futex(FUTEX_WAIT, ...)`.
 ///
@@ -167,51 +160,30 @@ impl PlatformFutex for KvmFutex {
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64 {
-        let deadline = timeout.map(|d| std::time::Instant::now() + d);
-        loop {
-            if interrupted() {
-                return -i64::from(LINUX_EINTR);
-            }
-            // Compute this iteration's relative-timeout slice (≤20 ms), or bail
-            // with -ETIMEDOUT if the deadline has already passed.
-            let slice_ns: i64 = match deadline {
-                Some(dl) => {
-                    let now = std::time::Instant::now();
-                    if now >= dl {
-                        return -i64::from(LINUX_ETIMEDOUT);
-                    }
-                    i64::try_from((dl - now).as_nanos())
-                        .unwrap_or(SHARED_FUTEX_MAX_SLICE_NS)
-                        .min(SHARED_FUTEX_MAX_SLICE_NS)
-                }
-                None => SHARED_FUTEX_MAX_SLICE_NS,
-            };
+        // The deadline/slice/interrupt loop is shared (carrick_hal); only the
+        // single kernel wait + its host-errno classification is KVM-specific.
+        carrick_hal::shared_wait_sliced(timeout, interrupted, &|slice_ns| {
             let r = futex_wait_on_address(host_addr, value, Some(slice_ns));
             if r == 0 {
-                // Woken, or the word already differed from `value` (the kernel
-                // returns 0 with EWOULDBLOCK only when the comparison fails at
-                // entry — see below). Caller re-checks its condition. Linux
-                // FUTEX_WAIT returns 0 on a successful wake.
-                return 0;
+                // Woken, or the word already differed from `value`. Linux
+                // FUTEX_WAIT returns 0 on a successful wake; the caller re-checks.
+                return carrick_hal::SharedWaitStep::Woken;
             }
             let host_errno = (-r) as i32;
             // EAGAIN/EWOULDBLOCK: the word != `value` at entry — the wait would
-            // not have blocked. Treat as a 0 return (the guest re-reads the word
-            // and re-evaluates), matching Linux FUTEX_WAIT's "value mismatch ->
-            // EAGAIN" which carrick surfaces to the guest as a re-dispatch.
+            // not have blocked; surface as a 0 return (the guest re-reads + re-
+            // evaluates), matching Linux FUTEX_WAIT's value-mismatch semantics.
             if host_errno == libc::EAGAIN {
-                return 0;
+                return carrick_hal::SharedWaitStep::Woken;
             }
-            // ETIMEDOUT: the ≤20 ms slice expired. EINTR: a signal nudged the
-            // blocked FUTEX_WAIT. Either way, re-check `interrupted()`/deadline at
-            // the loop top rather than returning — only a real deadline or a
-            // pending interrupt terminates the wait.
+            // ETIMEDOUT (≤20 ms slice expiry) / EINTR (signal nudge): re-check at
+            // the loop top — only a real deadline or pending interrupt terminates.
             if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
-                continue;
+                return carrick_hal::SharedWaitStep::Retry;
             }
             // Any other error (e.g. EFAULT on a bad address) is returned directly.
-            return r;
-        }
+            carrick_hal::SharedWaitStep::Error(r)
+        })
     }
 
     /// Wake up to `n` waiters on a `MAP_SHARED` (cross-process) futex via the
