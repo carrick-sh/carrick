@@ -38,6 +38,22 @@ pub const SENTINEL_GPA: u64 = 0x50_0000_0000; // 320 GiB
 /// the store always faults to stage-2 / MMIO.
 pub const FAULT_SENTINEL_GPA: u64 = 0x51_0000_0000; // 324 GiB
 
+/// Base of the KVM alias-GPA arena: a free identity hole between the private
+/// overlay (608+2 GiB) and the stack (~1 TiB), within the 40-bit nested-KVM IPA
+/// limit (lima reports `IPA Size Limit: 40 bits`). A guest `mmap(MAP_SHARED, fd)`
+/// (or other [`carrick_mem::memory::is_high_va`] alias) gets a dispatcher-chosen
+/// VA >= `LINUX_HIGH_VA_THRESHOLD` (1 TiB), which exceeds the IPA limit and so
+/// cannot itself be a KVM GPA. KVM instead backs it with a slot at
+/// `KVM_ALIAS_GPA_BASE + (va - LINUX_HIGH_VA_THRESHOLD)` — a deterministic,
+/// collision-free low GPA (the dispatcher's alias VAs are already unique and span
+/// exactly `LINUX_ALIAS_IPA_SIZE`), and maps VA -> that GPA in stage-1. HVF, with
+/// its own per-region `hv_vm_map`, uses the dispatcher's low IPA directly; this is
+/// the KVM-specific stage-2 glue.
+pub(crate) const KVM_ALIAS_GPA_BASE: u64 = 0xA0_0000_0000; // 640 GiB
+/// Size of the KVM alias-GPA arena. Matches `LINUX_ALIAS_IPA_SIZE` (64 GiB) so the
+/// VA->GPA delta always lands in-arena; ends at 704 GiB, well below the stack.
+pub(crate) const KVM_ALIAS_GPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB
+
 /// KVM memory-slot alignment. `KVM_SET_USER_MEMORY_REGION` requires the
 /// guest-physical base and size to be a multiple of the HOST page size; 64 KiB
 /// covers every aarch64 host granule (4K/16K/64K). The high guest regions are
@@ -183,6 +199,15 @@ struct Window {
     /// simply reuse the inherited host VA that the parent's `Window::host` recorded
     /// — no re-mmap is needed.
     kind: WindowKind,
+    /// For a dynamic ALIAS window (a guest `mmap(MAP_SHARED, fd)` / high-VA
+    /// mapping whose dispatcher-chosen VA is >= 1 TiB and so cannot itself be a
+    /// KVM GPA under the 40-bit nested-KVM IPA limit): the GPA the KVM slot is
+    /// registered at (a free identity hole < 1 TiB), which DIFFERS from `base`
+    /// (the guest VA used for the syscall-path `locate`). `None` for an ordinary
+    /// identity window (`base` IS the GPA). The guest reaches the backing via
+    /// stage-1 (VA -> this GPA, built by `map_aliased`) then stage-2 (the slot);
+    /// the host syscall path reaches the SAME backing by `locate(VA)`.
+    slot_gpa: Option<u64>,
 }
 
 /// Multi-window host-backed guest RAM. The MVP used a single low window; a real
@@ -367,6 +392,99 @@ impl GuestRam {
             host: host.cast::<u8>(),
             len,
             kind,
+            slot_gpa: None,
+        });
+        Ok(())
+    }
+
+    /// Back a dynamic ALIAS mapping on the LIVE VM: host-mmap the backing (a
+    /// `MAP_SHARED` dup'd fd for a guest `mmap(MAP_SHARED, fd)`, coherent across
+    /// fork + other openers; or `MAP_PRIVATE|MAP_ANON` seeded with `payload`),
+    /// register a NEW KVM memory slot at `gpa` (a low identity hole), and track
+    /// the window keyed by the guest `va` (which differs from `gpa`). The caller
+    /// then builds the VA->`gpa` stage-1 path via `map_aliased`. The host backing
+    /// is owned by this `GuestRam` and `munmap`'d on drop. Mirrors HVF's
+    /// `map_host_alias`, with a KVM slot in place of `hv_vm_map`.
+    pub(crate) fn add_alias(
+        &mut self,
+        vm: &mut KvmVm,
+        va: u64,
+        gpa: u64,
+        len: u64,
+        backing: AliasBacking,
+    ) -> Result<(), OsError> {
+        let size = usize::try_from(align_up_slot(len)?)
+            .map_err(|_| OsError::new(format!("kvm: alias len {len} too large")))?;
+        // The slot GPA must never back a sentinel (the KVM alias arena sits at
+        // 640..704 GiB, above both 320/324 GiB sentinels, but assert the contract).
+        let gpa_end = gpa
+            .checked_add(size as u64)
+            .ok_or_else(|| OsError::new(format!("kvm: alias slot 0x{gpa:x}+{size} overflows")))?;
+        if (gpa <= SENTINEL_GPA && SENTINEL_GPA < gpa_end)
+            || (gpa <= FAULT_SENTINEL_GPA && FAULT_SENTINEL_GPA < gpa_end)
+        {
+            return Err(OsError::new(format!(
+                "kvm: alias slot 0x{gpa:x}..0x{gpa_end:x} would back a sentinel gpa"
+            )));
+        }
+        let (host, kind) = match backing {
+            AliasBacking::File { fd, offset, prot } => {
+                // MAP_SHARED of the dup'd fd: writes hit the page cache (coherent
+                // with other openers + across fork). We own the dup; mmap takes its
+                // own reference, so close it once mapped.
+                let h = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        size,
+                        prot,
+                        libc::MAP_SHARED,
+                        fd,
+                        offset,
+                    )
+                };
+                unsafe { libc::close(fd) };
+                if h == libc::MAP_FAILED {
+                    return Err(OsError::new(format!(
+                        "kvm: alias MAP_SHARED file (fd={fd} off={offset} size={size} prot={prot}) failed"
+                    )));
+                }
+                (h.cast::<u8>(), WindowKind::Shared)
+            }
+            AliasBacking::Anon { payload } => {
+                let h = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        -1,
+                        0,
+                    )
+                };
+                if h == libc::MAP_FAILED {
+                    return Err(OsError::new(format!(
+                        "kvm: alias anon mmap size={size} failed"
+                    )));
+                }
+                if !payload.is_empty() {
+                    let n = payload.len().min(size);
+                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), h.cast::<u8>(), n) };
+                }
+                (h.cast::<u8>(), WindowKind::Private)
+            }
+        };
+        // Register the LIVE KVM slot at the alias GPA. On failure, unmap before
+        // returning so we never leak the host backing.
+        if let Err(e) = vm.map_memory(gpa, host, size, MemPerms::ReadWriteExec) {
+            unsafe { libc::munmap(host.cast::<libc::c_void>(), size) };
+            return Err(e);
+        }
+        self.windows.push(Window {
+            base: va,
+            host,
+            len: size,
+            kind,
+            slot_gpa: Some(gpa),
         });
         Ok(())
     }
@@ -554,7 +672,11 @@ impl GuestRam {
     /// registration, in slot order. Used by both bring-up and execve to publish
     /// the windows onto a (fresh or live) VM via [`KvmVm::map_memory`].
     pub(crate) fn windows_for_kvm(&self) -> impl Iterator<Item = (u64, *mut u8, usize)> + '_ {
-        self.windows.iter().map(|w| (w.base, w.host, w.len))
+        // An alias window registers its KVM slot at `slot_gpa` (a low identity
+        // hole), NOT `base` (its high guest VA); an ordinary window has base==gpa.
+        self.windows
+            .iter()
+            .map(|w| (w.slot_gpa.unwrap_or(w.base), w.host, w.len))
     }
 
     /// Number of registered windows (== the number of KVM slots in use). Used by
@@ -578,6 +700,7 @@ impl GuestRam {
                 host: w.host as usize,
                 len: w.len,
                 kind: w.kind,
+                slot_gpa: w.slot_gpa,
             })
             .collect()
     }
@@ -598,6 +721,7 @@ impl GuestRam {
                 host: d.host as *mut u8,
                 len: d.len,
                 kind: d.kind,
+                slot_gpa: d.slot_gpa,
             })
             .collect();
         Self {
@@ -618,6 +742,25 @@ pub(crate) struct WindowDesc {
     pub host: usize,
     pub len: usize,
     pub kind: WindowKind,
+    /// Alias windows: the KVM-slot GPA (differs from `base`). `None` for ordinary
+    /// identity windows. See [`Window::slot_gpa`].
+    pub slot_gpa: Option<u64>,
+}
+
+/// How [`GuestRam::add_alias`] backs a dynamic alias mapping's host memory.
+pub(crate) enum AliasBacking<'a> {
+    /// A guest `mmap(MAP_SHARED, fd)`: `MAP_SHARED` of a dup'd host fd at `offset`
+    /// with host `prot`, so guest writes hit the file's page cache (coherent with
+    /// other openers and inherited across `fork(2)`). `GuestRam::add_alias` owns
+    /// the dup and closes it after the mmap takes its own reference.
+    File {
+        fd: libc::c_int,
+        offset: libc::off_t,
+        prot: libc::c_int,
+    },
+    /// A high-VA anonymous alias: `MAP_PRIVATE|MAP_ANON` seeded with `payload`
+    /// (empty for a zero-filled region).
+    Anon { payload: &'a [u8] },
 }
 
 /// Load `image` (a freestanding aarch64 ELF), build the stage-1 identity map +
