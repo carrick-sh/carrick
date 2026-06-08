@@ -55,5 +55,6 @@ pub use carrick_abi::syscall;
 pub mod signal_arrival;
 pub mod thread;
 pub mod threaded_impl;
+pub mod timer_delivery;
 pub mod trap;
 pub mod vcpu_kick;

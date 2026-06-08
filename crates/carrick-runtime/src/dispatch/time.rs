@@ -271,33 +271,21 @@ impl SyscallDispatcher {
                     })
                 };
 
-                let ident = crate::itimer::ident_for(idx);
-                let kq = crate::host_signal::pump_kqueue();
                 if value.is_zero() {
-                    crate::itimer::disarm(idx);
-                    if kq >= 0 {
-                        let _ = crate::darwin_kqueue::apply_changes(
-                            kq,
-                            &[crate::darwin_kqueue::Kevent::timer(
-                                ident,
-                                carrick_portable::EV_DELETE,
-                                0,
-                            )],
-                        );
+                    // Disarm: clear the slot + tear down backend delivery (HVF
+                    // deletes the EVFILT_TIMER; KVM just clears the slot). No
+                    // registered backend (a backing-loop-less unit test) → just
+                    // clear the neutral slot.
+                    match crate::timer_delivery::delivery() {
+                        Some(d) => d.disarm_itimer(idx),
+                        None => crate::itimer::disarm(idx),
                     }
                 } else {
                     let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
                     let arm_value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
-                    let cpu_timer = crate::itimer::is_cpu_timer(idx);
-                    let kqueue_value_ns = if cpu_timer {
-                        crate::itimer::cpu_timer_recheck_delay_ns(arm_value_ns)
-                    } else {
-                        arm_value_ns
-                    };
-                    let value_ns = i64::try_from(kqueue_value_ns).unwrap_or(i64::MAX);
-                    let interval_value_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
-                    let periodic = !interval.is_zero() && value == interval && !cpu_timer;
                     let needs_periodic = !interval.is_zero() && value != interval;
+                    // Write the neutral slot state FIRST (timer-core), then ask
+                    // the backend to initiate delivery.
                     let generation =
                         crate::itimer::arm(idx, arm_value_ns, interval_ns, needs_periodic);
 
@@ -316,20 +304,15 @@ impl SyscallDispatcher {
                                 "setitimer delivery is emulated with an EVFILT_TIMER on the signal pump kqueue and {signal_name}"
                             ),
                         ));
-                    let mut armed_on_kqueue = false;
-                    if kq >= 0 {
-                        let (flags, data) = if periodic {
-                            (carrick_portable::EV_ADD, interval_value_ns)
-                        } else {
-                            (carrick_portable::EV_ADD | carrick_portable::EV_ONESHOT, value_ns)
-                        };
-                        armed_on_kqueue = crate::darwin_kqueue::apply_changes(
-                            kq,
-                            &[crate::darwin_kqueue::Kevent::timer(ident, flags, data)],
-                        )
-                        .is_ok();
-                    }
-                    if !armed_on_kqueue {
+                    // `arm_itimer` returns true if the backend owns delivery
+                    // (HVF armed an EVFILT_TIMER on the pump kq); false → spawn
+                    // the shared wall-clock fallback thread (KVM, or an HVF
+                    // process with no pump kqueue yet). No registered backend (a
+                    // backing-loop-less unit test) also falls back.
+                    let owned = crate::timer_delivery::delivery().is_some_and(|d| {
+                        d.arm_itimer(idx, arm_value_ns, interval_ns, needs_periodic, signum)
+                    });
+                    if !owned {
                         crate::itimer::spawn_fallback_timer(idx, generation, value, interval);
                     }
                 }
@@ -445,7 +428,16 @@ impl SyscallDispatcher {
                     }
                 }
             };
-            let old = crate::posix_timer::arm(id, value_ns, interval_ns);
+            // Route the arm through the backend `TimerDelivery` (HVF/KVM each
+            // spawn their own firing mechanism; signum/si_value were captured at
+            // timer_create and live on the slot, so only value/interval pass). No
+            // registered backend (a backing-loop-less unit test) → arm the
+            // neutral registry directly (no firing thread, matching the old
+            // pump-less path).
+            let old = match crate::timer_delivery::delivery() {
+                Some(d) => d.arm_posix(id, value_ns, interval_ns),
+                None => crate::posix_timer::arm(id, value_ns, interval_ns),
+            };
             if old_ptr.0 != 0 {
                 let prev = old.unwrap_or(crate::posix_timer::PosixTimerSpec {
                     signum: 0,

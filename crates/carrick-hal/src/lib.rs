@@ -34,3 +34,5 @@ pub use threaded::{
 pub mod sigframe;
 pub mod signal_arrival;
 pub use signal_arrival::SignalArrival;
+pub mod timer_delivery;
+pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery};

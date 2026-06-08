@@ -19,10 +19,12 @@ pub mod kvm_futex;
 pub mod kvm_kicker;
 pub mod run_elf;
 pub mod signal_arrival;
+pub mod timer_delivery;
 pub mod trap_engine;
 
 pub use kvm::{KvmVcpu, KvmVm};
 pub use signal_arrival::KvmSignalArrival;
+pub use timer_delivery::KvmTimerDelivery;
 pub use kvm_fork_coord::KvmForkCoordinator;
 pub use kvm_futex::KvmFutex;
 pub use kvm_kicker::{KvmKickHandle, KvmKicker, install_kvm_kick_handler};
