@@ -1,0 +1,17 @@
+[package]
+name = "carrick-timer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_timer_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-host = { path = "../carrick-host" }
+libc.workspace = true

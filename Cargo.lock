@@ -547,6 +547,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-signal-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-spec"
 version = "0.1.0"
 dependencies = [
@@ -576,6 +583,15 @@ dependencies = [
  "parking_lot",
  "parking_lot_core",
  "serde",
+]
+
+[[package]]
+name = "carrick-timer-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-host",
+ "carrick-signal-core",
+ "libc",
 ]
 
 [[package]]
