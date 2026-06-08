@@ -10,8 +10,7 @@
 //! `DispatchOutcome::Fork`; `CLONE_VFORK` is unmodeled. That mis-modeling is the
 //! confirmed root cause of the concurrent-`go build` deadlock: the vfork child
 //! runs Go's constrained pre-exec code expecting a shared address space, gets a
-//! private copy instead, and busy-spins forever (see
-//! docs/concurrent-go-build-netpoll-deadlock.md).
+//! private copy instead, and busy-spins forever.
 //!
 //! This pins the defect WITHOUT a flaky/spinning hang: a `CLONE_VM` child stores
 //! a sentinel into the (shared) address space, then the `CLONE_VFORK`-suspended

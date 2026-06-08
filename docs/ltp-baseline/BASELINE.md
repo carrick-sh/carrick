@@ -15,8 +15,8 @@ python3 scripts/ltp-baseline.py --area fs  # one area
 python3 scripts/ltp-baseline.py --tally    # re-emit the per-area table below
 ```
 
-Inventory: `docs/ltp-baseline/inventory.json` — **1436** syscall tests from the
-image's `runtest/syscalls` manifest, grouped into 11 areas:
+Inventory: **1436** syscall tests from the image's `runtest/syscalls` manifest,
+grouped into 11 areas:
 
 | area | tests |  | area | tests |
 |---|---|---|---|---|

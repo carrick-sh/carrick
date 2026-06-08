@@ -224,7 +224,5 @@ report, "verified (assertions ran and matched)" from "skipped both sides
 
 - Memory: `project_ltp_go_coverage.md` (this campaign + the Darwin-as-truth
   research backlog), `project_ltp_conformance.md` (harness origins).
-- `docs/ltp_baseline_4areas.log` — last full baseline.
-- `docs/superpowers/specs/2026-05-23-procfs-pid-introspection-design.md` — a
-  worked example of the spec→probe→fix flow.
+- `docs/ltp-baseline/BASELINE.md` — the summarized baseline tally.
 - `handoff.md` (repo root) — current state, open gaps, next steps.
