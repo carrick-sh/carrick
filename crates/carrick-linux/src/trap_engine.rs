@@ -653,6 +653,60 @@ impl SyscallTrap for KvmTrapEngine {
         let r = carrick_hal::sigframe::restore_sigframe(self, true)?;
         Ok(r.sigmask)
     }
+
+    /// Back a dynamic alias mapping (`DispatchOutcome::MapHostAlias`) — a guest
+    /// `mmap(MAP_SHARED, fd)` or other high-VA mapping the dispatcher placed at a
+    /// VA >= 1 TiB. KVM mirrors HVF (mmap the host file/anon, then map VA -> a low
+    /// alias GPA in stage-1) but backs stage-2 with a NEW KVM memory slot instead
+    /// of `hv_vm_map`. The stage-1 path is the SHARED `map_aliased`.
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        _ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    ) -> Result<(), TrapError> {
+        use crate::guest_setup::{AliasBacking, KVM_ALIAS_GPA_BASE, KVM_ALIAS_GPA_SIZE};
+        use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
+        // KVM IGNORES the dispatcher's `ipa` (HVF-shaped: a low IPA at 96 GiB that
+        // sits INSIDE KVM's single low-window slot, so it can't be a fresh slot).
+        // Derive the alias GPA deterministically from the guest VA, inside the free
+        // <1 TiB arena (the 40-bit nested-KVM IPA limit). The dispatcher's alias
+        // VAs span [1 TiB, 1 TiB + 64 GiB), so the offset always lands in-arena; a
+        // guest-FIXED VA outside that span (e.g. Rosetta amd64 mapping at 128 TiB)
+        // is not yet supported on KVM — fail clearly rather than corrupt memory.
+        let off = va
+            .checked_sub(LINUX_HIGH_VA_THRESHOLD)
+            .filter(|&o| o < KVM_ALIAS_GPA_SIZE)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "KVM map_host_alias: VA 0x{va:x} outside the alias arena \
+                     [1 TiB, 1 TiB+64 GiB) — guest-fixed high-VA / Rosetta unsupported on KVM"
+                ))
+            })?;
+        let gpa = KVM_ALIAS_GPA_BASE + off;
+        let writable = match file {
+            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+            None => true,
+        };
+        let backing = match file {
+            Some((fd, offset, prot)) => AliasBacking::File { fd, offset, prot },
+            None => AliasBacking::Anon { payload },
+        };
+        // mmap the host backing + register a live KVM slot at `gpa`, tracked in
+        // GuestRam keyed by `va` (so the syscall read/write path resolves it).
+        self.ram
+            .add_alias(&mut self.vm, va, gpa, len, backing)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Build the VA -> GPA stage-1 path via the SHARED PageTableManager. No
+        // TLBI: the alias VA is brand-new (no stale TLB entry), so the guest's
+        // first access walks the just-written tables — the same fresh-page
+        // argument as `protect_range`.
+        self.pt_edit(|mgr| mgr.map_aliased(va, gpa, len, writable))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl KvmTrapEngine {
@@ -1233,6 +1287,97 @@ mod execve_tests {
             engine.get_vreg(0).unwrap(),
             v0_before,
             "V0 restored from the frame"
+        );
+    }
+
+    /// `map_host_alias` with `file=None` (a high-VA anonymous alias) seeds the
+    /// payload into a fresh KVM-backed window and the syscall read-path resolves
+    /// the high alias VA back to it (proving the VA-keyed window + the live slot).
+    #[test]
+    fn kvm_map_host_alias_anon_roundtrips() {
+        use carrick_guest_mem::GuestMemory;
+        use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
+        if !kvm_available() {
+            eprintln!("SKIP kvm_map_host_alias_anon_roundtrips: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        let before = engine.ram.window_count();
+        // 2 MiB into the alias VA span (2 MiB-aligned -> map_aliased block path).
+        let va = LINUX_HIGH_VA_THRESHOLD + 0x20_0000;
+        let payload = b"carrick alias payload".to_vec();
+        engine
+            .map_host_alias(va, 0, 0x1000, &payload, None)
+            .expect("map_host_alias anon");
+        assert_eq!(
+            engine.ram.window_count(),
+            before + 1,
+            "alias added exactly one KVM-backed window"
+        );
+        let got = engine.read_bytes(va, payload.len()).expect("read alias VA");
+        assert_eq!(
+            got, payload,
+            "read_bytes at the alias VA returns the payload"
+        );
+    }
+
+    /// `map_host_alias` with `file=Some(..)` maps a host fd MAP_SHARED; the alias
+    /// VA reads back the file's bytes (the MAP_SHARED-file coherence path).
+    #[test]
+    fn kvm_map_host_alias_file_roundtrips() {
+        use carrick_guest_mem::GuestMemory;
+        use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
+        if !kvm_available() {
+            eprintln!("SKIP kvm_map_host_alias_file_roundtrips: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        let content = b"file-backed alias via MAP_SHARED";
+        // An anonymous host file (memfd) with known content.
+        let fd = unsafe { libc::memfd_create(c"carrick-alias".as_ptr(), 0) };
+        assert!(fd >= 0, "memfd_create");
+        assert_eq!(unsafe { libc::ftruncate(fd, 0x1000) }, 0, "ftruncate");
+        let n = unsafe { libc::pwrite(fd, content.as_ptr().cast(), content.len(), 0) };
+        assert_eq!(n, content.len() as isize, "pwrite");
+        // map_host_alias closes the fd it receives, so hand it a dup.
+        let dup = unsafe { libc::dup(fd) };
+        assert!(dup >= 0, "dup");
+        let va = LINUX_HIGH_VA_THRESHOLD + 0x40_0000;
+        engine
+            .map_host_alias(
+                va,
+                0,
+                0x1000,
+                &[],
+                Some((dup, 0, libc::PROT_READ | libc::PROT_WRITE)),
+            )
+            .expect("map_host_alias file");
+        let got = engine
+            .read_bytes(va, content.len())
+            .expect("read file alias VA");
+        assert_eq!(
+            got, content,
+            "read_bytes at the file-alias VA returns the file content"
+        );
+        unsafe { libc::close(fd) };
+    }
+
+    /// A guest-FIXED VA outside the 64 GiB alias arena (e.g. the Rosetta 128 TiB
+    /// range) is rejected with an error, NOT silently mapped to a colliding GPA.
+    #[test]
+    fn kvm_map_host_alias_rejects_out_of_arena_va() {
+        use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
+        if !kvm_available() {
+            eprintln!("SKIP kvm_map_host_alias_rejects_out_of_arena_va: no /dev/kvm");
+            return;
+        }
+        let mut engine = engine_for(INITIAL_ELF);
+        // 1 TiB + ~6.4 TiB: well past the 64 GiB arena.
+        let va = LINUX_HIGH_VA_THRESHOLD + 0x10_0000_0000u64 * 100;
+        let r = engine.map_host_alias(va, 0, 0x1000, &[1, 2, 3], None);
+        assert!(
+            r.is_err(),
+            "a VA outside the alias arena must be rejected, not corrupt memory"
         );
     }
 }
