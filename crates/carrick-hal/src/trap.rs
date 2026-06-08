@@ -98,8 +98,16 @@ pub trait SyscallTrap {
         Ok(())
     }
     /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): map host
-    /// memory at `ipa` and build the VA→IPA stage-1 path. Default error for
-    /// non-HVF/test traps (they never emit the outcome).
+    /// memory at `ipa` and build the VA→IPA stage-1 path.
+    ///
+    /// The dispatcher only emits `DispatchOutcome::MapHostAlias` for engines that
+    /// can back a high-VA alias, so reaching this default is a carrick coverage
+    /// bug — an engine received an outcome it cannot service — never a recoverable
+    /// runtime condition. Fail LOUD at the call site (with the offending
+    /// va/ipa/len) instead of returning a soft error that would propagate far
+    /// away and surface as a generic "unsupported platform" at process exit,
+    /// masking the real cause. An engine that wants this outcome MUST override
+    /// the hook (HVF and KVM do).
     fn map_host_alias(
         &mut self,
         va: u64,
@@ -108,8 +116,20 @@ pub trait SyscallTrap {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        let _ = (va, ipa, len, payload, file);
-        Err(TrapError::UnsupportedPlatform)
+        let _ = (payload, file);
+        // A genuine, immediate abort (SIGABRT) — the codebase's deterministic
+        // failure mechanism (see the panic-backstop note in the workspace
+        // Cargo.toml). NOT a `panic!`/`unimplemented!` (both are workspace-denied
+        // clippy lints) and NOT a soft `Err`: returning one would propagate far
+        // away and surface as a generic "unsupported platform" at process exit,
+        // masking the real cause. Aborting here names the offending va/ipa/len at
+        // the exact call site.
+        eprintln!(
+            "carrick: FATAL: SyscallTrap::map_host_alias reached the trait default \
+             (va={va:#x} ipa={ipa:#x} len={len:#x}) — this engine emitted a MapHostAlias \
+             outcome it cannot service. Implement map_host_alias for this platform."
+        );
+        std::process::abort()
     }
 }
 

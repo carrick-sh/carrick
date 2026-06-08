@@ -2,7 +2,7 @@
 //! `SyscallTrap` contract. `next_syscall` runs KVM_RUN until the EL1 vector's
 //! sentinel store surfaces as `VcpuExit::MmioWrite { gpa: SENTINEL_GPA, .. }`,
 //! reads x0..x5,x8 into an `Aarch64SyscallFrame`, and returns it.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
@@ -39,6 +39,20 @@ pub struct KvmTrapEngine {
     last_syscall_orig_x0: u64,
     /// ESR of the most recent synchronous exception. Supplies `InjectParams::fault_esr` (Task 5).
     last_fault_esr: u64,
+    /// Live stage-1 page-table editor over the guest's own translation tables at
+    /// `LINUX_PAGE_TABLES_BASE`. Built lazily on the first `protect_range`/
+    /// `unmap_range` edit from the live guest backing (which `build_for_image`
+    /// seeded with `stage1_identity_page_tables`). This is what makes a guest
+    /// `mmap`/`mprotect` GUEST-visible — clearing UXN so the dynamic loader's
+    /// freshly-mapped library text is executable (vs the host-side
+    /// `range_no_access` EFAULT check, which only guards syscall buffers).
+    ///
+    /// Shared across `clone(CLONE_THREAD)` siblings (they run on the SAME VM with
+    /// the SAME page-table backing) so concurrent edits stay coherent; a `fork(2)`
+    /// child resets it to a fresh `None` (its tables are a COW copy it rebuilds
+    /// lazily). `None` until the first edit. Mirrors HVF's
+    /// `page_tables: Arc<Mutex<Option<PageTableManager>>>`.
+    page_tables: Arc<Mutex<Option<carrick_mem::page_table::PageTableManager>>>,
 }
 
 impl KvmTrapEngine {
@@ -59,7 +73,74 @@ impl KvmTrapEngine {
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
+            page_tables: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Edit the live stage-1 page tables (the guest's own translation tables at
+    /// `LINUX_PAGE_TABLES_BASE`) and replay the changed descriptors into the
+    /// guest page-table backing, so a guest `mmap`/`mprotect`/`munmap` becomes
+    /// GUEST-visible (UXN / AP / validity), not merely host-side. Builds the
+    /// `PageTableManager` lazily from the live backing on first use (the boot
+    /// image already wrote `stage1_identity_page_tables` there).
+    ///
+    /// No stage-1 TLB flush is issued (the EL1-vector TLBI is the Phase-D
+    /// follow-up): a freshly-`mmap`'d page has no stale TLB entry, so the guest's
+    /// first access walks the just-updated tables — exactly the dynamic-loader
+    /// case (map a library `PROT_EXEC`, then jump into it). Re-protecting an
+    /// ALREADY-accessed page (RELRO `RW→RO`) is therefore not yet enforced.
+    /// Coalescing is disabled (`set_multi_vcpu(true)`) because the
+    /// break-before-make table-free is unsafe without that all-vCPU flush.
+    fn pt_edit(
+        &mut self,
+        edit: impl FnOnce(
+            &mut carrick_mem::page_table::PageTableManager,
+        ) -> Result<bool, carrick_mem::page_table::PageTableError>,
+    ) -> Result<(), MemoryError> {
+        use carrick_mem::page_table::{PageTableError, PageTableManager};
+        const PT_BASE: u64 = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let host = self
+            .ram
+            .host_ptr(PT_BASE, size)
+            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
+        let pt = Arc::clone(&self.page_tables);
+        let mut guard = pt.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            // Build from the live guest backing (the boot tables) on first edit —
+            // nothing else writes the tables before this, so it matches the image.
+            let bytes = self
+                .ram
+                .read(PT_BASE, size)
+                .map_err(|_| MemoryError::HostMap("read live page tables".to_string()))?;
+            *guard = Some(PageTableManager::new(bytes, PT_BASE));
+        }
+        // INVARIANT: populated just above if it was `None` (so the else is dead);
+        // a returned Err keeps us clear of the workspace's expect/panic deny lints.
+        let Some(mgr) = guard.as_mut() else {
+            return Err(MemoryError::HostMap(
+                "page-table manager unexpectedly absent".to_string(),
+            ));
+        };
+        // No all-vCPU TLB broadcast yet (Phase D), so the break-before-make
+        // table-free in coalescing is unsafe: keep it disabled.
+        mgr.set_multi_vcpu(true);
+        let changed = edit(mgr).map_err(|e| match e {
+            PageTableError::OutOfTables => {
+                MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
+            }
+            PageTableError::BadAddress => MemoryError::OutOfBounds {
+                address: 0,
+                length: 0,
+            },
+        })?;
+        if changed {
+            // SAFETY: `host` backs the live page-table region for the whole
+            // process lifetime; the manager writes only 8-byte-aligned descriptor
+            // slots within `[host, host + size)`.
+            unsafe { mgr.sync_to_host(host) };
+        }
+        Ok(())
     }
 
     /// Read `len` bytes of live guest memory at guest-physical `gpa` (e.g. a
@@ -87,11 +168,14 @@ impl KvmTrapEngine {
 ///
 /// `read_bytes`/`write_bytes` move syscall buffers; `set_no_access`/
 /// `zero_backing` implement the HOST-SIDE PROT_NONE check (a bad syscall
-/// buffer faults with EFAULT). The trait's default no-op bodies stand for the
-/// GUEST-fault methods (`protect_range`/`unmap_range`/`unmap_alias_range`/
-/// `repoint_private`) and the zero-copy / `shared_futex_host_addr` hooks
-/// (`None`): making the guest's own EL0 access fault needs stage-1 edits + a
-/// SIGSEGV the engine can't yet inject (Phase D).
+/// buffer faults with EFAULT). `protect_range`/`unmap_range`/`unmap_alias_range`
+/// edit the live stage-1 tables (via [`KvmTrapEngine::pt_edit`]) so the GUEST's
+/// own EL0 access honours `mmap`/`mprotect`/`munmap` permissions — clearing UXN
+/// makes a freshly-mapped library text executable; combined with the Phase-4
+/// EL0-fault→SIGSEGV path, a PROT_NONE/munmap'd page now faults the guest. Not
+/// yet wired: `repoint_private` (the MAP_FIXED|MAP_PRIVATE overlay), and a
+/// stage-1 TLB flush so re-protecting an ALREADY-accessed page takes effect
+/// (the EL1-vector TLBI is the remaining Phase-D piece — fresh pages need none).
 impl GuestMemory for KvmTrapEngine {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         // A syscall buffer overlapping a PROT_NONE range faults with EFAULT,
@@ -152,6 +236,41 @@ impl GuestMemory for KvmTrapEngine {
     /// shared path before this override).
     fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
         self.ram.shared_futex_host_addr(guest_addr, 4)
+    }
+
+    /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the
+    /// live stage-1 tables. PROT_EXEC clears UXN (executable); its absence sets
+    /// UXN (NX / W^X), matching Linux — so the dynamic loader's freshly-mapped
+    /// library text (PROT_READ|PROT_EXEC) actually executes instead of
+    /// permission-faulting on the NX-by-default arena. (Boot regions — image
+    /// text, trampolines, vDSO — are mapped executable at boot and never edited
+    /// here; only guest mmap/mprotect ranges pass through.) Mirrors HVF's
+    /// `protect_range`.
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+        let exec = prot & LINUX_PROT_EXEC != 0;
+        self.pt_edit(|mgr| {
+            if prot & LINUX_PROT_WRITE != 0 {
+                mgr.set_rw(address, len, exec)
+            } else if prot & LINUX_PROT_READ != 0 {
+                mgr.set_readonly(address, len, exec)
+            } else {
+                mgr.set_prot_none(address, len)
+            }
+        })
+    }
+
+    /// `munmap`: invalidate the stage-1 descriptors for `[address, address+len)`
+    /// so the guest's own access faults (vs the host-side `no_access` check).
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.pt_edit(|mgr| mgr.invalidate(address, len))
+    }
+
+    /// `munmap` of a high-VA alias: invalidate AND reclaim the now-empty alias
+    /// sub-table(s) (vs `unmap_range`, which keeps the table for the low-VA
+    /// arena's in-place reuse). Mirrors HVF.
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.pt_edit(|mgr| mgr.unmap_aliased(address, len))
     }
 }
 
@@ -376,6 +495,11 @@ impl SyscallTrap for KvmTrapEngine {
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
         self.last_fault_esr = 0;
+        // Drop the parent's shared page-table editor: the child's tables are a
+        // fresh Linux-COW copy of the parent's (in the rebuilt-VM's private
+        // windows), so it must rebuild its OWN manager lazily from that copy —
+        // not keep editing through the Arc the parent's siblings still share.
+        self.page_tables = Arc::new(Mutex::new(None));
         Ok(ForkOutcome::Child)
     }
 
@@ -458,6 +582,12 @@ impl SyscallTrap for KvmTrapEngine {
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
         self.last_fault_esr = 0;
+        // `build_for_image` wrote fresh `stage1_identity_page_tables` into the new
+        // RAM, so the old page-table editor is stale — drop it so the next edit
+        // rebuilds from the new image's tables. (execve replaces the whole address
+        // space; Linux has already torn down sibling threads, so the shared Arc is
+        // moot here.)
+        self.page_tables = Arc::new(Mutex::new(None));
 
         Ok(())
     }
@@ -574,6 +704,12 @@ pub struct KvmSiblingSpec {
     /// The parent's register file, already seeded for the new thread
     /// (x0=0, sp_el0=child stack, tpidr_el0=tls, pc=post-svc).
     snapshot: VcpuSnapshot,
+    /// The parent's live stage-1 page-table editor, SHARED (Arc clone): a
+    /// `clone(CLONE_THREAD)` sibling runs on the SAME VM with the SAME page-table
+    /// backing, so its `mmap`/`mprotect` edits must go through the SAME manager —
+    /// otherwise two managers over one backing would diverge (each holds its own
+    /// in-memory descriptor copy). Mirrors HVF sharing the `page_tables` Arc.
+    page_tables: Arc<Mutex<Option<carrick_mem::page_table::PageTableManager>>>,
 }
 
 impl carrick_hal::RegAccess for KvmTrapEngine {
@@ -641,6 +777,9 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             vm: self.vm.vm_handle(),
             windows: self.ram.window_descriptors(),
             snapshot,
+            // Share the SAME page-table editor (Arc clone): the sibling edits the
+            // SAME backing through the SAME manager.
+            page_tables: Arc::clone(&self.page_tables),
         })
     }
 
@@ -673,6 +812,8 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
             last_fault_esr: 0,
+            // Share the parent's page-table editor (same VM, same backing).
+            page_tables: spec.page_tables,
         })
     }
 
