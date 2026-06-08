@@ -1484,22 +1484,21 @@ pub mod itimer {
 
     use std::time::Duration;
 
-    /// Spawn the wall-clock fallback timer thread for `which`. The timing-loop
-    /// body is shared (`carrick_timer_core::itimer::run_fallback`); the per-fire
-    /// action delivers via `timer_delivery`. CPU-time timers are skipped here —
-    /// KVM has no guest-CPU-driven delivery yet (a later task removes this gate
-    /// once CPU itimers route through the core's `cpu_timer_decision`). At most
-    /// one thread per `which` is live — a disarm/re-arm bumps the generation so
-    /// the old thread exits.
+    /// Spawn the fallback timer thread for `which`. The timing-loop body is
+    /// shared (`carrick_timer_core::itimer::run_fallback`); the per-fire action
+    /// delivers via `timer_delivery` (publish the signal + kick the target
+    /// vCPU). For wall-time `ITIMER_REAL` the shared loop sleeps to the
+    /// deadline; for CPU-time `ITIMER_VIRTUAL`/`ITIMER_PROF` it POLLS the core's
+    /// `cpu_timer_decision` against the live aggregate guest CPU total — so CPU
+    /// itimers fire off real guest CPU time (Task 3 wired the source) and never
+    /// while the guest is idle. At most one thread per `which` is live — a
+    /// disarm/re-arm bumps the generation so the old thread exits.
     pub fn spawn_fallback_timer(
         which: usize,
         generation: u64,
         value: Duration,
         interval: Duration,
     ) {
-        if is_cpu_timer(which) {
-            return;
-        }
         let value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
         let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
         let signum = signum_for(which);

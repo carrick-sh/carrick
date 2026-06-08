@@ -925,8 +925,27 @@ CEOF
       printf "FAIL [cpu-time]: stdout=[%s] exit=%s oracle=[cpu-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 28. Task 6 (timer/signal refactor): guest-CPU ITIMER_VIRTUAL on KVM. With
+    #     guest CPU accounting wired (Task 3) and the CPU-timer fallback un-gated
+    #     (run_fallback now polls cpu_timer_decision for ITIMER_VIRTUAL/PROF), an
+    #     ITIMER_VIRTUAL armed for 50ms must FIRE SIGVTALRM after ~50ms of BUSY
+    #     guest CPU, and must NOT fire while the guest is IDLE (nanosleep). The
+    #     committed fixture .c does both phases in one process and prints
+    #     "cpu-itimer-ok" iff busy->fired AND idle->not-fired. Before this task
+    #     the fallback GATED CPU timers (early return), so the busy phase printed
+    #     "not-fired"; this is the conformance lock for the gap. REQUIRED gate.
+    itimer_virt_src="$fixdir/itimer-virtual/itimer-virtual.c"
+    gcc -static -O2 -o /tmp/itimer_virtual "$itimer_virt_src"
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/itimer_virtual" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "cpu-itimer-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+itimer-virtual]: ITIMER_VIRTUAL fired off guest CPU when busy and stayed silent while idle (cpu_timer_decision poll)."
+    else
+      printf "FAIL [itimer-virtual]: stdout=[%s] exit=%s oracle=[cpu-itimer-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -937,5 +956,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time — all 31 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual — all 32 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual) pass on KVM; ZERO xfail."
 '
