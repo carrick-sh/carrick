@@ -777,8 +777,79 @@ CEOF
       printf "FAIL [timer-sigwait]: stdout=[%s] exit=%s oracle=[sigwait-timer-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 23. Phase 4 follow-up: in-guest FAULT -> signal. A guest EL0 data abort
+    #     (null-deref) is NOT a KVM_RUN exit -- KVM vectors it to the guest EL1
+    #     vector -- so carrick lower-EL-sync slot reads ESR.EC, sees it is not an
+    #     svc, and stores to FAULT_SENTINEL_GPA. The host captures ESR/FAR/ELR and
+    #     deliver_fault_signal injects SIGSEGV (SEGV_MAPERR, si_addr == the bad VA).
+    #     This SA_SIGINFO handler asserts si_signo/si_code/si_addr then longjmps out.
+    cat > /tmp/fault_segv.c <<CEOF
+#include <signal.h>
+#include <unistd.h>
+#include <setjmp.h>
+#include <string.h>
+static sigjmp_buf jb; static volatile int gs, gc; static volatile unsigned long ga;
+static void h(int s, siginfo_t *si, void *u){ (void)u; gs=s; gc=si->si_code; ga=(unsigned long)si->si_addr; siglongjmp(jb,1); }
+int main(void){
+  struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_sigaction=h; sa.sa_flags=SA_SIGINFO;
+  if(sigaction(SIGSEGV,&sa,0)) return 2;
+  if(sigsetjmp(jb,1)==0){ volatile int *p=0; *p=42; return 9; }
+  if(gs!=11) return 3;     /* SIGSEGV */
+  if(ga!=0) return 4;      /* si_addr == faulting VA (FAR survived the sentinel store) */
+  if(gc!=1) return 5;      /* SEGV_MAPERR */
+  return write(1,"fault-segv-ok",13)==13 ? 0 : 6; }
+CEOF
+    gcc -static -O2 -o /tmp/fault_segv /tmp/fault_segv.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/fault_segv" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "fault-segv-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+fault-segv]: a null-deref data abort delivered SIGSEGV/SEGV_MAPERR with si_addr=0 (FAR captured)."
+    else
+      printf "FAIL [fault-segv]: stdout=[%s] exit=%s oracle=[fault-segv-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 24. Phase 4 follow-up: instruction abort. A call through a null function
+    #     pointer faults at PC=0 (ESR.EC=0x20/0x21) -> SIGSEGV. Exercises the
+    #     OTHER fault EC path (instruction vs data abort).
+    cat > /tmp/fault_iabort.c <<CEOF
+#include <signal.h>
+#include <unistd.h>
+#include <setjmp.h>
+#include <string.h>
+static sigjmp_buf jb; static volatile int gs;
+static void h(int s, siginfo_t *si, void *u){ (void)u; (void)si; gs=s; siglongjmp(jb,1); }
+int main(void){
+  struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_sigaction=h; sa.sa_flags=SA_SIGINFO;
+  if(sigaction(SIGSEGV,&sa,0)) return 2;
+  if(sigsetjmp(jb,1)==0){ void (*f)(void)=0; f(); return 9; }
+  if(gs!=11) return 3;
+  return write(1,"fault-iabort-ok",15)==15 ? 0 : 4; }
+CEOF
+    gcc -static -O2 -o /tmp/fault_iabort /tmp/fault_iabort.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/fault_iabort" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "fault-iabort-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+fault-iabort]: a call through a null pointer delivered SIGSEGV (instruction abort)."
+    else
+      printf "FAIL [fault-iabort]: stdout=[%s] exit=%s oracle=[fault-iabort-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 25. Phase 4 follow-up: fault with NO handler -> default action terminates the
+    #     process by SIGSEGV (exit 128+11 = 139), matching the kernel.
+    cat > /tmp/fault_nh.c <<CEOF
+int main(void){ volatile int *p=0; *p=42; return 0; }
+CEOF
+    gcc -static -O2 -o /tmp/fault_nh /tmp/fault_nh.c
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/fault_nh" 2>/dev/null)" && code=0 || code=$?
+    if [ -z "$got" ] && [ "$code" -eq 139 ]; then
+      echo "OK [real-dispatch+fault-nohandler]: an uncaught SIGSEGV terminated the process with exit 139 (128+SIGSEGV)."
+    else
+      printf "FAIL [fault-nohandler]: stdout=[%s] exit=%s expected exit=139\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -789,5 +860,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers — all 25 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults — all 28 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler) pass on KVM; ZERO xfail."
 '

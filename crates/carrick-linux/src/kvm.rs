@@ -377,6 +377,34 @@ impl HvVcpu for KvmVcpu {
 }
 
 impl KvmVcpu {
+    /// Read `ESR_EL1` (the syndrome of the most recent EL1 synchronous exception)
+    /// via the sysreg demux (op0=3,op1=0,CRn=5,CRm=2,op2=0). Used to capture an
+    /// EL0 fault after it vectors to the EL1 sentinel: the FAULT_SENTINEL store
+    /// that surfaces the fault to the host is a stage-2 MMIO abort, which does NOT
+    /// take an EL1 exception, so `ESR_EL1` still holds the ORIGINAL EL0-fault
+    /// syndrome. Kept KVM-local (not a `carrick_hal::SysReg` variant) because only
+    /// the KVM fault-capture path needs it — no cross-backend enum churn.
+    pub fn get_esr_el1(&self) -> Result<u64, OsError> {
+        let mut bytes = [0u8; 8];
+        self.fd
+            .get_one_reg(sysreg_id(3, 0, 5, 2, 0), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(ESR_EL1)", e))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// Read `FAR_EL1` (the faulting virtual address of the most recent EL1 sync
+    /// exception) via the sysreg demux (op0=3,op1=0,CRn=6,CRm=0,op2=0). Same
+    /// survival argument as [`Self::get_esr_el1`]: it retains the EL0 fault VA
+    /// across the FAULT_SENTINEL store, so the delivered `SIGSEGV`/`SIGBUS`
+    /// carries the correct `si_addr`.
+    pub fn get_far_el1(&self) -> Result<u64, OsError> {
+        let mut bytes = [0u8; 8];
+        self.fd
+            .get_one_reg(sysreg_id(3, 0, 6, 0, 0), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(FAR_EL1)", e))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
     /// Write a core register through `&self` (not `&mut self`). `KVM_SET_ONE_REG`
     /// is a `&self` ioctl on `VcpuFd`, so this needs no exclusive borrow — used
     /// by the `&self` [`carrick_hal::ThreadedEngine::set_guest_sp_el0`] (a clone

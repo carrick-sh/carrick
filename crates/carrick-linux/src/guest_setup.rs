@@ -29,6 +29,15 @@ use crate::kvm::{KvmVcpu, KvmVm};
 /// guest heap region.
 pub const SENTINEL_GPA: u64 = 0x50_0000_0000; // 320 GiB
 
+/// Guest-physical address the EL1 vector stores to on an EL0 *fault* (a data /
+/// instruction abort or alignment fault, as opposed to an `svc`). Distinct from
+/// [`SENTINEL_GPA`] so the host distinguishes a syscall trap from a fault trap
+/// by the MMIO `gpa` alone. Same dual constraints as SENTINEL_GPA: stage-1
+/// identity-mapped yet UNMAPPED in every KVM slot. 324 GiB sits in the same
+/// heap/mmap gap (between 320 GiB SENTINEL and 384 GiB `LINUX_MMAP_BASE`), so
+/// the store always faults to stage-2 / MMIO.
+pub const FAULT_SENTINEL_GPA: u64 = 0x51_0000_0000; // 324 GiB
+
 /// KVM memory-slot alignment. `KVM_SET_USER_MEMORY_REGION` requires the
 /// guest-physical base and size to be a multiple of the HOST page size; 64 KiB
 /// covers every aarch64 host granule (4K/16K/64K). The high guest regions are
@@ -66,6 +75,19 @@ fn enc_movk_x9(imm16: u16, hw: u32) -> u32 {
 // `str x8, [x9]` — store the syscall number to the sentinel (any store works).
 const ENC_STR_X8_X9: u32 = 0xf900_0128;
 
+// EL0-fault discriminator opcodes. The lower-EL-sync slot is entered by BOTH an
+// EL0 `svc` AND an EL0 synchronous fault (data/instruction abort, alignment),
+// because KVM/arm64 vectors a guest EL0 abort to the guest's own VBAR_EL1 — it
+// is NOT a KVM_RUN exit. So the slot must read ESR_EL1, extract the exception
+// class, and branch to a SECOND (fault) sentinel store when it is not an svc;
+// otherwise a fault would be mishandled as a syscall and re-fault forever.
+// These four opcodes were verified against the GNU assembler (`as`) and are
+// re-asserted by the `lower_el_sync_slot_*` test below.
+const ENC_MRS_X9_ESR_EL1: u32 = 0xd538_5209; // mrs  x9, esr_el1
+const ENC_UBFX_X9_X9_EC: u32 = 0xd35a_7d29; // ubfx x9, x9, #26, #6  (EC = ESR[31:26])
+const ENC_CMP_X9_SVC: u32 = 0xf100_553f; // cmp  x9, #0x15  (subs xzr, x9, #EC_SVC64)
+const ENC_BNE_FAULT: u32 = 0x5400_00e1; // b.ne +7 instructions -> the fault block
+
 /// Build the EL1 vector page: every slot is `eret`, except the lower-EL sync
 /// slot which materialises SENTINEL_GPA in x9 and stores there (-> MMIO exit),
 /// then `eret`. Mirrors carrick-mem's `el1_vectors_bytes` shape but with the
@@ -88,27 +110,39 @@ pub fn el1_vectors_sentinel_bytes() -> Vec<u8> {
         }
         slot += AARCH64_VECTOR_SLOT_SIZE;
     }
-    // Overwrite the lower-EL sync slot with the sentinel store sequence.
+    // Overwrite the lower-EL sync slot. It is entered by an EL0 `svc` AND by an
+    // EL0 synchronous fault, so it discriminates on ESR.EC: EC == 0x15 (SVC64)
+    // takes the syscall path (store to SENTINEL_GPA); anything else is a fault
+    // and takes the fault path (store to FAULT_SENTINEL_GPA). 16 instructions,
+    // well within the 0x80 (32-instruction) slot. The `mrs x9, esr_el1` MUST run
+    // before any sentinel store: that store is itself a stage-2 MMIO abort, but
+    // because it does NOT take an EL1 exception it leaves ESR_EL1/FAR_EL1 holding
+    // the ORIGINAL EL0-fault values for the host to read. The b.ne jumps +7
+    // instructions to the fault block, so the fault block MUST stay exactly 7
+    // instructions after it (the test asserts this).
     let s = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET as usize;
-    let g = SENTINEL_GPA;
-    put(&mut bytes, s, enc_movz_x9((g & 0xFFFF) as u16, 0));
-    put(
-        &mut bytes,
-        s + 4,
-        enc_movk_x9(((g >> 16) & 0xFFFF) as u16, 1),
-    );
-    put(
-        &mut bytes,
-        s + 8,
-        enc_movk_x9(((g >> 32) & 0xFFFF) as u16, 2),
-    );
-    put(
-        &mut bytes,
-        s + 12,
-        enc_movk_x9(((g >> 48) & 0xFFFF) as u16, 3),
-    );
-    put(&mut bytes, s + 16, ENC_STR_X8_X9);
-    put(&mut bytes, s + 20, AARCH64_ERET_OPCODE);
+    // movz x9, gpa[0]; movk x9, gpa[1..4] — materialize a 64-bit gpa into x9.
+    let materialize = |b: &mut [u8], off: usize, g: u64| {
+        put(b, off, enc_movz_x9((g & 0xFFFF) as u16, 0));
+        put(b, off + 4, enc_movk_x9(((g >> 16) & 0xFFFF) as u16, 1));
+        put(b, off + 8, enc_movk_x9(((g >> 32) & 0xFFFF) as u16, 2));
+        put(b, off + 12, enc_movk_x9(((g >> 48) & 0xFFFF) as u16, 3));
+    };
+    // ESR.EC discriminator (s+0 .. s+12).
+    put(&mut bytes, s, ENC_MRS_X9_ESR_EL1); //     mrs  x9, esr_el1
+    put(&mut bytes, s + 4, ENC_UBFX_X9_X9_EC); //  ubfx x9, x9, #26, #6  (x9 = EC)
+    put(&mut bytes, s + 8, ENC_CMP_X9_SVC); //     cmp  x9, #0x15
+    put(&mut bytes, s + 12, ENC_BNE_FAULT); //     b.ne fault_block (+7)
+    // SVC path (EC == 0x15), s+16 .. s+36: re-materialize x9 (clobbered by the
+    // mrs) with SENTINEL_GPA, store, eret.
+    materialize(&mut bytes, s + 16, SENTINEL_GPA);
+    put(&mut bytes, s + 32, ENC_STR_X8_X9); //     str x8, [x9]  (host: gpa == SENTINEL_GPA)
+    put(&mut bytes, s + 36, AARCH64_ERET_OPCODE); // eret
+    // FAULT path (EC != 0x15), s+40 .. s+60: store to FAULT_SENTINEL_GPA so the
+    // host captures ESR/FAR/ELR and delivers a guest signal, then eret.
+    materialize(&mut bytes, s + 40, FAULT_SENTINEL_GPA);
+    put(&mut bytes, s + 56, ENC_STR_X8_X9); //     str x8, [x9]  (host: gpa == FAULT_SENTINEL_GPA)
+    put(&mut bytes, s + 60, AARCH64_ERET_OPCODE); // eret
     bytes
 }
 
@@ -297,9 +331,12 @@ impl GuestRam {
         let end = base
             .checked_add(len as u64)
             .ok_or_else(|| OsError::new(format!("kvm: window 0x{base:x}+{len} overflows")))?;
-        if base <= SENTINEL_GPA && SENTINEL_GPA < end {
+        if (base <= SENTINEL_GPA && SENTINEL_GPA < end)
+            || (base <= FAULT_SENTINEL_GPA && FAULT_SENTINEL_GPA < end)
+        {
             return Err(OsError::new(format!(
-                "kvm: window 0x{base:x}..0x{end:x} would back the sentinel gpa 0x{SENTINEL_GPA:x}"
+                "kvm: window 0x{base:x}..0x{end:x} would back a sentinel gpa \
+                 (syscall 0x{SENTINEL_GPA:x} / fault 0x{FAULT_SENTINEL_GPA:x}); both must stay unmapped"
             )));
         }
         let mmap_flags = match kind {
@@ -685,6 +722,58 @@ pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Resul
         vcpu.set_reg(Reg::Sp, sp)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod vector_tests {
+    use super::*;
+
+    /// Byte-assert the lower-EL-sync slot: the ESR.EC discriminator, the svc
+    /// path (SENTINEL_GPA), and the fault path (FAULT_SENTINEL_GPA), plus that the
+    /// `b.ne` jumps exactly +7 instructions to the fault block. Hand-assembled
+    /// vector asm is high-risk; this locks every opcode + the branch offset.
+    #[test]
+    fn lower_el_sync_slot_discriminates_svc_vs_fault() {
+        let bytes = el1_vectors_sentinel_bytes();
+        let s = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET as usize;
+        let op = |off: usize| -> u32 {
+            u32::from_le_bytes(bytes[s + off..s + off + 4].try_into().unwrap())
+        };
+        // Discriminator.
+        assert_eq!(op(0), ENC_MRS_X9_ESR_EL1, "s+0 mrs x9, esr_el1");
+        assert_eq!(op(4), ENC_UBFX_X9_X9_EC, "s+4 ubfx x9,x9,#26,#6");
+        assert_eq!(op(8), ENC_CMP_X9_SVC, "s+8 cmp x9,#0x15");
+        assert_eq!(op(12), ENC_BNE_FAULT, "s+12 b.ne fault");
+        // A B.cond imm19 (bits[23:5]) is the branch distance in INSTRUCTIONS; the
+        // fault block (s+40) is 7 instructions after the b.ne (s+12).
+        assert_eq!(
+            (op(12) >> 5) & 0x7_ffff,
+            7,
+            "b.ne must jump +7 instructions"
+        );
+        assert_eq!((40 - 12) / 4, 7, "fault block is +7 instructions from b.ne");
+        // SVC path: SENTINEL_GPA materialize + str + eret.
+        assert_eq!(
+            op(16),
+            enc_movz_x9((SENTINEL_GPA & 0xFFFF) as u16, 0),
+            "s+16 movz SENTINEL"
+        );
+        assert_eq!(op(32), ENC_STR_X8_X9, "s+32 svc str x8,[x9]");
+        assert_eq!(op(36), AARCH64_ERET_OPCODE, "s+36 svc eret");
+        // FAULT path: FAULT_SENTINEL_GPA materialize + str + eret.
+        assert_eq!(
+            op(40),
+            enc_movz_x9((FAULT_SENTINEL_GPA & 0xFFFF) as u16, 0),
+            "s+40 movz FAULT"
+        );
+        assert_eq!(
+            op(44),
+            enc_movk_x9(((FAULT_SENTINEL_GPA >> 16) & 0xFFFF) as u16, 1),
+            "s+44 movk FAULT"
+        );
+        assert_eq!(op(56), ENC_STR_X8_X9, "s+56 fault str x8,[x9]");
+        assert_eq!(op(60), AARCH64_ERET_OPCODE, "s+60 fault eret");
+    }
 }
 
 #[cfg(test)]
