@@ -55,7 +55,7 @@ pub enum El0SysRegRead {
 }
 
 pub fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
-    if super::aarch64_exception_class(esr) != AARCH64_SYS64_EXCEPTION_CLASS {
+    if carrick_hal::aarch64::aarch64_exception_class(esr) != AARCH64_SYS64_EXCEPTION_CLASS {
         return None;
     }
     let iss = esr & AARCH64_ESR_ISS_MASK;

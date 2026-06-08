@@ -187,15 +187,26 @@ use carrick_mem::protections::MemoryProtections;
 // existing `crate::trap::…` paths in carrick-hvf and carrick-runtime are
 // unchanged. HvfTrapEngine below implements the trait from its new home.
 pub use carrick_hal::trap::{ForkOutcome, SyscallTrap, TrapError};
+use carrick_hal::aarch64::{
+    ExecLevel, aarch64_exception_class, is_aarch64_hvc_exception, is_aarch64_hvc_maintenance,
+    is_aarch64_svc_exception, is_aarch64_syscall_exception,
+};
+// Test-only: the sibling-snapshot test stamps last_exit_class; the counter-trap
+// tests synthesize ESR syndromes with the EC shift. Both are unused in the lib
+// build, so gate them to test to keep `-D warnings` clean.
+#[cfg(test)]
+use carrick_hal::aarch64::AARCH64_HVC_EXCEPTION_CLASS;
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
 // Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
 // chunks. Syscall memory copies must reselect the backing at this boundary.
 const GUEST_STAGE1_PAGE_SIZE: u64 = 0x1000;
-pub const AARCH64_SVC_EXCEPTION_CLASS: u64 = 0x15;
-pub const AARCH64_HVC_EXCEPTION_CLASS: u64 = 0x16;
+// ESR exception-class decode (svc/hvc/maintenance/syscall classifiers, the
+// SVC/HVC class consts, and ExecLevel) live in the shared carrick_hal::aarch64
+// module — imported above. This SHIFT is kept local only for the counter-trap
+// TESTS that synthesize an ESR syndrome (cntfrq/cntvct/dczid), so it is test-only.
+#[cfg(test)]
 const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
-const AARCH64_EXCEPTION_CLASS_MASK: u64 = 0x3f;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -653,37 +664,6 @@ fn set_simd_fp_reg_v(vcpu_id: u64, reg: applevisor_sys::hv_simd_fp_reg_t, value:
 }
 
 /// Which privilege level a vCPU was executing at when carrick observed it. The
-/// Linux guest runs its own code at EL0; everything at EL1 is carrick's trap
-/// trampoline (the VBAR_EL1 vector table + the HVC that exits to the host),
-/// never guest code. Keeping the two straight is a load-bearing invariant: a PC
-/// (or register snapshot) captured at EL1 belongs to *carrick*, and must NEVER
-/// be treated as a guest resume PC — injecting a signal frame at an EL1 PC
-/// overwrites an in-flight syscall. This is the systematic carrick-vs-guest
-/// distinction; classify with `ExecLevel::from_pstate(CPSR)` at every point
-/// that captures a live vCPU PC for guest use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecLevel {
-    /// EL0 — genuine guest userspace. Its PC is a valid guest resume target.
-    Guest,
-    /// EL1+ — inside carrick's trap trampoline. Its PC is a carrick address.
-    Kernel,
-}
-
-impl ExecLevel {
-    /// Classify from PSTATE/SPSR. `M[3:2]` is the exception level (00 = EL0).
-    pub fn from_pstate(pstate: u64) -> Self {
-        if (pstate >> 2) & 0b11 == 0 {
-            ExecLevel::Guest
-        } else {
-            ExecLevel::Kernel
-        }
-    }
-
-    pub fn is_guest(self) -> bool {
-        matches!(self, ExecLevel::Guest)
-    }
-}
-
 /// Full-speed diagnostic counters (the dtrace consumer perturbs the
 /// SIGURG-vs-futex race away, so observe with cheap atomics instead). Dumped at
 /// process teardown when built with the `debug-stats` feature (the USDT probe
@@ -4041,33 +4021,6 @@ impl GuestMemory for HvfTrapEngine {
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
         self.inner.guest_range_is_writable(address, length)
     }
-}
-
-pub fn aarch64_exception_class(syndrome: u64) -> u64 {
-    (syndrome >> AARCH64_EXCEPTION_CLASS_SHIFT) & AARCH64_EXCEPTION_CLASS_MASK
-}
-
-pub fn is_aarch64_svc_exception(syndrome: u64) -> bool {
-    aarch64_exception_class(syndrome) == AARCH64_SVC_EXCEPTION_CLASS
-}
-
-pub fn is_aarch64_hvc_exception(syndrome: u64) -> bool {
-    aarch64_exception_class(syndrome) == AARCH64_HVC_EXCEPTION_CLASS
-}
-
-/// True for the EL1 stage-1 maintenance trampoline's `hvc #1` completion
-/// marker. The HVC immediate is the low 16 bits of the syndrome ISS. Distinct
-/// from the `hvc #2` syscall forward so the maintenance run loop and the
-/// syscall trap path never confuse the two.
-pub fn is_aarch64_hvc_maintenance(syndrome: u64) -> bool {
-    is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == 1
-}
-
-/// True for syscall-shaped traps that the host can dispatch identically:
-/// EL0 `svc #0` (`EC = 0x15`) and our EL1 vector's `hvc #2` re-trap
-/// (`EC = 0x16`). Both deliver the syscall ABI registers unchanged.
-pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
-    is_aarch64_svc_exception(syndrome) || is_aarch64_hvc_exception(syndrome)
 }
 
 /// True for a memory abort taken from a LOWER exception level (EL0 guest code):
