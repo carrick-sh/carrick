@@ -890,8 +890,28 @@ CEOF
       printf "FAIL [fault-nohandler]: stdout=[%s] exit=%s expected exit=139\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 26. Signal refactor / Task 2: si_pid REGRESSION LOCK. A self-directed
+    #     kill(getpid,SIGUSR1) with an SA_SIGINFO handler must deliver the SENDER
+    #     pid in siginfo si_pid. glibc lowers kill onto the kill dispatcher arm,
+    #     which queues an SI_USER siginfo carrying the caller pid (== this guest);
+    #     the generic loop injects that exact siginfo into the handler frame. This
+    #     proves the dispatcher siginfo-queue path supplies si_pid on KVM -- NOT
+    #     the async last_sender_for path, which is correctly 0 on KVM (no
+    #     host-signal pump until Task 7). The committed fixture .c is gcc-compiled
+    #     in-guest (it needs glibc + the real dispatcher, like the other signal
+    #     cases). REQUIRED gate.
+    senderpid_src="$fixdir/signal-sender-pid/sender-pid.c"
+    gcc -static -O2 -o /tmp/sender_pid "$senderpid_src"
+    got="$(timeout 30 sg kvm -c "$kvm run-elf /tmp/sender_pid" 2>/dev/null)" && code=0 || code=$?
+    if printf '%s\n' "$got" | grep -q "sender-pid-ok" && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+si-pid]: a self-kill SA_SIGINFO handler saw si_pid==getpid() (dispatcher siginfo-queue path)."
+    else
+      printf "FAIL [si-pid]: stdout=[%s] exit=%s oracle=[*sender-pid-ok*]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -902,5 +922,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults — all 29 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid — all 30 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid) pass on KVM; ZERO xfail."
 '

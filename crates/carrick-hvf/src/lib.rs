@@ -52,6 +52,7 @@ pub mod probes;
 // (shared by KVM/bhyve, which used to get a `lookup → None` stub). Re-exported as
 // `crate::syscall` so HVF's compat reporter + the probes provider are unchanged.
 pub use carrick_abi::syscall;
+pub mod signal_arrival;
 pub mod thread;
 pub mod threaded_impl;
 pub mod trap;

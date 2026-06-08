@@ -160,7 +160,8 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 pub use carrick_hvf::darwin_kqueue;
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::{
-    fork_coord, host_signal, io_wait, itimer, posix_timer, probes, threaded_impl, trap, vcpu_kick,
+    fork_coord, host_signal, io_wait, itimer, posix_timer, probes, signal_arrival, threaded_impl,
+    trap, vcpu_kick,
 };
 // The syscall-compat reporter is platform-neutral; it lives in
 // carrick-observability so every backend shares the REAL recorder (the Linux/KVM
@@ -440,16 +441,25 @@ pub mod runtime {
         // The KVM host-fork coordinator (lean — no pump thread), boxed object-safe.
         let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
             Box::new(carrick_linux::KvmForkCoordinator::new());
-        let kernel = Arc::new(KernelState::new(dispatcher, fork_coordinator));
+        // The KVM kicker (registry of live vCPUs). Held object-safe as the
+        // `VcpuRegistry` the generic loop drives. Constructing it installs the
+        // kick-signal handler (idempotent) so a cross-thread `pthread_kill` forces
+        // a target vCPU out of `KVM_RUN` (→ `EINTR` → `VcpuExit::Kicked`). Built
+        // before the kernel so `KvmSignalArrival` can wake a target vCPU via it.
+        let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(carrick_linux::KvmKicker::new());
+        // The KVM signal ARRIVAL/wake mechanism: kicker + futex. The async
+        // host-signal pump (Task 7) and native rt_sigqueueinfo (Task 8) are inert
+        // here, matching today's KVM behavior. Held object-safe in `KernelState`.
+        let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
+            Arc::new(carrick_linux::KvmSignalArrival {
+                kicker: Arc::clone(&kicker),
+                futex: Arc::clone(&platform_futex),
+            });
+        let kernel = Arc::new(KernelState::new(dispatcher, fork_coordinator, signal_arrival));
         // Track spawned sibling threads so the process doesn't tear down while a
         // worker is mid-flight; joined after the main thread finishes.
         let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-        // The KVM kicker (registry of live vCPUs). Held object-safe as the
-        // `VcpuRegistry` the generic loop drives. Constructing it installs the
-        // kick-signal handler (idempotent) so a cross-thread `pthread_kill` forces
-        // a target vCPU out of `KVM_RUN` (→ `EINTR` → `VcpuExit::Kicked`).
-        let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(carrick_linux::KvmKicker::new());
         // Install the kick-signal handler up front via the coordinator, so a
         // process-directed signal turns an in-flight `KVM_RUN` into `EINTR`
         // regardless of whether a guest has forked yet. (KvmKicker::new already
@@ -1104,7 +1114,16 @@ pub mod host_signal {
     pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
         Vec::new()
     }
-    pub fn raise_for_self(_sig: i32) {}
+    /// Self-directed `kill(getpid(), sig)` for an UNBLOCKED signal: publish it
+    /// into the process-directed pending mask so the generic vCPU loop injects
+    /// the handler on the next pending check (the KVM analogue of HVF's
+    /// `publish_pending` — no host pump, the same-thread syscall return re-checks
+    /// pending). Without this the signal was dropped (the old inert stub), so a
+    /// self-kill with a handler never ran. The sender siginfo (si_pid) is queued
+    /// separately by the `kill` dispatcher arm and consumed by the loop.
+    pub fn raise_for_self(sig: i32) {
+        carrick_signal_core::publish_process_signal(sig);
+    }
     pub fn take_pending() -> i32 {
         0
     }

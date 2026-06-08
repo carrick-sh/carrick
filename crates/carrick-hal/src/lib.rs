@@ -32,3 +32,5 @@ pub use threaded::{
     RegAccess, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
 };
 pub mod sigframe;
+pub mod signal_arrival;
+pub use signal_arrival::SignalArrival;
