@@ -174,6 +174,48 @@ CEOF
       exit 1
     fi
 
+    # 6b. map_host_alias: a guest mmap(MAP_SHARED, fd) of a host-backed /tmp file.
+    #     The dispatcher emits DispatchOutcome::MapHostAlias (dispatch/mem.rs:435)
+    #     -> KvmTrapEngine::map_host_alias: a NEW KVM slot at a low alias GPA, with
+    #     the high alias VA (>= 1 TiB) mapped to it via the SHARED map_aliased. The
+    #     binary seeds the file via the fd, reads the seed back THROUGH the mapping
+    #     (proves the guest stage-1 VA->GPA path resolves to the slot), then writes
+    #     THROUGH the mapping + msync + pread of the fd (proves the alias is the LIVE
+    #     page cache, not a snapshot — the discriminator vs the arena-copy
+    #     fallthrough). The mmap returns p == 0x100_0000_0000 (1 TiB) under trace.
+    #     A native run of the SAME binary is the second, independent witness.
+    cat > /tmp/cmha.c <<CEOF
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <string.h>
+int main(void){
+  int fd=open("/tmp/carrick-mha.bin",O_RDWR|O_CREAT|O_TRUNC,0644);
+  if(fd<0) return 2;
+  if(ftruncate(fd,4096)!=0) return 3;
+  if(pwrite(fd,"ALIAS-SEED-0123",15,0)!=15) return 4;
+  char *p=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+  if(p==MAP_FAILED) return 5;
+  if(memcmp(p,"ALIAS-SEED-0123",15)!=0) return 6;   /* read THROUGH the alias */
+  memcpy(p,"ALIAS-WROTE-9876",16);                   /* write THROUGH the alias */
+  if(msync(p,4096,MS_SYNC)!=0) return 7;
+  char b[16]={0};
+  if(pread(fd,b,16,0)!=16) return 8;
+  if(memcmp(b,"ALIAS-WROTE-9876",16)!=0) return 9;   /* live-page-cache coherence */
+  munmap(p,4096); close(fd);
+  return write(1,"mha-ok",6)==6?0:10;
+}
+CEOF
+    gcc -static -O2 -o /tmp/cmha /tmp/cmha.c
+    got="$(sg kvm -c "$kvm run-elf /tmp/cmha")" && code=0 || code=$?
+    oracle="$(/tmp/cmha)" && ocode=0 || ocode=$?
+    if [ "$got" = "mha-ok" ] && [ "$code" -eq 0 ] && [ "$got" = "$oracle" ] && [ "$code" = "$ocode" ]; then
+      echo "OK [real-dispatch+map-host-alias]: guest mmap(MAP_SHARED,fd) aliases the live page cache at a >=1 TiB VA (== native oracle)."
+    else
+      printf "FAIL [map-host-alias]: carrick=[%s]/%s native=[%s]/%s\n" "$got" "$code" "$oracle" "$ocode" >&2
+      exit 1
+    fi
+
     # 7. Phase C / C5: epoll. epoll_create1 + epoll_ctl(ADD) + epoll_wait that
     #    TIMES OUT on an empty pipe, then RETURNS the ready fd after a write —
     #    serviced from the interest map + the ppoll waiter (no kqueue).
@@ -849,7 +891,7 @@ CEOF
       exit 1
     fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -860,5 +902,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults — all 28 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults — all 29 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler) pass on KVM; ZERO xfail."
 '
