@@ -33,7 +33,12 @@ pub use carrick_abi as linux_abi;
 pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 pub use carrick_mem::{elf, memory, page_table, vdso};
 
-pub mod compat;
+// The syscall-compat reporter is platform-neutral; it lives in carrick-observability
+// (every backend shares it instead of the old HVF-impl-vs-Linux-stub cfg split).
+// Re-exported as `crate::compat` so the probes provider's `crate::compat::{…}`
+// uses are unchanged. The macOS probe-fire hook is installed in
+// `probes::register_dtrace_probes`.
+pub use carrick_observability::compat;
 #[cfg(target_os = "macos")]
 pub mod darwin_kqueue;
 pub mod fork_coord;

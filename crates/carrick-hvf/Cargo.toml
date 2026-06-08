@@ -28,6 +28,7 @@ carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
+carrick-observability = { path = "../carrick-observability" }
 carrick-thread = { path = "../carrick-thread" }
 clap.workspace = true
 libc.workspace = true

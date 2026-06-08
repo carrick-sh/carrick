@@ -740,6 +740,11 @@ pub fn signal_deliver(tid: i32, pending: i32) {
 }
 
 pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
+    // Install the compat reporter's per-event probe hook so every recorded
+    // CompatEvent fires its DTrace probe. compat lives in the neutral
+    // carrick-observability crate (no usdt dep) and only fires probes through
+    // this hook; Linux/bhyve never install it. Idempotent (OnceLock).
+    crate::compat::set_probe_hook(fire);
     usdt::register_probes()
 }
 

@@ -419,6 +419,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-observability",
  "carrick-thread",
  "cc",
  "clap",
@@ -480,6 +481,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-observability"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "clap",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "carrick-portable"
 version = "0.1.0"
 dependencies = [
@@ -506,6 +519,7 @@ dependencies = [
  "carrick-image",
  "carrick-linux",
  "carrick-mem",
+ "carrick-observability",
  "carrick-portable",
  "carrick-spec",
  "carrick-test-support",

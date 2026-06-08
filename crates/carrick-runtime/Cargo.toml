@@ -62,6 +62,7 @@ carrick-linux = { path = "../carrick-linux", optional = true }
 carrick-bhyve = { path = "../carrick-bhyve", optional = true }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
+carrick-observability = { path = "../carrick-observability" }
 anyhow.workspace = true
 bitflags.workspace = true
 libc.workspace = true

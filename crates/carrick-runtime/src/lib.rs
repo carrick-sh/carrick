@@ -160,9 +160,15 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 pub use carrick_hvf::darwin_kqueue;
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::{
-    compat, fork_coord, host_signal, io_wait, itimer, posix_timer, probes, threaded_impl, trap,
-    vcpu_kick,
+    fork_coord, host_signal, io_wait, itimer, posix_timer, probes, threaded_impl, trap, vcpu_kick,
 };
+// The syscall-compat reporter is platform-neutral; it lives in
+// carrick-observability so every backend shares the REAL recorder (the Linux/KVM
+// arm was a no-op unit-struct stub; bhyve would have inherited it). DTrace
+// backends install the per-event probe-fire hook via `compat::set_probe_hook` in
+// their probe registration; Linux/bhyve leave it unset. Re-exported at
+// `crate::compat` so all call sites are unchanged.
+pub use carrick_observability::compat;
 // AArch64 syscall metadata is platform-neutral ABI data, hoisted to carrick-abi
 // so every backend shares ONE table (the Linux/KVM arm was a `lookup → None`
 // stub; bhyve would have inherited it). Re-exported at `crate::syscall` so the
@@ -1756,158 +1762,6 @@ pub mod posix_timer {
         lock().clear();
     }
 }
-
-
-#[cfg(not(feature = "platform-macos"))]
-pub mod compat {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct SyscallArgs(pub [u64; 6]);
-
-    impl From<[u64; 6]> for SyscallArgs {
-        fn from(args: [u64; 6]) -> Self {
-            Self(args)
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct GuestRegs {
-        pub pc: u64,
-        pub sp: u64,
-        pub fp: u64,
-        pub lr: u64,
-        pub x8: u64,
-        pub x0: u64,
-        pub stack_guest_base: u64,
-        pub stack_host_base: u64,
-        pub stack_guest_end: u64,
-    }
-
-    pub struct CompatReporter;
-    impl CompatReporter {
-        pub fn record(&self, _event: CompatEvent) {}
-        /// Snapshot the (empty) compat report. The KVM MVP loop builds a
-        /// `RunResult` with this; full compat reporting is a later slice.
-        pub fn snapshot(&self) -> CompatReport {
-            CompatReport::default()
-        }
-        /// Consume the reporter and produce the (empty, scaffolded) report — the
-        /// Linux mirror of the macOS `CompatReporter::finish`. Compat reporting is
-        /// scaffolded on BOTH backends (the CLI warns and emits an empty report),
-        /// so this keeps `carrick dispatch-syscall` working on Linux. The richer
-        /// `compat-report --format` (which needs the HVF `CompatReportFormat`
-        /// renderer) stays macOS-only.
-        pub fn finish(self) -> CompatReport {
-            self.snapshot()
-        }
-    }
-    impl Default for CompatReporter {
-        fn default() -> Self {
-            Self
-        }
-    }
-
-    /// JSON-serialisable compatibility report. The macOS reporter records guest
-    /// syscall coverage; the Linux KVM MVP carries an empty report so the
-    /// cross-platform `RunResult` has a single shape on both backends.
-    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct CompatReport {
-        pub events: Vec<CompatEvent>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum CompatEvent {
-        SyscallEntry {
-            number: u64,
-            name: std::borrow::Cow<'static, str>,
-            args: SyscallArgs,
-        },
-        SyscallReturn {
-            number: u64,
-            name: std::borrow::Cow<'static, str>,
-            retval: i64,
-            errno: Option<i32>,
-        },
-        UnhandledSyscall {
-            number: u64,
-            name: String,
-            args: SyscallArgs,
-        },
-        PartialSyscall {
-            number: u64,
-            name: String,
-            args: SyscallArgs,
-            reason: String,
-        },
-        UnhandledIoctl {
-            fd: i32,
-            request: u64,
-            arg: u64,
-        },
-        ProcReadUnimplemented {
-            path: String,
-        },
-        SysReadUnimplemented {
-            path: String,
-        },
-        SignalUnsupported {
-            signum: i32,
-            reason: String,
-        },
-        UnknownSyscallFlags {
-            number: u64,
-            name: String,
-            argument: u32,
-            unknown_bits: u64,
-        },
-    }
-    impl CompatEvent {
-        pub fn unhandled_syscall(number: u64, name: impl Into<String>, args: SyscallArgs) -> Self {
-            Self::UnhandledSyscall {
-                number,
-                name: name.into(),
-                args,
-            }
-        }
-        pub fn partial_syscall(
-            number: u64,
-            name: impl Into<String>,
-            args: SyscallArgs,
-            reason: impl Into<String>,
-        ) -> Self {
-            Self::PartialSyscall {
-                number,
-                name: name.into(),
-                args,
-                reason: reason.into(),
-            }
-        }
-        pub fn unhandled_ioctl(fd: i32, request: u64, arg: u64) -> Self {
-            Self::UnhandledIoctl { fd, request, arg }
-        }
-        pub fn proc_read_unimplemented(path: impl Into<String>) -> Self {
-            Self::ProcReadUnimplemented { path: path.into() }
-        }
-        pub fn sys_read_unimplemented(path: impl Into<String>) -> Self {
-            Self::SysReadUnimplemented { path: path.into() }
-        }
-        pub fn unknown_syscall_flags(
-            number: u64,
-            name: impl Into<String>,
-            argument: u32,
-            unknown_bits: u64,
-        ) -> Self {
-            Self::UnknownSyscallFlags {
-                number,
-                name: name.into(),
-                argument,
-                unknown_bits,
-            }
-        }
-    }
-}
-
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod probes {
