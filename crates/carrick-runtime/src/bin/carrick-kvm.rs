@@ -37,8 +37,65 @@ fn main() {
                 }
             }
         }
+        Some("run-oci") => {
+            // carrick-kvm run-oci <layer-tar[,layer-tar...]> <entrypoint> [args...]
+            // The OCI container driver: extract the image layers onto a rootfs,
+            // load the (full-path) entrypoint FROM the rootfs, run it under KVM.
+            // A single flat rootfs tar (`docker export`) is one "layer".
+            let (Some(layers_arg), Some(entrypoint)) = (args.next(), args.next()) else {
+                eprintln!("usage: carrick-kvm run-oci <layer-tar[,tar...]> <entrypoint> [args...]");
+                std::process::exit(2);
+            };
+            let rest: Vec<String> = args.collect();
+            let layers: Vec<camino::Utf8PathBuf> = layers_arg
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(camino::Utf8PathBuf::from)
+                .collect();
+            let mut argv = vec![entrypoint.clone()];
+            argv.extend(rest);
+            let spec = carrick_spec::RunSpec {
+                executable: entrypoint,
+                argv,
+                envp: vec![
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                    "HOME=/root".to_string(),
+                    "HOSTNAME=carrick".to_string(),
+                ],
+                cwd: None,
+                rootfs_layers: layers,
+                fs_backend: carrick_spec::FsBackendKind::Host,
+                mounts: Vec::new(),
+                tty: false,
+                raw: false,
+                interactive: false,
+                max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
+                debug_state_path: None,
+                platform: carrick_spec::Platform::default(),
+                pid: carrick_spec::PidMode::default(),
+                uid: 0,
+                gid: 0,
+            };
+            match carrick_runtime::runtime::run_oci(&spec) {
+                Ok(result) => {
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&result.stdout);
+                    let _ = out.flush();
+                    let mut err = std::io::stderr();
+                    let _ = err.write_all(&result.stderr);
+                    let _ = err.flush();
+                    std::process::exit(result.exit_code);
+                }
+                Err(e) => {
+                    eprintln!("carrick-kvm: {e}");
+                    std::process::exit(127);
+                }
+            }
+        }
         _ => {
-            eprintln!("usage: carrick-kvm run-elf <aarch64-elf>");
+            eprintln!(
+                "usage: carrick-kvm (run-elf <aarch64-elf> | run-oci <layer-tar> <entrypoint> [args...])"
+            );
             std::process::exit(2);
         }
     }
