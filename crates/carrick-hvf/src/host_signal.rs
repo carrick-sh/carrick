@@ -85,6 +85,20 @@ use std::sync::{Arc, LazyLock};
 
 use crate::linux_abi::LINUX_SIGINT;
 
+// Platform-NEUTRAL pending bookkeeping (the THREAD_PENDING/PROC_PENDING store,
+// SENDER_PID, and their pure operations) lives in `carrick-signal-core`, shared
+// verbatim with the KVM backend. Re-export the neutral surface; the HVF GLUE
+// below (the kqueue pump, self-pipe + per-thread wakes, and the cross-process
+// xsignal ring) layers on top. `publish_pending_for`, `has_pending_for`, and
+// `has_unblocked_pending_for` are NOT re-exported: HVF defines its own
+// glue-wrapped versions (wakes + xsignal peek) that call the core primitives.
+pub use carrick_signal_core::{
+    NO_PENDING_SIGNAL, clear_proc_pending, clear_thread_pending, forget_thread, has_process_pending,
+    last_sender_for, lowest_pending_signum, pending_bit, pending_thread_tids, proc_pending_fetch_or,
+    record_sender, signal_unblocked_by_mask, take_pending_for, take_pending_in_for,
+    take_process_pending, thread_pending_bit,
+};
+
 /// `(linux_signum, host_signum)` pairs that DIFFER between Linux and macOS.
 /// Signals not listed (HUP/INT/QUIT/ILL/TRAP/ABRT/FPE/KILL/SEGV/PIPE/ALRM/
 /// TERM/TTIN/TTOU/XCPU/XFSZ/VTALRM/PROF/WINCH) share the same number on both
@@ -180,36 +194,6 @@ pub fn block_hvf_private_thread_signals() -> HvfPrivateSignalMaskGuard {
 /// `ensure_host_handler` is idempotent per signal. Bit `n` = signum `n`.
 static INSTALLED_MASK: AtomicU64 = AtomicU64::new(0);
 
-/// "No signal pending" sentinel. Chosen as `0` because Linux's
-/// `kill(pid, 0)` is documented as the null-signal probe; no real
-/// delivery ever uses signum 0.
-pub const NO_PENDING_SIGNAL: i32 = 0;
-
-/// Process-directed pending signals: an `AtomicU64` BITMASK (bit `signum-1`),
-/// set from an async host signal handler (`publish_pending`) via a lock-free
-/// `fetch_or`. A bitmask — not a single i32 slot — so distinct process-directed
-/// signums pending at once all survive (a single slot dropped all but the last;
-/// LTP kill10's master, counting acks sent as SIGUSR1/SIGUSR2/SIGQUIT, hung when
-/// one was clobbered). Same-signum repeats still coalesce (standard-signal
-/// semantics); RT-signal queue depth lives in the dispatcher's `rt_pending_counts`.
-static PROC_PENDING: AtomicU64 = AtomicU64::new(0);
-
-/// Thread-directed pending signals, keyed by guest tid. A process-directed
-/// signal (host `SIGINT`, `kill(pid)`) goes into the global `PROC_PENDING` mask
-/// and may be serviced by any thread; a *thread*-directed signal (guest
-/// `tgkill(tid, sig)` / `tkill`) targets exactly one guest thread and is parked
-/// here so only that thread delivers it. Set ONLY from guest-dispatch context
-/// (never a host async handler — a host signal can't name a guest tid), so a
-/// plain `Mutex` is safe; it is never locked from a signal handler. The value
-/// is a per-tid BITMASK of pending signums (bit `signum-1`): distinct signals
-/// targeting one thread must ALL be delivered, so a second must not overwrite a
-/// first. A single i32 slot coalesced them — when libuv's signal_multiple_loops
-/// routed SIGUSR1 then SIGUSR2 to the same thread, SIGUSR1 was overwritten and
-/// its waiters hung. Same-signal repeats still coalesce (standard-signal
-/// semantics); RT-signal queue depth lives in the dispatcher's
-/// `rt_pending_counts`, not here.
-static THREAD_PENDING: LazyLock<Mutex<HashMap<i32, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -288,32 +272,15 @@ impl Drop for ThreadWakePipe {
     }
 }
 
-/// `THREAD_PENDING` bit for `signum` (bit `signum-1`), or 0 if out of range.
-fn thread_pending_bit(signum: i32) -> u64 {
-    if (1..=64).contains(&signum) {
-        1u64 << (signum - 1)
-    } else {
-        0
-    }
-}
-
-/// Lowest pending signum in a `THREAD_PENDING` bitmask (caller ensures `mask != 0`).
-fn lowest_pending_signum(mask: u64) -> i32 {
-    (mask.trailing_zeros() as i32) + 1
-}
-
 /// Publish a signal targeted at a specific guest `tid` and wake parked waiters.
 /// The waking thread (and only it, via `take_pending_for`) will deliver it.
 /// Unlike `publish_pending`, this is NOT async-signal-safe (takes a `Mutex`) —
 /// call it only from normal dispatch context, which is the only place a guest
-/// tid is known.
+/// tid is known. The pending store is the neutral core's; the probe + the three
+/// wake channels are HVF glue.
 pub fn publish_pending_for(tid: i32, signum: i32) {
     crate::probes::signal_publish(tid, signum, 1);
-    let bit = thread_pending_bit(signum);
-    #[allow(clippy::expect_used)]
-    if bit != 0 {
-        *THREAD_PENDING.lock().entry(tid).or_insert(0) |= bit;
-    }
+    carrick_signal_core::publish_pending_for(tid, signum);
     if !wake_thread_waiter(tid) {
         notify_waiters_fallback();
     }
@@ -418,93 +385,16 @@ pub fn is_tracked_child(child_pid: i32) -> bool {
     CHILD_WATCHES.lock().contains_key(&child_pid)
 }
 
-/// Pop the lowest pending process-directed signum from `PROC_PENDING` whose bit
-/// is also set in `wait_set` (pass `!0` to accept any). Returns `0` if none.
-/// `take_pending_for` can run concurrently on every vCPU kicked for one
-/// process-directed signal, so draining the bit must be compare/exchange based:
-/// a `load` + `fetch_and(!bit)` lets multiple threads observe and deliver the
-/// same pending bit.
-fn take_proc_pending_in(wait_set: u64) -> i32 {
-    loop {
-        let mask = PROC_PENDING.load(Ordering::SeqCst);
-        let candidates = mask & wait_set;
-        if candidates == 0 {
-            return NO_PENDING_SIGNAL;
-        }
-        let signum = lowest_pending_signum(candidates);
-        let bit = thread_pending_bit(signum);
-        let next = mask & !bit;
-        if PROC_PENDING
-            .compare_exchange(mask, next, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return signum;
-        }
-    }
-}
-
-/// Drain the signal deliverable to `tid`: a thread-directed one for this tid
-/// takes priority, otherwise the process-directed mask (lowest signum first).
-/// Returns `0` (`NO_PENDING_SIGNAL`) if neither is set. This is the single point
-/// of consumption (called under the dispatcher lock in `deliver_pending_signal`).
-pub fn take_pending_for(tid: i32) -> i32 {
-    #[allow(clippy::expect_used)]
-    {
-        let mut guard = THREAD_PENDING.lock();
-        if let Some(mask) = guard.get_mut(&tid)
-            && *mask != 0
-        {
-            let signum = lowest_pending_signum(*mask);
-            *mask &= *mask - 1; // clear the lowest set bit
-            if *mask == 0 {
-                guard.remove(&tid);
-            }
-            return signum;
-        }
-    }
-    take_proc_pending_in(!0)
-}
-
-/// Drain a signal pending for `tid` only if it intersects `wait_set` (bit
-/// `signum-1`). Used by `rt_sigtimedwait`: signals outside the waited set must
-/// remain pending for normal delivery instead of being consumed and requeued.
-pub fn take_pending_in_for(tid: i32, wait_set: u64) -> i32 {
-    #[allow(clippy::expect_used)]
-    {
-        // `wait_set` uses the same bit `signum-1` convention as the mask, so a
-        // bitwise AND yields the pending signums that are in the waited set;
-        // drain only the lowest, leaving the rest pending for normal delivery.
-        let mut guard = THREAD_PENDING.lock();
-        if let Some(mask) = guard.get_mut(&tid) {
-            let in_set_bits = *mask & wait_set;
-            if in_set_bits != 0 {
-                let signum = lowest_pending_signum(in_set_bits);
-                *mask &= !thread_pending_bit(signum);
-                if *mask == 0 {
-                    guard.remove(&tid);
-                }
-                return signum;
-            }
-        }
-    }
-    // Process-directed: drain only the lowest pending signum that's in the
-    // waited set, leaving the rest of the mask for normal delivery.
-    take_proc_pending_in(wait_set)
-}
-
 /// Is a signal deliverable to `tid` pending? True for a thread-directed signal
 /// for this tid OR any process-directed signal. Used by a thread parked in
 /// `kevent`/`futex` to decide whether to break its wait so the trap loop can
-/// run delivery — without waking siblings for a signal that isn't theirs.
+/// run delivery — without waking siblings for a signal that isn't theirs. Wraps
+/// the neutral core check with the HVF xsignal-ring peek.
 pub fn has_pending_for(tid: i32) -> bool {
-    if PROC_PENDING.load(Ordering::SeqCst) != 0 || xsig_has_unblocked_for_self(0) {
+    if xsig_has_unblocked_for_self(0) {
         return true;
     }
-    #[allow(clippy::expect_used)]
-    THREAD_PENDING
-        .lock()
-        .get(&tid)
-        .is_some_and(|&mask| mask != 0)
+    carrick_signal_core::has_pending_for(tid)
 }
 
 /// Like [`has_pending_for`], but a signal blocked by `block_mask` (bit
@@ -513,6 +403,7 @@ pub fn has_pending_for(tid: i32) -> bool {
 /// the signal stays pending (delivered after the syscall, per the persistent
 /// mask) but must not break the wait. `block_mask == 0` is identical to
 /// [`has_pending_for`]. SIGKILL/SIGSTOP can't be blocked, matching the kernel.
+/// Wraps the neutral core check with the HVF xsignal-ring peek.
 pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
     // A queued cross-process signal may be sitting in the xsignal ring. Peek at
     // the ring without consuming it so a temporary ppoll/epoll_pwait mask can
@@ -520,44 +411,7 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
     if xsig_has_unblocked_for_self(block_mask) {
         return true;
     }
-    // Any pending bit that isn't blocked is deliverable. SIGKILL/SIGSTOP can
-    // never be blocked, so they always count even if their bit is in block_mask.
-    let always_deliverable = thread_pending_bit(crate::linux_abi::LINUX_SIGKILL)
-        | thread_pending_bit(crate::linux_abi::LINUX_SIGSTOP);
-    let deliverable = |mask: u64| mask & (!block_mask | always_deliverable) != 0;
-    if deliverable(PROC_PENDING.load(Ordering::SeqCst)) {
-        return true;
-    }
-    #[allow(clippy::expect_used)]
-    let guard = THREAD_PENDING.lock();
-    guard.get(&tid).is_some_and(|&mask| deliverable(mask))
-}
-
-fn signal_unblocked_by_mask(signum: i32, block_mask: u64) -> bool {
-    let bit = thread_pending_bit(signum);
-    if bit == 0 {
-        return false;
-    }
-    let always_deliverable = thread_pending_bit(crate::linux_abi::LINUX_SIGKILL)
-        | thread_pending_bit(crate::linux_abi::LINUX_SIGSTOP);
-    bit & (!block_mask | always_deliverable) != 0
-}
-
-pub fn has_process_pending() -> bool {
-    PROC_PENDING.load(Ordering::SeqCst) != 0
-}
-
-pub fn pending_thread_tids() -> Vec<i32> {
-    #[allow(clippy::expect_used)]
-    THREAD_PENDING.lock().keys().copied().collect()
-}
-
-/// Drop any thread-directed pending entry for `tid` (called when a guest thread
-/// exits so a recycled tid never inherits a stale signal). A forked child also
-/// clears the whole table via `reinit_after_fork`.
-pub fn forget_thread(tid: i32) {
-    #[allow(clippy::expect_used)]
-    THREAD_PENDING.lock().remove(&tid);
+    carrick_signal_core::has_unblocked_pending_for(tid, block_mask)
 }
 
 /// Process-wide self-pipe used to wake threads parked in a blocking-I/O
@@ -790,13 +644,13 @@ pub fn reinit_after_fork() {
     crate::posix_timer::clear();
     // The child is single-threaded (fork copies only the calling thread); any
     // sibling-directed pending entries inherited from the parent are stale.
-    THREAD_PENDING.lock().clear();
+    clear_thread_pending();
     // The inherited child-exit watches belong to the PARENT's children (this
     // child's siblings); the freshly-forked child must not deliver SIGCHLD for
     // them. Its own children are registered on its own re-spawned pump.
     CHILD_WATCHES.lock().clear();
     clear_thread_waiters();
-    PROC_PENDING.store(0, Ordering::SeqCst);
+    clear_proc_pending();
 }
 
 /// Reset inherited host-signal state in the runtime child after the
@@ -806,9 +660,9 @@ pub fn reinit_after_fork() {
 pub fn reset_after_supervisor_fork() {
     INSTALLED.store(0, Ordering::SeqCst);
     INSTALLED_MASK.store(0, Ordering::SeqCst);
-    THREAD_PENDING.lock().clear();
+    clear_thread_pending();
     clear_thread_waiters();
-    PROC_PENDING.store(0, Ordering::SeqCst);
+    clear_proc_pending();
     open_pending_pipe();
 }
 
@@ -929,40 +783,10 @@ pub(crate) fn drain_fd(fd: RawFd) -> DrainResult {
     DrainResult::Dead
 }
 
-/// Sender's HOST pid for the most recent pending signal of each signum (index =
-/// signum-1, for 1..=64). The host handler stores it from `siginfo_t.si_pid`
-/// (SI_USER/SI_QUEUE/SI_TKILL carry the sender); the delivery path reads it to
-/// populate the guest siginfo's si_pid instead of synthesising 0 — which made
-/// LTP kill10 loop forever on "received signal from 0". A single atomic store
-/// keeps it async-signal-safe. 0 = no sender recorded (default action / timer).
-static SENDER_PID: [std::sync::atomic::AtomicI32; 64] =
-    [const { std::sync::atomic::AtomicI32::new(0) }; 64];
-
-/// Record `host_pid` as the sender of `signum`. Async-signal-safe (one atomic
-/// store); out-of-range signums and host deliveries with no real sender pid are
-/// ignored. A zero `si_pid` must not clobber the previous real sender for a
-/// coalesced standard signal under a signal flood (LTP kill10).
-fn record_sender(signum: i32, host_pid: i32) {
-    if host_pid > 0 && (1..=64).contains(&signum) {
-        SENDER_PID[(signum - 1) as usize].store(host_pid, Ordering::SeqCst);
-    }
-}
-
-/// The last recorded sender host pid for `signum` (0 when none ever recorded).
-/// READ, not take: clearing on read raced under a signal flood — a coalesced or
-/// re-delivered signal whose slot a prior delivery had already consumed read 0
-/// (LTP kill10 "received unexpected signal from 0"). Leaving the slot means a
-/// delivery always sees the most-recent sender; `handle_routed` overwrites it on
-/// each cross-process arrival and `raise_for_self` records self, so a stale
-/// cross-process value never leaks into a self-raise. (Standard signals coalesce
-/// — only the last sender survives, matching Linux.)
-pub fn last_sender_for(signum: i32) -> i32 {
-    if (1..=64).contains(&signum) {
-        SENDER_PID[(signum - 1) as usize].load(Ordering::SeqCst)
-    } else {
-        0
-    }
-}
+// SENDER_PID, `record_sender`, and `last_sender_for` are neutral and live in
+// `carrick-signal-core` (re-exported above). `handle_routed` overwrites the
+// sender on each cross-process arrival and `raise_for_self` records self, so a
+// stale cross-process value never leaks into a self-raise.
 
 // ---- Cross-process explicit-signal delivery (the "xsignal" ring) ----
 //
@@ -1152,11 +976,12 @@ extern "C" fn handle_xsig_nudge(
 /// lock-free atomic OR into the process-directed bitmask) + the pipe write are
 /// both async-signal-safe, so this is callable from a host signal handler.
 /// Distinct concurrent signums accumulate rather than clobber one another; a
-/// same-signum repeat coalesces (standard-signal semantics).
+/// same-signum repeat coalesces (standard-signal semantics). The lock-free store
+/// is the neutral core's; `notify_pending` is the HVF self-pipe wake.
 fn publish_pending(signum: i32) {
     let bit = thread_pending_bit(signum); // bit `signum-1`, 0 if out of range
     if bit != 0 {
-        PROC_PENDING.fetch_or(bit, Ordering::SeqCst);
+        proc_pending_fetch_or(bit);
     }
     notify_pending();
 }
@@ -1436,7 +1261,7 @@ pub fn install_default_handlers() {
 /// Atomic so the runtime can call this from any thread that's about to
 /// re-enter `vcpu.run`; other pending signums stay in the mask.
 pub fn take_pending() -> i32 {
-    take_proc_pending_in(!0)
+    take_process_pending()
 }
 
 /// Non-draining peek: is a signal currently pending? Used by a thread parked
@@ -1444,7 +1269,7 @@ pub fn take_pending() -> i32 {
 /// deliver the signal. Does NOT consume it — `take_pending` (under the kernel
 /// lock) is still the single point of delivery.
 pub fn has_pending() -> bool {
-    PROC_PENDING.load(Ordering::SeqCst) != 0
+    has_process_pending()
 }
 
 /// Set a pending guest signum from inside the guest itself (e.g. from
@@ -1590,7 +1415,7 @@ mod tests {
     fn waiter_pipe_drain_does_not_consume_pump_wake() {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
         ensure_pump_pipe_for_test();
 
         publish_pending(LINUX_SIGINT);
@@ -1603,7 +1428,7 @@ mod tests {
 
         drain_pump_pipe();
         assert!(!pipe_is_readable(pump_pipe_read_fd()));
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
     }
 
     #[test]
@@ -1658,7 +1483,7 @@ mod tests {
     fn thread_directed_wake_uses_target_private_pipe() {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
         ensure_pump_pipe_for_test();
 
         let target_tid = 900_010;
@@ -1684,7 +1509,7 @@ mod tests {
     fn wake_all_waiters_broadcasts_to_private_pipes() {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
 
         let first = register_thread_waiter(900_040).expect("first waiter pipe");
         let second = register_thread_waiter(900_041).expect("second waiter pipe");
@@ -1729,7 +1554,7 @@ mod tests {
     fn xsignal_peek_honors_temporary_block_mask() {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
         xsig_init();
         let _ = xsig_drain_for_self();
 
@@ -1776,7 +1601,7 @@ mod tests {
     #[test]
     fn thread_directed_takes_priority_for_its_tid() {
         let _g = TEST_LOCK.lock();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
         let tid = 900_001;
         publish_pending_for(tid, LINUX_SIGINT);
         assert!(has_pending_for(tid));
@@ -1793,7 +1618,7 @@ mod tests {
     #[test]
     fn distinct_thread_directed_signals_do_not_coalesce() {
         let _g = TEST_LOCK.lock();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
         let tid = 900_021;
         // Two DISTINCT signals routed to one tid must BOTH survive — a single
         // last-write-wins slot dropped the first (the signal_multiple_loops
@@ -1837,7 +1662,7 @@ mod tests {
     fn process_directed_signal_is_consumed_once_under_concurrent_takers() {
         let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
 
         publish_pending(10); // SIGUSR1
         let ready = std::sync::Arc::new(std::sync::Barrier::new(5));
@@ -1866,7 +1691,7 @@ mod tests {
     #[test]
     fn take_pending_in_for_leaves_non_matching_signals_queued() {
         let _g = TEST_LOCK.lock();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
         let tid = 900_012;
         publish_pending_for(tid, 12);
 
@@ -1886,7 +1711,7 @@ mod tests {
     #[test]
     fn forget_thread_drops_pending() {
         let _g = TEST_LOCK.lock();
-        PROC_PENDING.store(0, Ordering::SeqCst);
+        clear_proc_pending();
         let tid = 900_003;
         publish_pending_for(tid, 15);
         forget_thread(tid);
@@ -1898,12 +1723,13 @@ mod tests {
     #[test]
     fn take_pending_for_falls_back_to_process_directed() {
         let _g = TEST_LOCK.lock();
+        clear_proc_pending();
         let tid = 900_004;
         // No thread-directed entry; a process-directed signal is deliverable by
-        // any tid. Set bit `7-1` directly to simulate a pending SIGBUS(7).
-        PROC_PENDING.store(1u64 << (7 - 1), Ordering::SeqCst);
+        // any tid. Publish SIGBUS(7) into the process-directed mask.
+        publish_process_signal(7);
         assert!(has_pending_for(tid));
         assert_eq!(take_pending_for(tid), 7);
-        assert_eq!(PROC_PENDING.load(Ordering::SeqCst), 0);
+        assert!(!has_process_pending());
     }
 }
