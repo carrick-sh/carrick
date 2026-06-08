@@ -89,6 +89,9 @@
 
 mod args;
 mod commands;
+// `debug` (guest address-space snapshot for the lldb plugin) reads the macOS-only
+// `runtime::DebugStateSnapshot`; HVF-only.
+#[cfg(feature = "platform-macos")]
 mod debug;
 mod fs_setup;
 mod lifecycle;

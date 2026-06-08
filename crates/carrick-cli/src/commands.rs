@@ -76,14 +76,23 @@ use carrick_runtime::dtrace_consumer::join_ids;
 use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::RootFs;
-use carrick_runtime::runtime::{
-    DEFAULT_MAX_TRAPS, run_static_elf_with_hvf_args_and_dispatcher_debug,
-};
-use carrick_runtime::syscall::{aarch64_table, lookup_aarch64};
+use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
+// HVF-only diagnostics — the `run-elf`, `trap-capabilities`, and full
+// `syscalls`-table subcommands are macOS-only for now (Linux uses `carrick run
+// <oci>` / `carrick-kvm run-elf`; per-number `syscalls <n>` works on both).
+#[cfg(feature = "platform-macos")]
+use carrick_runtime::runtime::run_static_elf_with_hvf_args_and_dispatcher_debug;
+#[cfg(feature = "platform-macos")]
+use carrick_runtime::syscall::aarch64_table;
+use carrick_runtime::syscall::lookup_aarch64;
+#[cfg(feature = "platform-macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
 use crate::args::{Cli, Commands, RootfsCommand, SystemCommand};
+#[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
+// Used only by the macOS-only `run-elf` arm.
+#[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
@@ -164,6 +173,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }))?
             );
         }
+        #[cfg(feature = "platform-macos")]
         Commands::RunElf {
             path,
             rootfs_layers,
@@ -747,6 +757,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             workdir,
             env,
         )?,
+        #[cfg(feature = "platform-macos")]
         Commands::CompatReport { format, command } => {
             if command.is_empty() {
                 bail!("compat-report needs a command after --");
@@ -813,13 +824,29 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .with_context(|| format!("unknown Linux/aarch64 syscall {}", number))?;
                 println!("{}", serde_json::to_string_pretty(syscall)?);
             } else {
+                // The full-table dump comes from the HVF syscall table; macOS-only.
+                // The per-number lookup above works on both backends.
+                #[cfg(feature = "platform-macos")]
                 println!("{}", serde_json::to_string_pretty(aarch64_table())?);
+                #[cfg(not(feature = "platform-macos"))]
+                bail!(
+                    "the full syscall-table dump is HVF-only on this build; pass a syscall number"
+                );
             }
         }
         Commands::TrapCapabilities => {
+            #[cfg(feature = "platform-macos")]
             println!("{}", serde_json::to_string_pretty(&hvf_capabilities())?);
+            #[cfg(not(feature = "platform-macos"))]
+            bail!("trap-capabilities is HVF-only; not available on platform-linux");
         }
+        #[cfg(feature = "platform-macos")]
         Commands::Debug { command } => run_debug(command)?,
+        #[cfg(not(feature = "platform-macos"))]
+        Commands::Debug { command } => {
+            let _ = command;
+            bail!("debug (guest address-space inspection) is HVF-only on this build");
+        }
         Commands::TraceChild {
             trace_uid,
             trace_gid,
@@ -946,6 +973,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 bail!("carrick trace is only available on macOS (libdtrace).");
             }
         }
+        #[cfg(target_os = "macos")]
+        // The `Volume` variant + VolumeCommand are `#[cfg(target_os = "macos")]`
+        // in args.rs (APFS via `diskutil`), so match that exact gate here.
         #[cfg(target_os = "macos")]
         Commands::Volume { command } => match command {
             crate::args::VolumeCommand::Create { quota } => {
