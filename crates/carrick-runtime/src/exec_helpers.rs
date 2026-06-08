@@ -57,6 +57,77 @@ pub(crate) fn resolve_shebang(
     Ok((path, argv))
 }
 
+/// PATH-resolve a BARE initial-entrypoint command (`carrick run alpine ls`) the
+/// way Docker/`execvp` does — searching `$PATH` (or a sane default) for the first
+/// readable match in the dispatcher's rootfs. A name with `/` is left as-is. This
+/// applies ONLY to the initial entrypoint; the guest's own `execve(2)` keeps
+/// full-path semantics. Shared by the macOS (HVF) and KVM run paths.
+pub(crate) fn resolve_entrypoint_path(
+    path: &str,
+    env: &[String],
+    dispatcher: &SyscallDispatcher,
+) -> String {
+    if path.contains('/') {
+        return path.to_owned();
+    }
+    const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    let search = env
+        .iter()
+        .find_map(|e| e.strip_prefix("PATH="))
+        .filter(|p| !p.is_empty())
+        .unwrap_or(DEFAULT_PATH);
+    for dir in search.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{}/{}", dir.trim_end_matches('/'), path);
+        if dispatcher.read_exec_file(&candidate).is_some() {
+            return candidate;
+        }
+    }
+    // No match: keep the bare name so the existing NotFound error names it.
+    path.to_owned()
+}
+
+/// Resolve the initial entrypoint program for `carrick run`: PATH-resolve a bare
+/// command, then resolve any `#!` shebang to its interpreter, so a script
+/// entrypoint runs like Docker/`execve(2)`. Returns the final (program path,
+/// argv as opaque Linux-ABI bytes). Shared by both backends.
+pub(crate) fn resolve_entrypoint_program(
+    path: &str,
+    env: &[String],
+    argv: Vec<Vec<u8>>,
+    dispatcher: &SyscallDispatcher,
+) -> Result<(String, Vec<Vec<u8>>), i32> {
+    let resolved = resolve_entrypoint_path(path, env, dispatcher);
+    resolve_shebang(dispatcher, resolved, argv)
+}
+
+/// Build the initial guest `AddressSpace` from already-read entrypoint `bytes`:
+/// load the ELF (PT_INTERP / dynamic loader read through the dispatcher's rootfs
+/// reader), attach the vDSO auxv, optionally force `AT_BASE` (the Rosetta
+/// dynamic-target case — `None` on the native path), and serialise the initial
+/// Linux stack. The platform-NEUTRAL heart of `carrick run`: the ONLY divergence
+/// is the run-loop entry that consumes the returned image (HVF `finish_and_run_
+/// image` vs KVM `KvmTrapEngine::new` + `run_threaded_kvm_loop`).
+pub(crate) fn build_run_image(
+    bytes: &[u8],
+    argv: Vec<Vec<u8>>,
+    env: &[String],
+    dispatcher: &SyscallDispatcher,
+    vdso_enabled: bool,
+    at_base: Option<u64>,
+) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
+    let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader(bytes, &|p| {
+        dispatcher.read_exec_file(p)
+    })?
+    .with_vdso_auxv(vdso_enabled);
+    if let Some(base) = at_base {
+        image = image.with_auxv_base(base);
+    }
+    image.with_linux_initial_stack(argv, env.iter().map(|s| s.as_bytes()))
+}
+
 /// Parse a `#!` shebang line into (interpreter, optional single arg),
 /// matching Linux semantics: skip blanks after `#!`, take the interpreter up
 /// to the next whitespace, then the remainder of the line (trimmed) as ONE
