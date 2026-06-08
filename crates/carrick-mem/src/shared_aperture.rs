@@ -4,17 +4,20 @@
 //! THEORY OF OPERATION
 //!
 //! The central invariant of carrick's threaded memory model is that the guest's
-//! stage-2 (HVF) mapping topology must be STABLE once vCPU threads exist:
-//! arm64 HVF has no host-driven stage-2 TLB flush (it is EL2-only), so an
-//! `hv_vm_map`/`hv_vm_unmap` after sibling vCPUs are running can leave a stale
-//! stage-2 translation on another core and corrupt or hang the guest. The fix is
-//! to map ONE large region — the shared aperture, a single host
-//! `MAP_ANON | MAP_SHARED | MAP_NORESERVE` window `hv_vm_map`'d exactly once at
-//! boot, before any vCPU exists (see `linux_runtime_regions` in `memory.rs`) —
-//! and then satisfy every guest `MAP_SHARED` request by carving a sub-range out
-//! of that already-mapped window. This file is that carver. NO HVF call ever
-//! happens here; it is pure host-memory bookkeeping, so it composes safely with
-//! sibling vCPUs running.
+//! stage-2 mapping topology must be STABLE once vCPU threads exist: arm64 has no
+//! host-driven stage-2 TLB flush (it is EL2-only on HVF, and unavailable to a
+//! nested guest on KVM), so adding/removing a stage-2 mapping after sibling
+//! vCPUs are running can leave a stale stage-2 translation on another core and
+//! corrupt or hang the guest. The fix is to map ONE large region — the shared
+//! aperture, a single host `MAP_ANON | MAP_SHARED | MAP_NORESERVE` window mapped
+//! exactly once at boot, before any vCPU exists (see `linux_runtime_regions` in
+//! `memory.rs`) — and satisfy every guest `MAP_SHARED` request by carving a
+//! sub-range out of that already-mapped window. This file is that carver. NO
+//! hypervisor call ever happens here; it is pure host-memory bookkeeping, so it
+//! composes safely with sibling vCPUs running, and is shared verbatim by every
+//! backend (HVF / KVM / bhyve) — the stage-2 REGISTRATION of the window is the
+//! per-backend glue (`hv_vm_map` / a KVM slot / `vm_mmap_memseg`); this
+//! sub-allocator is not.
 //!
 //! [`SharedAperture`] is a bump-plus-free-list sub-allocator over the window,
 //! granule-aligned (`0x4000`). [`BackingObject`] records WHAT backs each live
@@ -65,8 +68,8 @@ pub struct SharedAlloc {
 
 /// Bump-plus-free-list sub-allocator over the fixed shared aperture window
 /// `[LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE)`.
-/// All sizes/addresses are HVF-granule (`0x4000`) aligned. No HVF calls happen
-/// here — the window is `hv_vm_map`'d once at boot.
+/// All sizes/addresses are mapping-granule (`0x4000`) aligned. No hypervisor
+/// calls happen here — the window is stage-2-mapped once at boot.
 #[derive(Debug, Clone)]
 pub struct SharedAperture {
     base: u64,
@@ -78,7 +81,7 @@ pub struct SharedAperture {
     live: Vec<SharedAlloc>,
 }
 
-const GRANULE: u64 = 0x4000; // HVF_PAGE_SIZE; kept local to avoid a trap.rs dep.
+const GRANULE: u64 = 0x4000; // 16 KiB mapping granule; kept local (no backend dep).
 
 impl Default for SharedAperture {
     fn default() -> Self {
@@ -236,7 +239,7 @@ mod tests {
         let a = ap.alloc(0x4000, BackingObject::SharedAnon).expect("alloc");
         let b = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
         assert_eq!(a, base());
-        // Second allocation is rounded up to the HVF granule (0x4000).
+        // Second allocation is rounded up to the 16 KiB granule (0x4000).
         assert_eq!(b, base() + 0x4000);
     }
 
