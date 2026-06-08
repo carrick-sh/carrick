@@ -1471,14 +1471,22 @@ fn run_threaded_hvf_loop(
     // `KernelState` never names the concrete `ForkCoordinator`.
     let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
         Box::new(crate::fork_coord::ForkCoordinator::new());
-    let kernel = Arc::new(KernelState::new(dispatcher, fork_coordinator));
+    // Registry of live vCPUs so a signalling thread (tgkill) or the
+    // process-directed signal pump can force a target out of `hv_vcpu_run`.
+    // Held object-safe as the `VcpuRegistry` the generic loop drives. Built
+    // before the kernel so `HvfSignalArrival` can wake a target vCPU via it.
+    let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(crate::vcpu_kick::VcpuKicker::new());
+    // The HVF signal ARRIVAL/wake mechanism (kqueue pump self-pipe, per-thread
+    // waiter wakes, xsig MAP_SHARED ring, child-exit watches). Delegates to the
+    // existing `crate::host_signal` glue; held object-safe in `KernelState`.
+    let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
+        Arc::new(crate::signal_arrival::HvfSignalArrival {
+            kicker: Arc::clone(&kicker),
+        });
+    let kernel = Arc::new(KernelState::new(dispatcher, fork_coordinator, signal_arrival));
     // Track spawned sibling threads so the process doesn't tear down while a
     // worker is mid-flight. We join them after the main thread finishes.
     let threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-    // Registry of live vCPUs so a signalling thread (tgkill) or the
-    // process-directed signal pump can force a target out of `hv_vcpu_run`.
-    // Held object-safe as the `VcpuRegistry` the generic loop drives.
-    let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(crate::vcpu_kick::VcpuKicker::new());
     // Daemon that kicks in-guest vCPUs when process-directed async signals are
     // observable. Non-interactive command runners start pump-free and request it
     // lazily when a guest installs a real signal handler or forks a child whose

@@ -202,14 +202,24 @@ pub(crate) struct KernelState {
     pub(crate) dispatcher: SyscallDispatcher,
     pub(crate) reporter: CompatReporter,
     pub(crate) fork: Box<dyn HostForkCoordinator>,
+    /// Per-backend signal ARRIVAL / wake mechanism (kicker+futex on KVM, the
+    /// kqueue pump / self-pipe / xsig ring on HVF). The neutral pending STORE is
+    /// carrick-signal-core; this is only how an async signal physically wakes a
+    /// waiter. Held object-safe so the loop never names the concrete impl.
+    pub(crate) signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
 }
 
 impl KernelState {
-    pub(crate) fn new(dispatcher: SyscallDispatcher, fork: Box<dyn HostForkCoordinator>) -> Self {
+    pub(crate) fn new(
+        dispatcher: SyscallDispatcher,
+        fork: Box<dyn HostForkCoordinator>,
+        signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
+    ) -> Self {
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
             fork,
+            signal_arrival,
         }
     }
 
@@ -1220,7 +1230,7 @@ where
         kernel.begin_exec_replacement(self.this_tid);
         self.kicker.kick_all_except(self.this_tid);
         self.platform_futex.notify_signal_pending();
-        crate::host_signal::wake_all_waiters();
+        kernel.signal_arrival.wake_all_waiters();
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -1237,7 +1247,7 @@ where
                 }
                 self.kicker.kick_all_except(self.this_tid);
                 self.platform_futex.notify_signal_pending();
-                crate::host_signal::wake_all_waiters();
+                kernel.signal_arrival.wake_all_waiters();
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
@@ -1354,7 +1364,7 @@ where
             // FIRST so a woken thread observes `is_quiescing()` and parks.
             self.kicker.kick_all_except(self.this_tid);
             self.platform_futex.notify_signal_pending();
-            crate::host_signal::wake_all_waiters();
+            kernel.signal_arrival.wake_all_waiters();
             loop {
                 // Re-read the LIVE sibling count each iteration. A vCPU that EXITS
                 // mid-quiesce drops out of the kicker, so an `others` captured ONCE
@@ -1374,7 +1384,7 @@ where
                 // class until all live vCPUs reach the barrier.
                 self.kicker.kick_all_except(self.this_tid);
                 self.platform_futex.notify_signal_pending();
-                crate::host_signal::wake_all_waiters();
+                kernel.signal_arrival.wake_all_waiters();
             }
             quiesced = true;
         }
@@ -1402,7 +1412,7 @@ where
                 }
                 self.kicker.kick_all_except(self.this_tid);
                 self.platform_futex.notify_signal_pending();
-                crate::host_signal::wake_all_waiters();
+                kernel.signal_arrival.wake_all_waiters();
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
