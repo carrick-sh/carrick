@@ -219,7 +219,7 @@ mod tests {
             timeout_s: 10,
             known_gaps: known.iter().map(|s| s.to_string()).collect(),
             entrypoint: None,
-            carrick_flags: vec!["--fs".into(), "memory".into()],
+            carrick_flags: vec!["--fs".into(), "host".into()],
             docker_flags: vec![],
             bind_mounts: vec![],
             env: vec![],

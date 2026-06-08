@@ -89,7 +89,7 @@ pub struct Suite {
     pub timeout_s: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_gaps: Vec<String>,
-    /// carrick-only envelope flags (e.g. `["--raw","--fs","memory"]`).
+    /// carrick-only envelope flags (e.g. `["--raw","--fs","host"]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carrick_flags: Vec<String>,
     /// docker-only flags (e.g. `["--user","65534"]`).
@@ -181,14 +181,17 @@ impl Manifest {
                 ));
             }
             // Coherent-rootfs suites must PIN --fs (never inherit the
-            // case-sensitive-volume default, which is the slow cap-std host backend).
-            // `shell`-verdict discovery suites are exempt (they may want the scratch).
+            // volume-dependent default). `--fs host` is the standard pin (the
+            // only fork-coherent backend; `--fs memory` is opt-in behind the
+            // `fs-memory` feature and rejected by a stock binary). `memory` is
+            // still accepted for feature-on runs. `shell`-verdict discovery
+            // suites are exempt (they may want the scratch).
             if s.verdict != VerdictKind::Shell {
                 match s.pinned_fs() {
-                    Some("memory") | Some("host") => {}
-                    Some(other) => errs.push(format!("{n}: --fs {other:?} is not memory|host")),
+                    Some("host") | Some("memory") => {}
+                    Some(other) => errs.push(format!("{n}: --fs {other:?} is not host|memory")),
                     None => errs.push(format!(
-                        "{n}: coherent suite must pin `--fs memory` in carrick_flags (the volume default is the slow cap-std host backend; never inherit it)"
+                        "{n}: coherent suite must pin `--fs host` in carrick_flags (never inherit the volume-dependent default)"
                     )),
                 }
             }
@@ -211,7 +214,7 @@ verdict = "regrtest"
 tier = "smoke"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 "#;
 
     #[test]
@@ -236,7 +239,7 @@ timeout_s = 40
 "#;
         let m = Manifest::from_toml(t).expect("parse");
         let e = m.validate();
-        assert!(e.iter().any(|s| s.contains("--fs memory")), "{e:?}");
+        assert!(e.iter().any(|s| s.contains("--fs host")), "{e:?}");
     }
 
     #[test]
@@ -251,7 +254,7 @@ verdict = "gotest"
 tier = "full"
 weight = "heavy"
 timeout_s = 0
-carrick_flags = ["--fs", "memory"]
+carrick_flags = ["--fs", "host"]
 
 [[suite]]
 name = "dup"
@@ -262,7 +265,7 @@ verdict = "gotest"
 tier = "full"
 weight = "heavy"
 timeout_s = 10
-carrick_flags = ["--fs", "memory"]
+carrick_flags = ["--fs", "host"]
 "#;
         let m = Manifest::from_toml(t).expect("parse");
         let e = m.validate();
