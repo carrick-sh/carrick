@@ -379,4 +379,3 @@ Docker oracle, with every divergence tracked or excused.
 - One-HVF-VM-per-process constraint: `crates/carrick-hvf/src/fork_quiesce.rs:55`,
   `crates/carrick-hvf/src/trap.rs:87`.
 - No-tokio-main invariant: `crates/carrick-cli/src/main.rs:54`.
-- Prior conservative audit (superseded posture): `docs/archive/docker-compat-audit.md`.

@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 const LINUX_TCP_KEEPIDLE: u64 = 4;
 
-/// Regression for the Go `net` unix-socket hang (docs/archive/go-conformance-punchlist.md
-/// P1b): carrick translates a guest unix path to a hashed host path under
+/// Regression for the Go `net` unix-socket hang: carrick translates a guest
+/// unix path to a hashed host path under
 /// carrick-unix-sockets/, but `getsockname` returned that HOST path verbatim — so
 /// Go's `ln.Addr()` reported it and a subsequent Dial re-translated (double-hash)
 /// → `connect: no such file or directory`. getsockname must reverse-translate to
@@ -585,8 +585,8 @@ fn unix_relative_socket_under_bind_mount_can_be_chmodded() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-/// Regression for the Go `net` `TestFileListener` hang (docs/archive/go-conformance-punchlist.md
-/// P1): a dup'd socket shares ONE host fd, but carrick's epoll kqueue is keyed by
+/// Regression for the Go `net` `TestFileListener` hang: a dup'd socket shares
+/// ONE host fd, but carrick's epoll kqueue is keyed by
 /// host fd. An `EPOLL_CTL_DEL` of one dup must NOT deafen the OTHER guest fds that
 /// still watch the same host socket — Linux epoll interest is per-fd. Before the
 /// fix, DEL of the dup did an unconditional `EV_DELETE` on the shared host fd, so

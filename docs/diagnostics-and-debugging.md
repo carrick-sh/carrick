@@ -4,8 +4,9 @@ Carrick is a syscall-translation layer, so almost every bug is "the guest asked
 the macOS host for something and got the wrong answer." The tools below let you
 watch that translation boundary from the host side without touching the guest
 binary. Three of them are first-class subcommands of the `carrick` CLI
-(`carrick trace`, `carrick debug …`, `carrick compat-report`); the rest are host
-debug environment variables and an lldb plugin.
+(`carrick trace`, `carrick debug …`, `carrick compat-report`); the rest are
+compile-time debug-trace Cargo features, a few runtime env-var tunables, and an
+lldb plugin.
 
 > [!IMPORTANT]
 > The project method is **real debuggers and probes, not `eprintln!`/`printf`**.
@@ -87,8 +88,8 @@ crate (`crates/carrick-hvf/src/probes.rs`, `#[usdt::provider(provider =
 > drops the `__DATA,__dof_carrick` section that `register_probes()` reads, so the
 > provider registers empty and `carrick trace` emits nothing. Verify with
 > `otool -l target/release/carrick | grep dof` and confirm events still fire.
-> Set `CARRICK_DTRACE_DEBUG=1` to log probe registration (and any failure) at
-> startup.
+> Build with `--features trace-dtrace` to log probe registration (and any
+> failure) at startup.
 
 ### Gotchas (the authoritative methodology lives in the `carrick-trace` skill)
 
@@ -230,56 +231,54 @@ without lldb; `carrick debug decode-esr <syndrome>` decodes an AArch64 `ESR_EL1`
 value (exception class, IL, ISS, with DFSC for data aborts) so you do not
 hand-parse syndromes during a session.
 
-`CARRICK_EVENTRING=<dir>` enables an optional autonomous file dump — a 1 Hz
-watchdog thread writes `<dir>/carrick-ring.<pid>` per process. It is *perturbing*
-(prefer the lldb reader for real debugging); the file dump is a convenience for a
-quick reproducible run.
+Built with `--features event-ring-dump`, setting `CARRICK_EVENTRING=<dir>`
+enables an optional autonomous file dump — a 1 Hz watchdog thread writes
+`<dir>/carrick-ring.<pid>` per process. It is *perturbing* (prefer the lldb
+reader for real debugging); the file dump is a convenience for a quick
+reproducible run. The in-memory ring itself is always-on, feature or not.
 
 ---
 
-## 3. Host debug environment variables
+## 3. Debug-trace build features
 
-These are opt-in (set the var to anything; carrick checks presence with
-`var_os(...).is_some()` unless noted) and gate verbose stderr traces or
-probe-only watchpoints. They are cached after the first read where they sit on a
-hot path, so they do not re-hit the environment per syscall.
+The verbose stderr traces and the watchpoint / event-ring file dump are
+**compile-time Cargo features** (default off), so a stock build carries none of
+them on its hot paths. Build with the feature(s) you need — e.g.
+`cargo build -p carrick-cli --features trace-tty`, or `--features debug-all` for
+the lot — then run normally.
 
-| Variable | Effect | Site |
-|---|---|---|
-| `CARRICK_TRACE_TRAPS` | Trace every HVF VM-exit (the EL1 trap → host boundary) as it is serviced. | `crates/carrick-runtime/src/runtime.rs:801` |
-| `CARRICK_TRACE_REGS` | Dump guest GPRs at the trap boundary (PC, x0–x8) for register-level inspection. | `crates/carrick-hvf/src/trap.rs:2037` |
-| `CARRICK_TRACE_SYSCALLS` | Emit one `[carrick-syscall] {json}` line per compat event (entry/return/unhandled) to stderr, alongside the USDT probe. The blunt "what did the guest call" log when you cannot attach dtrace. | `crates/carrick-hvf/src/compat.rs:207` |
-| `CARRICK_TRACE_MAPS` | Trace guest memory-map establishment (HVF `hv_vm_map` of guest regions). | `crates/carrick-hvf/src/trap.rs:1295` |
-| `CARRICK_TRACE_ELF` | Trace ELF loading: segment layout, PIE/interpreter base selection, auxv seeding. | `crates/carrick-mem/src/elf.rs:209` |
-| `CARRICK_KICK_STATS` | At process teardown, print vCPU "kick" (cross-thread interrupt) statistics — how often siblings were interrupted, and the carrick-vs-guest invariant counters from `inject_at_el1` (which must be 0). | `crates/carrick-hvf/src/trap.rs:668` |
-| `CARRICK_FAULT_DEBUG` | Verbose guest fault diagnostics: decode each data/instruction abort (faulting VA, ESR/DFSC) instead of just translating it. The first stop for an unexplained guest SIGSEGV. | `crates/carrick-runtime/src/runtime/fault.rs:109` |
-| `CARRICK_IO_DBG` | Trace host read/write byte movement (the bytes a guest fd read/write actually transferred on the host fd). | `crates/carrick-runtime/src/dispatch/fs.rs`, `host_tty.rs` |
-| `CARRICK_TTY_DBG` | Trace tty/pty byte flow specifically — the tool for the ONLCR / staircase-newline and line-discipline races. | `crates/carrick-runtime/src/dispatch/fs.rs:1478`, `vfs/dev.rs` |
-| `CARRICK_DTRACE_DEBUG` | Log USDT probe registration (and any failure) at startup. Use it to confirm the `__dof_carrick` section survived linking before blaming a silent `carrick trace`. | `crates/carrick-cli/src/runtime_util.rs:196` |
-| `CARRICK_WATCH_ADDR=<hex>` | Reusable guest-memory watchpoint. Fires the `mem-watch` USDT probe before *every* syscall with `(syscall_nr, addr, the current LE u64 at addr)`, so a trace can bracket exactly which syscall changes a guest address — e.g. which operation corrupts a GOT slot. Zero-cost (and not even read) when unset. | `crates/carrick-hvf/src/probes.rs:195` |
-| `CARRICK_GUEST_MEM_SUB_OFFSET` / `_LEN` | Configure the `guest-mem` USDT probe to dump a fixed subrange of a guest buffer (offset+length); `_LEN=0` disables it. | `crates/carrick-hvf/src/probes.rs:510` |
-| `CARRICK_EVENTRING=<dir>` | Autonomous per-process event-ring file dump (see §2). Perturbing; prefer the lldb reader. | `crates/carrick-runtime/src/event_ring.rs` |
+| Feature | What it traces |
+|---|---|
+| `trace-tty` | tty/pty byte flow — the tool for the ONLCR / staircase-newline and line-discipline races (`dispatch/fs.rs`, `dispatch/mod.rs`, `vfs/dev.rs`). |
+| `trace-io` | host read/write byte movement — the bytes a guest fd actually transferred on the host fd (`dispatch/mod.rs`, `dispatch/fs.rs`, `host_tty.rs`). |
+| `trace-traps` | every HVF VM-exit (the EL1 trap → host boundary), with the guest syscall frame, as each is serviced (`runtime.rs`). |
+| `trace-hvf` | trap-handler internals: guest registers at the boundary, `hv_vm_map` of guest regions, and EL0 abort fault dumps (faulting VA, ESR/DFSC) — the first stop for an unexplained guest SIGSEGV (`hvf/trap.rs`). |
+| `trace-syscalls` | one `[carrick-syscall] {json}` line per compat event (entry/return/unhandled) to stderr, alongside the always-on USDT probe — the blunt "what did the guest call" log when you can't attach dtrace (`hvf/compat.rs`). |
+| `trace-elf` | ELF loading: segment layout, PIE/interpreter base selection, auxv seeding (`mem/elf.rs`). |
+| `debug-stats` | at teardown, vCPU "kick" (cross-thread interrupt) and lazy-alias re-map counters to stderr; the USDT probes + atomic counters stay always-on (`hvf/trap.rs`). |
+| `trace-dtrace` | log USDT probe registration (and any failure) at startup — confirm `__dof_carrick` survived linking before blaming a silent `carrick trace` (`carrick-cli/runtime_util.rs`). |
+| `watchpoint` | reusable guest-memory watchpoint. With the feature built **and** `CARRICK_WATCH_ADDR=<hex>` set, fires the `mem-watch` USDT probe before *every* syscall with `(syscall_nr, addr, current LE u64 at addr)`, so a trace can bracket exactly which syscall changes a guest address — e.g. which operation corrupts a GOT slot (`hvf/probes.rs`, `dispatch/mod.rs`). |
+| `event-ring-dump` | with the feature built **and** `CARRICK_EVENTRING=<dir>` set, a 1 Hz watchdog writes `<dir>/carrick-ring.<pid>` (see §2). Perturbing; prefer the lldb reader. The in-memory ring itself is always-on regardless (`runtime/event_ring.rs`). |
+| `debug-all` | umbrella enabling every feature above. |
 
-> [!WARNING]
-> `CARRICK_XMMAP` does **not** exist. It was a transient debug var used during
-> one mmap-zero-fill investigation and removed; do not reach for it. `rg
-> CARRICK_XMMAP crates` returns nothing.
+### Runtime tunables (still environment variables)
 
-### Non-diagnostic tunables
+These take a runtime value (or toggle behavior rather than emit a trace), so
+they remain environment variables — useful for differential measurement (run
+with and without, compare):
 
-These change behavior rather than emit diagnostics, but are useful for
-differential measurement (run with and without, compare):
-
+- `CARRICK_GUEST_MEM_SUB_OFFSET` / `_LEN` — configure the `guest-mem` USDT probe
+  to dump a fixed subrange of a guest buffer; `_LEN=0` disables it.
 - `CARRICK_DISABLE_VDSO` / `CARRICK_VDSO_MODE` — disable or switch the vDSO
-  fast-path implementation (`runtime.rs:58`).
+  fast-path implementation.
 - `CARRICK_DISABLE_TSO` — disable the Apple-silicon Total Store Ordering memory
-  model toggle for the guest (`runtime.rs:83`).
+  model toggle for the guest.
 - `CARRICK_NO_FPSIMD` — disable FP/SIMD save-restore across signal handlers;
-  built specifically to A/B the SIMD/FP register-restore ABI path (`trap.rs:651`).
+  built specifically to A/B the SIMD/FP register-restore ABI path.
 - `CARRICK_MMAP_ARENA_GIB=<n>` — override the guest mmap-arena size (default
-  32 GiB) (`crates/carrick-mem/src/memory.rs:192`).
+  32 GiB).
 - `CARRICK_EXPOSED_CPUS=<n>` — override the CPU count carrick advertises to the
-  guest instead of the host hardware-thread count (`host_facts.rs:158`).
+  guest instead of the host hardware-thread count.
 
 ---
 

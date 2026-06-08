@@ -80,8 +80,7 @@ pub(in crate::dispatch) struct IoState {
 /// (which spawns fd_status.py repeatedly) times out. The cost is fine natively
 /// (~100ns/fstat) but fatal here; 1024 keeps such scans cheap. The tradeoff is a
 /// benign skip-vs-run divergence on test_no_leaking (it opens 1026 fds; Docker's
-/// huge limit makes it skip, carrick runs it and PASSES). See
-/// docs/archive/cpython-wave2-runner-notes.md.
+/// huge limit makes it skip, carrick runs it and PASSES).
 pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024;
 
 impl IoState {

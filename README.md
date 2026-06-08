@@ -64,10 +64,10 @@ Start here, then follow the map:
 | --- | --- |
 | [docs/architecture-overview.md](docs/architecture-overview.md) | The architectural deep-dive: the HVF trap boundary & CPU mode switch, the stage-1 identity mapping & `FEAT_PAN3` workaround, the BKL-free concurrency model, and the interactive `PtyRelay`. |
 | [docs/syscalls-emulation-map.md](docs/syscalls-emulation-map.md) | The supported-syscall map — categorized, with each call's emulation quality and the Darwin host mechanism backing it (`kqueue`, `os_sync_wait_on_address`, `parking_lot`, native BSD sockets, `sendfile`, …). |
-| [docs/diagnostics-and-debugging.md](docs/diagnostics-and-debugging.md) | The diagnostic toolbox: `carrick trace` (USDT + custom DTrace scripts), the always-on in-memory event ring + the `carrick_lldb.py` plugin, the `carrick debug` subcommands, and the host `CARRICK_*` debug environment variables. |
+| [docs/diagnostics-and-debugging.md](docs/diagnostics-and-debugging.md) | The diagnostic toolbox: `carrick trace` (USDT + custom DTrace scripts), the always-on in-memory event ring + the `carrick_lldb.py` plugin, the `carrick debug` subcommands, and the compile-time debug-trace Cargo features. |
 | [docs/conformance-testing.md](docs/conformance-testing.md) | How to run and interpret the host, differential-probe, and language-runtime (Go/Node/CPython) suites; the local registry setup; and the **compile-time** ABI conformance checks. |
 | [docs/conformance-coverage.md](docs/conformance-coverage.md) | The active probe-gate coverage map — which carrick-owned invariant each probe pins down. |
-| [docs/archive/](docs/archive/) | Historical session handoffs, code reviews, and superseded design/spec notes, kept out of the active tree. |
+| [docs/archive/](docs/archive/) | A few longer-form design-rationale notes still referenced from code comments (crate decomposition, the vDSO getrandom path, the multithreaded-fork quiesce, the epoll↔kqueue mapping). |
 
 For the per-crate and per-subsystem **Big Theory Statements** (the theory-of-operation `rustdoc`), build the API docs:
 
