@@ -473,51 +473,10 @@ where
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
-/// Docker/runc entrypoint semantics: when the program name contains no `/`,
-/// resolve it against `$PATH` (like `execvp`) using the guest rootfs, returning
-/// the first directory whose `dir/name` is a readable executable. A name that
-/// already contains `/` (absolute or relative) is returned unchanged — matching
-/// Linux `execve(2)`, which does NOT search `$PATH`. This applies ONLY to the
-/// initial entrypoint; the guest's own `execve(2)` syscall keeps full-path
-/// semantics via `resolve_exec_path`. Without this, `carrick run alpine ls`
-/// (a bare command, as Docker accepts) failed with "failed to read ELF bytes: ls".
-fn resolve_entrypoint_path(path: &str, env: &[String], dispatcher: &SyscallDispatcher) -> String {
-    if path.contains('/') {
-        return path.to_owned();
-    }
-    const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    let search = env
-        .iter()
-        .find_map(|e| e.strip_prefix("PATH="))
-        .filter(|p| !p.is_empty())
-        .unwrap_or(DEFAULT_PATH);
-    for dir in search.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = format!("{}/{}", dir.trim_end_matches('/'), path);
-        if dispatcher.read_exec_file(&candidate).is_some() {
-            return candidate;
-        }
-    }
-    // No match: keep the bare name so the existing NotFound error names it.
-    path.to_owned()
-}
-
-/// Resolve the initial entrypoint program for `carrick run`: PATH-resolve a bare
-/// command (`resolve_entrypoint_path`, Docker `execvp` semantics) and then
-/// resolve any `#!` shebang script to its interpreter, so a script entrypoint
-/// runs like Docker / `execve(2)` instead of failing "not an ELF binary".
-/// Returns the final (program path, argv as opaque Linux-ABI bytes).
-fn resolve_entrypoint_program(
-    path: &str,
-    env: &[String],
-    argv: Vec<Vec<u8>>,
-    dispatcher: &SyscallDispatcher,
-) -> Result<(String, Vec<Vec<u8>>), i32> {
-    let resolved = resolve_entrypoint_path(path, env, dispatcher);
-    exec::resolve_shebang(dispatcher, resolved, argv)
-}
+// `resolve_entrypoint_path` / `resolve_entrypoint_program` (Docker `execvp` PATH
+// search + `#!` shebang resolution) were hoisted into the cross-platform
+// `crate::exec_helpers`, shared by the macOS HVF and Linux KVM `carrick run`
+// paths — only the run-loop entry that consumes the assembled image differs.
 
 /// Run an ELF whose filesystem is entirely in the dispatcher's overlay
 /// (i.e. `--fs host` after `extract_layers`). The initial binary AND its
@@ -546,13 +505,14 @@ where
     // entrypoint runs instead of failing "not an ELF binary".
     let argv_for_cmdline = argv.clone();
     let argv_bytes: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
-    let (resolved, argv) = resolve_entrypoint_program(path, &env, argv_bytes, &dispatcher)
-        .map_err(|_| {
-            RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                path.to_owned(),
-            )))
-        })?;
+    let (resolved, argv) =
+        crate::exec_helpers::resolve_entrypoint_program(path, &env, argv_bytes, &dispatcher)
+            .map_err(|_| {
+                RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    path.to_owned(),
+                )))
+            })?;
     // /proc/self/cmdline reflects the user's argv, but /proc/self/exe MUST be the
     // RESOLVED absolute binary path — real Linux always stores the resolved path.
     // A bare `uname` would otherwise absolutize to `/uname` (cwd-relative) and
@@ -589,13 +549,17 @@ where
             }
             Some(Err(errno)) => return Err(rosetta_unavailable(errno, path)),
         };
-    let mut image =
-        AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))?
-            .with_vdso_auxv(vdso_enabled_for_debug());
-    if needs_at_base {
-        image = image.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
-    }
-    let image = image.with_linux_initial_stack(argv, env)?;
+    // The platform-neutral image assembly (load + auxv + initial stack) is shared
+    // with the KVM run path via `exec_helpers::build_run_image`; only the run-loop
+    // entry below (HVF `finish_and_run_image`) is macOS-specific.
+    let image = crate::exec_helpers::build_run_image(
+        &bytes,
+        argv,
+        &env,
+        &dispatcher,
+        vdso_enabled_for_debug(),
+        needs_at_base.then_some(ROSETTA_AT_BASE_PLACEHOLDER),
+    )?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
@@ -1936,22 +1900,31 @@ mod tests {
         let env = vec!["PATH=/usr/local/bin:/usr/bin:/bin".to_string()];
 
         // Bare names resolve to the first PATH dir that has them.
-        assert_eq!(resolve_entrypoint_path("ls", &env, &dispatcher), "/bin/ls");
         assert_eq!(
-            resolve_entrypoint_path("env", &env, &dispatcher),
+            crate::exec_helpers::resolve_entrypoint_path("ls", &env, &dispatcher),
+            "/bin/ls"
+        );
+        assert_eq!(
+            crate::exec_helpers::resolve_entrypoint_path("env", &env, &dispatcher),
             "/usr/bin/env"
         );
         // A path containing '/' is returned unchanged (execve, not execvp).
         assert_eq!(
-            resolve_entrypoint_path("/sbin/foo", &env, &dispatcher),
+            crate::exec_helpers::resolve_entrypoint_path("/sbin/foo", &env, &dispatcher),
             "/sbin/foo"
         );
-        assert_eq!(resolve_entrypoint_path("./x", &env, &dispatcher), "./x");
+        assert_eq!(
+            crate::exec_helpers::resolve_entrypoint_path("./x", &env, &dispatcher),
+            "./x"
+        );
         // Not found anywhere on PATH → keep the bare name (so the load error names it).
-        assert_eq!(resolve_entrypoint_path("nope", &env, &dispatcher), "nope");
+        assert_eq!(
+            crate::exec_helpers::resolve_entrypoint_path("nope", &env, &dispatcher),
+            "nope"
+        );
         // No PATH in env → fall back to the standard default set (covers /usr/bin).
         assert_eq!(
-            resolve_entrypoint_path("env", &[], &dispatcher),
+            crate::exec_helpers::resolve_entrypoint_path("env", &[], &dispatcher),
             "/usr/bin/env"
         );
     }
@@ -1968,7 +1941,7 @@ mod tests {
         ]);
         let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
-        let (path, argv) = resolve_entrypoint_program(
+        let (path, argv) = crate::exec_helpers::resolve_entrypoint_program(
             "/entry.sh",
             &[],
             vec![b"/entry.sh".to_vec(), b"arg1".to_vec()],
@@ -1988,9 +1961,13 @@ mod tests {
         // A normal ELF entrypoint is unchanged (no shebang, no argv splice).
         let rootfs = rootfs_with(&[("bin/true", b"\x7fELFx")]);
         let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
-        let (path, argv) =
-            resolve_entrypoint_program("/bin/true", &[], vec![b"/bin/true".to_vec()], &dispatcher)
-                .expect("resolve");
+        let (path, argv) = crate::exec_helpers::resolve_entrypoint_program(
+            "/bin/true",
+            &[],
+            vec![b"/bin/true".to_vec()],
+            &dispatcher,
+        )
+        .expect("resolve");
         assert_eq!(path, "/bin/true");
         assert_eq!(argv, vec![b"/bin/true".to_vec()]);
     }

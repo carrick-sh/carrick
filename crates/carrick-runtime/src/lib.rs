@@ -793,33 +793,45 @@ pub mod runtime {
         }
         let _ = dispatcher.set_fs_backend(Box::new(host));
 
-        // 3. Load the entrypoint ELF FROM the rootfs (the dynamic loader /
-        //    PT_INTERP is read through the same rootfs reader).
-        let path = spec.executable.as_str();
-        let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
+        // 3. Resolve + load the entrypoint FROM the rootfs via the SHARED helpers
+        //    (identical to the macOS run path): PATH-resolve a bare command,
+        //    resolve `#!` scripts, read the ELF (+ its PT_INTERP/loader) through
+        //    the rootfs reader, and assemble the image. The only platform fork is
+        //    step 4 (the run-loop entry). at_base=None: Rosetta amd64 redirection
+        //    is not wired on Linux yet (the build_run_image at_base param supports
+        //    it the day a Linux Rosetta interpreter is located).
+        let argv_bytes: Vec<Vec<u8>> = spec.argv.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let (resolved, argv) = crate::exec_helpers::resolve_entrypoint_program(
+            &spec.executable,
+            &spec.envp,
+            argv_bytes,
+            &dispatcher,
+        )
+        .map_err(|_| {
             RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                path.to_owned(),
+                spec.executable.clone(),
             )))
         })?;
         dispatcher.set_executable_identity(
-            path.to_owned(),
+            resolved.clone(),
             spec.argv.clone(),
             spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect(),
         );
-        let argv: Vec<Vec<u8>> = spec.argv.iter().map(|s| s.as_bytes().to_vec()).collect();
-        let envp: Vec<Vec<u8>> = spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect();
-        // load_elf_bytes_with_reader already builds the full auxv (AT_SYSINFO_EHDR
-        // + the dynamic-loader AT_BASE/AT_ENTRY/AT_PHDR via the reader) and the
-        // vdso region. with_vdso_auxv(true) is a no-op pass-through that keeps it;
-        // calling the full with_vdso() here would double-add the vdso + re-serialize
-        // the auxv, breaking the dynamic-loader handoff (mirrors the macOS bytes
-        // path in run_elf_from_dispatcher_debug).
-        let image = crate::memory::AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| {
-            dispatcher.read_exec_file(p)
-        })?
-        .with_vdso_auxv(true)
-        .with_linux_initial_stack(argv, envp)?;
+        let bytes = dispatcher.read_exec_file(&resolved).ok_or_else(|| {
+            RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                resolved.clone(),
+            )))
+        })?;
+        let image = crate::exec_helpers::build_run_image(
+            &bytes,
+            argv,
+            &spec.envp,
+            &dispatcher,
+            true,
+            None,
+        )?;
 
         // 4. Run on KVM through the same generic threaded loop as run-elf.
         let engine = carrick_linux::KvmTrapEngine::new(&image)?;
