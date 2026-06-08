@@ -23,7 +23,7 @@
 //! are cheap and only grow with the number of DISTINCT rare events.
 //!
 //! [`CompatReport`] is the rendered snapshot (text or JSON), cross-referenced
-//! against the static [`crate::syscall`] metadata table to compute coverage. The
+//! against the static `carrick_abi::syscall` metadata table to compute coverage. The
 //! `unknown_syscall_flags` channel in particular exists to catch Linux ABI drift
 //! LOUDLY — a guest passing a flag bit carrick doesn't recognise surfaces here
 //! instead of being silently dropped.
@@ -31,15 +31,32 @@
 //! This module also owns the two `#[repr(C)]` register-snapshot structs
 //! ([`SyscallArgs`], [`GuestRegs`]) that the hot-path USDT probes pass to DTrace
 //! by raw pointer; their field layout is mirrored by the `.d` scripts and is
-//! therefore an ABI — see the per-struct docs and [`crate::probes`].
+//! therefore an ABI — see the per-struct docs and the dtrace probes provider.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Optional per-event probe hook, fired for every recorded [`CompatEvent`] before
+/// aggregation. A DTrace-capable backend (macOS/FreeBSD) installs its
+/// `probes::fire` here via [`set_probe_hook`] so events reach a live DTrace
+/// consumer; Linux/bhyve leave it unset (no dtrace) and just record. This keeps
+/// the compat reporter free of any `usdt` dependency, so it lives in a neutral
+/// crate every backend shares.
+static PROBE_HOOK: OnceLock<fn(&CompatEvent)> = OnceLock::new();
+
+/// Install the per-event probe hook (idempotent; first call wins). Called once at
+/// startup by a dtrace-capable backend's probe registration, BEFORE the guest
+/// runs. Early-event loss (events recorded before this runs) is acceptable — the
+/// hook is diagnostic only; aggregation always happens.
+pub fn set_probe_hook(hook: fn(&CompatEvent)) {
+    let _ = PROBE_HOOK.set(hook);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyscallArgs(pub [u64; 6]);
@@ -240,12 +257,16 @@ impl Default for CompatReporter {
 
 impl CompatReporter {
     pub fn record(&self, event: CompatEvent) {
-        // USDT probe first — usdt gates the closure on is_enabled, so
-        // this is near-free when no DTrace consumer is attached.
-        crate::probes::fire(&event);
-        // Verbose per-event stderr trace, compile-gated behind `trace-syscalls`.
-        #[cfg(feature = "trace-syscalls")]
-        if let Ok(line) = serde_json::to_string(&event) {
+        // Fire the per-event probe hook first (a dtrace backend installs
+        // `probes::fire`; unset on Linux/bhyve). usdt gates the closure on
+        // is_enabled, so this is near-free when no DTrace consumer is attached.
+        if let Some(hook) = PROBE_HOOK.get() {
+            hook(&event);
+        }
+        // Opt-in verbose stderr trace (cached env check, not per-call).
+        if self.trace_syscalls
+            && let Ok(line) = serde_json::to_string(&event)
+        {
             eprintln!("[carrick-syscall] {line}");
         }
         // Aggregate inline. Common events (entry/return) are pure
@@ -332,7 +353,7 @@ impl CompatReporter {
         let mut deferred_map: HashMap<(u64, String), u64> = HashMap::new();
         let mut unknown_map: HashMap<(u64, String), u64> = HashMap::new();
         for (key, count) in unhandled_raw {
-            if crate::syscall::lookup_aarch64(key.0).is_some() {
+            if carrick_abi::syscall::lookup_aarch64(key.0).is_some() {
                 deferred_map.insert(key, count);
             } else {
                 unknown_map.insert(key, count);

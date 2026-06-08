@@ -186,11 +186,11 @@ use carrick_mem::protections::MemoryProtections;
 // (the runtime↔engine contract is platform-agnostic). Re-export them here so
 // existing `crate::trap::…` paths in carrick-hvf and carrick-runtime are
 // unchanged. HvfTrapEngine below implements the trait from its new home.
-pub use carrick_hal::trap::{ForkOutcome, SyscallTrap, TrapError};
 use carrick_hal::aarch64::{
     ExecLevel, aarch64_exception_class, is_aarch64_hvc_exception, is_aarch64_hvc_maintenance,
     is_aarch64_svc_exception, is_aarch64_syscall_exception,
 };
+pub use carrick_hal::trap::{ForkOutcome, SyscallTrap, TrapError};
 // Test-only: the sibling-snapshot test stamps last_exit_class; the counter-trap
 // tests synthesize ESR syndromes with the EC shift. Both are unused in the lib
 // build, so gate them to test to keep `-D warnings` clean.
