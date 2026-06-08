@@ -1370,6 +1370,20 @@ pub mod io_wait {
             }
             let err = unsafe { *libc::__errno_location() };
             if err == libc::EINTR {
+                // A host signal interrupted the wait. If it carried a now-pending
+                // PROCESS-directed guest signal (the async host-signal pump's
+                // SIGTERM/INT/HUP/QUIT, or a process-directed timer/kill fan-out),
+                // surface `Interrupted` so the caller returns EINTR and the
+                // generic loop's `deliver_pending_signal` drains PROC_PENDING and
+                // runs the guest handler. Without this an infinite `pause()`
+                // (ppoll with NULL fds + NULL timeout) wedged forever: the kick's
+                // EINTR was treated as spurious and re-entered the same wait, so
+                // the handler never ran. A spurious kick with nothing pending
+                // (e.g. a fork-quiesce nudge, handled by the caller) still falls
+                // through to the re-arm retry below.
+                if crate::host_signal::has_process_pending() {
+                    return WaitResult::Interrupted;
+                }
                 // Spurious host signal; no guest signal delivery yet — retry.
                 continue;
             }
@@ -1391,9 +1405,14 @@ pub mod timer_delivery {
 
     struct Delivery {
         kicker: Arc<dyn carrick_hal::VcpuRegistry>,
-        // Wall-clock interval timers are process-directed; deliver to the main
-        // thread (the common single-threaded timer case). A blocked-main /
-        // multi-thread fan-out is a future refinement.
+        // Wall-clock interval/POSIX timer signals (SIGALRM/SIGVTALRM/SIGPROF) are
+        // PROCESS-directed: Linux delivers them to the thread group, runnable by
+        // any thread that does not block the signal. `main_tid` is retained only
+        // as the kick target for the legacy single-threaded path; `deliver` now
+        // publishes into the SHARED process-directed mask and kicks ALL vCPUs so
+        // a blocked-main / multi-thread guest still gets the timer (matching the
+        // dispatcher's process-directed routing).
+        #[allow(dead_code)]
         main_tid: ThreadId,
     }
 
@@ -1412,12 +1431,15 @@ pub mod timer_delivery {
         *lock() = Some(Delivery { kicker, main_tid });
     }
 
-    /// Publish `signum` to the target thread and kick its vCPU. No-op if no run
-    /// loop has registered (e.g. a unit test exercising arm/disarm only).
+    /// Publish a PROCESS-directed timer `signum` into the shared process-directed
+    /// pending mask and kick EVERY vCPU so any unblocked thread re-checks pending
+    /// at its safe point and delivers (a blocked main thread does not drop the
+    /// timer). No-op if no run loop has registered (e.g. a unit test exercising
+    /// arm/disarm only).
     pub fn deliver(signum: i32) {
         if let Some(d) = lock().as_ref() {
-            crate::host_signal::publish_pending_for(d.main_tid, signum);
-            d.kicker.kick(d.main_tid);
+            carrick_signal_core::publish_process_signal(signum);
+            d.kicker.kick_all();
         }
     }
 

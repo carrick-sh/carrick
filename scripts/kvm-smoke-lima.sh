@@ -944,8 +944,53 @@ CEOF
       printf "FAIL [itimer-virtual]: stdout=[%s] exit=%s oracle=[cpu-itimer-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 29. Task 7 (timer/signal refactor): async host-signal pump + PROC_PENDING
+    #     fan-out. A guest installs a SIGTERM handler, forks a child that
+    #     kill(getppid(),SIGTERM)s the parent (a process-directed kill), and the
+    #     parent — blocked in pause() — must run the handler -> "got-term". The
+    #     dispatcher publishes SIGTERM into the shared PROC_PENDING mask and the
+    #     pump/wake fans it out so the pause()-blocked parent re-checks pending and
+    #     delivers. (Guest-fork-kill VARIANT: the smoke runs each case
+    #     synchronously, so it cannot kill -TERM the guest mid-case; the
+    #     guest-issued process-directed kill exercises the SAME fan-out + the
+    #     installed SIGTERM sigaction.) Before Task 7 the wake never reached the
+    #     pause()-blocked parent, so the handler never ran. REQUIRED gate.
+    hostterm_src="$fixdir/host-term/host-term.c"
+    gcc -static -O2 -o /tmp/host_term "$hostterm_src"
+    # NOTE: -s KILL. This guest INSTALLS a SIGTERM handler, so the carrick guest
+    # now CATCHES the host SIGTERM (that is the whole point of the pump). A plain
+    # `timeout` (which sends SIGTERM) would therefore be swallowed by a hung run
+    # and wedge the smoke; force a SIGKILL so a regression still fails-fast.
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/host_term" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "got-term" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+host-term]: a process-directed SIGTERM ran the pause-blocked parent handler via PROC_PENDING fan-out + pump wake."
+    else
+      printf "FAIL [host-term]: stdout=[%s] exit=%s oracle=[got-term]\n" "$got" "$code" >&2
+      exit 1
+    fi
+
+    # 30. Task 7 (timer/signal refactor): PROC_PENDING fan-out to a NON-MAIN
+    #     thread. The MAIN thread BLOCKS SIGUSR1, spawns a worker that does NOT
+    #     block it, then kill(getpid(),SIGUSR1) (process-directed). The worker
+    #     handler must run -> "worker-got-it", matching Linux thread-group
+    #     semantics (a process-directed signal runs on any unblocked thread). The
+    #     dispatcher routes the signal to the unblocked sibling and the kick wakes
+    #     the worker, which delivers at its safe point. Guards that a blocked main
+    #     thread never strands a process-directed signal. REQUIRED gate.
+    nonmain_src="$fixdir/proc-directed-nonmain/proc-directed-nonmain.c"
+    gcc -static -O2 -pthread -o /tmp/proc_nonmain "$nonmain_src"
+    # -s KILL for the same reason as host-term: the guest catches SIGTERM (via the
+    # pump), so a hung run must be force-killed for the smoke to fail-fast.
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/proc_nonmain" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "worker-got-it" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+proc-directed-nonmain]: a process-directed SIGUSR1 (main blocks it) ran on the unblocked worker thread."
+    else
+      printf "FAIL [proc-directed-nonmain]: stdout=[%s] exit=%s oracle=[worker-got-it]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -956,5 +1001,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual — all 32 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump — all 34 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain) pass on KVM; ZERO xfail."
 '

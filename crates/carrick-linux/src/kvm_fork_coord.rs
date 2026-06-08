@@ -71,12 +71,18 @@ impl KvmForkCoordinator {
 impl HostForkCoordinator for KvmForkCoordinator {
     fn start_signal_pump(
         &self,
-        _registry: &Arc<dyn VcpuRegistry>,
-        _futex: &Arc<dyn PlatformFutex>,
+        registry: &Arc<dyn VcpuRegistry>,
+        futex: &Arc<dyn PlatformFutex>,
     ) {
-        // No pump thread on KVM. Just keep the kick-signal handler installed so a
-        // process-directed signal turns an in-flight KVM_RUN into EINTR.
+        // Keep the kick-signal handler installed so a process-directed signal
+        // turns an in-flight KVM_RUN into EINTR.
         self.ensure_handler_installed();
+        // Start the async HOST-signal pump (idempotent): catch host-delivered
+        // SIGTERM/INT/HUP/QUIT, set PROC_PENDING, and kick every vCPU so the
+        // generic loop delivers the guest's handler instead of the host default
+        // action terminating the process. The `Once`-guarded `start_pump` makes
+        // repeated calls (startup + the loop's per-dispatch pump-request) free.
+        crate::kvm_signal_pump::start_pump(registry, futex);
     }
 
     fn prepare_host_fork(&self) -> PreparedHostFork {
@@ -105,8 +111,8 @@ impl HostForkCoordinator for KvmForkCoordinator {
     fn restart_after_child_fork(
         &self,
         prepared: PreparedHostFork,
-        _registry: &Arc<dyn VcpuRegistry>,
-        _futex: &Arc<dyn PlatformFutex>,
+        registry: &Arc<dyn VcpuRegistry>,
+        futex: &Arc<dyn PlatformFutex>,
     ) {
         // Child: `libc::fork` inherits the parent's signal dispositions, but the
         // child's process-global `SIGNAL_PUMP_INSTALLED` flag is a fresh copy of
@@ -115,6 +121,13 @@ impl HostForkCoordinator for KvmForkCoordinator {
         if prepared.had_signal_pump {
             self.ensure_handler_installed();
         }
+        // The child also needs its OWN async host-signal pump: only the forking
+        // thread survives `libc::fork`, so the parent's pump thread did not come
+        // across, and the child inherited the parent's (now defunct) self-pipe +
+        // a `PUMP_STARTED == true` guard. `reinit_after_fork` resets the guard,
+        // closes the stale write fd, and spawns a fresh pipe + pump thread bound
+        // to THIS child's registry/futex.
+        crate::kvm_signal_pump::reinit_after_fork(registry, futex);
     }
 
     fn restart_after_fork_error(
