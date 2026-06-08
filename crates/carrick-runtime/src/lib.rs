@@ -82,6 +82,20 @@
 
 #[cfg(target_os = "macos")]
 pub mod apfs;
+/// Linux/non-macOS `apfs` shim. The real `apfs` module (macOS-only, above) drives
+/// APFS volume management via `diskutil`; that does not apply on Linux. But the
+/// CLI + engine consult `default_writable_backend_kind` to pick the default fs
+/// backend, and on Linux the host filesystem (cap-std passthrough) is always the
+/// fork-coherent writable source of truth. The `*_carrick_volume` functions are
+/// genuinely macOS-only — the `carrick volume` subcommand is gated off on Linux.
+/// Gated as the exact complement of the real module's `target_os = "macos"` so the
+/// two can never both exist.
+#[cfg(not(target_os = "macos"))]
+pub mod apfs {
+    pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
+        carrick_spec::FsBackendKind::Host
+    }
+}
 pub mod binfmt;
 pub mod container;
 pub mod cred_ipc;
@@ -218,7 +232,28 @@ pub mod execute {
     pub fn guest_hostname() -> &'static str {
         "carrick"
     }
+
+    /// Linux mirror of the macOS `execute::Runtime`. The CLI's run seam
+    /// (`carrick_runtime::Runtime::execute(&spec)`, carrick-cli `commands.rs`) is
+    /// platform-agnostic: on macOS it drives the HVF run loop, on Linux it drives
+    /// the KVM OCI path. Both consume the SAME `carrick_spec::RunSpec` the engine
+    /// already resolved and return the SAME `Result<RunResult, RuntimeError>`, so
+    /// the CLI call site is byte-identical across platforms — only symbol
+    /// resolution flips per feature. Mirrors how `runtime::run_oci` already mirrors
+    /// the macOS `Runtime::execute` shape.
+    pub struct Runtime;
+
+    impl Runtime {
+        pub fn execute(
+            spec: &carrick_spec::RunSpec,
+        ) -> Result<crate::run_result::RunResult, crate::run_result::RuntimeError> {
+            crate::runtime::run_oci(spec)
+        }
+    }
 }
+
+#[cfg(not(feature = "platform-macos"))]
+pub use execute::Runtime;
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod runtime {
@@ -1878,6 +1913,15 @@ pub mod compat {
         pub fn snapshot(&self) -> CompatReport {
             CompatReport::default()
         }
+        /// Consume the reporter and produce the (empty, scaffolded) report — the
+        /// Linux mirror of the macOS `CompatReporter::finish`. Compat reporting is
+        /// scaffolded on BOTH backends (the CLI warns and emits an empty report),
+        /// so this keeps `carrick dispatch-syscall` working on Linux. The richer
+        /// `compat-report --format` (which needs the HVF `CompatReportFormat`
+        /// renderer) stays macOS-only.
+        pub fn finish(self) -> CompatReport {
+            self.snapshot()
+        }
     }
     impl Default for CompatReporter {
         fn default() -> Self {
@@ -1987,6 +2031,10 @@ pub mod compat {
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod syscall {
+    /// `Serialize` so the CLI's `carrick syscalls <n>` per-number lookup works on
+    /// Linux (the macOS `carrick_hvf::syscall::Syscall` is serializable too). The
+    /// full-table dump (`aarch64_table`) stays macOS-only.
+    #[derive(serde::Serialize)]
     pub struct Syscall {
         pub name: &'static str,
     }

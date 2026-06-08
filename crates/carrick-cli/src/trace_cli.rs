@@ -29,8 +29,12 @@
 //! The whole module is `cfg(target_os = "macos")`: libdtrace is the only tracer,
 //! and it is macOS-only.
 
+// Used only by the macOS-only (`cfg(target_os = "macos")`) tracer functions below
+// — the whole module is effectively macOS-only (libdtrace is the only tracer).
+#[cfg(target_os = "macos")]
 use anyhow::{Context, bail};
 
+#[cfg(target_os = "macos")]
 use crate::args::Cli;
 
 #[cfg(target_os = "macos")]

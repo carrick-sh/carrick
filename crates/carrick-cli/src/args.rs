@@ -32,6 +32,9 @@
 
 use std::path::PathBuf;
 
+// `compat-report --format` uses the HVF report renderer (`CompatReportFormat`),
+// which is macOS-only; the subcommand is gated off on platform-linux.
+#[cfg(feature = "platform-macos")]
 use carrick_runtime::compat::CompatReportFormat;
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
 use carrick_spec::{FsBackendKind, PidMode};
@@ -59,6 +62,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         find_text: Option<String>,
     },
+    /// `run-elf` drives a freestanding ELF straight through the HVF run loop
+    /// (`run_static_elf_with_hvf_…`), macOS-only. On Linux use `carrick run
+    /// <oci>`, or the `carrick-kvm run-elf` dev driver for a bare ELF.
+    #[cfg(feature = "platform-macos")]
     RunElf {
         path: PathBuf,
         #[arg(long = "rootfs-layer")]
@@ -491,6 +498,8 @@ pub(crate) enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// `compat-report` renders the HVF syscall-coverage report; macOS-only.
+    #[cfg(feature = "platform-macos")]
     CompatReport {
         #[arg(long, value_enum, default_value_t = CompatReportFormat::Json)]
         format: CompatReportFormat,
