@@ -69,6 +69,157 @@ pub trait VcpuRegistry: Send + Sync {
     fn count(&self) -> usize;
 }
 
+/// The platform-NEUTRAL [`VcpuRegistry`] implementation, shared by every backend.
+///
+/// It is two maps — per-tid kick handles and per-tid "currently in-guest" flags
+/// — plus the SeqCst Dekker handshake the fork / page-table-edit coordinators
+/// rely on. The only platform-specific piece is the kick MECHANISM, which is
+/// already behind [`VcpuKickDyn`] (HVF `hv_vcpus_exit`, KVM `pthread_kill`,
+/// bhyve `_umtx_op`/`vm_suspend_cpu`), so the registry itself names no backend.
+/// Kicks are per-handle (`kick_all` calls each handle's `kick()`); a backend that
+/// batched (HVF's old bulk `hv_vcpus_exit(ids)`) is behavior-equivalent — N
+/// single-id exits force the same vCPUs out, at the same infrequent quiesce
+/// points — so the bulk fast path is dropped in favour of one shared registry.
+///
+/// A backend that needs setup at construction (e.g. KVM installing its
+/// SIGRTMIN kick-signal handler) wraps this in a thin newtype whose `new()` does
+/// the setup and delegates the trait. This struct is only ever driven through
+/// [`VcpuRegistry`], so it intentionally has no inherent kick API.
+#[derive(Default)]
+pub struct GenericVcpuRegistry {
+    handles: std::sync::Mutex<std::collections::HashMap<ThreadId, Box<dyn VcpuKickDyn>>>,
+    in_guest: std::sync::Mutex<std::collections::HashMap<ThreadId, Arc<AtomicBool>>>,
+}
+
+impl GenericVcpuRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock_handles(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ThreadId, Box<dyn VcpuKickDyn>>> {
+        self.handles.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_in_guest(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ThreadId, Arc<AtomicBool>>> {
+        self.in_guest.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl VcpuRegistry for GenericVcpuRegistry {
+    fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>) {
+        self.lock_handles().insert(tid, handle);
+    }
+
+    fn register_in_guest(&self, tid: ThreadId) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.lock_in_guest().insert(tid, Arc::clone(&flag));
+        flag
+    }
+
+    fn unregister(&self, tid: ThreadId) {
+        self.lock_handles().remove(&tid);
+        self.lock_in_guest().remove(&tid);
+    }
+
+    fn kick(&self, tid: ThreadId) {
+        if let Some(h) = self.lock_handles().get(&tid) {
+            h.kick();
+        }
+    }
+
+    fn kick_all(&self) {
+        for h in self.lock_handles().values() {
+            h.kick();
+        }
+    }
+
+    fn kick_all_except(&self, except: ThreadId) {
+        for (tid, h) in self.lock_handles().iter() {
+            if *tid != except {
+                h.kick();
+            }
+        }
+    }
+
+    fn any_other_in_guest(&self, except: ThreadId) -> bool {
+        self.lock_in_guest()
+            .iter()
+            .any(|(tid, f)| *tid != except && f.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn set_in_guest(&self, tid: ThreadId, in_guest: bool) {
+        if let Some(flag) = self.lock_in_guest().get(&tid) {
+            flag.store(in_guest, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.lock_handles().len()
+    }
+}
+
+#[cfg(test)]
+mod generic_registry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct CountingHandle(Arc<AtomicU64>);
+    impl VcpuKickDyn for CountingHandle {
+        fn kick(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn target_in_guest(&self) -> bool {
+            false
+        }
+        fn raw_vcpu_id(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn register_unregister_count() {
+        let r = GenericVcpuRegistry::new();
+        assert_eq!(r.count(), 0);
+        r.register(1, Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
+        r.register(2, Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
+        assert_eq!(r.count(), 2);
+        r.unregister(1);
+        assert_eq!(r.count(), 1);
+    }
+
+    #[test]
+    fn kick_all_except_skips_caller() {
+        let r = GenericVcpuRegistry::new();
+        let c1 = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::new(AtomicU64::new(0));
+        r.register(1, Box::new(CountingHandle(Arc::clone(&c1))));
+        r.register(2, Box::new(CountingHandle(Arc::clone(&c2))));
+        r.kick_all_except(1);
+        assert_eq!(c1.load(Ordering::SeqCst), 0, "caller must not be kicked");
+        assert_eq!(c2.load(Ordering::SeqCst), 1, "the other vCPU is kicked");
+        r.kick_all();
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn in_guest_flag_handshake() {
+        let r = GenericVcpuRegistry::new();
+        let _flag = r.register_in_guest(1);
+        r.register_in_guest(2);
+        assert!(!r.any_other_in_guest(1));
+        r.set_in_guest(2, true);
+        assert!(r.any_other_in_guest(1), "tid 2 is in-guest");
+        assert!(!r.any_other_in_guest(2), "except self → false");
+        r.set_in_guest(2, false);
+        assert!(!r.any_other_in_guest(1));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FutexOutcome {
     Woken,

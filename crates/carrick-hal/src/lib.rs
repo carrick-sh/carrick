@@ -28,7 +28,7 @@ pub use host_info::HostFacts;
 pub use sendfile::Sendfile;
 pub mod threaded;
 pub use threaded::{
-    FutexOutcome, HostForkCoordinator, PlatformFutex, PreparedHostFork, RegAccess, ThreadId,
-    ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
+    FutexOutcome, GenericVcpuRegistry, HostForkCoordinator, PlatformFutex, PreparedHostFork,
+    RegAccess, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
 };
 pub mod sigframe;

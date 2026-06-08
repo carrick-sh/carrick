@@ -19,13 +19,9 @@
 //! the Dekker handshake with the fork / page-table coordinators is SeqCst on
 //! both sides.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use carrick_hal::ThreadId;
 
 /// The signal carrick uses to force a vCPU out of `KVM_RUN`.
 ///
@@ -86,6 +82,13 @@ pub struct KvmKickHandle {
 impl KvmKickHandle {
     /// Build a handle for the CURRENT thread (call on the owning vCPU thread).
     pub fn for_current_thread() -> Self {
+        // Install the SIGRTMIN kick-signal handler here (idempotent `Once`): a
+        // thread becomes a kick TARGET only once it has registered a handle, so
+        // installing on handle creation guarantees the handler is live process-
+        // wide before any kick can be issued. (The shared `GenericVcpuRegistry`
+        // used as `KvmKicker` has no constructor hook, and the fork coordinator
+        // also installs it defensively — both are idempotent.)
+        install_kvm_kick_handler();
         // SAFETY: `pthread_self` is always safe and returns this thread's id.
         let tid = unsafe { libc::pthread_self() };
         Self {
@@ -118,109 +121,13 @@ impl carrick_hal::VcpuKick for KvmKickHandle {
     // (no `hv_vcpus_exit`), so the bulk paths fan out per-handle `pthread_kill`.
 }
 
-/// Process-wide registry mapping each live guest tid to a handle that can kick
-/// its vCPU. Shared across all guest threads behind an `Arc`. Mirrors the HVF
-/// [`crate::trap_engine`]-facing `VcpuKicker` shape exactly (same two maps, same
-/// SeqCst bookkeeping); only the kick MECHANISM differs (`pthread_kill` vs
-/// `hv_vcpus_exit`).
-pub struct KvmKicker {
-    /// The per-tid kick handles, stored object-safe so the shared threaded
-    /// engine drives the kicker through [`carrick_hal::VcpuRegistry`] without
-    /// naming `KvmKickHandle`.
-    handles: Mutex<HashMap<ThreadId, Box<dyn carrick_hal::VcpuKickDyn>>>,
-    /// Per-vCPU "currently inside `KVM_RUN`" flag. The fork / page-table-edit
-    /// coordinators wait until every OTHER vCPU has this false before editing
-    /// shared state — a Dekker handshake (SeqCst on both sides).
-    in_guest: Mutex<HashMap<ThreadId, Arc<AtomicBool>>>,
-}
-
-impl Default for KvmKicker {
-    fn default() -> Self {
-        Self {
-            handles: Mutex::new(HashMap::new()),
-            in_guest: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl KvmKicker {
-    pub fn new() -> Self {
-        // Installing the kick handler here (idempotently) guarantees that by the
-        // time any vCPU could be kicked, the handler that turns the signal into
-        // a KVM_RUN EINTR is live. Cheap (a `Once`); safe from any thread.
-        install_kvm_kick_handler();
-        Self::default()
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn lock_handles(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<ThreadId, Box<dyn carrick_hal::VcpuKickDyn>>> {
-        self.handles.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn lock_in_guest(&self) -> std::sync::MutexGuard<'_, HashMap<ThreadId, Arc<AtomicBool>>> {
-        self.in_guest.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-impl carrick_hal::VcpuRegistry for KvmKicker {
-    fn register(&self, tid: ThreadId, handle: Box<dyn carrick_hal::VcpuKickDyn>) {
-        self.lock_handles().insert(tid, handle);
-    }
-
-    fn register_in_guest(&self, tid: ThreadId) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
-        self.lock_in_guest().insert(tid, Arc::clone(&flag));
-        flag
-    }
-
-    fn unregister(&self, tid: ThreadId) {
-        self.lock_handles().remove(&tid);
-        self.lock_in_guest().remove(&tid);
-    }
-
-    fn kick(&self, tid: ThreadId) {
-        // `pthread_kill` is async-signal-safe and returns promptly (it just
-        // enqueues the signal), so kicking under the registry lock is fine — the
-        // lock is held only for the brief syscall, exactly as the HVF kicker
-        // issues `hv_vcpus_exit` under its `handles` lock. An unknown tid is a
-        // harmless no-op.
-        if let Some(h) = self.lock_handles().get(&tid) {
-            h.kick();
-        }
-    }
-
-    fn kick_all(&self) {
-        for h in self.lock_handles().values() {
-            h.kick();
-        }
-    }
-
-    fn kick_all_except(&self, except: ThreadId) {
-        for (tid, h) in self.lock_handles().iter() {
-            if *tid != except {
-                h.kick();
-            }
-        }
-    }
-
-    fn any_other_in_guest(&self, except: ThreadId) -> bool {
-        self.lock_in_guest()
-            .iter()
-            .any(|(tid, f)| *tid != except && f.load(Ordering::SeqCst))
-    }
-
-    fn set_in_guest(&self, tid: ThreadId, in_guest: bool) {
-        if let Some(flag) = self.lock_in_guest().get(&tid) {
-            flag.store(in_guest, Ordering::SeqCst);
-        }
-    }
-
-    fn count(&self) -> usize {
-        self.lock_handles().len()
-    }
-}
+/// The KVM vCPU-kick registry. The bookkeeping (the two maps + the SeqCst Dekker
+/// handshake) is the platform-neutral [`carrick_hal::GenericVcpuRegistry`],
+/// shared with HVF/bhyve; the only KVM-specific piece is [`KvmKickHandle`] (the
+/// `pthread_kill` kick mechanism) + the SIGRTMIN handler install, which now
+/// happens in [`KvmKickHandle::for_current_thread`] (the registry has no
+/// constructor hook). So this is a plain alias — no duplicated registry logic.
+pub type KvmKicker = carrick_hal::GenericVcpuRegistry;
 
 #[cfg(test)]
 mod tests {
