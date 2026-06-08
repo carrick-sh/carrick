@@ -78,10 +78,16 @@ const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: u64 = 0x400;
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
 
-// Encoders for the sentinel store sequence. We use x9 as scratch (the guest's
-// svc convention leaves x0..x8 as the syscall frame; x9 is caller-saved and
-// unobserved across the trap because the host reads the frame, completes the
-// syscall, and resumes via ELR_EL1).
+// Encoders for the sentinel store sequence. The sentinel store needs a scratch
+// register holding the sentinel GPA (`str x8, [x9]`), and we use x9. But the
+// Linux aarch64 syscall ABI PRESERVES x1..x30 across an `svc` (the kernel
+// saves/restores the full register frame), and real code relies on it — e.g.
+// musl's `__expand_heap` keeps its malloc-context pointer in x9 across the
+// `brk(2)` svc, then does `str x10, [x9, #920]` AFTER. So the vector first SAVES
+// x9 to `TPIDR_EL1` (a per-vCPU EL1 sysreg carrick does NOT otherwise use on KVM:
+// the guest runs at EL0 and uses TPIDR_EL0 for TLS), and `complete_syscall`
+// restores x9 from it on the way out. (glibc happened never to hold a live x9
+// across an svc, which masked this for a long time; musl/alpine exposed it.)
 fn enc_movz_x9(imm16: u16, hw: u32) -> u32 {
     0xD280_0009 | (hw << 21) | (u32::from(imm16) << 5)
 }
@@ -90,6 +96,9 @@ fn enc_movk_x9(imm16: u16, hw: u32) -> u32 {
 }
 // `str x8, [x9]` — store the syscall number to the sentinel (any store works).
 const ENC_STR_X8_X9: u32 = 0xf900_0128;
+// `msr tpidr_el1, x9` — save the guest's live x9 before the vector clobbers it as
+// the sentinel-store scratch (see the comment above). Assembled via GNU `as`.
+const ENC_MSR_TPIDR_EL1_X9: u32 = 0xd518_d089;
 
 // EL0-fault discriminator opcodes. The lower-EL-sync slot is entered by BOTH an
 // EL0 `svc` AND an EL0 synchronous fault (data/instruction abort, alignment),
@@ -129,13 +138,17 @@ pub fn el1_vectors_sentinel_bytes() -> Vec<u8> {
     // Overwrite the lower-EL sync slot. It is entered by an EL0 `svc` AND by an
     // EL0 synchronous fault, so it discriminates on ESR.EC: EC == 0x15 (SVC64)
     // takes the syscall path (store to SENTINEL_GPA); anything else is a fault
-    // and takes the fault path (store to FAULT_SENTINEL_GPA). 16 instructions,
-    // well within the 0x80 (32-instruction) slot. The `mrs x9, esr_el1` MUST run
-    // before any sentinel store: that store is itself a stage-2 MMIO abort, but
-    // because it does NOT take an EL1 exception it leaves ESR_EL1/FAR_EL1 holding
-    // the ORIGINAL EL0-fault values for the host to read. The b.ne jumps +7
-    // instructions to the fault block, so the fault block MUST stay exactly 7
-    // instructions after it (the test asserts this).
+    // and takes the fault path (store to FAULT_SENTINEL_GPA). 17 instructions,
+    // well within the 0x80 (32-instruction) slot.
+    //
+    // s+0 SAVES the guest's x9 to TPIDR_EL1 BEFORE clobbering it (the ABI
+    // preserves x9; see the encoder comment). `complete_syscall` restores it.
+    // The `mrs x9, esr_el1` then MUST run before any sentinel store: that store
+    // is itself a stage-2 MMIO abort, but because it does NOT take an EL1
+    // exception it leaves ESR_EL1/FAR_EL1 holding the ORIGINAL EL0-fault values
+    // for the host to read. The b.ne jumps +7 instructions to the fault block, so
+    // the fault block MUST stay exactly 7 instructions after it (the test asserts
+    // this) — the +1 leading `msr` shifts BOTH paths uniformly, so +7 is intact.
     let s = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET as usize;
     // movz x9, gpa[0]; movk x9, gpa[1..4] — materialize a 64-bit gpa into x9.
     let materialize = |b: &mut [u8], off: usize, g: u64| {
@@ -144,21 +157,22 @@ pub fn el1_vectors_sentinel_bytes() -> Vec<u8> {
         put(b, off + 8, enc_movk_x9(((g >> 32) & 0xFFFF) as u16, 2));
         put(b, off + 12, enc_movk_x9(((g >> 48) & 0xFFFF) as u16, 3));
     };
-    // ESR.EC discriminator (s+0 .. s+12).
-    put(&mut bytes, s, ENC_MRS_X9_ESR_EL1); //     mrs  x9, esr_el1
-    put(&mut bytes, s + 4, ENC_UBFX_X9_X9_EC); //  ubfx x9, x9, #26, #6  (x9 = EC)
-    put(&mut bytes, s + 8, ENC_CMP_X9_SVC); //     cmp  x9, #0x15
-    put(&mut bytes, s + 12, ENC_BNE_FAULT); //     b.ne fault_block (+7)
-    // SVC path (EC == 0x15), s+16 .. s+36: re-materialize x9 (clobbered by the
+    // Save x9 (s+0), then the ESR.EC discriminator (s+4 .. s+16).
+    put(&mut bytes, s, ENC_MSR_TPIDR_EL1_X9); //   msr  tpidr_el1, x9  (save live x9)
+    put(&mut bytes, s + 4, ENC_MRS_X9_ESR_EL1); // mrs  x9, esr_el1
+    put(&mut bytes, s + 8, ENC_UBFX_X9_X9_EC); //  ubfx x9, x9, #26, #6  (x9 = EC)
+    put(&mut bytes, s + 12, ENC_CMP_X9_SVC); //    cmp  x9, #0x15
+    put(&mut bytes, s + 16, ENC_BNE_FAULT); //     b.ne fault_block (+7)
+    // SVC path (EC == 0x15), s+20 .. s+40: re-materialize x9 (clobbered by the
     // mrs) with SENTINEL_GPA, store, eret.
-    materialize(&mut bytes, s + 16, SENTINEL_GPA);
-    put(&mut bytes, s + 32, ENC_STR_X8_X9); //     str x8, [x9]  (host: gpa == SENTINEL_GPA)
-    put(&mut bytes, s + 36, AARCH64_ERET_OPCODE); // eret
-    // FAULT path (EC != 0x15), s+40 .. s+60: store to FAULT_SENTINEL_GPA so the
+    materialize(&mut bytes, s + 20, SENTINEL_GPA);
+    put(&mut bytes, s + 36, ENC_STR_X8_X9); //     str x8, [x9]  (host: gpa == SENTINEL_GPA)
+    put(&mut bytes, s + 40, AARCH64_ERET_OPCODE); // eret
+    // FAULT path (EC != 0x15), s+44 .. s+64: store to FAULT_SENTINEL_GPA so the
     // host captures ESR/FAR/ELR and delivers a guest signal, then eret.
-    materialize(&mut bytes, s + 40, FAULT_SENTINEL_GPA);
-    put(&mut bytes, s + 56, ENC_STR_X8_X9); //     str x8, [x9]  (host: gpa == FAULT_SENTINEL_GPA)
-    put(&mut bytes, s + 60, AARCH64_ERET_OPCODE); // eret
+    materialize(&mut bytes, s + 44, FAULT_SENTINEL_GPA);
+    put(&mut bytes, s + 60, ENC_STR_X8_X9); //     str x8, [x9]  (host: gpa == FAULT_SENTINEL_GPA)
+    put(&mut bytes, s + 64, AARCH64_ERET_OPCODE); // eret
     bytes
 }
 
@@ -895,40 +909,48 @@ mod vector_tests {
         let op = |off: usize| -> u32 {
             u32::from_le_bytes(bytes[s + off..s + off + 4].try_into().unwrap())
         };
-        // Discriminator.
-        assert_eq!(op(0), ENC_MRS_X9_ESR_EL1, "s+0 mrs x9, esr_el1");
-        assert_eq!(op(4), ENC_UBFX_X9_X9_EC, "s+4 ubfx x9,x9,#26,#6");
-        assert_eq!(op(8), ENC_CMP_X9_SVC, "s+8 cmp x9,#0x15");
-        assert_eq!(op(12), ENC_BNE_FAULT, "s+12 b.ne fault");
-        // A B.cond imm19 (bits[23:5]) is the branch distance in INSTRUCTIONS; the
-        // fault block (s+40) is 7 instructions after the b.ne (s+12).
+        // s+0 saves the guest's live x9 (the ABI preserves x9; the vector clobbers
+        // it as the sentinel-store scratch, and complete_syscall restores it).
         assert_eq!(
-            (op(12) >> 5) & 0x7_ffff,
+            op(0),
+            ENC_MSR_TPIDR_EL1_X9,
+            "s+0 msr tpidr_el1, x9 (save x9)"
+        );
+        // Discriminator (shifted +4 by the leading save).
+        assert_eq!(op(4), ENC_MRS_X9_ESR_EL1, "s+4 mrs x9, esr_el1");
+        assert_eq!(op(8), ENC_UBFX_X9_X9_EC, "s+8 ubfx x9,x9,#26,#6");
+        assert_eq!(op(12), ENC_CMP_X9_SVC, "s+12 cmp x9,#0x15");
+        assert_eq!(op(16), ENC_BNE_FAULT, "s+16 b.ne fault");
+        // A B.cond imm19 (bits[23:5]) is the branch distance in INSTRUCTIONS; the
+        // fault block (s+44) is 7 instructions after the b.ne (s+16) — both paths
+        // shifted uniformly by the leading save, so the distance is unchanged.
+        assert_eq!(
+            (op(16) >> 5) & 0x7_ffff,
             7,
             "b.ne must jump +7 instructions"
         );
-        assert_eq!((40 - 12) / 4, 7, "fault block is +7 instructions from b.ne");
+        assert_eq!((44 - 16) / 4, 7, "fault block is +7 instructions from b.ne");
         // SVC path: SENTINEL_GPA materialize + str + eret.
         assert_eq!(
-            op(16),
+            op(20),
             enc_movz_x9((SENTINEL_GPA & 0xFFFF) as u16, 0),
-            "s+16 movz SENTINEL"
+            "s+20 movz SENTINEL"
         );
-        assert_eq!(op(32), ENC_STR_X8_X9, "s+32 svc str x8,[x9]");
-        assert_eq!(op(36), AARCH64_ERET_OPCODE, "s+36 svc eret");
+        assert_eq!(op(36), ENC_STR_X8_X9, "s+36 svc str x8,[x9]");
+        assert_eq!(op(40), AARCH64_ERET_OPCODE, "s+40 svc eret");
         // FAULT path: FAULT_SENTINEL_GPA materialize + str + eret.
         assert_eq!(
-            op(40),
+            op(44),
             enc_movz_x9((FAULT_SENTINEL_GPA & 0xFFFF) as u16, 0),
-            "s+40 movz FAULT"
+            "s+44 movz FAULT"
         );
         assert_eq!(
-            op(44),
+            op(48),
             enc_movk_x9(((FAULT_SENTINEL_GPA >> 16) & 0xFFFF) as u16, 1),
-            "s+44 movk FAULT"
+            "s+48 movk FAULT"
         );
-        assert_eq!(op(56), ENC_STR_X8_X9, "s+56 fault str x8,[x9]");
-        assert_eq!(op(60), AARCH64_ERET_OPCODE, "s+60 fault eret");
+        assert_eq!(op(60), ENC_STR_X8_X9, "s+60 fault str x8,[x9]");
+        assert_eq!(op(64), AARCH64_ERET_OPCODE, "s+64 fault eret");
     }
 }
 

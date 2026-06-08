@@ -335,9 +335,17 @@ impl SyscallTrap for KvmTrapEngine {
                     });
                 }
                 VcpuExit::MmioWrite { gpa, data, len } => {
+                    let pc = self.vcpu.reg(Reg::Pc).unwrap_or(0);
+                    let elr = self.vcpu.reg(Reg::ElrEl1).unwrap_or(0);
+                    let g = |n: u32| self.vcpu.reg(Reg::X(n)).unwrap_or(0);
                     return Err(TrapError::UnexpectedExit {
                         reason: format!(
-                            "MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len}"
+                            "MMIO at non-sentinel gpa=0x{gpa:x} data=0x{data:x} len={len} \
+                             pc=0x{pc:x} elr=0x{elr:x} x0=0x{:x} x1=0x{:x} x8=0x{:x} sp=0x{:x}",
+                            g(0),
+                            g(1),
+                            g(8),
+                            self.vcpu.reg(Reg::Sp).unwrap_or(0),
                         ),
                     });
                 }
@@ -395,6 +403,21 @@ impl SyscallTrap for KvmTrapEngine {
         // or the instruction after the `svc` would be skipped.
         self.vcpu
             .set_reg(Reg::X(0), return_value as u64)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Restore the guest's x9. The Linux aarch64 syscall ABI preserves x1..x30
+        // across an `svc`, and musl relies on it (`__expand_heap` holds its
+        // malloc-context pointer in x9 across `brk(2)` and then `str x10, [x9,
+        // #920]`). The EL1 sentinel vector clobbers x9 as the sentinel-store
+        // scratch, so it first stashes the guest's x9 in TPIDR_EL1 (free on KVM);
+        // restore it here, on every syscall return. Without this the guest resumes
+        // with x9 = SENTINEL_GPA and faults on that store. (glibc never held a
+        // live x9 across an svc, which masked this until alpine/musl.)
+        let saved_x9 = self
+            .vcpu
+            .get_tpidr_el1()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        self.vcpu
+            .set_reg(Reg::X(9), saved_x9)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 

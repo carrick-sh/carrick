@@ -405,6 +405,21 @@ impl KvmVcpu {
         Ok(u64::from_le_bytes(bytes))
     }
 
+    /// Read `TPIDR_EL1` (op0=3,op1=0,CRn=13,CRm=0,op2=4 — `S3_0_C13_C0_4`), the
+    /// per-vCPU EL1 thread pointer. carrick does NOT use it for thread state on
+    /// KVM (the guest runs at EL0 with TPIDR_EL0 for TLS), so the EL1 sentinel
+    /// vector borrows it to STASH the guest's x9 before clobbering x9 as the
+    /// sentinel-store scratch; `complete_syscall` reads it back to restore x9 (the
+    /// Linux syscall ABI preserves x1..x30). Kept KVM-local like
+    /// [`Self::get_esr_el1`] — no `carrick_hal::SysReg` variant churn.
+    pub fn get_tpidr_el1(&self) -> Result<u64, OsError> {
+        let mut bytes = [0u8; 8];
+        self.fd
+            .get_one_reg(sysreg_id(3, 0, 13, 0, 4), &mut bytes)
+            .map_err(|e| os_err("KVM_GET_ONE_REG(TPIDR_EL1)", e))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
     /// Write a core register through `&self` (not `&mut self`). `KVM_SET_ONE_REG`
     /// is a `&self` ioctl on `VcpuFd`, so this needs no exclusive borrow — used
     /// by the `&self` [`carrick_hal::ThreadedEngine::set_guest_sp_el0`] (a clone
