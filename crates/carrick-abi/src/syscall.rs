@@ -8,7 +8,7 @@
 //! number to its name, the [`SyscallHandler`] subsystem that owns it, a
 //! [`SupportLevel`] (`BringUp`/`Planned`/`Deferred`), and an optional compat
 //! note. It is pure metadata: it does NOT dispatch anything itself. Two
-//! consumers read it. The [`crate::compat`] reporter cross-references it to turn
+//! consumers read it. The compat reporter cross-references it to turn
 //! raw event counters into a coverage report ("of the N syscalls a real kernel
 //! exposes, which has carrick actually serviced, and at what support level").
 //! And the handler grouping ([`handler_for_aarch64`]) is the canonical

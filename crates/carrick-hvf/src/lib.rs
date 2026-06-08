@@ -43,7 +43,10 @@ pub mod io_wait;
 pub mod itimer;
 pub mod posix_timer;
 pub mod probes;
-pub mod syscall;
+// AArch64 syscall metadata is platform-neutral ABI data — hoisted to carrick-abi
+// (shared by KVM/bhyve, which used to get a `lookup → None` stub). Re-exported as
+// `crate::syscall` so HVF's compat reporter + the probes provider are unchanged.
+pub use carrick_abi::syscall;
 pub mod thread;
 pub mod threaded_impl;
 pub mod trap;
