@@ -183,6 +183,18 @@ pub fn interval_ns(which: usize) -> u64 {
 /// For CPU timers, decide whether enough guest CPU has elapsed for this timer
 /// to fire. If not, return a wall-clock recheck delay so the pump can replay a
 /// one-shot wake instead of consuming the timer while the guest is idle.
+///
+/// Accuracy: this is EXACT for a single-vCPU guest — `total_ns_including_active`
+/// is the guest's CPU total, so `Fire` happens precisely when it crosses
+/// `cpu_due_ns`. For a MULTI-vCPU guest it is BEST-EFFORT: `cpu_due_ns` is set
+/// off the AGGREGATE guest CPU total (summed across vCPUs), and the recheck
+/// delay is scaled by the active vCPU count (see [`cpu_timer_recheck_delay_ns`],
+/// which divides the remaining CPU by `active_count`) so the bounded poll wakes
+/// roughly when the aggregate is expected to reach the deadline. Per-thread CPU
+/// attribution (CLOCK_THREAD_CPUTIME_ID semantics) is not modeled; ITIMER_VIRTUAL
+/// / ITIMER_PROF on a multi-threaded guest fire off whole-process aggregate CPU,
+/// which matches Linux's process-directed itimer semantics at the process level
+/// but does not pin delivery to the exact thread that burned the CPU.
 pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
     if !is_cpu_timer(which) {
         return None;
@@ -257,14 +269,27 @@ pub fn current_arms() -> impl Iterator<Item = TimerArm> {
     (0..WHICH_COUNT).filter_map(current_arm)
 }
 
-/// Shared wall-clock fallback-timer timing loop body. Sleeps to the first
-/// deadline, then (if still armed with this `generation`) invokes `on_fire`,
-/// repeating every `interval_ns` until the timer is disarmed or re-armed
-/// (generation bump) or `!is_armed`. The THREAD SPAWN and the actual `on_fire`
-/// (publish signal + kick) are per-backend; only this timing loop is shared.
+/// Shared fallback-timer timing loop body. Branches on the timer's nature:
 ///
-/// `value_ns`/`interval_ns` of 0 sleep for zero time (fire immediately /
-/// one-shot, respectively).
+/// * Wall-time (`ITIMER_REAL`): sleeps to the first deadline, then (if still
+///   armed with this `generation`) invokes `on_fire`, repeating every
+///   `interval_ns` until the timer is disarmed or re-armed (generation bump) or
+///   `!is_armed`. `value_ns`/`interval_ns` of 0 sleep for zero time (fire
+///   immediately / one-shot, respectively).
+///
+/// * CPU-time (`ITIMER_VIRTUAL`/`ITIMER_PROF`): does NOT sleep the wall-clock
+///   `value`/`interval`. Instead it POLLS [`cpu_timer_decision`], which compares
+///   the slot's `cpu_due_ns` against the live aggregate guest CPU total. On
+///   `Fire` it invokes `on_fire` (and `cpu_timer_decision` has already re-armed
+///   `cpu_due_ns` for the interval, or zeroed it for a one-shot — so a zeroed
+///   `cpu_due_ns` after a fire means "stop"). On `Wait { delay_ns }` it sleeps
+///   the bounded recheck delay and loops. Either way it retires on a generation
+///   bump (disarm/re-arm) or `!is_armed`, exactly like the wall-clock arm. This
+///   makes CPU itimers fire off REAL guest CPU time on backends with no pump
+///   kqueue (KVM) and in HVF fork-child fallbacks, NOT off wall-clock.
+///
+/// The THREAD SPAWN and the actual `on_fire` (publish signal + kick) are
+/// per-backend; only this timing loop is shared.
 pub fn run_fallback(
     which: usize,
     generation: u64,
@@ -272,6 +297,10 @@ pub fn run_fallback(
     interval_ns: u64,
     on_fire: impl Fn(),
 ) {
+    if is_cpu_timer(which) {
+        run_fallback_cpu(which, generation, &on_fire);
+        return;
+    }
     std::thread::sleep(Duration::from_nanos(value_ns));
     loop {
         if !generation_matches(which, generation) || !is_armed(which) {
@@ -282,6 +311,34 @@ pub fn run_fallback(
             break;
         }
         std::thread::sleep(Duration::from_nanos(interval_ns));
+    }
+}
+
+/// CPU-itimer fallback poll loop. Drives delivery off the aggregate guest CPU
+/// total via [`cpu_timer_decision`] rather than wall-clock sleeps, so the timer
+/// only advances while the guest actually burns CPU (and never while idle).
+/// `cpu_timer_decision` owns the one-shot-vs-interval re-arm of `cpu_due_ns`: on
+/// a `Fire` it either re-arms `cpu_due_ns` for the next interval (periodic) or
+/// zeroes it (one-shot). We therefore stop after a fire iff the timer has no
+/// interval — a one-shot is spent — and otherwise keep polling for the next
+/// interval expiry. Retires on a generation bump (disarm/re-arm) or `!is_armed`.
+fn run_fallback_cpu(which: usize, generation: u64, on_fire: &impl Fn()) {
+    loop {
+        if !generation_matches(which, generation) || !is_armed(which) {
+            break;
+        }
+        match cpu_timer_decision(which) {
+            Some(CpuTimerDecision::Fire) => {
+                on_fire();
+                if interval_ns(which) == 0 {
+                    break;
+                }
+            }
+            Some(CpuTimerDecision::Wait { delay_ns }) => {
+                std::thread::sleep(Duration::from_nanos(delay_ns));
+            }
+            None => break,
+        }
     }
 }
 
@@ -335,6 +392,57 @@ mod tests {
             other => panic!("expected Fire, got {other:?}"),
         }
         disarm(1);
+    }
+
+    #[test]
+    fn run_fallback_cpu_one_shot_fires_once_when_cpu_advances() {
+        use std::sync::atomic::AtomicUsize;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        carrick_host::guest_cpu::reset();
+        let which = 1; // VIRTUAL, one-shot
+        // Arm for a small CPU budget; cpu_due_ns = 0 + 1_000 since CPU total is 0.
+        let generation = arm(which, 1_000, 0, false);
+        // Charge enough guest CPU that the one-shot is due.
+        carrick_host::guest_cpu::begin_active();
+        carrick_host::guest_cpu::finish_active(10_000);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires2 = Arc::clone(&fires);
+        // run_fallback should Fire exactly once (one-shot) then return.
+        run_fallback(which, generation, 1_000, 0, move || {
+            fires2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(fires.load(Ordering::SeqCst), 1, "one-shot CPU timer fires once");
+        disarm(which);
+        carrick_host::guest_cpu::reset();
+    }
+
+    #[test]
+    fn run_fallback_cpu_retires_on_generation_bump() {
+        use std::sync::atomic::AtomicUsize;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        carrick_host::guest_cpu::reset();
+        let which = 2; // PROF, periodic — would loop forever if not retired.
+        let stale_generation = arm(which, 1_000, 1_000, false);
+        // Bump the generation (re-arm) so the stale fallback must retire.
+        let _new_generation = arm(which, 1_000, 1_000, false);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires2 = Arc::clone(&fires);
+        // Even with CPU charged past due, the stale-generation loop must exit
+        // immediately (generation mismatch) rather than fire/loop.
+        carrick_host::guest_cpu::begin_active();
+        carrick_host::guest_cpu::finish_active(1_000_000);
+        run_fallback(which, stale_generation, 1_000, 1_000, move || {
+            fires2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "stale-generation CPU fallback must not fire"
+        );
+        disarm(which);
+        carrick_host::guest_cpu::reset();
     }
 
     // ---- Regression tests carried from carrick-hvf. ----
