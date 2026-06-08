@@ -696,6 +696,135 @@ pub mod runtime {
         let _ = backend.set_file_contents("/etc/hosts", hosts.into_bytes());
         let _ = backend.set_file_contents("/etc/hostname", format!("{host}\n").into_bytes());
     }
+
+    /// Like [`seed_linux_baseline`] but GAP-FILLING: only create dirs (harmless
+    /// if the image already has them) and write an `/etc` file when the extracted
+    /// rootfs did NOT provide one. A container image owns its own `/etc/passwd`,
+    /// `PATH`, etc.; clobbering them (as `seed_linux_baseline` does for the bare
+    /// run-elf runner) would silently override the image. Mirrors the macOS
+    /// `seed_guest_baseline` + `set_baseline_file_if_missing` (execute.rs).
+    #[cfg(feature = "platform-linux")]
+    fn seed_linux_baseline_gaps(backend: &mut dyn crate::fs_backend::FsBackend) {
+        for dir in [
+            "/tmp",
+            "/var",
+            "/var/tmp",
+            "/root",
+            "/etc",
+            "/dev",
+            "/proc",
+            "/sys",
+            "/run",
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/local",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+        ] {
+            let _ = backend.make_dir(dir);
+        }
+        let _ = backend.set_mode("/tmp", 0o1777);
+        let _ = backend.set_mode("/var/tmp", 0o1777);
+        let fill = |path: &str, contents: Vec<u8>| {
+            if backend.metadata(path).is_none() {
+                let _ = backend.set_file_contents(path, contents);
+            }
+        };
+        fill(
+            "/etc/passwd",
+            b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n".to_vec(),
+        );
+        fill("/etc/group", b"root:x:0:\nnogroup:x:65534:\n".to_vec());
+        fill(
+            "/etc/nsswitch.conf",
+            b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec(),
+        );
+        let host = crate::execute::guest_hostname();
+        let hosts = format!(
+            "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t{host}\n"
+        );
+        fill("/etc/hosts", hosts.into_bytes());
+        fill("/etc/hostname", format!("{host}\n").into_bytes());
+    }
+
+    /// Phase 5 entry: run an OCI container under KVM. The macOS sibling of this is
+    /// `Runtime::execute`'s `FsBackendKind::Host` path (execute.rs): extract the
+    /// image layers onto a scratch rootfs, root the dispatcher there, set
+    /// cwd/uid/gid, load the entrypoint FROM the rootfs, and run it with the OCI
+    /// argv/env. The only divergence is the run-loop entry: this drives
+    /// `KvmTrapEngine` through `run_threaded_kvm_loop` instead of the HVF loop.
+    ///
+    /// NOTE: the entrypoint must be a FULL-PATH ELF (`/bin/echo`). PATH-resolution
+    /// of a bare command and `#!`-shebang resolution live in the macOS-gated
+    /// `resolve_entrypoint_program`; sharing them is a follow-up.
+    #[cfg(feature = "platform-linux")]
+    pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
+        use crate::fs_backend::HostFsBackend;
+        use std::path::PathBuf;
+
+        // 1. Extract the OCI layers onto a fresh cap-std scratch rootfs.
+        let mut host = HostFsBackend::new()
+            .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("scratch dir: {e}")))?;
+        let layer_paths: Vec<PathBuf> = spec
+            .rootfs_layers
+            .iter()
+            .map(|p| PathBuf::from(p.as_std_path()))
+            .collect();
+        host.extract_layers(&layer_paths)
+            .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("extract OCI layers: {e}")))?;
+        seed_linux_baseline_gaps(&mut host);
+
+        // 2. Build the dispatcher rooted at the extracted rootfs.
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_executable_path(spec.executable.clone());
+        if let Some(cwd) = &spec.cwd {
+            dispatcher.set_cwd(cwd.as_str());
+        }
+        dispatcher.set_credentials(spec.uid, spec.gid);
+        for mount in &spec.mounts {
+            let host_path = PathBuf::from(mount.source.as_std_path());
+            let target_path = PathBuf::from(mount.target.as_std_path());
+            let bind =
+                crate::vfs::bind::BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
+            dispatcher.register_mount(target_path, Box::new(bind));
+        }
+        let _ = dispatcher.set_fs_backend(Box::new(host));
+
+        // 3. Load the entrypoint ELF FROM the rootfs (the dynamic loader /
+        //    PT_INTERP is read through the same rootfs reader).
+        let path = spec.executable.as_str();
+        let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
+            RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.to_owned(),
+            )))
+        })?;
+        dispatcher.set_executable_identity(
+            path.to_owned(),
+            spec.argv.clone(),
+            spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        );
+        let argv: Vec<Vec<u8>> = spec.argv.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let envp: Vec<Vec<u8>> = spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect();
+        // load_elf_bytes_with_reader already builds the full auxv (AT_SYSINFO_EHDR
+        // + the dynamic-loader AT_BASE/AT_ENTRY/AT_PHDR via the reader) and the
+        // vdso region. with_vdso_auxv(true) is a no-op pass-through that keeps it;
+        // calling the full with_vdso() here would double-add the vdso + re-serialize
+        // the auxv, breaking the dynamic-loader handoff (mirrors the macOS bytes
+        // path in run_elf_from_dispatcher_debug).
+        let image = crate::memory::AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| {
+            dispatcher.read_exec_file(p)
+        })?
+        .with_vdso_auxv(true)
+        .with_linux_initial_stack(argv, envp)?;
+
+        // 4. Run on KVM through the same generic threaded loop as run-elf.
+        let engine = carrick_linux::KvmTrapEngine::new(&image)?;
+        run_threaded_kvm_loop(engine, dispatcher, spec.max_traps)
+    }
 }
 
 /// Whether the EL1 guest-side syscall shim (the register-only identity fast
