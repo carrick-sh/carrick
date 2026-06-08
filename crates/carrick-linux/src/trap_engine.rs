@@ -297,11 +297,12 @@ impl SyscallTrap for KvmTrapEngine {
         // One KVM_RUN per call. The loop exists ONLY to re-enter the guest when a
         // kick lands mid-syscall-trap (the `Kicked` arm); every other exit returns.
         loop {
-            match self
-                .vcpu
-                .run()
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?
-            {
+            let run_start = std::time::Instant::now();
+            carrick_host::guest_cpu::begin_active();
+            let run_result = self.vcpu.run().map_err(|e| TrapError::Hypervisor(e.to_string()));
+            let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            carrick_host::guest_cpu::finish_active(run_ns);
+            match run_result? {
                 VcpuExit::MmioWrite { gpa, .. } if gpa == SENTINEL_GPA => {
                     // The EL0 `svc` re-entered EL1 and hit the sentinel store.
                     // The hardware already set ELR_EL1 = (svc addr + 4) on the
