@@ -1405,6 +1405,18 @@ pub struct SyscallDispatcher {
     /// this after completing the syscall and starts the signal pump before
     /// re-entering guest code.
     signal_pump_requested: std::sync::atomic::AtomicBool,
+    /// Whether `execve` image loading may fall back to reading the LITERAL host
+    /// filesystem (`std::fs::read` at the absolute guest path) when the target
+    /// is absent from the overlay/rootfs/bind-mounts. `true` only for bare
+    /// run-elf boots (no container image — the guest IS a host ELF and its
+    /// execve targets are host-staged test fixtures). Container runs (run-oci,
+    /// `with_rootfs*`, `--fs host`/`--fs memory`) set this `false`: a guest
+    /// execve of a path not in the container filesystem must `ENOENT`, never
+    /// silently load the matching HOST binary (a containment hole that, e.g.,
+    /// loaded the host's glibc `/usr/bin/echo` into a musl rootfs during an
+    /// execvp PATH search). Plain `bool`: set once at construction, read at
+    /// execve through `&self`.
+    exec_host_fs_fallback: bool,
 }
 
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
@@ -1746,6 +1758,10 @@ impl SyscallDispatcher {
             sysv: Mutex::new(sysv::SysvShmState::new()),
             setgroups_override: Mutex::new(None),
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
+            // Default: bare run-elf boot — allow the host-fs execve fallback.
+            // Container constructors flip this off (see `with_rootfs*` /
+            // `sandbox_exec_to_container`).
+            exec_host_fs_fallback: true,
         }
     }
 
@@ -1790,14 +1806,33 @@ impl SyscallDispatcher {
     pub fn with_rootfs(rootfs: RootFs) -> Self {
         let mut s = Self::new();
         s.fs.rootfs_vfs.rootfs = Some(rootfs);
+        // A rootfs means a sandboxed container filesystem: no host-fs execve escape.
+        s.exec_host_fs_fallback = false;
         s
     }
 
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         let mut s = Self::new();
         s.fs.rootfs_vfs.rootfs = Some(rootfs);
+        s.exec_host_fs_fallback = false;
         s.set_executable_path(executable_path);
         s
+    }
+
+    /// Mark this dispatcher as running a sandboxed CONTAINER filesystem (an
+    /// extracted OCI image on a cap-std overlay), so `execve` never falls back
+    /// to the literal host filesystem. Call after constructing a container
+    /// dispatcher via `new()` + `set_fs_backend` (the run-oci / `--fs host`
+    /// paths, which do not go through `with_rootfs*`). `with_rootfs*` already
+    /// imply this; this is for the overlay-only container construction.
+    pub fn sandbox_exec_to_container(&mut self) {
+        self.exec_host_fs_fallback = false;
+    }
+
+    /// Whether `execve` image loading may read the literal host filesystem for a
+    /// target absent from the overlay/rootfs/mounts. See `exec_host_fs_fallback`.
+    pub fn exec_host_fs_fallback(&self) -> bool {
+        self.exec_host_fs_fallback
     }
 
     /// Swap the in-memory default for any other [`FsBackend`]. Used by
@@ -5122,6 +5157,36 @@ mod overlay_dispatch_tests {
         assert_eq!(join_rootfs_path("/tmp/work", ".."), "/tmp");
         assert_eq!(join_rootfs_path("/tmp/work", "../other/."), "/tmp/other");
         assert_eq!(join_rootfs_path("/tmp/work", "../../.."), "/");
+    }
+
+    #[test]
+    fn exec_host_fs_fallback_off_for_container_dispatchers() {
+        // A bare run-elf dispatcher (no container fs) may fall back to the host
+        // filesystem for an execve target (host-staged RunElf fixtures).
+        assert!(
+            SyscallDispatcher::new().exec_host_fs_fallback(),
+            "bare new() dispatcher must allow the host-fs execve fallback"
+        );
+        // A container dispatcher must NOT: a target absent from the rootfs must
+        // ENOENT, never escape to the matching host binary (the containment hole
+        // that loaded host glibc /usr/bin/echo into a musl rootfs mid-execvp).
+        assert!(
+            !SyscallDispatcher::with_rootfs(empty_rootfs()).exec_host_fs_fallback(),
+            "with_rootfs dispatcher must forbid the host-fs execve fallback"
+        );
+        assert!(
+            !SyscallDispatcher::with_rootfs_and_executable(empty_rootfs(), "/bin/sh")
+                .exec_host_fs_fallback(),
+            "with_rootfs_and_executable dispatcher must forbid the host-fs execve fallback"
+        );
+        // The overlay-only container path (run-oci / --fs host use new() +
+        // set_fs_backend, not with_rootfs) opts in explicitly.
+        let mut d = SyscallDispatcher::new();
+        d.sandbox_exec_to_container();
+        assert!(
+            !d.exec_host_fs_fallback(),
+            "sandbox_exec_to_container() must forbid the host-fs execve fallback"
+        );
     }
 
     #[test]

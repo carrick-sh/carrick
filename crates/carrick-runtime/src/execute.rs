@@ -255,6 +255,11 @@ impl Runtime {
                 }
 
                 let mut dispatcher = SyscallDispatcher::new();
+                // Sandboxed container fs (extracted OCI layers on a cap-std
+                // overlay): forbid the execve host-fs fallback so a target
+                // absent from the container ENOENTs instead of escaping to the
+                // matching host binary.
+                dispatcher.sandbox_exec_to_container();
                 dispatcher.set_executable_path(spec.executable.clone());
                 if let Some(cwd) = &spec.cwd {
                     dispatcher.set_cwd(cwd.as_str());
