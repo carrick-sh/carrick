@@ -231,6 +231,11 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
 /// EPOLLRDHUP, write EOF -> EPOLLHUP, `EV_ERROR` or `EV_EOF` carrying a
 /// non-zero `fflags` (the socket error) -> EPOLLERR. Returns 0 for non-IO
 /// filters (EVFILT_USER), which the caller ignores.
+// The only non-test caller (the kqueue-backed `epoll_pwait`) is behind
+// `feature = "platform-macos"`, so this is dead in the non-macOS binary — but a
+// unit test below calls it unconditionally, so `dead_code` allow (not a
+// `target_os` cfg, which would break that test) is the right relaxation.
+#[allow(dead_code)]
 pub(super) fn kevent_to_epoll(ev: crate::darwin_kqueue::Kevent) -> u32 {
     let mut events = 0u32;
     if ev.flags() & carrick_portable::EV_ERROR != 0 {

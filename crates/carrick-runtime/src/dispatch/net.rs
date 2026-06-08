@@ -1392,6 +1392,10 @@ impl SyscallDispatcher {
                 .into());
             };
             // Snapshot any already-queued ready events first.
+            // `ready` is reassigned on the macOS kqueue path below (it collects
+            // the drained-and-tagged events), so the `mut` is load-bearing there;
+            // the non-macOS path only reads it, hence `unused_mut` off-macOS.
+            #[allow(unused_mut)]
             let mut ready = {
                 let mut open = open_file.description.write();
                 let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {

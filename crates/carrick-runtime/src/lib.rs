@@ -4,6 +4,20 @@
     clippy::manual_dangling_ptr,
     clippy::items_after_test_module
 )]
+// Several cross-platform casts (e.g. `mode_t`, fd ints) target a libc type that
+// is ALREADY the destination width on non-macOS targets, so clippy flags them as
+// `unnecessary_cast` only there. On macOS the source type differs (the cast is
+// load-bearing), so we keep the lint STRICT on the macOS build and only relax it
+// off-macOS where the casts are genuinely redundant.
+#![cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
+// Same shape story for `CompatReporter::default()`: the reporter is a real
+// fielded struct on macOS (carrick-hvf) but a unit struct in the non-macOS
+// fallback, so `default_constructed_unit_structs` fires only off-macOS. Keep it
+// STRICT on macOS.
+#![cfg_attr(
+    not(target_os = "macos"),
+    allow(clippy::default_constructed_unit_structs)
+)]
 
 //! Carrick runtime — the core that runs an unmodified Linux ELF binary as a
 //! native macOS process.
@@ -1296,11 +1310,11 @@ pub mod io_wait {
                 // delivered signal returns `Interrupted` (the loop maps that to
                 // EINTR / a fork-quiesce park), then re-poll the child. Not a busy
                 // spin — each idle slice sleeps in `ppoll`.
-                match ppoll_wait(&[], Some(Duration::from_millis(50)), 0) {
-                    WaitResult::Interrupted => return WaitResult::Interrupted,
-                    // TimedOut (slice elapsed) or a spurious Ready: re-poll the
-                    // child at the loop top.
-                    _ => {}
+                // TimedOut (slice elapsed) or a spurious Ready: re-poll the
+                // child at the loop top; only an Interrupted bails out.
+                if let WaitResult::Interrupted = ppoll_wait(&[], Some(Duration::from_millis(50)), 0)
+                {
+                    return WaitResult::Interrupted;
                 }
             }
         }

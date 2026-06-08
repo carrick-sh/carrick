@@ -1132,6 +1132,9 @@ static ANON_FD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// guest deleted that still exist in the read-only rootfs layer
 /// underneath. The dispatcher's layered lookup consults this to shadow
 /// the rootfs, just like for the memory backend.
+// `root_prefix`/`fast_fs`/`cache_pid` drive the macOS `--fs host` fast-stat
+// path only; on non-macOS those fields are populated but never read.
+#[allow(dead_code)]
 pub struct HostFsBackend {
     /// The kernel-rooted sandbox handle. ALL fs operations on the
     /// scratch dir go through this. Holding it directly (rather than
@@ -1212,7 +1215,10 @@ struct StatCacheEntry {
 
 /// Non-macOS placeholder so the `stat_cache` field type is well-formed; the
 /// cache is only populated/consulted on macOS (the only `--fs host` fast path).
+// `real` is never read off-macOS (the cache is never consulted there), but the
+// field keeps the type identical to the macOS variant's payload.
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 struct StatCacheEntry {
     real: RealStat,
 }
