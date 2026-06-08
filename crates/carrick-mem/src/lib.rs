@@ -74,5 +74,6 @@ pub mod elf;
 pub mod memory;
 pub mod page_table;
 pub mod protections;
+pub mod shared_aperture;
 pub mod vdso;
 mod vdso_getrandom_chacha;

@@ -160,9 +160,16 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 pub use carrick_hvf::darwin_kqueue;
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::{
-    compat, fork_coord, host_signal, io_wait, itimer, posix_timer, probes, shared_aperture,
-    syscall, threaded_impl, trap, vcpu_kick,
+    compat, fork_coord, host_signal, io_wait, itimer, posix_timer, probes, syscall, threaded_impl,
+    trap, vcpu_kick,
 };
+// The shared-aperture sub-allocator is platform-NEUTRAL host-memory bookkeeping
+// (the stage-2 REGISTRATION of the window is the per-backend glue, not this
+// carver). It lives in carrick-mem so every backend — HVF, KVM, and bhyve —
+// consumes ONE allocator instead of the old cfg split (HVF re-export vs a Linux
+// inline reimplementation). Re-exported at `crate::shared_aperture` so
+// dispatch/mem.rs is unchanged.
+pub use carrick_mem::shared_aperture;
 // thread (ThreadRegistry/FutexTable) + fork_quiesce barriers are
 // hypervisor-agnostic; both backends use the real carrick-thread impls.
 pub use carrick_thread::{fork_quiesce, thread};
@@ -1745,161 +1752,6 @@ pub mod posix_timer {
     }
 }
 
-#[cfg(not(feature = "platform-macos"))]
-pub mod shared_aperture {
-    use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
-    use carrick_abi::align_up_u64;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum BackingObject {
-        SharedAnon,
-        SharedFile { host_fd: i32, offset: u64 },
-        PrivateAnon,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct SharedAlloc {
-        pub guest_addr: u64,
-        pub len: u64,
-        pub backing: BackingObject,
-        pub source: Option<u64>,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct SharedAperture {
-        base: u64,
-        size: u64,
-        next: u64,
-        free: Vec<(u64, u64)>,
-        live: Vec<SharedAlloc>,
-    }
-
-    const GRANULE: u64 = 0x4000;
-
-    impl Default for SharedAperture {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl SharedAperture {
-        pub fn new() -> Self {
-            Self::with_window(LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE)
-        }
-
-        pub fn with_window(base: u64, size: u64) -> Self {
-            Self {
-                base,
-                size,
-                next: base,
-                free: Vec::new(),
-                live: Vec::new(),
-            }
-        }
-
-        fn window_end(&self) -> u64 {
-            self.base + self.size
-        }
-
-        pub fn alloc(&mut self, len: u64, backing: BackingObject) -> Option<u64> {
-            self.alloc_sourced_with_reuse(len, backing, None)
-                .map(|(addr, _reused)| addr)
-        }
-
-        pub fn alloc_sourced(
-            &mut self,
-            len: u64,
-            backing: BackingObject,
-            source: Option<u64>,
-        ) -> Option<u64> {
-            self.alloc_sourced_with_reuse(len, backing, source)
-                .map(|(addr, _reused)| addr)
-        }
-
-        pub fn alloc_sourced_with_reuse(
-            &mut self,
-            len: u64,
-            backing: BackingObject,
-            source: Option<u64>,
-        ) -> Option<(u64, bool)> {
-            if len == 0 {
-                return None;
-            }
-            let len = align_up_u64(len, GRANULE)?;
-            if let Some(pos) = self.free.iter().position(|&(_, l)| l >= len) {
-                let (s, l) = self.free[pos];
-                if l == len {
-                    self.free.remove(pos);
-                } else {
-                    self.free[pos] = (s + len, l - len);
-                }
-                self.live.push(SharedAlloc {
-                    guest_addr: s,
-                    len,
-                    backing,
-                    source,
-                });
-                return Some((s, true));
-            }
-            let addr = align_up_u64(self.next, GRANULE)?;
-            let end = addr.checked_add(len)?;
-            if end > self.window_end() {
-                return None;
-            }
-            self.next = end;
-            self.live.push(SharedAlloc {
-                guest_addr: addr,
-                len,
-                backing,
-                source,
-            });
-            Some((addr, false))
-        }
-
-        pub fn find_by_source(&self, source: u64) -> Option<u64> {
-            self.live
-                .iter()
-                .find(|a| a.source == Some(source))
-                .map(|a| a.guest_addr)
-        }
-
-        pub fn free(&mut self, guest_addr: u64) -> Option<SharedAlloc> {
-            let pos = self.live.iter().position(|a| a.guest_addr == guest_addr)?;
-            let alloc = self.live.remove(pos);
-            free_insert(&mut self.free, alloc.guest_addr, alloc.len);
-            Some(alloc)
-        }
-
-        pub fn live(&self) -> &[SharedAlloc] {
-            &self.live
-        }
-    }
-
-    fn free_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
-        let mut start = addr;
-        let mut end = addr.saturating_add(len);
-        let mut out: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
-        let mut inserted = false;
-        for &(s, l) in regions.iter() {
-            let e = s.saturating_add(l);
-            if e < start || s > end {
-                if !inserted && s > end {
-                    out.push((start, end - start));
-                    inserted = true;
-                }
-                out.push((s, l));
-            } else {
-                start = start.min(s);
-                end = end.max(e);
-            }
-        }
-        if !inserted {
-            out.push((start, end - start));
-        }
-        out.sort_by_key(|&(s, _)| s);
-        *regions = out;
-    }
-}
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod compat {

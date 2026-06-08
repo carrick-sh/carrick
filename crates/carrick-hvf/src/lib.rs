@@ -43,7 +43,6 @@ pub mod io_wait;
 pub mod itimer;
 pub mod posix_timer;
 pub mod probes;
-pub mod shared_aperture;
 pub mod syscall;
 pub mod thread;
 pub mod threaded_impl;
