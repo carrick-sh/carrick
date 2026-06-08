@@ -15,9 +15,11 @@ pub struct KvmTimerDelivery {
     /// The live-vCPU registry used to force the target out of `KVM_RUN` on a
     /// timer expiry (the firing thread publishes pending, then kicks).
     pub kicker: Arc<dyn VcpuRegistry>,
-    /// Wall-clock interval/POSIX timers are process-directed; deliver to the
-    /// main thread (the common single-threaded timer case), matching the
-    /// runtime's `timer_delivery::deliver`.
+    /// The guest's main thread id. Wall-clock interval/POSIX timer signals are
+    /// PROCESS-directed and now fan out via the shared PROC_PENDING mask +
+    /// `kick_all` (so a blocked main thread does not drop the timer), so this is
+    /// retained only as the canonical main-thread handle for the construction
+    /// site; the firing thread no longer pins delivery to it.
     pub main_tid: ThreadId,
 }
 
@@ -46,10 +48,13 @@ impl TimerDelivery for KvmTimerDelivery {
             let generation = armed.generation;
             let slot = armed.slot.clone();
             let kicker = Arc::clone(&self.kicker);
-            let main_tid = self.main_tid;
             let deliver = move |sig: i32| {
-                carrick_signal_core::publish_pending_for(main_tid, sig);
-                kicker.kick(main_tid);
+                // POSIX per-process timer signals are PROCESS-directed: publish
+                // into the shared PROC_PENDING mask and kick EVERY vCPU so any
+                // unblocked thread delivers it (a blocked main thread must not
+                // drop the timer). Mirrors `timer_delivery::deliver` for itimers.
+                carrick_signal_core::publish_process_signal(sig);
+                kicker.kick_all();
             };
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-ptimer-{id}"))
