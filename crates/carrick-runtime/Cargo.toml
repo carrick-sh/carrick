@@ -64,6 +64,7 @@ carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-timer-core = { path = "../carrick-timer-core" }
 anyhow.workspace = true
 bitflags.workspace = true
 libc.workspace = true
