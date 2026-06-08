@@ -15,6 +15,11 @@ workspace = true
 carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
+# Timer-delivery trait return/arg types (`PosixTimerSpec`, `TimerArm`) live in the
+# neutral timer-core; carrick-hal re-exports them through the `TimerDelivery`
+# trait so backends name one set of types. No cycle: timer-core depends only on
+# carrick-abi/portable/host (none of which depend on carrick-hal).
+carrick-timer-core = { path = "../carrick-timer-core" }
 thiserror.workspace = true
 libc.workspace = true
 zerocopy.workspace = true

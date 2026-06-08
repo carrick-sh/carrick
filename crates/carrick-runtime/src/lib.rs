@@ -163,6 +163,11 @@ pub use carrick_hvf::{
     fork_coord, host_signal, io_wait, itimer, posix_timer, probes, signal_arrival, threaded_impl,
     trap, vcpu_kick,
 };
+// The HVF `TimerDelivery` impl. Re-exported under `timer_delivery_impl` (the
+// `timer_delivery` name is the runtime's own register/deliver module above), so
+// the macOS run-loop startup can name `HvfTimerDelivery`.
+#[cfg(feature = "platform-macos")]
+pub use carrick_hvf::timer_delivery as timer_delivery_impl;
 // The syscall-compat reporter is platform-neutral; it lives in
 // carrick-observability so every backend shares the REAL recorder (the Linux/KVM
 // arm was a no-op unit-struct stub; bhyve would have inherited it). DTrace
@@ -471,6 +476,14 @@ pub mod runtime {
         // fallback timer thread publishes the timer signal to `main_tid` and
         // kicks it through this same `VcpuRegistry`.
         crate::timer_delivery::register(Arc::clone(&kicker), main_tid);
+        // Install the backend `TimerDelivery` the dispatch arm reaches through
+        // the process-global (`dispatch/time.rs` has no KernelState ref). KVM's
+        // `arm_itimer` returns false → the dispatch arm spawns the shared
+        // fallback thread; `arm_posix` spawns the POSIX firing thread here.
+        crate::timer_delivery::register_delivery(Arc::new(carrick_linux::KvmTimerDelivery {
+            kicker: Arc::clone(&kicker),
+            main_tid,
+        }));
 
         let outcome = run_vcpu_until_exit(
             Arc::clone(&kernel),
@@ -1406,6 +1419,56 @@ pub mod timer_delivery {
             crate::host_signal::publish_pending_for(d.main_tid, signum);
             d.kicker.kick(d.main_tid);
         }
+    }
+
+    // The process-global `TimerDelivery` backend handle. This is the SAME
+    // OnceLock seam as `register`/`deliver` above, extended so the dispatch
+    // arm (`dispatch/time.rs`) can reach the backend's arm/disarm without
+    // KernelState (the dispatch handlers don't carry a KernelState ref). The
+    // run-loop startup registers the concrete backend (KVM `KvmTimerDelivery`).
+    static DELIVERY: OnceLock<Arc<dyn carrick_hal::TimerDelivery>> = OnceLock::new();
+
+    /// Install the backend `TimerDelivery`. Called once at run-loop startup
+    /// (the same site as `register`). Subsequent calls are ignored.
+    pub fn register_delivery(delivery: Arc<dyn carrick_hal::TimerDelivery>) {
+        let _ = DELIVERY.set(delivery);
+    }
+
+    /// The registered backend `TimerDelivery`, or `None` if no run loop has
+    /// registered one (e.g. a unit test exercising the dispatcher without a
+    /// backing run loop). Every real run-loop entry registers a backend before
+    /// the dispatcher can run a `setitimer`/`timer_settime`, so the `None` arm
+    /// only matters for tests, where the caller falls back to the shared
+    /// wall-clock timer thread (the pre-trait `kq < 0` behavior).
+    pub fn delivery() -> Option<Arc<dyn carrick_hal::TimerDelivery>> {
+        DELIVERY.get().map(Arc::clone)
+    }
+}
+
+// The process-global `TimerDelivery` handle for the macOS/HVF backend. macOS has
+// no kicker-based wall-clock `timer_delivery` (it arms EVFILT_TIMER on the pump
+// kqueue), so this module is ONLY the `register_delivery`/`delivery` seam the
+// dispatch arm consumes — mirroring the Linux module's extension above.
+#[cfg(feature = "platform-macos")]
+pub mod timer_delivery {
+    use std::sync::{Arc, OnceLock};
+
+    static DELIVERY: OnceLock<Arc<dyn carrick_hal::TimerDelivery>> = OnceLock::new();
+
+    /// Install the backend `TimerDelivery` (HVF `HvfTimerDelivery`). Called once
+    /// at run-loop startup. Subsequent calls are ignored.
+    pub fn register_delivery(delivery: Arc<dyn carrick_hal::TimerDelivery>) {
+        let _ = DELIVERY.set(delivery);
+    }
+
+    /// The registered backend `TimerDelivery`, or `None` if no run loop has
+    /// registered one (e.g. a unit test exercising the dispatcher without a
+    /// backing run loop). Every real run-loop entry registers a backend before
+    /// the dispatcher can run a `setitimer`/`timer_settime`, so the `None` arm
+    /// only matters for tests, where the caller falls back to the shared
+    /// wall-clock timer thread (the pre-trait `kq < 0` behavior).
+    pub fn delivery() -> Option<Arc<dyn carrick_hal::TimerDelivery>> {
+        DELIVERY.get().map(Arc::clone)
     }
 }
 

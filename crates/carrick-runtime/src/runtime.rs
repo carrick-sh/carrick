@@ -1483,6 +1483,11 @@ fn run_threaded_hvf_loop(
         Arc::new(crate::signal_arrival::HvfSignalArrival {
             kicker: Arc::clone(&kicker),
         });
+    // Install the backend `TimerDelivery` the dispatch arm reaches through the
+    // process-global (`dispatch/time.rs` has no KernelState ref). HVF arms an
+    // EVFILT_TIMER on the pump kqueue and returns true (it owns delivery); only
+    // a pump-less fork child falls back to the shared wall-clock thread.
+    crate::timer_delivery::register_delivery(Arc::new(crate::timer_delivery_impl::HvfTimerDelivery));
     let kernel = Arc::new(KernelState::new(dispatcher, fork_coordinator, signal_arrival));
     // Track spawned sibling threads so the process doesn't tear down while a
     // worker is mid-flight. We join them after the main thread finishes.

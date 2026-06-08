@@ -23,6 +23,15 @@ carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-abi = { path = "../carrick-abi" }
+# Neutral timer slot/registry bookkeeping. `KvmTimerDelivery` delegates slot
+# mutation here and (for POSIX) spawns the wall-clock firing thread; interval
+# timers use the caller-spawned `run_fallback` (arm_itimer → false).
+carrick-timer-core = { path = "../carrick-timer-core" }
+# The neutral per-thread pending store. The POSIX firing thread publishes the
+# timer signal here (publish_pending_for) then kicks the target vCPU — the same
+# publish+kick the runtime's `timer_delivery::deliver` does, replicated so the
+# firing thread does not cross back into carrick-runtime.
+carrick-signal-core = { path = "../carrick-signal-core" }
 # The hypervisor-agnostic private-futex parking table. `KvmFutex` wraps the SAME
 # `carrick_thread::thread::FutexTable` `HvfFutex` does (the private/cross-thread
 # path); only the shared (cross-process MAP_SHARED) path differs (host SYS_futex
