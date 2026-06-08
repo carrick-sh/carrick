@@ -442,6 +442,17 @@ impl SyscallTrap for KvmTrapEngine {
             .vcpu
             .snapshot()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // The EL1 vector stashed the guest's live x9 in TPIDR_EL1 (the sentinel
+        // store clobbers x9). The snapshot captured the CLOBBERED x9 and does NOT
+        // carry TPIDR_EL1, so capture the real x9 here to restore on the child.
+        // The child resumes straight at the eret and never runs `complete_syscall`
+        // (which is what restores x9 in the parent on syscall return), so without
+        // this it would resume holding x9 = SENTINEL_GPA. A guest that keeps a
+        // live x9 across to its next svc without reloading it (e.g. musl's
+        // `brk`-via-`__expand_heap`, `str x10,[x9,#920]`) would then fault on the
+        // sentinel GPA — the same class of bug the EL1-vector save/restore fixes
+        // for the straight-line path. (fork preserves x1..x30.)
+        let saved_x9 = self.vcpu.get_tpidr_el1().unwrap_or(0);
 
         // 2. Real host fork.
         //
@@ -488,6 +499,13 @@ impl SyscallTrap for KvmTrapEngine {
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         new_vcpu
             .set_reg(Reg::X(0), 0)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Restore the child's real x9 (the snapshot carried the vector-clobbered
+        // SENTINEL_GPA — see `saved_x9` above). The Linux syscall ABI preserves
+        // x1..x30 across the clone/fork svc, so the child must resume with the
+        // parent's pre-svc x9.
+        new_vcpu
+            .set_reg(Reg::X(9), saved_x9)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
 
         // CRITICAL: advance the child PC past the EL1 vector's sentinel store.
