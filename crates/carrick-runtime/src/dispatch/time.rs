@@ -447,10 +447,11 @@ impl SyscallDispatcher {
             };
             let old = crate::posix_timer::arm(id, value_ns, interval_ns);
             if old_ptr.0 != 0 {
-                let prev = old.unwrap_or(crate::posix_timer::TimerSpec {
+                let prev = old.unwrap_or(crate::posix_timer::PosixTimerSpec {
                     signum: 0,
                     value_ns: 0,
                     interval_ns: 0,
+                    si_value: 0,
                 });
                 let old_spec = build_itimerspec_ns(prev.value_ns, prev.interval_ns);
                 if memory

@@ -30,6 +30,7 @@ carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-timer-core = { path = "../carrick-timer-core" }
 carrick-thread = { path = "../carrick-thread" }
 clap.workspace = true
 libc.workspace = true

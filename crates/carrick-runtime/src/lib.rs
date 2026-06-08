@@ -1411,94 +1411,23 @@ pub mod timer_delivery {
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod itimer {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    //! KVM/Linux interval-timer glue. The neutral per-`which` slot state, the
+    //! CPU-due math, the ident/signum mapping, and the fallback-thread timing
+    //! loop now live in [`carrick_timer_core::itimer`]; this module re-exports
+    //! them and keeps only the KVM-specific wall-clock fallback thread spawn,
+    //! which delivers via `timer_delivery` (publish + kick the target vCPU).
+
+    pub use carrick_timer_core::itimer::*;
+
     use std::time::Duration;
 
-    struct Slot {
-        generation: AtomicU64,
-        interval_ns: AtomicU64,
-        armed: AtomicBool,
-    }
-    impl Slot {
-        fn new() -> Self {
-            Self {
-                generation: AtomicU64::new(0),
-                interval_ns: AtomicU64::new(0),
-                armed: AtomicBool::new(false),
-            }
-        }
-    }
-    // ITIMER_REAL / ITIMER_VIRTUAL / ITIMER_PROF.
-    fn slots() -> &'static [Slot; 3] {
-        static S: OnceLock<[Slot; 3]> = OnceLock::new();
-        S.get_or_init(|| [Slot::new(), Slot::new(), Slot::new()])
-    }
-
-    pub fn ident_for(which: usize) -> usize {
-        which
-    }
-    pub fn which_for_ident(ident: usize) -> Option<usize> {
-        (ident < 3).then_some(ident)
-    }
-    pub fn signum_for(which: usize) -> i32 {
-        match which {
-            1 => crate::linux_abi::LINUX_SIGVTALRM, // ITIMER_VIRTUAL
-            2 => crate::linux_abi::LINUX_SIGPROF,   // ITIMER_PROF
-            _ => crate::linux_abi::LINUX_SIGALRM,   // ITIMER_REAL
-        }
-    }
-    /// ITIMER_VIRTUAL/ITIMER_PROF measure GUEST CPU time, which carrick does not
-    /// account here — they are tracked (getitimer reports them) but NOT fired.
-    pub fn is_cpu_timer(which: usize) -> bool {
-        which == 1 || which == 2
-    }
-    pub fn arm(which: usize, _value_ns: u64, interval_ns: u64, _needs_periodic: bool) -> u64 {
-        match slots().get(which) {
-            Some(slot) => {
-                let generation = slot
-                    .generation
-                    .fetch_add(1, Ordering::SeqCst)
-                    .wrapping_add(1);
-                slot.interval_ns.store(interval_ns, Ordering::SeqCst);
-                slot.armed.store(true, Ordering::SeqCst);
-                generation
-            }
-            None => 0,
-        }
-    }
-    pub fn disarm(which: usize) {
-        if let Some(slot) = slots().get(which) {
-            slot.generation.fetch_add(1, Ordering::SeqCst);
-            slot.armed.store(false, Ordering::SeqCst);
-            slot.interval_ns.store(0, Ordering::SeqCst);
-        }
-    }
-    pub fn is_armed(which: usize) -> bool {
-        slots()
-            .get(which)
-            .is_some_and(|s| s.armed.load(Ordering::SeqCst))
-    }
-    pub fn interval_ns(which: usize) -> u64 {
-        slots()
-            .get(which)
-            .map_or(0, |s| s.interval_ns.load(Ordering::SeqCst))
-    }
-    pub fn cpu_timer_recheck_delay_ns(remaining_cpu_ns: u64) -> u64 {
-        remaining_cpu_ns
-    }
-    fn generation_matches(which: usize, generation: u64) -> bool {
-        slots()
-            .get(which)
-            .is_some_and(|s| s.generation.load(Ordering::SeqCst) == generation)
-    }
-
-    /// Spawn the wall-clock fallback timer thread for `which`. It sleeps to the
-    /// first deadline, then (if still armed with this `generation`) publishes the
-    /// signal + kicks via `timer_delivery`, repeating every `interval` until the
-    /// timer is disarmed or re-armed (generation bump). CPU-time timers are not
-    /// fired (no guest-CPU accounting). At most one thread per `which` is live —
-    /// a disarm/re-arm bumps the generation so the old thread exits.
+    /// Spawn the wall-clock fallback timer thread for `which`. The timing-loop
+    /// body is shared (`carrick_timer_core::itimer::run_fallback`); the per-fire
+    /// action delivers via `timer_delivery`. CPU-time timers are skipped here —
+    /// KVM has no guest-CPU-driven delivery yet (a later task removes this gate
+    /// once CPU itimers route through the core's `cpu_timer_decision`). At most
+    /// one thread per `which` is live — a disarm/re-arm bumps the generation so
+    /// the old thread exits.
     pub fn spawn_fallback_timer(
         which: usize,
         generation: u64,
@@ -1508,182 +1437,65 @@ pub mod itimer {
         if is_cpu_timer(which) {
             return;
         }
+        let value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
+        let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
         let signum = signum_for(which);
         let _ = std::thread::Builder::new()
             .name(format!("carrick-itimer-{which}"))
             .spawn(move || {
-                std::thread::sleep(value);
-                if !generation_matches(which, generation) {
-                    return;
-                }
-                crate::timer_delivery::deliver(signum);
-                if interval.is_zero() {
-                    return;
-                }
-                loop {
-                    std::thread::sleep(interval);
-                    if !generation_matches(which, generation) {
-                        return;
-                    }
+                run_fallback(which, generation, value_ns, interval_ns, || {
                     crate::timer_delivery::deliver(signum);
-                }
+                });
             });
     }
 }
 
 #[cfg(not(feature = "platform-macos"))]
 pub mod posix_timer {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicI32, Ordering};
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
+    //! KVM/Linux POSIX per-process timer glue. The neutral spec/registry
+    //! bookkeeping + remaining math now live in [`carrick_timer_core::posix`];
+    //! this module re-exports them and keeps only the KVM-specific firing thread
+    //! (spawn + deliver via `timer_delivery` on each expiry).
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct TimerSpec {
-        pub signum: i32,
-        pub value_ns: u64,
-        pub interval_ns: u64,
-    }
+    pub use carrick_timer_core::posix::{
+        PosixTimerSlot, PosixTimerSpec, clear, clock_id, create, delete, exists, getoverrun,
+        remaining,
+    };
 
-    struct Slot {
-        clock_id: i32,
-        signum: i32,
-        generation: u64,
-        value_ns: u64,
-        interval_ns: u64,
-        armed_at: Option<Instant>,
-    }
-
-    fn timers() -> &'static Mutex<HashMap<i32, Slot>> {
-        static T: OnceLock<Mutex<HashMap<i32, Slot>>> = OnceLock::new();
-        T.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-    fn lock() -> std::sync::MutexGuard<'static, HashMap<i32, Slot>> {
-        timers()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-    fn next_id() -> i32 {
-        static N: AtomicI32 = AtomicI32::new(1);
-        N.fetch_add(1, Ordering::SeqCst)
-    }
-
-    pub fn create(clock_id: i32, signum: i32) -> i32 {
-        let id = next_id();
-        lock().insert(
-            id,
-            Slot {
-                clock_id,
-                signum,
-                generation: 0,
-                value_ns: 0,
-                interval_ns: 0,
-                armed_at: None,
-            },
-        );
-        id
-    }
+    use std::time::Duration;
 
     /// (Re-)arm timer `id`. Returns the PREVIOUS spec (for `timer_settime`'s
-    /// old_value). A `value_ns == 0` disarms. A non-zero value spawns a wall-clock
-    /// firing thread that delivers `signum` after `value` then every `interval`,
-    /// until the timer is re-armed or deleted (generation bump).
-    pub fn arm(id: i32, value_ns: u64, interval_ns: u64) -> Option<TimerSpec> {
-        let (prev, generation, signum) = {
-            let mut g = lock();
-            let slot = g.get_mut(&id)?;
-            let prev = TimerSpec {
-                signum: slot.signum,
-                value_ns: slot.value_ns,
-                interval_ns: slot.interval_ns,
-            };
-            slot.generation = slot.generation.wrapping_add(1);
-            slot.value_ns = value_ns;
-            slot.interval_ns = interval_ns;
-            slot.armed_at = (value_ns > 0).then(Instant::now);
-            (prev, slot.generation, slot.signum)
-        };
+    /// old_value). A `value_ns == 0` disarms. A non-zero value spawns a
+    /// wall-clock firing thread that delivers `signum` after `value` then every
+    /// `interval`, until the timer is re-armed or deleted (generation bump).
+    pub fn arm(id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixTimerSpec> {
+        let armed = carrick_timer_core::posix::arm(id, value_ns, interval_ns)?;
         if value_ns > 0 {
-            spawn_timer(
-                id,
-                generation,
-                signum,
-                Duration::from_nanos(value_ns),
-                Duration::from_nanos(interval_ns),
-            );
-        }
-        Some(prev)
-    }
-
-    fn generation_matches(id: i32, generation: u64) -> bool {
-        lock().get(&id).is_some_and(|s| s.generation == generation)
-    }
-
-    fn spawn_timer(id: i32, generation: u64, signum: i32, value: Duration, interval: Duration) {
-        let _ = std::thread::Builder::new()
-            .name(format!("carrick-ptimer-{id}"))
-            .spawn(move || {
-                std::thread::sleep(value);
-                if !generation_matches(id, generation) {
-                    return;
-                }
-                crate::timer_delivery::deliver(signum);
-                if interval.is_zero() {
-                    return;
-                }
-                loop {
-                    std::thread::sleep(interval);
-                    if !generation_matches(id, generation) {
+            let signum = armed.signum;
+            let generation = armed.generation;
+            let slot = armed.slot.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("carrick-ptimer-{id}"))
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_nanos(value_ns));
+                    if !carrick_timer_core::posix::generation_matches(&slot, generation) {
                         return;
                     }
                     crate::timer_delivery::deliver(signum);
-                }
-            });
-    }
-
-    /// `timer_gettime`: time until the next expiration + the reload interval.
-    /// One-shot remaining counts down from arm; an already-fired one-shot is 0.
-    pub fn remaining(id: i32) -> Option<(u64, u64)> {
-        let g = lock();
-        let slot = g.get(&id)?;
-        let value = match (slot.armed_at, slot.value_ns) {
-            (Some(at), v) if v > 0 => {
-                let elapsed = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                if elapsed >= v && slot.interval_ns == 0 {
-                    0
-                } else if slot.interval_ns > 0 {
-                    // After the first fire, the next expiry is `interval` phased.
-                    let into = elapsed.saturating_sub(v) % slot.interval_ns;
-                    if elapsed < v {
-                        v - elapsed
-                    } else {
-                        slot.interval_ns - into
+                    if interval_ns == 0 {
+                        return;
                     }
-                } else {
-                    v - elapsed
-                }
-            }
-            _ => 0,
-        };
-        Some((value, slot.interval_ns))
-    }
-
-    pub fn delete(id: i32) -> bool {
-        // Removing the slot makes `generation_matches` false, so any live firing
-        // thread exits at its next deadline.
-        lock().remove(&id).is_some()
-    }
-    pub fn getoverrun(id: i32) -> Option<u32> {
-        lock().contains_key(&id).then_some(0)
-    }
-    pub fn exists(id: i32) -> bool {
-        lock().contains_key(&id)
-    }
-    pub fn clock_id(id: i32) -> i32 {
-        lock().get(&id).map_or(0, |s| s.clock_id)
-    }
-    pub fn clear() {
-        lock().clear();
+                    loop {
+                        std::thread::sleep(Duration::from_nanos(interval_ns));
+                        if !carrick_timer_core::posix::generation_matches(&slot, generation) {
+                            return;
+                        }
+                        carrick_timer_core::posix::record_overrun(&slot);
+                        crate::timer_delivery::deliver(signum);
+                    }
+                });
+        }
+        Some(armed.old)
     }
 }
 
