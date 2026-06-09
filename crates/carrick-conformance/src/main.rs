@@ -14,6 +14,7 @@
 mod engine;
 mod generate;
 mod images;
+mod lane;
 mod manifest;
 mod matrix;
 mod oracle;
