@@ -6,6 +6,9 @@
 use std::sync::Arc;
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
+use carrick_mem::arch_sysregs::{
+    CPACR_EL1_BOOTSTRAP, MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP,
+};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_EL1_VECTORS_SIZE,
     LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes, stage1_identity_page_tables,
@@ -897,29 +900,19 @@ pub(crate) fn populate_vdso_vvar(vcpu: &KvmVcpu, ram: &mut GuestRam) -> Result<(
 /// core registers, leaving x0..x30 to the caller's zeroing — and resets
 /// TPIDR_EL0 = 0 so the new image's libc re-initialises its thread pointer.
 pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsError> {
-    // MAIR_EL1 slot 0 = Normal Inner/Outer WB cacheable (0xFF), as HVF.
-    vcpu.set_sys_reg(SysReg::Mair, 0xFF)?;
+    // MAIR_EL1 slot 0 = Normal Inner/Outer WB cacheable (0xFF), as HVF. The
+    // bootstrap MAIR/TCR/SCTLR/CPACR values are SHARED with HVF in
+    // carrick_mem::arch_sysregs (byte-identical; one edit point).
+    vcpu.set_sys_reg(SysReg::Mair, MAIR_EL1_BOOTSTRAP)?;
     // TCR_EL1: identical bootstrap value to the HVF path. T0SZ=
     // T1SZ=16, Inner-WB/Inner-Shareable both halves, TG1=4K, IPS=40-bit, TBI0/1.
-    const T0SZ: u64 = 16;
-    const T1SZ: u64 = 16;
-    const TCR_EL1_BOOTSTRAP: u64 = T0SZ
-        | (0b11 << 8)
-        | (0b11 << 10)
-        | (0b11 << 12)
-        | (T1SZ << 16)
-        | (0b11 << 24)
-        | (0b11 << 26)
-        | (0b11 << 28)
-        | (0b10 << 30)
-        | (0b010 << 32)
-        | (1 << 37)
-        | (1 << 38);
     vcpu.set_sys_reg(SysReg::Tcr, TCR_EL1_BOOTSTRAP)?;
     vcpu.set_sys_reg(SysReg::Ttbr0, LINUX_PAGE_TABLES_BASE)?;
     vcpu.set_sys_reg(SysReg::Ttbr1, LINUX_PAGE_TABLES_BASE)?;
 
-    // SCTLR_EL1: C(2), I(12), DZE(14), UCT(15), SPAN(23), UCI(26) + M(0)=1 (stage-1 on).
+    // SCTLR_EL1: the shared base (C/I/DZE/UCT/UCI + M=1) from carrick-mem, plus
+    // SPAN (bit 23) which is KVM-SPECIFIC PAN GLUE — NOT part of the shared
+    // const.
     //
     // SPAN(bit 23)=1 is LOAD-BEARING for the MMIO sentinel: it means
     // "PSTATE.PAN is left UNCHANGED on taking an exception to EL1". With SPAN=0
@@ -929,12 +922,15 @@ pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Resul
     // sentinel page would then fault as a stage-1 PAN permission abort and
     // never reach stage-2 / KVM_EXIT_MMIO — wedging the first guest syscall.
     // The guest enters EL0 with PSTATE.PAN=0 (SPSR_EL1 below), so SPAN=1 keeps
-    // PAN=0 through the svc trap and the sentinel store reaches the host.
-    let sctlr: u64 = (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 23) | (1 << 26) | 1;
+    // PAN=0 through the svc trap and the sentinel store reaches the host. (HVF
+    // takes the opposite tack — SPAN=0 + forced PSTATE.PAN=1 — so this bit lives
+    // here, not in the shared SCTLR_EL1_BOOTSTRAP.)
+    const SCTLR_EL1_SPAN: u64 = 1 << 23;
+    let sctlr: u64 = SCTLR_EL1_BOOTSTRAP | SCTLR_EL1_SPAN;
     vcpu.set_sys_reg(SysReg::Sctlr, sctlr)?;
 
     // FP/SIMD on (CPACR_EL1.FPEN = 0b11) so guest NEON memset doesn't trap.
-    vcpu.set_sys_reg(SysReg::Cpacr, 0x3 << 20)?;
+    vcpu.set_sys_reg(SysReg::Cpacr, CPACR_EL1_BOOTSTRAP)?;
 
     // VBAR_EL1 -> our sentinel vector page.
     vcpu.set_sys_reg(SysReg::Vbar, LINUX_EL1_VECTORS_BASE)?;

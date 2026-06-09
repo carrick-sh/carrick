@@ -234,8 +234,9 @@ pub const LINUX_SIGRETURN_TRAMPOLINE_SIZE: u64 = 0x4000;
 pub fn is_carrick_el1_vector_va(va: u64) -> bool {
     (LINUX_EL1_VECTORS_BASE..LINUX_EL1_VECTORS_BASE + LINUX_EL1_VECTORS_SIZE).contains(&va)
 }
-// AArch64 `eret` opcode, little-endian.
-const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
+// AArch64 `eret` opcode, little-endian. `pub` so the backends' guest-setup /
+// trap code can share this one definition instead of re-declaring it.
+pub const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
 // AArch64 `clrex` opcode (clears the local Exclusives monitor).
 const AARCH64_CLREX_OPCODE: u32 = 0xd5033f5f;
 // AArch64 `hvc #0` opcode. SMCCC calls use `hvc #0` with a function ID in x0,
@@ -273,7 +274,8 @@ const AARCH64_DSB_SY_OPCODE: u32 = 0xd503_3f9f;
 // AArch64 `isb` — instruction synchronization barrier.
 const AARCH64_ISB_OPCODE: u32 = 0xd503_3fdf;
 // Size of one AArch64 exception vector slot (16 slots in the 2 KiB table).
-const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
+// `pub` so the backends can share this one definition cross-crate.
+pub const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
 // Offset of the "Lower EL using AArch64, synchronous" slot in the vector
 // table. EL0 `svc #0` from AArch64 lands here.
 const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
