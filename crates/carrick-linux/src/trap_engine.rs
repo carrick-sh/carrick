@@ -328,7 +328,10 @@ impl KvmTrapEngine {
 /// runs the EL1-maintenance TLBI ([`KvmTrapEngine::run_el1_maintenance`]) to drop
 /// the stale stage-1 TLB entry (a fresh, never-walked alias needs no flush, so
 /// [`KvmTrapEngine::map_host_alias`] uses the no-flush [`KvmTrapEngine::pt_edit`]).
-/// Not yet wired: `repoint_private` (the MAP_FIXED|MAP_PRIVATE overlay — Task 9).
+/// `repoint_private` (the MAP_FIXED|MAP_PRIVATE overlay) is a LIVE override too:
+/// it seeds the boot-mapped private-overlay slot then repoints the VA's stage-1
+/// leaf to it (+ flush), so a guest's "private" stores no longer leak through the
+/// fork-/sibling-shared backing.
 /// Gated (CARRICK_MEM_DEBUG) diagnostic for a failed syscall-path guest access:
 /// prints the address, length, and the calling thread's window view so a
 /// cross-thread translation miss (a stale per-sibling `GuestRam` snapshot) is
@@ -446,6 +449,62 @@ impl GuestMemory for KvmTrapEngine {
     /// arena's in-place reuse). Flush the stale TLB entry. Mirrors HVF.
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
+    }
+
+    /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE
+    /// overlay aperture (`overlay_ipa`, identity IPA==VA), seeding the slot with
+    /// `content` first. Backs a guest `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` over
+    /// a SHARED-aperture VA: carrick's shared aperture is host-`MAP_SHARED`, so it
+    /// is inherited across `fork(2)` AND visible to sibling carrick processes —
+    /// leaving the VA pointed there would make a guest's "private" stores leak. The
+    /// overlay window is `WindowKind::Private` (boot-mapped + its own KVM slot, so
+    /// `fork` COW-isolates it per process), so after this repoint the guest's
+    /// stores to `va` hit the per-process overlay page, not the shared backing.
+    ///
+    /// Mirrors HVF's `repoint_private`: (1) seed the overlay backing FIRST, while
+    /// `va` still translates to the OLD (shared) IPA, so no concurrent reader sees
+    /// a torn page through `va` during the flip; (2) `pt_edit_and_flush(map_aliased)`
+    /// repoints the stage-1 leaf (splitting any covering boot block down to a page
+    /// leaf) and — because the dispatcher may have ALREADY touched the overlay VA
+    /// (e.g. the guest wrote it before the MAP_FIXED) — runs the EL1-maintenance
+    /// TLBI so any stale stage-1 entry is invalidated. The overlay window was
+    /// registered as a KVM slot at boot (`build_for_image` maps every high region,
+    /// including `LINUX_PRIVATE_OVERLAY_BASE`), so this is a stage-1 edit only — no
+    /// post-vCPU stage-2 mutation.
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), MemoryError> {
+        // 1. Resolve the overlay slot's host backing pointer (the same resolver
+        //    the live page-table editor's `sync_to_host` uses). `len.max(1)` so a
+        //    zero-length repoint still resolves the start page.
+        let dst = self
+            .ram
+            .host_ptr(overlay_ipa, len.max(1))
+            .ok_or(MemoryError::OutOfBounds {
+                address: overlay_ipa,
+                length: len,
+            })?;
+        // 2. Seed `content` into the overlay backing FIRST, while `va` still
+        //    translates to the OLD (shared) IPA — no torn read through `va` during
+        //    the flip. Copy at most `len` bytes.
+        if !content.is_empty() {
+            let n = content.len().min(len);
+            // SAFETY: `host_ptr` proved `[overlay_ipa, overlay_ipa+len)` lies wholly
+            // within the overlay slot's backing, so `dst[..n]` (n <= len) is valid
+            // and writable; `content[..n]` is a distinct, valid source slice.
+            unsafe {
+                std::ptr::copy_nonoverlapping(content.as_ptr(), dst, n);
+            }
+        }
+        // 3. Stage-1 repoint + TLB flush. `map_aliased` splits the covering boot
+        //    block to a page leaf so a single page within the shared aperture is
+        //    repointed without disturbing its neighbours; the flush (Task 8)
+        //    invalidates any stale stage-1 entry for an already-touched overlay VA.
+        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, overlay_ipa, len as u64, true))
     }
 }
 
