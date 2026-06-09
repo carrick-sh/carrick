@@ -15,6 +15,12 @@
 // The handler is installed BEFORE the fork so there is no ordering race: the
 // child cannot deliver SIGRTMIN before the parent is ready to catch it. Nothing
 // else is written to stdout; the expected output is exactly "val-ok".
+// _GNU_SOURCE (before any include) exposes the POSIX.1b real-time-signal API on
+// glibc: SIGRTMIN and sigqueue(3) live behind _POSIX_C_SOURCE >= 199309L. Relying
+// on glibc's implicit _DEFAULT_SOURCE happens to work today, but a future in-guest
+// gcc (14+, where implicit function declarations are a hard error) would reject
+// sigqueue() — declare the feature explicitly. Matches proc-directed-nonmain.c.
+#define _GNU_SOURCE
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
