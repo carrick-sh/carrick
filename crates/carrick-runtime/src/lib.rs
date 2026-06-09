@@ -1144,7 +1144,50 @@ pub mod host_signal {
     /// Real POSIX impl shared with HVF (via carrick-host), no longer an identity
     /// stub that left internal fds at low, collision-prone numbers.
     pub use carrick_host::internal_fd::{duplicate_internal_fd, relocate_internal_fd};
-    pub fn reset_after_supervisor_fork() {}
+    /// Reset inherited host-signal state in the runtime child after the
+    /// interactive-`--tty` session supervisor forks (called from
+    /// `interactive_supervisor::adopt_stdio`, in the freshly-forked child BEFORE
+    /// it runs the normal runtime setup). The child must NOT inherit the
+    /// supervisor's stale pending signals, mirrored host dispositions, child-exit
+    /// watches, or its now-defunct signal-pump bookkeeping — it re-derives all of
+    /// them from scratch as it boots its own guest.
+    ///
+    /// NEUTRAL vs GLUE (mirrors the HVF arm's rationale,
+    /// `carrick_hvf::host_signal::reset_after_supervisor_fork`). The load-bearing
+    /// CORRECTNESS clears are the platform-NEUTRAL `carrick-signal-core` state —
+    /// the same pending / disposition / child-watch the HVF arm clears — so the
+    /// child starts with an empty pending set and re-derives its own host
+    /// dispositions. The PUMP re-arm is KVM GLUE: where HVF reopens its self-pipe
+    /// here, KVM resets the inherited pump guards (`PUMP_STARTED` /
+    /// `SIGCHLD_INSTALLED` / the stale `SELF_PIPE_W`) so the child's subsequent
+    /// `start_signal_pump` (the normal runtime setup, lib.rs:477 / runtime.rs:1500)
+    /// actually re-spawns a fresh pump instead of no-opping on the inherited
+    /// `PUMP_STARTED == true` guard and leaving a dead pump.
+    pub fn reset_after_supervisor_fork() {
+        // ---- NEUTRAL (shared with HVF): drop inherited pending / disposition /
+        // child-watch state so the child does not act on the supervisor's. ----
+        carrick_signal_core::clear_thread_pending();
+        carrick_signal_core::clear_proc_pending();
+        // The mirrored host-disposition install mask (Task 6's shared
+        // INSTALLED_MASK): clear it so the child re-derives its own host
+        // dispositions as the guest re-installs handlers, instead of believing the
+        // supervisor's mirrors are already in place.
+        carrick_signal_core::host_disposition::clear_all();
+        // The supervisor's child-exit watches belong to ITS children; the runtime
+        // child must not reap or deliver their exit signals.
+        carrick_signal_core::child_watch::clear();
+        // NOTE: there is no KVM thread-waiter registry of HVF's `THREAD_WAITERS`
+        // shape (per-thread self-pipes for thread-directed wakes) — the Linux
+        // waiter is a stateless `ppoll` woken by the kick's EINTR (see
+        // `io_wait::ThreadWaiter`), so there is nothing analogous to
+        // `clear_thread_waiters()` to call here.
+        //
+        // ---- GLUE (KVM-specific pump re-arm): reset the inherited signal-pump
+        // guards + stale self-pipe so the child's later `start_signal_pump`
+        // re-arms a working pump (spawn-free — the spawn is the caller's
+        // subsequent `start_signal_pump`). ----
+        carrick_linux::kvm_signal_pump::reset_state_for_supervisor_fork();
+    }
     pub fn linux_to_host_signum(sig: i32) -> i32 {
         sig
     }

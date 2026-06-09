@@ -373,6 +373,43 @@ mod tests {
         assert!(!has_process_pending());
     }
 
+    /// The NEUTRAL clears the KVM (and HVF) `reset_after_supervisor_fork` runs in
+    /// the interactive-`--tty` runtime child: publish thread-pending,
+    /// process-pending, a mirrored host disposition, and a child-exit watch, then
+    /// run exactly those neutral clears and assert every store is empty again — so
+    /// the child does not inherit the supervisor's stale state. (The pump-guard
+    /// re-arm is platform GLUE, unit-tested at its own layer.)
+    #[test]
+    fn supervisor_fork_neutral_clears_empty_all_state() {
+        let tid = 0x5757_i32;
+        // Seed each neutral store.
+        publish_pending_for(tid, 10); // thread-pending (SIGUSR1)
+        publish_process_signal(15); // process-pending (SIGTERM)
+        host_disposition::mark_installed(10); // mirrored host disposition
+        child_watch::register(0x6161, tid, 17); // a watched child-exit
+        assert!(has_pending_for(tid));
+        assert!(has_process_pending());
+        assert!(host_disposition::is_installed(10));
+        assert!(child_watch::is_tracked(0x6161));
+
+        // The exact neutral clears reset_after_supervisor_fork performs.
+        clear_thread_pending();
+        clear_proc_pending();
+        host_disposition::clear_all();
+        child_watch::clear();
+
+        assert!(!has_pending_for(tid), "thread-pending must be empty");
+        assert!(!has_process_pending(), "process-pending must be empty");
+        assert!(
+            !host_disposition::is_installed(10),
+            "mirrored host disposition mask must be empty"
+        );
+        assert!(
+            !child_watch::is_tracked(0x6161),
+            "child-exit watches must be empty"
+        );
+    }
+
     /// Test helper: the lowest pending signum for `tid` WITHOUT consuming it
     /// (the production drainers are consuming; there is no peek-by-tid in the
     /// neutral API because no backend needs one).
