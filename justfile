@@ -67,6 +67,16 @@ conformance TIER="full" *ARGS: build
 conformance-quick: build
     cargo run -p carrick-conformance -- --tier smoke
 
+# KVM/lima Docker-parity gate (Phase 5). Builds carrick IN-GUEST for platform-linux,
+# then runs the smoke tier on the KVM lane vs the (backend-independent) docker oracles,
+# consulting the layered KVM baseline overlay. Needs: `just lima-up` + Docker Desktop.
+conformance-kvm *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="$(bash scripts/conformance/build-carrick-in-lima.sh | tail -1)"
+    cargo run -p carrick-conformance -- --lane kvm --tier smoke \
+        --carrick-bin "$bin" --baseline-overlay scripts/conformance/baseline.kvm.jsonl {{ARGS}}
+
 # Re-render docs/support-matrix.md from the latest results (no run).
 matrix:
     cargo run -p carrick-conformance -- --render-matrix
