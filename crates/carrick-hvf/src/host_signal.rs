@@ -80,10 +80,16 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use crate::linux_abi::LINUX_SIGINT;
+// The platform-NEUTRAL host-disposition mirroring policy (the shared INSTALLED_MASK
+// idempotency bitmask + the `is_host_routable` base excluded-signum set) lives in
+// `carrick_signal_core::host_disposition`, shared verbatim with the KVM backend so
+// the two cannot drift. HVF's install/handler code below layers its own per-signum
+// SKIP set + the Linux<->macOS number translation on top.
+use carrick_signal_core::host_disposition;
 
 // Platform-NEUTRAL pending bookkeeping (the THREAD_PENDING/PROC_PENDING store,
 // SENDER_PID, and their pure operations) lives in `carrick-signal-core`, shared
@@ -198,9 +204,14 @@ pub fn block_hvf_private_thread_signals() -> HvfPrivateSignalMaskGuard {
     }
 }
 
-/// Bitmask of Linux signums for which we've installed a host handler, so
-/// `ensure_host_handler` is idempotent per signal. Bit `n` = signum `n`.
-static INSTALLED_MASK: AtomicU64 = AtomicU64::new(0);
+// The per-signum idempotency bitmask that records which signals have a mirrored
+// host disposition (so `ensure_host_handler`/`set_host_ignore` are idempotent) is
+// now the platform-NEUTRAL `carrick_signal_core::host_disposition::INSTALLED_MASK`
+// (shared verbatim with the KVM backend, so the two cannot drift on the install
+// bookkeeping). HVF reads/writes it through the neutral
+// `mark_installed`/`clear_installed`/`is_installed`/`installed_mask`/`clear_all`
+// helpers; the per-signum SKIP set (the HVF-specific exclusions layered on top of
+// the neutral `is_host_routable` base) stays HVF glue in the install code below.
 
 static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -651,7 +662,7 @@ pub fn reinit_after_fork() {
 /// signals, routed-handler bookkeeping, or the supervisor's self-pipe fds.
 pub fn reset_after_supervisor_fork() {
     INSTALLED.store(0, Ordering::SeqCst);
-    INSTALLED_MASK.store(0, Ordering::SeqCst);
+    host_disposition::clear_all();
     clear_thread_pending();
     clear_thread_waiters();
     clear_proc_pending();
@@ -949,8 +960,12 @@ pub fn ensure_host_handler(linux_signum: i32) {
     if !(1..=63).contains(&linux_signum) || matches!(linux_signum, 9 | 13 | 17 | 19) {
         return;
     }
-    let bit = 1u64 << linux_signum;
-    if INSTALLED_MASK.fetch_or(bit, Ordering::SeqCst) & bit != 0 {
+    // Idempotency bookkeeping is the SHARED neutral mask (bit `signum-1`); a
+    // second install of the same signum is a no-op. HVF's per-signum SKIP set
+    // above (9/13/17/19) is HVF glue and intentionally differs from the neutral
+    // `is_host_routable` base (HVF DOES route the fault set 4/5/6/7/8/11 through
+    // `handle_routed`'s synchronous-fault guard — see this fn's caller contract).
+    if host_disposition::mark_installed(linux_signum) {
         return;
     }
     let host = linux_to_host_signum(linux_signum);
@@ -1010,7 +1025,7 @@ pub fn set_host_ignore(linux_signum: i32) {
     // The host no longer routes this signal (it's ignored), so drop the
     // routed-handler bookkeeping: a later ensure_host_handler (guest installs a
     // real handler) must re-install handle_routed rather than skip as a no-op.
-    INSTALLED_MASK.fetch_and(!(1u64 << linux_signum), Ordering::SeqCst);
+    host_disposition::clear_installed(linux_signum);
 }
 
 /// Reset a guest-mirrorable signal's HOST disposition back to `SIG_DFL` — the
@@ -1044,7 +1059,7 @@ pub fn set_host_default(linux_signum: i32) {
     }
     // No longer overridden on the host; clear the routed-handler bookkeeping so a
     // later ensure_host_handler re-installs handle_routed instead of skipping.
-    INSTALLED_MASK.fetch_and(!(1u64 << linux_signum), Ordering::SeqCst);
+    host_disposition::clear_installed(linux_signum);
 }
 
 /// Reset host signal dispositions that were installed only to route guest
@@ -1057,14 +1072,20 @@ pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
         if matches!(linux_signum, LINUX_SIGINT | 9 | 13 | 17 | 19) {
             continue;
         }
-        let bit = 1u64 << linux_signum;
-        if INSTALLED_MASK.fetch_and(!bit, Ordering::SeqCst) & bit == 0 {
+        // Only reset signals we actually mirrored (the shared neutral install
+        // mask). `clear_installed` drops the bit; skip if it was never set.
+        if !host_disposition::is_installed(linux_signum) {
             continue;
         }
+        host_disposition::clear_installed(linux_signum);
+        // NOTE: `ignored_mask` is the dispatcher's caller ABI, indexed by bit
+        // `signum` (NOT `signum-1`) — see reset_signal_handlers_on_execve. It is a
+        // SEPARATE mask from the install bookkeeping above; keep its own bit here.
+        let ignored_bit = 1u64 << linux_signum;
         let host = linux_to_host_signum(linux_signum);
         unsafe {
             let mut action: libc::sigaction = core::mem::zeroed();
-            action.sa_sigaction = if ignored_mask & bit != 0 {
+            action.sa_sigaction = if ignored_mask & ignored_bit != 0 {
                 libc::SIG_IGN
             } else {
                 libc::SIG_DFL

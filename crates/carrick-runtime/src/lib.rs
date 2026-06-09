@@ -1164,7 +1164,15 @@ pub mod host_signal {
     pub fn is_tracked_child(child_pid: i32) -> bool {
         carrick_signal_core::child_watch::is_tracked(child_pid)
     }
-    pub fn reset_routed_handlers_after_execve(_ignored_mask: u64) {}
+    /// Guest `execve`: reset every mirrored host disposition to default, except
+    /// the signals the new image keeps ignored (the bits set in `ignored_mask`,
+    /// indexed by bit `signum` — the dispatcher's caller ABI). Because carrick
+    /// does not host-exec, the host process would otherwise keep catching/ignoring
+    /// those signals after the emulated disposition was replaced. Delegates to the
+    /// carrick-linux glue (parallels HVF's reset).
+    pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
+        carrick_linux::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
+    }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
     /// neutral ring core (the nudge handler in `carrick_linux::kvm_xsig` set the
     /// dirty flag).
@@ -1196,9 +1204,28 @@ pub mod host_signal {
     pub fn take_pending() -> i32 {
         carrick_signal_core::take_process_pending()
     }
-    pub fn ensure_host_handler(_sig: i32) {}
-    pub fn set_host_ignore(_sig: i32) {}
-    pub fn set_host_default(_linux_signum: i32) {}
+    /// Mirror a guest-installed handler onto a real HOST routed handler so a
+    /// sibling guest process's host `kill` of this STANDARD catchable signal (the
+    /// non-namespaced host-kill path) RUNS the guest handler instead of taking the
+    /// host default action and TERMINATING the receiver (CPython
+    /// test_interprocess_signal / LTP kill02). Idempotent; no-op for non-routable
+    /// or KVM-claimed (pump/kick/nudge/SIGCHLD) signals. Delegates to the
+    /// carrick-linux glue, whose policy is the shared neutral host_disposition.
+    pub fn ensure_host_handler(sig: i32) {
+        carrick_linux::kvm_disposition::ensure_host_handler(sig);
+    }
+    /// Mirror a guest `SIG_IGN` onto the HOST disposition so a sibling guest
+    /// process's host `kill` is DROPPED (honoring the guest's ignore) instead of
+    /// host-default-terminating us. No-op for non-routable / KVM-claimed signals.
+    pub fn set_host_ignore(sig: i32) {
+        carrick_linux::kvm_disposition::set_host_ignore(sig);
+    }
+    /// Reset a mirrored signal's HOST disposition to `SIG_DFL` (the guest reset it
+    /// to default): clear any host SIG_IGN / routed handler mirrored earlier and
+    /// possibly INHERITED across fork, so the host no longer swallows the signal.
+    pub fn set_host_default(linux_signum: i32) {
+        carrick_linux::kvm_disposition::set_host_default(linux_signum);
+    }
     /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
     /// ring (inherited across `fork`, so every carrick process shares ONE ring).
     /// Delegates to the neutral ring core; false = no ring or ring full.
@@ -1257,6 +1284,15 @@ pub mod host_signal {
         // consistency with the HVF arm; `kvm_signal_pump::reinit_after_fork` also
         // clears it (idempotent) when the fork coordinator re-arms the child pump.
         carrick_signal_core::child_watch::clear();
+        // The mirrored host DISPOSITIONS (the routed handlers / SIG_IGN installed
+        // by kvm_disposition + their shared INSTALLED_MASK) are INTENTIONALLY left
+        // intact across a guest fork — exactly as HVF's reinit_after_fork leaves
+        // them. `libc::fork` inherits both the host sigactions AND the guest
+        // sigaction table consistently, so the child's mirrored host dispositions
+        // still match its inherited guest dispositions; clearing them here would
+        // wrongly strip a handler the child still has installed. (The
+        // supervisor-fork path — Task 7 — is the one that resets them, because
+        // there the runtime re-installs from scratch.)
     }
     pub fn wake_all_waiters() {}
 }
