@@ -665,7 +665,20 @@ impl GuestRam {
     pub(crate) fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
         let mut vm = KvmVm::create_empty()?;
         for w in &self.windows {
-            vm.map_memory(w.base, w.host, w.len, MemPerms::ReadWriteExec)?;
+            // An ALIAS window's KVM slot lives at `slot_gpa` (a <1 TiB hole), NOT
+            // at `w.base` (the guest VA, e.g. 1 TiB — at/above the 40-bit nested
+            // IPA cap, which KVM rejects with EFAULT). Mirror the boot/sibling
+            // registration path (`window_slots` -> `slot_gpa.unwrap_or(base)`); a
+            // plain identity window has slot_gpa=None so this is `w.base`. Without
+            // this, a fork AFTER a map_host_alias (e.g. `go build` exec'ing
+            // `go tool compile`) crashed the child rebuild with
+            // KVM_SET_USER_MEMORY_REGION(gpa=1 TiB): Bad address.
+            vm.map_memory(
+                w.slot_gpa.unwrap_or(w.base),
+                w.host,
+                w.len,
+                MemPerms::ReadWriteExec,
+            )?;
         }
         let vcpu = vm.add_vcpu()?;
         Ok((vm, vcpu))
