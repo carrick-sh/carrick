@@ -4,11 +4,6 @@
 //! `localhost` conformance-registry host to the lima gateway so the guest can
 //! pull from the mac registry.
 
-// `carrick_invocation_argv` + `Lane::is_kvm` are consumed by `engine::run_carrick`
-// / `carrick_dry_run` in the next commit (threading `&Lane` through the run path);
-// until then the binary build sees them as unused. Allow it for this step.
-#![allow(dead_code)]
-
 use crate::engine::carrick_argv;
 use crate::manifest::Suite;
 
@@ -26,6 +21,10 @@ pub struct LimaConfig {
 #[derive(Clone, Debug)]
 pub enum Lane {
     Hvf,
+    // `Kvm` is constructed from the `--lane kvm` CLI args in the next commit
+    // (`lane_from_args`); for now only the unit tests build it. The argv builder
+    // and the env-skip already handle it, so this is purely the CLI wiring gap.
+    #[allow(dead_code)]
     Kvm(LimaConfig),
 }
 
@@ -189,5 +188,14 @@ mod tests {
                 .iter()
                 .any(|t| t == "localhost:5005/carrick-go-conformance:1.24")
         );
+    }
+
+    #[test]
+    fn dry_run_hvf_matches_legacy_carrick_argv() {
+        // Behavior-preservation: the Hvf dry-run argv equals the pre-lane argv.
+        let s = demo_suite();
+        let legacy = crate::engine::carrick_argv(&s, "target/release/carrick", "conf-1-2");
+        let now = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &Lane::Hvf);
+        assert_eq!(legacy, now);
     }
 }

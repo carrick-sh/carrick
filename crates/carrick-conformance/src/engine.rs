@@ -117,15 +117,25 @@ fn docker_argv(suite: &Suite, run_id: &str) -> Vec<String> {
     a
 }
 
-pub fn carrick_dry_run(suite: &Suite, carrick_bin: &str, run_id: &str) -> Vec<String> {
-    carrick_argv(suite, carrick_bin, run_id)
+pub fn carrick_dry_run(
+    suite: &Suite,
+    carrick_bin: &str,
+    run_id: &str,
+    lane: &crate::lane::Lane,
+) -> Vec<String> {
+    crate::lane::carrick_invocation_argv(suite, carrick_bin, run_id, lane)
 }
 pub fn docker_dry_run(suite: &Suite, run_id: &str) -> Vec<String> {
     docker_argv(suite, run_id)
 }
 
-pub fn run_carrick(suite: &Suite, carrick_bin: &str, run_id: &str) -> anyhow::Result<RunOutput> {
-    let argv = carrick_argv(suite, carrick_bin, run_id);
+pub fn run_carrick(
+    suite: &Suite,
+    carrick_bin: &str,
+    run_id: &str,
+    lane: &crate::lane::Lane,
+) -> anyhow::Result<RunOutput> {
+    let argv = crate::lane::carrick_invocation_argv(suite, carrick_bin, run_id, lane);
     // SAFE: argv comes from the version-controlled manifest (suites.toml), not external
     // input; `Command::args` passes each token literally (no shell), so there is no
     // metacharacter interpolation / injection surface.
@@ -133,7 +143,11 @@ pub fn run_carrick(suite: &Suite, carrick_bin: &str, run_id: &str) -> anyhow::Re
     cmd.args(&argv[1..]);
     // Scope comes from `--name <run_id>` in the argv now (carrick derives the
     // proctitle/kill id from it) — no bespoke CARRICK_RUN_ID env needed.
-    if let Some(host) = suite.registry_host() {
+    // Hvf still sets the insecure-registry env on the LOCAL process; Kvm already
+    // carried it INTO the guest argv (`env …`), so only set it for Hvf.
+    if !lane.is_kvm()
+        && let Some(host) = suite.registry_host()
+    {
         cmd.env("CARRICK_INSECURE_REGISTRIES", host);
     }
     run_one(cmd, argv, suite.timeout_s, run_id, Engine::Carrick)

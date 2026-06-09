@@ -124,6 +124,11 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
 
+    // Execution lane for the carrick side. Task 4 builds this from CLI args
+    // (`--lane`/`--lima-vm`/`--lima-gateway`); for now it is always the local
+    // Hvf lane, preserving today's behavior byte-for-byte.
+    let lane = lane::Lane::Hvf;
+
     if args.render_matrix {
         let reports = read_reports(&args.jsonl)?;
         let md = matrix::render(&reports);
@@ -167,6 +172,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 s,
                 &args.carrick_bin.to_string_lossy(),
                 &format!("conf-{}-cN", std::process::id()),
+                &lane,
             );
             let d = engine::docker_dry_run(s, &format!("conf-{}-dN", std::process::id()));
             println!("# {} [{}, {:?}]", s.name, s.ecosystem.as_str(), s.tier);
@@ -209,7 +215,7 @@ fn run() -> anyhow::Result<ExitCode> {
         // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
         // collision-free id is defense in depth against any unanchored grep.
         let run_id = format!("conf-{pid}-c{i:02}");
-        let out = engine::run_carrick(s, &carrick_bin, &run_id);
+        let out = engine::run_carrick(s, &carrick_bin, &run_id, &lane);
         eprintln!("  [carrick] {}", s.name);
         out
     });
@@ -324,7 +330,7 @@ fn run() -> anyhow::Result<ExitCode> {
             |i, attempt| {
                 let s = &selected[i];
                 let run_id = format!("conf-{pid}-r{i:02}-a{attempt}");
-                let cout = engine::run_carrick(s, &carrick_bin, &run_id).ok();
+                let cout = engine::run_carrick(s, &carrick_bin, &run_id, &lane).ok();
                 let rep = build_report(s, cout.as_ref(), &docker_sides[i], &baseline);
                 eprintln!(
                     "  [retry] {} attempt {attempt}/{retries} -> {}{}",
