@@ -67,6 +67,12 @@
 use serde::Serialize;
 use thiserror::Error;
 
+/// Neutral guest-memory region lookup + the combined PROT_NONE/region access
+/// gate ([`region::find_region_for_gpa`], [`region::safe_guest_access`]) — the
+/// recurrence guard that keeps a backend from wiring up the region lookup while
+/// forgetting the PROT_NONE gate (or vice versa). See the module docs.
+pub mod region;
+
 /// The Linux AArch64 syscall argument registers carrick reads at an `svc` trap
 /// (`x0`–`x5` args, `x8` syscall number).
 #[repr(C)]

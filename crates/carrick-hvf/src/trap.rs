@@ -3903,14 +3903,22 @@ impl HvfInner {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfMappedRegion {
+    /// Whether `[address, address+length)` lies wholly within this region's
+    /// VA span `[start, end)`. Delegates the whole-range containment+bounds math
+    /// to the neutral [`carrick_guest_mem::region::GuestMemoryRegion::contains_range`]
+    /// so the bounds test can't drift across backends. HVF keeps its RICHER
+    /// region SELECTION (newest-first + stage-1-IPA preference, chunked per page,
+    /// `translate_va` for high-VA aliases — see `mapping_index_for_range`) as its
+    /// own glue; only this per-region bounds primitive is shared. The projected
+    /// region keys on `start`/`end` (NOT `size`: a 16 KiB host-rounded `end` can
+    /// over-claim, and the copy loops compute `host_addr + (addr - start)`).
     fn contains_range(&self, address: u64, length: usize) -> bool {
-        let Ok(length) = u64::try_from(length) else {
-            return false;
-        };
-        let Some(end) = address.checked_add(length) else {
-            return false;
-        };
-        address >= self.start && end <= self.end
+        carrick_guest_mem::region::GuestMemoryRegion {
+            base: self.start,
+            len: (self.end - self.start) as usize,
+            host_addr: self.host_addr,
+        }
+        .contains_range(address, length)
     }
 }
 
