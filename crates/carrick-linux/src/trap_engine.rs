@@ -807,11 +807,33 @@ impl SyscallTrap for KvmTrapEngine {
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
         self.last_fault_esr = 0;
-        // Drop the parent's shared page-table editor: the child's tables are a
+        // Give the child its OWN page-table manager — a FRESH Arc, NOT the Arc the
+        // parent's CLONE_THREAD siblings still share (so a later child pt_edit can
+        // never reach back into the parent's manager). The child's tables are a
         // fresh Linux-COW copy of the parent's (in the rebuilt-VM's private
-        // windows), so it must rebuild its OWN manager lazily from that copy —
-        // not keep editing through the Arc the parent's siblings still share.
-        self.page_tables = Arc::new(Mutex::new(None));
+        // windows), and `pt_edit_locked`/`pt_host_ptr` already resolve their host
+        // backing through `self.ram` (the child's COW windows), so the child still
+        // edits/syncs to its OWN backing after this swap.
+        //
+        // But CLONE the parent's manager VALUE rather than RESET to None (which
+        // mirrors HVF, trap.rs ~:3542). A reset would force a lazy rebuild on the
+        // child's first pt_edit, but `syscall_buffer_ipa` is `&self` and CANNOT
+        // rebuild — so a forked child that passes a `repoint_private` overlay VA to
+        // a syscall (write/read/sendmsg/…) BEFORE its first mmap/mprotect/munmap
+        // would translate against a None manager, fall back to identity, and read
+        // the STALE SHARED aperture instead of its own COW overlay. Cloning lets
+        // the child translate immediately. Correctness: at fork the child's COW
+        // table backing == the parent's synced manager bytes, so the clone is
+        // exactly what a lazy rebuild from the child's backing would produce — and
+        // the bump cursor/pool state matches that backing too. If the parent never
+        // built a manager (None — never edited the tables), the clone is None,
+        // which is correct (nothing was repointed → identity VA → no translation).
+        let cloned = self
+            .page_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.page_tables = Arc::new(Mutex::new(cloned));
         // Re-calibrate the vDSO clock against the CHILD's counter: the child runs
         // on a brand-new KvmVm, so its guest counter basis differs from the
         // parent's, and the COW-inherited vvar's realtime_off no longer matches.

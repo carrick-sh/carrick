@@ -1189,8 +1189,32 @@ CEOF
       printf "FAIL [mapfixed-private-syscall]: stdout=[%s] exit=%s oracle=[syscall-priv-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 43) mapfixed-private-syscall-fork: POST-FORK repoint_private syscall-buffer
+    #     correctness (the KVM-only fork regression the non-fork case 42 missed).
+    #     A guest mmaps a SHARED-aperture page (0xAA), repoints it to a per-process
+    #     PRIVATE overlay (0xBB) with mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON), then
+    #     FORKS. The CHILD -- WITHOUT any prior mmap/mprotect/munmap -- uses the
+    #     repointed VA as a syscall read buffer (write down a pipe). KVM fork RESET
+    #     the stage-1 page-table manager to None, and syscall_buffer_ipa is &self so
+    #     it CANNOT rebuild -- so the child syscall copy resolved to the STALE
+    #     SHARED backing (0xAA) instead of its own COW overlay (0xBB), and the child
+    #     exited 3. The fix CLONES the parent manager VALUE into a fresh Arc at
+    #     fork (own manager, not the shared parent Arc), mirroring HVF, so the child
+    #     can stage-1-translate the overlay VA immediately. Asserts the child saw
+    #     0xBB and the parent prints "fork-syscall-priv-ok". Needs glibc mmap/fork/
+    #     pipe/read/write -> the REAL dispatcher. REQUIRED gate.
+    mapfixedprivsysfork_src="$fixdir/mapfixed-private-syscall-fork/mapfixed-private-syscall-fork.c"
+    gcc -static -O2 -o /tmp/mapfixed_private_syscall_fork "$mapfixedprivsysfork_src"
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/mapfixed_private_syscall_fork" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "fork-syscall-priv-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+mapfixed-private-syscall-fork]: a FORKED CHILD stage-1-translated a repoint_private overlay syscall buffer to its OWN COW overlay -- the child saw its private bytes, not the parent stale shared aperture (KVM fork now clones the page-table manager instead of resetting it)."
+    else
+      printf "FAIL [mapfixed-private-syscall-fork]: stdout=[%s] exit=%s oracle=[fork-syscall-priv-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork/sigchld-async/xproc-stdsig/mprotect-ro/mapfixed-private/mapfixed-private-syscall]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork/sigchld-async/xproc-stdsig/mprotect-ro/mapfixed-private/mapfixed-private-syscall/mapfixed-private-syscall-fork]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -1201,5 +1225,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring+async-sigchld+xproc-stdsig+stage1-tlbi+mapfixed-private+mapfixed-private-syscall — all 42 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork, sigchld-async, xproc-stdsig, mprotect-ro, mapfixed-private, mapfixed-private-syscall) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring+async-sigchld+xproc-stdsig+stage1-tlbi+mapfixed-private+mapfixed-private-syscall+mapfixed-private-syscall-fork — all 43 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork, sigchld-async, xproc-stdsig, mprotect-ro, mapfixed-private, mapfixed-private-syscall, mapfixed-private-syscall-fork) pass on KVM; ZERO xfail."
 '
