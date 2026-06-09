@@ -78,9 +78,7 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
-use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use crate::linux_abi::LINUX_SIGINT;
@@ -97,6 +95,14 @@ pub use carrick_signal_core::{
     last_sender_for, lowest_pending_signum, pending_bit, pending_thread_tids, proc_pending_fetch_or,
     record_sender, signal_unblocked_by_mask, take_pending_for, take_pending_in_for,
     take_process_pending, thread_pending_bit,
+};
+
+// The platform-NEUTRAL cross-process xsignal ring core now lives in
+// `carrick-signal-core::xsig`; only the nudge SIGNAL number + nudge handler wake
+// below is HVF glue. Re-export the ring surface so HVF's call sites are unchanged.
+pub use carrick_signal_core::xsig::{
+    mark_xsig_dirty, xsig_drain_for_self, xsig_enqueue, xsig_has_pending,
+    xsig_has_unblocked_for_self, xsig_init,
 };
 
 /// `(linux_signum, host_signum)` pairs that DIFFER between Linux and macOS.
@@ -809,99 +815,17 @@ pub(crate) fn drain_fd(fd: RawFd) -> DrainResult {
 // (where it can take locks) and publishes each signal to the guest with the
 // sender's ns-pid + sigval.
 
-const XSIG_SLOTS: usize = 256;
+// The platform-NEUTRAL ring core (the slot/ring layout, the `MAP_SHARED|MAP_ANON`
+// allocation, enqueue, drain, dirty flag, and the deliverable-for-self peek) now
+// lives in `carrick_signal_core::xsig` (re-exported above). Only the nudge SIGNAL
+// number + the nudge handler wake below is HVF glue.
+
 /// Host SIGINFO — the "drain your xsignal ring" nudge (free; see above).
 const XSIG_NUDGE_HOST_SIGNUM: i32 = 29;
-
-#[repr(C)]
-struct XSigSlot {
-    used: AtomicU32, // 0 = free, 1 = used
-    target_host_pid: AtomicI32,
-    signum: AtomicI32, // Linux signum
-    sender_ns_pid: AtomicI32,
-    sender_uid: AtomicU32,
-    value: AtomicI64, // sigval (rt_sigqueueinfo); 0 otherwise
-}
-
-#[repr(C)]
-struct XSigRing {
-    slots: [XSigSlot; XSIG_SLOTS],
-}
-
-static XSIG_RING: AtomicPtr<XSigRing> = AtomicPtr::new(std::ptr::null_mut());
-static XSIG_DIRTY: AtomicBool = AtomicBool::new(false);
-
-/// Allocate the shared xsignal ring once (`MAP_SHARED|MAP_ANON`, inherited
-/// across fork). Idempotent: the post-fork `install_default_handlers` call sees
-/// a non-null pointer (the child inherited the mapping) and is a no-op, so all
-/// processes share ONE ring. Best-effort — a failed mmap leaves the ring absent
-/// and senders fall back to a plain host `kill`.
-pub fn xsig_init() {
-    if !XSIG_RING.load(Ordering::Acquire).is_null() {
-        return;
-    }
-    let size = std::mem::size_of::<XSigRing>();
-    let p = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_ANON,
-            -1,
-            0,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        return;
-    }
-    // mmap zero-fills, so every slot's `used` is 0 (free) already.
-    XSIG_RING.store(p.cast::<XSigRing>(), Ordering::Release);
-}
-
-fn xsig_ring() -> Option<&'static XSigRing> {
-    let p = XSIG_RING.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        // SAFETY: a non-null XSIG_RING points at a live MAP_SHARED mapping of
-        // exactly one XSigRing, allocated by xsig_init and never unmapped.
-        Some(unsafe { &*p })
-    }
-}
 
 /// Whether the host signal `host_signum` is the xsignal nudge.
 pub fn is_xsig_nudge(host_signum: i32) -> bool {
     host_signum == XSIG_NUDGE_HOST_SIGNUM
-}
-
-/// Enqueue a cross-process signal for `target_host_pid` and return whether it
-/// was queued (false = no ring or ring full → caller falls back / drops).
-pub fn xsig_enqueue(
-    target_host_pid: i32,
-    signum: i32,
-    sender_ns_pid: i32,
-    sender_uid: u32,
-    value: i64,
-) -> bool {
-    let Some(ring) = xsig_ring() else {
-        return false;
-    };
-    for slot in ring.slots.iter() {
-        if slot
-            .used
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            slot.target_host_pid
-                .store(target_host_pid, Ordering::Relaxed);
-            slot.signum.store(signum, Ordering::Relaxed);
-            slot.sender_ns_pid.store(sender_ns_pid, Ordering::Relaxed);
-            slot.sender_uid.store(sender_uid, Ordering::Relaxed);
-            slot.value.store(value, Ordering::Release);
-            return true;
-        }
-    }
-    false
 }
 
 /// Nudge `target_host_pid` to drain its xsignal entries (host SIGINFO).
@@ -911,64 +835,16 @@ pub fn xsig_nudge(target_host_pid: i32) {
     }
 }
 
-/// Did a nudge arrive since the last drain? Folded into `has_pending_for` so the
-/// runtime delivers, and into the waiter so a parked thread wakes.
-pub fn xsig_has_pending() -> bool {
-    XSIG_DIRTY.load(Ordering::SeqCst)
-}
-
-fn xsig_has_unblocked_for_self(block_mask: u64) -> bool {
-    if !XSIG_DIRTY.load(Ordering::SeqCst) {
-        return false;
-    }
-    let Some(ring) = xsig_ring() else {
-        return true;
-    };
-    let me = std::process::id() as i32;
-    for slot in ring.slots.iter() {
-        if slot.used.load(Ordering::Acquire) == 1
-            && slot.target_host_pid.load(Ordering::Acquire) == me
-            && signal_unblocked_by_mask(slot.signum.load(Ordering::Acquire), block_mask)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Drain every entry targeting THIS process, clearing the dirty flag. Called in
-/// DISPATCH context (may allocate / take locks). Returns
-/// `(signum, sender_ns_pid, sender_uid, value)` per entry.
-pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
-    XSIG_DIRTY.store(false, Ordering::SeqCst);
-    let mut out = Vec::new();
-    let Some(ring) = xsig_ring() else {
-        return out;
-    };
-    let me = std::process::id() as i32;
-    for slot in ring.slots.iter() {
-        if slot.used.load(Ordering::Acquire) == 1
-            && slot.target_host_pid.load(Ordering::Acquire) == me
-        {
-            let signum = slot.signum.load(Ordering::Relaxed);
-            let sp = slot.sender_ns_pid.load(Ordering::Relaxed);
-            let su = slot.sender_uid.load(Ordering::Relaxed);
-            let v = slot.value.load(Ordering::Acquire);
-            slot.used.store(0, Ordering::Release); // free the slot
-            out.push((signum, sp, su, v));
-        }
-    }
-    out
-}
-
 /// The xsignal nudge handler: a guest process queued a SIGCHLD/RT for us. Just
-/// flag + wake (async-signal-safe); the real drain runs in dispatch context.
+/// flag + wake (async-signal-safe); the real drain runs in dispatch context. The
+/// dirty flag is the neutral core's (set via `mark_xsig_dirty`); `notify_pending`
+/// is the HVF self-pipe wake.
 extern "C" fn handle_xsig_nudge(
     _sig: libc::c_int,
     _info: *mut libc::siginfo_t,
     _ctx: *mut libc::c_void,
 ) {
-    XSIG_DIRTY.store(true, Ordering::SeqCst);
+    carrick_signal_core::xsig::mark_xsig_dirty();
     notify_pending();
 }
 
@@ -1561,7 +1437,7 @@ mod tests {
         let signum = crate::linux_abi::LINUX_SIGUSR1;
         let blocked = thread_pending_bit(signum);
         assert!(xsig_enqueue(std::process::id() as i32, signum, 42, 0, 0));
-        XSIG_DIRTY.store(true, Ordering::SeqCst);
+        mark_xsig_dirty();
 
         assert!(has_pending_for(900_050));
         assert!(has_unblocked_pending_for(900_050, 0));
@@ -1571,8 +1447,8 @@ mod tests {
             thread_pending_bit(crate::linux_abi::LINUX_SIGUSR2)
         ));
 
+        // `xsig_drain_for_self` clears the dirty flag, leaving the ring clean.
         let _ = xsig_drain_for_self();
-        XSIG_DIRTY.store(false, Ordering::SeqCst);
     }
 
     fn pipe_is_readable(fd: i32) -> bool {

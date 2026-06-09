@@ -3,9 +3,11 @@
 //! The dispatcher's blocked-signal/queued-siginfo store is SEPARATE (see the
 //! design doc's two-slot invariant).
 //!
-//! This crate owns ONLY the data structures and the pure operations on them.
-//! Backend-specific GLUE (the macOS/HVF kqueue pump + self-pipe wakes + the
-//! cross-process xsignal ring; the KVM vCPU kicks) lives in the backends. Each
+//! This crate owns the data structures and the pure operations on them, plus the
+//! platform-NEUTRAL cross-process xsignal ring core (see the [`xsig`] submodule:
+//! the `MAP_SHARED|MAP_ANON` ring, enqueue, drain, dirty flag). Backend-specific
+//! GLUE (the macOS/HVF kqueue pump + self-pipe wakes; the KVM vCPU kicks; and the
+//! xsignal NUDGE signal number + nudge handler wake) lives in the backends. Each
 //! backend's `host_signal` module re-exports the neutral surface from here and
 //! layers its own wake/route glue on top.
 //!
@@ -21,6 +23,8 @@
 //! handlers via a lock-free `fetch_or`, so it must stay lock-free.
 //! `THREAD_PENDING` is touched only from normal dispatch context (a host handler
 //! can't name a guest tid), so a plain `Mutex` is safe there.
+
+pub mod xsig;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
