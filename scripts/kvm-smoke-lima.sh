@@ -1051,8 +1051,32 @@ CEOF
       printf "FAIL [posix-timer-fork]: stdout=[%s] exit=%s oracle=[child-clean]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 38) sigchld-async: a parent installs an SA_SIGINFO|SA_RESTART SIGCHLD
+    #     handler that reaps the child with waitpid(WNOHANG) and sets a flag, forks
+    #     a child that exits after 50ms, and — crucially — NEVER calls a blocking
+    #     wait4 in main: it spins while(!got) pause() and prints sigchld-ok once the
+    #     ASYNC SIGCHLD fires. On a KVM guest a fork = separate host processes, so
+    #     the parent must be delivered SIGCHLD asynchronously the instant the child
+    #     exits. carrick records the child in the neutral child-watch registry and
+    #     the signal pump reaper waitid(WNOWAIT|WNOHANG)-peeks each tracked child,
+    #     then publishes the recorded exit-signal to the recorded parent tid +
+    #     kicks the vCPU. Before Task 5 register_child_exit_watch was a no-op on KVM
+    #     and this hung forever. Needs glibc sigaction/fork/waitpid -> the REAL
+    #     dispatcher. REQUIRED gate.
+    sigchld_src="$fixdir/sigchld-async/sigchld-async.c"
+    gcc -static -O2 -o /tmp/sigchld_async "$sigchld_src"
+    # -s KILL: a regression that wedges (async SIGCHLD never delivered) must be
+    # force-killed so the smoke fails fast rather than hanging for the timeout.
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/sigchld_async" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "sigchld-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+sigchld-async]: an async child-exit SIGCHLD reached a handler that reaps from the handler (no blocking wait4) — pump reaper published the recorded exit signal to the parent tid."
+    else
+      printf "FAIL [sigchld-async]: stdout=[%s] exit=%s oracle=[sigchld-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork/sigchld-async]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -1063,5 +1087,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring — all 37 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring+async-sigchld — all 38 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork, sigchld-async) pass on KVM; ZERO xfail."
 '
