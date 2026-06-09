@@ -1480,9 +1480,7 @@ fn run_threaded_hvf_loop(
     // waiter wakes, xsig MAP_SHARED ring, child-exit watches). Delegates to the
     // existing `crate::host_signal` glue; held object-safe in `KernelState`.
     let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
-        Arc::new(crate::signal_arrival::HvfSignalArrival {
-            kicker: Arc::clone(&kicker),
-        });
+        Arc::new(crate::signal_arrival::HvfSignalArrival);
     // Install the backend `TimerDelivery` the dispatch arm reaches through the
     // process-global (`dispatch/time.rs` has no KernelState ref). HVF arms an
     // EVFILT_TIMER on the pump kqueue and returns true (it owns delivery); only
