@@ -47,6 +47,15 @@ struct Args {
     /// Which tier to run: `smoke` (fast gate) or `full` (everything).
     #[arg(long, default_value = "full")]
     tier: String,
+    /// Execution lane: `hvf` (local signed binary, default) or `kvm` (carrick in the lima guest).
+    #[arg(long, default_value = "hvf")]
+    lane: String,
+    /// lima VM name for `--lane kvm`.
+    #[arg(long, default_value = "carrick", env = "LIMA_INSTANCE")]
+    lima_vm: String,
+    /// Host the lima guest resolves to the mac (for the conformance registry).
+    #[arg(long, default_value = "host.lima.internal")]
+    lima_gateway: String,
     /// Filter to these ecosystems (repeatable): cpython|go|node|ltp.
     #[arg(long)]
     ecosystem: Vec<String>,
@@ -124,10 +133,10 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
 
-    // Execution lane for the carrick side. Task 4 builds this from CLI args
-    // (`--lane`/`--lima-vm`/`--lima-gateway`); for now it is always the local
-    // Hvf lane, preserving today's behavior byte-for-byte.
-    let lane = lane::Lane::Hvf;
+    // Execution lane for the carrick side, built from the CLI args. `hvf` (the
+    // default) runs the local signed binary unchanged; `kvm` wraps carrick in the
+    // lima guest. The Hvf path is byte-for-byte the pre-lane behavior.
+    let lane = lane::lane_from_args(&args.lane, &args.lima_vm, &args.lima_gateway);
 
     if args.render_matrix {
         let reports = read_reports(&args.jsonl)?;
@@ -182,8 +191,14 @@ fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Binary preflight (abort on unsigned/missing; warn on stale).
-    preflight(&args.carrick_bin)?;
+    // Binary preflight (abort on unsigned/missing; warn on stale). The local-binary
+    // checks (codesign, exists) are HVF-only — the KVM binary lives in the guest and
+    // is validated by the lima preflight instead.
+    if lane.is_kvm() {
+        preflight_kvm(&lane, &args.carrick_bin)?;
+    } else {
+        preflight(&args.carrick_bin)?;
+    }
 
     let baseline = load_baseline(&args.baseline);
 
@@ -811,6 +826,13 @@ fn preflight(bin: &Path) -> anyhow::Result<()> {
             bin.display()
         );
     }
+    Ok(())
+}
+
+/// KVM-lane preflight: the local-binary checks do not apply (carrick lives in the
+/// guest), so this validates the lima wiring instead. Filled in by the next commit;
+/// for now it is a no-op gate.
+fn preflight_kvm(_lane: &lane::Lane, _carrick_in_guest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
