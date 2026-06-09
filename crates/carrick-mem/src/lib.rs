@@ -70,6 +70,7 @@
 // Moved files use `crate::linux_abi::…`; alias the leaf crate so they're unchanged.
 pub use carrick_abi as linux_abi;
 
+pub mod arch_sysregs;
 pub mod elf;
 pub mod memory;
 pub mod page_table;
