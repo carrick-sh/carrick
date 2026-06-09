@@ -1175,8 +1175,14 @@ pub mod host_signal {
     pub fn raise_for_self(sig: i32) {
         carrick_signal_core::publish_process_signal(sig);
     }
+    /// Drain the lowest process-directed pending signum (`0` if none). Bridges a
+    /// host-PUMPED process-directed signal (SIGTERM/SIGINT — the KVM pump sets
+    /// `carrick_signal_core::PROC_PENDING` via `proc_pending_fetch_or`) into the
+    /// post-EINTR delivery cycle so a `sigsuspend`-blocked thread wakes promptly
+    /// instead of only via the 5s safety belt. Delegates to the neutral core —
+    /// the same `take_process_pending` HVF's `take_pending` uses.
     pub fn take_pending() -> i32 {
-        0
+        carrick_signal_core::take_process_pending()
     }
     pub fn ensure_host_handler(_sig: i32) {}
     pub fn set_host_ignore(_sig: i32) {}
