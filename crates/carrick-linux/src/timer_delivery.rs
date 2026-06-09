@@ -89,11 +89,4 @@ impl TimerDelivery for KvmTimerDelivery {
     fn current_arm(&self, which: usize) -> Option<TimerArm> {
         carrick_timer_core::itimer::current_arm(which)
     }
-
-    fn clear(&self) {
-        // Fork-replay: reset all inherited interval-timer slots so a child does
-        // not fire a stale signal. (POSIX timers are not inherited across the
-        // fork-clear path; the registry is process-local.)
-        carrick_timer_core::itimer::clear();
-    }
 }
