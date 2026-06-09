@@ -76,6 +76,23 @@ extern "C" fn pump_handler(signum: libc::c_int) {
     }
 }
 
+/// Wake the pump thread from another async-signal-safe context (the xsignal
+/// nudge handler — see [`crate::kvm_xsig`]). Reads the published self-pipe write
+/// fd with a relaxed atomic load and, if live, `write(2)`s one byte (ignoring the
+/// result — a full nonblocking pipe already has a pending wake, EINTR is
+/// harmless). Async-signal-safe: only an atomic load + `write(2)`. Lets the nudge
+/// handler reuse the pump's `kick_all` fan-out without duplicating pipe state.
+pub fn poke() {
+    let w = SELF_PIPE_W.load(Ordering::Relaxed);
+    if w >= 0 {
+        let byte = [0u8; 1];
+        // SAFETY: write(2) is async-signal-safe; `w` is a live pipe write fd.
+        unsafe {
+            libc::write(w, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
+
 /// Install the `sigaction` disposition for every pumped signal. The handler runs
 /// with `SA_RESTART` so an interrupted host syscall (the pump's own `poll`/`read`
 /// is the only blocking host call on the threads that might catch it) restarts
