@@ -187,11 +187,32 @@ pub fn safe_guest_access_in(
     gpa: u64,
     len: usize,
 ) -> Result<*mut u8, GuestAccessError> {
-    if no_access(gpa, len) {
+    safe_guest_access_translated_in(no_access, regions, gpa, gpa, len)
+}
+
+/// Like [`safe_guest_access_in`], but the PROT_NONE check and the region lookup
+/// use SEPARATE guest addresses: `va` for the PROT_NONE gate, `ipa` for the
+/// backing lookup. This is the recurrence guard for the `repoint_private`
+/// (MAP_FIXED|MAP_PRIVATE over a shared-aperture VA) and high-VA-alias cases,
+/// where the guest's syscall pointer is NON-identity to its IPA: the syscall
+/// copy must land in the backing the guest's OWN EL0 accesses hit (the
+/// translated `ipa`), while `mprotect(PROT_NONE)` — which records the guest VA —
+/// must still fault EFAULT (keyed on `va`). For an identity VA the backend
+/// passes `ipa == va` and this is byte-identical to [`safe_guest_access_in`].
+pub fn safe_guest_access_translated_in(
+    no_access: impl FnOnce(u64, usize) -> bool,
+    regions: impl IntoIterator<Item = GuestMemoryRegion>,
+    va: u64,
+    ipa: u64,
+    len: usize,
+) -> Result<*mut u8, GuestAccessError> {
+    // PROT_NONE is recorded on the guest VA (mprotect's address), so gate on `va`.
+    if no_access(va, len) {
         return Err(GuestAccessError::NoAccess);
     }
-    find_region_in(regions, gpa, len)
-        // SAFETY: `find_region_in` proved `[gpa, gpa+len) ⊆ region`, so
+    // The host backing the guest actually reads/writes is keyed on the IPA.
+    find_region_in(regions, ipa, len)
+        // SAFETY: `find_region_in` proved `[ipa, ipa+len) ⊆ region`, so
         // `host_addr + off` points at `len` valid bytes of that region.
         .map(|(r, off)| unsafe { r.host_addr.add(off) })
         .ok_or(GuestAccessError::OutOfBounds)
@@ -330,6 +351,53 @@ mod tests {
             safe_guest_access(&prot, &regions, 0x3ff0, 0x20),
             Err(GuestAccessError::NoAccess)
         );
+    }
+
+    #[test]
+    fn translated_access_gates_va_but_looks_up_ipa() {
+        // Model the repoint_private case: a "shared" region at the VA (0x4000)
+        // and a private "overlay" region at a different IPA (0x9000). The guest
+        // VA 0x4040 is repointed (stage-1) to overlay IPA 0x9040.
+        let mut shared = vec![0xAAu8; 0x1000];
+        let mut overlay = vec![0xBBu8; 0x1000];
+        let shared_ptr = shared.as_mut_ptr();
+        let overlay_ptr = overlay.as_mut_ptr();
+        let regions = [
+            GuestMemoryRegion { base: 0x4000, len: 0x1000, host_addr: shared_ptr },
+            GuestMemoryRegion { base: 0x9000, len: 0x1000, host_addr: overlay_ptr },
+        ];
+        // The lookup follows the IPA (0x9040 -> overlay backing), NOT the VA.
+        let p = safe_guest_access_translated_in(
+            no_access_over(&[]),
+            regions,
+            0x4040, // va
+            0x9040, // ipa
+            0x10,
+        )
+        .expect("ok");
+        assert_eq!(p, unsafe { overlay_ptr.add(0x40) });
+        // PROT_NONE is keyed on the VA: mprotect(PROT_NONE) on the VA range must
+        // fault EVEN THOUGH the overlay IPA itself is accessible.
+        assert_eq!(
+            safe_guest_access_translated_in(
+                no_access_over(&[(0x4000, 0x5000)]),
+                regions,
+                0x4040, // va is PROT_NONE
+                0x9040, // ipa is fine
+                0x10,
+            ),
+            Err(GuestAccessError::NoAccess)
+        );
+        // A PROT_NONE recorded on the IPA must NOT affect a non-PROT_NONE VA.
+        let p2 = safe_guest_access_translated_in(
+            no_access_over(&[(0x9000, 0xa000)]),
+            regions,
+            0x4040, // va not protected
+            0x9040, // ipa "protected" but irrelevant — gate is VA-keyed
+            0x10,
+        )
+        .expect("ok: gate is keyed on the va, not the ipa");
+        assert_eq!(p2, unsafe { overlay_ptr.add(0x40) });
     }
 
     #[test]
