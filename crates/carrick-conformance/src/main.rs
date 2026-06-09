@@ -830,9 +830,59 @@ fn preflight(bin: &Path) -> anyhow::Result<()> {
 }
 
 /// KVM-lane preflight: the local-binary checks do not apply (carrick lives in the
-/// guest), so this validates the lima wiring instead. Filled in by the next commit;
-/// for now it is a no-op gate.
-fn preflight_kvm(_lane: &lane::Lane, _carrick_in_guest: &Path) -> anyhow::Result<()> {
+/// guest), so this validates the lima wiring instead — the VM is reachable, the
+/// in-guest carrick binary exists, and the conformance registry is reachable from
+/// the guest. The first two are FATAL (with actionable fixes); registry
+/// unreachability is a WARNING (the pull may still resolve, or be a transient).
+fn preflight_kvm(lane: &lane::Lane, carrick_in_guest: &Path) -> anyhow::Result<()> {
+    let lane::Lane::Kvm(cfg) = lane else {
+        return Ok(());
+    };
+    // 1. VM reachable.
+    let ok = Command::new("limactl")
+        .args(["shell", &cfg.vm, "--", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    anyhow::ensure!(
+        ok,
+        "lima VM '{}' not reachable — run `just lima-up` (or set --lima-vm).",
+        cfg.vm
+    );
+    // 2. carrick-in-guest present (build it with scripts/conformance/build-carrick-in-lima.sh).
+    let present = Command::new("limactl")
+        .args(["shell", &cfg.vm, "--", "test", "-x"])
+        .arg(carrick_in_guest)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    anyhow::ensure!(
+        present,
+        "carrick not built in guest at {} — run scripts/conformance/build-carrick-in-lima.sh and pass its output as --carrick_bin.",
+        carrick_in_guest.display()
+    );
+    // 3. registry reachable from the guest (best-effort: curl the v2 API).
+    let reg = format!("{}:5005", cfg.gateway);
+    let reachable = Command::new("limactl")
+        .args([
+            "shell",
+            &cfg.vm,
+            "--",
+            "bash",
+            "-lc",
+            &format!("curl -fsS http://{reg}/v2/ >/dev/null 2>&1"),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !reachable {
+        eprintln!(
+            "WARNING: conformance registry {reg} not reachable from the guest; \
+             image pulls may fail. Ensure the mac registry is published (-p 5005:5000) \
+             and {} resolves to the mac.",
+            cfg.gateway
+        );
+    }
     Ok(())
 }
 
