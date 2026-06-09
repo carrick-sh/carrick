@@ -989,8 +989,33 @@ CEOF
       printf "FAIL [proc-directed-nonmain]: stdout=[%s] exit=%s oracle=[worker-got-it]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 31. Task 8 (cross-process queued-signal fidelity): a REAL-TIME signal
+    #     queued from one guest process to a SIBLING guest process must be
+    #     delivered into that sibling guest WITH the sender si_value intact. The
+    #     guest installs an SA_SIGINFO SIGRTMIN handler, forks a child that
+    #     sigqueue(getppid(),SIGRTMIN,{.sival_int=0x1234})s the parent (a
+    #     cross-process queued send), and the parent — blocked in pause() — must
+    #     run the handler, observe sival_int==0x1234, and print "val-ok". A KVM
+    #     guest fork = separate host processes, so a native rt_sigqueueinfo would
+    #     NOT reach the sibling guest; carrick routes the signal through the
+    #     shared MAP_SHARED xsignal ring (sender writes a ring slot + nudges the
+    #     target with SIGRTMIN+1, whose handler marks the ring dirty + kicks the
+    #     target vCPUs out of KVM_RUN; the receiver drains the ring in dispatch
+    #     context and re-injects the signal with the sender siginfo). REQUIRED gate.
+    xproc_src="$fixdir/xproc-sigqueue/xproc-sigqueue.c"
+    gcc -static -O2 -o /tmp/xproc_sigqueue "$xproc_src"
+    # -s KILL: a regression that wedges (handler never runs) must be force-killed
+    # so the smoke fails fast rather than hanging for the full timeout.
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/xproc_sigqueue" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "val-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+xproc-sigqueue]: a cross-process sigqueue delivered SIGRTMIN into the sibling guest with si_value=0x1234 intact via the shared xsignal ring."
+    else
+      printf "FAIL [xproc-sigqueue]: stdout=[%s] exit=%s oracle=[val-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -1001,5 +1026,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump — all 34 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring — all 35 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue) pass on KVM; ZERO xfail."
 '

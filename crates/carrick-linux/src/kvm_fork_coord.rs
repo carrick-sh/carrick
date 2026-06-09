@@ -60,6 +60,16 @@ impl KvmForkCoordinator {
     /// Install the kick-signal handler (idempotent) and record it as live.
     fn ensure_handler_installed(&self) {
         install_kvm_kick_handler();
+        // Also initialise the cross-process explicit-signal ring + its nudge
+        // handler. ORDERING IS LOAD-BEARING: `ensure_handler_installed` first
+        // runs at STARTUP (pre-fork, via `start_signal_pump`), so the
+        // `MAP_SHARED` ring is created BEFORE `libc::fork` and inherited by every
+        // child — all carrick processes then share ONE ring. It ALSO runs in
+        // `restart_after_child_fork`, where `xsig_init` is idempotent (no-ops on
+        // the inherited ring) and only the nudge handler is re-asserted in the
+        // child. This single hook therefore covers both the pre-fork create and
+        // the post-fork re-arm.
+        crate::kvm_xsig::init_xsig();
         *self
             .signal_pump_installed
             .lock()

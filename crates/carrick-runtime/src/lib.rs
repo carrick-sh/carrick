@@ -1097,10 +1097,38 @@ pub mod host_signal {
     // path); for a self-raise the publishing thread reaches
     // `deliver_pending_signal` itself on the next loop iteration.
     pub use carrick_signal_core::{
-        NO_PENDING_SIGNAL, forget_thread, has_pending_for, has_process_pending,
-        has_unblocked_pending_for, last_sender_for, publish_pending_for, take_pending_for,
-        take_pending_in_for,
+        NO_PENDING_SIGNAL, forget_thread, has_process_pending, last_sender_for,
+        publish_pending_for, take_pending_for, take_pending_in_for,
     };
+
+    // `has_pending_for` / `has_unblocked_pending_for` are NOT pure re-exports on
+    // KVM: a cross-process guest signal may be sitting in the shared xsignal ring
+    // (see `carrick_linux::kvm_xsig`), so a waiter must also peek the ring. These
+    // wrappers fold the ring check over the neutral-core pending check, mirroring
+    // the HVF backend's `host_signal::has_pending_for` / `has_unblocked_pending_for`.
+
+    /// Is a signal deliverable to `tid` pending? True for a thread-directed signal
+    /// for this tid, any process-directed signal, OR an unblocked self-targeted
+    /// entry in the shared xsignal ring. Used by a parked thread to decide whether
+    /// to break its wait so the loop can deliver.
+    pub fn has_pending_for(tid: i32) -> bool {
+        if carrick_signal_core::xsig::xsig_has_unblocked_for_self(0) {
+            return true;
+        }
+        carrick_signal_core::has_pending_for(tid)
+    }
+
+    /// Like [`has_pending_for`], but a signal blocked by `block_mask` (bit
+    /// `signum-1`) does NOT count as deliverable-for-waking. A queued cross-process
+    /// signal in the xsignal ring is peeked WITHOUT consuming it so a temporary
+    /// ppoll/epoll_pwait mask keeps genuinely blocked signals pending until the
+    /// syscall returns. `block_mask == 0` is identical to [`has_pending_for`].
+    pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
+        if carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask) {
+            return true;
+        }
+        carrick_signal_core::has_unblocked_pending_for(tid, block_mask)
+    }
 
     // ---- KVM-arm-only glue stubs (no carrick-signal-core equivalent) ----
     // These are macOS host-signal-pump / cross-process-xsignal mechanisms with no
@@ -1121,11 +1149,17 @@ pub mod host_signal {
         None
     }
     pub fn reset_routed_handlers_after_execve(_ignored_mask: u64) {}
+    /// Did a cross-process nudge arrive since the last drain? Delegates to the
+    /// neutral ring core (the nudge handler in `carrick_linux::kvm_xsig` set the
+    /// dirty flag).
     pub fn xsig_has_pending() -> bool {
-        false
+        carrick_signal_core::xsig::xsig_has_pending()
     }
+    /// Drain every xsignal-ring entry targeting THIS process, clearing the dirty
+    /// flag. Called in dispatch context; the consumer rebuilds siginfo (preserving
+    /// `si_value` for RT signals) and marks each signal pending.
     pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
-        Vec::new()
+        carrick_signal_core::xsig::xsig_drain_for_self()
     }
     /// Self-directed `kill(getpid(), sig)` for an UNBLOCKED signal: publish it
     /// into the process-directed pending mask so the generic vCPU loop injects
@@ -1143,16 +1177,24 @@ pub mod host_signal {
     pub fn ensure_host_handler(_sig: i32) {}
     pub fn set_host_ignore(_sig: i32) {}
     pub fn set_host_default(_linux_signum: i32) {}
+    /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
+    /// ring (inherited across `fork`, so every carrick process shares ONE ring).
+    /// Delegates to the neutral ring core; false = no ring or ring full.
     pub fn xsig_enqueue(
-        _target_host: i32,
-        _sig: i32,
-        _sender_ns: i32,
-        _sender_uid: u32,
-        _value: i64,
+        target_host: i32,
+        sig: i32,
+        sender_ns: i32,
+        sender_uid: u32,
+        value: i64,
     ) -> bool {
-        false
+        carrick_signal_core::xsig::xsig_enqueue(target_host, sig, sender_ns, sender_uid, value)
     }
-    pub fn xsig_nudge(_target_host: i32) {}
+    /// Nudge `target_host` (a sibling carrick process) to drain its xsignal ring
+    /// — host `SIGRTMIN+1`, a pure wakeup whose handler marks the ring dirty +
+    /// kicks the target's vCPUs out of `KVM_RUN` (see `carrick_linux::kvm_xsig`).
+    pub fn xsig_nudge(target_host: i32) {
+        carrick_linux::kvm_xsig::xsig_nudge(target_host);
+    }
     /// No kqueue signal pump on Linux. Returning -1 makes the `setitimer`
     /// dispatch path (the only caller) skip the EVFILT_TIMER arming and use the
     /// wall-clock fallback timer thread (`itimer::spawn_fallback_timer`) instead.
@@ -1322,7 +1364,7 @@ pub mod io_wait {
         }
     }
 
-    fn ppoll_wait(fds: &[WaitFd], timeout: Option<Duration>, _block_mask: u64) -> WaitResult {
+    fn ppoll_wait(fds: &[WaitFd], timeout: Option<Duration>, block_mask: u64) -> WaitResult {
         let mut pollfds: Vec<libc::pollfd> = fds
             .iter()
             .map(|w| libc::pollfd {
@@ -1381,7 +1423,15 @@ pub mod io_wait {
                 // the handler never ran. A spurious kick with nothing pending
                 // (e.g. a fork-quiesce nudge, handled by the caller) still falls
                 // through to the re-arm retry below.
-                if crate::host_signal::has_process_pending() {
+                // A cross-process guest signal may instead be sitting in the
+                // shared xsignal ring (a SIGRTMIN+1 nudge marked it dirty — see
+                // `carrick_linux::kvm_xsig`): peek the ring (without consuming) so
+                // an `Interrupted` lets `deliver_pending_signal` drain it and
+                // re-inject the guest signal with the sender's siginfo. The
+                // `block_mask` keeps a genuinely-blocked ring signal parked.
+                if crate::host_signal::has_process_pending()
+                    || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
+                {
                     return WaitResult::Interrupted;
                 }
                 // Spurious host signal; no guest signal delivery yet — retry.
