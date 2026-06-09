@@ -10,9 +10,9 @@ use carrick_mem::arch_sysregs::{
     CPACR_EL1_BOOTSTRAP, MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP,
 };
 use carrick_mem::memory::{
-    AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_EL1_VECTORS_SIZE,
-    LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes, stage1_identity_page_tables,
-    va_in_shared_aperture,
+    AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_MAINT_BASE, LINUX_EL1_VECTORS_BASE,
+    LINUX_EL1_VECTORS_SIZE, LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes,
+    stage1_identity_page_tables, va_in_shared_aperture,
 };
 use carrick_mem::protections::MemoryProtections;
 
@@ -43,6 +43,22 @@ pub const SENTINEL_GPA: u64 = 0x50_0000_0000; // 320 GiB
 /// heap/mmap gap (between 320 GiB SENTINEL and 384 GiB `LINUX_MMAP_BASE`), so
 /// the store always faults to stage-2 / MMIO.
 pub const FAULT_SENTINEL_GPA: u64 = 0x51_0000_0000; // 324 GiB
+
+/// Guest-physical address the EL1 stage-1 MAINTENANCE trampoline stores to once
+/// it has flushed the stage-1 TLB. Same dual constraints as [`SENTINEL_GPA`]:
+/// stage-1 identity-mapped (so the EL1 store translates) yet UNMAPPED in every
+/// KVM slot (so it faults out as `KVM_EXIT_MMIO { gpa: MAINT_SENTINEL_GPA, .. }`
+/// — the completion vehicle). 328 GiB sits in the same heap/mmap gap as the
+/// other two sentinels (between 324 GiB FAULT_SENTINEL and 384 GiB
+/// `LINUX_MMAP_BASE`), so the store always faults to stage-2 / MMIO.
+///
+/// This is the KVM analogue of HVF's `hvc #1` maintenance-complete marker: KVM
+/// runs the guest with PSCI 0.2 enabled, so a guest `hvc` traps to EL2 and is
+/// consumed by KVM's PSCI/SMCCC handler (an unknown function-id is reflected
+/// back to the guest, NOT surfaced as a userspace exit) — it would never reach
+/// us. The MMIO sentinel store is the SAME proven mechanism the syscall/fault
+/// vectors use, so the maintenance run uses it too instead of `hvc #1`.
+pub const MAINT_SENTINEL_GPA: u64 = 0x52_0000_0000; // 328 GiB
 
 /// Base of the KVM alias-GPA arena: a free identity hole between the private
 /// overlay (608+2 GiB) and the stack (~1 TiB), within the 40-bit nested-KVM IPA
@@ -182,6 +198,77 @@ pub fn el1_vectors_sentinel_bytes() -> Vec<u8> {
     bytes
 }
 
+// Stage-1 maintenance barrier/TLBI opcodes (verified against GNU `as`, and
+// re-asserted by `maint_sentinel_bytes_*` below). These match carrick-mem's
+// private `el1_maintenance_bytes` opcodes; redefined locally because the KVM
+// variant ends in an MMIO sentinel store, not `hvc #1` (see MAINT_SENTINEL_GPA).
+const ENC_DSB_SY: u32 = 0xd503_3f9f; // dsb sy
+const ENC_TLBI_VMALLE1IS: u32 = 0xd508_831f; // tlbi vmalle1is (inner-shareable)
+const ENC_ISB: u32 = 0xd503_3fdf; // isb
+
+/// Build the EL1 stage-1 MAINTENANCE trampoline page for KVM. Carrick runs this
+/// on its own vCPU (PC = [`carrick_mem::memory::LINUX_EL1_MAINT_BASE`], PSTATE =
+/// EL1h-DAIF-masked) AFTER editing stage-1 page descriptors, to flush the stale
+/// stage-1 TLB so the guest observes the new mapping. It is the KVM analogue of
+/// carrick-mem's `el1_maintenance_bytes` (the HVF variant), differing ONLY in
+/// the completion marker: HVF ends in `hvc #1` (traps EL1→EL2 → HVF exit), but
+/// on KVM `hvc` is consumed by PSCI and never surfaces, so the KVM variant
+/// materialises [`MAINT_SENTINEL_GPA`] into x9 and STORES there — the same
+/// MMIO-exit completion vehicle the syscall/fault vectors use.
+///
+/// Register discipline: the trampoline clobbers x8 and x9 (the store value and
+/// the sentinel-address scratch). The caller ([`crate::trap_engine::
+/// KvmTrapEngine::run_el1_maintenance`]) SAVES and RESTORES x8 and x9 around the
+/// run, exactly as it saves/restores PC/PSTATE/ELR_EL1/SPSR_EL1 — so the
+/// in-flight (parked) syscall frame resumes unperturbed. The store value (x8) is
+/// irrelevant to the host (only the gpa matters), so it is left as the
+/// materialised gpa to avoid touching any other register.
+///
+/// `dsb sy; tlbi vmalle1is; dsb sy; isb` is the architectural sequence: make the
+/// prior descriptor stores observable, drop all stage-1 TLB entries in the
+/// inner-shareable domain (broadcasting to any PMR-paused sibling vCPUs), make
+/// the invalidation observable, then resynchronise translation before the store.
+pub fn el1_maintenance_sentinel_bytes() -> Vec<u8> {
+    use carrick_mem::memory::LINUX_EL1_MAINT_SIZE;
+    let size = LINUX_EL1_MAINT_SIZE as usize;
+    let mut bytes = vec![0u8; size];
+    let put = |b: &mut [u8], off: usize, op: u32| {
+        b[off..off + 4].copy_from_slice(&op.to_le_bytes());
+    };
+    // dsb sy; tlbi vmalle1is; dsb sy; isb — flush the stage-1 TLB (inner-shareable).
+    put(&mut bytes, 0, ENC_DSB_SY);
+    put(&mut bytes, 4, ENC_TLBI_VMALLE1IS);
+    put(&mut bytes, 8, ENC_DSB_SY);
+    put(&mut bytes, 12, ENC_ISB);
+    // movz/movk x9, MAINT_SENTINEL_GPA; str x8,[x9] — the completion MMIO store.
+    put(&mut bytes, 16, enc_movz_x9((MAINT_SENTINEL_GPA & 0xFFFF) as u16, 0));
+    put(
+        &mut bytes,
+        20,
+        enc_movk_x9(((MAINT_SENTINEL_GPA >> 16) & 0xFFFF) as u16, 1),
+    );
+    put(
+        &mut bytes,
+        24,
+        enc_movk_x9(((MAINT_SENTINEL_GPA >> 32) & 0xFFFF) as u16, 2),
+    );
+    put(
+        &mut bytes,
+        28,
+        enc_movk_x9(((MAINT_SENTINEL_GPA >> 48) & 0xFFFF) as u16, 3),
+    );
+    put(&mut bytes, 32, ENC_STR_X8_X9); // str x8,[x9] -> KVM_EXIT_MMIO { gpa == MAINT_SENTINEL_GPA }
+    // The MMIO store IS the exit: run_el1_maintenance stops the loop on the
+    // MAINT_SENTINEL exit and never re-enters, so anything after it is dead. Pad
+    // the rest with `nop` so an accidental over-run is harmless.
+    let mut c = 36;
+    while c + 4 <= size {
+        put(&mut bytes, c, AARCH64_NOP_OPCODE);
+        c += 4;
+    }
+    bytes
+}
+
 /// Whether the host `mmap` backing a guest-physical window is shared across
 /// `fork(2)` (`MAP_SHARED`) or copy-on-write snapshotted (`MAP_PRIVATE`).
 ///
@@ -244,9 +331,13 @@ pub struct GuestRam {
     /// mprotect/munmap). carrick backs the whole arena with accessible host
     /// memory, so a PROT_NONE buffer is otherwise readable on the syscall path —
     /// a guest passing such a buffer to a syscall must instead see EFAULT. This
-    /// is the HOST-SIDE syscall-read check only (cheap, no page tables); making
-    /// the GUEST itself fault mid-EL0 needs stage-1 edits + signal injection
-    /// (Phase D), so `protect_range`/`unmap_range` stay no-ops for now.
+    /// is the HOST-SIDE syscall-read check (cheap, no page tables). Making the
+    /// GUEST itself fault mid-EL0 is the COMPLEMENTARY stage-1 path:
+    /// `protect_range`/`unmap_range`/`unmap_alias_range` edit the live stage-1
+    /// descriptors (via [`crate::trap_engine::KvmTrapEngine::pt_edit_and_flush`],
+    /// which also runs the EL1-maintenance TLBI so a RE-protect of an already-
+    /// walked page takes effect) and the Phase-4 EL0-fault→SIGSEGV path delivers
+    /// the resulting abort — so these are LIVE overrides, not no-ops.
     ///
     /// SHARED (`Arc`) with every sibling vCPU thread's `GuestRam`, exactly like
     /// HVF: a `clone(CLONE_VM)` thread group runs on one VM, so a `mprotect`
@@ -349,10 +440,12 @@ impl GuestRam {
             .ok_or_else(|| OsError::new(format!("kvm: window 0x{base:x}+{len} overflows")))?;
         if (base <= SENTINEL_GPA && SENTINEL_GPA < end)
             || (base <= FAULT_SENTINEL_GPA && FAULT_SENTINEL_GPA < end)
+            || (base <= MAINT_SENTINEL_GPA && MAINT_SENTINEL_GPA < end)
         {
             return Err(OsError::new(format!(
                 "kvm: window 0x{base:x}..0x{end:x} would back a sentinel gpa \
-                 (syscall 0x{SENTINEL_GPA:x} / fault 0x{FAULT_SENTINEL_GPA:x}); both must stay unmapped"
+                 (syscall 0x{SENTINEL_GPA:x} / fault 0x{FAULT_SENTINEL_GPA:x} / \
+                 maint 0x{MAINT_SENTINEL_GPA:x}); all must stay unmapped"
             )));
         }
         let mmap_flags = match kind {
@@ -413,6 +506,7 @@ impl GuestRam {
             .ok_or_else(|| OsError::new(format!("kvm: alias slot 0x{gpa:x}+{size} overflows")))?;
         if (gpa <= SENTINEL_GPA && SENTINEL_GPA < gpa_end)
             || (gpa <= FAULT_SENTINEL_GPA && FAULT_SENTINEL_GPA < gpa_end)
+            || (gpa <= MAINT_SENTINEL_GPA && MAINT_SENTINEL_GPA < gpa_end)
         {
             return Err(OsError::new(format!(
                 "kvm: alias slot 0x{gpa:x}..0x{gpa_end:x} would back a sentinel gpa"
@@ -700,6 +794,15 @@ impl GuestRam {
         ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
         // 3. Our sentinel vector (NOT carrick-mem's hvc #2 variant).
         ram.write_gpa(LINUX_EL1_VECTORS_BASE, &el1_vectors_sentinel_bytes())?;
+        // 4. Our stage-1 MAINTENANCE trampoline (NOT carrick-mem's hvc #1
+        //    variant). The canonical AddressSpace already placed `el1_maintenance_
+        //    bytes()` (the HVF `hvc #1` version) at LINUX_EL1_MAINT_BASE via the
+        //    region loop above; OVERWRITE it with the KVM MMIO-sentinel variant so
+        //    run_el1_maintenance's flush completes via a KVM_EXIT_MMIO instead of an
+        //    `hvc` that PSCI would swallow. The page is inside the kernel hole's
+        //    first 2 MiB block, so stage-1 maps it EL1-executable (AP=00/UXN=1/
+        //    PXN=0) — runnable at EL1 by construction.
+        ram.write_gpa(LINUX_EL1_MAINT_BASE, &el1_maintenance_sentinel_bytes())?;
         Ok(ram)
     }
 
@@ -1029,6 +1132,54 @@ mod vector_tests {
         );
         assert_eq!(op(60), ENC_STR_X8_X9, "s+60 fault str x8,[x9]");
         assert_eq!(op(64), AARCH64_ERET_OPCODE, "s+64 fault eret");
+    }
+
+    /// Byte-assert the KVM stage-1 maintenance trampoline: the
+    /// `dsb sy; tlbi vmalle1is; dsb sy; isb` barrier sequence, then a
+    /// MAINT_SENTINEL_GPA materialize + `str x8,[x9]` completion store (the KVM
+    /// MMIO analogue of HVF's closing `hvc #1`). Hand-assembled EL1 asm is
+    /// high-risk; this locks every opcode + the gpa materialization.
+    #[test]
+    fn maint_sentinel_bytes_flush_then_mmio_store() {
+        let bytes = el1_maintenance_sentinel_bytes();
+        assert_eq!(
+            bytes.len() as u64,
+            carrick_mem::memory::LINUX_EL1_MAINT_SIZE,
+            "maint trampoline fills the whole region"
+        );
+        let op =
+            |off: usize| -> u32 { u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) };
+        assert_eq!(op(0), ENC_DSB_SY, "0 dsb sy");
+        assert_eq!(op(4), ENC_TLBI_VMALLE1IS, "4 tlbi vmalle1is");
+        assert_eq!(op(8), ENC_DSB_SY, "8 dsb sy");
+        assert_eq!(op(12), ENC_ISB, "12 isb");
+        assert_eq!(
+            op(16),
+            enc_movz_x9((MAINT_SENTINEL_GPA & 0xFFFF) as u16, 0),
+            "16 movz x9, MAINT_SENTINEL[0]"
+        );
+        assert_eq!(
+            op(20),
+            enc_movk_x9(((MAINT_SENTINEL_GPA >> 16) & 0xFFFF) as u16, 1),
+            "20 movk x9, MAINT_SENTINEL[1]"
+        );
+        assert_eq!(
+            op(24),
+            enc_movk_x9(((MAINT_SENTINEL_GPA >> 32) & 0xFFFF) as u16, 2),
+            "24 movk x9, MAINT_SENTINEL[2]"
+        );
+        assert_eq!(
+            op(28),
+            enc_movk_x9(((MAINT_SENTINEL_GPA >> 48) & 0xFFFF) as u16, 3),
+            "28 movk x9, MAINT_SENTINEL[3]"
+        );
+        assert_eq!(op(32), ENC_STR_X8_X9, "32 str x8,[x9] (MMIO completion)");
+        // The tail is `nop` padding (any over-run past the exit is harmless).
+        assert_eq!(op(36), AARCH64_NOP_OPCODE, "36 nop pad");
+        // The three sentinels must be DISTINCT gpas so the host disambiguates a
+        // syscall trap, a fault trap, and a maintenance completion by gpa alone.
+        assert_ne!(MAINT_SENTINEL_GPA, SENTINEL_GPA);
+        assert_ne!(MAINT_SENTINEL_GPA, FAULT_SENTINEL_GPA);
     }
 }
 

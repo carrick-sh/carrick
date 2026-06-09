@@ -80,25 +80,25 @@ impl KvmTrapEngine {
     }
 
     /// Edit the live stage-1 page tables (the guest's own translation tables at
-    /// `LINUX_PAGE_TABLES_BASE`) and replay the changed descriptors into the
-    /// guest page-table backing, so a guest `mmap`/`mprotect`/`munmap` becomes
-    /// GUEST-visible (UXN / AP / validity), not merely host-side. Builds the
-    /// `PageTableManager` lazily from the live backing on first use (the boot
-    /// image already wrote `stage1_identity_page_tables` there).
+    /// `LINUX_PAGE_TABLES_BASE`) under the shared manager lock and replay the
+    /// changed descriptors into the guest page-table backing — the locked EDIT
+    /// CORE, WITHOUT a TLB flush. Builds the `PageTableManager` lazily from the
+    /// live backing on first use (the boot image already wrote
+    /// `stage1_identity_page_tables` there). Returns whether the edit CHANGED any
+    /// descriptor (so the caller can skip a pointless flush on a no-op edit).
     ///
-    /// No stage-1 TLB flush is issued (the EL1-vector TLBI is the Phase-D
-    /// follow-up): a freshly-`mmap`'d page has no stale TLB entry, so the guest's
-    /// first access walks the just-updated tables — exactly the dynamic-loader
-    /// case (map a library `PROT_EXEC`, then jump into it). Re-protecting an
-    /// ALREADY-accessed page (RELRO `RW→RO`) is therefore not yet enforced.
-    /// Coalescing is disabled (`set_multi_vcpu(true)`) because the
-    /// break-before-make table-free is unsafe without that all-vCPU flush.
-    fn pt_edit(
+    /// This is the no-flush primitive: callers that map a BRAND-NEW VA (no stale
+    /// TLB entry, so the guest's first access walks the just-written tables) —
+    /// e.g. [`Self::map_host_alias`]'s fresh alias — use [`Self::pt_edit`]
+    /// directly. Callers that may RE-protect an already-walked VA route through
+    /// [`Self::pt_edit_and_flush`], which runs [`Self::run_el1_maintenance`]
+    /// afterwards so the stale stage-1 TLB entry is invalidated.
+    fn pt_edit_locked(
         &mut self,
         edit: impl FnOnce(
             &mut carrick_mem::page_table::PageTableManager,
         ) -> Result<bool, carrick_mem::page_table::PageTableError>,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<bool, MemoryError> {
         use carrick_mem::page_table::{PageTableError, PageTableManager};
         const PT_BASE: u64 = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
@@ -107,6 +107,23 @@ impl KvmTrapEngine {
             .host_ptr(PT_BASE, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
         let pt = Arc::clone(&self.page_tables);
+        // `Arc::strong_count > 1` ⟺ a `clone(CLONE_THREAD)` sibling shares THIS
+        // page-table manager (the spec clones the Arc into each sibling engine);
+        // `== 1` ⟺ this is the SOLE vCPU over the backing. Coalescing reclaims
+        // spare sub-tables into the pool — a break-before-make table↔block flip
+        // plus a page free, unsafe only if another vCPU holds a stale walk-cache
+        // reference to the freed page. So coalesce is safe iff the edit is
+        // EXCLUSIVE. The single-vCPU case (count==1) is provably exclusive here,
+        // so re-enable coalescing then (the OutOfTables→ENOMEM-under-churn fix
+        // for a single-threaded guest). The multi-vCPU case stays conservative
+        // (unsafe_to_coalesce = true): the generic loop's Pause-Modify-Resume DOES
+        // pause siblings + `tlbi vmalle1is`-broadcast around every threaded stage-1
+        // editor (vcpu_loop.rs pt_pause), making coalesce safe there too, but the
+        // engine cannot read that barrier from this crate (it lives in
+        // carrick-runtime), so it keeps today's conservative flag rather than
+        // assume the PMR is held. (HVF, which CAN read the barrier, uses
+        // `live_multi && !is_quiescing()`.)
+        let unsafe_to_coalesce = Arc::strong_count(&pt) > 1;
         let mut guard = pt.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             // Build from the live guest backing (the boot tables) on first edit —
@@ -124,9 +141,7 @@ impl KvmTrapEngine {
                 "page-table manager unexpectedly absent".to_string(),
             ));
         };
-        // No all-vCPU TLB broadcast yet (Phase D), so the break-before-make
-        // table-free in coalescing is unsafe: keep it disabled.
-        mgr.set_multi_vcpu(true);
+        mgr.set_multi_vcpu(unsafe_to_coalesce);
         let changed = edit(mgr).map_err(|e| match e {
             PageTableError::OutOfTables => {
                 MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
@@ -142,7 +157,141 @@ impl KvmTrapEngine {
             // slots within `[host, host + size)`.
             unsafe { mgr.sync_to_host(host) };
         }
-        Ok(())
+        Ok(changed)
+    }
+
+    /// Edit the stage-1 tables WITHOUT a TLB flush. For BRAND-NEW VAs only (no
+    /// stale TLB entry): the guest's first access walks the just-written tables.
+    /// Used by [`Self::map_host_alias`]'s fresh alias mapping — re-protecting an
+    /// already-walked VA must instead go through [`Self::pt_edit_and_flush`].
+    fn pt_edit(
+        &mut self,
+        edit: impl FnOnce(
+            &mut carrick_mem::page_table::PageTableManager,
+        ) -> Result<bool, carrick_mem::page_table::PageTableError>,
+    ) -> Result<(), MemoryError> {
+        self.pt_edit_locked(edit).map(|_changed| ())
+    }
+
+    /// Edit the stage-1 tables AND, if any descriptor changed, flush the stale
+    /// stage-1 TLB by running the EL1-maintenance trampoline on this vCPU
+    /// ([`Self::run_el1_maintenance`]). This makes a RE-protect / `munmap` of an
+    /// ALREADY-WALKED page take effect (e.g. `mprotect(PROT_READ)` of a touched
+    /// RW page → a subsequent store faults; `munmap` of a touched page → access
+    /// faults), where a bare descriptor edit would leave a stale writable TLB
+    /// entry live. A no-op edit (range already at the target protection) writes
+    /// nothing and skips the flush. Mirrors HVF's `pt_edit_and_flush`.
+    ///
+    /// Cross-vCPU: the generic threaded loop's Pause-Modify-Resume
+    /// (`vcpu_loop.rs` `pt_pause`) has already PAUSED every sibling vCPU out of
+    /// guest before this edit runs, and the maintenance trampoline's
+    /// `tlbi vmalle1is` is INNER-SHAREABLE, so it broadcasts the invalidation to
+    /// the paused siblings' stage-1 TLBs too — multi-threaded correctness comes
+    /// from PMR (pause) + the inner-shareable flush, both reused here, not
+    /// re-invented.
+    fn pt_edit_and_flush(
+        &mut self,
+        edit: impl FnOnce(
+            &mut carrick_mem::page_table::PageTableManager,
+        ) -> Result<bool, carrick_mem::page_table::PageTableError>,
+    ) -> Result<(), MemoryError> {
+        let changed = self.pt_edit_locked(edit)?;
+        if !changed {
+            // Nothing changed (range already at the target protection): no host
+            // write happened, so there is no stale TLB entry to flush.
+            return Ok(());
+        }
+        self.run_el1_maintenance()
+            .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
+    }
+
+    /// Flush the stale stage-1 TLB after a host page-descriptor edit by running
+    /// the EL1 stage-1 maintenance trampoline on THIS vCPU. The trampoline
+    /// (`dsb sy; tlbi vmalle1is; dsb sy; isb`) lives at
+    /// [`carrick_mem::memory::LINUX_EL1_MAINT_BASE`] and ends in an MMIO store to
+    /// [`crate::guest_setup::MAINT_SENTINEL_GPA`] — the KVM completion vehicle, in
+    /// place of HVF's `hvc #1` (which KVM's PSCI handler would swallow).
+    ///
+    /// The vCPU is parked at a syscall (or fault) trap when this runs, so it
+    /// saves and restores the interrupted EL1-vector state — PC, PSTATE (CPSR),
+    /// ELR_EL1, SPSR_EL1 — AND the two GPRs the trampoline clobbers (x8 the store
+    /// value, x9 the sentinel-address scratch). With those restored, the in-flight
+    /// syscall resumes exactly as before. Mirrors HVF's `run_el1_maintenance`.
+    fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
+        use crate::guest_setup::MAINT_SENTINEL_GPA;
+        // M[3:0]=0b0101 EL1h (SP_EL1) + DAIF masked, PAN(bit22)=0 — the SAME
+        // PSTATE boot uses to run the EL0-entry trampoline at EL1 (program_sysregs
+        // sets `PSTATE_M_EL1H | DAIF_MASKED`). The maintenance trampoline issues
+        // no EL0-accessible store under PAN, so PAN=0 is not strictly required,
+        // but matching boot keeps the EL1 entry conditions identical.
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+
+        let g = |this: &Self, r: Reg| {
+            this.vcpu
+                .reg(r)
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        };
+        // Save the interrupted EL1-vector state + the two scratch GPRs the
+        // trampoline clobbers.
+        let saved_pc = g(self, Reg::Pc)?;
+        let saved_pstate = g(self, Reg::Pstate)?;
+        let saved_elr = g(self, Reg::ElrEl1)?;
+        let saved_spsr = g(self, Reg::SpsrEl1)?;
+        let saved_x8 = g(self, Reg::X(8))?;
+        let saved_x9 = g(self, Reg::X(9))?;
+
+        let s = |this: &mut Self, r: Reg, v: u64| {
+            this.vcpu
+                .set_reg(r, v)
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        };
+        s(self, Reg::Pc, carrick_mem::memory::LINUX_EL1_MAINT_BASE)?;
+        s(self, Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
+
+        // Run the trampoline to its completion MMIO store. A cross-thread kick
+        // (KVM_RUN EINTR → VcpuExit::Kicked) can land mid-flush; the trampoline is
+        // tiny and idempotent, so just re-enter it. Any OTHER exit is ambiguous
+        // (we cannot trust guest memory visibility) — surface it. (No guest_cpu
+        // accounting: this is a host-driven flush, not guest execution time.)
+        let result = loop {
+            match self.vcpu.run() {
+                Ok(VcpuExit::MmioWrite { gpa, .. }) if gpa == MAINT_SENTINEL_GPA => {
+                    if std::env::var_os("CARRICK_MAINT_DEBUG").is_some() {
+                        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                        eprintln!("[MAINTDBG tid={tid}] stage-1 TLBI completed");
+                    }
+                    break Ok(());
+                }
+                Ok(VcpuExit::Kicked) => continue,
+                Ok(other) => {
+                    // `VcpuExit` is not Debug; describe the variant inline.
+                    let what = match other {
+                        VcpuExit::MmioWrite { gpa, .. } => {
+                            format!("MmioWrite at non-maint gpa=0x{gpa:x}")
+                        }
+                        VcpuExit::Halt => "Halt".to_string(),
+                        VcpuExit::Exception { syndrome, .. } => {
+                            format!("Exception esr=0x{syndrome:x}")
+                        }
+                        VcpuExit::Kicked => "Kicked".to_string(),
+                    };
+                    break Err(TrapError::UnexpectedExit {
+                        reason: format!("{what} during EL1 stage-1 maintenance"),
+                    });
+                }
+                Err(e) => break Err(TrapError::Hypervisor(e.to_string())),
+            }
+        };
+
+        // Restore the interrupted EL1-vector state + scratch GPRs on EVERY path so
+        // the parked syscall resumes unperturbed even if the flush errored.
+        s(self, Reg::Pc, saved_pc)?;
+        s(self, Reg::Pstate, saved_pstate)?;
+        s(self, Reg::ElrEl1, saved_elr)?;
+        s(self, Reg::SpsrEl1, saved_spsr)?;
+        s(self, Reg::X(8), saved_x8)?;
+        s(self, Reg::X(9), saved_x9)?;
+        result
     }
 
     /// Read `len` bytes of live guest memory at guest-physical `gpa` (e.g. a
@@ -171,13 +320,15 @@ impl KvmTrapEngine {
 /// `read_bytes`/`write_bytes` move syscall buffers; `set_no_access`/
 /// `zero_backing` implement the HOST-SIDE PROT_NONE check (a bad syscall
 /// buffer faults with EFAULT). `protect_range`/`unmap_range`/`unmap_alias_range`
-/// edit the live stage-1 tables (via [`KvmTrapEngine::pt_edit`]) so the GUEST's
-/// own EL0 access honours `mmap`/`mprotect`/`munmap` permissions — clearing UXN
-/// makes a freshly-mapped library text executable; combined with the Phase-4
-/// EL0-fault→SIGSEGV path, a PROT_NONE/munmap'd page now faults the guest. Not
-/// yet wired: `repoint_private` (the MAP_FIXED|MAP_PRIVATE overlay), and a
-/// stage-1 TLB flush so re-protecting an ALREADY-accessed page takes effect
-/// (the EL1-vector TLBI is the remaining Phase-D piece — fresh pages need none).
+/// edit the live stage-1 tables (via [`KvmTrapEngine::pt_edit_and_flush`]) so the
+/// GUEST's own EL0 access honours `mmap`/`mprotect`/`munmap` permissions —
+/// clearing UXN makes a freshly-mapped library text executable; combined with the
+/// Phase-4 EL0-fault→SIGSEGV path, a PROT_NONE/munmap'd page faults the guest. A
+/// RE-protect / `munmap` of an ALREADY-WALKED page also takes effect: the edit
+/// runs the EL1-maintenance TLBI ([`KvmTrapEngine::run_el1_maintenance`]) to drop
+/// the stale stage-1 TLB entry (a fresh, never-walked alias needs no flush, so
+/// [`KvmTrapEngine::map_host_alias`] uses the no-flush [`KvmTrapEngine::pt_edit`]).
+/// Not yet wired: `repoint_private` (the MAP_FIXED|MAP_PRIVATE overlay — Task 9).
 /// Gated (CARRICK_MEM_DEBUG) diagnostic for a failed syscall-path guest access:
 /// prints the address, length, and the calling thread's window view so a
 /// cross-thread translation miss (a stale per-sibling `GuestRam` snapshot) is
@@ -222,9 +373,11 @@ impl GuestMemory for KvmTrapEngine {
     }
 
     /// Record/clear a PROT_NONE range so syscall buffers there fault (EFAULT).
-    /// HOST-SIDE only — the guest's own EL0 accesses still hit the accessible
-    /// backing (making those fault needs stage-1 edits + signal injection,
-    /// Phase D), so `protect_range`/`unmap_range` keep their no-op defaults.
+    /// This is the HOST-SIDE check only; the COMPLEMENTARY guest-side enforcement
+    /// (so the guest's own EL0 access faults) is done by `protect_range`/
+    /// `unmap_range`/`unmap_alias_range`, which edit the live stage-1 tables AND
+    /// flush the stale TLB via `pt_edit_and_flush` + the Phase-4 EL0-fault→SIGSEGV
+    /// path — those are LIVE overrides, not no-ops.
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.ram.set_no_access(address, len, no_access);
     }
@@ -267,7 +420,10 @@ impl GuestMemory for KvmTrapEngine {
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
         let exec = prot & LINUX_PROT_EXEC != 0;
-        self.pt_edit(|mgr| {
+        // pt_edit_AND_FLUSH: a guest can `mprotect` an ALREADY-TOUCHED page (e.g.
+        // RELRO RW→RO), so the stale stage-1 TLB entry must be invalidated for the
+        // new protection to take effect.
+        self.pt_edit_and_flush(|mgr| {
             if prot & LINUX_PROT_WRITE != 0 {
                 mgr.set_rw(address, len, exec)
             } else if prot & LINUX_PROT_READ != 0 {
@@ -279,16 +435,17 @@ impl GuestMemory for KvmTrapEngine {
     }
 
     /// `munmap`: invalidate the stage-1 descriptors for `[address, address+len)`
-    /// so the guest's own access faults (vs the host-side `no_access` check).
+    /// so the guest's own access faults (vs the host-side `no_access` check). The
+    /// unmapped range is typically ALREADY-TOUCHED, so flush the stale TLB entry.
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.pt_edit(|mgr| mgr.invalidate(address, len))
+        self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
     }
 
     /// `munmap` of a high-VA alias: invalidate AND reclaim the now-empty alias
     /// sub-table(s) (vs `unmap_range`, which keeps the table for the low-VA
-    /// arena's in-place reuse). Mirrors HVF.
+    /// arena's in-place reuse). Flush the stale TLB entry. Mirrors HVF.
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.pt_edit(|mgr| mgr.unmap_aliased(address, len))
+        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
     }
 }
 
