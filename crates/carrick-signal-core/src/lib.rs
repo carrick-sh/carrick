@@ -25,6 +25,7 @@
 //! can't name a guest tid), so a plain `Mutex` is safe there.
 
 pub mod child_watch;
+pub mod host_disposition;
 pub mod xsig;
 
 use std::collections::HashMap;

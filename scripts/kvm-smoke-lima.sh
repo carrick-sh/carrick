@@ -1075,8 +1075,34 @@ CEOF
       printf "FAIL [sigchld-async]: stdout=[%s] exit=%s oracle=[sigchld-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 39) xproc-stdsig: a parent installs a real SIGUSR1 handler + ignores
+    #     SIGUSR2, forks a child that kill(getppid(),SIGUSR2) [must be DROPPED]
+    #     then kill(getppid(),SIGUSR1) [must RUN the handler], and prints usr1-ok.
+    #     This is NON-namespaced (plain run-elf), so each sibling kill of a
+    #     STANDARD catchable signal takes the host-kill path (libc::kill of the
+    #     host signum), NOT the xsignal ring. On a KVM guest a fork = separate host
+    #     processes; before Task 6 the receiver installed NO host disposition for
+    #     SIGUSR1/2, so the host default action TERMINATED the parent (the CPython
+    #     test_interprocess_signal / LTP kill02 bug). Task 6 mirrors the guest
+    #     disposition onto a REAL host routed handler (SIGUSR1 -> kvm_routed_handler
+    #     that publishes PROC_PENDING + pokes the pump; SIGUSR2 -> host SIG_IGN). The
+    #     parent surviving the SIGUSR2 AND running the SIGUSR1 handler proves both.
+    #     Needs glibc sigaction/signal/fork/kill -> the REAL dispatcher. REQUIRED gate.
+    xstdsig_src="$fixdir/xproc-stdsig/xproc-stdsig.c"
+    gcc -static -O2 -o /tmp/xproc_stdsig "$xstdsig_src"
+    # -s KILL: this guest INSTALLS a SIGUSR1 handler + mirrors it to the host, so a
+    # regression that wedges (handler never runs) must be force-killed so the smoke
+    # fails fast rather than hanging for the full timeout.
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/xproc_stdsig" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "usr1-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+xproc-stdsig]: a sibling kill of a STANDARD signal ran the receivers SIGUSR1 handler (host routed) and its SIGUSR2 was dropped (host ignored) — the parent survived the cross-process kill instead of host-default-terminating."
+    else
+      printf "FAIL [xproc-stdsig]: stdout=[%s] exit=%s oracle=[usr1-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork/sigchld-async]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork/sigchld-async/xproc-stdsig]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -1087,5 +1113,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring+async-sigchld — all 38 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork, sigchld-async) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring+async-sigchld+xproc-stdsig — all 39 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork, sigchld-async, xproc-stdsig) pass on KVM; ZERO xfail."
 '
