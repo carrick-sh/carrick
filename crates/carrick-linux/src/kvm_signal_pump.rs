@@ -342,6 +342,36 @@ pub fn reinit_after_fork(registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn Platf
     start_pump(registry, futex);
 }
 
+/// Reset the pump's process-global guard state in a forked child WITHOUT
+/// re-spawning. Used by the interactive-`--tty` supervisor-fork reset
+/// (`host_signal::reset_after_supervisor_fork`), where the runtime child has NO
+/// `(registry, futex)` in hand yet — it proceeds to the normal runtime setup,
+/// which calls `start_signal_pump` (and therefore [`start_pump`]) itself. This
+/// helper only undoes the inherited "already started" bookkeeping so that later
+/// `start_pump` actually re-arms the child instead of no-opping:
+///   * close + clear the stale inherited [`SELF_PIPE_W`] (the parent's pipe write
+///     end, whose read end / pump thread did NOT survive the fork) so the next
+///     `make_self_pipe` publishes a fresh fd;
+///   * reset [`PUMP_STARTED`] so the next `start_pump` CAS spawns the daemon
+///     thread + makes a new self-pipe;
+///   * reset [`SIGCHLD_INSTALLED`] so `install_handlers` re-asserts the SIGCHLD
+///     reaper disposition;
+///   * `child_watch::clear()` so the child does not reap or deliver the
+///     supervisor's child-exit watches.
+/// This is the spawn-free analogue of [`reinit_after_fork`]; the caller does the
+/// spawn (via its own later `start_signal_pump`).
+pub fn reset_state_for_supervisor_fork() {
+    let stale_w = SELF_PIPE_W.swap(-1, Ordering::SeqCst);
+    if stale_w >= 0 {
+        unsafe {
+            libc::close(stale_w);
+        }
+    }
+    carrick_signal_core::child_watch::clear();
+    PUMP_STARTED.store(false, Ordering::SeqCst);
+    SIGCHLD_INSTALLED.store(false, Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
