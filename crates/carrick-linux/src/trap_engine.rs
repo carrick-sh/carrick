@@ -302,6 +302,27 @@ impl KvmTrapEngine {
             .read(gpa, len)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
+
+    /// The IPA a syscall buffer at guest VA `va` resolves to. Identity (`va`) for
+    /// the common heap/stack/private-mmap pointer — NO page-table walk on the hot
+    /// path. Only a `repoint_private` overlay over a shared-aperture VA
+    /// ([`carrick_mem::memory::needs_stage1_translation`]) walks the live stage-1
+    /// tables to find the overlay IPA whose backing the guest's OWN EL0 accesses
+    /// hit (the VA-keyed window still resolves to the STALE shared aperture).
+    /// High-VA aliases are EXCLUDED: their KVM `Window::base == va`, so identity
+    /// is correct and re-basing on the IPA would miss the window. A walk miss
+    /// falls back to `va` (identity), preserving prior behaviour for an unmapped
+    /// VA.
+    fn syscall_buffer_ipa(&self, va: u64, len: usize) -> u64 {
+        if !carrick_mem::memory::needs_stage1_translation(va, len as u64) {
+            return va;
+        }
+        let guard = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .and_then(|m| m.translate(va))
+            .unwrap_or(va)
+    }
 }
 
 // NOTE: KvmTrapEngine implements the `carrick-hal` SyscallTrap contract; the
@@ -351,10 +372,16 @@ impl GuestMemory for KvmTrapEngine {
         // The PROT_NONE gate (a syscall buffer overlapping a PROT_NONE range
         // faults EFAULT even though the host backing is accessible — C2 host-side
         // check) AND the single-region whole-range lookup are the SHARED neutral
-        // gate (`safe_guest_access_in`), keyed on `Window::base`. Both failure
-        // modes map to OutOfBounds (→ EFAULT), unchanged; the copy stays glue.
-        let host = self.ram.safe_access(address, length).map_err(|e| {
-            mem_debug("read", &self.ram, address, length);
+        // gate (`safe_access_translated`). The PROT_NONE check stays keyed on the
+        // guest VA (`address`), while the backing lookup uses the stage-1
+        // translation (`ipa`) so a `repoint_private` overlay / high-VA alias
+        // resolves to the page the guest's OWN EL0 accesses hit — NOT the stale
+        // shared-aperture backing the VA still covers. Identity VAs: ipa==address,
+        // so this is byte-identical (and skips the walk). Both failure modes map
+        // to OutOfBounds (→ EFAULT), unchanged; the copy stays glue.
+        let ipa = self.syscall_buffer_ipa(address, length);
+        let host = self.ram.safe_access_translated(address, ipa, length).map_err(|e| {
+            mem_debug("read", &self.ram, ipa, length);
             e.map_to_memory_error(address, length)
         })?;
         let mut out = vec![0u8; length];
@@ -368,8 +395,12 @@ impl GuestMemory for KvmTrapEngine {
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
-        let host = self.ram.safe_access(address, length).map_err(|e| {
-            mem_debug("write", &self.ram, address, length);
+        // PROT_NONE on the guest VA; backing lookup on the translated IPA (see
+        // `read_bytes`). For a `repoint_private` overlay the syscall write lands
+        // in the PRIVATE overlay backing the guest reads, not the shared aperture.
+        let ipa = self.syscall_buffer_ipa(address, length);
+        let host = self.ram.safe_access_translated(address, ipa, length).map_err(|e| {
+            mem_debug("write", &self.ram, ipa, length);
             e.map_to_memory_error(address, length)
         })?;
         // SAFETY: `safe_access` proved [address, address+length) ⊆ one window, so

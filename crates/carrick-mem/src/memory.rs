@@ -354,6 +354,32 @@ pub fn va_in_shared_aperture(va: u64, len: u64) -> bool {
         None => false,
     }
 }
+
+/// True if a guest VA serving as a SYSCALL buffer must have its host backing
+/// looked up via the stage-1-TRANSLATED IPA, not the VA itself — because the VA
+/// is NON-identity to the backing the guest's OWN EL0 accesses hit.
+///
+/// This is EXACTLY the `repoint_private` case: a MAP_FIXED|MAP_PRIVATE over a
+/// shared-aperture VA ([`va_in_shared_aperture`]) repoints that VA's stage-1 leaf
+/// to a per-process PRIVATE overlay IPA (608 GiB), while the syscall-path
+/// window/region keyed at the VA still resolves to the STALE shared aperture. So
+/// the syscall copy must translate the VA → overlay IPA and look up by THAT.
+///
+/// High VAs ([`is_high_va`]: Rosetta + the alias arena) are DELIBERATELY excluded:
+/// although their stage-1 leaf is aliased, BOTH backends register the syscall-path
+/// window/region keyed at the VA (KVM `Window::base == va`, HVF `HvfMappedRegion
+/// .start == va`) with a VA-relative offset — HVF's high-VA `translate_va` only
+/// DISAMBIGUATES overlapping aliases, it does not change the lookup base. So a
+/// high-VA buffer resolves correctly by IDENTITY and must NOT be re-based on its
+/// IPA (doing so misses the VA-keyed window — the map-host-alias regression).
+///
+/// For every other guest pointer (heap/stack/private mmap) VA == IPA, so this is
+/// FALSE and the backend keeps its identity fast path with NO page-table walk.
+/// The PROT_NONE check always stays keyed on the guest VA (mprotect records the
+/// VA); only the backing/region lookup uses the translated IPA.
+pub fn needs_stage1_translation(va: u64, len: u64) -> bool {
+    va_in_shared_aperture(va, len)
+}
 pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
 
 // Linux's default main-thread stack soft RLIMIT_STACK is 8 MiB; the kernel grows
@@ -2659,6 +2685,34 @@ mod stage1_tests {
         assert_eq!(shared.end, LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE);
         assert!(shared.shared, "shared aperture must be flagged shared");
         assert!(shared.perms.read && shared.perms.write);
+    }
+
+    #[test]
+    fn needs_stage1_translation_only_for_shared_aperture() {
+        // The common syscall buffer (heap/stack/private mmap) is identity:
+        // no walk — the fast path stays.
+        assert!(!needs_stage1_translation(0x4000, 16));
+        assert!(!needs_stage1_translation(0x40_0000_0000, 0x1000)); // 256 GiB private arena
+        assert!(!needs_stage1_translation(LINUX_STACK_TOP - 0x1000, 0x100));
+        // The shared aperture (576 GiB) IS translated — its repoint_private
+        // overlay backing is keyed at the overlay IPA, not the VA.
+        assert!(!is_high_va(LINUX_SHARED_FILE_BASE));
+        assert!(needs_stage1_translation(LINUX_SHARED_FILE_BASE, 16));
+        assert!(needs_stage1_translation(
+            LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE - 0x1000,
+            0x1000
+        ));
+        // A span straddling the shared-aperture top edge is NOT wholly inside it,
+        // so the predicate is false (identity, same as today).
+        assert!(!needs_stage1_translation(
+            LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE - 8,
+            16
+        ));
+        // High VAs (Rosetta / alias arena) are DELIBERATELY excluded: their
+        // syscall-path window/region is keyed at the VA (VA-relative offset), so
+        // they resolve by identity and must NOT be re-based on their IPA.
+        assert!(is_high_va(LINUX_HIGH_VA_THRESHOLD));
+        assert!(!needs_stage1_translation(LINUX_HIGH_VA_THRESHOLD, 16));
     }
 }
 

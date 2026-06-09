@@ -602,21 +602,32 @@ impl GuestRam {
 
     /// The COMBINED syscall-buffer gate: the PROT_NONE check THEN the single-
     /// region whole-range lookup, via the neutral
-    /// [`carrick_guest_mem::region::safe_guest_access_in`] (the recurrence guard
-    /// shared with HVF/bhyve). Returns the host pointer to `gpa`, or a
-    /// [`carrick_guest_mem::region::GuestAccessError`] the caller maps to its
-    /// `MemoryError`. Zero-alloc: windows are projected on the fly. The PROT_NONE
-    /// predicate delegates to the shared, process-wide [`MemoryProtections`] so a
-    /// sibling thread's `mprotect` is observed here.
-    pub(crate) fn safe_access(
+    /// [`carrick_guest_mem::region::safe_guest_access_translated_in`] (the
+    /// recurrence guard shared with HVF/bhyve). Returns the host pointer to the
+    /// buffer, or a [`carrick_guest_mem::region::GuestAccessError`] the caller
+    /// maps to its `MemoryError`. Zero-alloc: windows are projected on the fly.
+    /// The PROT_NONE predicate delegates to the shared, process-wide
+    /// [`MemoryProtections`] so a sibling thread's `mprotect` is observed here.
+    ///
+    /// The PROT_NONE check and the window lookup use SEPARATE addresses: `va`
+    /// (the guest's syscall pointer) for the PROT_NONE gate, and `ipa` (its
+    /// stage-1 translation) for the backing lookup. For an identity VA the caller
+    /// passes `ipa == va` and this is byte-identical to the pre-translation gate.
+    /// For a `repoint_private` overlay (or a high-VA alias) `ipa != va`, so the
+    /// copy lands in the PRIVATE overlay backing the guest's OWN loads/stores hit
+    /// — while `mprotect(PROT_NONE)`, which records the guest VA, still faults
+    /// EFAULT (it's keyed on `va`, NOT the translated `ipa`).
+    pub(crate) fn safe_access_translated(
         &self,
-        gpa: u64,
+        va: u64,
+        ipa: u64,
         len: usize,
     ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
-        carrick_guest_mem::region::safe_guest_access_in(
+        carrick_guest_mem::region::safe_guest_access_translated_in(
             |g, l| self.protections.range_no_access(g, l),
             self.projected_windows(),
-            gpa,
+            va,
+            ipa,
             len,
         )
     }

@@ -2670,8 +2670,12 @@ impl HvfInner {
         let mut copied = 0usize;
         while copied < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            // For a `repoint_private` overlay VA the region+offset are keyed on the
+            // translated overlay IPA, not the VA (see `syscall_buffer_lookup_addr`).
+            // Identity otherwise — no walk. PROT_NONE was already gated on the VA.
+            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
-                let Some(mapping) = self.mapping_for_range(chunk_address, chunk_len) else {
+                let Some(mapping) = self.mapping_for_range(lookup_address, chunk_len) else {
                     return Err(MemoryError::OutOfBounds { address, length });
                 };
                 (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
@@ -2687,7 +2691,7 @@ impl HvfInner {
             // Read directly out of the host buffer. Works for both
             // applevisor-owned mappings (the parent case) and raw mappings
             // we re-created in a forked child via hv_vm_map.
-            let chunk_offset = (chunk_address - mapping_start) as usize;
+            let chunk_offset = (lookup_address - mapping_start) as usize;
             unsafe {
                 volatile_copy_from_guest(
                     host_addr.add(chunk_offset),
@@ -2749,8 +2753,13 @@ impl HvfInner {
         let mut copied = 0usize;
         while copied < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            // See `read_guest_bytes_into`: a `repoint_private` overlay VA resolves
+            // its region+offset via the translated overlay IPA, so a syscall write
+            // lands in the PRIVATE overlay backing the guest reads, not the shared
+            // aperture. Identity otherwise; PROT_NONE already gated on the VA.
+            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
-                let Some(mapping) = self.mapping_for_range_mut(chunk_address, chunk_len) else {
+                let Some(mapping) = self.mapping_for_range_mut(lookup_address, chunk_len) else {
                     return Err(MemoryError::OutOfBounds { address, length });
                 };
                 (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
@@ -2763,7 +2772,7 @@ impl HvfInner {
                 mapping_end,
                 mapping_ipa,
             );
-            let chunk_offset = (chunk_address - mapping_start) as usize;
+            let chunk_offset = (lookup_address - mapping_start) as usize;
             unsafe {
                 volatile_copy_to_guest(
                     bytes.as_ptr().add(copied),
@@ -2791,8 +2800,11 @@ impl HvfInner {
             return None;
         }
         let stripped = strip_pointer_tag(address);
-        let mapping = self.mapping_for_range(stripped, length)?;
-        let offset = (stripped - mapping.start) as usize;
+        // `repoint_private` overlay VAs look up + offset via the translated overlay
+        // IPA (see `syscall_buffer_lookup_addr`); identity otherwise (no walk).
+        let lookup = self.syscall_buffer_lookup_addr(stripped, length);
+        let mapping = self.mapping_for_range(lookup, length)?;
+        let offset = (lookup - mapping.start) as usize;
         Some(unsafe { mapping.host_addr.add(offset) } as *const u8)
     }
 
@@ -2813,8 +2825,11 @@ impl HvfInner {
         {
             return None;
         }
-        let mapping = self.mapping_for_range(stripped, length)?;
-        let offset = (stripped - mapping.start) as usize;
+        // `repoint_private` overlay VAs look up + offset via the translated overlay
+        // IPA (see `syscall_buffer_lookup_addr`); identity otherwise (no walk).
+        let lookup = self.syscall_buffer_lookup_addr(stripped, length);
+        let mapping = self.mapping_for_range(lookup, length)?;
+        let offset = (lookup - mapping.start) as usize;
         Some(unsafe { mapping.host_addr.add(offset) })
     }
 
@@ -2855,8 +2870,11 @@ impl HvfInner {
         let mut copied = 0usize;
         while copied < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            // `repoint_private` overlay VAs resolve region+offset via the translated
+            // overlay IPA (see `syscall_buffer_lookup_addr`); identity otherwise.
+            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
-                let Some(mapping) = self.mapping_for_range_mut(chunk_address, chunk_len) else {
+                let Some(mapping) = self.mapping_for_range_mut(lookup_address, chunk_len) else {
                     return Err(MemoryError::OutOfBounds { address, length });
                 };
                 (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
@@ -2869,7 +2887,7 @@ impl HvfInner {
                 mapping_end,
                 mapping_ipa,
             );
-            let chunk_offset = (chunk_address - mapping_start) as usize;
+            let chunk_offset = (lookup_address - mapping_start) as usize;
             unsafe {
                 volatile_copy_to_guest(
                     bytes.as_ptr().add(copied),
@@ -2896,7 +2914,11 @@ impl HvfInner {
         let mut checked = 0usize;
         while checked < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, checked, length)?;
-            let Some(mapping) = self.mapping_for_range(chunk_address, chunk_len) else {
+            // The writability check follows the same region a `repoint_private`
+            // overlay VA's copy will hit (the translated overlay IPA), so the
+            // overlay's guest_writable flag — not the stale shared region's — gates.
+            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+            let Some(mapping) = self.mapping_for_range(lookup_address, chunk_len) else {
                 return Err(MemoryError::OutOfBounds { address, length });
             };
             if require_guest_writable && !mapping.guest_writable {
@@ -3118,6 +3140,25 @@ impl HvfInner {
             .flatten();
         let idx = Self::mapping_index_for_range(&self.mappings, address, length, stage1_ipa)?;
         self.mappings.get_mut(idx)
+    }
+
+    /// The address the per-chunk region lookup + offset should use for a syscall
+    /// buffer at guest VA `chunk_va`. Identity for everything but a
+    /// `repoint_private` overlay: a MAP_FIXED|MAP_PRIVATE carved over a
+    /// shared-aperture VA repoints the stage-1 leaf to a per-process overlay IPA
+    /// (608 GiB), but registers NO region keyed at the original VA — the only
+    /// region with the overlay backing is keyed at the overlay IPA. So a syscall
+    /// copy must look up (and offset) by that translated IPA, or it resolves to
+    /// the STALE shared-aperture region the VA still covers (the repoint_private
+    /// syscall-buffer bug). High-VA aliases are NOT redirected here: their region
+    /// is keyed at the VA and `mapping_for_range` already disambiguates
+    /// overlapping aliases via `translate_va` internally (VA-relative offset). For
+    /// every other (identity) VA this returns `chunk_va` unchanged — no walk.
+    fn syscall_buffer_lookup_addr(&self, chunk_va: u64, chunk_len: usize) -> u64 {
+        if !crate::memory::needs_stage1_translation(chunk_va, chunk_len as u64) {
+            return chunk_va;
+        }
+        self.translate_va(chunk_va).unwrap_or(chunk_va)
     }
 
     /// True if `ipa` falls in `region`'s `hv_vm_map`'d IPA window.
