@@ -4,10 +4,13 @@
 //! `localhost` conformance-registry host to the lima gateway so the guest can
 //! pull from the mac registry.
 
-// The `Lane`/`LimaConfig`/`is_kvm` surface is wired into the engine in the next
-// commit (`carrick_invocation_argv` + `run_carrick`); allow it to be unused for
-// this isolated, test-only first step. Removed once the engine consumes it.
+// `carrick_invocation_argv` + `Lane::is_kvm` are consumed by `engine::run_carrick`
+// / `carrick_dry_run` in the next commit (threading `&Lane` through the run path);
+// until then the binary build sees them as unused. Allow it for this step.
 #![allow(dead_code)]
+
+use crate::engine::carrick_argv;
+use crate::manifest::Suite;
 
 /// How to reach the mac conformance registry from inside the lima guest, plus
 /// the in-guest carrick binary path and the VM name.
@@ -63,9 +66,57 @@ pub fn rewrite_registry_host(image: &str, from: &str, to: &str) -> String {
     }
 }
 
+/// Build the FULL OS-level argv to execute one suite's `carrick run` on `lane`.
+/// `carrick_bin` is the local binary path for Hvf, or the IN-GUEST path for Kvm.
+pub fn carrick_invocation_argv(
+    suite: &Suite,
+    carrick_bin: &str,
+    run_id: &str,
+    lane: &Lane,
+) -> Vec<String> {
+    let base = carrick_argv(suite, carrick_bin, run_id); // [carrick_bin, "run", …flags…, image, …cmd]
+    match lane {
+        Lane::Hvf => base,
+        Lane::Kvm(cfg) => {
+            // Rewrite the image-ref registry host (the only positional that is an
+            // image is `suite.image`; rewrite every token that equals it).
+            let rewritten: Vec<String> = base
+                .into_iter()
+                .map(|tok| {
+                    if tok == suite.image {
+                        rewrite_registry_host(&tok, "localhost", &cfg.gateway)
+                    } else {
+                        tok
+                    }
+                })
+                .collect();
+            let mut argv = vec![
+                "limactl".to_string(),
+                "shell".to_string(),
+                cfg.vm.clone(),
+                "--".to_string(),
+            ];
+            // Carry the insecure-registries env INTO the guest (limactl shell does
+            // not forward the host env), rewritten to the gateway host.
+            if let Some(host) = suite.registry_host() {
+                let host = rewrite_registry_host(host, "localhost", &cfg.gateway);
+                argv.push("env".to_string());
+                argv.push(format!("CARRICK_INSECURE_REGISTRIES={host}"));
+            }
+            argv.extend(rewritten); // [carrick-in-guest, "run", … rewritten image …]
+            argv
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn demo_suite() -> Suite {
+        // Minimal suite: image + a one-token cmd; default (empty) flags/env.
+        Suite::for_test("localhost:5005/carrick-go-conformance:1.24", &["true"])
+    }
 
     #[test]
     fn rewrite_localhost_registry_host_in_image_ref() {
@@ -98,6 +149,45 @@ mod tests {
         assert_eq!(
             rewrite_registry_host("busybox", "localhost", "host.lima.internal"),
             "busybox"
+        );
+    }
+
+    #[test]
+    fn hvf_invocation_is_the_local_carrick_argv() {
+        let s = demo_suite();
+        let argv = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &Lane::Hvf);
+        // Hvf: run the local binary directly — argv[0] is the carrick bin, then
+        // `run --name … <image> <cmd>` (no lima envelope, no host rewrite).
+        assert_eq!(argv[0], "target/release/carrick");
+        assert_eq!(argv[1], "run");
+        assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
+        assert!(!argv.contains(&"limactl".to_string()));
+    }
+
+    #[test]
+    fn kvm_invocation_wraps_in_limactl_with_rewrite_and_registry_env() {
+        let s = demo_suite();
+        let lane = Lane::Kvm(LimaConfig {
+            vm: "carrick".into(),
+            gateway: "host.lima.internal".into(),
+        });
+        let argv = carrick_invocation_argv(&s, "/home/user/ct/release/carrick", "conf-1-2", &lane);
+        // Kvm: limactl shell <vm> -- env CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005 <carrick-in-guest> run … <rewritten image> …
+        assert_eq!(
+            &argv[0..3],
+            &["limactl".to_string(), "shell".to_string(), "carrick".to_string()]
+        );
+        assert_eq!(argv[3], "--");
+        assert_eq!(argv[4], "env");
+        assert_eq!(argv[5], "CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005");
+        assert_eq!(argv[6], "/home/user/ct/release/carrick");
+        assert_eq!(argv[7], "run");
+        // image-ref host rewritten to the gateway:
+        assert!(argv.contains(&"host.lima.internal:5005/carrick-go-conformance:1.24".to_string()));
+        assert!(
+            !argv
+                .iter()
+                .any(|t| t == "localhost:5005/carrick-go-conformance:1.24")
         );
     }
 }

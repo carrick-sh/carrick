@@ -65,7 +65,7 @@ fn env_args(envs: &[&[EnvKv]]) -> Vec<String> {
 /// `--name` gives carrick the SAME single handle docker gets — carrick derives
 /// the proctitle / scoped-kill id from it (precedence: CARRICK_RUN_ID -> --name
 /// -> auto), so the run-id, the container name, and the kill scope are one thing.
-fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Vec<String> {
+pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Vec<String> {
     let mut a = vec![carrick_bin.to_string(), "run".to_string()];
     a.push("--name".to_string());
     a.push(run_id.to_string());

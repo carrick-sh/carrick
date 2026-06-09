@@ -136,6 +136,32 @@ impl Suite {
         let i = self.carrick_flags.iter().position(|f| f == "--fs")?;
         self.carrick_flags.get(i + 1).map(String::as_str)
     }
+
+    /// A minimal `Suite` for unit tests: the given `image` + `cmd`, everything
+    /// else empty/default. Used by `lane.rs` to exercise `carrick_invocation_argv`
+    /// without a full manifest.
+    #[cfg(test)]
+    pub fn for_test(image: &str, cmd: &[&str]) -> Suite {
+        Suite {
+            name: "for-test".to_string(),
+            ecosystem: Ecosystem::Ltp,
+            image: image.to_string(),
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            verdict: VerdictKind::Shell,
+            tier: Tier::Smoke,
+            weight: Weight::Light,
+            timeout_s: 1,
+            known_gaps: Vec::new(),
+            carrick_flags: Vec::new(),
+            docker_flags: Vec::new(),
+            bind_mounts: Vec::new(),
+            env: Vec::new(),
+            env_carrick: Vec::new(),
+            env_docker: Vec::new(),
+            workdir: None,
+            entrypoint: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
