@@ -1014,8 +1014,26 @@ CEOF
       printf "FAIL [xproc-sigqueue]: stdout=[%s] exit=%s oracle=[val-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 36) timer-disarm-race: a repeating ITIMER_REAL armed then DISARMED
+    #     immediately must deliver NO late SIGALRM — the interval-timer fallback
+    #     launched for the arm generation retires when the disarm bumps the slot
+    #     generation past it. Locks the disarm-during-fire invariant of the
+    #     timer/signal shared core. Needs glibc setitimer/sigaction/nanosleep ->
+    #     the REAL dispatcher. REQUIRED gate.
+    disarmrace_src="$fixdir/timer-disarm-race/timer-disarm-race.c"
+    gcc -static -O2 -o /tmp/timer_disarm_race "$disarmrace_src"
+    # -s KILL: a regression that wedges (late alarm loops) must be force-killed
+    # so the smoke fails fast rather than hanging for the full timeout.
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/timer_disarm_race" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "no-late-alarm" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+timer-disarm-race]: a disarmed repeating ITIMER_REAL delivered no late SIGALRM — fallback retired on the generation bump."
+    else
+      printf "FAIL [timer-disarm-race]: stdout=[%s] exit=%s oracle=[no-late-alarm]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -1026,5 +1044,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring — all 35 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring — all 36 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race) pass on KVM; ZERO xfail."
 '

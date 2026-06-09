@@ -445,6 +445,45 @@ mod tests {
         carrick_host::guest_cpu::reset();
     }
 
+    #[test]
+    fn run_fallback_real_retires_on_generation_bump() {
+        use std::sync::atomic::AtomicUsize;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        let which = 0; // REAL, wall-clock periodic — would loop forever if not retired.
+        let stale_generation = arm(which, 1_000, 1_000, false);
+        // Bump the generation (re-arm) so the stale fallback must retire.
+        let _new_generation = arm(which, 1_000, 1_000, false);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires2 = Arc::clone(&fires);
+        // The stale-generation loop must exit at its first guard (generation
+        // mismatch) and return promptly rather than fire/loop. Determinism comes
+        // from the generation guard, not the 1µs sleep — even if the sleep were
+        // instantaneous the guard would still break before any on_fire().
+        run_fallback(which, stale_generation, 1_000, 1_000, move || {
+            fires2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "stale-generation wall-clock fallback must not fire"
+        );
+
+        // Prove the CURRENT generation still fires exactly once (one-shot).
+        let g = arm(which, 1_000, 0, false);
+        let cur = Arc::new(AtomicUsize::new(0));
+        let cur2 = Arc::clone(&cur);
+        run_fallback(which, g, 1_000, 0, move || {
+            cur2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            cur.load(Ordering::SeqCst),
+            1,
+            "current-generation one-shot wall-clock timer fires once"
+        );
+        disarm(which);
+    }
+
     // ---- Regression tests carried from carrick-hvf. ----
 
     #[test]
