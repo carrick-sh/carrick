@@ -348,31 +348,36 @@ fn mem_debug(op: &str, ram: &GuestRam, address: u64, length: usize) {
 
 impl GuestMemory for KvmTrapEngine {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        // A syscall buffer overlapping a PROT_NONE range faults with EFAULT,
-        // even though the host backing is accessible (C2 host-side check).
-        if self.ram.range_no_access(address, length) {
+        // The PROT_NONE gate (a syscall buffer overlapping a PROT_NONE range
+        // faults EFAULT even though the host backing is accessible — C2 host-side
+        // check) AND the single-region whole-range lookup are the SHARED neutral
+        // gate (`safe_guest_access_in`), keyed on `Window::base`. Both failure
+        // modes map to OutOfBounds (→ EFAULT), unchanged; the copy stays glue.
+        let host = self.ram.safe_access(address, length).map_err(|e| {
             mem_debug("read", &self.ram, address, length);
-            return Err(MemoryError::OutOfBounds { address, length });
+            e.map_to_memory_error(address, length)
+        })?;
+        let mut out = vec![0u8; length];
+        // SAFETY: `safe_access` proved [address, address+length) ⊆ one window, so
+        // `host` points at `length` readable bytes of that window's backing.
+        unsafe {
+            std::ptr::copy_nonoverlapping(host, out.as_mut_ptr(), length);
         }
-        self.ram.read(address, length).map_err(|_| {
-            mem_debug("read", &self.ram, address, length);
-            MemoryError::OutOfBounds { address, length }
-        })
+        Ok(out)
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        if self.ram.range_no_access(address, bytes.len()) {
-            mem_debug("write", &self.ram, address, bytes.len());
-            return Err(MemoryError::OutOfBounds {
-                address,
-                length: bytes.len(),
-            });
+        let length = bytes.len();
+        let host = self.ram.safe_access(address, length).map_err(|e| {
+            mem_debug("write", &self.ram, address, length);
+            e.map_to_memory_error(address, length)
+        })?;
+        // SAFETY: `safe_access` proved [address, address+length) ⊆ one window, so
+        // `host` points at `length` writable bytes of that window's backing.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, length);
         }
-        let len = bytes.len();
-        self.ram.write_gpa(address, bytes).map_err(|_| {
-            mem_debug("write", &self.ram, address, len);
-            MemoryError::OutOfBounds { address, length: len }
-        })
+        Ok(())
     }
 
     /// Record/clear a PROT_NONE range so syscall buffers there fault (EFAULT).

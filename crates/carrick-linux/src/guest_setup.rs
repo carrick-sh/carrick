@@ -583,6 +583,44 @@ impl GuestRam {
         })
     }
 
+    /// Project each window into the neutral [`carrick_guest_mem::region::GuestMemoryRegion`]
+    /// keyed on `Window::base` (the SAME value `locate` keys on — the guest-VA
+    /// the host syscall path uses, NOT `slot_gpa`). Yielded BY VALUE so the gate
+    /// can iterate without allocating; the `slot_gpa` <1 TiB-alias handling stays
+    /// glue (it never enters the projection — `base` is always the lookup key).
+    fn projected_windows(
+        &self,
+    ) -> impl Iterator<Item = carrick_guest_mem::region::GuestMemoryRegion> + '_ {
+        self.windows
+            .iter()
+            .map(|w| carrick_guest_mem::region::GuestMemoryRegion {
+                base: w.base,
+                len: w.len,
+                host_addr: w.host,
+            })
+    }
+
+    /// The COMBINED syscall-buffer gate: the PROT_NONE check THEN the single-
+    /// region whole-range lookup, via the neutral
+    /// [`carrick_guest_mem::region::safe_guest_access_in`] (the recurrence guard
+    /// shared with HVF/bhyve). Returns the host pointer to `gpa`, or a
+    /// [`carrick_guest_mem::region::GuestAccessError`] the caller maps to its
+    /// `MemoryError`. Zero-alloc: windows are projected on the fly. The PROT_NONE
+    /// predicate delegates to the shared, process-wide [`MemoryProtections`] so a
+    /// sibling thread's `mprotect` is observed here.
+    pub(crate) fn safe_access(
+        &self,
+        gpa: u64,
+        len: usize,
+    ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
+        carrick_guest_mem::region::safe_guest_access_in(
+            |g, l| self.protections.range_no_access(g, l),
+            self.projected_windows(),
+            gpa,
+            len,
+        )
+    }
+
     /// Copy `data` to guest-physical `gpa` (must lie wholly within one window).
     /// `pub(crate)` so the `GuestMemory` impl on [`crate::trap_engine::KvmTrapEngine`]
     /// can service guest `write_bytes` through the same bounds-checked path
