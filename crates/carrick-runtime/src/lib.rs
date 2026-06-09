@@ -1139,9 +1139,11 @@ pub mod host_signal {
     // Linux analogue, or paths the dispatcher already covers. A later task moves
     // the platform-specific surface to a trait; for now they remain inert so the
     // KVM backend keeps compiling and behaving exactly as before.
-    pub fn relocate_internal_fd(fd: i32) -> i32 {
-        fd
-    }
+    /// Move a carrick-internal fd above the high floor (and close the original)
+    /// so it can never alias a low host fd handed to a guest under `--fs host`.
+    /// Real POSIX impl shared with HVF (via carrick-host), no longer an identity
+    /// stub that left internal fds at low, collision-prone numbers.
+    pub use carrick_host::internal_fd::{duplicate_internal_fd, relocate_internal_fd};
     pub fn reset_after_supervisor_fork() {}
     pub fn linux_to_host_signum(sig: i32) -> i32 {
         sig
