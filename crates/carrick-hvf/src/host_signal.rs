@@ -666,6 +666,12 @@ pub fn reset_after_supervisor_fork() {
     clear_thread_pending();
     clear_thread_waiters();
     clear_proc_pending();
+    // The supervisor's child-exit watches belong to ITS children; the runtime
+    // child must not reap or deliver their exit signals. Harmless today (the
+    // supervisor forks before any guest fork, so the watch map is empty), but
+    // matches the KVM runtime `reset_after_supervisor_fork` (lib.rs) and the
+    // HVF guest-fork `reset_after_fork` above, both of which clear it.
+    carrick_signal_core::child_watch::clear();
     open_pending_pipe();
 }
 
