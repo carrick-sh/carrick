@@ -241,17 +241,17 @@ pub mod pathcodec;
 
 // Cross-platform run-loop result/error + kernel-half state. Single home for
 // `RunResult` / `RuntimeError` / `KernelState` / `Kernel` / `VcpuLoopOutcome`,
-// shared by the HVF threaded loop (`vcpu_loop`) and the KVM single-threaded
-// loop (the Linux `runtime` module below).
+// shared by the generic threaded `vcpu_loop` on BOTH backends — the HVF setup
+// wrapper on macOS and `run_threaded_kvm_loop` on Linux (the `runtime` modules
+// below).
 pub mod run_result;
 
 // The multi-threaded vCPU run loop, generic over `carrick_hal::ThreadedEngine`.
-// Unconditional (compiles on both platforms); the generic `run_vcpu_until_exit`
-// is instantiated only by the macOS HVF setup wrapper in `runtime`, so on Linux
-// the whole module is dead code (the KVM run path is the single-threaded loop in
-// the `runtime` shim below) — allow `dead_code` there so the Linux cross-check
-// stays warning-clean without `#[allow]` peppered on every item.
-#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+// Unconditional (compiles on both platforms) and the SHARED threaded run path on
+// BOTH backends: the generic `run_vcpu_until_exit` is instantiated on macOS by
+// the HVF setup wrapper in `runtime`, and on Linux by `run_threaded_kvm_loop`
+// (which `runtime::run_oci` / `run_elf_real_dispatch` drive over `KvmTrapEngine`).
+// So the module is live on Linux too — NOT dead code — and carries no `#[allow]`.
 pub mod vcpu_loop;
 
 #[cfg(feature = "platform-macos")]
@@ -297,11 +297,12 @@ pub use execute::Runtime;
 pub mod runtime {
     //! Linux (KVM) run path. The full macOS run loop lives in `runtime.rs`
     //! (`cfg(platform-macos)`); on Linux we drive `carrick_linux::KvmTrapEngine`
-    //! through the REAL `SyscallDispatcher` with a single-threaded loop that
-    //! mirrors the macOS loop's non-blocking outcome handling
-    //! (`Returned`/`Errno`/`Exit`). Blocking I/O (the epoll waiter), futex, and
-    //! fork/exec/signal-injection are the full-backend spec's Phase C/D work and
-    //! deliberately surface here as `RuntimeError::Unsupported` for now.
+    //! through the REAL `SyscallDispatcher` on the SAME generic threaded
+    //! `vcpu_loop` the HVF backend uses, via `run_threaded_kvm_loop` (which
+    //! `run_oci` / `run_elf_real_dispatch` invoke). It mirrors the macOS loop's
+    //! non-blocking outcome handling (`Returned`/`Errno`/`Exit`); blocking I/O,
+    //! futex, and fork/exec/threads/signal-injection are all wired through the
+    //! shared loop (Phase 2 + Phase 4 complete), not stubbed `Unsupported`.
     use carrick_guest_mem::GuestMemory;
     use carrick_hal::SyscallTrap;
 
@@ -404,7 +405,7 @@ pub mod runtime {
     /// in-guest vCPU without a pump. The coordinator installs only the
     /// kick-signal handler (idempotently). The blocking-I/O / proc-exit / sleep /
     /// signal-wait arms use the `ppoll`/`waitid`-backed Linux `ThreadWaiter`
-    /// (`crate::io_wait`, the same one the single-threaded loop used).
+    /// (`crate::io_wait`).
     #[cfg(feature = "platform-linux")]
     pub fn run_threaded_kvm_loop(
         engine: carrick_linux::KvmTrapEngine,
