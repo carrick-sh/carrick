@@ -21,10 +21,6 @@ pub struct LimaConfig {
 #[derive(Clone, Debug)]
 pub enum Lane {
     Hvf,
-    // `Kvm` is constructed from the `--lane kvm` CLI args in the next commit
-    // (`lane_from_args`); for now only the unit tests build it. The argv builder
-    // and the env-skip already handle it, so this is purely the CLI wiring gap.
-    #[allow(dead_code)]
     Kvm(LimaConfig),
 }
 
@@ -108,6 +104,17 @@ pub fn carrick_invocation_argv(
     }
 }
 
+/// Map the `--lane`/`--lima-vm`/`--lima-gateway` CLI strings to a `Lane`.
+pub fn lane_from_args(lane: &str, lima_vm: &str, lima_gateway: &str) -> Lane {
+    match lane {
+        "kvm" => Lane::Kvm(LimaConfig {
+            vm: lima_vm.to_string(),
+            gateway: lima_gateway.to_string(),
+        }),
+        _ => Lane::Hvf,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +195,21 @@ mod tests {
                 .iter()
                 .any(|t| t == "localhost:5005/carrick-go-conformance:1.24")
         );
+    }
+
+    #[test]
+    fn lane_from_args_builds_kvm_with_defaults() {
+        assert!(matches!(
+            lane_from_args("hvf", "carrick", "host.lima.internal"),
+            Lane::Hvf
+        ));
+        match lane_from_args("kvm", "carrick", "host.lima.internal") {
+            Lane::Kvm(cfg) => {
+                assert_eq!(cfg.vm, "carrick");
+                assert_eq!(cfg.gateway, "host.lima.internal");
+            }
+            _ => panic!("expected Kvm"),
+        }
     }
 
     #[test]
