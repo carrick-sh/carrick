@@ -26,7 +26,7 @@ const XSIG_SLOTS: usize = 256;
 
 #[repr(C)]
 struct XSigSlot {
-    used: AtomicU32, // 0 = free, 1 = used
+    used: AtomicU32, // 0 = free, 1 = claiming (payload not yet valid), 2 = ready
     target_host_pid: AtomicI32,
     signum: AtomicI32, // Linux signum
     sender_ns_pid: AtomicI32,
@@ -100,6 +100,9 @@ pub fn xsig_enqueue(
         return false;
     };
     for slot in ring.slots.iter() {
+        // Phase 1 — CLAIM the slot (0 -> 1). `used == 1` means "claimed but the
+        // payload is NOT yet valid", so a concurrent cross-process consumer
+        // gating on `== 2` will skip it until we publish below.
         if slot
             .used
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -110,7 +113,12 @@ pub fn xsig_enqueue(
             slot.signum.store(signum, Ordering::Relaxed);
             slot.sender_ns_pid.store(sender_ns_pid, Ordering::Relaxed);
             slot.sender_uid.store(sender_uid, Ordering::Relaxed);
-            slot.value.store(value, Ordering::Release);
+            slot.value.store(value, Ordering::Relaxed);
+            // Phase 2 — PUBLISH (1 -> 2). This single Release store is the sole
+            // publish point: it carries all the Relaxed payload stores above, so
+            // a consumer that observes `used == 2` with an Acquire load is
+            // guaranteed to see the fully-written slot.
+            slot.used.store(2, Ordering::Release); // publish: payload is now fully written
             return true;
         }
     }
@@ -136,7 +144,7 @@ pub fn xsig_has_unblocked_for_self(block_mask: u64) -> bool {
     };
     let me = std::process::id() as i32;
     for slot in ring.slots.iter() {
-        if slot.used.load(Ordering::Acquire) == 1
+        if slot.used.load(Ordering::Acquire) == 2
             && slot.target_host_pid.load(Ordering::Acquire) == me
             && signal_unblocked_by_mask(slot.signum.load(Ordering::Acquire), block_mask)
         {
@@ -157,7 +165,7 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
     };
     let me = std::process::id() as i32;
     for slot in ring.slots.iter() {
-        if slot.used.load(Ordering::Acquire) == 1
+        if slot.used.load(Ordering::Acquire) == 2
             && slot.target_host_pid.load(Ordering::Acquire) == me
         {
             let signum = slot.signum.load(Ordering::Relaxed);
@@ -252,7 +260,7 @@ mod tests {
         let mut found = false;
         if let Some(ring) = xsig_ring() {
             for slot in ring.slots.iter() {
-                if slot.used.load(Ordering::Acquire) == 1
+                if slot.used.load(Ordering::Acquire) == 2
                     && slot.target_host_pid.load(Ordering::Acquire) == other
                 {
                     found = true;
@@ -260,6 +268,35 @@ mod tests {
             }
         }
         assert!(found, "an other-pid entry must stay for its real target");
+        reset_ring();
+    }
+
+    #[test]
+    fn two_phase_publish_slot_reaches_ready() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        let me = std::process::id() as i32;
+
+        // A successful enqueue must drive the slot all the way to the `used == 2`
+        // (ready) state — the drain gate is `== 2`, so a slot stuck at `1`
+        // (claimed-but-unpublished) would NOT be returned. Getting the entry back
+        // proves the publish store landed and the consumer gate matches.
+        assert!(xsig_enqueue(me, 13, 7777, 1234, 0x1234_5678_9abc_def0_u64 as i64));
+
+        // The entire payload tuple survives the MAP_SHARED round-trip intact,
+        // reinforcing that the single `used = 2` Release publishes ALL the
+        // preceding payload fields (target/signum/sender_ns/sender_uid/value),
+        // not just `value` — a torn read would corrupt one of these.
+        let drained = xsig_drain_for_self();
+        assert_eq!(
+            drained,
+            vec![(13, 7777, 1234, 0x1234_5678_9abc_def0_u64 as i64)],
+            "published payload must round-trip byte-for-byte"
+        );
+
+        // The slot was freed back to 0 by the drain, so a second drain is empty
+        // (no stale ready slot lingers at `used == 2`).
+        assert!(xsig_drain_for_self().is_empty());
         reset_ring();
     }
 
