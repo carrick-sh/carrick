@@ -73,35 +73,69 @@ pub fn carrick_invocation_argv(
     match lane {
         Lane::Hvf => base,
         Lane::Kvm(cfg) => {
-            // Rewrite the image-ref registry host (the only positional that is an
-            // image is `suite.image`; rewrite every token that equals it).
-            let rewritten: Vec<String> = base
-                .into_iter()
-                .map(|tok| {
-                    if tok == suite.image {
-                        rewrite_registry_host(&tok, "localhost", &cfg.gateway)
-                    } else {
-                        tok
-                    }
-                })
-                .collect();
-            let mut argv = vec![
+            // Build the inner command: `env CARRICK_INSECURE_REGISTRIES=<host>
+            // <carrick-in-guest> run … <rewritten image> … <cmd>`. The env is
+            // carried INTO the guest (limactl shell does not forward host env);
+            // the image-ref registry host is rewritten localhost->gateway.
+            let mut inner: Vec<String> = Vec::new();
+            if let Some(host) = suite.registry_host() {
+                let host = rewrite_registry_host(host, "localhost", &cfg.gateway);
+                inner.push("env".to_string());
+                inner.push(format!("CARRICK_INSECURE_REGISTRIES={host}"));
+            }
+            inner.extend(base.into_iter().map(|tok| {
+                if tok == suite.image {
+                    rewrite_registry_host(&tok, "localhost", &cfg.gateway)
+                } else {
+                    tok
+                }
+            }));
+            // /dev/kvm needs the `kvm` group ACTIVE in the guest; `limactl shell`
+            // does not activate it (the guest user is a member but kvm is not the
+            // active group), so wrap the inner command in `sg kvm -c '<argv>'` —
+            // matching scripts/kvm-smoke-lima.sh. Shell-quote each token so sg's
+            // shell reconstructs the EXACT argv: the guest cmd contains shell
+            // metacharacters (`&&`, quotes, redirects, the go-build heredoc).
+            let script = inner
+                .iter()
+                .map(|t| shell_quote(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            vec![
                 "limactl".to_string(),
                 "shell".to_string(),
                 cfg.vm.clone(),
                 "--".to_string(),
-            ];
-            // Carry the insecure-registries env INTO the guest (limactl shell does
-            // not forward the host env), rewritten to the gateway host.
-            if let Some(host) = suite.registry_host() {
-                let host = rewrite_registry_host(host, "localhost", &cfg.gateway);
-                argv.push("env".to_string());
-                argv.push(format!("CARRICK_INSECURE_REGISTRIES={host}"));
-            }
-            argv.extend(rewritten); // [carrick-in-guest, "run", … rewritten image …]
-            argv
+                "sg".to_string(),
+                "kvm".to_string(),
+                "-c".to_string(),
+                script,
+            ]
         }
     }
+}
+
+/// POSIX shell single-quote: a bareword of safe chars is returned as-is; anything
+/// else is wrapped in `'…'` with embedded `'` escaped as `'\''`. Used to rebuild
+/// the exact in-guest argv inside `sg kvm -c '<argv>'`.
+fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/=:,@+".contains(&b));
+    if safe {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Map the `--lane`/`--lima-vm`/`--lima-gateway` CLI strings to a `Lane`.
@@ -178,23 +212,28 @@ mod tests {
             gateway: "host.lima.internal".into(),
         });
         let argv = carrick_invocation_argv(&s, "/home/user/ct/release/carrick", "conf-1-2", &lane);
-        // Kvm: limactl shell <vm> -- env CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005 <carrick-in-guest> run … <rewritten image> …
+        // Kvm: limactl shell <vm> -- sg kvm -c '<shell-quoted: env …=host.lima.internal:5005 <carrick> run … <rewritten image> …>'
         assert_eq!(
-            &argv[0..3],
-            &["limactl".to_string(), "shell".to_string(), "carrick".to_string()]
+            argv[0..7],
+            ["limactl", "shell", "carrick", "--", "sg", "kvm", "-c"].map(String::from)
         );
-        assert_eq!(argv[3], "--");
-        assert_eq!(argv[4], "env");
-        assert_eq!(argv[5], "CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005");
-        assert_eq!(argv[6], "/home/user/ct/release/carrick");
-        assert_eq!(argv[7], "run");
-        // image-ref host rewritten to the gateway:
-        assert!(argv.contains(&"host.lima.internal:5005/carrick-go-conformance:1.24".to_string()));
-        assert!(
-            !argv
-                .iter()
-                .any(|t| t == "localhost:5005/carrick-go-conformance:1.24")
-        );
+        assert_eq!(argv.len(), 8, "the sg command string is one final arg");
+        let inner = &argv[7]; // the single shell-string `sg kvm -c` runs
+        assert!(inner.contains("CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005"));
+        assert!(inner.contains("/home/user/ct/release/carrick"));
+        assert!(inner.contains(" run "));
+        // image-ref host rewritten to the gateway, un-rewritten host absent:
+        assert!(inner.contains("host.lima.internal:5005/carrick-go-conformance:1.24"));
+        assert!(!inner.contains("localhost:5005/carrick-go-conformance:1.24"));
+    }
+
+    #[test]
+    fn shell_quote_handles_barewords_and_metachars() {
+        assert_eq!(shell_quote("simple"), "simple");
+        assert_eq!(shell_quote("/usr/local/go/bin"), "/usr/local/go/bin");
+        assert_eq!(shell_quote("a b && c"), "'a b && c'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]
