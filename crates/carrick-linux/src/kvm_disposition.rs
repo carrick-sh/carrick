@@ -45,9 +45,10 @@ use std::os::raw::c_int;
 
 use carrick_signal_core::host_disposition;
 
-/// Whether KVM has already CLAIMED `signum` for one of its own mechanisms, so the
-/// disposition mirror must leave it alone (the claiming mechanism already
-/// delivers/handles it correctly):
+/// Whether carrick has already CLAIMED `signum` on KVM — either for one of KVM's
+/// own delivery mechanisms OR as a process-wide runtime disposition carrick-cli
+/// owns — so the disposition mirror must leave it alone (the claiming owner
+/// already delivers/handles it correctly):
 ///   * SIGHUP(1)/SIGINT(2)/SIGQUIT(3)/SIGTERM(15): the async host-signal PUMP
 ///     ([`crate::kvm_signal_pump`]) catches these, fans them into PROC_PENDING,
 ///     and kicks the vCPUs so the generic loop runs the guest handler. Installing
@@ -58,10 +59,19 @@ use carrick_signal_core::host_disposition;
 ///     ring dirty + pokes the pump.
 ///   * SIGCHLD(17): the child-exit REAPER ([`crate::kvm_signal_pump`]) — its own
 ///     handler pokes the pump, whose thread `waitid`-peeks tracked children.
+///   * SIGPIPE(13): carrick-cli installs a process-wide host `SIG_IGN` for it
+///     (`carrick-cli/src/main.rs`, `configure_process_environment`) so carrick's
+///     OWN internal `write(2)`s to a closed pipe return EPIPE silently instead of
+///     killing the process; the guest's pipe-write SIGPIPE is synthesised on the
+///     syscall path. Mirroring a guest disposition onto host SIGPIPE here would
+///     either clobber that ignore with a routed handler (re-routing carrick's own
+///     EPIPE writes into the guest as a spurious SIGPIPE) or, worse, restore
+///     SIG_DFL so carrick's next internal closed-pipe write KILLS the process.
+///     HVF excludes SIGPIPE in its `ensure_host_handler` for the same reason.
 ///
-/// All four pump signals, the kick, the nudge, and SIGCHLD are therefore EXCLUDED
-/// from disposition mirroring. (SIGINT additionally is not host-routed by HVF for
-/// the same "carrick keeps its own" reason; here the pump owns it.)
+/// All four pump signals, the kick, the nudge, SIGCHLD, and SIGPIPE are therefore
+/// EXCLUDED from disposition mirroring. (SIGINT additionally is not host-routed by
+/// HVF for the same "carrick keeps its own" reason; here the pump owns it.)
 pub fn is_kvm_claimed(signum: i32) -> bool {
     // The four pumped process-directed signals.
     if matches!(signum, libc::SIGHUP | libc::SIGINT | libc::SIGQUIT | libc::SIGTERM) {
@@ -69,6 +79,11 @@ pub fn is_kvm_claimed(signum: i32) -> bool {
     }
     // SIGCHLD: the reaper owns it.
     if signum == libc::SIGCHLD {
+        return true;
+    }
+    // SIGPIPE: carrick-cli owns a process-wide SIG_IGN for its own internal
+    // closed-pipe writes; never mirror a guest disposition onto it.
+    if signum == libc::SIGPIPE {
         return true;
     }
     // The two RT signals carrick reserves: the kick (SIGRTMIN) and the xsignal
@@ -133,9 +148,18 @@ pub fn set_host_ignore(signum: i32) {
         return;
     }
     install_sigaction(signum, libc::SIG_IGN);
-    // Mark installed so a later `set_host_default` knows to clear it (and so the
-    // execve-reset visits it). A re-ignore is harmless.
-    let _ = host_disposition::mark_installed(signum);
+    // The host no longer ROUTES this signal (it's ignored), so DROP the
+    // routed-handler bookkeeping. The INSTALLED bit means "we have a routed
+    // handler installed", NOT "any non-default disposition": if the guest later
+    // transitions SIG_IGN -> a real handler, `ensure_host_handler` must RE-INSTALL
+    // `kvm_routed_handler` rather than early-return via its idempotency guard.
+    // (Leaving the bit set would make that transition silently drop cross-process
+    // kills — the host would stay SIG_IGN. HVF's `set_host_ignore` clears it too.)
+    //
+    // SIG_IGN survives `execve` natively (POSIX) and via the `ignored_mask` the
+    // dispatcher passes to `reset_routed_handlers_after_execve`, so NOT tracking
+    // SIG_IGN in the INSTALLED (routed-handler) mask is correct.
+    host_disposition::clear_installed(signum);
 }
 
 /// Reset a mirrored signal's HOST disposition back to `SIG_DFL` (the guest reset
@@ -247,9 +271,10 @@ mod tests {
     }
 
     /// Install / ignore / default round-trip through the real `sigaction` host
-    /// syscall on a signal carrick does not otherwise use here. Asserts the shared
-    /// install mask tracks the disposition and `set_host_default` clears it, then
-    /// restores the host default so the test is hermetic.
+    /// syscall on a signal carrick does not otherwise use here. The INSTALLED bit
+    /// means "a ROUTED HANDLER is installed" — so a routed handler SETS it, while
+    /// `set_host_ignore`/`set_host_default` CLEAR it (the host no longer routes the
+    /// signal). Restores the host default at the end so the test is hermetic.
     #[test]
     fn install_ignore_default_roundtrip_tracks_mask() {
         // Use SIGURG (23): routable, not claimed, and not otherwise touched by
@@ -264,9 +289,17 @@ mod tests {
         ensure_host_handler(SIG);
         assert!(host_disposition::is_installed(SIG));
 
+        // SIG_IGN means we no longer have a ROUTED handler installed: the bit is
+        // CLEARED (so a later ignore->handler transition re-installs the route).
         set_host_ignore(SIG);
-        assert!(host_disposition::is_installed(SIG), "ignore keeps it tracked");
+        assert!(
+            !host_disposition::is_installed(SIG),
+            "ignore drops the routed-handler bit (it's no longer routed)"
+        );
 
+        // Re-route then SIG_DFL: default also clears the install bit.
+        ensure_host_handler(SIG);
+        assert!(host_disposition::is_installed(SIG), "re-install marks installed");
         set_host_default(SIG);
         assert!(
             !host_disposition::is_installed(SIG),
@@ -280,17 +313,102 @@ mod tests {
             !host_disposition::is_installed(libc::SIGTERM),
             "a KVM-claimed signal must not be mirrored"
         );
+
+        // Hermetic cleanup: restore the host default for SIGURG.
+        set_host_default(SIG);
+        host_disposition::clear_installed(SIG);
     }
 
-    /// execve-reset clears the routed dispositions except the `ignored_mask` ones
-    /// (indexed by bit `signum`, the dispatcher ABI).
+    /// DEFECT 1 regression: SIGPIPE(13) must NOT be host-routed on KVM, because
+    /// carrick-cli owns a process-wide host `SIG_IGN` for its OWN internal
+    /// closed-pipe writes (carrick-cli/src/main.rs). It must be KVM-claimed so all
+    /// four disposition fns are no-ops for it (the process-wide ignore is
+    /// preserved). KVM's effective skip set is then a SUPERSET of HVF's
+    /// `9 | 13 | 17 | 19` guard: 9/19 are excluded by the neutral `is_host_routable`
+    /// base, and 13/17 by `is_kvm_claimed`.
+    #[test]
+    fn sigpipe_is_not_host_routed() {
+        assert!(
+            is_kvm_claimed(libc::SIGPIPE),
+            "SIGPIPE must be KVM-claimed (carrick-cli owns its process-wide SIG_IGN)"
+        );
+        // Therefore not routable, so every disposition fn no-ops.
+        assert!(!kvm_routable(libc::SIGPIPE), "SIGPIPE must never be KVM-routable");
+
+        // Each of the four disposition fns must be a no-op: they must not mark the
+        // install mask nor (since kvm_routable gates first) touch the host
+        // disposition. The observable proxy is the mask staying clear.
+        host_disposition::clear_installed(libc::SIGPIPE);
+        ensure_host_handler(libc::SIGPIPE);
+        assert!(
+            !host_disposition::is_installed(libc::SIGPIPE),
+            "ensure_host_handler must not mirror SIGPIPE"
+        );
+        set_host_ignore(libc::SIGPIPE);
+        assert!(
+            !host_disposition::is_installed(libc::SIGPIPE),
+            "set_host_ignore must not touch SIGPIPE"
+        );
+        set_host_default(libc::SIGPIPE);
+        assert!(
+            !host_disposition::is_installed(libc::SIGPIPE),
+            "set_host_default must not touch SIGPIPE"
+        );
+
+        // The HVF parity check: KVM's effective skip set ⊇ {9, 13, 17, 19}.
+        assert!(!kvm_routable(9), "SIGKILL excluded by is_host_routable");
+        assert!(!kvm_routable(13), "SIGPIPE excluded by is_kvm_claimed");
+        assert!(!kvm_routable(17), "SIGCHLD excluded by is_kvm_claimed");
+        assert!(!kvm_routable(19), "SIGSTOP excluded by is_host_routable");
+    }
+
+    /// DEFECT 2 regression: a guest SIG_IGN -> real-handler transition must
+    /// RE-INSTALL the routed handler. `set_host_ignore` clears the INSTALLED bit
+    /// (the host is no longer routing), so the subsequent `ensure_host_handler`
+    /// does NOT early-return via its idempotency guard — it installs
+    /// `kvm_routed_handler` and the bit ends up SET. (If `set_host_ignore` left the
+    /// bit marked, the transition would be silently skipped and cross-process kills
+    /// would be dropped while the host stayed SIG_IGN.)
+    #[test]
+    fn ignore_then_handler_installs_routed() {
+        const SIG: i32 = 10; // SIGUSR1 — routable, not claimed.
+        assert!(kvm_routable(SIG));
+        host_disposition::clear_installed(SIG);
+
+        // Guest sets SIG_IGN first.
+        set_host_ignore(SIG);
+        assert!(
+            !host_disposition::is_installed(SIG),
+            "set_host_ignore must clear the routed-handler bit"
+        );
+
+        // Guest then installs a real handler: the routed handler MUST be installed
+        // (the transition is not skipped), so the INSTALLED bit ends up SET.
+        ensure_host_handler(SIG);
+        assert!(
+            host_disposition::is_installed(SIG),
+            "ignore->handler must re-install the routed handler (not early-return)"
+        );
+
+        // Hermetic cleanup.
+        set_host_default(SIG);
+        host_disposition::clear_installed(SIG);
+    }
+
+    /// execve-reset clears the routed (INSTALLED) dispositions except the
+    /// `ignored_mask` ones (indexed by bit `signum`, the dispatcher ABI). The walk
+    /// is over the routed-handler mask: a signal the new image keeps ignored stays
+    /// in place; an ordinary routed handler is reset to host default.
     #[test]
     fn execve_reset_preserves_ignored_mask() {
         const SIG_KEEP: i32 = 10; // SIGUSR1 — kept ignored across execve
         const SIG_RESET: i32 = 12; // SIGUSR2 — reset to default
         host_disposition::clear_all();
-        set_host_ignore(SIG_KEEP);
-        set_host_ignore(SIG_RESET);
+        // Both carry a ROUTED handler (the INSTALLED bit) before execve. (A pure
+        // SIG_IGN no longer tracks in INSTALLED — see `set_host_ignore` — and
+        // survives execve natively, so it is not part of this reset walk.)
+        ensure_host_handler(SIG_KEEP);
+        ensure_host_handler(SIG_RESET);
         assert!(host_disposition::is_installed(SIG_KEEP));
         assert!(host_disposition::is_installed(SIG_RESET));
 
@@ -308,6 +426,27 @@ mod tests {
         );
         // Hermetic cleanup.
         set_host_default(SIG_KEEP);
+        host_disposition::clear_all();
+    }
+
+    /// A pure SIG_IGN (no routed handler) is NOT tracked in the INSTALLED mask, so
+    /// `reset_routed_handlers_after_execve` does not visit it and leaves the host
+    /// `SIG_IGN` in place — which is exactly correct: SIG_IGN survives execve
+    /// natively (POSIX), so carrick's mirrored host ignore should too.
+    #[test]
+    fn execve_reset_leaves_pure_sig_ign_untracked() {
+        const SIG: i32 = 14; // SIGALRM — routable, not claimed.
+        host_disposition::clear_all();
+        set_host_ignore(SIG);
+        assert!(
+            !host_disposition::is_installed(SIG),
+            "a pure SIG_IGN is not tracked as a routed handler"
+        );
+        // The reset walk is a no-op for it (nothing to reset); host SIG_IGN stays.
+        reset_routed_handlers_after_execve(0);
+        assert!(!host_disposition::is_installed(SIG));
+        // Hermetic cleanup: restore the host default.
+        set_host_default(SIG);
         host_disposition::clear_all();
     }
 }
