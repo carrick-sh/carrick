@@ -55,6 +55,7 @@
 
 pub mod guest_cpu;
 pub mod host_facts;
+pub mod internal_fd;
 pub mod host_mapping;
 pub mod host_proc;
 pub mod ulock;

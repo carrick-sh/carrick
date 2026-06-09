@@ -1,7 +1,6 @@
 //! Thin safe wrapper around Darwin/FreeBSD `kqueue`/`kevent`.
 
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Darwin's exceptional-condition filter. The `libc` crate version used here
 /// does not expose this SDK constant.
@@ -9,63 +8,11 @@ pub const EVFILT_EXCEPT: i16 = -15;
 /// `EVFILT_EXCEPT` hint for socket out-of-band data.
 pub const NOTE_OOB: u32 = 0x0000_0002;
 
-const HOST_INTERNAL_FD_MIN: i32 = 16 * 1024;
-const HOST_INTERNAL_FD_MIN_FALLBACK: i32 = 2048;
-const HOST_INTERNAL_FD_TARGET: libc::rlim_t = (HOST_INTERNAL_FD_MIN as libc::rlim_t) + 16;
-static NOFILE_RAISE_ATTEMPTED: AtomicU8 = AtomicU8::new(0);
-
-fn ensure_internal_fd_range() {
-    if NOFILE_RAISE_ATTEMPTED
-        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
-        return;
-    }
-    let mut limit = unsafe { limit.assume_init() };
-    if limit.rlim_cur >= HOST_INTERNAL_FD_TARGET {
-        return;
-    }
-    let desired = if limit.rlim_max == libc::RLIM_INFINITY {
-        HOST_INTERNAL_FD_TARGET
-    } else {
-        HOST_INTERNAL_FD_TARGET.min(limit.rlim_max)
-    };
-    if desired > limit.rlim_cur {
-        limit.rlim_cur = desired;
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
-}
-
-pub fn duplicate_internal_fd(fd: i32) -> Option<i32> {
-    ensure_internal_fd_range();
-    // Prefer the high internal range. On a host whose RLIMIT_NOFILE cannot reach
-    // it, `F_DUPFD_CLOEXEC` returns EMFILE for every fd >= HOST_INTERNAL_FD_MIN;
-    // fall back to a lower floor that still clears the guest fd range, so carrick
-    // keeps working (and CI runners with a low fd cap stay green) instead of
-    // failing every internal-pipe allocation.
-    for floor in [HOST_INTERNAL_FD_MIN, HOST_INTERNAL_FD_MIN_FALLBACK] {
-        let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
-        if duped >= 0 {
-            return Some(duped);
-        }
-    }
-    None
-}
-
-pub fn relocate_internal_fd(fd: i32) -> i32 {
-    let Some(duped) = duplicate_internal_fd(fd) else {
-        return fd;
-    };
-    unsafe { libc::close(fd) };
-    duped
-}
+// Internal-fd relocation is platform-neutral POSIX (F_DUPFD_CLOEXEC above a
+// high floor, then close the original); it now lives in the neutral
+// `carrick-host` crate so the KVM/Linux backend shares the real impl. Re-export
+// it here so this crate's public path (and HVF's via carrick_bsd) is unchanged.
+pub use carrick_host::internal_fd::{duplicate_internal_fd, relocate_internal_fd};
 
 /// RAII owner for a Darwin/FreeBSD kqueue fd.
 #[derive(Debug)]
