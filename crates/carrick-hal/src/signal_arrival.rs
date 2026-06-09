@@ -1,33 +1,16 @@
-//! How async signals physically ARRIVE and how a waiter is woken — the
-//! per-backend mechanism behind the neutral carrick-signal-core pending store.
-//! HVF wraps the kqueue pump / EVFILT / xsig ring; KVM uses kicker+futex, the
-//! native sigaction pump (Task 7), and native rt_sigqueueinfo (Task 8). The trait
-//! PERMITS divergence: HVF's xsig_* use a MAP_SHARED ring, KVM's use host syscalls.
-use crate::ThreadId;
+//! The one neutral signal-arrival hook the generic vCPU loop dispatches: "wake
+//! all parked waiters". This is needed at fork/exec quiesce points and for
+//! process-directed signal arrival, where the loop must release every thread
+//! parked in a backend-specific wait without naming the concrete backend.
+//!
+//! All OTHER signal-arrival mechanics — host-handler install, the cross-process
+//! xsig MAP_SHARED ring, sender recording (SI_USER si_pid), child-exit watch,
+//! per-tid wake, and the fork reset — are delivered by the backend's
+//! `host_signal::*` free-function seam and the [`crate::HostForkCoordinator`],
+//! NOT through this trait. The dispatcher reaches those directly, so they never
+//! needed an object-safe abstraction here.
 
 pub trait SignalArrival: Send + Sync {
-    /// Install host sigaction handlers / spawn the pump. Idempotent; init + after fork.
-    fn install_handlers(&self);
-    /// Wake the vCPU/waiter for `tid` after a signal was published into core state.
-    fn on_signal_arrived(&self, tid: ThreadId);
     /// Wake ALL parked waiters (fork/exec quiesce, process-directed arrival).
     fn wake_all_waiters(&self);
-    /// Record sender host pid for the NEXT async delivery of `signum` (SI_USER si_pid).
-    fn record_sender(&self, signum: i32, host_pid: i32);
-    /// Watch a guest child for exit, publishing `exit_signal` to `parent_tid` (SIGCHLD).
-    fn register_child_exit_watch(&self, child_pid: i32, parent_tid: i32, exit_signal: i32);
-    /// Cross-process queued signal. HVF: MAP_SHARED ring; KVM: native rt_sigqueueinfo.
-    fn xsig_enqueue(
-        &self,
-        target_host: i32,
-        signum: i32,
-        sender_ns: i32,
-        sender_uid: u32,
-        value: i64,
-    ) -> bool;
-    fn xsig_nudge(&self, target_host: i32);
-    fn xsig_drain_for_self(&self) -> Vec<(i32, i32, u32, i64)>;
-    fn xsig_has_pending(&self) -> bool;
-    /// Fork/exec reset (re-create pump kq, clear inherited rings/watches).
-    fn reinit_after_fork(&self);
 }
