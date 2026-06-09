@@ -49,9 +49,4 @@ pub trait TimerDelivery: Send + Sync {
     /// `EVFILT_TIMER` on the fresh pump kq; KVM re-spawns the fallback thread).
     /// `None` if `which` is disarmed.
     fn current_arm(&self, which: usize) -> Option<TimerArm>;
-
-    /// Reset ALL timer delivery in a forked child. MUST call
-    /// `carrick_timer_core::itimer::clear()` so inherited slot state does not
-    /// fire a stale signal in the child.
-    fn clear(&self);
 }

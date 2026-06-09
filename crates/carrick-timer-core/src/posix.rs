@@ -243,9 +243,16 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // The REGISTRY is a process-global static; `clear_empties_registry` wipes it
+    // wholesale, so serialize all tests in this module to keep them from racing
+    // each other's ids (mirrors the `itimer::tests::TEST_LOCK` idiom).
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn create_arm_remaining_delete_roundtrip() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let id = create(0, 14); // CLOCK_MONOTONIC=0, SIGALRM=14
         assert!(exists(id));
         let _ = arm(id, 1_000_000_000, 0);
@@ -259,9 +266,29 @@ mod tests {
 
     #[test]
     fn getoverrun_starts_at_zero() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let id = create(0, 14);
         let _ = arm(id, 50_000_000, 0);
         assert_eq!(getoverrun(id), Some(0));
         let _ = delete(id);
+    }
+
+    #[test]
+    fn clear_empties_registry() {
+        // Models the fork-clear path (`host_signal::reinit_after_fork` calls
+        // `posix::clear()`): an inherited timer id must NOT survive the clear, so a
+        // child sees the not-found result (the syscall layer maps that to EINVAL).
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let id = create(0, 14); // CLOCK_MONOTONIC=0, SIGALRM=14
+        let _ = arm(id, 1_000_000_000, 0);
+        assert!(exists(id));
+        assert_eq!(getoverrun(id), Some(0));
+        assert!(remaining(id).is_some());
+
+        clear();
+
+        assert!(!exists(id));
+        assert_eq!(getoverrun(id), None);
+        assert!(remaining(id).is_none());
     }
 }

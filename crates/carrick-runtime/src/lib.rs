@@ -453,8 +453,12 @@ pub mod runtime {
         // before the kernel so `KvmSignalArrival` can wake a target vCPU via it.
         let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(carrick_linux::KvmKicker::new());
         // The KVM signal ARRIVAL/wake mechanism: kicker + futex. The async
-        // host-signal pump (Task 7) and native rt_sigqueueinfo (Task 8) are inert
-        // here, matching today's KVM behavior. Held object-safe in `KernelState`.
+        // host-signal pump is now implemented via `KvmForkCoordinator` /
+        // `kvm_signal_pump`, and cross-process signal delivery via the shared
+        // `carrick_signal_core::xsig` ring + `kvm_xsig` (the dispatcher reaches
+        // these through `crate::host_signal::xsig_*`, so this `SignalArrival`
+        // value only carries the kicker + futex wake path). Held object-safe in
+        // `KernelState`.
         let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
             Arc::new(carrick_linux::KvmSignalArrival {
                 kicker: Arc::clone(&kicker),
@@ -1202,7 +1206,22 @@ pub mod host_signal {
         -1
     }
     pub fn register_child_exit_watch(_child_pid: i32, _parent_tid: i32, _exit_signal: i32) {}
-    pub fn reinit_after_fork() {}
+    pub fn reinit_after_fork() {
+        // A forked child inherits the parent's process-global timer + signal-pending
+        // state (these live in carrick-timer-core / carrick-signal-core statics, copied
+        // across libc::fork), but POSIX gives a fork child NO inherited timers and an
+        // EMPTY pending-signal set. The parent's interval/POSIX-timer fallback THREADS
+        // do not survive fork (only the forking thread does), so an inherited armed
+        // slot has no backing thread; clear the registries so the child does not see
+        // the parent's timer ids (EINVAL, not stale state) and a re-arm starts fresh.
+        // Mirrors the HVF host_signal::reinit_after_fork neutral clears (its self-pipe/
+        // kqueue/CHILD_WATCHES bits are HVF glue; the KVM pump re-inits separately in
+        // kvm_signal_pump::reinit_after_fork).
+        crate::posix_timer::clear();
+        crate::itimer::clear();
+        carrick_signal_core::clear_thread_pending();
+        carrick_signal_core::clear_proc_pending();
+    }
     pub fn wake_all_waiters() {}
 }
 

@@ -1,7 +1,10 @@
-//! KVM's SignalArrival: wakes via the kicker + futex. The async host-signal pump
-//! is Task 7; native rt_sigqueueinfo cross-process is Task 8 — those methods are
-//! inert here, matching today's KVM behavior (guest-issued sends already carry
-//! identity via the dispatcher's siginfo queue).
+//! KVM's SignalArrival: wakes a target vCPU via the kicker + futex. The async
+//! host-signal pump is implemented separately (`kvm_signal_pump`, re-armed on
+//! fork by `KvmForkCoordinator`), and cross-process signal delivery is wired
+//! through the shared `carrick_signal_core::xsig` ring + `kvm_xsig`. The
+//! dispatcher drives those via `carrick_runtime::host_signal::xsig_*` directly,
+//! so the `xsig_*` methods on this value stay unused delegation stubs (false /
+//! empty); only the kicker + futex wake path here is live.
 use std::sync::Arc;
 
 use carrick_hal::{PlatformFutex, SignalArrival, ThreadId, VcpuRegistry};

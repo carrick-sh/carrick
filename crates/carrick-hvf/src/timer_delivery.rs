@@ -83,11 +83,4 @@ impl TimerDelivery for HvfTimerDelivery {
     fn current_arm(&self, which: usize) -> Option<TimerArm> {
         crate::itimer::current_arm(which)
     }
-
-    fn clear(&self) {
-        // Fork-replay: reset inherited interval-timer slots. The pump's own
-        // `current_arms()` re-apply (vcpu_kick.rs) handles re-arming surviving
-        // timers on the fresh kq; this clears stale state in a forked child.
-        crate::itimer::clear();
-    }
 }
