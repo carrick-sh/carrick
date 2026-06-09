@@ -1101,8 +1101,40 @@ CEOF
       printf "FAIL [xproc-stdsig]: stdout=[%s] exit=%s oracle=[usr1-ok]\n" "$got" "$code" >&2
       exit 1
     fi
+
+    # 40) mprotect-ro: stage-1 re-protect TLBI (Task 8). A guest mmaps a RW page,
+    #     TOUCHES it (caching a writable stage-1 TLB entry), mprotect()s it
+    #     PROT_READ, installs an SA_SIGINFO SIGSEGV handler, then STORES to the
+    #     now-read-only page. The store must FAULT -> handler prints segv-ok. The
+    #     mprotect routes through KvmTrapEngine::protect_range ->
+    #     pt_edit_and_flush, which (because a descriptor changed) runs
+    #     run_el1_maintenance: the EL1 stage-1 maintenance trampoline
+    #     (dsb sy; tlbi vmalle1is; dsb sy; isb) on the vCPU, completing via an MMIO
+    #     store to MAINT_SENTINEL_GPA (the KVM analogue of HVFs hvc #1 -- PSCI would
+    #     swallow a real hvc). Without the flush a re-protect of an already-walked
+    #     page can leave a stale writable TLB entry, so the store would silently
+    #     succeed (no-segv). Needs glibc mmap/mprotect/sigaction -> the REAL
+    #     dispatcher. REQUIRED gate.
+    #     NOTE: the nested-KVM lima lane (vz/L1 + nested L2) was observed NOT to
+    #     retain stale stage-1 TLB entries, so this prints segv-ok on this lane
+    #     with OR without the flush; the flush is the architecturally-required fix
+    #     (real hardware + other backends DO retain), and CARRICK_MAINT_DEBUG=1
+    #     witnesses run_el1_maintenance executing. The case still locks that the
+    #     flush path BOOTS + resumes the in-flight syscall cleanly (a broken
+    #     maintenance round-trip would wedge or corrupt it -> not segv-ok).
+    mprotectro_src="$fixdir/mprotect-ro/mprotect-ro.c"
+    gcc -static -O2 -o /tmp/mprotect_ro "$mprotectro_src"
+    # -s KILL: a regression that wedges (the maintenance round-trip corrupts the
+    # in-flight mprotect) must be force-killed so the smoke fails fast.
+    got="$(timeout -s KILL 30 sg kvm -c "$kvm run-elf /tmp/mprotect_ro" 2>/dev/null)" && code=0 || code=$?
+    if [ "$got" = "segv-ok" ] && [ "$code" -eq 0 ]; then
+      echo "OK [real-dispatch+mprotect-ro]: a store to an mprotect-ed read-only page faulted SIGSEGV -- protect_range ran the EL1 stage-1 TLBI (run_el1_maintenance) and the in-flight mprotect resumed cleanly."
+    else
+      printf "FAIL [mprotect-ro]: stdout=[%s] exit=%s oracle=[segv-ok]\n" "$got" "$code" >&2
+      exit 1
+    fi
   else
-    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork/sigchld-async/xproc-stdsig]: no gcc in guest" >&2
+    echo "SKIP [glibc-static/blocking-io/file-io/map-host-alias/epoll/prot-none/signals/threads/condvar/shared-futex/vfork-exec/signal-handler/sa-onstack/fpsimd-signal/signal-sibling/sa-restart/timer-setitimer/timer-interval/timer-posix/timer-sigwait/fault-segv/fault-iabort/fault-nohandler/si-pid/cpu-time/itimer-virtual/host-term/proc-directed-nonmain/xproc-sigqueue/timer-disarm-race/posix-timer-fork/sigchld-async/xproc-stdsig/mprotect-ro]: no gcc in guest" >&2
   fi
 
   # Evidence the REAL dispatch path actually ran (write=64, exit_group=94 traps).
@@ -1113,5 +1145,5 @@ CEOF
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
-  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring+async-sigchld+xproc-stdsig — all 39 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork, sigchld-async, xproc-stdsig) pass on KVM; ZERO xfail."
+  echo "OK: B+C1+C2+C3+C5+C6+fs+fork+pipe-fork+execve+threads+futex+signal-injection+timers+faults+si-pid+cpu-time+itimer-virtual+host-signal-pump+xsignal-ring+async-sigchld+xproc-stdsig+stage1-tlbi — all 40 cases (hello, fork, pipe-fork, execve-true, execve-false, stack, glibc, blocking-IO, file-IO, map-host-alias, epoll, prot-none, signals, threads-counter, condvar-requeue, shared-futex-fork, vfork-exec, signal-handler, sa-onstack, fpsimd-signal, signal-sibling, sa-restart, timer-setitimer, timer-interval, timer-posix, timer-sigwait, fault-segv, fault-iabort, fault-nohandler, si-pid, cpu-time, itimer-virtual, host-term, proc-directed-nonmain, xproc-sigqueue, timer-disarm-race, posix-timer-fork, sigchld-async, xproc-stdsig, mprotect-ro) pass on KVM; ZERO xfail."
 '
