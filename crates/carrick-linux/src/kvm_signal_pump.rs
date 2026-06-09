@@ -56,6 +56,108 @@ const PUMP_SIGNALS: [i32; 4] = [
 /// the pipe. Read with a plain `load` in the handler (async-signal-safe).
 static SELF_PIPE_W: AtomicI32 = AtomicI32::new(-1);
 
+/// Async-signal-safe SIGCHLD handler. Unlike [`pump_handler`], it does NOT touch
+/// `PROC_PENDING`: SIGCHLD here is NOT a guest-published process signal but the
+/// host's native notification that a guest CHILD (a real host process — a guest
+/// `fork` ran `libc::fork`) exited. Resolving WHICH watched child exited and
+/// publishing the RECORDED exit signal to the RECORDED parent tid is the pump
+/// thread's reaper job (`reap_exited_watches`), which needs `waitid` + locks and
+/// must NOT run in an async handler. So the handler does ONLY `poke()` — one
+/// `write(2)` to the self-pipe — to wake the pump thread.
+extern "C" fn sigchld_handler(_signum: libc::c_int) {
+    poke();
+}
+
+/// Guards the one-time install of the separate SIGCHLD sigaction.
+static SIGCHLD_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Install the SIGCHLD disposition (idempotent). Installed with
+/// `SA_RESTART | SA_NOCLDSTOP`:
+///   * `SA_NOCLDSTOP` so a child STOP/CONTINUE does NOT fire SIGCHLD — only a
+///     terminal exit does, which is all the reaper cares about.
+///   * `SA_RESTART` so a blocking host `wait4`/`waitid` on the SYNCHRONOUS reap
+///     path (`io_wait::wait_proc_exit`) restarts across this handler's EINTR
+///     rather than failing (that path already tolerates EINTR by re-polling, but
+///     SA_RESTART keeps the contract explicit and minimises spurious wakeups).
+/// Must be live by the time the first child-exit watch is registered, so it is
+/// installed from the same `start_pump` path the kick + pump use.
+fn install_sigchld_handler() {
+    if SIGCHLD_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = sigchld_handler as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
+        libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+    }
+}
+
+/// Peek every currently-tracked guest child for a terminal exit and, on one,
+/// publish its RECORDED exit signal to its RECORDED parent tid. Runs on the pump
+/// THREAD (not the async handler), so `waitid` + the child-watch locks +
+/// `publish_pending_for` are all safe here.
+///
+/// For each `child_watch::tracked_pids()` entry we `waitid(P_PID, pid, WEXITED |
+/// WNOWAIT | WNOHANG)`. `WNOWAIT` is REQUIRED: it PEEKS the zombie WITHOUT reaping
+/// it, so the guest's own later `wait4` still returns the child's status (reaping
+/// here would make that `wait4` see `ECHILD`). On a terminal exit (si_pid == pid,
+/// code CLD_EXITED/KILLED/DUMPED) we `child_watch::take(pid)` (the atomic remove —
+/// publish-once) and, if it returned `Some((parent_tid, exit_signal))` with a
+/// non-zero exit signal, `publish_pending_for(parent_tid, exit_signal)`. The
+/// caller's subsequent `kick_all()` + `notify_signal_pending()` then wakes the
+/// parent vCPU to deliver it. An untracked child that exited is never `waitid`ed
+/// here (we only probe the tracked set), so it just leaves the pump wake harmless.
+fn reap_exited_watches() {
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    for pid in carrick_signal_core::child_watch::tracked_pids() {
+        if pid <= 0 {
+            continue;
+        }
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc != 0 {
+            // ESRCH/ECHILD: not ours / already reaped — drop the stale watch so
+            // the table does not grow unbounded. Any other errno: leave it for a
+            // later pump wake to retry.
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if errno == Some(libc::ECHILD) || errno == Some(libc::ESRCH) {
+                let _ = carrick_signal_core::child_watch::take(pid);
+            }
+            continue;
+        }
+        // WNOHANG with no ready child returns 0 with si_pid == 0 (still running).
+        // carrick-linux is a Linux-only crate, so `siginfo_t::si_pid()` (the libc
+        // accessor over the anonymous union) is available directly.
+        // SAFETY: reads the POSIX-defined `si_pid` union member; libc marks the
+        // accessor `unsafe` only because it reads a union.
+        let si_pid = unsafe { info.si_pid() };
+        if si_pid != pid || !matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED) {
+            continue;
+        }
+        // Terminal exit observed. Atomically remove the watch (publish-once) and
+        // publish the recorded exit signal to the recorded parent tid. If the
+        // guest already reaped this child synchronously, the dispatcher's
+        // terminal-reap cancel (`take_child_exit_parent`) removed it first, so
+        // `take` returns None here and we publish nothing (double-delivery guard).
+        if let Some((parent_tid, exit_signal)) = carrick_signal_core::child_watch::take(pid)
+            && exit_signal != 0
+        {
+            carrick_signal_core::publish_pending_for(parent_tid, exit_signal);
+        }
+    }
+}
+
 /// Async-signal-safe handler for the pumped host signals. Does ONLY:
 ///   1. `proc_pending_fetch_or(bit)` — a lock-free atomic OR into PROC_PENDING.
 ///   2. `write(SELF_PIPE_W, &[0u8], 1)` — wake the pump thread.
@@ -108,6 +210,11 @@ fn install_handlers() {
             libc::sigaction(sig, &action, std::ptr::null_mut());
         }
     }
+    // SIGCHLD gets its OWN (separate) disposition: it must NOT fan out into
+    // PROC_PENDING like the PUMP_SIGNALS — it triggers the child-exit reaper
+    // instead. Installed here (always, from the same `start_pump` path the kick +
+    // pump use) so it is live by the time the first child-exit watch registers.
+    install_sigchld_handler();
 }
 
 /// Create the nonblocking, close-on-exec self-pipe and publish its write end.
@@ -167,8 +274,16 @@ fn spawn_pump_thread(
                         break;
                     }
                 }
+                // Resolve any watched guest child that EXITED before kicking: the
+                // SIGCHLD handler only `poke()`d us (async-signal-safe), so the
+                // actual `waitid`-peek + publish of the recorded exit signal to the
+                // recorded parent tid runs HERE on the pump thread. This must
+                // precede the kick so the published thread-pending signal is
+                // visible when the woken parent vCPU reaches its delivery point.
+                reap_exited_watches();
                 // Wake every in-guest vCPU so it returns from KVM_RUN and the
-                // generic loop drains PROC_PENDING at its safe point. The futex
+                // generic loop drains PROC_PENDING (and any just-published
+                // thread-pending child-exit signal) at its safe point. The futex
                 // nudge covers threads blocked in a futex wait.
                 registry.kick_all();
                 futex.notify_signal_pending();
@@ -214,7 +329,16 @@ pub fn reinit_after_fork(registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn Platf
             libc::close(stale_w);
         }
     }
+    // The inherited child-exit watches belong to the PARENT's children (this
+    // child's siblings); the freshly-forked child must not reap or deliver their
+    // exit signals. Its own children are registered fresh on its own pump.
+    carrick_signal_core::child_watch::clear();
     PUMP_STARTED.store(false, Ordering::SeqCst);
+    // Re-install the SIGCHLD disposition in the child too: `libc::fork` preserves
+    // dispositions, but resetting the guard keeps `install_handlers` (called by
+    // `start_pump`) re-asserting it explicitly — and a future eager-teardown
+    // can't strand a child without it.
+    SIGCHLD_INSTALLED.store(false, Ordering::SeqCst);
     start_pump(registry, futex);
 }
 

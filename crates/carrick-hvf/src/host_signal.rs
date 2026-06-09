@@ -53,8 +53,9 @@
 //!     which wakes the [`crate::vcpu_kick`] pump so it can kick in-guest vCPUs
 //!     that are spinning in userspace (not parked in any host syscall, so the
 //!     self-pipe alone can't reach them). The pump is also where SIGCHLD comes
-//!     from: guest children are watched via `EVFILT_PROC`/`NOTE_EXIT`
-//!     (`CHILD_WATCHES`) so no host SIGCHLD handler is installed — installing one
+//!     from: guest children are watched via `EVFILT_PROC`/`NOTE_EXIT` (the
+//!     neutral `carrick_signal_core::child_watch` registry records the parent
+//!     tid + exit signal) so no host SIGCHLD handler is installed — installing one
 //!     would break `wait4`'s host-`waitpid` passthrough, since carrick reaps
 //!     guest children with real host `waitpid`. `NOTE_EXIT` is readiness-only; it
 //!     does NOT consume the child's status, leaving the reap to the guest.
@@ -62,7 +63,8 @@
 //! FORK COHERENCE. `fork(2)` does not inherit a kqueue, and the inherited
 //! self-pipe is shared with the parent. [`reinit_after_fork`] tears down the
 //! inherited channels and rebuilds private ones so a child's wakes are its own,
-//! and clears the inherited `CHILD_WATCHES`/`THREAD_*` tables. Carrick-internal
+//! and clears the inherited child-watch (`carrick_signal_core::child_watch`) /
+//! `THREAD_*` tables. Carrick-internal
 //! fds (self-pipes, kqueues) are relocated to a high fd range
 //! (`HOST_INTERNAL_FD_MIN`) above the guest's 1024-fd cap so fork
 //! reinitialization can't close a low host fd the guest fd layer has reused (see
@@ -203,21 +205,20 @@ static INSTALLED_MASK: AtomicU64 = AtomicU64::new(0);
 static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Children the guest forked, mapped from their (host == guest, mirrored) pid to
-/// the guest tid of the forking parent. The signal pump watches each child via
-/// `EVFILT_PROC`/`NOTE_EXIT` (macOS-native process-lifecycle tracking); on the
-/// child's exit it resolves the pid through this map and publishes SIGCHLD to
-/// the parent tid. This is how SIGCHLD reaches a guest handler WITHOUT installing
-/// a host SIGCHLD handler — installing one would break `wait4`'s host-`waitpid`
-/// passthrough (carrick reaps guest children with real host `waitpid`/`wait4`).
-/// `NOTE_EXIT` is purely a readiness notification: it does NOT consume the
-/// child's exit status, so the actual reap stays with the guest's `wait4`.
-/// Value is `(parent_tid, exit_signal)`: the guest tid to wake on the child's
-/// exit, and the signal the guest asked for (clone exit_signal / clone3
-/// `exit_signal`). `0` means "no exit signal" (e.g. `clone(0)`) — the pump
-/// publishes nothing in that case.
-static CHILD_WATCHES: LazyLock<Mutex<HashMap<i32, (i32, i32)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+// The `child_pid -> (parent_tid, exit_signal)` registry that records, for each
+// watched guest child, the guest tid to wake on the child's exit and the signal
+// the guest asked for (clone exit_signal / clone3 `exit_signal`), is now the
+// platform-NEUTRAL `carrick_signal_core::child_watch` core (shared verbatim with
+// the KVM backend). HVF's GLUE below layers the `EVFILT_PROC`/`NOTE_EXIT` kqueue
+// watch on top: the signal pump watches each registered child (macOS-native
+// process-lifecycle tracking); on the child's exit it resolves the pid through
+// the neutral registry and publishes the recorded exit signal to the recorded
+// parent tid. This is how SIGCHLD reaches a guest handler WITHOUT installing a
+// host SIGCHLD handler — installing one would break `wait4`'s host-`waitpid`
+// passthrough (carrick reaps guest children with real host `waitpid`/`wait4`).
+// `NOTE_EXIT` is purely a readiness notification: it does NOT consume the child's
+// exit status, so the actual reap stays with the guest's `wait4`. `0` as an exit
+// signal means "no exit signal" (e.g. `clone(0)`) — the pump publishes nothing.
 
 struct ThreadWakeRegistration {
     fds: Arc<ThreadWakeFds>,
@@ -297,7 +298,8 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 /// `EVFILT_PROC`/`NOTE_EXIT` watch for the child on the signal pump's kqueue so
 /// the pump publishes SIGCHLD to `parent_tid` when the child exits. Called from
 /// the runtime's fork parent branch (normal dispatch context). No host SIGCHLD
-/// handler is installed — see `CHILD_WATCHES`. If the pump kqueue is not yet
+/// handler is installed — see the neutral `carrick_signal_core::child_watch`
+/// registry. If the pump kqueue is not yet
 /// registered, the mapping is still recorded and the pump arms the watch when it
 /// next learns the pid (we re-arm on every register). The `EV_ONESHOT` watch
 /// (see `Kevent::proc_exit`) auto-removes once it fires.
@@ -305,20 +307,9 @@ pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i
     if child_pid <= 0 {
         return;
     }
-    // Sanitize the requested exit signal: 0 is the "no exit signal" sentinel
-    // (preserved as-is); any value outside the valid signal range falls back
-    // to SIGCHLD so a malformed signum still produces SIGCHLD-class behavior.
-    let exit_signal = if exit_signal == 0 {
-        0
-    } else if (1..=64).contains(&exit_signal) {
-        exit_signal
-    } else {
-        crate::linux_abi::LINUX_SIGCHLD
-    };
-    #[allow(clippy::expect_used)]
-    CHILD_WATCHES
-        .lock()
-        .insert(child_pid, (parent_tid, exit_signal));
+    // Record the mapping (with the 0-sentinel / SIGCHLD-fallback sanitization) in
+    // the neutral child-watch core; the EVFILT_PROC arming below is HVF glue.
+    carrick_signal_core::child_watch::register(child_pid, parent_tid, exit_signal);
     let kq = PUMP_KQUEUE.load(Ordering::SeqCst);
     if kq >= 0 {
         let result = crate::darwin_kqueue::apply_changes(
@@ -341,10 +332,7 @@ pub fn rearm_child_watches(kq: i32) {
     if kq < 0 {
         return;
     }
-    let pids: Vec<i32> = {
-        #[allow(clippy::expect_used)]
-        CHILD_WATCHES.lock().keys().copied().collect()
-    };
+    let pids: Vec<i32> = carrick_signal_core::child_watch::tracked_pids();
     for pid in pids {
         let result = crate::darwin_kqueue::apply_changes(
             kq,
@@ -379,16 +367,14 @@ fn publish_child_exit_signal(child_pid: i32) -> bool {
 /// is one-shot). `None` if the pid was not a tracked guest child. Called only
 /// from the signal pump.
 pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
-    #[allow(clippy::expect_used)]
-    CHILD_WATCHES.lock().remove(&child_pid)
+    carrick_signal_core::child_watch::take(child_pid)
 }
 
 /// True iff `child_pid` is a tracked guest child (a fired `EVFILT_PROC` event's
 /// `ident`). Lets the pump distinguish a child-exit event from its other wake
 /// sources without consuming the mapping.
 pub fn is_tracked_child(child_pid: i32) -> bool {
-    #[allow(clippy::expect_used)]
-    CHILD_WATCHES.lock().contains_key(&child_pid)
+    carrick_signal_core::child_watch::is_tracked(child_pid)
 }
 
 /// Is a signal deliverable to `tid` pending? True for a thread-directed signal
@@ -654,7 +640,7 @@ pub fn reinit_after_fork() {
     // The inherited child-exit watches belong to the PARENT's children (this
     // child's siblings); the freshly-forked child must not deliver SIGCHLD for
     // them. Its own children are registered on its own re-spawned pump.
-    CHILD_WATCHES.lock().clear();
+    carrick_signal_core::child_watch::clear();
     clear_thread_waiters();
     clear_proc_pending();
 }

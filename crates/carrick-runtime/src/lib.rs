@@ -1151,8 +1151,18 @@ pub mod host_signal {
     pub fn host_to_linux_signum(sig: i32) -> i32 {
         sig
     }
-    pub fn take_child_exit_parent(_child_pid: i32) -> Option<(i32, i32)> {
-        None
+    /// Resolve + REMOVE a child's `(parent_tid, exit_signal)` watch. Called by
+    /// the dispatcher's synchronous terminal-reap path to CANCEL the async
+    /// child-exit watch when the guest reaps the child itself (the double-delivery
+    /// guard: the pump's reaper then finds nothing to publish). Delegates to the
+    /// neutral child-watch registry.
+    pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
+        carrick_signal_core::child_watch::take(child_pid)
+    }
+    /// True iff `child_pid` is a tracked guest child (without consuming the
+    /// mapping). Delegates to the neutral child-watch registry.
+    pub fn is_tracked_child(child_pid: i32) -> bool {
+        carrick_signal_core::child_watch::is_tracked(child_pid)
     }
     pub fn reset_routed_handlers_after_execve(_ignored_mask: u64) {}
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
@@ -1213,7 +1223,19 @@ pub mod host_signal {
     pub fn pump_kqueue() -> i32 {
         -1
     }
-    pub fn register_child_exit_watch(_child_pid: i32, _parent_tid: i32, _exit_signal: i32) {}
+    /// Record that guest tid `parent_tid` forked child `child_pid`, which should
+    /// receive `exit_signal` when it exits, so the KVM signal pump's reaper
+    /// publishes that signal to `parent_tid` the instant the child exits. The
+    /// neutral child-watch core does the sanitize + insert; the KVM glue (the
+    /// separate SIGCHLD `sigaction` + the pump-thread reaper) is installed by
+    /// `kvm_signal_pump::start_pump` (called at startup via `start_signal_pump`,
+    /// lib.rs ~477, BEFORE any guest fork), so the SIGCHLD disposition is already
+    /// live by the time any watch registers — no per-register install needed.
+    /// Without this watch a guest that reaps from its SIGCHLD handler (no blocking
+    /// wait4) hung forever on KVM (the headline gap).
+    pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i32) {
+        carrick_signal_core::child_watch::register(child_pid, parent_tid, exit_signal);
+    }
     pub fn reinit_after_fork() {
         // A forked child inherits the parent's process-global timer + signal-pending
         // state (these live in carrick-timer-core / carrick-signal-core statics, copied
@@ -1229,6 +1251,12 @@ pub mod host_signal {
         crate::itimer::clear();
         carrick_signal_core::clear_thread_pending();
         carrick_signal_core::clear_proc_pending();
+        // The inherited child-exit watches belong to the PARENT's children (this
+        // child's siblings); the freshly-forked child must not deliver their exit
+        // signals. Cleared here alongside the other neutral fork-clears for
+        // consistency with the HVF arm; `kvm_signal_pump::reinit_after_fork` also
+        // clears it (idempotent) when the fork coordinator re-arms the child pump.
+        carrick_signal_core::child_watch::clear();
     }
     pub fn wake_all_waiters() {}
 }
@@ -1289,11 +1317,20 @@ pub mod io_wait {
     /// signals, so there is nothing to block. Spurious HOST signals are absorbed
     /// by retrying `ppoll` for the remaining time (no guest `EINTR` is fabricated
     /// — real signal delivery is the later signal slice).
-    pub struct ThreadWaiter;
+    pub struct ThreadWaiter {
+        /// The guest tid this waiter parks on behalf of. Used by the `ppoll`
+        /// EINTR-recheck so a THREAD-directed pending signal (e.g. an async
+        /// child-exit signal the pump reaper published to this tid, or a
+        /// `tgkill`) breaks the wait — not just a process-directed one. The
+        /// macOS waiter wakes via a self-pipe + `has_pending`; the Linux waiter
+        /// has no pipe in a `pause()` (empty-fd `ppoll`), so the kick's EINTR is
+        /// the only wake and the recheck must see thread-pending too.
+        tid: crate::thread::ThreadId,
+    }
 
     impl ThreadWaiter {
-        pub fn new(_tid: crate::thread::ThreadId) -> Self {
-            Self
+        pub fn new(tid: crate::thread::ThreadId) -> Self {
+            Self { tid }
         }
 
         /// No-op: `ppoll` needs no per-wait setup (the macOS waiter lazily
@@ -1306,7 +1343,7 @@ pub mod io_wait {
             timeout: Option<Duration>,
             block_mask: u64,
         ) -> WaitResult {
-            ppoll_wait(fds, timeout, block_mask)
+            ppoll_wait(self.tid, fds, timeout, block_mask)
         }
 
         /// `poll(2)`-flavoured wait. On Linux this is the same `ppoll` as
@@ -1317,7 +1354,7 @@ pub mod io_wait {
             timeout: Option<Duration>,
             block_mask: u64,
         ) -> WaitResult {
-            ppoll_wait(fds, timeout, block_mask)
+            ppoll_wait(self.tid, fds, timeout, block_mask)
         }
 
         /// Wait for a guest child process to become reapable (Phase 2 Task 7).
@@ -1344,7 +1381,8 @@ pub mod io_wait {
                 // spin — each idle slice sleeps in `ppoll`.
                 // TimedOut (slice elapsed) or a spurious Ready: re-poll the
                 // child at the loop top; only an Interrupted bails out.
-                if let WaitResult::Interrupted = ppoll_wait(&[], Some(Duration::from_millis(50)), 0)
+                if let WaitResult::Interrupted =
+                    ppoll_wait(self.tid, &[], Some(Duration::from_millis(50)), 0)
                 {
                     return WaitResult::Interrupted;
                 }
@@ -1391,7 +1429,12 @@ pub mod io_wait {
         }
     }
 
-    fn ppoll_wait(fds: &[WaitFd], timeout: Option<Duration>, block_mask: u64) -> WaitResult {
+    fn ppoll_wait(
+        tid: crate::thread::ThreadId,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: u64,
+    ) -> WaitResult {
         let mut pollfds: Vec<libc::pollfd> = fds
             .iter()
             .map(|w| libc::pollfd {
@@ -1456,7 +1499,18 @@ pub mod io_wait {
                 // an `Interrupted` lets `deliver_pending_signal` drain it and
                 // re-inject the guest signal with the sender's siginfo. The
                 // `block_mask` keeps a genuinely-blocked ring signal parked.
-                if crate::host_signal::has_process_pending()
+                // `has_unblocked_pending_for(tid, block_mask)` covers BOTH a
+                // process-directed pending signal (the host-signal pump's
+                // SIGTERM/INT/HUP/QUIT, a process-directed timer/kill fan-out) AND
+                // a THREAD-directed one published to THIS tid — notably the async
+                // child-exit signal the SIGCHLD pump reaper publishes to the
+                // recorded parent tid (`publish_pending_for`). Using only
+                // `has_process_pending()` here wedged a `pause()`-blocked parent
+                // forever: the reaper's thread-directed publish + kick EINTR'd the
+                // ppoll, but the recheck saw no process-pending and treated the
+                // kick as spurious, re-entering the same wait. The `block_mask`
+                // keeps a genuinely-blocked signal parked (sigwait/ppoll mask).
+                if crate::host_signal::has_unblocked_pending_for(tid, block_mask)
                     || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
                 {
                     return WaitResult::Interrupted;
