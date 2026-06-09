@@ -66,6 +66,12 @@ struct Args {
     manifest: PathBuf,
     #[arg(long, default_value = "scripts/conformance/baseline.jsonl")]
     baseline: PathBuf,
+    /// Additional baseline UNIONed onto `--baseline` before classification: a
+    /// divergence is excused iff it matches the shared baseline OR this overlay.
+    /// Used by the KVM lane (`baseline.kvm.jsonl`, starts empty) so every KVM
+    /// divergence is a gap until proven environmental. Absent/empty -> no-op.
+    #[arg(long, default_value = "scripts/conformance/baseline.kvm.jsonl")]
+    baseline_overlay: PathBuf,
     #[arg(long, default_value = "target/conformance/results.jsonl")]
     jsonl: PathBuf,
     /// Rewrite baseline.jsonl + support-matrix.md from this run (guarded).
@@ -200,7 +206,11 @@ fn run() -> anyhow::Result<ExitCode> {
         preflight(&args.carrick_bin)?;
     }
 
-    let baseline = load_baseline(&args.baseline);
+    // Load the shared baseline, then UNION the overlay onto it (a no-op when the
+    // overlay is absent/empty). A divergence is "expected" iff it matches the
+    // shared baseline OR the overlay; the KVM lane carries an (initially empty)
+    // overlay so every KVM-only divergence is a gap until proven environmental.
+    let baseline = load_baseline(&args.baseline).with_overlay(load_baseline(&args.baseline_overlay));
 
     let pid = std::process::id();
     let carrick_bin = args.carrick_bin.to_string_lossy().into_owned();

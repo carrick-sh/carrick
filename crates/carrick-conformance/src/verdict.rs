@@ -90,6 +90,18 @@ impl Baseline {
     fn pairs_for(&self, suite: &str) -> Option<&BTreeMap<String, [Outcome; 2]>> {
         self.by_suite.get(suite)
     }
+    /// UNION an overlay baseline onto this one, returning the combined baseline.
+    /// A divergence is excused iff its `(carrick, docker)` pair matches EITHER
+    /// the shared baseline OR the overlay — so the overlay's per-suite, per-id
+    /// pairs take precedence on collision and otherwise extend the shared set.
+    /// Used by the KVM lane to layer `baseline.kvm.jsonl` over the shared
+    /// `baseline.jsonl`; an empty overlay is a no-op.
+    pub fn with_overlay(mut self, overlay: Baseline) -> Baseline {
+        for (suite, pairs) in overlay.by_suite {
+            self.by_suite.entry(suite).or_default().extend(pairs);
+        }
+        self
+    }
 }
 
 pub struct Classification {
@@ -317,6 +329,72 @@ mod tests {
             false,
             &res(&[("a", Outcome::Ok)]),
             &baseline,
+        );
+        assert_eq!(c.verdict, Verdict::Diff);
+        assert!(!c.gating);
+    }
+
+    #[test]
+    fn overlay_baseline_suppresses_kvm_only_divergence() {
+        // The shared baseline lacks any pair for suite "s"; the KVM overlay
+        // records a -> [Fail, Ok]. After `with_overlay`, that divergence is
+        // excused (DIFF, non-gating) — but a divergence the overlay does NOT
+        // cover (b -> [Fail, Ok]) is still a first-obs NEW (and would be a
+        // REGRESSION against a present-but-incomplete baseline).
+        let shared = Baseline::from_jsonl("");
+        let overlay = {
+            let mut by = HashMap::new();
+            let mut p = BTreeMap::new();
+            p.insert("a".to_string(), [Outcome::Fail, Outcome::Ok]);
+            by.insert("s".to_string(), p);
+            Baseline { by_suite: by }
+        };
+        let combined = shared.with_overlay(overlay);
+
+        // a is excused by the overlay; with a present baseline for "s" and no
+        // unexcused diff, the verdict is DIFF (non-gating).
+        let c = classify(
+            &suite(&[]),
+            &res(&[("a", Outcome::Fail)]),
+            false,
+            &res(&[("a", Outcome::Ok)]),
+            &combined,
+        );
+        assert_eq!(c.verdict, Verdict::Diff);
+        assert!(!c.gating);
+        assert_eq!(c.known_diffs, vec!["a".to_string()]);
+
+        // b is NOT in the overlay -> unexcused divergence against a present
+        // baseline -> gating REGRESSION.
+        let c2 = classify(
+            &suite(&[]),
+            &res(&[("a", Outcome::Fail), ("b", Outcome::Fail)]),
+            false,
+            &res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]),
+            &combined,
+        );
+        assert_eq!(c2.verdict, Verdict::Regression);
+        assert!(c2.gating);
+        assert_eq!(c2.new_diffs, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn empty_overlay_is_a_noop() {
+        // Layering an empty overlay leaves the shared baseline unchanged.
+        let shared = {
+            let mut by = HashMap::new();
+            let mut p = BTreeMap::new();
+            p.insert("a".to_string(), [Outcome::Fail, Outcome::Ok]);
+            by.insert("s".to_string(), p);
+            Baseline { by_suite: by }
+        };
+        let combined = shared.with_overlay(Baseline::from_jsonl(""));
+        let c = classify(
+            &suite(&[]),
+            &res(&[("a", Outcome::Fail)]),
+            false,
+            &res(&[("a", Outcome::Ok)]),
+            &combined,
         );
         assert_eq!(c.verdict, Verdict::Diff);
         assert!(!c.gating);
