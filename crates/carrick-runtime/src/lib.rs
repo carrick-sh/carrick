@@ -215,15 +215,24 @@ pub mod trap {
     pub const HVF_PAGE_SIZE: u64 = 0x4000;
 
     // Cross-process VM-topology bookkeeping the shared threaded loop references
-    // around a guest fork. On HVF these coordinate the stop-the-world VM
-    // teardown/rebuild (carrick-hvf::trap); the Linux KVM backend has no such
-    // host-side VM surgery, so they are inert stubs — same no-op pattern as the
-    // `host_signal` / `probes` Linux stubs below. The vcpu_loop fork path that
-    // uses them is itself gated to the HVF run loop, so these are never hit on
-    // Linux; they exist only so the unconditional `vcpu_loop` module compiles.
+    // around a guest fork/exec. The shared `vcpu_loop` fork/exec paths RUN on
+    // Linux (the generic threaded loop drives them on both backends since the
+    // Phase 2 KVM bring-up); what differs is how much host-side VM surgery
+    // each backend needs. On HVF these hooks coordinate the stop-the-world VM
+    // teardown/rebuild (carrick-hvf::trap); KVM forks by rebuilding a fresh VM
+    // in the CHILD only, so the HVF-specific hooks below stay inert no-ops —
+    // same pattern as the `host_signal` / `probes` Linux stubs below.
 
-    /// Count of live vCPUs — the fork/exec quiesce invariant on HVF. Always 0 on
-    /// Linux (the fork quiesce is HVF-only).
+    /// Count of live vCPUs — the execve thread-group drain invariant on BOTH
+    /// backends (`terminate_siblings_for_exec` spin-waits for `<= 1` after
+    /// kicking siblings, so the exec teardown can't free guest RAM under a
+    /// still-running sibling). On platform-linux this is the REAL counter
+    /// maintained by the KVM engine (vcpu construction / sibling-spec tickets
+    /// / KvmVcpu::drop); only non-linux scaffolding (bhyve) gets an inert
+    /// always-0 stub (no drain) until it implements the same contract.
+    #[cfg(feature = "platform-linux")]
+    pub use carrick_linux::kvm::VCPU_LIVE;
+    #[cfg(not(feature = "platform-linux"))]
     pub static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
     /// Clear any VM republished by a previous fork. No-op on Linux.

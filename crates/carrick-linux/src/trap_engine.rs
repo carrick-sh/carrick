@@ -801,6 +801,17 @@ impl SyscallTrap for KvmTrapEngine {
         // slots point at.
         self.vm = new_vm;
         self.vcpu = new_vcpu;
+        // The child inherited the PARENT's VCPU_LIVE value (plain static,
+        // copied by libc::fork) — including siblings' vCPUs that do NOT exist
+        // in this process (fork replicates only the calling thread, and the
+        // KVM fork quiesce parks siblings WITHOUT releasing their vCPUs). The
+        // child owns exactly ONE vCPU: the rebuild above created it (+1) and
+        // the swap dropped the inherited engine vCPU (-1), but the inherited
+        // BASE value is still the parent's. Re-stamp the truth, or a child
+        // that later goes multithreaded and execve's would wait on phantom
+        // siblings in `terminate_siblings_for_exec` and ride out the bounded
+        // timeout on every exec.
+        crate::kvm::VCPU_LIVE.store(1, std::sync::atomic::Ordering::SeqCst);
         self.is_forked_child = true;
         // The child resumes mid-clone; clear stale parent syscall/fault state so
         // a signal arriving before the child's first svc cannot read parent values.
@@ -1116,6 +1127,11 @@ pub struct KvmSiblingSpec {
     /// `mprotect(PROT_NONE)`. Mirrors HVF sharing its `protections` Arc. Carried
     /// into the sibling's `GuestRam` via `from_shared_windows`.
     protections: Arc<MemoryProtections>,
+    /// The sibling's reserved `VCPU_LIVE` slot, acquired HERE (synchronously
+    /// with the trapped clone) so the execve drain can see the sibling before
+    /// its host thread constructs a vCPU. Consumed at materialization (the +1
+    /// transfers to the vcpu); dropped-unmaterialized releases it.
+    ticket: crate::kvm::VcpuLiveTicket,
 }
 
 impl carrick_hal::RegAccess for KvmTrapEngine {
@@ -1189,6 +1205,11 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             // Share the SAME PROT_NONE bookkeeping so the sibling observes the
             // parent's mprotect(PROT_NONE) (and vice versa) on the syscall path.
             protections: self.ram.shared_protections(),
+            // Reserve the sibling's VCPU_LIVE slot NOW — this runs while the
+            // parent is suspended at the trapped clone, BEFORE the guest can
+            // race ahead into execve, closing the materialization blind window
+            // (9/60 multithreaded-execv iterations EFAULT'd without it).
+            ticket: crate::kvm::VcpuLiveTicket::acquire(),
         })
     }
 
@@ -1202,6 +1223,12 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
         let mut vcpu = vm
             .add_sibling_vcpu()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // The vcpu now exists: transfer the spec's reserved VCPU_LIVE slot to
+        // it (KvmVcpu::drop owns the decrement from here on). Consume BEFORE
+        // the fallible restore below — if restore fails, the dropped vcpu does
+        // the single decrement; consuming later would double-count the error
+        // path (ticket Drop + vcpu Drop).
+        spec.ticket.consume();
         // Restore the seeded register file onto the new vCPU. Unlike the fork
         // child, the PC is already the post-svc address (seed_sibling_snapshot
         // set pc = parent.elr_el1), so there is NO sentinel-store replay to skip.
