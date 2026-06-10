@@ -577,6 +577,12 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
             .unwrap(),
         DispatchOutcome::Errno { errno: 110 }
     );
+    // FUTEX_WAKE never reads the futex word — Linux's futex_wake() only hashes
+    // the (mm, uaddr) key and wakes matching waiters, so an unmapped address is
+    // NOT EFAULT: it returns 0 (nobody woken). carrick used to pre-read the
+    // word and EFAULT here; the no-word-read fix (the Go-runtime
+    // sysmon-wakes-an-unmapped-note case) aligned it with the kernel. This
+    // assertion tracked the OLD pre-read behaviour.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -595,7 +601,7 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
