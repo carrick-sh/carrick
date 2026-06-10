@@ -150,7 +150,11 @@ pub fn run_carrick(
     {
         cmd.env("CARRICK_INSECURE_REGISTRIES", host);
     }
-    run_one(cmd, argv, suite.timeout_s, run_id, Engine::Carrick)
+    let lima = match lane {
+        crate::lane::Lane::Kvm(cfg) => Some(cfg.clone()),
+        crate::lane::Lane::Hvf => None,
+    };
+    run_one(cmd, argv, suite.timeout_s, run_id, Engine::Carrick, lima)
 }
 
 pub fn run_docker(suite: &Suite, run_id: &str) -> anyhow::Result<RunOutput> {
@@ -166,7 +170,7 @@ pub fn run_docker(suite: &Suite, run_id: &str) -> anyhow::Result<RunOutput> {
     // SAFE: see run_carrick — argv is from the trusted manifest; `Command::args` is shell-free.
     let mut cmd = Command::new(&argv[0]); // nosemgrep
     cmd.args(&argv[1..]);
-    let out = run_one(cmd, argv, suite.timeout_s, run_id, Engine::Docker);
+    let out = run_one(cmd, argv, suite.timeout_s, run_id, Engine::Docker, None);
     // Always remove the container we named (no `--rm`, so the exit code came
     // straight from the `docker run` process).
     let _ = Command::new("docker")
@@ -189,6 +193,7 @@ fn run_one(
     timeout_s: u64,
     run_id: &str,
     engine: Engine,
+    lima: Option<crate::lane::LimaConfig>,
 ) -> anyhow::Result<RunOutput> {
     std::fs::create_dir_all(raw_dir())?;
     let stdout_path = raw_dir().join(format!("{run_id}.out"));
@@ -212,7 +217,7 @@ fn run_one(
             None => {
                 if start.elapsed() >= deadline {
                     timed_out = true;
-                    kill_scoped(pid, run_id, engine);
+                    kill_scoped(pid, run_id, engine, lima.as_ref());
                     // Reap whatever is left.
                     let _ = child.wait();
                     break -1;
@@ -233,12 +238,38 @@ fn run_one(
 }
 
 /// Kill exactly this run — never an unscoped reap.
-fn kill_scoped(pid: i32, run_id: &str, engine: Engine) {
+fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane::LimaConfig>) {
     // Group kill of the direct child tree (cheap, scoped to our spawned pid).
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
     match engine {
+        Engine::Carrick if lima.is_some() => {
+            // KVM lane: the group kill above only reached the MAC side (limactl/
+            // ssh); the carrick tree lives in the GUEST and carrick escapes its
+            // process group there (it manages guest pgids), so reap it with a
+            // SCOPED in-guest pkill. On Linux carrick never rewrites argv
+            // (proctitle.rs is macOS-only) and fork children / in-place execve
+            // keep the spawn argv, so `run --name <run-id> ` (trailing space:
+            // run-id prefix safety) matches exactly this run's host processes.
+            // Killing the run's leftover wrapper sh/sg as well is fine — the
+            // whole run is being torn down. Best-effort: the in-band guest-side
+            // `timeout`+pkill (lane.rs) is the backstop if this cannot connect.
+            let cfg = lima.unwrap();
+            let _ = Command::new("limactl")
+                .args([
+                    "shell",
+                    &cfg.vm,
+                    "--",
+                    "pkill",
+                    "-9",
+                    "-f",
+                    &format!("run --name {run_id} "),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         Engine::Carrick => {
             // Belt for a guest that escaped its group (setpgid/setsid): the
             // SCOPED kill.sh, which matches only `carrick:<run-id>` and refuses
