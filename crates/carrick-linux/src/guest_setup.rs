@@ -879,9 +879,11 @@ impl GuestRam {
             .map(|w| (w.slot_gpa.unwrap_or(w.base), w.host, w.len))
     }
 
-    /// Number of registered windows (== the number of KVM slots in use). Used by
-    /// execve to know how many slots to unregister before remapping the new
-    /// image.
+    /// Number of windows in THIS view. Test-only: execve now unregisters by the
+    /// shared per-VM slot counter (`KvmVm::slot_count`), not the window count —
+    /// a sibling-registered alias slot lives in the VM but only in the SIBLING's
+    /// GuestRam view, so this undercounts the VM's live slots.
+    #[cfg(test)]
     pub(crate) fn window_count(&self) -> usize {
         self.windows.len()
     }
