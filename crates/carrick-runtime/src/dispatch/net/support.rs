@@ -324,6 +324,46 @@ fn host_to_linux_af(host_family: u16) -> u16 {
     }
 }
 
+/// Address family of a HOST sockaddr held as raw bytes. The 2-byte header is
+/// the ONLY layout divergence between the hosts: macOS/BSD is `sa_len(u8)
+/// sa_family(u8)`, Linux is `sa_family(u16)`. Everything past offset 2
+/// (sin_port/sin_addr, sun_path, …) lines up on both. Decoding bytes[1] as the
+/// family on a Linux host read the high byte of the u16 — 0 for every real
+/// family — so getsockname/getpeername/accept/recvfrom reported AF_UNSPEC and
+/// libuv's `uv_guess_handle` classified a socketpair stdio fd as
+/// UV_UNKNOWN_HANDLE (node then wired process.stdout to a black-hole stream
+/// and the child's pipe output vanished — the KVM-lane app-smoke failure).
+pub(super) fn host_sockaddr_family(bytes: &[u8]) -> u16 {
+    if bytes.len() < 2 {
+        return libc::AF_UNSPEC as u16;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        bytes[1] as u16
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        u16::from_ne_bytes([bytes[0], bytes[1]])
+    }
+}
+
+/// Stamp the 2-byte header of a HOST sockaddr under construction (the inverse
+/// of [`host_sockaddr_family`]): macOS wants `(sa_len, sa_family as u8)`,
+/// Linux wants the `sa_family` u16 and has no length byte. `out` must already
+/// be sized to the full sockaddr (macOS `sa_len` is taken from `out.len()`).
+pub(super) fn set_host_sockaddr_header(out: &mut [u8], family: i32) {
+    debug_assert!(out.len() >= 2);
+    #[cfg(target_os = "macos")]
+    {
+        out[0] = out.len().min(255) as u8;
+        out[1] = family as u8;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        out[0..2].copy_from_slice(&(family as u16).to_ne_bytes());
+    }
+}
+
 /// The host socket type to actually create for a guest `(family, base_type)`.
 /// macOS has no AF_UNIX `SOCK_SEQPACKET`, so back it with a `SOCK_STREAM` socket;
 /// carrick frames messages on top to recover SEQPACKET boundary semantics (see
@@ -1105,8 +1145,7 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
                 return Err(LINUX_EINVAL);
             }
             let mut out = vec![0u8; 16];
-            out[0] = 16; // sin_len
-            out[1] = libc::AF_INET as u8; // sin_family
+            set_host_sockaddr_header(&mut out, libc::AF_INET);
             out[2..4].copy_from_slice(&bytes[2..4]); // sin_port (network)
             out[4..8].copy_from_slice(&bytes[4..8]); // sin_addr
             // Linux treats the entire 127.0.0.0/8 as loopback (any 127.x.y.z
@@ -1129,8 +1168,7 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
                 return Err(LINUX_EINVAL);
             }
             let mut out = vec![0u8; 28];
-            out[0] = 28;
-            out[1] = libc::AF_INET6 as u8;
+            set_host_sockaddr_header(&mut out, libc::AF_INET6);
             out[2..4].copy_from_slice(&bytes[2..4]); // port
             out[4..8].copy_from_slice(&bytes[4..8]); // flowinfo
             out[8..24].copy_from_slice(&bytes[8..24]); // addr
@@ -1159,8 +1197,7 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
                         return Err(LINUX_ENAMETOOLONG);
                     }
                     let mut out = vec![0u8; 2 + pbytes.len() + 1];
-                    out[0] = out.len().min(255) as u8;
-                    out[1] = libc::AF_UNIX as u8;
+                    set_host_sockaddr_header(&mut out, libc::AF_UNIX);
                     out[2..2 + pbytes.len()].copy_from_slice(pbytes);
                     Ok(out)
                 }
@@ -1168,8 +1205,7 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
                 None => {
                     let path_len = len.saturating_sub(2);
                     let mut out = vec![0u8; 2 + path_len];
-                    out[0] = (2 + path_len).min(255) as u8;
-                    out[1] = libc::AF_UNIX as u8;
+                    set_host_sockaddr_header(&mut out, libc::AF_UNIX);
                     out[2..].copy_from_slice(&bytes[2..2 + path_len]);
                     Ok(out)
                 }
@@ -1182,8 +1218,7 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
             // then report EAFNOSUPPORT/EINVAL after disassociating, which the
             // connect() handler maps to success).
             let mut out = vec![0u8; 16];
-            out[0] = 16; // sa_len
-            out[1] = libc::AF_UNSPEC as u8; // 0
+            set_host_sockaddr_header(&mut out, libc::AF_UNSPEC);
             Ok(out)
         }
         _ => Err(LINUX_EAFNOSUPPORT),
@@ -1205,8 +1240,9 @@ pub(super) fn host_to_linux_sockaddr(
     if bytes.len() < 2 {
         return Vec::new();
     }
-    // macOS layout: sa_len(1) sa_family(1) ...
-    let host_family = bytes[1] as u16;
+    // Host header layout differs (macOS sa_len/sa_family bytes vs the Linux
+    // sa_family u16); everything past offset 2 lines up. See host_sockaddr_family.
+    let host_family = host_sockaddr_family(bytes);
     let linux_family = host_to_linux_af(host_family);
     match host_family as i32 {
         libc::AF_INET => {
@@ -1229,8 +1265,9 @@ pub(super) fn host_to_linux_sockaddr(
             out
         }
         libc::AF_UNIX => {
-            // Linux sockaddr_un is family(2) path[108]. macOS path starts
-            // at offset 2; skip the host's sun_len byte at offset 0.
+            // Linux sockaddr_un is family(2) path[108]. The host path also
+            // starts at offset 2 on BOTH hosts (macOS: after sun_len+sun_family;
+            // Linux: after the sun_family u16).
             let path_len = bytes.len().saturating_sub(2);
             let host_path = &bytes[2..2 + path_len];
             // An UNNAMED sender (unbound unix/unixgram socket) → macOS reports an
@@ -1862,12 +1899,38 @@ mod tests {
         memory.write_bytes(addr, &linux).unwrap();
 
         let host = read_linux_sockaddr(&memory, addr, linux.len() as u32, LINUX_AF_INET).unwrap();
+        // Header layout is host-specific (macOS sa_len/sa_family bytes vs the
+        // Linux sa_family u16); decode through the same helper the handlers use.
+        assert_eq!(host_sockaddr_family(&host), libc::AF_INET as u16);
+        #[cfg(target_os = "macos")]
         assert_eq!(host[0], 16);
-        assert_eq!(host[1], libc::AF_INET as u8);
         assert_eq!(&host[2..8], &linux[2..8]);
 
         let round_trip = host_to_linux_sockaddr(&host, LINUX_AF_INET, false);
         assert_eq!(round_trip, linux);
+    }
+
+    /// An UNNAMED AF_UNIX local address (a socketpair end / unbound socket)
+    /// must come back to the guest as a family-only AF_UNIX sockaddr — NOT
+    /// AF_UNSPEC. libuv's `uv_guess_handle` keys on the getsockname family to
+    /// classify a socket stdio fd; AF_UNSPEC made node wire process.stdout to
+    /// a black-hole stream (KVM-lane app-smoke: execFileSync read '' from the
+    /// child). The Linux-host header decode (family u16 at offset 0) is what
+    /// regressed; build the host bytes with the platform header writer so this
+    /// asserts the round-trip on BOTH hosts.
+    #[test]
+    fn unnamed_unix_local_addr_reports_af_unix_not_unspec() {
+        let mut host = vec![0u8; 16]; // zero-filled path = unnamed
+        set_host_sockaddr_header(&mut host, libc::AF_UNIX);
+        let linux = host_to_linux_sockaddr(&host, LINUX_AF_UNIX, false);
+        assert_eq!(linux.len(), 2);
+        assert_eq!(
+            u16::from_ne_bytes([linux[0], linux[1]]),
+            LINUX_AF_UNIX as u16
+        );
+        // The datagram *peer source* form stays AF_UNSPEC/empty (Go `from == nil`).
+        let unspec = host_to_linux_sockaddr(&host, LINUX_AF_UNIX, true);
+        assert!(unspec.is_empty());
     }
 
     #[test]
