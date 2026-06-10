@@ -56,6 +56,12 @@ struct Args {
     /// Host the lima guest resolves to the mac (for the conformance registry).
     #[arg(long, default_value = "host.lima.internal")]
     lima_gateway: String,
+    /// Timeout multiplier for CARRICK runs on the kvm lane (docker oracles and
+    /// the hvf lane keep the unscaled suite budget). Nested KVM roughly
+    /// doubles toolchain-heavy suites — go-build straddles its 180 s budget at
+    /// 1.0, which makes the gate flaky.
+    #[arg(long, default_value_t = 2.0)]
+    lima_timeout_scale: f64,
     /// Filter to these ecosystems (repeatable): cpython|go|node|ltp.
     #[arg(long)]
     ecosystem: Vec<String>,
@@ -142,7 +148,12 @@ fn run() -> anyhow::Result<ExitCode> {
     // Execution lane for the carrick side, built from the CLI args. `hvf` (the
     // default) runs the local signed binary unchanged; `kvm` wraps carrick in the
     // lima guest. The Hvf path is byte-for-byte the pre-lane behavior.
-    let lane = lane::lane_from_args(&args.lane, &args.lima_vm, &args.lima_gateway);
+    let lane = lane::lane_from_args(
+        &args.lane,
+        &args.lima_vm,
+        &args.lima_gateway,
+        args.lima_timeout_scale,
+    );
 
     if args.render_matrix {
         let reports = read_reports(&args.jsonl)?;

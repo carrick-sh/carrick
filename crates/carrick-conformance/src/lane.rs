@@ -15,6 +15,12 @@ pub struct LimaConfig {
     pub vm: String,
     /// Host that the lima guest resolves to the mac (e.g. "host.lima.internal").
     pub gateway: String,
+    /// Multiplier applied to each suite's `timeout_s` for CARRICK runs on this
+    /// lane (docker oracles keep the unscaled budget — they are not nested).
+    /// Nested KVM roughly doubles toolchain-heavy suites (go-build straddled
+    /// its 180 s budget: pass / timeout-then-recover / double-timeout across
+    /// three otherwise-green tiers), and a flaky deadline is a flaky GATE.
+    pub timeout_scale: f64,
 }
 
 /// The selected lane. `Kvm` carries the lima wiring.
@@ -27,6 +33,16 @@ pub enum Lane {
 impl Lane {
     pub fn is_kvm(&self) -> bool {
         matches!(self, Lane::Kvm(_))
+    }
+
+    /// The carrick-run deadline for a suite on this lane: `timeout_s` as-is on
+    /// Hvf (behavior-preserving), scaled by the lane's `timeout_scale` on Kvm.
+    /// Docker oracles always use the unscaled `timeout_s`.
+    pub fn scaled_timeout(&self, timeout_s: u64) -> u64 {
+        match self {
+            Lane::Hvf => timeout_s,
+            Lane::Kvm(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
+        }
     }
 }
 
@@ -120,7 +136,7 @@ pub fn carrick_invocation_argv(
             let kill_pattern = format!("^{carrick_bin} run --name {run_id} ");
             let script = format!(
                 "timeout -k 10 {} {argv_str}; rc=$?; pkill -9 -f {} >/dev/null 2>&1; exit $rc",
-                suite.timeout_s + 10,
+                lane.scaled_timeout(suite.timeout_s) + 10,
                 shell_quote(&kill_pattern),
             );
             vec![
@@ -160,12 +176,14 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Map the `--lane`/`--lima-vm`/`--lima-gateway` CLI strings to a `Lane`.
-pub fn lane_from_args(lane: &str, lima_vm: &str, lima_gateway: &str) -> Lane {
+/// Map the `--lane`/`--lima-vm`/`--lima-gateway`/`--lima-timeout-scale` CLI
+/// strings to a `Lane`.
+pub fn lane_from_args(lane: &str, lima_vm: &str, lima_gateway: &str, timeout_scale: f64) -> Lane {
     match lane {
         "kvm" => Lane::Kvm(LimaConfig {
             vm: lima_vm.to_string(),
             gateway: lima_gateway.to_string(),
+            timeout_scale,
         }),
         _ => Lane::Hvf,
     }
@@ -232,6 +250,7 @@ mod tests {
         let lane = Lane::Kvm(LimaConfig {
             vm: "carrick".into(),
             gateway: "host.lima.internal".into(),
+            timeout_scale: 1.0,
         });
         let argv = carrick_invocation_argv(&s, "/home/user/ct/release/carrick", "conf-1-2", &lane);
         // Kvm: limactl shell <vm> -- sg kvm -c '<shell-quoted: env …=host.lima.internal:5005 <carrick> run … <rewritten image> …>'
@@ -275,16 +294,38 @@ mod tests {
     #[test]
     fn lane_from_args_builds_kvm_with_defaults() {
         assert!(matches!(
-            lane_from_args("hvf", "carrick", "host.lima.internal"),
+            lane_from_args("hvf", "carrick", "host.lima.internal", 2.0),
             Lane::Hvf
         ));
-        match lane_from_args("kvm", "carrick", "host.lima.internal") {
+        match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0) {
             Lane::Kvm(cfg) => {
                 assert_eq!(cfg.vm, "carrick");
                 assert_eq!(cfg.gateway, "host.lima.internal");
+                assert_eq!(cfg.timeout_scale, 2.0);
             }
             _ => panic!("expected Kvm"),
         }
+    }
+
+    #[test]
+    fn kvm_timeout_scale_stretches_carrick_deadlines_only() {
+        // The lane scale applies to the carrick deadline (run_one + the
+        // in-band guest `timeout` prefix); Hvf and docker stay unscaled.
+        let s = demo_suite(); // timeout_s = 1
+        let lane = Lane::Kvm(LimaConfig {
+            vm: "carrick".into(),
+            gateway: "host.lima.internal".into(),
+            timeout_scale: 2.0,
+        });
+        assert_eq!(lane.scaled_timeout(s.timeout_s), 2);
+        assert_eq!(Lane::Hvf.scaled_timeout(s.timeout_s), 1);
+        let argv = carrick_invocation_argv(&s, "/x/carrick", "conf-1-2", &lane);
+        // guest in-band timeout = scaled deadline + 10 = 12.
+        assert!(
+            argv[7].starts_with("timeout -k 10 12 "),
+            "scaled guest timeout prefix: {}",
+            argv[7]
+        );
     }
 
     #[test]
