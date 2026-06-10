@@ -894,6 +894,24 @@ pub mod runtime {
         }
         let _ = dispatcher.set_fs_backend(Box::new(host));
 
+        // Stream guest stdio straight to the inherited host fds, mirroring the
+        // macOS `setup_interactive_stdio` raw arm (execute.rs) — the engine
+        // resolves EVERY container run with `raw: true`. Without this the
+        // KVM lane buffered bare-stdio writes in `io.stdout`/`io.stderr`
+        // (flushed only at exit via the CLI's `emit_raw`) while a fd dup2'd
+        // OVER stdio (an `open_files` entry wrapping a host dup) wrote LIVE —
+        // so output interleaving broke, and when carrick's stdout was a
+        // regular file the exit-time flush landed at the dup-shared kernel
+        // offset, OVERWRITING earlier live bytes (cpython test_subprocess
+        // test_close_fd_1's save/close/restore of fd 1 scrambled the suite
+        // log). A forked child also drops its buffered copy on exit (only the
+        // exit code crosses waitpid), so any buffered child output simply
+        // vanished. `tty` has no pty supervisor on Linux yet; degrade it to
+        // raw streaming rather than silently buffering.
+        if spec.raw || spec.tty {
+            dispatcher.set_stream_stdio(true);
+        }
+
         // 3. Resolve + load the entrypoint FROM the rootfs via the SHARED helpers
         //    (identical to the macOS run path): PATH-resolve a bare command,
         //    resolve `#!` scripts, read the ELF (+ its PT_INTERP/loader) through

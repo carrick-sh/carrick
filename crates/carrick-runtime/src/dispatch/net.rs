@@ -2500,8 +2500,7 @@ impl SyscallDispatcher {
                     return Ok(LINUX_ENAMETOOLONG.into());
                 }
                 let mut sa = vec![0u8; 2 + pb.len() + 1];
-                sa[0] = sa.len().min(255) as u8;
-                sa[1] = libc::AF_UNIX as u8;
+                set_host_sockaddr_header(&mut sa, libc::AF_UNIX);
                 sa[2..2 + pb.len()].copy_from_slice(pb);
                 // Remove a stale socket node left by a prior run (the generated
                 // name is per-process; a leftover host file would be EADDRINUSE),

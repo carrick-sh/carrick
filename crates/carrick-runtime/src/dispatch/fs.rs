@@ -1422,7 +1422,15 @@ impl SyscallDispatcher {
                         is_read_end,
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: None,
-                        bidirectional: false,
+                        // A VFS stream opened O_RDWR must serve BOTH directions
+                        // (mirrors the O_RDWR FIFO open above). DevVfs encodes
+                        // only `is_read_end = !write`, so an O_RDWR /dev/null —
+                        // exactly what CPython's subprocess DEVNULL opens —
+                        // came back write-only and the spawned child's
+                        // `sys.stdin.read()` EBADFed (test_subprocess
+                        // test_stdin_devnull's child traceback; Docker reads
+                        // EOF). Shared with HVF: same latent gap there.
+                        bidirectional: access == LINUX_O_RDWR,
                         write_kind,
                     }
                 };
