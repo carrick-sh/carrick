@@ -1222,8 +1222,22 @@ where
         _engine: &mut E,
     ) -> Result<(), RuntimeError> {
         // Linux execve replaces the whole thread group. Carrick's execve path
-        // destroys and recreates the process-wide HVF VM, so every sibling vCPU
-        // must be gone before `execve_into` runs.
+        // tears down the old guest address space — HVF destroys/recreates the
+        // process-wide VM; KVM deletes every memslot and munmaps the old
+        // `GuestRam` in place (`execve_into`) — so every sibling vCPU must be
+        // gone before `execve_into` runs. The drain below is therefore live on
+        // BOTH backends: a just-kicked sibling can still be mid-dispatch
+        // holding raw host pointers into the old RAM (use-after-free) or
+        // mid-`map_host_alias` (slot-allocator vs `reset_slot_counter` race)
+        // until its engine drops and `VCPU_LIVE` falls to 1 (measured without
+        // the drain: 60/60 multithreaded-execv iterations EFAULT'd sibling
+        // KVM_RUNs after the slot teardown). Forward progress is the kick
+        // protocol: the kick forces the vCPU out of the guest (hv_vcpus_exit /
+        // signal→KVM_RUN EINTR), blocked waits wake via
+        // `exec_replacing_other_thread` predicates, and the loop top observes
+        // the flag and exits — the wait stays BOUNDED (5s) against pathology
+        // either way. (Non-linux scaffolding (bhyve): inert always-0
+        // VCPU_LIVE → no wait, unchanged until it implements the contract.)
         let _topology = crate::fork_quiesce::topology_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1232,7 +1246,6 @@ where
         self.platform_futex.notify_signal_pending();
         kernel.signal_arrival.wake_all_waiters();
 
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             use std::sync::atomic::Ordering::SeqCst;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1394,6 +1407,14 @@ where
         // BOUNDED window (sleeping, NOT spinning) to finish releasing; if it still
         // doesn't hold, ABORT LOUDLY rather than proceed into a corrupting
         // hv_vm_destroy (HV_BUSY).
+        //
+        // HVF-ONLY (unlike the execve drain in `terminate_siblings_for_exec`,
+        // which is live on both backends): only HVF tears the parent VM down
+        // at fork, so only HVF siblings RELEASE their vCPUs at the quiesce
+        // barrier. KVM siblings park KEEPING their vCPUs (VCPU_LIVE stays at
+        // the thread count — the fork child rebuilds a fresh VM in its own
+        // process instead), so waiting for == 1 here would always time out
+        // and abort.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             use std::sync::atomic::Ordering::SeqCst;
