@@ -1251,10 +1251,12 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
     }
 
     fn destroy_vcpu_on_thread_exit(&mut self) {
-        // No explicit KVM teardown is required on a sibling thread exit: dropping
-        // `self.vcpu` (a `VcpuFd`) closes the vCPU fd, and the sibling's
-        // non-owning `GuestRam` view drops without munmapping the shared windows.
-        // The shared VM stays alive via the parent's (and other siblings') Arc.
+        // No explicit KVM teardown is required on a sibling thread exit:
+        // dropping `self.vcpu` PARKS its `VcpuFd` into the shared per-VM
+        // recycle pool for reuse (vcpu ids are finite and never freed — see
+        // `KvmVcpu::fd`), and the sibling's non-owning `GuestRam` view drops
+        // without munmapping the shared windows. The shared VM stays alive via
+        // the parent's (and other siblings') Arc.
     }
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {

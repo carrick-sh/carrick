@@ -54,23 +54,29 @@ pub fn is_stale(registry_digest: Option<&str>, last_pulled: Option<&str>) -> boo
     }
 }
 
-fn sidecar_path() -> PathBuf {
-    PathBuf::from("target/conformance/image-digests.json")
+/// PER-LANE sidecar: the hvf lane's image store lives on the mac, the kvm
+/// lane's lives in the lima guest — a refresh of one says nothing about the
+/// other, so each lane records its own last-pulled digests.
+fn sidecar_path(lane: &crate::lane::Lane) -> PathBuf {
+    match lane {
+        crate::lane::Lane::Hvf => PathBuf::from("target/conformance/image-digests.json"),
+        crate::lane::Lane::Kvm(_) => PathBuf::from("target/conformance/image-digests.kvm.json"),
+    }
 }
 
-fn load_sidecar() -> BTreeMap<String, String> {
-    std::fs::read(sidecar_path())
+fn load_sidecar(lane: &crate::lane::Lane) -> BTreeMap<String, String> {
+    std::fs::read(sidecar_path(lane))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn save_sidecar(map: &BTreeMap<String, String>) {
-    if let Some(parent) = sidecar_path().parent() {
+fn save_sidecar(map: &BTreeMap<String, String>, lane: &crate::lane::Lane) {
+    if let Some(parent) = sidecar_path(lane).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(s) = serde_json::to_string_pretty(map) {
-        let _ = std::fs::write(sidecar_path(), s);
+        let _ = std::fs::write(sidecar_path(lane), s);
     }
 }
 
@@ -112,8 +118,8 @@ fn registry_digest(host: &str, repo: &str, tag: &str) -> Option<String> {
 /// moved since we last pulled it. Returns the number of images refreshed. Run
 /// SERIALLY before the parallel carrick phase. Best-effort: a failed refresh
 /// warns and continues (the suite will then run against whatever carrick has).
-pub fn refresh_stale_images(images: &[String], carrick_bin: &str) -> usize {
-    let mut sidecar = load_sidecar();
+pub fn refresh_stale_images(images: &[String], carrick_bin: &str, lane: &crate::lane::Lane) -> usize {
+    let mut sidecar = load_sidecar(lane);
     let mut unique: Vec<&String> = images.iter().collect();
     unique.sort();
     unique.dedup();
@@ -122,6 +128,9 @@ pub fn refresh_stale_images(images: &[String], carrick_bin: &str) -> usize {
         let Some((host, repo, tag)) = parse_registry_ref(image) else {
             continue;
         };
+        // The digest probe always runs on the MAC against the local registry
+        // (same registry both lanes); only the rmi/pull must run where the
+        // lane's image store lives.
         let reg = registry_digest(&host, &repo, &tag);
         if !is_stale(reg.as_deref(), sidecar.get(image).map(String::as_str)) {
             continue;
@@ -129,27 +138,65 @@ pub fn refresh_stale_images(images: &[String], carrick_bin: &str) -> usize {
         eprintln!("image-guard: {image} registry digest moved -> re-pulling carrick's copy");
         // rmi (ignore "no such image") then pull — `carrick pull` short-circuits
         // on a present cache, so the rmi is what forces a fresh fetch.
-        let _ = Command::new(carrick_bin)
-            .args(["rmi", image])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let mut pull = Command::new(carrick_bin);
-        pull.args(["pull", image]);
-        if let Some((h, _, _)) = parse_registry_ref(image) {
-            pull.env("CARRICK_INSECURE_REGISTRIES", h);
-        }
-        match pull.stdout(Stdio::null()).stderr(Stdio::null()).status() {
-            Ok(s) if s.success() => {
-                if let Some(d) = reg {
-                    sidecar.insert(image.clone(), d);
-                }
-                refreshed += 1;
+        let ok = match lane {
+            crate::lane::Lane::Hvf => {
+                let _ = Command::new(carrick_bin)
+                    .args(["rmi", image])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let mut pull = Command::new(carrick_bin);
+                pull.args(["pull", image]);
+                pull.env("CARRICK_INSECURE_REGISTRIES", &host);
+                matches!(
+                    pull.stdout(Stdio::null()).stderr(Stdio::null()).status(),
+                    Ok(s) if s.success()
+                )
             }
-            _ => eprintln!("image-guard: WARNING failed to re-pull {image}; continuing"),
+            crate::lane::Lane::Kvm(cfg) => {
+                // KVM lane: `carrick_bin` is the IN-GUEST binary and the image
+                // cache lives in the lima guest — run rmi/pull THERE, with the
+                // registry host rewritten to the guest-visible gateway (the
+                // same rewrite the run argv gets). No `sg kvm` needed: pull is
+                // pure userspace (registry fetch + blob store), no /dev/kvm.
+                let guest_image =
+                    crate::lane::rewrite_registry_host(image, "localhost", &cfg.gateway);
+                let guest_host =
+                    crate::lane::rewrite_registry_host(&host, "localhost", &cfg.gateway);
+                let _ = Command::new("limactl")
+                    .args(["shell", &cfg.vm, "--", carrick_bin, "rmi", &guest_image])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                matches!(
+                    Command::new("limactl")
+                        .args([
+                            "shell",
+                            &cfg.vm,
+                            "--",
+                            "env",
+                            &format!("CARRICK_INSECURE_REGISTRIES={guest_host}"),
+                            carrick_bin,
+                            "pull",
+                            &guest_image,
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status(),
+                    Ok(s) if s.success()
+                )
+            }
+        };
+        if ok {
+            if let Some(d) = reg {
+                sidecar.insert(image.clone(), d);
+            }
+            refreshed += 1;
+        } else {
+            eprintln!("image-guard: WARNING failed to re-pull {image}; continuing");
         }
     }
-    save_sidecar(&sidecar);
+    save_sidecar(&sidecar, lane);
     refreshed
 }
 

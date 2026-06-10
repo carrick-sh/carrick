@@ -58,12 +58,14 @@ fn host_cntvct_el0() -> u64 {
 /// `KVM_ARM_SET_COUNTER_OFFSET` (`_IOW(KVMIO=0xAE, 0xb5,
 /// struct kvm_arm_counter_offset[16])` = 0x4010AEB5): set the VM-WIDE counter
 /// offset so `guest CNTVCT == host CNTVCT - offset`. Unlike a TIMER_CNT
-/// register write, the userspace-owned VM offset SURVIVES `KVM_ARM_VCPU_INIT`
-/// — which otherwise ZEROES the VM-wide CNTVOFF on every vcpu reset, yanking
-/// the guest clock back by the whole epoch the moment a sibling thread's vCPU
-/// is created (measured: one `threading.Thread` sent guest CLOCK_MONOTONIC
-/// back 317,858 s and every absolute futex deadline with it). kvm-ioctls has
-/// no wrapper; raw ioctl on the `VmFd`. Kernel 6.4+ (lima guest is 6.12).
+/// register write, the userspace-owned VM offset sets the kernel's VM-offset
+/// flag, after which vcpu CREATION no longer re-zeroes the VM-wide CNTVOFF
+/// (`kvm_timer_vcpu_init` zeroes it per NEW vcpu while the flag is unset) —
+/// without the pin, the guest clock snapped back by the whole epoch the
+/// moment a sibling thread's vCPU was created (measured: one
+/// `threading.Thread` sent guest CLOCK_MONOTONIC back 317,858 s and every
+/// absolute futex deadline with it). kvm-ioctls has no wrapper; raw ioctl on
+/// the `VmFd`. Kernel 6.4+ (lima guest is 6.12).
 fn set_vm_counter_offset_to_host_monotonic(vm: &VmFd) -> Result<(), OsError> {
     use std::os::unix::io::AsRawFd;
     const KVM_ARM_SET_COUNTER_OFFSET: libc::c_ulong = 0x4010_AEB5;
@@ -89,10 +91,12 @@ fn set_vm_counter_offset_to_host_monotonic(vm: &VmFd) -> Result<(), OsError> {
 /// FALLBACK alignment for kernels without `KVM_ARM_SET_COUNTER_OFFSET`:
 /// program the guest virtual counter to host CLOCK_MONOTONIC_RAW via a
 /// `KVM_REG_ARM_TIMER_CNT` write (`ARM64_SYS_REG(3,3,14,3,2)` — adjusts the
-/// VM-wide CNTVOFF). Because every `KVM_ARM_VCPU_INIT` re-zeroes that offset,
-/// this must run after EVERY vcpu init (fresh or recycled), and concurrent
-/// vcpus see a brief zero-epoch window between a sibling's init and its
-/// re-align — the VM ioctl above is the primary path for a reason.
+/// VM-wide CNTVOFF). Without the pinned VM offset, every NEW vcpu's creation
+/// re-zeroes that offset (`kvm_timer_vcpu_init` with the VM-offset flag
+/// unset), so this runs after EVERY vcpu init (recycled ones included — the
+/// re-write is harmless there) and concurrent vcpus see a brief zero-epoch
+/// window between a sibling's create and its re-align — the VM ioctl above
+/// is the primary path for a reason.
 fn align_counter_to_host_monotonic(fd: &VcpuFd) -> Result<(), OsError> {
     let ticks = host_monotonic_ticks()?;
     fd.set_one_reg(sysreg_id(3, 3, 14, 3, 2), &ticks.to_le_bytes())
@@ -279,14 +283,21 @@ pub struct KvmVcpu {
 
 impl KvmVcpu {
     /// The live vcpu fd. Present from construction to drop (the `Option` only
-    /// exists so `Drop` can move the fd into the recycle pool).
+    /// exists so `Drop` can move the fd into the recycle pool); the None arm
+    /// is unreachable, kept abort-deterministic per the crate's no-panic idiom.
     fn fd(&self) -> &VcpuFd {
-        self.fd.as_ref().expect("vcpu fd present until drop")
+        self.fd.as_ref().unwrap_or_else(|| {
+            eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
+            std::process::abort()
+        })
     }
 
     /// Mutable access for the one fd method that needs it (`VcpuFd::run`).
     fn fd_mut(&mut self) -> &mut VcpuFd {
-        self.fd.as_mut().expect("vcpu fd present until drop")
+        self.fd.as_mut().unwrap_or_else(|| {
+            eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
+            std::process::abort()
+        })
     }
 }
 
@@ -326,7 +337,19 @@ impl KvmVm {
         // rebuild a fresh VM through this same path, which also keeps guest
         // monotonic from jumping across fork. FATAL only if BOTH mechanisms
         // are unavailable — a silent miss is a wrong-timeout machine.
-        let counter_locked = set_vm_counter_offset_to_host_monotonic(&vm).is_ok();
+        let counter_locked = match set_vm_counter_offset_to_host_monotonic(&vm) {
+            Ok(()) => true,
+            Err(e) => {
+                // Pre-6.4 kernel (no KVM_ARM_SET_COUNTER_OFFSET): fall back to
+                // per-vcpu-init TIMER_CNT re-alignment. Loudly — the fallback
+                // has a documented transient zero-epoch window per vcpu init.
+                eprintln!(
+                    "carrick: KVM_ARM_SET_COUNTER_OFFSET unavailable ({e}); falling back \
+                     to per-vcpu-init TIMER_CNT counter alignment"
+                );
+                false
+            }
+        };
         Ok(Self {
             _kvm: Some(kvm),
             vm: Arc::new(vm),
@@ -427,11 +450,14 @@ impl KvmVm {
         let _ = fd.set_one_reg(sysreg_id(3, 0, 14, 1, 0), &0x3u64.to_le_bytes());
         // EPOCH INVARIANT (see `create_empty`): when the VM-wide counter offset
         // could NOT be pinned at VM creation (no KVM_ARM_SET_COUNTER_OFFSET),
-        // the vcpu_init above just ZEROED the VM-wide CNTVOFF — for every fresh
-        // AND recycled vcpu — so re-align the guest counter to the host
-        // monotonic clock here, every time. FATAL on failure: silently missing
-        // the alignment is a wrong-timeout machine (guest absolute deadlines
-        // land ~the host uptime away from where the dispatcher evaluates them).
+        // a FRESH vcpu's creation just re-zeroed the VM-wide CNTVOFF
+        // (kvm_timer_vcpu_init with the VM-offset flag unset), so re-align the
+        // guest counter to the host monotonic clock — unconditionally, every
+        // create (recycled vcpus don't re-zero, but re-writing the correct
+        // value is harmless and keeps this path branch-free). FATAL on
+        // failure: silently missing the alignment is a wrong-timeout machine
+        // (guest absolute deadlines land ~the host uptime away from where the
+        // dispatcher evaluates them).
         if !self.counter_locked {
             align_counter_to_host_monotonic(&fd)?;
         }
@@ -461,9 +487,20 @@ impl KvmVm {
         // SAFETY: deleting a slot references no host memory (memory_size = 0);
         // KVM only validates the slot id and tears down its bookkeeping.
         unsafe {
-            self.vm
-                .set_user_memory_region(region)
-                .map_err(|e| os_err("KVM_SET_USER_MEMORY_REGION(delete)", e))?;
+            match self.vm.set_user_memory_region(region) {
+                Ok(()) => {}
+                // Deleting a NONEXISTENT slot returns EINVAL (kernel
+                // __kvm_set_memory_region: `if (!old || !old->npages)`).
+                // Treat it as idempotent success: a slot id can be a hole when
+                // a registration burned its fetch_add'd id by failing (a
+                // sibling map_host_alias error is contained as thread-death,
+                // not process-death), and execve's `0..slot_count()` teardown
+                // must not abort MID-DESTRUCTION over a hole — slots 0..k are
+                // already gone, so failing here would strand the "surviving"
+                // old image with no RAM.
+                Err(e) if e.errno() == libc::EINVAL => {}
+                Err(e) => return Err(os_err("KVM_SET_USER_MEMORY_REGION(delete)", e)),
+            }
         }
         Ok(())
     }
@@ -477,10 +514,12 @@ impl KvmVm {
     }
 
     /// How many slot ids have been drawn on this VM (across ALL handles — the
-    /// allocator is shared). Registration failures are fatal on every call
-    /// path and `unmap_memory_slot` never recycles ids, so this equals the
-    /// number of live slots: `0..slot_count()` is exactly the set to unmap
-    /// when tearing the address space down in place (execve).
+    /// allocator is shared). Ids are never recycled, so `0..slot_count()` is a
+    /// SUPERSET of the live slots: a failed registration burns its id (and a
+    /// sibling's map_host_alias failure is contained as thread-death, so the
+    /// process can live on with a hole). `unmap_memory_slot` treats deleting a
+    /// nonexistent slot as idempotent success, so execve's `0..slot_count()`
+    /// teardown sweep is safe across holes.
     pub(crate) fn slot_count(&self) -> u32 {
         self.next_slot.load(Ordering::SeqCst)
     }

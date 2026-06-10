@@ -145,6 +145,15 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
 
+    // A scale < 1.0 (or NaN/inf) silently shrinks every carrick deadline to ~0
+    // via the f64->u64 cast — refuse it up front instead.
+    if !args.lima_timeout_scale.is_finite() || args.lima_timeout_scale < 1.0 {
+        anyhow::bail!(
+            "--lima-timeout-scale must be finite and >= 1.0 (got {})",
+            args.lima_timeout_scale
+        );
+    }
+
     // Execution lane for the carrick side, built from the CLI args. `hvf` (the
     // default) runs the local signed binary unchanged; `kvm` wraps carrick in the
     // lima guest. The Hvf path is byte-for-byte the pre-lane behavior.
@@ -231,7 +240,7 @@ fn run() -> anyhow::Result<ExitCode> {
     // carrick and docker run identical bytes (see images.rs). Skipped on request.
     if !args.no_image_refresh {
         let imgs: Vec<String> = selected.iter().map(|s| s.image.clone()).collect();
-        let refreshed = images::refresh_stale_images(&imgs, &carrick_bin);
+        let refreshed = images::refresh_stale_images(&imgs, &carrick_bin, &lane);
         if refreshed > 0 {
             eprintln!("image-guard: re-pulled {refreshed} stale image(s)");
         }
@@ -514,6 +523,16 @@ fn bless(
             "--bless requires a full-tier, unfiltered run (no --tier smoke / --ecosystem / --suite)"
         );
     }
+    // The blessed baseline.jsonl + support-matrix.md are the SHARED (hvf-lane)
+    // ground truth; a kvm-lane bless would overwrite them with KVM-lane
+    // observations. KVM-only excuses belong in the overlay (baseline.kvm.jsonl).
+    if args.lane != "hvf" {
+        anyhow::bail!(
+            "--bless is hvf-lane only (lane={}); record KVM-lane excuses in the \
+             baseline overlay (scripts/conformance/baseline.kvm.jsonl) instead",
+            args.lane
+        );
+    }
     let bad: Vec<&str> = reports
         .iter()
         .filter(|r| {
@@ -737,14 +756,53 @@ fn print_summary(reports: &[SuiteReport]) {
     eprintln!("\n=== summary ===");
     for r in reports {
         let mark = if r.gating { "FAIL" } else { "ok  " };
+        // Spec §error-handling: an image-pull/extract/disk failure must surface
+        // as an INFRA problem, not read as a parity divergence. Still gating
+        // (parity is unproven) — the annotation tells the operator where to look.
+        let infra = if r.gating {
+            infra_signature(&r.carrick_run_id)
+                .map(|sig| format!("  [infra: {sig}]"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         eprintln!(
-            "  {mark} {:14} {:40} carrick[{}] oracle[{}]",
+            "  {mark} {:14} {:40} carrick[{}] oracle[{}]{infra}",
             r.verdict.as_str(),
             r.name,
             side(&r.carrick),
             side(&r.docker),
         );
     }
+}
+
+/// Scan a gating carrick run's captured stderr for known ENVIRONMENT failure
+/// signatures (registry pull, layer extraction, disk). Returns the matching
+/// line (trimmed) so the summary can label the failure as infra rather than a
+/// behavioral divergence.
+fn infra_signature(carrick_run_id: &str) -> Option<String> {
+    const PATTERNS: &[&str] = &[
+        "extract OCI layers",
+        "No space left on device",
+        "failed to resolve image",
+        "failed to pull",
+        "Connection refused",
+        "connection refused",
+    ];
+    let path = engine::raw_dir().join(format!("{carrick_run_id}.err"));
+    let text = std::fs::read_to_string(path).ok()?; // nosemgrep
+    text.lines()
+        .rev()
+        .find(|l| PATTERNS.iter().any(|p| l.contains(p)))
+        .map(|l| {
+            let l = l.trim();
+            // Keep the summary line readable (char-safe truncation).
+            if l.chars().count() > 100 {
+                format!("{}…", l.chars().take(100).collect::<String>())
+            } else {
+                l.to_string()
+            }
+        })
 }
 
 fn side(s: &SideSummary) -> String {
@@ -879,7 +937,7 @@ fn preflight_kvm(lane: &lane::Lane, carrick_in_guest: &Path) -> anyhow::Result<(
         .unwrap_or(false);
     anyhow::ensure!(
         present,
-        "carrick not built in guest at {} — run scripts/conformance/build-carrick-in-lima.sh and pass its output as --carrick_bin.",
+        "carrick not built in guest at {} — run scripts/conformance/build-carrick-in-lima.sh and pass its output as --carrick-bin.",
         carrick_in_guest.display()
     );
     // 3. registry reachable from the guest (best-effort: curl the v2 API).

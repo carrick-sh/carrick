@@ -46,7 +46,7 @@ impl RunOutput {
     }
 }
 
-fn raw_dir() -> PathBuf {
+pub(crate) fn raw_dir() -> PathBuf {
     PathBuf::from("target/conformance/raw")
 }
 
