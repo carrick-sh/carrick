@@ -96,11 +96,33 @@ pub fn carrick_invocation_argv(
             // matching scripts/kvm-smoke-lima.sh. Shell-quote each token so sg's
             // shell reconstructs the EXACT argv: the guest cmd contains shell
             // metacharacters (`&&`, quotes, redirects, the go-build heredoc).
-            let script = inner
+            let argv_str = inner
                 .iter()
                 .map(|t| shell_quote(t))
                 .collect::<Vec<_>>()
                 .join(" ");
+            // GUEST-SIDE self-cleanup, so a wedged run cannot leak guest
+            // processes even if the harness itself dies (a mac-side kill cannot
+            // reach into the guest):
+            //  - `timeout -k 10 <suite timeout + 10>` group-kills the run 10 s
+            //    AFTER the harness's own deadline (the mac-side kill stays the
+            //    authoritative TIMEOUT verdict; this is the backstop).
+            //  - carrick ESCAPES its process group (it manages guest pgids), so
+            //    a group-kill alone strands it: follow with a SCOPED pkill. On
+            //    Linux carrick never rewrites argv (proctitle.rs is macOS-only)
+            //    and fork children/in-place execve keep the spawn argv, so
+            //    `^<carrick-bin> run --name <run-id> ` matches EXACTLY this
+            //    run's whole host-process tree. The `^` anchor keeps the pattern
+            //    from matching the wrapper shell (whose -c script embeds the
+            //    same text); the trailing space keeps run-id prefixes apart
+            //    (conf-1-2 vs conf-1-20). `exit $rc` preserves carrick's exit
+            //    code for verdict parsing on the non-timeout path.
+            let kill_pattern = format!("^{carrick_bin} run --name {run_id} ");
+            let script = format!(
+                "timeout -k 10 {} {argv_str}; rc=$?; pkill -9 -f {} >/dev/null 2>&1; exit $rc",
+                suite.timeout_s + 10,
+                shell_quote(&kill_pattern),
+            );
             vec![
                 "limactl".to_string(),
                 "shell".to_string(),
@@ -225,6 +247,20 @@ mod tests {
         // image-ref host rewritten to the gateway, un-rewritten host absent:
         assert!(inner.contains("host.lima.internal:5005/carrick-go-conformance:1.24"));
         assert!(!inner.contains("localhost:5005/carrick-go-conformance:1.24"));
+        // Guest-side self-cleanup envelope: the run is bounded by a guest
+        // `timeout` 10 s past the suite deadline (for_test timeout_s=1 -> 11),
+        // and a SCOPED pkill reaps group escapees (carrick manages guest pgids)
+        // even if the harness dies. `exit $rc` preserves carrick's exit code.
+        assert!(
+            inner.starts_with("timeout -k 10 11 "),
+            "guest timeout prefix: {inner}"
+        );
+        assert!(inner.contains("; rc=$?; pkill -9 -f "));
+        // The kill pattern is ^-anchored to the carrick bin (so it can never
+        // match the wrapper shell, whose -c script embeds the same text) and
+        // ends at the run-id token (prefix safety: conf-1-2 vs conf-1-20).
+        assert!(inner.contains("'^/home/user/ct/release/carrick run --name conf-1-2 '"));
+        assert!(inner.ends_with("; exit $rc"));
     }
 
     #[test]
