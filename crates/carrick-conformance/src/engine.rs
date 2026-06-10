@@ -154,7 +154,17 @@ pub fn run_carrick(
         crate::lane::Lane::Kvm(cfg) => Some(cfg.clone()),
         crate::lane::Lane::Hvf => None,
     };
-    run_one(cmd, argv, suite.timeout_s, run_id, Engine::Carrick, lima)
+    // Lane-scaled deadline: nested-KVM runs get a stretched budget (the gate
+    // asserts correctness parity with docker, not speed parity); docker
+    // oracles below keep the unscaled suite budget.
+    run_one(
+        cmd,
+        argv,
+        lane.scaled_timeout(suite.timeout_s),
+        run_id,
+        Engine::Carrick,
+        lima,
+    )
 }
 
 pub fn run_docker(suite: &Suite, run_id: &str) -> anyhow::Result<RunOutput> {
@@ -243,8 +253,8 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
-    match engine {
-        Engine::Carrick if lima.is_some() => {
+    match (engine, lima) {
+        (Engine::Carrick, Some(cfg)) => {
             // KVM lane: the group kill above only reached the MAC side (limactl/
             // ssh); the carrick tree lives in the GUEST and carrick escapes its
             // process group there (it manages guest pgids), so reap it with a
@@ -255,7 +265,6 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane
             // Killing the run's leftover wrapper sh/sg as well is fine — the
             // whole run is being torn down. Best-effort: the in-band guest-side
             // `timeout`+pkill (lane.rs) is the backstop if this cannot connect.
-            let cfg = lima.unwrap();
             let _ = Command::new("limactl")
                 .args([
                     "shell",
@@ -270,7 +279,7 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane
                 .stderr(Stdio::null())
                 .status();
         }
-        Engine::Carrick => {
+        (Engine::Carrick, None) => {
             // Belt for a guest that escaped its group (setpgid/setsid): the
             // SCOPED kill.sh, which matches only `carrick:<run-id>` and refuses
             // a global reap. Best-effort (needs the sudoers entry).
@@ -280,7 +289,7 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane
                 .stderr(Stdio::null())
                 .status();
         }
-        Engine::Docker => {
+        (Engine::Docker, _) => {
             let container = run_id.to_string();
             let _ = Command::new("docker")
                 .args(["kill", &container])
