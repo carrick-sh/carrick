@@ -74,7 +74,11 @@ conformance-kvm *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     bin="$(bash scripts/conformance/build-carrick-in-lima.sh | tail -1)"
-    cargo run -p carrick-conformance -- --lane kvm --tier smoke \
+    # --workers 3: each carrick run extracts a full rootfs into the guest's
+    # ~/.carrick/scratch; 8 concurrent extractions overflow the 30 GiB lima
+    # disk (node, the largest image, ENOSPCs). 3 fits comfortably and matches
+    # the 6-vCPU guest better anyway (each run is a nested VM).
+    cargo run -p carrick-conformance -- --lane kvm --tier smoke --workers 3 \
         --carrick-bin "$bin" --baseline-overlay scripts/conformance/baseline.kvm.jsonl {{ARGS}}
 
 # Re-render docs/support-matrix.md from the latest results (no run).
