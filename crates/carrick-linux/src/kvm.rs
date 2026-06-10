@@ -3,7 +3,7 @@
 //! KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT; guest RAM via
 //! KVM_SET_USER_MEMORY_REGION over a host mmap; registers via
 //! KVM_GET/SET_ONE_REG; run via KVM_RUN. kick() is a signal-based vCPU exit.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
@@ -16,6 +16,88 @@ use crate::fork::VcpuSnapshot;
 
 fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
+}
+
+/// Host `CLOCK_MONOTONIC_RAW` "now", expressed in generic-timer TICKS — the
+/// epoch+unit the guest counter must match so the shared dispatcher's
+/// absolute-deadline math holds (see `align`/`lock` callers).
+fn host_monotonic_ticks() -> Result<u64, OsError> {
+    // The host's CNTFRQ_EL0 (unprivileged `mrs`) — KVM passes the host timer
+    // frequency through to the guest unchanged, and KVM does NOT expose CNTFRQ
+    // via GET_ONE_REG (ENOENT), so the host read is both correct and the only
+    // option. Same source the vvar realtime calibration uses.
+    let freq = crate::guest_setup::host_cntfrq_el0();
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: plain clock read into a stack-local timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) } != 0 {
+        return Err(os_err(
+            "clock_gettime(CLOCK_MONOTONIC_RAW)",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let ns = ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128;
+    Ok((ns * freq as u128 / 1_000_000_000) as u64)
+}
+
+/// The host's own virtual counter (`CNTVCT_EL0`, unprivileged `mrs` — the
+/// same EL0 access the vDSO uses). The KVM guest's counter is this value
+/// minus the VM's counter offset.
+fn host_cntvct_el0() -> u64 {
+    let cnt: u64;
+    // SAFETY: `cntvct_el0` is an unprivileged read on aarch64 Linux (enabled
+    // by the kernel for the vDSO clock).
+    unsafe {
+        core::arch::asm!("isb; mrs {}, cntvct_el0", out(reg) cnt, options(nomem, nostack));
+    }
+    cnt
+}
+
+/// `KVM_ARM_SET_COUNTER_OFFSET` (`_IOW(KVMIO=0xAE, 0xb5,
+/// struct kvm_arm_counter_offset[16])` = 0x4010AEB5): set the VM-WIDE counter
+/// offset so `guest CNTVCT == host CNTVCT - offset`. Unlike a TIMER_CNT
+/// register write, the userspace-owned VM offset SURVIVES `KVM_ARM_VCPU_INIT`
+/// — which otherwise ZEROES the VM-wide CNTVOFF on every vcpu reset, yanking
+/// the guest clock back by the whole epoch the moment a sibling thread's vCPU
+/// is created (measured: one `threading.Thread` sent guest CLOCK_MONOTONIC
+/// back 317,858 s and every absolute futex deadline with it). kvm-ioctls has
+/// no wrapper; raw ioctl on the `VmFd`. Kernel 6.4+ (lima guest is 6.12).
+fn set_vm_counter_offset_to_host_monotonic(vm: &VmFd) -> Result<(), OsError> {
+    use std::os::unix::io::AsRawFd;
+    const KVM_ARM_SET_COUNTER_OFFSET: libc::c_ulong = 0x4010_AEB5;
+    let offs = kvm_bindings::kvm_arm_counter_offset {
+        // guest = host_cntvct - offset, and we want guest == host monotonic
+        // ticks: offset = host_cntvct_now - host_monotonic_ticks_now. The two
+        // reads are µs apart at worst — far inside timer-test tolerances.
+        counter_offset: host_cntvct_el0().wrapping_sub(host_monotonic_ticks()?),
+        reserved: 0,
+    };
+    // SAFETY: `vm` is a live KVM VM fd; the ioctl only reads the 16-byte
+    // struct we pass by reference.
+    let rc = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_ARM_SET_COUNTER_OFFSET, &offs) };
+    if rc != 0 {
+        return Err(os_err(
+            "KVM_ARM_SET_COUNTER_OFFSET",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// FALLBACK alignment for kernels without `KVM_ARM_SET_COUNTER_OFFSET`:
+/// program the guest virtual counter to host CLOCK_MONOTONIC_RAW via a
+/// `KVM_REG_ARM_TIMER_CNT` write (`ARM64_SYS_REG(3,3,14,3,2)` — adjusts the
+/// VM-wide CNTVOFF). Because every `KVM_ARM_VCPU_INIT` re-zeroes that offset,
+/// this must run after EVERY vcpu init (fresh or recycled), and concurrent
+/// vcpus see a brief zero-epoch window between a sibling's init and its
+/// re-align — the VM ioctl above is the primary path for a reason.
+fn align_counter_to_host_monotonic(fd: &VcpuFd) -> Result<(), OsError> {
+    let ticks = host_monotonic_ticks()?;
+    fd.set_one_reg(sysreg_id(3, 3, 14, 3, 2), &ticks.to_le_bytes())
+        .map_err(|e| os_err("KVM_SET_ONE_REG(TIMER_CNT)", e))?;
+    Ok(())
 }
 
 // KVM aarch64 register-id field layout (Linux arch/arm64/include/uapi/asm/kvm.h):
@@ -151,6 +233,16 @@ pub struct KvmVm {
     /// via `create_empty`, which starts its own counter at 0 (correct — new
     /// VM, new slot namespace).
     next_slot: Arc<AtomicU32>,
+    /// Parked vcpus of EXITED sibling threads, shared across every handle to
+    /// the same VM, for REUSE by later siblings (see [`KvmVcpu::fd`] — vcpu
+    /// ids are a finite per-VM resource and cannot be freed, only recycled).
+    vcpu_pool: Arc<Mutex<Vec<VcpuFd>>>,
+    /// `true` when `KVM_ARM_SET_COUNTER_OFFSET` pinned the VM-wide counter
+    /// offset at VM creation (the offset then SURVIVES every vcpu init).
+    /// `false` on kernels without the ioctl — then EVERY vcpu init must
+    /// re-align the counter via the `TIMER_CNT` fallback (vcpu init zeroes
+    /// the VM-wide CNTVOFF). Set once at `create_empty`; immutable after.
+    counter_locked: bool,
 }
 
 /// A `Send`-safe handle to the SHARED VM state a `clone(CLONE_THREAD)` sibling
@@ -164,9 +256,50 @@ pub(crate) struct SharedVmHandle {
     /// Shared slot allocator (see [`KvmVm::next_slot`]) — a sibling that
     /// registers a post-spawn alias slot must draw a unique id, not slot 0.
     next_slot: Arc<AtomicU32>,
+    /// Shared parked-vcpu pool (see [`KvmVcpu::fd`]) — exited siblings park
+    /// their vcpu here for reuse; ids are a finite per-VM resource.
+    vcpu_pool: Arc<Mutex<Vec<VcpuFd>>>,
+    /// Whether the VM-wide counter offset is pinned (see [`KvmVm::counter_locked`]).
+    counter_locked: bool,
 }
 pub struct KvmVcpu {
-    fd: VcpuFd,
+    /// `Some` until drop. On drop the fd is PARKED into `recycle` instead of
+    /// closed: KVM vcpu ids are a FINITE per-VM resource (KVM_CAP_MAX_VCPUS,
+    /// ~512) and a created vcpu persists until VM teardown — there is no
+    /// KVM_DESTROY_VCPU, and closing the fd does not free the id. A
+    /// thread-churny guest (cpython's test_threading spawns thousands of
+    /// short-lived threads, each a sibling vCPU) exhausts the id space and
+    /// later KVM_CREATE_VCPUs fail with EINVAL unless exited siblings' vcpus
+    /// are REUSED. `create_vcpu_on_shared_vm` pops a parked vcpu and
+    /// re-initializes it (KVM_ARM_VCPU_INIT is a full architectural reset)
+    /// before handing it out — same UNPROGRAMMED contract as a fresh vcpu.
+    fd: Option<VcpuFd>,
+    recycle: Option<Arc<Mutex<Vec<VcpuFd>>>>,
+}
+
+impl KvmVcpu {
+    /// The live vcpu fd. Present from construction to drop (the `Option` only
+    /// exists so `Drop` can move the fd into the recycle pool).
+    fn fd(&self) -> &VcpuFd {
+        self.fd.as_ref().expect("vcpu fd present until drop")
+    }
+
+    /// Mutable access for the one fd method that needs it (`VcpuFd::run`).
+    fn fd_mut(&mut self) -> &mut VcpuFd {
+        self.fd.as_mut().expect("vcpu fd present until drop")
+    }
+}
+
+impl Drop for KvmVcpu {
+    fn drop(&mut self) {
+        if let (Some(fd), Some(pool)) = (self.fd.take(), self.recycle.as_deref())
+            && let Ok(mut parked) = pool.lock()
+        {
+            parked.push(fd);
+        }
+        // No pool (or a poisoned lock): the fd just closes — correct for VM
+        // teardown, merely forgoing reuse.
+    }
 }
 
 impl KvmVm {
@@ -178,12 +311,30 @@ impl KvmVm {
     pub(crate) fn create_empty() -> Result<Self, OsError> {
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
         let vm = kvm.create_vm().map_err(|e| os_err("KVM_CREATE_VM", e))?;
+        // EPOCH INVARIANT: the shared dispatcher (clock_nanosleep TIMER_ABSTIME,
+        // absolute FUTEX_WAIT_BITSET deadlines, timer/timerfd ABSTIME) compares
+        // guest CLOCK_MONOTONIC deadlines against the HOST's monotonic clock
+        // (`carrick_portable::CLOCK_UPTIME_RAW` == Linux CLOCK_MONOTONIC_RAW) —
+        // an invariant HVF satisfies by construction (the macOS guest counter
+        // is already host-uptime-based, carrick-hvf trap.rs
+        // populate_vdso_data_page) but a fresh KVM VM does NOT: KVM zeroes the
+        // virtual counter at VM creation, so the guest's vDSO MONOTONIC sat
+        // ~316,000 s behind the host and every absolute deadline looked
+        // already-past (cpython `time.sleep(30)` returned instantly). Pin the
+        // VM-wide offset BEFORE any vcpu exists; fall back to per-vcpu-init
+        // TIMER_CNT alignment on kernels without the ioctl. Fork children
+        // rebuild a fresh VM through this same path, which also keeps guest
+        // monotonic from jumping across fork. FATAL only if BOTH mechanisms
+        // are unavailable — a silent miss is a wrong-timeout machine.
+        let counter_locked = set_vm_counter_offset_to_host_monotonic(&vm).is_ok();
         Ok(Self {
             _kvm: Some(kvm),
             vm: Arc::new(vm),
             // The owning VM's main vCPU takes id 0; siblings fetch-add from here.
             next_vcpu_id: Arc::new(AtomicU64::new(0)),
             next_slot: Arc::new(AtomicU32::new(0)),
+            vcpu_pool: Arc::new(Mutex::new(Vec::new())),
+            counter_locked,
         })
     }
 
@@ -198,6 +349,8 @@ impl KvmVm {
             vm: Arc::clone(&self.vm),
             next_vcpu_id: Arc::clone(&self.next_vcpu_id),
             next_slot: Arc::clone(&self.next_slot),
+            vcpu_pool: Arc::clone(&self.vcpu_pool),
+            counter_locked: self.counter_locked,
         }
     }
 
@@ -217,6 +370,8 @@ impl KvmVm {
             vm: handle.vm,
             next_vcpu_id: handle.next_vcpu_id,
             next_slot: handle.next_slot,
+            vcpu_pool: handle.vcpu_pool,
+            counter_locked: handle.counter_locked,
         }
     }
 
@@ -233,16 +388,27 @@ impl KvmVm {
     /// — no `next_slot` mutation, unlike [`HvVm::add_vcpu`]). Factored so both
     /// the owning and sibling paths share one vCPU-init sequence.
     fn create_vcpu_on_shared_vm(&self) -> Result<KvmVcpu, OsError> {
-        // Draw a UNIQUE vcpu_id from the shared allocator. The owning VM's main
-        // vCPU gets 0; every `clone(CLONE_THREAD)` sibling gets the next id
-        // (1, 2, 3, …). `KVM_CREATE_VCPU` REQUIRES distinct ids per VM —
-        // reusing id 0 returns EEXIST, the bug that deadlocked the threaded loop
-        // (no sibling ever materialised, so `pthread_join`'s futex never woke).
-        let vcpu_id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
-        let fd = self
-            .vm
-            .create_vcpu(vcpu_id)
-            .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
+        // REUSE a parked vcpu of an exited sibling when one is available: vcpu
+        // ids are a finite per-VM resource (KVM_CAP_MAX_VCPUS) that KVM never
+        // frees, so a thread-churny guest exhausts KVM_CREATE_VCPU (EINVAL once
+        // the id space is spent) unless vcpus are recycled. The vcpu_init below
+        // fully resets a recycled vcpu — same UNPROGRAMMED contract either way.
+        let parked = self.vcpu_pool.lock().ok().and_then(|mut p| p.pop());
+        let fd = match parked {
+            Some(fd) => fd,
+            None => {
+                // Draw a UNIQUE vcpu_id from the shared allocator. The owning
+                // VM's main vCPU gets 0; every `clone(CLONE_THREAD)` sibling
+                // gets the next id (1, 2, 3, …). `KVM_CREATE_VCPU` REQUIRES
+                // distinct ids per VM — reusing id 0 returns EEXIST, the bug
+                // that deadlocked the threaded loop (no sibling ever
+                // materialised, so `pthread_join`'s futex never woke).
+                let vcpu_id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
+                self.vm
+                    .create_vcpu(vcpu_id)
+                    .map_err(|e| os_err("KVM_CREATE_VCPU", e))?
+            }
+        };
         let mut kvi = kvm_bindings::kvm_vcpu_init::default();
         self.vm
             .get_preferred_target(&mut kvi)
@@ -259,7 +425,20 @@ impl KvmVm {
         // (like HVF): if a kernel rejects the write the vDSO clock just traps and
         // we lose the fast path — never a reason to fail vCPU creation.
         let _ = fd.set_one_reg(sysreg_id(3, 0, 14, 1, 0), &0x3u64.to_le_bytes());
-        Ok(KvmVcpu { fd })
+        // EPOCH INVARIANT (see `create_empty`): when the VM-wide counter offset
+        // could NOT be pinned at VM creation (no KVM_ARM_SET_COUNTER_OFFSET),
+        // the vcpu_init above just ZEROED the VM-wide CNTVOFF — for every fresh
+        // AND recycled vcpu — so re-align the guest counter to the host
+        // monotonic clock here, every time. FATAL on failure: silently missing
+        // the alignment is a wrong-timeout machine (guest absolute deadlines
+        // land ~the host uptime away from where the dispatcher evaluates them).
+        if !self.counter_locked {
+            align_counter_to_host_monotonic(&fd)?;
+        }
+        Ok(KvmVcpu {
+            fd: Some(fd),
+            recycle: Some(Arc::clone(&self.vcpu_pool)),
+        })
     }
 
     /// Unregister a previously-mapped memory slot by re-issuing
@@ -374,7 +553,7 @@ impl HvVcpu for KvmVcpu {
     fn run(&mut self) -> Result<VcpuExit, OsError> {
         // EINTR from the ioctl means a signal (KICK_SIGNAL via pthread_kill) interrupted
         // KVM_RUN before any guest exit — this is the cross-thread kick path.
-        let exit = match self.fd.run() {
+        let exit = match self.fd_mut().run() {
             Ok(e) => e,
             Err(e) if e.errno() == libc::EINTR => return Ok(VcpuExit::Kicked),
             Err(e) => return Err(os_err("KVM_RUN", e)),
@@ -400,21 +579,21 @@ impl HvVcpu for KvmVcpu {
 
     fn reg(&self, r: Reg) -> Result<u64, OsError> {
         let mut bytes = [0u8; 8];
-        self.fd
+        self.fd()
             .get_one_reg(reg_to_id(r), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG", e))?;
         Ok(u64::from_le_bytes(bytes))
     }
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
-        self.fd
+        self.fd()
             .set_one_reg(reg_to_id(r), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG", e))?;
         Ok(())
     }
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
-        self.fd
+        self.fd()
             .set_one_reg(sysreg_to_id(r), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG(sysreg)", e))?;
         Ok(())
@@ -439,7 +618,7 @@ impl KvmVcpu {
     /// the KVM fault-capture path needs it — no cross-backend enum churn.
     pub fn get_esr_el1(&self) -> Result<u64, OsError> {
         let mut bytes = [0u8; 8];
-        self.fd
+        self.fd()
             .get_one_reg(sysreg_id(3, 0, 5, 2, 0), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(ESR_EL1)", e))?;
         Ok(u64::from_le_bytes(bytes))
@@ -452,7 +631,7 @@ impl KvmVcpu {
     /// carries the correct `si_addr`.
     pub fn get_far_el1(&self) -> Result<u64, OsError> {
         let mut bytes = [0u8; 8];
-        self.fd
+        self.fd()
             .get_one_reg(sysreg_id(3, 0, 6, 0, 0), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(FAR_EL1)", e))?;
         Ok(u64::from_le_bytes(bytes))
@@ -464,7 +643,7 @@ impl KvmVcpu {
     /// realtime offset (`realtime_off = unix_ns - cnt/freq*1e9`).
     pub fn get_timer_cnt(&self) -> Result<u64, OsError> {
         let mut bytes = [0u8; 8];
-        self.fd
+        self.fd()
             .get_one_reg(sysreg_id(3, 3, 14, 3, 2), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(TIMER_CNT)", e))?;
         Ok(u64::from_le_bytes(bytes))
@@ -479,7 +658,7 @@ impl KvmVcpu {
     /// [`Self::get_esr_el1`] — no `carrick_hal::SysReg` variant churn.
     pub fn get_tpidr_el1(&self) -> Result<u64, OsError> {
         let mut bytes = [0u8; 8];
-        self.fd
+        self.fd()
             .get_one_reg(sysreg_id(3, 0, 13, 0, 4), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(TPIDR_EL1)", e))?;
         Ok(u64::from_le_bytes(bytes))
@@ -491,7 +670,7 @@ impl KvmVcpu {
     /// child's `child_stack` write) where the shared loop holds only `&E`.
     pub fn set_reg_shared(&self, r: Reg, v: u64) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
-        self.fd
+        self.fd()
             .set_one_reg(reg_to_id(r), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG", e))?;
         Ok(())
@@ -500,7 +679,7 @@ impl KvmVcpu {
     /// Write a system register through `&self` (see [`Self::set_reg_shared`]).
     pub fn set_sys_reg_shared(&self, r: SysReg, v: u64) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
-        self.fd
+        self.fd()
             .set_one_reg(sysreg_to_id(r), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG(sysreg)", e))?;
         Ok(())
@@ -512,7 +691,7 @@ impl KvmVcpu {
     /// across `fork(2)`.
     pub fn get_sys_reg(&self, r: SysReg) -> Result<u64, OsError> {
         let mut bytes = [0u8; 8];
-        self.fd
+        self.fd()
             .get_one_reg(sysreg_to_id(r), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(sysreg)", e))?;
         Ok(u64::from_le_bytes(bytes))
@@ -522,42 +701,42 @@ impl KvmVcpu {
     /// `KVM_GET_ONE_REG`. Little-endian; a non-16-byte slice yields EINVAL.
     pub fn get_vreg(&self, n: u32) -> Result<u128, OsError> {
         let mut bytes = [0u8; 16];
-        self.fd
+        self.fd()
             .get_one_reg(vreg_id(n), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(vreg)", e))?;
         Ok(u128::from_le_bytes(bytes))
     }
     pub fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
-        self.fd
+        self.fd()
             .set_one_reg(vreg_id(n), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG(vreg)", e))?;
         Ok(())
     }
     pub fn get_fpsr(&self) -> Result<u32, OsError> {
         let mut bytes = [0u8; 4];
-        self.fd
+        self.fd()
             .get_one_reg(fpsr_id(), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(fpsr)", e))?;
         Ok(u32::from_le_bytes(bytes))
     }
     pub fn set_fpsr(&mut self, v: u32) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
-        self.fd
+        self.fd()
             .set_one_reg(fpsr_id(), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG(fpsr)", e))?;
         Ok(())
     }
     pub fn get_fpcr(&self) -> Result<u32, OsError> {
         let mut bytes = [0u8; 4];
-        self.fd
+        self.fd()
             .get_one_reg(fpcr_id(), &mut bytes)
             .map_err(|e| os_err("KVM_GET_ONE_REG(fpcr)", e))?;
         Ok(u32::from_le_bytes(bytes))
     }
     pub fn set_fpcr(&mut self, v: u32) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
-        self.fd
+        self.fd()
             .set_one_reg(fpcr_id(), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG(fpcr)", e))?;
         Ok(())

@@ -1020,7 +1020,9 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
 /// Read the host's `CNTFRQ_EL0` (timer frequency, Hz). Unconditionally
 /// EL0-readable on aarch64, and equal to the KVM guest's CNTFRQ_EL0 (the same
 /// physical counter) — which KVM does not surface through `KVM_GET_ONE_REG`.
-fn host_cntfrq_el0() -> u64 {
+/// Also used by `kvm.rs::align_counter_to_host_monotonic` (the guest-counter
+/// epoch alignment) for the same reason.
+pub(crate) fn host_cntfrq_el0() -> u64 {
     let freq: u64;
     // SAFETY: `cntfrq_el0` is an unprivileged read on aarch64 Linux.
     unsafe {
