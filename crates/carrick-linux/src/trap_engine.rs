@@ -863,10 +863,15 @@ impl SyscallTrap for KvmTrapEngine {
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
 
         // 2. Unregister EVERY currently-registered KVM memory slot on the LIVE VM
-        //    (`KVM_SET_USER_MEMORY_REGION` with memory_size = 0). The old slots
-        //    were registered from slot 0 in window order, so slot ids are
-        //    `0..old window_count`.
-        let old_slot_count = self.ram.window_count() as u32;
+        //    (`KVM_SET_USER_MEMORY_REGION` with memory_size = 0). Slot ids are
+        //    dense from 0 (the shared allocator never recycles and failures are
+        //    fatal), so `0..slot_count()` is the complete live set — including
+        //    any alias slot a SIBLING thread registered post-spawn, which this
+        //    engine's `ram.window_count()` would UNDERCOUNT (the sibling's
+        //    window lives only in its own GuestRam view). Linux execve destroys
+        //    all threads' mappings; a stale alias slot would collide with a
+        //    re-issued id after the counter resets below.
+        let old_slot_count = self.vm.slot_count();
         for slot in 0..old_slot_count {
             self.vm
                 .unmap_memory_slot(slot)

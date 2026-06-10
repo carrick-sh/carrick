@@ -4,7 +4,7 @@
 //! KVM_SET_USER_MEMORY_REGION over a host mmap; registers via
 //! KVM_GET/SET_ONE_REG; run via KVM_RUN. kick() is a signal-based vCPU exit.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;
@@ -140,7 +140,17 @@ pub struct KvmVm {
     /// `create_empty`, which starts its own counter at 0 (correct — the child's
     /// VM has only the one vCPU until it spawns its own threads).
     next_vcpu_id: Arc<AtomicU64>,
-    next_slot: u32,
+    /// The next `KVM_SET_USER_MEMORY_REGION` slot id, shared across every
+    /// `KvmVm` handle that targets the SAME VM — exactly like `next_vcpu_id`.
+    /// Slot ids are a per-VM namespace: a `clone(CLONE_THREAD)` sibling that
+    /// registers a NEW slot (post-spawn `map_host_alias`, e.g. a guest
+    /// `mmap(MAP_SHARED, fd)` on a Go runtime thread) must draw from the same
+    /// allocator as the main engine, or it re-issues slot 0 — the main RAM
+    /// slot — and KVM returns EINVAL (changing an existing slot's
+    /// `userspace_addr` is not permitted). A fork CHILD rebuilds a fresh VM
+    /// via `create_empty`, which starts its own counter at 0 (correct — new
+    /// VM, new slot namespace).
+    next_slot: Arc<AtomicU32>,
 }
 
 /// A `Send`-safe handle to the SHARED VM state a `clone(CLONE_THREAD)` sibling
@@ -151,6 +161,9 @@ pub struct KvmVm {
 pub(crate) struct SharedVmHandle {
     vm: Arc<VmFd>,
     next_vcpu_id: Arc<AtomicU64>,
+    /// Shared slot allocator (see [`KvmVm::next_slot`]) — a sibling that
+    /// registers a post-spawn alias slot must draw a unique id, not slot 0.
+    next_slot: Arc<AtomicU32>,
 }
 pub struct KvmVcpu {
     fd: VcpuFd,
@@ -170,7 +183,7 @@ impl KvmVm {
             vm: Arc::new(vm),
             // The owning VM's main vCPU takes id 0; siblings fetch-add from here.
             next_vcpu_id: Arc::new(AtomicU64::new(0)),
-            next_slot: 0,
+            next_slot: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -184,21 +197,26 @@ impl KvmVm {
         SharedVmHandle {
             vm: Arc::clone(&self.vm),
             next_vcpu_id: Arc::clone(&self.next_vcpu_id),
+            next_slot: Arc::clone(&self.next_slot),
         }
     }
 
     /// Build a sibling [`KvmVm`] that SHARES the parent's VM (a
     /// `clone(CLONE_THREAD)` thread). It owns no `Kvm` handle (the parent keeps
-    /// `/dev/kvm` open) and registers no memory (the slots already exist on the
-    /// shared VM); `next_slot` is irrelevant for a sibling and starts at 0. It
-    /// SHARES the parent's `next_vcpu_id` allocator so its `KVM_CREATE_VCPU`
-    /// draws a unique id (1, 2, 3, …), never colliding with the main vCPU's 0.
+    /// `/dev/kvm` open) and registers no memory AT SPAWN (the slots already
+    /// exist on the shared VM) — but it SHARES both per-VM allocators: the
+    /// `next_vcpu_id` allocator so its `KVM_CREATE_VCPU` draws a unique id
+    /// (1, 2, 3, …, never colliding with the main vCPU's 0), AND the
+    /// `next_slot` allocator so a POST-SPAWN registration (`map_host_alias`
+    /// from a guest `mmap(MAP_SHARED, fd)` on this thread) draws a unique slot
+    /// id instead of re-issuing slot 0 — the main RAM slot — which KVM rejects
+    /// with EINVAL (`userspace_addr` of an existing slot cannot change).
     pub(crate) fn from_shared_vm(handle: SharedVmHandle) -> Self {
         Self {
             _kvm: None,
             vm: handle.vm,
             next_vcpu_id: handle.next_vcpu_id,
-            next_slot: 0,
+            next_slot: handle.next_slot,
         }
     }
 
@@ -276,7 +294,16 @@ impl KvmVm {
     /// old slot, so the new image's windows reuse the same slot ids/order the
     /// fresh VM would have used.
     pub(crate) fn reset_slot_counter(&mut self) {
-        self.next_slot = 0;
+        self.next_slot.store(0, Ordering::SeqCst);
+    }
+
+    /// How many slot ids have been drawn on this VM (across ALL handles — the
+    /// allocator is shared). Registration failures are fatal on every call
+    /// path and `unmap_memory_slot` never recycles ids, so this equals the
+    /// number of live slots: `0..slot_count()` is exactly the set to unmap
+    /// when tearing the address space down in place (execve).
+    pub(crate) fn slot_count(&self) -> u32 {
+        self.next_slot.load(Ordering::SeqCst)
     }
 }
 
@@ -294,8 +321,14 @@ impl HvVm for KvmVm {
         len: usize,
         _perms: MemPerms,
     ) -> Result<(), OsError> {
+        // Draw a UNIQUE slot id from the shared per-VM allocator BEFORE the
+        // ioctl: two sibling threads registering aliases concurrently must not
+        // observe the same id (KVM serializes the memslot update itself, but
+        // the id must be ours alone). A failed registration burns its id —
+        // harmless, since every caller treats map_memory failure as fatal.
+        let slot = self.next_slot.fetch_add(1, Ordering::SeqCst);
         let region = kvm_userspace_memory_region {
-            slot: self.next_slot,
+            slot,
             guest_phys_addr: gpa,
             memory_size: len as u64,
             userspace_addr: host as u64,
@@ -312,15 +345,14 @@ impl HvVm for KvmVm {
                 // full region so the failure is actionable.
                 os_err(
                     &format!(
-                        "KVM_SET_USER_MEMORY_REGION(slot={} gpa=0x{gpa:x} \
+                        "KVM_SET_USER_MEMORY_REGION(slot={slot} gpa=0x{gpa:x} \
                          userspace_addr=0x{:x} size=0x{len:x})",
-                        self.next_slot, host as u64
+                        host as u64
                     ),
                     e,
                 )
             })?;
         }
-        self.next_slot += 1;
         let _ = KVM_MEM_LOG_DIRTY_PAGES; // keep import meaningful; unused in MVP
         Ok(())
     }
