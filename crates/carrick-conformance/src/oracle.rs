@@ -17,7 +17,7 @@
 //! and so unfit for a committed artifact.
 
 use crate::manifest::{Suite, VerdictKind};
-use crate::parsers::{SuiteOutcome, SuiteResult};
+use crate::parsers::{Outcome, SuiteOutcome, SuiteResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -105,10 +105,34 @@ impl OracleCache {
     }
 
     /// The cached docker result for this suite, if its determinant key is present.
+    ///
+    /// Gotest ids are RE-NORMALIZED on the way out: entries cached before the
+    /// pointer-address normalization (`parsers::gotest::normalize_id`) carry
+    /// raw `0x<hex>` ids that can never match a freshly-parsed carrick side —
+    /// every all-pass suite with pointer-bearing subtest names would read as a
+    /// phantom REGRESSION. Normalizing at load keeps every old cache
+    /// comparable without a re-bless. Fail dominates on a collision, matching
+    /// the parser's own merge rule.
     pub fn get(&self, suite: &Suite) -> Option<SuiteResult> {
-        self.by_key
-            .get(&oracle_key(suite))
-            .map(|r| r.result.clone())
+        let mut result = self.by_key.get(&oracle_key(suite))?.result.clone();
+        if suite.verdict == VerdictKind::Gotest {
+            let mut ids: BTreeMap<String, Outcome> = BTreeMap::new();
+            for (id, o) in std::mem::take(&mut result.ids) {
+                let id = crate::parsers::gotest::normalize_id(&id);
+                match ids.entry(id) {
+                    std::collections::btree_map::Entry::Vacant(v) => {
+                        v.insert(o);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut e) => {
+                        if o == Outcome::Fail {
+                            *e.get_mut() = o;
+                        }
+                    }
+                }
+            }
+            result.ids = ids;
+        }
+        Some(result)
     }
 
     /// Cache a freshly-run docker result. Refuses a non-comparable (crashed /
