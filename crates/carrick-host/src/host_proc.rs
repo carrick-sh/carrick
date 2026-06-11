@@ -463,15 +463,108 @@ mod imp {
     }
 }
 
+/// Linux (KVM lane): the host kernel's own `/proc` is the source of truth.
+/// carrick forks each guest process as a real Linux process (the trees mirror,
+/// same as macOS), so a sibling guest's identity/state is read straight from
+/// the REAL `/proc/<pid>/stat` — the synthetic guest `/proc` then re-renders
+/// it in the guest's namespace. Reads degrade to `None`/`false` on any parse
+/// or IO failure (also keeping a non-Linux non-macOS build inert).
 #[cfg(not(target_os = "macos"))]
 mod imp {
     use super::{GuestProcInfo, ResourceUsage};
-    pub fn pid_info(_pid: u32) -> Option<GuestProcInfo> {
-        None
+
+    /// Parse a Linux `/proc/<pid>/stat` line into `(comm, state, ppid, pgrp)`.
+    /// The comm is delimited by the FIRST `(` and LAST `)` — it may itself
+    /// contain spaces or parens (proc_pid_stat(5)).
+    fn parse_stat(line: &str) -> Option<(String, char, u32, u32)> {
+        let open = line.find('(')?;
+        let close = line.rfind(')')?;
+        let comm = line.get(open + 1..close)?.to_owned();
+        let mut rest = line.get(close + 1..)?.split_ascii_whitespace();
+        let state = rest.next()?.chars().next()?;
+        let ppid = rest.next()?.parse().ok()?;
+        let pgrp = rest.next()?.parse().ok()?;
+        Some((comm, state, ppid, pgrp))
     }
-    pub fn is_guest_process(_pid: u32) -> bool {
+
+    fn read_stat(path: &str) -> Option<(String, char, u32, u32)> {
+        parse_stat(&std::fs::read_to_string(path).ok()?)
+    }
+
+    /// Aggregate Linux state char across the process's threads, mirroring the
+    /// macOS thread aggregation: the leader's state in `/proc/<pid>/stat` only
+    /// reflects the MAIN thread, but a carrick guest executes on a vCPU worker
+    /// thread — a guest spinning in userspace would otherwise read 'S' from
+    /// the parked leader. Any running task ⇒ 'R'; otherwise the leader state
+    /// stands (a blocked guest parks every carrick thread, so it reads 'S').
+    fn aggregate_state(pid: u32, leader: char) -> char {
+        if leader == 'Z' || leader == 'T' {
+            return leader;
+        }
+        let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return leader;
+        };
+        for ent in dir.flatten() {
+            let Some(tid) = ent.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some((_, st, _, _)) = read_stat(&format!("/proc/{pid}/task/{tid}/stat"))
+                && st == 'R'
+            {
+                return 'R';
+            }
+        }
+        leader
+    }
+
+    pub fn pid_info(pid: u32) -> Option<GuestProcInfo> {
+        let (comm, leader_state, ppid, pgid) = read_stat(&format!("/proc/{pid}/stat"))?;
+        // Real uid/gid of the host process (`/proc/<pid>` is owned by it). The
+        // guest-facing renderers substitute container creds where it matters.
+        let (uid, gid) = std::fs::metadata(format!("/proc/{pid}"))
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                (m.uid(), m.gid())
+            })
+            .unwrap_or((0, 0));
+        Some(GuestProcInfo {
+            state: aggregate_state(pid, leader_state),
+            ppid,
+            pgid,
+            uid,
+            gid,
+            comm,
+        })
+    }
+
+    /// True iff `pid` is a carrick GUEST process — same ppid-chain walk as the
+    /// macOS impl (chain must reach the root guest pid or this process), read
+    /// from the real `/proc`. Bounded so a cycle can't loop forever.
+    pub fn is_guest_process(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let me = std::process::id();
+        let root = super::ROOT_GUEST_PID.load(std::sync::atomic::Ordering::Relaxed);
+        if pid == root {
+            return true;
+        }
+        let mut cur = pid;
+        for _ in 0..256 {
+            let Some((_, _, pp, _)) = read_stat(&format!("/proc/{cur}/stat")) else {
+                return false;
+            };
+            if pp == me || (root != 0 && pp == root) {
+                return true;
+            }
+            if pp == 0 || pp == cur {
+                return false;
+            }
+            cur = pp;
+        }
         false
     }
+
     pub fn thread_run_state_char(_port: u32) -> char {
         'R'
     }
@@ -483,6 +576,28 @@ mod imp {
     }
     pub fn self_thread_cpu_us() -> Option<(u64, u64)> {
         None
+    }
+
+    #[cfg(test)]
+    mod stat_parse_tests {
+        use super::parse_stat;
+
+        #[test]
+        fn parses_fields_after_last_close_paren() {
+            // comm containing spaces AND a paren — the canonical proc(5) trap.
+            let line = "1234 (a (weird) name) S 1 1234 1234 0 -1 4194560 0 0\n";
+            let (comm, state, ppid, pgrp) = parse_stat(line).unwrap();
+            assert_eq!(comm, "a (weird) name");
+            assert_eq!(state, 'S');
+            assert_eq!(ppid, 1);
+            assert_eq!(pgrp, 1234);
+        }
+
+        #[test]
+        fn rejects_malformed_lines() {
+            assert!(parse_stat("not a stat line").is_none());
+            assert!(parse_stat("1 (x)").is_none());
+        }
     }
 }
 
