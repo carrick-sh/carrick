@@ -70,6 +70,14 @@ pub(in crate::dispatch) struct IoState {
     /// setrlimit/prlimit64 (libuv's TEST_FILE_LIMIT does). Lock-free so the fd
     /// allocator can read it while holding open_files (never the proc lock).
     pub nofile_soft: AtomicU64,
+    /// Guest fds that have hosted an epoll interest set (recorded at
+    /// `epoll_ctl`). Lets the Linux lane's consumption-based EPOLLET re-arm
+    /// ([`crate::dispatch::SyscallDispatcher::epoll_rearm_after_io`]) find the
+    /// epoll instances possibly watching an fd without scanning the whole fd
+    /// table on every guest read/write. Entries are pruned lazily: a stale fd
+    /// (closed / recycled as a non-epoll) is removed when the re-arm next
+    /// visits it.
+    pub epoll_fds: RwLock<std::collections::BTreeSet<i32>>,
 }
 
 /// Default soft RLIMIT_NOFILE. We keep the bare-Linux 1024 rather than the
@@ -97,6 +105,7 @@ impl IoState {
             fd_open_paths: RwLock::new(HashMap::new()),
             io_uring_instances: RwLock::new(HashMap::new()),
             nofile_soft: AtomicU64::new(DEFAULT_NOFILE_SOFT),
+            epoll_fds: RwLock::new(std::collections::BTreeSet::new()),
         }
     }
 }

@@ -1422,16 +1422,97 @@ pub struct SyscallDispatcher {
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
 /// for its lifetime (deregistered on drop). Derefs to the inner `Kqueue` so the
 /// epoll handlers use it transparently.
+///
+/// On the Linux lane it ALSO owns the instance's SELF-WAKE PIPE. The Linux
+/// `epoll_pwait` emulation samples readiness once, then parks in a plain host
+/// `ppoll` over the interest set's host fds — a snapshot the rest of the
+/// process can invalidate while the waiter sleeps: a sibling's `read`/`splice`
+/// drains the edge the park-set's ET exclusion was computed from (the go-os
+/// TestSpliceFile deaf-park wedge), an `epoll_ctl` ADDs an fd the parked
+/// `ppoll` doesn't watch, a `close` removes one. macOS doesn't have this
+/// problem — the persistent kqueue is shared, so registrations and EV_CLEAR
+/// re-arms reach a parked waiter natively. The wake pipe restores that
+/// property: the park set always includes the read end, and every
+/// snapshot-invalidating mutation (`epoll_rearm_after_io`, `epoll_ctl`,
+/// `detach_fd_from_epolls`) writes a byte, forcing the parked waiter to
+/// re-dispatch and rebuild from fresh state. The byte persists until the next
+/// dispatch drains it, so a wake between sample and park is never lost.
 #[derive(Debug)]
 pub(crate) struct EpollKqueue {
     kq: crate::darwin_kqueue::Kqueue,
+    /// Linux self-wake pipe `(read, write)`, both `O_NONBLOCK|O_CLOEXEC`.
+    /// `None` if pipe creation failed (the park then degrades to the old
+    /// snapshot behavior rather than failing epoll_create1).
+    #[cfg(not(feature = "platform-macos"))]
+    wake_pipe: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
 }
 
 impl EpollKqueue {
     pub(crate) fn new(kq: crate::darwin_kqueue::Kqueue) -> Self {
         register_epoll_kqueue(kq.raw_fd());
-        Self { kq }
+        #[cfg(not(feature = "platform-macos"))]
+        {
+            let mut fds = [0i32; 2];
+            let wake_pipe = if unsafe {
+                libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC)
+            } == 0
+            {
+                use std::os::fd::FromRawFd;
+                // SAFETY: pipe2 succeeded; fds[0]/fds[1] are fresh owned fds.
+                Some(unsafe {
+                    (
+                        std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                        std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+                    )
+                })
+            } else {
+                None
+            };
+            Self { kq, wake_pipe }
+        }
+        #[cfg(feature = "platform-macos")]
+        {
+            Self { kq }
+        }
     }
+
+    /// The wake pipe's read end for the `ppoll` park set (`None` on macOS or
+    /// if pipe creation failed).
+    #[cfg(not(feature = "platform-macos"))]
+    pub(crate) fn wake_read_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        self.wake_pipe.as_ref().map(|(r, _)| r.as_raw_fd())
+    }
+
+    /// Wake any waiter parked on this instance's `ppoll` so it rebuilds its
+    /// snapshot. Non-blocking; a full pipe (wake already pending) is success.
+    #[cfg(not(feature = "platform-macos"))]
+    pub(crate) fn wake_parked(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some((_, w)) = &self.wake_pipe {
+            // SAFETY: writing one byte from a valid stack buffer to an owned fd.
+            unsafe { libc::write(w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        }
+    }
+
+    /// Consume pending wake bytes so a stale wake doesn't spin the next park.
+    /// Called at the top of each `epoll_pwait` dispatch, BEFORE sampling — any
+    /// wake written after the drain (even between sample and park) leaves a
+    /// byte that pops the park immediately.
+    #[cfg(not(feature = "platform-macos"))]
+    pub(crate) fn drain_wake(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some((r, _)) = &self.wake_pipe {
+            let mut buf = [0u8; 64];
+            // SAFETY: reading into a valid stack buffer from an owned
+            // O_NONBLOCK fd; loop ends on EAGAIN (or any error/EOF).
+            while unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        }
+    }
+
+    /// macOS: the shared kqueue reaches parked waiters natively; no-ops.
+    #[cfg(feature = "platform-macos")]
+    pub(crate) fn wake_parked(&self) {}
 }
 
 impl Drop for EpollKqueue {
@@ -2294,6 +2375,11 @@ impl SyscallDispatcher {
         });
 
         let result = self.dispatch_normalized(request, memory, reporter, thread);
+        // Consumption-based EPOLLET re-arm: a read/write-family syscall on a
+        // watched fd services the latched edge; clear it so the next sampled
+        // assertion is delivered (the Linux-lane lost-edge wedge — see
+        // `epoll_rearm_after_io`). After the handler, idempotent on re-entry.
+        self.epoll_rearm_after_io(&request);
         let outcome = match result {
             Some(r) => match lower_handler_result(r) {
                 Ok(outcome) => outcome,
@@ -2479,6 +2565,8 @@ impl SyscallDispatcher {
         // dispatched here first; the borrow of memory/reporter is scoped to
         // the call, so the legacy match below can still use them for the rest.
         if let Some(result) = self.dispatch_normalized(request, memory, reporter, thread) {
+            // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
+            self.epoll_rearm_after_io(&request);
             let outcome = lower_handler_result(result)?;
             let (retval, errno) = outcome.retval_errno();
             reporter.record(CompatEvent::SyscallReturn {

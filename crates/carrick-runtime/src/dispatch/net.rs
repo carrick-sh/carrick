@@ -212,6 +212,105 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll
+    /// emulation: after the guest performs a read-family syscall on fd X,
+    /// clear the read-side bits of `last_ready` for X in every epoll interest
+    /// set watching X (write-side bits for write-family syscalls).
+    ///
+    /// The Linux-lane ET latch is a readiness DIFF between consecutive
+    /// `epoll_pwait` samples (`raw & !last_ready`), so a drain + refill that
+    /// both land BETWEEN two samples is indistinguishable from "asserted
+    /// since the last delivery": the new edge is masked from delivery AND
+    /// (per the ET park-set rule) excluded from the ppoll park — the waiter
+    /// parks forever. Captured live in go-os TestSpliceFile/Basic-TCP: the
+    /// writer's `write(1025)+close` lands between the reader's splice EAGAIN
+    /// (drain) and its `epoll_pwait` re-park; the sample sees IN still
+    /// asserted, masks it, and the netpoller M never wakes. macOS doesn't
+    /// need this: kqueue's `EV_CLEAR` re-arms in-kernel on consumption.
+    ///
+    /// An I/O syscall on X is exactly the consumption signal the sampling
+    /// can't see — the guest serviced the delivered edge, so the next
+    /// asserted sample is a NEW edge and must be delivered. Clearing on
+    /// every read (not only EAGAIN) can at worst re-deliver one spurious
+    /// event, which epoll's contract permits (and ET consumers drain to
+    /// EAGAIN by contract). HUP/ERR are cleared on both directions: poll(2)
+    /// reports them regardless of the requested set, and a guest that just
+    /// touched the fd must see a still-standing terminal condition again.
+    #[cfg(not(feature = "platform-macos"))]
+    pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest) {
+        const READ_CLEAR: u32 = LINUX_EPOLLIN
+            | LINUX_EPOLLRDHUP
+            | LINUX_EPOLLPRI
+            | LINUX_EPOLLHUP
+            | LINUX_EPOLLERR;
+        const WRITE_CLEAR: u32 = LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR;
+        let a = |i: usize| request.arg(i) as i32;
+        // (fd, bits-to-clear) per direction the syscall consumed. aarch64 nrs.
+        let targets: [Option<(i32, u32)>; 2] = match request.number {
+            // read / readv / pread64 / preadv / preadv2, accept / accept4,
+            // recvfrom / recvmsg / recvmmsg: consume the read side of arg0.
+            63 | 65 | 67 | 69 | 286 | 202 | 242 | 207 | 212 | 243 => {
+                [Some((a(0), READ_CLEAR)), None]
+            }
+            // write / writev / pwrite64 / pwritev / pwritev2, sendto /
+            // sendmsg / sendmmsg: consume the write side of arg0.
+            64 | 66 | 68 | 70 | 287 | 206 | 211 | 269 => [Some((a(0), WRITE_CLEAR)), None],
+            // sendfile(out_fd, in_fd, ..): reads in_fd, writes out_fd.
+            71 => [Some((a(1), READ_CLEAR)), Some((a(0), WRITE_CLEAR))],
+            // splice(fd_in, off_in, fd_out, ..) / copy_file_range: reads
+            // arg0, writes arg2. tee(fd_in, fd_out, ..): reads arg0, writes
+            // arg1.
+            76 | 285 => [Some((a(0), READ_CLEAR)), Some((a(2), WRITE_CLEAR))],
+            77 => [Some((a(0), READ_CLEAR)), Some((a(1), WRITE_CLEAR))],
+            _ => return,
+        };
+        // Snapshot the registered epoll fds and DROP the set lock before
+        // touching any description lock (epoll_ctl registers while holding no
+        // description lock either, keeping the order acyclic).
+        let epfds: Vec<i32> = self.io.epoll_fds.read().iter().copied().collect();
+        for epfd in epfds {
+            let stale = match self.open_file(epfd) {
+                None => true,
+                Some(open_file) => {
+                    let mut open = open_file.description.write();
+                    if let OpenDescription::Epoll {
+                        interest, kqueue, ..
+                    } = &mut *open
+                    {
+                        let mut cleared = false;
+                        for (fd, clear) in targets.iter().flatten() {
+                            if let Some(slot) = interest.get_mut(fd) {
+                                cleared |= slot.last_ready & clear != 0;
+                                slot.last_ready &= !clear;
+                            }
+                        }
+                        // A waiter parked before this consumption holds a park
+                        // set whose ET exclusion was computed from the now-
+                        // serviced edge (the fd may be parked with events==0 —
+                        // deaf). Pop it so it re-samples and re-parks armed.
+                        if cleared {
+                            kqueue.wake_parked();
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                }
+            };
+            // Lazy prune: the fd was closed or recycled as a non-epoll.
+            if stale {
+                self.io.epoll_fds.write().remove(&epfd);
+            }
+        }
+    }
+
+    /// No-op twin: macOS epoll instances are kqueue-backed (`EV_CLEAR` gives
+    /// kernel-native edge re-arm), so consumption tracking is unnecessary —
+    /// and the HVF lane's in-memory-fd latch behavior is deliberately left
+    /// untouched.
+    #[cfg(feature = "platform-macos")]
+    pub(crate) fn epoll_rearm_after_io(&self, _request: &SyscallRequest) {}
+
     fn read_optional_fd_set(
         &self,
         memory: &mut impl GuestMemory,
@@ -290,11 +389,15 @@ impl SyscallDispatcher {
             if let OpenDescription::Epoll {
                 interest,
                 pending_ready,
+                kqueue,
                 ..
             } = &mut *guard
                 && interest.remove(&fd).is_some()
             {
                 clear_pending_epoll_ready(pending_ready, fd);
+                // A parked waiter still ppolls the closed fd's host fd (a
+                // closed entry never wakes poll); pop it so it rebuilds.
+                kqueue.wake_parked();
             }
         }
     }
@@ -1230,6 +1333,14 @@ impl SyscallDispatcher {
             // taking the epoll write lock (it locks the *target* fd's description).
             let host_fd = this.host_fd_for_poll(fd);
 
+            // Record this epoll instance for the consumption-based EPOLLET
+            // re-arm ([`Self::epoll_rearm_after_io`]) BEFORE taking the
+            // description lock (the re-arm path snapshots this set first, then
+            // locks descriptions — registering here keeps the lock order
+            // acyclic). A non-epoll epfd inserted on the error path below is
+            // harmless: the re-arm prunes it lazily.
+            this.io.epoll_fds.write().insert(epfd);
+
             let mut open = open_file.description.write();
             let OpenDescription::Epoll {
                 interest,
@@ -1269,6 +1380,9 @@ impl SyscallDispatcher {
                             last_ready: 0,
                         },
                     );
+                    // A waiter parked on this instance's ppoll snapshot does
+                    // not watch the just-added fd; pop it so it rebuilds.
+                    kqueue.wake_parked();
                     crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -1294,6 +1408,8 @@ impl SyscallDispatcher {
                         event,
                         last_ready: 0,
                     };
+                    // Re-arm visible to a parked waiter: rebuild its park set.
+                    kqueue.wake_parked();
                     crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -1336,6 +1452,9 @@ impl SyscallDispatcher {
                         }
                     }
                     clear_pending_epoll_ready(pending_ready, fd);
+                    // A parked waiter still ppolls the removed fd's host fd;
+                    // pop it so it rebuilds without the dead entry.
+                    kqueue.wake_parked();
                     crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -1413,20 +1532,31 @@ impl SyscallDispatcher {
             // host-backed sockets/pipes via a non-blocking `poll`), apply the
             // EPOLLET edge latch + EPOLLONESHOT disarm, and — when nothing is
             // ready — block on the interest fds' host fds via `ppoll`
-            // (WaitOnPollFds), re-dispatching on readiness. Single-threaded: the
-            // kqueue's only extra role (a sibling thread's ADD seen by a blocked
-            // waiter) does not arise. (A timerfd with no host fd that expires
-            // mid-wait is bounded by the epoll timeout — full sub-timeout
-            // precision for that case is a follow-up.)
+            // (WaitOnPollFds), re-dispatching on readiness. The park is a
+            // SNAPSHOT another thread can invalidate (drain a latched edge,
+            // epoll_ctl ADD, close); every such mutation writes the instance's
+            // SELF-WAKE PIPE — always in the park set — so the parked waiter
+            // re-dispatches and rebuilds from fresh state (see `EpollKqueue`).
             #[cfg(not(feature = "platform-macos"))]
             {
-                let interests: Vec<(i32, EpollInterest)> = {
+                let (interests, instance_kq): (Vec<(i32, EpollInterest)>, Arc<EpollKqueue>) = {
                     let open = open_file.description.read();
-                    let OpenDescription::Epoll { interest, .. } = &*open else {
+                    let OpenDescription::Epoll {
+                        interest, kqueue, ..
+                    } = &*open
+                    else {
                         return Ok(LINUX_EINVAL.into());
                     };
-                    interest.iter().map(|(fd, i)| (*fd, i.clone())).collect()
+                    (
+                        interest.iter().map(|(fd, i)| (*fd, i.clone())).collect(),
+                        Arc::clone(kqueue),
+                    )
                 };
+                // Consume any pending self-wake BEFORE sampling: a mutation that
+                // landed before this point is covered by the fresh sample below;
+                // one landing after this drain leaves a byte that pops the ppoll
+                // park immediately.
+                instance_kq.drain_wake();
 
                 let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
                 let mut ready_updates: Vec<(i32, u32)> = Vec::new();
@@ -1548,6 +1678,13 @@ impl SyscallDispatcher {
                         Some((hfd, ev))
                     })
                     .collect();
+                let mut pollfds = pollfds;
+                // The instance self-wake pipe: a sibling thread invalidating
+                // this park's snapshot (consumption re-arm, epoll_ctl, close)
+                // writes a byte here, popping the park so it rebuilds.
+                if let Some(wake_fd) = instance_kq.wake_read_fd() {
+                    pollfds.push((wake_fd, libc::POLLIN));
+                }
                 return Ok(DispatchOutcome::WaitOnPollFds {
                     fds: WaitFds::raw(pollfds),
                     timeout,
