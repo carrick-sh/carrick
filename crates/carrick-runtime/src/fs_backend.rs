@@ -1809,6 +1809,73 @@ impl HostFsBackend {
         }
     }
 
+    /// Resolve `rel` to the cap-std `Dir` handle + path to actually operate
+    /// on, transparently splitting a DEEP path (one whose byte length could
+    /// exceed the kernel's per-call `PATH_MAX`) into an anchor handle and a
+    /// short tail.
+    ///
+    /// Why: on Linux, cap-std resolves a whole relative path with ONE
+    /// `openat2(RESOLVE_BENEATH)` call, so the kernel's `PATH_MAX` (4096
+    /// bytes, `getname()`-enforced) caps the path even though every
+    /// individual component is short. A guest that mkdir/chdir's its way
+    /// deeper than `PATH_MAX` (Go os TestGetwdDeep / TestRemoveAllLongPath)
+    /// got ENAMETOOLONG from operations a real Linux kernel serves fine —
+    /// the guest's own syscalls are short cwd/dirfd-relative names; only
+    /// carrick's cwd-joined ABSOLUTE backend path is deep. On macOS cap-std
+    /// resolves component-by-component (`manually::open`, no full-path
+    /// syscall), so the deep branch is compiled out there and the macOS
+    /// behavior is unchanged.
+    ///
+    /// For a deep path, [`HostFsBackend::deep_anchor`] descends in
+    /// sub-`PATH_MAX` chunks: each chunk of intermediate directories is
+    /// opened as its own cap-std `Dir` via `open_dir` (i.e. `openat2`
+    /// `RESOLVE_BENEATH` the PREVIOUS handle — the sandbox containment
+    /// property is preserved chunk by chunk), and the final operation runs
+    /// on the deepest handle with the short remaining tail.
+    fn at<'a, 'p>(
+        &'a self,
+        rel: &'p Path,
+    ) -> std::io::Result<(DirAt<'a>, std::borrow::Cow<'p, Path>)> {
+        #[cfg(target_os = "linux")]
+        if rel.as_os_str().len() >= DEEP_PATH_CHUNK
+            && let Some((anchor, tail)) = self.deep_anchor(rel)?
+        {
+            return Ok((DirAt::Anchor(anchor), std::borrow::Cow::Owned(tail)));
+        }
+        Ok((DirAt::Root(&self.dir), std::borrow::Cow::Borrowed(rel)))
+    }
+
+    /// Chunked descent for a deep relative path (see [`HostFsBackend::at`]):
+    /// opens successive ≲`DEEP_PATH_CHUNK`-byte component groups of `rel` as
+    /// intermediate `Dir` handles and returns the deepest handle plus the
+    /// remaining (always non-empty) tail. `Ok(None)` if `rel` never filled a
+    /// chunk (a single huge component — let the normal path report the
+    /// error). A descent failure (e.g. a missing intermediate) is the same
+    /// error the underlying operation would surface on a real kernel walk.
+    #[cfg(target_os = "linux")]
+    fn deep_anchor(&self, rel: &Path) -> std::io::Result<Option<(cap_std::fs::Dir, PathBuf)>> {
+        let mut anchor: Option<cap_std::fs::Dir> = None;
+        let mut chunk = PathBuf::new();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            chunk.push(component);
+            if components.peek().is_none() {
+                // The final group stays unresolved as the tail: the leaf must
+                // be left to the actual operation (create/remove/lstat).
+                break;
+            }
+            if chunk.as_os_str().len() >= DEEP_PATH_CHUNK {
+                let next = match &anchor {
+                    Some(dir) => dir.open_dir(&chunk)?,
+                    None => self.dir.open_dir(&chunk)?,
+                };
+                anchor = Some(next);
+                chunk = PathBuf::new();
+            }
+        }
+        Ok(anchor.map(|a| (a, chunk)))
+    }
+
     /// Resolve `path` to its final non-symlink target, following symlinks
     /// MANUALLY (40-hop ELOOP guard). cap-std follows a *relative* symlink
     /// target within the sandbox but refuses an *absolute* one as an escape —
@@ -1825,7 +1892,11 @@ impl HostFsBackend {
             let Some(rel) = Self::rel_path(&normalized) else {
                 return Some(normalized);
             };
-            let Ok(meta) = self.dir.symlink_metadata(rel) else {
+            let Ok((dir, at_rel)) = self.at(rel) else {
+                // Deep-descent miss (missing intermediate) — path as-is.
+                return Some(normalized);
+            };
+            let Ok(meta) = dir.symlink_metadata(&at_rel) else {
                 // Doesn't exist (or unreadable) — hand back the path as-is.
                 return Some(normalized);
             };
@@ -1836,7 +1907,7 @@ impl HostFsBackend {
                 return None; // ELOOP
             }
             hops += 1;
-            let target = self.dir.read_link_contents(rel).ok()?;
+            let target = dir.read_link_contents(&at_rel).ok()?;
             // `target` is raw host bytes; normalize it WITHOUT a String round-
             // trip so an undecodable symlink target isn't corrupted.
             normalized = if target.is_absolute() {
@@ -2306,6 +2377,37 @@ pub(crate) fn write_owner_xattr(
     });
 }
 
+/// Byte length from which a relative path is resolved via chunked descent
+/// instead of one full-path cap-std call (Linux only; see
+/// [`HostFsBackend::at`]). Comfortably below the kernel's `PATH_MAX` (4096)
+/// so every host path string — a flushed chunk or the tail, each at most
+/// this bound plus one ≤`NAME_MAX` (255) component — stays legal.
+#[cfg(target_os = "linux")]
+const DEEP_PATH_CHUNK: usize = 3000;
+
+/// A borrowed-or-anchored cap-std dir handle, paired with the (possibly
+/// shortened) path to use against it — produced by [`HostFsBackend::at`].
+/// Derefs to `cap_std::fs::Dir` so call sites read like `self.dir`.
+enum DirAt<'a> {
+    /// Short path: the sandbox root itself, no extra handle opened.
+    Root(&'a cap_std::fs::Dir),
+    /// Deep path (Linux): an intermediate directory opened by chunked
+    /// descent; operations run on the short tail relative to it.
+    #[cfg(target_os = "linux")]
+    Anchor(cap_std::fs::Dir),
+}
+
+impl std::ops::Deref for DirAt<'_> {
+    type Target = cap_std::fs::Dir;
+    fn deref(&self) -> &cap_std::fs::Dir {
+        match self {
+            DirAt::Root(dir) => dir,
+            #[cfg(target_os = "linux")]
+            DirAt::Anchor(dir) => dir,
+        }
+    }
+}
+
 impl FsBackend for HostFsBackend {
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
         let normalized = normalize(path)?;
@@ -2323,7 +2425,8 @@ impl FsBackend for HostFsBackend {
                 None
             };
         }
-        let meta = self.dir.symlink_metadata(rel).ok()?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        let meta = dir.symlink_metadata(&at_rel).ok()?;
         // Reject a host-aliased (Unicode-normalized) name: present the Linux
         // byte-exact view, where a differently-normalized name is a different
         // (non-existent) file. See `name_matches_on_disk`.
@@ -2338,7 +2441,7 @@ impl FsBackend for HostFsBackend {
         }
         if meta.is_file() {
             let mut buf = Vec::with_capacity(meta.len() as usize);
-            let mut file = self.dir.open(rel).ok()?;
+            let mut file = dir.open(&at_rel).ok()?;
             file.read_to_end(&mut buf).ok()?;
             return Some(OverlayEntry::File(buf));
         }
@@ -2348,7 +2451,7 @@ impl FsBackend for HostFsBackend {
         // Hand back the link target bytes so a content read is sensible;
         // `metadata`/`real_stat` carry the true `Symlink` kind for stat.
         if meta.is_symlink() {
-            let target = self.dir.read_link_contents(rel).ok()?;
+            let target = dir.read_link_contents(&at_rel).ok()?;
             // The stored target is already in the host's canonical (escape-
             // encoded or plain-UTF-8) form; hand back those bytes. readlink
             // goes through `read_link` (above) + a guest-facing decode.
@@ -2375,7 +2478,8 @@ impl FsBackend for HostFsBackend {
             return Some(OverlayEntryKind::Dir);
         }
         let rel = Self::rel_path(&normalized)?;
-        let meta = self.dir.symlink_metadata(rel).ok()?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        let meta = dir.symlink_metadata(&at_rel).ok()?;
         // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
         if !self.name_matches_on_disk(rel) {
             return None;
@@ -2444,7 +2548,8 @@ impl FsBackend for HostFsBackend {
                 size: if is_dir { 0 } else { st.st_size as usize },
             });
         }
-        let meta = self.dir.symlink_metadata(rel).ok()?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        let meta = dir.symlink_metadata(&at_rel).ok()?;
         // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
         if !self.name_matches_on_disk(rel) {
             return None;
@@ -2473,7 +2578,7 @@ impl FsBackend for HostFsBackend {
         let override_mode = if meta.is_symlink() {
             None
         } else {
-            read_mode_xattr(&self.dir, rel, meta.is_dir())
+            read_mode_xattr(&dir, &at_rel, meta.is_dir())
         };
         let mode = override_mode.unwrap_or_else(|| {
             use cap_std::fs::MetadataExt;
@@ -2495,7 +2600,7 @@ impl FsBackend for HostFsBackend {
             // An AF_UNIX socket node materialised by `create_socket` is a
             // regular file flagged with the socket-marker xattr → report
             // S_IFSOCK so getdents/stat see DT_SOCK/S_IFSOCK, not a plain file.
-            let kind = if read_socket_xattr(&self.dir, rel) {
+            let kind = if read_socket_xattr(&dir, &at_rel) {
                 RootFsEntryKind::Socket
             } else {
                 RootFsEntryKind::File
@@ -2530,8 +2635,9 @@ impl FsBackend for HostFsBackend {
         // guest root (cap-std won't traverse it). See `resolve_following`.
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
+        let (dir, at_rel) = self.at(rel).ok()?;
         let mut buf = Vec::new();
-        let mut file = self.dir.open(rel).ok()?;
+        let mut file = dir.open(&at_rel).ok()?;
         file.read_to_end(&mut buf).ok()?;
         Some(buf)
     }
@@ -2539,17 +2645,16 @@ impl FsBackend for HostFsBackend {
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
         // Create all parent dirs in the scratch tree so the guest's
         // mkdir-deep paths "just work" (apt does
         // mkdir(/var/lib/apt/lists/partial) without checking parents).
-        if let Some(parent) = rel.parent()
+        if let Some(parent) = at_rel.parent()
             && !parent.as_os_str().is_empty()
         {
-            self.dir
-                .create_dir_all(parent)
-                .map_err(|_| BackendError::Io)?;
+            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
         }
-        match self.dir.create_dir(rel) {
+        match dir.create_dir(&at_rel) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(BackendError::Io),
@@ -2560,17 +2665,15 @@ impl FsBackend for HostFsBackend {
     fn create_file(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        if let Some(parent) = rel.parent()
+        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
+        if let Some(parent) = at_rel.parent()
             && !parent.as_os_str().is_empty()
         {
-            self.dir
-                .create_dir_all(parent)
-                .map_err(|_| BackendError::Io)?;
+            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
         }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(false);
-        self.dir
-            .open_with(rel, &opts)
+        dir.open_with(&at_rel, &opts)
             .map_err(|_| BackendError::Io)?;
         Ok(())
     }
@@ -2661,18 +2764,16 @@ impl FsBackend for HostFsBackend {
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        if let Some(parent) = rel.parent()
+        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
+        if let Some(parent) = at_rel.parent()
             && !parent.as_os_str().is_empty()
         {
-            self.dir
-                .create_dir_all(parent)
-                .map_err(|_| BackendError::Io)?;
+            dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
         }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
-        let mut file = self
-            .dir
-            .open_with(rel, &opts)
+        let mut file = dir
+            .open_with(&at_rel, &opts)
             .map_err(|_| BackendError::Io)?;
         file.seek(SeekFrom::Start(0))
             .map_err(|_| BackendError::Io)?;
@@ -2747,16 +2848,21 @@ impl FsBackend for HostFsBackend {
         };
         // The cap-std scratch is the source of truth (readdir/lookup hit
         // it), so remove from disk unconditionally.
-        self.dir.remove_file(rel).is_ok() || self.dir.remove_dir(rel).is_ok()
+        let Ok((dir, at_rel)) = self.at(rel) else {
+            return false;
+        };
+        dir.remove_file(&at_rel).is_ok() || dir.remove_dir(&at_rel).is_ok()
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // Also evict any in-scratch entry so the scratch tree matches
         // the tombstoned view.
-        if let Some(rel) = Self::rel_path(&normalized) {
-            let _ = self.dir.remove_file(rel);
-            let _ = self.dir.remove_dir(rel);
+        if let Some(rel) = Self::rel_path(&normalized)
+            && let Ok((dir, at_rel)) = self.at(rel)
+        {
+            let _ = dir.remove_file(&at_rel);
+            let _ = dir.remove_dir(&at_rel);
         }
         Ok(())
     }
@@ -2772,7 +2878,10 @@ impl FsBackend for HostFsBackend {
         // so readdir/glob see everything that exists by path — including
         // apt's downloaded .deb that dpkg later needs to find.
         let read = match Self::rel_path(&normalized) {
-            Some(rel) => self.dir.read_dir(rel),
+            Some(rel) => match self.at(rel) {
+                Ok((dir, at_rel)) => dir.read_dir(&at_rel),
+                Err(e) => Err(e),
+            },
             None => self.dir.entries(), // scratch root == guest "/"
         };
         let Ok(read) = read else {
@@ -2831,18 +2940,22 @@ impl FsBackend for HostFsBackend {
         // The cap-std scratch is the source of truth: an entry is
         // renameable iff it actually exists on disk. (open_raw_fd
         // creations and seeded rootfs entries are all on disk.)
-        if self.dir.symlink_metadata(&src_rel).is_err() {
+        let Ok((src_dir, src_at)) = self.at(&src_rel) else {
+            return Ok(false); // deep-descent miss == source doesn't exist
+        };
+        if src_dir.symlink_metadata(&src_at).is_err() {
             return Ok(false);
         }
-        if let Some(parent) = dst_rel.parent()
+        let (dst_dir, dst_at) = self.at(&dst_rel).map_err(|_| BackendError::Io)?;
+        if let Some(parent) = dst_at.parent()
             && !parent.as_os_str().is_empty()
         {
-            self.dir
+            dst_dir
                 .create_dir_all(parent)
                 .map_err(|_| BackendError::Io)?;
         }
-        self.dir
-            .rename(&src_rel, &self.dir, &dst_rel)
+        src_dir
+            .rename(&src_at, &dst_dir, &dst_at)
             .map_err(|_| BackendError::Io)?;
         // A rename can move a directory that the stat cache holds as a parent
         // anchor; a cached fd silently follows the inode to its new location, so
@@ -2865,11 +2978,12 @@ impl FsBackend for HostFsBackend {
         // A tombstoned path is "deleted" in the layered view; don't
         // resurrect it via a raw open.
         let rel = Self::rel_path(&normalized)?;
+        let (dir, at_rel) = self.at(rel).ok()?;
         if create
-            && let Some(parent) = rel.parent()
+            && let Some(parent) = at_rel.parent()
             && !parent.as_os_str().is_empty()
         {
-            self.dir.create_dir_all(parent).ok()?;
+            dir.create_dir_all(parent).ok()?;
         }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.read(true);
@@ -2884,12 +2998,11 @@ impl FsBackend for HostFsBackend {
             // writability separately in OpenDescription::HostFile.
             let mut rw_opts = cap_std::fs::OpenOptions::new();
             rw_opts.read(true).write(true);
-            self.dir
-                .open_with(rel, &rw_opts)
-                .or_else(|_| self.dir.open_with(rel, &opts))
+            dir.open_with(&at_rel, &rw_opts)
+                .or_else(|_| dir.open_with(&at_rel, &opts))
                 .ok()?
         } else {
-            self.dir.open_with(rel, &opts).ok()?
+            dir.open_with(&at_rel, &opts).ok()?
         };
         // Hand the kernel fd to the caller. `into_raw_fd` consumes the
         // cap-std File without closing it, so the dispatcher owns the
@@ -3092,8 +3205,10 @@ impl FsBackend for HostFsBackend {
         use std::os::fd::AsRawFd;
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
+        let rel = &*at_rel;
         let mode = mode & 0o7777;
-        let meta = self.dir.symlink_metadata(rel);
+        let meta = dir.symlink_metadata(rel);
         // A FIFO's mode lives on the real node (not an xattr); set it via
         // PATH-BASED fchmodat — neither set_permissions nor the xattr write may
         // open the node, since an O_RDONLY open of a writer-less FIFO blocks.
@@ -3107,12 +3222,12 @@ impl FsBackend for HostFsBackend {
             && let Some(c_name) = cstring_from_osstr(file_name)
         {
             let parent_dir = match rel.parent() {
-                Some(p) if !p.as_os_str().is_empty() => self.dir.open_dir(p).ok(),
+                Some(p) if !p.as_os_str().is_empty() => dir.open_dir(p).ok(),
                 _ => None,
             };
             let dirfd = match &parent_dir {
                 Some(pdir) => pdir.as_raw_fd(),
-                None => self.dir.as_raw_fd(),
+                None => dir.as_raw_fd(),
             };
             unsafe {
                 libc::fchmodat(dirfd, c_name.as_ptr(), mode as libc::mode_t, 0);
@@ -3123,23 +3238,22 @@ impl FsBackend for HostFsBackend {
         // process) can always still open/stat/unlink it, then record the
         // guest-visible mode in an xattr ON the file (see CARRICK_MODE_XATTR).
         let is_dir = meta.map(|m| m.is_dir()).unwrap_or(false);
-        let _ = self
-            .dir
-            .set_permissions(rel, Permissions::from_mode(mode | 0o700));
-        write_mode_xattr(&self.dir, rel, is_dir, mode);
+        let _ = dir.set_permissions(rel, Permissions::from_mode(mode | 0o700));
+        write_mode_xattr(&dir, rel, is_dir, mode);
         Ok(())
     }
 
     fn set_owner(&self, path: &str, uid: u32, gid: u32) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
         // carrick is not root on macOS, so it can't chown(2) the scratch file
         // to an arbitrary uid — record the guest-visible owner in xattrs ON the
         // file (durable, fork-coherent) and report it from stat.
-        let m = self.dir.symlink_metadata(rel).ok();
+        let m = dir.symlink_metadata(&at_rel).ok();
         let is_dir = m.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let symlink = m.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
-        write_owner_xattr(&self.dir, rel, is_dir, symlink, uid, gid);
+        write_owner_xattr(&dir, &at_rel, is_dir, symlink, uid, gid);
         Ok(())
     }
 
@@ -3147,13 +3261,14 @@ impl FsBackend for HostFsBackend {
         use cap_std::fs::MetadataExt;
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let meta = self.dir.symlink_metadata(rel).ok()?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        let meta = dir.symlink_metadata(&at_rel).ok()?;
         // A FIFO has no owner xattr and reading one would open() the node
         // (O_RDONLY blocks a writer-less FIFO) — report root (0,0) directly.
         if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
             return Some((0, 0));
         }
-        let (uid, gid) = read_owner_xattr(&self.dir, rel, meta.is_dir(), meta.is_symlink());
+        let (uid, gid) = read_owner_xattr(&dir, &at_rel, meta.is_dir(), meta.is_symlink());
         Some((uid.unwrap_or(0), gid.unwrap_or(0)))
     }
 
@@ -3261,7 +3376,8 @@ impl FsBackend for HostFsBackend {
     fn read_link(&self, path: &str) -> Option<String> {
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let target = self.dir.read_link_contents(rel).ok()?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        let target = dir.read_link_contents(&at_rel).ok()?;
         // The stored target is already in the host's canonical (escape-encoded
         // or plain-UTF-8) form — both valid UTF-8. Return it unchanged; the
         // guest-facing readlinkat decodes the escape back to the raw bytes.
@@ -3555,7 +3671,8 @@ impl FsBackend for HostFsBackend {
                 let Some(rel) = Self::rel_path(&normalized) else {
                     break self.dir.dir_metadata().ok()?;
                 };
-                let m = self.dir.symlink_metadata(rel).ok()?;
+                let (dir, at_rel) = self.at(rel).ok()?;
+                let m = dir.symlink_metadata(&at_rel).ok()?;
                 if !m.is_symlink() {
                     break m;
                 }
@@ -3564,7 +3681,7 @@ impl FsBackend for HostFsBackend {
                     return None;
                 }
                 hops += 1;
-                let target = self.dir.read_link_contents(rel).ok()?;
+                let target = dir.read_link_contents(&at_rel).ok()?;
                 // `target` is raw host bytes; normalize WITHOUT a String round-
                 // trip so an undecodable symlink target isn't corrupted.
                 normalized = if target.is_absolute() {
@@ -3578,9 +3695,19 @@ impl FsBackend for HostFsBackend {
             }
         } else {
             match Self::rel_path(&normalized) {
-                Some(rel) => self.dir.symlink_metadata(rel).ok()?,
+                Some(rel) => {
+                    let (dir, at_rel) = self.at(rel).ok()?;
+                    dir.symlink_metadata(&at_rel).ok()?
+                }
                 None => self.dir.dir_metadata().ok()?,
             }
+        };
+        // One anchored handle serves every xattr peek below: a deep path's
+        // per-peek full-path cap-std call would exceed PATH_MAX on Linux
+        // (see `at`). `None` only for the scratch root itself.
+        let anchored = match Self::rel_path(&normalized) {
+            Some(rel) => self.at(rel).ok(),
+            None => None,
         };
         let kind = if meta.is_dir() {
             RootFsEntryKind::Directory
@@ -3588,8 +3715,7 @@ impl FsBackend for HostFsBackend {
             RootFsEntryKind::Symlink
         } else if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
             RootFsEntryKind::Fifo
-        } else if matches!(Self::rel_path(&normalized), Some(rel) if read_socket_xattr(&self.dir, rel))
-        {
+        } else if matches!(&anchored, Some((dir, at_rel)) if read_socket_xattr(dir, at_rel)) {
             // A regular scratch file flagged as an AF_UNIX socket node by
             // `create_socket` (see CARRICK_SOCKET_XATTR) → report S_IFSOCK.
             RootFsEntryKind::Socket
@@ -3618,23 +3744,23 @@ impl FsBackend for HostFsBackend {
         } else if kind == RootFsEntryKind::Symlink {
             // A symlink's mode is always 0o777; its owner lives on the link
             // itself (XATTR_NOFOLLOW), so lchown round-trips through lstat.
-            match Self::rel_path(&normalized) {
-                Some(rel) => (
+            match &anchored {
+                Some((dir, at_rel)) => (
                     None,
                     (
-                        symlink_get_u32_xattr(&self.dir, rel, CARRICK_UID_XATTR),
-                        symlink_get_u32_xattr(&self.dir, rel, CARRICK_GID_XATTR),
+                        symlink_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR),
+                        symlink_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR),
                     ),
                 ),
                 None => (None, (None, None)),
             }
         } else {
-            match Self::rel_path(&normalized) {
-                Some(rel) => {
+            match &anchored {
+                Some((dir, at_rel)) => {
                     let is_dir = matches!(kind, RootFsEntryKind::Directory);
                     (
-                        read_mode_xattr(&self.dir, rel, is_dir),
-                        read_owner_xattr(&self.dir, rel, is_dir, false),
+                        read_mode_xattr(dir, at_rel, is_dir),
+                        read_owner_xattr(dir, at_rel, is_dir, false),
                     )
                 }
                 None => (None, (None, None)),
@@ -3980,6 +4106,53 @@ mod tests {
         let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
             .unwrap();
         (HostFsBackend::from_existing_dir(dir), scratch)
+    }
+
+    /// Deep-path (> PATH_MAX) operations: a guest that mkdir/chdir's its way
+    /// deeper than the kernel's 4096-byte per-call limit (Go os
+    /// TestGetwdDeep / TestRemoveAllLongPath) must keep working. On Linux
+    /// this exercises the chunked `openat` descent (`HostFsBackend::at`); on
+    /// macOS cap-std's per-component resolver already handles it (the test
+    /// pins both).
+    #[test]
+    fn host_deep_path_ops_beyond_path_max() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let b = HostFsBackend::from_existing_dir(dir);
+        let name = "a".repeat(200);
+        let mut path = String::new();
+        for depth in 0..25 {
+            path.push('/');
+            path.push_str(&name);
+            b.make_dir(&path)
+                .unwrap_or_else(|e| panic!("make_dir depth {depth} len {}: {e:?}", path.len()));
+            assert!(
+                matches!(b.lookup_kind(&path), Some(OverlayEntryKind::Dir)),
+                "lookup_kind at len {}",
+                path.len()
+            );
+            assert!(b.metadata(&path).is_some(), "metadata at len {}", path.len());
+            assert!(
+                b.real_stat(&path, false).is_some(),
+                "real_stat at len {}",
+                path.len()
+            );
+        }
+        // File create/read/remove and readdir at > PATH_MAX depth.
+        let file = format!("{path}/hello.txt");
+        b.set_file_contents(&file, b"deep".to_vec()).unwrap();
+        assert_eq!(b.file_contents(&file).as_deref(), Some(&b"deep"[..]));
+        let names: Vec<String> = b.child_names(&path).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["hello.txt".to_owned()]);
+        let fd = b.open_raw_fd(&file, false, false, false).unwrap();
+        unsafe { libc::close(fd) };
+        assert!(b.remove_entry(&file));
+        assert!(b.metadata(&file).is_none());
+        // RemoveAll-style ascent: unlink the deepest dir, then its parent.
+        assert!(b.remove_entry(&path), "remove_entry deepest dir");
+        let parent = &path[..path.len() - (name.len() + 1)];
+        assert!(b.remove_entry(parent), "remove_entry parent dir");
     }
 
     #[cfg(target_os = "macos")]

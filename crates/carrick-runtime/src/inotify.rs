@@ -376,7 +376,9 @@ impl Drop for InotifyState {
     }
 }
 
-#[cfg(test)]
+// kqueue-vnode semantics (O_EVTONLY, EVFILT_VNODE) — macOS-only, like the
+// host-side inotify emulation itself.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::io::Write;
