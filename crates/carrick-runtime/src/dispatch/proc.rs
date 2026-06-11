@@ -1863,13 +1863,25 @@ impl SyscallDispatcher {
                     == 0
                 && !crate::guest_cpu::child_has_ptrace_stop_pending(pid.0 as u32);
             let result = if can_park_on_proc_exit {
-                let r = unsafe {
-                    libc::wait4(
-                        pid.0,
-                        &mut host_status,
-                        host_options | libc::WNOHANG,
-                        &mut host_rusage,
-                    )
+                let r = loop {
+                    let r = unsafe {
+                        libc::wait4(
+                            pid.0,
+                            &mut host_status,
+                            host_options | libc::WNOHANG,
+                            &mut host_rusage,
+                        )
+                    };
+                    // KVM lane: a tracee stop on a carrick-internal signal is
+                    // absorbed (PTRACE_CONT re-inject) and the WNOHANG probe is
+                    // re-issued — never surfaced to the guest.
+                    if let Ok(value) = r.host_syscall_errno()
+                        && value > 0
+                        && absorb_internal_tracee_stop(value, host_status)
+                    {
+                        continue;
+                    }
+                    break r;
                 };
                 match r.host_syscall_errno() {
                     Ok(0) => {
@@ -1895,7 +1907,14 @@ impl SyscallDispatcher {
                     let r =
                         unsafe { libc::wait4(pid.0, &mut host_status, host_options, &mut host_rusage) };
                     match r.host_syscall_errno() {
-                        Ok(value) => break Ok(value),
+                        Ok(value) => {
+                            // KVM lane: absorb (PTRACE_CONT re-inject) a tracee
+                            // stop on a carrick-internal signal and re-wait.
+                            if value > 0 && absorb_internal_tracee_stop(value, host_status) {
+                                continue;
+                            }
+                            break Ok(value);
+                        }
                         Err(errno) => {
                             if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
                                 continue;
@@ -2188,6 +2207,45 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
         state ^= state << 8;
         *byte = state as u8;
     }
+}
+
+/// KVM lane only: absorb a tracee stop on a carrick-INTERNAL signal (the
+/// SIGRTMIN vCPU kick / SIGRTMIN+1 xsignal nudge — see
+/// `io_wait::is_internal_kick_signal`). Such a stop is an implementation
+/// artifact the guest knows nothing about: `PTRACE_CONT` re-injects the signal
+/// (its handler still runs in the tracee) and the caller re-waits instead of
+/// surfacing a bogus `WIFSTOPPED`/`WSTOPSIG=SIGRTMIN` to the guest. The parked
+/// `wait_proc_exit` path absorbs the same stops; this covers the blocking
+/// host-wait4 observation points (the WNOHANG pre-flight and the blocking
+/// loop). Returns `true` when absorbed. On HVF this can't happen (vCPU kicks
+/// are `hv_vcpus_exit`, not signals), hence the compile-time no-op.
+#[cfg(all(target_os = "linux", not(feature = "platform-macos")))]
+fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
+    if pid <= 0 || !libc::WIFSTOPPED(host_status) {
+        return false;
+    }
+    let sig = libc::WSTOPSIG(host_status);
+    if !crate::io_wait::is_internal_kick_signal(sig) {
+        return false;
+    }
+    // SAFETY: PT_CONTINUE with addr 1 ("resume where stopped"), re-injecting
+    // `sig`; same shape as the dispatch ptrace(PTRACE_CONT). Failure (the
+    // tracee died meanwhile) is benign — the caller's re-wait surfaces the
+    // real state.
+    unsafe {
+        libc::ptrace(
+            carrick_portable::PT_CONTINUE,
+            pid,
+            std::ptr::without_provenance_mut::<libc::c_char>(1),
+            sig,
+        );
+    }
+    true
+}
+
+#[cfg(not(all(target_os = "linux", not(feature = "platform-macos"))))]
+fn absorb_internal_tracee_stop(_pid: i32, _host_status: i32) -> bool {
+    false
 }
 
 /// Translate a host `waitpid` status so a signal-death's termsig uses Linux
