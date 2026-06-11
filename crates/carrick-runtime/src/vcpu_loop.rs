@@ -1395,12 +1395,25 @@ where
             self.platform_futex.notify_signal_pending();
             kernel.signal_arrival.wake_all_waiters();
             loop {
-                // Re-read the LIVE sibling count each iteration. A vCPU that EXITS
-                // mid-quiesce drops out of the kicker, so an `others` captured ONCE
-                // goes stale-HIGH and wait_quiesced waits for a parker that no
-                // longer exists → spins forever (the multithreaded-fork wedge).
+                // The quiesce is complete only when the KICKER COUNT itself
+                // drains to 1 (just this forker). A parking sibling UNREGISTERS
+                // first and parks second (`release_and_park_vcpu_for_fork`), so
+                // the old predicate — parked count >= `count-1`, both re-read —
+                // DOUBLE-COUNTED each parker (once for leaving the count, once
+                // for joining `paused`) and was satisfied while a
+                // STILL-REGISTERED sibling (e.g. a stage-1 page-table editor
+                // mid `pt_pause`) had not parked. libc::fork then landed with
+                // the PT barrier's `quiescing=true` and the CHILD inherited it
+                // and parked FOREVER at its run-loop top (captured live in gdb
+                // on KVM under go-os_exec: the child's PtQuiesce bytes showed
+                // coordinator=1/quiescing=1 while the parent's were clear).
+                // Draining the count to 1 keeps the original stale-HIGH exit
+                // fix too: a vCPU that EXITS mid-quiesce unregisters and drops
+                // out of this predicate the same way a parker does. (HVF was
+                // immune to the double-count only via its extra VCPU_LIVE<=1
+                // wait below.)
                 others = self.kicker.count().saturating_sub(1);
-                if barrier.wait_quiesced(others, Duration::from_millis(50)) {
+                if others == 0 {
                     break;
                 }
                 crate::probes::fork_quiesce(
@@ -1410,10 +1423,14 @@ where
                     self.this_tid,
                 );
                 // Do not surface EAGAIN to the guest here. Keep nudging every wait
-                // class until all live vCPUs reach the barrier.
+                // class until all live vCPUs leave the kicker, sleeping briefly
+                // between nudges (the parked-count condvar can't be used as the
+                // sleep: the same unregister-then-park sequence satisfies it
+                // immediately).
                 self.kicker.kick_all_except(self.this_tid);
                 self.platform_futex.notify_signal_pending();
                 kernel.signal_arrival.wake_all_waiters();
+                std::thread::sleep(Duration::from_micros(200));
             }
             quiesced = true;
         }
@@ -1712,6 +1729,15 @@ where
                 fork_barrier().end_quiesce();
                 fork_barrier().end_fork();
                 fork_barrier().reset_paused_for_child();
+                // Also clear the inherited PAGE-TABLE-EDIT pause. If the fork
+                // landed while a parent sibling held `pt_pause` (the editor is
+                // not in the child), the inherited coordinator/quiescing flags
+                // would park this child's run loop FOREVER at its first loop
+                // top (captured live: PtQuiesce bytes coordinator=1/quiescing=1
+                // in a wedged go-os_exec vfork child). The count-drain predicate
+                // above makes that window unreachable going forward; this reset
+                // keeps the child self-healing regardless.
+                pt_barrier().end();
                 crate::event_ring::reinit_after_fork();
                 crate::host_signal::reinit_after_fork();
                 // PID namespace: block until the parent registered our ns-pid
