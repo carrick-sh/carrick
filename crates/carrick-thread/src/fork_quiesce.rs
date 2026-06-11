@@ -93,6 +93,43 @@ fn exec_owner() -> &'static AtomicI32 {
     &OWNER
 }
 
+/// Count of threads currently running a POST-UNREGISTER exit cleanup
+/// (`handle_thread_exit` and the sibling-bootstrap failure paths). The fork
+/// quiesce CANNOT see these threads: an exiting thread never parks at the
+/// barrier — it drops out of the kicker so the forker stops waiting on it —
+/// but it then mutates process-global state (the host-signal pending table,
+/// the dispatcher's signal-state map) AFTER the forker's count is satisfied.
+/// If `libc::fork` lands inside that window the CHILD inherits a HELD mutex
+/// whose owner does not exist in it and deadlocks on first touch (observed:
+/// the vfork child wedged forever in `migrate_thread_signal_state` →
+/// `parking_lot lock_slow` under go-os_exec TestConcurrentExec on KVM).
+/// The forker waits for this count to reach 0 (bounded) just before forking.
+static EXIT_CLEANUPS: AtomicI32 = AtomicI32::new(0);
+
+/// RAII token covering a thread's post-unregister exit cleanup. Acquire BEFORE
+/// `kicker.unregister` (so there is no instant where the thread is invisible
+/// to both the quiesce count and this gate) and hold until every touch of
+/// process-global state is done. Acquisition is a plain atomic increment — it
+/// NEVER blocks, so an exiting thread can never deadlock against a forker
+/// that holds the topology lock or the quiesce barrier.
+pub struct ExitCleanupGuard(());
+
+impl Drop for ExitCleanupGuard {
+    fn drop(&mut self) {
+        EXIT_CLEANUPS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub fn begin_exit_cleanup() -> ExitCleanupGuard {
+    EXIT_CLEANUPS.fetch_add(1, Ordering::SeqCst);
+    ExitCleanupGuard(())
+}
+
+/// Number of in-flight exit cleanups (the forker's pre-fork wait predicate).
+pub fn exit_cleanups_in_flight() -> i32 {
+    EXIT_CLEANUPS.load(Ordering::SeqCst)
+}
+
 /// Mark that `owner_tid` is replacing the thread group via execve(2).
 ///
 /// Unlike fork quiesce, sibling threads do not park and rebuild: Linux exec
@@ -215,6 +252,37 @@ impl QuiesceBarrier {
         self.quiescing.store(false, Ordering::SeqCst);
         let _g = self.paused.lock().unwrap();
         self.cv.notify_all();
+    }
+
+    /// Hold the barrier's internal mutex ACROSS `libc::fork`.
+    ///
+    /// A sibling that parks for a fork drops out of the kicker count FIRST
+    /// (`release_and_park_vcpu_for_fork` unregisters, then parks), so the
+    /// forker can observe "all quiesced" while a sibling is still INSIDE
+    /// [`Self::park_if_quiescing`]'s lock-increment-wait window — HOLDING this
+    /// mutex. If `libc::fork` lands in that window, the child inherits the
+    /// mutex locked by a thread that does not exist in it and deadlocks at its
+    /// own `end_quiesce` (captured live: a KVM vfork child of go-os_exec wedged
+    /// forever in `QuiesceBarrier::end_quiesce` → `Mutex::lock_contended`).
+    /// Holding the mutex across the fork excludes that window by mutual
+    /// exclusion: at the fork instant the FORKING thread owns it, and the
+    /// forking thread is the one thread that survives into the child, so both
+    /// sides can (and must) release it. Callers drop the guard immediately
+    /// after the fork returns, BEFORE touching the barrier again.
+    pub fn lock_paused_across_fork(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.paused.lock().unwrap()
+    }
+
+    /// CHILD-side post-fork reset of the parked-thread count. The count the
+    /// child inherits belongs to PARENT threads parked at the parent's barrier;
+    /// none of them exists in the child, and nothing will ever decrement it —
+    /// so a child that later goes multithreaded and forks would see
+    /// `wait_quiesced` satisfied by phantom parkers and fork UNQUIESCED.
+    /// Call after `end_quiesce`/`end_fork` in the child arm. Safe to lock here
+    /// because `lock_paused_across_fork` made the child's copy of the mutex
+    /// consistent (owned by the forking thread, released on guard drop).
+    pub fn reset_paused_for_child(&self) {
+        *self.paused.lock().unwrap() = 0;
     }
 }
 

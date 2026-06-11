@@ -35,8 +35,8 @@
 //! are still open in the child but its pump thread did not survive the fork, so
 //! the child needs its own).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use carrick_hal::{PlatformFutex, VcpuRegistry};
 
@@ -55,6 +55,20 @@ const PUMP_SIGNALS: [i32; 4] = [
 /// The self-pipe WRITE fd the async handler pokes. `-1` until the pump installs
 /// the pipe. Read with a plain `load` in the handler (async-signal-safe).
 static SELF_PIPE_W: AtomicI32 = AtomicI32::new(-1);
+
+/// The self-pipe READ fd the pump thread polls. Published so
+/// [`stop_pump_for_fork`] can close it after joining the pump (and the fork
+/// reinit paths can close the stale inherited copy).
+static SELF_PIPE_R: AtomicI32 = AtomicI32::new(-1);
+
+/// Raised by [`stop_pump_for_fork`]; the pump thread checks it on every wake
+/// and exits. Cleared again once the stop completes.
+static PUMP_STOP: AtomicBool = AtomicBool::new(false);
+
+/// The live pump thread's join handle, so [`stop_pump_for_fork`] can join it
+/// to a full stop before `libc::fork`. A plain std Mutex: never touched from a
+/// signal handler.
+static PUMP_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Async-signal-safe SIGCHLD handler. Unlike [`pump_handler`], it does NOT touch
 /// `PROC_PENDING`: SIGCHLD here is NOT a guest-published process signal but the
@@ -228,6 +242,7 @@ fn make_self_pipe() -> i32 {
         return -1;
     }
     SELF_PIPE_W.store(fds[1], Ordering::SeqCst);
+    SELF_PIPE_R.store(fds[0], Ordering::SeqCst);
     fds[0]
 }
 
@@ -239,7 +254,7 @@ fn spawn_pump_thread(
     registry: Arc<dyn VcpuRegistry>,
     futex: Arc<dyn PlatformFutex>,
 ) {
-    let _ = std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("carrick-sig-pump".to_string())
         .spawn(move || {
             let mut pfd = libc::pollfd {
@@ -249,7 +264,16 @@ fn spawn_pump_thread(
             };
             let mut drain = [0u8; 64];
             loop {
+                // A pre-fork stop (`stop_pump_for_fork`) raised the flag and
+                // poked the pipe; exit WITHOUT touching any shared lock so the
+                // joiner can proceed straight to `libc::fork`.
+                if PUMP_STOP.load(Ordering::SeqCst) {
+                    return;
+                }
                 let n = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if PUMP_STOP.load(Ordering::SeqCst) {
+                    return;
+                }
                 if n < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::EINTR) {
@@ -289,6 +313,51 @@ fn spawn_pump_thread(
                 futex.notify_signal_pending();
             }
         });
+    if let Ok(h) = handle {
+        *PUMP_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+}
+
+/// Stop + JOIN the pump thread before `libc::fork`, mirroring the HVF
+/// `ForkCoordinator::prepare_host_fork` contract. The pump takes process-global
+/// locks on every wake (`carrick_signal_core` THREAD_PENDING via
+/// `publish_pending_for`, the child-watch table in `reap_exited_watches`, the
+/// kicker registry in `kick_all`, the futex table in `notify_signal_pending`).
+/// A `libc::fork` landing while one is held hands the CHILD a mutex locked by a
+/// thread that does not exist in it — the child then deadlocks in
+/// `host_signal::reinit_after_fork` (`clear_thread_pending` /
+/// `child_watch::clear`) and the vfork parent rides its 60s suspend timeout
+/// (the go-os_exec TestConcurrentExec SIGCHLD-storm wedge). Returns whether a
+/// pump thread was actually running (the caller's restart token).
+pub fn stop_pump_for_fork() -> bool {
+    let handle = PUMP_THREAD.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(handle) = handle else {
+        return false;
+    };
+    PUMP_STOP.store(true, Ordering::SeqCst);
+    // Wake the pump out of its poll. If the nonblocking pipe is full, POLLIN is
+    // already pending — the pump wakes either way and sees the stop flag.
+    poke();
+    let _ = handle.join();
+    // Tear the pipe down (the restart makes a fresh one) and clear the guards
+    // so a post-fork `start_pump` re-arms instead of no-opping. The handler
+    // keeps running across the stop window: it sees SELF_PIPE_W == -1 and only
+    // sets PROC_PENDING bits, which the restarted pump's kick-off poke drains.
+    let w = SELF_PIPE_W.swap(-1, Ordering::SeqCst);
+    if w >= 0 {
+        unsafe {
+            libc::close(w);
+        }
+    }
+    let r = SELF_PIPE_R.swap(-1, Ordering::SeqCst);
+    if r >= 0 {
+        unsafe {
+            libc::close(r);
+        }
+    }
+    PUMP_STOP.store(false, Ordering::SeqCst);
+    PUMP_STARTED.store(false, Ordering::SeqCst);
+    true
 }
 
 /// Guards the one-time install of the sigactions + self-pipe + pump thread.
@@ -314,6 +383,12 @@ pub fn start_pump(registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFute
         return; // pipe failed; handlers still set PROC_PENDING (kick-delivered)
     }
     spawn_pump_thread(read_fd, Arc::clone(registry), Arc::clone(futex));
+    // Kick-start one pump pass: a signal (e.g. a SIGCHLD burst) that landed
+    // while the pump was stopped across a fork (`stop_pump_for_fork`) only set
+    // pending bits / left a zombie to reap — there is no byte in the NEW pipe
+    // to wake the fresh thread. One unconditional poke makes the first pass
+    // run reap_exited_watches + kick_all immediately; harmless when idle.
+    poke();
 }
 
 /// Re-arm the pump in a freshly forked CHILD. The child inherited the parent's
@@ -329,6 +404,18 @@ pub fn reinit_after_fork(registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn Platf
             libc::close(stale_w);
         }
     }
+    let stale_r = SELF_PIPE_R.swap(-1, Ordering::SeqCst);
+    if stale_r >= 0 {
+        unsafe {
+            libc::close(stale_r);
+        }
+    }
+    // Drop any inherited join handle: it names a PARENT thread that does not
+    // exist in this child; joining it would block forever. (After a fork via
+    // the coordinator this is already None — `stop_pump_for_fork` took it —
+    // but a path that forks without prepare must not strand it.)
+    *PUMP_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    PUMP_STOP.store(false, Ordering::SeqCst);
     // The inherited child-exit watches belong to the PARENT's children (this
     // child's siblings); the freshly-forked child must not reap or deliver their
     // exit signals. Its own children are registered fresh on its own pump.
@@ -367,6 +454,15 @@ pub fn reset_state_for_supervisor_fork() {
             libc::close(stale_w);
         }
     }
+    let stale_r = SELF_PIPE_R.swap(-1, Ordering::SeqCst);
+    if stale_r >= 0 {
+        unsafe {
+            libc::close(stale_r);
+        }
+    }
+    // See reinit_after_fork: the inherited handle names a parent thread.
+    *PUMP_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    PUMP_STOP.store(false, Ordering::SeqCst);
     carrick_signal_core::child_watch::clear();
     PUMP_STARTED.store(false, Ordering::SeqCst);
     SIGCHLD_INSTALLED.store(false, Ordering::SeqCst);

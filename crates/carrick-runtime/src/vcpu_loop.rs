@@ -1096,6 +1096,10 @@ where
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if !child_registry.is_live(tid) {
+                    // Exit-cleanup gate (see handle_thread_exit): taken BEFORE
+                    // dropping the topology lock so a fork can never land
+                    // mid-cleanup with one of these global mutexes held.
+                    let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
                     drop(topo);
                     child_kicker.unregister(tid);
                     crate::host_signal::forget_thread(tid);
@@ -1148,6 +1152,8 @@ where
                             }
                             Err(e) => {
                                 tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
+                                // Exit-cleanup gate (see handle_thread_exit).
+                                let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
                                 cleanup_registry.exit(tid);
                                 cleanup_kicker.unregister(tid);
                                 crate::host_signal::forget_thread(tid);
@@ -1194,6 +1200,16 @@ where
         code: i32,
         traps: usize,
     ) -> VcpuLoopOutcome {
+        // Exit-cleanup gate: the moment `kicker.unregister` below runs, a
+        // concurrent fork's quiesce stops counting this thread — but the
+        // cleanup that follows (host_signal::forget_thread, the dispatcher's
+        // forget_thread_signal_state) takes process-global mutexes. If
+        // `libc::fork` lands while one is held, the CHILD inherits it locked
+        // forever (the deterministic go-os_exec TestConcurrentExec wedge: the
+        // vfork child deadlocked in migrate_thread_signal_state). The guard is
+        // a non-blocking atomic count; `handle_fork` waits for it to drain
+        // (bounded) after the quiesce and before forking.
+        let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
         if let Some(addr) = self.registry.clear_child_tid(self.this_tid)
             && addr != 0
         {
@@ -1438,6 +1454,34 @@ where
             }
         }
 
+        // Drain in-flight EXIT CLEANUPS before forking. An exiting thread drops
+        // out of the kicker (so the quiesce above stops counting it) and THEN
+        // mutates process-global state — host_signal::forget_thread and the
+        // dispatcher's forget_thread_signal_state — under process-wide mutexes.
+        // `libc::fork` landing inside that window hands the child a mutex held
+        // by a thread that does not exist in it: the child deadlocks on its
+        // first touch (observed live on KVM: a vfork child of go-os_exec's
+        // TestConcurrentExec wedged forever in `migrate_thread_signal_state` →
+        // parking_lot `lock_slow`, surfacing as "vfork parent-suspend timed
+        // out"). The cleanups are short, straight-line, and NEVER block on fork
+        // state (the gate is a plain atomic count), so this wait is microseconds;
+        // the 5s bound exists only against pathology, and on expiry we proceed
+        // (the status-quo risk) rather than kill a healthy guest.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while crate::fork_quiesce::exit_cleanups_in_flight() > 0 {
+                if std::time::Instant::now() >= deadline {
+                    tracing::error!(
+                        in_flight = crate::fork_quiesce::exit_cleanups_in_flight(),
+                        "fork: exit-cleanup drain timed out after 5s; forking anyway \
+                         (child may inherit a held cleanup lock)"
+                    );
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+
         // Publish the arena high-water so the child snapshot's mincore scan is
         // bounded to the guest's used prefix, not all 32 GiB.
         crate::trap::set_guest_arena_high_water(kernel.dispatcher.mmap_arena_high_water());
@@ -1460,6 +1504,17 @@ where
             None
         };
         let prepared_fork = kernel.fork.prepare_host_fork();
+        // Hold the quiesce barrier's internal mutex ACROSS the fork: a sibling
+        // parking for this quiesce leaves the kicker count BEFORE it parks
+        // (`release_and_park_vcpu_for_fork` unregisters first), so the quiesce
+        // wait above can be satisfied while that sibling is still inside
+        // `park_if_quiescing`'s lock-increment window HOLDING the barrier
+        // mutex — and a fork landing there hands the child the mutex locked
+        // forever (captured live on KVM: a vfork child of go-os_exec wedged
+        // permanently in `end_quiesce` → `Mutex::lock_contended`). Owning the
+        // mutex here excludes that window by mutual exclusion; it is dropped on
+        // BOTH sides immediately after the fork, before any barrier call.
+        let paused_guard = fork_barrier().lock_paused_across_fork();
         // vfork shares the parent's guest RAM (CLONE_VM); an ordinary fork takes a
         // private CoW snapshot. CRITICAL: gate the SHARE on the suspend pipe
         // existing, NOT on vfork.is_some() — if pipe() failed the parent CANNOT be
@@ -1470,6 +1525,10 @@ where
         } else {
             engine.fork()
         };
+        // Release the barrier mutex FIRST THING on both sides (and on the error
+        // path): every arm below calls `end_quiesce` / `park_if_quiescing`,
+        // which retake it (self-deadlock if still held).
+        drop(paused_guard);
         let fork_outcome = match fork_result {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1644,9 +1703,15 @@ where
                 self.platform_futex = (self.platform_futex_factory)(Arc::clone(&self.futex));
                 self.threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
                 // Clear the quiesce + fork flags the child inherited (copied) from
-                // the parent so the child's single-threaded run loop runs.
+                // the parent so the child's single-threaded run loop runs. Also
+                // reset the inherited parked-thread COUNT: it belongs to PARENT
+                // threads that do not exist here and nothing would ever decrement
+                // it, so a child that later goes multithreaded and forks would
+                // see `wait_quiesced` satisfied by phantom parkers and fork
+                // UNQUIESCED (siblings running mid-anything).
                 fork_barrier().end_quiesce();
                 fork_barrier().end_fork();
+                fork_barrier().reset_paused_for_child();
                 crate::event_ring::reinit_after_fork();
                 crate::host_signal::reinit_after_fork();
                 // PID namespace: block until the parent registered our ns-pid

@@ -1,17 +1,19 @@
 //! `HostForkCoordinator` for the KVM backend.
 //!
-//! Unlike the HVF [`carrick_runtime::fork_coord::ForkCoordinator`], which must
-//! stop + join a kqueue/itimer signal-pump daemon thread before `libc::fork`
-//! (and recreate it after), the KVM coordinator is LEAN: KVM has no pump thread.
+//! Like the HVF [`carrick_runtime::fork_coord::ForkCoordinator`], this must
+//! STOP + JOIN the async host-signal pump daemon thread
+//! ([`crate::kvm_signal_pump`]) before `libc::fork` and recreate it after:
+//! the pump takes process-global locks (signal-core pending table, child-watch
+//! table, kicker, futex table) on every wake, and a fork landing while one is
+//! held hands the child a mutex with no owner — a permanent child deadlock
+//! (the go-os_exec TestConcurrentExec vfork-child wedge).
 //!
 //! On Linux a host signal delivered to a thread blocked in `KVM_RUN` natively
 //! makes the ioctl return `-EINTR` (this is exactly the cross-thread "kick"
-//! mechanism — see [`crate::kvm_kicker`]). So an async, process-directed signal
-//! interrupts the in-guest vCPU WITHOUT any pump thread polling for it. The
-//! coordinator therefore spawns NO thread; its only job is to keep the
-//! [`crate::kvm_kicker::kick_signal`] handler installed (idempotently) so that a
-//! delivered kick turns into an `EINTR` rather than killing the process or being
-//! silently restarted.
+//! mechanism — see [`crate::kvm_kicker`]). The coordinator's second job is to
+//! keep the [`crate::kvm_kicker::kick_signal`] handler installed (idempotently)
+//! so that a delivered kick turns into an `EINTR` rather than killing the
+//! process or being silently restarted.
 //!
 //! `PreparedHostFork { had_signal_pump }` records whether the handler was live
 //! at fork time. `libc::fork` preserves signal dispositions in BOTH the parent
@@ -96,25 +98,36 @@ impl HostForkCoordinator for KvmForkCoordinator {
     }
 
     fn prepare_host_fork(&self) -> PreparedHostFork {
-        // Nothing to stop/join (no pump thread). Record whether the handler was
-        // live so the restart paths re-assert it.
+        // STOP + JOIN the async host-signal pump thread before `libc::fork`,
+        // exactly like the HVF ForkCoordinator. The pump takes process-global
+        // locks on every wake (the signal-core pending table, the child-watch
+        // table, the kicker, the futex table); under a SIGCHLD storm (exec-heavy
+        // guests — go-os_exec TestConcurrentExec) it is hot near-continuously,
+        // so a fork that does not first join it routinely hands the CHILD a
+        // held mutex whose owner does not exist there — the child then wedges
+        // in `host_signal::reinit_after_fork` and the vfork parent rides its
+        // 60s suspend timeout. (The module docs' old "KVM has no pump thread"
+        // premise predates kvm_signal_pump and is no longer true.)
+        let was_running = crate::kvm_signal_pump::stop_pump_for_fork();
         PreparedHostFork {
-            had_signal_pump: SIGNAL_PUMP_INSTALLED.load(Ordering::SeqCst),
+            had_signal_pump: was_running || SIGNAL_PUMP_INSTALLED.load(Ordering::SeqCst),
         }
     }
 
     fn restart_after_parent_fork(
         &self,
         prepared: PreparedHostFork,
-        _registry: &Arc<dyn VcpuRegistry>,
-        _futex: &Arc<dyn PlatformFutex>,
+        registry: &Arc<dyn VcpuRegistry>,
+        futex: &Arc<dyn PlatformFutex>,
         child_exit_needs_signal_pump: bool,
     ) {
-        // Parent: re-assert the handler if it was live OR if the parent now needs
-        // to observe a child exit (child_exit_needs_signal_pump). The install is
-        // idempotent, so re-asserting is cheap and never double-installs.
+        // Parent: `prepare_host_fork` STOPPED the pump thread, so restart it
+        // (not just the handler) if one was running OR the parent now needs to
+        // observe a child exit. `start_signal_pump` re-asserts the handler and
+        // `start_pump`'s kick-off poke runs one immediate reap pass, covering
+        // any SIGCHLD that landed during the stopped window.
         if prepared.had_signal_pump || child_exit_needs_signal_pump {
-            self.ensure_handler_installed();
+            self.start_signal_pump(registry, futex);
         }
     }
 
