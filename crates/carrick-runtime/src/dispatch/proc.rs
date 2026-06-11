@@ -2196,6 +2196,24 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
 /// macOS and Linux. Exited children (low 7 bits == 0) and stopped children
 /// (low byte == 0x7f) are returned unchanged.
 fn translate_wait_status(status: i32) -> i32 {
+    // The host IS Linux on the KVM lane: the wait status is already in the
+    // guest ABI (same encoding, same signal numbers, and 0xffff really means
+    // WIFCONTINUED). The Darwin remapping below must NOT run there — its
+    // WIFCONTINUED sentinel (stop signal 0x13 == Darwin SIGCONT) collides with
+    // a genuine Linux SIGSTOP(19) signal-delivery stop, so a ptraced child
+    // stopped by SIGSTOP (raised directly, or as the shared kill path's
+    // RT/SIGCONT carrier) was reported as WIFCONTINUED instead of WIFSTOPPED
+    // (LTP ptrace05 signums 18/19/34..64).
+    #[cfg(target_os = "linux")]
+    {
+        return status;
+    }
+    #[cfg(not(target_os = "linux"))]
+    translate_wait_status_darwin(status)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn translate_wait_status_darwin(status: i32) -> i32 {
     let low = status & 0x7f;
     if low == 0x7f {
         // WIFSTOPPED (and macOS's WIFCONTINUED, which is a stopped status whose

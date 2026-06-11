@@ -1498,6 +1498,28 @@ pub mod io_wait {
                 if child_status_ready(pid) {
                     return WaitResult::Ready;
                 }
+                // A ptraced child (PTRACE_TRACEME, then a delivered signal) is in
+                // a signal-delivery STOP, not an exit — the WEXITED-only probe
+                // above never reports it and the park would wedge forever (LTP
+                // ptrace05 on the KVM lane). Probe the trap-stop separately:
+                //   * a guest-meaningful stop signal → Ready, so the re-dispatched
+                //     wait4's WNOHANG pre-check / blocking host wait observes the
+                //     WIFSTOPPED status (Linux reports tracee stops to wait4 even
+                //     without WUNTRACED);
+                //   * a carrick-INTERNAL signal (the SIGRTMIN vCPU kick / the
+                //     SIGRTMIN+1 xsignal nudge) → transparently PTRACE_CONT with
+                //     the signal re-injected (its handler still runs) and keep
+                //     waiting. The guest never asked for those; on HVF they don't
+                //     exist as host signals (`hv_vcpus_exit` kicks), so a traced
+                //     HVF child only ever stops for guest-raised signals.
+                match tracee_trap_stop(pid) {
+                    TraceeTrapStop::GuestSignal => return WaitResult::Ready,
+                    TraceeTrapStop::InternalSignal(sig) => {
+                        continue_tracee_with(pid, sig);
+                        continue;
+                    }
+                    TraceeTrapStop::None => {}
+                }
                 // Still running. Park briefly (≤50 ms) in an empty `ppoll` so a
                 // delivered signal returns `Interrupted` (the loop maps that to
                 // EINTR / a fork-quiesce park), then re-poll the child. Not a busy
@@ -1513,6 +1535,81 @@ pub mod io_wait {
         }
     }
 
+    /// What a `WSTOPPED` peek of a specific child found.
+    enum TraceeTrapStop {
+        /// Not stopped (or `pid <= 0`, or not a ptrace trap stop).
+        None,
+        /// Stopped in a ptrace signal-delivery stop for a signal the guest can
+        /// legitimately observe (it raised it, or a sibling killed it).
+        GuestSignal,
+        /// Stopped on a carrick-internal host signal that the guest knows
+        /// nothing about; carries the signal so the caller can re-inject it.
+        InternalSignal(i32),
+    }
+
+    /// Signals carrick reserves for its own cross-thread/cross-process plumbing
+    /// on the Linux lane: the vCPU kick (`carrick-linux`'s
+    /// `kvm_kicker::kick_signal()` = `SIGRTMIN`) and the xsignal-ring nudge
+    /// (`kvm_xsig::xsig_nudge_signal()` = `SIGRTMIN+1`). Guest signals never
+    /// travel as these host numbers (guest RT signals ride the xsig ring; the
+    /// shared kill path raises a host `SIGSTOP` carrier for RT/SIGCONT), so a
+    /// traced child stopped on one of these is ALWAYS an implementation
+    /// artifact, never guest-visible state. Mirrored by an equality test in
+    /// `carrick-linux` (`kvm_disposition`'s claimed-signal tests).
+    pub fn is_internal_kick_signal(signum: i32) -> bool {
+        signum == libc::SIGRTMIN() || signum == libc::SIGRTMIN() + 1
+    }
+
+    /// Peek (`WNOWAIT`) whether child `pid` sits in a ptrace signal-delivery
+    /// stop (`CLD_TRAPPED`), without consuming any state. Only meaningful for a
+    /// specific child; `pid <= 0` reports `None`.
+    fn tracee_trap_stop(pid: i32) -> TraceeTrapStop {
+        if pid <= 0 {
+            return TraceeTrapStop::None;
+        }
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc != 0 {
+            return TraceeTrapStop::None;
+        }
+        // A group-stop of an untraced child is CLD_STOPPED and is NOT ours to
+        // surface here (wait4 without WUNTRACED ignores it); only the ptrace
+        // trap stop (CLD_TRAPPED) keeps the WEXITED park from ever resolving.
+        const CLD_TRAPPED: i32 = 4;
+        if carrick_portable::si_pid(&info) == 0 || info.si_code != CLD_TRAPPED {
+            return TraceeTrapStop::None;
+        }
+        let sig = carrick_portable::si_status(&info);
+        if is_internal_kick_signal(sig) {
+            TraceeTrapStop::InternalSignal(sig)
+        } else {
+            TraceeTrapStop::GuestSignal
+        }
+    }
+
+    /// `PTRACE_CONT` a trap-stopped tracee, re-injecting `sig` so its handler
+    /// (the kick no-op / the nudge ring-drain) still runs. Failure is benign
+    /// (e.g. the tracee died meanwhile): the caller re-polls.
+    fn continue_tracee_with(pid: i32, sig: i32) {
+        // SAFETY: PT_CONTINUE with addr 1 ("resume where stopped") and the
+        // signal to re-inject; same shape as the dispatch ptrace(PTRACE_CONT).
+        unsafe {
+            libc::ptrace(
+                carrick_portable::PT_CONTINUE,
+                pid,
+                std::ptr::without_provenance_mut::<libc::c_char>(1),
+                sig,
+            );
+        }
+    }
+
     /// True when `pid` is a terminally-exited (CLD_EXITED/KILLED/DUMPED)
     /// reapable child, WITHOUT consuming it (`WNOWAIT` leaves the zombie for the
     /// caller's re-dispatched `wait4`/`waitid` to reap). `pid > 0` probes that
@@ -1521,6 +1618,14 @@ pub mod io_wait {
     /// surfaces the real status / `ECHILD` exactly as it would without this
     /// backstop.
     fn child_status_ready(pid: i32) -> bool {
+        // A ptraced child that published a pending signal-delivery stop (the
+        // shared kill path marks the slot BEFORE raising) is waitable NOW: the
+        // re-dispatched wait4 skips the park and its blocking host wait observes
+        // the WIFSTOPPED status. Mirrors the HVF waiter's identical pre-check
+        // (carrick-hvf io_wait::child_status_ready).
+        if pid > 0 && crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32) {
+            return true;
+        }
         let (idtype, id) = if pid > 0 {
             (libc::P_PID, pid as libc::id_t)
         } else {
@@ -1660,6 +1765,28 @@ pub mod io_wait {
                 continue;
             }
             return WaitResult::Errno(crate::host_to_linux_errno(err));
+        }
+    }
+
+    /// Parity guard: the internal-signal whitelist must track exactly the RT
+    /// signals the KVM backend reserves. Drift in either direction is a bug —
+    /// an unlisted internal signal wedges a traced child in an unobserved
+    /// ptrace stop; an over-listed one swallows a guest-visible stop.
+    #[cfg(all(test, feature = "platform-linux", target_os = "linux"))]
+    mod internal_signal_parity_tests {
+        #[test]
+        fn whitelist_matches_kvm_reserved_signals() {
+            assert!(super::is_internal_kick_signal(
+                carrick_linux::kvm_kicker::kick_signal()
+            ));
+            assert!(super::is_internal_kick_signal(
+                carrick_linux::kvm_xsig::nudge_signum()
+            ));
+            // Every standard signal (incl. the SIGSTOP RT/SIGCONT carrier the
+            // shared kill path raises) stays guest-visible.
+            for s in 1..=31 {
+                assert!(!super::is_internal_kick_signal(s), "signal {s}");
+            }
         }
     }
 }
