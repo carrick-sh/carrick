@@ -1505,22 +1505,47 @@ impl SyscallDispatcher {
                 };
                 // Block on the host fds backing the interest set; in-memory fds
                 // (no host fd) are simply re-checked when the wait returns.
+                //
+                // Honor the EPOLLET latch when building the park set: a bit that
+                // is STILL raw-asserted right now (`ready_updates` — just stored
+                // as `last_ready` above) was delivered on an earlier edge and
+                // masked by the ET gate this call, but the host's LEVEL-triggered
+                // ppoll would report it immediately, turning the park into a hot
+                // re-dispatch spin whose timeout never elapses (the re-dispatch
+                // restarts the wait from scratch). Go's netpoller registers
+                // IN|OUT|ET on every fd, so a FIFO/pipe write end is persistently
+                // OUT-asserted: the spin pinned the netpoller M and Go timers
+                // never fired (go-os TestFIFONonBlockingEOF's 200 ms writer-close
+                // AfterFunc — issue shape go#66239). Park only on the
+                // not-currently-asserted bits; a latched HUP/ERR excludes the fd
+                // entirely (poll(2) reports those regardless of `events`). An
+                // entry kept with ev == 0 still wakes on a NEW HUP/ERR edge —
+                // exactly epoll's always-on HUP/ERR behavior.
                 let pollfds: Vec<(i32, i16)> = interests
                     .iter()
-                    .filter_map(|(fd, intr)| {
-                        this.host_fd_for_poll(*fd).map(|hfd| {
-                            let mut ev: i16 = 0;
-                            if intr.event.events & LINUX_EPOLLIN != 0 {
-                                ev |= libc::POLLIN;
-                            }
-                            if intr.event.events & LINUX_EPOLLOUT != 0 {
-                                ev |= libc::POLLOUT;
-                            }
-                            if intr.event.events & LINUX_EPOLLPRI != 0 {
-                                ev |= libc::POLLPRI;
-                            }
-                            (hfd, ev)
-                        })
+                    .zip(ready_updates.iter())
+                    .filter_map(|((fd, intr), &(_, raw))| {
+                        let hfd = this.host_fd_for_poll(*fd)?;
+                        let et = intr.event.events & LINUX_EPOLLET != 0;
+                        if et && raw & (LINUX_EPOLLHUP | LINUX_EPOLLERR) != 0 {
+                            return None;
+                        }
+                        let effective = if et {
+                            intr.event.events & !raw
+                        } else {
+                            intr.event.events
+                        };
+                        let mut ev: i16 = 0;
+                        if effective & LINUX_EPOLLIN != 0 {
+                            ev |= libc::POLLIN;
+                        }
+                        if effective & LINUX_EPOLLOUT != 0 {
+                            ev |= libc::POLLOUT;
+                        }
+                        if effective & LINUX_EPOLLPRI != 0 {
+                            ev |= libc::POLLPRI;
+                        }
+                        Some((hfd, ev))
                     })
                     .collect();
                 return Ok(DispatchOutcome::WaitOnPollFds {
