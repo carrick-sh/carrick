@@ -485,7 +485,33 @@ impl KvmVm {
         // fully resets a recycled vcpu — same UNPROGRAMMED contract either way.
         let parked = self.vcpu_pool.lock().ok().and_then(|mut p| p.pop());
         let fd = match parked {
-            Some(fd) => fd,
+            Some(mut fd) => {
+                // A parked fd was dropped while its OLD guest thread sat at a
+                // trapped syscall — i.e. mid `KVM_EXIT_MMIO` on the sentinel
+                // store (thread exit parks exactly there). The in-kernel
+                // completion state survives both the park and the
+                // `KVM_ARM_VCPU_INIT` below (`vcpu->mmio_needed` = 1 and
+                // `run->exit_reason` = `KVM_EXIT_MMIO` are GENERIC vcpu state,
+                // not reset by the ARM init ioctl). The NEXT `KVM_RUN` would
+                // then "complete" that stale MMIO first: `kvm_handle_mmio_return`
+                // → `kvm_incr_pc` → PC advances 4 bytes — AFTER the caller has
+                // restored the new sibling's seeded snapshot, so the new guest
+                // thread SKIPS ITS FIRST INSTRUCTION. For a clone child seeded
+                // at `__clone`'s post-svc `cmp x0, #0`, the skip makes the
+                // following `b.eq thread_start` read the PARENT's stale PSTATE
+                // flags: the child `ret`s down the parent path of __clone and
+                // runs create_thread's tail on the child stack — the go-os
+                // TestProgWideChdir `*** stack smashing detected ***` abort.
+                // FLUSH the stale completion now: with `immediate_exit` set,
+                // `KVM_RUN` consumes the pending MMIO (bumping the soon-to-be-
+                // overwritten OLD PC) and returns EINTR before ever entering
+                // the guest. The caller's snapshot restore then programs the
+                // real entry state onto a clean vcpu.
+                fd.set_kvm_immediate_exit(1);
+                let _ = fd.run(); // -EINTR; consumes any stale MMIO completion
+                fd.set_kvm_immediate_exit(0);
+                fd
+            }
             None => {
                 // Draw a UNIQUE vcpu_id from the shared allocator. The owning
                 // VM's main vCPU gets 0; every `clone(CLONE_THREAD)` sibling
