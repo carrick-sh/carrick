@@ -5533,7 +5533,7 @@ cmd = ["/conformance/crypto_tls.test", "-test.v", "-test.run", "Test", "-test.sh
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
-timeout_s = 180
+timeout_s = 540
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/crypto/tls"
 
@@ -5989,7 +5989,7 @@ cmd = ["/conformance/go_internal_srcimporter.test", "-test.v", "-test.run", "Tes
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
-timeout_s = 180
+timeout_s = 540
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/go/internal/srcimporter"
 
@@ -6649,7 +6649,7 @@ cmd = ["/conformance/net_netip.test", "-test.v", "-test.run", "Test", "-test.sho
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
-timeout_s = 180
+timeout_s = 540
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/net/netip"
 

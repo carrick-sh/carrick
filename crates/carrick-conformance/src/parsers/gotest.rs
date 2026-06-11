@@ -85,7 +85,12 @@ impl VerdictParser for GotestParser {
 /// differ every run, so a blessed baseline id can never match a later run
 /// (or the other lane), producing phantom per-id diffs on suites where both
 /// sides pass everything. `0x` followed by hex becomes `0xADDR`.
-fn normalize_id(name: &str) -> String {
+pub(crate) fn normalize_id(name: &str) -> String {
+    // Only `0x` + >= 8 hex digits collapses to `0xADDR`: short hex literals
+    // are usually STABLE test inputs, not pointers (netip's
+    // `TestParseAddr/0xc0.0xa8.0x8c.0xff` is a hex-encoded IP — eating those
+    // merged distinct subtests and mismatched the cached oracle's raw ids).
+    const MIN_PTR_HEX_DIGITS: usize = 8;
     let mut out = String::with_capacity(name.len());
     let mut rest = name;
     while let Some(pos) = rest.find("0x") {
@@ -95,10 +100,11 @@ fn normalize_id(name: &str) -> String {
             .bytes()
             .take_while(|b| b.is_ascii_hexdigit())
             .count();
-        if hex_len > 0 {
+        if hex_len >= MIN_PTR_HEX_DIGITS {
             out.push_str("0xADDR");
         } else {
-            out.push_str("0x");
+            // Short hex literal (or bare "0x"): keep verbatim.
+            out.push_str(&tail[..2 + hex_len]);
         }
         rest = &tail[2 + hex_len..];
     }
@@ -155,12 +161,17 @@ FAIL";
         let out = "\
 --- PASS: TestAs/As(Errorf(...),_0x6048040008) (0.00s)
 --- PASS: TestAs/As(Errorf(...),_0x604801cb10) (0.00s)
+--- PASS: TestParseAddr/0xc0.0xa8.0x8c.0xff (0.00s)
 --- PASS: TestNotHex/0xzz (0.00s)
 PASS";
         let r = GotestParser.parse(&raw(out));
         assert_eq!(r.ids.get("TestAs/As(Errorf(...),_0xADDR)"), Some(&Outcome::Ok));
-        // Two different addresses collapse to ONE stable id.
-        assert_eq!(r.ids.len(), 2);
+        // Two different pointer addresses collapse to ONE stable id.
+        assert_eq!(r.ids.len(), 3);
+        // SHORT hex literals are stable test inputs (hex-encoded IPs), kept
+        // verbatim — collapsing them merged distinct subtests and mismatched
+        // pre-normalization cached oracle ids.
+        assert_eq!(r.ids.get("TestParseAddr/0xc0.0xa8.0x8c.0xff"), Some(&Outcome::Ok));
         // A non-hex "0x" tail is left alone.
         assert_eq!(r.ids.get("TestNotHex/0xzz"), Some(&Outcome::Ok));
     }
