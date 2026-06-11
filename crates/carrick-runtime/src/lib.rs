@@ -871,6 +871,22 @@ pub mod runtime {
         use crate::fs_backend::HostFsBackend;
         use std::path::PathBuf;
 
+        // 0. Docker's container init is a SESSION LEADER (runc setsid()s before
+        //    exec'ing the entrypoint): a leader's own setpgid() is EPERM
+        //    (ltp-setpgid01 case 1), getsid(0) == getpid(), and there is no
+        //    controlling tty unless one is allocated. The macOS path gets this
+        //    guest-visible state from the PID-namespace layer (ns-pid 1 +
+        //    init_host_sid seeding → translate_setpgid_args EPERM); on Linux the
+        //    HOST kernel is the source of truth for the passthrough process
+        //    model, so make the guest init a REAL session leader. Best-effort:
+        //    setsid(2) fails (EPERM) only when this process is already a
+        //    process-group leader, in which case it keeps its current group —
+        //    none of the CLI / conformance spawn shapes hit that.
+        // SAFETY: setsid takes no arguments; on failure it changes nothing.
+        unsafe {
+            libc::setsid();
+        }
+
         // 1. Extract the OCI layers onto a fresh cap-std scratch rootfs.
         let mut host = HostFsBackend::new()
             .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("scratch dir: {e}")))?;
