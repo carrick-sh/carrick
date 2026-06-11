@@ -119,6 +119,13 @@ use zerocopy::IntoBytes;
 // with both the regions and the kernel-only first-2 MiB block, so they couldn't
 // run. Moving the hole high frees the low VA range for such binaries.
 pub const LINUX_KERNEL_REGION_BASE: u64 = 0x2D_0000_0000;
+// The NULL guard: stage-1 leaves VA 0..0x10000 UNMAPPED (16 4 KiB pages in
+// L3A), mirroring Linux's default `vm.mmap_min_addr` (65536) — a guest NULL
+// deref faults cleanly at stage 1 instead of reading backing memory. Backends
+// whose host-side syscall-buffer gate is a flat window that DOES back GPA 0
+// (KVM's low identity window) must consult this so a NULL syscall buffer
+// EFAULTs like the guest's own access would (LTP pipe05: pipe(NULL) → EFAULT).
+pub const LINUX_NULL_GUARD_END: u64 = 0x10000;
 pub const LINUX_EL0_TRAMPOLINE_BASE: u64 = LINUX_KERNEL_REGION_BASE;
 // Trampoline region size. Must be at least one HVF page (16 KiB) so the
 // stage-2 mapping is aligned. The first 4 bytes carry the `eret` opcode;
@@ -1722,10 +1729,10 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     }
 
     // ----- L3_A: first 2 MiB in 4 KiB pages -----
-    // VA 0..0x10000 (16 pages) is left INVALID as the null guard (matches Linux
-    // mmap_min_addr); 0x10000..2 MiB are user pages so a static binary loading
-    // at 0x10000 can run.
-    const NULL_GUARD_PAGES: u64 = 0x10000 / 0x1000; // 16
+    // VA 0..LINUX_NULL_GUARD_END (16 pages) is left INVALID as the null guard
+    // (matches Linux mmap_min_addr); 0x10000..2 MiB are user pages so a static
+    // binary loading at 0x10000 can run.
+    const NULL_GUARD_PAGES: u64 = LINUX_NULL_GUARD_END / 0x1000; // 16
     for index in NULL_GUARD_PAGES..512_u64 {
         let pa = index << 12;
         let descriptor = (pa & PA_MASK_4KIB) | USER_PAGE_FLAGS;
