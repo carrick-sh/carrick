@@ -43,7 +43,7 @@ impl VerdictParser for GotestParser {
                     _ => Outcome::Skipped,
                 };
                 // Fail dominates Ok dominates Skip for a repeated name.
-                let slot = ids.entry(name.as_str().to_string()).or_insert(o);
+                let slot = ids.entry(normalize_id(name.as_str())).or_insert(o);
                 if dominance(o) > dominance(*slot) {
                     *slot = o;
                 }
@@ -77,6 +77,33 @@ impl VerdictParser for GotestParser {
             ids,
         }
     }
+}
+
+/// Strip run-varying hex addresses from a subtest name so ids are STABLE
+/// across runs. Some Go subtests embed pointer values in their names (e.g.
+/// errors' `TestAs/As(Errorf(...),_0x6048040008)`) — ASLR makes the address
+/// differ every run, so a blessed baseline id can never match a later run
+/// (or the other lane), producing phantom per-id diffs on suites where both
+/// sides pass everything. `0x` followed by hex becomes `0xADDR`.
+fn normalize_id(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(pos) = rest.find("0x") {
+        let (head, tail) = rest.split_at(pos);
+        out.push_str(head);
+        let hex_len = tail[2..]
+            .bytes()
+            .take_while(|b| b.is_ascii_hexdigit())
+            .count();
+        if hex_len > 0 {
+            out.push_str("0xADDR");
+        } else {
+            out.push_str("0x");
+        }
+        rest = &tail[2 + hex_len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn dominance(o: Outcome) -> u8 {
@@ -118,6 +145,24 @@ FAIL";
         assert_eq!(r.ids.get("TestC"), Some(&Outcome::Skipped));
         assert_eq!(r.totals.passed, 1);
         assert_eq!(r.totals.failed, 1);
+    }
+
+    #[test]
+    fn pointer_addresses_normalize_to_stable_ids() {
+        // errors' TestAs subtests embed pointer values (ASLR-varying) in their
+        // names; ids must be stable across runs/lanes or the baseline can
+        // never excuse them (phantom diffs on an all-pass suite).
+        let out = "\
+--- PASS: TestAs/As(Errorf(...),_0x6048040008) (0.00s)
+--- PASS: TestAs/As(Errorf(...),_0x604801cb10) (0.00s)
+--- PASS: TestNotHex/0xzz (0.00s)
+PASS";
+        let r = GotestParser.parse(&raw(out));
+        assert_eq!(r.ids.get("TestAs/As(Errorf(...),_0xADDR)"), Some(&Outcome::Ok));
+        // Two different addresses collapse to ONE stable id.
+        assert_eq!(r.ids.len(), 2);
+        // A non-hex "0x" tail is left alone.
+        assert_eq!(r.ids.get("TestNotHex/0xzz"), Some(&Outcome::Ok));
     }
 
     #[test]
