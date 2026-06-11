@@ -191,9 +191,20 @@ fn is_rt_signal(signum: i32) -> bool {
 ///     receiver instead of being ignored (LTP kill12's `sigset(sig, SIG_IGN)`
 ///     loop). Routing through the ring keeps the host fault disposition intact
 ///     while still honouring the guest's ignore/handler.
+///   * SIGPIPE (13) — carrick keeps a process-wide host `SIG_IGN` for SIGPIPE
+///     (its OWN internal writes to a closed pipe must return EPIPE, not kill
+///     the process), and NEITHER backend mirrors a guest SIGPIPE disposition
+///     onto the host (`ensure_host_handler` excludes 13 on both: a routed host
+///     SIGPIPE handler would re-route carrick's internal EPIPE writes into the
+///     guest as a spurious signal). So a host kill of SIGPIPE to a sibling
+///     carrick process is silently DROPPED by the receiver's host SIG_IGN —
+///     LTP sigrelse01's `kill(child, SIGPIPE)` was never delivered on the
+///     non-namespaced path. The ring carries it to the receiver's dispatch
+///     layer, which honours the guest disposition (handler/pending/SIG_DFL).
 ///   * RT signals (32..=64) — macOS has no such signal number to host-kill with.
 fn cross_process_needs_xsig(signum: i32) -> bool {
     signum == crate::linux_abi::LINUX_SIGCHLD
+        || signum == crate::linux_abi::LINUX_SIGPIPE
         || matches!(signum, 4 | 5 | 6 | 7 | 8 | 11)
         || is_rt_signal(signum)
 }
@@ -1837,6 +1848,25 @@ pub(crate) fn bootstrap_signal_send_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_process_xsig_policy_routes_unhostable_signals() {
+        // SIGPIPE: both backends keep a process-wide host SIG_IGN for it (and
+        // never mirror a guest disposition onto host SIGPIPE), so a plain host
+        // kill is silently dropped — it MUST take the ring (LTP sigrelse01).
+        assert!(cross_process_needs_xsig(crate::linux_abi::LINUX_SIGPIPE));
+        // SIGCHLD, the synchronous-fault set, and RT signals (no host number /
+        // host disposition owned by another mechanism) ride the ring too.
+        assert!(cross_process_needs_xsig(crate::linux_abi::LINUX_SIGCHLD));
+        for s in [4, 5, 6, 7, 8, 11, 34] {
+            assert!(cross_process_needs_xsig(s), "signum {s} must take the ring");
+        }
+        // Ordinary host-carryable standard signals stay on the host-kill path
+        // (the routed-handler mirror delivers them faithfully).
+        for s in [1, 10, 12, 14, 15] {
+            assert!(!cross_process_needs_xsig(s), "signum {s} is host-carryable");
+        }
+    }
 
     #[test]
     fn namespace_member_xsig_policy_routes_catchable_standard_signals() {

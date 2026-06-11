@@ -103,20 +103,37 @@ fn kvm_routable(signum: i32) -> bool {
 /// sibling guest process `kill`ed us with `signum` (the host-kill path); publish
 /// it as a pending guest signal and wake the pump so the generic loop delivers
 /// the guest's handler at its next safe point. Does ONLY:
-///   1. `proc_pending_fetch_or(pending_bit(signum))` — a lock-free atomic OR into
+///   1. `record_sender(signum, si_pid)` — one atomic store of the sender's host
+///      pid, so the delivery path can stamp the guest siginfo's `si_pid`
+///      (mirrors HVF's `handle_routed`; without it LTP kill10's SA_SIGINFO
+///      handshake handlers saw `si_pid == 0` — "received unexpected signal 10
+///      from 0" — and the manager→master ready/done acks looped forever).
+///      SI_USER/SI_QUEUE/SI_TKILL carry the real sender; `record_sender`
+///      ignores a non-positive si_pid, so a kernel-generated code is inert.
+///   2. `proc_pending_fetch_or(pending_bit(signum))` — a lock-free atomic OR into
 ///      PROC_PENDING (so `has_process_pending()` becomes true).
-///   2. `kvm_signal_pump::poke()` — one `write(2)` to the pump's self-pipe, so the
+///   3. `kvm_signal_pump::poke()` — one `write(2)` to the pump's self-pipe, so the
 ///      pump's `kick_all` fans every vCPU out of `KVM_RUN`.
 /// This is the existing [`crate::kvm_signal_pump`] `pump_handler` GENERALIZED to
 /// an arbitrary routable signum (on Linux host signum == guest signum, so no
 /// translation). NOTHING else (no locks, allocation, or `println!`).
 ///
-/// si_pid fidelity (the sender pid for the guest siginfo) is NOT captured here:
-/// the SI_USER siginfo for a cross-process standard kill is best-effort and the
-/// dispatcher's `kill` arm already records the local-send case; a future
-/// SA_SIGINFO variant could `record_sender` for full fidelity, but the fixture
-/// does not require it.
-extern "C" fn kvm_routed_handler(signum: c_int) {
+/// Unlike HVF's `handle_routed` there is no synchronous-fault guard: the neutral
+/// `is_host_routable` base excludes the fault set (4/5/6/7/8/11) from routing on
+/// KVM, so this handler is never installed for a signal a genuine carrick host
+/// fault could raise.
+extern "C" fn kvm_routed_handler(
+    signum: c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    if !info.is_null() {
+        // SAFETY: the kernel hands a valid siginfo_t to an SA_SIGINFO handler;
+        // `si_pid()` reads the POSIX-defined union member (libc marks the
+        // accessor unsafe only because it reads a union). record_sender is one
+        // atomic store — async-signal-safe.
+        carrick_signal_core::record_sender(signum, unsafe { (*info).si_pid() });
+    }
     if let Some(bit) = carrick_signal_core::pending_bit(signum) {
         carrick_signal_core::proc_pending_fetch_or(bit);
     }
@@ -210,9 +227,11 @@ pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
 
 /// Install `handler` (a routed handler fn, `SIG_IGN`, or `SIG_DFL`) as the host
 /// disposition for `signum`. A routed handler gets `SA_RESTART` (so an
-/// interrupted host syscall restarts across delivery); `SIG_IGN`/`SIG_DFL` get no
-/// flags. On Linux host signum == guest signum, so no translation. Helper kept
-/// private; the public fns above gate on `kvm_routable` first.
+/// interrupted host syscall restarts across delivery) plus `SA_SIGINFO` (the
+/// routed handler is the 3-arg form — it reads `si_pid` to record the sender);
+/// `SIG_IGN`/`SIG_DFL` get no flags. On Linux host signum == guest signum, so no
+/// translation. Helper kept private; the public fns above gate on `kvm_routable`
+/// first.
 fn install_sigaction(signum: i32, handler: libc::sighandler_t) {
     let is_action = handler != libc::SIG_IGN && handler != libc::SIG_DFL;
     // SAFETY: a zeroed `sigaction` is the documented "no flags, empty mask" form;
@@ -222,7 +241,11 @@ fn install_sigaction(signum: i32, handler: libc::sighandler_t) {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = handler;
         libc::sigemptyset(&mut action.sa_mask);
-        action.sa_flags = if is_action { libc::SA_RESTART } else { 0 };
+        action.sa_flags = if is_action {
+            libc::SA_RESTART | libc::SA_SIGINFO
+        } else {
+            0
+        };
         libc::sigaction(signum, &action, std::ptr::null_mut());
     }
 }
