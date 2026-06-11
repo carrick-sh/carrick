@@ -11,7 +11,7 @@ use carrick_mem::arch_sysregs::{
 };
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_MAINT_BASE, LINUX_EL1_VECTORS_BASE,
-    LINUX_EL1_VECTORS_SIZE, LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes,
+    LINUX_EL1_VECTORS_SIZE, LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes,
     stage1_identity_page_tables, va_in_shared_aperture,
 };
 use carrick_mem::protections::MemoryProtections;
@@ -623,6 +623,18 @@ impl GuestRam {
         ipa: u64,
         len: usize,
     ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
+        // The stage-1 tables leave VA 0..LINUX_NULL_GUARD_END UNMAPPED (the
+        // null guard = Linux's default vm.mmap_min_addr): the guest's OWN NULL
+        // deref faults. The host syscall path must agree — KVM's flat low
+        // identity window DOES back GPA 0, so without this gate a NULL syscall
+        // buffer silently reads/writes that backing instead of EFAULTing (LTP
+        // pipe05: pipe(NULL) must fail EFAULT). HVF gets this structurally
+        // from its discrete per-region windows (no region covers VA 0).
+        // Zero-length accesses stay exempt, matching HVF's `read_bytes`
+        // zero-length short-circuit (`read(fd, NULL, 0)` returns 0 on Linux).
+        if len > 0 && va < LINUX_NULL_GUARD_END {
+            return Err(carrick_guest_mem::region::GuestAccessError::OutOfBounds);
+        }
         carrick_guest_mem::region::safe_guest_access_translated_in(
             |g, l| self.protections.range_no_access(g, l),
             self.projected_windows(),
