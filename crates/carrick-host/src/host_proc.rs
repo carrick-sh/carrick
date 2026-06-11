@@ -574,8 +574,33 @@ mod imp {
     pub fn self_resource_usage() -> Option<ResourceUsage> {
         None
     }
+
+    /// (user_us, system_us) CPU time for the CURRENT thread, from the host
+    /// kernel's own per-thread accounting: `getrusage(RUSAGE_THREAD)`. KVM
+    /// guest execution is charged to the vCPU thread as guest time, which
+    /// Linux folds into utime — so a busy guest's user time ADVANCES here
+    /// (LTP getrusage04 spins on getrusage(RUSAGE_THREAD) until it does).
+    /// The dispatcher runs on the same host thread as the vCPU that issued
+    /// the syscall, so "current thread" is the right scope — mirroring the
+    /// macOS impl, which reads the calling host thread's
+    /// `thread_info(THREAD_BASIC_INFO)`. Non-Linux non-macOS stays inert.
     pub fn self_thread_cpu_us() -> Option<(u64, u64)> {
-        None
+        #[cfg(target_os = "linux")]
+        {
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: getrusage(RUSAGE_THREAD) fills `ru` for the calling
+            // thread; a zeroed rusage is a valid out-buffer.
+            if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) } != 0 {
+                return None;
+            }
+            let to_us =
+                |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+            Some((to_us(ru.ru_utime), to_us(ru.ru_stime)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     #[cfg(test)]
