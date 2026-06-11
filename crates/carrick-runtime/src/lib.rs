@@ -1617,6 +1617,24 @@ pub mod io_wait {
                 // ppoll, but the recheck saw no process-pending and treated the
                 // kick as spurious, re-entering the same wait. The `block_mask`
                 // keeps a genuinely-blocked signal parked (sigwait/ppoll mask).
+                // A FORK-QUIESCE (or execve thread-group replacement) nudge must
+                // ALSO surface as Interrupted: the forker now waits for the
+                // kicker count to drain to 1, and a ppoll-parked waiter that
+                // swallows the nudge as "spurious" never reaches
+                // `release_and_park_vcpu_for_fork` — with `wait_proc_exit`'s
+                // re-poll loop that deadlocked the whole guest (forker waiting
+                // on the waiter; the waiter's awaited CHILD un-runnable behind
+                // the stopped world; captured live in gdb under go-os_exec
+                // TestConcurrentExec). The Interrupted callers all re-check
+                // `is_quiescing()` themselves, so a nudge with no quiesce by the
+                // time they look is surfaced as a harmless EINTR exactly as any
+                // other interrupted slice. Mirrors the futex-wait predicate
+                // (`is_quiescing || exec_replacing_other_thread`).
+                if crate::fork_quiesce::is_quiescing()
+                    || crate::fork_quiesce::exec_replacing_other_thread(tid)
+                {
+                    return WaitResult::Interrupted;
+                }
                 if crate::host_signal::has_unblocked_pending_for(tid, block_mask)
                     || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
                 {
