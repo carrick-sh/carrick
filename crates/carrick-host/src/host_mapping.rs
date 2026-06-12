@@ -48,6 +48,7 @@ pub struct OwnedHostMapping {
 
 impl OwnedHostMapping {
     pub fn map_shared_anon(len: usize, kind: HostMappingKind) -> Result<Self, std::io::Error> {
+        #[allow(deprecated)] // MAP_NORESERVE: removed in FreeBSD 11, harmless no-op elsewhere
         let host = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
