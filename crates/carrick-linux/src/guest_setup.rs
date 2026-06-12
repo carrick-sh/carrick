@@ -6,9 +6,6 @@
 use std::sync::Arc;
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
-use carrick_mem::arch_sysregs::{
-    CPACR_EL1_BOOTSTRAP, MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP,
-};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_MAINT_BASE, LINUX_EL1_VECTORS_BASE,
     LINUX_EL1_VECTORS_SIZE, LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes,
@@ -1088,12 +1085,17 @@ pub(crate) fn populate_vdso_vvar(vcpu: &KvmVcpu, ram: &mut GuestRam) -> Result<(
 /// TPIDR_EL0 = 0 so the new image's libc re-initialises its thread pointer.
 pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsError> {
     // MAIR_EL1 slot 0 = Normal Inner/Outer WB cacheable (0xFF), as HVF. The
-    // bootstrap MAIR/TCR/SCTLR/CPACR values are SHARED with HVF in
-    // carrick_mem::arch_sysregs (byte-identical; one edit point).
-    vcpu.set_sys_reg(SysReg::Mair, MAIR_EL1_BOOTSTRAP)?;
+    // bootstrap MAIR/TCR/SCTLR/CPACR values are SHARED with HVF via GuestArch
+    // (canonical rationale in carrick_mem::arch_sysregs; byte-identical, one
+    // edit point). Free function, so name the engine explicitly.
+    use carrick_hal::GuestArch as _;
+    let boot =
+        <crate::trap_engine::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs(
+        );
+    vcpu.set_sys_reg(SysReg::Mair, boot.mair_el1)?;
     // TCR_EL1: identical bootstrap value to the HVF path. T0SZ=
     // T1SZ=16, Inner-WB/Inner-Shareable both halves, TG1=4K, IPS=40-bit, TBI0/1.
-    vcpu.set_sys_reg(SysReg::Tcr, TCR_EL1_BOOTSTRAP)?;
+    vcpu.set_sys_reg(SysReg::Tcr, boot.tcr_el1)?;
     vcpu.set_sys_reg(SysReg::Ttbr0, LINUX_PAGE_TABLES_BASE)?;
     vcpu.set_sys_reg(SysReg::Ttbr1, LINUX_PAGE_TABLES_BASE)?;
 
@@ -1111,13 +1113,13 @@ pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Resul
     // The guest enters EL0 with PSTATE.PAN=0 (SPSR_EL1 below), so SPAN=1 keeps
     // PAN=0 through the svc trap and the sentinel store reaches the host. (HVF
     // takes the opposite tack — SPAN=0 + forced PSTATE.PAN=1 — so this bit lives
-    // here, not in the shared SCTLR_EL1_BOOTSTRAP.)
+    // here, not in the shared bootstrap SCTLR value.)
     const SCTLR_EL1_SPAN: u64 = 1 << 23;
-    let sctlr: u64 = SCTLR_EL1_BOOTSTRAP | SCTLR_EL1_SPAN;
+    let sctlr: u64 = boot.sctlr_el1 | SCTLR_EL1_SPAN;
     vcpu.set_sys_reg(SysReg::Sctlr, sctlr)?;
 
     // FP/SIMD on (CPACR_EL1.FPEN = 0b11) so guest NEON memset doesn't trap.
-    vcpu.set_sys_reg(SysReg::Cpacr, CPACR_EL1_BOOTSTRAP)?;
+    vcpu.set_sys_reg(SysReg::Cpacr, boot.cpacr_el1)?;
 
     // VBAR_EL1 -> our sentinel vector page.
     vcpu.set_sys_reg(SysReg::Vbar, LINUX_EL1_VECTORS_BASE)?;

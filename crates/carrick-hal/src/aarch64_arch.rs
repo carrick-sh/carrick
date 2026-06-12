@@ -58,6 +58,17 @@ impl SyscallTable for Aarch64SyscallTable {
     }
 }
 
+/// The aarch64 initial bring-up sysreg VALUES (see `carrick_mem::arch_sysregs`
+/// for the canonical bit-by-bit rationale). Values only; each backend's
+/// programming procedure (and its PAN/SPAN divergence) stays backend-private.
+#[derive(Clone, Copy, Debug)]
+pub struct Aarch64BootSysregs {
+    pub mair_el1: u64,
+    pub tcr_el1: u64,
+    pub sctlr_el1: u64,
+    pub cpacr_el1: u64,
+}
+
 /// The aarch64 [`GuestArch`] impl. Unit struct selected as `ThreadedEngine::Arch`
 /// on both the HVF and KVM backends; monomorphized, so zero-cost.
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,6 +78,7 @@ impl GuestArch for Aarch64GuestArch {
     type Frame = Aarch64SyscallFrame;
     type Mmu = Aarch64Mmu;
     type Table = Aarch64SyscallTable;
+    type BootSysregs = Aarch64BootSysregs;
 
     fn decode_syscall(frame: &Self::Frame) -> (u64, [u64; 6]) {
         // Verbatim from `SyscallRequest::from_aarch64_frame`: x8 → number,
@@ -91,6 +103,15 @@ impl GuestArch for Aarch64GuestArch {
 
     fn entry_trampoline_bytes() -> Vec<u8> {
         carrick_mem::memory::el0_trampoline_bytes()
+    }
+
+    fn bootstrap_sysregs() -> Aarch64BootSysregs {
+        Aarch64BootSysregs {
+            mair_el1: carrick_mem::arch_sysregs::MAIR_EL1_BOOTSTRAP,
+            tcr_el1: carrick_mem::arch_sysregs::TCR_EL1_BOOTSTRAP,
+            sctlr_el1: carrick_mem::arch_sysregs::SCTLR_EL1_BOOTSTRAP,
+            cpacr_el1: carrick_mem::arch_sysregs::CPACR_EL1_BOOTSTRAP,
+        }
     }
 
     fn build_sigframe<E: crate::RegAccess + carrick_guest_mem::GuestMemory>(
@@ -147,6 +168,21 @@ mod tests {
         assert_eq!(Aarch64SyscallTable::name(64), Some("write"));
         // A wildly-out-of-range number is unknown.
         assert!(!Aarch64SyscallTable::is_known(u64::MAX));
+    }
+
+    #[test]
+    fn bootstrap_sysregs_match_the_carrick_mem_constants() {
+        let boot = Aarch64GuestArch::bootstrap_sysregs();
+        assert_eq!(boot.mair_el1, carrick_mem::arch_sysregs::MAIR_EL1_BOOTSTRAP);
+        assert_eq!(boot.tcr_el1, carrick_mem::arch_sysregs::TCR_EL1_BOOTSTRAP);
+        assert_eq!(
+            boot.sctlr_el1,
+            carrick_mem::arch_sysregs::SCTLR_EL1_BOOTSTRAP
+        );
+        assert_eq!(
+            boot.cpacr_el1,
+            carrick_mem::arch_sysregs::CPACR_EL1_BOOTSTRAP
+        );
     }
 
     #[test]

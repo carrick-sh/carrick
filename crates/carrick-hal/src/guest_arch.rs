@@ -6,9 +6,10 @@
 //! ([`crate::aarch64_arch::Aarch64GuestArch`]) delegates to the existing
 //! `carrick-mem` / `carrick-abi` / `carrick-guest-mem` code verbatim. The trait
 //! grows one subsystem at a time as each is routed through it: the
-//! sigframe build/restore methods are now declared (Task 4); CPU bring-up and
-//! the MMU-descriptor codec follow in later plan tasks (5-6), each carrying its
-//! real ctx types rather than a speculative signature.
+//! sigframe build/restore methods (Task 4) and the initial CPU bring-up
+//! register VALUES (Task 5) are now declared; only the MMU-descriptor codec
+//! (T6) remains, carrying its real ctx types rather than a speculative
+//! signature.
 
 use crate::sigframe::{InjectParams, SigframeInject, SigframeRestore};
 use crate::{RegAccess, TrapError};
@@ -56,6 +57,11 @@ pub trait GuestArch: Copy + 'static {
     type Mmu: PageTableCodec;
     /// Syscall-number metadata table for this ISA.
     type Table: SyscallTable;
+    /// Per-ISA bundle of initial CPU bring-up register VALUES (aarch64:
+    /// MAIR/TCR/SCTLR/CPACR_EL1; x86_64 in Phase 2: CR0/CR4/EFER/...). Values
+    /// only — the programming procedure stays in each backend, which interleaves
+    /// backend-specific registers and intentionally divergent PAN/SPAN glue.
+    type BootSysregs: Copy;
 
     /// Decode the raw frame into `(number, args[6])`. The runtime maps this to
     /// its `SyscallRequest` (aarch64: `x8` → number, `x0..x5` → args).
@@ -75,11 +81,14 @@ pub trait GuestArch: Copy + 'static {
     /// the same reason as [`GuestArch::vdso_bytes`].
     fn entry_trampoline_bytes() -> Vec<u8>;
 
-    // CPU bring-up and the page-table descriptor codec are expressed over the
-    // engine's `RegAccess` + the sysreg ctx types; their exact signatures are
-    // lifted verbatim from `carrick-mem::{arch_sysregs,page_table}` in later plan
-    // tasks (5-6), kept here as trait methods so the engine calls `Arch::*`.
-    // Declared once their concrete ctx types are in scope.
+    /// The ISA's initial CPU bring-up register values.
+    fn bootstrap_sysregs() -> Self::BootSysregs;
+
+    // The page-table descriptor codec is expressed over the engine's
+    // `RegAccess` + the descriptor ctx types; its exact signatures are lifted
+    // verbatim from `carrick-mem::page_table` in a later plan task (T6), kept
+    // here as trait methods so the engine calls `Arch::*`. Declared once its
+    // concrete ctx types are in scope.
 
     /// Build the `rt_sigframe` for a delivered signal: push it onto the guest
     /// user stack and redirect the vCPU to the handler. ISA-specific frame
