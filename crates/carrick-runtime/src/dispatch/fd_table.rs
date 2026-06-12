@@ -546,6 +546,48 @@ fn insert_dirty_range(
     Ok(())
 }
 
+/// macOS pidfd readiness backend: a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
+/// watching the real macOS process (`EVFILT_PROC`/`NOTE_EXIT`+`NOTE_EXITSTATUS`).
+/// Wrapped so `OpenDescription` can keep deriving `Debug` (the trait object is
+/// not `Debug`); the poll fd (the kqueue fd) is the only state callers read.
+#[cfg(feature = "platform-macos")]
+pub(super) struct PidfdWatch {
+    /// Owns the kqueue fd; held only so `Drop` closes it (the registered
+    /// `EVFILT_PROC` watch is reclaimed with it). Never read after construction.
+    /// `Mutex` only to make the otherwise-`!Sync` trait object shareable across
+    /// threads (the dispatcher's `KernelState` must be `Send`); never locked.
+    #[allow(dead_code)]
+    mux: Mutex<Box<dyn carrick_hal::event::EventMultiplexer>>,
+    poll_fd: i32,
+}
+
+#[cfg(feature = "platform-macos")]
+impl PidfdWatch {
+    pub(super) fn new(mux: Box<dyn carrick_hal::event::EventMultiplexer>) -> Self {
+        let poll_fd = mux.poll_fd();
+        Self {
+            mux: Mutex::new(mux),
+            poll_fd,
+        }
+    }
+
+    /// The pollable fd readable when the watched process exits.
+    pub(super) fn poll_fd(&self) -> i32 {
+        self.poll_fd
+    }
+}
+
+#[cfg(feature = "platform-macos")]
+impl std::fmt::Debug for PidfdWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PidfdWatch")
+            .field("poll_fd", &self.poll_fd)
+            // The mux keeps the kqueue fd alive; nothing else to surface.
+            .field("mux", &"<dyn EventMultiplexer>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum OpenDescription {
     File {
@@ -612,6 +654,9 @@ pub(super) enum OpenDescription {
     Pidfd {
         base: OpenDescriptionBase,
         host_pid: i32,
+        #[cfg(feature = "platform-macos")]
+        kqueue: Arc<PidfdWatch>,
+        #[cfg(not(feature = "platform-macos"))]
         kqueue: Arc<crate::darwin_kqueue::Kqueue>,
     },
     /// A Linux inotify instance. Backed by an [`InotifyState`](crate::inotify::InotifyState) (a kqueue +

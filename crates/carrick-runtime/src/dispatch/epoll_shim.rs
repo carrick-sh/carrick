@@ -23,8 +23,20 @@ pub(crate) fn unregister_epoll_kqueue(fd: i32) {
 /// `epoll_wait` re-checks in-memory fd readiness. Call when an eventfd/pipe/
 /// timerfd becomes readable. A coarse broadcast — a spurious wake just makes the
 /// poller recompute and find nothing, which is harmless.
+///
+/// The registry is keyed on each instance's `poll_fd` (the kqueue fd cached by
+/// `EpollKqueue`). On macOS that fd backs the instance's [`EventMultiplexer`],
+/// whose `register_user(0)` armed the `EVFILT_USER(0)` channel; firing it is
+/// exactly what `KqueueMultiplexer::trigger_user` does, so we drive the same
+/// underlying `carrick_bsd::kqueue::trigger_user` on the registered fd (reaching
+/// the instance's mux without threading a handle through the registry).
 pub(crate) fn notify_inmem_epoll() {
     for &fd in EPOLL_INMEM_KQUEUES.lock().iter() {
+        #[cfg(feature = "platform-macos")]
+        let _ = carrick_bsd::kqueue::trigger_user(fd, 0);
+        // Linux drives parked-waiter wakes through the self-wake pipe
+        // (`EpollKqueue::wake_parked`); the kqueue user-trigger is a no-op stub.
+        #[cfg(not(feature = "platform-macos"))]
         let _ = crate::darwin_kqueue::trigger_user(fd, 0);
     }
 }
