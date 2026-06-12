@@ -120,7 +120,6 @@ fn kick_ids(ids: &[u64]) {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn kick_ids(_ids: &[u64]) {}
 
-
 /// Handle for the process-directed signal pump thread. Dropping or stopping it
 /// asks the pump to exit and joins the host thread, which gives the runtime a
 /// fork point with no pump thread alive.

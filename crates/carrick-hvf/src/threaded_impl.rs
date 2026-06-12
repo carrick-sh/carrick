@@ -84,10 +84,9 @@ impl PlatformFutex for HvfFutex {
         // The deadline/slice/interrupt loop is shared (carrick_hal); only the
         // single `os_sync` wait + its macOS-errno classification is HVF-specific.
         carrick_hal::shared_wait_sliced(timeout, interrupted, &|slice_ns| {
-            let slice_us = u32::try_from(
-                (slice_ns / 1_000).min(i64::from(SHARED_FUTEX_MAX_SLICE_US)),
-            )
-            .unwrap_or(SHARED_FUTEX_MAX_SLICE_US);
+            let slice_us =
+                u32::try_from((slice_ns / 1_000).min(i64::from(SHARED_FUTEX_MAX_SLICE_US)))
+                    .unwrap_or(SHARED_FUTEX_MAX_SLICE_US);
             crate::probes::ulock_wait(host_addr as u64, value, slice_us, 0, 0);
             let r = carrick_host::ulock::wait(host_addr, value, slice_us);
             crate::probes::ulock_wait(host_addr as u64, value, slice_us, 1, r);

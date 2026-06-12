@@ -99,10 +99,10 @@ use carrick_signal_core::host_disposition;
 // `has_unblocked_pending_for` are NOT re-exported: HVF defines its own
 // glue-wrapped versions (wakes + xsignal peek) that call the core primitives.
 pub use carrick_signal_core::{
-    NO_PENDING_SIGNAL, clear_proc_pending, clear_thread_pending, forget_thread, has_process_pending,
-    last_sender_for, lowest_pending_signum, pending_bit, pending_thread_tids, proc_pending_fetch_or,
-    record_sender, signal_unblocked_by_mask, take_pending_for, take_pending_in_for,
-    take_process_pending, thread_pending_bit,
+    NO_PENDING_SIGNAL, clear_proc_pending, clear_thread_pending, forget_thread,
+    has_process_pending, last_sender_for, lowest_pending_signum, pending_bit, pending_thread_tids,
+    proc_pending_fetch_or, record_sender, signal_unblocked_by_mask, take_pending_for,
+    take_pending_in_for, take_process_pending, thread_pending_bit,
 };
 
 // The platform-NEUTRAL cross-process xsignal ring core now lives in

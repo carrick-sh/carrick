@@ -64,7 +64,11 @@ impl TimerDelivery for HvfTimerDelivery {
         if kq >= 0 {
             let _ = crate::darwin_kqueue::apply_changes(
                 kq,
-                &[crate::darwin_kqueue::Kevent::timer(ident, libc::EV_DELETE, 0)],
+                &[crate::darwin_kqueue::Kevent::timer(
+                    ident,
+                    libc::EV_DELETE,
+                    0,
+                )],
             );
         }
     }

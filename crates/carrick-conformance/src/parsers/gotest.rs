@@ -165,13 +165,19 @@ FAIL";
 --- PASS: TestNotHex/0xzz (0.00s)
 PASS";
         let r = GotestParser.parse(&raw(out));
-        assert_eq!(r.ids.get("TestAs/As(Errorf(...),_0xADDR)"), Some(&Outcome::Ok));
+        assert_eq!(
+            r.ids.get("TestAs/As(Errorf(...),_0xADDR)"),
+            Some(&Outcome::Ok)
+        );
         // Two different pointer addresses collapse to ONE stable id.
         assert_eq!(r.ids.len(), 3);
         // SHORT hex literals are stable test inputs (hex-encoded IPs), kept
         // verbatim — collapsing them merged distinct subtests and mismatched
         // pre-normalization cached oracle ids.
-        assert_eq!(r.ids.get("TestParseAddr/0xc0.0xa8.0x8c.0xff"), Some(&Outcome::Ok));
+        assert_eq!(
+            r.ids.get("TestParseAddr/0xc0.0xa8.0x8c.0xff"),
+            Some(&Outcome::Ok)
+        );
         // A non-hex "0x" tail is left alone.
         assert_eq!(r.ids.get("TestNotHex/0xzz"), Some(&Outcome::Ok));
     }

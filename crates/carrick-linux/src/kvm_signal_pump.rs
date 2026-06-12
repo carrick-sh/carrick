@@ -249,11 +249,7 @@ fn make_self_pipe() -> i32 {
 /// Spawn the pump daemon thread: block in `poll` on `read_fd`, drain on wake,
 /// then kick every vCPU + nudge the futex so all in-guest threads re-check
 /// `has_process_pending()`.
-fn spawn_pump_thread(
-    read_fd: i32,
-    registry: Arc<dyn VcpuRegistry>,
-    futex: Arc<dyn PlatformFutex>,
-) {
+fn spawn_pump_thread(read_fd: i32, registry: Arc<dyn VcpuRegistry>, futex: Arc<dyn PlatformFutex>) {
     let handle = std::thread::Builder::new()
         .name("carrick-sig-pump".to_string())
         .spawn(move || {
@@ -289,7 +285,11 @@ fn spawn_pump_thread(
                 // the pending bits already record WHICH signals arrived).
                 loop {
                     let r = unsafe {
-                        libc::read(read_fd, drain.as_mut_ptr() as *mut libc::c_void, drain.len())
+                        libc::read(
+                            read_fd,
+                            drain.as_mut_ptr() as *mut libc::c_void,
+                            drain.len(),
+                        )
                     };
                     if r <= 0 {
                         break;

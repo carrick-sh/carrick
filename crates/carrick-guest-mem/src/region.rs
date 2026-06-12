@@ -281,8 +281,16 @@ mod tests {
         let pa = a.as_mut_ptr();
         let pb = b.as_mut_ptr();
         let regions = [
-            GuestMemoryRegion { base: 0x4000, len: 0x1000, host_addr: pa },
-            GuestMemoryRegion { base: 0x9000, len: 0x1000, host_addr: pb },
+            GuestMemoryRegion {
+                base: 0x4000,
+                len: 0x1000,
+                host_addr: pa,
+            },
+            GuestMemoryRegion {
+                base: 0x9000,
+                len: 0x1000,
+                host_addr: pb,
+            },
         ];
         let (r, off) = find_region_for_gpa(&regions, 0x9100, 0x10).expect("hit b");
         assert_eq!(r.base, 0x9000);
@@ -298,8 +306,16 @@ mod tests {
         // straddling the boundary fits NEITHER region wholly → miss. (Whole-range
         // single-region containment, the flat-window invariant.)
         let regions = [
-            GuestMemoryRegion { base: 0x4000, len: 0x1000, host_addr: a.as_mut_ptr() },
-            GuestMemoryRegion { base: 0x5000, len: 0x1000, host_addr: b.as_mut_ptr() },
+            GuestMemoryRegion {
+                base: 0x4000,
+                len: 0x1000,
+                host_addr: a.as_mut_ptr(),
+            },
+            GuestMemoryRegion {
+                base: 0x5000,
+                len: 0x1000,
+                host_addr: b.as_mut_ptr(),
+            },
         ];
         assert!(find_region_for_gpa(&regions, 0x4ff0, 0x20).is_none());
     }
@@ -363,8 +379,16 @@ mod tests {
         let shared_ptr = shared.as_mut_ptr();
         let overlay_ptr = overlay.as_mut_ptr();
         let regions = [
-            GuestMemoryRegion { base: 0x4000, len: 0x1000, host_addr: shared_ptr },
-            GuestMemoryRegion { base: 0x9000, len: 0x1000, host_addr: overlay_ptr },
+            GuestMemoryRegion {
+                base: 0x4000,
+                len: 0x1000,
+                host_addr: shared_ptr,
+            },
+            GuestMemoryRegion {
+                base: 0x9000,
+                len: 0x1000,
+                host_addr: overlay_ptr,
+            },
         ];
         // The lookup follows the IPA (0x9040 -> overlay backing), NOT the VA.
         let p = safe_guest_access_translated_in(
@@ -415,8 +439,16 @@ mod tests {
         let mut a = vec![0u8; 0x1000];
         let mut b = vec![0u8; 0x1000];
         let regions = [
-            GuestMemoryRegion { base: 0x4000, len: 0x1000, host_addr: a.as_mut_ptr() },
-            GuestMemoryRegion { base: 0x9000, len: 0x1000, host_addr: b.as_mut_ptr() },
+            GuestMemoryRegion {
+                base: 0x4000,
+                len: 0x1000,
+                host_addr: a.as_mut_ptr(),
+            },
+            GuestMemoryRegion {
+                base: 0x9000,
+                len: 0x1000,
+                host_addr: b.as_mut_ptr(),
+            },
         ];
         // find_region_in (projected by value) agrees with find_region_for_gpa.
         let by_slice = find_region_for_gpa(&regions, 0x9100, 0x10);
@@ -438,8 +470,20 @@ mod tests {
     #[test]
     fn error_maps_to_out_of_bounds_memory_error() {
         let e = GuestAccessError::NoAccess.map_to_memory_error(0x1234, 8);
-        assert_eq!(e, MemoryError::OutOfBounds { address: 0x1234, length: 8 });
+        assert_eq!(
+            e,
+            MemoryError::OutOfBounds {
+                address: 0x1234,
+                length: 8
+            }
+        );
         let e = GuestAccessError::OutOfBounds.map_to_memory_error(0x1234, 8);
-        assert_eq!(e, MemoryError::OutOfBounds { address: 0x1234, length: 8 });
+        assert_eq!(
+            e,
+            MemoryError::OutOfBounds {
+                address: 0x1234,
+                length: 8
+            }
+        );
     }
 }

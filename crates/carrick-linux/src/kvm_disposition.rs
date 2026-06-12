@@ -74,7 +74,10 @@ use carrick_signal_core::host_disposition;
 /// HVF for the same "carrick keeps its own" reason; here the pump owns it.)
 pub fn is_kvm_claimed(signum: i32) -> bool {
     // The four pumped process-directed signals.
-    if matches!(signum, libc::SIGHUP | libc::SIGINT | libc::SIGQUIT | libc::SIGTERM) {
+    if matches!(
+        signum,
+        libc::SIGHUP | libc::SIGINT | libc::SIGQUIT | libc::SIGTERM
+    ) {
         return true;
     }
     // SIGCHLD: the reaper owns it.
@@ -153,7 +156,10 @@ pub fn ensure_host_handler(signum: i32) {
     if host_disposition::mark_installed(signum) {
         return;
     }
-    install_sigaction(signum, kvm_routed_handler as *const () as libc::sighandler_t);
+    install_sigaction(
+        signum,
+        kvm_routed_handler as *const () as libc::sighandler_t,
+    );
 }
 
 /// Mirror a guest `SIG_IGN` onto the HOST disposition so a sibling guest
@@ -259,7 +265,10 @@ mod tests {
         for s in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
             assert!(is_kvm_claimed(s), "pumped signal {s} must be KVM-claimed");
         }
-        assert!(is_kvm_claimed(libc::SIGCHLD), "SIGCHLD reaper is KVM-claimed");
+        assert!(
+            is_kvm_claimed(libc::SIGCHLD),
+            "SIGCHLD reaper is KVM-claimed"
+        );
         assert!(is_kvm_claimed(libc::SIGRTMIN()), "the kick is KVM-claimed");
         assert!(
             is_kvm_claimed(libc::SIGRTMIN() + 1),
@@ -271,7 +280,10 @@ mod tests {
     fn standard_catchable_signals_are_not_kvm_claimed() {
         // SIGUSR1(10)/SIGUSR2(12)/SIGALRM(14): mirrorable, not claimed.
         for s in [10, 12, 14] {
-            assert!(!is_kvm_claimed(s), "standard signal {s} must not be claimed");
+            assert!(
+                !is_kvm_claimed(s),
+                "standard signal {s} must not be claimed"
+            );
         }
     }
 
@@ -286,7 +298,10 @@ mod tests {
         assert!(!kvm_routable(libc::SIGRTMIN()));
         // Not routable: the synchronous-fault set (neutral base excludes it).
         for s in [4, 5, 6, 7, 8, 11] {
-            assert!(!kvm_routable(s), "fault signum {s} must never be KVM-routable");
+            assert!(
+                !kvm_routable(s),
+                "fault signum {s} must never be KVM-routable"
+            );
         }
         // Not routable: uncatchable.
         assert!(!kvm_routable(9)); // SIGKILL
@@ -307,7 +322,10 @@ mod tests {
         host_disposition::clear_installed(SIG);
 
         ensure_host_handler(SIG);
-        assert!(host_disposition::is_installed(SIG), "handler marks installed");
+        assert!(
+            host_disposition::is_installed(SIG),
+            "handler marks installed"
+        );
         // Idempotent second install: still installed, no panic.
         ensure_host_handler(SIG);
         assert!(host_disposition::is_installed(SIG));
@@ -322,7 +340,10 @@ mod tests {
 
         // Re-route then SIG_DFL: default also clears the install bit.
         ensure_host_handler(SIG);
-        assert!(host_disposition::is_installed(SIG), "re-install marks installed");
+        assert!(
+            host_disposition::is_installed(SIG),
+            "re-install marks installed"
+        );
         set_host_default(SIG);
         assert!(
             !host_disposition::is_installed(SIG),
@@ -356,7 +377,10 @@ mod tests {
             "SIGPIPE must be KVM-claimed (carrick-cli owns its process-wide SIG_IGN)"
         );
         // Therefore not routable, so every disposition fn no-ops.
-        assert!(!kvm_routable(libc::SIGPIPE), "SIGPIPE must never be KVM-routable");
+        assert!(
+            !kvm_routable(libc::SIGPIPE),
+            "SIGPIPE must never be KVM-routable"
+        );
 
         // Each of the four disposition fns must be a no-op: they must not mark the
         // install mask nor (since kvm_routable gates first) touch the host

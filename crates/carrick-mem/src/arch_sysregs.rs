@@ -69,8 +69,7 @@ pub const TCR_EL1_BOOTSTRAP: u64 = {
 /// KVM_EXIT_MMIO). HVF leaves SPAN clear and forces PSTATE.PAN=1 with a
 /// FEAT_PAN3 workaround instead. SPAN therefore stays per-backend PAN glue and
 /// is NOT part of this shared constant.
-pub const SCTLR_EL1_BOOTSTRAP: u64 =
-    (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 26) | 1;
+pub const SCTLR_EL1_BOOTSTRAP: u64 = (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 26) | 1;
 
 /// `CPACR_EL1` bootstrap value — `FPEN=0b11` (no FP/SIMD trap at EL0). Without
 /// this, the guest libc's first NEON `memset`/`dup` faults on startup.

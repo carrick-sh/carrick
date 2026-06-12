@@ -241,7 +241,11 @@ pub fn el1_maintenance_sentinel_bytes() -> Vec<u8> {
     put(&mut bytes, 8, ENC_DSB_SY);
     put(&mut bytes, 12, ENC_ISB);
     // movz/movk x9, MAINT_SENTINEL_GPA; str x8,[x9] — the completion MMIO store.
-    put(&mut bytes, 16, enc_movz_x9((MAINT_SENTINEL_GPA & 0xFFFF) as u16, 0));
+    put(
+        &mut bytes,
+        16,
+        enc_movz_x9((MAINT_SENTINEL_GPA & 0xFFFF) as u16, 0),
+    );
     put(
         &mut bytes,
         20,
@@ -723,7 +727,9 @@ impl GuestRam {
             .protections
             .snapshot()
             .into_iter()
-            .filter(|&(s, e)| e > gpa.saturating_sub(0x100_0000) && s < gpa.saturating_add(0x100_0000))
+            .filter(|&(s, e)| {
+                e > gpa.saturating_sub(0x100_0000) && s < gpa.saturating_add(0x100_0000)
+            })
             .map(|(s, e)| format!("[0x{s:x}..0x{e:x})"))
             .collect();
         let mut wins: Vec<String> = self

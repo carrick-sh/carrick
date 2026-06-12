@@ -412,7 +412,11 @@ mod tests {
         run_fallback(which, generation, 1_000, 0, move || {
             fires2.fetch_add(1, Ordering::SeqCst);
         });
-        assert_eq!(fires.load(Ordering::SeqCst), 1, "one-shot CPU timer fires once");
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "one-shot CPU timer fires once"
+        );
         disarm(which);
         carrick_host::guest_cpu::reset();
     }

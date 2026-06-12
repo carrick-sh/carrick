@@ -355,8 +355,8 @@ mod tests {
         assert_eq!(lowest_pending_signum_for(4242), 9);
         // The drainer consumes ONE signum per call (lowest-first), not the whole
         // mask at once; reconstruct the published mask from the two takes.
-        let taken = thread_pending_bit(take_pending_for(4242))
-            | thread_pending_bit(take_pending_for(4242));
+        let taken =
+            thread_pending_bit(take_pending_for(4242)) | thread_pending_bit(take_pending_for(4242));
         assert_eq!(taken, pending_bit(9).unwrap() | pending_bit(17).unwrap());
         assert!(!has_pending_for(4242));
         forget_thread(4242);

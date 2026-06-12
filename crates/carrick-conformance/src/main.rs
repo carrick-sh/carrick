@@ -230,7 +230,8 @@ fn run() -> anyhow::Result<ExitCode> {
     // overlay is absent/empty). A divergence is "expected" iff it matches the
     // shared baseline OR the overlay; the KVM lane carries an (initially empty)
     // overlay so every KVM-only divergence is a gap until proven environmental.
-    let baseline = load_baseline(&args.baseline).with_overlay(load_baseline(&args.baseline_overlay));
+    let baseline =
+        load_baseline(&args.baseline).with_overlay(load_baseline(&args.baseline_overlay));
 
     let pid = std::process::id();
     let carrick_bin = args.carrick_bin.to_string_lossy().into_owned();

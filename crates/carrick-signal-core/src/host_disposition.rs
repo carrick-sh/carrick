@@ -122,12 +122,24 @@ mod tests {
     #[test]
     fn standard_catchable_signals_are_routable() {
         // The signals a sibling's host kill could otherwise terminate us with.
-        for sig in [10 /*SIGUSR1*/, 12 /*SIGUSR2*/, 14 /*SIGALRM*/, 13 /*SIGPIPE*/] {
-            assert!(is_host_routable(sig), "signum {sig} should be host-routable");
+        for sig in [
+            10, /*SIGUSR1*/
+            12, /*SIGUSR2*/
+            14, /*SIGALRM*/
+            13, /*SIGPIPE*/
+        ] {
+            assert!(
+                is_host_routable(sig),
+                "signum {sig} should be host-routable"
+            );
         }
         // Job-control SIGTSTP/SIGTTIN/SIGTTOU are routable (a guest may mirror an
         // ignore onto them, e.g. a job-control shell).
-        for sig in [20 /*SIGTSTP*/, 21 /*SIGTTIN*/, 22 /*SIGTTOU*/] {
+        for sig in [
+            20, /*SIGTSTP*/
+            21, /*SIGTTIN*/
+            22, /*SIGTTOU*/
+        ] {
             assert!(is_host_routable(sig), "job-control signum {sig} routable");
         }
     }
@@ -139,7 +151,14 @@ mod tests {
         assert!(!is_host_routable(19), "SIGSTOP must never be host-routed");
         assert!(!is_host_routable(18), "SIGCONT keeps its host default");
         // The synchronous-fault set arrives as vmexits, never host kills.
-        for sig in [4 /*ILL*/, 5 /*TRAP*/, 6 /*ABRT*/, 7 /*BUS*/, 8 /*FPE*/, 11 /*SEGV*/] {
+        for sig in [
+            4,  /*ILL*/
+            5,  /*TRAP*/
+            6,  /*ABRT*/
+            7,  /*BUS*/
+            8,  /*FPE*/
+            11, /*SEGV*/
+        ] {
             assert!(
                 !is_host_routable(sig),
                 "fault signum {sig} must never be host-routed"

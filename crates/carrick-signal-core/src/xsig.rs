@@ -281,7 +281,13 @@ mod tests {
         // (ready) state — the drain gate is `== 2`, so a slot stuck at `1`
         // (claimed-but-unpublished) would NOT be returned. Getting the entry back
         // proves the publish store landed and the consumer gate matches.
-        assert!(xsig_enqueue(me, 13, 7777, 1234, 0x1234_5678_9abc_def0_u64 as i64));
+        assert!(xsig_enqueue(
+            me,
+            13,
+            7777,
+            1234,
+            0x1234_5678_9abc_def0_u64 as i64
+        ));
 
         // The entire payload tuple survives the MAP_SHARED round-trip intact,
         // reinforcing that the single `used = 2` Release publishes ALL the
