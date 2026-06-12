@@ -546,14 +546,16 @@ fn insert_dirty_range(
     Ok(())
 }
 
-/// macOS pidfd readiness backend: a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
-/// watching the real macOS process (`EVFILT_PROC`/`NOTE_EXIT`+`NOTE_EXITSTATUS`).
-/// Wrapped so `OpenDescription` can keep deriving `Debug` (the trait object is
-/// not `Debug`); the poll fd (the kqueue fd) is the only state callers read.
-#[cfg(feature = "platform-macos")]
+/// Pidfd readiness backend: a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
+/// watching the real host process. On macOS the backend is kqueue
+/// (`EVFILT_PROC`/`NOTE_EXIT`+`NOTE_EXITSTATUS`); on Linux it is the
+/// `EpollMultiplexer` (a real `pidfd_open(2)` added to the epoll set). Wrapped so
+/// `OpenDescription` can keep deriving `Debug` (the trait object is not `Debug`);
+/// the poll fd (the kqueue fd on macOS, the pidfd-bearing epoll fd on Linux) is
+/// the only state callers read.
 pub(super) struct PidfdWatch {
-    /// Owns the kqueue fd; held only so `Drop` closes it (the registered
-    /// `EVFILT_PROC` watch is reclaimed with it). Never read after construction.
+    /// Owns the backing fds; held only so `Drop` closes them (the registered
+    /// process-exit watch is reclaimed with it). Never read after construction.
     /// `Mutex` only to make the otherwise-`!Sync` trait object shareable across
     /// threads (the dispatcher's `KernelState` must be `Send`); never locked.
     #[allow(dead_code)]
@@ -561,7 +563,6 @@ pub(super) struct PidfdWatch {
     poll_fd: i32,
 }
 
-#[cfg(feature = "platform-macos")]
 impl PidfdWatch {
     pub(super) fn new(mux: Box<dyn carrick_hal::event::EventMultiplexer>) -> Self {
         let poll_fd = mux.poll_fd();
@@ -577,7 +578,6 @@ impl PidfdWatch {
     }
 }
 
-#[cfg(feature = "platform-macos")]
 impl std::fmt::Debug for PidfdWatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PidfdWatch")
@@ -654,10 +654,10 @@ pub(super) enum OpenDescription {
     Pidfd {
         base: OpenDescriptionBase,
         host_pid: i32,
-        #[cfg(feature = "platform-macos")]
+        /// The readiness backend (kqueue on macOS, epoll+pidfd on Linux). Named
+        /// `kqueue` for historical continuity; both platforms now route through
+        /// the `EventMultiplexer` via [`PidfdWatch`].
         kqueue: Arc<PidfdWatch>,
-        #[cfg(not(feature = "platform-macos"))]
-        kqueue: Arc<crate::darwin_kqueue::Kqueue>,
     },
     /// A Linux inotify instance. Backed by an [`InotifyState`](crate::inotify::InotifyState) (a kqueue +
     /// `EVFILT_VNODE` watch table); like `Pidfd`/`TimerFd` it is a pollable,

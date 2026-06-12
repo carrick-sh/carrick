@@ -165,7 +165,13 @@ pub struct PollEvent {
     pub error: Option<i32>,
     /// → `EPOLLHUP`.
     pub eof: bool,
-    /// `NOTE_EXITSTATUS`.
+    /// For a process-exit readiness (`watch_process_exit`), the exited
+    /// process's BARE exit code: `WEXITSTATUS` on a normal exit, or
+    /// `128 + signal` on a signal death (the shell convention). `None` for a
+    /// non-exit event. This is the value the guest's `waitid(P_PIDFD)`
+    /// `si_status` should reflect, NOT a raw `waitpid(2)` status word — both the
+    /// macOS kqueue backend (which decodes its `NOTE_EXITSTATUS` data) and the
+    /// Linux epoll backend (which peeks `waitid(P_PIDFD)`) normalize to it.
     pub exit_status: Option<i32>,
     /// For an `EVFILT_VNODE`/inotify readiness, the precise filesystem events
     /// that fired (the kqueue `NOTE_*` fflags expressed structurally). `None`
