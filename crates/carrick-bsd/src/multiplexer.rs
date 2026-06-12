@@ -1,5 +1,7 @@
 //! macOS/FreeBSD EventMultiplexer implementation based on kqueue.
 
+#[cfg(target_os = "macos")]
+use crate::kqueue::NOTE_EXITSTATUS;
 use crate::kqueue::{EVFILT_EXCEPT, Kevent, Kqueue, NOTE_OOB};
 use carrick_hal::error::OsError;
 use carrick_hal::event::{
@@ -135,6 +137,7 @@ impl EventMultiplexer for KqueueMultiplexer {
 
             let mut readiness = Readiness::empty();
             let mut is_eof = false;
+            #[cfg_attr(target_os = "freebsd", allow(unused_mut))]
             let mut exit_status = None;
 
             match filter {
@@ -163,7 +166,9 @@ impl EventMultiplexer for KqueueMultiplexer {
                     if fflags & libc::NOTE_EXIT != 0 {
                         is_eof = true;
                     }
-                    if fflags & libc::NOTE_EXITSTATUS != 0 {
+                    // NOTE_EXITSTATUS is macOS-only; on FreeBSD it is 0 (no-op).
+                    #[cfg(target_os = "macos")]
+                    if fflags & NOTE_EXITSTATUS != 0 {
                         exit_status = Some(ev.data() as i32);
                     }
                 }
