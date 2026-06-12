@@ -32,3 +32,7 @@ pub mod signal_arrival;
 pub use signal_arrival::SignalArrival;
 pub mod timer_delivery;
 pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery};
+pub mod guest_arch;
+pub use guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallTable};
+pub mod aarch64_arch;
+pub use aarch64_arch::{Aarch64GuestArch, Aarch64Mmu, Aarch64SyscallTable};

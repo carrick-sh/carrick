@@ -5248,6 +5248,7 @@ impl carrick_hal::RegAccess for HvfTrapEngine {
 unsafe impl Send for HvfTrapEngine {}
 
 impl carrick_hal::ThreadedEngine for HvfTrapEngine {
+    type Arch = carrick_hal::Aarch64GuestArch;
     type KickHandle = crate::vcpu_kick::VcpuKickHandle;
     type SiblingSpec = ThreadSpec;
 
