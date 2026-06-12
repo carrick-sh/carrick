@@ -19,7 +19,12 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+#[cfg(not(feature = "platform-macos"))]
 use crate::darwin_kqueue::{Kevent, Kqueue};
+#[cfg(feature = "platform-macos")]
+use carrick_hal::event::{EventMultiplexer, PollEvent, VnodeEvents};
+#[cfg(feature = "platform-macos")]
+use std::time::Duration;
 
 // Linux inotify event/mask bits (asm-generic, shared by aarch64).
 pub(crate) const IN_ACCESS: u32 = 0x0000_0001;
@@ -48,6 +53,12 @@ const LINUX_ENOSPC: i32 = 28;
 /// Map a Linux watch mask to the Darwin `EVFILT_VNODE` `NOTE_*` flags to
 /// request. A mask with no recognized data-changing bit still watches the
 /// common set so a broad `IN_ALL_EVENTS` watch behaves sensibly.
+///
+/// On macOS the live registration path uses [`linux_mask_to_vnode_events`]
+/// instead (the `EventMultiplexer` register API takes structural `VnodeEvents`),
+/// so this is only compiled for the non-macOS kqueue path and the round-trip
+/// test.
+#[cfg(any(not(feature = "platform-macos"), test))]
 fn linux_mask_to_note(mask: u32) -> u32 {
     let mut note = 0;
     if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS | IN_CREATE | IN_DELETE) != 0 {
@@ -69,6 +80,36 @@ fn linux_mask_to_note(mask: u32) -> u32 {
             | carrick_portable::NOTE_DELETE;
     }
     note
+}
+
+/// macOS analogue of [`linux_mask_to_note`] producing the [`VnodeEvents`] the
+/// [`EventMultiplexer`] register API consumes. Mirrors `linux_mask_to_note`
+/// bit-for-bit so the kqueue registration is behavior-identical: the same
+/// `NOTE_*` set is requested, just expressed structurally.
+#[cfg(feature = "platform-macos")]
+fn linux_mask_to_vnode_events(mask: u32) -> VnodeEvents {
+    let mut ev = VnodeEvents::default();
+    if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS | IN_CREATE | IN_DELETE) != 0 {
+        ev.write = true;
+        ev.extend = true;
+    }
+    if mask & IN_ATTRIB != 0 {
+        ev.attrib = true;
+    }
+    if mask & (IN_DELETE_SELF | IN_DELETE) != 0 {
+        ev.delete = true;
+    }
+    if mask & (IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO) != 0 {
+        ev.rename = true;
+    }
+    if !(ev.write || ev.extend || ev.attrib || ev.delete || ev.rename) {
+        // Broad fallback identical to linux_mask_to_note's: WRITE|EXTEND|ATTRIB|DELETE.
+        ev.write = true;
+        ev.extend = true;
+        ev.attrib = true;
+        ev.delete = true;
+    }
+    ev
 }
 
 /// Translate the `NOTE_*` fflags of a fired vnode event back into a Linux
@@ -122,15 +163,56 @@ struct Inner {
     pending: VecDeque<Vec<u8>>,
 }
 
-/// One inotify instance: a kqueue plus its watch-descriptor table. Owns every
-/// watched fd and closes them on `rm_watch`/drop.
-#[derive(Debug)]
+/// One inotify instance: a readiness multiplexer plus its watch-descriptor
+/// table. Owns every watched fd and closes them on `rm_watch`/drop.
+///
+/// On macOS the multiplexer is a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
+/// (kqueue-backed via `EVFILT_VNODE`); the watch register/drain go through the
+/// trait. On non-macOS there is no multiplexer yet (Part C Phase 2), so the
+/// backend stays the dummy `Kqueue` exactly as before — `new()` returns `None`
+/// there, matching the historical "inotify unavailable off-macOS" behavior.
 pub(crate) struct InotifyState {
+    /// The readiness backend. `Mutex` because the trait's register/drain methods
+    /// need `&mut` yet `InotifyState` is shared via `Arc` and exposes `&self`
+    /// methods; the lock is only ever held for a non-blocking kqueue change or a
+    /// zero-timeout drain.
+    #[cfg(feature = "platform-macos")]
+    mux: Mutex<Box<dyn EventMultiplexer>>,
+    /// Cached `mux.poll_fd()` — stable for the instance's life, read lock-free.
+    #[cfg(feature = "platform-macos")]
+    poll_fd: RawFd,
+    #[cfg(not(feature = "platform-macos"))]
     kqueue: Kqueue,
     inner: Mutex<Inner>,
 }
 
+impl std::fmt::Debug for InotifyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn EventMultiplexer` is not `Debug`; expose the stable poll fd only.
+        f.debug_struct("InotifyState")
+            .field("poll_fd", &self.poll_fd())
+            .finish_non_exhaustive()
+    }
+}
+
 impl InotifyState {
+    #[cfg(feature = "platform-macos")]
+    pub(crate) fn new() -> Option<Self> {
+        let mux = crate::event_mux::make_event_multiplexer().ok()?;
+        let poll_fd = mux.poll_fd();
+        Some(Self {
+            mux: Mutex::new(mux),
+            poll_fd,
+            inner: Mutex::new(Inner {
+                next_wd: 1,
+                watches: HashMap::new(),
+                wd_by_fd: HashMap::new(),
+                pending: VecDeque::new(),
+            }),
+        })
+    }
+
+    #[cfg(not(feature = "platform-macos"))]
     pub(crate) fn new() -> Option<Self> {
         Kqueue::new_internal().map(|kqueue| Self {
             kqueue,
@@ -143,8 +225,17 @@ impl InotifyState {
         })
     }
 
+    /// The backing multiplexer's pollable fd (the kqueue fd on macOS), so
+    /// poll/epoll/blocking-read can wait on inotify readiness the same way they
+    /// do for timerfd/pidfd.
+    #[cfg(feature = "platform-macos")]
+    pub(crate) fn poll_fd(&self) -> RawFd {
+        self.poll_fd
+    }
+
     /// The backing kqueue's fd, so poll/epoll/blocking-read can wait on inotify
     /// readiness the same way they do for timerfd/pidfd.
+    #[cfg(not(feature = "platform-macos"))]
     pub(crate) fn poll_fd(&self) -> RawFd {
         self.kqueue.raw_fd()
     }
@@ -164,13 +255,29 @@ impl InotifyState {
         if watch_fds.is_empty() {
             return Err(LINUX_EINVAL);
         }
-        let note = linux_mask_to_note(mask);
         let host_fds: Vec<RawFd> = watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect();
-        let events: Vec<Kevent> = host_fds
-            .iter()
-            .map(|host_fd| Kevent::vnode(*host_fd, note))
-            .collect();
-        if self.kqueue.apply(&events).is_err() {
+
+        // Register each watched vnode for the requested `NOTE_*` set. The token
+        // is the host fd so `read_records` can map a fired event back to its wd.
+        #[cfg(feature = "platform-macos")]
+        let registered = {
+            let events = linux_mask_to_vnode_events(mask);
+            let mut mux = self.mux.lock();
+            host_fds.iter().try_for_each(|host_fd| {
+                mux.register_vnode(*host_fd, *host_fd as u64, events)
+                    .map_err(|_| ())
+            })
+        };
+        #[cfg(not(feature = "platform-macos"))]
+        let registered = {
+            let note = linux_mask_to_note(mask);
+            let events: Vec<Kevent> = host_fds
+                .iter()
+                .map(|host_fd| Kevent::vnode(*host_fd, note))
+                .collect();
+            self.kqueue.apply(&events).map_err(|_| ())
+        };
+        if registered.is_err() {
             // Registration failed: we own the fds, so don't leak them.
             for host_fd in host_fds {
                 unsafe { libc::close(host_fd) };
@@ -220,7 +327,14 @@ impl InotifyState {
         };
         for host_fd in watch.host_fds {
             inner.wd_by_fd.remove(&host_fd);
-            let _ = self.kqueue.apply(&[Kevent::vnode_delete(host_fd)]);
+            #[cfg(feature = "platform-macos")]
+            {
+                let _ = self.mux.lock().deregister(host_fd);
+            }
+            #[cfg(not(feature = "platform-macos"))]
+            {
+                let _ = self.kqueue.apply(&[Kevent::vnode_delete(host_fd)]);
+            }
             unsafe { libc::close(host_fd) };
         }
         Ok(())
@@ -234,18 +348,40 @@ impl InotifyState {
     /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
     /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
-        let mut events = [Kevent::empty(); 32];
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
+        // Non-blocking drain of newly-ready vnode changes, normalized to a list
+        // of `(watched host fd, fired NOTE_* fflags)` so the record-encode /
+        // dir-diff logic below is platform-neutral.
+        #[cfg(feature = "platform-macos")]
+        let fired: Vec<(RawFd, u32)> = {
+            let mut out: Vec<PollEvent> = Vec::new();
+            let _ = self.mux.lock().wait(&mut out, Some(Duration::ZERO));
+            out.iter()
+                .map(|ev| {
+                    // The token is the watched host fd (set at register_vnode).
+                    let fd = ev.token as RawFd;
+                    let fflags = ev.vnode.map(|v| v.to_note()).unwrap_or(0);
+                    (fd, fflags)
+                })
+                .collect()
         };
-        let n = self
-            .kqueue
-            .wait(&[], &mut events, Some(&timeout))
-            .unwrap_or(0);
+        #[cfg(not(feature = "platform-macos"))]
+        let fired: Vec<(RawFd, u32)> = {
+            let mut events = [Kevent::empty(); 32];
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let n = self
+                .kqueue
+                .wait(&[], &mut events, Some(&timeout))
+                .unwrap_or(0);
+            events[..n]
+                .iter()
+                .map(|ev| (ev.vnode_ident(), ev.fflags()))
+                .collect()
+        };
         let mut inner = self.inner.lock();
-        for ev in &events[..n] {
-            let fd = ev.vnode_ident();
+        for &(fd, fflags) in &fired {
             let Some(watched) = inner.wd_by_fd.get(&fd).cloned() else {
                 continue;
             };
@@ -259,7 +395,7 @@ impl InotifyState {
                 inner.pending.extend(records);
                 continue;
             }
-            let mask = note_to_linux_mask(ev.fflags(), requested);
+            let mask = note_to_linux_mask(fflags, requested);
             if mask == 0 {
                 continue;
             }

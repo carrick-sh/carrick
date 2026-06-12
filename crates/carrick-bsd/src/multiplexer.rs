@@ -141,6 +141,7 @@ impl EventMultiplexer for KqueueMultiplexer {
             let mut is_eof = false;
             #[cfg_attr(target_os = "freebsd", allow(unused_mut))]
             let mut exit_status = None;
+            let mut vnode = None;
 
             match filter {
                 libc::EVFILT_READ => {
@@ -165,6 +166,9 @@ impl EventMultiplexer for KqueueMultiplexer {
                 }
                 libc::EVFILT_VNODE => {
                     readiness.read = true;
+                    // Carry the precise filesystem events so the inotify
+                    // emulation can derive the exact Linux `inotify_event` mask.
+                    vnode = Some(VnodeEvents::from_note(fflags));
                 }
                 libc::EVFILT_PROC => {
                     readiness.read = true;
@@ -201,6 +205,7 @@ impl EventMultiplexer for KqueueMultiplexer {
                 error,
                 eof: is_eof,
                 exit_status,
+                vnode,
             });
         }
         Ok(n)

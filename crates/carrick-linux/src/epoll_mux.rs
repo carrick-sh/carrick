@@ -439,6 +439,7 @@ impl EventMultiplexer for EpollMultiplexer {
                     error: None,
                     eof: false,
                     exit_status: None,
+                    vnode: None,
                 });
                 continue;
             }
@@ -464,6 +465,7 @@ impl EventMultiplexer for EpollMultiplexer {
                     error: None,
                     eof: false,
                     exit_status: None,
+                    vnode: None,
                 });
                 continue;
             }
@@ -478,6 +480,7 @@ impl EventMultiplexer for EpollMultiplexer {
                     error: None,
                     eof: true,
                     exit_status,
+                    vnode: None,
                 });
                 continue;
             }
@@ -507,6 +510,7 @@ impl EventMultiplexer for EpollMultiplexer {
                 error,
                 eof,
                 exit_status: None,
+                vnode: None,
             });
         }
 
@@ -549,6 +553,7 @@ impl EpollMultiplexer {
                         error: None,
                         eof: ev.mask & (libc::IN_IGNORED | libc::IN_DELETE_SELF) != 0,
                         exit_status: None,
+                        vnode: None,
                     });
                 }
                 off += hdr + len;

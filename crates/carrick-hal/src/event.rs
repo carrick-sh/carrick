@@ -94,6 +94,28 @@ impl VnodeEvents {
         }
         note
     }
+
+    /// Inverse of [`to_note`](Self::to_note): decode the `NOTE_*` fflags a fired
+    /// `EVFILT_VNODE` event carried back into structural events.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    pub fn from_note(note: u32) -> Self {
+        Self {
+            delete: note & libc::NOTE_DELETE != 0,
+            write: note & libc::NOTE_WRITE != 0,
+            extend: note & libc::NOTE_EXTEND != 0,
+            attrib: note & libc::NOTE_ATTRIB != 0,
+            link: note & libc::NOTE_LINK != 0,
+            rename: note & libc::NOTE_RENAME != 0,
+            revoke: note & libc::NOTE_REVOKE != 0,
+        }
+    }
 }
 
 /// What the caller learns about a token's readiness.
@@ -145,6 +167,13 @@ pub struct PollEvent {
     pub eof: bool,
     /// `NOTE_EXITSTATUS`.
     pub exit_status: Option<i32>,
+    /// For an `EVFILT_VNODE`/inotify readiness, the precise filesystem events
+    /// that fired (the kqueue `NOTE_*` fflags expressed structurally). `None`
+    /// for non-vnode events. The macOS inotify emulation needs these to derive
+    /// the exact Linux `inotify_event` mask (modify vs delete-self vs
+    /// move-self); the Linux `EpollMultiplexer` demuxes inotify internally and
+    /// leaves this `None`.
+    pub vnode: Option<VnodeEvents>,
 }
 
 pub trait EventMultiplexer: Send {

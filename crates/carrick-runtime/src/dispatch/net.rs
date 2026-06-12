@@ -345,7 +345,11 @@ impl SyscallDispatcher {
                 // broadcast needed (the robust path for Go's netpollBreak).
                 OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => Some(state.read_fd),
                 // A pidfd is read-ready when its process exits; the backing
-                // kqueue's own fd is what poll/epoll watch (EVFILT_PROC fires).
+                // multiplexer's poll fd (the kqueue fd) is what poll/epoll watch
+                // (EVFILT_PROC fires).
+                #[cfg(feature = "platform-macos")]
+                OpenDescription::Pidfd { kqueue, .. } => Some(kqueue.poll_fd()),
+                #[cfg(not(feature = "platform-macos"))]
                 OpenDescription::Pidfd { kqueue, .. } => Some(kqueue.raw_fd()),
                 // inotify readiness is the backing kqueue's fd, so poll/epoll/
                 // blocking-read wait on it natively.

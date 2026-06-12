@@ -542,19 +542,39 @@ impl SyscallDispatcher {
     /// `CLONE_PIDFD` fork path. Registers `EVFILT_PROC`/`NOTE_EXIT` so the fd
     /// becomes readable when the process exits.
     pub(super) fn open_pidfd(&self, host_pid: i32, status_flags: u64) -> DispatchOutcome {
-        let Some(kqueue) = crate::darwin_kqueue::Kqueue::new_internal() else {
-            return crate::linux_abi::LINUX_EMFILE.into();
+        // Watch the real macOS process for exit (the kqueue arms
+        // `NOTE_EXIT|NOTE_EXITSTATUS`, so the guest reads the pidfd's exit code).
+        // The token is the host pid (no consumer reads it back today, but it
+        // keeps the registration self-describing).
+        #[cfg(feature = "platform-macos")]
+        let kqueue = {
+            let mut mux = match crate::event_mux::make_event_multiplexer() {
+                Ok(m) => m,
+                Err(_) => return crate::linux_abi::LINUX_EMFILE.into(),
+            };
+            if mux.watch_process_exit(host_pid, host_pid as u64).is_err() {
+                // No such process (already reaped, or never existed).
+                return crate::linux_abi::LINUX_ESRCH.into();
+            }
+            std::sync::Arc::new(PidfdWatch::new(mux))
         };
-        if kqueue
-            .apply(&[crate::darwin_kqueue::Kevent::proc_exit(host_pid)])
-            .is_err()
-        {
-            // No such process (already reaped, or never existed).
-            return crate::linux_abi::LINUX_ESRCH.into();
-        }
+        #[cfg(not(feature = "platform-macos"))]
+        let kqueue = {
+            let Some(kqueue) = crate::darwin_kqueue::Kqueue::new_internal() else {
+                return crate::linux_abi::LINUX_EMFILE.into();
+            };
+            if kqueue
+                .apply(&[crate::darwin_kqueue::Kevent::proc_exit(host_pid)])
+                .is_err()
+            {
+                // No such process (already reaped, or never existed).
+                return crate::linux_abi::LINUX_ESRCH.into();
+            }
+            std::sync::Arc::new(kqueue)
+        };
         let description = OpenDescription::Pidfd {
             host_pid,
-            kqueue: std::sync::Arc::new(kqueue),
+            kqueue,
             base: OpenDescriptionBase::new(status_flags),
         };
         // Linux creates the pidfd with O_CLOEXEC unconditionally (the flags arg

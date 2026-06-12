@@ -1934,6 +1934,7 @@ mod tests {
             error,
             eof,
             exit_status: None,
+            vnode: None,
         };
 
         // OOB → EPOLLPRI.
