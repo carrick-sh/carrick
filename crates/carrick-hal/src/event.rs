@@ -203,4 +203,16 @@ pub trait EventMultiplexer: Send {
     /// The pollable fd readable when any registered event is ready (kqueue fd on
     /// BSD, epoll fd on Linux).
     fn poll_fd(&self) -> RawFd;
+
+    /// The raw fd whose readiness drives the user-wake channel for `ident`, when
+    /// that wake is a *separate* fd the caller can pulse without re-entering the
+    /// multiplexer. On Linux the user-wake is an `eventfd` distinct from the
+    /// epoll `poll_fd`, so an in-memory readiness broadcast that holds only the
+    /// fd (not the `&mut` mux) can wake a parked waiter by writing it directly.
+    /// On BSD the EVFILT_USER channel is driven through the kqueue fd itself
+    /// (`poll_fd`), so there is no separate fd — the default returns `None` and
+    /// the caller falls back to triggering via the kqueue fd.
+    fn user_wake_fd(&self, _ident: u64) -> Option<RawFd> {
+        None
+    }
 }

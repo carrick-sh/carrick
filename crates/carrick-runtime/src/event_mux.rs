@@ -17,7 +17,7 @@ pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
     }
     #[cfg(all(not(feature = "platform-macos"), feature = "platform-linux"))]
     {
-        todo!("Linux EpollMultiplexer — Part C Phase 2")
+        Ok(Box::new(carrick_linux::EpollMultiplexer::new()?))
     }
     #[cfg(not(any(feature = "platform-macos", feature = "platform-linux")))]
     {

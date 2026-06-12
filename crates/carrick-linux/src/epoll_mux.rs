@@ -520,6 +520,34 @@ impl EventMultiplexer for EpollMultiplexer {
     fn poll_fd(&self) -> RawFd {
         self.epfd
     }
+
+    /// The raw eventfd backing the user-wake channel for `ident` (registered via
+    /// [`register_user`](EventMultiplexer::register_user)), if any. The runtime's
+    /// in-memory wake registry stores this fd so a process-wide readiness
+    /// broadcast can pop a parked `epoll_pwait` by writing the eventfd directly
+    /// (mirroring the BSD path's `kqueue::trigger_user`, which drives the
+    /// EVFILT_USER channel from the kqueue fd alone).
+    fn user_wake_fd(&self, ident: u64) -> Option<RawFd> {
+        self.user_eventfds.get(&ident).copied()
+    }
+}
+
+/// Pulse a user-wake `eventfd` (the channel registered by
+/// [`EpollMultiplexer::register_user`]) by writing its 8-byte counter. Used by
+/// the runtime's in-memory readiness broadcast to wake a thread blocked on the
+/// owning epoll set's `poll_fd`. A failed/closed fd is ignored (best-effort
+/// wake); the eventfd is `EFD_NONBLOCK` so a saturated counter never blocks.
+pub fn trigger_user_eventfd(efd: RawFd) {
+    let one: u64 = 1;
+    // SAFETY: writing 8 bytes of a u64 counter to an eventfd is its defined wake
+    // primitive; `one`'s pointer/len are valid for the call.
+    unsafe {
+        libc::write(
+            efd,
+            &one as *const u64 as *const libc::c_void,
+            std::mem::size_of::<u64>(),
+        );
+    }
 }
 
 impl EpollMultiplexer {

@@ -92,7 +92,6 @@ pub(super) fn read_epoll_event(
 /// always-reported EPOLLHUP/EPOLLERR edges (which ride the read filter) are
 /// observed; RDHUP/PRI also ride the read/oob filters. (Mirrors the old
 /// `epoll_kq_filters` read-fallback exactly.)
-#[cfg(feature = "platform-macos")]
 pub(super) fn epoll_interest_for(events: u32) -> carrick_hal::event::Interest {
     let write = events & LINUX_EPOLLOUT != 0;
     let read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0 || !write;
@@ -104,7 +103,6 @@ pub(super) fn epoll_interest_for(events: u32) -> carrick_hal::event::Interest {
 }
 
 /// Edge (`EPOLLET`) vs level trigger mode for a multiplexer registration.
-#[cfg(feature = "platform-macos")]
 pub(super) fn epoll_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode {
     if events & LINUX_EPOLLET != 0 {
         carrick_hal::event::TriggerMode::Edge
@@ -162,11 +160,18 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
 /// readiness direction per event, so read readiness -> EPOLLIN (read EOF ->
 /// EPOLLRDHUP), write readiness -> EPOLLOUT (write EOF -> EPOLLHUP), oob ->
 /// EPOLLPRI. A carried socket error (`PollEvent::error`, from `EV_ERROR` or an
-/// EOF's non-zero fflags) -> EPOLLERR. Returns 0 for non-IO wakes (the
-/// EVFILT_USER(0) in-memory channel surfaces no readiness), which the caller
-/// ignores. This preserves the exact bits the old `kevent_to_epoll` produced
-/// (the multiplexer's per-filter `PollEvent` is 1:1 with one returned kevent).
-#[cfg(feature = "platform-macos")]
+/// EOF's non-zero fflags) -> EPOLLERR.
+///
+/// `eof`/`error` are surfaced INDEPENDENTLY of read/write readiness so a *bare*
+/// hangup or error edge still translates to a non-zero mask. On Linux the native
+/// epoll reports `EPOLLHUP`/`EPOLLERR` without an accompanying `EPOLLIN`/`EPOLLOUT`
+/// (e.g. a pipe whose write-end closed with no buffered data, or a connect()
+/// failure) — and on an `EPOLLET` registration that edge fires exactly once, so
+/// if it translated to 0 the caller would drop it as a no-op wake and never
+/// re-deliver it (the Go netpoller deadlock: a hung-up pollDesc never wakes).
+/// macOS couples EOF to a read/write filter (kqueue `EV_EOF` rides `EVFILT_READ`/
+/// `EVFILT_WRITE`), so a bare `eof` never arises there and these branches are
+/// inert — the exact bits the old `kevent_to_epoll` produced are preserved.
 pub(super) fn pollevent_to_epoll(ev: &carrick_hal::event::PollEvent) -> u32 {
     let mut events = 0u32;
     if ev.error.is_some() {
@@ -186,6 +191,12 @@ pub(super) fn pollevent_to_epoll(ev: &carrick_hal::event::PollEvent) -> u32 {
     }
     if ev.readiness.oob {
         events |= LINUX_EPOLLPRI;
+    }
+    // A bare hangup (EOF with neither read nor write readiness) is a full
+    // EPOLLHUP — surface it so an EPOLLET pollDesc whose only edge is the
+    // hangup is not silently dropped.
+    if ev.eof && !ev.readiness.read && !ev.readiness.write {
+        events |= LINUX_EPOLLHUP;
     }
     events
 }
