@@ -8,6 +8,12 @@ license.workspace = true
 name = "carrick_observability"
 path = "src/lib.rs"
 
+[features]
+# Verbose per-syscall stderr trace in CompatReporter::record (compiled out by
+# default). Forwarded from carrick-runtime/trace-syscalls alongside the HVF
+# crate's own gate, mirroring the upstream debug-feature refactor.
+trace-syscalls = []
+
 [lints]
 workspace = true
 
