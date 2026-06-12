@@ -179,10 +179,6 @@ use sysreg::*;
 // Process-wide PROT_NONE bookkeeping is a neutral-core abstraction shared with
 // every other backend (KVM included) — see carrick_mem::protections. Both hold
 // it as `Arc<MemoryProtections>` and clone it into each sibling vCPU thread.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use carrick_mem::arch_sysregs::{
-    CPACR_EL1_BOOTSTRAP, MAIR_EL1_BOOTSTRAP, SCTLR_EL1_BOOTSTRAP, TCR_EL1_BOOTSTRAP,
-};
 use carrick_mem::protections::MemoryProtections;
 
 // SyscallTrap/TrapError/ForkOutcome moved down into the carrick-hal leaf crate
@@ -1548,12 +1544,15 @@ impl HvfTrapEngine {
         // CTR_EL0 — glibc 2.41 reads cache line sizes at startup; without this
         // the MRS traps to EL1 and crashed CPython), DZE=1 (bit 14: EL0 DC ZVA +
         // DCZID_EL0 read — glibc memset). Matches Linux's SCTLR_EL1 for EL0.
-        // Shared bootstrap SCTLR (carrick_mem::arch_sysregs) carries M=1
-        // (stage-1 on); HVF enables M only when stage-1 tables exist (below), so
-        // start from the const with M cleared and OR M back in there. HVF leaves
-        // SPAN(23) CLEAR and forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue,
-        // NOT part of the shared const.
-        let mut sctlr_el1: u64 = SCTLR_EL1_BOOTSTRAP & !1;
+        // Shared bootstrap SCTLR (via GuestArch; canonical rationale in
+        // carrick_mem::arch_sysregs) carries M=1 (stage-1 on); HVF enables M
+        // only when stage-1 tables exist (below), so start from the value with
+        // M cleared and OR M back in there. HVF leaves SPAN(23) CLEAR and
+        // forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue, NOT part of the
+        // shared value.
+        use carrick_hal::GuestArch as _;
+        let boot = <Self as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
+        let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
         // Stage-1 MMU is on by default. The identity tables use AP=00 for
         // kernel pages (trampoline/vectors/PT) and AP=01+PXN=1 for user
         // pages, which is required on Apple Silicon because HVF starts
@@ -1566,7 +1565,7 @@ impl HvfTrapEngine {
             // nGnRnE), unused for now.
             self.inner
                 .vcpu
-                .set_sys_reg(SysReg::MAIR_EL1, MAIR_EL1_BOOTSTRAP)
+                .set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
                 .map_err(hvf_error)?;
             // TCR_EL1: TTBR0 (lower half) and TTBR1 (upper half) BOTH active.
             //   T0SZ = T1SZ = 16 (48-bit VA each half) — wide enough for
@@ -1586,10 +1585,11 @@ impl HvfTrapEngine {
             //              Rosetta tags pointers in the top byte and asserts
             //              unless hardware ignores it (pairs with the 16-bit
             //              software tag strip in mapping_for_range / mmap).
-            // TCR_EL1_BOOTSTRAP is the shared const from carrick_mem::arch_sysregs.
+            // boot.tcr_el1 is the shared bootstrap value via GuestArch
+            // (canonical rationale in carrick_mem::arch_sysregs).
             self.inner
                 .vcpu
-                .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
+                .set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
                 .map_err(hvf_error)?;
             self.inner
                 .vcpu
@@ -1614,10 +1614,10 @@ impl HvfTrapEngine {
         // garbage syscall numbers, and the guest spins forever. FPEN=0b11
         // turns the trap off; the bottom two bits of each TRC* field are kept
         // at zero (trace unsupported, no SME).
-        // CPACR_EL1_BOOTSTRAP (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
+        // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
         self.inner
             .vcpu
-            .set_sys_reg(SysReg::CPACR_EL1, CPACR_EL1_BOOTSTRAP)
+            .set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
             .map_err(hvf_error)?;
         // Allow EL0 to read the virtual (EL0VCTEN, bit 1) and physical
         // (EL0PCTEN, bit 0) counters directly without trapping to EL1. This is
@@ -3887,21 +3887,26 @@ impl HvfInner {
         // maintenance ops + CTR_EL0/DCZID_EL0 reads + DC ZVA, matching Linux.
         // See the matching comment at the initial-bringup site; glibc 2.41 reads
         // CTR_EL0 at startup, which traps to EL1 (fatal) without UCT.
-        // Shared bootstrap SCTLR (carrick_mem::arch_sysregs) carries M=1
-        // (stage-1 on); HVF enables M only when stage-1 tables exist (below), so
-        // start from the const with M cleared and OR M back in there. HVF leaves
-        // SPAN(23) CLEAR and forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue,
-        // NOT part of the shared const.
-        let mut sctlr_el1: u64 = SCTLR_EL1_BOOTSTRAP & !1;
+        // Shared bootstrap SCTLR (via GuestArch; canonical rationale in
+        // carrick_mem::arch_sysregs) carries M=1 (stage-1 on); HVF enables M
+        // only when stage-1 tables exist (below), so start from the value with
+        // M cleared and OR M back in there. HVF leaves SPAN(23) CLEAR and
+        // forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue, NOT part of the
+        // shared value.
+        // (`Self` here is the inner state, not the engine, so name the engine.)
+        use carrick_hal::GuestArch as _;
+        let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
+        let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
         if let Some(pt_base) = plan.stage1_page_tables_base {
             self.vcpu
-                .set_sys_reg(SysReg::MAIR_EL1, MAIR_EL1_BOOTSTRAP)
+                .set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
                 .map_err(hvf_error)?;
             // 48-bit VA, TTBR0 + TTBR1 both active sharing one root. MUST stay
             // identical to the canonical TCR comment/value in map_address_space.
-            // TCR_EL1_BOOTSTRAP is the shared const from carrick_mem::arch_sysregs.
+            // boot.tcr_el1 is the shared bootstrap value via GuestArch
+            // (canonical rationale in carrick_mem::arch_sysregs).
             self.vcpu
-                .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
+                .set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
                 .map_err(hvf_error)?;
             self.vcpu
                 .set_sys_reg(SysReg::TTBR0_EL1, pt_base)
@@ -3915,9 +3920,9 @@ impl HvfInner {
         self.vcpu
             .set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
             .map_err(hvf_error)?;
-        // CPACR_EL1_BOOTSTRAP (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
+        // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
         self.vcpu
-            .set_sys_reg(SysReg::CPACR_EL1, CPACR_EL1_BOOTSTRAP)
+            .set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
             .map_err(hvf_error)?;
         if let Some(vectors_base) = plan.el1_vectors_base {
             self.vcpu
