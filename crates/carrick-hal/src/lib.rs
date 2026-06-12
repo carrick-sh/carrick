@@ -3,7 +3,7 @@
 //! Traits-only leaf crate: zero OS / hypervisor dependencies. Holds the
 //! runtime↔engine contract (`SyscallTrap`, `TrapError`, `ForkOutcome`),
 //! the raw hypervisor traits (`HvVm`/`HvVcpu`/`VcpuExit`), the host-primitive
-//! traits (`EventMultiplexer`, `CrossProcessFutex`, `Sendfile`, `HostFacts`),
+//! traits (`EventMultiplexer`, `CrossProcessFutex`),
 //! errno translation, and shared types (`OsError`, `MemPerms`, `Reg`, `SysReg`).
 //! Modules are added by the following tasks.
 pub mod aarch64;
@@ -21,11 +21,7 @@ pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
 pub mod futex;
-pub mod host_info;
-pub mod sendfile;
 pub use futex::{CrossProcessFutex, SHARED_FUTEX_MAX_SLICE_NS, SharedWaitStep, shared_wait_sliced};
-pub use host_info::HostFacts;
-pub use sendfile::Sendfile;
 pub mod threaded;
 pub use threaded::{
     FutexOutcome, GenericVcpuRegistry, HostForkCoordinator, PlatformFutex, PreparedHostFork,
