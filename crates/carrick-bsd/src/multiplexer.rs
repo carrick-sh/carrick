@@ -182,9 +182,13 @@ impl EventMultiplexer for KqueueMultiplexer {
                     // a proc-exit kqueue test when EventMultiplexer::watch_process_exit
                     // lands (the proc_exit_status accessor already reads `data`).
                 }
-                libc::EVFILT_USER => {
-                    readiness.read = true;
-                }
+                // A user-triggered wake is a "something changed, re-check"
+                // signal, not fd readiness: it carries NO IO readiness bits (the
+                // consumer recomputes its own state on return). Surfacing it as
+                // read-readiness would make an epoll consumer report a spurious
+                // EPOLLIN on the wake's `token`. (Matches the epoll path's old
+                // `kevent_to_epoll`, which returned 0 for EVFILT_USER.)
+                libc::EVFILT_USER => {}
                 libc::EVFILT_TIMER => {
                     readiness.read = true;
                 }
@@ -200,5 +204,9 @@ impl EventMultiplexer for KqueueMultiplexer {
             });
         }
         Ok(n)
+    }
+
+    fn poll_fd(&self) -> RawFd {
+        self.kq.raw_fd()
     }
 }

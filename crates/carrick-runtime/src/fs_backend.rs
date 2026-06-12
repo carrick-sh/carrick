@@ -4132,7 +4132,11 @@ mod tests {
                 "lookup_kind at len {}",
                 path.len()
             );
-            assert!(b.metadata(&path).is_some(), "metadata at len {}", path.len());
+            assert!(
+                b.metadata(&path).is_some(),
+                "metadata at len {}",
+                path.len()
+            );
             assert!(
                 b.real_stat(&path, false).is_some(),
                 "real_stat at len {}",

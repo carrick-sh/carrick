@@ -123,6 +123,7 @@ pub mod deadlock_watchdog;
 pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;
+pub mod event_mux;
 pub mod event_ring;
 pub(crate) mod exec_helpers;
 pub mod fs_backend;
@@ -474,7 +475,11 @@ pub mod runtime {
                 kicker: Arc::clone(&kicker),
                 futex: Arc::clone(&platform_futex),
             });
-        let kernel = Arc::new(KernelState::new(dispatcher, fork_coordinator, signal_arrival));
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            fork_coordinator,
+            signal_arrival,
+        ));
         // Track spawned sibling threads so the process doesn't tear down while a
         // worker is mid-flight; joined after the main thread finishes.
         let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =
