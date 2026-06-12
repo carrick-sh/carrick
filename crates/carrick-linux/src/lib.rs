@@ -10,6 +10,7 @@
 //! empty.
 #![cfg(target_os = "linux")]
 
+pub mod epoll_mux;
 pub mod errno;
 pub mod fork;
 pub mod guest_setup;
@@ -25,11 +26,12 @@ pub mod signal_arrival;
 pub mod timer_delivery;
 pub mod trap_engine;
 
+pub use epoll_mux::EpollMultiplexer;
 pub use kvm::{KvmVcpu, KvmVm};
-pub use signal_arrival::KvmSignalArrival;
-pub use timer_delivery::KvmTimerDelivery;
 pub use kvm_fork_coord::KvmForkCoordinator;
 pub use kvm_futex::KvmFutex;
 pub use kvm_kicker::{KvmKickHandle, KvmKicker, install_kvm_kick_handler};
 pub use run_elf::run_elf_kvm;
+pub use signal_arrival::KvmSignalArrival;
+pub use timer_delivery::KvmTimerDelivery;
 pub use trap_engine::KvmTrapEngine;
