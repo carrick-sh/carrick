@@ -218,3 +218,45 @@ mod tests {
         );
     }
 }
+
+/// FreeBSD-specific errno translation pins. These lock down the three arms most
+/// likely to silently regress on FreeBSD: the EAGAIN/EDEADLK numeric collision
+/// (BSD 35/11 vs Linux 11/35) and the ENOATTR → ENODATA xattr mapping.
+#[cfg(all(test, target_os = "freebsd"))]
+mod freebsd_errno_tests {
+    use super::*;
+
+    #[test]
+    fn collision_and_xattr_arms_are_freebsd_correct() {
+        // FreeBSD EAGAIN = 35; Linux EAGAIN = 11.
+        // Without the explicit arm, BSD 35 would fall through the 1..=34
+        // passthrough unchanged and reach the guest as Linux 35 = EDEADLK.
+        assert_eq!(
+            bsd_to_linux_errno(libc::EAGAIN),
+            carrick_abi::LINUX_EAGAIN as i32,
+            "BSD EAGAIN({}) must map to Linux EAGAIN({})",
+            libc::EAGAIN,
+            carrick_abi::LINUX_EAGAIN
+        );
+
+        // FreeBSD EDEADLK = 11; Linux EDEADLK = 35.
+        // Without the explicit arm, BSD 11 passes through the 1..=34 zone and
+        // reaches the guest as Linux 11 = EAGAIN.
+        assert_eq!(
+            bsd_to_linux_errno(libc::EDEADLK),
+            carrick_abi::LINUX_EDEADLK as i32,
+            "BSD EDEADLK({}) must map to Linux EDEADLK({})",
+            libc::EDEADLK,
+            carrick_abi::LINUX_EDEADLK
+        );
+
+        // FreeBSD ENOATTR ("attribute not found") → Linux ENODATA.
+        assert_eq!(
+            bsd_to_linux_errno(libc::ENOATTR),
+            carrick_abi::LINUX_ENODATA as i32,
+            "BSD ENOATTR({}) must map to Linux ENODATA({})",
+            libc::ENOATTR,
+            carrick_abi::LINUX_ENODATA
+        );
+    }
+}

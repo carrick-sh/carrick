@@ -117,7 +117,11 @@ mod tests {
         // The relocated fd is still a live read end: it carries CLOEXEC.
         let flags = unsafe { libc::fcntl(relocated, libc::F_GETFD) };
         assert!(flags >= 0, "relocated fd {relocated} not open");
-        assert_ne!(flags & libc::FD_CLOEXEC, 0, "CLOEXEC not set on relocated fd");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "CLOEXEC not set on relocated fd"
+        );
 
         unsafe {
             libc::close(relocated);
@@ -141,7 +145,10 @@ mod tests {
         );
         // The ORIGINAL stays open (duplicate, unlike relocate, does not close it).
         let orig_flags = unsafe { libc::fcntl(read_end, libc::F_GETFD) };
-        assert!(orig_flags >= 0, "original fd {read_end} should still be open");
+        assert!(
+            orig_flags >= 0,
+            "original fd {read_end} should still be open"
+        );
 
         unsafe {
             libc::close(duped);

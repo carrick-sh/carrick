@@ -2,11 +2,36 @@
 
 use std::os::fd::RawFd;
 
-/// Darwin's exceptional-condition filter. The `libc` crate version used here
-/// does not expose this SDK constant.
+/// Darwin's exceptional-condition filter. The `libc` crate version (0.2.186)
+/// does not expose this SDK constant for Darwin.
+///
+/// **IMPORTANT platform difference:** On Darwin, `-15` is `EVFILT_EXCEPT` (OOB
+/// socket events). On FreeBSD, `-15` is `EVFILT_JAILDESC` (jail-descriptor
+/// events) — an entirely different filter. FreeBSD has **no** `EVFILT_EXCEPT`
+/// equivalent; OOB socket readiness is not exposed through kqueue on FreeBSD.
+/// The FreeBSD constant is therefore a positive sentinel (`i16::MAX`) that can
+/// never match any real kqueue filter (all real filters are negative), so the
+/// `Kevent::oob` constructor compiles on FreeBSD but kevent(2) rejects it with
+/// `EINVAL`, which callers propagate as "OOB unsupported".
+#[cfg(target_os = "macos")]
 pub const EVFILT_EXCEPT: i16 = -15;
-/// `EVFILT_EXCEPT` hint for socket out-of-band data.
+/// FreeBSD has no `EVFILT_EXCEPT`. Use a positive sentinel that can never match
+/// a real kqueue filter (all filters are negative ints) so an accidental
+/// registration returns EINVAL rather than silently matching EVFILT_JAILDESC.
+#[cfg(target_os = "freebsd")]
+pub const EVFILT_EXCEPT: i16 = i16::MAX;
+
+/// `EVFILT_EXCEPT` hint for socket out-of-band data (Darwin only).
+///
+/// On Darwin, registering `EVFILT_EXCEPT` with `NOTE_OOB` delivers OOB/urgent
+/// data readiness. On FreeBSD this feature does not exist; `NOTE_OOB` is
+/// defined as `0` so it is a no-op fflags addition (consistent with
+/// `NOTE_EXITSTATUS` on FreeBSD).
+#[cfg(target_os = "macos")]
 pub const NOTE_OOB: u32 = 0x0000_0002;
+/// FreeBSD has no `EVFILT_EXCEPT`/`NOTE_OOB`; defined as 0 (no-op fflags).
+#[cfg(target_os = "freebsd")]
+pub const NOTE_OOB: u32 = 0;
 /// macOS `EVFILT_PROC` fflag that requests the exit status be delivered in
 /// `data`. FreeBSD has no such fflag — but its `NOTE_EXIT` already delivers the
 /// wait-status in `data` UNCONDITIONALLY — so we define this as 0 (a no-op
@@ -330,6 +355,12 @@ impl Kevent {
     pub fn is_user(self, ident: usize) -> bool {
         self.0.ident == ident && self.0.filter == libc::EVFILT_USER
     }
+
+    /// Return the raw filter value of this event. Used in tests only.
+    #[cfg(test)]
+    pub fn raw_filter(self) -> i16 {
+        self.0.filter
+    }
 }
 
 pub fn trigger_user(kq: RawFd, ident: usize) -> Result<(), i32> {
@@ -445,5 +476,49 @@ mod tests {
             .expect("wait timer");
         assert_eq!(n, 1);
         assert_eq!(out[0].timer_ident(), Some(ident));
+    }
+}
+
+/// FreeBSD-specific tests: verify EVFILT_EXCEPT/NOTE_OOB constants are
+/// host-correct and do NOT collide with FreeBSD's real filter assignments.
+#[cfg(all(test, target_os = "freebsd"))]
+mod freebsd_kqueue_tests {
+    use super::*;
+
+    /// On FreeBSD, `-15` is `EVFILT_JAILDESC` — a completely different filter
+    /// from Darwin's `EVFILT_EXCEPT`. Our sentinel (`i16::MAX`) must never
+    /// equal `EVFILT_JAILDESC` so that an accidental OOB registration returns
+    /// `EINVAL` rather than silently arming a jail-descriptor watch.
+    #[test]
+    fn evfilt_except_sentinel_does_not_collide_with_jaildesc() {
+        // FreeBSD EVFILT_JAILDESC = -15 (from /usr/include/sys/event.h).
+        const EVFILT_JAILDESC: i16 = -15;
+        assert_ne!(
+            EVFILT_EXCEPT, EVFILT_JAILDESC,
+            "EVFILT_EXCEPT sentinel must not collide with FreeBSD EVFILT_JAILDESC (-15)"
+        );
+        // Sentinel must be positive so it can never match any real filter
+        // (all real kqueue filters are negative integers).
+        assert!(
+            EVFILT_EXCEPT > 0,
+            "FreeBSD EVFILT_EXCEPT sentinel must be positive (all real filters are negative)"
+        );
+    }
+
+    /// Registering EVFILT_EXCEPT on FreeBSD must return an error (EINVAL or
+    /// ENOTSUP) — not silently succeed as a EVFILT_JAILDESC watch.
+    #[test]
+    fn oob_kevent_register_returns_error_on_freebsd() {
+        let kq = Kqueue::new_internal().expect("kqueue should open");
+        // Create a real TCP socket so the fd is valid.
+        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(sock >= 0, "socket creation failed");
+        let result = kq.apply(&[Kevent::oob(sock, libc::EV_ADD)]);
+        unsafe { libc::close(sock) };
+        assert!(
+            result.is_err(),
+            "registering EVFILT_EXCEPT (sentinel) on FreeBSD must fail; \
+             got Ok — sentinel may have accidentally matched a real filter"
+        );
     }
 }
