@@ -3,8 +3,8 @@
 //! KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT; guest RAM via
 //! KVM_SET_USER_MEMORY_REGION over a host mmap; registers via
 //! KVM_GET/SET_ONE_REG; run via KVM_RUN. kick() is a signal-based vCPU exit.
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;

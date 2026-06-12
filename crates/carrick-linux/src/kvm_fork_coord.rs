@@ -81,11 +81,7 @@ impl KvmForkCoordinator {
 }
 
 impl HostForkCoordinator for KvmForkCoordinator {
-    fn start_signal_pump(
-        &self,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-    ) {
+    fn start_signal_pump(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>) {
         // Keep the kick-signal handler installed so a process-directed signal
         // turns an in-flight KVM_RUN into EINTR.
         self.ensure_handler_installed();

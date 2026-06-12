@@ -252,7 +252,8 @@ mod tests {
             gateway: "host.lima.internal".into(),
             timeout_scale: 1.0,
         });
-        let argv = carrick_invocation_argv(&s, "/home/user/ct/release/carrick", "conf-1-2", &lane);
+        let argv =
+            carrick_invocation_argv(&s, "/home/user/ct/release/carrick", "conf-1-2", &lane);
         // Kvm: limactl shell <vm> -- sg kvm -c '<shell-quoted: env …=host.lima.internal:5005 <carrick> run … <rewritten image> …>'
         assert_eq!(
             argv[0..7],

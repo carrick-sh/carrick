@@ -318,10 +318,7 @@ impl KvmTrapEngine {
             return va;
         }
         let guard = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .as_ref()
-            .and_then(|m| m.translate(va))
-            .unwrap_or(va)
+        guard.as_ref().and_then(|m| m.translate(va)).unwrap_or(va)
     }
 }
 
@@ -380,10 +377,13 @@ impl GuestMemory for KvmTrapEngine {
         // so this is byte-identical (and skips the walk). Both failure modes map
         // to OutOfBounds (→ EFAULT), unchanged; the copy stays glue.
         let ipa = self.syscall_buffer_ipa(address, length);
-        let host = self.ram.safe_access_translated(address, ipa, length).map_err(|e| {
-            mem_debug("read", &self.ram, ipa, length);
-            e.map_to_memory_error(address, length)
-        })?;
+        let host = self
+            .ram
+            .safe_access_translated(address, ipa, length)
+            .map_err(|e| {
+                mem_debug("read", &self.ram, ipa, length);
+                e.map_to_memory_error(address, length)
+            })?;
         let mut out = vec![0u8; length];
         // SAFETY: `safe_access` proved [address, address+length) ⊆ one window, so
         // `host` points at `length` readable bytes of that window's backing.
@@ -399,10 +399,13 @@ impl GuestMemory for KvmTrapEngine {
         // `read_bytes`). For a `repoint_private` overlay the syscall write lands
         // in the PRIVATE overlay backing the guest reads, not the shared aperture.
         let ipa = self.syscall_buffer_ipa(address, length);
-        let host = self.ram.safe_access_translated(address, ipa, length).map_err(|e| {
-            mem_debug("write", &self.ram, ipa, length);
-            e.map_to_memory_error(address, length)
-        })?;
+        let host = self
+            .ram
+            .safe_access_translated(address, ipa, length)
+            .map_err(|e| {
+                mem_debug("write", &self.ram, ipa, length);
+                e.map_to_memory_error(address, length)
+            })?;
         // SAFETY: `safe_access` proved [address, address+length) ⊆ one window, so
         // `host` points at `length` writable bytes of that window's backing.
         unsafe {
@@ -551,7 +554,10 @@ impl SyscallTrap for KvmTrapEngine {
         loop {
             let run_start = std::time::Instant::now();
             carrick_host::guest_cpu::begin_active();
-            let run_result = self.vcpu.run().map_err(|e| TrapError::Hypervisor(e.to_string()));
+            let run_result = self
+                .vcpu
+                .run()
+                .map_err(|e| TrapError::Hypervisor(e.to_string()));
             let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             carrick_host::guest_cpu::finish_active(run_ns);
             match run_result? {

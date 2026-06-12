@@ -118,7 +118,11 @@ fn registry_digest(host: &str, repo: &str, tag: &str) -> Option<String> {
 /// moved since we last pulled it. Returns the number of images refreshed. Run
 /// SERIALLY before the parallel carrick phase. Best-effort: a failed refresh
 /// warns and continues (the suite will then run against whatever carrick has).
-pub fn refresh_stale_images(images: &[String], carrick_bin: &str, lane: &crate::lane::Lane) -> usize {
+pub fn refresh_stale_images(
+    images: &[String],
+    carrick_bin: &str,
+    lane: &crate::lane::Lane,
+) -> usize {
     let mut sidecar = load_sidecar(lane);
     let mut unique: Vec<&String> = images.iter().collect();
     unique.sort();
