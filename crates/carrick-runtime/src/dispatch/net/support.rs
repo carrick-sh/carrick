@@ -87,99 +87,30 @@ pub(super) fn read_epoll_event(
     read_kernel_struct(memory, address)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EpollKqFilters {
-    read: bool,
-    write: bool,
-    priority: bool,
-}
-
-fn epoll_kq_filters(events: u32) -> EpollKqFilters {
-    let read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0;
+/// Translate the epoll interest mask into the [`Interest`] the multiplexer
+/// registers. A mask with neither IN nor OUT still requests `read` so the
+/// always-reported EPOLLHUP/EPOLLERR edges (which ride the read filter) are
+/// observed; RDHUP/PRI also ride the read/oob filters. (Mirrors the old
+/// `epoll_kq_filters` read-fallback exactly.)
+#[cfg(feature = "platform-macos")]
+pub(super) fn epoll_interest_for(events: u32) -> carrick_hal::event::Interest {
     let write = events & LINUX_EPOLLOUT != 0;
-    let priority = events & LINUX_EPOLLPRI != 0;
-    EpollKqFilters {
-        read: read || !write,
+    let read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0 || !write;
+    carrick_hal::event::Interest {
+        read,
         write,
-        priority,
+        oob: events & LINUX_EPOLLPRI != 0,
     }
 }
 
-/// Build the kqueue change list to register a host-backed fd's epoll interest
-/// on the epoll instance's persistent kqueue. EPOLLIN/RDHUP ride the read
-/// filter (EV_EOF on read -> EPOLLRDHUP); EPOLLOUT rides the write filter;
-/// EPOLLPRI rides Darwin's exceptional-condition filter with NOTE_OOB.
-/// EPOLLET -> `EV_CLEAR` (edge); otherwise the filter is level-triggered,
-/// exactly matching Linux. `udata` carries the guest fd so a returned event
-/// maps straight back. A mask with neither IN nor OUT still arms a read filter
-/// so EPOLLHUP/EPOLLERR (which Linux always reports) are still observed.
-pub(super) fn epoll_kq_add_changes(
-    host_fd: i32,
-    guest_fd: i32,
-    events: u32,
-) -> Vec<crate::darwin_kqueue::Kevent> {
-    use crate::darwin_kqueue::Kevent;
-    let edge: u16 = if events & LINUX_EPOLLET != 0 {
-        carrick_portable::EV_CLEAR
+/// Edge (`EPOLLET`) vs level trigger mode for a multiplexer registration.
+#[cfg(feature = "platform-macos")]
+pub(super) fn epoll_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode {
+    if events & LINUX_EPOLLET != 0 {
+        carrick_hal::event::TriggerMode::Edge
     } else {
-        0
-    };
-    let base = carrick_portable::EV_ADD | carrick_portable::EV_ENABLE | edge;
-    let filters = epoll_kq_filters(events);
-    let mut changes = Vec::with_capacity(3);
-    if filters.read {
-        changes.push(Kevent::read(host_fd, base).with_udata(guest_fd));
+        carrick_hal::event::TriggerMode::Level
     }
-    if filters.write {
-        changes.push(Kevent::write(host_fd, base).with_udata(guest_fd));
-    }
-    if filters.priority {
-        changes.push(Kevent::oob(host_fd, base).with_udata(guest_fd));
-    }
-    changes
-}
-
-fn epoll_kq_removed_filter_changes(
-    host_fd: i32,
-    old_events: u32,
-    new_events: u32,
-) -> Vec<crate::darwin_kqueue::Kevent> {
-    use crate::darwin_kqueue::Kevent;
-    let old = epoll_kq_filters(old_events);
-    let new = epoll_kq_filters(new_events);
-    let mut changes = Vec::with_capacity(3);
-    if old.read && !new.read {
-        changes.push(Kevent::read(host_fd, carrick_portable::EV_DELETE));
-    }
-    if old.write && !new.write {
-        changes.push(Kevent::write(host_fd, carrick_portable::EV_DELETE));
-    }
-    if old.priority && !new.priority {
-        changes.push(Kevent::oob(host_fd, carrick_portable::EV_DELETE));
-    }
-    changes
-}
-
-pub(super) fn epoll_kq_delete_removed_filters(
-    kqueue: &crate::darwin_kqueue::Kqueue,
-    host_fd: i32,
-    old_events: u32,
-    new_events: u32,
-) {
-    for change in epoll_kq_removed_filter_changes(host_fd, old_events, new_events) {
-        let _ = kqueue.apply(&[change]);
-    }
-}
-
-/// Remove both filters for a host-backed fd from the epoll instance kqueue.
-/// Read and write are deleted in separate `kevent` calls so a missing filter's
-/// ENOENT doesn't abort the other (one changelist stops at the first failing
-/// entry without `EV_RECEIPT`).
-pub(super) fn epoll_kq_delete(kqueue: &crate::darwin_kqueue::Kqueue, host_fd: i32) {
-    use crate::darwin_kqueue::Kevent;
-    let _ = kqueue.apply(&[Kevent::read(host_fd, carrick_portable::EV_DELETE)]);
-    let _ = kqueue.apply(&[Kevent::write(host_fd, carrick_portable::EV_DELETE)]);
-    let _ = kqueue.apply(&[Kevent::oob(host_fd, carrick_portable::EV_DELETE)]);
 }
 
 pub(super) fn clear_pending_epoll_ready(
@@ -226,48 +157,35 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
     })
 }
 
-/// Translate one returned kqueue event (from an epoll instance kqueue) to Linux
-/// epoll event bits. Direction-sensitive (jiixyj/epoll-shim model): read EOF ->
-/// EPOLLRDHUP, write EOF -> EPOLLHUP, `EV_ERROR` or `EV_EOF` carrying a
-/// non-zero `fflags` (the socket error) -> EPOLLERR. Returns 0 for non-IO
-/// filters (EVFILT_USER), which the caller ignores.
-// The only non-test caller (the kqueue-backed `epoll_pwait`) is behind
-// `feature = "platform-macos"`, so this is dead in the non-macOS binary — but a
-// unit test below calls it unconditionally, so `dead_code` allow (not a
-// `target_os` cfg, which would break that test) is the right relaxation.
-#[allow(dead_code)]
-pub(super) fn kevent_to_epoll(ev: crate::darwin_kqueue::Kevent) -> u32 {
+/// Translate one multiplexer [`PollEvent`] to Linux epoll event bits.
+/// Direction-sensitive (jiixyj/epoll-shim model): the multiplexer reports one
+/// readiness direction per event, so read readiness -> EPOLLIN (read EOF ->
+/// EPOLLRDHUP), write readiness -> EPOLLOUT (write EOF -> EPOLLHUP), oob ->
+/// EPOLLPRI. A carried socket error (`PollEvent::error`, from `EV_ERROR` or an
+/// EOF's non-zero fflags) -> EPOLLERR. Returns 0 for non-IO wakes (the
+/// EVFILT_USER(0) in-memory channel surfaces no readiness), which the caller
+/// ignores. This preserves the exact bits the old `kevent_to_epoll` produced
+/// (the multiplexer's per-filter `PollEvent` is 1:1 with one returned kevent).
+#[cfg(feature = "platform-macos")]
+pub(super) fn pollevent_to_epoll(ev: &carrick_hal::event::PollEvent) -> u32 {
     let mut events = 0u32;
-    if ev.flags() & carrick_portable::EV_ERROR != 0 {
+    if ev.error.is_some() {
         events |= LINUX_EPOLLERR;
     }
-    let eof = ev.flags() & carrick_portable::EV_EOF != 0;
-    match ev.filter() {
-        carrick_portable::EVFILT_READ => {
-            events |= LINUX_EPOLLIN;
-            if eof {
-                events |= LINUX_EPOLLRDHUP;
-                if ev.fflags() != 0 {
-                    events |= LINUX_EPOLLERR;
-                }
-            }
+    if ev.readiness.read {
+        events |= LINUX_EPOLLIN;
+        if ev.eof {
+            events |= LINUX_EPOLLRDHUP;
         }
-        carrick_portable::EVFILT_WRITE => {
-            events |= LINUX_EPOLLOUT;
-            if eof {
-                events |= LINUX_EPOLLHUP;
-                if ev.fflags() != 0 {
-                    events |= LINUX_EPOLLERR;
-                }
-            }
+    }
+    if ev.readiness.write {
+        events |= LINUX_EPOLLOUT;
+        if ev.eof {
+            events |= LINUX_EPOLLHUP;
         }
-        filter
-            if filter == crate::darwin_kqueue::EVFILT_EXCEPT
-                && ev.fflags() & crate::darwin_kqueue::NOTE_OOB != 0 =>
-        {
-            events |= LINUX_EPOLLPRI;
-        }
-        _ => {}
+    }
+    if ev.readiness.oob {
+        events |= LINUX_EPOLLPRI;
     }
     events
 }
@@ -1954,87 +1872,100 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(required.try_into().unwrap()), 16);
     }
 
+    // The epoll interest-mask → multiplexer `Interest` mapping preserves the
+    // HUP/ERR-observability read-fallback (a mask with neither IN nor OUT still
+    // arms read) and routes RDHUP/PRI onto read; the actual kqueue filter
+    // selection now lives in (and is tested by) `carrick-bsd`'s multiplexer.
+    #[cfg(feature = "platform-macos")]
     #[test]
-    fn epoll_kqueue_filter_selection_preserves_hup_err_observability() {
+    fn epoll_interest_selection_preserves_hup_err_observability() {
+        use carrick_hal::event::Interest;
         assert_eq!(
-            epoll_kq_filters(0),
-            EpollKqFilters {
+            epoll_interest_for(0),
+            Interest {
                 read: true,
                 write: false,
-                priority: false,
+                oob: false,
             }
         );
         assert_eq!(
-            epoll_kq_filters(LINUX_EPOLLIN),
-            EpollKqFilters {
+            epoll_interest_for(LINUX_EPOLLIN),
+            Interest {
                 read: true,
                 write: false,
-                priority: false,
+                oob: false,
             }
         );
         assert_eq!(
-            epoll_kq_filters(LINUX_EPOLLOUT),
-            EpollKqFilters {
+            epoll_interest_for(LINUX_EPOLLOUT),
+            Interest {
                 read: false,
                 write: true,
-                priority: false,
+                oob: false,
             }
         );
         assert_eq!(
-            epoll_kq_filters(LINUX_EPOLLIN | LINUX_EPOLLOUT),
-            EpollKqFilters {
+            epoll_interest_for(LINUX_EPOLLIN | LINUX_EPOLLOUT),
+            Interest {
                 read: true,
                 write: true,
-                priority: false,
+                oob: false,
             }
         );
         assert_eq!(
-            epoll_kq_filters(LINUX_EPOLLPRI),
-            EpollKqFilters {
+            epoll_interest_for(LINUX_EPOLLPRI),
+            Interest {
                 read: true,
                 write: false,
-                priority: true,
+                oob: true,
             }
         );
     }
 
+    // `pollevent_to_epoll` must reproduce the direction-sensitive RDHUP/HUP/ERR
+    // bits the old `kevent_to_epoll` produced from a single returned kevent.
+    #[cfg(feature = "platform-macos")]
     #[test]
-    fn epoll_kqueue_changes_include_oob_filter_for_priority_events() {
-        let changes = epoll_kq_add_changes(42, 7, LINUX_EPOLLPRI);
-        assert!(
-            changes
-                .iter()
-                .any(|ev| ev.filter() == carrick_portable::EVFILT_READ)
+    fn pollevent_translation_preserves_rdhup_hup_err_and_pri() {
+        use carrick_hal::event::{PollEvent, Readiness};
+        let ev = |readiness: Readiness, eof: bool, error: Option<i32>| PollEvent {
+            token: 7,
+            readiness,
+            error,
+            eof,
+            exit_status: None,
+        };
+
+        // OOB → EPOLLPRI.
+        assert_eq!(
+            pollevent_to_epoll(&ev(Readiness::OOB, false, None)),
+            LINUX_EPOLLPRI
         );
-        assert!(
-            changes
-                .iter()
-                .any(|ev| ev.filter() == crate::darwin_kqueue::EVFILT_EXCEPT
-                    && ev.fflags() == crate::darwin_kqueue::NOTE_OOB)
+        // Plain read/write readiness.
+        assert_eq!(
+            pollevent_to_epoll(&ev(Readiness::READ, false, None)),
+            LINUX_EPOLLIN
         );
-
-        let pri = crate::darwin_kqueue::Kevent::oob(42, 0);
-        assert_eq!(kevent_to_epoll(pri), LINUX_EPOLLPRI);
-    }
-
-    #[test]
-    fn epoll_mod_delete_list_contains_only_filters_removed_by_new_mask() {
-        let removed =
-            epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN | LINUX_EPOLLOUT, LINUX_EPOLLOUT);
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].filter(), carrick_portable::EVFILT_READ);
-
-        let removed =
-            epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN | LINUX_EPOLLOUT, LINUX_EPOLLIN);
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].filter(), carrick_portable::EVFILT_WRITE);
-
-        let removed = epoll_kq_removed_filter_changes(42, LINUX_EPOLLPRI, LINUX_EPOLLIN);
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].filter(), crate::darwin_kqueue::EVFILT_EXCEPT);
-        assert_eq!(removed[0].fflags(), crate::darwin_kqueue::NOTE_OOB);
-
-        assert!(epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN, LINUX_EPOLLIN).is_empty());
+        assert_eq!(
+            pollevent_to_epoll(&ev(Readiness::WRITE, false, None)),
+            LINUX_EPOLLOUT
+        );
+        // Read EOF → RDHUP (not HUP); write EOF → HUP.
+        assert_eq!(
+            pollevent_to_epoll(&ev(Readiness::READ, true, None)),
+            LINUX_EPOLLIN | LINUX_EPOLLRDHUP
+        );
+        assert_eq!(
+            pollevent_to_epoll(&ev(Readiness::WRITE, true, None)),
+            LINUX_EPOLLOUT | LINUX_EPOLLHUP
+        );
+        // A carried socket error adds EPOLLERR alongside the direction bits.
+        assert_eq!(
+            pollevent_to_epoll(&ev(Readiness::READ, true, Some(libc::ECONNRESET))),
+            LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLERR
+        );
+        // A non-IO wake (EVFILT_USER) carries no readiness → no bits.
+        assert_eq!(pollevent_to_epoll(&ev(Readiness::empty(), false, None)), 0);
     }
 
     #[cfg(target_os = "macos")]

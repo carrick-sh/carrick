@@ -171,4 +171,7 @@ pub trait EventMultiplexer: Send {
         out: &mut Vec<PollEvent>,
         timeout: Option<Duration>,
     ) -> Result<usize, OsError>;
+    /// The pollable fd readable when any registered event is ready (kqueue fd on
+    /// BSD, epoll fd on Linux).
+    fn poll_fd(&self) -> RawFd;
 }

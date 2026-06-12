@@ -238,11 +238,8 @@ impl SyscallDispatcher {
     /// touched the fd must see a still-standing terminal condition again.
     #[cfg(not(feature = "platform-macos"))]
     pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest) {
-        const READ_CLEAR: u32 = LINUX_EPOLLIN
-            | LINUX_EPOLLRDHUP
-            | LINUX_EPOLLPRI
-            | LINUX_EPOLLHUP
-            | LINUX_EPOLLERR;
+        const READ_CLEAR: u32 =
+            LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI | LINUX_EPOLLHUP | LINUX_EPOLLERR;
         const WRITE_CLEAR: u32 = LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR;
         let a = |i: usize| request.arg(i) as i32;
         // (fd, bits-to-clear) per direction the syscall consumed. aarch64 nrs.
@@ -568,7 +565,7 @@ impl SyscallDispatcher {
                         ready |= LINUX_POLLIN;
                     } else {
                         let mut pfd = libc::pollfd {
-                            fd: kqueue.raw_fd(),
+                            fd: kqueue.poll_fd(),
                             events: libc::POLLIN,
                             revents: 0,
                         };
@@ -1276,28 +1273,37 @@ impl SyscallDispatcher {
             if flags & !LINUX_EPOLL_CLOEXEC != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let kqueue = match crate::darwin_kqueue::Kqueue::new_internal() {
-                Some(k) => k,
-                // macOS: a real kqueue couldn't be allocated (fd table full).
-                #[cfg(feature = "platform-macos")]
-                None => return Ok(crate::linux_abi::LINUX_EMFILE.into()),
-                // Linux: there is no kqueue; epoll_pwait services this instance
-                // from the interest map + ppoll, so a dummy backing is fine.
-                #[cfg(not(feature = "platform-macos"))]
-                None => crate::darwin_kqueue::Kqueue::dummy(),
-            };
+            // macOS: the readiness backend is an EventMultiplexer (kqueue-backed).
             // EVFILT_USER(0) is the in-memory wake channel: `notify_inmem_epoll`
             // NOTE_TRIGGERs it when an eventfd/pipe/timerfd readiness changes, so a
-            // thread blocked on this kqueue's fd re-checks in-memory interests.
-            let _ = kqueue.apply(&[crate::darwin_kqueue::Kevent::user(
-                0,
-                carrick_portable::EV_ADD | carrick_portable::EV_CLEAR,
-            )]);
+            // thread blocked on this instance's poll_fd re-checks in-memory interests.
+            #[cfg(feature = "platform-macos")]
+            let epoll_kqueue = {
+                let mut mux = match crate::event_mux::make_event_multiplexer() {
+                    Ok(m) => m,
+                    // A real kqueue couldn't be allocated (fd table full).
+                    Err(_) => return Ok(crate::linux_abi::LINUX_EMFILE.into()),
+                };
+                let _ = mux.register_user(0);
+                crate::dispatch::EpollKqueue::new(mux)
+            };
+            // Linux: there is no kqueue; epoll_pwait services this instance from
+            // the interest map + ppoll, so a dummy backing is fine.
+            #[cfg(not(feature = "platform-macos"))]
+            let epoll_kqueue = {
+                let kqueue = crate::darwin_kqueue::Kqueue::new_internal()
+                    .unwrap_or_else(crate::darwin_kqueue::Kqueue::dummy);
+                let _ = kqueue.apply(&[crate::darwin_kqueue::Kevent::user(
+                    0,
+                    carrick_portable::EV_ADD | carrick_portable::EV_CLEAR,
+                )]);
+                crate::dispatch::EpollKqueue::new(kqueue)
+            };
             let description = OpenDescription::Epoll {
                 interest: HashMap::new(),
                 base: OpenDescriptionBase::new(0),
                 pending_ready: VecDeque::new(),
-                kqueue: Arc::new(crate::dispatch::EpollKqueue::new(kqueue)),
+                kqueue: Arc::new(epoll_kqueue),
             };
             Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
 
@@ -1365,13 +1371,28 @@ impl SyscallDispatcher {
                     }
                     if let Some(host_fd) = host_fd {
                         let ev_events = event.events;
-                        let _ = kqueue.apply(&epoll_kq_add_changes(host_fd, fd, ev_events));
-                        crate::event_ring::rec(
-                            crate::event_ring::EPADD,
-                            kqueue.raw_fd(),
-                            host_fd,
-                            ev_events as i32,
-                        );
+                        #[cfg(feature = "platform-macos")]
+                        {
+                            kqueue.with_mux(|mux| {
+                                let _ = mux.register_io(
+                                    host_fd,
+                                    fd as u64,
+                                    epoll_interest_for(ev_events),
+                                    epoll_trigger_mode(ev_events),
+                                );
+                            });
+                            crate::event_ring::rec(
+                                crate::event_ring::EPADD,
+                                kqueue.poll_fd(),
+                                host_fd,
+                                ev_events as i32,
+                            );
+                        }
+                        // Non-macOS: no kqueue backend; readiness is recomputed
+                        // from the interest map in epoll_pwait. (The old dummy
+                        // kqueue apply was a no-op.)
+                        #[cfg(not(feature = "platform-macos"))]
+                        let _ = (host_fd, ev_events);
                     }
                     interest.insert(
                         fd,
@@ -1391,18 +1412,24 @@ impl SyscallDispatcher {
                     let Some(slot) = interest.get_mut(&fd) else {
                         return Ok(LINUX_ENOENT.into());
                     };
-                    let old_events = slot.event.events;
-                    // MOD first applies the new filters, then removes filters no
-                    // longer present in the new mask. That avoids a no-interest
-                    // gap where a readiness edge can be lost; the transient overlap
-                    // can only produce an extra wake.
-                    if let Some(host_fd) = host_fd
-                        && kqueue
-                            .apply(&epoll_kq_add_changes(host_fd, fd, event.events))
-                            .is_ok()
-                        {
-                            epoll_kq_delete_removed_filters(kqueue, host_fd, old_events, event.events);
-                        }
+                    // `register_io` re-arms the filters present in the new mask and
+                    // EV_DELETEs the ones no longer present in a single call, so the
+                    // old "add new, then delete removed" sequence — which avoided a
+                    // no-interest gap where a readiness edge could be lost — is now
+                    // atomic per direction (no transient gap at all).
+                    if let Some(host_fd) = host_fd {
+                        #[cfg(feature = "platform-macos")]
+                        kqueue.with_mux(|mux| {
+                            let _ = mux.register_io(
+                                host_fd,
+                                fd as u64,
+                                epoll_interest_for(event.events),
+                                epoll_trigger_mode(event.events),
+                            );
+                        });
+                        #[cfg(not(feature = "platform-macos"))]
+                        let _ = host_fd;
+                    }
                     clear_pending_epoll_ready(pending_ready, fd);
                     *slot = EpollInterest {
                         event,
@@ -1414,9 +1441,9 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_DEL => {
-                    let Some(removed) = interest.remove(&fd) else {
+                    if interest.remove(&fd).is_none() {
                         return Ok(LINUX_ENOENT.into());
-                    };
+                    }
                     if let Some(host_fd) = host_fd {
                         // Other guest fds in THIS epoll instance can be dups of the
                         // same socket/pipe, all sharing ONE host fd. The kqueue
@@ -1437,19 +1464,26 @@ impl SyscallDispatcher {
                                 union_events |= slot.event.events;
                             }
                         }
-                        match survivor {
+                        // With a survivor: re-arm the host filter to the surviving
+                        // fd carrying the UNION of all survivors' masks (register_io
+                        // also EV_DELETEs filter classes no survivor still wants).
+                        // With none: drop the host filter entirely (deregister).
+                        #[cfg(feature = "platform-macos")]
+                        kqueue.with_mux(|mux| match survivor {
                             Some(sfd) => {
-                                let _ = kqueue
-                                    .apply(&epoll_kq_add_changes(host_fd, sfd, union_events));
-                                epoll_kq_delete_removed_filters(
-                                    kqueue,
+                                let _ = mux.register_io(
                                     host_fd,
-                                    removed.event.events,
-                                    union_events,
+                                    sfd as u64,
+                                    epoll_interest_for(union_events),
+                                    epoll_trigger_mode(union_events),
                                 );
                             }
-                            None => epoll_kq_delete(kqueue, host_fd),
-                        }
+                            None => {
+                                let _ = mux.deregister(host_fd);
+                            }
+                        });
+                        #[cfg(not(feature = "platform-macos"))]
+                        let _ = (survivor, union_events);
                     }
                     clear_pending_epoll_ready(pending_ready, fd);
                     // A parked waiter still ppolls the removed fd's host fd;
@@ -1719,7 +1753,7 @@ impl SyscallDispatcher {
                         .map(|(fd, interest)| (*fd, interest.clone()))
                         .collect::<Vec<_>>(),
                     Arc::clone(kqueue),
-                    kqueue.raw_fd(),
+                    kqueue.poll_fd(),
                 )
             };
             let has_interests = !interests.is_empty();
@@ -1740,16 +1774,15 @@ impl SyscallDispatcher {
             // `WaitOnFds` (signal-pipe-and-timeout-only) below.
             let mut kq_drained_all_filtered = false;
             {
-                let cap = interests.len() * 2 + 4;
-                let mut out = vec![crate::darwin_kqueue::Kevent::empty(); cap.max(1)];
-                let zero = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                };
-                if let Ok(n) = kq.wait(&[], &mut out, Some(&zero)) {
+                // Non-blocking drain of the multiplexer for host-backed fds.
+                let mut poll_events: Vec<carrick_hal::event::PollEvent> = Vec::new();
+                if kq
+                    .with_mux(|mux| mux.wait(&mut poll_events, Some(Duration::ZERO)))
+                    .is_ok()
+                {
                     let acc_before = acc.len();
-                    // Count only REAL host-fd events (EVFILT_READ/WRITE/EXCEPT →
-                    // nonzero epoll bits). A consumed EVFILT_USER(0) in-memory wake
+                    // Count only REAL host-fd events (read/write/oob → nonzero
+                    // epoll bits). A consumed EVFILT_USER(0) in-memory wake
                     // (bits == 0, registered EV_CLEAR so it auto-resets on this
                     // drain) must NOT count toward `kq_drained_all_filtered`: it is
                     // gone now, so polling kq_fd will not spin, whereas the
@@ -1758,15 +1791,15 @@ impl SyscallDispatcher {
                     // reached by the next notify_inmem_epoll / host-fd readiness
                     // edge (the Node worker-teardown loop-thread hang).
                     let mut translatable_events = 0usize;
-                    for ev in &out[..n] {
-                        let bits = kevent_to_epoll(*ev);
+                    for ev in &poll_events {
+                        let bits = pollevent_to_epoll(ev);
                         if bits == 0 {
                             // EVFILT_USER(0) in-memory wake, or a filter with no
                             // translatable bits — recompute below covers in-memory.
                             continue;
                         }
                         translatable_events += 1;
-                        let guest_fd = ev.udata_i32();
+                        let guest_fd = ev.token as i32;
                         // The kqueue filter is keyed by HOST fd, but several guest
                         // fds can be dups of one socket/pipe sharing that host fd,
                         // and Linux wakes EACH fd's pollDesc independently. The
@@ -1896,11 +1929,9 @@ impl SyscallDispatcher {
             // applied to the freshly-disarmed ONESHOT slot).
             for fd in &oneshot_fds {
                 if let Some(host_fd) = this.host_fd_for_poll(*fd) {
-                    let _ = kq.apply(&[
-                        crate::darwin_kqueue::Kevent::read(host_fd, carrick_portable::EV_DELETE),
-                        crate::darwin_kqueue::Kevent::write(host_fd, carrick_portable::EV_DELETE),
-                        crate::darwin_kqueue::Kevent::oob(host_fd, carrick_portable::EV_DELETE),
-                    ]);
+                    kq.with_mux(|mux| {
+                        let _ = mux.deregister(host_fd);
+                    });
                 }
             }
 
