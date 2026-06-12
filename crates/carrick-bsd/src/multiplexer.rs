@@ -166,11 +166,16 @@ impl EventMultiplexer for KqueueMultiplexer {
                     if fflags & libc::NOTE_EXIT != 0 {
                         is_eof = true;
                     }
-                    // NOTE_EXITSTATUS is macOS-only; on FreeBSD it is 0 (no-op).
+                    // macOS delivers the exit status in `data` only when the
+                    // NOTE_EXITSTATUS fflag was requested.
                     #[cfg(target_os = "macos")]
                     if fflags & NOTE_EXITSTATUS != 0 {
                         exit_status = Some(ev.data() as i32);
                     }
+                    // FreeBSD carries the wait-status in `data` UNCONDITIONALLY
+                    // under NOTE_EXIT. TODO(part-c): wire it into exit_status with
+                    // a proc-exit kqueue test when EventMultiplexer::watch_process_exit
+                    // lands (the proc_exit_status accessor already reads `data`).
                 }
                 libc::EVFILT_USER => {
                     readiness.read = true;
