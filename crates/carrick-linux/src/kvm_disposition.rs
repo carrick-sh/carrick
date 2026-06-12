@@ -117,6 +117,7 @@ fn kvm_routable(signum: i32) -> bool {
 ///      PROC_PENDING (so `has_process_pending()` becomes true).
 ///   3. `kvm_signal_pump::poke()` — one `write(2)` to the pump's self-pipe, so the
 ///      pump's `kick_all` fans every vCPU out of `KVM_RUN`.
+///
 /// This is the existing [`crate::kvm_signal_pump`] `pump_handler` GENERALIZED to
 /// an arbitrary routable signum (on Linux host signum == guest signum, so no
 /// translation). NOTHING else (no locks, allocation, or `println!`).

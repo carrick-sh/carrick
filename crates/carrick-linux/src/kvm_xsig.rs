@@ -74,6 +74,7 @@ pub fn xsig_nudge(target_host_pid: i32) {
 ///   2. `kvm_signal_pump::poke()` — one `write(2)` to the pump's self-pipe, so
 ///      the pump's `kick_all` fans every vCPU out of `KVM_RUN` and each re-checks
 ///      pending at its safe point (`deliver_pending_signal`).
+///
 /// NOTHING else (no locks, allocation, or `println!`).
 extern "C" fn xsig_nudge_handler(_sig: c_int) {
     carrick_signal_core::xsig::mark_xsig_dirty();
