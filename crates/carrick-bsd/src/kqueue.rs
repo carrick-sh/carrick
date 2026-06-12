@@ -7,13 +7,12 @@ use std::os::fd::RawFd;
 pub const EVFILT_EXCEPT: i16 = -15;
 /// `EVFILT_EXCEPT` hint for socket out-of-band data.
 pub const NOTE_OOB: u32 = 0x0000_0002;
-/// macOS `EVFILT_PROC` flag that requests the exit status in `data`.
-/// On FreeBSD `EVFILT_PROC` does not carry the exit status this way,
-/// so we define the constant as 0 (a no-op fflags addition) to keep
-/// the code compiling; the `proc_exit_status` accessor will return 0.
-/// macOS `EVFILT_PROC` flag requesting exit status in `data`.
-/// On FreeBSD this flag does not exist; defined as 0 (no-op) so cross-platform
-/// code compiles. `proc_exit_status` will return 0 on FreeBSD.
+/// macOS `EVFILT_PROC` fflag that requests the exit status be delivered in
+/// `data`. FreeBSD has no such fflag — but its `NOTE_EXIT` already delivers the
+/// wait-status in `data` UNCONDITIONALLY — so we define this as 0 (a no-op
+/// fflags addition) purely to keep the shared arming code compiling. Note the
+/// consequence: on FreeBSD `proc_exit_status` (which reads `data`) returns the
+/// REAL status, not 0.
 #[cfg(target_os = "macos")]
 pub use libc::NOTE_EXITSTATUS;
 #[cfg(target_os = "freebsd")]
