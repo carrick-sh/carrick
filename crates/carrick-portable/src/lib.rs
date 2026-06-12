@@ -302,7 +302,31 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
         let mut off = offset as libc::off_t;
         unsafe { libc::sendfile(sock_fd, file_fd, &mut off, count) }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut sbytes: libc::off_t = 0;
+        // FreeBSD sendfile(2): sendfile(fd, s, offset, nbytes, hdtr, *sbytes, flags)
+        // fd=source file, s=socket — note the arg order is opposite to Linux.
+        // Returns 0 on success with bytes written in *sbytes; -1 on error (errno set).
+        // SAFETY: file_fd/sock_fd are live caller-owned fds; sbytes is a valid out-param.
+        let rc = unsafe {
+            libc::sendfile(
+                file_fd,
+                sock_fd,
+                offset as libc::off_t,
+                count,
+                std::ptr::null_mut(),
+                &mut sbytes,
+                0,
+            )
+        };
+        if rc == 0 {
+            sbytes as isize
+        } else {
+            rc as isize
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
     {
         let _ = (file_fd, sock_fd, offset, count);
         -libc::ENOSYS as isize
@@ -471,12 +495,14 @@ siginfo_accessor!(si_status -> libc::c_int);
 
 /// kqueue flag/filter/fflag constants. BSD-only; on Linux these are typed
 /// placeholders (see the module doc) carrying the canonical BSD numeric value.
+/// On macOS and FreeBSD the real `libc` constant is re-exported; on Linux a
+/// typed placeholder carrying the canonical 4.4BSD numeric value is used.
 macro_rules! port_kqueue {
     ($ty:ty: $($name:ident = $val:expr),+ $(,)?) => {
         $(
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             pub use libc::$name;
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
             pub const $name: $ty = $val;
         )+
     };
@@ -504,6 +530,53 @@ port_kqueue!(u32:
     NOTE_ATTRIB = 0x0000_0008,
     NOTE_RENAME = 0x0000_0020,
 );
+
+#[cfg(all(test, target_os = "freebsd"))]
+mod freebsd_const_tests {
+    #[test]
+    fn port_kqueue_uses_real_freebsd_values() {
+        assert_eq!(super::EV_CLEAR, libc::EV_CLEAR);
+        assert_eq!(super::EVFILT_READ, libc::EVFILT_READ);
+        assert_eq!(super::NOTE_WRITE, libc::NOTE_WRITE);
+    }
+
+    #[test]
+    fn siginfo_accessor_reads_fields_on_freebsd() {
+        let info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(super::si_pid(&info), 0);
+        assert_eq!(super::si_uid(&info), 0);
+        assert_eq!(super::si_status(&info), 0);
+    }
+
+    #[test]
+    fn sendfile_to_socket_transfers_on_freebsd() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let mut tmp = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open("/tmp/carrick_sendfile_test.bin")
+            .unwrap();
+        tmp.write_all(b"hello-sendfile").unwrap();
+        tmp.flush().unwrap();
+        let mut sv = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+            0
+        );
+        let n = unsafe { super::sendfile_to_socket(tmp.as_raw_fd(), sv[0], 0, 14) };
+        assert!(n > 0, "sendfile_to_socket returned {n}, expected > 0");
+        let mut buf = [0u8; 14];
+        let got = unsafe { libc::read(sv[1], buf.as_mut_ptr() as *mut libc::c_void, 14) };
+        assert!(got > 0, "socket read returned {got}");
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+    }
+}
 
 #[cfg(all(test, target_os = "freebsd"))]
 mod freebsd_xattr_tests {
