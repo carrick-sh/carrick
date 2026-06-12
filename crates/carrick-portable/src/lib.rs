@@ -80,6 +80,37 @@ pub fn set_errno(value: i32) {
 // for the xattrs carrick uses) that Linux lacks; the `flags`/`options` arg also
 // shifts position. These wrappers expose the common (Linux-shaped) signature.
 
+/// On FreeBSD, parse a Linux-style xattr name (`"user.foo"`, `"system.foo"`, …)
+/// into a `(namespace, attr_name)` pair for the `extattr_*_fd` API.
+/// Unmapped prefixes fall back to `EXTATTR_NAMESPACE_USER`.
+#[cfg(target_os = "freebsd")]
+fn freebsd_xattr_ns(name: &std::ffi::CStr) -> (libc::c_int, std::ffi::CString) {
+    let bytes = name.to_bytes();
+    for (prefix, ns) in [
+        (&b"user."[..], libc::EXTATTR_NAMESPACE_USER as libc::c_int),
+        (
+            &b"system."[..],
+            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+        ),
+        (
+            &b"trusted."[..],
+            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+        ),
+        (
+            &b"security."[..],
+            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+        ),
+    ] {
+        if let Some(rest) = bytes.strip_prefix(prefix) {
+            return (ns, std::ffi::CString::new(rest).unwrap_or_default());
+        }
+    }
+    (
+        libc::EXTATTR_NAMESPACE_USER as libc::c_int,
+        std::ffi::CString::new(bytes).unwrap_or_default(),
+    )
+}
+
 /// `fsetxattr` with the portable `(fd, name, value, size, flags)` shape.
 ///
 /// # Safety
@@ -96,9 +127,22 @@ pub unsafe fn fsetxattr(
     {
         unsafe { libc::fsetxattr(fd, name, value, size, 0, flags) }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         unsafe { libc::fsetxattr(fd, name, value, size, flags) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        // extattr_set_fd has no flags parameter; xattr flags are ignored on FreeBSD.
+        let _ = flags;
+        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let rc = unsafe { libc::extattr_set_fd(fd, ns, attr.as_ptr(), value, size) };
+        if rc >= 0 { 0 } else { -1 }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (fd, name, value, size, flags);
+        -libc::ENOSYS
     }
 }
 
@@ -117,9 +161,19 @@ pub unsafe fn fgetxattr(
     {
         unsafe { libc::fgetxattr(fd, name, value, size, 0, 0) }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         unsafe { libc::fgetxattr(fd, name, value, size) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        unsafe { libc::extattr_get_fd(fd, ns, attr.as_ptr(), value, size) }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (fd, name, value, size);
+        -libc::ENOSYS as isize
     }
 }
 
@@ -133,9 +187,60 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
     {
         unsafe { libc::flistxattr(fd, list, size, 0) }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         unsafe { libc::flistxattr(fd, list, size) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        // FreeBSD extattr_list_fd returns per-namespace `[u8 len][name bytes]` entries
+        // (no NUL terminator on each entry). Merge USER+SYSTEM namespaces and re-emit
+        // Linux-style NUL-terminated `"prefix.name\0"` entries.
+        let mut out: Vec<u8> = Vec::new();
+        for (ns, prefix) in [
+            (libc::EXTATTR_NAMESPACE_USER as libc::c_int, &b"user."[..]),
+            (
+                libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+                &b"system."[..],
+            ),
+        ] {
+            let need = unsafe { libc::extattr_list_fd(fd, ns, std::ptr::null_mut(), 0) };
+            if need <= 0 {
+                continue;
+            }
+            let mut raw = vec![0u8; need as usize];
+            let got = unsafe { libc::extattr_list_fd(fd, ns, raw.as_mut_ptr().cast(), raw.len()) };
+            if got <= 0 {
+                continue;
+            }
+            let raw = &raw[..got as usize];
+            let mut i = 0usize;
+            while i < raw.len() {
+                let nlen = raw[i] as usize;
+                i += 1;
+                if i + nlen > raw.len() {
+                    break;
+                }
+                out.extend_from_slice(prefix);
+                out.extend_from_slice(&raw[i..i + nlen]);
+                out.push(0);
+                i += nlen;
+            }
+        }
+        if size == 0 {
+            return out.len() as isize;
+        }
+        if out.len() > size {
+            set_errno(libc::ERANGE);
+            return -1;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), list.cast::<u8>(), out.len()) };
+        out.len() as isize
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (fd, list, size);
+        -libc::ENOSYS as isize
     }
 }
 
@@ -149,9 +254,20 @@ pub unsafe fn fremovexattr(fd: i32, name: *const libc::c_char) -> libc::c_int {
     {
         unsafe { libc::fremovexattr(fd, name, 0) }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         unsafe { libc::fremovexattr(fd, name) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let rc = unsafe { libc::extattr_delete_fd(fd, ns, attr.as_ptr()) };
+        if rc >= 0 { 0 } else { -1 }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (fd, name);
+        -libc::ENOSYS
     }
 }
 
@@ -219,7 +335,7 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
             (0, 0, 0)
         }
     }
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
         let mut xlen = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
@@ -260,6 +376,19 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
         };
         (pid, uid, gid)
     }
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: uid/gid are valid out-params for getpeereid on a socket fd.
+        // FreeBSD has no peer-pid API; report pid as 0.
+        let rc = unsafe { libc::getpeereid(host_fd, &mut uid, &mut gid) };
+        if rc == 0 {
+            (0, uid as u32, gid as u32)
+        } else {
+            (0, 0, 0)
+        }
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
@@ -273,21 +402,37 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
 }
 
 /// Re-export a constant that has a real (possibly differently-named) equivalent
-/// on non-macOS: `port_alias!(PORTNAME => macos_libc_name, other_libc_name)`.
+/// on every platform. Two-way form: `port_alias!(NAME => mac_name, linux_name)`
+/// uses `mac_name` on macOS and FreeBSD (when the macOS name exists on FreeBSD
+/// too), and `linux_name` on Linux. Three-way form:
+/// `port_alias!(NAME => mac_name, bsd_name, linux_name)` for constants where
+/// macOS and FreeBSD use different libc names.
 macro_rules! port_alias {
     ($name:ident => $mac:ident, $other:ident) => {
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        pub use libc::$mac as $name;
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        pub use libc::$other as $name;
+    };
+    ($name:ident => $mac:ident, $bsd:ident, $linux:ident) => {
+        #[cfg(target_os = "freebsd")]
+        pub use libc::$bsd as $name;
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        pub use libc::$linux as $name;
         #[cfg(target_os = "macos")]
         pub use libc::$mac as $name;
-        #[cfg(not(target_os = "macos"))]
-        pub use libc::$other as $name;
     };
 }
 
 // Darwin name -> Linux equivalent. Re-exported as the Darwin name so call sites
 // keep reading naturally; the value is the platform-native libc constant.
-port_alias!(CLOCK_UPTIME_RAW => CLOCK_UPTIME_RAW, CLOCK_MONOTONIC_RAW);
+//
+// CLOCK_UPTIME_RAW: macOS=CLOCK_UPTIME_RAW, FreeBSD=CLOCK_UPTIME_PRECISE
+//   (both measure unhalted wall time; PRECISE is the highest-res FreeBSD clock)
+// TCP_KEEPALIVE: macOS name; FreeBSD and Linux both use TCP_KEEPIDLE
+port_alias!(CLOCK_UPTIME_RAW => CLOCK_UPTIME_RAW, CLOCK_UPTIME_PRECISE, CLOCK_MONOTONIC_RAW);
 port_alias!(TCP_NOPUSH => TCP_NOPUSH, TCP_CORK);
-port_alias!(TCP_KEEPALIVE => TCP_KEEPALIVE, TCP_KEEPIDLE);
+port_alias!(TCP_KEEPALIVE => TCP_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPIDLE);
 port_alias!(AF_LINK => AF_LINK, AF_PACKET);
 
 // Host `ptrace(2)` request constants (Darwin `PT_*` ↔ Linux `PTRACE_*`). Used
@@ -359,3 +504,36 @@ port_kqueue!(u32:
     NOTE_ATTRIB = 0x0000_0008,
     NOTE_RENAME = 0x0000_0020,
 );
+
+#[cfg(all(test, target_os = "freebsd"))]
+mod freebsd_xattr_tests {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn user_namespace_xattr_round_trip() {
+        let f = std::fs::File::create("/tmp/carrick_xattr_test.bin").unwrap();
+        let fd = f.as_raw_fd();
+        let name = CString::new("user.carrick.test").unwrap();
+        let val = b"42";
+        let rc = unsafe { super::fsetxattr(fd, name.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
+        assert!(rc >= 0, "fsetxattr failed: {rc}");
+        let mut buf = [0u8; 16];
+        let got =
+            unsafe { super::fgetxattr(fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(got, 2, "fgetxattr len");
+        assert_eq!(&buf[..2], b"42");
+        let mut list = [0u8; 256];
+        let ln = unsafe { super::flistxattr(fd, list.as_mut_ptr().cast(), list.len()) };
+        assert!(ln > 0, "flistxattr len {ln}");
+        assert!(
+            list[..ln as usize]
+                .split(|&b| b == 0)
+                .any(|e| e == b"user.carrick.test"),
+            "list missing entry: {:?}",
+            &list[..ln as usize]
+        );
+        let rm = unsafe { super::fremovexattr(fd, name.as_ptr()) };
+        assert!(rm >= 0, "fremovexattr failed: {rm}");
+    }
+}
