@@ -7,6 +7,17 @@ use std::os::fd::RawFd;
 pub const EVFILT_EXCEPT: i16 = -15;
 /// `EVFILT_EXCEPT` hint for socket out-of-band data.
 pub const NOTE_OOB: u32 = 0x0000_0002;
+/// macOS `EVFILT_PROC` flag that requests the exit status in `data`.
+/// On FreeBSD `EVFILT_PROC` does not carry the exit status this way,
+/// so we define the constant as 0 (a no-op fflags addition) to keep
+/// the code compiling; the `proc_exit_status` accessor will return 0.
+/// macOS `EVFILT_PROC` flag requesting exit status in `data`.
+/// On FreeBSD this flag does not exist; defined as 0 (no-op) so cross-platform
+/// code compiles. `proc_exit_status` will return 0 on FreeBSD.
+#[cfg(target_os = "macos")]
+pub use libc::NOTE_EXITSTATUS;
+#[cfg(target_os = "freebsd")]
+pub const NOTE_EXITSTATUS: u32 = 0;
 
 // Internal-fd relocation is platform-neutral POSIX (F_DUPFD_CLOEXEC above a
 // high floor, then close the original); it now lives in the neutral
@@ -122,6 +133,8 @@ impl Kevent {
             fflags: 0,
             data: 0,
             udata: std::ptr::null_mut(),
+            #[cfg(target_os = "freebsd")]
+            ext: [0; 4],
         })
     }
 
@@ -155,7 +168,7 @@ impl Kevent {
             pid as usize,
             libc::EVFILT_PROC,
             libc::EV_ADD | libc::EV_ONESHOT,
-            libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
+            libc::NOTE_EXIT | NOTE_EXITSTATUS,
         )
     }
 
@@ -196,7 +209,11 @@ impl Kevent {
     }
 
     pub fn data(self) -> i64 {
-        self.0.data as i64
+        // macOS: `data` is `isize`; FreeBSD: `data` is `i64`. Cast only when needed.
+        #[cfg(target_os = "macos")]
+        return self.0.data as i64;
+        #[cfg(not(target_os = "macos"))]
+        return self.0.data;
     }
 
     /// The integer previously stashed via [`with_udata`](Self::with_udata) (the
@@ -242,7 +259,15 @@ impl Kevent {
     /// from EVFILT_READ fds and EVFILT_USER idents.
     pub fn timer(ident: usize, flags: u16, interval_ns: i64) -> Self {
         let mut ev = Self::new(ident, libc::EVFILT_TIMER, flags, libc::NOTE_NSECONDS);
-        ev.0.data = interval_ns as isize;
+        // macOS: data is `isize`; FreeBSD: data is `i64`.
+        #[cfg(target_os = "macos")]
+        {
+            ev.0.data = interval_ns as isize;
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            ev.0.data = interval_ns;
+        }
         ev
     }
 
@@ -280,6 +305,8 @@ impl Kevent {
             fflags,
             data: 0,
             udata: std::ptr::null_mut(),
+            #[cfg(target_os = "freebsd")]
+            ext: [0; 4],
         })
     }
 
