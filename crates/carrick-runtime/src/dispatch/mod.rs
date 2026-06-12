@@ -1439,85 +1439,54 @@ pub struct SyscallDispatcher {
 /// dispatch drains it, so a wake between sample and park is never lost.
 /// An epoll instance's persistent readiness backend.
 ///
-/// On macOS the backend is a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
-/// (kqueue-backed); `epoll_ctl` registers host-fd interest through the trait and
-/// `epoll_pwait` drains it. The mux is wrapped in a `Mutex` because the instance
-/// is shared via `Arc` (so a dup'd epoll fd refers to the same backend) yet the
-/// trait's mutating methods need `&mut`; every macOS call site holds the lock
-/// only for a non-blocking kqueue change/drain (the blocking wait happens on the
-/// `poll_fd` via the runtime's poll park, never under this lock). `poll_fd` is
-/// cached so `Drop`/the wake registry/`host_fd_for_poll` read it lock-free.
-///
-/// On non-macOS there is no multiplexer yet (Part C Phase 2); the backend stays
-/// the dummy `Kqueue` plus the Linux self-wake pipe exactly as before.
+/// The backend is a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer):
+/// kqueue-backed on macOS (`carrick_bsd::KqueueMultiplexer`), epoll-backed on
+/// Linux (`carrick_linux::EpollMultiplexer`). `epoll_ctl` registers host-fd
+/// interest through the trait and `epoll_pwait` drains it. The mux is wrapped in
+/// a `Mutex` because the instance is shared via `Arc` (so a dup'd epoll fd refers
+/// to the same backend) yet the trait's mutating methods need `&mut`; every call
+/// site holds the lock only for a non-blocking change/drain (the blocking wait
+/// happens on the `poll_fd` via the runtime's poll park, never under this lock).
+/// `poll_fd` is cached so `Drop`/the wake registry/`host_fd_for_poll` read it
+/// lock-free.
 pub(crate) struct EpollKqueue {
-    #[cfg(feature = "platform-macos")]
     mux: std::sync::Mutex<Box<dyn carrick_hal::event::EventMultiplexer>>,
-    /// Cached `mux.poll_fd()` (the kqueue fd) — stable for the instance's life,
-    /// read lock-free by the wake registry, `Drop`, and `host_fd_for_poll`.
-    #[cfg(feature = "platform-macos")]
+    /// Cached `mux.poll_fd()` (the kqueue/epoll fd) — stable for the instance's
+    /// life, read lock-free by `Drop` and `host_fd_for_poll`.
     poll_fd: i32,
-    #[cfg(not(feature = "platform-macos"))]
-    kq: crate::darwin_kqueue::Kqueue,
-    /// Linux self-wake pipe `(read, write)`, both `O_NONBLOCK|O_CLOEXEC`.
-    /// `None` if pipe creation failed (the park then degrades to the old
-    /// snapshot behavior rather than failing epoll_create1).
-    #[cfg(not(feature = "platform-macos"))]
-    wake_pipe: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+    /// The fd the in-memory wake registry pulses to pop a parked waiter on this
+    /// instance: the user-wake `eventfd` on Linux (a separate fd) or the kqueue
+    /// `poll_fd` on macOS (EVFILT_USER rides the kqueue fd). Stable for life;
+    /// read lock-free by the registry and `Drop`.
+    wake_fd: i32,
 }
 
 impl EpollKqueue {
-    /// macOS: take ownership of a freshly-built multiplexer (its `EVFILT_USER(0)`
-    /// in-memory wake channel already registered) and record it in the in-memory
-    /// wake registry so `notify_inmem_epoll` can reach this instance.
-    #[cfg(feature = "platform-macos")]
+    /// Take ownership of a freshly-built multiplexer (its user-wake channel
+    /// `register_user(0)` already armed) and record it in the in-memory wake
+    /// registry so `notify_inmem_epoll`/`wake_parked` can reach this instance.
     pub(crate) fn new(mux: Box<dyn carrick_hal::event::EventMultiplexer>) -> Self {
         let poll_fd = mux.poll_fd();
-        register_epoll_kqueue(poll_fd);
+        // On Linux the user-wake is a separate eventfd; on macOS it rides the
+        // kqueue fd, so fall back to poll_fd. The registry pulses this fd.
+        let wake_fd = mux.user_wake_fd(0).unwrap_or(poll_fd);
+        register_epoll_kqueue(wake_fd);
         Self {
             mux: std::sync::Mutex::new(mux),
             poll_fd,
+            wake_fd,
         }
     }
 
-    #[cfg(not(feature = "platform-macos"))]
-    pub(crate) fn new(kq: crate::darwin_kqueue::Kqueue) -> Self {
-        register_epoll_kqueue(kq.raw_fd());
-        let mut fds = [0i32; 2];
-        let wake_pipe =
-            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } == 0 {
-                use std::os::fd::FromRawFd;
-                // SAFETY: pipe2 succeeded; fds[0]/fds[1] are fresh owned fds.
-                Some(unsafe {
-                    (
-                        std::os::fd::OwnedFd::from_raw_fd(fds[0]),
-                        std::os::fd::OwnedFd::from_raw_fd(fds[1]),
-                    )
-                })
-            } else {
-                None
-            };
-        Self { kq, wake_pipe }
-    }
-
-    /// The pollable fd readable when any registered event is ready. On macOS the
-    /// runtime parks `WaitOnPollFds` on this; the wake registry and the
-    /// epoll-fd readiness computation also read it. (Replaces the old `Deref` to
-    /// `Kqueue`.) On non-macOS the dummy kqueue's fd (`-1`) is returned — the
-    /// Linux epoll path never polls it (readiness comes from the interest map).
-    #[cfg(feature = "platform-macos")]
+    /// The pollable fd readable when any registered event is ready. The runtime
+    /// parks `WaitOnPollFds` on this; the wake registry and the epoll-fd
+    /// readiness computation also read it.
     pub(crate) fn poll_fd(&self) -> i32 {
         self.poll_fd
     }
 
-    #[cfg(not(feature = "platform-macos"))]
-    pub(crate) fn poll_fd(&self) -> i32 {
-        self.kq.raw_fd()
-    }
-
     /// Run a closure against the underlying multiplexer (locked for the call).
-    /// Used by the macOS epoll dispatch for non-blocking register/drain only.
-    #[cfg(feature = "platform-macos")]
+    /// Used by the epoll dispatch for non-blocking register/drain only.
     pub(crate) fn with_mux<R>(
         &self,
         f: impl FnOnce(&mut dyn carrick_hal::event::EventMultiplexer) -> R,
@@ -1526,41 +1495,26 @@ impl EpollKqueue {
         f(&mut **guard)
     }
 
-    /// The wake pipe's read end for the `ppoll` park set (`None` on macOS or
-    /// if pipe creation failed).
-    #[cfg(not(feature = "platform-macos"))]
-    pub(crate) fn wake_read_fd(&self) -> Option<i32> {
-        use std::os::fd::AsRawFd;
-        self.wake_pipe.as_ref().map(|(r, _)| r.as_raw_fd())
-    }
-
-    /// Wake any waiter parked on this instance's `ppoll` so it rebuilds its
-    /// snapshot. Non-blocking; a full pipe (wake already pending) is success.
+    /// Wake any waiter parked on this instance's `poll_fd` so it re-checks
+    /// readiness. On Linux it fires the multiplexer's user-wake
+    /// (`trigger_user(0)`), which makes the epoll `poll_fd` readable and pops the
+    /// park; the parked thread re-samples and re-parks armed. (The shared epoll
+    /// set already auto-wakes on an ADD-of-ready-fd, so this covers the readiness
+    /// changes that don't ride a freshly-registered fd: ET re-arm and the
+    /// in-memory broadcast.) Best-effort — a saturated user-wake is already a
+    /// pending wake.
+    ///
+    /// On macOS this is a no-op: the shared kqueue reaches parked waiters
+    /// natively and the in-memory broadcast drives `trigger_user(0)` directly via
+    /// `notify_inmem_epoll`, so the historical macOS behavior is preserved.
     #[cfg(not(feature = "platform-macos"))]
     pub(crate) fn wake_parked(&self) {
-        use std::os::fd::AsRawFd;
-        if let Some((_, w)) = &self.wake_pipe {
-            // SAFETY: writing one byte from a valid stack buffer to an owned fd.
-            unsafe { libc::write(w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-        }
+        self.with_mux(|mux| {
+            let _ = mux.trigger_user(0);
+        });
     }
 
-    /// Consume pending wake bytes so a stale wake doesn't spin the next park.
-    /// Called at the top of each `epoll_pwait` dispatch, BEFORE sampling — any
-    /// wake written after the drain (even between sample and park) leaves a
-    /// byte that pops the park immediately.
-    #[cfg(not(feature = "platform-macos"))]
-    pub(crate) fn drain_wake(&self) {
-        use std::os::fd::AsRawFd;
-        if let Some((r, _)) = &self.wake_pipe {
-            let mut buf = [0u8; 64];
-            // SAFETY: reading into a valid stack buffer from an owned
-            // O_NONBLOCK fd; loop ends on EAGAIN (or any error/EOF).
-            while unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-        }
-    }
-
-    /// macOS: the shared kqueue reaches parked waiters natively; no-ops.
+    /// macOS: the shared kqueue reaches parked waiters natively; no-op.
     #[cfg(feature = "platform-macos")]
     pub(crate) fn wake_parked(&self) {}
 }
@@ -1576,10 +1530,7 @@ impl std::fmt::Debug for EpollKqueue {
 
 impl Drop for EpollKqueue {
     fn drop(&mut self) {
-        #[cfg(feature = "platform-macos")]
-        unregister_epoll_kqueue(self.poll_fd);
-        #[cfg(not(feature = "platform-macos"))]
-        unregister_epoll_kqueue(self.kq.raw_fd());
+        unregister_epoll_kqueue(self.wake_fd);
     }
 }
 
