@@ -93,6 +93,7 @@ static SIGCHLD_INSTALLED: AtomicBool = AtomicBool::new(false);
 ///     path (`io_wait::wait_proc_exit`) restarts across this handler's EINTR
 ///     rather than failing (that path already tolerates EINTR by re-polling, but
 ///     SA_RESTART keeps the contract explicit and minimises spurious wakeups).
+///
 /// Must be live by the time the first child-exit watch is registered, so it is
 /// installed from the same `start_pump` path the kick + pump use.
 fn install_sigchld_handler() {
@@ -175,6 +176,7 @@ fn reap_exited_watches() {
 /// Async-signal-safe handler for the pumped host signals. Does ONLY:
 ///   1. `proc_pending_fetch_or(bit)` — a lock-free atomic OR into PROC_PENDING.
 ///   2. `write(SELF_PIPE_W, &[0u8], 1)` — wake the pump thread.
+///
 /// `carrick_signal_core::pending_bit` is pure arithmetic (`1 << (signum-1)`), so
 /// it is safe to call here. NO allocation, locks, or non-reentrant libc.
 extern "C" fn pump_handler(signum: libc::c_int) {
@@ -445,6 +447,7 @@ pub fn reinit_after_fork(registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn Platf
 ///     reaper disposition;
 ///   * `child_watch::clear()` so the child does not reap or deliver the
 ///     supervisor's child-exit watches.
+///
 /// This is the spawn-free analogue of [`reinit_after_fork`]; the caller does the
 /// spawn (via its own later `start_signal_pump`).
 pub fn reset_state_for_supervisor_fork() {
