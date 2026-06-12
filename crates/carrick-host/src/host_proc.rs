@@ -593,8 +593,7 @@ mod imp {
             if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) } != 0 {
                 return None;
             }
-            let to_us =
-                |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+            let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
             Some((to_us(ru.ru_utime), to_us(ru.ru_stime)))
         }
         #[cfg(not(target_os = "linux"))]

@@ -2,7 +2,9 @@
 
 #[cfg(target_os = "macos")]
 use crate::kqueue::NOTE_EXITSTATUS;
-use crate::kqueue::{EVFILT_EXCEPT, Kevent, Kqueue, NOTE_OOB};
+#[cfg(target_os = "macos")]
+use crate::kqueue::{EVFILT_EXCEPT, NOTE_OOB};
+use crate::kqueue::{Kevent, Kqueue};
 use carrick_hal::error::OsError;
 use carrick_hal::event::{
     EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents,
@@ -153,6 +155,9 @@ impl EventMultiplexer for KqueueMultiplexer {
                         is_eof = true;
                     }
                 }
+                // EVFILT_EXCEPT/NOTE_OOB is Darwin-only; FreeBSD has no OOB
+                // socket filter and NOTE_OOB is defined as 0 there (no-op).
+                #[cfg(target_os = "macos")]
                 f if f == EVFILT_EXCEPT => {
                     if fflags & NOTE_OOB != 0 {
                         readiness.oob = true;
