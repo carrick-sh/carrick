@@ -201,7 +201,7 @@ pub use carrick_hal::aarch64::{
     is_aarch64_hvc_exception, is_aarch64_hvc_maintenance, is_aarch64_svc_exception,
     is_aarch64_syscall_exception,
 };
-pub use carrick_hal::trap::{ForkOutcome, SyscallTrap, TrapError};
+pub use carrick_hal::trap::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
 // Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
@@ -4898,8 +4898,16 @@ impl SyscallTrap for HvfTrapEngine {
         HvfTrapEngine::is_forked_child(self)
     }
 
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
-        self.run_until_syscall()
+    fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
+        // Read the raw per-ISA register frame exactly as before, then decode it
+        // through this engine's `GuestArch` so the runtime loop is ISA-neutral
+        // (Phase 1, Task 3). The aarch64 decode is x8 → number, x0..x5 → args.
+        use carrick_hal::GuestArch as _;
+        Ok(self.run_until_syscall()?.map(|frame| {
+            let (number, args) =
+                <Self as carrick_hal::ThreadedEngine>::Arch::decode_syscall(&frame);
+            carrick_hal::RawSyscall { number, args }
+        }))
     }
 
     fn current_pc(&self) -> Result<u64, TrapError> {

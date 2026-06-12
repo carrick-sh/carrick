@@ -783,6 +783,17 @@ impl SyscallRequest {
             args: SyscallArgs::from([frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5]),
         }
     }
+
+    /// Build a request from the ISA-neutral [`carrick_hal::RawSyscall`] the
+    /// backend now hands back from `next_syscall` (the per-ISA register decode
+    /// moved into the backend's `GuestArch`; the runtime loop only sees
+    /// number + args).
+    pub fn from_raw(raw: carrick_hal::RawSyscall) -> Self {
+        Self {
+            number: raw.number,
+            args: SyscallArgs::from(raw.args),
+        }
+    }
 }
 
 #[derive(Eq)]

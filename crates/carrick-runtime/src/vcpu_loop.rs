@@ -45,8 +45,7 @@ use carrick_hal::{HostForkCoordinator, PlatformFutex, ThreadedEngine, VcpuRegist
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    Aarch64SyscallFrame, DispatchError, DispatchOutcome, GuestMemory, ProcMapsEntry,
-    SyscallDispatcher, SyscallRequest,
+    DispatchError, DispatchOutcome, GuestMemory, ProcMapsEntry, SyscallDispatcher, SyscallRequest,
 };
 use crate::memory::AddressSpace;
 use crate::run_result::{RunResult, RuntimeError};
@@ -682,16 +681,17 @@ where
         Ok(())
     }
 
-    fn trace_syscall(&self, traps: usize, frame: Aarch64SyscallFrame) {
+    fn trace_syscall(&self, traps: usize, frame: carrick_hal::RawSyscall) {
         if !self.trace {
             return;
         }
-        let name = crate::syscall::lookup_aarch64(frame.x8)
+        let name = crate::syscall::lookup_aarch64(frame.number)
             .map(|s| s.name)
             .unwrap_or("<unknown>");
+        let a = frame.args;
         eprintln!(
-            "tid#{} trap#{}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x}",
-            self.this_tid, traps, frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4
+            "tid#{} trap#{}: nr={} ({name}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x}",
+            self.this_tid, traps, frame.number, a[0], a[1], a[2], a[3], a[4]
         );
     }
 
@@ -720,13 +720,13 @@ where
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
-        frame: Aarch64SyscallFrame,
+        frame: carrick_hal::RawSyscall,
     ) -> Result<DispatchOutcome, RuntimeError> {
         // Stage-1 page-table editors — munmap(215), mremap(216), mmap(222),
         // mprotect(226) — mutate the shared guest descriptors from the host.
         // With sibling vCPUs live, Pause-Modify-Resume them so none walks a
         // half-edited descriptor tree.
-        let _pt_pause = match frame.x8 {
+        let _pt_pause = match frame.number {
             215 | 216 | 222 | 226 if self.kicker.count() > 1 => Some(self.pt_pause()),
             _ => None,
         };
@@ -735,7 +735,7 @@ where
         // preserved across quiesce-park re-dispatch so the sleep isn't restarted.
         let mut sleep_deadline: Option<Instant> = None;
         loop {
-            let request = SyscallRequest::from_aarch64_frame(frame);
+            let request = SyscallRequest::from_raw(frame);
             let outcome = dispatch_with_panic_backstop(request.number, self.this_tid, || {
                 kernel.dispatcher.dispatch_threaded(
                     request,

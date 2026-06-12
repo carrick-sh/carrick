@@ -116,8 +116,7 @@ use std::time::Instant;
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    Aarch64SyscallFrame, DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher,
-    SyscallRequest,
+    DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher, SyscallRequest,
 };
 use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::rootfs::RootFs;
@@ -891,17 +890,18 @@ where
         };
         #[cfg(feature = "trace-traps")]
         {
-            let name = crate::syscall::lookup_aarch64(frame.x8)
+            let name = crate::syscall::lookup_aarch64(frame.number)
                 .map(|s| s.name)
                 .unwrap_or("<unknown>");
+            let a = frame.args;
             eprintln!(
-                "trap#{traps}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}",
-                frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5
+                "trap#{traps}: nr={} ({name}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                frame.number, a[0], a[1], a[2], a[3], a[4], a[5]
             );
         }
         let outcome = dispatch_single_threaded_syscall(
             &mut dispatcher,
-            SyscallRequest::from_aarch64_frame(frame),
+            SyscallRequest::from_raw(frame),
             runtime,
             &reporter,
             &mut waiter,
@@ -1802,7 +1802,7 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
 }
 
 impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
+    fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
         self.trap.next_syscall()
     }
     fn current_pc(&self) -> Result<u64, TrapError> {
