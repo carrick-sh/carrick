@@ -1,11 +1,11 @@
 # Pin the toolchain so rustfmt output is identical across every machine and CI,
 # eliminating the formatting skew that previously made `just fmt-check` fail on
 # unrelated files (CI's moving dtolnay@stable vs each dev's local stable).
-# Mac + the lima KVM-gate guest + CI all run 1.96.0 today, so this is a no-op
-# install for them. Bump deliberately (and re-run `cargo fmt --all`) when moving.
-# NOTE: the FreeBSD host (Part A) uses pkg-managed rust (1.94, not rustup); build
-# the leaf crates there with its own toolchain — this pin targets the workspace
-# build/format path on macOS/Linux/CI.
+# Mac, the lima KVM-gate guest, the FreeBSD host, and CI all run 1.96.0, so this
+# is a no-op install for them. Bump deliberately (and re-run `cargo fmt --all`)
+# when moving. The FreeBSD host was converted from pkg-rust to rustup-managed
+# (`rustup default 1.96.0`) so it honors this pin too — the toolchain (and rustfmt
+# 1.9.0) is now identical across every build/format environment.
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
