@@ -277,6 +277,10 @@ pub trait RegAccess {
 /// `GuestMemory` is a supertrait so the shared loop can `write_bytes` to the
 /// guest (tid stamps, clone parent/child-tid writes) through the engine.
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
+    /// The guest CPU ISA this engine runs. Fixed per process (the guest ISA
+    /// equals the host ISA), so it is an associated type — monomorphized per
+    /// ISA, no syscall-hot-path vtable. Aarch64 today; x86_64 in Phase 2.
+    type Arch: crate::guest_arch::GuestArch;
     type KickHandle: VcpuKick + 'static;
     type SiblingSpec: Send;
 

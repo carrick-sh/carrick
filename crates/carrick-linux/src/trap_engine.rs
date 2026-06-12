@@ -1174,6 +1174,7 @@ impl carrick_hal::RegAccess for KvmTrapEngine {
 }
 
 impl carrick_hal::ThreadedEngine for KvmTrapEngine {
+    type Arch = carrick_hal::Aarch64GuestArch;
     type KickHandle = KvmKickHandle;
     type SiblingSpec = KvmSiblingSpec;
 
