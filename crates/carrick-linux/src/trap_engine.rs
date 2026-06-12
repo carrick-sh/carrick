@@ -977,6 +977,7 @@ impl SyscallTrap for KvmTrapEngine {
         queued_siginfo: Option<LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
+        use carrick_hal::GuestArch as _;
         use carrick_hal::RegAccess;
         // The interrupted PSTATE to save into the sigframe. Which register holds
         // it depends on HOW we left EL0 — NOT on the EL (KVM is always EL0; the
@@ -1011,7 +1012,7 @@ impl SyscallTrap for KvmTrapEngine {
             fpsimd_enabled: true,
             sigreturn_trampoline_base: carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE,
         };
-        carrick_hal::sigframe::build_sigframe(self, params)?;
+        <Self as carrick_hal::ThreadedEngine>::Arch::build_sigframe(self, params)?;
         // The fault ESR is only valid between fault and delivery; clear it so a
         // later async signal doesn't reuse a stale synchronous-fault syndrome.
         self.last_fault_esr = 0;
@@ -1019,9 +1020,10 @@ impl SyscallTrap for KvmTrapEngine {
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+        use carrick_hal::GuestArch as _;
         // fpsimd_enabled MUST match inject_signal (true on KVM). Returns the
         // SAVED SIGMASK — not saved_pc — mirroring HVF.
-        let r = carrick_hal::sigframe::restore_sigframe(self, true)?;
+        let r = <Self as carrick_hal::ThreadedEngine>::Arch::restore_sigframe(self, true)?;
         Ok(r.sigmask)
     }
 

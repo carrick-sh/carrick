@@ -1282,6 +1282,7 @@ impl HvfTrapEngine {
         queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
+        use carrick_hal::GuestArch as _;
         use carrick_hal::RegAccess;
 
         // HVF-only kick-path tripwire. Invariant: a kick-path resume PC is
@@ -1325,7 +1326,7 @@ impl HvfTrapEngine {
             fpsimd_enabled: fpsimd_save_enabled(),
             sigreturn_trampoline_base: crate::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE,
         };
-        let info = carrick_hal::sigframe::build_sigframe(self, params)?;
+        let info = <Self as carrick_hal::ThreadedEngine>::Arch::build_sigframe(self, params)?;
         crate::probes::signal_inject(signum, info.saved_pc, info.new_sp, handler);
 
         // Signal-injection trap: x8 sentinel marks "not a syscall",
@@ -1367,7 +1368,11 @@ impl HvfTrapEngine {
     /// signal register state. Used by `rt_sigreturn(2)`.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        let r = carrick_hal::sigframe::restore_sigframe(self, fpsimd_save_enabled())?;
+        use carrick_hal::GuestArch as _;
+        let r = <Self as carrick_hal::ThreadedEngine>::Arch::restore_sigframe(
+            self,
+            fpsimd_save_enabled(),
+        )?;
         crate::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
         Ok(r.sigmask)
     }

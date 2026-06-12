@@ -93,8 +93,18 @@ impl GuestArch for Aarch64GuestArch {
         carrick_mem::memory::el0_trampoline_bytes()
     }
 
-    fn _isa_marker() -> &'static str {
-        "aarch64"
+    fn build_sigframe<E: crate::RegAccess + carrick_guest_mem::GuestMemory>(
+        engine: &mut E,
+        params: crate::sigframe::InjectParams,
+    ) -> Result<crate::sigframe::SigframeInject, crate::TrapError> {
+        crate::sigframe::build_sigframe(engine, params)
+    }
+
+    fn restore_sigframe<E: crate::RegAccess + carrick_guest_mem::GuestMemory>(
+        engine: &mut E,
+        fpsimd_enabled: bool,
+    ) -> Result<crate::sigframe::SigframeRestore, crate::TrapError> {
+        crate::sigframe::restore_sigframe(engine, fpsimd_enabled)
     }
 }
 
@@ -122,7 +132,6 @@ mod tests {
     fn arch_tags_are_aarch64() {
         assert_eq!(Aarch64GuestArch::elf_machine(), 183);
         assert_eq!(Aarch64GuestArch::uname_machine(), "aarch64");
-        assert_eq!(Aarch64GuestArch::_isa_marker(), "aarch64");
     }
 
     #[test]

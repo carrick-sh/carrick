@@ -5,12 +5,14 @@
 //! Phase 1 is a behavior-preserving refactor: the aarch64 impl
 //! ([`crate::aarch64_arch::Aarch64GuestArch`]) delegates to the existing
 //! `carrick-mem` / `carrick-abi` / `carrick-guest-mem` code verbatim. The trait
-//! deliberately starts minimal — only the concerns that don't need the
-//! sigframe / sysreg context types are declared here; the sigframe-build,
-//! CPU bring-up, and MMU-codec methods are added in later plan tasks (4-6) as
-//! each subsystem is routed, so each carries its real ctx types rather than a
-//! speculative signature. The `_isa_marker` anchor below is the explicit,
-//! named temporary placeholder for the first such method (replaced in Task 4).
+//! grows one subsystem at a time as each is routed through it: the
+//! sigframe build/restore methods are now declared (Task 4); CPU bring-up and
+//! the MMU-descriptor codec follow in later plan tasks (5-6), each carrying its
+//! real ctx types rather than a speculative signature.
+
+use crate::sigframe::{InjectParams, SigframeInject, SigframeRestore};
+use crate::{RegAccess, TrapError};
+use carrick_guest_mem::GuestMemory;
 
 /// Encode/decode for the guest page-table descriptor format (AArch64
 /// long-descriptor vs x86-64 4-level). Same operation shape per ISA. The
@@ -73,13 +75,26 @@ pub trait GuestArch: Copy + 'static {
     /// the same reason as [`GuestArch::vdso_bytes`].
     fn entry_trampoline_bytes() -> Vec<u8>;
 
-    // sigframe build/restore, CPU bring-up, and the page-table descriptor codec
-    // are expressed over the engine's `RegAccess` + the sigframe/sysreg ctx
-    // types; their exact signatures are lifted verbatim from
-    // `carrick-hal::sigframe` / `carrick-mem::{arch_sysregs,page_table}` in later
-    // plan tasks (4-6), kept here as trait methods so the engine calls
-    // `Arch::*`. Declared once their concrete ctx types are in scope.
-    /// Placeholder anchor (Phase 1 Task 1): proves the trait is callable and
-    /// names the ISA. Replaced by the first real ctx-method in Task 4.
-    fn _isa_marker() -> &'static str;
+    // CPU bring-up and the page-table descriptor codec are expressed over the
+    // engine's `RegAccess` + the sysreg ctx types; their exact signatures are
+    // lifted verbatim from `carrick-mem::{arch_sysregs,page_table}` in later plan
+    // tasks (5-6), kept here as trait methods so the engine calls `Arch::*`.
+    // Declared once their concrete ctx types are in scope.
+
+    /// Build the `rt_sigframe` for a delivered signal: push it onto the guest
+    /// user stack and redirect the vCPU to the handler. ISA-specific frame
+    /// layout (aarch64 `CarrickSigframe` today; x86_64 in Phase 2). Generic over
+    /// the engine because a trap engine impls both `RegAccess` and `GuestMemory`
+    /// on one type, and the shared builder needs both.
+    fn build_sigframe<E: RegAccess + GuestMemory>(
+        engine: &mut E,
+        params: InjectParams,
+    ) -> Result<SigframeInject, TrapError>;
+
+    /// Pop the `rt_sigframe` at the guest SP and restore the pre-signal register
+    /// state (the `rt_sigreturn(2)` path). Counterpart to [`GuestArch::build_sigframe`].
+    fn restore_sigframe<E: RegAccess + GuestMemory>(
+        engine: &mut E,
+        fpsimd_enabled: bool,
+    ) -> Result<SigframeRestore, TrapError>;
 }
