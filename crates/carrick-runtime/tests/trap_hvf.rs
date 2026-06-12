@@ -288,11 +288,11 @@ fn el1_shim_services_getpid_at_el1_without_a_host_trap() {
     // EL1 handler read the identity page and returned it in the syscall result.
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
-        frame.x8, 94,
+        frame.number, 94,
         "getpid (172) must NOT reach the host; first trap is exit_group"
     );
     assert_eq!(
-        frame.x0 & 0xFFFF_FFFF,
+        frame.args[0] & 0xFFFF_FFFF,
         u64::from(SENTINEL_PID),
         "fast-path getpid must return the stamped identity-page pid"
     );
@@ -329,7 +329,7 @@ fn el1_legacy_vectors_trap_getpid_to_the_host() {
     engine.map_address_space(&image).unwrap();
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
-        frame.x8, 172,
+        frame.number, 172,
         "without the shim, getpid must trap to the host"
     );
 }
@@ -385,11 +385,11 @@ fn el1_shim_services_gettid_from_tpidr_el1() {
 
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
-        frame.x8, 94,
+        frame.number, 94,
         "gettid (178) must be serviced at EL1; first host trap is exit_group"
     );
     assert_eq!(
-        frame.x0, SENTINEL_TID,
+        frame.args[0], SENTINEL_TID,
         "fast-path gettid must return the per-vCPU TPIDR_EL1 tid"
     );
 }
@@ -406,7 +406,7 @@ fn el1_shim_gettid_guard_traps_when_tpidr_el1_unstamped() {
     engine.map_address_space(&gettid_probe_image(true)).unwrap();
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
-        frame.x8, 178,
+        frame.number, 178,
         "unstamped TPIDR_EL1 must trap gettid to the host (cbz guard), not return 0"
     );
 }

@@ -548,7 +548,8 @@ impl GuestMemory for KvmTrapEngine {
 }
 
 impl SyscallTrap for KvmTrapEngine {
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
+    fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
+        use carrick_hal::GuestArch as _;
         // One KVM_RUN per call. The loop exists ONLY to re-enter the guest when a
         // kick lands mid-syscall-trap (the `Kicked` arm); every other exit returns.
         loop {
@@ -570,7 +571,13 @@ impl SyscallTrap for KvmTrapEngine {
                     let frame = self.read_frame()?;
                     self.last_syscall_nr = Some(frame.x8);
                     self.last_syscall_orig_x0 = frame.x0;
-                    return Ok(Some(frame));
+                    // Decode through this engine's `GuestArch` so the runtime
+                    // loop is ISA-neutral (Phase 1, Task 3): x8 → number,
+                    // x0..x5 → args. `last_syscall_nr`/`orig_x0` stay set from
+                    // the raw frame above (their x8/x0 meaning is aarch64-fixed).
+                    let (number, args) =
+                        <Self as carrick_hal::ThreadedEngine>::Arch::decode_syscall(&frame);
+                    return Ok(Some(carrick_hal::RawSyscall { number, args }));
                 }
                 VcpuExit::MmioWrite { gpa, .. } if gpa == FAULT_SENTINEL_GPA => {
                     // An EL0 SYNCHRONOUS FAULT (data/instruction abort, alignment)

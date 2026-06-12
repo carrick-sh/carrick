@@ -210,7 +210,7 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
 // selected by the run-loop, which is itself platform-gated.
 #[cfg(not(feature = "platform-macos"))]
 pub mod trap {
-    pub use carrick_hal::{ForkOutcome, SyscallTrap, TrapError};
+    pub use carrick_hal::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
     pub const HVF_PAGE_SIZE: u64 = 0x4000;
 
     // Cross-process VM-topology bookkeeping the shared threaded loop references
@@ -354,16 +354,17 @@ pub mod runtime {
                 None => continue,
             };
             if trace_traps {
+                let a = frame.args;
                 eprintln!(
-                    "trap#{traps}: x8={} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}",
-                    frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5
+                    "trap#{traps}: nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                    frame.number, a[0], a[1], a[2], a[3], a[4], a[5]
                 );
             }
             // Dispatch, servicing any blocking-I/O wait inline (ppoll) and
             // re-dispatching on readiness, so the returned outcome is terminal.
             let outcome = service_syscall(
                 &mut dispatcher,
-                SyscallRequest::from_aarch64_frame(frame),
+                SyscallRequest::from_raw(frame),
                 runtime,
                 &reporter,
                 &mut waiter,

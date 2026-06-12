@@ -236,10 +236,17 @@ impl ScriptedTrap {
 }
 
 impl SyscallTrap for ScriptedTrap {
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
+    fn next_syscall(&mut self) -> Result<Option<carrick_runtime::trap::RawSyscall>, TrapError> {
+        // The backend now decodes the per-ISA frame into an ISA-neutral
+        // `RawSyscall` (aarch64: x8 -> number, x0..x5 -> args); mirror that here.
         self.frames
             .pop_front()
-            .map(Some)
+            .map(|f| {
+                Some(carrick_runtime::trap::RawSyscall {
+                    number: f.x8,
+                    args: [f.x0, f.x1, f.x2, f.x3, f.x4, f.x5],
+                })
+            })
             .ok_or_else(|| TrapError::Hypervisor("scripted trap stream exhausted".to_owned()))
     }
 

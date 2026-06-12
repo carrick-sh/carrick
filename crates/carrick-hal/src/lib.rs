@@ -15,7 +15,7 @@ pub use aarch64::{
 pub mod error;
 pub use error::{MemPerms, OsError, Reg, SysReg};
 pub mod trap;
-pub use trap::{ForkOutcome, SyscallTrap, TrapError};
+pub use trap::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
 pub mod hypervisor;
 pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod event;

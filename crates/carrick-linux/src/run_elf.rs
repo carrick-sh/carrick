@@ -45,8 +45,21 @@ pub fn run_elf_kvm(path: impl AsRef<Path>) -> Result<i32, String> {
     let trace = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
 
     loop {
+        // `next_syscall` now returns the ISA-neutral `RawSyscall` (the per-ISA
+        // decode moved into the backend's `GuestArch`). This standalone KVM
+        // bring-up loop and its `sys_*` helpers still read named aarch64 frame
+        // fields, so rebuild the frame from the decoded number/args here — the
+        // aarch64 mapping (number → x8, args[0..5] → x0..x5) is exact.
         let frame = match engine.next_syscall().map_err(|e| format!("trap: {e}"))? {
-            Some(frame) => frame,
+            Some(raw) => Aarch64SyscallFrame {
+                x0: raw.args[0],
+                x1: raw.args[1],
+                x2: raw.args[2],
+                x3: raw.args[3],
+                x4: raw.args[4],
+                x5: raw.args[5],
+                x8: raw.number,
+            },
             // A bare kick/halt with no pending syscall: nothing left to do.
             None => return Ok(0),
         };

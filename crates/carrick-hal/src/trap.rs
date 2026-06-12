@@ -10,11 +10,23 @@
 //! backends inherit sane behavior.
 
 use carrick_abi::LinuxSiginfo;
-use carrick_guest_mem::Aarch64SyscallFrame;
 use carrick_mem::memory::AddressSpace;
 use thiserror::Error;
 
 use crate::error::OsError;
+
+/// An ISA-neutral decoded syscall: the Linux syscall number plus its six
+/// argument registers, already extracted from the per-ISA register frame by the
+/// backend's [`crate::GuestArch::decode_syscall`]. `SyscallTrap::next_syscall`
+/// returns this (not a raw aarch64 frame) so the runtime loop is ISA-agnostic —
+/// the runtime maps it onto its own `SyscallRequest`. The backend keeps reading
+/// the raw registers into its `GuestArch::Frame` as before; only the decode
+/// moved into the backend (Phase 1, Task 3 of the x86_64 guest-ISA seam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawSyscall {
+    pub number: u64,
+    pub args: [u64; 6],
+}
 
 /// A register/V-reg access through [`crate::RegAccess`] failed mid-sigframe
 /// build/restore. The shared builder reports it as a hypervisor error so it can
@@ -30,11 +42,13 @@ impl From<OsError> for TrapError {
 /// and fork/execve the guest address space. Implemented by `HvfTrapEngine`
 /// (macOS), `KvmTrapEngine` (Linux), and the runtime's `SplitView` adapter.
 pub trait SyscallTrap {
-    /// Run the vCPU until it traps. `Ok(Some(frame))` is a guest syscall;
-    /// `Ok(None)` means the vCPU was forced out of the guest by a cross-thread
-    /// kick (`hv_vcpus_exit` / KVM signal-kick) with no syscall pending — the
-    /// loop should run signal delivery and resume. `Err` is a real fault.
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError>;
+    /// Run the vCPU until it traps. `Ok(Some(raw))` is a guest syscall, already
+    /// decoded to an ISA-neutral [`RawSyscall`] by the backend's
+    /// [`crate::GuestArch::decode_syscall`]; `Ok(None)` means the vCPU was forced
+    /// out of the guest by a cross-thread kick (`hv_vcpus_exit` / KVM
+    /// signal-kick) with no syscall pending — the loop should run signal
+    /// delivery and resume. `Err` is a real fault.
+    fn next_syscall(&mut self) -> Result<Option<RawSyscall>, TrapError>;
     /// The guest PC the vCPU is currently parked at. Used as the resume address
     /// when injecting a signal on a non-syscall (kick) exit, where `ELR_EL1`
     /// does not hold a meaningful return address.
