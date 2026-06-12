@@ -1923,7 +1923,10 @@ impl HvfInner {
                 let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
                 let mut bytes = vec![0u8; size];
                 unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), size) };
-                crate::page_table::PageTableManager::new(
+                // Build through this engine's `GuestArch` MMU codec (`Self`
+                // here is the inner state, not the engine, so name the engine).
+                use carrick_hal::PageTableCodec as _;
+                <<HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
                     bytes,
                     crate::memory::LINUX_PAGE_TABLES_BASE,
                 )
@@ -2472,7 +2475,11 @@ impl HvfInner {
                     // SAFETY: `host` backs the page-table region for the whole
                     // process; we read `size` bytes from it, no writes.
                     let bytes = unsafe { std::slice::from_raw_parts(host, size) };
-                    let d = crate::page_table::walk_descriptors(
+                    // Walk through this engine's `GuestArch` MMU codec (`Self`
+                    // here is the inner state, not the engine, so name the
+                    // engine).
+                    use carrick_hal::PageTableCodec as _;
+                    let d = <<HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::walk_descriptors(
                         bytes,
                         crate::memory::LINUX_PAGE_TABLES_BASE,
                         far,

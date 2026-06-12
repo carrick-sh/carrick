@@ -6,10 +6,10 @@
 //! ([`crate::aarch64_arch::Aarch64GuestArch`]) delegates to the existing
 //! `carrick-mem` / `carrick-abi` / `carrick-guest-mem` code verbatim. The trait
 //! grows one subsystem at a time as each is routed through it: the
-//! sigframe build/restore methods (Task 4) and the initial CPU bring-up
-//! register VALUES (Task 5) are now declared; only the MMU-descriptor codec
-//! (T6) remains, carrying its real ctx types rather than a speculative
-//! signature.
+//! sigframe build/restore methods (Task 4), the initial CPU bring-up
+//! register VALUES (Task 5), and the MMU-descriptor codec (Task 6) are now
+//! declared; the remaining routing tasks are trampoline/vDSO placement (T7)
+//! and the syscall-table accessor (T8).
 
 use crate::sigframe::{InjectParams, SigframeInject, SigframeRestore};
 use crate::{RegAccess, TrapError};
@@ -17,14 +17,30 @@ use carrick_guest_mem::GuestMemory;
 
 /// Encode/decode for the guest page-table descriptor format (AArch64
 /// long-descriptor vs x86-64 4-level). Same operation shape per ISA. The
-/// surface here is the minimal granule descriptor; the per-descriptor
-/// bit helpers (AP/UXN/PXN, `set_prot_none`/`set_rw`/`map_aliased`) are
-/// finalized against `carrick-mem::page_table` in a later plan task (T6).
+/// surface is the granule parameters plus the descriptor-editing entry
+/// points: the stateful [`PageTableCodec::Manager`] (which carries the
+/// per-descriptor bit helpers — AP/UXN/PXN, `set_prot_none`/`set_rw`/
+/// `map_aliased`) and the stateless diagnostic walk.
 pub trait PageTableCodec {
     /// Page-shift for the guest granule (aarch64 4 KiB granule → 12).
     fn page_shift() -> u32;
     /// Granule / index-shift parameters the walker needs.
     fn granule() -> PtGranule;
+
+    /// The stateful page-table editor for this ISA's descriptor format
+    /// (aarch64: `carrick_mem::page_table::PageTableManager`).
+    type Manager;
+    /// Errors the editor reports (aarch64:
+    /// `carrick_mem::page_table::PageTableError`).
+    type Error;
+
+    /// Build the editor over a byte snapshot of the live tables rooted at
+    /// `base` (the existing `PageTableManager::new` contract, verbatim).
+    fn new_manager(bytes: Vec<u8>, base: u64) -> Self::Manager;
+
+    /// Raw descriptor walk for diagnostics: the four descriptors the hardware
+    /// walker would traverse for `va` in tables at `base` (no state).
+    fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4];
 }
 
 /// Granule parameters for one guest page-table format.
@@ -84,11 +100,10 @@ pub trait GuestArch: Copy + 'static {
     /// The ISA's initial CPU bring-up register values.
     fn bootstrap_sysregs() -> Self::BootSysregs;
 
-    // The page-table descriptor codec is expressed over the engine's
-    // `RegAccess` + the descriptor ctx types; its exact signatures are lifted
-    // verbatim from `carrick-mem::page_table` in a later plan task (T6), kept
-    // here as trait methods so the engine calls `Arch::*`. Declared once its
-    // concrete ctx types are in scope.
+    // The page-table descriptor codec lives on `Self::Mmu` (Task 6): the
+    // backends construct the stateful editor via `Mmu::new_manager` and run
+    // the diagnostic walk via `Mmu::walk_descriptors`, lifted verbatim from
+    // `carrick-mem::page_table`.
 
     /// Build the `rt_sigframe` for a delivered signal: push it onto the guest
     /// user stack and redirect the vCPU to the handler. ISA-specific frame
