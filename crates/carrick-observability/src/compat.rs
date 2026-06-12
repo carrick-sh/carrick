@@ -263,10 +263,11 @@ impl CompatReporter {
         if let Some(hook) = PROBE_HOOK.get() {
             hook(&event);
         }
-        // Opt-in verbose stderr trace (cached env check, not per-call).
-        if self.trace_syscalls
-            && let Ok(line) = serde_json::to_string(&event)
-        {
+        // Verbose per-event stderr trace, compile-gated behind `trace-syscalls`
+        // (a stock build compiles it out entirely — the upstream debug-feature
+        // refactor's contract, carried to this hoisted location).
+        #[cfg(feature = "trace-syscalls")]
+        if let Ok(line) = serde_json::to_string(&event) {
             eprintln!("[carrick-syscall] {line}");
         }
         // Aggregate inline. Common events (entry/return) are pure
