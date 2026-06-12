@@ -157,8 +157,6 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 // syscall metadata (`syscall`). None depend on dispatch/VFS. Re-exported under
 // their original `crate::trap::…` / `crate::thread::…` / … paths so every call
 // site across the runtime is unchanged.
-#[cfg(all(target_os = "macos", feature = "platform-macos"))]
-pub use carrick_hvf::darwin_kqueue;
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::{
     fork_coord, host_signal, io_wait, itimer, posix_timer, probes, signal_arrival, threaded_impl,
@@ -1018,61 +1016,6 @@ pub use carrick_bsd::bsd_to_linux_errno as host_to_linux_errno;
 #[cfg(not(feature = "platform-macos"))]
 pub fn host_to_linux_errno(host: i32) -> i32 {
     host
-}
-
-// Off-macOS stub for `carrick_hvf::darwin_kqueue`.
-//
-// The readiness paths (epoll IO/timers/user-wakes, pidfd, inotify) are fully
-// migrated to `carrick_hal::EventMultiplexer` on both platforms, so they no
-// longer touch this module off-macOS. The ONE remaining non-mux kqueue
-// consumer is the PID-namespace `NsSupervisor` (`namespace/supervisor.rs`),
-// which orchestrates orphan-reparenting + exit-status harvest via raw
-// `EVFILT_PROC`/`NOTE_EXIT` and is compiled (though not driven) off-macOS.
-// Migrating that whole subsystem to the multiplexer is out of scope here, so
-// this stub is pared down to exactly the `Kevent`/`Kqueue` surface the
-// supervisor references; everything the readiness migration retired is gone.
-// On Linux the supervisor's `Kqueue::new_internal()` returns `None`, so the
-// loop is never entered.
-#[cfg(not(feature = "platform-macos"))]
-pub mod darwin_kqueue {
-    #[derive(Debug, Clone, Copy)]
-    pub struct Kevent;
-    impl Kevent {
-        pub fn empty() -> Self {
-            Self
-        }
-        pub fn read(_fd: i32, _flags: u16) -> Self {
-            Self
-        }
-        pub fn proc_exit(_pid: i32) -> Self {
-            Self
-        }
-        pub fn proc_exit_ident(&self) -> Option<i32> {
-            None
-        }
-        pub fn proc_exit_status(&self) -> i32 {
-            0
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct Kqueue;
-    impl Kqueue {
-        pub fn new_internal() -> Option<Self> {
-            None
-        }
-        pub fn apply(&self, _changes: &[Kevent]) -> Result<(), i32> {
-            Ok(())
-        }
-        pub fn wait(
-            &self,
-            _changes: &[Kevent],
-            _events: &mut [Kevent],
-            _timeout: Option<&libc::timespec>,
-        ) -> Result<usize, i32> {
-            Ok(0)
-        }
-    }
 }
 
 #[cfg(not(feature = "platform-macos"))]

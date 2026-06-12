@@ -28,8 +28,9 @@ pub const MEMBER_ALIVE: u8 = 0;
 /// Member's namespace-parent died; `getppid` should report ns-pid 1 (design
 /// §3.6). Set by the NsSupervisor.
 pub const MEMBER_ORPHANED: u8 = 1;
-/// Member has exited; `exit_status` holds the `waitpid`-format status harvested
-/// from `NOTE_EXITSTATUS` (design §3.4).
+/// Member has exited; `exit_status` holds the harvested bare exit code (the
+/// multiplexer's `PollEvent::exit_status`: WEXITSTATUS, or 128+signal for a
+/// signal death) so the ns-init can report it for an orphaned grandchild (§3.4).
 pub const MEMBER_DEAD: u8 = 2;
 
 /// Number of member slots in the shared table. Container process trees are tens
