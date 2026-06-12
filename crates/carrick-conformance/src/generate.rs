@@ -40,6 +40,12 @@ const CPY_SMOKE: &[&str] = &[
 ];
 /// Go packages in the fast tier (proven MATCH).
 const GO_SMOKE: &[&str] = &["runtime", "sync", "context", "time"];
+
+/// Go packages whose test suites are CPU-bound-slow (not stuck) under nested
+/// KVM — toolchain subprocess churn (importers' compile/cgo) and bulk TLS
+/// handshakes — and need the larger budget (see the timeout comment at the
+/// suite construction site).
+const GO_SLOW: &[&str] = &["crypto/tls", "go/internal/srcimporter", "net/netip"];
 const GO_RUNTIME_SMOKE_RE: &str = "^(Test(FinalizerRegisterABI|UserArena.*|BitCursor|Callers.*|FPUnwindAfterRecovery|Chan|NonblockRecvRace|NonblockSelectRace2?|SelfSelect|SelectStress|SelectFairness|MultiConsumer|ShrinkStackDuringBlockedSend|NoShrinkStackWhileParking|SelectDuplicateChannel|SelectStackAdjust))$";
 /// LTP testcases in the fast tier (proven MATCH).
 const LTP_SMOKE: &[&str] = &[
@@ -55,169 +61,36 @@ const LTP_SMOKE: &[&str] = &[
     "sched_getaffinity01",
 ];
 
-/// Syscall-ABI family stems carrick emulates. An LTP binary is included iff its
-/// name (trailing digits/letter stripped) is one of these — the rest of LTP's
-/// ~1457 binaries are fs-image/network-heavy and TBROK on setup (noise, not
-/// coverage).
-const LTP_FAMILY_STEMS: &[&str] = &[
-    "fork",
-    "vfork",
-    "clone",
-    "execve",
-    "execveat",
-    "execl",
-    "execlp",
-    "execvp",
-    "exit",
-    "exit_group",
-    "wait",
-    "wait4",
-    "waitpid",
-    "waitid",
-    "signal",
-    "sigaction",
-    "rt_sigaction",
-    "sigprocmask",
-    "rt_sigprocmask",
-    "sigsuspend",
-    "sigpending",
-    "sigwait",
-    "sighold",
-    "sigrelse",
-    "sigignore",
-    "sigaltstack",
-    "kill",
-    "tkill",
-    "tgkill",
-    "pause",
-    "alarm",
-    "setitimer",
-    "getitimer",
-    "mmap",
-    "munmap",
-    "mprotect",
-    "mremap",
-    "madvise",
-    "msync",
-    "mlock",
-    "mlockall",
-    "munlock",
-    "brk",
-    "sbrk",
-    "futex",
-    "futex_wait",
-    "futex_wake",
-    "futex_cmp_requeue",
-    "epoll",
-    "epoll_create",
-    "epoll_ctl",
-    "epoll_wait",
-    "epoll_pwait",
-    "poll",
-    "ppoll",
-    "select",
-    "pselect",
-    "pipe",
-    "pipe2",
-    "dup",
-    "dup2",
-    "dup3",
-    "fcntl",
-    "flock",
-    "read",
-    "write",
-    "pread",
-    "pwrite",
-    "readv",
-    "writev",
-    "preadv",
-    "pwritev",
-    "open",
-    "openat",
-    "close",
-    "lseek",
-    "creat",
-    "stat",
-    "fstat",
-    "lstat",
-    "statx",
-    "access",
-    "faccessat",
-    "chdir",
-    "fchdir",
-    "getcwd",
-    "getpid",
-    "getppid",
-    "gettid",
-    "getpgid",
-    "getpgrp",
-    "setpgid",
-    "setsid",
-    "getsid",
-    "nanosleep",
-    "clock_gettime",
-    "clock_getres",
-    "clock_nanosleep",
-    "clock_settime",
-    "timer_create",
-    "timer_settime",
-    "timer_gettime",
-    "sched_setscheduler",
-    "sched_getscheduler",
-    "sched_yield",
-    "sched_getaffinity",
-    "sched_setaffinity",
-    "sched_getparam",
-    "sched_get_priority_max",
-    "socket",
-    "socketpair",
-    "bind",
-    "listen",
-    "accept",
-    "accept4",
-    "connect",
-    "send",
-    "sendto",
-    "sendmsg",
-    "recv",
-    "recvfrom",
-    "recvmsg",
-    "shutdown",
-    "getsockopt",
-    "setsockopt",
-    "eventfd",
-    "eventfd2",
-    "timerfd_create",
-    "timerfd_settime",
-    "signalfd",
-    "signalfd4",
-    "inotify_init",
-    "prctl",
-    "setrlimit",
-    "getrlimit",
-    "prlimit",
-    "getrusage",
-    "times",
-    "ptrace",
-    "membarrier",
-    "set_robust_list",
-    "get_robust_list",
-    "setresuid",
-    "setreuid",
-    "setuid",
-    "setgid",
-    "setresgid",
-    "setregid",
-    "umask",
-    "getrandom",
-    "memfd_create",
-    "userfaultfd",
-    "pidfd_open",
-    "pidfd_send_signal",
-    "gettimeofday",
-    "settimeofday",
-    "getcpu",
+/// LTP coverage is DENYLIST-based: every test binary in the image is a suite
+/// unless excluded here. (The original allowlist of syscall-family stems kept
+/// the sweep small during bring-up; with both lanes at full parity on that
+/// set, coverage now defaults to ON so LTP image updates are auto-covered.)
+/// Exclusions, each with a reason:
+///  - pure libc/string/allocator tests: exercise musl, not carrick's syscall
+///    surface (memcmp/memcpy/memset/string/mallinfo/mallopt/gethostbyname_r).
+///  - in-test HELPER binaries a parent test execs (never meaningful alone).
+const LTP_EXCLUDED_STEMS: &[&str] = &[
+    "memcmp",
+    "memcpy",
+    "memset",
+    "string",
+    "mallinfo",
+    "mallopt",
+    "gethostbyname_r",
 ];
+
+/// Helper binaries shipped beside their parent test (run BY it, not a test).
+const LTP_EXCLUDED_BINS: &[&str] = &["prctl06_execve", "landlock_exec"];
+
+/// A bin is a runnable standalone test iff it has no file extension (scripts/
+/// data carry one) and is not a documented helper/exclusion.
+fn ltp_is_test(name: &str) -> bool {
+    !name.contains('.')
+        && !name.ends_with("_child")
+        && !name.ends_with("_helper")
+        && !LTP_EXCLUDED_BINS.contains(&name)
+        && !LTP_EXCLUDED_STEMS.contains(&ltp_stem(name))
+}
 
 fn docker_stdout(args: &[&str]) -> String {
     Command::new("docker")
@@ -450,6 +323,15 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         } else {
             "Test"
         };
+        // CPU-bound toolchain/TLS suites proven slow-not-stuck under nested
+        // KVM: at the kvm lane's 2x scale, 540 gives the 1080 s ceiling the
+        // 6x-budget verification showed sufficient (560/560, 6/6, 268/268
+        // MATCH). docker and the hvf lane finish in seconds — upper bound only.
+        let timeout_s = if GO_SLOW.contains(&pkg.as_str()) {
+            540
+        } else {
+            180
+        };
         suites.push(mk(
             format!("go-{binn}"),
             Go,
@@ -464,7 +346,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             Gotest,
             smoke(GO_SMOKE.contains(&pkg.as_str())),
             Heavy,
-            180,
+            timeout_s,
             Some(format!("/usr/local/go/src/{pkg}")),
             None,
         ));
@@ -481,12 +363,12 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
     ]);
     let mut ltp: Vec<String> = bins
         .split_whitespace()
-        .filter(|b| LTP_FAMILY_STEMS.contains(&ltp_stem(b)))
+        .filter(|b| ltp_is_test(b))
         .map(String::from)
         .collect();
     ltp.sort();
     for b in &ltp {
-        suites.push(mk(
+        let mut suite = mk(
             format!("ltp-{b}"),
             Ecosystem::Ltp,
             LTP_IMG,
@@ -497,7 +379,14 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             40,
             None,
             None,
-        ));
+        );
+        if b == "fork09" {
+            // fork09 opens fds to RLIMIT_NOFILE; Docker's default (1048576) is
+            // far above carrick's, so align the oracle to the same bound the
+            // carrick guest sees (same rationale as cpython test_no_leaking).
+            suite.docker_flags = vec![s("--ulimit"), s("nofile=1024:1024")];
+        }
+        suites.push(suite);
     }
 
     (suites, (cpy.len(), go.len(), ltp.len()))
