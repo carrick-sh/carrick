@@ -99,7 +99,7 @@ impl KvmTrapEngine {
             &mut carrick_mem::page_table::PageTableManager,
         ) -> Result<bool, carrick_mem::page_table::PageTableError>,
     ) -> Result<bool, MemoryError> {
-        use carrick_mem::page_table::{PageTableError, PageTableManager};
+        use carrick_mem::page_table::PageTableError;
         const PT_BASE: u64 = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
@@ -132,7 +132,11 @@ impl KvmTrapEngine {
                 .ram
                 .read(PT_BASE, size)
                 .map_err(|_| MemoryError::HostMap("read live page tables".to_string()))?;
-            *guard = Some(PageTableManager::new(bytes, PT_BASE));
+            // Build through this engine's `GuestArch` MMU codec.
+            use carrick_hal::PageTableCodec as _;
+            *guard = Some(
+                <<Self as carrick_hal::ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(bytes, PT_BASE),
+            );
         }
         // INVARIANT: populated just above if it was `None` (so the else is dead);
         // a returned Err keeps us clear of the workspace's expect/panic deny lints.

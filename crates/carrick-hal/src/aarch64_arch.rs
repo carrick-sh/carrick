@@ -22,10 +22,10 @@ const AARCH64_PAGE_SHIFT: u32 = 12;
 const AARCH64_PT_LEVELS: u8 = 4;
 const AARCH64_PT_INDEX_BITS: u32 = 9;
 
-/// The AArch64 page-table descriptor codec. Phase 1 surface: the granule
-/// parameters mirroring `carrick-mem::page_table` (4 KiB granule, 4 levels).
-/// The per-descriptor bit helpers are finalized against `page_table.rs` in a
-/// later plan task.
+/// The AArch64 page-table descriptor codec: the granule parameters mirroring
+/// `carrick-mem::page_table` (4 KiB granule, 4 levels) plus the descriptor
+/// editor (`PageTableManager`, which carries the per-descriptor bit helpers)
+/// and the stateless diagnostic walk, delegated verbatim.
 #[derive(Clone, Copy, Debug)]
 pub struct Aarch64Mmu;
 
@@ -40,6 +40,17 @@ impl PageTableCodec for Aarch64Mmu {
             levels: AARCH64_PT_LEVELS,
             index_bits: AARCH64_PT_INDEX_BITS,
         }
+    }
+
+    type Manager = carrick_mem::page_table::PageTableManager;
+    type Error = carrick_mem::page_table::PageTableError;
+
+    fn new_manager(bytes: Vec<u8>, base: u64) -> Self::Manager {
+        carrick_mem::page_table::PageTableManager::new(bytes, base)
+    }
+
+    fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
+        carrick_mem::page_table::walk_descriptors(bytes, base, va)
     }
 }
 
@@ -192,5 +203,19 @@ mod tests {
         assert_eq!(granule.page_shift, 12);
         assert_eq!(granule.levels, 4);
         assert_eq!(granule.index_bits, 9);
+    }
+
+    #[test]
+    fn mmu_codec_builds_manager_and_walks_descriptors() {
+        // A small zeroed table image: every descriptor invalid, so both the
+        // manager's translate and the stateless walk see nothing.
+        let base = 0x8000_0000u64;
+        let bytes = vec![0u8; 4096 * 6];
+        let mgr = Aarch64Mmu::new_manager(bytes.clone(), base);
+        assert_eq!(mgr.translate(0x40_0000), None);
+        assert_eq!(
+            Aarch64Mmu::walk_descriptors(&bytes, base, 0x40_0000),
+            [0; 4]
+        );
     }
 }
