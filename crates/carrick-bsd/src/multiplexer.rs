@@ -12,6 +12,23 @@ use carrick_hal::event::{
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+/// Decode a `waitpid(2)`-format status word into the BARE exit code the
+/// [`PollEvent::exit_status`](carrick_hal::event::PollEvent::exit_status)
+/// contract carries: `WEXITSTATUS` for a normal exit, `128 + WTERMSIG` for a
+/// signal death (the shell convention, matching the Linux `EpollMultiplexer`'s
+/// `waitid(P_PIDFD)` si_status). A still-running/unknown word falls back to the
+/// low byte so the value is always a small integer.
+#[cfg(target_os = "macos")]
+fn wait_status_to_bare(status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        status & 0xff
+    }
+}
+
 pub struct KqueueMultiplexer {
     kq: Kqueue,
 }
@@ -176,10 +193,15 @@ impl EventMultiplexer for KqueueMultiplexer {
                         is_eof = true;
                     }
                     // macOS delivers the exit status in `data` only when the
-                    // NOTE_EXITSTATUS fflag was requested.
+                    // NOTE_EXITSTATUS fflag was requested. `data` is the raw
+                    // `waitpid(2)` out-parameter STATUS WORD; the
+                    // `PollEvent.exit_status` contract is the BARE exit code
+                    // (WEXITSTATUS, or 128+signal for a signal death — matching
+                    // the Linux `EpollMultiplexer`'s `waitid(P_PIDFD)` si_status).
+                    // Decode here so both backends agree.
                     #[cfg(target_os = "macos")]
                     if fflags & NOTE_EXITSTATUS != 0 {
-                        exit_status = Some(ev.data() as i32);
+                        exit_status = Some(wait_status_to_bare(ev.data() as i32));
                     }
                     // FreeBSD carries the wait-status in `data` UNCONDITIONALLY
                     // under NOTE_EXIT. TODO(part-c): wire it into exit_status with

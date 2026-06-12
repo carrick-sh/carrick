@@ -1020,19 +1020,21 @@ pub fn host_to_linux_errno(host: i32) -> i32 {
     host
 }
 
-// Fallbacks for the configured-out carrick-hvf re-exports when platform-macos is disabled.
+// Off-macOS stub for `carrick_hvf::darwin_kqueue`.
+//
+// The readiness paths (epoll IO/timers/user-wakes, pidfd, inotify) are fully
+// migrated to `carrick_hal::EventMultiplexer` on both platforms, so they no
+// longer touch this module off-macOS. The ONE remaining non-mux kqueue
+// consumer is the PID-namespace `NsSupervisor` (`namespace/supervisor.rs`),
+// which orchestrates orphan-reparenting + exit-status harvest via raw
+// `EVFILT_PROC`/`NOTE_EXIT` and is compiled (though not driven) off-macOS.
+// Migrating that whole subsystem to the multiplexer is out of scope here, so
+// this stub is pared down to exactly the `Kevent`/`Kqueue` surface the
+// supervisor references; everything the readiness migration retired is gone.
+// On Linux the supervisor's `Kqueue::new_internal()` returns `None`, so the
+// loop is never entered.
 #[cfg(not(feature = "platform-macos"))]
 pub mod darwin_kqueue {
-    pub const EVFILT_EXCEPT: i16 = -15;
-    pub const NOTE_OOB: u32 = 0x0000_0002;
-
-    pub fn trigger_user(_kq: i32, _ident: usize) -> Result<(), i32> {
-        Ok(())
-    }
-    pub fn apply_changes(_kq: i32, _changes: &[Kevent]) -> Result<(), i32> {
-        Ok(())
-    }
-
     #[derive(Debug, Clone, Copy)]
     pub struct Kevent;
     impl Kevent {
@@ -1042,57 +1044,8 @@ pub mod darwin_kqueue {
         pub fn read(_fd: i32, _flags: u16) -> Self {
             Self
         }
-        pub fn write(_fd: i32, _flags: u16) -> Self {
-            Self
-        }
-        pub fn oob(_fd: i32, _flags: u16) -> Self {
-            Self
-        }
-        pub fn vnode(_fd: i32, _note: u32) -> Self {
-            Self
-        }
-        pub fn vnode_delete(_fd: i32) -> Self {
-            Self
-        }
         pub fn proc_exit(_pid: i32) -> Self {
             Self
-        }
-        pub fn with_udata(self, _udata: i32) -> Self {
-            Self
-        }
-        pub fn user(_ident: usize, _flags: u16) -> Self {
-            Self
-        }
-        pub fn timer(_ident: usize, _flags: u16, _interval_ns: i64) -> Self {
-            Self
-        }
-        pub fn udata_i32(&self) -> i32 {
-            0
-        }
-        pub fn vnode_ident(&self) -> i32 {
-            -1
-        }
-
-        pub fn is_proc_exit(&self) -> bool {
-            false
-        }
-        pub fn is_read_for_fd(&self, _fd: i32) -> bool {
-            false
-        }
-        pub fn filter(&self) -> i16 {
-            0
-        }
-        pub fn flags(&self) -> u16 {
-            0
-        }
-        pub fn fflags(&self) -> u32 {
-            0
-        }
-        pub fn data(&self) -> i64 {
-            0
-        }
-        pub fn ident(&self) -> usize {
-            0
         }
         pub fn proc_exit_ident(&self) -> Option<i32> {
             None
@@ -1108,18 +1061,8 @@ pub mod darwin_kqueue {
         pub fn new_internal() -> Option<Self> {
             None
         }
-        /// A do-nothing kqueue for the Linux epoll instance. Linux `epoll_pwait`
-        /// computes readiness directly from the interest map and blocks via
-        /// `ppoll` (see net.rs), so the kqueue is never driven — but the
-        /// `OpenDescription::Epoll` struct still needs one to construct.
-        pub fn dummy() -> Self {
-            Self
-        }
         pub fn apply(&self, _changes: &[Kevent]) -> Result<(), i32> {
             Ok(())
-        }
-        pub fn raw_fd(&self) -> i32 {
-            -1
         }
         pub fn wait(
             &self,
