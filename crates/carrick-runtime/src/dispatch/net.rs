@@ -236,7 +236,7 @@ impl SyscallDispatcher {
     /// EAGAIN by contract). HUP/ERR are cleared on both directions: poll(2)
     /// reports them regardless of the requested set, and a guest that just
     /// touched the fd must see a still-standing terminal condition again.
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
     pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest) {
         const READ_CLEAR: u32 =
             LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI | LINUX_EPOLLHUP | LINUX_EPOLLERR;

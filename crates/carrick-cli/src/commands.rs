@@ -836,7 +836,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 // The per-number lookup above works on both backends.
                 #[cfg(feature = "platform-macos")]
                 println!("{}", serde_json::to_string_pretty(aarch64_table())?);
-                #[cfg(not(feature = "platform-macos"))]
+                #[cfg(feature = "platform-linux")]
                 bail!(
                     "the full syscall-table dump is HVF-only on this build; pass a syscall number"
                 );
@@ -845,12 +845,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::TrapCapabilities => {
             #[cfg(feature = "platform-macos")]
             println!("{}", serde_json::to_string_pretty(&hvf_capabilities())?);
-            #[cfg(not(feature = "platform-macos"))]
-            bail!("trap-capabilities is HVF-only; not available on platform-linux");
+            #[cfg(feature = "platform-linux")]
+            bail!("trap-capabilities is HVF-only; not available on this backend");
         }
         #[cfg(feature = "platform-macos")]
         Commands::Debug { command } => run_debug(command)?,
-        #[cfg(not(feature = "platform-macos"))]
+        #[cfg(feature = "platform-linux")]
         Commands::Debug { command } => {
             let _ = command;
             bail!("debug (guest address-space inspection) is HVF-only on this build");

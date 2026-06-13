@@ -16,7 +16,7 @@ pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
     {
         Ok(Box::new(carrick_bsd::KqueueMultiplexer::new()?))
     }
-    #[cfg(all(not(feature = "platform-macos"), feature = "platform-linux"))]
+    #[cfg(feature = "platform-linux")]
     {
         Ok(Box::new(carrick_linux::EpollMultiplexer::new()?))
     }
@@ -24,11 +24,9 @@ pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
     // `cfg(any(macos, freebsd))`, so the same `KqueueMultiplexer` compiles and
     // runs here. Without this arm a platform-freebsd runtime falls through to
     // ENOSYS at multiplexer construction (every guest process dies at startup).
-    #[cfg(all(
-        not(feature = "platform-macos"),
-        not(feature = "platform-linux"),
-        feature = "platform-freebsd"
-    ))]
+    // The `platform-*` features are mutually exclusive, so positive predicates
+    // suffice (no `not(platform-macos)` disambiguation needed).
+    #[cfg(feature = "platform-freebsd")]
     {
         Ok(Box::new(carrick_bsd::KqueueMultiplexer::new()?))
     }

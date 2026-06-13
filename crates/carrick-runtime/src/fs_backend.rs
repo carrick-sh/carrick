@@ -2034,14 +2034,13 @@ fn is_guest_xattr_namespace(name: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
     let v = val.to_le_bytes();
-    // macOS: fsetxattr(fd, name, value, size, position, options)
+    // Portable fd-xattr (carrick-portable maps the Darwin position/options args).
     unsafe {
-        libc::fsetxattr(
+        carrick_portable::fsetxattr(
             fd,
             name.as_ptr() as *const libc::c_char,
             v.as_ptr() as *const libc::c_void,
             v.len(),
-            0,
             0,
         );
     }
@@ -2051,13 +2050,11 @@ fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
 fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
     let mut v = [0u8; 4];
     let n = unsafe {
-        libc::fgetxattr(
+        carrick_portable::fgetxattr(
             fd,
             name.as_ptr() as *const libc::c_char,
             v.as_mut_ptr() as *mut libc::c_void,
             v.len(),
-            0,
-            0,
         )
     };
     (n == 4).then(|| u32::from_le_bytes(v))
@@ -2247,9 +2244,6 @@ fn sandbox_abs_path(dir: &cap_std::fs::Dir, rel: &Path) -> Option<std::path::Pat
     Some(std::path::Path::new(std::str::from_utf8(&buf[..end]).ok()?).join(rel))
 }
 
-#[cfg(target_os = "macos")]
-const XATTR_NOFOLLOW: i32 = 0x0001;
-
 /// Path-based u32 xattr read (macOS). Unlike `with_entry_fd` + `fget_u32_xattr`,
 /// this issues NO open() — so it avoids cap-std's per-component path walk (the
 /// dominant cost of every stat on `--fs host`; ~291 host opens per guest open,
@@ -2269,14 +2263,21 @@ fn path_get_u32_xattr(
     let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
     let mut v = [0u8; 4];
     let n = unsafe {
-        libc::getxattr(
-            cpath.as_ptr(),
-            name.as_ptr() as *const libc::c_char,
-            v.as_mut_ptr() as *mut libc::c_void,
-            v.len(),
-            0,
-            if nofollow { XATTR_NOFOLLOW } else { 0 },
-        )
+        if nofollow {
+            carrick_portable::lgetxattr(
+                cpath.as_ptr(),
+                name.as_ptr() as *const libc::c_char,
+                v.as_mut_ptr() as *mut libc::c_void,
+                v.len(),
+            )
+        } else {
+            carrick_portable::getxattr(
+                cpath.as_ptr(),
+                name.as_ptr() as *const libc::c_char,
+                v.as_mut_ptr() as *mut libc::c_void,
+                v.len(),
+            )
+        }
     };
     (n == 4).then(|| u32::from_le_bytes(v))
 }
@@ -2296,14 +2297,14 @@ fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u
         return;
     };
     let v = val.to_le_bytes();
+    // symlink_set always targets the link itself (no-follow).
     unsafe {
-        libc::setxattr(
+        carrick_portable::lsetxattr(
             cpath.as_ptr(),
             name.as_ptr() as *const libc::c_char,
             v.as_ptr() as *const libc::c_void,
             v.len(),
             0,
-            XATTR_NOFOLLOW,
         );
     }
 }
