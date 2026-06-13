@@ -1325,6 +1325,231 @@ impl CarrickSigframe {
     }
 }
 
+// ─── x86-64 rt_sigframe (M3d) ────────────────────────────────────────────────
+//
+// The Linux x86-64 signal frame a guest handler runs on. Layout derived
+// CLEAN-ROOM from the x86-64 psABI, sigreturn(2)/signal(7), the Intel SDM
+// (FXSAVE area), and the <sys/ucontext.h> REG_* gregset indices — NOT from
+// kernel/glibc/UAPI source. Every field is naturally 8-byte aligned, so
+// `packed` (for unaligned zerocopy access at the guest SP) yields the identical
+// byte layout the kernel produces. The running 104 fixture is the oracle.
+
+/// x86-64 FXSAVE area (`struct _fpstate`, 512 bytes; Intel SDM Vol.1 §10.5.1).
+/// carrick fills `mxcsr` + `xmm_space` (XMM0–15) from `KVM_GET_FPU`; the x87
+/// `st_space` is zeroed (revisit if a fixture needs x87).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct X8664Fpstate {
+    pub cwd: u16,
+    pub swd: u16,
+    pub ftw: u16,
+    pub fop: u16,
+    pub rip: u64,
+    pub rdp: u64,
+    pub mxcsr: u32,
+    pub mxcr_mask: u32,
+    pub st_space: [u32; 32],  // x87 registers (128 bytes)
+    pub xmm_space: [u32; 64], // XMM0–15 (256 bytes)
+    pub padding: [u32; 24],   // reserved (96 bytes)
+}
+
+impl X8664Fpstate {
+    pub const fn empty() -> Self {
+        Self {
+            cwd: 0,
+            swd: 0,
+            ftw: 0,
+            fop: 0,
+            rip: 0,
+            rdp: 0,
+            mxcsr: 0,
+            mxcr_mask: 0,
+            st_space: [0; 32],
+            xmm_space: [0; 64],
+            padding: [0; 24],
+        }
+    }
+}
+
+/// x86-64 `struct sigcontext` / `mcontext` (256 bytes). The gregset order IS the
+/// ABI (`<sys/ucontext.h>` `REG_*` indices 0–22 / x86-64 psABI):
+/// r8..r15, rdi,rsi,rbp,rbx,rdx,rax,rcx,rsp, rip, eflags, then cs/gs/fs/ss
+/// (which alias the packed `REG_CSGSFS` u64: cs | gs<<16 | fs<<32 | ss<<48).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct X8664Sigcontext {
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub eflags: u64,
+    pub cs: u16,
+    pub gs: u16,
+    pub fs: u16,
+    pub ss: u16,
+    pub err: u64,
+    pub trapno: u64,
+    pub oldmask: u64,
+    pub cr2: u64,
+    pub fpstate: u64, // guest pointer to the X8664Fpstate (or 0)
+    pub reserved: [u64; 8],
+}
+
+impl X8664Sigcontext {
+    pub const fn empty() -> Self {
+        Self {
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rdi: 0,
+            rsi: 0,
+            rbp: 0,
+            rbx: 0,
+            rdx: 0,
+            rax: 0,
+            rcx: 0,
+            rsp: 0,
+            rip: 0,
+            eflags: 0,
+            cs: 0,
+            gs: 0,
+            fs: 0,
+            ss: 0,
+            err: 0,
+            trapno: 0,
+            oldmask: 0,
+            cr2: 0,
+            fpstate: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+/// x86-64 `struct ucontext` (424 bytes). `uc_sigmask` is a 128-byte sigset_t;
+/// only `[0]` (the low 64 signals) is live for Linux.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct X8664Ucontext {
+    pub uc_flags: u64,
+    pub uc_link: u64,
+    pub uc_stack: LinuxSignalStack,
+    pub uc_mcontext: X8664Sigcontext,
+    pub uc_sigmask: [u64; 16],
+}
+
+impl X8664Ucontext {
+    pub const fn empty() -> Self {
+        Self {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack: LinuxSignalStack::empty(),
+            uc_mcontext: X8664Sigcontext::empty(),
+            uc_sigmask: [0; 16],
+        }
+    }
+}
+
+/// The Linux x86-64 `struct rt_sigframe` written to the guest stack at the new
+/// RSP. `pretcode` is the address the handler RETs to (the restorer →
+/// rt_sigreturn). The FXSAVE area lives at the tail; `uc.uc_mcontext.fpstate`
+/// points to it. Kernel field order: pretcode, uc, info, fpstate.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct X8664Rtsigframe {
+    pub pretcode: u64,
+    pub uc: X8664Ucontext,
+    pub info: LinuxSiginfo,
+    pub fpstate: X8664Fpstate,
+}
+
+impl X8664Rtsigframe {
+    pub const fn empty() -> Self {
+        Self {
+            pretcode: 0,
+            uc: X8664Ucontext::empty(),
+            info: LinuxSiginfo::empty(),
+            fpstate: X8664Fpstate::empty(),
+        }
+    }
+}
+
+// Compile-time ABI size guards (x86-64 psABI / Intel SDM). A layout drift fails
+// the BUILD rather than producing a silently-wrong guest signal frame.
+const _: () = assert!(core::mem::size_of::<X8664Fpstate>() == 512);
+const _: () = assert!(core::mem::size_of::<X8664Sigcontext>() == 256);
+const _: () = assert!(core::mem::size_of::<X8664Ucontext>() == 424);
+
+#[cfg(test)]
+mod x8664_sigframe_tests {
+    use super::*;
+
+    /// The gregset byte offsets must equal the psABI `REG_*` index × 8
+    /// (`<sys/ucontext.h>`): REG_R8=0, REG_RDI=8, REG_RAX=13, REG_RCX=14,
+    /// REG_RSP=15, REG_RIP=16, REG_EFL=17. A wrong order makes a handler read
+    /// the wrong register out of `ucontext`.
+    #[test]
+    fn sigcontext_gregset_order_matches_psabi() {
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, r8), 0);
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, rdi), 8 * 8);
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, rdx), 12 * 8);
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, rax), 13 * 8);
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, rcx), 14 * 8);
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, rsp), 15 * 8);
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, rip), 16 * 8);
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, eflags), 17 * 8);
+        // cs/gs/fs/ss alias the REG_CSGSFS u64 at index 18.
+        assert_eq!(core::mem::offset_of!(X8664Sigcontext, cs), 18 * 8);
+    }
+
+    /// Kernel `struct rt_sigframe` field order: pretcode(0), uc, info, fpstate.
+    #[test]
+    fn rtsigframe_field_order() {
+        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, pretcode), 0);
+        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, uc), 8);
+        // uc is 424 bytes → info immediately after.
+        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, info), 8 + 424);
+        assert_eq!(
+            core::mem::offset_of!(X8664Rtsigframe, fpstate),
+            8 + 424 + 128
+        );
+    }
+
+    /// `ucontext`: uc_mcontext follows uc_flags(8) + uc_link(8) + uc_stack(24).
+    #[test]
+    fn ucontext_mcontext_offset() {
+        assert_eq!(
+            core::mem::offset_of!(X8664Ucontext, uc_mcontext),
+            8 + 8 + 24
+        );
+    }
+}
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
