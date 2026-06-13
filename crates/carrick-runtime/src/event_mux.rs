@@ -1,9 +1,10 @@
 //! Backend selection for the readiness multiplexer (Part C).
 //!
 //! Hands the runtime a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
-//! implementation appropriate for the host platform: kqueue-backed on macOS/BSD,
-//! a future epoll-backed multiplexer on Linux. The epoll dispatch path
-//! (`dispatch/net.rs`) drives readiness exclusively through this trait so the
+//! implementation appropriate for the host platform: kqueue-backed on macOS and
+//! FreeBSD (the same `carrick_bsd::KqueueMultiplexer`, whose `to_note`/`from_note`
+//! helpers already carry FreeBSD cfg gates), epoll-backed on Linux. The dispatch
+//! path (`dispatch/net.rs`) drives readiness exclusively through this trait so the
 //! backend choice lives in exactly one place.
 
 use carrick_hal::error::OsError;
@@ -19,7 +20,23 @@ pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
     {
         Ok(Box::new(carrick_linux::EpollMultiplexer::new()?))
     }
-    #[cfg(not(any(feature = "platform-macos", feature = "platform-linux")))]
+    // FreeBSD shares the macOS kqueue multiplexer: `carrick_bsd` is gated
+    // `cfg(any(macos, freebsd))`, so the same `KqueueMultiplexer` compiles and
+    // runs here. Without this arm a platform-freebsd runtime falls through to
+    // ENOSYS at multiplexer construction (every guest process dies at startup).
+    #[cfg(all(
+        not(feature = "platform-macos"),
+        not(feature = "platform-linux"),
+        feature = "platform-freebsd"
+    ))]
+    {
+        Ok(Box::new(carrick_bsd::KqueueMultiplexer::new()?))
+    }
+    #[cfg(not(any(
+        feature = "platform-macos",
+        feature = "platform-linux",
+        feature = "platform-freebsd"
+    )))]
     {
         Err(OsError::from_raw(libc::ENOSYS))
     }

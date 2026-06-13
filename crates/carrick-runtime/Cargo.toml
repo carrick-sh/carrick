@@ -48,7 +48,8 @@ platform-macos = ["dep:carrick-hvf", "dep:carrick-bsd"]
 platform-linux = ["dep:carrick-linux"]
 # FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2 — see
 # docs/superpowers/adr/2026-06-06-bhyve-backend-design.md). Mirrors platform-linux.
-platform-freebsd = ["dep:carrick-bhyve"]
+# Pulls in carrick-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
+platform-freebsd = ["dep:carrick-bhyve", "dep:carrick-bsd"]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
