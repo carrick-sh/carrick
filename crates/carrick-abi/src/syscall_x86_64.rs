@@ -114,6 +114,12 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(20, "writev", 66),
     // x86_64=60 (syscalls(2)/filippo) → canonical exit=93 (AARCH64_SYSCALLS[93])
     direct(60, "exit", 93),
+    // x86_64=63 (syscalls(2)/filippo) → canonical uname=160 (AARCH64_SYSCALLS[160]).
+    // WITHOUT this entry x86_64 uname(63) falls through to Unknown and passes its
+    // raw number 63 to the ISA-neutral dispatcher, which COLLIDES with canonical
+    // read=63 → uname is mis-dispatched as read and fails. Trap-confirmed on the
+    // KVM-x86 dispatcher lane (the x86-fsprobe fixture).
+    direct(63, "uname", 160),
     // x86_64=131 (syscalls(2)/filippo) → canonical sigaltstack=132
     // (AARCH64_SYSCALLS[132]). musl calls sigaltstack at startup to establish an
     // alternate signal stack; M2 treats it as a no-op (no signals).
