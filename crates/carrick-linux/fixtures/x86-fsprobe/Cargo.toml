@@ -1,0 +1,24 @@
+[package]
+name = "carrick-x86-fsprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone fixture crate (the root Cargo.toml excludes crates/*/fixtures/*).
+# Cross-compiled to x86_64-unknown-linux-musl by build.sh. It calls uname(2) —
+# a syscall the standalone ~15-syscall `run_elf_kvm_x86` loop does NOT service
+# (ENOSYS) but the full SyscallDispatcher DOES. That differential is the M1
+# proof that x86 reached the real dispatcher.
+
+[[bin]]
+name = "carrick-x86-fsprobe"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
