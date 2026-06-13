@@ -25,40 +25,40 @@ use std::os::fd::RawFd;
 
 use parking_lot::Mutex;
 
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 use carrick_hal::event::{EventMultiplexer, PollEvent, VnodeEvents};
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 use std::collections::HashSet;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 use std::time::Duration;
 
 // Linux inotify event/mask bits (asm-generic, shared by aarch64). Only the
 // macOS emulation needs the individual event bits (to translate kqueue
 // `NOTE_*` ↔ Linux mask); the native Linux backend passes the guest mask to the
 // kernel verbatim, so they are macOS-gated to stay dead-code-clean off-macOS.
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_ACCESS: u32 = 0x0000_0001;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_MODIFY: u32 = 0x0000_0002;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_ATTRIB: u32 = 0x0000_0004;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_CREATE: u32 = 0x0000_0100;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_DELETE: u32 = 0x0000_0200;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_DELETE_SELF: u32 = 0x0000_0400;
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 pub(crate) const IN_MOVE_SELF: u32 = 0x0000_0800;
 
 // inotify_init1 / open flags carried in the `flags` argument.
@@ -77,7 +77,7 @@ const LINUX_ENOSPC: i32 = 28;
 /// register API consumes. Requests the kqueue `NOTE_*` set corresponding to the
 /// Linux watch mask; a mask with no recognized data-changing bit falls back to
 /// the common set so a broad `IN_ALL_EVENTS` watch behaves sensibly.
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 fn linux_mask_to_vnode_events(mask: u32) -> VnodeEvents {
     let mut ev = VnodeEvents::default();
     if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS | IN_CREATE | IN_DELETE) != 0 {
@@ -105,7 +105,7 @@ fn linux_mask_to_vnode_events(mask: u32) -> VnodeEvents {
 
 /// Translate the `NOTE_*` fflags of a fired vnode event back into a Linux
 /// inotify event mask, restricted to the bits the watch actually requested.
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 fn note_to_linux_mask(fflags: u32, requested: u32) -> u32 {
     let mut mask = 0;
     if fflags & (carrick_portable::NOTE_WRITE | carrick_portable::NOTE_EXTEND) != 0 {
@@ -131,7 +131,7 @@ struct Watch {
     mask: u32,
 }
 
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 #[derive(Clone, Debug)]
 struct ScannedDir {
     path: PathBuf,
@@ -141,9 +141,9 @@ struct ScannedDir {
 #[derive(Clone, Debug)]
 struct WatchedFd {
     wd: i32,
-    #[cfg(feature = "platform-macos")]
+    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
     name: Option<Vec<u8>>,
-    #[cfg(feature = "platform-macos")]
+    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
     scan_dir: Option<ScannedDir>,
 }
 
@@ -160,7 +160,7 @@ struct Inner {
     /// Linux only: native-inotify watch descriptor → guest wd. The kernel hands
     /// out its own wd from `inotify_add_watch`; the guest sees our `wd`, so a
     /// record read off the native fd is rewritten through this map.
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(feature = "platform-linux")]
     native_wd_to_guest: HashMap<i32, i32>,
 }
 
@@ -175,11 +175,11 @@ pub(crate) struct InotifyState {
     /// methods need `&mut` yet `InotifyState` is shared via `Arc` and exposes
     /// `&self` methods; the lock is only ever held for a non-blocking kqueue
     /// change or a zero-timeout drain.
-    #[cfg(feature = "platform-macos")]
+    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
     mux: Mutex<Box<dyn EventMultiplexer>>,
     /// The native Linux inotify fd (`IN_NONBLOCK | IN_CLOEXEC`). Pollable
     /// directly; `read(2)` returns native `inotify_event` records.
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(feature = "platform-linux")]
     inotify_fd: RawFd,
     /// Cached pollable fd — stable for the instance's life, read lock-free
     /// (`mux.poll_fd()` on macOS, the inotify fd on Linux).
@@ -196,7 +196,7 @@ impl std::fmt::Debug for InotifyState {
 }
 
 impl InotifyState {
-    #[cfg(feature = "platform-macos")]
+    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
     pub(crate) fn new() -> Option<Self> {
         let mux = crate::event_mux::make_event_multiplexer().ok()?;
         let poll_fd = mux.poll_fd();
@@ -212,7 +212,7 @@ impl InotifyState {
         })
     }
 
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(feature = "platform-linux")]
     pub(crate) fn new() -> Option<Self> {
         // SAFETY: inotify_init1 takes a flags int and returns an fd or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -246,7 +246,7 @@ impl InotifyState {
         self.add_watch_fds(vec![crate::vfs::WatchFd::unnamed(host_fd)], mask)
     }
 
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(feature = "platform-linux")]
     pub(crate) fn add_watch_fds(
         &self,
         watch_fds: Vec<crate::vfs::WatchFd>,
@@ -300,7 +300,7 @@ impl InotifyState {
         Ok(wd)
     }
 
-    #[cfg(feature = "platform-macos")]
+    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
     pub(crate) fn add_watch_fds(
         &self,
         watch_fds: Vec<crate::vfs::WatchFd>,
@@ -371,11 +371,11 @@ impl InotifyState {
         };
         for host_fd in watch.host_fds {
             inner.wd_by_fd.remove(&host_fd);
-            #[cfg(feature = "platform-macos")]
+            #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
             {
                 let _ = self.mux.lock().deregister(host_fd);
             }
-            #[cfg(not(feature = "platform-macos"))]
+            #[cfg(feature = "platform-linux")]
             {
                 // Drop the kernel watch(es) that map to this guest wd.
                 let native: Vec<i32> = inner
@@ -402,7 +402,7 @@ impl InotifyState {
     /// An empty return means no events are ready (caller maps to EAGAIN / a
     /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
     /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(feature = "platform-linux")]
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
         let mut inner = self.inner.lock();
         // Drain whatever the kernel has queued on the native inotify fd, rewrite
@@ -448,7 +448,7 @@ impl InotifyState {
         drain_pending(&mut inner, max_bytes)
     }
 
-    #[cfg(feature = "platform-macos")]
+    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
         // Non-blocking drain of newly-ready vnode changes, normalized to a list
         // of `(watched host fd, fired NOTE_* fflags)`.
@@ -490,7 +490,7 @@ impl InotifyState {
         drain_pending(&mut inner, max_bytes)
     }
 
-    #[cfg(feature = "platform-macos")]
+    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
     fn scan_directory_records(
         inner: &mut Inner,
         fd: RawFd,
@@ -567,7 +567,7 @@ fn drain_pending(inner: &mut Inner, max_bytes: usize) -> Result<Vec<u8>, i32> {
 
 /// Native Linux `inotify_add_watch` against the path `host_fd` currently names.
 /// Returns the kernel's watch descriptor, or `Err(())` on any failure.
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(feature = "platform-linux")]
 fn native_add_watch(inotify_fd: RawFd, host_fd: RawFd, mask: u32) -> Result<i32, ()> {
     let link = format!("/proc/self/fd/{host_fd}");
     let clink = std::ffi::CString::new(link).map_err(|_| ())?;
@@ -590,7 +590,7 @@ fn native_add_watch(inotify_fd: RawFd, host_fd: RawFd, mask: u32) -> Result<i32,
     if wd < 0 { Err(()) } else { Ok(wd) }
 }
 
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
     let name_len = name.map(|name| align4(name.len() + 1)).unwrap_or(0);
     let mut record = Vec::with_capacity(INOTIFY_EVENT_HEADER_SIZE + name_len);
@@ -605,12 +605,12 @@ fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
     record
 }
 
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 fn align4(len: usize) -> usize {
     (len + 3) & !3
 }
 
-#[cfg(feature = "platform-macos")]
+#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
 fn scan_dir_entries(path: &Path) -> std::io::Result<HashSet<Vec<u8>>> {
     let mut entries = HashSet::new();
     for entry in std::fs::read_dir(path)? {
@@ -630,7 +630,7 @@ impl Drop for InotifyState {
         }
         // The native inotify fd is owned here on Linux; close it last so any
         // outstanding watches are torn down with it.
-        #[cfg(not(feature = "platform-macos"))]
+        #[cfg(feature = "platform-linux")]
         unsafe {
             libc::close(self.inotify_fd);
         }
@@ -703,7 +703,7 @@ mod tests {
 
 // Native Linux inotify smoke test — exercises the real kernel inotify backend
 // (the non-macOS path) end to end.
-#[cfg(all(test, not(feature = "platform-macos"), target_os = "linux"))]
+#[cfg(all(test, feature = "platform-linux", target_os = "linux"))]
 mod linux_tests {
     use super::*;
     use std::io::Write;
