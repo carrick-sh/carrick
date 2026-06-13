@@ -5084,6 +5084,8 @@ fn hvf_get_sys_reg(
         carrick_hal::SysReg::Vbar => SysReg::VBAR_EL1,
         carrick_hal::SysReg::Cpacr => SysReg::CPACR_EL1,
         carrick_hal::SysReg::TpidrEl0 => SysReg::TPIDR_EL0,
+        // x86_64 FsBase/GsBase are a disjoint ISA view; never on the macOS/HVF lane.
+        _ => return Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
     };
     vcpu.get_sys_reg(hvf_reg).map_err(hvf_os_error)
 }
@@ -5109,6 +5111,8 @@ fn hvf_set_sys_reg(
         carrick_hal::SysReg::Vbar => SysReg::VBAR_EL1,
         carrick_hal::SysReg::Cpacr => SysReg::CPACR_EL1,
         carrick_hal::SysReg::TpidrEl0 => SysReg::TPIDR_EL0,
+        // x86_64 FsBase/GsBase are a disjoint ISA view; never on the macOS/HVF lane.
+        _ => return Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
     };
     vcpu.set_sys_reg(hvf_reg, v).map_err(hvf_os_error)
 }
