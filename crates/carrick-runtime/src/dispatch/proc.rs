@@ -2271,7 +2271,7 @@ fn translate_wait_status(status: i32) -> i32 {
     // (LTP ptrace05 signums 18/19/34..64).
     #[cfg(target_os = "linux")]
     {
-        return status;
+        status
     }
     #[cfg(not(target_os = "linux"))]
     translate_wait_status_darwin(status)

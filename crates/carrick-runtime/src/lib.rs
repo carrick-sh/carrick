@@ -10,6 +10,16 @@
 // load-bearing), so we keep the lint STRICT on the macOS build and only relax it
 // off-macOS where the casts are genuinely redundant.
 #![cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
+// Audit #1 M1: the x86_64 KVM lane runs guests through the SINGLE-THREADED
+// combined loop (`run_combined_syscall_loop_linux`). The MULTI-THREADED run path
+// (`vcpu_loop`'s `run_vcpu_until_exit` + `ThreadRuntimeState`, `exec_helpers`, the
+// OCI `run_oci` path) is the aarch64 KVM lane today and is wired for x86 in M3,
+// so it is legitimately not-yet-used on the x86_64 `platform-linux` build. Scope
+// the dead-code lint off ONLY for that config — aarch64 and macOS stay strict.
+#![cfg_attr(
+    all(feature = "platform-linux", target_arch = "x86_64"),
+    allow(dead_code)
+)]
 // Same shape story for `CompatReporter::default()`: the reporter is a real
 // fielded struct on macOS (carrick-hvf) but a unit struct in the non-macOS
 // fallback, so `default_constructed_unit_structs` fires only off-macOS. Keep it

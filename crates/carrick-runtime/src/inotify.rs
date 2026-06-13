@@ -427,8 +427,17 @@ impl InotifyState {
             while off + INOTIFY_EVENT_HEADER_SIZE <= n {
                 // Header fields are at fixed little-endian offsets; read them by
                 // copy to avoid an unaligned reference into `buf`.
-                let native_wd = i32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
-                let len = u32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap()) as usize;
+                // Explicit byte indexing (no `unwrap()` — the no-panic gate): the
+                // loop guard `off + INOTIFY_EVENT_HEADER_SIZE(16) <= n` proves
+                // [off, off+16) is in-bounds.
+                let native_wd =
+                    i32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                let len = u32::from_ne_bytes([
+                    buf[off + 12],
+                    buf[off + 13],
+                    buf[off + 14],
+                    buf[off + 15],
+                ]) as usize;
                 let record_end = off + INOTIFY_EVENT_HEADER_SIZE + len;
                 if record_end > n {
                     break;
