@@ -1221,7 +1221,9 @@ CEOF
   echo "--- trap trace (proves real dispatch, not the thin shim) ---" >&2
   sg kvm -c "CARRICK_TRACE_TRAPS=1 $kvm run-elf $fixdir/hello-aarch64/hello-aarch64" \
     >/dev/null 2>/tmp/carrick-kvm-trace || true
-  grep -E "x8=64|x8=94" /tmp/carrick-kvm-trace >&2 || {
+  # The threaded loop (vcpu_loop.rs) traces as `nr=<n> (<name>)`; match that
+  # (the older `x8=<n>` pattern predates the current CARRICK_TRACE_TRAPS format).
+  grep -E "nr=64 \(write\)|nr=94 \(exit_group\)" /tmp/carrick-kvm-trace >&2 || {
     echo "FAIL: expected write(64)+exit_group(94) traps in the real-dispatch trace" >&2
     exit 1
   }
