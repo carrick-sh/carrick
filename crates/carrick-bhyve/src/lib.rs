@@ -22,9 +22,23 @@
 //! and `eret`s to EL0 — the way a real guest kernel sets up its own EL1 state.
 //! That stub + the trap-vehicle wiring are the next slice, on the aarch64 host.
 //!
+//! # Phase 2: the amd64 arm (x86_64 guests on x86_64 FreeBSD)
+//!
+//! Since bhyve virtualizes the host's own ISA, an **amd64 FreeBSD host runs
+//! x86_64 guests** — and that path is live (the box's nested-virt blocker was
+//! resolved; see `docs/superpowers/specs/2026-06-13-x86_64-bhyve-phase2-design.md`).
+//! The `vmm_x86` module carries the amd64 model (x86 `vm_exit`/`vm_inout`,
+//! amd64 register/exitcode constants, inherent raw-register/descriptor
+//! access); on x86_64 the aarch64-named `HvVm`/`HvVcpu` impls are deliberately
+//! not provided and the x86 backend uses the inherent surface instead.
+//!
 //! On every non-FreeBSD host this crate is intentionally empty.
 #![cfg(target_os = "freebsd")]
 
 pub mod vmm;
+#[cfg(target_arch = "x86_64")]
+pub mod vmm_x86;
 
 pub use vmm::{BhyveVcpu, BhyveVm};
+#[cfg(target_arch = "x86_64")]
+pub use vmm_x86::X86Exit;
