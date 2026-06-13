@@ -545,6 +545,11 @@ use crate::linux_abi::{
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
+// Canonical-number lookups: carrick's canonical syscall numbering IS the
+// aarch64 numbering. The dispatcher receives canonical numbers (a per-ISA
+// table remaps raw numbers to canonical at the GuestArch seam — Phase 2 for
+// x86_64), so its own metadata lookups stay aarch64-keyed by design; only
+// raw-frame consumers (the vCPU-loop trace) use the per-ISA Arch::Table.
 use crate::syscall::lookup_aarch64;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;

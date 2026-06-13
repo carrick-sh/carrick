@@ -897,6 +897,9 @@ where
         };
         #[cfg(feature = "trace-traps")]
         {
+            // Canonical (= aarch64) lookup: this single-threaded loop is generic
+            // over `SyscallTrap` only (no `ThreadedEngine::Arch` to consult); a
+            // per-ISA name needs the threaded loop's `Arch::Table` route.
             let name = crate::syscall::lookup_aarch64(frame.number)
                 .map(|s| s.name)
                 .unwrap_or("<unknown>");
