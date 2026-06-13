@@ -167,13 +167,14 @@ const ACCESS_RING0_CS64: u32 = 0x209B; // P|S|exec/read|DPL0|L
 const ACCESS_RING0_SS: u32 = 0x0093; // P|S|data/RW|DPL0
 /// Ring-3 data segment: P=1 S=1 type=0x2 (data/RW) DPL=3.
 /// Mirrors GDT[3] = 0x0000_F200_0000_0000.
-/// (Wired into `vm_set_desc` for the user SS by T7's ring-3 entry; referenced
-/// by the GDT-encoding unit tests now.)
+/// Ring-3 data segment access rights (the user SS/DS/ES/FS/GS value the iretq
+/// latches from GDT[3]). The iretq loads these from the GDT on the privilege
+/// change, so they are not pre-programmed; kept for the GDT-encoding unit tests
+/// and the (blocked) ring-3 entry work — see the M1 iretq blocker note.
 #[allow(dead_code)]
 const ACCESS_RING3_SS: u32 = 0x00F3; // P|S|data/RW|DPL3
 /// Ring-3 64-bit code segment: P=1 S=1 type=0xA (exec/read) DPL=3 L=1.
-/// Mirrors GDT[4] = 0x0020_FA00_0000_0000.
-/// (Wired into `vm_set_desc` for the user CS by T7; tested now.)
+/// Mirrors GDT[4] = 0x0020_FA00_0000_0000 (latched by the iretq from the GDT).
 #[allow(dead_code)]
 const ACCESS_RING3_CS64: u32 = 0x20FB; // P|S|exec/read|DPL3|L
 /// "Unusable" segment: bit 16 set — the selector is not loaded.
@@ -186,8 +187,9 @@ const ACCESS_LDT_UNUSABLE: u32 = 0x0001_0082; // system + unusable
 /// TSS64 available: P=1 S=0 type=0x9 (64-bit TSS available).
 /// Required by VT-x — a valid TSS must be present (Intel SDM vol. 3 §21.2.5).
 const ACCESS_TSS64: u32 = 0x008B; // P|system|type=9 (TSS available)
-/// Data segment for DS/ES/FS/GS at ring-3 init (= `ACCESS_RING3_SS`).
-/// (Wired into `vm_set_desc` for the user data segments by T7's ring-3 entry.)
+/// Ring-3 data segment for DS/ES/FS/GS (= `ACCESS_RING3_SS`); latched by the
+/// iretq from the GDT on the ring-3 transition. Kept for the (blocked) ring-3
+/// entry work — see the M1 iretq blocker note.
 #[allow(dead_code)]
 const ACCESS_RING3_DATA: u32 = 0x00F3; // = ACCESS_RING3_SS
 
@@ -254,6 +256,88 @@ pub fn m0_doorbell_blob() -> Vec<u8> {
         0xE6, 0xC5, // out %al, $0xC5
         0xF4, // hlt
     ]
+}
+
+// ─── M1 blob ─────────────────────────────────────────────────────────────────
+
+/// User VA for the M1 ring-3 blob and inline message.
+/// Placed at 0x40_0000 (4 MiB) — low user space, well below the carrick
+/// layout constants, easy to hand-encode in 32-bit immediates.
+pub const M1_BLOB_VA: u64 = 0x40_0000;
+
+/// M1 ring-3 blob: `write(1, "hello\n", 6)` then `exit_group(0)` via real
+/// SYSCALL instructions.  Uses **x86_64 syscall numbers** (write=1,
+/// exit_group=231); the host remaps them to canonical (64, 94) via
+/// [`X8664SyscallTable::remap`].
+///
+/// Byte encoding (AMD64 APM vol. 3 / OSDev ISA reference; offsets from
+/// [`M1_BLOB_VA`]). The code is exactly 0x21 (33) bytes — counting
+/// 5+5+5+5+2+2+5+2+2 — and the msg follows immediately at 0x21:
+/// ```text
+/// +0x00  bf 01 00 00 00   mov  $1, %edi          ; fd = stdout
+/// +0x05  be 21 00 40 00   mov  $0x400021, %esi   ; buf = M1_BLOB_VA + 0x21
+/// +0x0a  ba 06 00 00 00   mov  $6, %edx          ; count = 6
+/// +0x0f  b8 01 00 00 00   mov  $1, %eax          ; __NR_write (x86_64) = 1
+/// +0x14  0f 05            syscall
+/// +0x16  31 ff            xor  %edi, %edi        ; status = 0
+/// +0x18  b8 e7 00 00 00   mov  $231, %eax        ; __NR_exit_group (x86_64) = 231
+/// +0x1d  0f 05            syscall
+/// +0x1f  eb fe            jmp  .                 ; not reached (exit_group ends it)
+/// +0x21  68 65 6c 6c 6f 0a  "hello\n"
+/// ```
+///
+/// Total: 0x21 + 6 = 39 bytes; byte-pinned below.
+pub fn m1_ring3_blob() -> Vec<u8> {
+    // The code is exactly 0x21 (33) bytes — the four 5-byte movs (20) + two
+    // 2-byte syscalls (4) + xor (2) + the 5-byte exit_group mov + the 2-byte
+    // jmp = 33 — so msg follows IMMEDIATELY at offset 0x21. (An earlier 0x20
+    // placement overlapped the jmp's second byte.)
+    let msg_va_lo = (M1_BLOB_VA + 0x21) as u32; // fits in 32 bits (= 0x400021)
+    let mut b: Vec<u8> = Vec::with_capacity(0x21 + 6);
+
+    // mov $1, %edi  (BF id — opcode BF + 4-byte imm, Intel SDM vol. 2A "MOV")
+    b.push(0xBF);
+    b.extend_from_slice(&1u32.to_le_bytes());
+
+    // mov $msg_va, %esi  (BE id)
+    b.push(0xBE);
+    b.extend_from_slice(&msg_va_lo.to_le_bytes());
+
+    // mov $6, %edx  (BA id)
+    b.push(0xBA);
+    b.extend_from_slice(&6u32.to_le_bytes());
+
+    // mov $1, %eax  (B8 id) — __NR_write (x86_64)
+    b.push(0xB8);
+    b.extend_from_slice(&1u32.to_le_bytes());
+
+    // syscall  (0F 05, Intel SDM vol. 2B "SYSCALL")
+    b.push(0x0F);
+    b.push(0x05);
+
+    // xor %edi, %edi  (31 FF, Intel SDM vol. 2A "XOR")
+    b.push(0x31);
+    b.push(0xFF);
+
+    // mov $231, %eax  (B8 id) — __NR_exit_group (x86_64)
+    b.push(0xB8);
+    b.extend_from_slice(&231u32.to_le_bytes());
+
+    // syscall  (0F 05)
+    b.push(0x0F);
+    b.push(0x05);
+
+    // jmp .  (EB FE — short backward jmp; not reached)
+    b.push(0xEB);
+    b.push(0xFE);
+
+    // Code complete at offset 0x21 (33); msg follows with no padding.
+    assert_eq!(b.len(), 0x21, "M1 code must be exactly 0x21 (33) bytes");
+
+    // msg: "hello\n" at offset 0x21
+    b.extend_from_slice(b"hello\n");
+
+    b
 }
 
 /// The 3-entry long-mode boot GDT image `vm_setup_freebsd_registers` expects
@@ -689,15 +773,19 @@ pub struct BroughtUpX86 {
 /// 4. Program vCPU via `vm_set_register` + `vm_set_desc`:
 ///    - CR0/CR4/EFER from `X8664GuestArch::bootstrap_sysregs()` (EFER = 0xD01,
 ///      overriding `vm_setup_freebsd_registers`'s 0x1500 — adds SCE+NXE).
-///    - CS = kCS64 (0x08, ring-0) so the init blob runs at CPL 0.
-///    - SS = kSS (0x10, ring-0); DS/ES/FS/GS = unusable at ring-0 start.
+///    - CS = uCS64 (0x23, ring-3 pre-loaded for VT-x iretq); SS = uSS (0x1B,
+///      ring-3); DS/ES/FS/GS = user data (0x1B, ACCESS_RING3_DATA).  VT-x
+///      requires the hidden descriptor fields for any iretq-loaded selector to
+///      be programmed BEFORE vm_run (Intel SDM vol. 3 §21.3.1.2); setting them
+///      to ring-3 values here is idempotent — the init blob only executes
+///      WRMSRs then iretq (no data-segment access at ring-0).
 ///    - GDTR = carrick's 5-entry GDT (base = `X86_GDT_GPA`, limit = 5*8-1 = 39).
 ///    - IDTR = base 0, limit 0 (valid-but-empty; SFMASK masks IF; ring-3
 ///      exceptions become VM exits per spec §4.3/§6; real IDT is M3).
 ///    - TR = TSS64 at base 0, limit 0x67 (minimum 64-bit TSS size per Intel
 ///      SDM vol. 3 §7.2.1 — vmm.ko requires a valid TSS).
 ///    - LDTR = unusable (no LDT in Phase 2).
-///    - RIP = `X86_INIT_BLOB_GPA`; RSP = `X86_STACK_TOP_GPA`; RFLAGS = 0x2.
+///    - RIP = `X86_INIT_BLOB_GPA`; RSP = `LINUX_STACK_TOP` (guest VA); RFLAGS = 0x2.
 ///    - CR3 = `X86_PML4_GPA` (the PML4 root GPA).
 /// 5. Enable `VM_CAP_HALT_EXIT`.
 ///
@@ -767,14 +855,16 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
     // User stack: LINUX_STACK_TOP is the top; stack grows down.
     // VA range: [LINUX_STACK_TOP - LINUX_STACK_SIZE, LINUX_STACK_TOP).
     let stack_va_bottom = LINUX_STACK_TOP - LINUX_STACK_SIZE;
-    let stack_gpa = ram.add_bump(
+    // The returned GPA is unused: the RSP is the stack-top VA (LINUX_STACK_TOP),
+    // and the window→GPA resolution happens through the PML4 / vm_map_gpa cache.
+    // add_bump is called for its side effect of registering the stack window.
+    ram.add_bump(
         stack_va_bottom,
         LINUX_STACK_SIZE as usize,
         true,
         true,
         false,
     )?;
-    let stack_top_gpa = stack_gpa + LINUX_STACK_SIZE;
 
     // ── Step 2: vm_setup_memory + mmap_memseg ────────────────────────────
 
@@ -793,13 +883,15 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
         regs.star,
         regs.sfmask,
         LINUX_EL0_TRAMPOLINE_BASE, // ring-3 RIP after iretq
-        // FIXME(T7): with paging on, RSP is a guest VA, not a GPA — this must
-        // be the stack-top VA (LINUX_STACK_TOP), which the stack window maps to
-        // stack_gpa. Using the GPA here will #PF the first push when T7 runs the
-        // vCPU. Left as the bump GPA pending T7's live validation of the iretq
-        // frame (T6 only checks static register state, not execution).
-        stack_top_gpa, // ring-3 RSP after iretq
-        regs.rflags,   // RFLAGS (0x2)
+        // T7 RSP fix: with CR0.PG=1 the vCPU is in paged mode when iretq runs,
+        // so RSP in the iretq frame is a guest VIRTUAL address (not a GPA).
+        // The stack window maps VA [LINUX_STACK_TOP-LINUX_STACK_SIZE,
+        // LINUX_STACK_TOP) → bump GPA stack_gpa..stack_top_gpa, so the correct
+        // ring-3 RSP is the stack-top VA = LINUX_STACK_TOP (rounded down 16-byte
+        // aligned).  Using stack_top_gpa here would #PF on the first `push`
+        // because that GPA is not mapped at itself in the PML4.
+        LINUX_STACK_TOP, // ring-3 RSP after iretq (guest VA, not GPA)
+        regs.rflags,     // RFLAGS (0x2)
     );
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
 
@@ -829,7 +921,14 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
 
     // General-purpose + RFLAGS.
     vcpu.set_reg_raw(VM_REG_GUEST_RIP, X86_INIT_BLOB_GPA)?;
-    vcpu.set_reg_raw(VM_REG_GUEST_RSP, X86_STACK_TOP_GPA)?;
+    // T7 RSP fix: the vCPU starts in paged mode (CR0.PG=1) with the PML4
+    // already mapped, so RSP must be a guest VA.  The ring-0 init blob itself
+    // never touches the stack (no `push`/`call` before iretq), so this only
+    // matters as the ring-0 selector value and as the RSP iretq-frame value
+    // (which we already fixed above to LINUX_STACK_TOP).  Use LINUX_STACK_TOP
+    // here for consistency — the kernel RSP is the same VA the user will land
+    // on after iretq (stack grows down from LINUX_STACK_TOP).
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, LINUX_STACK_TOP)?;
     vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, regs.rflags)?;
 
     // Code and stack segment: ring-0 (the init blob runs at CPL 0 to WRMSR).
@@ -874,7 +973,162 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
     vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
     vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
 
+    // ── Step 4b: ring-3 segment descriptors ──────────────────────────────
+    //
+    // The vCPU BOOTS IN RING 0 (CS/SS set to the kernel selectors above) so the
+    // WRMSR init blob runs at CPL 0. The ring-3 transition is the blob's iretq,
+    // which loads CS=0x23/SS=0x1B by walking the GDT and latching their hidden
+    // state itself — VT-x does NOT require pre-loading the iretq target's hidden
+    // state (the earlier theory that it did was wrong: it forced a CPL-3 boot
+    // that #GP'd the WRMSRs, and the iretq triple-faults independently — see
+    // docs/superpowers/notes/2026-06-13-m1-iretq-ring3-blocker.md). Here we only
+    // give DS/ES/FS/GS valid RING-0 data descriptors for a clean VT-x entry; the
+    // iretq nulls/reloads them on the privilege change per the architecture.
+    for reg in [
+        VM_REG_GUEST_DS,
+        VM_REG_GUEST_ES,
+        VM_REG_GUEST_FS,
+        VM_REG_GUEST_GS,
+    ] {
+        vcpu.set_desc(reg, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+        vcpu.set_reg_raw(reg, KERN_SS_SEL)?;
+    }
+
     // ── Step 5: capabilities ──────────────────────────────────────────────
+
+    vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
+
+    Ok(BroughtUpX86 { vm, vcpu, ram })
+}
+
+/// Bring up a carrick x86_64/bhyve vCPU for the M1 test: like [`bring_up_x86`]
+/// but with an additional user-exec window for the M1 ring-3 blob and the
+/// ring-3 entry RIP pointing at [`M1_BLOB_VA`].
+///
+/// The M1 blob is placed at [`M1_BLOB_VA`] (user/exec/read-only in the PML4).
+/// The iretq frame targets `user_rip = M1_BLOB_VA` so the vCPU's first ring-3
+/// instruction is the `mov $1, %edi` of the blob (which then issues SYSCALL).
+pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
+    let regs = X8664GuestArch::bootstrap_sysregs();
+
+    let mut ram = BhyveGuestRam::new();
+
+    // Fixed-GPA kernel windows (same as bring_up_x86).
+    let blob_size = 4096;
+    ram.add_fixed(
+        X86_INIT_BLOB_GPA,
+        X86_INIT_BLOB_GPA,
+        blob_size,
+        false,
+        false,
+        true,
+    );
+    ram.add_fixed(X86_GDT_GPA, X86_GDT_GPA, 4096, false, false, false);
+    ram.add_fixed(
+        LINUX_EL0_TRAMPOLINE_BASE,
+        X86_LSTAR_GPA,
+        4096,
+        false,
+        false,
+        true,
+    );
+    ram.add_fixed(
+        LINUX_PAGE_TABLES_BASE,
+        X86_PML4_GPA,
+        X86_PML4_CAPACITY,
+        false,
+        true,
+        false,
+    );
+
+    // User stack.
+    let stack_va_bottom = LINUX_STACK_TOP - LINUX_STACK_SIZE;
+    let _stack_gpa = ram.add_bump(
+        stack_va_bottom,
+        LINUX_STACK_SIZE as usize,
+        true,
+        true,
+        false,
+    )?;
+
+    // M1 user-code window: the ring-3 blob at M1_BLOB_VA (user, read-exec).
+    // One 4 KiB page covers the 38-byte blob.
+    let _m1_blob_gpa = ram.add_bump(M1_BLOB_VA, 4096, true, false, true)?;
+
+    // VM setup.
+    let mut vm = BhyveVm::create()?;
+    vm.setup_memory(X86_MEM_SIZE)?;
+    vm.mmap_memseg(0, VM_SEGID_SYSMEM, X86_MEM_SIZE, PROT_RWX)?;
+
+    // Kernel artifacts.
+    let blob = msr_init_blob(
+        regs.lstar,
+        regs.star,
+        regs.sfmask,
+        M1_BLOB_VA,      // ring-3 RIP: entry of the M1 user code
+        LINUX_STACK_TOP, // ring-3 RSP (guest VA)
+        regs.rflags,
+    );
+    write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
+    write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
+    write_gpa(&vm, X86_LSTAR_GPA, &entry_trampoline_bytes())?;
+
+    // M1 ring-3 blob at its bump GPA (resolved through the PML4).
+    let m1_gpa = ram
+        .windows
+        .iter()
+        .find(|w| w.va == M1_BLOB_VA)
+        .map(|w| w.gpa)
+        .ok_or_else(|| OsError::new("bhyve: M1 blob window was not planned".to_string()))?;
+    write_gpa(&vm, m1_gpa, &m1_ring3_blob())?;
+
+    // PML4 tables.
+    let specs = pml4_map_specs(&ram);
+    let tables = pml4_tables(&specs, X86_PML4_GPA, X86_PML4_CAPACITY)
+        .map_err(|e| OsError::new(format!("bhyve: M1 PML4 build failed: {e:?}")))?;
+    write_gpa(&vm, X86_PML4_GPA, &tables)?;
+
+    // vCPU register programming (same as bring_up_x86).
+    let mut vcpu = vm.add_vcpu()?;
+
+    vcpu.set_reg_raw(VM_REG_GUEST_CR0, regs.cr0)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR3, X86_PML4_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR4, regs.cr4)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_EFER, regs.efer)?;
+
+    vcpu.set_reg_raw(VM_REG_GUEST_RIP, X86_INIT_BLOB_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, LINUX_STACK_TOP)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, regs.rflags)?;
+
+    // The vCPU BOOTS IN RING 0 to run the WRMSR init blob (WRMSR is CPL-0
+    // only). Initial segments are the KERNEL (DPL-0) selectors/descriptors —
+    // identical to bring_up_x86. The ring-3 transition is the init blob's
+    // iretq, whose frame carries USER_CS64_SEL(0x23)/USER_SS_SEL(0x1B); the
+    // iretq reloads CS/SS from the GDT (entries 4/3) at that point. (Setting
+    // the initial segments to the user selectors was the M1 triple-fault: the
+    // blob couldn't WRMSR at CPL 3 and the iretq state was inconsistent.)
+    vcpu.set_desc(VM_REG_GUEST_CS, 0, 0xFFFF_FFFF, ACCESS_RING0_CS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CS, KERN_CS64_SEL)?;
+
+    vcpu.set_desc(VM_REG_GUEST_SS, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_SS, KERN_SS_SEL)?;
+
+    for reg in [
+        VM_REG_GUEST_DS,
+        VM_REG_GUEST_ES,
+        VM_REG_GUEST_FS,
+        VM_REG_GUEST_GS,
+    ] {
+        vcpu.set_desc(reg, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+        vcpu.set_reg_raw(reg, KERN_SS_SEL)?;
+    }
+
+    vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
 
     vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
 
@@ -913,6 +1167,59 @@ mod tests {
     #[test]
     fn doorbell_ports_are_distinct() {
         assert_ne!(SYSCALL_DOORBELL_PORT, MAINT_DOORBELL_PORT);
+    }
+
+    /// M1 blob: byte-pin the instruction encodings and verify the inline
+    /// message placement.
+    ///
+    /// Encoding sources: AMD64 APM vol. 3 / OSDev / Intel SDM vol. 2A-2B.
+    #[test]
+    fn m1_ring3_blob_bytes_pinned() {
+        let blob = m1_ring3_blob();
+        // Total length: 0x21 (33 code) + 6 (msg) = 39 bytes.
+        assert_eq!(
+            blob.len(),
+            39,
+            "M1 blob must be 39 bytes (0x21 code + 6 msg)"
+        );
+
+        // Offset +0x00: mov $1, %edi  (BF 01 00 00 00)
+        assert_eq!(&blob[0x00..0x05], &[0xBF, 0x01, 0x00, 0x00, 0x00]);
+
+        // Offset +0x05: mov $0x400021, %esi  (BE 21 00 40 00)
+        // msg_va = M1_BLOB_VA + 0x21 = 0x400000 + 0x21 = 0x400021
+        let msg_va = (M1_BLOB_VA + 0x21u64) as u32;
+        assert_eq!(
+            &blob[0x05..0x0a],
+            &[
+                0xBE,
+                msg_va as u8,
+                (msg_va >> 8) as u8,
+                (msg_va >> 16) as u8,
+                (msg_va >> 24) as u8
+            ]
+        );
+
+        // Offset +0x0f: mov $1, %eax  (B8 01 00 00 00) — __NR_write=1
+        assert_eq!(&blob[0x0f..0x14], &[0xB8, 0x01, 0x00, 0x00, 0x00]);
+
+        // Offset +0x14: syscall (0F 05)
+        assert_eq!(&blob[0x14..0x16], &[0x0F, 0x05]);
+
+        // Offset +0x16: xor %edi, %edi  (31 FF)
+        assert_eq!(&blob[0x16..0x18], &[0x31, 0xFF]);
+
+        // Offset +0x18: mov $231, %eax  (B8 E7 00 00 00) — __NR_exit_group=231
+        assert_eq!(&blob[0x18..0x1d], &[0xB8, 0xE7, 0x00, 0x00, 0x00]);
+
+        // Offset +0x1d: syscall (0F 05)
+        assert_eq!(&blob[0x1d..0x1f], &[0x0F, 0x05]);
+
+        // Offset +0x1f: jmp . (EB FE)
+        assert_eq!(&blob[0x1f..0x21], &[0xEB, 0xFE]);
+
+        // Offset +0x21: msg "hello\n" (6 bytes), immediately after the code
+        assert_eq!(&blob[0x21..0x27], b"hello\n");
     }
 
     /// The M0 identity tables build inside the reserved capacity, and the
