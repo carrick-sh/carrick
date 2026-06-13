@@ -25,9 +25,11 @@
 //! - kvm-ioctls 0.22.1 `VcpuExit::IoOut(port, data_slice)`
 //! - arch_prctl(2) man7.org `ARCH_SET_FS = 0x1002`
 
+use std::sync::Arc;
+
 use carrick_guest_mem::{GuestMemory, MemoryError, X8664SyscallFrame};
 use carrick_hal::{
-    RawSyscall, SyscallTrap, TrapError, VcpuExit,
+    OsError, RawSyscall, Reg, SysReg, SyscallTrap, TrapError, VcpuExit,
     guest_arch::{GuestArch as _, SyscallRemap, SyscallTable as _},
     x8664_arch::{X8664GuestArch, X8664SyscallTable},
 };
@@ -36,6 +38,7 @@ use carrick_mem::memory::AddressSpace;
 use crate::guest_setup::GuestRam;
 use crate::guest_setup_x86::BroughtUpX86;
 use crate::kvm::{KvmVcpu, KvmVm};
+use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
 
 // ─── Doorbell port ────────────────────────────────────────────────────────────
 
@@ -343,6 +346,236 @@ impl SyscallTrap for KvmX86TrapEngine {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+// ─── RegAccess (x86_64 via KVM_GET/SET_REGS/SREGS/FPU) ───────────────────────
+//
+// The aarch64 KvmVcpu::reg/set_reg are non-aarch64 Err stubs (kvm.rs:790); x86
+// goes straight through the VcpuFd. get/set_reg read-modify-write the full
+// kvm_regs (KVM has no per-GPR ioctl on x86) — fine off the syscall hot path
+// (only the clone/sigframe paths read these). The aarch64 Reg/SysReg variants
+// are a disjoint ISA view and never reach this engine (-> EINVAL).
+impl carrick_hal::RegAccess for KvmX86TrapEngine {
+    fn get_reg(&self, r: Reg) -> Result<u64, OsError> {
+        let regs = self
+            .vcpu
+            .fd()
+            .get_regs()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        Ok(match r {
+            Reg::Rax => regs.rax,
+            Reg::Rbx => regs.rbx,
+            Reg::Rcx => regs.rcx,
+            Reg::Rdx => regs.rdx,
+            Reg::Rsi => regs.rsi,
+            Reg::Rdi => regs.rdi,
+            Reg::Rbp => regs.rbp,
+            Reg::Rsp => regs.rsp,
+            Reg::R8 => regs.r8,
+            Reg::R9 => regs.r9,
+            Reg::R10 => regs.r10,
+            Reg::R11 => regs.r11,
+            Reg::R12 => regs.r12,
+            Reg::R13 => regs.r13,
+            Reg::R14 => regs.r14,
+            Reg::R15 => regs.r15,
+            Reg::Rip => regs.rip,
+            Reg::Rflags => regs.rflags,
+            _ => return Err(OsError::from_raw(libc::EINVAL)),
+        })
+    }
+
+    fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), OsError> {
+        let mut regs = self
+            .vcpu
+            .fd()
+            .get_regs()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        match r {
+            Reg::Rax => regs.rax = v,
+            Reg::Rbx => regs.rbx = v,
+            Reg::Rcx => regs.rcx = v,
+            Reg::Rdx => regs.rdx = v,
+            Reg::Rsi => regs.rsi = v,
+            Reg::Rdi => regs.rdi = v,
+            Reg::Rbp => regs.rbp = v,
+            Reg::Rsp => regs.rsp = v,
+            Reg::R8 => regs.r8 = v,
+            Reg::R9 => regs.r9 = v,
+            Reg::R10 => regs.r10 = v,
+            Reg::R11 => regs.r11 = v,
+            Reg::R12 => regs.r12 = v,
+            Reg::R13 => regs.r13 = v,
+            Reg::R14 => regs.r14 = v,
+            Reg::R15 => regs.r15 = v,
+            Reg::Rip => regs.rip = v,
+            Reg::Rflags => regs.rflags = v,
+            _ => return Err(OsError::from_raw(libc::EINVAL)),
+        }
+        self.vcpu
+            .fd()
+            .set_regs(&regs)
+            .map_err(|_| OsError::from_raw(libc::EIO))
+    }
+
+    fn get_sys_reg(&self, r: SysReg) -> Result<u64, OsError> {
+        let sregs = self
+            .vcpu
+            .fd()
+            .get_sregs()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        Ok(match r {
+            SysReg::FsBase => sregs.fs.base,
+            SysReg::GsBase => sregs.gs.base,
+            _ => return Err(OsError::from_raw(libc::EINVAL)),
+        })
+    }
+
+    fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError> {
+        let mut sregs = self
+            .vcpu
+            .fd()
+            .get_sregs()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        match r {
+            SysReg::FsBase => sregs.fs.base = v,
+            SysReg::GsBase => sregs.gs.base = v,
+            _ => return Err(OsError::from_raw(libc::EINVAL)),
+        }
+        self.vcpu
+            .fd()
+            .set_sregs(&sregs)
+            .map_err(|_| OsError::from_raw(libc::EIO))
+    }
+
+    fn get_vreg(&self, n: u32) -> Result<u128, OsError> {
+        if n >= 16 {
+            return Err(OsError::from_raw(libc::EINVAL));
+        }
+        let fpu = self
+            .vcpu
+            .fd()
+            .get_fpu()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        Ok(u128::from_le_bytes(fpu.xmm[n as usize]))
+    }
+
+    fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), OsError> {
+        if n >= 16 {
+            return Err(OsError::from_raw(libc::EINVAL));
+        }
+        let mut fpu = self
+            .vcpu
+            .fd()
+            .get_fpu()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        fpu.xmm[n as usize] = v.to_le_bytes();
+        self.vcpu
+            .fd()
+            .set_fpu(&fpu)
+            .map_err(|_| OsError::from_raw(libc::EIO))
+    }
+
+    fn get_fpcr(&self) -> Result<u64, OsError> {
+        // x86 has no FPCR; MXCSR is the nearest control word. The x86 sigframe
+        // (M3d) builds fpregs from KVM_GET_FPU directly and does not consult this.
+        let fpu = self
+            .vcpu
+            .fd()
+            .get_fpu()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        Ok(u64::from(fpu.mxcsr))
+    }
+
+    fn set_fpcr(&mut self, v: u64) -> Result<(), OsError> {
+        let mut fpu = self
+            .vcpu
+            .fd()
+            .get_fpu()
+            .map_err(|_| OsError::from_raw(libc::EIO))?;
+        fpu.mxcsr = v as u32;
+        self.vcpu
+            .fd()
+            .set_fpu(&fpu)
+            .map_err(|_| OsError::from_raw(libc::EIO))
+    }
+
+    fn get_fpsr(&self) -> Result<u64, OsError> {
+        // No distinct x86 status word in this model (unused on the x86 sigframe path).
+        Ok(0)
+    }
+
+    fn set_fpsr(&mut self, _v: u64) -> Result<(), OsError> {
+        Ok(())
+    }
+}
+
+// SAFETY: `KvmX86TrapEngine` holds a `KvmVm` (`Arc<VmFd>` + `Option<Kvm>` — `File`s,
+// `Send + Sync`), a `KvmVcpu` (`VcpuFd` — `Send + Sync` in kvm-ioctls), and a
+// `GuestRam` whose only non-`Send` members are the window mmaps' raw `*mut u8`.
+// Those host pointers are valid in EVERY thread of the process (threads share the
+// address space) and the KVM fds are usable from any thread, so moving the engine
+// to its owning sibling/vCPU thread is sound. Mirrors `unsafe impl Send for
+// KvmTrapEngine` (trap_engine.rs).
+unsafe impl Send for KvmX86TrapEngine {}
+
+// ─── ThreadedEngine (minimal — single-threaded M3a/M3b) ──────────────────────
+//
+// Puts x86 on the canonical run_vcpu_until_exit loop. clone(CLONE_THREAD) sibling
+// vCPUs are M3c (build/materialize_sibling = typed-error stubs); fork/execve_into/
+// inject_signal/restore_from_sigframe keep their SyscallTrap stubs (M3c/M3d).
+impl carrick_hal::ThreadedEngine for KvmX86TrapEngine {
+    type Arch = X8664GuestArch;
+    type KickHandle = KvmKickHandle;
+    type SiblingSpec = ();
+
+    fn kick_handle(&self) -> Self::KickHandle {
+        KvmKickHandle::for_current_thread()
+    }
+
+    fn wait_for_vcpu_slot() {
+        // No-op: KVM has no Apple-HVF concurrent-vCPU admission cap.
+    }
+
+    fn build_sibling_spec(&self, _stack: u64, _tls: u64) -> Result<Self::SiblingSpec, TrapError> {
+        Err(TrapError::Hypervisor(
+            "x86_64 clone(CLONE_THREAD) sibling vCPU not implemented (M3c)".to_string(),
+        ))
+    }
+
+    fn materialize_sibling(_spec: Self::SiblingSpec) -> Result<Self, TrapError> {
+        Err(TrapError::Hypervisor(
+            "x86_64 sibling vCPU materialization not implemented (M3c)".to_string(),
+        ))
+    }
+
+    fn program_counter(&self) -> Result<u64, TrapError> {
+        self.current_pc()
+    }
+
+    fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
+        // x86 "SP_EL0" analogue is RSP. &self read-modify-write of the GPR set.
+        let mut regs = self
+            .vcpu
+            .fd()
+            .get_regs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(set_rsp): {e}")))?;
+        regs.rsp = sp;
+        self.vcpu
+            .fd()
+            .set_regs(&regs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(rsp): {e}")))
+    }
+
+    fn set_guest_thread_id(&self, _tid: u64) -> Result<(), TrapError> {
+        // No in-guest gettid fast path on KVM (no syscall shim); the dispatcher
+        // services gettid. Mirrors the HVF/aarch64 no-shim path.
+        Ok(())
+    }
+
+    fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
+        Arc::new(KvmKicker::new())
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -10,16 +10,6 @@
 // load-bearing), so we keep the lint STRICT on the macOS build and only relax it
 // off-macOS where the casts are genuinely redundant.
 #![cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
-// Audit #1 M1: the x86_64 KVM lane runs guests through the SINGLE-THREADED
-// combined loop (`run_combined_syscall_loop_linux`). The MULTI-THREADED run path
-// (`vcpu_loop`'s `run_vcpu_until_exit` + `ThreadRuntimeState`, `exec_helpers`, the
-// OCI `run_oci` path) is the aarch64 KVM lane today and is wired for x86 in M3,
-// so it is legitimately not-yet-used on the x86_64 `platform-linux` build. Scope
-// the dead-code lint off ONLY for that config — aarch64 and macOS stay strict.
-#![cfg_attr(
-    all(feature = "platform-linux", target_arch = "x86_64"),
-    allow(dead_code)
-)]
 // Same shape story for `CompatReporter::default()`: the reporter is a real
 // fielded struct on macOS (carrick-hvf) but a unit struct in the non-macOS
 // fallback, so `default_constructed_unit_structs` fires only off-macOS. Keep it
@@ -430,12 +420,16 @@ pub mod runtime {
     /// kick-signal handler (idempotently). The blocking-I/O / proc-exit / sleep /
     /// signal-wait arms use the `ppoll`/`waitid`-backed Linux `ThreadWaiter`
     /// (`crate::io_wait`).
-    #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
-    pub fn run_threaded_kvm_loop(
-        engine: carrick_linux::KvmTrapEngine,
+    #[cfg(feature = "platform-linux")]
+    pub fn run_threaded_kvm_loop<E>(
+        engine: E,
         dispatcher: SyscallDispatcher,
         max_traps: usize,
-    ) -> Result<RunResult, RuntimeError> {
+    ) -> Result<RunResult, RuntimeError>
+    where
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_linux::KvmKickHandle> + 'static,
+        E::SiblingSpec: 'static,
+    {
         use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
         use crate::vcpu_loop::{
             KernelState, PlatformFutexFactory, VcpuLoopOutcome, run_vcpu_until_exit,
@@ -780,7 +774,18 @@ pub mod runtime {
         .with_linux_initial_stack([argv0.as_bytes()], std::iter::empty::<&[u8]>())?
         .with_vdso_auxv(false);
         let mut engine = carrick_linux::KvmX86TrapEngine::new(&image)?;
-        run_combined_syscall_loop_linux(&mut engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+        // Default: the canonical multi-threaded loop, now SHARED with aarch64-KVM
+        // and HVF (M3). `CARRICK_NO_THREADS` keeps the M1 single-threaded combined
+        // loop reachable as an A/B fallback (mirrors the aarch64 arm). fork/clone/
+        // futex/signal outcomes still surface Unsupported until M3c/M3d.
+        if std::env::var_os("CARRICK_NO_THREADS").is_some() {
+            return run_combined_syscall_loop_linux(
+                &mut engine,
+                make_linux_dispatcher(),
+                DEFAULT_MAX_TRAPS,
+            );
+        }
+        run_threaded_kvm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
     }
 
     /// Build the dispatcher for the bare KVM ELF runner with a real, writable
@@ -862,6 +867,12 @@ pub mod runtime {
     /// run-elf runner) would silently override the image. Mirrors the macOS
     /// `seed_guest_baseline` + `set_baseline_file_if_missing` (execute.rs).
     #[cfg(feature = "platform-linux")]
+    // Used by the OCI run_oci path (aarch64-KVM); x86-KVM's run_oci is a stub until
+    // OCI-x86 lands, so this is unused only on the x86_64 platform-linux build.
+    #[cfg_attr(
+        all(feature = "platform-linux", target_arch = "x86_64"),
+        allow(dead_code)
+    )]
     fn seed_linux_baseline_gaps(backend: &mut dyn crate::fs_backend::FsBackend) {
         for dir in [
             "/tmp",
