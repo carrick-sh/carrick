@@ -2066,9 +2066,9 @@ fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
 #[cfg(not(target_os = "macos"))]
 fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
     let v = val.to_le_bytes();
-    // Linux: fsetxattr(fd, name, value, size, flags)
+    // Portable fd-xattr (Linux fsetxattr / macOS f*xattr+position / FreeBSD extattr_set_fd).
     unsafe {
-        libc::fsetxattr(
+        carrick_portable::fsetxattr(
             fd,
             name.as_ptr() as *const libc::c_char,
             v.as_ptr() as *const libc::c_void,
@@ -2082,7 +2082,7 @@ fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
 fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
     let mut v = [0u8; 4];
     let n = unsafe {
-        libc::fgetxattr(
+        carrick_portable::fgetxattr(
             fd,
             name.as_ptr() as *const libc::c_char,
             v.as_mut_ptr() as *mut libc::c_void,
@@ -3414,10 +3414,10 @@ impl FsBackend for HostFsBackend {
         // (same semantics, different numeric values).
         let mut opts: libc::c_int = 0;
         if flags & crate::linux_abi::LINUX_XATTR_CREATE != 0 {
-            opts |= libc::XATTR_CREATE;
+            opts |= carrick_portable::XATTR_CREATE;
         }
         if flags & crate::linux_abi::LINUX_XATTR_REPLACE != 0 {
-            opts |= libc::XATTR_REPLACE;
+            opts |= carrick_portable::XATTR_REPLACE;
         }
         let rc = unsafe {
             carrick_portable::fsetxattr(
