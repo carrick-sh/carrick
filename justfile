@@ -104,6 +104,10 @@ bench PROFILE="quick":
 build-fixture:
     ./crates/carrick-linux/fixtures/hello-aarch64/build.sh
 
+# Build the static x86_64 musl M2 fixture (Mac-native: rustup + rust-lld, no C/Docker).
+build-x86-fixture:
+    ./crates/carrick-bhyve/fixtures/hello-x86_64/build.sh
+
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).
 # Runs on the Mac (no nested VM needed) — matches the CI cross-check job.
