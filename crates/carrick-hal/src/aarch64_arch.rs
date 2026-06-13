@@ -10,7 +10,7 @@
 //! function verbatim. No routing through the trait happens yet (that starts in
 //! later plan tasks).
 
-use crate::guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallTable};
+use crate::guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 use carrick_guest_mem::Aarch64SyscallFrame;
 
 /// ELF `e_machine` for AArch64 (`EM_AARCH64`).
@@ -66,6 +66,17 @@ impl SyscallTable for Aarch64SyscallTable {
 
     fn is_known(number: u64) -> bool {
         carrick_abi::syscall::lookup_aarch64(number).is_some()
+    }
+
+    /// AArch64 IS the canonical numbering (asm-generic), so every known
+    /// syscall number remaps to itself via `Direct(n)`. Unknown numbers
+    /// produce `Unknown` (honest -ENOSYS).
+    fn remap(number: u64) -> SyscallRemap {
+        if Self::is_known(number) {
+            SyscallRemap::Direct(number)
+        } else {
+            SyscallRemap::Unknown
+        }
     }
 }
 

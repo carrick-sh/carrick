@@ -108,6 +108,16 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 /// `lookup → None` stub). See `syscall` module docs.
 pub mod syscall;
 
+/// x86_64 syscall number table + canonical remap. Also defines [`SyscallRemap`],
+/// which lives here (the leaf crate) so it can be shared by both `carrick-abi`
+/// and `carrick-hal` without a cycle. `carrick-hal::guest_arch` re-exports
+/// `SyscallRemap` from here.
+pub mod syscall_x86_64;
+
+/// Re-export [`SyscallRemap`] at the crate root for ergonomic use by consumers
+/// that `use carrick_abi::SyscallRemap`.
+pub use syscall_x86_64::SyscallRemap;
+
 pub const LINUX_S_IFMT: u32 = 0o170000;
 pub const LINUX_S_IFDIR: u32 = 0o040000;
 pub const LINUX_S_IFREG: u32 = 0o100000;
