@@ -12,7 +12,6 @@
 
 pub mod epoll_mux;
 pub mod errno;
-pub mod fork;
 pub mod guest_setup;
 pub mod kvm;
 pub mod kvm_disposition;
@@ -21,9 +20,18 @@ pub mod kvm_futex;
 pub mod kvm_kicker;
 pub mod kvm_signal_pump;
 pub mod kvm_xsig;
-pub mod run_elf;
 pub mod signal_arrival;
 pub mod timer_delivery;
+
+// aarch64-only modules: fork snapshot/restore, the MMIO-sentinel trap engine,
+// and the aarch64 standalone run-elf loop all use ARM-specific KVM APIs
+// (KVM_GET/SET_ONE_REG, ARM sysregs, EL1 vector, vDSO vvar) that do not exist
+// on x86_64.  The x86_64 analogues live in the cfg(x86_64) stubs below.
+#[cfg(target_arch = "aarch64")]
+pub mod fork;
+#[cfg(target_arch = "aarch64")]
+pub mod run_elf;
+#[cfg(target_arch = "aarch64")]
 pub mod trap_engine;
 
 pub use epoll_mux::EpollMultiplexer;
@@ -31,7 +39,19 @@ pub use kvm::{KvmVcpu, KvmVm};
 pub use kvm_fork_coord::KvmForkCoordinator;
 pub use kvm_futex::KvmFutex;
 pub use kvm_kicker::{KvmKickHandle, KvmKicker, install_kvm_kick_handler};
-pub use run_elf::run_elf_kvm;
 pub use signal_arrival::KvmSignalArrival;
 pub use timer_delivery::KvmTimerDelivery;
+
+#[cfg(target_arch = "aarch64")]
+pub use run_elf::run_elf_kvm;
+#[cfg(target_arch = "aarch64")]
 pub use trap_engine::KvmTrapEngine;
+
+// x86_64 KVM backend modules (stub placeholders for Tasks 2–4).
+// Compiled only on Linux x86_64 — invisible to the aarch64 build.
+#[cfg(target_arch = "x86_64")]
+pub mod guest_setup_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod run_elf_x86;
+#[cfg(target_arch = "x86_64")]
+pub mod trap_engine_x86;

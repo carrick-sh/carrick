@@ -1,17 +1,24 @@
 //! KvmVm / KvmVcpu: the `carrick-hal` raw-hypervisor layer (HvVm/HvVcpu) on
-//! Linux/KVM, aarch64. /dev/kvm -> KVM_CREATE_VM -> KVM_CREATE_VCPU ->
-//! KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT; guest RAM via
-//! KVM_SET_USER_MEMORY_REGION over a host mmap; registers via
-//! KVM_GET/SET_ONE_REG; run via KVM_RUN. kick() is a signal-based vCPU exit.
+//! Linux/KVM. On aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT; registers
+//! via KVM_GET/SET_ONE_REG. On x86_64: bare KVM_CREATE_VCPU (no ARM init);
+//! registers via KVM_GET/SET_REGS/SREGS from guest_setup_x86 (Tasks 2–3).
+//! Guest RAM via KVM_SET_USER_MEMORY_REGION over a host mmap; run via KVM_RUN.
+// On x86_64, the aarch64-specific functions in this module are dead until
+// Tasks 2–4 wire the x86 paths.  Suppress dead_code warnings on non-aarch64
+// targets to keep `cargo clippy -- -D warnings` clean on container-104.
+#![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;
-use kvm_bindings::{KVM_ARM_VCPU_PSCI_0_2, KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
+#[cfg(target_arch = "aarch64")]
+use kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
+use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit as KvmExit, VcpuFd, VmFd};
 use libc;
 
+#[cfg(target_arch = "aarch64")]
 use crate::fork::VcpuSnapshot;
 
 fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
@@ -77,6 +84,7 @@ impl Drop for VcpuLiveTicket {
 /// Host `CLOCK_MONOTONIC_RAW` "now", expressed in generic-timer TICKS — the
 /// epoch+unit the guest counter must match so the shared dispatcher's
 /// absolute-deadline math holds (see `align`/`lock` callers).
+#[cfg(target_arch = "aarch64")]
 fn host_monotonic_ticks() -> Result<u64, OsError> {
     // The host's CNTFRQ_EL0 (unprivileged `mrs`) — KVM passes the host timer
     // frequency through to the guest unchanged, and KVM does NOT expose CNTFRQ
@@ -101,6 +109,7 @@ fn host_monotonic_ticks() -> Result<u64, OsError> {
 /// The host's own virtual counter (`CNTVCT_EL0`, unprivileged `mrs` — the
 /// same EL0 access the vDSO uses). The KVM guest's counter is this value
 /// minus the VM's counter offset.
+#[cfg(target_arch = "aarch64")]
 fn host_cntvct_el0() -> u64 {
     let cnt: u64;
     // SAFETY: `cntvct_el0` is an unprivileged read on aarch64 Linux (enabled
@@ -122,6 +131,7 @@ fn host_cntvct_el0() -> u64 {
 /// `threading.Thread` sent guest CLOCK_MONOTONIC back 317,858 s and every
 /// absolute futex deadline with it). kvm-ioctls has no wrapper; raw ioctl on
 /// the `VmFd`. Kernel 6.4+ (lima guest is 6.12).
+#[cfg(target_arch = "aarch64")]
 fn set_vm_counter_offset_to_host_monotonic(vm: &VmFd) -> Result<(), OsError> {
     use std::os::unix::io::AsRawFd;
     const KVM_ARM_SET_COUNTER_OFFSET: libc::c_ulong = 0x4010_AEB5;
@@ -153,6 +163,7 @@ fn set_vm_counter_offset_to_host_monotonic(vm: &VmFd) -> Result<(), OsError> {
 /// re-write is harmless there) and concurrent vcpus see a brief zero-epoch
 /// window between a sibling's create and its re-align — the VM ioctl above
 /// is the primary path for a reason.
+#[cfg(target_arch = "aarch64")]
 fn align_counter_to_host_monotonic(fd: &VcpuFd) -> Result<(), OsError> {
     let ticks = host_monotonic_ticks()?;
     fd.set_one_reg(sysreg_id(3, 3, 14, 3, 2), &ticks.to_le_bytes())
@@ -166,16 +177,24 @@ fn align_counter_to_host_monotonic(fd: &VcpuFd) -> Result<(), OsError> {
 //   KVM_REG_ARM_COPROC_SHIFT = 16  -> the coprocessor field is bits 16-27
 //   KVM_REG_ARM_CORE        = 0x0010 << 16  (the core register file)
 //   KVM_REG_ARM64_SYSREG    = 0x0013 << 16  (the sysreg demux)
+#[cfg(target_arch = "aarch64")]
 const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+#[cfg(target_arch = "aarch64")]
 const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+#[cfg(target_arch = "aarch64")]
 const KVM_REG_SIZE_U128: u64 = 0x0040_0000_0000_0000;
+#[cfg(target_arch = "aarch64")]
 const KVM_REG_SIZE_U32: u64 = 0x0020_0000_0000_0000;
+#[cfg(target_arch = "aarch64")]
 const KVM_REG_ARM_COPROC_SHIFT: u64 = 16;
+#[cfg(target_arch = "aarch64")]
 const KVM_REG_ARM_CORE: u64 = 0x0010 << KVM_REG_ARM_COPROC_SHIFT;
+#[cfg(target_arch = "aarch64")]
 const KVM_REG_ARM64_SYSREG: u64 = 0x0013 << KVM_REG_ARM_COPROC_SHIFT;
 
 /// Core-reg id for a `struct kvm_regs` field at `byte_offset`. The low bits of
 /// a KVM_REG_ARM_CORE id are `offsetof(kvm_regs, field) / sizeof(__u32)`.
+#[cfg(target_arch = "aarch64")]
 fn core_reg_id(byte_offset: u64) -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (byte_offset / 4)
 }
@@ -186,21 +205,31 @@ fn core_reg_id(byte_offset: u64) -> u64 {
 //   __u64 elr_el1;              // 280
 //   __u64 spsr[KVM_NR_SPSR];    // 288 (spsr[0] == SPSR_EL1)
 // `user_pt_regs.sp` is SP_EL0 (the EL0/user stack).
+#[cfg(target_arch = "aarch64")]
 const USER_PT_REGS_SP_EL0: u64 = 31 * 8; // 248
+#[cfg(target_arch = "aarch64")]
 const USER_PT_REGS_PC: u64 = USER_PT_REGS_SP_EL0 + 8; // 256
+#[cfg(target_arch = "aarch64")]
 const USER_PT_REGS_PSTATE: u64 = USER_PT_REGS_PC + 8; // 264
+#[cfg(target_arch = "aarch64")]
 const KVM_REGS_SP_EL1: u64 = 272;
+#[cfg(target_arch = "aarch64")]
 const KVM_REGS_ELR_EL1: u64 = 280;
+#[cfg(target_arch = "aarch64")]
 const KVM_REGS_SPSR_EL1: u64 = 288;
 // `struct user_fpsimd_state fp_regs` is the trailing field of `struct kvm_regs`,
 // after `spsr[KVM_NR_SPSR]` (288 + 5*8 = 328). Its first member `vregs[32]` is
 // 16-byte aligned, so fp_regs is padded to offset 336. Within it: vregs[n]@16*n,
 // fpsr@512, fpcr@516.
+#[cfg(target_arch = "aarch64")]
 const KVM_REGS_FP_REGS: u64 = 336;
+#[cfg(target_arch = "aarch64")]
 const KVM_REGS_FP_FPSR: u64 = KVM_REGS_FP_REGS + 512; // 848
+#[cfg(target_arch = "aarch64")]
 const KVM_REGS_FP_FPCR: u64 = KVM_REGS_FP_REGS + 516; // 852
 
 // KVM_REG_ARM64_SYSREG: id = base | (op0<<14)|(op1<<11)|(crn<<7)|(crm<<3)|op2
+#[cfg(target_arch = "aarch64")]
 fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
     KVM_REG_ARM64
         | KVM_REG_SIZE_U64
@@ -215,6 +244,7 @@ fn sysreg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
 /// Core-reg id for the 128-bit SIMD/FP vector register V`n` (n in 0..32). The
 /// FP/SIMD regs live in `fp_regs`, the trailing CORE field of `struct kvm_regs`,
 /// so they are addressed by byte-offset just like `core_reg_id`.
+#[cfg(target_arch = "aarch64")]
 fn vreg_id(n: u32) -> u64 {
     assert!(n < 32, "vreg index {n} out of range");
     KVM_REG_ARM64
@@ -222,13 +252,16 @@ fn vreg_id(n: u32) -> u64 {
         | KVM_REG_ARM_CORE
         | ((KVM_REGS_FP_REGS + u64::from(n) * 16) / 4)
 }
+#[cfg(target_arch = "aarch64")]
 fn fpsr_id() -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | (KVM_REGS_FP_FPSR / 4)
 }
+#[cfg(target_arch = "aarch64")]
 fn fpcr_id() -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | (KVM_REGS_FP_FPCR / 4)
 }
 
+#[cfg(target_arch = "aarch64")]
 fn reg_to_id(r: Reg) -> u64 {
     // All of these live in the CORE register file (`struct kvm_regs`), NOT the
     // sysreg demux — including ELR_EL1 / SPSR_EL1 / SP_EL1 (see SysReg vs Reg).
@@ -242,6 +275,7 @@ fn reg_to_id(r: Reg) -> u64 {
         Reg::SpsrEl1 => core_reg_id(KVM_REGS_SPSR_EL1),
     }
 }
+#[cfg(target_arch = "aarch64")]
 fn sysreg_to_id(r: SysReg) -> u64 {
     // Architectural (op0,op1,CRn,CRm,op2) encodings (ARM ARM, AArch64-sysreg).
     match r {
@@ -341,7 +375,11 @@ impl KvmVcpu {
     /// The live vcpu fd. Present from construction to drop (the `Option` only
     /// exists so `Drop` can move the fd into the recycle pool); the None arm
     /// is unreachable, kept abort-deterministic per the crate's no-panic idiom.
-    fn fd(&self) -> &VcpuFd {
+    ///
+    /// `pub(crate)` so `guest_setup_x86` (Task 2) and `trap_engine_x86` (Task 3)
+    /// can call `kvm_ioctls::VcpuFd::get_regs`/`set_regs`/`get_sregs`/`set_sregs`
+    /// without going through the aarch64 `HvVcpu::reg`/`set_reg` path.
+    pub(crate) fn fd(&self) -> &VcpuFd {
         self.fd.as_ref().unwrap_or_else(|| {
             eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
             std::process::abort()
@@ -349,7 +387,7 @@ impl KvmVcpu {
     }
 
     /// Mutable access for the one fd method that needs it (`VcpuFd::run`).
-    fn fd_mut(&mut self) -> &mut VcpuFd {
+    pub(crate) fn fd_mut(&mut self) -> &mut VcpuFd {
         self.fd.as_mut().unwrap_or_else(|| {
             eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
             std::process::abort()
@@ -399,6 +437,7 @@ impl KvmVm {
         // rebuild a fresh VM through this same path, which also keeps guest
         // monotonic from jumping across fork. FATAL only if BOTH mechanisms
         // are unavailable — a silent miss is a wrong-timeout machine.
+        #[cfg(target_arch = "aarch64")]
         let counter_locked = match set_vm_counter_offset_to_host_monotonic(&vm) {
             Ok(()) => true,
             Err(e) => {
@@ -412,6 +451,10 @@ impl KvmVm {
                 false
             }
         };
+        // On x86_64 the ARM counter-offset mechanism does not exist; x86 KVM
+        // uses TSC-based timekeeping which does not need this calibration.
+        #[cfg(not(target_arch = "aarch64"))]
+        let counter_locked = false;
         Ok(Self {
             _kvm: Some(kvm),
             vm: Arc::new(vm),
@@ -525,34 +568,40 @@ impl KvmVm {
                     .map_err(|e| os_err("KVM_CREATE_VCPU", e))?
             }
         };
-        let mut kvi = kvm_bindings::kvm_vcpu_init::default();
-        self.vm
-            .get_preferred_target(&mut kvi)
-            .map_err(|e| os_err("KVM_ARM_PREFERRED_TARGET", e))?;
-        kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
-        fd.vcpu_init(&kvi)
-            .map_err(|e| os_err("KVM_ARM_VCPU_INIT", e))?;
-        // Enable EL0 reads of CNTVCT_EL0/CNTFRQ_EL0 (CNTKCTL_EL1.EL0VCTEN|EL0PCTEN)
-        // so the vDSO clock fast path (`mrs cntvct_el0`) does NOT trap at EL0 (EC
-        // 0x18 — which alpine/musl `ls` hit via the vDSO clock and died on). MUST
-        // be on EVERY vCPU; this is the single shared create path (initial +
-        // clone-siblings + fork-child rebuild via add_vcpu). Mirrors HVF's
-        // `enable_el0_counter_access`. CNTKCTL_EL1 = S3_0_C14_C1_0. Best-effort
-        // (like HVF): if a kernel rejects the write the vDSO clock just traps and
-        // we lose the fast path — never a reason to fail vCPU creation.
-        let _ = fd.set_one_reg(sysreg_id(3, 0, 14, 1, 0), &0x3u64.to_le_bytes());
-        // EPOCH INVARIANT (see `create_empty`): when the VM-wide counter offset
-        // could NOT be pinned at VM creation (no KVM_ARM_SET_COUNTER_OFFSET),
-        // a FRESH vcpu's creation just re-zeroed the VM-wide CNTVOFF
-        // (kvm_timer_vcpu_init with the VM-offset flag unset), so re-align the
-        // guest counter to the host monotonic clock — unconditionally, every
-        // create (recycled vcpus don't re-zero, but re-writing the correct
-        // value is harmless and keeps this path branch-free). FATAL on
-        // failure: silently missing the alignment is a wrong-timeout machine
-        // (guest absolute deadlines land ~the host uptime away from where the
-        // dispatcher evaluates them).
-        if !self.counter_locked {
-            align_counter_to_host_monotonic(&fd)?;
+        // aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT + counter align.
+        // x86_64: no ARM-specific init; the x86 bring-up path (guest_setup_x86.rs)
+        // programs registers via KVM_SET_SREGS/KVM_SET_REGS/KVM_SET_MSRS instead.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut kvi = kvm_bindings::kvm_vcpu_init::default();
+            self.vm
+                .get_preferred_target(&mut kvi)
+                .map_err(|e| os_err("KVM_ARM_PREFERRED_TARGET", e))?;
+            kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+            fd.vcpu_init(&kvi)
+                .map_err(|e| os_err("KVM_ARM_VCPU_INIT", e))?;
+            // Enable EL0 reads of CNTVCT_EL0/CNTFRQ_EL0 (CNTKCTL_EL1.EL0VCTEN|EL0PCTEN)
+            // so the vDSO clock fast path (`mrs cntvct_el0`) does NOT trap at EL0 (EC
+            // 0x18 — which alpine/musl `ls` hit via the vDSO clock and died on). MUST
+            // be on EVERY vCPU; this is the single shared create path (initial +
+            // clone-siblings + fork-child rebuild via add_vcpu). Mirrors HVF's
+            // `enable_el0_counter_access`. CNTKCTL_EL1 = S3_0_C14_C1_0. Best-effort
+            // (like HVF): if a kernel rejects the write the vDSO clock just traps and
+            // we lose the fast path — never a reason to fail vCPU creation.
+            let _ = fd.set_one_reg(sysreg_id(3, 0, 14, 1, 0), &0x3u64.to_le_bytes());
+            // EPOCH INVARIANT (see `create_empty`): when the VM-wide counter offset
+            // could NOT be pinned at VM creation (no KVM_ARM_SET_COUNTER_OFFSET),
+            // a FRESH vcpu's creation just re-zeroed the VM-wide CNTVOFF
+            // (kvm_timer_vcpu_init with the VM-offset flag unset), so re-align the
+            // guest counter to the host monotonic clock — unconditionally, every
+            // create (recycled vcpus don't re-zero, but re-writing the correct
+            // value is harmless and keeps this path branch-free). FATAL on
+            // failure: silently missing the alignment is a wrong-timeout machine
+            // (guest absolute deadlines land ~the host uptime away from where the
+            // dispatcher evaluates them).
+            if !self.counter_locked {
+                align_counter_to_host_monotonic(&fd)?;
+            }
         }
         Ok(KvmVcpu {
             fd: Some(fd),
@@ -713,6 +762,7 @@ impl HvVcpu for KvmVcpu {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn reg(&self, r: Reg) -> Result<u64, OsError> {
         let mut bytes = [0u8; 8];
         self.fd()
@@ -720,6 +770,12 @@ impl HvVcpu for KvmVcpu {
             .map_err(|e| os_err("KVM_GET_ONE_REG", e))?;
         Ok(u64::from_le_bytes(bytes))
     }
+    #[cfg(not(target_arch = "aarch64"))]
+    fn reg(&self, _r: Reg) -> Result<u64, OsError> {
+        // x86_64: use KVM_GET_REGS via kvm_ioctls VcpuFd::get_regs() instead.
+        Err(os_err("reg", "use get_regs() on x86_64"))
+    }
+    #[cfg(target_arch = "aarch64")]
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
         self.fd()
@@ -727,12 +783,23 @@ impl HvVcpu for KvmVcpu {
             .map_err(|e| os_err("KVM_SET_ONE_REG", e))?;
         Ok(())
     }
+    #[cfg(not(target_arch = "aarch64"))]
+    fn set_reg(&mut self, _r: Reg, _v: u64) -> Result<(), OsError> {
+        // x86_64: use KVM_SET_REGS via kvm_ioctls VcpuFd::set_regs() instead.
+        Err(os_err("set_reg", "use set_regs() on x86_64"))
+    }
+    #[cfg(target_arch = "aarch64")]
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError> {
         let bytes = v.to_le_bytes();
         self.fd()
             .set_one_reg(sysreg_to_id(r), &bytes)
             .map_err(|e| os_err("KVM_SET_ONE_REG(sysreg)", e))?;
         Ok(())
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    fn set_sys_reg(&mut self, _r: SysReg, _v: u64) -> Result<(), OsError> {
+        // x86_64: use KVM_SET_SREGS via kvm_ioctls VcpuFd::set_sregs() instead.
+        Err(os_err("set_sys_reg", "use set_sregs() on x86_64"))
     }
 
     fn kick(&self) -> Result<(), OsError> {
@@ -744,6 +811,11 @@ impl HvVcpu for KvmVcpu {
     }
 }
 
+/// aarch64-only KVM register access methods on `KvmVcpu` (ESR_EL1, FAR_EL1,
+/// TPIDR_EL1, timer counter, SIMD/FP registers, snapshot/restore). These all use
+/// `get_one_reg`/`set_one_reg` with ARM sysreg IDs, which do not exist on x86_64.
+/// The x86_64 backend uses `KVM_GET_REGS`/`KVM_SET_REGS`/`KVM_GET_SREGS` instead.
+#[cfg(target_arch = "aarch64")]
 impl KvmVcpu {
     /// Read `ESR_EL1` (the syndrome of the most recent EL1 synchronous exception)
     /// via the sysreg demux (op0=3,op1=0,CRn=5,CRm=2,op2=0). Used to capture an
@@ -950,7 +1022,7 @@ impl KvmVcpu {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "aarch64"))]
 mod fp_reg_id_tests {
     use super::*;
 

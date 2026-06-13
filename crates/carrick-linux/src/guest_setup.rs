@@ -3,6 +3,10 @@
 //! tiny EL1 vector whose lower-EL-sync slot STORES TO A SENTINEL gpa (the MMIO
 //! trap vehicle) instead of HVF's `hvc #2`, and program the system registers
 //! WITHOUT the Apple-Silicon FEAT_PAN3 / PSTATE.PAN=1 workaround.
+// On x86_64, the aarch64-specific items (EL1 vector builders, bring_up,
+// program_sysregs, BroughtUp) are cfg-gated.  Suppress dead_code/unused-import
+// warnings on x86_64 to keep `cargo clippy -- -D warnings` clean.
+#![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
 use std::sync::Arc;
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
@@ -793,6 +797,9 @@ impl GuestRam {
 
 /// Result of bring-up: a VM + a vCPU initialised to the EL1 trampoline, ready
 /// for the trap engine to drive. `ram` is kept alive (its mmap backs KVM).
+/// Result of the aarch64 KVM bring-up. The x86_64 analogue is `BroughtUpX86`
+/// in `guest_setup_x86.rs` (Task 2).
+#[cfg(target_arch = "aarch64")]
 pub struct BroughtUp {
     pub vm: KvmVm,
     pub vcpu: KvmVcpu,
@@ -818,6 +825,7 @@ impl GuestRam {
     /// programming) — those steps differ between bring-up (fresh VM) and execve
     /// (live VM remap), so the caller drives them via [`Self::windows_for_kvm`]
     /// and [`program_sysregs`].
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn build_for_image(image: &AddressSpace) -> Result<Self, OsError> {
         let mut ram = GuestRam::new();
         // Low window covers image segments + kernel-region pages; always private
@@ -998,6 +1006,7 @@ pub(crate) enum AliasBacking<'a> {
 /// trampoline + sentinel vector, program the vCPU, and return it parked at the
 /// EL1 trampoline. Reuses carrick-mem's architectural builders; does NOT use
 /// the FEAT_PAN3 workaround (see `program_sysregs`).
+#[cfg(target_arch = "aarch64")]
 pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
     // 1-3. Lay out guest physical RAM: windows + image segments + the
     //       architectural bring-up pages (shared with execve_into).
@@ -1017,6 +1026,9 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
     //    wall-clock time (EL0 counter access is enabled per-vCPU in the vCPU
     //    create path). Best-effort: a calibration failure leaves the vvar zeroed
     //    (realtime reads as boot-relative) rather than aborting bring-up.
+    // vDSO vvar calibration is aarch64-only (CNTVCT/CNTFRQ timer; vDSO not
+    // present in the x86 KVM backend Phase 2 — spec N3).
+    #[cfg(target_arch = "aarch64")]
     let _ = populate_vdso_vvar(&vcpu, &mut ram);
 
     Ok(BroughtUp {
@@ -1043,6 +1055,14 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
 /// physical counter) — which KVM does not surface through `KVM_GET_ONE_REG`.
 /// Also used by `kvm.rs::align_counter_to_host_monotonic` (the guest-counter
 /// epoch alignment) for the same reason.
+// compile error recorded when building for x86_64 before this gate was added:
+//   error: instruction requires: aarch64
+//   --> crates/carrick-linux/src/guest_setup.rs:1050:9
+//   note: `mrs {}, cntfrq_el0` is an AArch64-only system-register read
+// and in kvm.rs:
+//   error[E0432]: unresolved import `kvm_bindings::KVM_ARM_VCPU_PSCI_0_2`
+//   error[E0599]: no method named `get_one_reg`/`set_one_reg` found ...
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn host_cntfrq_el0() -> u64 {
     let freq: u64;
     // SAFETY: `cntfrq_el0` is an unprivileged read on aarch64 Linux.
@@ -1052,6 +1072,7 @@ pub(crate) fn host_cntfrq_el0() -> u64 {
     freq
 }
 
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn populate_vdso_vvar(vcpu: &KvmVcpu, ram: &mut GuestRam) -> Result<(), OsError> {
     use carrick_mem::vdso::{LINUX_VVAR_BASE, VVAR_OFF_REALTIME_OFF_NS};
     // KVM does NOT expose CNTFRQ_EL0 via KVM_GET_ONE_REG (ENOENT), but the guest's
@@ -1089,6 +1110,7 @@ pub(crate) fn populate_vdso_vvar(vcpu: &KvmVcpu, ram: &mut GuestRam) -> Result<(
 /// (Linux execve clears the GPRs); this routine sets only SP/PC/PSTATE among the
 /// core registers, leaving x0..x30 to the caller's zeroing — and resets
 /// TPIDR_EL0 = 0 so the new image's libc re-initialises its thread pointer.
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Result<(), OsError> {
     // MAIR_EL1 slot 0 = Normal Inner/Outer WB cacheable (0xFF), as HVF. The
     // bootstrap MAIR/TCR/SCTLR/CPACR values are SHARED with HVF via GuestArch
