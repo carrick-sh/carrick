@@ -864,7 +864,13 @@ impl AddressSpace {
     /// here at EL1h with SPSR_EL1 staged for EL0t, so the first instruction
     /// drops the guest to EL0 with PC = user entry.
     pub fn with_el0_trampoline(self) -> Result<Self, AddressSpaceError> {
-        let bytes = el0_trampoline_bytes();
+        self.with_el0_trampoline_bytes(el0_trampoline_bytes())
+    }
+
+    /// Same, with caller-supplied trampoline machine code (the per-ISA bytes
+    /// come from `GuestArch::entry_trampoline_bytes` above the seam; this
+    /// builder is ISA-agnostic).
+    pub fn with_el0_trampoline_bytes(self, bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
         let start = LINUX_EL0_TRAMPOLINE_BASE;
         let end = start.checked_add(LINUX_EL0_TRAMPOLINE_SIZE).ok_or(
             AddressSpaceError::RegionOverflow {
@@ -1107,7 +1113,11 @@ impl AddressSpace {
         self.with_vdso_bytes(crate::vdso::vdso_image_bytes_with_clock_syscalls())
     }
 
-    fn with_vdso_bytes(self, mut vdso_bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
+    /// ISA-agnostic vDSO entry point: installs the caller-supplied vDSO ELF
+    /// image (per-ISA bytes come from `GuestArch::vdso_bytes` above the seam)
+    /// plus the zero-filled vvar page. `with_vdso` and the debug variants
+    /// above delegate here with the aarch64 builders.
+    pub fn with_vdso_bytes(self, mut vdso_bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
         let vvar = MemoryRegion {
             start: crate::vdso::LINUX_VVAR_BASE,
             end: crate::vdso::LINUX_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE,

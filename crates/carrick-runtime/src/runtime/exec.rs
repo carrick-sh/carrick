@@ -83,11 +83,15 @@ pub(crate) fn load_execve_image(
     if needs_at_base {
         staged = staged.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
     }
+    // Per-ISA trampoline/vDSO bytes come from the engine's GuestArch (the
+    // x86_64 seam); this is the macOS/HVF execve staging path.
+    use carrick_hal::GuestArch as _;
+    type HvfArch = <crate::trap::HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
     let image = staged
-        .with_el0_trampoline()
+        .with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())
         .and_then(vectors_and_id)
         .and_then(|a| a.with_stage1_page_tables())
-        .and_then(with_optional_vdso)
+        .and_then(with_optional_vdso::<HvfArch>)
         .and_then(|a| a.with_linux_initial_stack(argv, env))
         .map_err(|_| LINUX_ENOENT)?;
     // execve point of no return (image fully built): reset CAUGHT signal

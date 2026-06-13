@@ -194,9 +194,12 @@ fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bo
     requested && !debug_env_flag_enabled(disable)
 }
 
-fn with_optional_vdso(image: AddressSpace) -> Result<AddressSpace, AddressSpaceError> {
+fn with_optional_vdso<A: carrick_hal::GuestArch>(
+    image: AddressSpace,
+) -> Result<AddressSpace, AddressSpaceError> {
     match vdso_debug_mode() {
-        VdsoDebugMode::Full => image.with_vdso(),
+        VdsoDebugMode::Full => image.with_vdso_bytes(A::vdso_bytes()),
+        // Debug variants are aarch64-only escape hatches; only the production image routes through GuestArch.
         VdsoDebugMode::Disabled => Ok(image),
         VdsoDebugMode::NoGetrandom => image.with_vdso_without_getrandom(),
         VdsoDebugMode::NoFastpaths => image.with_vdso_without_fastpaths(),
@@ -777,7 +780,11 @@ fn finish_and_run_image(
     // Arm this (initial) process's deadlock watchdog; forked children re-arm in
     // the ForkOutcome::Child path. No-op unless CARRICK_DEADLOCK_WATCHDOG_MS set.
     crate::deadlock_watchdog::arm();
-    let image = image.with_el0_trampoline()?;
+    // Per-ISA image bytes come from the engine's GuestArch (the x86_64 seam);
+    // this file is the macOS/HVF path, so the engine is `HvfTrapEngine`.
+    use carrick_hal::GuestArch as _;
+    type HvfArch = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+    let image = image.with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())?;
     // The syscall shim swaps the legacy EL1 vectors for the identity-fast-path
     // dispatcher and adds the kernel-hole identity page it reads. Opt-in; the
     // legacy path is byte-identical when off. See docs/syscall-shim-design.md.
@@ -787,7 +794,7 @@ fn finish_and_run_image(
         image.with_el1_vectors()?
     };
     let image = image.with_stage1_page_tables()?;
-    let image = with_optional_vdso(image)?;
+    let image = with_optional_vdso::<HvfArch>(image)?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
