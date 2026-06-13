@@ -87,6 +87,22 @@ pub struct Aarch64SyscallFrame {
     pub x8: u64,
 }
 
+/// The Linux x86_64 syscall argument registers carrick reads at a SYSCALL trap.
+/// Per syscall(2) (man7.org), "Architecture calling conventions": number in
+/// rax; args rdi, rsi, rdx, r10, r8, r9; return in rax; rcx/r11 are the
+/// hardware SYSCALL clobbers (return RIP/RFLAGS) and never carry arguments.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct X8664SyscallFrame {
+    pub rax: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub r10: u64,
+    pub r8: u64,
+    pub r9: u64,
+}
+
 /// The guest physical/virtual memory a syscall handler reads and writes. The
 /// backend may be the real HVF-backed address space or the in-memory
 /// `LinearMemory` used by unit tests.

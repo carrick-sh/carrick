@@ -36,3 +36,8 @@ pub mod guest_arch;
 pub use guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 pub mod aarch64_arch;
 pub use aarch64_arch::{Aarch64BootSysregs, Aarch64GuestArch, Aarch64Mmu, Aarch64SyscallTable};
+pub mod x8664_arch;
+pub use x8664_arch::{
+    GDT_LEN, X8664BootSysregs, X8664GuestArch, X8664Mmu, X8664SyscallTable,
+    entry_trampoline_bytes as x8664_entry_trampoline_bytes,
+};
