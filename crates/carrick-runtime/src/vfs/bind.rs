@@ -117,28 +117,18 @@ fn read_u32_xattr(host: &Path, name: &str, nofollow: bool) -> Option<u32> {
     let cpath = CString::new(host.as_os_str().as_bytes()).ok()?;
     let cname = CString::new(name).ok()?;
     let mut value = [0u8; 4];
-    #[cfg(target_os = "macos")]
-    let n = unsafe {
-        libc::getxattr(
-            cpath.as_ptr(),
-            cname.as_ptr(),
-            value.as_mut_ptr() as *mut libc::c_void,
-            value.len(),
-            0,
-            if nofollow { libc::XATTR_NOFOLLOW } else { 0 },
-        )
-    };
-    #[cfg(not(target_os = "macos"))]
+    // Portable path-xattr (macOS getxattr+XATTR_NOFOLLOW / Linux l?getxattr /
+    // FreeBSD extattr_get_file|_link). The seam lives in carrick-portable.
     let n = unsafe {
         if nofollow {
-            libc::lgetxattr(
+            carrick_portable::lgetxattr(
                 cpath.as_ptr(),
                 cname.as_ptr(),
                 value.as_mut_ptr() as *mut libc::c_void,
                 value.len(),
             )
         } else {
-            libc::getxattr(
+            carrick_portable::getxattr(
                 cpath.as_ptr(),
                 cname.as_ptr(),
                 value.as_mut_ptr() as *mut libc::c_void,
@@ -153,21 +143,11 @@ fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Resul
     let cpath = CString::new(host.as_os_str().as_bytes()).map_err(|_| LINUX_EINVAL)?;
     let cname = CString::new(name).map_err(|_| LINUX_EINVAL)?;
     let value = value.to_le_bytes();
-    #[cfg(target_os = "macos")]
-    let rc = unsafe {
-        libc::setxattr(
-            cpath.as_ptr(),
-            cname.as_ptr(),
-            value.as_ptr() as *const libc::c_void,
-            value.len(),
-            0,
-            if nofollow { libc::XATTR_NOFOLLOW } else { 0 },
-        )
-    };
-    #[cfg(not(target_os = "macos"))]
+    // Portable path-xattr (macOS setxattr+XATTR_NOFOLLOW / Linux l?setxattr /
+    // FreeBSD extattr_set_file|_link). The seam lives in carrick-portable.
     let rc = unsafe {
         if nofollow {
-            libc::lsetxattr(
+            carrick_portable::lsetxattr(
                 cpath.as_ptr(),
                 cname.as_ptr(),
                 value.as_ptr() as *const libc::c_void,
@@ -175,7 +155,7 @@ fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Resul
                 0,
             )
         } else {
-            libc::setxattr(
+            carrick_portable::setxattr(
                 cpath.as_ptr(),
                 cname.as_ptr(),
                 value.as_ptr() as *const libc::c_void,
