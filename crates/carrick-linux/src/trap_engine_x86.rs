@@ -48,6 +48,28 @@ use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
 /// `0xE6 0xC5` = `OUT imm8($0xC5), %al`.  Source: AMD64 ISA / OSDev "OUT".
 pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
 
+/// Canonical (asm-generic/aarch64) `clone` number. Used to detect the one
+/// syscall whose x86-64 raw arg order differs from the dispatcher's. The swap is
+/// keyed on 220 PRECISELY so it never touches clone3 (canonical 435), which
+/// reads its parameters from a guest `clone_args` struct (no positional args to
+/// swap). Source: `clone(2)` man-page "C library/kernel differences".
+const CANONICAL_CLONE: u64 = 220;
+
+// x86-64 fork(2)/vfork(2) syscall numbers and the canonical Linux clone(2) flag
+// values they desugar to. x86-64 HAS SYS_fork/SYS_vfork (asm-generic/aarch64 do
+// NOT — they implement fork via clone), so musl's fork()/vfork() issue these
+// directly. Translate them to canonical clone(220) + flags so the ISA-neutral
+// dispatcher routes them to engine.fork()/fork_vfork() (the SAME path aarch64's
+// clone(SIGCHLD) takes). Without this, raw 57/58 fall through Unknown and
+// collide with canonical close(57)/… → silent misdispatch. Flag values:
+// clone(2) man-page (exit-signal = low byte; CLONE_VM=0x100, CLONE_VFORK=0x4000);
+// SIGCHLD=17 (signal(7)).
+const X86_NR_FORK: u64 = 57;
+const X86_NR_VFORK: u64 = 58;
+const LINUX_SIGCHLD: u64 = 17;
+const LINUX_CLONE_VM: u64 = 0x0000_0100;
+const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
+
 // ─── KvmX86TrapEngine ────────────────────────────────────────────────────────
 
 /// The KVM x86_64 syscall trap engine.
@@ -56,9 +78,12 @@ pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
 /// single-threaded, no fork/execve/signals (those return typed errors per
 /// spec N1–N2).
 pub struct KvmX86TrapEngine {
-    _vm: KvmVm,
+    vm: KvmVm,
     vcpu: KvmVcpu,
     ram: GuestRam,
+    /// Set `true` on the child side of a guest `fork(2)` (mirrors aarch64
+    /// `KvmTrapEngine::is_forked_child`). Steers the exit-reporting path.
+    is_forked_child: bool,
 }
 
 impl KvmX86TrapEngine {
@@ -72,9 +97,10 @@ impl KvmX86TrapEngine {
     /// Build from a fully brought-up `BroughtUpX86` (avoids re-running bring-up).
     pub fn from_brought_up(bux: BroughtUpX86) -> Self {
         Self {
-            _vm: bux.vm,
+            vm: bux.vm,
             vcpu: bux.vcpu,
             ram: bux.ram,
+            is_forked_child: false,
         }
     }
 
@@ -238,6 +264,42 @@ impl SyscallTrap for KvmX86TrapEngine {
                         continue;
                     }
 
+                    // x86-64 fork(57)/vfork(58): desugar to canonical clone(220)
+                    // + flags so the shared dispatcher routes them to
+                    // engine.fork()/fork_vfork(). (Raw 57/58 Unknown-collide with
+                    // canonical close(57)/… → silent misdispatch.)
+                    if x86_number == X86_NR_FORK {
+                        return Ok(Some(RawSyscall {
+                            number: CANONICAL_CLONE,
+                            args: [LINUX_SIGCHLD, 0, 0, 0, 0, 0],
+                        }));
+                    }
+                    if x86_number == X86_NR_VFORK {
+                        return Ok(Some(RawSyscall {
+                            number: CANONICAL_CLONE,
+                            args: [
+                                LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                        }));
+                    }
+
+                    // x86-64 raw clone(2) arg order is
+                    // (flags, stack, parent_tid, child_tid, tls); the shared
+                    // dispatcher binds the asm-generic order
+                    // (flags, stack, parent_tid, tls, child_tid). Swap args[3]<->
+                    // args[4] for canonical clone so the ISA-neutral clone handler
+                    // reads tls/child_tid correctly. clone3 (435) passes a struct
+                    // → no swap (the CANONICAL_CLONE guard keys on 220).
+                    let mut args = args;
+                    if canonical == CANONICAL_CLONE {
+                        args.swap(3, 4);
+                    }
+
                     return Ok(Some(RawSyscall {
                         number: canonical,
                         args,
@@ -306,12 +368,51 @@ impl SyscallTrap for KvmX86TrapEngine {
         Ok(())
     }
 
-    // ── Phase 2 deferred (spec N1–N2) ────────────────────────────────────────
+    fn is_forked_child(&self) -> bool {
+        self.is_forked_child
+    }
+
+    // ── M3c: real fork; execve_into + signals still deferred (M3d) ────────────
 
     fn fork(&mut self) -> Result<carrick_hal::ForkOutcome, TrapError> {
-        Err(TrapError::Hypervisor(
-            "kvm-x86: fork is not implemented in Phase 2 (M3+; spec N1)".into(),
-        ))
+        use crate::guest_setup_x86::{restore_x86, seed_entry_snapshot_x86, snapshot_x86};
+
+        // Snapshot the parent vCPU BEFORE forking (suspended at the trap — atomic).
+        let snap = snapshot_x86(&self.vcpu).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // Real host fork. The carrick-linux run loop quiesces other threads
+        // around a guest fork (fork_quiesce); the calling thread is the only
+        // active one here.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(TrapError::ForkFailed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        if pid > 0 {
+            // PARENT: live VM untouched; report child pid (loop writes it to RAX).
+            return Ok(carrick_hal::ForkOutcome::Parent { child_pid: pid });
+        }
+
+        // CHILD: rebuild a fresh KvmVm over the COW-inherited host mmaps (the
+        // PML4/GDT/trampoline windows came along COW), then restore the parent
+        // register file seeded as a fork child (rax=0, rip=SYSRETQ, inherit
+        // stack+tls). No page-table manager to clone (x86 static identity PML4);
+        // no sentinel/PC fixup. restore_x86 re-applies the SYSCALL MSRs.
+        let (new_vm, new_vcpu) = self
+            .ram
+            .rebuild_vm_for_child()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let child_snap = seed_entry_snapshot_x86(&snap, carrick_hal::GuestEntryRegs::default());
+        restore_x86(&new_vcpu, &child_snap).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        self.vm = new_vm;
+        self.vcpu = new_vcpu;
+        // Re-stamp the live-vcpu counter: libc::fork copied the parent's static
+        // VCPU_LIVE (incl. phantom siblings absent post-fork). The child owns
+        // exactly one vCPU. Mirrors aarch64 trap_engine.rs.
+        crate::kvm::VCPU_LIVE.store(1, std::sync::atomic::Ordering::SeqCst);
+        self.is_forked_child = true;
+        Ok(carrick_hal::ForkOutcome::Child)
     }
 
     fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
@@ -518,6 +619,21 @@ impl carrick_hal::RegAccess for KvmX86TrapEngine {
 // KvmTrapEngine` (trap_engine.rs).
 unsafe impl Send for KvmX86TrapEngine {}
 
+/// The `Send` payload `build_sibling_spec` hands to a freshly spawned host
+/// thread, which `materialize_sibling` turns into a sibling engine on the SAME
+/// VM (no new VM, no re-registration — siblings share every slot). x86
+/// counterpart of aarch64 `KvmSiblingSpec`, minus the page-table manager (x86
+/// uses a static identity PML4 — nothing to share). Auto-`Send`: `SharedVmHandle`
+/// is `Arc`-backed, `WindowDesc.host` is a `usize`, the snapshot is POD, and
+/// `VcpuLiveTicket`/`Arc<MemoryProtections>` are `Send`.
+pub struct X8664SiblingSpec {
+    vm: crate::kvm::SharedVmHandle,
+    windows: Vec<crate::guest_setup::WindowDesc>,
+    snapshot: crate::guest_setup_x86::X8664VcpuSnapshot,
+    protections: std::sync::Arc<carrick_mem::protections::MemoryProtections>,
+    ticket: crate::kvm::VcpuLiveTicket,
+}
+
 // ─── ThreadedEngine (minimal — single-threaded M3a/M3b) ──────────────────────
 //
 // Puts x86 on the canonical run_vcpu_until_exit loop. clone(CLONE_THREAD) sibling
@@ -526,7 +642,7 @@ unsafe impl Send for KvmX86TrapEngine {}
 impl carrick_hal::ThreadedEngine for KvmX86TrapEngine {
     type Arch = X8664GuestArch;
     type KickHandle = KvmKickHandle;
-    type SiblingSpec = ();
+    type SiblingSpec = X8664SiblingSpec;
 
     fn kick_handle(&self) -> Self::KickHandle {
         KvmKickHandle::for_current_thread()
@@ -536,16 +652,53 @@ impl carrick_hal::ThreadedEngine for KvmX86TrapEngine {
         // No-op: KVM has no Apple-HVF concurrent-vCPU admission cap.
     }
 
-    fn build_sibling_spec(&self, _stack: u64, _tls: u64) -> Result<Self::SiblingSpec, TrapError> {
-        Err(TrapError::Hypervisor(
-            "x86_64 clone(CLONE_THREAD) sibling vCPU not implemented (M3c)".to_string(),
-        ))
+    fn build_sibling_spec(
+        &self,
+        entry: carrick_hal::GuestEntryRegs,
+    ) -> Result<Self::SiblingSpec, TrapError> {
+        use crate::guest_setup_x86::{seed_entry_snapshot_x86, snapshot_x86};
+        // Snapshot the parent (suspended at the trapped clone — atomic), seed it
+        // for the new thread (rax=0, rsp=stack, fs.base=tls, rip=SYSRETQ), and
+        // carry SHARED handles so the sibling runs in the SAME VM/address space.
+        let parent = snapshot_x86(&self.vcpu).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let snapshot = seed_entry_snapshot_x86(&parent, entry);
+        Ok(X8664SiblingSpec {
+            vm: self.vm.vm_handle(),
+            windows: self.ram.window_descriptors(),
+            snapshot,
+            protections: self.ram.shared_protections(),
+            // Reserve the sibling's VCPU_LIVE slot NOW (parent suspended at the
+            // trapped clone) — closes the execve-drain blind window. Consumed at
+            // materialization; dropped-unmaterialized releases it.
+            ticket: crate::kvm::VcpuLiveTicket::acquire(),
+        })
     }
 
-    fn materialize_sibling(_spec: Self::SiblingSpec) -> Result<Self, TrapError> {
-        Err(TrapError::Hypervisor(
-            "x86_64 sibling vCPU materialization not implemented (M3c)".to_string(),
-        ))
+    fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
+    where
+        Self: Sized,
+    {
+        use crate::guest_setup_x86::restore_x86;
+        // New vCPU on the SAME VM (siblings share all slots). The unique vcpu id
+        // is drawn from the shared allocator in SharedVmHandle.
+        let vm = KvmVm::from_shared_vm(spec.vm);
+        let vcpu = vm
+            .add_sibling_vcpu()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Transfer the reserved VCPU_LIVE slot to the vcpu BEFORE the fallible
+        // restore (so a restore error decrements exactly once via the vcpu Drop).
+        spec.ticket.consume();
+        restore_x86(&vcpu, &spec.snapshot).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Non-owning view over the parent's host windows (shares the same backing
+        // + PROT_NONE bookkeeping; never munmaps — the parent owns it).
+        let ram =
+            GuestRam::from_shared_windows(&spec.windows, std::sync::Arc::clone(&spec.protections));
+        Ok(Self {
+            vm,
+            vcpu,
+            ram,
+            is_forked_child: false,
+        })
     }
 
     fn program_counter(&self) -> Result<u64, TrapError> {

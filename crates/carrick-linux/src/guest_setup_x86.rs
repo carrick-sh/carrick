@@ -29,7 +29,7 @@ use carrick_hal::guest_arch::GuestArch;
 use carrick_hal::x8664_arch::X8664GuestArch;
 use carrick_mem::memory::{AddressSpace, LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_SIZE};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
-use kvm_bindings::{Msrs, kvm_dtable, kvm_msr_entry, kvm_regs, kvm_segment};
+use kvm_bindings::{Msrs, kvm_dtable, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs};
 use kvm_ioctls::VcpuFd;
 
 use crate::guest_setup::{GuestRam, WindowKind};
@@ -103,6 +103,18 @@ pub const GDT_ENTRIES: usize = carrick_hal::x8664_arch::GDT_LEN;
 /// 448 pages × 4 KiB = 1,835,008 bytes (1.75 MiB).  Shared with the aarch64
 /// [`LINUX_PAGE_TABLES_SIZE`] constant so the `pml4_tables` budget is the same.
 pub const X86_PML4_CAPACITY: usize = LINUX_PAGE_TABLES_SIZE as usize;
+
+/// Length of the LSTAR stub's `OUT imm8, %al` doorbell (`0xE6 0xC5`), in bytes.
+/// A rebuilt fork-child / fresh sibling vCPU resumes at the `SYSRETQ` that
+/// follows the `OUT` — `X86_TRAMPOLINE_BASE + X86_OUT_DOORBELL_LEN` — regardless
+/// of whether KVM advanced RIP past the `OUT` synchronously on the parent's
+/// vCPU. (The parent keeps its own vCPU and resumes via KVM's own mechanism.)
+/// Source: AMD64 ISA `OUT imm8` encoding; `entry_trampoline_bytes()` (carrick-hal).
+pub const X86_OUT_DOORBELL_LEN: u64 = 2;
+
+/// Guest RIP at which a freshly-built x86 vCPU resumes after a clone/fork trap:
+/// the `SYSRETQ` immediately after the LSTAR `OUT` doorbell.
+pub const X86_SYSRET_RESUME: u64 = X86_TRAMPOLINE_BASE + X86_OUT_DOORBELL_LEN;
 
 // ─── Segment type nibbles ─────────────────────────────────────────────────────
 
@@ -517,6 +529,125 @@ fn program_x86_regs(
     Ok(())
 }
 
+// ─── x86 vCPU snapshot / restore (fork-child + sibling-thread state transfer) ──
+
+/// Full dynamic register state of an x86_64 KVM vCPU, captured at a syscall trap
+/// so a forked child (fresh VM) or a clone sibling (fresh vCPU on the same VM)
+/// can resume inside the same trapped syscall. The x86 counterpart of the
+/// aarch64 `VcpuSnapshot` (fork.rs). All three members are POD (`Send`).
+#[derive(Clone)]
+pub struct X8664VcpuSnapshot {
+    /// GPRs + RIP + RFLAGS (`KVM_GET_REGS`).
+    pub regs: kvm_regs,
+    /// CR0/CR3/CR4/EFER + segments incl fs.base/gs.base + GDT/IDT (`KVM_GET_SREGS`).
+    pub sregs: kvm_sregs,
+    /// x87/XMM/MXCSR (`KVM_GET_FPU`).
+    pub fpu: kvm_fpu,
+}
+
+/// Capture the parent vCPU's full dynamic state at a syscall trap.
+pub fn snapshot_x86(vcpu: &KvmVcpu) -> Result<X8664VcpuSnapshot, OsError> {
+    let fd = vcpu.fd();
+    let regs = fd
+        .get_regs()
+        .map_err(|e| OsError::new(format!("kvm-x86 snapshot: KVM_GET_REGS: {e}")))?;
+    let sregs = fd
+        .get_sregs()
+        .map_err(|e| OsError::new(format!("kvm-x86 snapshot: KVM_GET_SREGS: {e}")))?;
+    let fpu = fd
+        .get_fpu()
+        .map_err(|e| OsError::new(format!("kvm-x86 snapshot: KVM_GET_FPU: {e}")))?;
+    Ok(X8664VcpuSnapshot { regs, sregs, fpu })
+}
+
+/// Program a freshly-created vCPU (fork child's rebuilt VM, or a sibling on the
+/// shared VM) from `snap`, then re-apply the 3 static SYSCALL MSRs. Order:
+/// SREGS (establish long mode + segment bases) → FPU → REGS (GPRs/RIP/RFLAGS) →
+/// MSRS. A fresh KVM vCPU is at reset state with LSTAR/STAR/SFMASK = 0, which
+/// `KVM_SET_SREGS` does NOT carry; without re-applying them the guest's next
+/// SYSCALL jumps to RIP 0 and triple-faults. The MSR re-apply mirrors
+/// `program_x86_regs` (the `0xc000_008{1,2,4}` block). NOTE: `KVM_SET_FPU` has
+/// no counterpart in `bring_up_x86_kvm` (bring-up never sets FPU) — it is an
+/// intentional ADDITION carrying the parent's dirtied x87/SSE state across
+/// fork/clone. The "all control regs + 64-bit CS in one `KVM_SET_SREGS`"
+/// invariant is preserved by restoring the whole `kvm_sregs` at once
+/// (paging-enabled-without-64-bit-CS → EINVAL; see `program_x86_regs`).
+pub fn restore_x86(vcpu: &KvmVcpu, snap: &X8664VcpuSnapshot) -> Result<(), OsError> {
+    let fd = vcpu.fd();
+    fd.set_sregs(&snap.sregs)
+        .map_err(|e| OsError::new(format!("kvm-x86 restore: KVM_SET_SREGS: {e}")))?;
+    fd.set_fpu(&snap.fpu)
+        .map_err(|e| OsError::new(format!("kvm-x86 restore: KVM_SET_FPU: {e}")))?;
+    fd.set_regs(&snap.regs)
+        .map_err(|e| OsError::new(format!("kvm-x86 restore: KVM_SET_REGS: {e}")))?;
+    reapply_x86_syscall_msrs(vcpu)
+}
+
+/// Re-apply LSTAR/STAR/SFMASK to a fresh vCPU (the static SYSCALL config from
+/// `bring_up_x86_kvm`). Identical values for every vCPU in the process.
+fn reapply_x86_syscall_msrs(vcpu: &KvmVcpu) -> Result<(), OsError> {
+    let boot = X8664GuestArch::bootstrap_sysregs();
+    let msrs = Msrs::from_entries(&[
+        kvm_msr_entry {
+            index: 0xc000_0081,
+            data: boot.star,
+            ..Default::default()
+        }, // STAR
+        kvm_msr_entry {
+            index: 0xc000_0082,
+            data: X86_TRAMPOLINE_BASE,
+            ..Default::default()
+        }, // LSTAR
+        kvm_msr_entry {
+            index: 0xc000_0084,
+            data: boot.sfmask,
+            ..Default::default()
+        }, // SFMASK
+    ])
+    .map_err(|e| OsError::new(format!("kvm-x86 restore: Msrs::from_entries: {e}")))?;
+    let n = vcpu
+        .fd()
+        .set_msrs(&msrs)
+        .map_err(|e| OsError::new(format!("kvm-x86 restore: KVM_SET_MSRS: {e}")))?;
+    if n != 3 {
+        return Err(OsError::new(format!(
+            "kvm-x86 restore: KVM_SET_MSRS wrote {n}/3 (partial)"
+        )));
+    }
+    Ok(())
+}
+
+/// Seed a freshly-built x86 vCPU's register file from the ISA-neutral
+/// [`carrick_hal::GuestEntryRegs`]. Serves BOTH a `clone(CLONE_THREAD)` sibling
+/// and a `fork(2)` child (x86 fork and clone both resume at the SYSRETQ after
+/// the doorbell — unlike aarch64, where fork replays a sentinel store and clone
+/// does not). Starts from the parent snapshot (same CR3/segments/long-mode →
+/// same address space) and applies:
+///   - `rax = entry.return_value`      — clone()/fork() return value (0 for child).
+///   - `rsp = entry.stack` (if `Some`)   — new user stack; `None` inherits (fork).
+///   - `fs.base = entry.tls` (if `Some`) — x86-64 TLS base; `None` inherits (fork).
+///   - `rip = X86_SYSRET_RESUME`       — the SYSRETQ after the LSTAR doorbell. A
+///     fresh vCPU has no in-kernel IO-completion state, so resuming at the
+///     captured rip could re-execute the OUT → re-trap → fork bomb; forcing the
+///     SYSRETQ is deterministic and idempotent.
+///
+/// FPU is carried verbatim (correct for fork; harmless for a new thread).
+pub fn seed_entry_snapshot_x86(
+    parent: &X8664VcpuSnapshot,
+    entry: carrick_hal::GuestEntryRegs,
+) -> X8664VcpuSnapshot {
+    let mut snap = parent.clone();
+    snap.regs.rax = entry.return_value;
+    if let Some(stack) = entry.stack {
+        snap.regs.rsp = stack;
+    }
+    if let Some(tls) = entry.tls {
+        snap.sregs.fs.base = tls;
+    }
+    snap.regs.rip = X86_SYSRET_RESUME;
+    snap
+}
+
 // ─── PML4 builder ─────────────────────────────────────────────────────────────
 
 /// Build the x86-64 4-level page tables for `image`.
@@ -682,6 +813,70 @@ pub fn m01_blob() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_hal::GuestEntryRegs;
+
+    /// A clone(CLONE_THREAD) sibling: rax=0, rsp=child stack, fs.base=tls,
+    /// rip=SYSRETQ. Pure (no /dev/kvm needed).
+    #[test]
+    fn seed_entry_sibling_applies_thread_deltas() {
+        let parent = X8664VcpuSnapshot {
+            regs: kvm_regs {
+                rax: 0xdead,
+                rsp: 0x1111,
+                rip: X86_TRAMPOLINE_BASE,
+                ..Default::default()
+            },
+            sregs: {
+                let mut s = kvm_sregs::default();
+                s.fs.base = 0x2222;
+                s
+            },
+            fpu: kvm_fpu::default(),
+        };
+        let child = seed_entry_snapshot_x86(
+            &parent,
+            GuestEntryRegs {
+                return_value: 0,
+                stack: Some(0xCAFE_0000),
+                tls: Some(0xBEEF_0000),
+            },
+        );
+        assert_eq!(child.regs.rax, 0, "child clone() returns 0");
+        assert_eq!(child.regs.rsp, 0xCAFE_0000, "rsp = child stack");
+        assert_eq!(child.sregs.fs.base, 0xBEEF_0000, "fs.base = tls");
+        assert_eq!(
+            child.regs.rip, X86_SYSRET_RESUME,
+            "rip = SYSRETQ after doorbell"
+        );
+    }
+
+    /// A fork(2) child == GuestEntryRegs::default(): rax=0, rip=SYSRETQ, and it
+    /// INHERITS the parent's rsp + fs.base (None deltas).
+    #[test]
+    fn seed_entry_fork_child_inherits_stack_and_tls() {
+        let parent = X8664VcpuSnapshot {
+            regs: kvm_regs {
+                rax: 0xdead,
+                rsp: 0x1111,
+                rip: X86_TRAMPOLINE_BASE,
+                ..Default::default()
+            },
+            sregs: {
+                let mut s = kvm_sregs::default();
+                s.fs.base = 0x2222;
+                s
+            },
+            fpu: kvm_fpu::default(),
+        };
+        let child = seed_entry_snapshot_x86(&parent, GuestEntryRegs::default());
+        assert_eq!(child.regs.rax, 0);
+        assert_eq!(child.regs.rip, X86_SYSRET_RESUME);
+        assert_eq!(child.regs.rsp, 0x1111, "fork child inherits parent rsp");
+        assert_eq!(
+            child.sregs.fs.base, 0x2222,
+            "fork child inherits parent fs.base"
+        );
+    }
 
     /// Verify the GDT selector encoding and the STAR arithmetic.
     ///
