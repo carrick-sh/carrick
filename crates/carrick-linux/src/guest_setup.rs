@@ -395,7 +395,7 @@ impl Drop for GuestRam {
 }
 
 impl GuestRam {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             windows: Vec::new(),
             protections: Arc::new(MemoryProtections::default()),
@@ -436,7 +436,12 @@ impl GuestRam {
     ///   futex words remain coherent across the `fork` used by `clone(2)`).
     ///
     /// The KVM slot `flags` field is always `0` regardless of `kind`.
-    fn add_window(&mut self, base: u64, len: usize, kind: WindowKind) -> Result<(), OsError> {
+    pub(crate) fn add_window(
+        &mut self,
+        base: u64,
+        len: usize,
+        kind: WindowKind,
+    ) -> Result<(), OsError> {
         if len == 0 {
             return Ok(());
         }
