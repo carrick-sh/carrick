@@ -58,8 +58,7 @@ use state::*;
 pub(super) use state::{FsState, IoState};
 
 fn get_last_error() -> i32 {
-    let raw = carrick_portable::errno();
-    raw
+    carrick_portable::errno()
 }
 
 fn gather_bounded_iovec_bytes(

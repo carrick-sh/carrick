@@ -122,8 +122,7 @@ unsafe extern "C" {
 }
 
 fn last_error() -> i32 {
-    let raw = carrick_portable::errno();
-    raw
+    carrick_portable::errno()
 }
 
 fn ptsname_r_owned(master: i32) -> Result<String, i32> {
