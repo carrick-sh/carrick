@@ -5296,8 +5296,14 @@ impl carrick_hal::ThreadedEngine for HvfTrapEngine {
     ///
     /// The trait signature matches the existing `build_thread_spec(stack, tls)`
     /// method exactly — no adaptation needed.
-    fn build_sibling_spec(&self, stack: u64, tls: u64) -> Result<Self::SiblingSpec, TrapError> {
-        self.build_thread_spec(stack, tls)
+    fn build_sibling_spec(
+        &self,
+        entry: carrick_hal::GuestEntryRegs,
+    ) -> Result<Self::SiblingSpec, TrapError> {
+        // Map the ISA-neutral entry deltas onto HVF's existing (stack, tls) API.
+        // A clone(CLONE_THREAD) sibling always supplies both; `None` (a fork
+        // child, which does not route through build_sibling_spec) defaults to 0.
+        self.build_thread_spec(entry.stack.unwrap_or(0), entry.tls.unwrap_or(0))
     }
 
     /// Materialise a thread sibling on the current host thread from a

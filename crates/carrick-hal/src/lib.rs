@@ -24,8 +24,8 @@ pub mod futex;
 pub use futex::{CrossProcessFutex, SHARED_FUTEX_MAX_SLICE_NS, SharedWaitStep, shared_wait_sliced};
 pub mod threaded;
 pub use threaded::{
-    FutexOutcome, GenericVcpuRegistry, HostForkCoordinator, PlatformFutex, PreparedHostFork,
-    RegAccess, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
+    FutexOutcome, GenericVcpuRegistry, GuestEntryRegs, HostForkCoordinator, PlatformFutex,
+    PreparedHostFork, RegAccess, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
 };
 pub mod sigframe;
 pub mod signal_arrival;

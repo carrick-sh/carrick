@@ -276,6 +276,30 @@ pub trait RegAccess {
 /// trap vehicle + register access + guest memory + per-thread/fork lifecycle.
 /// `GuestMemory` is a supertrait so the shared loop can `write_bytes` to the
 /// guest (tid stamps, clone parent/child-tid writes) through the engine.
+/// ISA-neutral entry register deltas for a freshly-created guest execution
+/// context — a `clone(CLONE_THREAD)` sibling thread or a `fork(2)` child.
+///
+/// Each backend maps these named fields onto its ISA registers when seeding a
+/// vCPU snapshot, so adding an architecture is "map three named values onto my
+/// register file," not "reimplement entry seeding." `None` means "inherit the
+/// parent's value" (a fork child inherits stack+tls via COW; a clone sibling
+/// supplies fresh ones).
+///
+/// | field          | aarch64       | x86_64      |
+/// |----------------|---------------|-------------|
+/// | `return_value` | `X0`          | `RAX`       |
+/// | `stack`        | `SP_EL0`      | `RSP`       |
+/// | `tls`          | `TPIDR_EL0`   | `FS.base`   |
+///
+/// The resume PC is intentionally NOT here — it is backend-derived (aarch64
+/// `ELR_EL1`; x86_64 the `SYSRETQ` after the doorbell), not caller-supplied.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GuestEntryRegs {
+    pub return_value: u64,
+    pub stack: Option<u64>,
+    pub tls: Option<u64>,
+}
+
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// The guest CPU ISA this engine runs. Fixed per process (the guest ISA
     /// equals the host ISA), so it is an associated type — monomorphized per
@@ -286,7 +310,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
 
     fn kick_handle(&self) -> Self::KickHandle;
     fn wait_for_vcpu_slot();
-    fn build_sibling_spec(&self, stack: u64, tls: u64) -> Result<Self::SiblingSpec, TrapError>;
+    fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError>;
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
     where
         Self: Sized;
