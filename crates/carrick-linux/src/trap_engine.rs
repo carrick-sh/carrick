@@ -278,6 +278,10 @@ impl KvmTrapEngine {
                             format!("Exception esr=0x{syndrome:x}")
                         }
                         VcpuExit::Kicked => "Kicked".to_string(),
+                        // IoOut never occurs on aarch64 KVM; treat as unexpected.
+                        VcpuExit::IoOut { port, .. } => {
+                            format!("IoOut port=0x{port:04x}")
+                        }
                     };
                     break Err(TrapError::UnexpectedExit {
                         reason: format!("{what} during EL1 stage-1 maintenance"),
@@ -668,6 +672,13 @@ impl SyscallTrap for KvmTrapEngine {
                         syndrome,
                         virtual_address: far,
                         physical_address: far,
+                    });
+                }
+                // IoOut: the x86-KVM doorbell — never occurs on aarch64 KVM.
+                // Treated as an unexpected exit (same as the MMIO non-sentinel arm).
+                VcpuExit::IoOut { port, .. } => {
+                    return Err(TrapError::UnexpectedExit {
+                        reason: format!("unexpected IoOut on port=0x{port:04x} (aarch64 KVM path)"),
                     });
                 }
             }

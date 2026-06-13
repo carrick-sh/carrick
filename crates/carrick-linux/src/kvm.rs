@@ -755,6 +755,16 @@ impl HvVcpu for KvmVcpu {
                     len,
                 })
             }
+            // x86-64 KVM backend: `OUT port, al` (KVM_EXIT_IO) — the SYSCALL
+            // doorbell vehicle.  Port 0xC5 is the SYSCALL trap; the
+            // `KvmX86TrapEngine` in `trap_engine_x86.rs` dispatches on it.
+            // KVM auto-advances RIP past the OUT instruction on KVM_EXIT_IO
+            // (Linux KVM API §4.35), so no RIP fixup is needed in complete_syscall.
+            // Source: kvm-ioctls 0.22.1 `VcpuExit::IoOut(port, data_slice)`.
+            KvmExit::IoOut(port, data) => Ok(VcpuExit::IoOut {
+                port,
+                data: data.to_vec(),
+            }),
             KvmExit::SystemEvent(_, _) => Ok(VcpuExit::Halt),
             KvmExit::Shutdown | KvmExit::Hlt => Ok(VcpuExit::Halt),
             KvmExit::Intr => Ok(VcpuExit::Kicked),

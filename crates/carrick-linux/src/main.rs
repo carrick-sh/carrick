@@ -32,11 +32,29 @@ fn main() {
     }
 }
 
-// x86_64 Linux: run-elf entry point is wired in Task 4.
+// x86_64 Linux: standalone run-elf over KVM.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn main() {
-    eprintln!("carrick-linux x86_64: run-elf not yet implemented (Task 4)");
-    std::process::exit(1);
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("run-elf") => {
+            let Some(path) = args.next() else {
+                eprintln!("usage: carrick-linux run-elf <x86_64-elf>");
+                std::process::exit(2);
+            };
+            match carrick_linux::run_elf_x86::run_elf_kvm_x86(&path) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("carrick-linux: {e}");
+                    std::process::exit(127);
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: carrick-linux run-elf <x86_64-elf>");
+            std::process::exit(2);
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

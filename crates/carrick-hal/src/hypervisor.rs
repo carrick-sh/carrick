@@ -33,10 +33,26 @@ pub trait HvVcpu {
 }
 
 /// Why the vCPU stopped running. The MMIO-sentinel trap vehicle surfaces as
-/// `MmioWrite { gpa: SENTINEL, .. }`.
+/// `MmioWrite { gpa: SENTINEL, .. }`. The INOUT doorbell (x86 KVM backend)
+/// surfaces as `IoOut { port: SYSCALL_DOORBELL_PORT, .. }`.
 pub enum VcpuExit {
-    MmioWrite { gpa: u64, data: u64, len: u8 },
-    Exception { syndrome: u64, far: u64 },
+    MmioWrite {
+        gpa: u64,
+        data: u64,
+        len: u8,
+    },
+    Exception {
+        syndrome: u64,
+        far: u64,
+    },
     Kicked,
     Halt,
+    /// x86-64 KVM backend only: `OUT port, al` exited as `KVM_EXIT_IO`.
+    /// `port` is the doorbell port (0xC5 for the SYSCALL trap vehicle).
+    /// `data` is the slice KVM provides (1 byte for `OUT imm8, %al`).
+    /// Source: KVM API §4.35 "KVM_EXIT_IO" + kvm-ioctls `VcpuExit::IoOut`.
+    IoOut {
+        port: u16,
+        data: Vec<u8>,
+    },
 }
