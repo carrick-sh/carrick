@@ -168,6 +168,33 @@ impl GuestMemory for BhyveTrapEngine {
     }
 }
 
+// ─── arch_prctl FS/GS base (the carrick-hal shared policy calls these) ───────
+//
+// The bhyve mechanism is vm_get/set_desc on the FS/GS segment descriptor
+// (vm_set_register(FS_BASE) returns EINVAL — the base is VT-x hidden state);
+// the arch_prctl POLICY is shared with KVM in carrick_hal::x8664_arch.
+impl carrick_hal::x8664_arch::SegmentBaseRegs for BhyveTrapEngine {
+    fn seg_set_fs_base(&mut self, addr: u64) -> Result<(), TrapError> {
+        self.set_fs_base(addr)
+            .map_err(|e| TrapError::Hypervisor(format!("vm_set_desc(FS.base): {e}")))
+    }
+
+    fn seg_get_fs_base(&self) -> Result<u64, TrapError> {
+        self.get_fs_base()
+            .map_err(|e| TrapError::Hypervisor(format!("vm_get_desc(FS.base): {e}")))
+    }
+
+    fn seg_set_gs_base(&mut self, addr: u64) -> Result<(), TrapError> {
+        self.set_gs_base(addr)
+            .map_err(|e| TrapError::Hypervisor(format!("vm_set_desc(GS.base): {e}")))
+    }
+
+    fn seg_get_gs_base(&self) -> Result<u64, TrapError> {
+        self.get_gs_base()
+            .map_err(|e| TrapError::Hypervisor(format!("vm_get_desc(GS.base): {e}")))
+    }
+}
+
 impl SyscallTrap for BhyveTrapEngine {
     fn next_syscall(&mut self) -> Result<Option<RawSyscall>, TrapError> {
         // The LSTAR stub is two instructions: `out %al, $0xC5` (2 bytes) then
@@ -233,6 +260,20 @@ impl SyscallTrap for BhyveTrapEngine {
                         // -ENOSYS and logs the x86_64 name for diagnostics.
                         SyscallRemap::Native | SyscallRemap::Unknown => x86_number,
                     };
+
+                    // arch_prctl(SET/GET FS/GS) is serviced engine-side via the
+                    // SHARED carrick-hal policy (FS/GS base = VT-x hidden state set
+                    // by vm_set_desc, which the ISA-neutral dispatcher cannot do;
+                    // raw x86 158 would also misroute to canonical getgroups=158).
+                    // The pending INOUT was stashed above, so complete_syscall
+                    // resumes past the doorbell; then re-enter the guest. Identical
+                    // to the KVM lane.
+                    if x86_number == carrick_hal::x8664_arch::ARCH_PRCTL_X86_NR {
+                        let ret =
+                            carrick_hal::x8664_arch::service_arch_prctl(self, args[0], args[1])?;
+                        self.complete_syscall(ret)?;
+                        continue;
+                    }
 
                     return Ok(Some(RawSyscall {
                         number: canonical,

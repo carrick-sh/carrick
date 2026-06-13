@@ -9,9 +9,10 @@
 //!
 //! [`BhyveTrapEngine::next_syscall`] returns **canonical**
 //! (aarch64/asm-generic) numbers for `SyscallRemap::Direct` entries.  The
-//! handlers below dispatch on those canonical numbers.  `arch_prctl` is
-//! `SyscallRemap::Native` and arrives as raw x86_64 158 — handled explicitly
-//! before the canonical dispatch arm.
+//! handlers below dispatch on those canonical numbers.  `arch_prctl`
+//! (`SyscallRemap::Native`, raw x86_64 158) is serviced engine-side inside
+//! `next_syscall` via the shared `carrick_hal::x8664_arch::service_arch_prctl`
+//! policy and never surfaces here.
 //!
 //! # Memory model (M2, run-to-exit only)
 //!
@@ -70,23 +71,6 @@ const SYS_SIGALTSTACK: u64 = 132;
 /// musl calls `tkill(tid, SIGABRT)` when poll returns -ENOSYS; we map to exit.
 const SYS_TKILL: u64 = 130;
 
-// ─── x86_64-private syscall (Native remap — returned untranslated) ────────────
-
-/// `arch_prctl` x86_64 number 158.  Arrives from `next_syscall` as 158
-/// (not remapped — `SyscallRemap::Native`).  arch_prctl(2) man7.org.
-const X86_ARCH_PRCTL: u64 = 158;
-
-// ─── arch_prctl codes  (arch_prctl(2) man7.org) ───────────────────────────────
-
-/// `ARCH_SET_GS = 0x1001` (arch_prctl(2)).
-const ARCH_SET_GS: u64 = 0x1001;
-/// `ARCH_SET_FS = 0x1002` — musl TLS pointer (arch_prctl(2)).
-const ARCH_SET_FS: u64 = 0x1002;
-/// `ARCH_GET_FS = 0x1003` (arch_prctl(2)).
-const ARCH_GET_FS: u64 = 0x1003;
-/// `ARCH_GET_GS = 0x1004` (arch_prctl(2)).
-const ARCH_GET_GS: u64 = 0x1004;
-
 // ─── signal numbers (signal(7) man7.org) ─────────────────────────────────────
 
 /// `SIGABRT = 6` (signal(7) man7.org).  musl calls `tkill(tid, SIGABRT)` to
@@ -122,7 +106,6 @@ const NEG_ENOMEM: i64 = -12;
 ///
 /// | Canonical | x86_64 | Handler |
 /// |---|---|---|
-/// | 158 (Native) | arch_prctl | `set_fs_base`/`set_gs_base` via `vm_set_desc` |
 /// | 214 | 12 brk | bump over `LINUX_HEAP_BASE` window |
 /// | 222 | 9 mmap | anon-private bump over `LINUX_MMAP_BASE` window |
 /// | 215 | 11 munmap | no-op (run-to-exit) |
@@ -193,15 +176,9 @@ pub fn run_elf_bhyve(path: impl AsRef<Path>) -> Result<i32, String> {
         let canonical = raw.number;
         let args = raw.args;
 
-        // arch_prctl: Native remap — arrives as raw x86_64 158.
-        if canonical == X86_ARCH_PRCTL {
-            let ret = sys_arch_prctl(&mut engine, args[0], args[1])
-                .map_err(|e| format!("arch_prctl: {e}"))?;
-            engine
-                .complete_syscall(ret)
-                .map_err(|e| format!("complete_syscall(arch_prctl): {e}"))?;
-            continue;
-        }
+        // NOTE: arch_prctl (x86_64 158) is serviced engine-side inside
+        // BhyveTrapEngine::next_syscall via the shared carrick-hal policy
+        // (service_arch_prctl) and never surfaces here.
 
         let ret: i64 = match canonical {
             // ── write(fd, buf, count) ─────────────────────────────────────────
@@ -353,53 +330,6 @@ pub fn run_elf_bhyve(path: impl AsRef<Path>) -> Result<i32, String> {
         engine
             .complete_syscall(ret)
             .map_err(|e| format!("complete_syscall: {e}"))?;
-    }
-}
-
-// ─── arch_prctl (Native — x86_64 158) ────────────────────────────────────────
-
-/// Service `arch_prctl(code, addr)` via `BhyveTrapEngine::set/get_fs_base`.
-///
-/// FS.base / GS.base are part of the segment descriptor's hidden state in
-/// VT-x (Intel SDM vol. 3 §21.3.1.2).  `vm_set_register(VM_REG_GUEST_FS_BASE)`
-/// returns EINVAL — these values must be written via `vm_set_desc` which writes
-/// the base field of the segment descriptor.  `BhyveTrapEngine::set_fs_base` /
-/// `get_fs_base` (and their GS equivalents) use `vm_get_desc`+`vm_set_desc`
-/// to update only the base while preserving limit and access-rights (proven
-/// live on the box: `set_reg_raw(FS_BASE)` = EINVAL; `set_desc(FS, base)` = OK).
-///
-/// arch_prctl(2) man7.org codes: `ARCH_SET_FS=0x1002`, `ARCH_SET_GS=0x1001`,
-/// `ARCH_GET_FS=0x1003`, `ARCH_GET_GS=0x1004`.  Unknown code → `-EINVAL`.
-fn sys_arch_prctl(
-    engine: &mut BhyveTrapEngine,
-    code: u64,
-    addr: u64,
-) -> Result<i64, carrick_hal::OsError> {
-    match code {
-        ARCH_SET_FS => {
-            engine.set_fs_base(addr)?;
-            Ok(0)
-        }
-        ARCH_GET_FS => {
-            // Write the current FS.base value to the user pointer (8 bytes LE).
-            let val = engine.get_fs_base()?;
-            // Best-effort write — if musl's pointer is bad, ignore the error.
-            let _ = engine.write_bytes(addr, &val.to_le_bytes());
-            Ok(0)
-        }
-        ARCH_SET_GS => {
-            engine.set_gs_base(addr)?;
-            Ok(0)
-        }
-        ARCH_GET_GS => {
-            let val = engine.get_gs_base()?;
-            let _ = engine.write_bytes(addr, &val.to_le_bytes());
-            Ok(0)
-        }
-        _ => {
-            eprintln!("arch_prctl: unknown code={code:#x} addr={addr:#x} → -EINVAL");
-            Ok(NEG_EINVAL)
-        }
     }
 }
 

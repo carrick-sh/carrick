@@ -8,14 +8,14 @@
 //!
 //! `KvmX86TrapEngine::next_syscall` returns **canonical** (aarch64/asm-generic)
 //! numbers for `SyscallRemap::Direct` entries.  The handlers below dispatch on
-//! those canonical numbers.  `arch_prctl` is `SyscallRemap::Native` and arrives
-//! as raw x86_64 158 — handled explicitly before the canonical dispatch arm.
+//! those canonical numbers.  `arch_prctl` (`SyscallRemap::Native`, raw x86_64
+//! 158) is serviced engine-side inside `next_syscall` via the shared
+//! `carrick_hal::x8664_arch::service_arch_prctl` policy and never surfaces here.
 //!
 //! # Startup-syscall service set (trap-driven, from bhyve oracle + live run)
 //!
 //! | Canonical | x86_64 | Handler |
 //! |---|---|---|
-//! | 158 (Native) | arch_prctl | `set_fs_base` via `KVM_SET_SREGS` |
 //! | 214 | 12 brk | bump over `LINUX_HEAP_BASE` window |
 //! | 222 | 9 mmap | anon-private bump over `LINUX_MMAP_BASE` window |
 //! | 215 | 11 munmap | no-op (run-to-exit) |
@@ -79,24 +79,6 @@ const SYS_SIGALTSTACK: u64 = 132;
 const SYS_PPOLL: u64 = 73;
 /// `tkill` — asm-generic 130. x86_64 `tkill`=200 remaps here.
 const SYS_TKILL: u64 = 130;
-
-// ─── x86_64-private syscall (Native remap — returned untranslated) ────────────
-
-/// `arch_prctl` x86_64 number 158.  Arrives from `next_syscall` as 158
-/// (`SyscallRemap::Native` — not remapped to a canonical number).
-/// Source: arch_prctl(2) man7.org.
-const X86_ARCH_PRCTL: u64 = 158;
-
-// ─── arch_prctl codes (arch_prctl(2) man7.org) ───────────────────────────────
-
-/// `ARCH_SET_FS = 0x1002` — set FS.base (musl TLS pointer).
-const ARCH_SET_FS: u64 = 0x1002;
-/// `ARCH_GET_FS = 0x1003` — read FS.base.
-const ARCH_GET_FS: u64 = 0x1003;
-/// `ARCH_SET_GS = 0x1001` — set GS.base.
-const ARCH_SET_GS: u64 = 0x1001;
-/// `ARCH_GET_GS = 0x1004` — read GS.base.
-const ARCH_GET_GS: u64 = 0x1004;
 
 // ─── mmap flags (mmap(2) man7.org) ───────────────────────────────────────────
 
@@ -176,15 +158,9 @@ pub fn run_elf_kvm_x86(path: impl AsRef<Path>) -> Result<i32, String> {
         let canonical = raw.number;
         let args = raw.args;
 
-        // arch_prctl: Native remap — arrives as raw x86_64 158.
-        if canonical == X86_ARCH_PRCTL {
-            let ret = sys_arch_prctl(&mut engine, args[0], args[1])
-                .map_err(|e| format!("arch_prctl: {e}"))?;
-            engine
-                .complete_syscall(ret)
-                .map_err(|e| format!("complete_syscall(arch_prctl): {e}"))?;
-            continue;
-        }
+        // NOTE: arch_prctl (x86_64 158) is serviced engine-side inside
+        // KvmX86TrapEngine::next_syscall via the shared carrick-hal policy
+        // (service_arch_prctl) and never surfaces here.
 
         let ret: i64 = match canonical {
             // ── write(fd, buf, count) ─────────────────────────────────────────
@@ -327,56 +303,6 @@ pub fn run_elf_kvm_x86(path: impl AsRef<Path>) -> Result<i32, String> {
         engine
             .complete_syscall(ret)
             .map_err(|e| format!("complete_syscall: {e}"))?;
-    }
-}
-
-// ─── arch_prctl (Native — x86_64 158) ────────────────────────────────────────
-
-/// Service `arch_prctl(code, addr)` via `KvmX86TrapEngine::set/get_fs_base`.
-///
-/// On KVM x86_64, FS.base is directly accessible through `sregs.fs.base` via
-/// `KVM_GET_SREGS` / `KVM_SET_SREGS` — simpler than bhyve's `vm_set_desc` path.
-///
-/// arch_prctl(2) man7.org: `ARCH_SET_FS=0x1002`, `ARCH_GET_FS=0x1003`,
-/// `ARCH_SET_GS=0x1001`, `ARCH_GET_GS=0x1004`.  Unknown code → `-EINVAL`.
-fn sys_arch_prctl(
-    engine: &mut KvmX86TrapEngine,
-    code: u64,
-    addr: u64,
-) -> Result<i64, carrick_hal::TrapError> {
-    match code {
-        ARCH_SET_FS => engine.set_fs_base(addr),
-        ARCH_GET_FS => {
-            let val = engine.get_fs_base()?;
-            // Write the current FS.base value to the user pointer (8 bytes LE).
-            let _ = engine.write_bytes(addr, &val.to_le_bytes());
-            Ok(0)
-        }
-        ARCH_SET_GS => {
-            // GS.base: same mechanism as FS.base via KVM_GET/SET_SREGS.
-            let mut sregs = engine
-                .vcpu_fd()
-                .get_sregs()
-                .map_err(|e| carrick_hal::TrapError::Hypervisor(format!("KVM_GET_SREGS: {e}")))?;
-            sregs.gs.base = addr;
-            engine
-                .vcpu_fd()
-                .set_sregs(&sregs)
-                .map_err(|e| carrick_hal::TrapError::Hypervisor(format!("KVM_SET_SREGS: {e}")))?;
-            Ok(0)
-        }
-        ARCH_GET_GS => {
-            let sregs = engine
-                .vcpu_fd()
-                .get_sregs()
-                .map_err(|e| carrick_hal::TrapError::Hypervisor(format!("KVM_GET_SREGS: {e}")))?;
-            let _ = engine.write_bytes(addr, &sregs.gs.base.to_le_bytes());
-            Ok(0)
-        }
-        _ => {
-            eprintln!("kvm-x86 arch_prctl: unknown code={code:#x} addr={addr:#x} → -EINVAL");
-            Ok(NEG_EINVAL)
-        }
     }
 }
 
