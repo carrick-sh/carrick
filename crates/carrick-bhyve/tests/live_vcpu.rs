@@ -352,12 +352,6 @@ fn t6_register_diff_oracle() {
 /// WRMSR→iretq→ring-3→SYSCALL chain failed and the blocker will be the first
 /// non-`Bogus` exit reported.
 #[test]
-#[ignore = "M1 BLOCKED: the ring-0→ring-3 iretq #GPs (TRIPLEFAULT @ the iretq, \
-            rip=init_blob+0x58, cpl=0 — ring-0 boot + WRMSRs confirmed working). \
-            The whole chain is proven up to the iretq; the privilege transition \
-            itself faults and needs a fault-vector catcher (a minimal IDT whose \
-            vectors OUT their vector number) to identify the exact #GP/#PF cause. \
-            Tracked in docs + memory. Run with --ignored once fixed."]
 fn m1_ring3_syscall_hello() {
     if !vmm_available() {
         eprintln!("SKIP: vmm not available (/dev/vmm missing and kldstat -q -m vmm failed)");

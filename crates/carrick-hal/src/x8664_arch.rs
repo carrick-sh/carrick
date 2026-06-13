@@ -154,9 +154,9 @@ pub struct X8664BootSysregs {
     ///
     /// Long-mode descriptor bit layout per Intel SDM vol. 3 §3.4.5: bits 47=P,
     /// 46:45=DPL, 44=S, 43:40=type (0xA=exec/read, 0x2=data/RW), 53=L (64-bit
-    /// code), all base/limit fields vestigial. Encoded: kCS64=0x0020_9A00_0000_0000,
-    /// kSS=0x0000_9200_0000_0000, uSS=0x0000_F200_0000_0000,
-    /// uCS64=0x0020_FA00_0000_0000. Source: Intel SDM vol. 3 §3.4.5.
+    /// code), all base/limit fields vestigial. Encoded (ACCESSED-bit set): kCS64=0x0020_9B00_0000_0000,
+    /// kSS=0x0000_9300_0000_0000, uSS=0x0000_F300_0000_0000,
+    /// uCS64=0x0020_FB00_0000_0000. Source: Intel SDM vol. 3 §3.4.5.
     pub gdt: [u64; GDT_LEN],
 }
 
@@ -194,22 +194,30 @@ impl X8664BootSysregs {
             rflags: 0x0000_0002,
             // GDT[5]: null / kCS64 / kSS / uSS / uCS64.
             // Encoding per Intel SDM vol. 3 §3.4.5 (see struct docs above).
+            //
+            // The type fields carry the ACCESSED bit set (code 0xB not 0xA,
+            // data 0x3 not 0x2). When `iretq`/segment-load reads a descriptor
+            // from the GDT, the resulting segment Access-Rights must be VMX-
+            // valid; under NESTED VMX (bhyve-on-KVM) a loaded segment with
+            // accessed=0 trips KVM's "invalid guest state" / emulation_required
+            // path, which it cannot emulate for an L2 guest → synthesized
+            // TRIPLE_FAULT (the M1 iretq blocker, 2026-06-13). Pre-setting
+            // accessed avoids the writeback AND keeps the loaded AR valid.
             gdt: [
                 // [0] null
                 0x0000_0000_0000_0000,
-                // [1] 0x08 kernel CS64: P=1 S=1 type=A(exec/read) DPL=0 L=1
-                //   bits[47]=P=1, [46:45]=DPL=00, [44]=S=1, [43:40]=type=A(1010)
-                //   → byte 5 = 0x9A; bits[53]=L=1 → byte 6 = 0x20
-                0x0020_9A00_0000_0000,
-                // [2] 0x10 kernel SS: P=1 S=1 type=2(data/RW) DPL=0
-                //   byte 5 = 0x92; byte 6 = 0x00 (L=0 for data)
-                0x0000_9200_0000_0000,
-                // [3] 0x18 user SS: P=1 S=1 type=2(data/RW) DPL=3
-                //   DPL=11 → bits[46:45]=11; byte 5 = 0xF2
-                0x0000_F200_0000_0000,
-                // [4] 0x20 user CS64: P=1 S=1 type=A(exec/read) DPL=3 L=1
-                //   byte 5 = 0xFA; byte 6 = 0x20 (L=1)
-                0x0020_FA00_0000_0000,
+                // [1] 0x08 kernel CS64: P=1 S=1 type=B(exec/read/ACCESSED) DPL=0 L=1
+                //   byte 5 = 0x9B; bits[53]=L=1 → byte 6 = 0x20
+                0x0020_9B00_0000_0000,
+                // [2] 0x10 kernel SS: P=1 S=1 type=3(data/RW/ACCESSED) DPL=0
+                //   byte 5 = 0x93; byte 6 = 0x00 (L=0 for data)
+                0x0000_9300_0000_0000,
+                // [3] 0x18 user SS: P=1 S=1 type=3(data/RW/ACCESSED) DPL=3
+                //   DPL=11 → bits[46:45]=11; byte 5 = 0xF3
+                0x0000_F300_0000_0000,
+                // [4] 0x20 user CS64: P=1 S=1 type=B(exec/read/ACCESSED) DPL=3 L=1
+                //   byte 5 = 0xFB; byte 6 = 0x20 (L=1)
+                0x0020_FB00_0000_0000,
             ],
         }
     }
@@ -487,28 +495,34 @@ mod tests {
     fn gdt_kernel_cs64_encoding() {
         let boot = X8664GuestArch::bootstrap_sysregs();
         // kCS64: P=1 S=1 type=A(exec/read) DPL=0 L=1
-        assert_eq!(boot.gdt[1], 0x0020_9A00_0000_0000, "GDT[1] kCS64");
+        assert_eq!(
+            boot.gdt[1], 0x0020_9B00_0000_0000,
+            "GDT[1] kCS64 (accessed)"
+        );
     }
 
     #[test]
     fn gdt_kernel_ss_encoding() {
         let boot = X8664GuestArch::bootstrap_sysregs();
         // kSS: P=1 S=1 type=2(data/RW) DPL=0
-        assert_eq!(boot.gdt[2], 0x0000_9200_0000_0000, "GDT[2] kSS");
+        assert_eq!(boot.gdt[2], 0x0000_9300_0000_0000, "GDT[2] kSS (accessed)");
     }
 
     #[test]
     fn gdt_user_ss_encoding() {
         let boot = X8664GuestArch::bootstrap_sysregs();
         // uSS: P=1 S=1 type=2(data/RW) DPL=3
-        assert_eq!(boot.gdt[3], 0x0000_F200_0000_0000, "GDT[3] uSS");
+        assert_eq!(boot.gdt[3], 0x0000_F300_0000_0000, "GDT[3] uSS (accessed)");
     }
 
     #[test]
     fn gdt_user_cs64_encoding() {
         let boot = X8664GuestArch::bootstrap_sysregs();
         // uCS64: P=1 S=1 type=A(exec/read) DPL=3 L=1
-        assert_eq!(boot.gdt[4], 0x0020_FA00_0000_0000, "GDT[4] uCS64");
+        assert_eq!(
+            boot.gdt[4], 0x0020_FB00_0000_0000,
+            "GDT[4] uCS64 (accessed)"
+        );
     }
 
     // ── MMU / PML4 granule ────────────────────────────────────────────────
