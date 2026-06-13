@@ -15,6 +15,11 @@ use crate::sigframe::{InjectParams, SigframeInject, SigframeRestore};
 use crate::{RegAccess, TrapError};
 use carrick_guest_mem::GuestMemory;
 
+// `SyscallRemap` is defined in `carrick-abi` (the dependency-leaf) so that
+// `carrick-abi::syscall_x86_64` can also use it without a cycle. Re-export it
+// here so all `guest_arch` consumers get a single path.
+pub use carrick_abi::SyscallRemap;
+
 /// Encode/decode for the guest page-table descriptor format (AArch64
 /// long-descriptor vs x86-64 4-level). Same operation shape per ISA. The
 /// surface is the granule parameters plus the descriptor-editing entry
@@ -62,6 +67,10 @@ pub trait SyscallTable {
     fn name(number: u64) -> Option<&'static str>;
     /// Whether the table has an entry for `number`.
     fn is_known(number: u64) -> bool;
+    /// Canonical-number remap for this ISA's `number`. For aarch64 the table
+    /// IS canonical, so every known number remaps to itself via `Direct(n)`
+    /// and unknown numbers map to `Unknown`.
+    fn remap(number: u64) -> SyscallRemap;
 }
 
 /// The per-guest-ISA seam. One impl per guest CPU ISA, selected statically as
@@ -166,6 +175,9 @@ mod tests {
         }
         fn is_known(_number: u64) -> bool {
             false
+        }
+        fn remap(_number: u64) -> SyscallRemap {
+            SyscallRemap::Unknown
         }
     }
 
