@@ -74,6 +74,7 @@ pub mod arch_sysregs;
 pub mod elf;
 pub mod memory;
 pub mod page_table;
+pub mod pml4;
 pub mod protections;
 pub mod shared_aperture;
 pub mod vdso;
