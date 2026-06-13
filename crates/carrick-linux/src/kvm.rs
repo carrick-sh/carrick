@@ -273,6 +273,9 @@ fn reg_to_id(r: Reg) -> u64 {
         Reg::SpEl1 => core_reg_id(KVM_REGS_SP_EL1),
         Reg::ElrEl1 => core_reg_id(KVM_REGS_ELR_EL1),
         Reg::SpsrEl1 => core_reg_id(KVM_REGS_SPSR_EL1),
+        // The x86_64 Reg variants are a disjoint ISA view; they never reach the
+        // aarch64 KVM lane (KvmX86TrapEngine has its own RegAccess impl).
+        _ => unreachable!("x86_64 Reg variant on the aarch64 KVM lane"),
     }
 }
 #[cfg(target_arch = "aarch64")]
@@ -287,6 +290,8 @@ fn sysreg_to_id(r: SysReg) -> u64 {
         SysReg::Vbar => sysreg_id(3, 0, 12, 0, 0),     // VBAR_EL1
         SysReg::Cpacr => sysreg_id(3, 0, 1, 0, 2),     // CPACR_EL1
         SysReg::TpidrEl0 => sysreg_id(3, 3, 13, 0, 2), // TPIDR_EL0 (EL0 thread pointer)
+        // x86_64 FsBase/GsBase are a disjoint ISA view; never on the aarch64 lane.
+        _ => unreachable!("x86_64 SysReg variant on the aarch64 KVM lane"),
     }
 }
 

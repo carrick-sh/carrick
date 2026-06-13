@@ -100,6 +100,29 @@ pub enum Reg {
     ElrEl1,
     /// `kvm_regs.spsr[0]` == SPSR_EL1 — saved PSTATE (eret target PSTATE).
     SpsrEl1,
+    // ── x86_64 user register view (kvm_regs). Disjoint from the aarch64 set
+    // above: an x86 engine never uses X(n)/Sp/Pc/Pstate/SpEl1/ElrEl1/SpsrEl1, and
+    // an aarch64 engine never uses these. Keeping them as explicit, separate
+    // variants (vs aliasing onto the aarch64 names) makes every per-ISA match
+    // total and turns a cross-ISA mixup into a compile error, not silent garbage.
+    Rax,
+    Rbx,
+    Rcx,
+    Rdx,
+    Rsi,
+    Rdi,
+    Rbp,
+    Rsp,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    Rip,
+    Rflags,
 }
 
 /// AArch64 **system** registers reached through KVM's `KVM_REG_ARM64_SYSREG`
@@ -123,4 +146,9 @@ pub enum SysReg {
     /// pointer; otherwise the child's libc post-clone path computes thread-struct
     /// offsets from a bogus base. (KVM sysreg demux: op0=3,op1=3,CRn=13,CRm=0,op2=2.)
     TpidrEl0,
+    /// x86_64 `FS.base` — the long-mode TLS pointer (arch_prctl ARCH_SET_FS).
+    /// Disjoint from the aarch64 set above (see [`Reg`] for the rationale).
+    FsBase,
+    /// x86_64 `GS.base`.
+    GsBase,
 }
