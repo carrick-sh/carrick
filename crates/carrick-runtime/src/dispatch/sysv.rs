@@ -846,20 +846,39 @@ fn sysv_semop<M: GuestMemory>(
     }
 }
 
-/// Translate a Linux semctl command to the macOS value. Returns `None` for a
-/// command macOS doesn't have (SEM_STAT/SEM_INFO).
+/// Translate a Linux semctl command to the host value. Returns `None` for a
+/// command the host doesn't have (SEM_STAT/SEM_INFO).
 fn linux_semctl_cmd_to_host(cmd: u64) -> Option<i32> {
+    // FreeBSD's libc bindings omit the GET*/SET* semctl cmd consts (though the
+    // kernel has them); supply them from the host <sys/sem.h> (host ABI).
+    // IPC_RMID/SET/STAT exist in libc on every host.
+    #[cfg(target_os = "freebsd")]
+    const GETNCNT: i32 = 3;
+    #[cfg(target_os = "freebsd")]
+    const GETPID: i32 = 4;
+    #[cfg(target_os = "freebsd")]
+    const GETVAL: i32 = 5;
+    #[cfg(target_os = "freebsd")]
+    const GETALL: i32 = 6;
+    #[cfg(target_os = "freebsd")]
+    const GETZCNT: i32 = 7;
+    #[cfg(target_os = "freebsd")]
+    const SETVAL: i32 = 8;
+    #[cfg(target_os = "freebsd")]
+    const SETALL: i32 = 9;
+    #[cfg(not(target_os = "freebsd"))]
+    use libc::{GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, SETALL, SETVAL};
     Some(match cmd {
         LINUX_IPC_RMID => libc::IPC_RMID,
         LINUX_IPC_SET => libc::IPC_SET,
         LINUX_IPC_STAT => libc::IPC_STAT,
-        LINUX_GETPID => libc::GETPID,
-        LINUX_GETVAL => libc::GETVAL,
-        LINUX_GETALL => libc::GETALL,
-        LINUX_GETNCNT => libc::GETNCNT,
-        LINUX_GETZCNT => libc::GETZCNT,
-        LINUX_SETVAL => libc::SETVAL,
-        LINUX_SETALL => libc::SETALL,
+        LINUX_GETPID => GETPID,
+        LINUX_GETVAL => GETVAL,
+        LINUX_GETALL => GETALL,
+        LINUX_GETNCNT => GETNCNT,
+        LINUX_GETZCNT => GETZCNT,
+        LINUX_SETVAL => SETVAL,
+        LINUX_SETALL => SETALL,
         _ => return None,
     })
 }
