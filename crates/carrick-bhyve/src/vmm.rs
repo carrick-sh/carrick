@@ -231,6 +231,20 @@ pub struct BhyveVm {
     next_vcpu: c_int,
 }
 
+impl Drop for BhyveVm {
+    /// Tear down /dev/vmm/<name> unless `destroy()` already did (it nulls
+    /// `ctx`). Without this, a `?`-early-return during bring-up leaks the VM
+    /// node, and — names being pid-derived — the next same-process `create`
+    /// then fails EEXIST, cascading every later live test in the binary.
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            // SAFETY: a live, not-yet-destroyed vmctx (destroy() nulls ctx).
+            unsafe { vm_destroy(self.ctx) };
+            self.ctx = std::ptr::null_mut();
+        }
+    }
+}
+
 pub struct BhyveVcpu {
     pub(crate) vcpu: *mut Vcpu,
 }
@@ -282,7 +296,10 @@ impl BhyveVm {
         // SAFETY: `name` is a valid NUL-terminated C string for the call's life.
         let ctx = unsafe {
             let rc = vm_create(name.as_ptr());
-            if rc != 0 && rc != libc::EEXIST {
+            // vm_create returns -1 and sets errno on failure (NOT the errno as
+            // rc). Tolerate an already-existing node — we open it below; error
+            // on anything else.
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
                 return Err(os_err("vm_create", rc));
             }
             vm_openf(name.as_ptr(), VMMAPI_OPEN_CREATE)
@@ -312,9 +329,11 @@ impl BhyveVm {
     }
 
     /// Tear down the VM (and /dev/vmm/<name>).
-    pub fn destroy(self) -> Result<(), OsError> {
+    pub fn destroy(mut self) -> Result<(), OsError> {
         // SAFETY: `self.ctx` is a live vmctx; destroying it tears down /dev/vmm/<name>.
         unsafe { vm_destroy(self.ctx) };
+        // Null the ctx so the `Drop` below is a no-op (no double vm_destroy).
+        self.ctx = std::ptr::null_mut();
         Ok(())
     }
 
