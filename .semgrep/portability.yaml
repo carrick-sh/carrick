@@ -38,3 +38,37 @@ rules:
           - pattern: libc::TCP_NOPUSH
           - pattern: libc::TCP_KEEPALIVE
           - pattern: libc::AF_LINK
+          # Linux errno accessor (carrick_portable::errno wraps both __error/__errno_location)
+          - pattern: libc::__errno_location()
+          # extended attributes: carrick-portable wraps the Darwin position arg /
+          # FreeBSD extattr_* namespace mapping behind the Linux-shaped signature.
+          - pattern: libc::fsetxattr
+          - pattern: libc::fgetxattr
+          - pattern: libc::flistxattr
+          - pattern: libc::fremovexattr
+          - pattern: libc::setxattr
+          - pattern: libc::lsetxattr
+          - pattern: libc::getxattr
+          - pattern: libc::lgetxattr
+          - pattern: libc::XATTR_CREATE
+          - pattern: libc::XATTR_REPLACE
+
+  - id: no-cfg-not-platform-macos
+    languages: [generic]
+    severity: ERROR
+    message: >
+      `not(feature = "platform-macos")` conflates the host-OS and
+      hypervisor-backend axes and silently captures every non-macOS host
+      (FreeBSD today; NetBSD/OpenBSD/illumos tomorrow). Use an explicit positive
+      predicate instead: `feature = "platform-linux"` for Linux-lane (KVM) code,
+      or `any(feature = "platform-linux", feature = "platform-freebsd")` for
+      shared non-macOS infrastructure. ABI-shape branches that are not yet behind
+      carrick-portable may use the build.rs `carrick_bsd`/`carrick_linux` cfgs.
+      See docs/superpowers/specs/2026-06-13-host-os-portability-layering-design.md.
+    paths:
+      include:
+        - crates/
+      exclude:
+        - crates/*/tests/
+    patterns:
+      - pattern-regex: 'not\(feature\s*=\s*"platform-macos"\)'
