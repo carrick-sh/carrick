@@ -8,6 +8,10 @@ license.workspace = true
 name = "carrick_bhyve"
 path = "src/lib.rs"
 
+[[bin]]
+name = "carrick-bhyve"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 

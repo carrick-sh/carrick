@@ -92,6 +92,52 @@ impl BhyveTrapEngine {
         None
     }
 
+    /// Set a raw guest register by ID (delegates to the inner vcpu).
+    pub fn set_reg_raw(&mut self, id: std::ffi::c_int, val: u64) -> Result<(), OsError> {
+        self.vcpu.set_reg_raw(id, val)
+    }
+
+    /// Get a raw guest register by ID.
+    pub fn get_reg_raw(&self, id: std::ffi::c_int) -> Result<u64, OsError> {
+        self.vcpu.get_reg_raw(id)
+    }
+
+    /// Set the FS segment base address (arch_prctl ARCH_SET_FS).
+    ///
+    /// `vm_set_register(VM_REG_GUEST_FS_BASE)` returns EINVAL — the base is
+    /// part of the segment descriptor's hidden state in VT-x (Intel SDM vol. 3
+    /// §21.3.1.2); it must be written via `vm_set_desc`.  We read the current
+    /// limit and access-rights with `vm_get_desc` and rewrite only the base so
+    /// the selector and type stay coherent.  This is the TPIDR_EL0 analogue on
+    /// x86_64 (musl uses `ARCH_SET_FS` to install the TLS pointer).
+    pub fn set_fs_base(&mut self, addr: u64) -> Result<(), OsError> {
+        use crate::vmm_x86::VM_REG_GUEST_FS;
+        let (_, limit, access) = self.vcpu.get_desc(VM_REG_GUEST_FS)?;
+        self.vcpu.set_desc(VM_REG_GUEST_FS, addr, limit, access)
+    }
+
+    /// Get the FS segment base address.
+    pub fn get_fs_base(&self) -> Result<u64, OsError> {
+        use crate::vmm_x86::VM_REG_GUEST_FS;
+        let (base, _, _) = self.vcpu.get_desc(VM_REG_GUEST_FS)?;
+        Ok(base)
+    }
+
+    /// Set the GS segment base address (arch_prctl ARCH_SET_GS).
+    /// Same rationale as [`set_fs_base`].
+    pub fn set_gs_base(&mut self, addr: u64) -> Result<(), OsError> {
+        use crate::vmm_x86::VM_REG_GUEST_GS;
+        let (_, limit, access) = self.vcpu.get_desc(VM_REG_GUEST_GS)?;
+        self.vcpu.set_desc(VM_REG_GUEST_GS, addr, limit, access)
+    }
+
+    /// Get the GS segment base address.
+    pub fn get_gs_base(&self) -> Result<u64, OsError> {
+        use crate::vmm_x86::VM_REG_GUEST_GS;
+        let (base, _, _) = self.vcpu.get_desc(VM_REG_GUEST_GS)?;
+        Ok(base)
+    }
+
     /// Consume the VM (called after the guest exits cleanly).
     pub fn destroy(self) -> Result<(), OsError> {
         self.vm.destroy()

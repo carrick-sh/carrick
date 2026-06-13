@@ -93,6 +93,9 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(1, "write", 64),
     // x86_64=3 (syscalls(2)/filippo) → canonical close=57 (AARCH64_SYSCALLS[57])
     direct(3, "close", 57),
+    // x86_64=7 (syscalls(2)/filippo) → canonical ppoll=73 (AARCH64_SYSCALLS[73])
+    // musl calls poll(fds, n, 0) at startup to probe fd validity (non-blocking).
+    direct(7, "poll", 73),
     // x86_64=9 (syscalls(2)/filippo) → canonical mmap=222 (AARCH64_SYSCALLS[222])
     direct(9, "mmap", 222),
     // x86_64=10 (syscalls(2)/filippo) → canonical mprotect=226 (AARCH64_SYSCALLS[226])
@@ -111,9 +114,17 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(20, "writev", 66),
     // x86_64=60 (syscalls(2)/filippo) → canonical exit=93 (AARCH64_SYSCALLS[93])
     direct(60, "exit", 93),
+    // x86_64=131 (syscalls(2)/filippo) → canonical sigaltstack=132
+    // (AARCH64_SYSCALLS[132]). musl calls sigaltstack at startup to establish an
+    // alternate signal stack; M2 treats it as a no-op (no signals).
+    direct(131, "sigaltstack", 132),
     // x86_64=158 (syscalls(2)/filippo): arch_prctl is x86_64-private (sets FS/GS
     // base via ARCH_SET_FS / ARCH_SET_GS); the bhyve backend handles it natively.
     native(158, "arch_prctl"),
+    // x86_64=200 (syscalls(2)/filippo) → canonical tkill=130 (AARCH64_SYSCALLS[130])
+    // musl calls tkill(tid, SIGABRT) to abort; carrick maps this to an exit in
+    // the run-to-exit M2 dispatcher (no signal delivery in Phase 2).
+    direct(200, "tkill", 130),
     // x86_64=218 (syscalls(2)/filippo) → canonical set_tid_address=96
     // (AARCH64_SYSCALLS[96])
     direct(218, "set_tid_address", 96),
