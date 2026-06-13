@@ -1,0 +1,25 @@
+[package]
+name = "carrick-x86-threads"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone M3c fixture (the root Cargo.toml excludes crates/*/fixtures/*).
+# Cross-compiled to x86_64-unknown-linux-musl by build.sh (rust-lld, static,
+# non-PIE ET_EXEC). A std::thread worker writes a thread_local (forcing a
+# TLS/fs.base access) then the main thread joins it (futex): the proof that the
+# x86 KVM clone(CLONE_THREAD) sibling-vCPU path + the clone tls/child_tid arg
+# normalization work end-to-end under carrick-kvm.
+
+[[bin]]
+name = "x86-threads"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

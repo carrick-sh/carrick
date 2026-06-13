@@ -1,0 +1,21 @@
+# Build this fixture for the x86 guest target with carrick's loader requirements
+# baked in, so a plain `cargo build --release` (run in this dir) produces the
+# runnable artifact at target/x86_64-unknown-linux-musl/release/x86-fork.
+#
+# Why these flags (carrick's x86 loader needs a static, fixed-address ET_EXEC):
+#   relocation-model=static + link-arg=--no-pie → ET_EXEC at fixed VAs (no
+#     dynamic loader; the bring-up identity-maps the ELF segments).
+#   linker=rust-lld → link the musl target from a Mac with no C toolchain.
+#
+# One-time host setup (cargo errors helpfully if missing):
+#   rustup target add x86_64-unknown-linux-musl
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=--no-pie",
+]
