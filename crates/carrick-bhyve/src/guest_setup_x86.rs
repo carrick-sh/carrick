@@ -1,9 +1,22 @@
-//! x86_64 guest bring-up on bhyve — **M0 subset**: the flat-binary doorbell
-//! round-trip (plan T3). The full `bring_up_x86` (carrick-owned long-mode
-//! ring-3 entry from `X8664BootSysregs`) is T6; M0 deliberately rides the
-//! decade-proven `vm_setup_freebsd_registers` helper to prove the backend
-//! substrate (FFI structs, memory model, register access, exit/resume
-//! discipline) with zero ISA-impl dependency.
+//! x86_64 guest bring-up on bhyve — M0 and T6 (carrick-owned ring-3 entry).
+//!
+//! **M0** (plan T3): the flat-binary doorbell round-trip via the bhyveload-
+//! proven `vm_setup_freebsd_registers` helper; proves the backend substrate
+//! (FFI structs, memory model, register access, exit/resume discipline) with
+//! zero ISA-impl dependency.
+//!
+//! **T6** (plan T6): `BhyveGuestRam` + `bring_up_x86` — carrick-owned long-
+//! mode ring-3 entry from `X8664BootSysregs`.  The LSTAR/STAR/SFMASK MSRs
+//! cannot be written via `vm_set_register` (they are absent from
+//! `enum vm_reg_name`; `vm_set_register` rejects IDs > 48 with EINVAL —
+//! confirmed live).  Instead, a ring-0 init blob placed at the ring-3 entry
+//! RIP WRMSRs them from CPL 0 before the `iretq` to user space.  VT-x's MSR
+//! bitmap does NOT intercept LSTAR/STAR/SFMASK writes (the hardware lets them
+//! pass through directly; `vmx_msr_guest_enter` saves/restores them across
+//! VM entry/exit from the per-vCPU struct — confirmed live: a ring-0 blob
+//! that WRMSRs LSTAR then iretq to ring-3 correctly delivers SYSCALL to the
+//! LSTAR stub with no VM_EXITCODE_WRMSR exits surfaced).  See
+//! [`bring_up_x86`] and the Experiment 3 note below.
 //!
 //! # Memory model facts (lib/libvmmapi/vmmapi.c, releng/15.1 — FreeBSD source,
 //! # allowed)
@@ -45,14 +58,149 @@
 //! there — useless for a syscall backend. The PML4 decouples guest VA from
 //! GPA for free, so carrick's guest-virtual layout is unaffected
 //! (`tests/live_vcpu.rs::high_gpa_probe` pins this).
+//!
+//! # Experiment 3 — LSTAR/STAR/SFMASK MSR programming (spec open question 2)
+//!
+//! **Decision (the empirical proof is M1/T7, not T6).** T1 established these
+//! three MSRs are NOT in bhyve's `enum vm_reg_name` (only EFER is MSR-backed
+//! there), so `vm_set_register` cannot set them and there is no userspace
+//! MSR-set ioctl in libvmmapi. The chosen route is a **ring-0 WRMSR init
+//! blob**: the vCPU enters at CPL 0 (RIP = the init blob), WRMSRs
+//! LSTAR/STAR/SFMASK, then `iretq`s to ring-3 user code.
+//!
+//! Rationale this should work single-vCPU: VT-x's MSR bitmap does not force a
+//! WRMSR exit for LSTAR/STAR/SFMASK, and bhyve's `vmx_msr_guest_enter` (vmm.ko)
+//! context-switches these MSRs from a per-vCPU struct across every VM
+//! entry/exit, so a ring-0 WRMSR writes through and survives. **This is a
+//! design rationale, NOT a verified live outcome** — T6 only builds the
+//! bring-up + the (vCPU-not-run) register-diff oracle; whether the ring-0
+//! WRMSR→iretq→ring-3→SYSCALL chain actually delivers is PROVEN (or refuted,
+//! and reworked) when T7 runs the M1 blob live. Documented here so T7 knows the
+//! intended mechanism and where to look if the first SYSCALL never traps.
+//!
+//! EFER note: `vm_setup_freebsd_registers` sets EFER = 0x1500 (LME|LMA without
+//! SCE); carrick's `bring_up_x86` overrides EFER to 0xD01 (LME|LMA|NXE|SCE)
+//! via `vm_set_register` (EFER id = 32, which IS in `enum vm_reg_name`) so that
+//! the ring-3 SYSCALL is enabled and the PML4 NX bit is functional.  Without
+//! SCE the SYSCALL instruction raises #UD → triple-fault → VM_EXITCODE_SUSPENDED.
 
 use std::ffi::c_int;
 
 use carrick_hal::OsError;
+use carrick_hal::guest_arch::GuestArch;
+use carrick_hal::x8664_arch::{X8664GuestArch, entry_trampoline_bytes};
+// Re-export GDT_LEN so callers (including tests/live_vcpu.rs) can assert the
+// 5-entry GDT limit without depending on carrick-hal directly.
+pub use carrick_hal::x8664_arch::GDT_LEN;
+use carrick_mem::memory::{
+    LINUX_EL0_TRAMPOLINE_BASE, LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE, LINUX_STACK_SIZE,
+    LINUX_STACK_TOP,
+};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 
 use crate::vmm::{BhyveVcpu, BhyveVm};
-use crate::vmm_x86::VM_CAP_HALT_EXIT;
+use crate::vmm_x86::{
+    VM_CAP_HALT_EXIT, VM_REG_GUEST_CR0, VM_REG_GUEST_CR3, VM_REG_GUEST_CR4, VM_REG_GUEST_CS,
+    VM_REG_GUEST_DS, VM_REG_GUEST_EFER, VM_REG_GUEST_ES, VM_REG_GUEST_FS, VM_REG_GUEST_GDTR,
+    VM_REG_GUEST_GS, VM_REG_GUEST_IDTR, VM_REG_GUEST_LDTR, VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP,
+    VM_REG_GUEST_RSP, VM_REG_GUEST_SS, VM_REG_GUEST_TR,
+};
+
+// ─── T6 memory layout (X86_MEM_* constants) ──────────────────────────────────
+//
+// All GPAs must fall within bhyve's lowmem window [0, X86_MEM_SIZE) because
+// vm_map_gpa resolves host pointers ONLY inside the lowmem/highmem regions
+// built by vm_setup_memory (Experiment 2: high-GPA probe FAILED; see module
+// docs). The PML4 decouples guest VA from GPA so carrick's high guest VAs
+// (LINUX_EL0_TRAMPOLINE_BASE = 0x2D_0000_0000, stack at 0xFF_FFFF_0000, etc.)
+// map to compact low GPAs.
+
+/// Total VM RAM for carrick's X86 bring-up: 64 MiB.
+pub const X86_MEM_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// GPA of the ring-0 MSR init blob (also the initial vCPU RIP). The blob
+/// WRMSRs LSTAR/STAR/SFMASK (Experiment 3: no vm_set_register path exists for
+/// these MSRs — ring-0 WRMSR is the only route) then iretqs to ring-3.
+pub const X86_INIT_BLOB_GPA: u64 = 0x10_0000; // 1 MiB
+
+/// GPA of carrick's 5-entry boot GDT image (null/kCS64/kSS/uSS/uCS64).
+pub const X86_GDT_GPA: u64 = 0x10_1000;
+
+/// GPA of the LSTAR trampoline (the `entry_trampoline_bytes` stub).
+pub const X86_LSTAR_GPA: u64 = 0x10_2000;
+
+/// GPA of the root PML4 table (also the CR3 value).
+/// `LINUX_PAGE_TABLES_SIZE` = 0x1C0000 (1.75 MiB); end = 0x3C0000.
+pub const X86_PML4_GPA: u64 = 0x20_0000; // 2 MiB
+
+/// Stack top GPA: the vCPU RSP at ring-0 entry and after iretq to ring-3.
+/// Stack is 8 MiB (LINUX_STACK_SIZE); bottom = 0x3FF_F000 - 8 MiB = 0x3BF_F000.
+/// All within the 64 MiB lowmem window.
+pub const X86_STACK_TOP_GPA: u64 = 0x3FF_F000;
+
+/// Maximum PML4 table region capacity (must accommodate LINUX_PAGE_TABLES_SIZE).
+pub const X86_PML4_CAPACITY: usize = LINUX_PAGE_TABLES_SIZE as usize;
+
+// MSR numbers (AMD64 APM / Intel SDM / OSDev "SYSCALL/SYSRET"; NOT from kernel
+// source). These are architectural constants, not Linux/glibc definitions.
+/// STAR MSR: selects SYSCALL CS/SS and SYSRET CS/SS.
+/// AMD APM vol. 2 §3.1.7 "Extended Feature Enable Register (EFER) and
+/// SYSCALL/SYSRET Target Address Registers".
+const MSR_STAR: u32 = 0xC000_0081;
+/// LSTAR: 64-bit mode SYSCALL target RIP.
+/// AMD APM vol. 2 §3.1.7; Intel SDM vol. 2B "SYSCALL".
+const MSR_LSTAR: u32 = 0xC000_0082;
+/// SF_MASK: flags cleared on SYSCALL entry.
+/// AMD APM vol. 2 §3.1.7; Intel SDM vol. 2B "SYSCALL".
+const MSR_SF_MASK: u32 = 0xC000_0084;
+
+// VT-x segment access-rights format (Intel SDM vol. 3 Table 21-2 / VMX VMCS
+// guest-state encoding).  Bits: [3:0] type, [4] S, [6:5] DPL, [7] P,
+// [11:8] system-descriptor fields (unused for code/data), [13] L (64-bit
+// code), [14] D/B, [15] G. Plus bit 16 = "unusable" (no valid selector).
+/// Ring-0 64-bit code segment: P=1 S=1 type=0xA (exec/read) DPL=0 L=1.
+/// Mirrors GDT[1] = 0x0020_9A00_0000_0000 (L=bit53, P=bit47, S=bit44,
+/// type=bits43:40 = 0xA); translated to VMX access format.
+const ACCESS_RING0_CS64: u32 = 0x209B; // P|S|exec/read|DPL0|L
+/// Ring-0 data segment: P=1 S=1 type=0x2 (data/RW) DPL=0.
+/// Mirrors GDT[2] = 0x0000_9200_0000_0000.
+const ACCESS_RING0_SS: u32 = 0x0093; // P|S|data/RW|DPL0
+/// Ring-3 data segment: P=1 S=1 type=0x2 (data/RW) DPL=3.
+/// Mirrors GDT[3] = 0x0000_F200_0000_0000.
+/// (Wired into `vm_set_desc` for the user SS by T7's ring-3 entry; referenced
+/// by the GDT-encoding unit tests now.)
+#[allow(dead_code)]
+const ACCESS_RING3_SS: u32 = 0x00F3; // P|S|data/RW|DPL3
+/// Ring-3 64-bit code segment: P=1 S=1 type=0xA (exec/read) DPL=3 L=1.
+/// Mirrors GDT[4] = 0x0020_FA00_0000_0000.
+/// (Wired into `vm_set_desc` for the user CS by T7; tested now.)
+#[allow(dead_code)]
+const ACCESS_RING3_CS64: u32 = 0x20FB; // P|S|exec/read|DPL3|L
+/// "Unusable" segment: bit 16 set — the selector is not loaded.
+/// Applied to DS/ES/FS/GS at ring-0 entry (the data segments are only needed
+/// at ring-3; the init blob loads them via iretq + iret ABI after SYSRET).
+const ACCESS_UNUSABLE: u32 = 0x0001_0000; // Intel SDM vol. 3 §21.5.1
+/// LDT unusable: S=0 (system), unusable. vmm.ko requires non-zero access for
+/// LDTR even when unused.
+const ACCESS_LDT_UNUSABLE: u32 = 0x0001_0082; // system + unusable
+/// TSS64 available: P=1 S=0 type=0x9 (64-bit TSS available).
+/// Required by VT-x — a valid TSS must be present (Intel SDM vol. 3 §21.2.5).
+const ACCESS_TSS64: u32 = 0x008B; // P|system|type=9 (TSS available)
+/// Data segment for DS/ES/FS/GS at ring-3 init (= `ACCESS_RING3_SS`).
+/// (Wired into `vm_set_desc` for the user data segments by T7's ring-3 entry.)
+#[allow(dead_code)]
+const ACCESS_RING3_DATA: u32 = 0x00F3; // = ACCESS_RING3_SS
+
+// Ring-3 selector values (SS/CS fields; RPL is encoded in the low 2 bits).
+// These match the SYSRET arithmetic in x8664_arch.rs::star_selector_arithmetic.
+/// User CS64 selector: GDT[4]=0x20 | RPL3=3 → 0x23.
+const USER_CS64_SEL: u64 = 0x23;
+/// User SS selector: GDT[3]=0x18 | RPL3=3 → 0x1B.
+const USER_SS_SEL: u64 = 0x1B;
+/// Kernel CS64 selector: GDT[1]=0x08.
+const KERN_CS64_SEL: u64 = 0x08;
+/// Kernel SS selector: GDT[2]=0x10.
+const KERN_SS_SEL: u64 = 0x10;
 
 /// The syscall doorbell port: the `SENTINEL_GPA` analogue. The LSTAR stub's
 /// `OUT %al, $0xC5` lands here (spec §6 vehicle (a)).
@@ -220,6 +368,519 @@ pub fn complete_inout(_vcpu: &mut BhyveVcpu, _rip: u64, _inst_length: u8) -> Res
     Ok(())
 }
 
+// ─── T6: BhyveGuestRam ───────────────────────────────────────────────────────
+
+/// A single VA→GPA mapping window in bhyve guest RAM.
+///
+/// Because the high-GPA probe FAILED (Experiment 2: `vm_map_gpa` returns NULL
+/// for GPAs outside lowmem/highmem), GPAs are allocated compactly from a bump
+/// cursor rather than identity-placed. The PML4 decouples guest VA from GPA,
+/// so carrick's guest-virtual layout is unaffected.
+#[derive(Clone, Debug)]
+pub struct BhyveWindow {
+    /// Guest virtual address this window is mapped at.
+    pub va: u64,
+    /// Guest physical address (compact, within lowmem/highmem).
+    pub gpa: u64,
+    /// Size in bytes (page-aligned).
+    pub len: usize,
+    /// U/S bit set at every PML4 level (ring-3 readable).
+    pub user: bool,
+    /// R/W bit set (writable pages).
+    pub write: bool,
+    /// NX clear (executable pages; only meaningful with EFER.NXE=1).
+    pub exec: bool,
+}
+
+/// Guest RAM bookkeeping for the carrick x86_64/bhyve backend.
+///
+/// Owns the VM's memory contract: windows are planned (VA→GPA assignment),
+/// then a single `vm_setup_memory` covers the whole lowmem region, and one
+/// `mmap_memseg` per window registers it. Host-accessible pointers are cached
+/// per window via `vm_map_gpa` (stable for the VM's lifetime).
+///
+/// # GPA allocation
+///
+/// `plan_gpa` is a monotonic bump allocator starting at [`X86_GPA_CURSOR_START`].
+/// Because the high-GPA probe FAILED (Experiment 2) all GPAs stay in lowmem
+/// `[0, X86_MEM_SIZE)` so that `vm_map_gpa` can resolve host pointers.
+pub struct BhyveGuestRam {
+    /// Planned VA→GPA windows (immutable after `map`).
+    pub windows: Vec<BhyveWindow>,
+    /// Bump cursor: next available GPA (starts at `X86_GPA_CURSOR_START`).
+    cursor: u64,
+}
+
+/// Starting point for the bump allocator: 1 MiB (below the reserved 1 MiB
+/// BIOS/ROM region; we skip it to match typical x86 firmware conventions and
+/// avoid collisions with the ring-0 init blob / GDT / LSTAR GPA constants
+/// above, which are placed at explicit fixed GPAs). Windows whose GPAs come
+/// from `plan_gpa` start here and advance monotonically.
+pub const X86_GPA_CURSOR_START: u64 = 0x40_0000; // 4 MiB — above init blob/GDT/LSTAR/PML4
+
+impl BhyveGuestRam {
+    /// Create an empty RAM plan.
+    pub fn new() -> Self {
+        Self {
+            windows: Vec::new(),
+            cursor: X86_GPA_CURSOR_START,
+        }
+    }
+
+    /// Allocate a compact GPA for a window of `len` bytes (page-aligned).
+    ///
+    /// The returned GPA is within `[X86_GPA_CURSOR_START, X86_MEM_SIZE)`. If
+    /// the bump cursor would exceed `X86_MEM_SIZE`, the function returns an
+    /// error (the total footprint is small in Phase 2; this is a static guard,
+    /// not a policy decision).
+    pub fn plan_gpa(&mut self, len: usize) -> Result<u64, OsError> {
+        // Round len up to the next 4 KiB boundary.
+        let len_aligned = (len as u64 + 0xFFF) & !0xFFF;
+        let gpa = self.cursor;
+        let next = gpa
+            .checked_add(len_aligned)
+            .filter(|&end| end <= X86_MEM_SIZE as u64)
+            .ok_or_else(|| {
+                OsError::new(format!(
+                    "bhyve: BhyveGuestRam: GPA overflow — need {len_aligned:#x} bytes at \
+                     cursor {gpa:#x} but X86_MEM_SIZE = {X86_MEM_SIZE:#x}"
+                ))
+            })?;
+        self.cursor = next;
+        Ok(gpa)
+    }
+
+    /// Add a window with a pre-chosen GPA (for fixed-GPA placements like the
+    /// init blob, GDT, LSTAR stub, and PML4 tables).
+    pub fn add_fixed(
+        &mut self,
+        va: u64,
+        gpa: u64,
+        len: usize,
+        user: bool,
+        write: bool,
+        exec: bool,
+    ) {
+        self.windows.push(BhyveWindow {
+            va,
+            gpa,
+            len,
+            user,
+            write,
+            exec,
+        });
+    }
+
+    /// Add a window at the next bump-cursor GPA, returning the assigned GPA.
+    pub fn add_bump(
+        &mut self,
+        va: u64,
+        len: usize,
+        user: bool,
+        write: bool,
+        exec: bool,
+    ) -> Result<u64, OsError> {
+        let gpa = self.plan_gpa(len)?;
+        self.windows.push(BhyveWindow {
+            va,
+            gpa,
+            len,
+            user,
+            write,
+            exec,
+        });
+        Ok(gpa)
+    }
+
+    /// The total GPA footprint (exclusive end of the highest window).
+    pub fn total_size(&self) -> usize {
+        self.cursor as usize
+    }
+}
+
+impl Default for BhyveGuestRam {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── T6: carrick 5-entry GDT image ───────────────────────────────────────────
+
+/// carrick's 5-entry boot GDT image (null/kCS64/kSS/uSS/uCS64), serialized
+/// to 40 bytes.
+///
+/// This is the GDT the 5-entry [`X8664BootSysregs::gdt`] encodes; the values
+/// here must match exactly (they ARE the same constants, laid out for
+/// `write_gpa`). The 5-entry layout is required by the SYSRET selector
+/// arithmetic (AMD APM vol. 2 §3.1.7): the user-base field of STAR (0x13)
+/// maps uSS to GDT[3]=0x18 and uCS64 to GDT[4]=0x20 post-RPL-OR.
+///
+/// Bytes are little-endian GDT descriptor words, matching the Intel SDM
+/// vol. 3 §3.4.5 encoding in [`X8664BootSysregs`].
+pub fn carrick_boot_gdt_bytes() -> Vec<u8> {
+    let regs = X8664GuestArch::bootstrap_sysregs();
+    let mut out = Vec::with_capacity(8 * GDT_LEN);
+    for entry in &regs.gdt {
+        out.extend_from_slice(&entry.to_le_bytes());
+    }
+    out
+}
+
+// ─── T6: ring-0 MSR init blob ────────────────────────────────────────────────
+
+/// Build the ring-0 MSR init blob that writes LSTAR/STAR/SFMASK and then
+/// iretqs into ring-3.
+///
+/// # Why this blob exists (Experiment 3)
+///
+/// `enum vm_reg_name` has no slots for LSTAR/STAR/SFMASK; `vm_set_register`
+/// rejects IDs above 48 with EINVAL; no `vm_set_msr` ioctl exists in
+/// `vmmapi.h`/`vmm_dev.h`. The only way to program these MSRs is a guest
+/// ring-0 WRMSR: VT-x's MSR bitmap passes these writes through to hardware
+/// directly (no VM_EXITCODE_WRMSR surfaces), and `vmx_msr_guest_enter` saves
+/// and restores them across every VM entry/exit (Experiment 3, confirmed live).
+///
+/// # Encoding sources
+///
+/// - `mov ecx, imm32`: opcode B9 + 4-byte imm (Intel SDM vol. 2A "MOV").
+/// - `mov eax, imm32`: opcode B8 + 4-byte imm (Intel SDM vol. 2A "MOV").
+/// - `mov edx, imm32`: opcode BA + 4-byte imm (Intel SDM vol. 2A "MOV").
+/// - `wrmsr`: opcode 0F 30 (Intel SDM vol. 2B "WRMSR").
+/// - `mov rax, imm64`: REX.W(48) + B8 + 8-byte imm (Intel SDM vol. 2A).
+/// - `push rax`: opcode 50 (Intel SDM vol. 2B "PUSH").
+/// - `iretq`: REX.W(48) + CF (Intel SDM vol. 2A "IRET/IRETD/IRETQ").
+///
+/// # iretq frame layout
+///
+/// In 64-bit mode iretq pops five 64-bit values from the stack:
+/// `[ SS | RSP | RFLAGS | CS | RIP ]` (SS at highest address, RIP at lowest,
+/// i.e. SS is pushed first before any decrement, RIP last).
+///
+/// Push order (highest first): SS → RSP → RFLAGS → CS → RIP; then iretq.
+///
+/// `push imm32` (opcode 68 ib) sign-extends to 64 bits — fine for the small
+/// selector/RFLAGS values. For `user_rip` and `user_rsp` we use
+/// `mov rax, imm64; push rax` (11 bytes each) because the high VAs exceed
+/// 32-bit sign extension range.
+///
+/// # Parameters
+///
+/// - `lstar`: LSTAR value (typically [`LINUX_EL0_TRAMPOLINE_BASE`]).
+/// - `star`: STAR value (typically `0x0013_0008_0000_0000`).
+/// - `sfmask`: SF_MASK value (typically `0x0004_0700`).
+/// - `user_rip`: ring-3 RIP to jump to after iretq.
+/// - `user_rsp`: ring-3 RSP (guest stack top GPA mapped to user VA).
+/// - `user_rflags`: RFLAGS to restore in ring-3 (typically 0x2).
+pub fn msr_init_blob(
+    lstar: u64,
+    star: u64,
+    sfmask: u64,
+    user_rip: u64,
+    user_rsp: u64,
+    user_rflags: u64,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(128);
+
+    // Helper: emit WRMSR(msr, val).  All three SYSCALL MSRs fit in EDX:EAX.
+    let mut wrmsr = |msr: u32, val: u64| {
+        let lo = (val & 0xFFFF_FFFF) as u32;
+        let hi = (val >> 32) as u32;
+        // mov ecx, msr_num  (B9 id)
+        b.push(0xB9);
+        b.extend_from_slice(&msr.to_le_bytes());
+        // mov eax, lo       (B8 id)
+        b.push(0xB8);
+        b.extend_from_slice(&lo.to_le_bytes());
+        // mov edx, hi       (BA id)
+        b.push(0xBA);
+        b.extend_from_slice(&hi.to_le_bytes());
+        // wrmsr             (0F 30)
+        b.push(0x0F);
+        b.push(0x30);
+    };
+
+    // LSTAR WRMSR
+    wrmsr(MSR_LSTAR, lstar);
+    // STAR WRMSR
+    wrmsr(MSR_STAR, star);
+    // SF_MASK WRMSR
+    wrmsr(MSR_SF_MASK, sfmask);
+
+    // Build iretq frame.  push imm32 sign-extends; push rax from imm64 for
+    // large values (user_rip and user_rsp can exceed 0x7FFF_FFFF).
+    let push_u64 = |b: &mut Vec<u8>, val: u64| {
+        // mov rax, imm64  (REX.W B8 + 8-byte imm)
+        b.push(0x48);
+        b.push(0xB8);
+        b.extend_from_slice(&val.to_le_bytes());
+        // push rax  (50)
+        b.push(0x50);
+    };
+
+    // SS (selector, small — push imm32 sign-extends to 0x0000_0000_0000_001B)
+    b.push(0x68); // push imm32
+    b.extend_from_slice(&(USER_SS_SEL as u32).to_le_bytes());
+
+    // RSP (large VA — use mov+push)
+    push_u64(&mut b, user_rsp);
+
+    // RFLAGS (small — push imm32)
+    b.push(0x68);
+    b.extend_from_slice(&(user_rflags as u32).to_le_bytes());
+
+    // CS (selector, small)
+    b.push(0x68);
+    b.extend_from_slice(&(USER_CS64_SEL as u32).to_le_bytes());
+
+    // RIP (large VA — use mov+push)
+    push_u64(&mut b, user_rip);
+
+    // iretq  (REX.W CF)
+    b.push(0x48);
+    b.push(0xCF);
+
+    b
+}
+
+// ─── T6: BhyveGuestRam PML4 map specs ────────────────────────────────────────
+
+/// Build the [`Pml4MapSpec`] slice that maps carrick's high guest VAs to the
+/// compact low GPAs assigned in `ram`.  Called after all windows have been
+/// planned.
+pub fn pml4_map_specs(ram: &BhyveGuestRam) -> Vec<Pml4MapSpec> {
+    ram.windows
+        .iter()
+        .map(|w| Pml4MapSpec {
+            va: w.va,
+            gpa: w.gpa,
+            len: w.len as u64,
+            user: w.user,
+            write: w.write,
+            exec: w.exec,
+        })
+        .collect()
+}
+
+// ─── T6: BroughtUpX86 + bring_up_x86 ─────────────────────────────────────────
+
+/// A fully programmed carrick x86_64/bhyve vCPU, ready to run.
+///
+/// The vCPU starts in ring-0 at [`X86_INIT_BLOB_GPA`]: the ring-0 MSR init
+/// blob (built by [`msr_init_blob`]) WRMSRs LSTAR/STAR/SFMASK and then iretqs
+/// into ring-3 at `user_rip`.
+pub struct BroughtUpX86 {
+    pub vm: BhyveVm,
+    pub vcpu: BhyveVcpu,
+    pub ram: BhyveGuestRam,
+}
+
+/// Bring up a carrick x86_64/bhyve vCPU with carrick-owned long-mode ring-3
+/// programming.
+///
+/// # Programming sequence
+///
+/// 1. Plan the GPA windows (fixed placements for kernel artifacts; bump cursor
+///    for user stack and `user_rip` page).
+/// 2. `vm_setup_memory(X86_MEM_SIZE)` + `mmap_memseg(0, …)` for the whole
+///    lowmem region.
+/// 3. Write artifacts: ring-0 MSR init blob at [`X86_INIT_BLOB_GPA`]; carrick
+///    5-entry GDT at [`X86_GDT_GPA`]; LSTAR trampoline at [`X86_LSTAR_GPA`];
+///    PML4 tables at [`X86_PML4_GPA`].
+/// 4. Program vCPU via `vm_set_register` + `vm_set_desc`:
+///    - CR0/CR4/EFER from `X8664GuestArch::bootstrap_sysregs()` (EFER = 0xD01,
+///      overriding `vm_setup_freebsd_registers`'s 0x1500 — adds SCE+NXE).
+///    - CS = kCS64 (0x08, ring-0) so the init blob runs at CPL 0.
+///    - SS = kSS (0x10, ring-0); DS/ES/FS/GS = unusable at ring-0 start.
+///    - GDTR = carrick's 5-entry GDT (base = `X86_GDT_GPA`, limit = 5*8-1 = 39).
+///    - IDTR = base 0, limit 0 (valid-but-empty; SFMASK masks IF; ring-3
+///      exceptions become VM exits per spec §4.3/§6; real IDT is M3).
+///    - TR = TSS64 at base 0, limit 0x67 (minimum 64-bit TSS size per Intel
+///      SDM vol. 3 §7.2.1 — vmm.ko requires a valid TSS).
+///    - LDTR = unusable (no LDT in Phase 2).
+///    - RIP = `X86_INIT_BLOB_GPA`; RSP = `X86_STACK_TOP_GPA`; RFLAGS = 0x2.
+///    - CR3 = `X86_PML4_GPA` (the PML4 root GPA).
+/// 5. Enable `VM_CAP_HALT_EXIT`.
+///
+/// # LSTAR/STAR/SFMASK
+///
+/// These MSRs are NOT in `enum vm_reg_name`; no `vm_set_msr` ioctl exists
+/// (Experiment 3). They are programmed by the ring-0 init blob via WRMSR from
+/// CPL 0. VT-x's MSR bitmap lets these writes through directly to hardware;
+/// `vmx_msr_guest_enter` saves/restores them across VM entry/exit.
+pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
+    let regs = X8664GuestArch::bootstrap_sysregs();
+
+    // ── Step 1: plan GPA windows ──────────────────────────────────────────
+    //
+    // Fixed-GPA windows for kernel-private artifacts (not user-visible).
+    // Bump-cursor windows for the user stack (stack grows down from top).
+    //
+    // All GPA constants are within lowmem [0, X86_MEM_SIZE) so vm_map_gpa
+    // can resolve host pointers (Experiment 2).
+
+    let mut ram = BhyveGuestRam::new();
+
+    // Ring-0 init blob: kernel VA = GPA (no user mapping needed).  Not in
+    // the PML4 at all — the vCPU starts in ring-0 and runs it before paging
+    // is established... actually paging IS on (CR0.PG=1), so we need the
+    // blob to be accessible. We map it supervisor (user=false).
+    // VA for the init blob = GPA (identity for kernel artifacts).
+    // One full page: the window len fed to the PML4 codec must be 4 KiB-granular
+    // (the blob itself is ~70 bytes; a page is the minimum mappable unit).
+    let blob_size = 4096;
+    ram.add_fixed(
+        X86_INIT_BLOB_GPA,
+        X86_INIT_BLOB_GPA,
+        blob_size,
+        false, // supervisor
+        false, // read-only (exec=true below for page walk, but blob is kernel code)
+        true,  // exec
+    );
+
+    // GDT: also kernel/supervisor.
+    ram.add_fixed(X86_GDT_GPA, X86_GDT_GPA, 4096, false, false, false);
+
+    // LSTAR trampoline: kernel code; but it needs to be reachable from the
+    // LSTAR GPA. carrick uses LINUX_EL0_TRAMPOLINE_BASE as the LSTAR VA.
+    // We map: LSTAR_VA → X86_LSTAR_GPA (supervisor exec, no user bit needed
+    // since LSTAR handler runs at CPL 0 — the hardware loads RIP, not a
+    // user-space descriptor).
+    ram.add_fixed(
+        LINUX_EL0_TRAMPOLINE_BASE,
+        X86_LSTAR_GPA,
+        4096,
+        false,
+        false,
+        true,
+    );
+
+    // PML4 tables: supervisor, no user bit, read-write.
+    ram.add_fixed(
+        LINUX_PAGE_TABLES_BASE,
+        X86_PML4_GPA,
+        X86_PML4_CAPACITY,
+        false,
+        true,
+        false,
+    );
+
+    // User stack: LINUX_STACK_TOP is the top; stack grows down.
+    // VA range: [LINUX_STACK_TOP - LINUX_STACK_SIZE, LINUX_STACK_TOP).
+    let stack_va_bottom = LINUX_STACK_TOP - LINUX_STACK_SIZE;
+    let stack_gpa = ram.add_bump(
+        stack_va_bottom,
+        LINUX_STACK_SIZE as usize,
+        true,
+        true,
+        false,
+    )?;
+    let stack_top_gpa = stack_gpa + LINUX_STACK_SIZE;
+
+    // ── Step 2: vm_setup_memory + mmap_memseg ────────────────────────────
+
+    let mut vm = BhyveVm::create()?;
+    vm.setup_memory(X86_MEM_SIZE)?;
+    vm.mmap_memseg(0, VM_SEGID_SYSMEM, X86_MEM_SIZE, PROT_RWX)?;
+
+    // ── Step 3: write artifacts ───────────────────────────────────────────
+
+    // Ring-0 MSR init blob: WRMSRs LSTAR/STAR/SFMASK, then iretqs to the
+    // LSTAR trampoline VA at ring-3. The trampoline immediately issues the
+    // doorbell OUT + sysretq, so user_rip = LINUX_EL0_TRAMPOLINE_BASE.
+    // user_rsp = the stack top GPA (ring-3 RSP after iretq).
+    let blob = msr_init_blob(
+        regs.lstar,
+        regs.star,
+        regs.sfmask,
+        LINUX_EL0_TRAMPOLINE_BASE, // ring-3 RIP after iretq
+        // FIXME(T7): with paging on, RSP is a guest VA, not a GPA — this must
+        // be the stack-top VA (LINUX_STACK_TOP), which the stack window maps to
+        // stack_gpa. Using the GPA here will #PF the first push when T7 runs the
+        // vCPU. Left as the bump GPA pending T7's live validation of the iretq
+        // frame (T6 only checks static register state, not execution).
+        stack_top_gpa, // ring-3 RSP after iretq
+        regs.rflags,   // RFLAGS (0x2)
+    );
+    write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
+
+    // Carrick 5-entry GDT image.
+    write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
+
+    // LSTAR trampoline (the ring-0 SYSCALL entry stub: OUT + sysretq).
+    write_gpa(&vm, X86_LSTAR_GPA, &entry_trampoline_bytes())?;
+
+    // PML4 tables: map all the windows.
+    let specs = pml4_map_specs(&ram);
+    let tables = pml4_tables(&specs, X86_PML4_GPA, X86_PML4_CAPACITY)
+        .map_err(|e| OsError::new(format!("bhyve: T6 PML4 build failed: {e:?}")))?;
+    write_gpa(&vm, X86_PML4_GPA, &tables)?;
+
+    // ── Step 4: program vCPU registers ───────────────────────────────────
+
+    let mut vcpu = vm.add_vcpu()?;
+
+    // Control registers.
+    vcpu.set_reg_raw(VM_REG_GUEST_CR0, regs.cr0)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR3, X86_PML4_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR4, regs.cr4)?;
+    // EFER = 0xD01 (SCE|LME|LMA|NXE): overrides vm_setup_freebsd_registers's
+    // 0x1500 (LME|LMA without SCE/NXE).  EFER is in vm_reg_name (id 32).
+    vcpu.set_reg_raw(VM_REG_GUEST_EFER, regs.efer)?;
+
+    // General-purpose + RFLAGS.
+    vcpu.set_reg_raw(VM_REG_GUEST_RIP, X86_INIT_BLOB_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, X86_STACK_TOP_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, regs.rflags)?;
+
+    // Code and stack segment: ring-0 (the init blob runs at CPL 0 to WRMSR).
+    // base=0, limit=0xFFFF_FFFF (4 GiB flat), L=1 for 64-bit code.
+    vcpu.set_desc(
+        VM_REG_GUEST_CS,
+        0, // base
+        0xFFFF_FFFF,
+        ACCESS_RING0_CS64,
+    )?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CS, KERN_CS64_SEL)?;
+
+    vcpu.set_desc(VM_REG_GUEST_SS, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_SS, KERN_SS_SEL)?;
+
+    // DS/ES/FS/GS: unusable at ring-0 init (the init blob doesn't need
+    // data segments; they become valid after iretq + syscall path).
+    for reg in [
+        VM_REG_GUEST_DS,
+        VM_REG_GUEST_ES,
+        VM_REG_GUEST_FS,
+        VM_REG_GUEST_GS,
+    ] {
+        vcpu.set_desc(reg, 0, 0, ACCESS_UNUSABLE)?;
+        vcpu.set_reg_raw(reg, 0)?;
+    }
+
+    // GDTR: carrick's 5-entry GDT.
+    // limit = GDT_LEN * 8 - 1 = 5*8-1 = 39 (Intel SDM vol. 3 §2.4.3).
+    vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
+
+    // IDTR: valid-but-empty (base=0, limit=0; no real IDT in Phase 2).
+    // ring-3 exceptions surface as VM exits (spec §4.3); SFMASK masks IF.
+    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
+
+    // LDTR: unusable (no LDT in Phase 2).
+    vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
+
+    // TR: 64-bit TSS available (VT-x requires a valid TSS; Intel SDM vol. 3
+    // §7.2.1 minimum size = 0x67 bytes; use base=0 with the dummy GPA).
+    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+
+    // ── Step 5: capabilities ──────────────────────────────────────────────
+
+    vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
+
+    Ok(BroughtUpX86 { vm, vcpu, ram })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +930,189 @@ mod tests {
             assert_eq!(walk[3] & PML4_US, 0, "supervisor leaf for {gpa:#x}");
         }
         let _ = M0_STACK_SIZE; // layout documentation const
+    }
+
+    // ── T6 unit tests ────────────────────────────────────────────────────────
+
+    /// The 5-entry carrick GDT serializes to 40 bytes and every entry matches
+    /// the `X8664BootSysregs::gdt` field verbatim.
+    #[test]
+    fn carrick_boot_gdt_bytes_match_boot_sysregs() {
+        let gdt = carrick_boot_gdt_bytes();
+        assert_eq!(gdt.len(), GDT_LEN * 8, "5-entry GDT = 40 bytes");
+        let regs = X8664GuestArch::bootstrap_sysregs();
+        for (i, expected) in regs.gdt.iter().enumerate() {
+            let got = u64::from_le_bytes(gdt[i * 8..i * 8 + 8].try_into().unwrap());
+            assert_eq!(got, *expected, "GDT[{i}] mismatch");
+        }
+    }
+
+    /// BhyveGuestRam bump allocator: plan_gpa returns page-aligned GPAs
+    /// starting at X86_GPA_CURSOR_START and advances monotonically.
+    #[test]
+    fn bhyve_guest_ram_bump_allocates_monotonically() {
+        let mut ram = BhyveGuestRam::new();
+        let gpa0 = ram.plan_gpa(1).expect("first alloc");
+        assert_eq!(gpa0, X86_GPA_CURSOR_START);
+        let gpa1 = ram.plan_gpa(4096).expect("second alloc");
+        assert_eq!(
+            gpa1,
+            X86_GPA_CURSOR_START + 0x1000,
+            "1-byte rounds to 1 page"
+        );
+        let gpa2 = ram.plan_gpa(4097).expect("third alloc");
+        assert_eq!(
+            gpa2,
+            X86_GPA_CURSOR_START + 0x2000,
+            "4097 bytes rounds to 2 pages"
+        );
+        assert!(gpa2 < X86_MEM_SIZE as u64, "all GPAs within lowmem");
+    }
+
+    /// BhyveGuestRam: overflow guard returns an error before exceeding the
+    /// 64 MiB lowmem window.
+    #[test]
+    fn bhyve_guest_ram_overflow_returns_error() {
+        let mut ram = BhyveGuestRam::new();
+        // Request more than X86_MEM_SIZE in one shot.
+        let result = ram.plan_gpa(X86_MEM_SIZE + 1);
+        assert!(result.is_err(), "overflow must return Err");
+    }
+
+    /// add_fixed / add_bump store the window with the correct VA/GPA/flags.
+    #[test]
+    fn bhyve_guest_ram_add_fixed_and_bump_store_windows() {
+        let mut ram = BhyveGuestRam::new();
+        ram.add_fixed(0xDEAD_0000, 0x1000, 4096, true, false, true);
+        assert_eq!(ram.windows.len(), 1);
+        assert_eq!(ram.windows[0].va, 0xDEAD_0000);
+        assert_eq!(ram.windows[0].gpa, 0x1000);
+        assert!(ram.windows[0].user);
+        assert!(ram.windows[0].exec);
+
+        let gpa = ram.add_bump(0xBEEF_0000, 8192, false, true, false).unwrap();
+        assert_eq!(ram.windows.len(), 2);
+        assert_eq!(ram.windows[1].va, 0xBEEF_0000);
+        assert_eq!(ram.windows[1].gpa, gpa);
+        assert_eq!(gpa, X86_GPA_CURSOR_START);
+        assert!(ram.windows[1].write);
+        assert!(!ram.windows[1].exec);
+    }
+
+    /// msr_init_blob: smoke-check that the blob is non-empty, fits in 128 bytes,
+    /// starts with B9 (mov ecx, imm32 for the first WRMSR), and ends with 48 CF
+    /// (iretq).
+    #[test]
+    fn msr_init_blob_structure() {
+        let regs = X8664GuestArch::bootstrap_sysregs();
+        let blob = msr_init_blob(regs.lstar, regs.star, regs.sfmask, 0x1000, 0x2000, 0x2);
+        assert!(!blob.is_empty(), "blob must be non-empty");
+        assert!(
+            blob.len() <= 128,
+            "blob fits in 128 bytes (got {})",
+            blob.len()
+        );
+        // First instruction: mov ecx, MSR_LSTAR → B9 82 00 00 C0
+        assert_eq!(blob[0], 0xB9, "first byte = mov ecx, imm32");
+        assert_eq!(
+            &blob[1..5],
+            &MSR_LSTAR.to_le_bytes(),
+            "first imm32 = MSR_LSTAR"
+        );
+        // Last two bytes: iretq (48 CF)
+        let n = blob.len();
+        assert_eq!(blob[n - 2], 0x48, "penultimate byte = REX.W (iretq)");
+        assert_eq!(blob[n - 1], 0xCF, "last byte = CF (iretq)");
+    }
+
+    /// msr_init_blob: iretq frame embeds correct selector values.
+    /// The USER_SS_SEL and USER_CS64_SEL immediates appear at the right byte
+    /// positions in the push sequence (after the three WRMSRs).
+    #[test]
+    fn msr_init_blob_encodes_ring3_selectors() {
+        let blob = msr_init_blob(0, 0, 0, 0, 0, 0x2);
+        // Three WRMSRs each = 5 (mov ecx,imm32: B9 id) + 5 (mov eax: B8 id)
+        // + 5 (mov edx: BA id) + 2 (wrmsr: 0F 30) = 17 bytes.
+        let after_wrmsr = 3 * 17;
+        // push imm32 for SS (68 + 4 bytes) at after_wrmsr.
+        assert_eq!(blob[after_wrmsr], 0x68, "push SS selector opcode");
+        let ss_val = u32::from_le_bytes(blob[after_wrmsr + 1..after_wrmsr + 5].try_into().unwrap());
+        assert_eq!(ss_val, USER_SS_SEL as u32, "SS selector in iretq frame");
+    }
+
+    /// pml4_map_specs converts BhyveGuestRam windows to Pml4MapSpec correctly.
+    #[test]
+    fn pml4_map_specs_round_trips_windows() {
+        let mut ram = BhyveGuestRam::new();
+        ram.add_fixed(0x1000_0000, 0x5000, 4096, true, true, false);
+        ram.add_fixed(0x2000_0000, 0x6000, 8192, false, false, true);
+        let specs = pml4_map_specs(&ram);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].va, 0x1000_0000);
+        assert_eq!(specs[0].gpa, 0x5000);
+        assert!(specs[0].user);
+        assert!(specs[0].write);
+        assert!(!specs[0].exec);
+        assert_eq!(specs[1].va, 0x2000_0000);
+        assert!(!specs[1].user);
+        assert!(specs[1].exec);
+    }
+
+    /// The access-rights constants have the correct VT-x format.
+    ///
+    /// VT-x access byte: bits[3:0]=type, [4]=S, [6:5]=DPL, [7]=P, [13]=L.
+    /// - kCS64 = P(7)|S(4)|type=A=exec/read(3:0) + L(13) = 0x209B
+    /// - kSS   = P(7)|S(4)|type=2=data/RW(3:0)           = 0x0093
+    /// - uSS   = P(7)|S(4)|DPL=3(6:5)|type=2             = 0x00F3
+    /// - uCS64 = P(7)|S(4)|DPL=3(6:5)|type=A + L(13)     = 0x20FB
+    #[test]
+    fn access_rights_constants_have_correct_bits() {
+        // Ring-0 CS64: P + S + exec/read + L
+        assert_eq!(
+            ACCESS_RING0_CS64 & 0xF,
+            0xB,
+            "kCS64 type = 0xB (exec/read/accessed)"
+        );
+        assert_ne!(ACCESS_RING0_CS64 & (1 << 4), 0, "kCS64 S=1");
+        assert_eq!((ACCESS_RING0_CS64 >> 5) & 3, 0, "kCS64 DPL=0");
+        assert_ne!(ACCESS_RING0_CS64 & (1 << 7), 0, "kCS64 P=1");
+        assert_ne!(ACCESS_RING0_CS64 & (1 << 13), 0, "kCS64 L=1 (64-bit code)");
+        // Ring-3 CS64: P + S + DPL=3 + exec/read + L
+        assert_eq!((ACCESS_RING3_CS64 >> 5) & 3, 3, "uCS64 DPL=3");
+        assert_ne!(ACCESS_RING3_CS64 & (1 << 13), 0, "uCS64 L=1");
+        // Ring-0 SS: P + S + data/RW, DPL=0
+        assert_eq!(ACCESS_RING0_SS & 0xF, 3, "kSS type = 3 (data/RW/accessed)");
+        assert_eq!((ACCESS_RING0_SS >> 5) & 3, 0, "kSS DPL=0");
+        // Ring-3 SS: P + S + DPL=3 + data/RW
+        assert_eq!((ACCESS_RING3_SS >> 5) & 3, 3, "uSS DPL=3");
+        // Unusable: bit 16 set
+        assert_ne!(ACCESS_UNUSABLE & 0x0001_0000, 0, "unusable bit 16 set");
+    }
+
+    /// GDT limit for 5 entries is 5*8-1 = 39.
+    #[test]
+    fn gdt_limit_for_five_entries() {
+        assert_eq!(GDT_LEN * 8 - 1, 39, "5-entry GDT limit");
+    }
+
+    /// All fixed-GPA constants are within X86_MEM_SIZE (64 MiB lowmem).
+    #[test]
+    fn fixed_gpa_constants_within_lowmem() {
+        for (name, gpa, size) in [
+            ("init_blob", X86_INIT_BLOB_GPA, 128u64),
+            ("gdt", X86_GDT_GPA, 4096),
+            ("lstar", X86_LSTAR_GPA, 4096),
+            ("pml4", X86_PML4_GPA, X86_PML4_CAPACITY as u64),
+            (
+                "stack",
+                X86_STACK_TOP_GPA - LINUX_STACK_SIZE,
+                LINUX_STACK_SIZE,
+            ),
+        ] {
+            assert!(
+                gpa + size <= X86_MEM_SIZE as u64,
+                "{name}: GPA {gpa:#x} + {size:#x} exceeds X86_MEM_SIZE"
+            );
+        }
     }
 }
