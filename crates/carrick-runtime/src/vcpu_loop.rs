@@ -89,7 +89,7 @@ use crate::runtime::hardware_tso_for_debug;
 // `load_execve_image` (HVF AddressSpace builder) and `hardware_tso_for_debug`
 // (Apple TSO) stay genuinely macOS-only stubs — the KVM execve path builds its
 // own image (Task 7d) and KVM has no Rosetta TSO toggle.
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 #[allow(unused_variables, clippy::needless_pass_by_value)]
 mod macos_helper_stubs {
     use super::{AddressSpace, SyscallDispatcher};
@@ -151,11 +151,22 @@ mod macos_helper_stubs {
         // trampoline / page-tables / sentinel vectors. Matches the boot chain in
         // `run_elf_real_dispatch`. Per-ISA vDSO bytes come from the engine's
         // GuestArch (the x86_64 seam); this is the Linux/KVM path.
-        use carrick_hal::GuestArch as _;
-        type KvmArch = <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+        #[cfg(feature = "platform-linux")]
+        let image = {
+            use carrick_hal::GuestArch as _;
+            type KvmArch = <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+            raw.with_vdso_bytes(KvmArch::vdso_bytes())
+                .and_then(|a| a.with_linux_initial_stack(argv, env))
+                .map_err(|_| LINUX_ENOENT)?
+        };
+        // BSD lane (FreeBSD/bhyve): the per-ISA vDSO + the real execve-image
+        // builder are wired in #1 (bhyve through the shared dispatcher). For now
+        // build the initial stack without a vDSO so this module compiles on the
+        // BSD lane; `not(platform-linux)` here means FreeBSD (the module is gated
+        // any(platform-linux, platform-freebsd)).
+        #[cfg(not(feature = "platform-linux"))]
         let image = raw
-            .with_vdso_bytes(KvmArch::vdso_bytes())
-            .and_then(|a| a.with_linux_initial_stack(argv, env))
+            .with_linux_initial_stack(argv, env)
             .map_err(|_| LINUX_ENOENT)?;
         // execve point of no return: reset CAUGHT handlers to SIG_DFL (the kernel
         // does this; SIG_IGN/mask/pending are preserved).
@@ -175,7 +186,7 @@ mod macos_helper_stubs {
         unreachable!("Apple-Silicon hardware TSO toggle is HVF-only; KVM has no Rosetta TSO")
     }
 }
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 use macos_helper_stubs::{
     forked_child_die_by_signal, forked_child_exit, hardware_tso_for_debug, load_execve_image,
     stop_after_traced_exec, stop_by_signal,
