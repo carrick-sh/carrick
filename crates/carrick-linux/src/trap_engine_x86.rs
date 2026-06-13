@@ -45,21 +45,6 @@ use crate::kvm::{KvmVcpu, KvmVm};
 /// `0xE6 0xC5` = `OUT imm8($0xC5), %al`.  Source: AMD64 ISA / OSDev "OUT".
 pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
 
-// ─── arch_prctl(2) ─────────────────────────────────────────────────────────────
-//
-// arch_prctl is x86-ISA-specific (no asm-generic/aarch64 equivalent) and its
-// FS/GS-base subfunctions need KVM_GET/SET_SREGS — an engine-only operation the
-// ISA-neutral SyscallDispatcher cannot perform. The engine therefore services it
-// inside `next_syscall` and never surfaces it to the dispatcher. Source:
-// arch_prctl(2) man7.org.
-const X86_ARCH_PRCTL: u64 = 158;
-const ARCH_SET_GS: u64 = 0x1001;
-const ARCH_SET_FS: u64 = 0x1002;
-const ARCH_GET_FS: u64 = 0x1003;
-const ARCH_GET_GS: u64 = 0x1004;
-/// `-EINVAL` for an unknown arch_prctl subfunction (asm-generic errno 22).
-const NEG_EINVAL: i64 = -22;
-
 // ─── KvmX86TrapEngine ────────────────────────────────────────────────────────
 
 /// The KVM x86_64 syscall trap engine.
@@ -90,82 +75,6 @@ impl KvmX86TrapEngine {
         }
     }
 
-    /// Set `FS.base` via `KVM_SET_SREGS` — the `arch_prctl(ARCH_SET_FS)` handler.
-    ///
-    /// In long-mode, FS.base is a 64-bit base address for the FS segment used by
-    /// musl as the TLS pointer.  KVM exposes it directly through `sregs.fs.base`
-    /// (unlike bhyve, which requires `vm_set_desc` for segment hidden state).
-    ///
-    /// Source: arch_prctl(2) man7.org `ARCH_SET_FS = 0x1002`; kvm-ioctls `get_sregs`.
-    pub fn set_fs_base(&mut self, addr: u64) -> Result<i64, TrapError> {
-        let mut sregs = self
-            .vcpu
-            .fd()
-            .get_sregs()
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(set_fs): {e}")))?;
-        sregs.fs.base = addr;
-        self.vcpu
-            .fd()
-            .set_sregs(&sregs)
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(fs.base): {e}")))?;
-        Ok(0)
-    }
-
-    /// Get the current `FS.base` value — used by `arch_prctl(ARCH_GET_FS)`.
-    pub fn get_fs_base(&self) -> Result<u64, TrapError> {
-        let sregs = self
-            .vcpu
-            .fd()
-            .get_sregs()
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(get_fs): {e}")))?;
-        Ok(sregs.fs.base)
-    }
-
-    /// Raw `VcpuFd` accessor for in-crate helpers (arch_prctl GS path in
-    /// `run_elf_x86.rs`).  `pub(crate)` keeps the encapsulation at the crate
-    /// boundary.
-    pub(crate) fn vcpu_fd(&self) -> &kvm_ioctls::VcpuFd {
-        self.vcpu.fd()
-    }
-
-    /// Service `arch_prctl(code, addr)` engine-side (FS/GS base via
-    /// KVM_GET/SET_SREGS). Returns the Linux return value (`0` on success,
-    /// `-EINVAL` for an unknown subfunction). Mirrors `run_elf_x86::sys_arch_prctl`
-    /// so both the standalone loop and the dispatcher path share one implementation.
-    /// Source: arch_prctl(2) man7.org.
-    fn service_arch_prctl(&mut self, code: u64, addr: u64) -> Result<i64, TrapError> {
-        match code {
-            ARCH_SET_FS => self.set_fs_base(addr),
-            ARCH_GET_FS => {
-                let val = self.get_fs_base()?;
-                // Write the current FS.base to the user pointer (8 bytes LE).
-                let _ = self.write_bytes(addr, &val.to_le_bytes());
-                Ok(0)
-            }
-            ARCH_SET_GS => {
-                let mut sregs =
-                    self.vcpu.fd().get_sregs().map_err(|e| {
-                        TrapError::Hypervisor(format!("KVM_GET_SREGS(set_gs): {e}"))
-                    })?;
-                sregs.gs.base = addr;
-                self.vcpu
-                    .fd()
-                    .set_sregs(&sregs)
-                    .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(gs.base): {e}")))?;
-                Ok(0)
-            }
-            ARCH_GET_GS => {
-                let sregs =
-                    self.vcpu.fd().get_sregs().map_err(|e| {
-                        TrapError::Hypervisor(format!("KVM_GET_SREGS(get_gs): {e}"))
-                    })?;
-                let _ = self.write_bytes(addr, &sregs.gs.base.to_le_bytes());
-                Ok(0)
-            }
-            _ => Ok(NEG_EINVAL),
-        }
-    }
-
     /// Resolve guest VA to a host pointer through the GuestRam window table.
     ///
     /// Returns `(host_ptr, bytes_available_in_window)` or `None` if the VA
@@ -175,6 +84,54 @@ impl KvmX86TrapEngine {
         // On the x86 path GPA == VA (identity mapping), so pass va directly.
         let host = self.ram.host_ptr(va, len)?;
         Some((host, len))
+    }
+}
+
+// ─── arch_prctl FS/GS base (the carrick-hal shared policy calls these) ───────
+
+impl carrick_hal::x8664_arch::SegmentBaseRegs for KvmX86TrapEngine {
+    fn seg_set_fs_base(&mut self, addr: u64) -> Result<(), TrapError> {
+        let mut sregs = self
+            .vcpu
+            .fd()
+            .get_sregs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(set_fs): {e}")))?;
+        sregs.fs.base = addr;
+        self.vcpu
+            .fd()
+            .set_sregs(&sregs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(fs.base): {e}")))
+    }
+
+    fn seg_get_fs_base(&self) -> Result<u64, TrapError> {
+        let sregs = self
+            .vcpu
+            .fd()
+            .get_sregs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(get_fs): {e}")))?;
+        Ok(sregs.fs.base)
+    }
+
+    fn seg_set_gs_base(&mut self, addr: u64) -> Result<(), TrapError> {
+        let mut sregs = self
+            .vcpu
+            .fd()
+            .get_sregs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(set_gs): {e}")))?;
+        sregs.gs.base = addr;
+        self.vcpu
+            .fd()
+            .set_sregs(&sregs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(gs.base): {e}")))
+    }
+
+    fn seg_get_gs_base(&self) -> Result<u64, TrapError> {
+        let sregs = self
+            .vcpu
+            .fd()
+            .get_sregs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(get_gs): {e}")))?;
+        Ok(sregs.gs.base)
     }
 }
 
@@ -264,15 +221,16 @@ impl SyscallTrap for KvmX86TrapEngine {
 
                     // arch_prctl(SET/GET FS/GS) is x86-ISA-specific and needs
                     // KVM_GET/SET_SREGS — an engine-only op the ISA-neutral
-                    // SyscallDispatcher cannot perform. Service it HERE and re-enter
+                    // SyscallDispatcher cannot perform (and raw x86 158 would
+                    // misroute to canonical getgroups=158). Service it HERE via the
+                    // SHARED carrick-hal policy (identical for bhyve) and re-enter
                     // the guest, so the dispatcher never sees it. (musl's first
                     // syscall is arch_prctl(ARCH_SET_FS, tls); without this the FS
                     // base stays 0, the first TLS access faults, and KVM_RUN returns
-                    // KVM_EXIT_INTERNAL_ERROR. The standalone run_elf_x86 loop
-                    // intercepted it in the loop; centralizing it here serves BOTH
-                    // the dispatcher path and the standalone loop.)
-                    if x86_number == X86_ARCH_PRCTL {
-                        let ret = self.service_arch_prctl(args[0], args[1])?;
+                    // KVM_EXIT_INTERNAL_ERROR.)
+                    if x86_number == carrick_hal::x8664_arch::ARCH_PRCTL_X86_NR {
+                        let ret =
+                            carrick_hal::x8664_arch::service_arch_prctl(self, args[0], args[1])?;
                         self.complete_syscall(ret)?;
                         continue;
                     }

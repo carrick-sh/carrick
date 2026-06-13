@@ -93,6 +93,76 @@ impl SyscallTable for X8664SyscallTable {
     }
 }
 
+// ─── arch_prctl(2): shared x86_64 FS/GS-base policy ──────────────────────────
+//
+// `arch_prctl` is the sole `SyscallRemap::Native` x86_64 syscall: it sets/reads
+// the FS/GS segment base (the long-mode TLS pointer). Setting those bases is a
+// per-vCPU register op the ISA-neutral `SyscallDispatcher` cannot perform, so an
+// x86_64 trap engine MUST service it before the syscall reaches the dispatcher —
+// where the raw x86 number 158 would otherwise collide with canonical
+// `getgroups`=158 and TLS would stay unset (faulting on first access). The POLICY
+// (which subfunction does what) is identical across backends; only the register
+// MECHANISM differs (KVM `KVM_SET_SREGS` vs bhyve `vm_set_desc`), captured by
+// [`SegmentBaseRegs`]. Both `KvmX86TrapEngine` and `BhyveTrapEngine` call
+// [`service_arch_prctl`] from their `next_syscall`. Source: arch_prctl(2) man7.org.
+
+/// The raw x86_64 `arch_prctl` syscall number (man7.org syscalls(2)).
+pub const ARCH_PRCTL_X86_NR: u64 = 158;
+
+/// Per-backend FS/GS segment-base register access — the only ISA-mechanism part
+/// of `arch_prctl`. KVM implements it via `KVM_GET/SET_SREGS`; bhyve via
+/// `vm_get/set_desc`. (Distinct method names avoid clashing with any inherent
+/// `set_fs_base`/etc. the engines also expose.)
+pub trait SegmentBaseRegs {
+    fn seg_set_fs_base(&mut self, addr: u64) -> Result<(), TrapError>;
+    fn seg_get_fs_base(&self) -> Result<u64, TrapError>;
+    fn seg_set_gs_base(&mut self, addr: u64) -> Result<(), TrapError>;
+    fn seg_get_gs_base(&self) -> Result<u64, TrapError>;
+}
+
+/// Service `arch_prctl(code, addr)` — the shared policy both x86_64 backends run
+/// before surfacing a syscall to the dispatcher. Returns the Linux return value
+/// (`0` on success, `-EINVAL` for an unknown subfunction). The GET subfunctions
+/// write the base to the user pointer; a bad pointer is swallowed (ret 0) — the
+/// same behavior the per-backend standalone loops had (a `-EFAULT` fidelity gap
+/// tracked separately, not introduced here). Source: arch_prctl(2) man7.org.
+pub fn service_arch_prctl<E>(engine: &mut E, code: u64, addr: u64) -> Result<i64, TrapError>
+where
+    E: SegmentBaseRegs + carrick_guest_mem::GuestMemory,
+{
+    /// `ARCH_SET_GS` (arch_prctl(2)).
+    const ARCH_SET_GS: u64 = 0x1001;
+    /// `ARCH_SET_FS` — the musl/glibc TLS pointer.
+    const ARCH_SET_FS: u64 = 0x1002;
+    /// `ARCH_GET_FS`.
+    const ARCH_GET_FS: u64 = 0x1003;
+    /// `ARCH_GET_GS`.
+    const ARCH_GET_GS: u64 = 0x1004;
+    /// `-EINVAL` (asm-generic errno 22) for an unknown subfunction.
+    const NEG_EINVAL: i64 = -22;
+    Ok(match code {
+        ARCH_SET_FS => {
+            engine.seg_set_fs_base(addr)?;
+            0
+        }
+        ARCH_GET_FS => {
+            let v = engine.seg_get_fs_base()?;
+            let _ = engine.write_bytes(addr, &v.to_le_bytes());
+            0
+        }
+        ARCH_SET_GS => {
+            engine.seg_set_gs_base(addr)?;
+            0
+        }
+        ARCH_GET_GS => {
+            let v = engine.seg_get_gs_base()?;
+            let _ = engine.write_bytes(addr, &v.to_le_bytes());
+            0
+        }
+        _ => NEG_EINVAL,
+    })
+}
+
 // ─── X8664BootSysregs ─────────────────────────────────────────────────────────
 
 /// Number of GDT entries in carrick's minimal long-mode descriptor table.
