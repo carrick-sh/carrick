@@ -9,9 +9,11 @@ mod support;
 use std::collections::VecDeque;
 use std::process::Command;
 
-use carrick_runtime::dispatch::{
-    Aarch64SyscallFrame, GuestMemory, LinearMemory, SyscallDispatcher,
-};
+// `Aarch64SyscallFrame` comes from the leaf crate directly: the dispatch
+// re-export is gone (the dispatcher is ISA-neutral; this harness scripts
+// aarch64 frames and decodes them the way a backend's `GuestArch` would).
+use carrick_guest_mem::Aarch64SyscallFrame;
+use carrick_runtime::dispatch::{GuestMemory, LinearMemory, SyscallDispatcher};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::{LayerSource, RootFs};
 use carrick_runtime::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};

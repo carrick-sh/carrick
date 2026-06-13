@@ -122,3 +122,98 @@ pub trait GuestArch: Copy + 'static {
         fpsimd_enabled: bool,
     ) -> Result<SigframeRestore, TrapError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Compile-shape smoke for the seam — the minimal "second ISA impl" the
+    // trait must admit. Dummy types prove no aarch64 type leaks through the
+    // trait signatures and that an engine can monomorphize over a non-aarch64
+    // Arch. The method bodies are unreachable stand-ins; only the shape counts.
+    #[derive(Clone, Copy)]
+    struct FakeArch;
+    #[derive(Clone, Copy)]
+    struct FakeFrame;
+    struct FakeMmu;
+    struct FakeTable;
+    #[derive(Clone, Copy)]
+    struct FakeBootRegs;
+
+    impl PageTableCodec for FakeMmu {
+        type Manager = ();
+        type Error = ();
+
+        fn page_shift() -> u32 {
+            12
+        }
+        fn granule() -> PtGranule {
+            PtGranule {
+                page_shift: 12,
+                levels: 4,
+                index_bits: 9,
+            }
+        }
+        fn new_manager(_bytes: Vec<u8>, _base: u64) -> Self::Manager {}
+        fn walk_descriptors(_bytes: &[u8], _base: u64, _va: u64) -> [u64; 4] {
+            [0; 4]
+        }
+    }
+
+    impl SyscallTable for FakeTable {
+        fn name(_number: u64) -> Option<&'static str> {
+            None
+        }
+        fn is_known(_number: u64) -> bool {
+            false
+        }
+    }
+
+    impl GuestArch for FakeArch {
+        type Frame = FakeFrame;
+        type Mmu = FakeMmu;
+        type Table = FakeTable;
+        type BootSysregs = FakeBootRegs;
+
+        fn decode_syscall(_frame: &Self::Frame) -> (u64, [u64; 6]) {
+            (0, [0; 6])
+        }
+        fn elf_machine() -> u16 {
+            0
+        }
+        fn uname_machine() -> &'static str {
+            "fake"
+        }
+        fn vdso_bytes() -> Vec<u8> {
+            Vec::new()
+        }
+        fn entry_trampoline_bytes() -> Vec<u8> {
+            Vec::new()
+        }
+        fn bootstrap_sysregs() -> Self::BootSysregs {
+            FakeBootRegs
+        }
+        fn build_sigframe<E: RegAccess + GuestMemory>(
+            _engine: &mut E,
+            _params: InjectParams,
+        ) -> Result<SigframeInject, TrapError> {
+            Err(TrapError::Hypervisor("FakeArch is shape-only".to_string()))
+        }
+        fn restore_sigframe<E: RegAccess + GuestMemory>(
+            _engine: &mut E,
+            _fpsimd_enabled: bool,
+        ) -> Result<SigframeRestore, TrapError> {
+            Err(TrapError::Hypervisor("FakeArch is shape-only".to_string()))
+        }
+    }
+
+    fn assert_is_guest_arch<A: GuestArch>() {}
+
+    #[test]
+    fn a_second_isa_impl_compiles_against_the_seam() {
+        assert_is_guest_arch::<FakeArch>();
+        assert_eq!(FakeArch::uname_machine(), "fake");
+        assert_eq!(FakeArch::elf_machine(), 0);
+        assert!(!FakeTable::is_known(64));
+    }
+}
