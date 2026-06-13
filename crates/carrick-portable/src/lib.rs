@@ -271,6 +271,158 @@ pub unsafe fn fremovexattr(fd: i32, name: *const libc::c_char) -> libc::c_int {
     }
 }
 
+// ---- path-based extended attributes ----
+// Linux exposes path-based `{l,}{get,set}xattr`; macOS folds no-follow into a
+// `XATTR_NOFOLLOW` option on `{get,set}xattr`; FreeBSD uses `extattr_*_file`
+// (follow) / `extattr_*_link` (no-follow). These wrappers expose the common
+// Linux-shaped signature so call sites stay cfg-free.
+
+/// Linux xattr flags, portable. FreeBSD `extattr` has no create/replace flags;
+/// the FreeBSD shims accept and ignore them (matching the fd-based shims).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub const XATTR_CREATE: libc::c_int = libc::XATTR_CREATE;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub const XATTR_REPLACE: libc::c_int = libc::XATTR_REPLACE;
+#[cfg(target_os = "linux")]
+pub const XATTR_CREATE: libc::c_int = libc::XATTR_CREATE;
+#[cfg(target_os = "linux")]
+pub const XATTR_REPLACE: libc::c_int = libc::XATTR_REPLACE;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+pub const XATTR_CREATE: libc::c_int = 1;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+pub const XATTR_REPLACE: libc::c_int = 2;
+
+/// Path-based `getxattr` (follow symlinks), portable `(path, name, value, size)`.
+///
+/// # Safety
+/// `path`/`name` are valid C strings; `value` is writable for `size` bytes.
+#[inline]
+pub unsafe fn getxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *mut libc::c_void,
+    size: usize,
+) -> isize {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::getxattr(path, name, value, size, 0, 0) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::getxattr(path, name, value, size) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        unsafe { libc::extattr_get_file(path, ns, attr.as_ptr(), value, size) }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (path, name, value, size);
+        -libc::ENOSYS as isize
+    }
+}
+
+/// Path-based `lgetxattr` (no-follow), portable `(path, name, value, size)`.
+///
+/// # Safety
+/// As [`getxattr`].
+#[inline]
+pub unsafe fn lgetxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *mut libc::c_void,
+    size: usize,
+) -> isize {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::getxattr(path, name, value, size, 0, libc::XATTR_NOFOLLOW) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::lgetxattr(path, name, value, size) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        unsafe { libc::extattr_get_link(path, ns, attr.as_ptr(), value, size) }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (path, name, value, size);
+        -libc::ENOSYS as isize
+    }
+}
+
+/// Path-based `setxattr` (follow symlinks), portable `(path, name, value, size, flags)`.
+///
+/// # Safety
+/// `path`/`name` are valid C strings; `value` is readable for `size` bytes.
+#[inline]
+pub unsafe fn setxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *const libc::c_void,
+    size: usize,
+    flags: libc::c_int,
+) -> libc::c_int {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::setxattr(path, name, value, size, 0, flags) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::setxattr(path, name, value, size, flags) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        // extattr_set_file has no flags parameter; xattr flags are ignored on FreeBSD.
+        let _ = flags;
+        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let rc = unsafe { libc::extattr_set_file(path, ns, attr.as_ptr(), value, size) };
+        if rc >= 0 { 0 } else { -1 }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (path, name, value, size, flags);
+        -libc::ENOSYS
+    }
+}
+
+/// Path-based `lsetxattr` (no-follow), portable `(path, name, value, size, flags)`.
+///
+/// # Safety
+/// As [`setxattr`].
+#[inline]
+pub unsafe fn lsetxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *const libc::c_void,
+    size: usize,
+    flags: libc::c_int,
+) -> libc::c_int {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::setxattr(path, name, value, size, 0, flags | libc::XATTR_NOFOLLOW) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::lsetxattr(path, name, value, size, flags) }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let _ = flags;
+        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let rc = unsafe { libc::extattr_set_link(path, ns, attr.as_ptr(), value, size) };
+        if rc >= 0 { 0 } else { -1 }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = (path, name, value, size, flags);
+        -libc::ENOSYS
+    }
+}
+
 /// Zero-copy regular-file → socket transfer. Returns bytes sent, or `-errno`.
 /// Darwin: `sendfile(file, sock, off, *len_in_out, hdtr, flags)`. Linux:
 /// `sendfile(out_sock, in_file, *off, count)` — note the swapped fd order.
@@ -608,5 +760,46 @@ mod freebsd_xattr_tests {
         );
         let rm = unsafe { super::fremovexattr(fd, name.as_ptr()) };
         assert!(rm >= 0, "fremovexattr failed: {rm}");
+    }
+
+    #[test]
+    fn path_namespace_xattr_round_trip() {
+        let path = "/tmp/carrick_path_xattr_test.bin";
+        std::fs::write(path, b"hi").unwrap();
+        let cpath = CString::new(path).unwrap();
+        let name = CString::new("user.carrick.ptest").unwrap();
+        let val = 0x1122_3344u32.to_le_bytes();
+        let rc = unsafe {
+            super::setxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                val.as_ptr().cast(),
+                val.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "setxattr failed: errno {}", super::errno());
+        let mut out = [0u8; 4];
+        let n = unsafe {
+            super::getxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+            )
+        };
+        assert_eq!(n, 4, "getxattr len");
+        assert_eq!(out, val);
+        // no-follow variant on a regular (non-symlink) file behaves identically.
+        let ln = unsafe {
+            super::lsetxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                val.as_ptr().cast(),
+                val.len(),
+                0,
+            )
+        };
+        assert_eq!(ln, 0, "lsetxattr failed: errno {}", super::errno());
     }
 }
