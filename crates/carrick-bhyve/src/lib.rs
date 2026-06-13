@@ -46,6 +46,9 @@ pub mod guest_setup_x86;
 pub mod trap_engine;
 
 #[cfg(target_arch = "x86_64")]
+pub mod run_elf;
+
+#[cfg(target_arch = "x86_64")]
 pub use trap_engine::BhyveTrapEngine;
 pub use vmm::{BhyveVcpu, BhyveVm};
 #[cfg(target_arch = "x86_64")]

@@ -1135,6 +1135,240 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
     Ok(BroughtUpX86 { vm, vcpu, ram })
 }
 
+// ─── T10: bring_up_x86_elf ───────────────────────────────────────────────────
+
+/// M2-grade cap on large runtime windows: max bytes we allocate in bhyve's
+/// 64 MiB lowmem for the heap / mmap / sigreturn / shared / overlay regions.
+/// A static musl hello only touches a handful of pages; these caps leave room
+/// for all other windows while fitting within `X86_MEM_SIZE`.
+pub const M2_HEAP_CAP: usize = 4 * 1024 * 1024; // 4 MiB
+pub const M2_MMAP_CAP: usize = 16 * 1024 * 1024; // 16 MiB
+/// Miscellaneous small regions (sigreturn trampoline, shared/private apertures):
+/// each capped to one page.  These are not reachable in M2's run-to-exit path.
+pub const M2_MISC_CAP: usize = 4096; // 1 page
+
+/// Bring up a carrick x86_64/bhyve vCPU from a fully loaded [`AddressSpace`].
+///
+/// Mirrors [`bring_up_x86_m1`] but maps ALL regions from `image.regions()` as
+/// bhyve windows instead of a hard-coded user blob, then sets the vCPU's ring-3
+/// entry `RIP = entry_rip` and `RSP = initial_rsp`.
+///
+/// # Memory model (M2)
+///
+/// Each `MemoryRegion` → one `BhyveGuestRam` bump window with a compact GPA.
+/// Large "synthetic" runtime windows (heap 128 MiB, mmap arena 32 GiB, shared
+/// aperture, private overlay) are CAPPED to `M2_*_CAP` so they fit within
+/// bhyve's 64 MiB lowmem. The run-to-exit service loop (brk/mmap handlers)
+/// uses these same caps as the upper bounds for their bump allocators.
+///
+/// # VA→GPA
+///
+/// High guest VAs (heap at 256 GiB, mmap at 384 GiB, stack at ~1 TiB) are
+/// mapped to compact low GPAs via the PML4 (Experiment 2: identity placement
+/// FAILED at high GPAs — `vm_map_gpa` returns NULL).
+///
+/// # ring-3 entry
+///
+/// The vCPU starts at the ring-0 MSR init blob (`X86_INIT_BLOB_GPA`) exactly
+/// as in M1.  The iretq frame in the blob uses `entry_rip` (the ELF entry
+/// point) and `initial_rsp` (the initial-stack pointer written by
+/// `with_linux_initial_stack`).
+pub fn bring_up_x86_elf(
+    image: &carrick_mem::memory::AddressSpace,
+    entry_rip: u64,
+    initial_rsp: u64,
+) -> Result<BroughtUpX86, OsError> {
+    use carrick_mem::memory::{
+        LINUX_HEAP_BASE, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_PRIVATE_OVERLAY_BASE,
+        LINUX_SHARED_FILE_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE, LINUX_STACK_TOP,
+    };
+
+    let regs = X8664GuestArch::bootstrap_sysregs();
+
+    // ── Step 1: plan GPA windows ──────────────────────────────────────────────
+
+    let mut ram = BhyveGuestRam::new();
+
+    // Fixed-GPA kernel windows: init blob, GDT, LSTAR, PML4 tables.
+    // (Mirrors bring_up_x86_m1 exactly.)
+    ram.add_fixed(
+        X86_INIT_BLOB_GPA,
+        X86_INIT_BLOB_GPA,
+        4096,
+        false,
+        false,
+        true,
+    );
+    ram.add_fixed(X86_GDT_GPA, X86_GDT_GPA, 4096, false, false, false);
+    ram.add_fixed(
+        LINUX_EL0_TRAMPOLINE_BASE,
+        X86_LSTAR_GPA,
+        4096,
+        false,
+        false,
+        true,
+    );
+    ram.add_fixed(
+        LINUX_PAGE_TABLES_BASE,
+        X86_PML4_GPA,
+        X86_PML4_CAPACITY,
+        false,
+        true,
+        false,
+    );
+
+    // Map each region from the AddressSpace.  Apply M2-grade caps on the
+    // large runtime windows so they fit in 64 MiB lowmem.
+    for region in image.regions() {
+        let va = region.start;
+        let full_len = (region.end - region.start) as usize;
+
+        // Skip zero-length regions (shouldn't appear, but be defensive).
+        if full_len == 0 {
+            continue;
+        }
+
+        // Skip the PML4 tables and LSTAR windows: already added above as fixed.
+        if va == LINUX_PAGE_TABLES_BASE || va == LINUX_EL0_TRAMPOLINE_BASE {
+            continue;
+        }
+
+        // Apply M2 caps on the known large synthetic windows.
+        let capped_len = if va == LINUX_HEAP_BASE {
+            // Heap: cap to M2_HEAP_CAP (full = LINUX_HEAP_SIZE = 128 MiB).
+            full_len.min(M2_HEAP_CAP)
+        } else if va == LINUX_MMAP_BASE {
+            // mmap arena: cap to M2_MMAP_CAP (full ≥ 32 GiB).
+            full_len.min(M2_MMAP_CAP)
+        } else if va == LINUX_SIGRETURN_TRAMPOLINE_BASE
+            || va == LINUX_SHARED_FILE_BASE
+            || va == LINUX_PRIVATE_OVERLAY_BASE
+        {
+            // Sigreturn trampoline / shared aperture / private overlay: one page.
+            // Not exercised in M2's run-to-exit path; presence lets brk/mmap
+            // detect out-of-bounds without a fault.
+            full_len.min(M2_MISC_CAP)
+        } else {
+            // ELF segments, initial stack: map in full (these are small).
+            full_len
+        };
+
+        // Page-align upward (bhyve windows must be 4 KiB granular).
+        let page_len = (capped_len + 0xFFF) & !0xFFF;
+
+        // All regions from image.regions() that reach the dispatch loop must
+        // be accessible from ring-3 (CPL=3 after the iretq to user space).
+        // The aarch64 "kernel hole" convention (LINUX_KERNEL_REGION_BASE) does
+        // not apply here: the fixed-GPA kernel windows (init blob, GDT, LSTAR,
+        // PML4 tables) are skipped above and added with user=false; every
+        // remaining region — ELF segments, initial stack, heap, mmap arena,
+        // sigreturn trampoline, shared/private apertures — must be U/S-mapped.
+        let user = true;
+        let write = region.perms.write;
+        let exec = region.perms.execute;
+
+        let gpa = ram.add_bump(va, page_len, user, write, exec)?;
+
+        // Write the region's initialised prefix into guest RAM.
+        // Beyond `region.bytes().len()` the bump window is already zeroed
+        // (bhyve's vm_setup_memory zeroes the sysmem segment).
+        let _ = gpa; // used below after vm_setup_memory
+    }
+
+    // ── Step 2: vm_setup_memory + mmap_memseg ────────────────────────────────
+
+    let total = ram.total_size().max(X86_MEM_SIZE);
+    let ram_size = total.min(X86_MEM_SIZE); // never exceed the 64 MiB cap
+
+    let mut vm = BhyveVm::create()?;
+    vm.setup_memory(ram_size)?;
+    vm.mmap_memseg(0, VM_SEGID_SYSMEM, ram_size, PROT_RWX)?;
+
+    // ── Step 3: write artifacts ───────────────────────────────────────────────
+
+    // Ring-0 MSR init blob: WRMSRs LSTAR/STAR/SFMASK, then iretqs to entry_rip
+    // at ring-3 with initial_rsp as the stack pointer.
+    let blob = msr_init_blob(
+        regs.lstar,
+        regs.star,
+        regs.sfmask,
+        entry_rip,   // ring-3 RIP: ELF entry point
+        initial_rsp, // ring-3 RSP: initial stack from with_linux_initial_stack
+        regs.rflags,
+    );
+    write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
+
+    write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
+    write_gpa(&vm, X86_LSTAR_GPA, &entry_trampoline_bytes())?;
+
+    // Write each region's bytes into its bump window.
+    for region in image.regions() {
+        let va = region.start;
+        let bytes = region.bytes();
+        if bytes.is_empty() {
+            continue;
+        }
+        // Skip kernel-fixed windows (already written above).
+        if va == LINUX_PAGE_TABLES_BASE || va == LINUX_EL0_TRAMPOLINE_BASE {
+            continue;
+        }
+        // Find the window for this VA to get its GPA.
+        if let Some(w) = ram.windows.iter().find(|w| w.va == va) {
+            let write_len = bytes.len().min(w.len);
+            if write_len > 0 {
+                write_gpa(&vm, w.gpa, &bytes[..write_len])?;
+            }
+        }
+    }
+
+    // PML4 tables: map all the windows.
+    let specs = pml4_map_specs(&ram);
+    let tables = pml4_tables(&specs, X86_PML4_GPA, X86_PML4_CAPACITY)
+        .map_err(|e| OsError::new(format!("bhyve: ELF PML4 build failed: {e:?}")))?;
+    write_gpa(&vm, X86_PML4_GPA, &tables)?;
+
+    // ── Step 4: program vCPU registers (identical to bring_up_x86_m1) ────────
+
+    let mut vcpu = vm.add_vcpu()?;
+
+    vcpu.set_reg_raw(VM_REG_GUEST_CR0, regs.cr0)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR3, X86_PML4_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR4, regs.cr4)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_EFER, regs.efer)?;
+
+    vcpu.set_reg_raw(VM_REG_GUEST_RIP, X86_INIT_BLOB_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, LINUX_STACK_TOP)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, regs.rflags)?;
+
+    // Initial segments: kernel (DPL 0) — the init blob runs at CPL 0 to WRMSR.
+    // The iretq loads user CS/SS from the GDT.
+    vcpu.set_desc(VM_REG_GUEST_CS, 0, 0xFFFF_FFFF, ACCESS_RING0_CS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CS, KERN_CS64_SEL)?;
+    vcpu.set_desc(VM_REG_GUEST_SS, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_SS, KERN_SS_SEL)?;
+
+    for reg in [
+        VM_REG_GUEST_DS,
+        VM_REG_GUEST_ES,
+        VM_REG_GUEST_FS,
+        VM_REG_GUEST_GS,
+    ] {
+        vcpu.set_desc(reg, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+        vcpu.set_reg_raw(reg, KERN_SS_SEL)?;
+    }
+
+    vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+
+    vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
+
+    Ok(BroughtUpX86 { vm, vcpu, ram })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
