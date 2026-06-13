@@ -1,16 +1,29 @@
-//! `BhyveVm` / `BhyveVcpu`: the `carrick-hal` raw-hypervisor layer (`HvVm`/
-//! `HvVcpu`) on FreeBSD/bhyve, aarch64, via the userspace **libvmmapi**
-//! (`/usr/lib/libvmmapi.so`). The KVM analog is `carrick-linux::kvm`.
+//! `BhyveVm` / `BhyveVcpu`: the raw-hypervisor layer on FreeBSD/bhyve via the
+//! userspace **libvmmapi** (`/usr/lib/libvmmapi.so`). The KVM analog is
+//! `carrick-linux::kvm`.
 //!
-//! SCAFFOLD (see `docs/superpowers/adr/2026-06-06-bhyve-backend-design.md`):
-//! compile-verified on an amd64 FreeBSD host; the aarch64 register-enum values,
-//! the `struct vm_exit` union layout, and the guest bring-up are confirmed on an
-//! aarch64 FreeBSD host (bhyve runs same-arch guests only). Interfaces below are
-//! transcribed from FreeBSD 15.1 `/usr/include/vmmapi.h`, `machine/vmm_dev.h`,
-//! and `sys/arm64/include/vmm.h` (releng/15.1).
-use std::ffi::{CString, c_char, c_int, c_void};
+//! Arch split: the opaque handles, VM/vCPU lifecycle, guest-RAM calls
+//! (`vm_setup_memory`/`vm_mmap_memseg`/`vm_map_gpa`), and the extern block are
+//! arch-neutral and live here unconditionally. The aarch64 story (aarch64
+//! `enum vm_reg_name`/`enum vm_exitcode` ordinals, the aarch64 `struct vm_exit`
+//! guess, and the `HvVm`/`HvVcpu` impls whose `Reg`/`SysReg` enums are
+//! aarch64-named) is gated `#[cfg(target_arch = "aarch64")]`. The amd64 model
+//! (x86 `vm_exit`/`vm_inout`, amd64 register/exitcode constants, inherent
+//! raw-register access) lives in `vmm_x86.rs` — on x86_64 the carrick-hal
+//! `HvVm`/`HvVcpu` traits are deliberately NOT implemented (Phase 2 decision;
+//! the x86 backend uses the inherent surface instead).
+//!
+//! SCAFFOLD (see `docs/superpowers/adr/2026-06-06-bhyve-backend-design.md` and
+//! `docs/superpowers/specs/2026-06-13-x86_64-bhyve-phase2-design.md`):
+//! aarch64 interfaces are transcribed from FreeBSD 15.1 `/usr/include/vmmapi.h`,
+//! `machine/vmm_dev.h`, and `sys/arm64/include/vmm.h` (releng/15.1) and remain
+//! compile-verified only (bhyve runs same-arch guests; the box is amd64).
+use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 
-use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
+use carrick_hal::OsError;
+#[cfg(target_arch = "aarch64")]
+use carrick_hal::{HvVcpu, HvVm, MemPerms, Reg, SysReg, VcpuExit};
+#[cfg(target_arch = "aarch64")]
 use carrick_mem::memory::AddressSpace;
 
 // Opaque libvmmapi handles.
@@ -31,29 +44,46 @@ const VMMAPI_OPEN_CREATE: c_int = 0x01;
 // aarch64 `enum vm_reg_name` (sys/arm64/include/vmm.h, releng/15.1).
 // X0..X29 = 0..29; LR(X30)=30; SP=31; PC=32; CPSR=33; then the MMU sysregs.
 // CONFIRM these ordinals on the aarch64 target.
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_X0: c_int = 0; // X0..X30 = 0..30 (LR is X30)
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_SP: c_int = 31;
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_PC: c_int = 32;
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_CPSR: c_int = 33;
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_SCTLR_EL1: c_int = 34;
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_TTBR0_EL1: c_int = 35;
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_TTBR1_EL1: c_int = 36;
+#[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_TCR_EL1: c_int = 37;
 
 // aarch64 `enum vm_exitcode` (order from sys/arm64/include/vmm.h).
+#[cfg(target_arch = "aarch64")]
 const VM_EXITCODE_BOGUS: c_int = 0;
+#[cfg(target_arch = "aarch64")]
 const VM_EXITCODE_INST_EMUL: c_int = 1;
+#[cfg(target_arch = "aarch64")]
 const VM_EXITCODE_HVC: c_int = 3;
+#[cfg(target_arch = "aarch64")]
 const VM_EXITCODE_SUSPENDED: c_int = 4;
+#[cfg(target_arch = "aarch64")]
 const VM_EXITCODE_WFI: c_int = 6;
+#[cfg(target_arch = "aarch64")]
 const VM_EXITCODE_PAGING: c_int = 7;
+#[cfg(target_arch = "aarch64")]
 const VM_EXITCODE_SMCCC: c_int = 8;
 
-/// `struct vm_exit` (machine/vmm.h): common prefix `{ enum vm_exitcode; int
-/// inst_length; uint64_t pc; }` then an arch union. The union's first member is
-/// the faulting `gpa` for PAGING/INST_EMUL (the MMIO-sentinel decode), so we
-/// model the union as a `u64` word array and read `u[0]`. CONFIRM the union
-/// layout on the aarch64 target.
+/// aarch64 `struct vm_exit` (sys/arm64/include/vmm.h): common prefix `{ enum
+/// vm_exitcode; int inst_length; uint64_t pc; }` then an arch union. The
+/// union's first member is the faulting `gpa` for PAGING/INST_EMUL (the
+/// MMIO-sentinel decode), so we model the union as a `u64` word array and read
+/// `u[0]`. CONFIRM the union layout on the aarch64 target. (The amd64
+/// `struct vm_exit` is modeled separately in `vmm_x86.rs`.)
+#[cfg(target_arch = "aarch64")]
 #[repr(C)]
 struct VmExit {
     exitcode: c_int,
@@ -62,14 +92,16 @@ struct VmExit {
     u: [u64; 8],
 }
 
-/// `struct vm_run` (machine/vmm_dev.h): the caller provides `vm_exit` storage;
-/// `vm_run()` fills it.
+/// `struct vm_run` (machine/vmm_dev.h:84-89): the caller provides per-arch
+/// `struct vm_exit` storage; `vm_run()` fills it. The exit pointer is typed
+/// `*mut c_void` here because the pointee is the per-arch `vm_exit` model
+/// (aarch64's above; amd64's in `vmm_x86.rs`).
 #[repr(C)]
-struct VmRun {
-    cpuid: c_int,
-    cpuset: *mut c_void,
-    cpusetsize: usize,
-    vm_exit: *mut VmExit,
+pub(crate) struct VmRun {
+    pub(crate) cpuid: c_int,
+    pub(crate) cpuset: *mut c_void,
+    pub(crate) cpusetsize: usize,
+    pub(crate) vm_exit: *mut c_void,
 }
 
 #[link(name = "vmmapi")]
@@ -90,12 +122,61 @@ unsafe extern "C" {
     fn vm_vcpu_open(ctx: *mut Vmctx, vcpuid: c_int) -> *mut Vcpu;
     fn vm_activate_cpu(vcpu: *mut Vcpu) -> c_int;
     fn vcpu_reset(vcpu: *mut Vcpu) -> c_int;
-    fn vm_set_register(vcpu: *mut Vcpu, reg: c_int, val: u64) -> c_int;
-    fn vm_get_register(vcpu: *mut Vcpu, reg: c_int, retval: *mut u64) -> c_int;
-    fn vm_run(vcpu: *mut Vcpu, vmrun: *mut VmRun) -> c_int;
+    pub(crate) fn vm_set_register(vcpu: *mut Vcpu, reg: c_int, val: u64) -> c_int;
+    pub(crate) fn vm_get_register(vcpu: *mut Vcpu, reg: c_int, retval: *mut u64) -> c_int;
+    pub(crate) fn vm_run(vcpu: *mut Vcpu, vmrun: *mut VmRun) -> c_int;
+    // --- Phase 2 additions, transcribed from the box's /usr/include/vmmapi.h
+    // (FreeBSD 15.1-RC3 amd64). NOTE: the plan sketch cited vm_get_register_set
+    // at vmmapi.h:156 — on the box :156 is vm_set_register_set; the GET variant
+    // is :158. Same signature either way; the header wins.
+    /// vmmapi.h:158-159: `int vm_get_register_set(struct vcpu *vcpu,
+    /// unsigned int count, const int *regnums, uint64_t *regvals);`
+    pub(crate) fn vm_get_register_set(
+        vcpu: *mut Vcpu,
+        count: c_uint,
+        regnums: *const c_int,
+        regvals: *mut u64,
+    ) -> c_int;
+    /// vmmapi.h:148-149 (inside `#ifdef __amd64__`, vmmapi.h:147 — amd64-only
+    /// in the header, hence the cfg): `int vm_set_desc(struct vcpu *vcpu,
+    /// int reg, uint64_t base, uint32_t limit, uint32_t access);`
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn vm_set_desc(
+        vcpu: *mut Vcpu,
+        reg: c_int,
+        base: u64,
+        limit: u32,
+        access: u32,
+    ) -> c_int;
+    /// vmmapi.h:150-151 (same `#ifdef __amd64__` block): `int vm_get_desc(
+    /// struct vcpu *vcpu, int reg, uint64_t *base, uint32_t *limit,
+    /// uint32_t *access);`
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn vm_get_desc(
+        vcpu: *mut Vcpu,
+        reg: c_int,
+        base: *mut u64,
+        limit: *mut u32,
+        access: *mut u32,
+    ) -> c_int;
+    /// vmmapi.h:201-202: `int vm_set_capability(struct vcpu *vcpu,
+    /// enum vm_cap_type cap, int val);` (C enum == int here).
+    pub(crate) fn vm_set_capability(vcpu: *mut Vcpu, cap: c_int, val: c_int) -> c_int;
+    /// vmmapi.h:268: `int vm_restart_instruction(struct vcpu *vcpu);`
+    pub(crate) fn vm_restart_instruction(vcpu: *mut Vcpu) -> c_int;
+    /// vmmapi.h:279-281 ("FreeBSD specific APIs"; unconditional in the header):
+    /// `int vm_setup_freebsd_registers(struct vcpu *vcpu, uint64_t rip,
+    /// uint64_t cr3, uint64_t gdtbase, uint64_t rsp);`
+    pub(crate) fn vm_setup_freebsd_registers(
+        vcpu: *mut Vcpu,
+        rip: u64,
+        cr3: u64,
+        gdtbase: u64,
+        rsp: u64,
+    ) -> c_int;
 }
 
-fn os_err(context: &str, rc: c_int) -> OsError {
+pub(crate) fn os_err(context: &str, rc: c_int) -> OsError {
     OsError::new(format!("bhyve: {context} failed (rc={rc})"))
 }
 
@@ -104,6 +185,7 @@ fn os_err(context: &str, rc: c_int) -> OsError {
 /// are programmed by the guest-side EL1 init stub, not the host (see the crate
 /// docs). `Reg::Sp` is SP_EL0; bhyve exposes the active `SP`, which at EL1 is
 /// SP_EL1 — the init stub sets SP_EL0 for EL0 before the `eret`.
+#[cfg(target_arch = "aarch64")]
 fn reg_id(r: Reg) -> Result<c_int, OsError> {
     Ok(match r {
         Reg::X(n) => VM_REG_GUEST_X0 + n as c_int, // X0..X30
@@ -123,6 +205,7 @@ fn reg_id(r: Reg) -> Result<c_int, OsError> {
 /// regs (SCTLR/TTBR0/TTBR1/TCR) but NOT `MAIR_EL1`/`VBAR_EL1`/`CPACR_EL1`/
 /// `TPIDR_EL0`; those are set by the guest-side EL1 init stub (memory attrs /
 /// vector base / FP) or handled elsewhere.
+#[cfg(target_arch = "aarch64")]
 fn sysreg_id(r: SysReg) -> Result<c_int, OsError> {
     Ok(match r {
         SysReg::Sctlr => VM_REG_GUEST_SCTLR_EL1,
@@ -144,29 +227,15 @@ pub struct BhyveVm {
 }
 
 pub struct BhyveVcpu {
-    vcpu: *mut Vcpu,
+    pub(crate) vcpu: *mut Vcpu,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl HvVm for BhyveVm {
     type Vcpu = BhyveVcpu;
 
     fn create(_mem: &AddressSpace) -> Result<Self, OsError> {
-        // A unique VM name; the device node is /dev/vmm/<name>. (A pid-based
-        // name keeps concurrent runs distinct; refine when the run entry lands.)
-        let name = CString::new(format!("carrick-{}", std::process::id()))
-            .map_err(|_| OsError::new("bhyve: VM name has a NUL".to_string()))?;
-        // SAFETY: `name` is a valid NUL-terminated C string for the call's life.
-        let ctx = unsafe {
-            let rc = vm_create(name.as_ptr());
-            if rc != 0 && rc != libc::EEXIST {
-                return Err(os_err("vm_create", rc));
-            }
-            vm_openf(name.as_ptr(), VMMAPI_OPEN_CREATE)
-        };
-        if ctx.is_null() {
-            return Err(OsError::new("bhyve: vm_openf returned NULL".to_string()));
-        }
-        Ok(Self { ctx, next_vcpu: 0 })
+        BhyveVm::create()
     }
 
     /// bhyve owns the guest RAM (allocated by `vm_setup_memory` / mapped at GPAs
@@ -190,6 +259,37 @@ impl HvVm for BhyveVm {
     }
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, OsError> {
+        BhyveVm::add_vcpu(self)
+    }
+
+    fn destroy(self) -> Result<(), OsError> {
+        BhyveVm::destroy(self)
+    }
+}
+
+impl BhyveVm {
+    /// Create + open the VM device. A unique VM name; the device node is
+    /// /dev/vmm/<name>. (A pid-based name keeps concurrent runs distinct;
+    /// refine when the run entry lands.)
+    pub fn create() -> Result<Self, OsError> {
+        let name = CString::new(format!("carrick-{}", std::process::id()))
+            .map_err(|_| OsError::new("bhyve: VM name has a NUL".to_string()))?;
+        // SAFETY: `name` is a valid NUL-terminated C string for the call's life.
+        let ctx = unsafe {
+            let rc = vm_create(name.as_ptr());
+            if rc != 0 && rc != libc::EEXIST {
+                return Err(os_err("vm_create", rc));
+            }
+            vm_openf(name.as_ptr(), VMMAPI_OPEN_CREATE)
+        };
+        if ctx.is_null() {
+            return Err(OsError::new("bhyve: vm_openf returned NULL".to_string()));
+        }
+        Ok(Self { ctx, next_vcpu: 0 })
+    }
+
+    /// Open + activate the next vCPU.
+    pub fn add_vcpu(&mut self) -> Result<BhyveVcpu, OsError> {
         let id = self.next_vcpu;
         // SAFETY: `self.ctx` is a live vmctx for the VM's lifetime.
         let vcpu = unsafe { vm_vcpu_open(self.ctx, id) };
@@ -206,14 +306,13 @@ impl HvVm for BhyveVm {
         Ok(BhyveVcpu { vcpu })
     }
 
-    fn destroy(self) -> Result<(), OsError> {
+    /// Tear down the VM (and /dev/vmm/<name>).
+    pub fn destroy(self) -> Result<(), OsError> {
         // SAFETY: `self.ctx` is a live vmctx; destroying it tears down /dev/vmm/<name>.
         unsafe { vm_destroy(self.ctx) };
         Ok(())
     }
-}
 
-impl BhyveVm {
     /// Host pointer into guest-physical `[gpa, gpa+len)` (bhyve owns the
     /// backing). Used by the bhyve GuestMemory to read/write syscall buffers —
     /// the analog of carrick-linux's host mmap. `None` if the GPA is unmapped.
@@ -250,6 +349,7 @@ impl BhyveVm {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 impl HvVcpu for BhyveVcpu {
     fn run(&mut self) -> Result<VcpuExit, OsError> {
         let mut exit = VmExit {
@@ -262,7 +362,7 @@ impl HvVcpu for BhyveVcpu {
             cpuid: 0,
             cpuset: std::ptr::null_mut(),
             cpusetsize: 0,
-            vm_exit: &mut exit,
+            vm_exit: std::ptr::from_mut(&mut exit).cast::<c_void>(),
         };
         // SAFETY: `self.vcpu` is live; `run`/`exit` outlive the call.
         let rc = unsafe { vm_run(self.vcpu, &mut run) };
