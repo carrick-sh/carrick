@@ -108,6 +108,10 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(13, "rt_sigaction", 134),
     // x86_64=14 (syscalls(2)/filippo) → canonical rt_sigprocmask=135 (AARCH64_SYSCALLS[135])
     direct(14, "rt_sigprocmask", 135),
+    // x86_64=15 (syscalls(2)/filippo) → canonical rt_sigreturn=139 (AARCH64_SYSCALLS[139]).
+    // The signal handler's restorer invokes it to return from a handler; the
+    // dispatcher routes 139 → DispatchOutcome::SigReturn → engine.restore_from_sigframe.
+    direct(15, "rt_sigreturn", 139),
     // x86_64=16 (syscalls(2)/filippo) → canonical ioctl=29 (AARCH64_SYSCALLS[29])
     direct(16, "ioctl", 29),
     // x86_64=20 (syscalls(2)/filippo) → canonical writev=66 (AARCH64_SYSCALLS[66])
@@ -210,6 +214,13 @@ mod tests {
         let e = lookup_x86_64(9).expect("mmap must be in the table");
         assert_eq!(e.name, "mmap");
         assert_eq!(e.remap, SyscallRemap::Direct(222));
+    }
+
+    #[test]
+    fn rt_sigreturn_remaps_to_canonical_139() {
+        let e = lookup_x86_64(15).expect("rt_sigreturn must be in the table");
+        assert_eq!(e.name, "rt_sigreturn");
+        assert_eq!(e.remap, SyscallRemap::Direct(139));
     }
 
     #[test]
