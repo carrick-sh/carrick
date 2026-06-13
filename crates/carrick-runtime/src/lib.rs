@@ -420,7 +420,7 @@ pub mod runtime {
     /// kick-signal handler (idempotently). The blocking-I/O / proc-exit / sleep /
     /// signal-wait arms use the `ppoll`/`waitid`-backed Linux `ThreadWaiter`
     /// (`crate::io_wait`).
-    #[cfg(feature = "platform-linux")]
+    #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
     pub fn run_threaded_kvm_loop(
         engine: carrick_linux::KvmTrapEngine,
         dispatcher: SyscallDispatcher,
@@ -695,7 +695,7 @@ pub mod runtime {
     /// it through the REAL dispatcher — the `cfg(platform-linux)` sibling of the
     /// macOS `HvfTrapEngine` run path. `KvmTrapEngine` satisfies the loop's
     /// `GuestMemory + SyscallTrap` bound directly.
-    #[cfg(feature = "platform-linux")]
+    #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
     pub fn run_elf_real_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         // Build the full guest image WITH a Linux initial stack: argc/argv/envp
         // and the auxv (AT_RANDOM/AT_PLATFORM/AT_EXECFN) a real binary's CRT
@@ -744,6 +744,33 @@ pub mod runtime {
             );
         }
         run_threaded_kvm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+    }
+
+    /// x86_64 KVM run through the FULL `SyscallDispatcher` (audit #1, M1).
+    ///
+    /// KVM runs same-arch guests, so the HOST arch selects the engine: on an
+    /// x86_64 host this is `KvmX86TrapEngine`. That engine already satisfies
+    /// `GuestMemory + SyscallTrap` — the only bounds `run_combined_syscall_loop_linux`
+    /// requires — so this needs NO new trait impls. It drives the single-threaded
+    /// combined loop through the real ~209-handler dispatcher (vs the standalone
+    /// ~15-syscall `run_elf_kvm_x86` loop). fork/clone/futex/signal outcomes
+    /// surface `Unsupported` here; full multithreading is M3 (`ThreadedEngine`).
+    /// No vDSO on x86 yet (musl falls back to real `SYSCALL`; mirrors
+    /// `run_elf_kvm_x86`'s `with_vdso_auxv(false)`).
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    pub fn run_elf_real_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
+        use carrick_hal::GuestArch as _;
+        let argv0 = path.to_string_lossy().into_owned();
+        // Mirror run_elf_kvm_x86's image build EXACTLY (empty env) — a non-empty
+        // env is a separate variable to introduce only once the bare path is proven.
+        let image = crate::memory::AddressSpace::load_elf_for(
+            path,
+            carrick_hal::X8664GuestArch::elf_machine(),
+        )?
+        .with_linux_initial_stack([argv0.as_bytes()], std::iter::empty::<&[u8]>())?
+        .with_vdso_auxv(false);
+        let mut engine = carrick_linux::KvmX86TrapEngine::new(&image)?;
+        run_combined_syscall_loop_linux(&mut engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
     }
 
     /// Build the dispatcher for the bare KVM ELF runner with a real, writable
@@ -881,7 +908,7 @@ pub mod runtime {
     /// NOTE: the entrypoint must be a FULL-PATH ELF (`/bin/echo`). PATH-resolution
     /// of a bare command and `#!`-shebang resolution live in the macOS-gated
     /// `resolve_entrypoint_program`; sharing them is a follow-up.
-    #[cfg(feature = "platform-linux")]
+    #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
     pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
         use crate::fs_backend::HostFsBackend;
         use std::path::PathBuf;
@@ -1016,6 +1043,17 @@ pub mod runtime {
         // 4. Run on KVM through the same generic threaded loop as run-elf.
         let engine = carrick_linux::KvmTrapEngine::new(&image)?;
         run_threaded_kvm_loop(engine, dispatcher, spec.max_traps)
+    }
+
+    /// OCI container run on x86_64 is not yet wired: audit #1 M1 covers bare-ELF
+    /// `run-elf` through the dispatcher; the OCI rootfs/entrypoint path on x86
+    /// follows. Exists so the `carrick-kvm` bin compiles on an x86_64 host.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    pub fn run_oci(_spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "OCI run on x86_64 is not yet wired (M1 = bare-ELF run-elf through the dispatcher)"
+                .to_string(),
+        ))
     }
 }
 

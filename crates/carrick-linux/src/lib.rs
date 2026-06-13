@@ -55,3 +55,5 @@ pub mod guest_setup_x86;
 pub mod run_elf_x86;
 #[cfg(target_arch = "x86_64")]
 pub mod trap_engine_x86;
+#[cfg(target_arch = "x86_64")]
+pub use trap_engine_x86::KvmX86TrapEngine;
