@@ -36,8 +36,13 @@ pub struct Vcpu {
     _opaque: [u8; 0],
 }
 
-// enum vm_mmap_style
-const VM_MMAP_SPARSE: c_int = 2;
+// enum vm_mmap_style (vmmapi.h:55-59 on the box: NONE=0, ALL=1, SPARSE=2).
+// 15.1's vm_setup_memory_domains supports ONLY VM_MMAP_ALL — it asserts
+// `vms == VM_MMAP_ALL` (lib/libvmmapi/vmmapi.c:497, releng/15.1) — so that is
+// what carrick passes. (The scaffold's earlier VM_MMAP_SPARSE pick predated
+// reading the implementation; even with NDEBUG asserts off, the style
+// argument is otherwise unused and the function behaves as ALL.)
+const VM_MMAP_ALL: c_int = 1;
 // vm_openf flags
 const VMMAPI_OPEN_CREATE: c_int = 0x01;
 
@@ -326,12 +331,16 @@ impl BhyveVm {
         }
     }
 
-    /// Allocate `len` bytes of sparse guest RAM (the carrick layout is mostly
-    /// holes). The bhyve guest_setup maps regions at their GPAs with
-    /// `vm_mmap_memseg`; exposed here for that path.
+    /// Allocate `len` bytes of guest RAM. In 15.1 `vm_setup_memory` does
+    /// three things itself (lib/libvmmapi/vmmapi.c:486-605, releng/15.1):
+    /// creates the `VM_SYSMEM` segment, maps it into the guest at GPA
+    /// `[0, len)` (for `len` ≤ 3 GiB; larger sizes split across the
+    /// 3 GiB/4 GiB lowmem/highmem boundary), and host-mmaps the region so
+    /// `vm_map_gpa` can resolve pointers into it. `VM_MMAP_ALL` is the only
+    /// style the implementation accepts (it asserts).
     pub fn setup_memory(&self, len: usize) -> Result<(), OsError> {
         // SAFETY: `self.ctx` is a live vmctx.
-        let rc = unsafe { vm_setup_memory(self.ctx, len, VM_MMAP_SPARSE) };
+        let rc = unsafe { vm_setup_memory(self.ctx, len, VM_MMAP_ALL) };
         if rc != 0 {
             return Err(os_err("vm_setup_memory", rc));
         }

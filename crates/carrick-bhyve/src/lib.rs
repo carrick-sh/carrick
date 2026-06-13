@@ -39,6 +39,9 @@ pub mod vmm;
 #[cfg(target_arch = "x86_64")]
 pub mod vmm_x86;
 
+#[cfg(target_arch = "x86_64")]
+pub mod guest_setup_x86;
+
 pub use vmm::{BhyveVcpu, BhyveVm};
 #[cfg(target_arch = "x86_64")]
 pub use vmm_x86::X86Exit;
