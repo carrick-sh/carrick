@@ -1073,7 +1073,11 @@ where
             let _ = engine.write_bytes(child_tid_addr, &tid_bytes);
         }
 
-        let spec = engine.build_sibling_spec(stack, tls)?;
+        let spec = engine.build_sibling_spec(carrick_hal::GuestEntryRegs {
+            return_value: 0,
+            stack: Some(stack),
+            tls: Some(tls),
+        })?;
         let child_kernel = Arc::clone(kernel);
         let child_registry = Arc::clone(&self.registry);
         let child_futex = Arc::clone(&self.futex);

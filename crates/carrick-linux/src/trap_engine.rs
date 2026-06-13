@@ -1215,7 +1215,10 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
         // sibling never has to wait for a slot before KVM_CREATE_VCPU.
     }
 
-    fn build_sibling_spec(&self, stack: u64, tls: u64) -> Result<Self::SiblingSpec, TrapError> {
+    fn build_sibling_spec(
+        &self,
+        entry: carrick_hal::GuestEntryRegs,
+    ) -> Result<Self::SiblingSpec, TrapError> {
         // Snapshot the parent vCPU (taken while it is suspended at the trapped
         // `clone` syscall — atomic, race-free), then seed it for the new thread
         // (x0=0, sp_el0=stack, tpidr_el0=tls, pc=parent.elr_el1 = post-svc).
@@ -1223,7 +1226,7 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
             .vcpu
             .snapshot()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        let snapshot = seed_sibling_snapshot(&parent, stack, tls);
+        let snapshot = seed_sibling_snapshot(&parent, entry);
         // Share the SAME VM (Arc<VmFd>) + the parent's window descriptors so the
         // sibling vCPU runs in the SAME address space on the SAME VM.
         Ok(KvmSiblingSpec {

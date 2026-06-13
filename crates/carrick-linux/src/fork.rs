@@ -76,11 +76,18 @@ pub struct VcpuSnapshot {
 ///
 /// FP/SIMD (`vregs`/`fpsr`/`fpcr`) is carried verbatim (`.fpsr` stays FPSR,
 /// `.fpcr` stays FPCR — do NOT swap); it is zero-stubbed until Phase 4.
-pub fn seed_sibling_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> VcpuSnapshot {
+pub fn seed_sibling_snapshot(
+    parent: &VcpuSnapshot,
+    entry: carrick_hal::GuestEntryRegs,
+) -> VcpuSnapshot {
     let mut snap = parent.clone();
-    snap.gprs[0] = 0;
-    snap.sp_el0 = stack;
-    snap.tpidr_el0 = tls;
+    snap.gprs[0] = entry.return_value;
+    if let Some(stack) = entry.stack {
+        snap.sp_el0 = stack;
+    }
+    if let Some(tls) = entry.tls {
+        snap.tpidr_el0 = tls;
+    }
     snap.pc = parent.elr_el1;
     // EL0-resume PSTATE: the SPSR latched on the parent's `svc` trap IS the EL0t
     // PSTATE the new thread must run with. Without this the sibling restores the
