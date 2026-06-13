@@ -527,9 +527,9 @@ fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
                 // One link-layer record per entry (carries the index + hw addr).
                 // The sockaddr shape differs: Darwin AF_LINK -> sockaddr_dl,
                 // Linux AF_PACKET -> sockaddr_ll.
-                #[cfg(target_os = "macos")]
+                #[cfg(carrick_bsd)]
                 let (hw, idx) = {
-                    // SAFETY: AF_LINK sockaddr is a sockaddr_dl.
+                    // SAFETY: AF_LINK sockaddr is a sockaddr_dl (Darwin + the BSDs).
                     let dl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
                     let nlen = dl.sdl_nlen as usize;
                     let alen = dl.sdl_alen as usize;
@@ -547,9 +547,9 @@ fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
                     };
                     (hw, idx)
                 };
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(carrick_linux)]
                 let (hw, idx) = {
-                    // SAFETY: AF_PACKET sockaddr is a sockaddr_ll.
+                    // SAFETY: AF_PACKET sockaddr is a sockaddr_ll (Linux).
                     let ll = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_ll) };
                     let alen = (ll.sll_halen as usize).min(ll.sll_addr.len());
                     let hw = ll.sll_addr[..alen].to_vec();
