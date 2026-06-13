@@ -1477,7 +1477,7 @@ pub mod io_wait {
         /// `Interrupted` rather than wedging the parent. `pid > 0` watches that
         /// specific child; `pid <= 0` watches ANY child (`P_ALL`), matching the
         /// guest `wait4(-1, …)` / `wait4(0, …)` "any child" forms.
-        pub fn wait_proc_exit(&self, pid: i32, _block_mask: u64) -> WaitResult {
+        pub fn wait_proc_exit(&self, pid: i32, block_mask: u64) -> WaitResult {
             loop {
                 if child_status_ready(pid) {
                     return WaitResult::Ready;
@@ -1510,8 +1510,20 @@ pub mod io_wait {
                 // spin — each idle slice sleeps in `ppoll`.
                 // TimedOut (slice elapsed) or a spurious Ready: re-poll the
                 // child at the loop top; only an Interrupted bails out.
+                //
+                // CRITICAL: pass `block_mask` (the caller's non-interrupting mask
+                // — blocked signals + default-ignored unblocked SIGCHLD/SIGURG/
+                // SIGWINCH) so a carrick-internal vCPU kick (SIGRTMIN, e.g. the
+                // signal pump's `kick_all` after a fork) or a default-ignored
+                // SIGCHLD does NOT spuriously surface as `Interrupted` → EINTR.
+                // A handler-less guest `wait4` is not interruptible by those on
+                // real Linux; without the mask, a parent whose `wait4` parks
+                // before the child exits gets a bogus EINTR (x86 fork race — the
+                // child exited during the park; aarch64 reaps before parking so
+                // it never bit). `ppoll_wait` retries on a masked interrupt and
+                // re-polls the child, so the wait restarts transparently.
                 if let WaitResult::Interrupted =
-                    ppoll_wait(self.tid, &[], Some(Duration::from_millis(50)), 0)
+                    ppoll_wait(self.tid, &[], Some(Duration::from_millis(50)), block_mask)
                 {
                     return WaitResult::Interrupted;
                 }
