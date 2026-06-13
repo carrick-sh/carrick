@@ -195,7 +195,7 @@ pub use carrick_thread::{fork_quiesce, thread};
 // ports, so we return every registered thread with state 'R' (running).
 #[cfg(feature = "platform-macos")]
 pub use carrick_hvf::thread::current_thread_states;
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
     thread::current_thread_ports()
         .into_iter()
@@ -208,7 +208,7 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
 // HAL). Re-export a `trap` shim so `crate::trap::{SyscallTrap, …}` resolves on
 // both platforms. The concrete engine (HvfTrapEngine / KvmTrapEngine) is
 // selected by the run-loop, which is itself platform-gated.
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod trap {
     pub use carrick_hal::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
     pub const HVF_PAGE_SIZE: u64 = 0x4000;
@@ -273,8 +273,9 @@ pub mod vfs;
 #[cfg(feature = "platform-macos")]
 pub use execute::Runtime;
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod execute {
+    // Shared on the non-macOS lane (used by /proc + uname on every backend).
     pub fn guest_hostname() -> &'static str {
         "carrick"
     }
@@ -287,8 +288,12 @@ pub mod execute {
     /// the CLI call site is byte-identical across platforms — only symbol
     /// resolution flips per feature. Mirrors how `runtime::run_oci` already mirrors
     /// the macOS `Runtime::execute` shape.
+    // Linux-lane run entry (drives the KVM OCI path via run_oci); the BSD/bhyve
+    // run entry is wired in #1. guest_hostname above stays shared.
+    #[cfg(feature = "platform-linux")]
     pub struct Runtime;
 
+    #[cfg(feature = "platform-linux")]
     impl Runtime {
         pub fn execute(
             spec: &carrick_spec::RunSpec,
@@ -298,10 +303,10 @@ pub mod execute {
     }
 }
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(feature = "platform-linux")]
 pub use execute::Runtime;
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod runtime {
     //! Linux (KVM) run path. The full macOS run loop lives in `runtime.rs`
     //! (`cfg(platform-macos)`); on Linux we drive `carrick_linux::KvmTrapEngine`
@@ -1025,12 +1030,12 @@ pub(crate) const fn syscall_shim_enabled() -> bool {
 #[cfg(feature = "platform-macos")]
 pub use carrick_bsd::bsd_to_linux_errno as host_to_linux_errno;
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub fn host_to_linux_errno(host: i32) -> i32 {
     host
 }
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod host_signal {
     // The platform-NEUTRAL pending bookkeeping (the THREAD_PENDING/PROC_PENDING
     // store, SENDER_PID, and their pure operations) lives in
@@ -1133,7 +1138,9 @@ pub mod host_signal {
         // guards + stale self-pipe so the child's later `start_signal_pump`
         // re-arms a working pump (spawn-free — the spawn is the caller's
         // subsequent `start_signal_pump`). ----
+        #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_signal_pump::reset_state_for_supervisor_fork();
+        // BSD lane: bhyve signal-pump glue is wired in #1.
     }
     pub fn linux_to_host_signum(sig: i32) -> i32 {
         sig
@@ -1161,7 +1168,10 @@ pub mod host_signal {
     /// those signals after the emulated disposition was replaced. Delegates to the
     /// carrick-linux glue (parallels HVF's reset).
     pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
+        #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
+        #[cfg(not(feature = "platform-linux"))]
+        let _ = ignored_mask; // BSD lane: bhyve disposition glue wired in #1.
     }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
     /// neutral ring core (the nudge handler in `carrick_linux::kvm_xsig` set the
@@ -1202,19 +1212,28 @@ pub mod host_signal {
     /// or KVM-claimed (pump/kick/nudge/SIGCHLD) signals. Delegates to the
     /// carrick-linux glue, whose policy is the shared neutral host_disposition.
     pub fn ensure_host_handler(sig: i32) {
+        #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::ensure_host_handler(sig);
+        #[cfg(not(feature = "platform-linux"))]
+        let _ = sig; // BSD lane: bhyve disposition glue wired in #1.
     }
     /// Mirror a guest `SIG_IGN` onto the HOST disposition so a sibling guest
     /// process's host `kill` is DROPPED (honoring the guest's ignore) instead of
     /// host-default-terminating us. No-op for non-routable / KVM-claimed signals.
     pub fn set_host_ignore(sig: i32) {
+        #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::set_host_ignore(sig);
+        #[cfg(not(feature = "platform-linux"))]
+        let _ = sig; // BSD lane: bhyve disposition glue wired in #1.
     }
     /// Reset a mirrored signal's HOST disposition to `SIG_DFL` (the guest reset it
     /// to default): clear any host SIG_IGN / routed handler mirrored earlier and
     /// possibly INHERITED across fork, so the host no longer swallows the signal.
     pub fn set_host_default(linux_signum: i32) {
+        #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::set_host_default(linux_signum);
+        #[cfg(not(feature = "platform-linux"))]
+        let _ = linux_signum; // BSD lane: bhyve disposition glue wired in #1.
     }
     /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
     /// ring (inherited across `fork`, so every carrick process shares ONE ring).
@@ -1232,7 +1251,10 @@ pub mod host_signal {
     /// — host `SIGRTMIN+1`, a pure wakeup whose handler marks the ring dirty +
     /// kicks the target's vCPUs out of `KVM_RUN` (see `carrick_linux::kvm_xsig`).
     pub fn xsig_nudge(target_host: i32) {
+        #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_xsig::xsig_nudge(target_host);
+        #[cfg(not(feature = "platform-linux"))]
+        let _ = target_host; // BSD lane: bhyve xsignal-nudge glue wired in #1.
     }
     /// No kqueue signal pump on Linux. Returning -1 makes the `setitimer`
     /// dispatch path (the only caller) skip the EVFILT_TIMER arming and use the
@@ -1287,7 +1309,7 @@ pub mod host_signal {
     pub fn wake_all_waiters() {}
 }
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod io_wait {
     use std::os::fd::RawFd;
     use std::time::{Duration, Instant};
@@ -1460,7 +1482,17 @@ pub mod io_wait {
     /// artifact, never guest-visible state. Mirrored by an equality test in
     /// `carrick-linux` (`kvm_disposition`'s claimed-signal tests).
     pub fn is_internal_kick_signal(signum: i32) -> bool {
-        signum == libc::SIGRTMIN() || signum == libc::SIGRTMIN() + 1
+        #[cfg(feature = "platform-linux")]
+        {
+            signum == libc::SIGRTMIN() || signum == libc::SIGRTMIN() + 1
+        }
+        // BSD lane: bhyve's kick-signal reservation is wired in #1; nothing is
+        // reserved yet, so no host signum is carrick-internal.
+        #[cfg(not(feature = "platform-linux"))]
+        {
+            let _ = signum;
+            false
+        }
     }
 
     /// Peek (`WNOWAIT`) whether child `pid` sits in a ptrace signal-delivery
@@ -1611,7 +1643,7 @@ pub mod io_wait {
             if n == 0 {
                 return WaitResult::TimedOut;
             }
-            let err = unsafe { *libc::__errno_location() };
+            let err = carrick_portable::errno();
             if err == libc::EINTR {
                 // A host signal interrupted the wait. If it carried a now-pending
                 // PROCESS-directed guest signal (the async host-signal pump's
@@ -1700,7 +1732,7 @@ pub mod io_wait {
 // to the deadline and then PUBLISHES the timer signal into the per-thread pending
 // table and KICKS the target vCPU so the generic loop runs delivery. The target
 // is registered once when the run loop starts (`register`).
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod timer_delivery {
     use crate::thread::ThreadId;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -1796,7 +1828,7 @@ pub mod timer_delivery {
     }
 }
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod itimer {
     //! KVM/Linux interval-timer glue. The neutral per-`which` slot state, the
     //! CPU-due math, the ident/signum mapping, and the fallback-thread timing
@@ -1836,7 +1868,7 @@ pub mod itimer {
     }
 }
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod posix_timer {
     //! KVM/Linux POSIX per-process timer glue. The neutral spec/registry
     //! bookkeeping + remaining math now live in [`carrick_timer_core::posix`];
@@ -1885,7 +1917,7 @@ pub mod posix_timer {
     }
 }
 
-#[cfg(not(feature = "platform-macos"))]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod probes {
     macro_rules! stub {
         ($name:ident($($param:ident: $ty:ty),* $(,)?)) => {
