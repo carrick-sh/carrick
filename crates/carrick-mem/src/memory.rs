@@ -87,7 +87,7 @@ use std::path::Path;
 // Imported from the leaf crate (not `crate::dispatch`) — this is the edge that
 // previously closed the `memory ↔ dispatch` cycle (docs/archive/build-decomposition-design.md §3.A-A2).
 use crate::elf::{
-    ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load, plan_elf_load_bytes,
+    ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load_bytes, plan_elf_load_for,
 };
 use crate::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_CLKTCK, LINUX_AT_EGID, LINUX_AT_ENTRY, LINUX_AT_EUID, LINUX_AT_EXECFN,
@@ -663,8 +663,20 @@ pub enum AddressSpaceError {
 
 impl AddressSpace {
     pub fn load_elf(path: impl AsRef<Path>) -> Result<Self, AddressSpaceError> {
+        // EM_AARCH64 = 183 — the default aarch64 path; byte-identical to the
+        // previous unconditional implementation.
+        use goblin::elf::header::EM_AARCH64;
+        Self::load_elf_for(path, EM_AARCH64)
+    }
+
+    /// Load a guest ELF image from `path`, accepting only the given `machine`
+    /// type (`EM_AARCH64 = 183`, `EM_X86_64 = 62` per elf(5)/psABI §4.1).
+    /// The bhyve x86_64 backend calls this with `X8664GuestArch::elf_machine()`
+    /// (= 62). All existing callers continue to use [`load_elf`] which
+    /// delegates here with `EM_AARCH64` — the aarch64 path is byte-identical.
+    pub fn load_elf_for(path: impl AsRef<Path>, machine: u16) -> Result<Self, AddressSpaceError> {
         let path = path.as_ref();
-        let plan = plan_elf_load(path)?;
+        let plan = plan_elf_load_for(path, machine)?;
         let file = fs::read(path)?;
         Self::load_elf_segments_with_interpreter(&file, plan, &|p| fs::read(p).ok())
     }

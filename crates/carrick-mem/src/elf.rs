@@ -140,13 +140,32 @@ pub fn inspect_elf_bytes(bytes: &[u8]) -> Result<ElfMetadata, ElfInspectError> {
 }
 
 pub fn plan_elf_load(path: impl AsRef<Path>) -> Result<LoadPlan, ElfInspectError> {
+    plan_elf_load_for(path, EM_AARCH64)
+}
+
+/// Load-plan a binary at `path`, accepting only the given `machine` type
+/// (e.g. `EM_AARCH64 = 183`, `EM_X86_64 = 62` per elf(5)/psABI).
+/// The default aarch64 callers use [`plan_elf_load`] which delegates here
+/// with `EM_AARCH64`, preserving byte-identical behaviour.
+pub fn plan_elf_load_for(
+    path: impl AsRef<Path>,
+    machine: u16,
+) -> Result<LoadPlan, ElfInspectError> {
     let bytes = fs::read(path)?;
-    plan_elf_load_bytes(&bytes)
+    plan_elf_load_bytes_for(&bytes, machine)
 }
 
 pub fn plan_elf_load_bytes(bytes: &[u8]) -> Result<LoadPlan, ElfInspectError> {
+    plan_elf_load_bytes_for(bytes, EM_AARCH64)
+}
+
+/// Load-plan from an in-memory ELF image, accepting only the given `machine`
+/// type. `EM_X86_64 = 62` (elf(5)/psABI §4.1 e_machine); `EM_AARCH64 = 183`.
+/// The default aarch64 callers use [`plan_elf_load_bytes`] which delegates
+/// here with `EM_AARCH64`, preserving byte-identical behaviour.
+pub fn plan_elf_load_bytes_for(bytes: &[u8], machine: u16) -> Result<LoadPlan, ElfInspectError> {
     let elf = parse_elf_bytes(bytes)?;
-    if elf.header.e_machine != EM_AARCH64 {
+    if elf.header.e_machine != machine {
         return Err(ElfInspectError::UnsupportedMachine(elf.header.e_machine));
     }
     Ok(load_plan_from_elf(&elf))
@@ -347,5 +366,41 @@ mod tests {
         assert_eq!(rebased.load_bias, 0x7000_0000_0000);
         assert_eq!(rebased.entry, 0x7000_0000_0000 + 0x120);
         assert_eq!(rebased.segments[0].virtual_address, 0x7000_0000_0000);
+    }
+
+    /// Construct a minimal synthetic ELF header with the given e_machine value.
+    /// Clones `synthetic_aarch64_elf` then overwrites bytes [18..20] with
+    /// `machine` in little-endian — the e_machine field per elf(5).
+    fn synthetic_elf_with_machine(machine: u16) -> Vec<u8> {
+        let mut bytes = synthetic_aarch64_elf(ET_EXEC_TYPE, 0x400000, 0x400000);
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes
+    }
+
+    /// `plan_elf_load_bytes_for` with EM_X86_64 (= 62, elf(5)/psABI §4.1)
+    /// accepts a synthetic x86_64 ELF header and returns a valid plan.
+    #[test]
+    fn plan_elf_load_bytes_for_accepts_x86_64() {
+        // EM_X86_64 = 62 per elf(5) and the x86-64 psABI §4.1 e_machine field.
+        let bytes = synthetic_elf_with_machine(EM_X86_64);
+        let plan = plan_elf_load_bytes_for(&bytes, EM_X86_64).unwrap();
+        assert_eq!(plan.e_type, ElfType::Exec);
+        assert_eq!(plan.load_bias, 0);
+        assert_eq!(plan.entry, 0x400000);
+        assert_eq!(plan.segments.len(), 1);
+    }
+
+    /// `plan_elf_load_bytes_for` with EM_AARCH64 rejects an x86_64 header —
+    /// proving the `machine` parameter gates correctly in both directions.
+    #[test]
+    fn plan_elf_load_bytes_for_rejects_machine_mismatch() {
+        // A header with e_machine = EM_X86_64 must be rejected when the caller
+        // requests EM_AARCH64.
+        let bytes = synthetic_elf_with_machine(EM_X86_64);
+        let err = plan_elf_load_bytes_for(&bytes, EM_AARCH64).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported ELF machine"),
+            "unexpected error: {err}",
+        );
     }
 }
