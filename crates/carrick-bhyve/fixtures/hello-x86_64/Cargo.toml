@@ -1,0 +1,21 @@
+[package]
+name = "carrick-hello-x86_64"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone fixture crate — NOT a workspace member (the root Cargo.toml
+# excludes crates/*/fixtures/*). Cross-compiled to x86_64-unknown-linux-musl
+# by build.sh as the M2 static-ELF guest. A real std binary (unlike the
+# aarch64 no_std-asm hello) so it exercises genuine musl libc startup — the
+# point of M2.
+
+[[bin]]
+name = "carrick-hello-x86_64"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
