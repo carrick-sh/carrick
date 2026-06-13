@@ -13,8 +13,7 @@
 
 pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 pub use carrick_runtime::dispatch::{
-    Aarch64SyscallFrame, DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher,
-    SyscallRequest,
+    DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
 };
 pub use carrick_runtime::elf::SegmentPerms;
 pub use carrick_runtime::linux_abi::{

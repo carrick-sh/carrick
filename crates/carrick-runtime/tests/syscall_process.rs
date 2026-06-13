@@ -74,19 +74,17 @@ fn unknown_syscall_returns_enosys_and_records_report_entry() {
 }
 
 #[test]
-fn syscall_request_can_be_built_from_aarch64_register_frame() {
-    let frame = Aarch64SyscallFrame {
-        x0: 1,
-        x1: 0x4000,
-        x2: 17,
-        x3: 0,
-        x4: 0,
-        x5: 0,
-        x8: 64,
+fn syscall_request_can_be_built_from_a_raw_syscall() {
+    // The per-ISA register decode lives behind `GuestArch::decode_syscall`
+    // (covered by carrick-hal's aarch64 tests); the dispatcher consumes the
+    // ISA-neutral `RawSyscall`.
+    let raw = carrick_hal::RawSyscall {
+        number: 64,
+        args: [1, 0x4000, 17, 0, 0, 0],
     };
 
     assert_eq!(
-        SyscallRequest::from_aarch64_frame(frame),
+        SyscallRequest::from_raw(raw),
         SyscallRequest::new(64, SyscallArgs::from([1, 0x4000, 17, 0, 0, 0]))
     );
 }

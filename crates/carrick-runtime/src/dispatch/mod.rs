@@ -767,11 +767,13 @@ pub(crate) fn guest_visible_tid(
     }
 }
 
-// `Aarch64SyscallFrame`, `GuestMemory`, and `MemoryError` were lifted into the
-// leaf crate `carrick-guest-mem` to break the `memory ↔ dispatch` cycle (see
+// `GuestMemory` and `MemoryError` were lifted into the leaf crate
+// `carrick-guest-mem` to break the `memory ↔ dispatch` cycle (see
 // docs/archive/build-decomposition-design.md §3.A-A2). Re-exported here so every
 // `crate::dispatch::{…}` / `carrick_runtime::dispatch::{…}` site is unchanged.
-pub use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
+// (The `Aarch64SyscallFrame` re-export is gone: the dispatcher is ISA-neutral —
+// backends decode raw frames behind `GuestArch` and hand over `RawSyscall`.)
+pub use carrick_guest_mem::{GuestMemory, MemoryError};
 
 impl SyscallRequest {
     pub fn new(number: u64, args: SyscallArgs) -> Self {
@@ -780,13 +782,6 @@ impl SyscallRequest {
 
     pub fn arg(&self, index: usize) -> u64 {
         self.args.0[index]
-    }
-
-    pub fn from_aarch64_frame(frame: Aarch64SyscallFrame) -> Self {
-        Self {
-            number: frame.x8,
-            args: SyscallArgs::from([frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5]),
-        }
     }
 
     /// Build a request from the ISA-neutral [`carrick_hal::RawSyscall`] the
