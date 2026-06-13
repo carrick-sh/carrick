@@ -45,6 +45,21 @@ use crate::kvm::{KvmVcpu, KvmVm};
 /// `0xE6 0xC5` = `OUT imm8($0xC5), %al`.  Source: AMD64 ISA / OSDev "OUT".
 pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
 
+// ─── arch_prctl(2) ─────────────────────────────────────────────────────────────
+//
+// arch_prctl is x86-ISA-specific (no asm-generic/aarch64 equivalent) and its
+// FS/GS-base subfunctions need KVM_GET/SET_SREGS — an engine-only operation the
+// ISA-neutral SyscallDispatcher cannot perform. The engine therefore services it
+// inside `next_syscall` and never surfaces it to the dispatcher. Source:
+// arch_prctl(2) man7.org.
+const X86_ARCH_PRCTL: u64 = 158;
+const ARCH_SET_GS: u64 = 0x1001;
+const ARCH_SET_FS: u64 = 0x1002;
+const ARCH_GET_FS: u64 = 0x1003;
+const ARCH_GET_GS: u64 = 0x1004;
+/// `-EINVAL` for an unknown arch_prctl subfunction (asm-generic errno 22).
+const NEG_EINVAL: i64 = -22;
+
 // ─── KvmX86TrapEngine ────────────────────────────────────────────────────────
 
 /// The KVM x86_64 syscall trap engine.
@@ -111,6 +126,44 @@ impl KvmX86TrapEngine {
     /// boundary.
     pub(crate) fn vcpu_fd(&self) -> &kvm_ioctls::VcpuFd {
         self.vcpu.fd()
+    }
+
+    /// Service `arch_prctl(code, addr)` engine-side (FS/GS base via
+    /// KVM_GET/SET_SREGS). Returns the Linux return value (`0` on success,
+    /// `-EINVAL` for an unknown subfunction). Mirrors `run_elf_x86::sys_arch_prctl`
+    /// so both the standalone loop and the dispatcher path share one implementation.
+    /// Source: arch_prctl(2) man7.org.
+    fn service_arch_prctl(&mut self, code: u64, addr: u64) -> Result<i64, TrapError> {
+        match code {
+            ARCH_SET_FS => self.set_fs_base(addr),
+            ARCH_GET_FS => {
+                let val = self.get_fs_base()?;
+                // Write the current FS.base to the user pointer (8 bytes LE).
+                let _ = self.write_bytes(addr, &val.to_le_bytes());
+                Ok(0)
+            }
+            ARCH_SET_GS => {
+                let mut sregs =
+                    self.vcpu.fd().get_sregs().map_err(|e| {
+                        TrapError::Hypervisor(format!("KVM_GET_SREGS(set_gs): {e}"))
+                    })?;
+                sregs.gs.base = addr;
+                self.vcpu
+                    .fd()
+                    .set_sregs(&sregs)
+                    .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(gs.base): {e}")))?;
+                Ok(0)
+            }
+            ARCH_GET_GS => {
+                let sregs =
+                    self.vcpu.fd().get_sregs().map_err(|e| {
+                        TrapError::Hypervisor(format!("KVM_GET_SREGS(get_gs): {e}"))
+                    })?;
+                let _ = self.write_bytes(addr, &sregs.gs.base.to_le_bytes());
+                Ok(0)
+            }
+            _ => Ok(NEG_EINVAL),
+        }
     }
 
     /// Resolve guest VA to a host pointer through the GuestRam window table.
@@ -208,6 +261,21 @@ impl SyscallTrap for KvmX86TrapEngine {
                         SyscallRemap::Direct(c) => c,
                         SyscallRemap::Native | SyscallRemap::Unknown => x86_number,
                     };
+
+                    // arch_prctl(SET/GET FS/GS) is x86-ISA-specific and needs
+                    // KVM_GET/SET_SREGS — an engine-only op the ISA-neutral
+                    // SyscallDispatcher cannot perform. Service it HERE and re-enter
+                    // the guest, so the dispatcher never sees it. (musl's first
+                    // syscall is arch_prctl(ARCH_SET_FS, tls); without this the FS
+                    // base stays 0, the first TLS access faults, and KVM_RUN returns
+                    // KVM_EXIT_INTERNAL_ERROR. The standalone run_elf_x86 loop
+                    // intercepted it in the loop; centralizing it here serves BOTH
+                    // the dispatcher path and the standalone loop.)
+                    if x86_number == X86_ARCH_PRCTL {
+                        let ret = self.service_arch_prctl(args[0], args[1])?;
+                        self.complete_syscall(ret)?;
+                        continue;
+                    }
 
                     return Ok(Some(RawSyscall {
                         number: canonical,

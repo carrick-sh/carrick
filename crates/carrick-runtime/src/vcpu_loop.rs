@@ -150,8 +150,10 @@ mod macos_helper_stubs {
         // initial stack (argc/argv/envp/auxv). `build_for_image` adds the
         // trampoline / page-tables / sentinel vectors. Matches the boot chain in
         // `run_elf_real_dispatch`. Per-ISA vDSO bytes come from the engine's
-        // GuestArch (the x86_64 seam); this is the Linux/KVM path.
-        #[cfg(feature = "platform-linux")]
+        // GuestArch. Only the aarch64 KVM lane materializes a vDSO today; the
+        // x86_64 KVM lane and the BSD lane build the stack without one (x86 musl
+        // falls back to real `SYSCALL`; mirrors `run_elf_real_dispatch`'s x86 arm).
+        #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
         let image = {
             use carrick_hal::GuestArch as _;
             type KvmArch = <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
@@ -159,12 +161,7 @@ mod macos_helper_stubs {
                 .and_then(|a| a.with_linux_initial_stack(argv, env))
                 .map_err(|_| LINUX_ENOENT)?
         };
-        // BSD lane (FreeBSD/bhyve): the per-ISA vDSO + the real execve-image
-        // builder are wired in #1 (bhyve through the shared dispatcher). For now
-        // build the initial stack without a vDSO so this module compiles on the
-        // BSD lane; `not(platform-linux)` here means FreeBSD (the module is gated
-        // any(platform-linux, platform-freebsd)).
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(not(all(feature = "platform-linux", target_arch = "aarch64")))]
         let image = raw
             .with_linux_initial_stack(argv, env)
             .map_err(|_| LINUX_ENOENT)?;
