@@ -149,9 +149,12 @@ mod macos_helper_stubs {
         // KVM boot-image shape: vdso (so AT_SYSINFO_EHDR resolves) + the Linux
         // initial stack (argc/argv/envp/auxv). `build_for_image` adds the
         // trampoline / page-tables / sentinel vectors. Matches the boot chain in
-        // `run_elf_real_dispatch`.
+        // `run_elf_real_dispatch`. Per-ISA vDSO bytes come from the engine's
+        // GuestArch (the x86_64 seam); this is the Linux/KVM path.
+        use carrick_hal::GuestArch as _;
+        type KvmArch = <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
         let image = raw
-            .with_vdso()
+            .with_vdso_bytes(KvmArch::vdso_bytes())
             .and_then(|a| a.with_linux_initial_stack(argv, env))
             .map_err(|_| LINUX_ENOENT)?;
         // execve point of no return: reset CAUGHT handlers to SIG_DFL (the kernel

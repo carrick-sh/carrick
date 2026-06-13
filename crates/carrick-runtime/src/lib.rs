@@ -698,6 +698,12 @@ pub mod runtime {
         // unaffected; a libc binary needs it. argv[0] is the path; a minimal
         // env keeps the CRT happy.
         let argv0 = path.to_string_lossy().into_owned();
+        // Per-ISA vDSO bytes come from the engine's GuestArch (the x86_64
+        // seam); this is the Linux/KVM path. Free function, so name the engine
+        // explicitly (same idiom as `guest_setup::program_sysregs`).
+        use carrick_hal::GuestArch as _;
+        let vdso_bytes =
+            <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::vdso_bytes();
         // `AddressSpaceError` and `TrapError` are absorbed by the unified
         // RuntimeError via `#[from]`, so `?` carries each through directly.
         let image = crate::memory::AddressSpace::load_elf(path)?
@@ -708,7 +714,7 @@ pub mod runtime {
             // (which serialises the auxv). The vDSO clock fast path reads
             // `cntvct_el0` at EL0; bring_up enables it (CNTKCTL_EL1) + fills the
             // vvar so the read is correct.
-            .with_vdso()?
+            .with_vdso_bytes(vdso_bytes)?
             .with_linux_initial_stack(
                 [argv0.as_bytes()],
                 [
@@ -995,7 +1001,12 @@ pub mod runtime {
         // vdso-then-stack order. The vDSO clock fast path reads `cntvct_el0` at
         // EL0; `bring_up` enables that (CNTKCTL_EL1) and fills the vvar with the
         // freq + realtime offset so the read is correct (see `populate_vdso_vvar`).
-        let image = image.with_vdso()?;
+        // Per-ISA vDSO bytes come from the engine's GuestArch (the x86_64 seam);
+        // this is the Linux/KVM path.
+        use carrick_hal::GuestArch as _;
+        let image = image.with_vdso_bytes(
+            <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::vdso_bytes(),
+        )?;
 
         // 4. Run on KVM through the same generic threaded loop as run-elf.
         let engine = carrick_linux::KvmTrapEngine::new(&image)?;

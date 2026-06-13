@@ -8,7 +8,7 @@ use std::sync::Arc;
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_MAINT_BASE, LINUX_EL1_VECTORS_BASE,
-    LINUX_EL1_VECTORS_SIZE, LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE, el0_trampoline_bytes,
+    LINUX_EL1_VECTORS_SIZE, LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE,
     stage1_identity_page_tables, va_in_shared_aperture,
 };
 use carrick_mem::protections::MemoryProtections;
@@ -866,8 +866,14 @@ impl GuestRam {
                 ram.write_gpa(region.start, bytes)?;
             }
         }
-        // 2. Architectural bring-up pages (low window), reused from carrick-mem.
-        ram.write_gpa(LINUX_EL0_TRAMPOLINE_BASE, &el0_trampoline_bytes())?;
+        // 2. Architectural bring-up pages (low window). The per-ISA trampoline
+        //    bytes come from the engine's GuestArch (the x86_64 seam); free
+        //    function, so name the engine explicitly (as `program_sysregs`).
+        use carrick_hal::GuestArch as _;
+        ram.write_gpa(
+            LINUX_EL0_TRAMPOLINE_BASE,
+            &<crate::trap_engine::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::entry_trampoline_bytes(),
+        )?;
         ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
         // 3. Our sentinel vector (NOT carrick-mem's hvc #2 variant).
         ram.write_gpa(LINUX_EL1_VECTORS_BASE, &el1_vectors_sentinel_bytes())?;
