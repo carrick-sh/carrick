@@ -688,9 +688,12 @@ where
         if !self.trace {
             return;
         }
-        let name = crate::syscall::lookup_aarch64(frame.number)
-            .map(|s| s.name)
-            .unwrap_or("<unknown>");
+        // The frame carries the RAW per-ISA number, so the name comes from this
+        // engine's per-ISA table (Phase 1 T8), not the canonical aarch64 table.
+        let name = <<E::Arch as carrick_hal::GuestArch>::Table as carrick_hal::SyscallTable>::name(
+            frame.number,
+        )
+        .unwrap_or("<unknown>");
         let a = frame.args;
         eprintln!(
             "tid#{} trap#{}: nr={} ({name}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x}",
