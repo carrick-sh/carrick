@@ -112,8 +112,19 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(16, "ioctl", 29),
     // x86_64=20 (syscalls(2)/filippo) → canonical writev=66 (AARCH64_SYSCALLS[66])
     direct(20, "writev", 66),
+    // x86_64=56 (syscalls(2)/filippo) → canonical clone=220 (AARCH64_SYSCALLS[220]).
+    // musl/glibc fork() AND pthread_create() both lower to SYS_clone on x86-64
+    // (neither libc emits SYS_fork/SYS_vfork). The shared dispatcher's clone
+    // handler routes thread-create (CLONE_VM|CLONE_THREAD) vs process-fork
+    // (SIGCHLD) by flags. NOTE: the x86-64 raw clone arg order swaps tls/child_tid
+    // vs the asm-generic order the dispatcher expects — the x86 engine normalizes
+    // it (trap_engine_x86.rs next_syscall). Source: clone(2) man-page.
+    direct(56, "clone", 220),
     // x86_64=60 (syscalls(2)/filippo) → canonical exit=93 (AARCH64_SYSCALLS[93])
     direct(60, "exit", 93),
+    // x86_64=61 (syscalls(2)/filippo) → canonical wait4=260 (AARCH64_SYSCALLS[260]).
+    // A forking parent reaps its child via wait4.
+    direct(61, "wait4", 260),
     // x86_64=63 (syscalls(2)/filippo) → canonical uname=160 (AARCH64_SYSCALLS[160]).
     // WITHOUT this entry x86_64 uname(63) falls through to Unknown and passes its
     // raw number 63 to the ISA-neutral dispatcher, which COLLIDES with canonical
@@ -127,16 +138,24 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=158 (syscalls(2)/filippo): arch_prctl is x86_64-private (sets FS/GS
     // base via ARCH_SET_FS / ARCH_SET_GS); the bhyve backend handles it natively.
     native(158, "arch_prctl"),
+    // x86_64=186 (syscalls(2)/filippo) → canonical gettid=178 (AARCH64_SYSCALLS[178]).
+    direct(186, "gettid", 178),
     // x86_64=200 (syscalls(2)/filippo) → canonical tkill=130 (AARCH64_SYSCALLS[130])
     // musl calls tkill(tid, SIGABRT) to abort; carrick maps this to an exit in
     // the run-to-exit M2 dispatcher (no signal delivery in Phase 2).
     direct(200, "tkill", 130),
+    // x86_64=202 (syscalls(2)/filippo) → canonical futex=98 (AARCH64_SYSCALLS[98]).
+    // pthread mutex/join block on futex.
+    direct(202, "futex", 98),
     // x86_64=218 (syscalls(2)/filippo) → canonical set_tid_address=96
     // (AARCH64_SYSCALLS[96])
     direct(218, "set_tid_address", 96),
     // x86_64=231 (syscalls(2)/filippo) → canonical exit_group=94
     // (AARCH64_SYSCALLS[94])
     direct(231, "exit_group", 94),
+    // x86_64=273 (syscalls(2)/filippo) → canonical set_robust_list=99
+    // (AARCH64_SYSCALLS[99]). glibc/musl thread setup registers a robust-futex list.
+    direct(273, "set_robust_list", 99),
 ];
 
 // Compile-time guard: the table MUST stay strictly sorted (uniqueness +
@@ -191,6 +210,27 @@ mod tests {
         let e = lookup_x86_64(9).expect("mmap must be in the table");
         assert_eq!(e.name, "mmap");
         assert_eq!(e.remap, SyscallRemap::Direct(222));
+    }
+
+    #[test]
+    fn clone_remaps_to_canonical_220() {
+        let e = lookup_x86_64(56).expect("clone must be in the table");
+        assert_eq!(e.name, "clone");
+        assert_eq!(e.remap, SyscallRemap::Direct(220));
+    }
+
+    #[test]
+    fn wait4_remaps_to_canonical_260() {
+        let e = lookup_x86_64(61).expect("wait4 must be in the table");
+        assert_eq!(e.name, "wait4");
+        assert_eq!(e.remap, SyscallRemap::Direct(260));
+    }
+
+    #[test]
+    fn futex_gettid_set_robust_list_present() {
+        assert_eq!(lookup_x86_64(202).unwrap().remap, SyscallRemap::Direct(98)); // futex
+        assert_eq!(lookup_x86_64(186).unwrap().remap, SyscallRemap::Direct(178)); // gettid
+        assert_eq!(lookup_x86_64(273).unwrap().remap, SyscallRemap::Direct(99)); // set_robust_list
     }
 
     #[test]
