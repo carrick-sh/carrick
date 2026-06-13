@@ -1518,7 +1518,7 @@ impl EpollKqueue {
     /// On macOS this is a no-op: the shared kqueue reaches parked waiters
     /// natively and the in-memory broadcast drives `trigger_user(0)` directly via
     /// `notify_inmem_epoll`, so the historical macOS behavior is preserved.
-    #[cfg(not(feature = "platform-macos"))]
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
     pub(crate) fn wake_parked(&self) {
         self.with_mux(|mux| {
             let _ = mux.trigger_user(0);
@@ -4564,12 +4564,7 @@ pub(crate) struct HostSyscallError {
 
 impl HostSyscallError {
     pub(crate) fn last() -> Self {
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         let raw_errno = carrick_portable::errno();
-        #[cfg(target_os = "linux")]
-        let raw_errno = unsafe { *libc::__errno_location() };
-        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
-        let raw_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
 
         Self {
             raw_errno,

@@ -2226,7 +2226,7 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
 /// host-wait4 observation points (the WNOHANG pre-flight and the blocking
 /// loop). Returns `true` when absorbed. On HVF this can't happen (vCPU kicks
 /// are `hv_vcpus_exit`, not signals), hence the compile-time no-op.
-#[cfg(all(target_os = "linux", not(feature = "platform-macos")))]
+#[cfg(target_os = "linux")]
 fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
     if pid <= 0 || !libc::WIFSTOPPED(host_status) {
         return false;
@@ -2250,7 +2250,7 @@ fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
     true
 }
 
-#[cfg(not(all(target_os = "linux", not(feature = "platform-macos"))))]
+#[cfg(not(target_os = "linux"))]
 fn absorb_internal_tracee_stop(_pid: i32, _host_status: i32) -> bool {
     false
 }

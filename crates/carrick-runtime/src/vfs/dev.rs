@@ -255,12 +255,7 @@ impl Vfs for DevVfs {
 }
 
 pub(crate) fn host_open_errno() -> i32 {
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let raw = carrick_portable::errno();
-    #[cfg(target_os = "linux")]
-    let raw = unsafe { *libc::__errno_location() };
-    #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
-    let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
 
     if raw == libc::ENOENT {
         LINUX_ENOENT
