@@ -45,23 +45,36 @@ pub fn install_bhyve_kick_handler() {
 pub struct BhyveKickHandle {
     tid: libc::pthread_t,
     in_guest: Option<Arc<AtomicBool>>,
+    /// Set by `kick()` BEFORE the `pthread_kill`. A pthread_kill makes the
+    /// in-flight `vm_run` exit with `VM_EXITCODE_BOGUS` (a pending thread AST →
+    /// `vm_exit_astpending`), NOT `EINTR`. This flag lets `next_syscall` tell
+    /// OUR kick from a spurious VT-x BOGUS: if set on a BOGUS exit, return to
+    /// the generic loop (Ok(None)); else re-enter the guest.
+    kick_pending: Arc<AtomicBool>,
 }
 
 impl BhyveKickHandle {
     /// Build a handle for the CURRENT thread (call on the owning vCPU thread).
-    pub fn for_current_thread() -> Self {
+    /// `kick_pending` is the engine-owned flag the kick raises and that
+    /// `next_syscall` clears on a requested-kick BOGUS exit.
+    pub fn for_current_thread(kick_pending: Arc<AtomicBool>) -> Self {
         install_bhyve_kick_handler();
         // SAFETY: pthread_self is always safe.
         let tid = unsafe { libc::pthread_self() };
         Self {
             tid,
             in_guest: None,
+            kick_pending,
         }
     }
 }
 
 impl carrick_hal::VcpuKick for BhyveKickHandle {
     fn kick(&self) {
+        // A pthread_kill makes vm_run exit with VM_EXITCODE_BOGUS (astpending),
+        // NOT EINTR; the flag lets next_syscall tell our kick from a spurious
+        // VT-x BOGUS. Raise it BEFORE the signal so it is observable on the exit.
+        self.kick_pending.store(true, Ordering::SeqCst);
         // SAFETY: pthread_kill with a live id + valid signal. ESRCH is ignored.
         unsafe {
             libc::pthread_kill(self.tid, kick_signal());

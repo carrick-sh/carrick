@@ -60,6 +60,12 @@ pub struct BhyveTrapEngine {
     ram: BhyveGuestRam,
     /// Set when `next_syscall` dequeues an INOUT; cleared by `complete_syscall`.
     pending_inout: Option<PendingInout>,
+    /// Shared into the `BhyveKickHandle`: `kick()` raises it before the
+    /// `pthread_kill`; `next_syscall` clears it on a requested-kick BOGUS exit.
+    /// A kick surfaces as `VM_EXITCODE_BOGUS` (thread AST → astpending), NOT
+    /// `EINTR`, so this flag is how the engine distinguishes our kick from a
+    /// spurious VT-x BOGUS re-entry.
+    kick_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // SAFETY: BhyveTrapEngine owns one vCPU + one VM-context view + a guest-RAM
@@ -78,6 +84,7 @@ impl BhyveTrapEngine {
             vcpu: bux.vcpu,
             ram: bux.ram,
             pending_inout: None,
+            kick_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -400,13 +407,28 @@ impl SyscallTrap for BhyveTrapEngine {
                     }));
                 }
 
-                // Spurious: VT-x re-schedules or the VM is idle — re-enter.
-                X86Exit::Bogus => continue,
+                // A kick (pthread_kill → astpending) surfaces as VM_EXITCODE_BOGUS, not
+                // EINTR. If WE requested a kick, return to the generic loop so it re-checks
+                // pending (signals/futex/quiesce); a spurious VT-x BOGUS just re-enters.
+                X86Exit::Bogus => {
+                    if self
+                        .kick_pending
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Ok(None);
+                    }
+                    continue;
+                }
 
                 // A cross-thread kick forced this vCPU out of the guest with no
                 // syscall pending. Return Ok(None): the generic loop re-checks
                 // signals/futex/quiesce at the interrupted PC, then re-enters.
-                X86Exit::Kicked => return Ok(None),
+                // (EINTR path kept as belt-and-suspenders; clear the flag too.)
+                X86Exit::Kicked => {
+                    self.kick_pending
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(None);
+                }
 
                 // A real `hlt` is the only CLEAN stop (M0 ends this way).
                 X86Exit::Hlt => return Ok(None),
@@ -554,7 +576,9 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
     type SiblingSpec = ();
 
     fn kick_handle(&self) -> Self::KickHandle {
-        crate::bhyve_kicker::BhyveKickHandle::for_current_thread()
+        crate::bhyve_kicker::BhyveKickHandle::for_current_thread(std::sync::Arc::clone(
+            &self.kick_pending,
+        ))
     }
 
     fn wait_for_vcpu_slot() {
