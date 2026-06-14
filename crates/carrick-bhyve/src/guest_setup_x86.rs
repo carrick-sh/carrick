@@ -672,6 +672,13 @@ pub fn carrick_boot_gdt_bytes() -> Vec<u8> {
 /// - `user_rip`: ring-3 RIP to jump to after iretq.
 /// - `user_rsp`: ring-3 RSP (guest stack top GPA mapped to user VA).
 /// - `user_rflags`: RFLAGS to restore in ring-3 (typically 0x2).
+/// - `clear_rax`: when true, emit `xor eax, eax` (31 C0) IMMEDIATELY before the
+///   `iretq`. The frame pushes use RAX as scratch for the large `user_rip`/
+///   `user_rsp` (`mov rax, imm64; push rax`), so RAX is clobbered to `user_rip`
+///   by the end of the pushes. A child returning from a `clone(2)` syscall must
+///   see `rax = 0`; zeroing RAX after the pushes (but before iretq) delivers
+///   that. The boot ELF `_start` ignores the inbound RAX, so the boot call site
+///   passes `false`.
 pub fn msr_init_blob(
     lstar: u64,
     star: u64,
@@ -679,6 +686,7 @@ pub fn msr_init_blob(
     user_rip: u64,
     user_rsp: u64,
     user_rflags: u64,
+    clear_rax: bool,
 ) -> Vec<u8> {
     let mut b = Vec::with_capacity(128);
 
@@ -735,6 +743,14 @@ pub fn msr_init_blob(
 
     // RIP (large VA — use mov+push)
     push_u64(&mut b, user_rip);
+
+    // Optionally zero RAX (xor eax, eax = 31 C0) so a clone(2) child sees
+    // rax = 0. Placed AFTER the frame pushes (which clobber RAX via the
+    // mov rax, imm64 scratch) but BEFORE the iretq.
+    if clear_rax {
+        b.push(0x31);
+        b.push(0xC0);
+    }
 
     // iretq  (REX.W CF)
     b.push(0x48);
@@ -909,6 +925,7 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
         // because that GPA is not mapped at itself in the PML4.
         LINUX_STACK_TOP, // ring-3 RSP after iretq (guest VA, not GPA)
         regs.rflags,     // RFLAGS (0x2)
+        false,           // M1 trampoline path ignores the inbound RAX
     );
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
 
@@ -1085,6 +1102,7 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
         M1_BLOB_VA,      // ring-3 RIP: entry of the M1 user code
         LINUX_STACK_TOP, // ring-3 RSP (guest VA)
         regs.rflags,
+        false, // M1 user code ignores the inbound RAX
     );
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
     write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
@@ -1207,13 +1225,17 @@ pub fn bring_up_x86_elf(
     let mut ram = BhyveGuestRam::new();
 
     // Fixed-GPA kernel windows: init blob, GDT, LSTAR, PML4 tables.
-    // (Mirrors bring_up_x86_m1 exactly.)
+    // The init-blob page is WRITABLE (write=true): it stays the kernel scratch
+    // page after boot. Sibling vCPU bring-up (Tier 2) carves per-sibling ring-0
+    // MSR blobs from it AND uses the slot tail as the blob's ring-0 scratch
+    // stack — the blob's `push`es (iretq frame) WRITE this page, so it must be
+    // RW. It is user=false (kernel-only), so RW exposes nothing to the guest.
     ram.add_fixed(
         X86_INIT_BLOB_GPA,
         X86_INIT_BLOB_GPA,
         4096,
         false,
-        false,
+        true,
         true,
     );
     ram.add_fixed(X86_GDT_GPA, X86_GDT_GPA, 4096, false, false, false);
@@ -1312,6 +1334,7 @@ pub fn bring_up_x86_elf(
         entry_rip,   // ring-3 RIP: ELF entry point
         initial_rsp, // ring-3 RSP: initial stack from with_linux_initial_stack
         regs.rflags,
+        false, // the ELF `_start` ignores the inbound RAX
     );
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
 
@@ -1400,6 +1423,9 @@ pub fn bring_up_x86_elf(
 pub const GPR_IDX_RAX: usize = 0;
 /// Index of RBX within [`X8664BhyveSnapshot::gpr`].
 pub const GPR_IDX_RBX: usize = 1;
+/// Index of RCX within [`X8664BhyveSnapshot::gpr`]. After a `syscall`, hardware
+/// sets RCX = the post-syscall return RIP — the child's ring-3 resume PC.
+pub const GPR_IDX_RCX: usize = 2;
 
 /// The 15 GPR `vm_reg_name` ordinals captured by [`snapshot_x86_bhyve`], in the
 /// order they occupy [`X8664BhyveSnapshot::gpr`].
@@ -1544,6 +1570,142 @@ pub fn restore_x86_bhyve(
     vcpu.set_reg_raw(VM_REG_GUEST_FS_BASE, snap.fs_base)?;
     vcpu.set_reg_raw(VM_REG_GUEST_GS_BASE, snap.gs_base)?;
     vcpu.set_reg_raw(VM_REG_GUEST_KGS_BASE, snap.kgs_base)?;
+    Ok(())
+}
+
+/// Fully program a FRESH sibling vCPU (from `add_sibling_vcpu` → `vcpu_reset`,
+/// which leaves it in REAL MODE) for long-mode ring-3 execution as a
+/// `clone(CLONE_THREAD)` child, then point it at a per-sibling ring-0 MSR blob
+/// that `iretq`s into the child's post-clone userspace.
+///
+/// # Why a per-sibling ring-0 blob
+///
+/// bhyve has NO `vm_set_msr`: LSTAR/STAR/SFMASK can only be installed by a guest
+/// ring-0 `WRMSR`. A fresh sibling vCPU has none of the parent's long-mode VMCS
+/// state (segment descriptors, GDTR, TR — VT-x REQUIRES a usable TR + 64-bit CS
+/// for VM entry) or the SYSCALL MSRs. So the sibling must replicate the parent's
+/// bring-up: program long-mode descriptors over the SHARED PML4/GDT and run a
+/// ring-0 MSR blob that ends with an `iretq` into the child's ring-3 context.
+///
+/// # Child entry ABI
+///
+/// The child resumes as if returning from the `clone` syscall: at the
+/// post-`syscall` RIP with `rax = 0`. Hardware `syscall` set RCX = the return
+/// RIP (then jumped to LSTAR, the `out` doorbell where the parent trapped), so
+/// the child's ring-3 entry RIP = the parent's RCX = `snap.gpr[GPR_IDX_RCX]`.
+/// The child's stack = `snap.rsp` (already seeded to the clone `child_stack`).
+/// The blob's `iretq` is the ring-3 transition (no sysretq) and `clear_rax`
+/// zeroes RAX so the child sees `clone` → 0.
+///
+/// # Per-sibling blob slot
+///
+/// The boot init-blob page ([`X86_INIT_BLOB_GPA`], one 4 KiB identity-mapped
+/// page) is FREE after boot (the parent's blob ran once; the parent is now in
+/// ring-3). We carve per-sibling 256-byte slots from it by vCPU id: `slot = id *
+/// 256` (sibling ids start at 1; id 0 is the main vCPU's dead boot blob). The
+/// blob code (~80 bytes) sits at the slot base; the ring-0 scratch RSP is the
+/// slot top (`blob_gpa + 256`), so the blob's ≤5 pushes (~40 bytes) grow down
+/// into the slot tail and never reach the code. Each slot is self-contained, so
+/// concurrent siblings do not race. The page holds ids 1..=15.
+///
+/// # FS base
+///
+/// FS.base (the TLS pointer) is written via `vm_set_desc` (the proven path —
+/// `vm_set_register(FS_BASE)` returns EINVAL on FreeBSD 15.1). It is written
+/// LAST so the ring-0 FS descriptor override above cannot clobber it. `iretq`
+/// does NOT reload FS on x86-64, so the ring-0 FS base persists into ring-3.
+pub fn program_sibling_long_mode(
+    vcpu: &mut crate::vmm::BhyveVcpu,
+    vm: &BhyveVm,
+    snap: &X8664BhyveSnapshot,
+    id: c_int,
+) -> Result<(), OsError> {
+    let regs = X8664GuestArch::bootstrap_sysregs();
+
+    // Child ring-3 entry: post-clone RIP = parent's RCX; stack = seeded child
+    // stack (snap.rsp). snap.rip (the seeded sysretq resume) is unused here —
+    // the iretq goes DIRECTLY to RCX.
+    let child_rip = snap.gpr[GPR_IDX_RCX];
+    let child_rsp = snap.rsp;
+
+    // Per-sibling blob + ring-0 scratch-stack slot in the post-boot-free
+    // init-blob page (identity-mapped; no PML4 edit needed).
+    let slot = id as u64 * 256;
+    if slot + 256 > 4096 {
+        return Err(OsError::new(format!(
+            "bhyve: too many sibling vCPUs for the init-blob page (id {id})"
+        )));
+    }
+    let blob_gpa = X86_INIT_BLOB_GPA + slot;
+    let ring0_rsp = blob_gpa + 256;
+
+    // Sibling MSR blob: WRMSR LSTAR/STAR/SFMASK, then iretq → ring-3 at
+    // child_rip with child_rsp and rax = 0 (clear_rax = true).
+    let blob = msr_init_blob(
+        regs.lstar,
+        regs.star,
+        regs.sfmask,
+        child_rip,
+        child_rsp,
+        regs.rflags,
+        true,
+    );
+    write_gpa(vm, blob_gpa, &blob)?;
+
+    // Inherit the parent's integer state. We do NOT call restore_x86_bhyve here
+    // because (a) its RIP/RSP/CR3 writes are immediately overridden for the
+    // ring-0 blob entry, and (b) its FS/GS-base writes go through
+    // vm_set_register(FS_BASE/GS_BASE) which is unreliable on FreeBSD 15.1 (the
+    // base is VT-x hidden descriptor state); we install those via vm_set_desc
+    // below instead. So inherit only the 15 GPRs + RFLAGS + CR0/CR4/EFER here.
+    for (i, &gid) in SNAPSHOT_GPR_IDS.iter().enumerate() {
+        vcpu.set_reg_raw(gid, snap.gpr[i])?;
+    }
+    vcpu.set_reg_raw(VM_REG_GUEST_CR0, snap.cr0)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR4, snap.cr4)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_EFER, snap.efer)?;
+
+    // Override for the ring-0 blob entry (mirror bring_up_x86_elf Step 4).
+    // CR3 = the SHARED PML4 (snap.cr3 equals this, but be explicit).
+    vcpu.set_reg_raw(VM_REG_GUEST_CR3, X86_PML4_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RIP, blob_gpa)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, ring0_rsp)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, regs.rflags)?;
+
+    // Segment descriptors + selectors (ring-0; the blob's iretq loads user
+    // CS/SS from the frame).
+    vcpu.set_desc(VM_REG_GUEST_CS, 0, 0xFFFF_FFFF, ACCESS_RING0_CS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CS, KERN_CS64_SEL)?;
+    vcpu.set_desc(VM_REG_GUEST_SS, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_SS, KERN_SS_SEL)?;
+    for reg in [
+        VM_REG_GUEST_DS,
+        VM_REG_GUEST_ES,
+        VM_REG_GUEST_FS,
+        VM_REG_GUEST_GS,
+    ] {
+        vcpu.set_desc(reg, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+        vcpu.set_reg_raw(reg, KERN_SS_SEL)?;
+    }
+    vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
+    // TR: VT-x requires a usable 64-bit TSS for VM entry (base 0, limit 0x67).
+    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+
+    // FS/GS bases — set LAST, via vm_set_desc (the FS/GS descriptor overrides
+    // above set base = 0; rewrite them with the inherited bases, preserving the
+    // ring-0 limit/access we just wrote). vm_set_register(FS_BASE/GS_BASE) is
+    // unreliable for the hidden base; the descriptor base IS the segment base in
+    // long mode and persists across iretq (iretq does NOT reload FS/GS on
+    // x86-64). FS.base carries the child's TLS pointer.
+    vcpu.set_desc(VM_REG_GUEST_FS, snap.fs_base, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+    vcpu.set_desc(VM_REG_GUEST_GS, snap.gs_base, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_GS, KERN_SS_SEL)?;
+
+    vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
     Ok(())
 }
 
@@ -1754,7 +1916,15 @@ mod tests {
     #[test]
     fn msr_init_blob_structure() {
         let regs = X8664GuestArch::bootstrap_sysregs();
-        let blob = msr_init_blob(regs.lstar, regs.star, regs.sfmask, 0x1000, 0x2000, 0x2);
+        let blob = msr_init_blob(
+            regs.lstar,
+            regs.star,
+            regs.sfmask,
+            0x1000,
+            0x2000,
+            0x2,
+            false,
+        );
         assert!(!blob.is_empty(), "blob must be non-empty");
         assert!(
             blob.len() <= 128,
@@ -1779,7 +1949,7 @@ mod tests {
     /// positions in the push sequence (after the three WRMSRs).
     #[test]
     fn msr_init_blob_encodes_ring3_selectors() {
-        let blob = msr_init_blob(0, 0, 0, 0, 0, 0x2);
+        let blob = msr_init_blob(0, 0, 0, 0, 0, 0x2, false);
         // Three WRMSRs each = 5 (mov ecx,imm32: B9 id) + 5 (mov eax: B8 id)
         // + 5 (mov edx: BA id) + 2 (wrmsr: 0F 30) = 17 bytes.
         let after_wrmsr = 3 * 17;
@@ -1787,6 +1957,28 @@ mod tests {
         assert_eq!(blob[after_wrmsr], 0x68, "push SS selector opcode");
         let ss_val = u32::from_le_bytes(blob[after_wrmsr + 1..after_wrmsr + 5].try_into().unwrap());
         assert_eq!(ss_val, USER_SS_SEL as u32, "SS selector in iretq frame");
+    }
+
+    /// msr_init_blob with `clear_rax = true` emits `xor eax, eax` (31 C0)
+    /// immediately before the `iretq` (48 CF), and that adds exactly two bytes
+    /// versus the `false` variant. This is the clone(2) child-entry path: the
+    /// child must see `rax = 0` after the iretq.
+    #[test]
+    fn msr_init_blob_clear_rax_emits_xor_before_iretq() {
+        let with = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true);
+        let without = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false);
+        assert_eq!(
+            with.len(),
+            without.len() + 2,
+            "clear_rax adds exactly the 2-byte xor eax,eax"
+        );
+        let n = with.len();
+        // ... 31 C0 48 CF  (xor eax,eax ; iretq)
+        assert_eq!(
+            &with[n - 4..],
+            &[0x31, 0xC0, 0x48, 0xCF],
+            "clear_rax tail = xor eax,eax + iretq"
+        );
     }
 
     /// pml4_map_specs converts BhyveGuestRam windows to Pml4MapSpec correctly.

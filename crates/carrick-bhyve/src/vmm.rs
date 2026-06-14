@@ -451,7 +451,12 @@ impl BhyveSharedVm {
     /// `BhyveVm::add_vcpu`, but takes `&self` and draws the vcpu id from the
     /// SHARED `AtomicI32` so concurrent siblings each get a DISTINCT id —
     /// bhyve's SMP model runs distinct vcpus of one ctx on separate threads.
-    pub fn add_sibling_vcpu(&self) -> Result<BhyveVcpu, OsError> {
+    ///
+    /// Returns the opened vCPU AND its allocated id: the long-mode sibling
+    /// bring-up (Tier 2 `materialize_sibling`) carves a per-sibling ring-0 MSR
+    /// blob + scratch-stack slot from the post-boot-free init-blob page by id, so
+    /// the caller needs the id (sibling ids start at 1; id 0 is the main vCPU).
+    pub fn add_sibling_vcpu(&self) -> Result<(BhyveVcpu, c_int), OsError> {
         let id = self.0.next_vcpu.fetch_add(1, Ordering::SeqCst);
         // SAFETY: `self.0.ctx` is a live vmctx for the VM's lifetime.
         let vcpu = unsafe { vm_vcpu_open(self.0.ctx, id) };
@@ -464,7 +469,7 @@ impl BhyveSharedVm {
             return Err(os_err("vm_activate_cpu", rc));
         }
         let _ = unsafe { vcpu_reset(vcpu) };
-        Ok(BhyveVcpu { vcpu })
+        Ok((BhyveVcpu { vcpu }, id))
     }
 }
 

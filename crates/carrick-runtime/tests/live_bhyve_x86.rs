@@ -80,3 +80,29 @@ fn fsprobe_uname_runs_to_zero_via_dispatcher() {
         String::from_utf8_lossy(&result.stdout)
     );
 }
+
+#[test]
+fn threads_run_to_zero_via_sibling_vcpus() {
+    // The multithreaded acceptance (M2 Tier 2): a guest that
+    // `clone(CLONE_THREAD)`s sibling threads — each running on its own bhyve
+    // sibling vCPU on the SHARED VM — with TLS and a futex-backed join, then
+    // exits 0. Success here proves `materialize_sibling` fully programs a fresh
+    // (real-mode) sibling vCPU for long mode and runs it into the child's
+    // post-clone ring-3 context.
+    let Some(path) = fixture("CARRICK_BHYVE_THREADS") else {
+        eprintln!("skip: set CARRICK_BHYVE_THREADS to the threads ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "multithreaded guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("threads ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
