@@ -25,7 +25,7 @@
 
 use carrick_guest_mem::{GuestMemory, MemoryError, X8664SyscallFrame};
 use carrick_hal::{
-    OsError, RawSyscall, SyscallTrap, TrapError,
+    OsError, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError,
     guest_arch::{GuestArch, SyscallRemap, SyscallTable as _},
     x8664_arch::{X8664GuestArch, X8664SyscallTable},
 };
@@ -34,9 +34,10 @@ use carrick_mem::memory::AddressSpace;
 use crate::guest_setup_x86::{BhyveGuestRam, BroughtUpX86, SYSCALL_DOORBELL_PORT, complete_inout};
 use crate::vmm::{BhyveVcpu, BhyveVm};
 use crate::vmm_x86::{
-    VM_REG_GUEST_CS, VM_REG_GUEST_R8, VM_REG_GUEST_R9, VM_REG_GUEST_R10, VM_REG_GUEST_RAX,
-    VM_REG_GUEST_RCX, VM_REG_GUEST_RDI, VM_REG_GUEST_RDX, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI,
-    X86Exit,
+    VM_REG_GUEST_CS, VM_REG_GUEST_R8, VM_REG_GUEST_R9, VM_REG_GUEST_R10, VM_REG_GUEST_R11,
+    VM_REG_GUEST_R12, VM_REG_GUEST_R13, VM_REG_GUEST_R14, VM_REG_GUEST_R15, VM_REG_GUEST_RAX,
+    VM_REG_GUEST_RBP, VM_REG_GUEST_RBX, VM_REG_GUEST_RCX, VM_REG_GUEST_RDI, VM_REG_GUEST_RDX,
+    VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI, VM_REG_GUEST_RSP, X86Exit,
 };
 
 /// Pending INOUT state: the vCPU is parked on the `OUT 0xC5` instruction.
@@ -192,6 +193,114 @@ impl carrick_hal::x8664_arch::SegmentBaseRegs for BhyveTrapEngine {
     fn seg_get_gs_base(&self) -> Result<u64, TrapError> {
         self.get_gs_base()
             .map_err(|e| TrapError::Hypervisor(format!("vm_get_desc(GS.base): {e}")))
+    }
+}
+
+// ─── RegAccess (x86_64 via vm_get/set_register + FS/GS via vm_get/set_desc) ───
+//
+// Map the ISA-neutral `Reg`/`SysReg` onto bhyve's amd64 `vm_reg_name` ordinals.
+// GPRs go through `vm_get/set_register`; FS/GS base reuse the SegmentBaseRegs
+// `vm_get/set_desc` path (the base is VT-x hidden state — `vm_set_register` on
+// it returns EINVAL). The aarch64 `Reg`/`SysReg` variants never reach this x86
+// engine (→ a loud error, mirroring the KVM-x86 RegAccess). FP/SIMD is the one
+// gap: FreeBSD 15.1 libvmmapi exposes no FP/XSAVE getter, so the vreg/fp methods
+// error — a documented blocker for bhyve signal frames + clone/fork FP snapshot
+// (the GPR-driven dispatcher + threading foundation never call them).
+
+/// Map an ISA-neutral [`Reg`] to its bhyve amd64 `vm_reg_name` ordinal.
+fn reg_to_vmreg(r: Reg) -> Result<std::ffi::c_int, OsError> {
+    Ok(match r {
+        Reg::Rax => VM_REG_GUEST_RAX,
+        Reg::Rbx => VM_REG_GUEST_RBX,
+        Reg::Rcx => VM_REG_GUEST_RCX,
+        Reg::Rdx => VM_REG_GUEST_RDX,
+        Reg::Rsi => VM_REG_GUEST_RSI,
+        Reg::Rdi => VM_REG_GUEST_RDI,
+        Reg::Rbp => VM_REG_GUEST_RBP,
+        Reg::Rsp => VM_REG_GUEST_RSP,
+        Reg::R8 => VM_REG_GUEST_R8,
+        Reg::R9 => VM_REG_GUEST_R9,
+        Reg::R10 => VM_REG_GUEST_R10,
+        Reg::R11 => VM_REG_GUEST_R11,
+        Reg::R12 => VM_REG_GUEST_R12,
+        Reg::R13 => VM_REG_GUEST_R13,
+        Reg::R14 => VM_REG_GUEST_R14,
+        Reg::R15 => VM_REG_GUEST_R15,
+        Reg::Rip => VM_REG_GUEST_RIP,
+        Reg::Rflags => VM_REG_GUEST_RFLAGS,
+        other => {
+            return Err(OsError::new(format!(
+                "bhyve RegAccess: {other:?} is an aarch64 register view on the x86 engine"
+            )));
+        }
+    })
+}
+
+impl RegAccess for BhyveTrapEngine {
+    fn get_reg(&self, r: Reg) -> Result<u64, OsError> {
+        self.vcpu.get_reg_raw(reg_to_vmreg(r)?)
+    }
+
+    fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), OsError> {
+        self.vcpu.set_reg_raw(reg_to_vmreg(r)?, v)
+    }
+
+    fn get_sys_reg(&self, r: SysReg) -> Result<u64, OsError> {
+        match r {
+            SysReg::FsBase => self.get_fs_base(),
+            SysReg::GsBase => self.get_gs_base(),
+            other => Err(OsError::new(format!(
+                "bhyve RegAccess: SysReg {other:?} unsupported (aarch64 view on the x86 engine)"
+            ))),
+        }
+    }
+
+    fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError> {
+        match r {
+            SysReg::FsBase => self.set_fs_base(v),
+            SysReg::GsBase => self.set_gs_base(v),
+            other => Err(OsError::new(format!(
+                "bhyve RegAccess: SysReg {other:?} unsupported (aarch64 view on the x86 engine)"
+            ))),
+        }
+    }
+
+    // FP/SIMD gap: no libvmmapi FP/XSAVE getter on FreeBSD 15.1. Inert until the
+    // bhyve signal-frame / FP-snapshot work adds the FFI (or a kernel getter).
+    fn get_vreg(&self, _n: u32) -> Result<u128, OsError> {
+        Err(OsError::new(
+            "bhyve RegAccess: FP/SIMD (XMM) not exposed by libvmmapi".to_string(),
+        ))
+    }
+
+    fn set_vreg(&mut self, _n: u32, _v: u128) -> Result<(), OsError> {
+        Err(OsError::new(
+            "bhyve RegAccess: FP/SIMD (XMM) not exposed by libvmmapi".to_string(),
+        ))
+    }
+
+    fn get_fpcr(&self) -> Result<u64, OsError> {
+        Err(OsError::new(
+            "bhyve RegAccess: MXCSR not exposed by libvmmapi".to_string(),
+        ))
+    }
+
+    fn set_fpcr(&mut self, _v: u64) -> Result<(), OsError> {
+        Err(OsError::new(
+            "bhyve RegAccess: MXCSR not exposed by libvmmapi".to_string(),
+        ))
+    }
+
+    fn get_fpsr(&self) -> Result<u64, OsError> {
+        Err(OsError::new(
+            "bhyve RegAccess: x87 status not exposed by libvmmapi".to_string(),
+        ))
+    }
+
+    fn set_fpsr(&mut self, _v: u64) -> Result<(), OsError> {
+        Err(OsError::new(
+            "bhyve RegAccess: x87 status not exposed by libvmmapi".to_string(),
+        ))
     }
 }
 
