@@ -88,6 +88,12 @@ pub struct BhyveTrapEngine {
     /// Default `false`: `new`/`materialize_sibling`/the fork child all own their
     /// VM. Cleared back to `false` in `execve_into` (the fresh VM is owned).
     vm_borrowed: bool,
+    /// The RAX value (the syscall NUMBER) captured at the most recent syscall
+    /// doorbell, BEFORE `complete_syscall` overwrites RAX with the retval. A
+    /// SA_RESTART signal injected at a syscall boundary needs it to restore RAX
+    /// (the shared builder rewinds RIP-2 and reloads this). Mirrors
+    /// `KvmX86TrapEngine::last_syscall_orig_rax`.
+    last_syscall_orig_rax: u64,
 }
 
 // SAFETY: BhyveTrapEngine owns one vCPU + one VM-context view + a guest-RAM
@@ -110,6 +116,7 @@ impl BhyveTrapEngine {
             is_forked_child: false,
             // The main process VM is owned (created by bring_up_x86_elf).
             vm_borrowed: false,
+            last_syscall_orig_rax: 0,
         }
     }
 
@@ -384,6 +391,10 @@ impl SyscallTrap for BhyveTrapEngine {
                         .vcpu
                         .get_register_set(&ids)
                         .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+                    // Capture the syscall NUMBER (RAX) before complete_syscall
+                    // overwrites RAX with the retval — SA_RESTART needs it (SP3).
+                    self.last_syscall_orig_rax = vals[0];
 
                     let frame = X8664SyscallFrame {
                         rax: vals[0],
@@ -936,6 +947,7 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
             // A sibling holds an owning Arc clone of the shared VM (from_shared);
             // teardown is refcounted via Drop. Not borrowed.
             vm_borrowed: false,
+            last_syscall_orig_rax: 0,
         })
     }
 
