@@ -41,6 +41,14 @@ use crate::vmm_x86::{
 // The canonical clone number + the x86-64 clone arg-swap now live in
 // carrick_hal::x8664_arch (defined once, shared with the KVM-x86 lane via
 // X8664GuestArch::normalize_syscall).
+//
+// NOTE (SP1.1): `minherit(INHERIT_COPY)` was evaluated as a way to drop the
+// pre-fork heap freeze in `fork()` (let the child copy from a COW-frozen
+// inherited mapping). It is NOT used: the spikes proved it freezes only
+// USERSPACE writes through the vm_map_gpa pointer, while bhyve's in-kernel vCPU
+// writes guest RAM through the wired physical mapping and BYPASS the COW PTE —
+// so the resumed parent vCPU still tears the child's image. See the negative
+// result documented at the `frozen_ram` site and the `minherit_cow_*` tests.
 
 /// Pending INOUT state: the vCPU is parked on the `OUT 0xC5` instruction.
 /// `complete_syscall` applies the resume discipline once (writing RAX then
@@ -575,6 +583,25 @@ impl SyscallTrap for BhyveTrapEngine {
         // instead of resuming at the post-fork branch — the child silently
         // skipped its own fork-child logic. Snapshotting before the fork closes
         // the race: the child's image is exactly the parent's state at fork time.
+        //
+        // NEGATIVE RESULT (SP1.1, verified 2026-06-14 on FreeBSD 15.1-RC3): the
+        // tempting optimization — `minherit(parent_map_gpa, X86_MEM_SIZE,
+        // INHERIT_COPY)` before fork so the child inherits a frozen COW view and
+        // copies from its OWN mapping (dropping this heap freeze) — does NOT work
+        // for the real guest write path. minherit(INHERIT_COPY) sets COW only on
+        // the USERSPACE vm_map entry: a host-side write through the `vm_map_gpa`
+        // pointer is frozen for the child (the spikes `minherit_cow_frozen_*` in
+        // tests/live_vcpu.rs PASS — child sees the pre-fork sentinel even after a
+        // child VM is built). But bhyve's in-kernel vCPU writes guest RAM through
+        // the WIRED physical mapping, which BYPASSES the userspace COW PTE, so the
+        // resumed parent vCPU's post-fork writes mutate the same physical pages the
+        // child's inherited mapping still aliases — COW never breaks for them. With
+        // the heap freeze replaced by minherit, BOTH fork acceptance tests
+        // (`fork_wait4_runs_to_zero`, `fork_raw_runs_to_zero`) FAILED
+        // deterministically (3/3) with a torn child image (`child exit code \0`,
+        // garbage wait4 pid) — the original bug. The explicit pre-fork heap freeze
+        // is therefore required; the spikes are kept as committed regressions that
+        // document the (userspace-only) scope of the COW.
         let frozen_ram: Vec<u8> = {
             let src = self.vm.map_gpa(0, X86_MEM_SIZE).ok_or_else(|| {
                 TrapError::Hypervisor("fork: parent map_gpa(0, X86_MEM_SIZE) NULL".to_string())
@@ -602,10 +629,11 @@ impl SyscallTrap for BhyveTrapEngine {
         }
 
         // CHILD. The child inherited the parent's vmctx (self.vm aliases the
-        // parent's live kernel RAM — the eager-copy SOURCE). Build a fresh,
-        // uniquely-named VM and copy. The child's RAM layout MUST match the
-        // parent's so the per-window copy lands at the right GPAs:
-        // bring_up_x86_elf sized the parent's sysmem at X86_MEM_SIZE (64 MiB)
+        // parent's live kernel RAM — NOT a usable copy source; see the SP1.1
+        // negative result above). Build a fresh, uniquely-named VM and copy from
+        // the PRE-FORK `frozen_ram` buffer. The child's RAM layout MUST match the
+        // parent's so the copy lands at the right GPAs: bring_up_x86_elf sized the
+        // parent's sysmem at X86_MEM_SIZE (64 MiB)
         // (total_size().max(X86_MEM_SIZE).min(X86_MEM_SIZE)), so the child uses
         // the same size — NOT ram.total_size() (the bump cursor, which is smaller
         // than the parent's actual segment and would truncate the high windows).
@@ -650,6 +678,7 @@ impl SyscallTrap for BhyveTrapEngine {
         // alias — its Drop would vm_destroy the PARENT's live kernel VM from the
         // child. mem::forget it (the Arc leaks in this child process, which is
         // correct — the parent's VM stays alive for the still-running parent).
+        // Safe to forget the source mapping now: the copy above is complete.
         let inherited_parent = std::mem::replace(&mut self.vm, child_vm);
         std::mem::forget(inherited_parent);
         self.vcpu = child_vcpu; // the old parent vcpu handle has no Drop — harmless
