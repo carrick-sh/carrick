@@ -740,21 +740,25 @@ impl SyscallTrap for BhyveTrapEngine {
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
 
         // Swap in the fresh VM/vCPU/RAM. The fresh VM is already built, so
-        // destroying the OLD one now is safe (nothing references it).
-        let old_vm = std::mem::replace(&mut self.vm, bux.vm);
-        if self.vm_borrowed {
-            // A vfork child detaching from the SHARED parent VM: the parent owns
-            // that node and resumes on it. Never destroy it — leak the handle in
-            // this child process (the Arc refcount is per-process-wrong across
-            // fork; the parent keeps it alive). Mirrors the SP1 fork landmine.
-            std::mem::forget(old_vm);
-        } else {
-            // A normal process execve: the old VM is owned by this engine, and
-            // execve replaces the old image — tear it down (no leaked /dev/vmm
-            // node). `destroy_in_place` honors owns=true here.
-            let mut old_vm = old_vm;
-            old_vm.destroy_in_place();
-        }
+        // tearing down the OLD one now is safe (nothing references it).
+        //
+        // Robust-by-construction (Part A): the OLD VM's teardown is gated on its
+        // INNER's `owns` flag — a vfork child's borrowed `old_vm` is a distinct
+        // `owns == false` inner, so `destroy_in_place` (and a plain drop) are
+        // structural no-ops and CANNOT touch the parent's node. A normal process
+        // execve's `old_vm` is an owning inner, so `destroy_in_place` runs
+        // `vm_destroy` and reclaims the /dev/vmm node. We therefore call
+        // `destroy_in_place` unconditionally and let the inner decide — no
+        // `vm_borrowed`-keyed `mem::forget` is needed any longer (the borrowed
+        // inner is the backstop). `self.vm_borrowed` is asserted here only as a
+        // cross-check on the structural verdict.
+        let mut old_vm = std::mem::replace(&mut self.vm, bux.vm);
+        debug_assert_eq!(
+            self.vm_borrowed,
+            !old_vm.owns(),
+            "execve_into: engine vm_borrowed must match the old VM's inner ownership"
+        );
+        old_vm.destroy_in_place();
         self.vcpu = bux.vcpu;
         self.ram = bux.ram;
         // The fresh VM from bring_up_x86_elf is OWNED (BhyveVm::create → owns).

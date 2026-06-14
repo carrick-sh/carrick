@@ -245,10 +245,28 @@ fn sysreg_id(r: SysReg) -> Result<c_int, OsError> {
 /// a kernel-owned handle valid for the VM's whole lifetime; bhyve's SMP model
 /// runs DISTINCT vcpus of one ctx concurrently on separate host threads
 /// (bhyverun.c fbsdrun_addcpu/vm_loop). vm_destroy runs once, when the last
-/// Arc holder (main engine + all siblings) drops.
+/// Arc holder (main engine + all siblings) drops — but ONLY if this inner OWNS
+/// the node (`owns`).
+///
+/// `owns` is the load-bearing, robust-by-construction ownership backstop. It
+/// lives HERE (not on `BhyveVm`) so that `Drop` itself is gated: a BORROWED
+/// inner (`owns == false`) is STRUCTURALLY incapable of `vm_destroy` on ANY drop
+/// path — normal drop, a panic-unwind drop, an early-return drop — regardless of
+/// what the caller does. A borrowed handle (e.g. a vfork child's view of the
+/// parent's shared VM) is built over a DISTINCT non-owning inner whose `drop` is
+/// a guaranteed no-op, so the parent's `/dev/vmm` node can never be torn down by
+/// the borrower. (Previously `owns` lived on `BhyveVm` while `BhyveVmInner::drop`
+/// destroyed unconditionally — a borrowed `BhyveVm` that happened to be the last
+/// in-process Arc holder would still destroy the parent's VM. Moving the flag
+/// into the inner removes that footgun by construction.)
 struct BhyveVmInner {
     ctx: *mut Vmctx,
     next_vcpu: AtomicI32,
+    /// `true` for an OWNING inner (`create`'s fresh VM, an execve's fresh VM, a
+    /// fork child's fresh VM): its `Drop`/`destroy_in_place` run `vm_destroy`.
+    /// `false` for a BORROWED inner (a vfork child's non-owning view of the
+    /// parent's shared VM): its `Drop`/`destroy_in_place` are no-ops.
+    owns: bool,
 }
 
 // SAFETY: ctx is a kernel handle usable from any thread; only DISTINCT vcpus
@@ -263,34 +281,32 @@ impl Drop for BhyveVmInner {
     /// sibling engine that cloned the handle have all been dropped. With the
     /// per-create unique name (see `BhyveVm::create`) each VM owns a distinct
     /// node, so `vm_destroy` here is unambiguous (no shared-ctx EINVAL).
+    ///
+    /// Gated on `owns` (robust-by-construction): a BORROWED inner never destroys
+    /// the node on ANY drop path. A vfork child's borrowed view of the parent's
+    /// shared VM is a distinct `owns == false` inner, so the parent's node is
+    /// structurally safe from the borrower's drops (normal, panic, or early).
     fn drop(&mut self) {
-        if !self.ctx.is_null() {
-            // SAFETY: a live, not-yet-destroyed vmctx; this is the LAST holder
-            // (Arc refcount hit 0), so vm_destroy is unambiguous and single.
+        if self.owns && !self.ctx.is_null() {
+            // SAFETY: an OWNING, live, not-yet-destroyed vmctx; this is the LAST
+            // holder (Arc refcount hit 0), so vm_destroy is unambiguous + single.
             unsafe { vm_destroy(self.ctx) };
         }
     }
 }
 
 pub struct BhyveVm {
+    /// The shared inner carries the `owns` flag (robust-by-construction): a
+    /// borrowed handle is a DISTINCT non-owning inner over the same `ctx`, so its
+    /// `Drop`/`destroy_in_place` are structurally no-ops (see `from_borrowed`).
+    /// Ownership is therefore per-INNER, not per-handle: every `BhyveVm` and
+    /// `BhyveSharedVm` clone over one inner shares that inner's ownership verdict,
+    /// and the `Arc` refcount governs WHEN the (gated) `vm_destroy` fires (the
+    /// last owning holder's drop). Across `libc::fork` the inherited owning inner
+    /// must NOT be the one a borrower drops — so the vfork child builds a fresh
+    /// `owns == false` inner via `from_borrowed` rather than inheriting the
+    /// owning one.
     inner: Arc<BhyveVmInner>,
-    /// Per-handle ownership of the kernel `/dev/vmm` node, honored by
-    /// `destroy_in_place` (the forked-child `_exit` teardown). `true` for a VM
-    /// this handle is responsible for tearing down (`create` / a fork child's
-    /// fresh VM / an execve's fresh VM); `false` for a non-owning BORROWED view
-    /// of a VM owned elsewhere (a vfork child's view of the parent's shared VM —
-    /// see `from_borrowed`).
-    ///
-    /// Ownership is per-HANDLE, not per-`BhyveVmInner`, because across
-    /// `libc::fork` the `Arc` refcount is per-process and WRONG: a forked child
-    /// inherits the parent's `Arc` (refcount continues in the child's copy) but
-    /// must NOT `vm_destroy` the parent's node. So a forked child uses `owns =
-    /// false` for the borrowed parent VM and `owns = true` for its own fresh VM.
-    /// Within ONE process, the `Arc` refcount remains authoritative for `Drop`
-    /// (the last holder runs `vm_destroy`); `owns` only gates the explicit
-    /// `destroy_in_place` teardown the forked-child `_exit` path uses (which
-    /// skips `Drop`).
-    owns: bool,
 }
 
 /// A cloneable, Send+Sync handle to a shared VM, carried in a sibling spec to a
@@ -375,10 +391,10 @@ impl BhyveVm {
             inner: Arc::new(BhyveVmInner {
                 ctx,
                 next_vcpu: AtomicI32::new(0),
+                // A freshly-created VM is OWNED: its `Drop`/`destroy_in_place`
+                // run `vm_destroy`.
+                owns: true,
             }),
-            // A freshly-created VM is owned by this handle: its teardown path
-            // (`destroy_in_place`) runs `vm_destroy`.
-            owns: true,
         })
     }
 
@@ -412,38 +428,57 @@ impl BhyveVm {
     /// resulting `BhyveVm` only drops that one `Arc` clone — `vm_destroy` runs
     /// when the LAST holder drops, never before.
     pub fn from_shared(shared: BhyveSharedVm) -> BhyveVm {
-        BhyveVm {
-            inner: shared.0,
-            // A sibling-in-one-process handle: it holds its own `Arc` clone, so
-            // within the process the refcount keeps the VM alive and the LAST
-            // holder's `Drop` runs `vm_destroy`. `owns = true` lets a sibling's
-            // `destroy_in_place` participate in that refcounted teardown if ever
-            // called (Arc::get_mut only fires for the genuine sole holder).
-            owns: true,
-        }
+        // A sibling-in-one-process handle: it clones the SAME owning inner, so
+        // within the process the `Arc` refcount keeps the VM alive and the LAST
+        // holder's `Drop` runs `vm_destroy` (the inner is `owns == true` — it was
+        // built by `create`). The inner's ownership verdict is shared verbatim;
+        // `from_shared` introduces no new inner.
+        BhyveVm { inner: shared.0 }
     }
 
     /// Build a NON-owning [`BhyveVm`] view over a shared VM that is owned by
     /// ANOTHER process or handle — a BORROWED handle.
     ///
-    /// Its teardown is a no-op: `destroy_in_place` skips `vm_destroy` because the
-    /// node belongs to someone else (e.g. a vfork child's view of the parent's
-    /// shared VM — the parent owns it and resumes on it after the vfork window).
+    /// Robust-by-construction: this does NOT clone the shared (owning) inner.
+    /// It builds a FRESH, DISTINCT `BhyveVmInner { ctx, next_vcpu, owns: false }`
+    /// over the SAME `ctx`. Because the new inner is `owns == false`, its
+    /// `Drop` AND its `destroy_in_place` are guaranteed no-ops on EVERY path
+    /// (normal drop, panic-unwind, early return) — the borrowed handle can NEVER
+    /// `vm_destroy` the node. The owner (the parent process / the owning inner)
+    /// is the only thing that can tear it down. This makes the safety property
+    /// structural rather than resting on the caller's `mem::forget` discipline.
     ///
-    /// Distinct from [`from_shared`] (sibling-in-one-process, owning-via-`Arc`):
-    /// across `libc::fork` the `Arc` refcount is per-process and wrong, so a
-    /// forked child that shares the parent's VM must explicitly mark its handle
-    /// non-owning here rather than rely on the refcount. (`Drop` is still a
-    /// refcount decrement of the child's inherited `Arc`; the inner `ctx` is
-    /// only `vm_destroy`d if that inherited refcount hit zero in the child — for
-    /// a borrowed handle the caller arranges that the parent's node is never
-    /// destroyed by `mem::forget`-ing the handle on detach, as `execve_into`
-    /// does. `owns = false` makes the explicit `destroy_in_place` path a no-op.)
+    /// `next_vcpu` decision (option ii — correct + minimal for vfork): the
+    /// borrowed inner gets a FRESH `AtomicI32::new(1)`, NOT a clone of the
+    /// owner's atomic. This is sound precisely because `from_borrowed` is used by
+    /// the vfork child, which is a SEPARATE PROCESS (post-`libc::fork`) whose
+    /// parent is SUSPENDED on the vfork pipe for the whole window — the parent
+    /// allocates no vcpu ids concurrently, so the child can safely allocate
+    /// sibling ids starting at a non-colliding base (1; id 0 is the parent's main
+    /// vCPU, which the child does not reuse — it opens its OWN sibling vCPU). The
+    /// owner's atomic is in the OTHER process's address space anyway; sharing it
+    /// across `libc::fork` would only give the child a private post-fork copy, so
+    /// a fresh base-1 atomic is both simpler and equivalent.
+    ///
+    /// Distinct from [`from_shared`] (sibling-in-one-process, which clones the
+    /// owning inner and relies on the per-process `Arc` refcount): across
+    /// `libc::fork` the `Arc` refcount is per-process and wrong for ownership, so
+    /// a forked child that shares the parent's VM uses this fresh non-owning
+    /// inner instead.
     pub fn from_borrowed(shared: BhyveSharedVm) -> BhyveVm {
         BhyveVm {
-            inner: shared.0,
-            owns: false,
+            inner: Arc::new(BhyveVmInner {
+                ctx: shared.0.ctx,
+                next_vcpu: AtomicI32::new(1),
+                owns: false,
+            }),
         }
+    }
+
+    /// Whether this handle's inner OWNS the `/dev/vmm` node (its drop/teardown
+    /// runs `vm_destroy`). `false` for a borrowed view (see `from_borrowed`).
+    pub fn owns(&self) -> bool {
+        self.inner.owns
     }
 
     /// Tear down the VM (and /dev/vmm/<name>). With `Arc`-based ownership this
@@ -501,9 +536,12 @@ impl BhyveVm {
     pub fn destroy_in_place(&mut self) {
         // A BORROWED handle (a vfork child's view of the parent's shared VM)
         // never tears down the node — the owner (the parent process) resumes on
-        // it. The `owns` flag is per-handle precisely because the `Arc` refcount
-        // is per-process-wrong across `libc::fork` (see `from_borrowed`).
-        if !self.owns {
+        // it. The `owns` flag lives on the inner precisely because the `Arc`
+        // refcount is per-process-wrong across `libc::fork`, and a borrowed
+        // handle is a distinct non-owning inner (see `from_borrowed`). This guard
+        // plus the gated `BhyveVmInner::drop` make a borrowed node structurally
+        // safe from teardown on every path.
+        if !self.inner.owns {
             return;
         }
         if let Some(inner) = Arc::get_mut(&mut self.inner)
