@@ -42,6 +42,15 @@ use crate::vmm_x86::{
     VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI, VM_REG_GUEST_RSP, X86Exit,
 };
 
+/// Canonical (asm-generic/aarch64) `clone` number. The ONE syscall whose x86-64
+/// raw arg order differs from the dispatcher's asm-generic order: the engine
+/// swaps args[3]<->args[4] (child_tid<->tls) for it in `next_syscall`. Keyed on
+/// 220 PRECISELY so it never touches clone3 (canonical 435), which reads its
+/// parameters from a guest `clone_args` struct (no positional args to swap).
+/// Source: `clone(2)` man-page "C library/kernel differences". Mirrors the
+/// KVM-x86 lane's `CANONICAL_CLONE`.
+const CANONICAL_CLONE: u64 = 220;
+
 /// Pending INOUT state: the vCPU is parked on the `OUT 0xC5` instruction.
 /// `complete_syscall` applies the resume discipline once (writing RAX then
 /// calling `complete_inout`).
@@ -401,6 +410,24 @@ impl SyscallTrap for BhyveTrapEngine {
                         continue;
                     }
 
+                    // x86-64 raw clone(2) arg order is
+                    // (flags, stack, parent_tid, child_tid, tls); the shared
+                    // ISA-neutral dispatcher binds the asm-generic/aarch64 order
+                    // (flags, stack, parent_tid, tls, child_tid). Swap args[3]<->
+                    // args[4] for canonical clone(220) so the clone handler reads
+                    // tls/child_tid correctly — without this a CLONE_SETTLS thread
+                    // gets the child-tid pointer as its TLS base (the self-pointer
+                    // at %fs:0 reads 0 → the musl thread prologue #PFs → the empty
+                    // IDT triple-faults the sibling vCPU). clone3 (canonical 435)
+                    // reads a guest clone_args struct → no positional swap (the
+                    // CANONICAL_CLONE guard keys on 220). Mirrors the KVM-x86 lane
+                    // (trap_engine_x86.rs); source: clone(2) "C library/kernel
+                    // differences".
+                    let mut args = args;
+                    if canonical == CANONICAL_CLONE {
+                        args.swap(3, 4);
+                    }
+
                     return Ok(Some(RawSyscall {
                         number: canonical,
                         args,
@@ -647,19 +674,29 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
     where
         Self: Sized,
     {
-        use crate::guest_setup_x86::restore_x86_bhyve;
+        use crate::guest_setup_x86::program_sibling_long_mode;
         // New vCPU on the SAME VM (shared ctx/CR3/PML4/RAM). add_sibling_vcpu
         // draws a DISTINCT vcpu id from the shared allocator; it must be called
-        // BEFORE from_shared consumes spec.vm.
-        let mut vcpu = spec
+        // BEFORE from_shared consumes spec.vm. We capture the id to carve a
+        // per-sibling ring-0 MSR-blob + scratch-stack slot from the post-boot-
+        // free init-blob page.
+        let (mut vcpu, id) = spec
             .vm
             .add_sibling_vcpu()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        // FP skipped (D4): the snapshot carries no FP; the fresh vcpu's FP is
-        // its own (zeroed) state — acceptable for a new thread.
-        restore_x86_bhyve(&mut vcpu, &spec.snapshot)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Build a non-owning BhyveVm view of the shared ctx (its own Arc clone,
+        // keeping the VM alive while this sibling runs) — needed to write the
+        // per-sibling blob into guest RAM via vm_map_gpa.
         let vm = crate::vmm::BhyveVm::from_shared(spec.vm);
+        // A fresh sibling from add_sibling_vcpu → vcpu_reset starts in REAL
+        // MODE. program_sibling_long_mode replicates the parent's long-mode
+        // bring-up (descriptors/GDTR/TR/CR/EFER over the SHARED PML4+GDT),
+        // installs the SYSCALL MSRs via a ring-0 WRMSR blob, and iretqs the vCPU
+        // into the child's post-clone ring-3 context (RCX, child stack, rax=0).
+        // FP is skipped (D4): the snapshot carries no FP; the fresh vCPU's FP is
+        // its own (zeroed) state — acceptable for a new thread.
+        program_sibling_long_mode(&mut vcpu, &vm, &spec.snapshot, id)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         Ok(Self {
             vm,
             vcpu,
