@@ -210,6 +210,11 @@ pub enum X86Exit {
     /// `VM_EXITCODE_BOGUS` / `VM_EXITCODE_REQIDLE`: spurious, re-run (the KVM
     /// `Kicked` analogue).
     Bogus,
+    /// The in-flight `vm_run` was interrupted by a cross-thread kick
+    /// (`pthread_kill(SIGRTMIN)` → EINTR). No syscall pending; the loop
+    /// re-checks signals/futex/quiesce and re-enters. The threaded-loop kick
+    /// contract's `Ok(None)`.
+    Kicked,
     /// `VM_EXITCODE_PAGING`: nested-page fault the host must resolve or treat
     /// as a fatal guest fault (Phase 2: fatal with a page-walk dump).
     Paging { gpa: u64, fault_type: i32, rip: u64 },
@@ -236,6 +241,16 @@ impl BhyveVcpu {
         // SAFETY: `self.vcpu` is live; `run`/`exit` outlive the call.
         let rc = unsafe { vm_run(self.vcpu, &mut run) };
         if rc != 0 {
+            // A cross-thread kick (pthread_kill(SIGRTMIN), no SA_RESTART) makes
+            // vm_run return -1/EINTR. That is the kick, not a fatal error: surface
+            // it so next_syscall returns Ok(None) and the loop re-checks pending.
+            // libvmmapi's vm_run follows libc convention (returns -1, sets errno;
+            // os_err does NOT read errno, mirroring the vm_create comment in vmm.rs),
+            // so EINTR is read from last_os_error.
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                return Ok(X86Exit::Kicked);
+            }
             return Err(os_err("vm_run", rc));
         }
         Ok(match exit.exitcode {
