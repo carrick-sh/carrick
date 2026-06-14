@@ -1,0 +1,26 @@
+[package]
+name = "carrick-bhyve-vfork-exit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone SP2 fixture: vfork WITHOUT exec. Cross-compiled to
+# x86_64-unknown-linux-musl (static, non-PIE ET_EXEC) by a plain
+# `cargo build --release` via .cargo/config.toml (rust-lld; no build.sh).
+# Raw `syscall(SYS_vfork = 58)` → child `_exit(9)` → parent `wait4` asserts
+# WEXITSTATUS 9 → prints "vfork-exit ok" + exit 0. Proves fork_vfork runs a
+# true CLONE_VM child as a sibling vCPU on the BORROWED shared parent VM (parent
+# suspended), and the child exit never destroys the parent's /dev/vmm node.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-vfork-exit"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
