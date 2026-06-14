@@ -19,6 +19,8 @@
 //! `machine/vmm_dev.h`, and `sys/arm64/include/vmm.h` (releng/15.1) and remain
 //! compile-verified only (bhyve runs same-arch guests; the box is amd64).
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use carrick_hal::OsError;
 #[cfg(target_arch = "aarch64")]
@@ -239,24 +241,47 @@ fn sysreg_id(r: SysReg) -> Result<c_int, OsError> {
     })
 }
 
-pub struct BhyveVm {
+/// The shared inner state backing one VM across all its vCPU threads. The ctx is
+/// a kernel-owned handle valid for the VM's whole lifetime; bhyve's SMP model
+/// runs DISTINCT vcpus of one ctx concurrently on separate host threads
+/// (bhyverun.c fbsdrun_addcpu/vm_loop). vm_destroy runs once, when the last
+/// Arc holder (main engine + all siblings) drops.
+struct BhyveVmInner {
     ctx: *mut Vmctx,
-    next_vcpu: c_int,
+    next_vcpu: AtomicI32,
 }
 
-impl Drop for BhyveVm {
-    /// Tear down /dev/vmm/<name> unless `destroy()` already did (it nulls
-    /// `ctx`). Without this, a `?`-early-return during bring-up leaks the VM
-    /// node; with the per-create unique name (see `create`) each VM owns a
-    /// distinct node, so `vm_destroy` here is unambiguous (no shared-ctx EINVAL).
+// SAFETY: ctx is a kernel handle usable from any thread; only DISTINCT vcpus
+// run concurrently (the same vcpu is never touched from two threads). vcpu-id
+// allocation is atomic. The pointer is never mutated after create.
+unsafe impl Send for BhyveVmInner {}
+unsafe impl Sync for BhyveVmInner {}
+
+impl Drop for BhyveVmInner {
+    /// Tear down /dev/vmm/<name>. This runs exactly once, when the last `Arc`
+    /// holder drops (refcount hit 0) — i.e. after the main engine AND every
+    /// sibling engine that cloned the handle have all been dropped. With the
+    /// per-create unique name (see `BhyveVm::create`) each VM owns a distinct
+    /// node, so `vm_destroy` here is unambiguous (no shared-ctx EINVAL).
     fn drop(&mut self) {
         if !self.ctx.is_null() {
-            // SAFETY: a live, not-yet-destroyed vmctx (destroy() nulls ctx).
+            // SAFETY: a live, not-yet-destroyed vmctx; this is the LAST holder
+            // (Arc refcount hit 0), so vm_destroy is unambiguous and single.
             unsafe { vm_destroy(self.ctx) };
-            self.ctx = std::ptr::null_mut();
         }
     }
 }
+
+pub struct BhyveVm {
+    inner: Arc<BhyveVmInner>,
+}
+
+/// A cloneable, Send+Sync handle to a shared VM, carried in a sibling spec to a
+/// new thread which opens its own vCPU via `add_sibling_vcpu`. Each clone holds
+/// an `Arc` to the same `BhyveVmInner`, keeping the VM (and its `vm_destroy`)
+/// alive until every holder drops.
+#[derive(Clone)]
+pub struct BhyveSharedVm(Arc<BhyveVmInner>);
 
 pub struct BhyveVcpu {
     pub(crate) vcpu: *mut Vcpu,
@@ -309,7 +334,7 @@ impl BhyveVm {
     /// already-configured `/dev/vmm` node (ENOMEM/ENXIO), and Drop's
     /// `vm_destroy` of the shared ctx then failed EINVAL on the duplicate.
     pub fn create() -> Result<Self, OsError> {
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU32;
         // Process-global VM sequence — distinct name per create() in this process.
         static VM_SEQ: AtomicU32 = AtomicU32::new(0);
         let seq = VM_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -329,14 +354,19 @@ impl BhyveVm {
         if ctx.is_null() {
             return Err(OsError::new("bhyve: vm_openf returned NULL".to_string()));
         }
-        Ok(Self { ctx, next_vcpu: 0 })
+        Ok(Self {
+            inner: Arc::new(BhyveVmInner {
+                ctx,
+                next_vcpu: AtomicI32::new(0),
+            }),
+        })
     }
 
     /// Open + activate the next vCPU.
     pub fn add_vcpu(&mut self) -> Result<BhyveVcpu, OsError> {
-        let id = self.next_vcpu;
-        // SAFETY: `self.ctx` is a live vmctx for the VM's lifetime.
-        let vcpu = unsafe { vm_vcpu_open(self.ctx, id) };
+        let id = self.inner.next_vcpu.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `self.inner.ctx` is a live vmctx for the VM's lifetime.
+        let vcpu = unsafe { vm_vcpu_open(self.inner.ctx, id) };
         if vcpu.is_null() {
             return Err(OsError::new(format!("bhyve: vm_vcpu_open({id}) NULL")));
         }
@@ -346,16 +376,33 @@ impl BhyveVm {
             return Err(os_err("vm_activate_cpu", rc));
         }
         let _ = unsafe { vcpu_reset(vcpu) };
-        self.next_vcpu += 1;
         Ok(BhyveVcpu { vcpu })
     }
 
-    /// Tear down the VM (and /dev/vmm/<name>).
-    pub fn destroy(mut self) -> Result<(), OsError> {
-        // SAFETY: `self.ctx` is a live vmctx; destroying it tears down /dev/vmm/<name>.
-        unsafe { vm_destroy(self.ctx) };
-        // Null the ctx so the `Drop` below is a no-op (no double vm_destroy).
-        self.ctx = std::ptr::null_mut();
+    /// A cloneable handle to this VM's shared inner state, to hand to a sibling
+    /// vCPU thread. The clone holds its own `Arc`, so the VM stays alive (and
+    /// `vm_destroy` is deferred) until every holder — this `BhyveVm` and all
+    /// handles derived from it — has dropped.
+    pub fn shared_handle(&self) -> BhyveSharedVm {
+        BhyveSharedVm(Arc::clone(&self.inner))
+    }
+
+    /// Rebuild a `BhyveVm` from a shared handle: a sibling's engine holds its
+    /// own `Arc` clone, keeping the VM alive while it runs. Dropping the
+    /// resulting `BhyveVm` only drops that one `Arc` clone — `vm_destroy` runs
+    /// when the LAST holder drops, never before.
+    pub fn from_shared(shared: BhyveSharedVm) -> BhyveVm {
+        BhyveVm { inner: shared.0 }
+    }
+
+    /// Tear down the VM (and /dev/vmm/<name>). With `Arc`-based ownership this
+    /// is just dropping `self`: the `Arc` refcount decrements, and when it hits
+    /// zero (this was the LAST holder — the main engine plus every sibling that
+    /// cloned a handle have all dropped) `BhyveVmInner::drop` runs `vm_destroy`
+    /// exactly once. If siblings still hold clones, the ctx survives this drop
+    /// and is destroyed later, avoiding a use-after-free of a still-live ctx.
+    pub fn destroy(self) -> Result<(), OsError> {
+        drop(self);
         Ok(())
     }
 
@@ -363,8 +410,8 @@ impl BhyveVm {
     /// backing). Used by the bhyve GuestMemory to read/write syscall buffers —
     /// the analog of carrick-linux's host mmap. `None` if the GPA is unmapped.
     pub fn map_gpa(&self, gpa: u64, len: usize) -> Option<*mut u8> {
-        // SAFETY: `self.ctx` is live; vm_map_gpa returns NULL for an unmapped GPA.
-        let p = unsafe { vm_map_gpa(self.ctx, gpa, len) };
+        // SAFETY: `self.inner.ctx` is live; vm_map_gpa returns NULL for an unmapped GPA.
+        let p = unsafe { vm_map_gpa(self.inner.ctx, gpa, len) };
         if p.is_null() {
             None
         } else {
@@ -380,8 +427,8 @@ impl BhyveVm {
     /// `vm_map_gpa` can resolve pointers into it. `VM_MMAP_ALL` is the only
     /// style the implementation accepts (it asserts).
     pub fn setup_memory(&self, len: usize) -> Result<(), OsError> {
-        // SAFETY: `self.ctx` is a live vmctx.
-        let rc = unsafe { vm_setup_memory(self.ctx, len, VM_MMAP_ALL) };
+        // SAFETY: `self.inner.ctx` is a live vmctx.
+        let rc = unsafe { vm_setup_memory(self.inner.ctx, len, VM_MMAP_ALL) };
         if rc != 0 {
             return Err(os_err("vm_setup_memory", rc));
         }
@@ -390,12 +437,34 @@ impl BhyveVm {
 
     /// Map memory segment `segid` into the guest at `[gpa, gpa+len)`.
     pub fn mmap_memseg(&self, gpa: u64, segid: i32, len: usize, prot: i32) -> Result<(), OsError> {
-        // SAFETY: `self.ctx` is a live vmctx.
-        let rc = unsafe { vm_mmap_memseg(self.ctx, gpa, segid, 0, len, prot) };
+        // SAFETY: `self.inner.ctx` is a live vmctx.
+        let rc = unsafe { vm_mmap_memseg(self.inner.ctx, gpa, segid, 0, len, prot) };
         if rc != 0 {
             return Err(os_err("vm_mmap_memseg", rc));
         }
         Ok(())
+    }
+}
+
+impl BhyveSharedVm {
+    /// Open + activate a sibling vCPU on the shared ctx. Mirrors
+    /// `BhyveVm::add_vcpu`, but takes `&self` and draws the vcpu id from the
+    /// SHARED `AtomicI32` so concurrent siblings each get a DISTINCT id —
+    /// bhyve's SMP model runs distinct vcpus of one ctx on separate threads.
+    pub fn add_sibling_vcpu(&self) -> Result<BhyveVcpu, OsError> {
+        let id = self.0.next_vcpu.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `self.0.ctx` is a live vmctx for the VM's lifetime.
+        let vcpu = unsafe { vm_vcpu_open(self.0.ctx, id) };
+        if vcpu.is_null() {
+            return Err(OsError::new(format!("bhyve: vm_vcpu_open({id}) NULL")));
+        }
+        // SAFETY: `vcpu` is the just-opened vcpu handle.
+        let rc = unsafe { vm_activate_cpu(vcpu) };
+        if rc != 0 {
+            return Err(os_err("vm_activate_cpu", rc));
+        }
+        let _ = unsafe { vcpu_reset(vcpu) };
+        Ok(BhyveVcpu { vcpu })
     }
 }
 

@@ -65,6 +65,6 @@ pub use bhyve_threaded_glue::{BhyveForkCoordinator, BhyveSignalArrival, BhyveTim
 
 #[cfg(target_arch = "x86_64")]
 pub use trap_engine::BhyveTrapEngine;
-pub use vmm::{BhyveVcpu, BhyveVm};
+pub use vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm};
 #[cfg(target_arch = "x86_64")]
 pub use vmm_x86::X86Exit;
