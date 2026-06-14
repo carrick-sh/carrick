@@ -435,6 +435,29 @@ impl BhyveVm {
         Ok(())
     }
 
+    /// Destroy the VM in place (for a forked-child `_exit`, which skips `Drop`).
+    ///
+    /// bhyve VMs are NAME-bound `/dev/vmm/<name>` nodes that persist until
+    /// `vm_destroy` — they are NOT released by fd-close (unlike KVM). A forked
+    /// guest child `_exit`s without running `Drop`, so the engine calls this from
+    /// `process_exit_cleanup` to tear the child VM down and avoid leaking the
+    /// node. The forked child is the SOLE holder of its freshly-created child VM
+    /// (no siblings cloned the handle), so `Arc::get_mut` succeeds; we run
+    /// `vm_destroy` exactly once and NULL the ctx so the later `BhyveVmInner::drop`
+    /// (if it ever runs) is a no-op — guarding against a double-destroy. If
+    /// somehow another `Arc` holder existed (it should not for a child VM), we
+    /// leave the ctx alone and let the last holder's `Drop` destroy it.
+    pub fn destroy_in_place(&mut self) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner)
+            && !inner.ctx.is_null()
+        {
+            // SAFETY: a live, not-yet-destroyed vmctx; this is the sole Arc
+            // holder (Arc::get_mut succeeded), so vm_destroy is unambiguous.
+            unsafe { vm_destroy(inner.ctx) };
+            inner.ctx = std::ptr::null_mut();
+        }
+    }
+
     /// Map memory segment `segid` into the guest at `[gpa, gpa+len)`.
     pub fn mmap_memseg(&self, gpa: u64, segid: i32, len: usize, prot: i32) -> Result<(), OsError> {
         // SAFETY: `self.inner.ctx` is a live vmctx.

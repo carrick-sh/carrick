@@ -1,0 +1,25 @@
+[package]
+name = "carrick-bhyve-fork"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone SP1 fixture (the root Cargo.toml excludes crates/*/fixtures/*).
+# Cross-compiled to x86_64-unknown-linux-musl (static, non-PIE ET_EXEC) by a
+# plain `cargo build --release` via .cargo/config.toml (rust-lld; no build.sh).
+# fork() + wait4() + _exit(7): proves the bhyve eager-RAM-copy fork + the shared
+# wait_proc_exit + the normalize_syscall fork(57)→clone(220) desugar run
+# end-to-end.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-fork"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

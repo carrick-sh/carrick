@@ -1924,6 +1924,9 @@ where
                     // the rebuilt HVF context doesn't run the panicky Drops.
                     if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
                         crate::probes::guest_exit(code);
+                        // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
+                        // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
+                        engine.process_exit_cleanup();
                         forked_child_exit(
                             code,
                             kernel.dispatcher.stdout(),
@@ -1950,6 +1953,9 @@ where
                 DispatchOutcome::SignalDeath { signum } => {
                     crate::trap::dump_kick_stats();
                     if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                        // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
+                        // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
+                        engine.process_exit_cleanup();
                         forked_child_die_by_signal(
                             signum,
                             kernel.dispatcher.stdout(),
@@ -2322,6 +2328,9 @@ fn service_signals_threaded<E: ThreadedEngine>(
             }
             if let Some(signum) = action.term_signal {
                 if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                    // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
+                    // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
+                    engine.process_exit_cleanup();
                     let out = kernel.dispatcher.stdout();
                     let err = kernel.dispatcher.stderr();
                     forked_child_die_by_signal(signum, &out, &err);
