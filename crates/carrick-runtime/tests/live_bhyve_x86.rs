@@ -106,3 +106,51 @@ fn threads_run_to_zero_via_sibling_vcpus() {
         String::from_utf8_lossy(&result.stdout)
     );
 }
+
+#[test]
+fn fork_wait4_runs_to_zero() {
+    // The fork(2) acceptance (SP1): a guest that `fork`s, the child `_exit(7)`s,
+    // and the parent `wait4`s + verifies WEXITSTATUS==7, then exits 0. Success
+    // here proves `BhyveTrapEngine::fork()` eagerly copies the parent guest RAM
+    // into a fresh child VM, long-mode-programs child vCPU 0 at the post-fork
+    // resume, and the child VM is destroyed on `_exit` (process_exit_cleanup,
+    // no /dev/vmm leak). wait4 reuses the shared wait_proc_exit.
+    let Some(path) = fixture("CARRICK_BHYVE_FORK") else {
+        eprintln!("skip: set CARRICK_BHYVE_FORK to the fork ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "fork+wait4 guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("fork ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
+fn fork_raw_runs_to_zero() {
+    // The fork(2) BISECTION regression (SP1): a guest that forks via the RAW
+    // `SYS_fork` syscall (NOT musl's fork() wrapper), the child `_exit(7)`s
+    // immediately (no wait4, no musl child-side cleanup), and the parent wait4s +
+    // verifies WEXITSTATUS==7, exiting 0. This isolates carrick's child
+    // syscall-return-register delivery from musl's fork() wrapper: it stays GREEN
+    // even if the wrapper-driven `fork_wait4_runs_to_zero` regresses, pinning
+    // "the child sees fork()→0 in RAX" independent of libc.
+    let Some(path) = fixture("CARRICK_BHYVE_FORK_RAW") else {
+        eprintln!("skip: set CARRICK_BHYVE_FORK_RAW to the raw-fork ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "raw fork+wait4 guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

@@ -1,0 +1,24 @@
+[package]
+name = "carrick-bhyve-fork-raw"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone SP1 bisection fixture (the root Cargo.toml excludes
+# crates/*/fixtures/*). Cross-compiled to x86_64-unknown-linux-musl (static,
+# non-PIE ET_EXEC) by a plain `cargo build --release` via .cargo/config.toml
+# (rust-lld; no build.sh). Raw `SYS_fork` + `_exit(7)` in the child: isolates
+# carrick's child-return-register delivery from musl's fork() wrapper.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-fork-raw"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

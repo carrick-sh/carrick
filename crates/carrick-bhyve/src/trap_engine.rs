@@ -45,6 +45,7 @@ use crate::vmm_x86::{
 /// Pending INOUT state: the vCPU is parked on the `OUT 0xC5` instruction.
 /// `complete_syscall` applies the resume discipline once (writing RAX then
 /// calling `complete_inout`).
+#[derive(Debug)]
 struct PendingInout {
     rip: u64,
     inst_length: u8,
@@ -66,6 +67,11 @@ pub struct BhyveTrapEngine {
     /// `EINTR`, so this flag is how the engine distinguishes our kick from a
     /// spurious VT-x BOGUS re-entry.
     kick_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set `true` on the child side of a guest `fork(2)` — steers the exit path
+    /// (the loop `_exit`s the child, skipping Drops, and calls
+    /// `process_exit_cleanup` to destroy the name-bound child VM first). Mirrors
+    /// `KvmX86TrapEngine::is_forked_child`.
+    is_forked_child: bool,
 }
 
 // SAFETY: BhyveTrapEngine owns one vCPU + one VM-context view + a guest-RAM
@@ -85,6 +91,7 @@ impl BhyveTrapEngine {
             ram: bux.ram,
             pending_inout: None,
             kick_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            is_forked_child: false,
         }
     }
 
@@ -511,10 +518,146 @@ impl SyscallTrap for BhyveTrapEngine {
         Ok(())
     }
 
+    fn is_forked_child(&self) -> bool {
+        self.is_forked_child
+    }
+
+    fn process_exit_cleanup(&mut self) {
+        // bhyve VMs persist as /dev/vmm/<name> until vm_destroy (NOT released by
+        // fd-close, unlike KVM). A forked child _exits (skipping Drop), so destroy
+        // its VM here to avoid leaking the node. Only meaningful in a forked child
+        // (the main process exits via Drop). Safe: this engine is the sole holder
+        // of the freshly-created child VM.
+        self.vm.destroy_in_place();
+    }
+
     fn fork(&mut self) -> Result<carrick_hal::ForkOutcome, TrapError> {
-        Err(TrapError::Hypervisor(
-            "bhyve x86_64: fork is not implemented in Phase 2 (M3; spec N1)".into(),
-        ))
+        use crate::guest_setup_x86::{
+            PROT_RWX, VM_SEGID_SYSMEM, X86_MEM_SIZE, program_x86_vcpu_longmode_entry,
+            snapshot_x86_bhyve,
+        };
+        use crate::vmm::BhyveVm;
+
+        // Snapshot the parent vCPU BEFORE forking (suspended at the fork doorbell
+        // trap — atomic). The parent snapshot: fork inherits everything, so we do
+        // NOT seed a new stack/tls (unlike clone-thread). child RIP = parent RCX
+        // (the SYSCALL-saved return RIP), child RSP = parent RSP, rax=0.
+        //
+        // RAX is zeroed in the snapshot HERE (not only via the blob's clear_rax)
+        // to mirror the sibling path (`seed_entry_snapshot_bhyve` sets
+        // gpr[RAX]=0). At fork-trap time RAX holds the raw x86 fork number (57),
+        // and program_x86_vcpu_longmode_entry inherits all 15 GPRs verbatim
+        // (including RAX) into the child vCPU before the ring-0 blob runs. Relying
+        // solely on the blob's `xor eax,eax` left the child seeing RAX=57 (≠ 0) —
+        // it took fork()'s PARENT branch and re-ran wait4 on a bogus pid. Zeroing
+        // the snapshot RAX makes the child see fork() → 0 robustly.
+        let mut snap =
+            snapshot_x86_bhyve(&self.vcpu).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        snap.gpr[crate::guest_setup_x86::GPR_IDX_RAX] = 0;
+        let ram = self.ram.clone();
+
+        // Freeze the parent's ENTIRE guest RAM into a private heap buffer BEFORE
+        // libc::fork — while the parent vCPU is suspended at the fork doorbell
+        // (atomic, no guest writes in flight). The child copies from THIS frozen
+        // buffer, NOT from `self.vm.map_gpa` (the parent's LIVE kernel RAM).
+        //
+        // Why this is mandatory on bhyve (and not on KVM): KVM guest RAM is
+        // MAP_PRIVATE|MAP_ANONYMOUS, so libc::fork's copy-on-write hands the child
+        // a frozen snapshot of the parent's address space for free. bhyve guest
+        // RAM is KERNEL-OWNED (vm_setup_memory) and is NOT copy-on-write across
+        // libc::fork — the inherited vmctx aliases the parent's SAME live kernel
+        // pages. After libc::fork the parent process resumes its vCPU and runs the
+        // post-fork guest code CONCURRENTLY with the child's copy, mutating its
+        // stack/heap mid-copy. The child then copied a TORN, already-advanced
+        // image: e.g. the musl `syscall()` wrapper's saved return address on the
+        // stack had been overwritten by the parent's subsequent calls, so the
+        // child's `ret` jumped to the parent's later code (a clean `_exit(0)`)
+        // instead of resuming at the post-fork branch — the child silently
+        // skipped its own fork-child logic. Snapshotting before the fork closes
+        // the race: the child's image is exactly the parent's state at fork time.
+        let frozen_ram: Vec<u8> = {
+            let src = self.vm.map_gpa(0, X86_MEM_SIZE).ok_or_else(|| {
+                TrapError::Hypervisor("fork: parent map_gpa(0, X86_MEM_SIZE) NULL".to_string())
+            })?;
+            let mut buf = vec![0u8; X86_MEM_SIZE];
+            // SAFETY: `src` spans the full X86_MEM_SIZE-byte parent sysmem segment;
+            // the parent vCPU is suspended at the doorbell so no concurrent guest
+            // write races this read. `buf` is a fresh, disjoint allocation.
+            unsafe { std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), X86_MEM_SIZE) };
+            buf
+        };
+
+        // The generic loop has quiesced sibling vCPUs (fork barrier); this is the
+        // only active thread.
+        // SAFETY: libc::fork in a quiesced single-active-thread state.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(TrapError::ForkFailed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        if pid > 0 {
+            // PARENT: live VM untouched; report child pid (loop writes it to RAX).
+            return Ok(carrick_hal::ForkOutcome::Parent { child_pid: pid });
+        }
+
+        // CHILD. The child inherited the parent's vmctx (self.vm aliases the
+        // parent's live kernel RAM — the eager-copy SOURCE). Build a fresh,
+        // uniquely-named VM and copy. The child's RAM layout MUST match the
+        // parent's so the per-window copy lands at the right GPAs:
+        // bring_up_x86_elf sized the parent's sysmem at X86_MEM_SIZE (64 MiB)
+        // (total_size().max(X86_MEM_SIZE).min(X86_MEM_SIZE)), so the child uses
+        // the same size — NOT ram.total_size() (the bump cursor, which is smaller
+        // than the parent's actual segment and would truncate the high windows).
+        let mut child_vm = BhyveVm::create().map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        child_vm
+            .setup_memory(X86_MEM_SIZE)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        child_vm
+            .mmap_memseg(0, VM_SEGID_SYSMEM, X86_MEM_SIZE, PROT_RWX)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // Eager full-RAM copy: write the ENTIRE [0, X86_MEM_SIZE) lowmem segment
+        // from the PRE-FORK frozen buffer (NOT the parent's now-concurrently-live
+        // RAM — see `frozen_ram` above). bhyve maps the whole sysmem segment
+        // contiguously at GPA 0, so `vm_map_gpa(0, X86_MEM_SIZE)` resolves a
+        // single host pointer spanning all of guest RAM. A full-segment copy is
+        // strictly more correct than iterating `ram.windows`: it captures every
+        // window PLUS any guest memory the parent dirtied that is not tracked by
+        // a window descriptor (e.g. a `brk`/`mmap` region whose VA→GPA window was
+        // not registered, or pages between windows). bhyve guest RAM is
+        // kernel-owned and NOT COW (unlike KVM), so the copy is mandatory.
+        // (A child triple-faulting at rip=0x0 traced to exactly this: the
+        // per-window copy left part of the child's stack/heap zeroed, so a `ret`
+        // landed on a NULL return address.)
+        let dst = child_vm.map_gpa(0, X86_MEM_SIZE).ok_or_else(|| {
+            TrapError::Hypervisor("fork: child map_gpa(0, X86_MEM_SIZE) NULL".to_string())
+        })?;
+        // SAFETY: `frozen_ram` is X86_MEM_SIZE bytes; `dst` is the full
+        // X86_MEM_SIZE-byte child sysmem segment; the regions are disjoint
+        // (private heap buffer vs the child VM's mapping).
+        unsafe { std::ptr::copy_nonoverlapping(frozen_ram.as_ptr(), dst, X86_MEM_SIZE) };
+        let _ = &ram; // retained below for self.ram = ram (the child's window view)
+
+        // Program child vCPU 0 for long-mode entry at the post-fork resume.
+        let mut child_vcpu = child_vm
+            .add_vcpu()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        program_x86_vcpu_longmode_entry(&mut child_vcpu, &child_vm, &snap, 0)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // Swap in the child VM. CRITICAL: the OLD self.vm is the inherited parent
+        // alias — its Drop would vm_destroy the PARENT's live kernel VM from the
+        // child. mem::forget it (the Arc leaks in this child process, which is
+        // correct — the parent's VM stays alive for the still-running parent).
+        let inherited_parent = std::mem::replace(&mut self.vm, child_vm);
+        std::mem::forget(inherited_parent);
+        self.vcpu = child_vcpu; // the old parent vcpu handle has no Drop — harmless
+        self.ram = ram;
+        self.pending_inout = None; // the fresh child vCPU never hit a doorbell
+        self.kick_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.is_forked_child = true;
+        Ok(carrick_hal::ForkOutcome::Child)
     }
 
     fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
@@ -664,6 +807,7 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
             pending_inout: None,
             // Fresh kick-pending for THIS sibling vCPU (its own kick handle).
             kick_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            is_forked_child: false,
         })
     }
 

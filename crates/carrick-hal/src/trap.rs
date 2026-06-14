@@ -67,6 +67,14 @@ pub trait SyscallTrap {
     fn is_forked_child(&self) -> bool {
         false
     }
+    /// Called immediately before a forked child process `_exit`s (which skips
+    /// every `Drop`). Backends whose VM is NOT released by fd-close must tear it
+    /// down here. KVM/HVF: no-op — the VM is fd-lifetime-bound, so closing the
+    /// inherited descriptor (or letting the kernel reap it at `_exit`) frees it.
+    /// bhyve: the VM is a NAME-bound `/dev/vmm/<name>` node that persists until
+    /// `vm_destroy`, so a forked child that `_exit`s without this would LEAK its
+    /// node — the bhyve engine overrides this to `vm_destroy` the child VM.
+    fn process_exit_cleanup(&mut self) {}
     /// Inject a guest signal frame for `signum`. Writes a `CarrickSigframe` to
     /// SP_EL0, points the guest's x30 at `sa_restorer`, sets x0 to `signum`,
     /// and redirects the vCPU's next resumed PC to the user handler. The
