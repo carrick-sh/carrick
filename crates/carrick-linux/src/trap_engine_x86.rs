@@ -84,6 +84,11 @@ pub struct KvmX86TrapEngine {
     /// Set `true` on the child side of a guest `fork(2)` (mirrors aarch64
     /// `KvmTrapEngine::is_forked_child`). Steers the exit-reporting path.
     is_forked_child: bool,
+    /// RAX (the syscall NUMBER) captured at each syscall trap, BEFORE
+    /// `complete_syscall` overwrites RAX with the retval. SA_RESTART signal
+    /// injection restores it so a restarted syscall re-executes with its number
+    /// intact. Mirrors aarch64 `last_syscall_orig_x0` (M3d).
+    last_syscall_orig_rax: u64,
 }
 
 impl KvmX86TrapEngine {
@@ -101,6 +106,7 @@ impl KvmX86TrapEngine {
             vcpu: bux.vcpu,
             ram: bux.ram,
             is_forked_child: false,
+            last_syscall_orig_rax: 0,
         }
     }
 
@@ -221,6 +227,9 @@ impl SyscallTrap for KvmX86TrapEngine {
                         .fd()
                         .get_regs()
                         .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS: {e}")))?;
+                    // Capture the syscall NUMBER (RAX) before complete_syscall
+                    // overwrites RAX with the retval — SA_RESTART needs it (M3d).
+                    self.last_syscall_orig_rax = regs.rax;
 
                     // x86_64 Linux syscall ABI (syscall(2) man7.org):
                     //   number = rax
@@ -421,28 +430,57 @@ impl SyscallTrap for KvmX86TrapEngine {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inject_signal(
         &mut self,
-        _signum: i32,
-        _handler: u64,
-        _sa_restorer: u64,
-        _pending_syscall_retval: Option<i64>,
-        _interrupted_pc: Option<u64>,
-        _altstack: Option<(u64, u64)>,
-        _saved_sigmask: u64,
-        _fault_siginfo: Option<(i32, u64)>,
-        _queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
-        _restart_syscall: bool,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
+        restart_syscall: bool,
     ) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "kvm-x86: inject_signal is not implemented in Phase 2 (M3+; spec N2)".into(),
-        ))
+        use carrick_hal::RegAccess;
+        // The interrupted RFLAGS, saved into the frame's eflags and restored
+        // verbatim by rt_sigreturn. (x86 has no privilege-latched analogue of
+        // aarch64's SPSR_EL1; the live RFLAGS is authoritative on both paths.)
+        let pstate_source = self
+            .get_reg(Reg::Rflags)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let params = carrick_hal::sigframe::InjectParams {
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+            altstack,
+            saved_sigmask,
+            fault_siginfo,
+            queued_siginfo,
+            restart_syscall,
+            pstate_source,
+            // x86 reinterpretation: `orig_x0` carries the original RAX (the
+            // syscall NUMBER) so SA_RESTART can restore it (RAX was clobbered by
+            // the retval). See `last_syscall_orig_rax`.
+            orig_x0: self.last_syscall_orig_rax,
+            // x86 has no ESR; the faulting address rides in sigcontext.cr2/si_addr.
+            fault_esr: 0,
+            fpsimd_enabled: true,
+            // x86-64 MANDATES sa_restorer (no kernel vDSO sigreturn trampoline);
+            // glibc/musl always pass `__restore_rt`, so this fallback is never hit.
+            sigreturn_trampoline_base: 0,
+        };
+        <Self as carrick_hal::ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        Ok(())
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        Err(TrapError::Hypervisor(
-            "kvm-x86: restore_from_sigframe is not implemented in Phase 2 (M3+; spec N2)".into(),
-        ))
+        let restored = <Self as carrick_hal::ThreadedEngine>::Arch::restore_sigframe(self, true)?;
+        Ok(restored.sigmask)
     }
 }
 
@@ -698,6 +736,7 @@ impl carrick_hal::ThreadedEngine for KvmX86TrapEngine {
             vcpu,
             ram,
             is_forked_child: false,
+            last_syscall_orig_rax: 0,
         })
     }
 
