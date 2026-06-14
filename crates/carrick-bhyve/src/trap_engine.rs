@@ -80,6 +80,14 @@ pub struct BhyveTrapEngine {
     /// `process_exit_cleanup` to destroy the name-bound child VM first). Mirrors
     /// `KvmX86TrapEngine::is_forked_child`.
     is_forked_child: bool,
+    /// Set `true` when `self.vm` is a BORROWED view of a VM owned elsewhere — a
+    /// vfork child sharing the parent's VM (SP2). A borrowed VM must NOT be torn
+    /// down by this engine: `process_exit_cleanup` skips `vm_destroy` when set
+    /// (the parent owns the node and resumes on it), and `execve_into`
+    /// `mem::forget`s the old borrowed VM on detach instead of destroying it.
+    /// Default `false`: `new`/`materialize_sibling`/the fork child all own their
+    /// VM. Cleared back to `false` in `execve_into` (the fresh VM is owned).
+    vm_borrowed: bool,
 }
 
 // SAFETY: BhyveTrapEngine owns one vCPU + one VM-context view + a guest-RAM
@@ -100,6 +108,8 @@ impl BhyveTrapEngine {
             pending_inout: None,
             kick_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_forked_child: false,
+            // The main process VM is owned (created by bring_up_x86_elf).
+            vm_borrowed: false,
         }
     }
 
@@ -536,6 +546,15 @@ impl SyscallTrap for BhyveTrapEngine {
         // its VM here to avoid leaking the node. Only meaningful in a forked child
         // (the main process exits via Drop). Safe: this engine is the sole holder
         // of the freshly-created child VM.
+        //
+        // SP2: a vfork child sharing the parent's VM (vm_borrowed) must NOT
+        // destroy it on `_exit` — the parent owns the node and resumes on it
+        // after the vfork window. `destroy_in_place` already honors the borrowed
+        // handle's `owns=false`, but guard here too so the intent is explicit and
+        // a borrowed engine never even calls into the teardown.
+        if self.vm_borrowed {
+            return;
+        }
         self.vm.destroy_in_place();
     }
 
@@ -686,6 +705,9 @@ impl SyscallTrap for BhyveTrapEngine {
         self.pending_inout = None; // the fresh child vCPU never hit a doorbell
         self.kick_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.is_forked_child = true;
+        // SP1 fork OWNS its freshly-created child VM (child_vm above): its
+        // process_exit_cleanup destroys the name-bound node on _exit.
+        self.vm_borrowed = false;
         Ok(carrick_hal::ForkOutcome::Child)
     }
 
@@ -837,6 +859,9 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
             // Fresh kick-pending for THIS sibling vCPU (its own kick handle).
             kick_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_forked_child: false,
+            // A sibling holds an owning Arc clone of the shared VM (from_shared);
+            // teardown is refcounted via Drop. Not borrowed.
+            vm_borrowed: false,
         })
     }
 
