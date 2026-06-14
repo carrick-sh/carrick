@@ -95,33 +95,12 @@ const NEG_EINVAL: i64 = -22;
 /// `-ENOMEM` — out of memory (Linux errno 12).
 const NEG_ENOMEM: i64 = -12;
 
-// ─── run_elf_bhyve ────────────────────────────────────────────────────────────
+// ─── build_x86_engine ─────────────────────────────────────────────────────────
 
-/// Boot the static x86_64 ELF at `path` under bhyve and run it to exit.
-///
-/// Returns the guest's exit code on success, or a diagnostic string on
-/// bring-up failure.  Mirrors `run_elf_kvm` in structure.
-///
-/// # Startup-syscall service set (trap-driven, discovered on FreeBSD box)
-///
-/// | Canonical | x86_64 | Handler |
-/// |---|---|---|
-/// | 214 | 12 brk | bump over `LINUX_HEAP_BASE` window |
-/// | 222 | 9 mmap | anon-private bump over `LINUX_MMAP_BASE` window |
-/// | 215 | 11 munmap | no-op (run-to-exit) |
-/// | 226 | 10 mprotect | `0` (PML4 already correct) |
-/// | 134 | 13 rt_sigaction | `0` (no signals in M2) |
-/// | 135 | 14 rt_sigprocmask | `0` (no signals) |
-/// | 96 | 218 set_tid_address | host `getpid()` |
-/// | 64 | 1 write | guest buffer → host `write(2)` |
-/// | 66 | 20 writev | guest iovec → host writes |
-/// | 63 | 0 read | host `read(2)` → guest buffer |
-/// | 93/94 | 60/231 exit/exit_group | return code |
-/// | 132 | 131 sigaltstack | `0` (no signals in M2) |
-/// | 73 | 7 poll | `0` (no fds ready — non-blocking musl startup probe) |
-/// | 130 | 200 tkill | `exit(134)` on SIGABRT, else `0` |
-/// | default | — | `-ENOSYS` + x86_64 name logged |
-pub fn run_elf_bhyve(path: impl AsRef<Path>) -> Result<i32, String> {
+/// Build a fully-brought-up x86_64 bhyve trap engine from a static ELF on disk.
+/// Shared by `run_elf_bhyve` (the single-threaded `CARRICK_NO_THREADS` fallback)
+/// and `run_threaded_bhyve_loop` (carrick-runtime, the canonical loop).
+pub fn build_x86_engine(path: impl AsRef<std::path::Path>) -> Result<BhyveTrapEngine, String> {
     let path = path.as_ref();
 
     // ── Load the ELF ─────────────────────────────────────────────────────────
@@ -151,7 +130,39 @@ pub fn run_elf_bhyve(path: impl AsRef<Path>) -> Result<i32, String> {
 
     let bux = bring_up_x86_elf(&image, entry_rip, initial_rsp)
         .map_err(|e| format!("bring_up_x86_elf: {e}"))?;
-    let mut engine = BhyveTrapEngine::new(bux);
+    let engine = BhyveTrapEngine::new(bux);
+
+    Ok(engine)
+}
+
+// ─── run_elf_bhyve ────────────────────────────────────────────────────────────
+
+/// Boot the static x86_64 ELF at `path` under bhyve and run it to exit.
+///
+/// Returns the guest's exit code on success, or a diagnostic string on
+/// bring-up failure.  Mirrors `run_elf_kvm` in structure.
+///
+/// # Startup-syscall service set (trap-driven, discovered on FreeBSD box)
+///
+/// | Canonical | x86_64 | Handler |
+/// |---|---|---|
+/// | 214 | 12 brk | bump over `LINUX_HEAP_BASE` window |
+/// | 222 | 9 mmap | anon-private bump over `LINUX_MMAP_BASE` window |
+/// | 215 | 11 munmap | no-op (run-to-exit) |
+/// | 226 | 10 mprotect | `0` (PML4 already correct) |
+/// | 134 | 13 rt_sigaction | `0` (no signals in M2) |
+/// | 135 | 14 rt_sigprocmask | `0` (no signals) |
+/// | 96 | 218 set_tid_address | host `getpid()` |
+/// | 64 | 1 write | guest buffer → host `write(2)` |
+/// | 66 | 20 writev | guest iovec → host writes |
+/// | 63 | 0 read | host `read(2)` → guest buffer |
+/// | 93/94 | 60/231 exit/exit_group | return code |
+/// | 132 | 131 sigaltstack | `0` (no signals in M2) |
+/// | 73 | 7 poll | `0` (no fds ready — non-blocking musl startup probe) |
+/// | 130 | 200 tkill | `exit(134)` on SIGABRT, else `0` |
+/// | default | — | `-ENOSYS` + x86_64 name logged |
+pub fn run_elf_bhyve(path: impl AsRef<Path>) -> Result<i32, String> {
+    let mut engine = build_x86_engine(path)?;
 
     // ── brk / mmap bump state ─────────────────────────────────────────────────
     //
