@@ -29,9 +29,8 @@ use std::sync::Arc;
 
 use carrick_guest_mem::{GuestMemory, MemoryError, X8664SyscallFrame};
 use carrick_hal::{
-    OsError, RawSyscall, Reg, SysReg, SyscallTrap, TrapError, VcpuExit,
-    guest_arch::{GuestArch as _, SyscallRemap, SyscallTable as _},
-    x8664_arch::{X8664GuestArch, X8664SyscallTable},
+    OsError, RawSyscall, Reg, SysReg, SyscallTrap, TrapError, VcpuExit, guest_arch::GuestArch as _,
+    x8664_arch::X8664GuestArch,
 };
 use carrick_mem::memory::AddressSpace;
 
@@ -48,27 +47,9 @@ use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
 /// `0xE6 0xC5` = `OUT imm8($0xC5), %al`.  Source: AMD64 ISA / OSDev "OUT".
 pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
 
-/// Canonical (asm-generic/aarch64) `clone` number. Used to detect the one
-/// syscall whose x86-64 raw arg order differs from the dispatcher's. The swap is
-/// keyed on 220 PRECISELY so it never touches clone3 (canonical 435), which
-/// reads its parameters from a guest `clone_args` struct (no positional args to
-/// swap). Source: `clone(2)` man-page "C library/kernel differences".
-const CANONICAL_CLONE: u64 = 220;
-
-// x86-64 fork(2)/vfork(2) syscall numbers and the canonical Linux clone(2) flag
-// values they desugar to. x86-64 HAS SYS_fork/SYS_vfork (asm-generic/aarch64 do
-// NOT — they implement fork via clone), so musl's fork()/vfork() issue these
-// directly. Translate them to canonical clone(220) + flags so the ISA-neutral
-// dispatcher routes them to engine.fork()/fork_vfork() (the SAME path aarch64's
-// clone(SIGCHLD) takes). Without this, raw 57/58 fall through Unknown and
-// collide with canonical close(57)/… → silent misdispatch. Flag values:
-// clone(2) man-page (exit-signal = low byte; CLONE_VM=0x100, CLONE_VFORK=0x4000);
-// SIGCHLD=17 (signal(7)).
-const X86_NR_FORK: u64 = 57;
-const X86_NR_VFORK: u64 = 58;
-const LINUX_SIGCHLD: u64 = 17;
-const LINUX_CLONE_VM: u64 = 0x0000_0100;
-const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
+// The x86-64 syscall normalization constants (CANONICAL_CLONE, fork/vfork
+// numbers, clone flag values) now live in carrick_hal::x8664_arch (defined once,
+// shared with the bhyve lane via X8664GuestArch::normalize_syscall).
 
 // ─── KvmX86TrapEngine ────────────────────────────────────────────────────────
 
@@ -246,73 +227,27 @@ impl SyscallTrap for KvmX86TrapEngine {
                         r9: regs.r9,
                     };
 
-                    let (x86_number, args) = X8664GuestArch::decode_syscall(&frame);
-
-                    // Remap x86_64 number → canonical (aarch64/asm-generic).
-                    // Direct(c)  → canonical number (runtime dispatch).
-                    // Native     → raw x86_64 number (arch_prctl etc.).
-                    // Unknown    → raw x86_64 number (-ENOSYS in the loop).
-                    let canonical = match X8664SyscallTable::remap(x86_number) {
-                        SyscallRemap::Direct(c) => c,
-                        SyscallRemap::Native | SyscallRemap::Unknown => x86_number,
-                    };
-
-                    // arch_prctl(SET/GET FS/GS) is x86-ISA-specific and needs
-                    // KVM_GET/SET_SREGS — an engine-only op the ISA-neutral
-                    // SyscallDispatcher cannot perform (and raw x86 158 would
-                    // misroute to canonical getgroups=158). Service it HERE via the
-                    // SHARED carrick-hal policy (identical for bhyve) and re-enter
-                    // the guest, so the dispatcher never sees it. (musl's first
+                    // Normalize the raw x86-64 syscall via the shared ISA seam:
+                    // fork(57)/vfork(58)→clone(220) desugar + clone(220) tls↔
+                    // child_tid arg-swap + arch_prctl dispatch all live in
+                    // carrick_hal::x8664_arch (one definition shared with the
+                    // bhyve lane). arch_prctl(SET/GET FS/GS) needs KVM_GET/SET_SREGS
+                    // — an engine-only op the ISA-neutral SyscallDispatcher cannot
+                    // perform (raw x86 158 would also misroute to canonical
+                    // getgroups=158) — so it is serviced HERE and the guest
+                    // re-entered, never reaching the dispatcher. (musl's first
                     // syscall is arch_prctl(ARCH_SET_FS, tls); without this the FS
                     // base stays 0, the first TLS access faults, and KVM_RUN returns
                     // KVM_EXIT_INTERNAL_ERROR.)
-                    if x86_number == carrick_hal::x8664_arch::ARCH_PRCTL_X86_NR {
-                        let ret =
-                            carrick_hal::x8664_arch::service_arch_prctl(self, args[0], args[1])?;
-                        self.complete_syscall(ret)?;
-                        continue;
+                    match carrick_hal::x8664_arch::X8664GuestArch::normalize_syscall(&frame) {
+                        carrick_hal::x8664_arch::SyscallNorm::ArchPrctl { code, addr } => {
+                            let ret =
+                                carrick_hal::x8664_arch::service_arch_prctl(self, code, addr)?;
+                            self.complete_syscall(ret)?;
+                            continue;
+                        }
+                        carrick_hal::x8664_arch::SyscallNorm::Plain(raw) => return Ok(Some(raw)),
                     }
-
-                    // x86-64 fork(57)/vfork(58): desugar to canonical clone(220)
-                    // + flags so the shared dispatcher routes them to
-                    // engine.fork()/fork_vfork(). (Raw 57/58 Unknown-collide with
-                    // canonical close(57)/… → silent misdispatch.)
-                    if x86_number == X86_NR_FORK {
-                        return Ok(Some(RawSyscall {
-                            number: CANONICAL_CLONE,
-                            args: [LINUX_SIGCHLD, 0, 0, 0, 0, 0],
-                        }));
-                    }
-                    if x86_number == X86_NR_VFORK {
-                        return Ok(Some(RawSyscall {
-                            number: CANONICAL_CLONE,
-                            args: [
-                                LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                            ],
-                        }));
-                    }
-
-                    // x86-64 raw clone(2) arg order is
-                    // (flags, stack, parent_tid, child_tid, tls); the shared
-                    // dispatcher binds the asm-generic order
-                    // (flags, stack, parent_tid, tls, child_tid). Swap args[3]<->
-                    // args[4] for canonical clone so the ISA-neutral clone handler
-                    // reads tls/child_tid correctly. clone3 (435) passes a struct
-                    // → no swap (the CANONICAL_CLONE guard keys on 220).
-                    let mut args = args;
-                    if canonical == CANONICAL_CLONE {
-                        args.swap(3, 4);
-                    }
-
-                    return Ok(Some(RawSyscall {
-                        number: canonical,
-                        args,
-                    }));
                 }
 
                 // ── Other IoOut ports ─────────────────────────────────────────
