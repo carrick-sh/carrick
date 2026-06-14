@@ -1321,13 +1321,34 @@ pub mod host_signal {
         // subsequent `start_signal_pump`). ----
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_signal_pump::reset_state_for_supervisor_fork();
-        // BSD lane: bhyve signal-pump glue is wired in #1.
+        #[cfg(not(feature = "platform-linux"))]
+        carrick_bhyve::bhyve_signal_pump::reset_state_for_supervisor_fork();
     }
+    /// Translate a Linux (guest) signal number to the host kernel's number. On a
+    /// Linux host this is identity (the numbers match); on a FreeBSD host the BSD
+    /// numbering differs for several signals (SIGUSR1/2, SIGCHLD, SIGCONT/STOP/TSTP,
+    /// SIGBUS, SIGURG, SIGIO, SIGSYS) so it routes through the bhyve table.
     pub fn linux_to_host_signum(sig: i32) -> i32 {
-        sig
+        #[cfg(feature = "platform-linux")]
+        {
+            sig
+        }
+        #[cfg(not(feature = "platform-linux"))]
+        {
+            carrick_bhyve::bhyve_signum::linux_to_host_signum(sig)
+        }
     }
+    /// Translate a host kernel signal number back to its Linux (guest) number.
+    /// Identity on a Linux host; the inverse BSD table on FreeBSD.
     pub fn host_to_linux_signum(sig: i32) -> i32 {
-        sig
+        #[cfg(feature = "platform-linux")]
+        {
+            sig
+        }
+        #[cfg(not(feature = "platform-linux"))]
+        {
+            carrick_bhyve::bhyve_signum::host_to_linux_signum(sig)
+        }
     }
     /// Resolve + REMOVE a child's `(parent_tid, exit_signal)` watch. Called by
     /// the dispatcher's synchronous terminal-reap path to CANCEL the async
@@ -1352,7 +1373,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
         #[cfg(not(feature = "platform-linux"))]
-        let _ = ignored_mask; // BSD lane: bhyve disposition glue wired in #1.
+        carrick_bhyve::bhyve_disposition::reset_routed_handlers_after_execve(ignored_mask);
     }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
     /// neutral ring core (the nudge handler in `carrick_linux::kvm_xsig` set the
@@ -1396,7 +1417,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::ensure_host_handler(sig);
         #[cfg(not(feature = "platform-linux"))]
-        let _ = sig; // BSD lane: bhyve disposition glue wired in #1.
+        carrick_bhyve::bhyve_disposition::ensure_host_handler(sig);
     }
     /// Mirror a guest `SIG_IGN` onto the HOST disposition so a sibling guest
     /// process's host `kill` is DROPPED (honoring the guest's ignore) instead of
@@ -1405,7 +1426,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::set_host_ignore(sig);
         #[cfg(not(feature = "platform-linux"))]
-        let _ = sig; // BSD lane: bhyve disposition glue wired in #1.
+        carrick_bhyve::bhyve_disposition::set_host_ignore(sig);
     }
     /// Reset a mirrored signal's HOST disposition to `SIG_DFL` (the guest reset it
     /// to default): clear any host SIG_IGN / routed handler mirrored earlier and
@@ -1414,7 +1435,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::set_host_default(linux_signum);
         #[cfg(not(feature = "platform-linux"))]
-        let _ = linux_signum; // BSD lane: bhyve disposition glue wired in #1.
+        carrick_bhyve::bhyve_disposition::set_host_default(linux_signum);
     }
     /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
     /// ring (inherited across `fork`, so every carrick process shares ONE ring).
@@ -1435,7 +1456,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_xsig::xsig_nudge(target_host);
         #[cfg(not(feature = "platform-linux"))]
-        let _ = target_host; // BSD lane: bhyve xsignal-nudge glue wired in #1.
+        carrick_bhyve::bhyve_xsig::xsig_nudge(target_host);
     }
     /// No kqueue signal pump on Linux. Returning -1 makes the `setitimer`
     /// dispatch path (the only caller) skip the EVFILT_TIMER arming and use the

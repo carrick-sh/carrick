@@ -295,6 +295,74 @@ fn async_signal_interrupts_tight_loop() {
 }
 
 #[test]
+fn cross_process_kill_delivers_with_sender_pid() {
+    // SP4.2: a guest parent forks a child; the child installs an SA_SIGINFO SIGUSR1
+    // handler and pauses; the parent kill(child, SIGUSR1)s it. The handler must run
+    // with si_signo==SIGUSR1 AND si_pid == the parent's (ns-)pid, proving the
+    // cross-process host-kill path carries the correct sender identity. Exercises
+    // the FreeBSD linux<->host signum table (Linux SIGUSR1 10 -> FreeBSD 30), the
+    // mirrored host routed handler, and the signal pump turning the host signal
+    // into a guest-delivered SIGUSR1. RED before the bhyve cross-process host layer
+    // (no-op nudge/disposition/pump + identity signum table).
+    let Some(path) = fixture("CARRICK_BHYVE_CROSSSIG") else {
+        eprintln!("skip: set CARRICK_BHYVE_CROSSSIG to the crosssig ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "cross-process kill guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // The forked CHILD's "crosssig-ok" marker writes to the raw terminal fd 1 (a
+    // separate guest process — captured-stdout gotcha), so we assert on the PARENT's
+    // marker. The parent only prints "crosssig-parent-ok" + exits 0 if its wait4 saw
+    // the child exit 0, which the child does ONLY after its handler validated
+    // si_signo == SIGUSR1 AND si_pid == the parent's pid (else it _exit(15|16)s and
+    // the parent dies with "crosssig-child-nonzero"). So this is the full proof.
+    let out = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        out.contains("crosssig-parent-ok"),
+        "parent must wait4 the cross-process-signalled child to exit 0; stdout: {out:?}, stderr: {:?}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn cross_process_kill_sigusr2_delivers_with_sender_pid() {
+    // SP4.2: a SECOND host-kill cross-process proof on a DIFFERENT signum-table
+    // entry than the SIGUSR1 test. A guest parent forks a child that installs an
+    // SA_SIGINFO SIGUSR2 handler + waits; the parent kill(child, SIGUSR2)s it. The
+    // handler must run with si_signo == SIGUSR2 AND si_pid == the parent's pid.
+    // SIGUSR2 is Linux 12 -> FreeBSD 31 (vs SIGUSR1 Linux 10 -> FreeBSD 30), so a
+    // one-off mistranslation of the FreeBSD linux<->host signum table that a single
+    // signal would miss is caught here. Same mechanism as the SIGUSR1 test: the
+    // mirrored host routed handler + the signal pump.
+    let Some(path) = fixture("CARRICK_BHYVE_CROSSSIG_USR2") else {
+        eprintln!("skip: set CARRICK_BHYVE_CROSSSIG_USR2 to the crosssig-usr2 ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "cross-process SIGUSR2 guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // The child's "crossusr2-ok" marker writes to the raw terminal fd 1 (separate
+    // guest process). Assert on the PARENT marker: it only prints + exits 0 if its
+    // wait4 saw the child exit 0, which the child does ONLY after its handler
+    // validated si_signo == SIGUSR2 AND si_pid == the parent (else _exit(15|16)).
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("crossusr2-parent-ok"),
+        "parent must wait4 the cross-process-SIGUSR2'd child to exit 0; stdout: {:?}, stderr: {:?}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn fp_preserved_across_signal() {
     // The FP-fidelity acceptance (SP3.2): the guest seeds known XMM values, then
     // `raise`s a signal whose handler CLOBBERS XMM, then after rt_sigreturn

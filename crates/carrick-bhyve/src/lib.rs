@@ -58,6 +58,16 @@ mod bhyve_kicker;
 #[cfg(target_arch = "x86_64")]
 pub use bhyve_kicker::{BhyveKickHandle, BhyveKicker, install_bhyve_kick_handler, kick_signal};
 
+// SP4.2 cross-process signal host-layer glue (FreeBSD mirrors of the KVM modules).
+#[cfg(target_arch = "x86_64")]
+pub mod bhyve_disposition;
+#[cfg(target_arch = "x86_64")]
+pub mod bhyve_signal_pump;
+#[cfg(target_arch = "x86_64")]
+pub mod bhyve_signum;
+#[cfg(target_arch = "x86_64")]
+pub mod bhyve_xsig;
+
 #[cfg(target_arch = "x86_64")]
 mod bhyve_threaded_glue;
 #[cfg(target_arch = "x86_64")]
