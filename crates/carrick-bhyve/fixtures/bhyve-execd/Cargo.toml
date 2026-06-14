@@ -1,0 +1,24 @@
+[package]
+name = "carrick-bhyve-execd"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone SP2 fixture: the execve TARGET (the "execd" of bhyve-execve).
+# Cross-compiled to x86_64-unknown-linux-musl (static, non-PIE ET_EXEC) by a
+# plain `cargo build --release` via .cargo/config.toml (rust-lld; no build.sh).
+# Prints "execd ok" + _exit(0): proves execve_into rebuilt a fresh VM from the
+# second image and ran it from its entry point.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-execd"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

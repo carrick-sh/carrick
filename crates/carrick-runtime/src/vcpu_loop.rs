@@ -141,10 +141,26 @@ mod macos_helper_stubs {
             .read_exec_file(&path)
             .or_else(|| host_read(&path))
             .ok_or(LINUX_ENOENT)?;
+        // The ELF machine this lane accepts. The byte-based loader otherwise
+        // defaults to EM_AARCH64 (the aarch64 KVM lane); the x86_64 lanes
+        // (KVM-x86, bhyve) MUST pass EM_X86_64 or an x86_64 execve target is
+        // rejected as a machine mismatch → the dispatcher would ENOENT the
+        // execve (trap-confirmed on the bhyve lane: a static-musl x86_64 execd
+        // failed to load until the machine was threaded through). Resolve it from
+        // the build target arch (the engine's GuestArch::elf_machine()).
+        #[cfg(target_arch = "x86_64")]
+        let machine = {
+            use carrick_hal::guest_arch::GuestArch as _;
+            carrick_hal::x8664_arch::X8664GuestArch::elf_machine()
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let machine = goblin::elf::header::EM_AARCH64;
         // Load the ELF, resolving a dynamic interpreter through the same reader.
-        let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
-            dispatcher.read_exec_file(p).or_else(|| host_read(p))
-        })
+        let raw = AddressSpace::load_elf_bytes_with_reader_for(
+            &raw_bytes,
+            &|p| dispatcher.read_exec_file(p).or_else(|| host_read(p)),
+            machine,
+        )
         .map_err(|_| LINUX_ENOENT)?;
         // KVM boot-image shape: vdso (so AT_SYSINFO_EHDR resolves) + the Linux
         // initial stack (argc/argv/envp/auxv). `build_for_image` adds the
