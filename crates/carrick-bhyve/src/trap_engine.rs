@@ -31,7 +31,10 @@ use carrick_hal::{
 };
 use carrick_mem::memory::AddressSpace;
 
-use crate::guest_setup_x86::{BhyveGuestRam, BroughtUpX86, SYSCALL_DOORBELL_PORT, complete_inout};
+use crate::guest_setup_x86::{
+    BhyveGuestRam, BroughtUpX86, FP_STUB_DOORBELL_PORT, SYSCALL_DOORBELL_PORT, X86_FP_SCRATCH_GPA,
+    complete_inout,
+};
 use crate::vmm::{BhyveVcpu, BhyveVm};
 use crate::vmm_x86::{
     VM_REG_GUEST_CS, VM_REG_GUEST_R8, VM_REG_GUEST_R9, VM_REG_GUEST_R10, VM_REG_GUEST_R11,
@@ -96,6 +99,15 @@ pub struct BhyveTrapEngine {
     /// (the shared builder rewinds RIP-2 and reloads this). Mirrors
     /// `KvmX86TrapEngine::last_syscall_orig_rax`.
     last_syscall_orig_rax: u64,
+    /// GPA of the ring-3 `fxsave (%rdi)` + doorbell stub (SP3.2). `run_fp_stub`
+    /// redirects the live vCPU here to capture the FP that libvmmapi cannot read.
+    fxsave_stub_gpa: u64,
+    /// GPA of the ring-3 `fxrstor (%rdi)` + doorbell stub (SP3.2).
+    fxrstor_stub_gpa: u64,
+    /// GPA of THIS vCPU's 4 KiB / 16-aligned FP scratch page (FXSAVE/FXRSTOR
+    /// operand). vCPU 0 gets slot 0; siblings get a distinct slot (FP is
+    /// per-thread) assigned in `materialize_sibling`.
+    fp_scratch_gpa: u64,
 }
 
 // SAFETY: BhyveTrapEngine owns one vCPU + one VM-context view + a guest-RAM
@@ -119,6 +131,10 @@ impl BhyveTrapEngine {
             // The main process VM is owned (created by bring_up_x86_elf).
             vm_borrowed: false,
             last_syscall_orig_rax: 0,
+            // SP3.2 FP-stub GPAs carried out of bring-up (slot 0 for the main vCPU).
+            fxsave_stub_gpa: bux.fxsave_stub_gpa,
+            fxrstor_stub_gpa: bux.fxrstor_stub_gpa,
+            fp_scratch_gpa: bux.fp_scratch_gpa,
         }
     }
 
@@ -193,6 +209,60 @@ impl BhyveTrapEngine {
     /// Consume the VM (called after the guest exits cleanly).
     pub fn destroy(self) -> Result<(), OsError> {
         self.vm.destroy()
+    }
+
+    /// Run a ring-3 FXSAVE/FXRSTOR stub once to read/write the live vCPU FP that
+    /// `libvmmapi` cannot expose directly (SP3.2).
+    ///
+    /// Saves RIP/RAX/RDI/RFLAGS, points RDI at the 512-byte scratch GPA, sets
+    /// RAX=0 (the `out %al` source) and RIP at the stub, then `vm_run`s until the
+    /// FP-stub doorbell (`OUT %al,$0xC6` → `FP_STUB_DOORBELL_PORT`). bhyve
+    /// auto-advances RIP past the `out`, but we override it back to the saved RIP,
+    /// so afterward the vCPU is byte-identical to before the stub ran (FXSAVE is
+    /// non-destructive; FXRSTOR loads FP only). Spurious `Bogus`/`Kicked` re-entries
+    /// are tolerated (continue), exactly like `next_syscall`; any other exit is a
+    /// loud error (the stub never reached its doorbell).
+    fn run_fp_stub(&mut self, stub_gpa: u64, scratch_gpa: u64) -> Result<(), TrapError> {
+        let reg_err = |e: OsError| TrapError::Hypervisor(e.to_string());
+
+        let saved_rip = self.get_reg(Reg::Rip).map_err(reg_err)?;
+        let saved_rax = self.get_reg(Reg::Rax).map_err(reg_err)?;
+        let saved_rdi = self.get_reg(Reg::Rdi).map_err(reg_err)?;
+        let saved_rflags = self.get_reg(Reg::Rflags).map_err(reg_err)?;
+
+        self.set_reg(Reg::Rdi, scratch_gpa).map_err(reg_err)?;
+        self.set_reg(Reg::Rax, 0).map_err(reg_err)?; // `out %al` source
+        self.set_reg(Reg::Rip, stub_gpa).map_err(reg_err)?;
+
+        loop {
+            match self
+                .vcpu
+                .run_x86()
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?
+            {
+                X86Exit::Inout {
+                    port: FP_STUB_DOORBELL_PORT,
+                    is_in: false,
+                    ..
+                } => break,
+                // Spurious VT-x re-entry / cross-thread kick — re-run the stub.
+                X86Exit::Bogus | X86Exit::Kicked => continue,
+                other => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "run_fp_stub: unexpected exit {other:?} \
+                         (stub did not reach the FP doorbell {FP_STUB_DOORBELL_PORT:#x})"
+                    )));
+                }
+            }
+        }
+
+        // Restore the four touched regs (RIP override cancels bhyve's auto-advance
+        // past the `out`).
+        self.set_reg(Reg::Rip, saved_rip).map_err(reg_err)?;
+        self.set_reg(Reg::Rax, saved_rax).map_err(reg_err)?;
+        self.set_reg(Reg::Rdi, saved_rdi).map_err(reg_err)?;
+        self.set_reg(Reg::Rflags, saved_rflags).map_err(reg_err)?;
+        Ok(())
     }
 }
 
@@ -788,6 +858,11 @@ impl SyscallTrap for BhyveTrapEngine {
         old_vm.destroy_in_place();
         self.vcpu = bux.vcpu;
         self.ram = bux.ram;
+        // The fresh VM re-wrote the FP stub + scratch (bring_up_x86_elf); track
+        // its GPAs (same constants, but keep the engine in lockstep with bux).
+        self.fxsave_stub_gpa = bux.fxsave_stub_gpa;
+        self.fxrstor_stub_gpa = bux.fxrstor_stub_gpa;
+        self.fp_scratch_gpa = bux.fp_scratch_gpa;
         // The fresh VM from bring_up_x86_elf is OWNED (BhyveVm::create → owns).
         self.vm_borrowed = false;
         // The fresh vCPU never hit a doorbell; start a fresh kick-pending.
@@ -818,6 +893,17 @@ impl SyscallTrap for BhyveTrapEngine {
         queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
+        // SP3.2 FP overlay: capture the live vCPU FP via the guest-side FXSAVE
+        // stub BEFORE build_sigframe runs (the live regs are still the pristine
+        // interrupted context here — cleaner save/restore than after the builder
+        // has rewritten RSP/RDI/RIP for handler entry). The 512-byte FXSAVE blob
+        // is X8664Fpstate verbatim, so it overlays the frame's fpstate field as
+        // one memcpy (see the overlay after build_sigframe below).
+        self.run_fp_stub(self.fxsave_stub_gpa, self.fp_scratch_gpa)?;
+        let fp_blob = self
+            .read_bytes(self.fp_scratch_gpa, 512)
+            .map_err(|e| TrapError::Hypervisor(format!("FP scratch read: {e}")))?;
+
         // The interrupted RFLAGS, saved into the frame's eflags and restored
         // verbatim by rt_sigreturn. (x86 has no privilege-latched analogue of
         // aarch64's SPSR_EL1; the live RFLAGS is authoritative on both paths.)
@@ -842,23 +928,49 @@ impl SyscallTrap for BhyveTrapEngine {
             orig_x0: self.last_syscall_orig_rax,
             // x86 has no ESR; the faulting address rides in sigcontext.cr2/si_addr.
             fault_esr: 0,
-            // SP3.1 baseline: zeroed FP (the shared builder writes a zeroed
-            // FXSAVE area and skips FP restore). bhyve's libvmmapi exposes no FP
-            // getter, so real XMM/FP fidelity is a separate later task (SP3.2);
-            // `false` is correct for handlers that do not rely on interrupted
-            // XMM surviving — the model fixture.
+            // `fpsimd_enabled` stays `false`: the shared builder reserves +
+            // zero-fills the frame's FXSAVE area (and sets mc.fpstate to its GPA)
+            // but never touches FP regs (libvmmapi has no FP getter). SP3.2 then
+            // OVERLAYS the captured `fp_blob` over those zeros below — so the
+            // shared layer stays FP-agnostic while bhyve supplies real FP.
             fpsimd_enabled: false,
             // x86-64 MANDATES sa_restorer (no kernel vDSO sigreturn trampoline);
             // glibc/musl always pass `__restore_rt`, so this fallback is never hit.
             sigreturn_trampoline_base: 0,
         };
-        <Self as carrick_hal::ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        let inj = <Self as carrick_hal::ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        // SP3.2 FP overlay: write the 512-byte FXSAVE blob captured above over the
+        // frame's (zeroed) fpstate field. The builder already pointed mc.fpstate at
+        // this exact GPA, so the handler's ucontext sees the real interrupted FP,
+        // and restore_from_sigframe FXRSTORs it back on rt_sigreturn.
+        let fp_gpa =
+            inj.new_sp + core::mem::offset_of!(carrick_abi::X8664Rtsigframe, fpstate) as u64;
+        self.write_bytes(fp_gpa, &fp_blob)
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
         Ok(())
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+        // Read the saved FP from the frame BEFORE the shared restore rewrites RSP.
+        // At rt_sigreturn the handler's `ret` popped the 8-byte pretcode, so the
+        // frame starts at RSP-8 (mirrors restore_sigframe's own frame_sp). SP3.2.
+        let rsp = self
+            .get_reg(Reg::Rsp)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let fp_gpa = rsp.wrapping_sub(8)
+            + core::mem::offset_of!(carrick_abi::X8664Rtsigframe, fpstate) as u64;
+        let fp_blob = self
+            .read_bytes(fp_gpa, 512)
+            .map_err(|e| TrapError::Hypervisor(format!("sigframe FP read: {e}")))?;
+
         // SP3.1: GPR/RIP/RSP restore only (fpsimd_enabled=false matches inject).
         let restored = <Self as carrick_hal::ThreadedEngine>::Arch::restore_sigframe(self, false)?;
+
+        // SP3.2: FXRSTOR the interrupted FP back into the live vCPU via the scratch
+        // GPA + the guest-side fxrstor stub (the shared layer cannot reach FP).
+        self.write_bytes(self.fp_scratch_gpa, &fp_blob)
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
+        self.run_fp_stub(self.fxrstor_stub_gpa, self.fp_scratch_gpa)?;
         Ok(restored.sigmask)
     }
 }
@@ -983,6 +1095,16 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
             // teardown is refcounted via Drop. Not borrowed.
             vm_borrowed: false,
             last_syscall_orig_rax: 0,
+            // SP3.2: the stub CODE GPAs are shared (re-entrant via RDI), but FP is
+            // per-thread — this sibling gets a DISTINCT scratch slot keyed on its
+            // vcpu id (X86_FP_SCRATCH_GPA + id*0x1000) so concurrent FXSAVE/FXRSTOR
+            // on sibling vCPUs sharing this VM never alias. (id < X86_FP_SCRATCH_
+            // SLOTS = hw.vmm.maxcpu; the per-slot page was identity-mapped at
+            // bring-up.) NOTE: the SP3.2 fixture is single-threaded, so this path
+            // is correct-by-construction but not yet exercised live (SP4).
+            fxsave_stub_gpa: crate::guest_setup_x86::X86_FP_STUB_GPA,
+            fxrstor_stub_gpa: crate::guest_setup_x86::X86_FP_STUB_GPA + 8,
+            fp_scratch_gpa: X86_FP_SCRATCH_GPA + (id as u64) * 0x1000,
         })
     }
 

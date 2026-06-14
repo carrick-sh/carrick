@@ -268,3 +268,28 @@ fn signal_handler_runs_to_zero() {
         String::from_utf8_lossy(&result.stdout)
     );
 }
+
+#[test]
+fn fp_preserved_across_signal() {
+    // The FP-fidelity acceptance (SP3.2): the guest seeds known XMM values, then
+    // `raise`s a signal whose handler CLOBBERS XMM, then after rt_sigreturn
+    // asserts its XMM survived. RED on the Option-C baseline (zeroed/leaked FP),
+    // GREEN once `inject_signal`/`restore_from_sigframe` round-trip FP via the
+    // guest-side FXSAVE/FXRSTOR stub. Prints "fp-ok" + exit 0 on success.
+    let Some(path) = fixture("CARRICK_BHYVE_FPSIGNAL") else {
+        eprintln!("skip: set CARRICK_BHYVE_FPSIGNAL to the fp-signal ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "fp-signal guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("fp-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}

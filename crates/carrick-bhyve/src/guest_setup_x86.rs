@@ -133,6 +133,19 @@ pub const X86_GDT_GPA: u64 = 0x10_1000;
 /// GPA of the LSTAR trampoline (the `entry_trampoline_bytes` stub).
 pub const X86_LSTAR_GPA: u64 = 0x10_2000;
 
+/// FXSAVE/FXRSTOR ring-3 stub code (one page; both stubs < 16 bytes total).
+/// The gap 0x10_3000..0x20_0000 is free between the LSTAR stub and the PML4.
+/// CR0.PG=1 at injection time, so the stub runs paged: it is identity-mapped
+/// (VA==GPA) at bring-up, exactly like the init blob / LSTAR stub. SP3.2.
+pub const X86_FP_STUB_GPA: u64 = 0x10_3000;
+/// FP scratch region: one 4 KiB page PER vCPU (FXSAVE needs a 16-byte-aligned
+/// 512B operand; a page-per-vCPU is trivially aligned and race-free across
+/// sibling vCPUs that share this VM). 8 slots = hw.vmm.maxcpu. vCPU i uses
+/// `X86_FP_SCRATCH_GPA + i*0x1000`. Identity-mapped supervisor read-write. SP3.2.
+pub const X86_FP_SCRATCH_GPA: u64 = 0x10_4000;
+/// Number of per-vCPU FP scratch slots (one 4 KiB page each).
+pub const X86_FP_SCRATCH_SLOTS: u64 = 8;
+
 /// GPA of the root PML4 table (also the CR3 value).
 /// `LINUX_PAGE_TABLES_SIZE` = 0x1C0000 (1.75 MiB); end = 0x3C0000.
 pub const X86_PML4_GPA: u64 = 0x20_0000; // 2 MiB
@@ -213,6 +226,12 @@ const KERN_SS_SEL: u64 = 0x10;
 pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
 /// Reserved for M3 (TLB-shootdown completion / maintenance doorbell).
 pub const MAINT_DOORBELL_PORT: u16 = 0xC6;
+/// The FP-stub doorbell port (distinct from the syscall doorbell `0xC5`): the
+/// FXSAVE/FXRSTOR ring-3 stubs `OUT %al,$0xC6` here to signal completion, so
+/// `run_fp_stub` knows the stub finished and `next_syscall` never confuses the
+/// two. Shares the `0xC6` ordinal with the (still-unused, M3-reserved)
+/// `MAINT_DOORBELL_PORT`; SP3.2 is the first live user of `0xC6`.
+pub const FP_STUB_DOORBELL_PORT: u16 = 0xC6;
 
 /// M0 guest RAM: 32 MiB, all lowmem (≤ 3 GiB ⇒ a single `[0, len)` sysmem
 /// mapping; see the module docs).
@@ -395,6 +414,36 @@ fn write_gpa(vm: &BhyveVm, gpa: u64, bytes: &[u8]) -> Result<(), OsError> {
     // verified containment); the source slice is disjoint from it.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
     Ok(())
+}
+
+/// SP3.2 FXSAVE/FXRSTOR ring-3 stub bytes (16 bytes, two 8-byte slots).
+///
+/// libvmmapi exposes no FP getter, so carrick reads/writes the live vCPU FP by
+/// redirecting RIP to one of these stubs (with `RDI = scratch GPA`) and running
+/// until the FP doorbell (`OUT %al,$0xC6`). FXSAVE is non-destructive; FXRSTOR
+/// loads FP only — so after the stub the vCPU is byte-identical (run_fp_stub
+/// restores the saved RIP/RAX/RDI/RFLAGS).
+///
+/// Encodings (AMD64 APM vol. 3 / Intel SDM vol. 2A "FXSAVE"/"FXRSTOR"):
+/// ```text
+///   fxsave  (%rdi)    0F AE 07     ; capture FP into [rdi]=scratch  (slot +0)
+///   fxrstor (%rdi)    0F AE 0F     ; load FP from [rdi]=scratch     (slot +8)
+///   out %al,$0xC6     E6 C6        ; FP doorbell (FP_STUB_DOORBELL_PORT)
+///   jmp .             EB FE        ; park (never reached: host restores RIP)
+/// ```
+/// `fxsave_stub` at +0, `fxrstor_stub` at +8 (each padded to 8 bytes).
+pub fn fp_stub_bytes() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    // fxsave (%rdi); out %al,$0xC6; jmp .
+    b[0..7].copy_from_slice(&[0x0F, 0xAE, 0x07, 0xE6, 0xC6, 0xEB, 0xFE]);
+    // fxrstor (%rdi); out %al,$0xC6; jmp .
+    b[8..15].copy_from_slice(&[0x0F, 0xAE, 0x0F, 0xE6, 0xC6, 0xEB, 0xFE]);
+    b
+}
+
+/// Write the SP3.2 FXSAVE/FXRSTOR stubs into [`X86_FP_STUB_GPA`].
+fn write_fp_stub(vm: &BhyveVm) -> Result<(), OsError> {
+    write_gpa(vm, X86_FP_STUB_GPA, &fp_stub_bytes())
 }
 
 /// A brought-up M0 VM: the doorbell blob is loaded, the identity PML4 + boot
@@ -789,6 +838,14 @@ pub struct BroughtUpX86 {
     pub vm: BhyveVm,
     pub vcpu: BhyveVcpu,
     pub ram: BhyveGuestRam,
+    /// GPA of the ring-3 `fxsave (%rdi)` + doorbell stub (SP3.2). `run_fp_stub`
+    /// redirects the vCPU here to capture the live FP that libvmmapi cannot read.
+    pub fxsave_stub_gpa: u64,
+    /// GPA of the ring-3 `fxrstor (%rdi)` + doorbell stub (SP3.2).
+    pub fxrstor_stub_gpa: u64,
+    /// GPA of vCPU 0's 4 KiB / 16-aligned FP scratch page (FXSAVE/FXRSTOR
+    /// operand). Sibling vCPUs get a distinct slot in `materialize_sibling`.
+    pub fp_scratch_gpa: u64,
 }
 
 /// Bring up a carrick x86_64/bhyve vCPU with carrick-owned long-mode ring-3
@@ -875,6 +932,21 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
         true,
     );
 
+    // SP3.2 FP stub code: identity-mapped supervisor exec. Runs at the CURRENT
+    // CPL when run_fp_stub redirects RIP here (at a syscall-doorbell injection
+    // the vCPU is parked at the ring-0 LSTAR stub, i.e. CPL 0). FXSAVE/FXRSTOR
+    // and `out` are not CPL-gated for our purposes; supervisor mapping is fine.
+    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
+    // SP3.2 FP scratch: identity-mapped supervisor read-write, one page per vCPU.
+    ram.add_fixed(
+        X86_FP_SCRATCH_GPA,
+        X86_FP_SCRATCH_GPA,
+        (X86_FP_SCRATCH_SLOTS as usize) * 4096,
+        false,
+        true,
+        false,
+    );
+
     // PML4 tables: supervisor, no user bit, read-write.
     ram.add_fixed(
         LINUX_PAGE_TABLES_BASE,
@@ -934,6 +1006,9 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
 
     // LSTAR trampoline (the ring-0 SYSCALL entry stub: OUT + sysretq).
     write_gpa(&vm, X86_LSTAR_GPA, &entry_trampoline_bytes())?;
+
+    // SP3.2 FXSAVE/FXRSTOR stubs.
+    write_fp_stub(&vm)?;
 
     // PML4 tables: map all the windows.
     let specs = pml4_map_specs(&ram);
@@ -1032,7 +1107,14 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
 
     vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
 
-    Ok(BroughtUpX86 { vm, vcpu, ram })
+    Ok(BroughtUpX86 {
+        vm,
+        vcpu,
+        ram,
+        fxsave_stub_gpa: X86_FP_STUB_GPA,
+        fxrstor_stub_gpa: X86_FP_STUB_GPA + 8,
+        fp_scratch_gpa: X86_FP_SCRATCH_GPA, // slot 0 (the main vCPU)
+    })
 }
 
 /// Bring up a carrick x86_64/bhyve vCPU for the M1 test: like [`bring_up_x86`]
@@ -1065,6 +1147,16 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
         false,
         false,
         true,
+    );
+    // SP3.2 FP stub + scratch windows (identity-mapped supervisor).
+    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
+    ram.add_fixed(
+        X86_FP_SCRATCH_GPA,
+        X86_FP_SCRATCH_GPA,
+        (X86_FP_SCRATCH_SLOTS as usize) * 4096,
+        false,
+        true,
+        false,
     );
     ram.add_fixed(
         LINUX_PAGE_TABLES_BASE,
@@ -1107,6 +1199,7 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
     write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
     write_gpa(&vm, X86_LSTAR_GPA, &entry_trampoline_bytes())?;
+    write_fp_stub(&vm)?; // SP3.2 FXSAVE/FXRSTOR stubs
 
     // M1 ring-3 blob at its bump GPA (resolved through the PML4).
     let m1_gpa = ram
@@ -1167,7 +1260,14 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
 
     vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
 
-    Ok(BroughtUpX86 { vm, vcpu, ram })
+    Ok(BroughtUpX86 {
+        vm,
+        vcpu,
+        ram,
+        fxsave_stub_gpa: X86_FP_STUB_GPA,
+        fxrstor_stub_gpa: X86_FP_STUB_GPA + 8,
+        fp_scratch_gpa: X86_FP_SCRATCH_GPA,
+    })
 }
 
 // ─── T10: bring_up_x86_elf ───────────────────────────────────────────────────
@@ -1246,6 +1346,17 @@ pub fn bring_up_x86_elf(
         false,
         false,
         true,
+    );
+    // SP3.2 FP stub + scratch windows (identity-mapped supervisor; see the FP
+    // overlay in BhyveTrapEngine::inject_signal / restore_from_sigframe).
+    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
+    ram.add_fixed(
+        X86_FP_SCRATCH_GPA,
+        X86_FP_SCRATCH_GPA,
+        (X86_FP_SCRATCH_SLOTS as usize) * 4096,
+        false,
+        true,
+        false,
     );
     ram.add_fixed(
         LINUX_PAGE_TABLES_BASE,
@@ -1340,6 +1451,7 @@ pub fn bring_up_x86_elf(
 
     write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
     write_gpa(&vm, X86_LSTAR_GPA, &entry_trampoline_bytes())?;
+    write_fp_stub(&vm)?; // SP3.2 FXSAVE/FXRSTOR stubs
 
     // Write each region's bytes into its bump window.
     for region in image.regions() {
@@ -1406,7 +1518,14 @@ pub fn bring_up_x86_elf(
 
     vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
 
-    Ok(BroughtUpX86 { vm, vcpu, ram })
+    Ok(BroughtUpX86 {
+        vm,
+        vcpu,
+        ram,
+        fxsave_stub_gpa: X86_FP_STUB_GPA,
+        fxrstor_stub_gpa: X86_FP_STUB_GPA + 8,
+        fp_scratch_gpa: X86_FP_SCRATCH_GPA, // slot 0 (the main vCPU)
+    })
 }
 
 // ─── M2 Tier 0: vCPU register snapshot / restore / seed ──────────────────────
