@@ -1,0 +1,35 @@
+[package]
+name = "carrick-bhyve-vfork-exec"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone SP2 fixture: vfork + exec (the dominant vfork pattern).
+# Cross-compiled to x86_64-unknown-linux-musl (static, non-PIE ET_EXEC) by a
+# plain `cargo build --release` via .cargo/config.toml (rust-lld; no build.sh).
+# Raw `syscall(SYS_vfork = 58)` → child execve's the deployed bhyve-execd target
+# (prints "execd ok" + exit 0) → parent (released on the child's exec) wait4
+# asserts WEXITSTATUS 0 → prints "vfork-exec ok" + exit 0. Proves vfork+exec
+# through the trait DEFAULT fork_vfork (fork-COPY, fresh OWNED child VM) plus the
+# generic loop's vfork pipe release-on-execve. There is NO shared bhyve VM.
+#
+# PATH RESOLUTION: the target path is the ABSOLUTE deployed host path of execd.
+# Under run_elf_bhyve_dispatch the dispatcher's `load_execve_image` resolves an
+# absolute execve path through the in-memory/cap-std overlay FIRST, then (since a
+# bare run-elf dispatcher leaves `exec_host_fs_fallback = true`) falls back to
+# `std::fs::read(path)` on the literal host fs. The deployed execd lives at the
+# host path baked into src/main.rs (default /root/fixtures/execd), so the
+# host-fs fallback resolves it. Override at build time with CARRICK_EXECD_PATH.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-vfork-exec"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

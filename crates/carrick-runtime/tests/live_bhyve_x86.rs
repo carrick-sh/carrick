@@ -184,3 +184,61 @@ fn execve_runs_second_image() {
         String::from_utf8_lossy(&result.stdout)
     );
 }
+
+#[test]
+fn vfork_exit_runs_to_zero() {
+    // The vfork(2)-without-exec acceptance (SP2): the guest `vfork`s (raw
+    // SYS_vfork), the child `_exit(9)`s immediately, and the parent — released
+    // when the child's exit closes the vfork suspend pipe (EOF) — `wait4`s and
+    // verifies WEXITSTATUS==9, then exits 0. Success here proves bhyve's vfork
+    // works through the trait DEFAULT `fork_vfork() → self.fork()` (a fork-COPY:
+    // the child gets its OWN fresh VM via SP1, exactly like the `fork` test) plus
+    // the generic loop's vfork-pipe parent-suspend. There is NO shared bhyve VM;
+    // true cross-process CLONE_VM was proven infeasible (see the design spec).
+    let Some(path) = fixture("CARRICK_BHYVE_VFORK_EXIT") else {
+        eprintln!("skip: set CARRICK_BHYVE_VFORK_EXIT to the vfork-exit ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "vfork+_exit guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("vfork-exit ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
+fn vfork_exec_runs_to_zero() {
+    // The vfork(2)+execve(2) acceptance (SP2) — the DOMINANT vfork pattern. The
+    // guest `vfork`s (raw SYS_vfork), the child immediately `execve`s the
+    // deployed `execd` target (prints `execd ok` + exit 0), and the parent —
+    // released the moment the child's execve succeeds (the loop writes the vfork
+    // pipe in handle_execve) — `wait4`s and verifies WEXITSTATUS==0, then prints
+    // `vfork-exec ok` + exits 0. Success here exercises the whole vfork+exec
+    // path on bhyve: the trait-default `fork_vfork() → self.fork()` fork-COPY
+    // child runs its OWN fresh VM, hits execve → `execve_into` rebuilds a fresh
+    // VM AND releases the suspended parent → the parent resumes + reaps 0. There
+    // is NO shared bhyve VM (cross-process CLONE_VM was proven infeasible).
+    let Some(path) = fixture("CARRICK_BHYVE_VFORK_EXEC") else {
+        eprintln!("skip: set CARRICK_BHYVE_VFORK_EXEC to the vfork-exec ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "vfork+execve guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("vfork-exec ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}

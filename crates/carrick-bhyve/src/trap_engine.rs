@@ -711,6 +711,20 @@ impl SyscallTrap for BhyveTrapEngine {
         Ok(carrick_hal::ForkOutcome::Child)
     }
 
+    // NOTE: bhyve INTENTIONALLY does NOT override `fork_vfork`; it uses the trait
+    // DEFAULT `fork_vfork() → self.fork()` (the fork-COPY above). vfork is thus a
+    // fresh, OWNED child VM eagerly copied from the parent — NOT a shared parent
+    // VM. True cross-process CLONE_VM (two processes on ONE bhyve VM) was proven
+    // EMPIRICALLY infeasible: a borrowed-VM child leaves the parent's `active_cpus`
+    // bit permanently set, the suspend rendezvous can't be satisfied, and `vm_run`
+    // returns EINVAL. The fork-copy + the generic loop's vfork-pipe parent-suspend
+    // (the parent waits until the child execve's/_exit's) is correct for every
+    // conforming vfork user (POSIX: the child may only exec/_exit) and matches the
+    // KVM x86 lane. See the vfork design-correction section of
+    // docs/superpowers/specs/2026-06-14-bhyve-process-model-2-vfork-execve-design.md.
+    // Acceptance: the `vfork_exit_runs_to_zero` + `vfork_exec_runs_to_zero` live
+    // tests in crates/carrick-runtime/tests/live_bhyve_x86.rs.
+
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
         use crate::guest_setup_x86::bring_up_x86_elf;
 
