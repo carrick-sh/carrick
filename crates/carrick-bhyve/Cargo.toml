@@ -26,4 +26,15 @@ carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-abi = { path = "../carrick-abi" }
+# The hypervisor-agnostic private-futex parking table. `BhyveFutex` wraps the
+# SAME `carrick_thread::thread::FutexTable` `KvmFutex`/`HvfFutex` do; only the
+# shared (MAP_SHARED cross-process) path differs (FreeBSD `_umtx_op`).
+carrick-thread = { path = "../carrick-thread" }
+# `carrick_host::umtx` is the FreeBSD `_umtx_op` shared-futex wrapper used by
+# BhyveFutex's shared half. (cfg(target_os = "freebsd") inside carrick-host.)
+carrick-host = { path = "../carrick-host" }
+# Neutral timer slot bookkeeping (BhyveTimerDelivery) + per-thread pending store
+# (the timer firing thread publishes here then kicks). Mirrors carrick-linux.
+carrick-timer-core = { path = "../carrick-timer-core" }
+carrick-signal-core = { path = "../carrick-signal-core" }
 libc.workspace = true
