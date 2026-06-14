@@ -634,7 +634,7 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
     where
         Self: Sized,
     {
-        use crate::guest_setup_x86::program_sibling_long_mode;
+        use crate::guest_setup_x86::program_x86_vcpu_longmode_entry;
         // New vCPU on the SAME VM (shared ctx/CR3/PML4/RAM). add_sibling_vcpu
         // draws a DISTINCT vcpu id from the shared allocator; it must be called
         // BEFORE from_shared consumes spec.vm. We capture the id to carve a
@@ -649,13 +649,13 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
         // per-sibling blob into guest RAM via vm_map_gpa.
         let vm = crate::vmm::BhyveVm::from_shared(spec.vm);
         // A fresh sibling from add_sibling_vcpu → vcpu_reset starts in REAL
-        // MODE. program_sibling_long_mode replicates the parent's long-mode
+        // MODE. program_x86_vcpu_longmode_entry replicates the parent's long-mode
         // bring-up (descriptors/GDTR/TR/CR/EFER over the SHARED PML4+GDT),
         // installs the SYSCALL MSRs via a ring-0 WRMSR blob, and iretqs the vCPU
         // into the child's post-clone ring-3 context (RCX, child stack, rax=0).
         // FP is skipped (D4): the snapshot carries no FP; the fresh vCPU's FP is
         // its own (zeroed) state — acceptable for a new thread.
-        program_sibling_long_mode(&mut vcpu, &vm, &spec.snapshot, id)
+        program_x86_vcpu_longmode_entry(&mut vcpu, &vm, &spec.snapshot, id)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         Ok(Self {
             vm,
