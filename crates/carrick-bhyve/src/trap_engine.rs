@@ -23,6 +23,8 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use std::sync::Arc;
+
 use carrick_guest_mem::{GuestMemory, MemoryError, X8664SyscallFrame};
 use carrick_hal::{
     OsError, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError,
@@ -59,6 +61,14 @@ pub struct BhyveTrapEngine {
     /// Set when `next_syscall` dequeues an INOUT; cleared by `complete_syscall`.
     pending_inout: Option<PendingInout>,
 }
+
+// SAFETY: BhyveTrapEngine owns one vCPU + one VM-context view + a guest-RAM
+// window map, all driven from EXACTLY ONE thread at a time. The generic loop
+// moves the engine into its owning thread; sibling vCPUs (Tier 2) are
+// constructed on their own threads via materialize_sibling (the raw vmctx/vcpu
+// pointers are never dereferenced from two threads at once). Sync is NOT
+// implemented (the engine is never shared by reference across threads).
+unsafe impl Send for BhyveTrapEngine {}
 
 impl BhyveTrapEngine {
     /// Create a trap engine from a fully-brought-up M1 VM.
@@ -527,6 +537,68 @@ impl SyscallTrap for BhyveTrapEngine {
             "bhyve x86_64: restore_from_sigframe is not implemented in Phase 2 (M3; spec N2)"
                 .into(),
         ))
+    }
+}
+
+// ─── ThreadedEngine (minimal — Tier 1; sibling vCPUs stubbed for Tier 2) ─────
+//
+// Puts bhyve on the canonical run_vcpu_until_exit loop. clone(CLONE_THREAD)
+// sibling vCPUs are Tier 2 (build/materialize_sibling = typed-error stubs,
+// SiblingSpec=()); fork/execve_into/inject_signal/restore_from_sigframe keep
+// their SyscallTrap stubs (M3). Mirrors KvmX86TrapEngine's M3a/M3b stub.
+impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
+    type Arch = carrick_hal::x8664_arch::X8664GuestArch;
+    type KickHandle = crate::bhyve_kicker::BhyveKickHandle;
+    // Tier 1: sibling vCPUs not yet implemented (Tier 2 replaces this with a
+    // real BhyveSiblingSpec). Unit type is trivially Send + 'static.
+    type SiblingSpec = ();
+
+    fn kick_handle(&self) -> Self::KickHandle {
+        crate::bhyve_kicker::BhyveKickHandle::for_current_thread()
+    }
+
+    fn wait_for_vcpu_slot() {
+        // No admission cap (bhyve activates vCPUs eagerly; no HVF-style limit).
+    }
+
+    fn build_sibling_spec(
+        &self,
+        _entry: carrick_hal::GuestEntryRegs,
+    ) -> Result<Self::SiblingSpec, TrapError> {
+        Err(TrapError::Hypervisor(
+            "bhyve: clone(CLONE_THREAD) sibling vCPU not implemented (M2 Tier 2)".to_string(),
+        ))
+    }
+
+    fn materialize_sibling(_spec: Self::SiblingSpec) -> Result<Self, TrapError>
+    where
+        Self: Sized,
+    {
+        Err(TrapError::Hypervisor(
+            "bhyve: sibling vCPU materialization not implemented (M2 Tier 2)".to_string(),
+        ))
+    }
+
+    fn program_counter(&self) -> Result<u64, TrapError> {
+        self.current_pc()
+    }
+
+    fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
+        // x86 "SP_EL0" analogue is RSP. The trait hands us &self; use the shared
+        // single-reg writer (the engine is single-threaded).
+        self.vcpu
+            .set_reg_raw_shared(crate::vmm_x86::VM_REG_GUEST_RSP, sp)
+            .map_err(|e| TrapError::Hypervisor(format!("set RSP: {e}")))
+    }
+
+    fn set_guest_thread_id(&self, _tid: u64) -> Result<(), TrapError> {
+        // No in-guest gettid fast path on bhyve (no syscall shim); the dispatcher
+        // services gettid. Mirrors the KVM/HVF no-shim path.
+        Ok(())
+    }
+
+    fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
+        Arc::new(crate::bhyve_kicker::BhyveKicker::new())
     }
 }
 

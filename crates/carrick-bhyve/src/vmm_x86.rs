@@ -312,6 +312,19 @@ impl BhyveVcpu {
         Ok(())
     }
 
+    /// Write one register by raw amd64 ordinal through a shared reference.
+    /// Sound because the owning engine is single-threaded (sibling vCPUs hold
+    /// DISTINCT vcpu handles); used where the ThreadedEngine trait hands us
+    /// `&self` (e.g. set_guest_sp_el0). Mirrors `set_reg_raw` minus `&mut`.
+    pub fn set_reg_raw_shared(&self, id: c_int, val: u64) -> Result<(), OsError> {
+        // SAFETY: self.vcpu is live; vm_set_register writes one register.
+        let rc = unsafe { vm_set_register(self.vcpu, id, val) };
+        if rc != 0 {
+            return Err(os_err("vm_set_register", rc));
+        }
+        Ok(())
+    }
+
     /// Batched register read (vmmapi.h:158): one ioctl for the whole syscall
     /// frame instead of seven `vm_get_register` round-trips.
     pub fn get_register_set(&self, ids: &[c_int]) -> Result<Vec<u64>, OsError> {
