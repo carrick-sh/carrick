@@ -100,9 +100,13 @@ use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 
 use crate::vmm::{BhyveVcpu, BhyveVm};
 use crate::vmm_x86::{
-    VM_CAP_HALT_EXIT, VM_REG_GUEST_CR0, VM_REG_GUEST_CR3, VM_REG_GUEST_CR4, VM_REG_GUEST_CS,
-    VM_REG_GUEST_DS, VM_REG_GUEST_EFER, VM_REG_GUEST_ES, VM_REG_GUEST_FS, VM_REG_GUEST_GDTR,
-    VM_REG_GUEST_GS, VM_REG_GUEST_IDTR, VM_REG_GUEST_LDTR, VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP,
+    VM_CAP_HALT_EXIT, VM_REG_GUEST_CR0, VM_REG_GUEST_CR2, VM_REG_GUEST_CR3, VM_REG_GUEST_CR4,
+    VM_REG_GUEST_CS, VM_REG_GUEST_DS, VM_REG_GUEST_EFER, VM_REG_GUEST_ES, VM_REG_GUEST_FS,
+    VM_REG_GUEST_FS_BASE, VM_REG_GUEST_GDTR, VM_REG_GUEST_GS, VM_REG_GUEST_GS_BASE,
+    VM_REG_GUEST_IDTR, VM_REG_GUEST_KGS_BASE, VM_REG_GUEST_LDTR, VM_REG_GUEST_R8, VM_REG_GUEST_R9,
+    VM_REG_GUEST_R10, VM_REG_GUEST_R11, VM_REG_GUEST_R12, VM_REG_GUEST_R13, VM_REG_GUEST_R14,
+    VM_REG_GUEST_R15, VM_REG_GUEST_RAX, VM_REG_GUEST_RBP, VM_REG_GUEST_RBX, VM_REG_GUEST_RCX,
+    VM_REG_GUEST_RDI, VM_REG_GUEST_RDX, VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI,
     VM_REG_GUEST_RSP, VM_REG_GUEST_SS, VM_REG_GUEST_TR,
 };
 
@@ -1369,6 +1373,197 @@ pub fn bring_up_x86_elf(
     Ok(BroughtUpX86 { vm, vcpu, ram })
 }
 
+// ─── M2 Tier 0: vCPU register snapshot / restore / seed ──────────────────────
+//
+// A GPR + segment-base + control-register capture of a vCPU's state, used to
+// seed a sibling vCPU (Tier 2) and the deferred fork (Tier 3).
+//
+// FP/SIMD is EXCLUDED by design (D4): FreeBSD 15.1 libvmmapi exposes no FP/XMM
+// getter (`enum vm_reg_name` has no FP slots; there is no `vm_get_fpu`-style
+// ioctl in vmmapi.h), and a freshly spun sibling thread starts with its own FP
+// state, so there is nothing to copy.
+
+/// Index of RAX within [`X8664BhyveSnapshot::gpr`].
+pub const GPR_IDX_RAX: usize = 0;
+/// Index of RBX within [`X8664BhyveSnapshot::gpr`].
+pub const GPR_IDX_RBX: usize = 1;
+
+/// The 15 GPR `vm_reg_name` ordinals captured by [`snapshot_x86_bhyve`], in the
+/// order they occupy [`X8664BhyveSnapshot::gpr`].
+///
+/// These are the 15 contiguous general-purpose registers RAX..R15 (ordinals
+/// 0..14). RSP is ordinal 19 — OUTSIDE this block (DR7=18 sits between CR4=17
+/// and RSP=19) — so it is a SEPARATE named field on the snapshot, not part of
+/// this array.
+const SNAPSHOT_GPR_IDS: [c_int; 15] = [
+    VM_REG_GUEST_RAX,
+    VM_REG_GUEST_RBX,
+    VM_REG_GUEST_RCX,
+    VM_REG_GUEST_RDX,
+    VM_REG_GUEST_RSI,
+    VM_REG_GUEST_RDI,
+    VM_REG_GUEST_RBP,
+    VM_REG_GUEST_R8,
+    VM_REG_GUEST_R9,
+    VM_REG_GUEST_R10,
+    VM_REG_GUEST_R11,
+    VM_REG_GUEST_R12,
+    VM_REG_GUEST_R13,
+    VM_REG_GUEST_R14,
+    VM_REG_GUEST_R15,
+];
+
+/// A snapshot of a bhyve x86_64 vCPU's GPRs, segment bases, and control
+/// registers — everything carrick needs to re-create the integer execution
+/// state of a vCPU on a fresh sibling thread (Tier 2) or a deferred fork
+/// (Tier 3).
+///
+/// FP/SIMD is intentionally absent (D4 — see the module note above).
+#[derive(Clone, Debug)]
+pub struct X8664BhyveSnapshot {
+    /// The 15 GPRs RAX..R15, indexed by [`SNAPSHOT_GPR_IDS`] (RAX = index 0).
+    /// RSP is the separate `rsp` field — ordinal 19 is outside the 0..14 block.
+    pub gpr: [u64; 15],
+    /// RSP (ordinal 19).
+    pub rsp: u64,
+    /// RIP (ordinal 20).
+    pub rip: u64,
+    /// RFLAGS (ordinal 21).
+    pub rflags: u64,
+    /// FS_BASE (ordinal 45) — the TLS base on x86_64 Linux.
+    pub fs_base: u64,
+    /// GS_BASE (ordinal 46).
+    pub gs_base: u64,
+    /// KGS_BASE (ordinal 47) — the kernel GS base (swapgs partner).
+    pub kgs_base: u64,
+    /// CR0 (ordinal 15).
+    pub cr0: u64,
+    /// CR2 (ordinal 33) — page-fault linear address. Captured for diagnostics
+    /// only; NOT re-applied on restore (it is transient fault state).
+    pub cr2: u64,
+    /// CR3 (ordinal 16) — the PML4 root.
+    pub cr3: u64,
+    /// CR4 (ordinal 17).
+    pub cr4: u64,
+    /// EFER (ordinal 32).
+    pub efer: u64,
+}
+
+impl X8664BhyveSnapshot {
+    /// An all-zero snapshot (the test seed and a safe default).
+    pub fn zeroed() -> Self {
+        Self {
+            gpr: [0; 15],
+            rsp: 0,
+            rip: 0,
+            rflags: 0,
+            fs_base: 0,
+            gs_base: 0,
+            kgs_base: 0,
+            cr0: 0,
+            cr2: 0,
+            cr3: 0,
+            cr4: 0,
+            efer: 0,
+        }
+    }
+}
+
+/// Capture a vCPU's integer execution state into an [`X8664BhyveSnapshot`].
+///
+/// Reads the 15 GPRs (RAX..R15) plus RSP/RIP/RFLAGS, the three segment bases
+/// (FS/GS/KGS), and the control registers (CR0/CR2/CR3/CR4/EFER) via
+/// `vm_get_register`. FP/SIMD is excluded (D4).
+pub fn snapshot_x86_bhyve(vcpu: &crate::vmm::BhyveVcpu) -> Result<X8664BhyveSnapshot, OsError> {
+    let mut gpr = [0u64; 15];
+    for (i, &id) in SNAPSHOT_GPR_IDS.iter().enumerate() {
+        gpr[i] = vcpu.get_reg_raw(id)?;
+    }
+    Ok(X8664BhyveSnapshot {
+        gpr,
+        rsp: vcpu.get_reg_raw(VM_REG_GUEST_RSP)?,
+        rip: vcpu.get_reg_raw(VM_REG_GUEST_RIP)?,
+        rflags: vcpu.get_reg_raw(VM_REG_GUEST_RFLAGS)?,
+        fs_base: vcpu.get_reg_raw(VM_REG_GUEST_FS_BASE)?,
+        gs_base: vcpu.get_reg_raw(VM_REG_GUEST_GS_BASE)?,
+        kgs_base: vcpu.get_reg_raw(VM_REG_GUEST_KGS_BASE)?,
+        cr0: vcpu.get_reg_raw(VM_REG_GUEST_CR0)?,
+        cr2: vcpu.get_reg_raw(VM_REG_GUEST_CR2)?,
+        cr3: vcpu.get_reg_raw(VM_REG_GUEST_CR3)?,
+        cr4: vcpu.get_reg_raw(VM_REG_GUEST_CR4)?,
+        efer: vcpu.get_reg_raw(VM_REG_GUEST_EFER)?,
+    })
+}
+
+/// Re-apply a snapshot to a vCPU via `vm_set_register`.
+///
+/// Writes the 15 GPRs, then RSP/RIP/RFLAGS, then CR0/CR3/CR4/EFER, then the
+/// three segment bases FS_BASE/GS_BASE/KGS_BASE.
+///
+/// # What is NOT restored
+///
+/// - **CR2** — page-fault linear address (transient fault state, not execution
+///   state).
+/// - **Segment SELECTORS and hidden DESCRIPTORS** (CS/SS/DS/ES/FS/GS, GDTR,
+///   IDTR, LDTR, TR). A sibling vCPU SHARES the parent's already-programmed GDT
+///   and selector/descriptor state (set up at bring-up); re-applying them would
+///   be redundant and risks disturbing VT-x's required guest-state invariants.
+///   Only the segment BASES (FS/GS/KGS) — which `arch_prctl(ARCH_SET_FS)` proves
+///   are writable via `vm_set_register` (ordinals 45/46/47) — carry per-thread
+///   state and ARE restored.
+pub fn restore_x86_bhyve(
+    vcpu: &mut crate::vmm::BhyveVcpu,
+    snap: &X8664BhyveSnapshot,
+) -> Result<(), OsError> {
+    for (i, &id) in SNAPSHOT_GPR_IDS.iter().enumerate() {
+        vcpu.set_reg_raw(id, snap.gpr[i])?;
+    }
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, snap.rsp)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RIP, snap.rip)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, snap.rflags)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR0, snap.cr0)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR3, snap.cr3)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR4, snap.cr4)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_EFER, snap.efer)?;
+    // Segment bases (writable via vm_set_register — arch_prctl proves it).
+    // CR2 is deliberately NOT restored (fault state); SELECTORS/DESCRIPTORS are
+    // shared with the parent and not re-applied.
+    vcpu.set_reg_raw(VM_REG_GUEST_FS_BASE, snap.fs_base)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_GS_BASE, snap.gs_base)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_KGS_BASE, snap.kgs_base)?;
+    Ok(())
+}
+
+/// Derive a child snapshot from a parent's, applying the clone/fork entry ABI.
+///
+/// Inherits the parent's full integer state, then overrides only the registers
+/// the Linux clone/fork return convention dictates:
+/// - `gpr[GPR_IDX_RAX] = entry.return_value` — the child sees `0` from
+///   `clone`/`fork` in RAX.
+/// - `rsp = entry.stack` if a new stack was supplied (else inherit the
+///   parent's RSP).
+/// - `fs_base = entry.tls` if a new TLS base was supplied (else inherit).
+/// - `rip = resume_rip` — the PC to resume at (past the syscall doorbell).
+///
+/// All other registers (RBX..R15, RFLAGS, GS/KGS bases, control registers) are
+/// inherited verbatim from the parent.
+pub fn seed_entry_snapshot_bhyve(
+    parent: &X8664BhyveSnapshot,
+    entry: carrick_hal::GuestEntryRegs,
+    resume_rip: u64,
+) -> X8664BhyveSnapshot {
+    let mut child = parent.clone();
+    child.gpr[GPR_IDX_RAX] = entry.return_value;
+    if let Some(s) = entry.stack {
+        child.rsp = s;
+    }
+    if let Some(t) = entry.tls {
+        child.fs_base = t;
+    }
+    child.rip = resume_rip;
+    child
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,5 +1850,33 @@ mod tests {
                 "{name}: GPA {gpa:#x} + {size:#x} exceeds X86_MEM_SIZE"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn seed_entry_overrides_only_the_named_regs() {
+        let mut snap = X8664BhyveSnapshot::zeroed();
+        snap.gpr[GPR_IDX_RBX] = 0x1111;
+        snap.gpr[GPR_IDX_RAX] = 0x9999;
+        snap.rsp = 0x2222;
+        snap.fs_base = 0x3333;
+        snap.rip = 0x4444;
+
+        let entry = carrick_hal::GuestEntryRegs {
+            return_value: 0,
+            stack: Some(0xDEAD_0000),
+            tls: Some(0xBEEF_0000),
+        };
+        let seeded = seed_entry_snapshot_bhyve(&snap, entry, 0x5000);
+
+        assert_eq!(seeded.gpr[GPR_IDX_RAX], 0, "child clone returns 0 in RAX");
+        assert_eq!(seeded.rsp, 0xDEAD_0000, "child stack");
+        assert_eq!(seeded.fs_base, 0xBEEF_0000, "child TLS");
+        assert_eq!(seeded.rip, 0x5000, "resume PC past the doorbell");
+        assert_eq!(seeded.gpr[GPR_IDX_RBX], 0x1111, "other GPRs inherited");
     }
 }
