@@ -492,6 +492,19 @@ pub struct BhyveWindow {
 /// `plan_gpa` is a monotonic bump allocator starting at [`X86_GPA_CURSOR_START`].
 /// Because the high-GPA probe FAILED (Experiment 2) all GPAs stay in lowmem
 /// `[0, X86_MEM_SIZE)` so that `vm_map_gpa` can resolve host pointers.
+///
+/// # `Clone` (sibling vCPUs, Tier 2)
+///
+/// `BhyveGuestRam` is plain bookkeeping — a `Vec<BhyveWindow>` of VA→GPA window
+/// descriptors plus the bump `cursor`. It owns NO host mappings and has NO
+/// `Drop`: the kernel-owned guest RAM is freed exactly once by
+/// `BhyveVmInner::drop` (`vm_destroy`), and `BhyveTrapEngine::va_to_host`
+/// re-resolves every host pointer through `vm_map_gpa` per access (nothing is
+/// cached). A `clone()` therefore yields an independent view that resolves the
+/// SAME guest physical memory via the shared ctx — exactly what a sibling vCPU
+/// on the same VM needs. (Contrast the KVM lane, which owns host mmaps and so
+/// needs a non-owning `from_shared_windows` view; bhyve's clone is sufficient.)
+#[derive(Clone)]
 pub struct BhyveGuestRam {
     /// Planned VA→GPA windows (immutable after `map`).
     pub windows: Vec<BhyveWindow>,

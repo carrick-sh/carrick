@@ -562,18 +562,41 @@ impl SyscallTrap for BhyveTrapEngine {
     }
 }
 
-// ─── ThreadedEngine (minimal — Tier 1; sibling vCPUs stubbed for Tier 2) ─────
+/// Send payload for sibling vCPU materialization (clone CLONE_THREAD). Carries
+/// the SHARED VM (so the sibling runs in the SAME address space / CR3 / PML4 /
+/// guest RAM as the parent), the seeded per-thread register snapshot, and a
+/// shared view of the parent's guest RAM. No page tables (x86 shares the parent
+/// PML4 via the snapshot's CR3) and no FP (D4: no libvmmapi FP getter; a fresh
+/// vCPU gets its own zeroed FP).
+pub struct BhyveSiblingSpec {
+    vm: crate::vmm::BhyveSharedVm,
+    snapshot: crate::guest_setup_x86::X8664BhyveSnapshot,
+    /// A clone of the parent's `BhyveGuestRam` window/bump bookkeeping. It owns
+    /// no host mappings and has no Drop (the VM owns the kernel RAM via
+    /// `vm_destroy`); the materialized sibling re-resolves the SAME GPAs through
+    /// the shared ctx, so a plain clone is the correct shared view (see the
+    /// `BhyveGuestRam` Clone note).
+    ram: crate::guest_setup_x86::BhyveGuestRam,
+}
+
+// SAFETY: BhyveSharedVm is already Send+Sync; the snapshot is plain data; the
+// RAM payload holds host-window descriptors into the shared guest mapping that
+// the materialized engine touches single-threaded. The spec crosses to the new
+// thread exactly once.
+unsafe impl Send for BhyveSiblingSpec {}
+
+// ─── ThreadedEngine (Tier 2 — real sibling vCPUs on the shared VM) ───────────
 //
 // Puts bhyve on the canonical run_vcpu_until_exit loop. clone(CLONE_THREAD)
-// sibling vCPUs are Tier 2 (build/materialize_sibling = typed-error stubs,
-// SiblingSpec=()); fork/execve_into/inject_signal/restore_from_sigframe keep
-// their SyscallTrap stubs (M3). Mirrors KvmX86TrapEngine's M3a/M3b stub.
+// spawns a sibling vCPU on the SAME VM (shared ctx/CR3/PML4/RAM via
+// BhyveSharedVm) — build/materialize_sibling below. fork/execve_into/
+// inject_signal/restore_from_sigframe keep their SyscallTrap stubs (M3).
+// Mirrors KvmX86TrapEngine's X8664SiblingSpec (bhyve shares RAM instead of
+// rebuilding it, has no page-table Arc, and skips FP — D4).
 impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
     type Arch = carrick_hal::x8664_arch::X8664GuestArch;
     type KickHandle = crate::bhyve_kicker::BhyveKickHandle;
-    // Tier 1: sibling vCPUs not yet implemented (Tier 2 replaces this with a
-    // real BhyveSiblingSpec). Unit type is trivially Send + 'static.
-    type SiblingSpec = ();
+    type SiblingSpec = BhyveSiblingSpec;
 
     fn kick_handle(&self) -> Self::KickHandle {
         crate::bhyve_kicker::BhyveKickHandle::for_current_thread(std::sync::Arc::clone(
@@ -587,20 +610,64 @@ impl carrick_hal::ThreadedEngine for BhyveTrapEngine {
 
     fn build_sibling_spec(
         &self,
-        _entry: carrick_hal::GuestEntryRegs,
+        entry: carrick_hal::GuestEntryRegs,
     ) -> Result<Self::SiblingSpec, TrapError> {
-        Err(TrapError::Hypervisor(
-            "bhyve: clone(CLONE_THREAD) sibling vCPU not implemented (M2 Tier 2)".to_string(),
-        ))
+        use crate::guest_setup_x86::{seed_entry_snapshot_bhyve, snapshot_x86_bhyve};
+        // The parent is suspended at the trapped clone, parked on the LSTAR
+        // doorbell `out %al, $0xC5` (2 bytes), with the pending INOUT recorded.
+        // The sibling is a FRESH vCPU that never hit the doorbell, so it must be
+        // seeded with RIP PAST the `out` (at the following `sysretq`, the
+        // 3-byte tail of `entry_trampoline_bytes`), so it `sysretq`s straight
+        // into the child's post-clone userspace with RAX=0. Compute that resume
+        // RIP from the pending INOUT (robust to the actual trap site):
+        //   resume_rip = pending.rip + pending.inst_length  (= rip-after-`out`).
+        // Cross-check: this equals the KVM lane's X86_SYSRET_RESUME analogue,
+        // LINUX_EL0_TRAMPOLINE_BASE + 2 (the LSTAR VA + the 2-byte `out`); the
+        // pending-INOUT form is preferred because it does not assume the trap
+        // site, but they agree (inst_length of `out %al,$imm8` is 2).
+        let pending = self.pending_inout.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("bhyve build_sibling_spec: no pending doorbell".to_string())
+        })?;
+        let resume_rip = pending.rip + pending.inst_length as u64;
+        // Parent is suspended at the trapped clone → atomic snapshot.
+        let parent =
+            snapshot_x86_bhyve(&self.vcpu).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let snapshot = seed_entry_snapshot_bhyve(&parent, entry, resume_rip);
+        Ok(BhyveSiblingSpec {
+            vm: self.vm.shared_handle(),
+            snapshot,
+            // Clone the parent's RAM bookkeeping: it owns nothing and has no
+            // Drop, and the sibling re-resolves the SAME GPAs through the shared
+            // ctx — so a plain clone is the correct shared view.
+            ram: self.ram.clone(),
+        })
     }
 
-    fn materialize_sibling(_spec: Self::SiblingSpec) -> Result<Self, TrapError>
+    fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
     where
         Self: Sized,
     {
-        Err(TrapError::Hypervisor(
-            "bhyve: sibling vCPU materialization not implemented (M2 Tier 2)".to_string(),
-        ))
+        use crate::guest_setup_x86::restore_x86_bhyve;
+        // New vCPU on the SAME VM (shared ctx/CR3/PML4/RAM). add_sibling_vcpu
+        // draws a DISTINCT vcpu id from the shared allocator; it must be called
+        // BEFORE from_shared consumes spec.vm.
+        let mut vcpu = spec
+            .vm
+            .add_sibling_vcpu()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // FP skipped (D4): the snapshot carries no FP; the fresh vcpu's FP is
+        // its own (zeroed) state — acceptable for a new thread.
+        restore_x86_bhyve(&mut vcpu, &spec.snapshot)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let vm = crate::vmm::BhyveVm::from_shared(spec.vm);
+        Ok(Self {
+            vm,
+            vcpu,
+            ram: spec.ram,
+            pending_inout: None,
+            // Fresh kick-pending for THIS sibling vCPU (its own kick handle).
+            kick_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
     }
 
     fn program_counter(&self) -> Result<u64, TrapError> {
