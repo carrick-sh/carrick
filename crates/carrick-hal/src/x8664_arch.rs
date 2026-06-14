@@ -375,24 +375,238 @@ impl GuestArch for X8664GuestArch {
     }
 
     fn build_sigframe<E: RegAccess + GuestMemory>(
-        _engine: &mut E,
-        _params: crate::sigframe::InjectParams,
+        engine: &mut E,
+        params: crate::sigframe::InjectParams,
     ) -> Result<crate::sigframe::SigframeInject, TrapError> {
-        // x86_64 rt_sigframe layout is deferred to Phase 2 M3 (spec §4.2).
-        // Return a loud error: never silently produce a wrong frame.
-        Err(TrapError::Hypervisor(
-            "x86_64 signal frames are not implemented in Phase 2 (M3; spec §4.2)".into(),
-        ))
+        use crate::Reg;
+        use carrick_abi::{X8664Fpstate, X8664Rtsigframe, X8664Sigcontext, X8664Ucontext};
+        use zerocopy::IntoBytes;
+
+        let p = params;
+
+        // ── Snapshot the interrupted GPRs into the gregset (psABI order). ──
+        let mut mc = X8664Sigcontext::empty();
+        mc.r8 = engine.get_reg(Reg::R8)?;
+        mc.r9 = engine.get_reg(Reg::R9)?;
+        mc.r10 = engine.get_reg(Reg::R10)?;
+        mc.r11 = engine.get_reg(Reg::R11)?;
+        mc.r12 = engine.get_reg(Reg::R12)?;
+        mc.r13 = engine.get_reg(Reg::R13)?;
+        mc.r14 = engine.get_reg(Reg::R14)?;
+        mc.r15 = engine.get_reg(Reg::R15)?;
+        mc.rdi = engine.get_reg(Reg::Rdi)?;
+        mc.rsi = engine.get_reg(Reg::Rsi)?;
+        mc.rbp = engine.get_reg(Reg::Rbp)?;
+        mc.rbx = engine.get_reg(Reg::Rbx)?;
+        mc.rdx = engine.get_reg(Reg::Rdx)?;
+        mc.rcx = engine.get_reg(Reg::Rcx)?;
+        let saved_rsp = engine.get_reg(Reg::Rsp)?;
+        mc.rsp = saved_rsp;
+        // RAX = the syscall retval, so handler-return resumes with it visible.
+        mc.rax = match p.pending_syscall_retval {
+            Some(ret) => ret as u64,
+            None => engine.get_reg(Reg::Rax)?,
+        };
+        // Resume RIP: kick path uses the live PC; syscall path uses RCX (the
+        // SYSCALL instruction stashed the user return RIP there, untouched by
+        // complete_syscall which only writes RAX).
+        let resume_rip = match p.interrupted_pc {
+            Some(pc) => pc,
+            None => mc.rcx,
+        };
+        mc.rip = resume_rip;
+        mc.eflags = p.pstate_source;
+        // SA_RESTART: rewind RIP to re-execute the 2-byte `syscall` (0F 05) and
+        // restore RAX = the original syscall number (the engine passes it in
+        // `orig_x0`; complete_syscall clobbered RAX with the retval). Only valid
+        // on the syscall-boundary path (caller guarantees interrupted_pc None).
+        if p.restart_syscall {
+            mc.rip = resume_rip.wrapping_sub(2);
+            mc.rax = p.orig_x0;
+        }
+        // Ring-3 selectors (informational; rt_sigreturn restores GPRs, not segs).
+        mc.cs = 0x23;
+        mc.ss = 0x1b;
+        mc.cr2 = p.fault_siginfo.map(|(_, addr)| addr).unwrap_or(0);
+
+        // ── Compute the new RSP: skip the 128-byte red zone (or the alt-stack
+        //    top for SA_ONSTACK), reserve the frame, and align so &pretcode ≡ 8
+        //    (mod 16) at handler entry (x86-64 psABI: RSP+8 is 16-aligned at a
+        //    function entry; the handler is entered as-if-CALLed). ──
+        let frame_size = core::mem::size_of::<X8664Rtsigframe>() as u64;
+        let base = match p.altstack {
+            Some((ss_sp, ss_size)) => ss_sp.wrapping_add(ss_size),
+            None => saved_rsp.wrapping_sub(128),
+        };
+        let new_sp = (base.wrapping_sub(frame_size) & !0xf).wrapping_sub(8);
+        // fpstate pointer = the FXSAVE area's address within the frame.
+        mc.fpstate = new_sp + core::mem::offset_of!(X8664Rtsigframe, fpstate) as u64;
+
+        // ── FXSAVE area: MXCSR + XMM0–15. ──
+        let mut fp = X8664Fpstate::empty();
+        if p.fpsimd_enabled {
+            fp.mxcsr = engine.get_fpcr()? as u32;
+            let mut xmm = [0u32; 64];
+            for n in 0..16u32 {
+                let v = engine.get_vreg(n)?.to_le_bytes();
+                let b = (n * 4) as usize;
+                for j in 0..4 {
+                    xmm[b + j] =
+                        u32::from_le_bytes([v[j * 4], v[j * 4 + 1], v[j * 4 + 2], v[j * 4 + 3]]);
+                }
+            }
+            fp.xmm_space = xmm;
+        }
+
+        // ── siginfo: queued > fault > SI_USER; re-stamp si_signo. ──
+        let mut siginfo = match (p.queued_siginfo, p.fault_siginfo) {
+            (Some(q), _) => q,
+            (None, Some((si_code, si_addr))) => {
+                let mut s = carrick_abi::LinuxSiginfo::empty();
+                s.si_code = si_code;
+                s.si_addr = si_addr;
+                s
+            }
+            (None, None) => {
+                let mut s = carrick_abi::LinuxSiginfo::empty();
+                s.si_code = carrick_abi::LINUX_SI_USER;
+                s
+            }
+        };
+        siginfo.si_signo = p.signum;
+
+        // ── ucontext. ──
+        let mut uc = X8664Ucontext::empty();
+        uc.uc_sigmask[0] = p.saved_sigmask;
+        if let Some((ss_sp, ss_size)) = p.altstack {
+            uc.uc_stack = carrick_abi::LinuxSignalStack {
+                ss_sp,
+                ss_flags: carrick_abi::LINUX_SS_ONSTACK as i32,
+                _pad0: 0,
+                ss_size,
+            };
+        }
+        uc.uc_mcontext = mc;
+
+        // ── Assemble + write the frame. ──
+        let mut frame = X8664Rtsigframe::empty();
+        // pretcode: the restorer the handler RETs to (→ rt_sigreturn). musl/glibc
+        // pass an explicit sa_restorer; fall back to the fixed trampoline.
+        frame.pretcode = if p.sa_restorer != 0 {
+            p.sa_restorer
+        } else {
+            p.sigreturn_trampoline_base
+        };
+        frame.uc = uc;
+        frame.info = siginfo;
+        frame.fpstate = fp;
+        engine
+            .write_bytes(new_sp, frame.as_bytes())
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
+
+        // ── Handler entry register state (x86-64 psABI handler ABI). ──
+        engine.set_reg(Reg::Rsp, new_sp)?;
+        engine.set_reg(Reg::Rdi, p.signum as u64)?; // arg0 = signum
+        engine.set_reg(
+            Reg::Rsi,
+            new_sp + core::mem::offset_of!(X8664Rtsigframe, info) as u64,
+        )?; // arg1 = &siginfo
+        engine.set_reg(
+            Reg::Rdx,
+            new_sp + core::mem::offset_of!(X8664Rtsigframe, uc) as u64,
+        )?; // arg2 = &ucontext
+        engine.set_reg(Reg::Rax, 0)?;
+        engine.set_reg(Reg::Rip, p.handler)?;
+        // The ABI requires DF=0 at function entry; also clear TF. (bit10=DF, bit8=TF)
+        let rflags = engine.get_reg(Reg::Rflags)?;
+        engine.set_reg(Reg::Rflags, rflags & !((1u64 << 10) | (1u64 << 8)))?;
+
+        Ok(crate::sigframe::SigframeInject {
+            new_sp,
+            saved_pc: resume_rip,
+        })
     }
 
     fn restore_sigframe<E: RegAccess + GuestMemory>(
-        _engine: &mut E,
-        _fpsimd_enabled: bool,
+        engine: &mut E,
+        fpsimd_enabled: bool,
     ) -> Result<crate::sigframe::SigframeRestore, TrapError> {
-        // Symmetric with build_sigframe — loud error, never silently wrong.
-        Err(TrapError::Hypervisor(
-            "x86_64 signal frames are not implemented in Phase 2 (M3; spec §4.2)".into(),
-        ))
+        use crate::Reg;
+        use carrick_abi::X8664Rtsigframe;
+        use zerocopy::FromBytes;
+
+        // At rt_sigreturn the handler's `ret` already popped the 8-byte pretcode,
+        // so RSP points just past it (at uc); the frame starts at RSP - 8 (the
+        // x86-64 kernel does the identical `regs->sp - sizeof(long)`).
+        let rsp = engine.get_reg(Reg::Rsp)?;
+        let frame_sp = rsp.wrapping_sub(8);
+        let size = core::mem::size_of::<X8664Rtsigframe>();
+        let bytes = engine
+            .read_bytes(frame_sp, size)
+            .map_err(|e| TrapError::Hypervisor(format!("x86 sigframe read failed: {e}")))?;
+        let frame = X8664Rtsigframe::read_from_bytes(&bytes)
+            .map_err(|_| TrapError::Hypervisor("x86 sigframe decode failed".into()))?;
+
+        // Copy nested packed fields OUT into standalone locals (cannot borrow
+        // fields of a #[repr(C, packed)] value).
+        let uc = frame.uc;
+        let mc = uc.uc_mcontext;
+        let sigmask = { uc.uc_sigmask }[0];
+        let fp = frame.fpstate;
+
+        // Validate the resume RIP is canonical (bits 47..63 sign-extended) — a
+        // corrupt frame / rt_sigreturn outside a handler would otherwise resume
+        // the vCPU at garbage. Replaces the aarch64 EL0-PSTATE gate.
+        let rip = mc.rip;
+        let top = rip >> 47;
+        if top != 0 && top != 0x1_ffff {
+            return Err(TrapError::Hypervisor(format!(
+                "x86 rt_sigreturn: non-canonical resume RIP 0x{rip:x} (frame at 0x{frame_sp:x})"
+            )));
+        }
+
+        // Restore GPRs + RIP + RSP.
+        engine.set_reg(Reg::R8, mc.r8)?;
+        engine.set_reg(Reg::R9, mc.r9)?;
+        engine.set_reg(Reg::R10, mc.r10)?;
+        engine.set_reg(Reg::R11, mc.r11)?;
+        engine.set_reg(Reg::R12, mc.r12)?;
+        engine.set_reg(Reg::R13, mc.r13)?;
+        engine.set_reg(Reg::R14, mc.r14)?;
+        engine.set_reg(Reg::R15, mc.r15)?;
+        engine.set_reg(Reg::Rdi, mc.rdi)?;
+        engine.set_reg(Reg::Rsi, mc.rsi)?;
+        engine.set_reg(Reg::Rbp, mc.rbp)?;
+        engine.set_reg(Reg::Rbx, mc.rbx)?;
+        engine.set_reg(Reg::Rdx, mc.rdx)?;
+        engine.set_reg(Reg::Rax, mc.rax)?;
+        engine.set_reg(Reg::Rcx, mc.rcx)?;
+        engine.set_reg(Reg::Rsp, mc.rsp)?;
+        engine.set_reg(Reg::Rip, mc.rip)?;
+        // RFLAGS: restore, force reserved bit 1 = 1, keep IF (bit 9), clear TF.
+        let ef = (mc.eflags | 0x2) & !(1u64 << 8);
+        engine.set_reg(Reg::Rflags, ef)?;
+
+        // Restore MXCSR + XMM0–15 from the frame's FXSAVE area.
+        if fpsimd_enabled {
+            engine.set_fpcr(u64::from({ fp }.mxcsr))?;
+            let xmm = fp.xmm_space;
+            for n in 0..16u32 {
+                let b = (n * 4) as usize;
+                let mut raw = [0u8; 16];
+                for j in 0..4 {
+                    raw[j * 4..j * 4 + 4].copy_from_slice(&xmm[b + j].to_le_bytes());
+                }
+                engine.set_vreg(n, u128::from_le_bytes(raw))?;
+            }
+        }
+
+        Ok(crate::sigframe::SigframeRestore {
+            sigmask,
+            saved_pc: mc.rip,
+            frame_sp,
+            magic: 0,
+        })
     }
 }
 
