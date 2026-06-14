@@ -26,13 +26,19 @@
 /// constants so the bitwise math matches the live `termios` fields on each OS.
 pub type TcFlag = libc::tcflag_t;
 
-/// Current thread errno. Darwin/BSD use `__error()`, Linux `__errno_location()`.
+/// Current thread errno. Darwin/FreeBSD use `__error()`, NetBSD `__errno()`,
+/// Linux `__errno_location()`.
 #[inline]
 pub fn errno() -> i32 {
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
     // SAFETY: `__error()` returns a valid per-thread pointer for the caller.
     {
         unsafe { *libc::__error() }
+    }
+    #[cfg(target_os = "netbsd")]
+    // SAFETY: `__errno()` returns a valid per-thread pointer for the caller.
+    {
+        unsafe { *libc::__errno() }
     }
     #[cfg(target_os = "linux")]
     // SAFETY: `__errno_location()` returns a valid per-thread pointer.
@@ -43,6 +49,7 @@ pub fn errno() -> i32 {
         target_os = "macos",
         target_os = "ios",
         target_os = "freebsd",
+        target_os = "netbsd",
         target_os = "linux"
     )))]
     {
@@ -59,6 +66,11 @@ pub fn set_errno(value: i32) {
     unsafe {
         *libc::__error() = value;
     }
+    #[cfg(target_os = "netbsd")]
+    // SAFETY: `__errno()` returns a valid per-thread pointer for the caller.
+    unsafe {
+        *libc::__errno() = value;
+    }
     #[cfg(target_os = "linux")]
     // SAFETY: `__errno_location()` returns a valid per-thread pointer.
     unsafe {
@@ -68,6 +80,7 @@ pub fn set_errno(value: i32) {
         target_os = "macos",
         target_os = "ios",
         target_os = "freebsd",
+        target_os = "netbsd",
         target_os = "linux"
     )))]
     {
@@ -552,12 +565,12 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
         };
         (pid, uid, gid)
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
         let mut uid: libc::uid_t = 0;
         let mut gid: libc::gid_t = 0;
         // SAFETY: uid/gid are valid out-params for getpeereid on a socket fd.
-        // FreeBSD has no peer-pid API; report pid as 0.
+        // FreeBSD/NetBSD have no peer-pid API; report pid as 0.
         let rc = unsafe { libc::getpeereid(host_fd, &mut uid, &mut gid) };
         if rc == 0 {
             (0, uid as u32, gid as u32)
@@ -569,7 +582,8 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
         target_os = "linux",
         target_os = "macos",
         target_os = "ios",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "netbsd"
     )))]
     {
         let _ = host_fd;
@@ -578,18 +592,26 @@ pub fn peer_ucred(host_fd: i32) -> (u32, u32, u32) {
 }
 
 /// Re-export a constant that has a real (possibly differently-named) equivalent
-/// on every platform. Two-way form: `port_alias!(NAME => mac_name, linux_name)`
-/// uses `mac_name` on macOS and FreeBSD (when the macOS name exists on FreeBSD
-/// too), and `linux_name` on Linux. Three-way form:
-/// `port_alias!(NAME => mac_name, bsd_name, linux_name)` for constants where
-/// macOS and FreeBSD use different libc names.
+/// on every platform. Two-way form: `port_alias!(NAME => bsd_name, linux_name)`
+/// uses `bsd_name` on the BSD family (macOS, FreeBSD, NetBSD — for constants all
+/// three share under the same libc name) and `linux_name` everywhere else.
+/// Three-way form: `port_alias!(NAME => mac_name, freebsd_name, linux_name)` for
+/// constants where macOS and FreeBSD use different libc names; here NetBSD takes
+/// the `linux_name` arm by default — when NetBSD needs a *different* name, add an
+/// explicit `netbsd =` clause: `port_alias!(NAME => mac, freebsd, linux, netbsd = nb)`.
+///
+/// NetBSD is a BSD, so it shares most constants with the `bsd_name` position
+/// (e.g. `PT_*`); the explicit-`netbsd` form covers the deltas (e.g. NetBSD has
+/// no `CLOCK_*_RAW`, so `CLOCK_UPTIME_RAW` maps to `CLOCK_MONOTONIC`).
 macro_rules! port_alias {
-    ($name:ident => $mac:ident, $other:ident) => {
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        pub use libc::$mac as $name;
-        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    // BSD family (macOS + FreeBSD + NetBSD) share the same name; Linux differs.
+    ($name:ident => $bsd:ident, $other:ident) => {
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+        pub use libc::$bsd as $name;
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
         pub use libc::$other as $name;
     };
+    // macOS / FreeBSD / (Linux + NetBSD) each take a distinct name.
     ($name:ident => $mac:ident, $bsd:ident, $linux:ident) => {
         #[cfg(target_os = "freebsd")]
         pub use libc::$bsd as $name;
@@ -598,23 +620,48 @@ macro_rules! port_alias {
         #[cfg(target_os = "macos")]
         pub use libc::$mac as $name;
     };
+    // As the three-way form, but with an explicit NetBSD name distinct from all
+    // three (NetBSD does not take the Linux arm).
+    ($name:ident => $mac:ident, $bsd:ident, $linux:ident, netbsd = $nb:ident) => {
+        #[cfg(target_os = "freebsd")]
+        pub use libc::$bsd as $name;
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+        pub use libc::$linux as $name;
+        #[cfg(target_os = "macos")]
+        pub use libc::$mac as $name;
+        #[cfg(target_os = "netbsd")]
+        pub use libc::$nb as $name;
+    };
 }
 
 // Darwin name -> Linux equivalent. Re-exported as the Darwin name so call sites
 // keep reading naturally; the value is the platform-native libc constant.
 //
 // CLOCK_UPTIME_RAW: macOS=CLOCK_UPTIME_RAW, FreeBSD=CLOCK_UPTIME_PRECISE
-//   (both measure unhalted wall time; PRECISE is the highest-res FreeBSD clock)
-// TCP_KEEPALIVE: macOS name; FreeBSD and Linux both use TCP_KEEPIDLE
-port_alias!(CLOCK_UPTIME_RAW => CLOCK_UPTIME_RAW, CLOCK_UPTIME_PRECISE, CLOCK_MONOTONIC_RAW);
-port_alias!(TCP_NOPUSH => TCP_NOPUSH, TCP_CORK);
+//   (both measure unhalted wall time; PRECISE is the highest-res FreeBSD clock);
+//   NetBSD has no CLOCK_*_RAW/UPTIME clock, so map to CLOCK_MONOTONIC.
+// TCP_KEEPALIVE: macOS name; FreeBSD/Linux/NetBSD all use TCP_KEEPIDLE (NetBSD
+//   has no TCP_KEEPALIVE, so it correctly takes the `linux` = TCP_KEEPIDLE arm).
+port_alias!(CLOCK_UPTIME_RAW => CLOCK_UPTIME_RAW, CLOCK_UPTIME_PRECISE, CLOCK_MONOTONIC_RAW, netbsd = CLOCK_MONOTONIC);
 port_alias!(TCP_KEEPALIVE => TCP_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPIDLE);
 port_alias!(AF_LINK => AF_LINK, AF_PACKET);
 
-// Host `ptrace(2)` request constants (Darwin `PT_*` ↔ Linux `PTRACE_*`). Used
-// to drive the *host* ptrace when emulating the guest's ptrace; the request
-// type also differs (Darwin `c_int` vs Linux `c_uint`), which the native
-// re-export resolves automatically.
+// TCP_NOPUSH: macOS/FreeBSD name; Linux uses TCP_CORK. NetBSD's libc bindings
+// (libc 0.2.x) do NOT export TCP_NOPUSH even though <netinet/tcp.h> defines it,
+// so supply the header value directly.
+//   NetBSD /usr/include/netinet/tcp.h: `#define TCP_NOPUSH 4`
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub use libc::TCP_NOPUSH;
+#[cfg(target_os = "netbsd")]
+pub const TCP_NOPUSH: libc::c_int = 4;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub use libc::TCP_CORK as TCP_NOPUSH;
+
+// Host `ptrace(2)` request constants (Darwin `PT_*` ↔ Linux `PTRACE_*`). NetBSD
+// is a BSD and shares the `PT_*` names (libc `netbsdlike` module), so it takes
+// the `bsd` arm of the two-way form. Used to drive the *host* ptrace when
+// emulating the guest's ptrace; the request type also differs (Darwin `c_int`
+// vs Linux `c_uint`), which the native re-export resolves automatically.
 port_alias!(PT_TRACE_ME => PT_TRACE_ME, PTRACE_TRACEME);
 port_alias!(PT_CONTINUE => PT_CONTINUE, PTRACE_CONT);
 port_alias!(PT_KILL => PT_KILL, PTRACE_KILL);

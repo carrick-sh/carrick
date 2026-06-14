@@ -21,15 +21,17 @@ impl OsError {
 
     /// Construct from the current `errno` with the given context.
     pub fn new(context: impl Into<String>) -> Self {
+        // Darwin/FreeBSD/DragonFly expose the per-thread errno via `__error()`;
+        // NetBSD/OpenBSD via `__errno()`; Linux via `__errno_location()`.
         #[cfg(any(
             target_os = "macos",
             target_os = "ios",
             target_os = "freebsd",
-            target_os = "dragonfly",
-            target_os = "openbsd",
-            target_os = "netbsd"
+            target_os = "dragonfly"
         ))]
         let errno = unsafe { *libc::__error() };
+        #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+        let errno = unsafe { *libc::__errno() };
         #[cfg(target_os = "linux")]
         let errno = unsafe { *libc::__errno_location() };
         #[cfg(not(any(
