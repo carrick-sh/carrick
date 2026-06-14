@@ -1,0 +1,23 @@
+[package]
+name = "carrick-bhyve-signal"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP3.1 fixture: SA_SIGINFO SIGUSR1 handler + raise + rt_sigreturn round-trip.
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC) via a plain
+# `cargo build --release` (rust-lld; .cargo/config.toml). Prints "signal-ok" +
+# exit 0 iff the handler ran (correct si_signo) AND rt_sigreturn resumed main.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-signal"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

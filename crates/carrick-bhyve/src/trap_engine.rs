@@ -26,7 +26,9 @@
 use std::sync::Arc;
 
 use carrick_guest_mem::{GuestMemory, MemoryError, X8664SyscallFrame};
-use carrick_hal::{OsError, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError};
+use carrick_hal::{
+    GuestArch as _, OsError, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError,
+};
 use carrick_mem::memory::AddressSpace;
 
 use crate::guest_setup_x86::{BhyveGuestRam, BroughtUpX86, SYSCALL_DOORBELL_PORT, complete_inout};
@@ -802,29 +804,62 @@ impl SyscallTrap for BhyveTrapEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inject_signal(
         &mut self,
-        _signum: i32,
-        _handler: u64,
-        _sa_restorer: u64,
-        _pending_syscall_retval: Option<i64>,
-        _interrupted_pc: Option<u64>,
-        _altstack: Option<(u64, u64)>,
-        _saved_sigmask: u64,
-        _fault_siginfo: Option<(i32, u64)>,
-        _queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
-        _restart_syscall: bool,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
+        restart_syscall: bool,
     ) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "bhyve x86_64: inject_signal is not implemented in Phase 2 (M3; spec N2)".into(),
-        ))
+        // The interrupted RFLAGS, saved into the frame's eflags and restored
+        // verbatim by rt_sigreturn. (x86 has no privilege-latched analogue of
+        // aarch64's SPSR_EL1; the live RFLAGS is authoritative on both paths.)
+        let pstate_source = self
+            .get_reg(Reg::Rflags)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let params = carrick_hal::sigframe::InjectParams {
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+            altstack,
+            saved_sigmask,
+            fault_siginfo,
+            queued_siginfo,
+            restart_syscall,
+            pstate_source,
+            // x86 reinterpretation: `orig_x0` carries the original RAX (the
+            // syscall NUMBER) so SA_RESTART can restore it (RAX was clobbered by
+            // the retval). See `last_syscall_orig_rax`.
+            orig_x0: self.last_syscall_orig_rax,
+            // x86 has no ESR; the faulting address rides in sigcontext.cr2/si_addr.
+            fault_esr: 0,
+            // SP3.1 baseline: zeroed FP (the shared builder writes a zeroed
+            // FXSAVE area and skips FP restore). bhyve's libvmmapi exposes no FP
+            // getter, so real XMM/FP fidelity is a separate later task (SP3.2);
+            // `false` is correct for handlers that do not rely on interrupted
+            // XMM surviving — the model fixture.
+            fpsimd_enabled: false,
+            // x86-64 MANDATES sa_restorer (no kernel vDSO sigreturn trampoline);
+            // glibc/musl always pass `__restore_rt`, so this fallback is never hit.
+            sigreturn_trampoline_base: 0,
+        };
+        <Self as carrick_hal::ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        Ok(())
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        Err(TrapError::Hypervisor(
-            "bhyve x86_64: restore_from_sigframe is not implemented in Phase 2 (M3; spec N2)"
-                .into(),
-        ))
+        // SP3.1: GPR/RIP/RSP restore only (fpsimd_enabled=false matches inject).
+        let restored = <Self as carrick_hal::ThreadedEngine>::Arch::restore_sigframe(self, false)?;
+        Ok(restored.sigmask)
     }
 }
 
