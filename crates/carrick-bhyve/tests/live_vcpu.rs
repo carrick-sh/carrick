@@ -444,3 +444,283 @@ fn m1_ring3_syscall_hello() {
 
     engine.destroy().expect("clean vm_destroy (m1)");
 }
+
+/// SPIKE (SP1.1): does `minherit(INHERIT_COPY)` give a forked child a
+/// COW-FROZEN view of a bhyve guest-RAM (`vm_map_gpa`) host mapping, or does the
+/// device/SG VM pager silently force INHERIT_SHARE (the child then ALIASES the
+/// parent's LIVE pages)?
+///
+/// `BhyveTrapEngine::fork()` currently freezes the parent's whole guest RAM into
+/// a heap `Vec<u8>` BEFORE `libc::fork`, because bhyve guest RAM is kernel-owned
+/// and (unlike KVM's MAP_PRIVATE|ANON) is NOT copy-on-write across fork — the
+/// inherited mapping aliases the parent's live pages, so a post-fork parent that
+/// resumes its vCPU tears the child's image mid-copy. The proposed optimization
+/// is to `minherit(host_ptr, len, INHERIT_COPY)` the parent's mapping before
+/// fork so the child inherits a frozen COW copy and can copy from its OWN
+/// inherited view, dropping the eager heap freeze. That optimization is ONLY
+/// valid if COW is actually honored on this device mapping — which this test
+/// decides empirically.
+///
+/// Method (host-level; no vCPU run): map a small sysmem segment, write sentinel
+/// `0xAAAA_AAAA_AAAA_AAAA` at offset 0, `minherit(INHERIT_COPY)`, `fork`. The
+/// PARENT overwrites offset 0 with `0xBBBB...` then signals the child via a
+/// pipe; the CHILD waits for that signal, then reads offset 0 through the
+/// inherited mapping. Child sees `0xAAAA` ⇒ COW FROZEN (exit 0); `0xBBBB` ⇒
+/// ALIASED LIVE / COW NOT honored (exit 1); anything else ⇒ exit 2.
+#[test]
+fn minherit_cow_frozen_across_fork() {
+    use std::ffi::c_void;
+
+    if !vmm_available() {
+        eprintln!("SKIP: vmm not available (/dev/vmm missing and kldstat -q -m vmm failed)");
+        return;
+    }
+    let _guard = VM_LOCK.lock().unwrap();
+
+    // FreeBSD sys/mman.h: INHERIT_SHARE=0, INHERIT_COPY=1, INHERIT_NONE=2.
+    // libc 0.2.186 does NOT expose these (nor minherit) for FreeBSD, so declare
+    // the value + prototype here (verified against /usr/include/sys/mman.h on the
+    // 15.1-RC3 box: `#define INHERIT_COPY 1`, `int minherit(void *, size_t, int)`).
+    const INHERIT_COPY: libc::c_int = 1;
+    unsafe extern "C" {
+        fn minherit(addr: *mut c_void, len: libc::size_t, inherit: libc::c_int) -> libc::c_int;
+    }
+
+    // A small multiple of the page size that vm_map_gpa resolves at GPA 0.
+    const SZ: usize = 0x40_0000; // 4 MiB
+    const SENTINEL_A: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+    const SENTINEL_B: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+
+    let vm = BhyveVm::create().expect("vm create");
+    vm.setup_memory(SZ).expect("setup_memory");
+    vm.mmap_memseg(0, VM_SEGID_SYSMEM, SZ, PROT_RWX)
+        .expect("mmap_memseg");
+    let p = vm.map_gpa(0, SZ).expect("map_gpa(0, SZ)");
+
+    // Write the sentinel through the host pointer (the parent's live mapping).
+    // SAFETY: p spans [0, SZ) of guest RAM (vm_map_gpa contract); offset 0 fits.
+    unsafe { (p as *mut u64).write_volatile(SENTINEL_A) };
+
+    // Request COPY (frozen) inheritance for the whole mapping.
+    // SAFETY: p/SZ describe the live vm_map_gpa region; minherit only sets an
+    // inheritance attribute on it.
+    let mrc = unsafe { minherit(p as *mut c_void, SZ, INHERIT_COPY) };
+    assert_eq!(
+        mrc,
+        0,
+        "minherit(INHERIT_COPY) returned {mrc} (errno={})",
+        std::io::Error::last_os_error()
+    );
+
+    // Pipe handshake so the parent's overwrite strictly precedes the child read.
+    let mut fds = [0i32; 2];
+    // SAFETY: fds is a valid 2-int array.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (rd, wr) = (fds[0], fds[1]);
+
+    // SAFETY: single-threaded test body; fork here is well-defined.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+
+    if pid == 0 {
+        // CHILD: close the write end, wait for the parent's one-byte go signal,
+        // then read offset 0 through the INHERITED mapping `p`.
+        // SAFETY: rd/wr are valid fds owned by this process.
+        unsafe { libc::close(wr) };
+        let mut go = [0u8; 1];
+        // SAFETY: reading 1 byte into a valid buffer; blocks until the parent
+        // has overwritten the sentinel and written the go byte.
+        let n = unsafe { libc::read(rd, go.as_mut_ptr() as *mut c_void, 1) };
+        // SAFETY: p is the inherited mapping; offset 0 holds the (frozen-or-live) u64.
+        let seen = unsafe { (p as *const u64).read_volatile() };
+        let code = if n != 1 {
+            3 // handshake failed
+        } else if seen == SENTINEL_A {
+            0 // COW FROZEN — child kept the pre-fork value
+        } else if seen == SENTINEL_B {
+            1 // ALIASED LIVE — child saw the parent's post-fork overwrite
+        } else {
+            2 // unexpected
+        };
+        // SAFETY: _exit is async-signal-safe and skips Drops (correct in a child
+        // that must NOT vm_destroy the parent's VM).
+        unsafe { libc::_exit(code) };
+    }
+
+    // PARENT: overwrite the sentinel through `p` (the LIVE parent mapping), then
+    // release the child.
+    // SAFETY: p is the parent's live mapping; offset 0 fits.
+    unsafe { (p as *mut u64).write_volatile(SENTINEL_B) };
+    unsafe { libc::close(rd) };
+    let go = [1u8; 1];
+    // SAFETY: writing 1 byte from a valid buffer to the pipe's write end.
+    let wn = unsafe { libc::write(wr, go.as_ptr() as *const c_void, 1) };
+    assert_eq!(wn, 1, "parent pipe write");
+    // SAFETY: wr is a valid fd.
+    unsafe { libc::close(wr) };
+
+    let mut status: libc::c_int = 0;
+    // SAFETY: pid is the live child; status is a valid out-pointer.
+    let w = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(w, pid, "waitpid");
+    assert!(
+        libc::WIFEXITED(status),
+        "child did not exit normally (status={status:#x})"
+    );
+    let code = libc::WEXITSTATUS(status);
+
+    let verdict = match code {
+        0 => "COW FROZEN (child saw 0xAAAA — INHERIT_COPY honored)",
+        1 => "ALIASED LIVE (child saw 0xBBBB — INHERIT_COPY NOT honored, forced SHARE)",
+        2 => "UNEXPECTED sentinel value",
+        3 => "handshake failed",
+        other => panic!("child exit code {other} is not in the protocol"),
+    };
+    eprintln!("SP1.1 minherit-COW VERDICT: exit={code} → {verdict}");
+
+    vm.destroy().expect("clean vm_destroy (minherit spike)");
+
+    assert_eq!(
+        code, 0,
+        "minherit(INHERIT_COPY) did NOT give a frozen child view of bhyve \
+         vm_map_gpa memory (verdict: {verdict}); the eager pre-fork heap freeze \
+         in BhyveTrapEngine::fork() is required and must not be removed"
+    );
+}
+
+/// SPIKE diagnostic (SP1.1 follow-up): faithfully reproduce the REAL fork path's
+/// child sequence — after fork the child CREATES A SECOND VM (vm_create +
+/// setup_memory + mmap_memseg + map_gpa) and only THEN reads the inherited
+/// (minherit-COW) parent mapping as the copy source. The plain spike kept the
+/// SAME inherited pointer and never built a child VM; this checks whether the
+/// child's own VM-creation work disturbs the frozen view (re-mmap, address-space
+/// churn, or the inherited mapping being re-resolved to a live alias).
+///
+/// Verdict via child exit: 0 = inherited source still FROZEN (0xAAAA) after the
+/// child built its VM and the parent overwrote the page; 1 = source went LIVE
+/// (0xBBBB); 4 = the COPIED-IN child-VM byte was wrong; other = setup failure.
+#[test]
+fn minherit_cow_frozen_across_fork_with_child_vm() {
+    use std::ffi::c_void;
+
+    if !vmm_available() {
+        eprintln!("SKIP: vmm not available");
+        return;
+    }
+    let _guard = VM_LOCK.lock().unwrap();
+
+    const INHERIT_COPY: libc::c_int = 1;
+    unsafe extern "C" {
+        fn minherit(addr: *mut c_void, len: libc::size_t, inherit: libc::c_int) -> libc::c_int;
+    }
+    const SZ: usize = 0x40_0000;
+    const SENTINEL_A: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+    const SENTINEL_B: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+
+    let vm = BhyveVm::create().expect("parent vm create");
+    vm.setup_memory(SZ).expect("parent setup_memory");
+    vm.mmap_memseg(0, VM_SEGID_SYSMEM, SZ, PROT_RWX)
+        .expect("parent mmap_memseg");
+    let p = vm.map_gpa(0, SZ).expect("parent map_gpa");
+    // SAFETY: p spans [0, SZ).
+    unsafe { (p as *mut u64).write_volatile(SENTINEL_A) };
+    // SAFETY: live region; set inheritance attr only.
+    let mrc = unsafe { minherit(p as *mut c_void, SZ, INHERIT_COPY) };
+    assert_eq!(mrc, 0, "minherit (with-child-vm)");
+
+    let mut fds = [0i32; 2];
+    // SAFETY: valid 2-int array.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (rd, wr) = (fds[0], fds[1]);
+
+    // SAFETY: single-threaded test fork.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork");
+
+    if pid == 0 {
+        // CHILD: build a SECOND VM first (the real fork path's child work), THEN
+        // wait for the parent's overwrite signal and read the inherited source.
+        // SAFETY: pipe fds owned by this process.
+        unsafe { libc::close(wr) };
+        let child_code = (|| -> i32 {
+            let child_vm = match BhyveVm::create() {
+                Ok(v) => v,
+                Err(_) => return 10,
+            };
+            if child_vm.setup_memory(SZ).is_err() {
+                return 11;
+            }
+            if child_vm
+                .mmap_memseg(0, VM_SEGID_SYSMEM, SZ, PROT_RWX)
+                .is_err()
+            {
+                return 12;
+            }
+            let dst = match child_vm.map_gpa(0, SZ) {
+                Some(d) => d,
+                None => return 13,
+            };
+            // Now read the inherited (frozen-or-live) source AFTER all the child
+            // VM-creation work, mirroring the real fork ordering.
+            let mut go = [0u8; 1];
+            // SAFETY: 1-byte read; blocks until parent overwrote + signaled.
+            let n = unsafe { libc::read(rd, go.as_mut_ptr() as *mut c_void, 1) };
+            if n != 1 {
+                return 3;
+            }
+            // SAFETY: p is the inherited mapping (the copy SOURCE in the real path).
+            let src_seen = unsafe { (p as *const u64).read_volatile() };
+            // Do the real copy: inherited source → child VM, then read it back.
+            // SAFETY: src=p spans SZ; dst spans SZ; distinct VMs' kernel RAM.
+            unsafe { std::ptr::copy_nonoverlapping(p as *const u8, dst, SZ) };
+            // SAFETY: dst spans SZ; offset 0 is the copied u64.
+            let dst_seen = unsafe { (dst as *const u64).read_volatile() };
+            let _ = child_vm.destroy();
+            if src_seen == SENTINEL_B {
+                1 // inherited source went LIVE
+            } else if src_seen != SENTINEL_A {
+                2 // inherited source garbage
+            } else if dst_seen != SENTINEL_A {
+                4 // copy landed wrong
+            } else {
+                0 // frozen source + correct copy
+            }
+        })();
+        // SAFETY: async-signal-safe exit, skips Drops.
+        unsafe { libc::_exit(child_code) };
+    }
+
+    // PARENT: overwrite the page, then release the child.
+    // SAFETY: p is the live parent mapping.
+    unsafe { (p as *mut u64).write_volatile(SENTINEL_B) };
+    // SAFETY: rd valid.
+    unsafe { libc::close(rd) };
+    let go = [1u8; 1];
+    // SAFETY: 1-byte write to the pipe.
+    let wn = unsafe { libc::write(wr, go.as_ptr() as *const c_void, 1) };
+    assert_eq!(wn, 1, "parent write");
+    // SAFETY: wr valid.
+    unsafe { libc::close(wr) };
+
+    let mut status: libc::c_int = 0;
+    // SAFETY: pid live; status valid.
+    let w = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(w, pid, "waitpid");
+    let code = libc::WEXITSTATUS(status);
+    eprintln!(
+        "SP1.1 with-child-VM VERDICT: exit={code} ({})",
+        match code {
+            0 => "FROZEN source + correct copy",
+            1 => "inherited source went LIVE (0xBBBB)",
+            2 => "inherited source garbage",
+            3 => "handshake failed",
+            4 => "copy landed wrong byte",
+            _ => "child VM setup failure",
+        }
+    );
+    vm.destroy().expect("clean vm_destroy (with-child spike)");
+    assert_eq!(
+        code, 0,
+        "minherit COW must survive the child building its own VM"
+    );
+}
