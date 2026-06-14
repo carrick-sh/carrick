@@ -242,3 +242,29 @@ fn vfork_exec_runs_to_zero() {
         String::from_utf8_lossy(&result.stdout)
     );
 }
+
+#[test]
+fn signal_handler_runs_to_zero() {
+    // The intra-process signal acceptance (SP3.1): the guest installs a
+    // SA_SIGINFO SIGUSR1 handler, `raise`s it, runs the handler (correct
+    // si_signo), returns through the libc restorer → rt_sigreturn, and RESUMES
+    // here — exiting 0. Success proves `BhyveTrapEngine::inject_signal` wrote a
+    // valid x86 rt_sigframe (GPR/RIP/RSP/siginfo/ucontext) via the shared
+    // builder and `restore_from_sigframe` restored the pre-signal state.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGNAL") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGNAL to the signal ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "signal guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("signal-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
