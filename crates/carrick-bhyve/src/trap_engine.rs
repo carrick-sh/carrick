@@ -393,6 +393,11 @@ impl SyscallTrap for BhyveTrapEngine {
                 // Spurious: VT-x re-schedules or the VM is idle — re-enter.
                 X86Exit::Bogus => continue,
 
+                // A cross-thread kick forced this vCPU out of the guest with no
+                // syscall pending. Return Ok(None): the generic loop re-checks
+                // signals/futex/quiesce at the interrupted PC, then re-enters.
+                X86Exit::Kicked => return Ok(None),
+
                 // A real `hlt` is the only CLEAN stop (M0 ends this way).
                 X86Exit::Hlt => return Ok(None),
 
