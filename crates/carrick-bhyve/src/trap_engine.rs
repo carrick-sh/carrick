@@ -711,10 +711,66 @@ impl SyscallTrap for BhyveTrapEngine {
         Ok(carrick_hal::ForkOutcome::Child)
     }
 
-    fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "bhyve x86_64: execve is not implemented in Phase 2 (M3; spec N1)".into(),
-        ))
+    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+        use crate::guest_setup_x86::bring_up_x86_elf;
+
+        // execve replaces the guest image. Unlike the aarch64 KVM reference
+        // (in-place memslot remap on the LIVE VM), bhyve REBUILDS a fresh owned
+        // VM from `new_image` and swaps it in — mirroring the HVF lane and the
+        // SP1 fork child path. `new_image` was already fully staged by the loop's
+        // `load_execve_image`: ELF segments loaded + argv/envp/auxv on the
+        // initial stack (with_linux_initial_stack). Extract the entry RIP and the
+        // initial RSP exactly as `build_x86_engine` does for the bare run-elf
+        // path (the same two accessors).
+        let entry_rip = new_image.entry();
+        let initial_rsp = new_image.initial_stack_pointer().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "bhyve execve_into: new_image has no initial stack pointer \
+                 (with_linux_initial_stack not applied?)"
+                    .to_string(),
+            )
+        })?;
+
+        // Build the fresh OWNED VM FIRST, so any image/bring-up error surfaces
+        // BEFORE we tear down the current image (Linux execve semantics: on
+        // failure the caller keeps running its old image). bring_up_x86_elf does
+        // the whole job: fresh BhyveVm::create + setup_memory + PML4/GDT/LSTAR/
+        // init-blob + the vCPU programmed at the new entry via the ring-0 iretq.
+        let bux = bring_up_x86_elf(new_image, entry_rip, initial_rsp)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+
+        // Swap in the fresh VM/vCPU/RAM. The fresh VM is already built, so
+        // destroying the OLD one now is safe (nothing references it).
+        let old_vm = std::mem::replace(&mut self.vm, bux.vm);
+        if self.vm_borrowed {
+            // A vfork child detaching from the SHARED parent VM: the parent owns
+            // that node and resumes on it. Never destroy it — leak the handle in
+            // this child process (the Arc refcount is per-process-wrong across
+            // fork; the parent keeps it alive). Mirrors the SP1 fork landmine.
+            std::mem::forget(old_vm);
+        } else {
+            // A normal process execve: the old VM is owned by this engine, and
+            // execve replaces the old image — tear it down (no leaked /dev/vmm
+            // node). `destroy_in_place` honors owns=true here.
+            let mut old_vm = old_vm;
+            old_vm.destroy_in_place();
+        }
+        self.vcpu = bux.vcpu;
+        self.ram = bux.ram;
+        // The fresh VM from bring_up_x86_elf is OWNED (BhyveVm::create → owns).
+        self.vm_borrowed = false;
+        // The fresh vCPU never hit a doorbell; start a fresh kick-pending.
+        self.pending_inout = None;
+        self.kick_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Do NOT advance PC: bring_up_x86_elf programmed the new entry (the
+        // ring-0 init blob iretqs to entry_rip), so the next `next_syscall`
+        // resumes at the new image. Mirrors the aarch64 reference (no PC bump).
+        //
+        // PRESERVE is_forked_child across execve (matching the aarch64
+        // reference, trap_engine.rs ~:959): a vfork child that execve's is still
+        // a child process for the loop's exit routing. The flag is a plain field
+        // untouched by the swap above — left unchanged deliberately.
+        Ok(())
     }
 
     fn inject_signal(

@@ -87,7 +87,8 @@ use std::path::Path;
 // Imported from the leaf crate (not `crate::dispatch`) — this is the edge that
 // previously closed the `memory ↔ dispatch` cycle (docs/archive/build-decomposition-design.md §3.A-A2).
 use crate::elf::{
-    ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load_bytes, plan_elf_load_for,
+    ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load_bytes,
+    plan_elf_load_bytes_for, plan_elf_load_for,
 };
 use crate::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_CLKTCK, LINUX_AT_EGID, LINUX_AT_ENTRY, LINUX_AT_EUID, LINUX_AT_EXECFN,
@@ -698,7 +699,23 @@ impl AddressSpace {
         file: &[u8],
         read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Result<Self, AddressSpaceError> {
-        let plan = plan_elf_load_bytes(file)?;
+        use goblin::elf::header::EM_AARCH64;
+        Self::load_elf_bytes_with_reader_for(file, read_interp, EM_AARCH64)
+    }
+
+    /// Like [`load_elf_bytes_with_reader`] but accepts only the given `machine`
+    /// type (`EM_X86_64 = 62`, `EM_AARCH64 = 183` per elf(5)/psABI §4.1) — the
+    /// execve image builder on the x86_64 lanes (KVM-x86 / bhyve) passes
+    /// `X8664GuestArch::elf_machine()` so an x86_64 ELF is not rejected as an
+    /// aarch64-machine mismatch. [`load_elf_bytes_with_reader`] delegates here
+    /// with `EM_AARCH64`, preserving byte-identical behaviour for the aarch64
+    /// lane.
+    pub fn load_elf_bytes_with_reader_for(
+        file: &[u8],
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
+        machine: u16,
+    ) -> Result<Self, AddressSpaceError> {
+        let plan = plan_elf_load_bytes_for(file, machine)?;
         Self::load_elf_segments_with_interpreter(file, plan, read_interp)
     }
 

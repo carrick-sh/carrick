@@ -154,3 +154,33 @@ fn fork_raw_runs_to_zero() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn execve_runs_second_image() {
+    // The execve(2) acceptance (SP2): the CALLER fixture (`CARRICK_BHYVE_EXECVE`)
+    // `execve`s the deployed `execd` TARGET, which prints `execd ok` + exit 0.
+    // Success here proves `BhyveTrapEngine::execve_into` rebuilt a fresh OWNED VM
+    // from the second image (bring_up_x86_elf), swapped it in, tore down the old
+    // image, and resumed at the new entry — with NO /dev/vmm leak.
+    //
+    // PATH RESOLUTION: the caller execve's the ABSOLUTE deployed host path of
+    // execd (baked default `/root/fixtures/execd`). `load_execve_image` resolves
+    // it overlay-first, then via the host-fs fallback (`std::fs::read`), which is
+    // ON for the bare run-elf dispatcher — so the deployed execd is found.
+    let Some(path) = fixture("CARRICK_BHYVE_EXECVE") else {
+        eprintln!("skip: set CARRICK_BHYVE_EXECVE to the execve-caller ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "execve target must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("execd ok"),
+        "the execve'd second image must print 'execd ok'; stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}

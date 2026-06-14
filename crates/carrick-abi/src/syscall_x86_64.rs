@@ -124,6 +124,15 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // vs the asm-generic order the dispatcher expects — the x86 engine normalizes
     // it (trap_engine_x86.rs next_syscall). Source: clone(2) man-page.
     direct(56, "clone", 220),
+    // x86_64=59 (syscalls(2)/filippo) → canonical execve=221 (AARCH64_SYSCALLS[221]).
+    // glibc/musl execve() lowers to SYS_execve(59); the shared dispatcher's
+    // execve handler returns DispatchOutcome::Execve → the loop's handle_execve
+    // → engine.execve_into (the SP2 fresh-VM image replacement). WITHOUT this
+    // entry x86_64 execve(59) falls through to Unknown → -ENOSYS, so the guest's
+    // execve fails before ever reaching the dispatcher (trap-confirmed on the
+    // bhyve dispatcher lane with the bhyve-execve fixture). Source: execve(2)
+    // man-page; the canonical 221 cross-checked against AARCH64_SYSCALLS.
+    direct(59, "execve", 221),
     // x86_64=60 (syscalls(2)/filippo) → canonical exit=93 (AARCH64_SYSCALLS[93])
     direct(60, "exit", 93),
     // x86_64=61 (syscalls(2)/filippo) → canonical wait4=260 (AARCH64_SYSCALLS[260]).

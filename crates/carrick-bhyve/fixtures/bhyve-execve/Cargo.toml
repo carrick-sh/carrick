@@ -1,0 +1,32 @@
+[package]
+name = "carrick-bhyve-execve"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone SP2 fixture: the execve CALLER. Cross-compiled to
+# x86_64-unknown-linux-musl (static, non-PIE ET_EXEC) by a plain
+# `cargo build --release` via .cargo/config.toml (rust-lld; no build.sh).
+# execve()s the deployed bhyve-execd target: proves execve_into replaces the
+# guest image (fresh VM) so the second program runs to "execd ok" + exit 0.
+#
+# PATH RESOLUTION: the target path is the ABSOLUTE deployed host path of execd.
+# Under run_elf_bhyve_dispatch the dispatcher's `load_execve_image` resolves an
+# absolute execve path through the in-memory/cap-std overlay FIRST, then (since a
+# bare run-elf dispatcher leaves `exec_host_fs_fallback = true`) falls back to
+# `std::fs::read(path)` on the literal host fs. The deployed execd lives at the
+# host path baked below, so the host-fs fallback resolves it. Override at build
+# time with CARRICK_EXECD_PATH if execd is deployed elsewhere.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-execve"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
