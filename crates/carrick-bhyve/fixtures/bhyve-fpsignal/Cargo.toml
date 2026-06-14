@@ -1,0 +1,24 @@
+[package]
+name = "carrick-bhyve-fpsignal"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP3.2 fixture: SA_SIGINFO SIGUSR1 handler that CLOBBERS xmm0 + a raw self-kill
+# raise + the post-rt_sigreturn assertion that the interrupted xmm0 survived.
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC) via a plain
+# `cargo build --release` (rust-lld; .cargo/config.toml). Prints "fp-ok" + exit 0
+# iff the interrupted xmm0 (the sentinel) round-tripped across the signal frame.
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-fpsignal"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
