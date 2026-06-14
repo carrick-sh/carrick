@@ -1,0 +1,27 @@
+[package]
+name = "carrick-bhyve-crosssig-usr2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP4.2 fixture: cross-process kill() of SIGUSR2 to another guest PID — a second
+# host-kill cross-process proof distinct from bhyve-crosssig (SIGUSR1). SIGUSR2 is
+# Linux 12 -> FreeBSD 31, so this exercises a DIFFERENT entry of the FreeBSD
+# linux<->host signum table than SIGUSR1 (Linux 10 -> FreeBSD 30). The parent
+# forks a child that installs an SA_SIGINFO SIGUSR2 handler + waits; the parent
+# kill(child, SIGUSR2)s it; the child handler asserts si_signo == SIGUSR2 AND
+# si_pid == the parent's pid -> "crossusr2-ok"; the parent wait4s exit 0.
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC).
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-crosssig-usr2"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

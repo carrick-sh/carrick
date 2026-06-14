@@ -1,0 +1,28 @@
+[package]
+name = "carrick-bhyve-crosssig"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP4.2 fixture: cross-process kill() to ANOTHER guest PID. The parent forks a
+# child; the child installs an SA_SIGINFO SIGUSR1 handler and pauses; the parent
+# kill(child, SIGUSR1)s it. The child handler must run with si_signo==SIGUSR1 and
+# si_pid == the parent's (ns-)pid -> "crosssig-ok"; the child _exit(0)s and the
+# parent wait4s 0. Exercises the host-kill cross-process path (SIGUSR1 is not a
+# ring-routed signal without a pid namespace): the FreeBSD linux<->host signum
+# table (Linux 10 -> FreeBSD 30), the mirrored host routed handler, and the
+# signal pump turning the host signal into a guest-delivered SIGUSR1.
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC).
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-crosssig"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
