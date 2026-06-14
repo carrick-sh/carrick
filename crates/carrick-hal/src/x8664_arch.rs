@@ -17,6 +17,7 @@
 //!   TTBR0_EL1 from the stage-1 tables.
 
 use crate::guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
+use crate::trap::RawSyscall;
 use crate::{RegAccess, TrapError};
 use carrick_guest_mem::{GuestMemory, X8664SyscallFrame};
 
@@ -610,7 +611,187 @@ impl GuestArch for X8664GuestArch {
     }
 }
 
+// ─── x86-64 syscall normalization (shared by every x86 backend) ──────────────
+//
+// fork(57)/vfork(58)→clone(220) desugar + the clone(220) tls↔child_tid arg-swap
+// + the arch_prctl dispatch are PURE guest-ISA ABI (host/VMM-agnostic). They were
+// duplicated in the KVM-x86 and bhyve `next_syscall`; hoisted here so both call
+// one function. Sources (clean-room, man-pages / psABI only): clone(2) "C
+// library/kernel differences" (x86-64 raw arg order; CLONE_VM=0x100,
+// CLONE_VFORK=0x4000; exit-signal in the low byte), signal(7) (SIGCHLD=17),
+// syscalls(2) (x86-64 fork=57/vfork=58).
+
+/// Canonical (asm-generic / aarch64) `clone` number. x86-64 raw clone (56) and
+/// fork(57)/vfork(58) all normalize to this; clone3 (435) does NOT.
+pub const CANONICAL_CLONE: u64 = 220;
+/// x86-64 `fork(2)` (syscalls(2)). asm-generic/aarch64 have no SYS_fork — they
+/// implement fork via clone — so we desugar it to canonical clone(220)+SIGCHLD.
+const X86_NR_FORK: u64 = 57;
+/// x86-64 `vfork(2)` (syscalls(2)). Desugars to clone(220)+CLONE_VM|CLONE_VFORK|SIGCHLD.
+const X86_NR_VFORK: u64 = 58;
+/// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
+const LINUX_SIGCHLD: u64 = 17;
+/// `CLONE_VM` (clone(2)).
+const LINUX_CLONE_VM: u64 = 0x0000_0100;
+/// `CLONE_VFORK` (clone(2)).
+const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
+
+/// The result of normalizing a raw x86-64 syscall into the canonical ABI.
+pub enum SyscallNorm {
+    /// Ready for the dispatcher: number remapped to canonical, args in
+    /// asm-generic order, fork/vfork desugared to clone.
+    Plain(RawSyscall),
+    /// arch_prctl(SET/GET FS|GS): serviced engine-side (FS/GS base is VMM
+    /// hidden state); the engine calls `service_arch_prctl(self, code, addr)`.
+    ArchPrctl { code: u64, addr: u64 },
+}
+
+impl X8664GuestArch {
+    /// Pure x86-64 ABI normalization shared by every x86 backend (KVM, bhyve,
+    /// HVF). Folds decode + remap + fork/vfork→clone desugar + clone arg-swap +
+    /// arch_prctl dispatch into one place — no host/VMM state.
+    pub fn normalize_syscall(frame: &X8664SyscallFrame) -> SyscallNorm {
+        let (x86_number, mut args) = X8664GuestArch::decode_syscall(frame);
+
+        if x86_number == ARCH_PRCTL_X86_NR {
+            return SyscallNorm::ArchPrctl {
+                code: args[0],
+                addr: args[1],
+            };
+        }
+        if x86_number == X86_NR_FORK {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_CLONE,
+                args: [LINUX_SIGCHLD, 0, 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_VFORK {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_CLONE,
+                args: [
+                    LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            });
+        }
+
+        let canonical = match X8664SyscallTable::remap(x86_number) {
+            SyscallRemap::Direct(c) => c,
+            SyscallRemap::Native | SyscallRemap::Unknown => x86_number,
+        };
+        // x86-64 raw clone(2) arg order (flags, stack, ptid, child_tid, tls) vs
+        // the asm-generic order the dispatcher binds (.., tls, child_tid): swap
+        // args[3]<->args[4] for canonical clone(220) only (clone3=435 is a
+        // struct-based syscall with no positional args to swap).
+        if canonical == CANONICAL_CLONE {
+            args.swap(3, 4);
+        }
+        SyscallNorm::Plain(RawSyscall {
+            number: canonical,
+            args,
+        })
+    }
+}
+
 // ─── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    fn frame(rax: u64, a: [u64; 6]) -> X8664SyscallFrame {
+        X8664SyscallFrame {
+            rax,
+            rdi: a[0],
+            rsi: a[1],
+            rdx: a[2],
+            r10: a[3],
+            r8: a[4],
+            r9: a[5],
+        }
+    }
+
+    #[test]
+    fn fork_desugars_to_clone_sigchld() {
+        // x86 fork = 57 → canonical clone(220) with flags=SIGCHLD(17), rest 0.
+        match X8664GuestArch::normalize_syscall(&frame(57, [0; 6])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 220);
+                assert_eq!(rs.args, [17, 0, 0, 0, 0, 0]);
+            }
+            _ => panic!("fork must be Plain(clone)"),
+        }
+    }
+
+    #[test]
+    fn vfork_desugars_to_clone_vm_vfork_sigchld() {
+        // x86 vfork = 58 → clone(220) flags = CLONE_VM|CLONE_VFORK|SIGCHLD.
+        match X8664GuestArch::normalize_syscall(&frame(58, [0; 6])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 220);
+                assert_eq!(rs.args[0], 0x0000_0100 | 0x0000_4000 | 17);
+            }
+            _ => panic!("vfork must be Plain(clone)"),
+        }
+    }
+
+    #[test]
+    fn clone_swaps_tls_and_child_tid() {
+        // x86 clone = 56 → canonical 220; raw x86 arg order
+        // (flags, stack, ptid, child_tid, tls) → asm-generic (.., tls, child_tid):
+        // args[3] (child_tid) and args[4] (tls) swap.
+        // raw args: flags=0x11, stack=0x22, ptid=0x33, child_tid=0xC, tls=0xT
+        match X8664GuestArch::normalize_syscall(&frame(56, [0x11, 0x22, 0x33, 0xC, 0x7, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 220);
+                assert_eq!(rs.args[3], 0x7, "args[3] becomes tls");
+                assert_eq!(rs.args[4], 0xC, "args[4] becomes child_tid");
+            }
+            _ => panic!("clone must be Plain"),
+        }
+    }
+
+    #[test]
+    fn clone3_is_not_swapped() {
+        // x86 clone3 = 435 → canonical 435 (struct-based; no positional swap).
+        match X8664GuestArch::normalize_syscall(&frame(435, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])) {
+            SyscallNorm::Plain(rs) => {
+                assert_ne!(rs.number, 220);
+                assert_eq!(rs.args[3], 0xDD, "clone3 args untouched");
+                assert_eq!(rs.args[4], 0xEE);
+            }
+            _ => panic!("clone3 must be Plain"),
+        }
+    }
+
+    #[test]
+    fn arch_prctl_returns_archprctl() {
+        // x86 arch_prctl = 158, args: code=0x1002 (SET_FS), addr=0xDEAD.
+        match X8664GuestArch::normalize_syscall(&frame(158, [0x1002, 0xDEAD, 0, 0, 0, 0])) {
+            SyscallNorm::ArchPrctl { code, addr } => {
+                assert_eq!(code, 0x1002);
+                assert_eq!(addr, 0xDEAD);
+            }
+            _ => panic!("arch_prctl must be ArchPrctl"),
+        }
+    }
+
+    #[test]
+    fn ordinary_syscall_is_plain_canonical() {
+        // x86 write = 1 → canonical write = 64 (Direct). args pass through.
+        match X8664GuestArch::normalize_syscall(&frame(1, [1, 0x100, 5, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 64); // canonical write
+                assert_eq!(rs.args, [1, 0x100, 5, 0, 0, 0]);
+            }
+            _ => panic!("write must be Plain"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

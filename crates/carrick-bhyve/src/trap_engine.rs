@@ -26,11 +26,7 @@
 use std::sync::Arc;
 
 use carrick_guest_mem::{GuestMemory, MemoryError, X8664SyscallFrame};
-use carrick_hal::{
-    OsError, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError,
-    guest_arch::{GuestArch, SyscallRemap, SyscallTable as _},
-    x8664_arch::{X8664GuestArch, X8664SyscallTable},
-};
+use carrick_hal::{OsError, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError};
 use carrick_mem::memory::AddressSpace;
 
 use crate::guest_setup_x86::{BhyveGuestRam, BroughtUpX86, SYSCALL_DOORBELL_PORT, complete_inout};
@@ -42,14 +38,9 @@ use crate::vmm_x86::{
     VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI, VM_REG_GUEST_RSP, X86Exit,
 };
 
-/// Canonical (asm-generic/aarch64) `clone` number. The ONE syscall whose x86-64
-/// raw arg order differs from the dispatcher's asm-generic order: the engine
-/// swaps args[3]<->args[4] (child_tid<->tls) for it in `next_syscall`. Keyed on
-/// 220 PRECISELY so it never touches clone3 (canonical 435), which reads its
-/// parameters from a guest `clone_args` struct (no positional args to swap).
-/// Source: `clone(2)` man-page "C library/kernel differences". Mirrors the
-/// KVM-x86 lane's `CANONICAL_CLONE`.
-const CANONICAL_CLONE: u64 = 220;
+// The canonical clone number + the x86-64 clone arg-swap now live in
+// carrick_hal::x8664_arch (defined once, shared with the KVM-x86 lane via
+// X8664GuestArch::normalize_syscall).
 
 /// Pending INOUT state: the vCPU is parked on the `OUT 0xC5` instruction.
 /// `complete_syscall` applies the resume discipline once (writing RAX then
@@ -382,56 +373,25 @@ impl SyscallTrap for BhyveTrapEngine {
                     // Stash the pending INOUT so `complete_syscall` can resume.
                     self.pending_inout = Some(PendingInout { rip, inst_length });
 
-                    // Decode through the GuestArch trait (ISA-neutral number +
-                    // args); then remap x86_64 number → canonical.
-                    let (x86_number, args) = X8664GuestArch::decode_syscall(&frame);
-
-                    let canonical = match X8664SyscallTable::remap(x86_number) {
-                        // Direct: dispatch on the canonical (aarch64/asm-generic)
-                        // number — the runtime loop contract.
-                        SyscallRemap::Direct(c) => c,
-                        // Native (e.g. arch_prctl=158) or Unknown: pass the raw
-                        // x86_64 number; the M1 test loop's default arm answers
-                        // -ENOSYS and logs the x86_64 name for diagnostics.
-                        SyscallRemap::Native | SyscallRemap::Unknown => x86_number,
-                    };
-
-                    // arch_prctl(SET/GET FS/GS) is serviced engine-side via the
-                    // SHARED carrick-hal policy (FS/GS base = VT-x hidden state set
-                    // by vm_set_desc, which the ISA-neutral dispatcher cannot do;
-                    // raw x86 158 would also misroute to canonical getgroups=158).
-                    // The pending INOUT was stashed above, so complete_syscall
-                    // resumes past the doorbell; then re-enter the guest. Identical
-                    // to the KVM lane.
-                    if x86_number == carrick_hal::x8664_arch::ARCH_PRCTL_X86_NR {
-                        let ret =
-                            carrick_hal::x8664_arch::service_arch_prctl(self, args[0], args[1])?;
-                        self.complete_syscall(ret)?;
-                        continue;
+                    // Normalize the raw x86-64 syscall via the shared ISA seam:
+                    // fork/vfork→clone desugar + clone(220) tls↔child_tid arg-swap
+                    // + arch_prctl dispatch all live in carrick_hal::x8664_arch
+                    // (one definition shared with the KVM-x86 lane). arch_prctl
+                    // (SET/GET FS/GS) is serviced engine-side (FS/GS base = VT-x
+                    // hidden state set by vm_set_desc, which the ISA-neutral
+                    // dispatcher cannot do; raw x86 158 would also misroute to
+                    // canonical getgroups=158). The pending INOUT was stashed
+                    // above, so complete_syscall resumes past the doorbell; then
+                    // re-enter the guest. Identical to the KVM lane.
+                    match carrick_hal::x8664_arch::X8664GuestArch::normalize_syscall(&frame) {
+                        carrick_hal::x8664_arch::SyscallNorm::ArchPrctl { code, addr } => {
+                            let ret =
+                                carrick_hal::x8664_arch::service_arch_prctl(self, code, addr)?;
+                            self.complete_syscall(ret)?;
+                            continue;
+                        }
+                        carrick_hal::x8664_arch::SyscallNorm::Plain(raw) => return Ok(Some(raw)),
                     }
-
-                    // x86-64 raw clone(2) arg order is
-                    // (flags, stack, parent_tid, child_tid, tls); the shared
-                    // ISA-neutral dispatcher binds the asm-generic/aarch64 order
-                    // (flags, stack, parent_tid, tls, child_tid). Swap args[3]<->
-                    // args[4] for canonical clone(220) so the clone handler reads
-                    // tls/child_tid correctly — without this a CLONE_SETTLS thread
-                    // gets the child-tid pointer as its TLS base (the self-pointer
-                    // at %fs:0 reads 0 → the musl thread prologue #PFs → the empty
-                    // IDT triple-faults the sibling vCPU). clone3 (canonical 435)
-                    // reads a guest clone_args struct → no positional swap (the
-                    // CANONICAL_CLONE guard keys on 220). Mirrors the KVM-x86 lane
-                    // (trap_engine_x86.rs); source: clone(2) "C library/kernel
-                    // differences".
-                    let mut args = args;
-                    if canonical == CANONICAL_CLONE {
-                        args.swap(3, 4);
-                    }
-
-                    return Ok(Some(RawSyscall {
-                        number: canonical,
-                        args,
-                    }));
                 }
 
                 // A kick (pthread_kill → astpending) surfaces as VM_EXITCODE_BOGUS, not
