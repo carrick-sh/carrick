@@ -59,6 +59,11 @@ mod bhyve_kicker;
 pub use bhyve_kicker::{BhyveKickHandle, BhyveKicker, install_bhyve_kick_handler, kick_signal};
 
 #[cfg(target_arch = "x86_64")]
+mod bhyve_threaded_glue;
+#[cfg(target_arch = "x86_64")]
+pub use bhyve_threaded_glue::{BhyveForkCoordinator, BhyveSignalArrival, BhyveTimerDelivery};
+
+#[cfg(target_arch = "x86_64")]
 pub use trap_engine::BhyveTrapEngine;
 pub use vmm::{BhyveVcpu, BhyveVm};
 #[cfg(target_arch = "x86_64")]
