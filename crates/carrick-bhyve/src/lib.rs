@@ -49,6 +49,11 @@ pub mod trap_engine;
 pub mod run_elf;
 
 #[cfg(target_arch = "x86_64")]
+mod bhyve_futex;
+#[cfg(target_arch = "x86_64")]
+pub use bhyve_futex::BhyveFutex;
+
+#[cfg(target_arch = "x86_64")]
 pub use trap_engine::BhyveTrapEngine;
 pub use vmm::{BhyveVcpu, BhyveVm};
 #[cfg(target_arch = "x86_64")]
