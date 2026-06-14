@@ -1,0 +1,25 @@
+[package]
+name = "carrick-x86-signal"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone M3d fixture (the root Cargo.toml excludes crates/*/fixtures/*).
+# Cross-compiled to x86_64-unknown-linux-musl by `cargo build --release`
+# (loader flags in .cargo/config.toml — no build.sh). Installs a SA_SIGINFO
+# SIGUSR1 handler, raise()s it, and verifies the handler ran (with the right
+# siginfo) AND execution resumed after rt_sigreturn: the proof that the x86
+# rt_sigframe build + restore work end-to-end under carrick-kvm.
+
+[[bin]]
+name = "x86-signal"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
