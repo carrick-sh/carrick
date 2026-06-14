@@ -1,0 +1,26 @@
+[package]
+name = "carrick-nvmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_nvmm"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# The NetBSD/NVMM host backend (the fourth platform, after macOS/HVF,
+# Linux/KVM, and FreeBSD/bhyve). The whole crate is `#![cfg(target_os =
+# "netbsd")]`; on any other host the lib compiles to an empty crate, so the
+# default macOS workspace build (and Linux CI) stay green without libnvmm on
+# the link line.
+#
+# M0 keeps deps minimal: std + libc only. It FFIs to the system **libnvmm**
+# (linked via `#[link(name = "nvmm")]`, found at /usr/lib/libnvmm.so). The
+# carrick-hal trait impls + the shared x86_64 ISA layer are M1/M2 — they are
+# deliberately NOT pulled in here yet (carrick-hal on the box's pkgsrc rust is
+# untested; M0 is a leaf de-risk of state-programming + the run loop).
+[dependencies]
+libc.workspace = true

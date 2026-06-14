@@ -491,6 +491,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-nvmm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-observability"
 version = "0.1.0"
 dependencies = [
