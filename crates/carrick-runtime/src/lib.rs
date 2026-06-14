@@ -545,6 +545,128 @@ pub mod runtime {
         Ok(result)
     }
 
+    /// The FreeBSD/bhyve analogue of `run_threaded_kvm_loop` (M2 Tier 1).
+    ///
+    /// A near-verbatim clone of the KVM lane: it wires carrick-bhyve's newtypes
+    /// (`Bhyve{Futex,ForkCoordinator,Kicker,SignalArrival,TimerDelivery}`) into the
+    /// SHARED `run_vcpu_until_exit` loop, so x86_64 bhyve guests run through the same
+    /// canonical dispatcher/fork/futex/timer plumbing as KVM and HVF. Lives here in
+    /// carrick-runtime (where `KernelState` / `run_vcpu_until_exit` are pub(crate));
+    /// carrick-bhyve stays a leaf crate.
+    #[cfg(feature = "platform-freebsd")]
+    pub fn run_threaded_bhyve_loop<E>(
+        engine: E,
+        dispatcher: SyscallDispatcher,
+        max_traps: usize,
+    ) -> Result<RunResult, RuntimeError>
+    where
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_bhyve::BhyveKickHandle> + 'static,
+        E::SiblingSpec: 'static,
+    {
+        use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
+        use crate::vcpu_loop::{
+            KernelState, PlatformFutexFactory, VcpuLoopOutcome, run_vcpu_until_exit,
+        };
+        use std::sync::Arc;
+
+        let main_tid: ThreadId = std::process::id() as ThreadId;
+        let registry = Arc::new(ThreadRegistry::new(main_tid));
+        crate::thread::set_current_registry(Arc::clone(&registry));
+        crate::host_proc::set_root_guest_pid(std::process::id());
+        crate::guest_cpu::init_child_table();
+
+        let futex = Arc::new(FutexTable::new());
+        let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
+            Arc::new(carrick_bhyve::BhyveFutex(Arc::clone(&futex)));
+        let platform_futex_factory: PlatformFutexFactory = Arc::new(
+            |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
+                Arc::new(carrick_bhyve::BhyveFutex(table))
+            },
+        );
+        let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
+            Box::new(carrick_bhyve::BhyveForkCoordinator::new());
+        let kicker: Arc<dyn carrick_hal::VcpuRegistry> =
+            Arc::new(carrick_bhyve::BhyveKicker::new());
+        let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
+            Arc::new(carrick_bhyve::BhyveSignalArrival {
+                kicker: Arc::clone(&kicker),
+                futex: Arc::clone(&platform_futex),
+            });
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            fork_coordinator,
+            signal_arrival,
+        ));
+        let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        kernel.fork.start_signal_pump(&kicker, &platform_futex);
+
+        crate::timer_delivery::register(Arc::clone(&kicker), main_tid);
+        crate::timer_delivery::register_delivery(Arc::new(carrick_bhyve::BhyveTimerDelivery {
+            kicker: Arc::clone(&kicker),
+            main_tid,
+        }));
+
+        let outcome = run_vcpu_until_exit(
+            Arc::clone(&kernel),
+            engine,
+            Arc::clone(&registry),
+            Arc::clone(&futex),
+            Arc::clone(&platform_futex),
+            Arc::clone(&platform_futex_factory),
+            main_tid,
+            Arc::clone(&threads),
+            Arc::clone(&kicker),
+            max_traps,
+        )?;
+
+        let result = match outcome {
+            VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
+            VcpuLoopOutcome::ThreadDone => {
+                let report = kernel.reporter.snapshot();
+                RunResult {
+                    exit_code: 0,
+                    stdout: kernel.dispatcher.stdout(),
+                    stderr: kernel.dispatcher.stderr(),
+                    traps: 0,
+                    report,
+                    trap_limit_hit: false,
+                }
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// x86_64 bhyve run through the FULL `SyscallDispatcher` on the canonical loop
+    /// (M2 Tier 1). Mirrors the x86_64 arm of `run_elf_real_dispatch`: build a
+    /// `BhyveTrapEngine` via `carrick_bhyve::run_elf::build_x86_engine` and drive it
+    /// through `run_threaded_bhyve_loop`. `CARRICK_NO_THREADS` falls back to the M1
+    /// single-threaded `carrick_bhyve::run_elf::run_elf_bhyve` (which writes guest
+    /// stdout/stderr straight to the host — hence empty buffers in the RunResult).
+    /// The carrick-bhyve helpers return `Result<_, String>`; map those to
+    /// `RuntimeError::Unsupported` (the variant the codebase uses for opaque
+    /// backend messages).
+    #[cfg(feature = "platform-freebsd")]
+    pub fn run_elf_bhyve_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
+        if std::env::var_os("CARRICK_NO_THREADS").is_some() {
+            let code = carrick_bhyve::run_elf::run_elf_bhyve(path)
+                .map_err(|e| RuntimeError::Unsupported(format!("run_elf_bhyve: {e}")))?;
+            return Ok(RunResult {
+                exit_code: code,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                traps: 0,
+                report: crate::compat::CompatReport::default(),
+                trap_limit_hit: false,
+            });
+        }
+        let engine = carrick_bhyve::run_elf::build_x86_engine(path)
+            .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine: {e}")))?;
+        run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+    }
+
     /// Dispatch one syscall, servicing any blocking-I/O outcome inline via the
     /// `ppoll` waiter (then re-dispatching the SAME syscall on readiness), and
     /// return the TERMINAL outcome. Mirrors the macOS `dispatch_single_threaded_
@@ -796,7 +918,7 @@ pub mod runtime {
     /// and seed a minimal Linux baseline (`/tmp`, `/etc/{passwd,group,hosts,…}`),
     /// mirroring carrick-cli's `--fs host`. If the backend can't be created the
     /// guest simply has no filesystem (the runner still works for fs-free code).
-    #[cfg(feature = "platform-linux")]
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
     fn make_linux_dispatcher() -> SyscallDispatcher {
         use crate::fs_backend::{FsBackend, HostFsBackend};
 
@@ -819,7 +941,7 @@ pub mod runtime {
 
     /// Pre-create the standard Linux directories and a few `/etc` databases a
     /// raw static binary assumes exist (it has no OCI rootfs to supply them).
-    #[cfg(feature = "platform-linux")]
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
     fn seed_linux_baseline(backend: &mut dyn crate::fs_backend::FsBackend) {
         for dir in [
             "/tmp",
