@@ -1573,10 +1573,10 @@ pub fn restore_x86_bhyve(
     Ok(())
 }
 
-/// Fully program a FRESH sibling vCPU (from `add_sibling_vcpu` → `vcpu_reset`,
-/// which leaves it in REAL MODE) for long-mode ring-3 execution as a
-/// `clone(CLONE_THREAD)` child, then point it at a per-sibling ring-0 MSR blob
-/// that `iretq`s into the child's post-clone userspace.
+/// Program a fresh vCPU (a sibling vCPU `id` on the shared VM, or vCPU 0 of a
+/// forked child's fresh VM) for long-mode ring-3 entry at the snapshot's
+/// post-trap context (RIP = snap.gpr[RCX], RSP = snap.rsp, rax=0 via the blob's
+/// clear_rax).
 ///
 /// # Why a per-sibling ring-0 blob
 ///
@@ -1614,7 +1614,7 @@ pub fn restore_x86_bhyve(
 /// `vm_set_register(FS_BASE)` returns EINVAL on FreeBSD 15.1). It is written
 /// LAST so the ring-0 FS descriptor override above cannot clobber it. `iretq`
 /// does NOT reload FS on x86-64, so the ring-0 FS base persists into ring-3.
-pub fn program_sibling_long_mode(
+pub fn program_x86_vcpu_longmode_entry(
     vcpu: &mut crate::vmm::BhyveVcpu,
     vm: &BhyveVm,
     snap: &X8664BhyveSnapshot,
