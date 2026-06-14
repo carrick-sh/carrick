@@ -270,6 +270,31 @@ fn signal_handler_runs_to_zero() {
 }
 
 #[test]
+fn async_signal_interrupts_tight_loop() {
+    // SP4.1: a guest spins in a tight ALU loop with NO syscalls while a SIBLING
+    // guest thread tgkills it. The signal must interrupt the running vCPU at an
+    // ARBITRARY ring-3 PC (kick -> Ok(None) -> deliver at interrupted_pc), run
+    // the handler, rt_sigreturn, and resume the loop -> exit 0. Proves async
+    // host->guest delivery (vs SP3's syscall-boundary delivery).
+    let Some(path) = fixture("CARRICK_BHYVE_ASYNCSIG") else {
+        eprintln!("skip: set CARRICK_BHYVE_ASYNCSIG to the asyncsig ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "async-signal guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("asyncsig-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
 fn fp_preserved_across_signal() {
     // The FP-fidelity acceptance (SP3.2): the guest seeds known XMM values, then
     // `raise`s a signal whose handler CLOBBERS XMM, then after rt_sigreturn

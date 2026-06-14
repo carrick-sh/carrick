@@ -222,6 +222,25 @@ impl BhyveTrapEngine {
     /// non-destructive; FXRSTOR loads FP only). Spurious `Bogus`/`Kicked` re-entries
     /// are tolerated (continue), exactly like `next_syscall`; any other exit is a
     /// loud error (the stub never reached its doorbell).
+    ///
+    /// # CPL-0 precondition (SP4.1)
+    ///
+    /// This MUST be called only when the vCPU is parked at **CPL 0** — the SP3
+    /// syscall-boundary path (`inject_signal`/`restore_from_sigframe` for an
+    /// intra-process `raise`/tkill, and rt_sigreturn, all enter via SYSCALL so the
+    /// LSTAR stub leaves the vCPU in ring 0). At CPL 0 the supervisor-mapped stub +
+    /// scratch pages are reachable, the `out` is not IOPL-gated, and `fxsave`
+    /// executes. `inject_signal` enforces this by SKIPPING the FP capture on the
+    /// async path (a cross-thread kick parks the vCPU at an arbitrary ring-3 PC).
+    ///
+    /// Running the stub at ring 3 was tried and FAILS: `fxsave` raises #UD →
+    /// triple-fault against carrick's empty IDT (verified live — CS DPL=3 #UDs,
+    /// DPL=0 works, with identical CR0/CR3/CR4/EFER/OSFXSR). Forcing the segments
+    /// to ring 0 (vm_set_register/vm_set_desc CS/SS → kernel selectors) ALSO #UDs
+    /// even with the resulting VMX guest state byte-identical to the working CPL-0
+    /// context — re-programming CS/SS on a vCPU VT-x believes is mid-ring-3 leaves a
+    /// hidden VMCS inconsistency vmm.ko (FreeBSD 15.1) does not reconcile. Hence the
+    /// CPL-0 gate in `inject_signal` rather than a per-CPL detour here.
     fn run_fp_stub(&mut self, stub_gpa: u64, scratch_gpa: u64) -> Result<(), TrapError> {
         let reg_err = |e: OsError| TrapError::Hypervisor(e.to_string());
 
@@ -899,10 +918,38 @@ impl SyscallTrap for BhyveTrapEngine {
         // has rewritten RSP/RDI/RIP for handler entry). The 512-byte FXSAVE blob
         // is X8664Fpstate verbatim, so it overlays the frame's fpstate field as
         // one memcpy (see the overlay after build_sigframe below).
-        self.run_fp_stub(self.fxsave_stub_gpa, self.fp_scratch_gpa)?;
-        let fp_blob = self
-            .read_bytes(self.fp_scratch_gpa, 512)
-            .map_err(|e| TrapError::Hypervisor(format!("FP scratch read: {e}")))?;
+        //
+        // SP4.1 CPL gate: the FXSAVE stub can only run when the vCPU is parked at
+        // CPL 0 (the SP3 syscall-boundary path — `raise`/intra-proc signals enter
+        // via SYSCALL, so the LSTAR stub already left the vCPU in ring 0). On the
+        // ASYNC path a cross-thread kick parks the vCPU at an ARBITRARY ring-3 PC
+        // (CPL 3), where `fxsave` raises #UD against carrick's empty IDT → triple
+        // fault (verified live: cs DPL=3 #UDs, DPL=0 works; identical CR0/CR3/CR4/
+        // EFER/OSFXSR otherwise — see the run_fp_stub negative result). Forcing the
+        // segments to ring 0 ALSO #UDs (a hidden VMCS inconsistency vmm.ko won't
+        // reconcile). So for an async (ring-3-interrupted) signal we SKIP the live
+        // FP capture: build_sigframe zero-fills the frame's FXSAVE area, and
+        // restore_from_sigframe FXRSTORs that (a clean FP reset) on rt_sigreturn
+        // (which always runs at CPL 0). LIMITATION: an async signal that interrupts
+        // ring-3 code resets the FP/SSE state across the handler rather than
+        // preserving it bit-exact; intra-process (syscall-boundary) signals keep
+        // full SP3.2 FP fidelity. Honest, bounded, no corruption/triple-fault.
+        let cpl0 = (self
+            .get_reg_raw(VM_REG_GUEST_CS)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?
+            & 3)
+            == 0;
+        let fp_blob = if cpl0 {
+            self.run_fp_stub(self.fxsave_stub_gpa, self.fp_scratch_gpa)?;
+            self.read_bytes(self.fp_scratch_gpa, 512)
+                .map_err(|e| TrapError::Hypervisor(format!("FP scratch read: {e}")))?
+        } else {
+            // Async (ring-3-interrupted) path: capture skipped (see above). Hand
+            // build_sigframe a ZEROED FP image (NOT the possibly-stale scratch
+            // page from a prior CPL-0 capture) so the frame is a clean FP reset;
+            // restore_from_sigframe FXRSTORs it at CPL 0 on rt_sigreturn.
+            vec![0u8; 512]
+        };
 
         // The interrupted RFLAGS, saved into the frame's eflags and restored
         // verbatim by rt_sigreturn. (x86 has no privilege-latched analogue of

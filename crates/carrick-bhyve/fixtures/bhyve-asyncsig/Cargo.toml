@@ -1,0 +1,25 @@
+[package]
+name = "carrick-bhyve-asyncsig"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP4.1 fixture: async host->guest signal at an ARBITRARY ring-3 PC. The main
+# thread spins in a TIGHT syscall-free ALU loop while a sibling thread tgkills it
+# with SIGUSR1. The kick must interrupt the running vCPU mid-loop (NOT at a
+# syscall boundary), run the handler, rt_sigreturn, and resume -> "asyncsig-ok".
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC) via a plain
+# `cargo build --release` (rust-lld; .cargo/config.toml).
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-asyncsig"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

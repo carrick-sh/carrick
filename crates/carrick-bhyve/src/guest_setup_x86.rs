@@ -933,9 +933,10 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
     );
 
     // SP3.2 FP stub code: identity-mapped supervisor exec. Runs at the CURRENT
-    // CPL when run_fp_stub redirects RIP here (at a syscall-doorbell injection
-    // the vCPU is parked at the ring-0 LSTAR stub, i.e. CPL 0). FXSAVE/FXRSTOR
-    // and `out` are not CPL-gated for our purposes; supervisor mapping is fine.
+    // CPL when run_fp_stub redirects RIP here. run_fp_stub only invokes it from a
+    // CPL-0 boundary (the SP3 syscall path; the SP4.1 async path is CPL 3 and
+    // SKIPS FP capture — fxsave #UDs at ring 3, see the run_fp_stub gate), so a
+    // supervisor mapping is correct.
     ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
     // SP3.2 FP scratch: identity-mapped supervisor read-write, one page per vCPU.
     ram.add_fixed(
