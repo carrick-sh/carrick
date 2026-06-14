@@ -247,8 +247,8 @@ pub struct BhyveVm {
 impl Drop for BhyveVm {
     /// Tear down /dev/vmm/<name> unless `destroy()` already did (it nulls
     /// `ctx`). Without this, a `?`-early-return during bring-up leaks the VM
-    /// node, and — names being pid-derived — the next same-process `create`
-    /// then fails EEXIST, cascading every later live test in the binary.
+    /// node; with the per-create unique name (see `create`) each VM owns a
+    /// distinct node, so `vm_destroy` here is unambiguous (no shared-ctx EINVAL).
     fn drop(&mut self) {
         if !self.ctx.is_null() {
             // SAFETY: a live, not-yet-destroyed vmctx (destroy() nulls ctx).
@@ -300,11 +300,20 @@ impl HvVm for BhyveVm {
 }
 
 impl BhyveVm {
-    /// Create + open the VM device. A unique VM name; the device node is
-    /// /dev/vmm/<name>. (A pid-based name keeps concurrent runs distinct;
-    /// refine when the run entry lands.)
+    /// Create + open the VM device. The name `carrick-{pid}-{seq}` is unique per
+    /// `create` call: the pid keeps concurrent PROCESSES distinct (incl. a
+    /// forked guest child), and the process-global `seq` keeps multiple VMs in
+    /// ONE process distinct (e.g. two live tests in a cargo binary, or future
+    /// per-call runs). A bare `carrick-{pid}` collided when one process built
+    /// two VMs: the second `vm_setup_memory`/`vm_activate_cpu` hit the SAME
+    /// already-configured `/dev/vmm` node (ENOMEM/ENXIO), and Drop's
+    /// `vm_destroy` of the shared ctx then failed EINVAL on the duplicate.
     pub fn create() -> Result<Self, OsError> {
-        let name = CString::new(format!("carrick-{}", std::process::id()))
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Process-global VM sequence — distinct name per create() in this process.
+        static VM_SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = VM_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(format!("carrick-{}-{}", std::process::id(), seq))
             .map_err(|_| OsError::new("bhyve: VM name has a NUL".to_string()))?;
         // SAFETY: `name` is a valid NUL-terminated C string for the call's life.
         let ctx = unsafe {
