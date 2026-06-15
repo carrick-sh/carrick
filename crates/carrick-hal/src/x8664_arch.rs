@@ -387,6 +387,10 @@ impl GuestArch for X8664GuestArch {
         "x86_64"
     }
 
+    fn linux_guest_abi() -> carrick_abi::LinuxGuestAbi {
+        carrick_abi::LinuxGuestAbi::X86_64
+    }
+
     fn vdso_bytes() -> Vec<u8> {
         // No vDSO in Phase 2 (spec §4.6). AT_SYSINFO_EHDR is omitted; the
         // guest libc falls back to real SYSCALL instructions per vdso(7).
@@ -658,6 +662,11 @@ const X86_NR_VFORK: u64 = 58;
 /// x86-64 `dup2(2)` (syscalls(2)). Desugars to a private dispatcher shim because
 /// canonical/asm-generic has `dup3(2)` but no `dup2(2)`.
 const X86_NR_DUP2: u64 = 33;
+/// x86-64 `pipe(2)` (syscalls(2)). Desugars to canonical `pipe2(2)` with
+/// flags=0 because asm-generic only exposes `pipe2`.
+const X86_NR_PIPE: u64 = 22;
+/// Canonical (asm-generic / aarch64) `pipe2` number.
+const CANONICAL_PIPE2: u64 = 59;
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -711,6 +720,12 @@ impl X8664GuestArch {
             return SyscallNorm::Plain(RawSyscall {
                 number: carrick_abi::CARRICK_PRIVATE_X86_DUP2,
                 args: [args[0], args[1], 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_PIPE {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_PIPE2,
+                args: [args[0], 0, 0, 0, 0, 0],
             });
         }
 
@@ -837,6 +852,19 @@ mod normalize_tests {
                 assert_eq!(rs.args, [3, 1, 0, 0, 0, 0]);
             }
             _ => panic!("dup2 must be Plain"),
+        }
+    }
+
+    #[test]
+    fn pipe_normalizes_to_pipe2_with_zero_flags() {
+        // x86 pipe = 22, but canonical 22 is epoll_pwait. Normalize through the
+        // asm-generic successor and append flags=0.
+        match X8664GuestArch::normalize_syscall(&frame(22, [0x4000, 0xBAD, 0, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 59);
+                assert_eq!(rs.args, [0x4000, 0, 0, 0, 0, 0]);
+            }
+            _ => panic!("pipe must be Plain"),
         }
     }
 }

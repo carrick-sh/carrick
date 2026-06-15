@@ -83,8 +83,21 @@ use crate::linux_abi::{
 pub(super) fn read_epoll_event(
     memory: &impl GuestMemory,
     address: u64,
+    guest_abi: LinuxGuestAbi,
 ) -> Result<LinuxEpollEvent, i32> {
-    read_kernel_struct(memory, address)
+    match guest_abi {
+        LinuxGuestAbi::Aarch64 => read_kernel_struct(memory, address),
+        LinuxGuestAbi::X86_64 => {
+            let event: LinuxX8664EpollEvent = read_kernel_struct(memory, address)?;
+            let events = event.events;
+            let data = event.data;
+            Ok(LinuxEpollEvent {
+                events,
+                _pad: 0,
+                data,
+            })
+        }
+    }
 }
 
 /// Translate the epoll interest mask into the [`Interest`] the multiplexer
@@ -135,8 +148,12 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
     memory: &mut M,
     events_address: u64,
     ready: &[LinuxEpollEvent],
+    guest_abi: LinuxGuestAbi,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let event_size = core::mem::size_of::<LinuxEpollEvent>();
+    let event_size = match guest_abi {
+        LinuxGuestAbi::Aarch64 => <LinuxEpollEvent as KernelAbi>::ABI_SIZE,
+        LinuxGuestAbi::X86_64 => <LinuxX8664EpollEvent as KernelAbi>::ABI_SIZE,
+    };
     for (index, event) in ready.iter().enumerate() {
         let offset = index
             .checked_mul(event_size)
@@ -146,8 +163,21 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
         let Ok(address) = address else {
             return Ok(LINUX_EFAULT.into());
         };
-        if write_kernel_struct_raw(memory, address, event).is_err() {
-            return Ok(LINUX_EFAULT.into());
+        match guest_abi {
+            LinuxGuestAbi::Aarch64 => {
+                if write_kernel_struct_raw(memory, address, event).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            LinuxGuestAbi::X86_64 => {
+                let wire = LinuxX8664EpollEvent {
+                    events: event.events,
+                    data: event.data,
+                };
+                if write_kernel_struct_raw(memory, address, &wire).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
         }
     }
     Ok(DispatchOutcome::Returned {
