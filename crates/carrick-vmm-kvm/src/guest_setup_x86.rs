@@ -113,6 +113,43 @@ pub const X86_OUT_DOORBELL_LEN: u64 = 2;
 /// the `SYSRETQ` immediately after the LSTAR `OUT` doorbell.
 pub const X86_SYSRET_RESUME: u64 = X86_TRAMPOLINE_BASE + X86_OUT_DOORBELL_LEN;
 
+fn align_down_kvm_slot(addr: u64) -> u64 {
+    addr & !0xFFFF
+}
+
+fn align_up_kvm_slot(addr: u64) -> Option<u64> {
+    addr.checked_add(0xFFFF).map(|end| end & !0xFFFF)
+}
+
+fn high_region_window(
+    start: u64,
+    end: u64,
+    shared: bool,
+) -> Result<Option<(u64, usize, WindowKind)>, OsError> {
+    if end <= LINUX_NULL_GUARD_END {
+        return Ok(None);
+    }
+    let low_window_end = X86_KERNEL_WINDOW_BASE + X86_KERNEL_WINDOW_SIZE;
+    if start < low_window_end {
+        return Ok(None);
+    }
+
+    let base = align_down_kvm_slot(start);
+    let end = align_up_kvm_slot(end)
+        .ok_or_else(|| OsError::new(format!("kvm-x86: window 0x{start:x}.. overflows")))?;
+    let len = usize::try_from(end.saturating_sub(base))
+        .map_err(|_| OsError::new(format!("kvm-x86: window 0x{base:x}..0x{end:x} too large")))?;
+    if len == 0 {
+        return Ok(None);
+    }
+    let kind = if shared {
+        WindowKind::Shared
+    } else {
+        WindowKind::Private
+    };
+    Ok(Some((base, len, kind)))
+}
+
 // ─── Segment type nibbles ─────────────────────────────────────────────────────
 
 /// Code segment type nibble for `kvm_segment::type_`.
@@ -157,9 +194,11 @@ impl GuestRam {
     ///   - ELF text/data/BSS (typically loaded at 0x400000, a few MiB)
     ///   - The x86 kernel window at 256 MiB (trampoline + GDT + PML4)
     ///
-    /// Each image region beyond the low window boundary (stack, heap, mmap arena)
-    /// gets its own `MAP_NORESERVE` private window + KVM slot, capped at 64 MiB
-    /// to avoid registering multi-GiB pre-allocated arenas as KVM slots.
+    /// Each image region beyond the low window boundary (stack, heap, mmap arena,
+    /// shared apertures) gets its own `MAP_NORESERVE` window + KVM slot covering
+    /// the full address-space extent. The dispatcher may hand out any address in
+    /// the declared mmap arena; truncating that KVM slot makes valid mmap results
+    /// fail later in syscall-path buffer checks or guest stage-2 faults.
     ///
     /// KVM slots for high GPAs (> 64 GiB) work fine — only CR3 must be below the
     /// host's physical-address ceiling (36 bits on the reference LXC host).
@@ -186,18 +225,14 @@ impl GuestRam {
                 }
                 continue;
             }
-            // High region (stack, heap, mmap arena, shared apertures).
-            // Cap at 64 MiB: the M2 bump allocators never use more than 64 MiB
-            // of the pre-allocated heap/mmap arenas, and the shared apertures
-            // are empty for the MVP.
-            const MAX_WINDOW_LEN: u64 = 64 * 1024 * 1024; // 64 MiB
-            let raw_len = region.end.saturating_sub(region.start);
-            let capped_end = region.start.saturating_add(raw_len.min(MAX_WINDOW_LEN));
-            let base = region.start & !0xFFFF; // align down to 64 KiB (KVM slot min size)
-            let end = (capped_end + 0xFFFF) & !0xFFFF; // align up
-            let len = (end - base) as usize;
-            if len > 0 {
-                ram.add_window(base, len, WindowKind::Private)?;
+            // High region (stack, heap, mmap arena, shared apertures). Back the
+            // full declared extent lazily with MAP_NORESERVE: this is virtual
+            // coverage, not resident memory. Go's heap reservation path can
+            // quickly allocate well past 64 MiB into the mmap arena.
+            if let Some((base, len, kind)) =
+                high_region_window(region.start, region.end, region.shared)?
+            {
+                ram.add_window(base, len, kind)?;
             }
             let bytes = region.bytes();
             if !bytes.is_empty() {
@@ -289,6 +324,7 @@ pub fn m01_blob() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_mem::memory::{LINUX_MMAP_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size};
 
     // NOTE: the snapshot/seed-entry tests now live in `carrick-x86`
     // (`bringup_fns::tests::seed_entry_*`) — the seed/snapshot logic moved there
@@ -385,6 +421,38 @@ mod tests {
             boot.sfmask & (1 << 9) != 0,
             "SFMASK must mask IF (bit 9) so no interrupt window in the LSTAR stub"
         );
+    }
+
+    #[test]
+    fn high_region_window_covers_full_mmap_arena() {
+        let arena_size = mmap_arena_size();
+        let (base, len, kind) =
+            high_region_window(LINUX_MMAP_BASE, LINUX_MMAP_BASE + arena_size, false)
+                .expect("window plan")
+                .expect("mmap arena is a high region");
+
+        assert_eq!(base, LINUX_MMAP_BASE);
+        assert_eq!(len as u64, arena_size);
+        assert!(
+            len as u64 > 64 * 1024 * 1024,
+            "x86 KVM must not truncate the mmap arena to the old 64 MiB cap"
+        );
+        assert_eq!(kind, WindowKind::Private);
+    }
+
+    #[test]
+    fn high_region_window_preserves_shared_aperture_kind() {
+        let (base, len, kind) = high_region_window(
+            LINUX_SHARED_FILE_BASE,
+            LINUX_SHARED_FILE_BASE + 0x20_0000,
+            true,
+        )
+        .expect("window plan")
+        .expect("shared aperture is a high region");
+
+        assert_eq!(base, LINUX_SHARED_FILE_BASE);
+        assert_eq!(len, 0x20_0000);
+        assert_eq!(kind, WindowKind::Shared);
     }
 
     /// Verify the M0/M1 blob places the message at the correct offset.
