@@ -401,34 +401,72 @@ pub mod runtime {
         Err(RuntimeError::TrapLimitExceeded { max_traps })
     }
 
-    /// Multi-threaded KVM run loop (Phase 2 Task 7) — the Linux analog of the
-    /// macOS `run_threaded_hvf_loop` (`runtime.rs`). Constructs the KVM trait
-    /// objects (the concrete private `FutexTable`, the `KvmFutex` as
-    /// `Arc<dyn PlatformFutex>`, the `PlatformFutexFactory` that rebuilds that
-    /// pairing on the fork-child side, the `KvmKicker` as `Arc<dyn VcpuRegistry>`,
-    /// and the `KvmForkCoordinator` as `Box<dyn HostForkCoordinator>`) and drives
-    /// the generic `vcpu_loop::run_vcpu_until_exit::<KvmTrapEngine>`. THIS is what
-    /// makes the KVM backend multi-process / multi-threaded: `handle_fork` (real
-    /// `libc::fork` + child VM rebuild), `spawn_clone_thread` (sibling vCPUs on
-    /// the same VM), and the private/shared futex paths all flow through here,
-    /// byte-matching Docker.
+    /// The host-OS seam for the shared threaded vCPU loop ([`run_threaded_loop`]).
     ///
-    /// Unlike HVF, KVM needs NO signal-pump daemon thread: a host signal
-    /// delivered to a vCPU thread blocked in `KVM_RUN` returns `EINTR` natively
-    /// (`VcpuExit::Kicked`), so async process-directed signals interrupt the
-    /// in-guest vCPU without a pump. The coordinator installs only the
-    /// kick-signal handler (idempotently). The blocking-I/O / proc-exit / sleep /
-    /// signal-wait arms use the `ppoll`/`waitid`-backed Linux `ThreadWaiter`
-    /// (`crate::io_wait`).
-    #[cfg(feature = "platform-linux")]
-    pub fn run_threaded_kvm_loop<E>(
+    /// The KVM and bhyve loops were ~85-line near-verbatim clones: identical
+    /// scaffold (thread registry, root-pid + child-CPU-table init, `KernelState`,
+    /// `run_vcpu_until_exit`, result assembly) differing only in the four host
+    /// trait objects each backend plugs in. `HostBackend` is that seam — a backend
+    /// is now one ~25-line impl, NOT a copied loop. Each method supplies the host's
+    /// BEST primitive (its own futex, fork coordinator, kicker, timer delivery) —
+    /// never a lowest-common-denominator.
+    ///
+    /// The kicker is `Arc<dyn VcpuRegistry>` and the engine's `KickHandle` is
+    /// type-erased into `Box<dyn VcpuKickDyn>` at registration (`register_vcpu`),
+    /// so `run_threaded_loop` is generic over any `E: ThreadedEngine` with NO
+    /// `KickHandle =` binding to thread through — the backend↔engine pair agree via
+    /// the type-erased registry, not a generic associated-type clause.
+    ///
+    /// The signal-arrival mechanism is the shared
+    /// [`carrick_hal::GenericSignalArrival`] (kicker + futex wake) for every
+    /// `HostBackend` host; HVF's kqueue-pump wake is a different mechanism, so HVF
+    /// keeps its own loop (`runtime.rs`) — it is migrated last / deferrable.
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    pub trait HostBackend: Send + Sync + 'static {
+        /// Wrap a process-private `FutexTable` as this host's `PlatformFutex`
+        /// (its shared-page futex shim — Linux `SYS_futex` / FreeBSD `_umtx_op`).
+        fn make_futex(
+            &self,
+            table: std::sync::Arc<crate::thread::FutexTable>,
+        ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex>;
+
+        /// This host's fork coordinator (signal-pump stop/join across `libc::fork`,
+        /// kick-handler + xsig-ring install). Boxed object-safe for `KernelState`.
+        fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator>;
+
+        /// The live-vCPU kick registry. Both current backends use the neutral
+        /// `GenericVcpuRegistry`; a host may override (e.g. a bulk-kick primitive).
+        fn make_kicker(&self) -> std::sync::Arc<dyn carrick_hal::VcpuRegistry> {
+            std::sync::Arc::new(carrick_hal::GenericVcpuRegistry::new())
+        }
+
+        /// This host's wall-clock/POSIX timer delivery (itimer/posix arm/disarm).
+        fn make_timer_delivery(
+            &self,
+            kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+            main_tid: crate::thread::ThreadId,
+        ) -> std::sync::Arc<dyn carrick_hal::TimerDelivery>;
+    }
+
+    /// The ONE threaded vCPU run loop, parameterized over the host seam
+    /// [`HostBackend`]. Replaces `run_threaded_kvm_loop` / `run_threaded_bhyve_loop`
+    /// (and any future kick+futex backend's): builds the shared scaffold + the
+    /// host's four trait objects, installs the kick handler / pump via the
+    /// coordinator, wires timer delivery, and drives the generic
+    /// `vcpu_loop::run_vcpu_until_exit`. `handle_fork` (real `libc::fork` + child VM
+    /// rebuild), `spawn_clone_thread` (sibling vCPUs), and the private/shared futex
+    /// paths all flow through the shared loop.
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    pub fn run_threaded_loop<E, H>(
         engine: E,
         dispatcher: SyscallDispatcher,
+        host: H,
         max_traps: usize,
     ) -> Result<RunResult, RuntimeError>
     where
-        E: carrick_hal::ThreadedEngine<KickHandle = carrick_linux::KvmKickHandle> + 'static,
+        E: carrick_hal::ThreadedEngine + 'static,
         E::SiblingSpec: 'static,
+        H: HostBackend,
     {
         use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
         use crate::vcpu_loop::{
@@ -438,8 +476,7 @@ pub mod runtime {
 
         let main_tid: ThreadId = std::process::id() as ThreadId;
         let registry = Arc::new(ThreadRegistry::new(main_tid));
-        // Publish for /proc/<tid>/stat + /proc/<pid>/task/ synthesis (no-op on
-        // the bare run-elf path, but kept parallel to HVF for the container path).
+        // Publish for /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
         crate::thread::set_current_registry(Arc::clone(&registry));
         // Root guest pid (before any fork) so /proc/<pid>/ can tell a guest
         // descendant from a host process.
@@ -450,34 +487,29 @@ pub mod runtime {
 
         // The CONCRETE process-private futex table, threaded UNCHANGED through the
         // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
-        // protocol stays byte-identical). The object-safe `KvmFutex` wraps the
-        // SAME table for the SHARED-futex / notify-signal-pending ops; the factory
-        // rebuilds that pairing over a fresh table on the fork CHILD side
-        // (`vcpu_loop::handle_fork`) without the generic loop naming `KvmFutex`.
+        // protocol stays byte-identical). The host's object-safe `PlatformFutex`
+        // wraps the SAME table for the SHARED-futex / notify-signal-pending ops;
+        // the factory rebuilds that pairing over a fresh table on the fork CHILD
+        // side (`vcpu_loop::handle_fork`).
         let futex = Arc::new(FutexTable::new());
         let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
-            Arc::new(carrick_linux::make_kvm_futex(Arc::clone(&futex)));
+            host.make_futex(Arc::clone(&futex));
+        let host_for_factory = std::sync::Arc::new(host);
+        let factory_host = Arc::clone(&host_for_factory);
         let platform_futex_factory: PlatformFutexFactory = Arc::new(
-            |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
-                Arc::new(carrick_linux::make_kvm_futex(table))
+            move |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
+                factory_host.make_futex(table)
             },
         );
-        // The KVM host-fork coordinator (lean — no pump thread), boxed object-safe.
         let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
-            Box::new(carrick_linux::KvmForkCoordinator::new());
-        // The KVM kicker (registry of live vCPUs). Held object-safe as the
-        // `VcpuRegistry` the generic loop drives. Constructing it installs the
-        // kick-signal handler (idempotent) so a cross-thread `pthread_kill` forces
-        // a target vCPU out of `KVM_RUN` (→ `EINTR` → `VcpuExit::Kicked`). Built
-        // before the kernel so `KvmSignalArrival` can wake a target vCPU via it.
-        let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(carrick_linux::KvmKicker::new());
-        // The KVM signal ARRIVAL/wake mechanism: kicker + futex. The async
-        // host-signal pump is now implemented via `KvmForkCoordinator` /
-        // `kvm_signal_pump`, and cross-process signal delivery via the shared
-        // `carrick_signal_core::xsig` ring + `kvm_xsig` (the dispatcher reaches
-        // these through `crate::host_signal::xsig_*`, so this `SignalArrival`
-        // value only carries the kicker + futex wake path). Held object-safe in
-        // `KernelState`.
+            host_for_factory.make_fork_coordinator();
+        // The live-vCPU registry. Constructing the kicker installs the kick-signal
+        // handler (idempotent) so a cross-thread `pthread_kill` forces a target
+        // vCPU out of its run ioctl. Built before the kernel so the signal-arrival
+        // wake can reach a target vCPU via it.
+        let kicker: Arc<dyn carrick_hal::VcpuRegistry> = host_for_factory.make_kicker();
+        // The signal ARRIVAL/wake mechanism shared by every kick+futex host: kick
+        // every live vCPU + nudge the futex so parked threads re-check pending.
         let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
             Arc::new(carrick_hal::GenericSignalArrival {
                 kicker: Arc::clone(&kicker),
@@ -492,25 +524,19 @@ pub mod runtime {
         // worker is mid-flight; joined after the main thread finishes.
         let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-        // Install the kick-signal handler up front via the coordinator, so a
-        // process-directed signal turns an in-flight `KVM_RUN` into `EINTR`
-        // regardless of whether a guest has forked yet. (KvmKicker::new already
-        // installs it; this makes the dependency explicit and matches the HVF
-        // wrapper's `start_signal_pump` call site.)
+        // Install the kick handler / start the host's signal pump up front via the
+        // coordinator, so a process-directed signal is observable regardless of
+        // whether a guest has forked yet.
         kernel.fork.start_signal_pump(&kicker, &platform_futex);
 
-        // Wire wall-clock timer signals (setitimer/alarm/timer_settime): a
-        // fallback timer thread publishes the timer signal to `main_tid` and
-        // kicks it through this same `VcpuRegistry`.
+        // Wire wall-clock timer signals (setitimer/alarm/timer_settime): the
+        // firing thread publishes the timer signal then kicks through this registry.
         crate::timer_delivery::register(Arc::clone(&kicker), main_tid);
-        // Install the backend `TimerDelivery` the dispatch arm reaches through
-        // the process-global (`dispatch/time.rs` has no KernelState ref). KVM's
-        // `arm_itimer` returns false → the dispatch arm spawns the shared
-        // fallback thread; `arm_posix` spawns the POSIX firing thread here.
-        crate::timer_delivery::register_delivery(Arc::new(carrick_linux::KvmTimerDelivery {
-            kicker: Arc::clone(&kicker),
-            main_tid,
-        }));
+        // Install the backend `TimerDelivery` the dispatch arm reaches through the
+        // process-global (`dispatch/time.rs` has no KernelState ref).
+        crate::timer_delivery::register_delivery(
+            host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid),
+        );
 
         let outcome = run_vcpu_until_exit(
             Arc::clone(&kernel),
@@ -545,14 +571,109 @@ pub mod runtime {
         Ok(result)
     }
 
-    /// The FreeBSD/bhyve analogue of `run_threaded_kvm_loop` (M2 Tier 1).
+    /// KVM's [`HostBackend`]: bare-`SYS_futex` futex, the lean (no pump thread)
+    /// `KvmForkCoordinator`, and `KvmTimerDelivery` (no pump kqueue → the dispatch
+    /// arm spawns the shared wall-clock fallback thread).
+    #[cfg(feature = "platform-linux")]
+    pub struct KvmHostBackend;
+
+    #[cfg(feature = "platform-linux")]
+    impl HostBackend for KvmHostBackend {
+        fn make_futex(
+            &self,
+            table: std::sync::Arc<crate::thread::FutexTable>,
+        ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex> {
+            std::sync::Arc::new(carrick_linux::make_kvm_futex(table))
+        }
+
+        fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator> {
+            Box::new(carrick_linux::KvmForkCoordinator::new())
+        }
+
+        fn make_kicker(&self) -> std::sync::Arc<dyn carrick_hal::VcpuRegistry> {
+            std::sync::Arc::new(carrick_linux::KvmKicker::new())
+        }
+
+        fn make_timer_delivery(
+            &self,
+            kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+            main_tid: crate::thread::ThreadId,
+        ) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
+            std::sync::Arc::new(carrick_linux::KvmTimerDelivery { kicker, main_tid })
+        }
+    }
+
+    /// bhyve's [`HostBackend`]: `_umtx_op` futex, the `BhyveForkCoordinator`
+    /// (stops/joins the FreeBSD host-signal pump across `libc::fork`), and
+    /// `BhyveTimerDelivery`.
+    #[cfg(feature = "platform-freebsd")]
+    pub struct BhyveHostBackend;
+
+    #[cfg(feature = "platform-freebsd")]
+    impl HostBackend for BhyveHostBackend {
+        fn make_futex(
+            &self,
+            table: std::sync::Arc<crate::thread::FutexTable>,
+        ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex> {
+            std::sync::Arc::new(carrick_bhyve::make_bhyve_futex(table))
+        }
+
+        fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator> {
+            Box::new(carrick_bhyve::BhyveForkCoordinator::new())
+        }
+
+        fn make_kicker(&self) -> std::sync::Arc<dyn carrick_hal::VcpuRegistry> {
+            std::sync::Arc::new(carrick_bhyve::BhyveKicker::new())
+        }
+
+        fn make_timer_delivery(
+            &self,
+            kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+            main_tid: crate::thread::ThreadId,
+        ) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
+            std::sync::Arc::new(carrick_bhyve::BhyveTimerDelivery { kicker, main_tid })
+        }
+    }
+
+    /// Multi-threaded KVM run loop (Phase 2 Task 7) — the Linux analog of the
+    /// macOS `run_threaded_hvf_loop` (`runtime.rs`). Constructs the KVM trait
+    /// objects (the concrete private `FutexTable`, the `KvmFutex` as
+    /// `Arc<dyn PlatformFutex>`, the `PlatformFutexFactory` that rebuilds that
+    /// pairing on the fork-child side, the `KvmKicker` as `Arc<dyn VcpuRegistry>`,
+    /// and the `KvmForkCoordinator` as `Box<dyn HostForkCoordinator>`) and drives
+    /// the generic `vcpu_loop::run_vcpu_until_exit::<KvmTrapEngine>`. THIS is what
+    /// makes the KVM backend multi-process / multi-threaded: `handle_fork` (real
+    /// `libc::fork` + child VM rebuild), `spawn_clone_thread` (sibling vCPUs on
+    /// the same VM), and the private/shared futex paths all flow through here,
+    /// byte-matching Docker.
     ///
-    /// A near-verbatim clone of the KVM lane: it wires carrick-bhyve's newtypes
-    /// (`Bhyve{Futex,ForkCoordinator,Kicker,SignalArrival,TimerDelivery}`) into the
-    /// SHARED `run_vcpu_until_exit` loop, so x86_64 bhyve guests run through the same
-    /// canonical dispatcher/fork/futex/timer plumbing as KVM and HVF. Lives here in
-    /// carrick-runtime (where `KernelState` / `run_vcpu_until_exit` are pub(crate));
-    /// carrick-bhyve stays a leaf crate.
+    /// Now a thin wrapper over [`run_threaded_loop`] with [`KvmHostBackend`].
+    ///
+    /// Unlike HVF, KVM needs NO signal-pump daemon thread: a host signal
+    /// delivered to a vCPU thread blocked in `KVM_RUN` returns `EINTR` natively
+    /// (`VcpuExit::Kicked`), so async process-directed signals interrupt the
+    /// in-guest vCPU without a pump. The coordinator installs only the
+    /// kick-signal handler (idempotently). The blocking-I/O / proc-exit / sleep /
+    /// signal-wait arms use the `ppoll`/`waitid`-backed Linux `ThreadWaiter`
+    /// (`crate::io_wait`).
+    #[cfg(feature = "platform-linux")]
+    pub fn run_threaded_kvm_loop<E>(
+        engine: E,
+        dispatcher: SyscallDispatcher,
+        max_traps: usize,
+    ) -> Result<RunResult, RuntimeError>
+    where
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_linux::KvmKickHandle> + 'static,
+        E::SiblingSpec: 'static,
+    {
+        run_threaded_loop(engine, dispatcher, KvmHostBackend, max_traps)
+    }
+
+    /// The FreeBSD/bhyve analogue of `run_threaded_kvm_loop` (M2 Tier 1) — now a
+    /// thin wrapper over the shared [`run_threaded_loop`] with [`BhyveHostBackend`].
+    /// x86_64 bhyve guests run through the same canonical dispatcher/fork/futex/
+    /// timer plumbing as KVM (and HVF), with only the host trait objects (the
+    /// `_umtx_op` futex, the `BhyveForkCoordinator`, `BhyveTimerDelivery`) differing.
     #[cfg(feature = "platform-freebsd")]
     pub fn run_threaded_bhyve_loop<E>(
         engine: E,
@@ -563,80 +684,7 @@ pub mod runtime {
         E: carrick_hal::ThreadedEngine<KickHandle = carrick_bhyve::BhyveKickHandle> + 'static,
         E::SiblingSpec: 'static,
     {
-        use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
-        use crate::vcpu_loop::{
-            KernelState, PlatformFutexFactory, VcpuLoopOutcome, run_vcpu_until_exit,
-        };
-        use std::sync::Arc;
-
-        let main_tid: ThreadId = std::process::id() as ThreadId;
-        let registry = Arc::new(ThreadRegistry::new(main_tid));
-        crate::thread::set_current_registry(Arc::clone(&registry));
-        crate::host_proc::set_root_guest_pid(std::process::id());
-        crate::guest_cpu::init_child_table();
-
-        let futex = Arc::new(FutexTable::new());
-        let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
-            Arc::new(carrick_bhyve::make_bhyve_futex(Arc::clone(&futex)));
-        let platform_futex_factory: PlatformFutexFactory = Arc::new(
-            |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
-                Arc::new(carrick_bhyve::make_bhyve_futex(table))
-            },
-        );
-        let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
-            Box::new(carrick_bhyve::BhyveForkCoordinator::new());
-        let kicker: Arc<dyn carrick_hal::VcpuRegistry> =
-            Arc::new(carrick_bhyve::BhyveKicker::new());
-        let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
-            Arc::new(carrick_hal::GenericSignalArrival {
-                kicker: Arc::clone(&kicker),
-                futex: Arc::clone(&platform_futex),
-            });
-        let kernel = Arc::new(KernelState::new(
-            dispatcher,
-            fork_coordinator,
-            signal_arrival,
-        ));
-        let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =
-            Arc::new(parking_lot::Mutex::new(Vec::new()));
-
-        kernel.fork.start_signal_pump(&kicker, &platform_futex);
-
-        crate::timer_delivery::register(Arc::clone(&kicker), main_tid);
-        crate::timer_delivery::register_delivery(Arc::new(carrick_bhyve::BhyveTimerDelivery {
-            kicker: Arc::clone(&kicker),
-            main_tid,
-        }));
-
-        let outcome = run_vcpu_until_exit(
-            Arc::clone(&kernel),
-            engine,
-            Arc::clone(&registry),
-            Arc::clone(&futex),
-            Arc::clone(&platform_futex),
-            Arc::clone(&platform_futex_factory),
-            main_tid,
-            Arc::clone(&threads),
-            Arc::clone(&kicker),
-            max_traps,
-        )?;
-
-        let result = match outcome {
-            VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
-            VcpuLoopOutcome::ThreadDone => {
-                let report = kernel.reporter.snapshot();
-                RunResult {
-                    exit_code: 0,
-                    stdout: kernel.dispatcher.stdout(),
-                    stderr: kernel.dispatcher.stderr(),
-                    traps: 0,
-                    report,
-                    trap_limit_hit: false,
-                }
-            }
-        };
-
-        Ok(result)
+        run_threaded_loop(engine, dispatcher, BhyveHostBackend, max_traps)
     }
 
     /// x86_64 bhyve run through the FULL `SyscallDispatcher` on the canonical loop
@@ -908,7 +956,12 @@ pub mod runtime {
         )?
         .with_linux_initial_stack([argv0.as_bytes()], std::iter::empty::<&[u8]>())?
         .with_vdso_auxv(false);
-        let mut engine = carrick_linux::KvmX86TrapEngine::new(&image)?;
+        // Stage-4 KVM migration: the x86 engine is now the shared
+        // `X86EngineCore<KvmVmm>` (built by `kvm_x86_engine::bring_up`), which
+        // replaced the hand-rolled `KvmX86TrapEngine`. It satisfies the same
+        // `GuestMemory + SyscallTrap` (single-threaded) and `ThreadedEngine`
+        // (multi-threaded) bounds, so the loop wiring below is unchanged.
+        let mut engine = carrick_linux::kvm_x86_engine::bring_up(&image)?;
         // Default: the canonical multi-threaded loop, now SHARED with aarch64-KVM
         // and HVF (M3). `CARRICK_NO_THREADS` keeps the M1 single-threaded combined
         // loop reachable as an A/B fallback (mirrors the aarch64 arm). fork/clone/
