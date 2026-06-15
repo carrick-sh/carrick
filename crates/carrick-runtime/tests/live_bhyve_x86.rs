@@ -111,7 +111,7 @@ fn threads_run_to_zero_via_sibling_vcpus() {
 fn fork_wait4_runs_to_zero() {
     // The fork(2) acceptance (SP1): a guest that `fork`s, the child `_exit(7)`s,
     // and the parent `wait4`s + verifies WEXITSTATUS==7, then exits 0. Success
-    // here proves `BhyveTrapEngine::fork()` eagerly copies the parent guest RAM
+    // here proves `BhyveVmm::freeze_ram()` eagerly copies the parent guest RAM
     // into a fresh child VM, long-mode-programs child vCPU 0 at the post-fork
     // resume, and the child VM is destroyed on `_exit` (process_exit_cleanup,
     // no /dev/vmm leak). wait4 reuses the shared wait_proc_exit.
@@ -159,7 +159,7 @@ fn fork_raw_runs_to_zero() {
 fn execve_runs_second_image() {
     // The execve(2) acceptance (SP2): the CALLER fixture (`CARRICK_BHYVE_EXECVE`)
     // `execve`s the deployed `execd` TARGET, which prints `execd ok` + exit 0.
-    // Success here proves `BhyveTrapEngine::execve_into` rebuilt a fresh OWNED VM
+    // Success here proves `BhyveVmm::execve_rebuild` rebuilt a fresh OWNED VM
     // from the second image (bring_up_x86_elf), swapped it in, tore down the old
     // image, and resumed at the new entry — with NO /dev/vmm leak.
     //
@@ -248,7 +248,7 @@ fn signal_handler_runs_to_zero() {
     // The intra-process signal acceptance (SP3.1): the guest installs a
     // SA_SIGINFO SIGUSR1 handler, `raise`s it, runs the handler (correct
     // si_signo), returns through the libc restorer → rt_sigreturn, and RESUMES
-    // here — exiting 0. Success proves `BhyveTrapEngine::inject_signal` wrote a
+    // here — exiting 0. Success proves the shared x86 signal-inject path wrote a
     // valid x86 rt_sigframe (GPR/RIP/RSP/siginfo/ucontext) via the shared
     // builder and `restore_from_sigframe` restored the pre-signal state.
     let Some(path) = fixture("CARRICK_BHYVE_SIGNAL") else {

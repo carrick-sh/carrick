@@ -502,7 +502,7 @@ pub fn bring_up_m0() -> Result<BroughtUpM0, OsError> {
 /// (vmm.c:1161). Bumping RIP here would SKIP an instruction — the
 /// must-not-replay reasoning of KVM's `SENTINEL_STR_WIDTH` PC bump applies
 /// in reverse (must-not-double-advance). The helper exists so the discipline
-/// lives in exactly one place: `BhyveTrapEngine::complete_syscall` (T7)
+/// lives in exactly one place: the shared x86 engine's syscall completion path
 /// reuses it, and if a future FreeBSD changes the contract only this
 /// function (and the M0 test pinning it) needs to change.
 pub fn complete_inout(_vcpu: &mut BhyveVcpu, _rip: u64, _inst_length: u8) -> Result<(), OsError> {
@@ -551,7 +551,7 @@ pub struct BhyveWindow {
 /// `BhyveGuestRam` is plain bookkeeping — a `Vec<BhyveWindow>` of VA→GPA window
 /// descriptors plus the bump `cursor`. It owns NO host mappings and has NO
 /// `Drop`: the kernel-owned guest RAM is freed exactly once by
-/// `BhyveVmInner::drop` (`vm_destroy`), and `BhyveTrapEngine::va_to_host`
+/// `BhyveVmInner::drop` (`vm_destroy`), and the shared x86 bhyve engine
 /// re-resolves every host pointer through `vm_map_gpa` per access (nothing is
 /// cached). A `clone()` therefore yields an independent view that resolves the
 /// SAME guest physical memory via the shared ctx — exactly what a sibling vCPU
@@ -1353,7 +1353,7 @@ pub fn bring_up_x86_elf(
         true,
     );
     // SP3.2 FP stub + scratch windows (identity-mapped supervisor; see the FP
-    // overlay in BhyveTrapEngine::inject_signal / restore_from_sigframe).
+    // overlay in the shared x86 signal inject / restore path.
     ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
     ram.add_fixed(
         X86_FP_SCRATCH_GPA,

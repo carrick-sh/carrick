@@ -42,13 +42,6 @@ pub mod vmm_x86;
 #[cfg(target_arch = "x86_64")]
 pub mod guest_setup_x86;
 
-// The old hand-rolled trap engine. Kept compiled (the M0/M1 `tests/live_vcpu.rs`
-// scaffolds reference `BhyveTrapEngine`/`bring_up_x86*`), and selected at the
-// run path only under the `bhyve-legacy-engine` instant-revert flag. The DEFAULT
-// run path is the shared `X86EngineCore<BhyveVmm>` (`bhyve_x86_engine`).
-#[cfg(target_arch = "x86_64")]
-pub mod trap_engine;
-
 // The bhyve x86 backend on the shared `carrick-x86` engine scaffold (Stage 4).
 #[cfg(target_arch = "x86_64")]
 pub mod bhyve_x86_engine;
@@ -83,8 +76,6 @@ pub use bhyve_threaded_glue::{BhyveForkCoordinator, BhyveTimerDelivery};
 
 #[cfg(target_arch = "x86_64")]
 pub use bhyve_x86_engine::{BhyveVmm, BhyveX86Vcpu, bring_up as bring_up_x86_engine};
-#[cfg(target_arch = "x86_64")]
-pub use trap_engine::BhyveTrapEngine;
 pub use vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm};
 #[cfg(target_arch = "x86_64")]
 pub use vmm_x86::X86Exit;

@@ -48,10 +48,4 @@ carrick-x86 = { path = "../carrick-x86" }
 libc.workspace = true
 
 [features]
-# Stage-4 (portability) instant-revert flag. The DEFAULT (flag OFF) drives the
-# new `X86EngineCore<BhyveVmm>` shared engine. With `bhyve-legacy-engine` ON the
-# run-path falls back to the hand-rolled `BhyveTrapEngine` (kept for one cycle so
-# a regression is a flag flip, not a code revert). Exercised once on-box before
-# the new path is blessed.
 default = []
-bhyve-legacy-engine = []

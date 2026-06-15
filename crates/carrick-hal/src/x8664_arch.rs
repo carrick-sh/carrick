@@ -2,9 +2,9 @@
 //!
 //! This is the second `GuestArch` impl (after [`crate::aarch64_arch`]). It lives
 //! in `carrick-hal` (host-OS-independent) so it compiles and unit-tests on
-//! macOS, lima, and FreeBSD alike. Nothing wires it to an engine yet (that is
-//! Task 7's `BhyveTrapEngine` in `carrick-vmm-bhyve`); this task establishes the
-//! standalone impl validated by unit tests.
+//! macOS, lima, and FreeBSD alike. The bhyve backend wires it through the shared
+//! `X86EngineCore<BhyveVmm>` path in `carrick-vmm-bhyve`; this task establishes
+//! the standalone impl validated by unit tests.
 //!
 //! ## Implemented surface
 //!
@@ -121,8 +121,9 @@ impl SyscallTable for X8664SyscallTable {
 // `getgroups`=158 and TLS would stay unset (faulting on first access). The POLICY
 // (which subfunction does what) is identical across backends; only the register
 // MECHANISM differs (KVM `KVM_SET_SREGS` vs bhyve `vm_set_desc`), captured by
-// [`SegmentBaseRegs`]. Both `KvmX86TrapEngine` and `BhyveTrapEngine` call
-// [`service_arch_prctl`] from their `next_syscall`. Source: arch_prctl(2) man7.org.
+// [`SegmentBaseRegs`]. Both KVM's x86 trap engine and the shared bhyve x86
+// engine call [`service_arch_prctl`] from their syscall path. Source:
+// arch_prctl(2) man7.org.
 
 /// The raw x86_64 `arch_prctl` syscall number (man7.org syscalls(2)).
 pub const ARCH_PRCTL_X86_NR: u64 = 158;
@@ -355,9 +356,9 @@ pub fn entry_trampoline_bytes() -> Vec<u8> {
 /// The x86_64 [`GuestArch`] impl.
 ///
 /// Standalone — validates by unit tests here. The bhyve backend
-/// (`crates/carrick-vmm-bhyve`) wires this as its trap-engine arch in Task 7
-/// (`BhyveTrapEngine`). It is host-OS-independent (pure struct + const data)
-/// so it builds on macOS, lima Linux, and FreeBSD equally.
+/// (`crates/carrick-vmm-bhyve`) wires this through `X86EngineCore<BhyveVmm>`.
+/// It is host-OS-independent (pure struct + const data) so it builds on macOS,
+/// lima Linux, and FreeBSD equally.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct X8664GuestArch;
 

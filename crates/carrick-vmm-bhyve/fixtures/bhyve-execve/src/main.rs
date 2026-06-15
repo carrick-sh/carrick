@@ -1,6 +1,6 @@
 //! SP2 fixture: the execve CALLER. A static-musl x86_64 program that `execve`s
 //! the deployed `bhyve-execd` target (which prints `execd ok` + `_exit(0)`).
-//! Reaching execd's output proves `BhyveTrapEngine::execve_into` replaced the
+//! Reaching execd's output proves `BhyveVmm::execve_rebuild` replaced the
 //! guest image with a freshly-rebuilt VM and ran the second program.
 //!
 //! PATH RESOLUTION (see Cargo.toml): the target is the ABSOLUTE deployed host
