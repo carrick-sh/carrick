@@ -466,18 +466,44 @@ pub(crate) fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
     }
 }
 
-/// Deliver a synchronous guest EL0 fault as a Linux signal, exactly as the
-/// kernel does. Returns `Some(outcome)` to terminate, `None` to resume into the
-/// injected handler. `elr` is the faulting instruction's PC.
+/// Lower a raw aarch64 `EL0Fault` (raw `ESR_EL1` + `elr`/`far`) to the
+/// ISA-neutral resolved signal triple `(signum, si_code, fault_addr)`, or `None`
+/// for a class we don't translate (kept fatal → caller terminates by SIGSEGV).
+///
+/// This is the aarch64 → [`TrapError::GuestFault`] lowering. It MUST cover BOTH
+/// fault arms so the GuestFault path is byte-identical to the historical
+/// `EL0Fault` path: `el0_debug_signal` (BRK/single-step/HW-bp → SIGTRAP/TRAP_*)
+/// is tried FIRST (so a debug exception carries the faulting PC as `si_addr`),
+/// then `el0_fault_signal` (instruction/data abort → SIGSEGV/SIGBUS, carrying
+/// `FAR_EL1` as `si_addr`). Mapping only `el0_fault_signal` would regress
+/// BRK/single-step SIGTRAP delivery (ptrace, Go TestDebugCall).
+fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
+    if let Some((signum, si_code)) = el0_debug_signal(esr) {
+        Some((signum, si_code, elr))
+    } else {
+        el0_fault_signal(esr).map(|(signum, si_code)| (signum, si_code, far))
+    }
+}
+
+/// Deliver a synchronous guest fault as a Linux signal, exactly as the kernel
+/// does, from the ALREADY-RESOLVED [`TrapError::GuestFault`] triple. Returns
+/// `Some(outcome)` to terminate, `None` to resume into the injected handler.
+///
+/// `interrupted_pc` is the faulting instruction's PC iff the sigframe should
+/// record it as the resume target (aarch64's direct-EL0-abort path); `None`
+/// means the injected frame re-runs the faulting instruction from the engine's
+/// own saved PC. ISA-neutral: aarch64 lowers `EL0Fault` to this via
+/// [`lower_el0_fault`]; x86 backends emit `GuestFault` directly (CR2 →
+/// `fault_addr`).
 #[allow(clippy::too_many_arguments)]
 fn deliver_fault_signal<E: ThreadedEngine>(
     kernel: &Kernel,
     engine: &mut E,
     this_tid: ThreadId,
-    esr: u64,
-    elr: u64,
-    far: u64,
-    from_el0_direct: bool,
+    signum: i32,
+    si_code: i32,
+    si_addr: u64,
+    interrupted_pc: Option<u64>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     let dispatcher = &kernel.dispatcher;
@@ -495,23 +521,9 @@ fn deliver_fault_signal<E: ThreadedEngine>(
         Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))))
     };
 
-    let (signum, si_code, si_addr) = if let Some((signum, si_code)) = el0_debug_signal(esr) {
-        (signum, si_code, elr)
-    } else if let Some((signum, si_code)) = el0_fault_signal(esr) {
-        (signum, si_code, far)
-    } else {
-        if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
-            eprintln!(
-                "[FAULTDBG tid={this_tid:?}] UNCLASSIFIED EL0 fault esr={esr:#x} ec={:#x} elr={elr:#x} far={far:#x} -> SIGSEGV terminate",
-                (esr >> 26) & 0x3f
-            );
-        }
-        return terminate(11);
-    };
     if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
         eprintln!(
-            "[FAULTDBG tid={this_tid:?}] esr={esr:#x} ec={:#x} elr={elr:#x} far={far:#x} signum={signum} si_addr={si_addr:#x}",
-            (esr >> 26) & 0x3f
+            "[FAULTDBG tid={this_tid:?}] signum={signum} si_code={si_code} si_addr={si_addr:#x} interrupted_pc={interrupted_pc:?}"
         );
     }
     crate::probes::signal_deliver(this_tid, signum);
@@ -536,7 +548,6 @@ fn deliver_fault_signal<E: ThreadedEngine>(
         None
     };
     let saved_sigmask = dispatcher.enter_signal_handler(this_tid, signum, action);
-    let interrupted_pc = if from_el0_direct { Some(elr) } else { None };
     let injected = engine.inject_signal(
         signum,
         action.sa_handler,
@@ -1898,16 +1909,64 @@ where
                     from_el0_direct,
                     ..
                 }) => {
-                    // A synchronous guest EL0 fault (nil deref, bad access). Deliver
-                    // it to the guest as SIGSEGV/SIGBUS (Linux semantics).
+                    // A synchronous guest EL0 fault (nil deref, bad access, BRK,
+                    // single-step). Lower the raw aarch64 ESR to the ISA-neutral
+                    // (signum, si_code, fault_addr) triple — covering BOTH the
+                    // abort classes (SIGSEGV/SIGBUS) AND the debug classes
+                    // (BRK/single-step → SIGTRAP) — then deliver via the shared
+                    // GuestFault path. `from_el0_direct` selects whether the
+                    // sigframe records the faulting PC as the resume target.
+                    if let Some((signum, si_code, si_addr)) = lower_el0_fault(syndrome, elr, far) {
+                        let interrupted_pc = if from_el0_direct { Some(elr) } else { None };
+                        if let Some(outcome) = deliver_fault_signal(
+                            &kernel,
+                            &mut engine,
+                            state.this_tid,
+                            signum,
+                            si_code,
+                            si_addr,
+                            interrupted_pc,
+                            traps,
+                        )? {
+                            return Ok(outcome);
+                        }
+                    } else {
+                        // Unclassified EL0 fault: Linux forces the default action
+                        // (terminate by SIGSEGV).
+                        if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+                            eprintln!(
+                                "[FAULTDBG tid={:?}] UNCLASSIFIED EL0 fault esr={syndrome:#x} ec={:#x} elr={elr:#x} far={far:#x} -> SIGSEGV terminate",
+                                state.this_tid,
+                                (syndrome >> 26) & 0x3f
+                            );
+                        }
+                        if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+                            let out = kernel.dispatcher.stdout();
+                            let err = kernel.dispatcher.stderr();
+                            forked_child_die_by_signal(11, &out, &err);
+                        }
+                        let result = assemble_run_result(&kernel, 128 + 11, traps, false);
+                        return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
+                    }
+                    continue;
+                }
+                Err(TrapError::GuestFault {
+                    signum,
+                    si_code,
+                    fault_addr,
+                }) => {
+                    // The ISA-neutral structured fault path: an x86 backend emits
+                    // this directly (fault_addr = CR2). The faulting instruction
+                    // is re-run from the engine's saved PC (interrupted_pc=None),
+                    // matching the x86 fault-resume semantics.
                     if let Some(outcome) = deliver_fault_signal(
                         &kernel,
                         &mut engine,
                         state.this_tid,
-                        syndrome,
-                        elr,
-                        far,
-                        from_el0_direct,
+                        signum,
+                        si_code,
+                        fault_addr,
+                        None,
                         traps,
                     )? {
                         return Ok(outcome);
@@ -2418,5 +2477,50 @@ mod tests {
         assert_eq!(el0_debug_signal(esr(0x20)), None); // instruction abort
         assert_eq!(el0_debug_signal(esr(0x24)), None); // data abort
         assert_eq!(el0_debug_signal(esr(0x00)), None); // unknown
+    }
+
+    const SIGSEGV: i32 = 11;
+    const SIGBUS: i32 = 7;
+    const SEGV_MAPERR: i32 = 1;
+    const BUS_ADRALN: i32 = 1;
+
+    #[test]
+    fn lower_el0_fault_covers_both_debug_and_abort_arms() {
+        // The Stage-0 lowering MUST be identity w.r.t. the historical
+        // EL0Fault→deliver_fault_signal resolution: debug classes win first and
+        // carry `elr` as si_addr; abort classes carry `far` as si_addr.
+        let elr = 0xDEAD_BEEF;
+        let far = 0xCAFE_F00D;
+
+        // BRK (debug) → SIGTRAP/TRAP_BRKPT, si_addr = elr (the faulting PC).
+        assert_eq!(
+            lower_el0_fault(esr(0x3c), elr, far),
+            Some((SIGTRAP, TRAP_BRKPT, elr)),
+            "BRK must lower to SIGTRAP carrying the PC — regressing this breaks ptrace/Go debug-call"
+        );
+        // Single-step (debug) → SIGTRAP/TRAP_TRACE, si_addr = elr.
+        assert_eq!(
+            lower_el0_fault(esr(0x32), elr, far),
+            Some((SIGTRAP, TRAP_TRACE, elr))
+        );
+
+        // Data abort (fault) → SIGSEGV/SEGV_MAPERR, si_addr = far (the bad VA).
+        assert_eq!(
+            lower_el0_fault(esr(0x24), elr, far),
+            Some((SIGSEGV, SEGV_MAPERR, far))
+        );
+        // Instruction abort (fault) → SIGSEGV, si_addr = far.
+        assert_eq!(
+            lower_el0_fault(esr(0x20), elr, far),
+            Some((SIGSEGV, SEGV_MAPERR, far))
+        );
+        // Alignment fault (DFSC=0x21 under a data abort) → SIGBUS/BUS_ADRALN.
+        assert_eq!(
+            lower_el0_fault(esr(0x24) | 0x21, elr, far),
+            Some((SIGBUS, BUS_ADRALN, far))
+        );
+
+        // Unclassified → None (caller terminates by SIGSEGV).
+        assert_eq!(lower_el0_fault(esr(0x00), elr, far), None);
     }
 }

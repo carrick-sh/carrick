@@ -223,7 +223,11 @@ const KERN_SS_SEL: u64 = 0x10;
 
 /// The syscall doorbell port: the `SENTINEL_GPA` analogue. The LSTAR stub's
 /// `OUT %al, $0xC5` lands here (spec §6 vehicle (a)).
-pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
+///
+/// Single-sourced from `carrick_hal::x8664_arch` (the same const the
+/// `entry_trampoline_bytes` emitter derives its immediate from), re-exported here
+/// so bhyve call sites keep referring to it via `guest_setup_x86`.
+pub use carrick_hal::SYSCALL_DOORBELL_PORT;
 /// Reserved for M3 (TLB-shootdown completion / maintenance doorbell).
 pub const MAINT_DOORBELL_PORT: u16 = 0xC6;
 /// The FP-stub doorbell port (distinct from the syscall doorbell `0xC5`): the

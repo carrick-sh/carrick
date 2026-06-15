@@ -6,10 +6,13 @@
 //! Task 7's `BhyveTrapEngine` in `carrick-bhyve`); this task establishes the
 //! standalone impl validated by unit tests.
 //!
+//! ## Implemented surface
+//!
+//! - Full x86_64 `rt_sigframe` build/restore ([`build_sigframe`] /
+//!   [`restore_sigframe`]) — the codec is implemented, not deferred.
+//!
 //! ## Phase 2 non-goals (deferred)
 //!
-//! - Real `rt_sigframe` build/restore for x86_64 (M3; spec §4.2): both methods
-//!   return a typed `TrapError` so callers fail loudly instead of silently.
 //! - A real x86_64 vDSO: `vdso_bytes()` returns `Vec::new()` (spec §4.6). The
 //!   guest libc falls back to real SYSCALL instructions per `vdso(7)`.
 //! - CR3: NOT in `X8664BootSysregs` — the bhyve backend computes it from the
@@ -26,6 +29,20 @@ use carrick_guest_mem::{GuestMemory, X8664SyscallFrame};
 /// `EM_X86_64` = 62. Source: x86-64 psABI (gABI supplement), §1 / `elf(5)`
 /// man-page (man7.org): "A file's `e_machine` member … 62 (EM_X86_64)".
 const EM_X86_64: u16 = 62;
+
+// ─── SYSCALL doorbell port (single source of truth) ──────────────────────────
+
+/// The I/O port the LSTAR entry stub's `out %al, $PORT` doorbell writes to. This
+/// is THE single source of truth for the doorbell port across every x86 VMM
+/// backend (KVM/bhyve/NVMM): the trampoline emitter ([`entry_trampoline_bytes`])
+/// derives the immediate byte from this const, and each backend's trap loop
+/// matches the resulting `IoOut`/`INOUT`/`EXIT_IO` exit against it.
+///
+/// `0xC5` is an otherwise-unused 8-bit port. The `out imm8, %al` form is used so
+/// the doorbell is a single 2-byte instruction (`0xE6 PORT`) with no register
+/// clobbers beyond `%al` and no stack use. Source: AMD64 ISA / Intel SDM
+/// vol. 2B "OUT" (`E6 ib` — output byte to I/O port address).
+pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
 
 // ─── Granule (same shape as aarch64 stage-1; only descriptor bits differ) ────
 
@@ -321,8 +338,16 @@ impl Default for X8664BootSysregs {
 ///     §2.5 "SYSRET"; Intel SDM vol. 2B "SYSRET" — REX.W selects 64-bit
 ///     operand size returning to 64-bit userspace).
 pub fn entry_trampoline_bytes() -> Vec<u8> {
-    // out %al, $0xC5  ; sysretq
-    vec![0xE6, 0xC5, 0x48, 0x0F, 0x07]
+    // `out %al, $SYSCALL_DOORBELL_PORT` ; sysretq
+    //
+    // The port immediate is derived from the single-source const so the
+    // trampoline byte and every backend's doorbell-match cannot drift apart.
+    // The port is an 8-bit immediate (`out imm8, %al` = `E6 ib`); assert it fits.
+    const _: () = assert!(
+        SYSCALL_DOORBELL_PORT <= 0xFF,
+        "SYSCALL_DOORBELL_PORT must fit in the `out imm8, %al` (E6 ib) immediate"
+    );
+    vec![0xE6, SYSCALL_DOORBELL_PORT as u8, 0x48, 0x0F, 0x07]
 }
 
 // ─── X8664GuestArch ──────────────────────────────────────────────────────────
@@ -866,6 +891,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lstar_stub_port_byte_matches_const() {
+        // The single-source agreement guarantee: the trampoline's port-immediate
+        // byte (stub[1]) MUST equal SYSCALL_DOORBELL_PORT. This is no longer
+        // vacuous w.r.t. a hand-typed literal — the emitter derives the byte from
+        // the const — but the check stays as the enforced cross-crate contract so
+        // a future refactor that re-hardcodes the byte is caught here.
+        let stub = X8664GuestArch::entry_trampoline_bytes();
+        assert_eq!(stub[0], 0xE6, "stub[0] must be the `out imm8, %al` opcode");
+        assert_eq!(
+            stub[1], SYSCALL_DOORBELL_PORT as u8,
+            "trampoline port byte must equal SYSCALL_DOORBELL_PORT"
+        );
+    }
+
     // ── STAR selector arithmetic (the mandated unit test) ────────────────────
     //
     // GDT order: null[0x00] / kCS[0x08] / kSS[0x10] / uSS[0x18] / uCS[0x20].
@@ -1042,11 +1082,13 @@ mod tests {
         assert_eq!(X8664SyscallTable::remap(172), SyscallRemap::Unknown);
     }
 
-    // ── sigframe methods return loud errors (spec §4.2) ──────────────────
+    // ── sigframe codec exercises the real path against a no-op stub ───────
     //
-    // Both build_sigframe and restore_sigframe return Err immediately without
-    // touching the engine or params. We satisfy the type bounds with a minimal
-    // stub; the bodies are unreachable in practice.
+    // build_sigframe / restore_sigframe ARE implemented (the full x86-64
+    // rt_sigframe codec). Against `SigframeStub` — whose guest-memory backend is
+    // `Unsupported` — they run the real codec and fail only at the guest-memory
+    // boundary (writing/reading the frame), proving the codec is engaged rather
+    // than short-circuiting with a "not implemented" stub.
 
     struct SigframeStub;
 
@@ -1121,35 +1163,40 @@ mod tests {
     }
 
     #[test]
-    fn build_sigframe_returns_typed_error() {
+    fn build_sigframe_runs_codec_and_faults_only_at_guest_memory() {
+        // The codec IS implemented: it builds the frame and only fails when the
+        // stub's `write_bytes` (Unsupported) refuses the guest-stack write. The
+        // error therefore names the guest-memory write, NOT "not implemented".
         let result = X8664GuestArch::build_sigframe(&mut SigframeStub, make_inject_params());
-        assert!(result.is_err(), "build_sigframe must return Err in Phase 2");
+        // The real codec builds the frame and tries to write it to the guest
+        // stack; the stub's Unsupported `write_bytes` makes that a
+        // `SignalDeliveryFault` (Linux force_sigsegv) — NOT a "not implemented"
+        // stub error. That it reaches the write at all proves the codec runs.
         match result {
-            Err(TrapError::Hypervisor(msg)) => {
-                assert!(
-                    msg.contains("x86_64 signal frames are not implemented"),
-                    "error message must name the reason: {msg}"
-                );
-            }
-            _ => panic!("expected TrapError::Hypervisor"),
+            Err(TrapError::SignalDeliveryFault) => {}
+            Err(other) => panic!("expected SignalDeliveryFault from the codec, got {other:?}"),
+            Ok(_) => panic!("codec must fail against the Unsupported memory stub"),
         }
     }
 
     #[test]
-    fn restore_sigframe_returns_typed_error() {
+    fn restore_sigframe_runs_codec_and_faults_only_at_guest_memory() {
+        // Symmetric to build: the codec reads the frame from the guest stack and
+        // fails only at the stub's Unsupported `read_bytes`.
         let result = X8664GuestArch::restore_sigframe(&mut SigframeStub, false);
         assert!(
             result.is_err(),
-            "restore_sigframe must return Err in Phase 2"
+            "restore_sigframe must fail against the Unsupported memory stub"
         );
         match result {
             Err(TrapError::Hypervisor(msg)) => {
                 assert!(
-                    msg.contains("x86_64 signal frames are not implemented"),
-                    "error message must name the reason: {msg}"
+                    !msg.contains("not implemented"),
+                    "codec is implemented; error must not claim otherwise: {msg}"
                 );
             }
-            _ => panic!("expected TrapError::Hypervisor"),
+            Err(other) => panic!("expected TrapError::Hypervisor, got {other:?}"),
+            Ok(_) => panic!("codec must fail against the Unsupported memory stub"),
         }
     }
 
