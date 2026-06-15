@@ -614,6 +614,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-x86"
+version = "0.1.0"
+dependencies = [
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-mem",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
