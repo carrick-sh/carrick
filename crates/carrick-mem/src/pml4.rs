@@ -369,6 +369,25 @@ impl Pml4Manager {
         self.apply(va, len, |desc| Ok(desc & !PML4_P))
     }
 
+    /// Mark `[va, va+len)` present read-only, with NX per `exec`. This is the
+    /// x86 sibling of `PageTableManager::set_readonly`: stores should raise a
+    /// present-page protection fault (#PF with PFEC.P=1), while reads remain
+    /// allowed.
+    pub fn set_readonly(&mut self, va: u64, len: usize, exec: bool) -> Result<bool, Pml4Error> {
+        self.apply(va, len, |desc| {
+            if desc == 0 {
+                return Err(Pml4Error::BadAddress);
+            }
+            let mut new = (desc | PML4_P) & !PML4_RW;
+            if exec {
+                new &= !PML4_NX;
+            } else {
+                new |= PML4_NX;
+            }
+            Ok(new)
+        })
+    }
+
     /// Restore `[va, va+len)` to present read-write, with NX per `exec`
     /// (`exec=true` clears NX — PROT_EXEC; else NX set, the W^X default).
     /// Errors `BadAddress` on a leaf that never had a mapping recorded (an
@@ -557,6 +576,25 @@ mod tests {
         assert_eq!(mgr.set_rw(va, 0x1000, false), Ok(true));
         let walk = walk_descriptors(mgr.bytes(), BASE, va);
         assert_ne!(walk[3] & PML4_NX, 0, "exec=false set NX");
+    }
+
+    #[test]
+    fn set_readonly_clears_rw_and_preserves_present_mapping() {
+        let va = 0x40_0000;
+        let bytes = build(&[user_rw_nx(va, va, 0x1000)]);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+
+        assert_eq!(mgr.set_readonly(va, 0x1000, false), Ok(true));
+
+        assert_eq!(mgr.translate(va), Some(va), "RO page stays present");
+        let walk = walk_descriptors(mgr.bytes(), BASE, va);
+        assert_eq!(walk[3] & PML4_RW, 0, "leaf R/W cleared");
+        assert_ne!(walk[3] & PML4_NX, 0, "non-exec RO page remains NX");
+        assert_eq!(
+            mgr.set_readonly(va, 0x1000, false),
+            Ok(false),
+            "idempotent RO"
+        );
     }
 
     #[test]

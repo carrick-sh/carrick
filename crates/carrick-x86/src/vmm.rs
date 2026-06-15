@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use carrick_guest_mem::X8664SyscallFrame;
+use carrick_guest_mem::{MemoryError, X8664SyscallFrame};
 use carrick_hal::{TrapError, VcpuKick, VcpuRegistry};
 
 /// The shared x86 register view the engine reads/writes through the backend. The
@@ -224,6 +224,12 @@ pub trait X86Vmm: Sized {
     /// The host pointer backing `[gpa, gpa + len)`, or `None` if unmapped. The
     /// engine's `GuestMemory` impl copies through this.
     fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8>;
+
+    /// Change the guest-visible protection for a VA range. Backends with real
+    /// page tables override this; simple bring-up backends can keep the default.
+    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+        Ok(())
+    }
 
     /// Create a fresh vCPU bound to this VM.
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError>;

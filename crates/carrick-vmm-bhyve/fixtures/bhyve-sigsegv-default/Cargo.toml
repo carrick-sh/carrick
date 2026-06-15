@@ -1,0 +1,21 @@
+[package]
+name = "carrick-bhyve-sigsegv-default"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP4.4 fixture: synchronous #PF with Linux's default SIGSEGV action.
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC).
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-sigsegv-default"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]
