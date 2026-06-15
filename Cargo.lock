@@ -307,11 +307,11 @@ dependencies = [
  "camino",
  "carrick-engine",
  "carrick-host-bsd",
- "carrick-hvf",
  "carrick-image",
  "carrick-runtime",
  "carrick-spec",
  "carrick-test-support",
+ "carrick-vmm-hvf",
  "carrick-vmm-kvm",
  "chrono",
  "clap",
@@ -406,34 +406,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "carrick-hvf"
-version = "0.1.0"
-dependencies = [
- "applevisor",
- "applevisor-sys",
- "carrick-abi",
- "carrick-guest-mem",
- "carrick-hal",
- "carrick-host",
- "carrick-host-bsd",
- "carrick-mem",
- "carrick-observability",
- "carrick-signal-core",
- "carrick-thread",
- "carrick-timer-core",
- "cc",
- "clap",
- "libc",
- "parking_lot",
- "parking_lot_core",
- "serde",
- "serde_json",
- "thiserror",
- "usdt",
- "zerocopy",
-]
-
-[[package]]
 name = "carrick-image"
 version = "0.1.0"
 dependencies = [
@@ -500,7 +472,6 @@ dependencies = [
  "carrick-host",
  "carrick-host-bsd",
  "carrick-host-linux",
- "carrick-hvf",
  "carrick-image",
  "carrick-mem",
  "carrick-observability",
@@ -511,6 +482,7 @@ dependencies = [
  "carrick-thread",
  "carrick-timer-core",
  "carrick-vmm-bhyve",
+ "carrick-vmm-hvf",
  "carrick-vmm-kvm",
  "clap",
  "fd-lock",
@@ -597,6 +569,34 @@ dependencies = [
  "carrick-timer-core",
  "carrick-x86",
  "libc",
+]
+
+[[package]]
+name = "carrick-vmm-hvf"
+version = "0.1.0"
+dependencies = [
+ "applevisor",
+ "applevisor-sys",
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-host",
+ "carrick-host-bsd",
+ "carrick-mem",
+ "carrick-observability",
+ "carrick-signal-core",
+ "carrick-thread",
+ "carrick-timer-core",
+ "cc",
+ "clap",
+ "libc",
+ "parking_lot",
+ "parking_lot_core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "usdt",
+ "zerocopy",
 ]
 
 [[package]]

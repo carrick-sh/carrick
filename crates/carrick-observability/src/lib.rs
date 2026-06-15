@@ -3,7 +3,7 @@
 //! Currently the syscall-compatibility reporter ([`compat`]) — the recorder that
 //! aggregates unhandled/partial syscalls, ioctls, and coverage against the static
 //! [`carrick_abi::syscall`] table and renders a JSON/text report. It was
-//! carrick-hvf-private (re-exported on macOS, a no-op unit-struct STUB on the
+//! carrick-vmm-hvf-private (re-exported on macOS, a no-op unit-struct STUB on the
 //! Linux/KVM arm), so neither Linux nor bhyve produced a real compat report;
 //! hoisting it here gives every backend the real reporter.
 //!

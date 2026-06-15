@@ -29,7 +29,7 @@ fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
 /// dropped) — the Linux implementation of the `crate::trap::VCPU_LIVE` drain
 /// contract the shared threaded run loop relies on (carrick-runtime
 /// re-exports this under `platform-linux`; HVF has its own identical counter
-/// in carrick-hvf's trap module). LOAD-BEARING, not a diagnostic:
+/// in carrick-vmm-hvf's trap module). LOAD-BEARING, not a diagnostic:
 /// `terminate_siblings_for_exec` spin-waits for this to reach 1 after kicking
 /// sibling vCPU threads, so the execing thread cannot delete the VM's
 /// memslots / munmap the old `GuestRam` while a just-kicked sibling is still
@@ -432,7 +432,7 @@ impl KvmVm {
         // guest CLOCK_MONOTONIC deadlines against the HOST's monotonic clock
         // (`carrick_portable::CLOCK_UPTIME_RAW` == Linux CLOCK_MONOTONIC_RAW) —
         // an invariant HVF satisfies by construction (the macOS guest counter
-        // is already host-uptime-based, carrick-hvf trap.rs
+        // is already host-uptime-based, carrick-vmm-hvf trap.rs
         // populate_vdso_data_page) but a fresh KVM VM does NOT: KVM zeroes the
         // virtual counter at VM creation, so the guest's vDSO MONOTONIC sat
         // ~316,000 s behind the host and every absolute deadline looked

@@ -488,7 +488,7 @@ mod tests {
         disarm(which);
     }
 
-    // ---- Regression tests carried from carrick-hvf. ----
+    // ---- Regression tests carried from carrick-vmm-hvf. ----
 
     #[test]
     fn ident_round_trips_for_each_which() {

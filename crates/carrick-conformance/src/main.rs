@@ -33,7 +33,7 @@ use std::sync::{Condvar, Mutex};
 /// freshness backstop — §4.5). Deliberately NOT all of `crates/`.
 const RUNTIME_CRATES: &[&str] = &[
     "carrick-runtime",
-    "carrick-hvf",
+    "carrick-vmm-hvf",
     "carrick-host",
     "carrick-abi",
     "carrick-mem",

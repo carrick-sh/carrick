@@ -139,7 +139,7 @@ use exec::{
 
 use crate::trap::{HvfTrapEngine, TrapError};
 // `SyscallTrap`/`TrapError`/`ForkOutcome` live in the carrick-hal leaf crate
-// and are re-exported through `carrick_hvf::trap` (re-exported here as
+// and are re-exported through `carrick_vmm_hvf::trap` (re-exported here as
 // `crate::trap`). Re-export `SyscallTrap` from this module too so the original
 // `carrick_runtime::runtime::SyscallTrap` path (used by the runtime_loop tests
 // and the engine crate) is unchanged.
@@ -277,7 +277,7 @@ pub fn maybe_dump_debug_state(image: &AddressSpace, path: Option<&PathBuf>) -> O
 pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
 
 // `SyscallTrap` (the trap-engine contract the loops drive) moved into
-// carrick-hvf alongside `TrapError`/`ForkOutcome`/`HvfTrapEngine`. Re-exported
+// carrick-vmm-hvf alongside `TrapError`/`ForkOutcome`/`HvfTrapEngine`. Re-exported
 // from `crate::trap`; imported here via the `use crate::trap::{…}` below so
 // `SplitView`/`HvfTrapEngine` impls and the loop bounds are unchanged.
 
@@ -1895,7 +1895,7 @@ where
     run_combined_syscall_loop_with_dispatcher(&mut view, dispatcher, max_traps)
 }
 
-// `impl SyscallTrap for HvfTrapEngine` moved into carrick-hvf (trap.rs):
+// `impl SyscallTrap for HvfTrapEngine` moved into carrick-vmm-hvf (trap.rs):
 // both the trait and the type now live there, so the impl must too (orphan
 // rule). The blanket loop bounds (`T: SyscallTrap`) and `SplitView` impl below
 // use the re-exported trait and are unchanged.

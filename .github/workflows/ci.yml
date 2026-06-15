@@ -83,8 +83,8 @@ jobs:
 
 
   # L1 — cross-compile our OWNED crates for aarch64-linux + assert the
-  # platform-linux dependency closure links NO macOS hypervisor (carrick-hvf /
-  # applevisor). Proves the C4 decouple and the carrick-hvf/build.rs host-cfg
+  # platform-linux dependency closure links NO macOS hypervisor (carrick-vmm-hvf /
+  # applevisor). Proves the C4 decouple and the carrick-vmm-hvf/build.rs host-cfg
   # fix. Cheap on a hosted Linux runner; the full CLI is NOT cross-compiled
   # here (ring/oci-client need a C cross toolchain) — that real Linux build
   # happens natively in the local nested-KVM VM (see `just build-linux`).
