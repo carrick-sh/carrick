@@ -116,7 +116,7 @@ fn m0_doorbell_out_0xc5() {
     let mut io_npc: u64 = 0;
     let mut rip_at_io: u64 = 0;
     for iter in 0..64 {
-        let exit = vcpu.run().expect("nvmm_vcpu_run");
+        let exit = vcpu.run_until_exit().expect("nvmm_vcpu_run");
         eprintln!("  [iter {iter}] exit reason = {:#x}", exit.reason);
         match exit.reason {
             NVMM_VCPU_EXIT_NONE => {
