@@ -46,7 +46,7 @@ pub const NOTE_EXITSTATUS: u32 = 0;
 // Internal-fd relocation is platform-neutral POSIX (F_DUPFD_CLOEXEC above a
 // high floor, then close the original); it now lives in the neutral
 // `carrick-host` crate so the KVM/Linux backend shares the real impl. Re-export
-// it here so this crate's public path (and HVF's via carrick_bsd) is unchanged.
+// it here so this crate's public path (and HVF's via carrick_host_bsd) is unchanged.
 pub use carrick_host::internal_fd::{duplicate_internal_fd, relocate_internal_fd};
 
 /// RAII owner for a Darwin/FreeBSD kqueue fd.

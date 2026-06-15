@@ -2,7 +2,7 @@
 //!
 //! Hands the runtime a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
 //! implementation appropriate for the host platform: kqueue-backed on macOS and
-//! FreeBSD (the same `carrick_bsd::KqueueMultiplexer`, whose `to_note`/`from_note`
+//! FreeBSD (the same `carrick_host_bsd::KqueueMultiplexer`, whose `to_note`/`from_note`
 //! helpers already carry FreeBSD cfg gates), epoll-backed on Linux. The dispatch
 //! path (`dispatch/net.rs`) drives readiness exclusively through this trait so the
 //! backend choice lives in exactly one place.
@@ -14,7 +14,7 @@ use carrick_hal::event::EventMultiplexer;
 pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
     #[cfg(feature = "platform-macos")]
     {
-        Ok(Box::new(carrick_bsd::KqueueMultiplexer::new()?))
+        Ok(Box::new(carrick_host_bsd::KqueueMultiplexer::new()?))
     }
     #[cfg(feature = "platform-linux")]
     {
@@ -28,7 +28,7 @@ pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
     // suffice (no `not(platform-macos)` disambiguation needed).
     #[cfg(feature = "platform-freebsd")]
     {
-        Ok(Box::new(carrick_bsd::KqueueMultiplexer::new()?))
+        Ok(Box::new(carrick_host_bsd::KqueueMultiplexer::new()?))
     }
     #[cfg(not(any(
         feature = "platform-macos",

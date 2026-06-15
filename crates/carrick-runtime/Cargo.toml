@@ -44,12 +44,12 @@ trace-elf = ["carrick-mem/trace-elf"]
 # `default` enables `platform-macos`; a `platform-linux` build links NO HVF.
 # The `dep:` syntax keeps the optional crates from auto-becoming implicit
 # features, so the only way to pull in carrick-hvf is via `platform-macos`.
-platform-macos = ["dep:carrick-hvf", "dep:carrick-bsd"]
+platform-macos = ["dep:carrick-hvf", "dep:carrick-host-bsd"]
 platform-linux = ["dep:carrick-linux"]
 # FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2 — see
 # docs/superpowers/adr/2026-06-06-bhyve-backend-design.md). Mirrors platform-linux.
-# Pulls in carrick-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
-platform-freebsd = ["dep:carrick-bhyve", "dep:carrick-bsd"]
+# Pulls in carrick-host-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
+platform-freebsd = ["dep:carrick-bhyve", "dep:carrick-host-bsd"]
 # Stage-4 instant-revert: route the bhyve run path through the OLD hand-rolled
 # `BhyveTrapEngine` instead of the shared `X86EngineCore<BhyveVmm>`. Off by
 # default (the shared engine is the blessed path).
@@ -62,7 +62,7 @@ carrick-portable = { path = "../carrick-portable" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-thread = { path = "../carrick-thread" }
 carrick-hvf = { path = "../carrick-hvf", optional = true }
-carrick-bsd = { path = "../carrick-bsd", optional = true }
+carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
 carrick-linux = { path = "../carrick-linux", optional = true }
 carrick-bhyve = { path = "../carrick-bhyve", optional = true }
 carrick-host = { path = "../carrick-host" }

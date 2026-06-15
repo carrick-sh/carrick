@@ -301,25 +301,15 @@ name = "carrick-bhyve"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
- "carrick-bsd",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
+ "carrick-host-bsd",
  "carrick-mem",
  "carrick-signal-core",
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",
- "libc",
-]
-
-[[package]]
-name = "carrick-bsd"
-version = "0.1.0"
-dependencies = [
- "carrick-abi",
- "carrick-hal",
- "carrick-host",
  "libc",
 ]
 
@@ -332,8 +322,8 @@ dependencies = [
  "base64 0.22.1",
  "bollard",
  "camino",
- "carrick-bsd",
  "carrick-engine",
+ "carrick-host-bsd",
  "carrick-hvf",
  "carrick-image",
  "carrick-linux",
@@ -415,16 +405,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-host-bsd"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-hal",
+ "carrick-host",
+ "libc",
+]
+
+[[package]]
 name = "carrick-hvf"
 version = "0.1.0"
 dependencies = [
  "applevisor",
  "applevisor-sys",
  "carrick-abi",
- "carrick-bsd",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
+ "carrick-host-bsd",
  "carrick-mem",
  "carrick-observability",
  "carrick-signal-core",
@@ -535,10 +535,10 @@ dependencies = [
  "cap-std",
  "carrick-abi",
  "carrick-bhyve",
- "carrick-bsd",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
+ "carrick-host-bsd",
  "carrick-hvf",
  "carrick-image",
  "carrick-linux",

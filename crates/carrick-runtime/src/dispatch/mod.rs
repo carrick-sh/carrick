@@ -1451,7 +1451,7 @@ pub struct SyscallDispatcher {
 /// An epoll instance's persistent readiness backend.
 ///
 /// The backend is a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer):
-/// kqueue-backed on macOS (`carrick_bsd::KqueueMultiplexer`), epoll-backed on
+/// kqueue-backed on macOS (`carrick_host_bsd::KqueueMultiplexer`), epoll-backed on
 /// Linux (`carrick_linux::EpollMultiplexer`). `epoll_ctl` registers host-fd
 /// interest through the trait and `epoll_pwait` drains it. The mux is wrapped in
 /// a `Mutex` because the instance is shared via `Arc` (so a dup'd epoll fd refers
@@ -5629,7 +5629,7 @@ mod overlay_dispatch_tests {
     #[test]
     fn host_syscall_result_translates_captured_host_errno() {
         use crate::dispatch::HostSyscallResult;
-        use carrick_bsd::errno::linux_errno;
+        use carrick_host_bsd::errno::linux_errno;
 
         carrick_portable::set_errno(libc::EINPROGRESS);
         let err = (-1i32).host_syscall_result().unwrap_err();

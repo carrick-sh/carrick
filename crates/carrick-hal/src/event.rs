@@ -1,6 +1,6 @@
 //! Backend-agnostic readiness multiplexer (kqueue on macOS ↔ epoll on Linux).
 //!
-//! Defined here so `carrick-bsd`'s `KqueueMultiplexer` and the future Linux
+//! Defined here so `carrick-host-bsd`'s `KqueueMultiplexer` and the future Linux
 //! `EpollMultiplexer` share one contract. The contract is informed by the
 //! runtime's actual epoll dependencies: EVFILT_VNODE/inotify, EVFILT_EXCEPT/
 //! NOTE_OOB → EPOLLPRI, edge-vs-level, EV_EOF/error, NOTE_EXITSTATUS.

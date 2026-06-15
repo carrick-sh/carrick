@@ -20,7 +20,7 @@ default        = ["syscall-shim", "platform-macos"]
 syscall-shim   = ["carrick-runtime/syscall-shim"]
 # Exactly one platform-* is active at a time; `default` keeps macOS building
 # exactly as today. `platform-linux` links NO HVF.
-platform-macos = ["dep:carrick-hvf", "dep:carrick-bsd", "carrick-runtime/platform-macos", "carrick-engine/platform-macos"]
+platform-macos = ["dep:carrick-hvf", "dep:carrick-host-bsd", "carrick-runtime/platform-macos", "carrick-engine/platform-macos"]
 platform-linux = ["dep:carrick-linux", "carrick-runtime/platform-linux", "carrick-engine/platform-linux"]
 # In-memory fs backend selection (`--fs memory`). Default OFF on purpose; opt in
 # with `cargo build -p carrick-cli --features fs-memory`.
@@ -53,7 +53,7 @@ debug-all = [
 [dependencies]
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
 carrick-hvf = { path = "../carrick-hvf", optional = true }
-carrick-bsd = { path = "../carrick-bsd", optional = true }
+carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
 carrick-linux = { path = "../carrick-linux", optional = true }
 carrick-spec = { path = "../carrick-spec", features = ["clap"] }
 carrick-image = { path = "../carrick-image" }

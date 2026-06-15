@@ -36,7 +36,7 @@ carrick-host = { path = "../carrick-host" }
 # The BSD-family host layer: the one shared `SIGNUM_XLATE` signal-number table
 # (`carrick_bsd::signum`), shared verbatim with the HVF/macOS backend. Gated on
 # `carrick_bsd_family` (includes freebsd), so it is present on the bhyve host.
-carrick-bsd = { path = "../carrick-bsd" }
+carrick-host-bsd = { path = "../carrick-host-bsd" }
 # Neutral timer slot bookkeeping (BhyveTimerDelivery) + per-thread pending store
 # (the timer firing thread publishes here then kicks). Mirrors carrick-linux.
 carrick-timer-core = { path = "../carrick-timer-core" }

@@ -9,10 +9,10 @@
 //! The mechanism is pure POSIX — `F_DUPFD_CLOEXEC` to dup the fd to the lowest
 //! free number `>= floor`, then close the original — so it compiles and behaves
 //! identically on Linux and macOS/FreeBSD. It was originally homed in the
-//! macOS-only `carrick-bsd` crate (alongside the kqueue wrapper that first used
+//! macOS-only `carrick-host-bsd` crate (alongside the kqueue wrapper that first used
 //! it); it lives here in the neutral `carrick-host` crate so the KVM/Linux
 //! backend gets the real implementation instead of an identity stub, and
-//! `carrick-bsd` re-exports it (keeping HVF's public path stable).
+//! `carrick-host-bsd` re-exports it (keeping HVF's public path stable).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 

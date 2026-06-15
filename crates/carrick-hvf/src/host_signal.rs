@@ -115,13 +115,13 @@ pub use carrick_signal_core::xsig::{
 
 // The `(linux, host)` signal-number translation table that DIFFERS between Linux
 // and the BSDs (SIGUSR1/SIGCHLD/SIGSTOP/SIGURG/…) is the ONE BSD-family table in
-// `carrick_bsd::signum` — macOS shares BSD signal numbering with FreeBSD, so the
+// `carrick_host_bsd::signum` — macOS shares BSD signal numbering with FreeBSD, so the
 // table that was duplicated here (and again in `carrick_bhyve::bhyve_signum`)
 // now lives once. Cross-process signals must be translated on the send side
 // (`libc::kill`), the receive side (host handler -> guest), and in the `wait4`
 // status, or e.g. a guest SIGUSR1 (10) would be sent to macOS as signal 10
 // (SIGBUS). Re-exported so HVF's many call sites are unchanged.
-pub use carrick_bsd::signum::{host_to_linux_signum, linux_to_host_signum};
+pub use carrick_host_bsd::signum::{host_to_linux_signum, linux_to_host_signum};
 
 fn hvf_private_thread_signal_set(set: &mut libc::sigset_t) {
     unsafe {
@@ -599,7 +599,7 @@ fn close_raw_fds(fds: &[i32; 2]) {
     }
 }
 
-pub use carrick_bsd::{duplicate_internal_fd, relocate_internal_fd};
+pub use carrick_host_bsd::{duplicate_internal_fd, relocate_internal_fd};
 
 /// fork(2) does not inherit a kqueue, and the inherited self-pipe is shared
 /// with the parent (cross-process spurious wakes). Give the child a fresh
