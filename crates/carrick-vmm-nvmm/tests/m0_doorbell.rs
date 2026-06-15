@@ -17,9 +17,9 @@
 
 use carrick_vmm_nvmm::nvmm::{
     self, NVMM_PROT_EXEC, NVMM_PROT_READ, NVMM_PROT_WRITE, NVMM_VCPU_EXIT_HALTED,
-    NVMM_VCPU_EXIT_IO, NVMM_VCPU_EXIT_NONE, NVMM_X64_GPR_RIP, NVMM_X64_NSEG, NVMM_X64_SEG_CS,
-    NVMM_X64_SEG_DS, NVMM_X64_SEG_ES, NVMM_X64_SEG_FS, NVMM_X64_SEG_GS, NVMM_X64_SEG_SS,
-    NVMM_X64_STATE_GPRS, NVMM_X64_STATE_SEGS, NvmmX64StateSeg,
+    NVMM_VCPU_EXIT_IO, NVMM_VCPU_EXIT_NONE, NVMM_X64_GPR_RAX, NVMM_X64_GPR_RIP, NVMM_X64_NSEG,
+    NVMM_X64_SEG_CS, NVMM_X64_SEG_DS, NVMM_X64_SEG_ES, NVMM_X64_SEG_FS, NVMM_X64_SEG_GS,
+    NVMM_X64_SEG_SS, NVMM_X64_STATE_GPRS, NVMM_X64_STATE_SEGS, NvmmX64StateSeg,
 };
 
 /// The doorbell stub at GPA 0x1000:
@@ -27,6 +27,8 @@ use carrick_vmm_nvmm::nvmm::{
 ///   e6 c5         out  %al, $0xc5     <- surfaces as NVMM_VCPU_EXIT_IO port 0xC5
 ///   f4            hlt                 <- if we resume, this halts cleanly
 const STUB: &[u8] = &[0xb0, 0xc5, 0xe6, 0xc5, 0xf4];
+/// Real mode needs an operand-size prefix to make E7 emit EAX instead of AX.
+const EAX_PAYLOAD_STUB: &[u8] = &[0xb8, 0x78, 0x56, 0x34, 0x12, 0x66, 0xe7, 0xc7, 0xf4];
 
 const GUEST_GPA: u64 = 0x1000;
 const RAM_SIZE: usize = 0x1000; // one page is enough for the stub
@@ -46,6 +48,46 @@ fn real_mode_seg(selector: u16) -> NvmmX64StateSeg {
         limit: 0xFFFF,
         base: 0,
     }
+}
+
+fn program_real_mode_stub(stub: &[u8]) -> (nvmm::NvmmMachine, carrick_vmm_nvmm::nvmm::NvmmVcpu) {
+    nvmm::init().expect("nvmm_init (modload nvmm if ENXIO; run as root)");
+
+    let mut mach = nvmm::NvmmMachine::create().expect("nvmm_machine_create");
+    let hva = mach
+        .map_guest_ram(
+            GUEST_GPA,
+            RAM_SIZE,
+            NVMM_PROT_READ | NVMM_PROT_WRITE | NVMM_PROT_EXEC,
+        )
+        .expect("map_guest_ram (mmap + hva_map + gpa_map)");
+
+    // SAFETY: `hva` points at a live RAM_SIZE region we own; each stub fits.
+    unsafe {
+        std::ptr::copy_nonoverlapping(stub.as_ptr(), hva, stub.len());
+    }
+
+    let mut vcpu = mach.create_vcpu(0).expect("nvmm_vcpu_create");
+    let mut state = vcpu
+        .get_state(NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS)
+        .expect("nvmm_vcpu_getstate (initial)");
+
+    let flat = real_mode_seg(0);
+    for i in 0..NVMM_X64_NSEG {
+        state.segs[i] = flat;
+    }
+    state.segs[NVMM_X64_SEG_CS] = real_mode_seg(0xf000);
+    state.segs[NVMM_X64_SEG_SS] = real_mode_seg(0);
+    state.segs[NVMM_X64_SEG_DS] = real_mode_seg(0);
+    state.segs[NVMM_X64_SEG_ES] = real_mode_seg(0);
+    state.segs[NVMM_X64_SEG_FS] = real_mode_seg(0);
+    state.segs[NVMM_X64_SEG_GS] = real_mode_seg(0);
+    state.gprs[NVMM_X64_GPR_RIP] = GUEST_GPA;
+
+    vcpu.set_state(&state, NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS)
+        .expect("nvmm_vcpu_setstate (segs+gprs)");
+
+    (mach, vcpu)
 }
 
 #[test]
@@ -193,4 +235,38 @@ fn m0_doorbell_out_0xc5() {
     );
 
     eprintln!("M0 doorbell smoke PASS: NVMM_VCPU_EXIT_IO port 0xC5 observed.");
+}
+
+#[test]
+fn m0_out_eax_payload_is_not_in_nvmm_io_exit() {
+    let (_mach, mut vcpu) = program_real_mode_stub(EAX_PAYLOAD_STUB);
+
+    for iter in 0..64 {
+        let exit = vcpu.run_until_exit().expect("nvmm_vcpu_run");
+        eprintln!("  [payload iter {iter}] exit reason = {:#x}", exit.reason);
+        match exit.reason {
+            NVMM_VCPU_EXIT_NONE => continue,
+            NVMM_VCPU_EXIT_IO => {
+                let io = exit.io();
+                let state = vcpu
+                    .get_state(NVMM_X64_STATE_GPRS)
+                    .expect("getstate at IO exit");
+                assert_eq!(
+                    io.port, 0xC7,
+                    "payload diagnostic uses the fault doorbell port"
+                );
+                assert_eq!(io.operand_size, 4, "OUT EAX should report a 4-byte operand");
+                eprintln!(
+                    "M0 payload diagnostic: NVMM IO exit has port={:#x} operand_size={} \
+                     and RAX-at-exit={:#x}; the exit struct has no OUT payload field.",
+                    io.port, io.operand_size, state.gprs[NVMM_X64_GPR_RAX] as u32
+                );
+                return;
+            }
+            NVMM_VCPU_EXIT_HALTED => panic!("guest HALTED before the IO payload doorbell"),
+            other => panic!("unexpected exit before IO payload doorbell: reason={other:#x}"),
+        }
+    }
+
+    panic!("never observed the IO payload doorbell");
 }
