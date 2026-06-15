@@ -135,6 +135,38 @@ pub fn build_x86_engine(path: impl AsRef<std::path::Path>) -> Result<BhyveTrapEn
     Ok(engine)
 }
 
+/// Build a fully-brought-up x86_64 bhyve engine on the SHARED `carrick-x86`
+/// scaffold (`X86EngineCore<BhyveVmm>`) — the Stage-4 default path. Mirrors
+/// [`build_x86_engine`] (legacy) but wraps the `BroughtUpX86` into the generic
+/// engine via `bhyve_x86_engine::engine_from_brought_up`. Drives the SAME
+/// `run_threaded_bhyve_loop` (the runtime function is generic over any
+/// `ThreadedEngine<KickHandle = BhyveKickHandle>`).
+pub fn build_x86_engine_shared(
+    path: impl AsRef<std::path::Path>,
+) -> Result<carrick_x86::X86EngineCore<crate::bhyve_x86_engine::BhyveVmm>, String> {
+    use carrick_hal::guest_arch::GuestArch as _;
+    use carrick_hal::x8664_arch::X8664GuestArch;
+
+    let path = path.as_ref();
+    let image = AddressSpace::load_elf_for(path, X8664GuestArch::elf_machine())
+        .map_err(|e| format!("load_elf_for: {e}"))?
+        .with_linux_initial_stack(
+            [path.as_os_str().as_encoded_bytes()],
+            std::iter::empty::<&[u8]>(),
+        )
+        .map_err(|e| format!("with_linux_initial_stack: {e}"))?
+        .with_vdso_auxv(false);
+
+    let entry_rip = image.entry();
+    let initial_rsp = image
+        .initial_stack_pointer()
+        .ok_or_else(|| "no initial stack pointer (with_linux_initial_stack failed?)".to_string())?;
+
+    let bux = bring_up_x86_elf(&image, entry_rip, initial_rsp)
+        .map_err(|e| format!("bring_up_x86_elf: {e}"))?;
+    Ok(crate::bhyve_x86_engine::engine_from_brought_up(bux))
+}
+
 // ─── run_elf_bhyve ────────────────────────────────────────────────────────────
 
 /// Boot the static x86_64 ELF at `path` under bhyve and run it to exit.

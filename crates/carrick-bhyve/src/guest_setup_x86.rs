@@ -178,10 +178,10 @@ const MSR_SF_MASK: u32 = 0xC000_0084;
 /// Ring-0 64-bit code segment: P=1 S=1 type=0xA (exec/read) DPL=0 L=1.
 /// Mirrors GDT[1] = 0x0020_9A00_0000_0000 (L=bit53, P=bit47, S=bit44,
 /// type=bits43:40 = 0xA); translated to VMX access format.
-const ACCESS_RING0_CS64: u32 = 0x209B; // P|S|exec/read|DPL0|L
+pub const ACCESS_RING0_CS64: u32 = 0x209B; // P|S|exec/read|DPL0|L
 /// Ring-0 data segment: P=1 S=1 type=0x2 (data/RW) DPL=0.
 /// Mirrors GDT[2] = 0x0000_9200_0000_0000.
-const ACCESS_RING0_SS: u32 = 0x0093; // P|S|data/RW|DPL0
+pub const ACCESS_RING0_SS: u32 = 0x0093; // P|S|data/RW|DPL0
 /// Ring-3 data segment: P=1 S=1 type=0x2 (data/RW) DPL=3.
 /// Mirrors GDT[3] = 0x0000_F200_0000_0000.
 /// Ring-3 data segment access rights (the user SS/DS/ES/FS/GS value the iretq
@@ -200,10 +200,10 @@ const ACCESS_RING3_CS64: u32 = 0x20FB; // P|S|exec/read|DPL3|L
 const ACCESS_UNUSABLE: u32 = 0x0001_0000; // Intel SDM vol. 3 §21.5.1
 /// LDT unusable: S=0 (system), unusable. vmm.ko requires non-zero access for
 /// LDTR even when unused.
-const ACCESS_LDT_UNUSABLE: u32 = 0x0001_0082; // system + unusable
+pub const ACCESS_LDT_UNUSABLE: u32 = 0x0001_0082; // system + unusable
 /// TSS64 available: P=1 S=0 type=0x9 (64-bit TSS available).
 /// Required by VT-x — a valid TSS must be present (Intel SDM vol. 3 §21.2.5).
-const ACCESS_TSS64: u32 = 0x008B; // P|system|type=9 (TSS available)
+pub const ACCESS_TSS64: u32 = 0x008B; // P|system|type=9 (TSS available)
 /// Ring-3 data segment for DS/ES/FS/GS (= `ACCESS_RING3_SS`); latched by the
 /// iretq from the GDT on the ring-3 transition. Kept for the (blocked) ring-3
 /// entry work — see the M1 iretq blocker note.
@@ -217,9 +217,9 @@ const USER_CS64_SEL: u64 = 0x23;
 /// User SS selector: GDT[3]=0x18 | RPL3=3 → 0x1B.
 const USER_SS_SEL: u64 = 0x1B;
 /// Kernel CS64 selector: GDT[1]=0x08.
-const KERN_CS64_SEL: u64 = 0x08;
+pub const KERN_CS64_SEL: u64 = 0x08;
 /// Kernel SS selector: GDT[2]=0x10.
-const KERN_SS_SEL: u64 = 0x10;
+pub const KERN_SS_SEL: u64 = 0x10;
 
 /// The syscall doorbell port: the `SENTINEL_GPA` analogue. The LSTAR stub's
 /// `OUT %al, $0xC5` lands here (spec §6 vehicle (a)).
