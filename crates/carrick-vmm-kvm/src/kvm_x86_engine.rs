@@ -29,13 +29,14 @@
 //! the sigframe carries). `KERNEL_GS_BASE` (the SWAPGS shadow) is not used by
 //! the ring-3-only guest, so `get/set_gs_base` operate on `sregs.gs.base`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
+use carrick_mem::pml4::Pml4Manager;
 use carrick_x86::{
     BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86Reg, X86Seg,
-    X86Vcpu, X86Vmm,
+    X86Vcpu, X86VcpuSnapshot, X86Vmm,
 };
 use kvm_bindings::{Msrs, kvm_dtable, kvm_msr_entry, kvm_segment};
 
@@ -61,6 +62,7 @@ pub const KVM_X86_LAYOUT: BringupLayout = BringupLayout {
 pub struct KvmVmm {
     vm: KvmVm,
     ram: GuestRam,
+    page_tables: Arc<Mutex<Pml4Manager>>,
 }
 
 impl KvmVmm {
@@ -70,10 +72,15 @@ impl KvmVmm {
         handle: SharedVmHandle,
         windows: &[WindowDesc],
         protections: Arc<carrick_mem::protections::MemoryProtections>,
+        page_tables: Arc<Mutex<Pml4Manager>>,
     ) -> Self {
         let vm = KvmVm::from_shared_vm(handle);
         let ram = GuestRam::from_shared_windows(windows, protections);
-        Self { vm, ram }
+        Self {
+            vm,
+            ram,
+            page_tables,
+        }
     }
 }
 
@@ -84,6 +91,7 @@ pub struct KvmSiblingBuilder {
     vm: SharedVmHandle,
     windows: Vec<WindowDesc>,
     protections: Arc<carrick_mem::protections::MemoryProtections>,
+    page_tables: Arc<Mutex<Pml4Manager>>,
     ticket: VcpuLiveTicket,
 }
 
@@ -117,6 +125,53 @@ impl X86Vmm for KvmVmm {
         self.ram.host_ptr(gpa, len)
     }
 
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        _ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    ) -> Result<(), TrapError> {
+        use crate::guest_setup::{AliasBacking, KVM_ALIAS_GPA_BASE, KVM_ALIAS_GPA_SIZE};
+        use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
+
+        let off = va
+            .checked_sub(LINUX_HIGH_VA_THRESHOLD)
+            .filter(|&o| o < KVM_ALIAS_GPA_SIZE)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "KVM x86 map_host_alias: VA 0x{va:x} outside the alias arena \
+                     [1 TiB, 1 TiB+64 GiB)"
+                ))
+            })?;
+        let gpa = KVM_ALIAS_GPA_BASE + off;
+        let writable = match file {
+            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+            None => true,
+        };
+        let backing = match file {
+            Some((fd, offset, prot)) => AliasBacking::File { fd, offset, prot },
+            None => AliasBacking::Anon { payload },
+        };
+        let pt_host = self
+            .ram
+            .host_ptr(X86_PML4_BASE, carrick_x86::X86_PML4_CAPACITY as usize)
+            .ok_or_else(|| TrapError::Hypervisor("kvm-x86: PML4 backing not mapped".into()))?;
+        self.ram
+            .add_alias(&mut self.vm, va, gpa, len, backing)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        let mut page_tables = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
+        page_tables
+            .map_aliased(va, gpa, len, writable)
+            .map_err(|e| TrapError::Hypervisor(format!("kvm-x86: PML4 map_aliased: {e:?}")))?;
+        let bytes = page_tables.bytes();
+        // SAFETY: `pt_host` backs the full PML4 table region in the live guest;
+        // `bytes` has exactly that arena's size and stays valid for this copy.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pt_host, bytes.len()) };
+        Ok(())
+    }
+
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         use carrick_hal::HvVm as _;
         self.vm
@@ -127,6 +182,50 @@ impl X86Vmm for KvmVmm {
     fn fork_ram_strategy(&self) -> ForkRamStrategy {
         // KVM: MAP_PRIVATE windows inherit via COW; nothing is frozen/copied.
         ForkRamStrategy::Cow
+    }
+
+    fn rebuild_child_after_fork(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        _frozen: &[u8],
+    ) -> Result<(), TrapError> {
+        let (new_vm, new_vcpu) = self
+            .ram
+            .rebuild_vm_for_child()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        self.vm = new_vm;
+        *vcpu = new_vcpu;
+        crate::kvm::VCPU_LIVE.store(1, std::sync::atomic::Ordering::SeqCst);
+        let page_tables = self
+            .page_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.page_tables = Arc::new(Mutex::new(page_tables));
+        Ok(())
+    }
+
+    fn restore_vcpu(
+        &self,
+        vcpu: &mut Self::Vcpu,
+        layout: BringupLayout,
+        snapshot: &X86VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        restore_kvm_vcpu(vcpu, layout, snapshot)
+    }
+
+    fn execve_rebuild(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError> {
+        let (new_vm, new_ram, new_page_tables, new_vcpu) = build_kvm_x86_guest(new_image)?;
+        vcpu.close_on_drop();
+        *vcpu = new_vcpu;
+        self.vm = new_vm;
+        self.ram = new_ram;
+        self.page_tables = new_page_tables;
+        Ok(())
     }
 
     fn kick_handle(&self) -> Self::KickHandle {
@@ -142,6 +241,7 @@ impl X86Vmm for KvmVmm {
             vm: self.vm.vm_handle(),
             windows: self.ram.window_descriptors(),
             protections: self.ram.shared_protections(),
+            page_tables: Arc::clone(&self.page_tables),
             // Reserve the sibling's VCPU_LIVE slot now (closes the execve-drain
             // blind window); consumed at materialization.
             ticket: VcpuLiveTicket::acquire(),
@@ -149,7 +249,12 @@ impl X86Vmm for KvmVmm {
     }
 
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
-        let vmm = Self::from_sibling(builder.vm, &builder.windows, builder.protections);
+        let vmm = Self::from_sibling(
+            builder.vm,
+            &builder.windows,
+            builder.protections,
+            builder.page_tables,
+        );
         let vcpu = vmm
             .vm
             .add_sibling_vcpu()
@@ -208,6 +313,92 @@ fn ar_to_kvm_segment(base: u64, limit: u32, ar: u32, selector: u16) -> kvm_segme
         unusable: ((ar >> 16) & 1) as u8,
         ..Default::default()
     }
+}
+
+fn restore_kvm_vcpu(
+    vcpu: &mut KvmVcpu,
+    layout: BringupLayout,
+    s: &X86VcpuSnapshot,
+) -> Result<(), TrapError> {
+    use carrick_hal::guest_arch::GuestArch as _;
+    use carrick_hal::x8664_arch::X8664GuestArch;
+
+    let boot = X8664GuestArch::bootstrap_sysregs();
+    let segs = carrick_x86::long_mode_segment_state();
+    let kernel_cs = ((boot.star >> 32) & 0xFFFF) as u16;
+    let kernel_ss = kernel_cs.wrapping_add(8);
+    let user_base = ((boot.star >> 48) & 0xFFFF) as u16;
+    let user_ss = user_base.wrapping_add(8);
+    let user_cs = user_base.wrapping_add(16);
+    let at_sysret = s.rip == layout.trampoline_base + 2;
+    let (cs_ar, cs_selector, ss_ar, ss_selector) = if at_sysret {
+        (segs.kernel_cs_ar, kernel_cs, segs.kernel_data_ar, kernel_ss)
+    } else {
+        (segs.cs_ar, user_cs, segs.data_ar, user_ss)
+    };
+    let mut sregs = vcpu
+        .fd()
+        .get_sregs()
+        .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(restore): {e}")))?;
+    sregs.cr0 = s.cr0;
+    sregs.cr2 = 0;
+    sregs.cr3 = s.cr3;
+    sregs.cr4 = s.cr4;
+    sregs.efer = s.efer;
+    sregs.cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, cs_ar, cs_selector);
+    let data = |base| ar_to_kvm_segment(base, 0xFFFF_FFFF, segs.data_ar, 0);
+    sregs.ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, ss_ar, ss_selector);
+    sregs.ds = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
+    sregs.es = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
+    sregs.fs = data(s.fs_base);
+    sregs.gs = data(s.gs_base);
+    sregs.tr = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.tr_ar, seg_selector(X86Seg::Tr));
+    sregs.ldt = ar_to_kvm_segment(0, 0, segs.ldtr_ar, seg_selector(X86Seg::Ldtr));
+    sregs.gdt = kvm_dtable {
+        base: layout.gdt_base,
+        limit: segs.gdt_limit as u16,
+        ..Default::default()
+    };
+    sregs.idt = kvm_dtable {
+        base: 0,
+        limit: 0,
+        ..Default::default()
+    };
+    vcpu.fd()
+        .set_sregs(&sregs)
+        .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(restore): {e}")))?;
+
+    let mut regs = vcpu
+        .fd()
+        .get_regs()
+        .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(restore): {e}")))?;
+    regs.rax = s.gprs[0];
+    regs.rbx = s.gprs[1];
+    regs.rcx = s.gprs[2];
+    regs.rdx = s.gprs[3];
+    regs.rsi = s.gprs[4];
+    regs.rdi = s.gprs[5];
+    regs.rbp = s.gprs[6];
+    regs.rsp = s.rsp;
+    regs.r8 = s.gprs[8];
+    regs.r9 = s.gprs[9];
+    regs.r10 = s.gprs[10];
+    regs.r11 = s.gprs[11];
+    regs.r12 = s.gprs[12];
+    regs.r13 = s.gprs[13];
+    regs.r14 = s.gprs[14];
+    regs.r15 = s.gprs[15];
+    regs.rip = s.rip;
+    regs.rflags = s.rflags;
+    vcpu.fd()
+        .set_regs(&regs)
+        .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(restore): {e}")))?;
+
+    if let Some(fx) = &s.fp {
+        let _ = vcpu.set_fp(fx)?;
+    }
+    vcpu.set_syscall_msrs(layout.trampoline_base, boot.star, boot.sfmask)?;
+    Ok(())
 }
 
 impl X86Vcpu for KvmVcpu {
@@ -556,6 +747,18 @@ fn fxsave_into_kvm_fpu(fx: &[u8; 512], fpu: &mut kvm_bindings::kvm_fpu) {
 /// writes the trampoline/GDT/PML4 images, creates the vCPU, and programs long
 /// mode via the shared [`carrick_x86::program_longmode_entry`].
 pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<KvmVmm>, TrapError> {
+    let (vm, ram, page_tables, vcpu) = build_kvm_x86_guest(image)?;
+    let vmm = KvmVmm {
+        vm,
+        ram,
+        page_tables,
+    };
+    Ok(X86EngineCore::from_parts(vmm, vcpu, KVM_X86_LAYOUT))
+}
+
+fn build_kvm_x86_guest(
+    image: &AddressSpace,
+) -> Result<(KvmVm, GuestRam, Arc<Mutex<Pml4Manager>>, KvmVcpu), TrapError> {
     use carrick_hal::HvVm as _;
 
     // 1. Lay out guest RAM (identity GPA = VA; N capped MAP_NORESERVE windows).
@@ -573,6 +776,10 @@ pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<KvmVmm>, TrapError
     //    The plan/PML4 are built via the shared region-walk.
     let plan = carrick_x86::plan_windows(image, KVM_X86_LAYOUT)?;
     let pml4_bytes = carrick_x86::build_pml4(&plan, KVM_X86_LAYOUT)?;
+    let page_tables = Arc::new(Mutex::new(Pml4Manager::new(
+        pml4_bytes.clone(),
+        X86_PML4_BASE,
+    )));
     write_bringup_images_via_ram(&mut ram, &pml4_bytes)?;
 
     // 4. Create the vCPU and program long mode (CR/EFER/segs/GDTR/MSRs).
@@ -587,8 +794,7 @@ pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<KvmVmm>, TrapError
         carrick_x86::program_longmode_entry(&mut vcpu, KVM_X86_LAYOUT, image.entry(), rsp)?;
     // KVM is MsrInstall::Direct — the SYSCALL MSRs are already live; no ring-0 blob.
 
-    let vmm = KvmVmm { vm, ram };
-    Ok(X86EngineCore::from_parts(vmm, vcpu, KVM_X86_LAYOUT))
+    Ok((vm, ram, page_tables, vcpu))
 }
 
 /// Write the trampoline/GDT/PML4 byte images into `ram` directly (the bring-up
