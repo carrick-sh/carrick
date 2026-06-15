@@ -1,7 +1,7 @@
 use carrick_hal::TrapError;
 
 use crate::bringup_fns::BringupLayout;
-use crate::vmm::{WindowRegion, X86_PML4_CAPACITY, X86FaultKind, X86Seg, X86Vcpu};
+use crate::vmm::{WindowRegion, X86_PML4_CAPACITY, X86Exit, X86FaultKind, X86Reg, X86Seg, X86Vcpu};
 
 pub const FP_STUB_DOORBELL_PORT: u16 = 0xC6;
 pub const FAULT_DOORBELL_PORT: u16 = 0xC7;
@@ -272,6 +272,37 @@ pub fn program_fault_segments<C: X86Vcpu>(
         X86_TSS64_LIMIT,
         segs.tr_ar,
     )
+}
+
+pub fn fault_exit_from_record<C: X86Vcpu>(
+    vcpu: &mut C,
+    record: FaultDoorbellRecord,
+    backend: &str,
+) -> Result<X86Exit, TrapError> {
+    if record.cs & 3 != 3 {
+        return Err(TrapError::Hypervisor(format!(
+            "{backend}: ring-0 fault vector={} error=0x{:x} rip=0x{:x} cs=0x{:x} cr2=0x{:x}",
+            record.vector, record.error_code, record.rip, record.cs, record.cr2
+        )));
+    }
+
+    restore_user_after_fault(vcpu, record)?;
+    Ok(X86Exit::Fault {
+        kind: record.kind(),
+        fault_addr: record.fault_addr(),
+        error_code: record.error_code,
+    })
+}
+
+fn restore_user_after_fault<C: X86Vcpu>(
+    vcpu: &mut C,
+    record: FaultDoorbellRecord,
+) -> Result<(), TrapError> {
+    crate::program_user_segments(vcpu)?;
+    vcpu.set_gpr(X86Reg::Rax, record.saved_rax)?;
+    vcpu.set_gpr(X86Reg::Rip, record.rip)?;
+    vcpu.set_gpr(X86Reg::Rsp, record.rsp)?;
+    vcpu.set_gpr(X86Reg::Rflags, record.rflags | 0x2)
 }
 
 fn vector_has_error_code(vector: u8) -> bool {
