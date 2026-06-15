@@ -97,6 +97,16 @@ impl<V: X86Vmm> X86EngineCore<V> {
         }
     }
 
+    fn flush_current_tlb(&mut self) -> Result<(), MemoryError> {
+        let cr3 = self
+            .vcpu
+            .get_gpr(X86Reg::Cr3)
+            .map_err(|e| MemoryError::HostMap(format!("x86: read CR3 for TLB flush: {e}")))?;
+        self.vcpu
+            .set_gpr(X86Reg::Cr3, cr3)
+            .map_err(|e| MemoryError::HostMap(format!("x86: reload CR3 for TLB flush: {e}")))
+    }
+
     /// Immutable access to the underlying VM (sibling-spec construction, fork).
     pub fn vm(&self) -> &V {
         &self.vm
@@ -161,7 +171,18 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        self.vm.protect_range(address, len, prot)
+        self.vm.protect_range(address, len, prot)?;
+        self.flush_current_tlb()
+    }
+
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.vm.unmap_range(address, len)?;
+        self.flush_current_tlb()
+    }
+
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.vm.unmap_alias_range(address, len)?;
+        self.flush_current_tlb()
     }
 }
 

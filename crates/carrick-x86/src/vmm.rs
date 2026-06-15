@@ -240,6 +240,19 @@ pub trait X86Vmm: Sized {
         Ok(())
     }
 
+    /// Make a VA range non-present for `munmap`. Backends with page tables can
+    /// override this when unmap differs from `PROT_NONE`; otherwise clearing
+    /// present bits through `protect_range(..., PROT_NONE)` is the x86 default.
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.protect_range(address, len, 0)
+    }
+
+    /// Tear down an alias VA range. Backends may reclaim alias-specific table
+    /// storage; the default invalidates the leaves like an ordinary unmap.
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.unmap_range(address, len)
+    }
+
     /// Back a dynamic high-VA mapping and install the VA→GPA page-table path.
     /// Backends that can receive `DispatchOutcome::MapHostAlias` override this.
     fn map_host_alias(
