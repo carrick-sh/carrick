@@ -179,10 +179,12 @@ mod macos_helper_stubs {
         };
         #[cfg(not(all(feature = "platform-linux", target_arch = "aarch64")))]
         let image = raw
+            .with_vdso_auxv(false)
             .with_linux_initial_stack(argv, env)
             .map_err(|_| LINUX_ENOENT)?;
         // execve point of no return: reset CAUGHT handlers to SIG_DFL (the kernel
         // does this; SIG_IGN/mask/pending are preserved).
+        dispatcher.reset_memory_state_on_execve();
         dispatcher.reset_signal_handlers_on_execve();
         Ok(image)
     }

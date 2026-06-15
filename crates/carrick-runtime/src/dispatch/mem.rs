@@ -117,6 +117,14 @@ impl MemState {
             linux_auxv_image: Vec::new(),
         }
     }
+
+    fn reset_for_execve(&mut self) {
+        let address_space_regions = self.address_space_regions.take();
+        let linux_auxv_image = std::mem::take(&mut self.linux_auxv_image);
+        *self = Self::new();
+        self.address_space_regions = address_space_regions;
+        self.linux_auxv_image = linux_auxv_image;
+    }
 }
 
 /// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
@@ -148,6 +156,17 @@ fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     *regions = out;
 }
 impl SyscallDispatcher {
+    /// Reset memory-accounting state that Linux destroys across `execve(2)`.
+    ///
+    /// The guest VM is rebuilt separately by the active engine; this resets the
+    /// dispatcher-owned view of that VM: program break, mmap bump/free lists,
+    /// shared/overlay aperture allocators, and any mprotect state implied by the
+    /// old image. The proc/auxv snapshot is preserved because callers refresh it
+    /// for the new image in the same execve transition.
+    pub(crate) fn reset_memory_state_on_execve(&self) {
+        self.mem.lock().reset_for_execve();
+    }
+
     pub(in crate::dispatch) fn next_mmap_address(
         &self,
         requested: u64,
@@ -1318,6 +1337,34 @@ mod tests {
         assert_eq!(second, Some((freed + LINUX_PAGE_SIZE, true)));
 
         assert!(dispatcher.mem.lock().free_regions.is_empty());
+    }
+
+    #[test]
+    fn reset_memory_state_on_execve_resets_arenas_and_preserves_auxv_snapshot() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_auxv_image(vec![1, 2, 3, 4]);
+        {
+            let mut mem = dispatcher.mem.lock();
+            mem.brk_current = LINUX_HEAP_BASE + 0x21000;
+            mem.mmap_next = LINUX_MMAP_BASE + 0x8000;
+            mem.mmap_dirty_high = LINUX_MMAP_BASE + 0x9000;
+            free_regions_insert(&mut mem.free_regions, LINUX_MMAP_BASE + 0x1000, 0x1000);
+        }
+
+        dispatcher.reset_memory_state_on_execve();
+
+        {
+            let mem = dispatcher.mem.lock();
+            assert_eq!(mem.brk_current, LINUX_HEAP_BASE);
+            assert_eq!(mem.mmap_next, LINUX_MMAP_BASE);
+            assert_eq!(mem.mmap_dirty_high, LINUX_MMAP_BASE);
+            assert!(mem.free_regions.is_empty());
+            assert_eq!(mem.linux_auxv_image, vec![1, 2, 3, 4]);
+        }
+        assert_eq!(
+            dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0),
+            Some((LINUX_MMAP_BASE, false))
+        );
     }
 
     #[test]
