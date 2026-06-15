@@ -1956,9 +1956,11 @@ where
                     fault_addr,
                 }) => {
                     // The ISA-neutral structured fault path: an x86 backend emits
-                    // this directly (fault_addr = CR2). The faulting instruction
-                    // is re-run from the engine's saved PC (interrupted_pc=None),
-                    // matching the x86 fault-resume semantics.
+                    // this directly (fault_addr = CR2). The backend restores the
+                    // interrupted user context before surfacing the fault, so the
+                    // live PC is the faulting instruction, not a syscall-return
+                    // RCX path.
+                    let interrupted_pc = Some(engine.current_pc()?);
                     if let Some(outcome) = deliver_fault_signal(
                         &kernel,
                         &mut engine,
@@ -1966,7 +1968,7 @@ where
                         signum,
                         si_code,
                         fault_addr,
-                        None,
+                        interrupted_pc,
                         traps,
                     )? {
                         return Ok(outcome);

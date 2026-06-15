@@ -339,16 +339,98 @@ impl FaultScratchRecord {
 }
 
 pub fn fault_scratch_record_from_bytes(bytes: &[u8]) -> Result<FaultScratchRecord, OsError> {
-    let size = std::mem::size_of::<FaultScratchRecord>();
+    read_packed_record(bytes, "fault scratch record")
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct FaultFrameWithError {
+    saved_rax: u64,
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct FaultFrameNoError {
+    saved_rax: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<FaultFrameWithError>() == 56);
+const _: () = assert!(std::mem::size_of::<FaultFrameNoError>() == 48);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaultUserContext {
+    pub saved_rax: u64,
+    pub error_code: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+pub fn fault_stack_frame_len(vector: u64) -> Result<usize, OsError> {
+    let vector = u8::try_from(vector)
+        .map_err(|_| OsError::new(format!("bhyve: invalid fault vector {vector}")))?;
+    Ok(if vector_has_error_code(vector) {
+        std::mem::size_of::<FaultFrameWithError>()
+    } else {
+        std::mem::size_of::<FaultFrameNoError>()
+    })
+}
+
+pub fn fault_user_context_from_bytes(
+    vector: u64,
+    bytes: &[u8],
+) -> Result<FaultUserContext, OsError> {
+    let vector = u8::try_from(vector)
+        .map_err(|_| OsError::new(format!("bhyve: invalid fault vector {vector}")))?;
+    if vector_has_error_code(vector) {
+        let frame: FaultFrameWithError = read_packed_record(bytes, "fault frame with error")?;
+        Ok(FaultUserContext {
+            saved_rax: frame.saved_rax,
+            error_code: frame.error_code,
+            rip: frame.rip,
+            cs: frame.cs,
+            rflags: frame.rflags,
+            rsp: frame.rsp,
+            ss: frame.ss,
+        })
+    } else {
+        let frame: FaultFrameNoError = read_packed_record(bytes, "fault frame without error")?;
+        Ok(FaultUserContext {
+            saved_rax: frame.saved_rax,
+            error_code: 0,
+            rip: frame.rip,
+            cs: frame.cs,
+            rflags: frame.rflags,
+            rsp: frame.rsp,
+            ss: frame.ss,
+        })
+    }
+}
+
+fn read_packed_record<T: Copy>(bytes: &[u8], name: &str) -> Result<T, OsError> {
+    let size = std::mem::size_of::<T>();
     if bytes.len() < size {
         return Err(OsError::new(format!(
-            "bhyve: fault scratch record too short: {} < {size}",
+            "bhyve: {name} too short: {} < {size}",
             bytes.len()
         )));
     }
-    // SAFETY: FaultScratchRecord is repr(C, packed) POD integer fields, and
+    // SAFETY: callers use repr(C, packed) POD integer structs, and
     // read_unaligned copies exactly the record prefix from the byte slice.
-    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<FaultScratchRecord>()) })
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
 }
 
 #[repr(C, packed)]
@@ -697,23 +779,32 @@ fn fault_stub_for_vector(
 ) -> Result<Vec<u8>, OsError> {
     let mut stub = Vec::with_capacity(X86_FAULT_STUB_STRIDE as usize);
 
+    // Save the interrupted RAX. The stub uses RAX as scratch, then restores it
+    // before the doorbell exit so signal-frame construction snapshots the guest
+    // value, not the stub's temporary vector/error value.
+    stub.push(0x50); // push %rax
+
     // scratch[0] = vector as u64
     stub.extend_from_slice(&[0x48, 0xB8]); // movabs imm64,%rax
     stub.extend_from_slice(&u64::from(vector).to_le_bytes());
     let store_vector_va = stub_start + stub.len() as u64;
     push_store_rax_riprel(&mut stub, store_vector_va, scratch_gpa)?;
 
-    // scratch[8] = CPU-pushed error code, or 0 for vectors without one.
+    // scratch[8] = CPU-pushed error code, or 0 for vectors without one. The
+    // saved RAX is at (%rsp), so error-code vectors now have errcode at 8(%rsp).
     if vector_has_error_code(vector) {
-        stub.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov (%rsp),%rax
+        stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x08]); // mov 8(%rsp),%rax
     } else {
         stub.extend_from_slice(&[0x31, 0xC0]); // xor %eax,%eax
     }
     let store_error_va = stub_start + stub.len() as u64;
     push_store_rax_riprel(&mut stub, store_error_va, scratch_gpa + 8)?;
 
+    // Restore interrupted RAX before exiting to the host.
+    stub.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov (%rsp),%rax
+
     // Report the vector and park. The host consumes the INOUT exit.
-    stub.extend_from_slice(&[0xB0, vector, 0xE6, FAULT_DOORBELL_PORT as u8, 0xEB, 0xFE]);
+    stub.extend_from_slice(&[0xE6, FAULT_DOORBELL_PORT as u8, 0xEB, 0xFE]);
 
     if stub.len() > X86_FAULT_STUB_STRIDE as usize {
         return Err(OsError::new(format!(
