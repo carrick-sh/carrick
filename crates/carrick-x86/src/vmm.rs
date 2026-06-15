@@ -100,12 +100,13 @@ pub enum X86Exit {
     /// (`get_fp() == None`) ever surfaces this, and only while
     /// [`crate::bringup::run_fp_stub`] is driving the stub.
     FpDoorbell,
-    /// A synchronous guest fault → the runtime delivers it as
-    /// [`carrick_hal::TrapError::GuestFault`] (SIGSEGV/SIGBUS). `gpa` is the
-    /// faulting address (CR2 on x86); `error_code` is the page-fault error code.
+    /// A synchronous guest fault -> the runtime delivers it as
+    /// [`carrick_hal::TrapError::GuestFault`]. `fault_addr` is the Linux
+    /// `siginfo.si_addr` value already resolved by the backend (CR2 for #PF,
+    /// RIP for #UD/#DE, NULL for #GP); `error_code` is the x86 error code.
     Fault {
         kind: X86FaultKind,
-        gpa: u64,
+        fault_addr: u64,
         error_code: u64,
     },
 }
@@ -116,8 +117,14 @@ pub enum X86Exit {
 pub enum X86FaultKind {
     /// Page fault (#PF) → SIGSEGV.
     PageFault,
-    /// General protection / alignment fault → SIGSEGV/SIGBUS.
-    Protection,
+    /// Divide error (#DE) -> SIGFPE/FPE_INTDIV.
+    DivideError,
+    /// Invalid opcode (#UD) -> SIGILL/ILL_ILLOPN.
+    InvalidOpcode,
+    /// General protection (#GP) -> SIGSEGV/SI_KERNEL.
+    GeneralProtection,
+    /// Alignment check (#AC) -> SIGBUS/BUS_ADRALN.
+    AlignmentCheck,
     /// Any other fatal guest exception.
     Other,
 }

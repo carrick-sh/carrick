@@ -333,6 +333,72 @@ fn sigsegv_accerr_handler_receives_protection_siginfo() {
 }
 
 #[test]
+fn sigill_handler_receives_ud2_siginfo() {
+    // SP4.4 non-#PF oracle: Docker linux/amd64 reports UD2 as
+    // SIGILL/ILL_ILLOPN with si_addr equal to the faulting instruction RIP.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGILL") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGILL to the sigill ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "sigill guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("sigill-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
+fn sigfpe_handler_receives_divide_error_siginfo() {
+    // SP4.4 non-#PF oracle: Docker linux/amd64 reports integer divide-by-zero as
+    // SIGFPE/FPE_INTDIV with si_addr equal to the faulting instruction RIP.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGFPE") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGFPE to the sigfpe ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "sigfpe guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("sigfpe-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
+fn sigsegv_gp_handler_receives_linux_siginfo() {
+    // SP4.4 non-#PF oracle: Docker linux/amd64 reports a user-mode privileged
+    // instruction (#GP via CLI) as SIGSEGV/SI_KERNEL with si_addr == NULL.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGSEGV_GP") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGSEGV_GP to the sigsegv-gp ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "sigsegv-gp guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("sigsegv-gp-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
 fn async_signal_interrupts_tight_loop() {
     // SP4.1: a guest spins in a tight ALU loop with NO syscalls while a SIBLING
     // guest thread tgkills it. The signal must interrupt the running vCPU at an
