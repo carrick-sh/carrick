@@ -470,6 +470,7 @@ dependencies = [
  "carrick-signal-core",
  "carrick-thread",
  "carrick-timer-core",
+ "carrick-x86",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
