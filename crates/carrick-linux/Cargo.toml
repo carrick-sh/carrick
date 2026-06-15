@@ -23,6 +23,9 @@ carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-abi = { path = "../carrick-abi" }
+# The shared x86 engine scaffold (Stage 4-KVM): the KVM x86 lane is migrated onto
+# `X86EngineCore<KvmVmm>` instead of the hand-rolled `KvmX86TrapEngine`.
+carrick-x86 = { path = "../carrick-x86" }
 # Neutral timer slot/registry bookkeeping. `KvmTimerDelivery` delegates slot
 # mutation here and (for POSIX) spawns the wall-clock firing thread; interval
 # timers use the caller-spawned `run_fallback` (arm_itimer → false).
