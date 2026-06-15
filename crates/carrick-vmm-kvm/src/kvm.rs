@@ -773,6 +773,25 @@ impl HvVcpu for KvmVcpu {
             KvmExit::SystemEvent(_, _) => Ok(VcpuExit::Halt),
             KvmExit::Shutdown | KvmExit::Hlt => Ok(VcpuExit::Halt),
             KvmExit::Intr => Ok(VcpuExit::Kicked),
+            KvmExit::Debug(debug) => Err(os_err("unexpected KVM_RUN exit", format!("{debug:?}"))),
+            KvmExit::InternalError => {
+                let regs = self.fd().get_regs().ok();
+                let sregs = self.fd().get_sregs().ok();
+                let mut msg = "InternalError".to_string();
+                if let Some(r) = regs {
+                    msg.push_str(&format!(
+                        " rip=0x{:x} rsp=0x{:x} rflags=0x{:x} rax=0x{:x}",
+                        r.rip, r.rsp, r.rflags, r.rax
+                    ));
+                }
+                if let Some(s) = sregs {
+                    msg.push_str(&format!(
+                        " cr0=0x{:x} cr2=0x{:x} cr3=0x{:x} cr4=0x{:x} efer=0x{:x}",
+                        s.cr0, s.cr2, s.cr3, s.cr4, s.efer
+                    ));
+                }
+                Err(os_err("unexpected KVM_RUN exit", msg))
+            }
             other => Err(os_err("unexpected KVM_RUN exit", format!("{other:?}"))),
         }
     }
