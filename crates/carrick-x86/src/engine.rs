@@ -25,12 +25,31 @@ use carrick_hal::{
 use carrick_mem::memory::AddressSpace;
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
-use crate::vmm::{X86Exit, X86Reg, X86Vcpu, X86Vmm};
+use crate::vmm::{X86Exit, X86FaultKind, X86Reg, X86Vcpu, X86Vmm};
 
 /// fxsave-area byte offsets (Intel SDM vol. 1 §10.5.1 "FXSAVE Area"):
 ///   MXCSR at +24, XMM0 at +160 (16 bytes each).
 const FXSAVE_MXCSR_OFF: usize = 24;
 const FXSAVE_XMM0_OFF: usize = 160;
+const X86_PFEC_PRESENT: u64 = 1 << 0;
+
+fn x86_fault_signal(kind: X86FaultKind, error_code: u64) -> Option<(i32, i32)> {
+    const SIGSEGV: i32 = libc::SIGSEGV;
+    const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
+    match kind {
+        X86FaultKind::PageFault => {
+            let si_code = if error_code & X86_PFEC_PRESENT != 0 {
+                SEGV_ACCERR
+            } else {
+                SEGV_MAPERR
+            };
+            Some((SIGSEGV, si_code))
+        }
+        X86FaultKind::Protection => Some((SIGSEGV, SEGV_MAPERR)),
+        X86FaultKind::Other => None,
+    }
+}
 
 /// The generic x86 trap engine. Owns the VM, the (one) vCPU, the pending-syscall
 /// resume PC, and the SA_RESTART syscall-number stash. Per-backend behaviour is
@@ -129,6 +148,10 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         // the source slice is disjoint.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, length) };
         Ok(())
+    }
+
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        self.vm.protect_range(address, len, prot)
     }
 }
 
@@ -317,10 +340,12 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                     error_code,
                 } => {
                     // Deliver as an ISA-neutral guest fault. CR2 (the faulting
-                    // VA) rides in `gpa`. Page/protection faults → SIGSEGV.
-                    let _ = (kind, error_code);
-                    let signum = libc::SIGSEGV;
-                    let si_code = 1; // SEGV_MAPERR (address not mapped to object)
+                    // VA) rides in `gpa`. For #PF, PFEC.P selects MAPERR vs
+                    // ACCERR exactly like Linux.
+                    let (signum, si_code) =
+                        x86_fault_signal(kind, error_code).ok_or_else(|| {
+                            TrapError::Hypervisor(format!("unsupported x86 fault kind {kind:?}"))
+                        })?;
                     return Err(TrapError::GuestFault {
                         signum,
                         si_code,
@@ -543,3 +568,22 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
 // valid in every thread of the process (threads share the address space). The
 // engine is moved to its owning sibling/vCPU thread before use.
 unsafe impl<V: X86Vmm> Send for X86EngineCore<V> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x86_page_fault_present_bit_selects_accerr() {
+        assert_eq!(
+            x86_fault_signal(X86FaultKind::PageFault, 0),
+            Some((libc::SIGSEGV, 1)),
+            "non-present #PF is SEGV_MAPERR"
+        );
+        assert_eq!(
+            x86_fault_signal(X86FaultKind::PageFault, X86_PFEC_PRESENT),
+            Some((libc::SIGSEGV, 2)),
+            "present-page protection #PF is SEGV_ACCERR"
+        );
+    }
+}

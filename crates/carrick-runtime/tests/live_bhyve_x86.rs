@@ -293,6 +293,46 @@ fn sigsegv_handler_receives_fault_siginfo() {
 }
 
 #[test]
+fn sigsegv_default_action_terminates_with_139() {
+    // SP4.4 default-action acceptance: a guest null store with no installed
+    // handler must take Linux's default SIGSEGV action and surface as exit 139.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGSEGV_DEFAULT") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGSEGV_DEFAULT to the sigsegv-default ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        139,
+        "unhandled sigsegv guest must exit 139 (stdout: {:?}, stderr: {:?})",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn sigsegv_accerr_handler_receives_protection_siginfo() {
+    // SP4.4 ACCERR acceptance: a write to a present read-only mapping must be
+    // delivered as SIGSEGV/SEGV_ACCERR, not the null-page SEGV_MAPERR case.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGSEGV_ACCERR") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGSEGV_ACCERR to the sigsegv-accerr ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "sigsegv-accerr guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("sigsegv-accerr-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
 fn async_signal_interrupts_tight_loop() {
     // SP4.1: a guest spins in a tight ALU loop with NO syscalls while a SIBLING
     // guest thread tgkills it. The signal must interrupt the running vCPU at an

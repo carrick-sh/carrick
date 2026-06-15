@@ -49,9 +49,12 @@ use std::ffi::c_int;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
+use carrick_abi::LinuxProtFlags;
+use carrick_guest_mem::MemoryError;
 use carrick_hal::OsError;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
+use carrick_mem::pml4::Pml4Manager;
 use carrick_x86::{
     BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86FaultKind,
     X86Reg, X86Seg, X86Vcpu, X86Vmm,
@@ -61,9 +64,9 @@ use crate::bhyve_kicker::{BhyveKickHandle, BhyveKicker};
 use crate::guest_setup_x86::{
     BhyveGuestRam, BroughtUpX86, FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultScratchRecord,
     PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA, X86_FP_STUB_GPA,
-    X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_GPA, bring_up_x86_elf, fault_scratch_gpa,
-    fault_scratch_record_from_bytes, fault_stack_frame_len, fault_user_context_from_bytes,
-    program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
+    X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_CAPACITY, X86_PML4_GPA, bring_up_x86_elf,
+    fault_scratch_gpa, fault_scratch_record_from_bytes, fault_stack_frame_len,
+    fault_user_context_from_bytes, program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
 };
 use crate::vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm, Vcpu};
 use crate::vmm_x86::{
@@ -650,6 +653,47 @@ impl X86Vmm for BhyveVmm {
             }
         }
         None
+    }
+
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        let host = self
+            .vm
+            .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
+            .ok_or_else(|| {
+                MemoryError::HostMap(format!(
+                    "bhyve-x86: PML4 map_gpa 0x{X86_PML4_GPA:x} unmapped"
+                ))
+            })?;
+        let mut tables = vec![0u8; X86_PML4_CAPACITY];
+        // SAFETY: map_gpa proved the live PML4 table window is mapped.
+        unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
+
+        let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
+        let prot = LinuxProtFlags::from_bits_truncate(prot);
+        let exec = prot.contains(LinuxProtFlags::EXEC);
+        let changed = if prot.is_empty() {
+            mgr.set_prot_none(address, len)
+        } else if prot.contains(LinuxProtFlags::WRITE) {
+            mgr.set_rw(address, len, exec)
+        } else {
+            mgr.set_readonly(address, len, exec)
+        }
+        .map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: len,
+        })?;
+        if !changed {
+            return Ok(());
+        }
+
+        // SAFETY: the live table window and edited table image are both
+        // X86_PML4_CAPACITY bytes.
+        unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
+        self.h
+            .as_bhyve()
+            .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
+            .map_err(|e| MemoryError::HostMap(format!("bhyve-x86: reload CR3: {e}")))?;
+        Ok(())
     }
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
