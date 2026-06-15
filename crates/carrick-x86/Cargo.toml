@@ -20,3 +20,8 @@ workspace = true
 carrick-hal = { path = "../carrick-hal" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+# The shared sigframe glue (`inject_signal`) trades in `carrick_abi::LinuxSiginfo`;
+# the run-elf service loop + fault delivery call host `read(2)`/`write(2)` and
+# reference `libc` signal/errno numbers.
+carrick-abi = { path = "../carrick-abi" }
+libc.workspace = true

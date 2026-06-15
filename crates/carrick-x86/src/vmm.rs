@@ -12,8 +12,10 @@
 //! Stage 1 defines this surface only — NOTHING implements it yet (no backend is
 //! migrated). It must compile standalone.
 
+use std::sync::Arc;
+
 use carrick_guest_mem::X8664SyscallFrame;
-use carrick_hal::TrapError;
+use carrick_hal::{TrapError, VcpuKick, VcpuRegistry};
 
 /// The shared x86 register view the engine reads/writes through the backend. The
 /// union of KVM's `kvm_regs` named fields, bhyve's `vm_reg_name` ordinals, and
@@ -173,6 +175,12 @@ pub struct WindowPlan {
     pub regions: Vec<WindowRegion>,
 }
 
+/// Capacity of the PML4 table region in bytes (448 pages × 4 KiB = 1.75 MiB).
+/// Shared with `carrick_mem::memory::LINUX_PAGE_TABLES_SIZE` so the `pml4_tables`
+/// budget matches the aarch64 lane. The bring-up reserves a supervisor-only
+/// window of this size for the page tables at `BringupLayout::pml4_base`.
+pub const X86_PML4_CAPACITY: u64 = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE;
+
 impl WindowPlan {
     /// The minimum contiguous `[0, max_gpa)` size a single-segment backend
     /// (bhyve) needs to cover every planned region. Returns 0 for an empty plan.
@@ -188,8 +196,23 @@ impl WindowPlan {
 /// VM-level memory + lifecycle. One per guest process. See §2.1/§2.5 for the
 /// honest semantic seams hiding behind `setup_memory`, `fork_ram_strategy`,
 /// `freeze_ram`/`rebuild_child_vm`.
+///
+/// The trait also carries the threaded-lifecycle surface
+/// (`build_sibling_builder` / `materialize_sibling` / `kick_handle` /
+/// `fresh_fork_kicker` / `set_guest_sp`) the generic engine's `ThreadedEngine`
+/// impl drives — these are the per-backend "spawn a sibling vCPU on the same VM"
+/// and "kick a vCPU thread" mechanisms, which differ per VMM.
 pub trait X86Vmm: Sized {
     type Vcpu: X86Vcpu;
+
+    /// The per-backend vCPU-kick handle (`KvmKickHandle` / `BhyveKickHandle`).
+    /// Surfaces as `X86EngineCore<V>::KickHandle`.
+    type KickHandle: VcpuKick + 'static;
+
+    /// The `Send` payload `build_sibling_builder` hands to a freshly spawned host
+    /// thread; `materialize_sibling` turns it into a fresh `(Self, Self::Vcpu)`
+    /// pair on the SAME VM (clone(CLONE_THREAD)) without re-registering memory.
+    type SiblingBuilder: Send;
 
     /// Consume the SHARED [`WindowPlan`]; the backend owns the slot-vs-segment
     /// decision (§2.5a).
@@ -221,6 +244,34 @@ pub trait X86Vmm: Sized {
     fn rebuild_child_vm(&mut self, _frozen: &[u8]) -> Result<(), TrapError> {
         Ok(())
     }
+
+    // ── Threaded-lifecycle surface (the generic ThreadedEngine drives these) ──
+
+    /// A kick handle for the current vCPU thread (the engine's `kick_handle`).
+    fn kick_handle(&self) -> Self::KickHandle;
+
+    /// Backend admission gate before a new vCPU thread runs (HVF's concurrent-
+    /// vCPU cap; a no-op on KVM/bhyve).
+    fn wait_for_vcpu_slot() {}
+
+    /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling thread needs to
+    /// add its own vCPU on the SAME VM (shared VM handle + window descriptors +
+    /// a reserved live-vcpu slot, etc.).
+    fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError>;
+
+    /// On the sibling thread, turn the builder into a fresh `(VM-handle, vCPU)`
+    /// pair on the SAME VM. The vCPU is returned UNPROGRAMMED; the engine
+    /// restores the seeded snapshot onto it.
+    fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError>;
+
+    /// Set the guest user stack pointer (RSP) on a vfork child given an explicit
+    /// `child_stack`, through `&self` (the shared loop holds only `&engine`).
+    fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError>;
+
+    /// A FRESH vCPU-kick registry for the CHILD side of a guest `fork(2)`
+    /// (`libc::fork` replicates only the calling thread — the child drops the
+    /// parent's kicker).
+    fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry>;
 }
 
 /// Per-vCPU register/run surface. The ONLY thing genuinely per-VMM.
