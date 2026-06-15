@@ -213,7 +213,7 @@ fn make_self_pipe() -> i32 {
 /// any exited child, then kick every vCPU + nudge the futex.
 fn spawn_pump_thread(read_fd: i32, registry: Arc<dyn VcpuRegistry>, futex: Arc<dyn PlatformFutex>) {
     let handle = std::thread::Builder::new()
-        .name("carrick-bhyve-sig-pump".to_string())
+        .name("carrick-vmm-bhyve-sig-pump".to_string())
         .spawn(move || {
             let mut pfd = libc::pollfd {
                 fd: read_fd,

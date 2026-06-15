@@ -1,4 +1,4 @@
-//! carrick-bhyve: the FreeBSD/bhyve HAL backend (third platform).
+//! carrick-vmm-bhyve: the FreeBSD/bhyve HAL backend (third platform).
 //!
 //! Mirrors `carrick-linux`'s shape — a `carrick-hal` `HvVm`/`HvVcpu` over the
 //! host hypervisor, eventually paired with a `SyscallTrap`/`GuestMemory` trap

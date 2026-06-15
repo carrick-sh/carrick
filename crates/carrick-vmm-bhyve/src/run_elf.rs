@@ -343,7 +343,7 @@ pub fn run_elf_bhyve(path: impl AsRef<Path>) -> Result<i32, String> {
             SYS_TKILL => {
                 let sig = args[1];
                 if sig == SIGABRT {
-                    eprintln!("carrick-bhyve: guest called tkill(SIGABRT) → exit(134)");
+                    eprintln!("carrick-vmm-bhyve: guest called tkill(SIGABRT) → exit(134)");
                     return Ok(134);
                 }
                 0
@@ -362,7 +362,7 @@ pub fn run_elf_bhyve(path: impl AsRef<Path>) -> Result<i32, String> {
                 use carrick_hal::x8664_arch::X8664SyscallTable;
                 let name = X8664SyscallTable::name(other).unwrap_or("<unknown>");
                 eprintln!(
-                    "carrick-bhyve run-elf: unhandled canonical={other} \
+                    "carrick-vmm-bhyve run-elf: unhandled canonical={other} \
                      x86_name={name} args={:x?} → -ENOSYS",
                     &args
                 );

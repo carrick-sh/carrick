@@ -5,11 +5,11 @@
 //! `run_elf_service_loop` — and asserts the guest prints "hello, x86_64 world"
 //! and exits 0. This is the portability Stage-5 BINDING acceptance test: a real
 //! x86-64 Linux ELF runs to "hello" on NVMM through the thin per-VMM trait pair
-//! over the shared engine (zero copy from carrick-bhyve).
+//! over the shared engine (zero copy from carrick-vmm-bhyve).
 //!
 //! The fixture is a static-musl x86_64 ELF provided by absolute path via env
 //! (cross-built off-box; the NetBSD box has no musl cross-target):
-//!   * `CARRICK_NVMM_FIXTURE` → hello (`crates/carrick-bhyve/fixtures/hello-x86_64`)
+//!   * `CARRICK_NVMM_FIXTURE` → hello (`crates/carrick-vmm-bhyve/fixtures/hello-x86_64`)
 //!
 //! Run on VM 201 (root, for `/dev/nvmm`; `modload nvmm` if ENXIO):
 //! ```

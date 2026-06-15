@@ -2,7 +2,7 @@
 //!
 //! `NvmmVmm` (+ `impl X86Vcpu for NvmmVcpu`) is the thin per-VMM trait pair the
 //! generic [`carrick_x86::X86EngineCore`] is parameterized over — mirroring
-//! `carrick-linux`'s `kvm_x86_engine`, NOT copied from carrick-bhyve. The trap
+//! `carrick-linux`'s `kvm_x86_engine`, NOT copied from carrick-vmm-bhyve. The trap
 //! loop, register walk, guest-memory access, snapshot triple, long-mode
 //! bring-up, and run-elf loop all live ONCE in `carrick-x86`; this supplies only
 //! the NVMM-specific marshalling.
