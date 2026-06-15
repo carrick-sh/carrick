@@ -15,7 +15,9 @@ use carrick_mem::memory::AddressSpace;
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
 #[cfg(target_arch = "x86_64")]
-use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES};
+use kvm_bindings::{
+    CpuId, KVM_CAP_EXIT_ON_EMULATION_FAILURE, KVM_MAX_CPUID_ENTRIES, kvm_enable_cap,
+};
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit as KvmExit, VcpuFd, VmFd};
 use libc;
@@ -27,11 +29,11 @@ fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
 }
 
-fn append_vcpu_state(fd: &VcpuFd, msg: &mut String) {
+pub(crate) fn append_vcpu_state(fd: &VcpuFd, msg: &mut String) {
     match fd.get_regs() {
         Ok(r) => msg.push_str(&format!(
-            " rip=0x{:x} rsp=0x{:x} rflags=0x{:x} rax=0x{:x}",
-            r.rip, r.rsp, r.rflags, r.rax
+            " rip=0x{:x} rsp=0x{:x} rflags=0x{:x} rax=0x{:x} rcx=0x{:x} r11=0x{:x}",
+            r.rip, r.rsp, r.rflags, r.rax, r.rcx, r.r11
         )),
         Err(e) => msg.push_str(&format!(" regs=<KVM_GET_REGS failed: {e}>")),
     }
@@ -354,7 +356,7 @@ pub struct KvmVm {
     /// Parked vcpus of EXITED sibling threads, shared across every handle to
     /// the same VM, for REUSE by later siblings (see [`KvmVcpu::fd`] — vcpu
     /// ids are a finite per-VM resource and cannot be freed, only recycled).
-    vcpu_pool: Arc<Mutex<Vec<VcpuFd>>>,
+    vcpu_pool: Arc<Mutex<Vec<ParkedVcpu>>>,
     /// `true` when `KVM_ARM_SET_COUNTER_OFFSET` pinned the VM-wide counter
     /// offset at VM creation (the offset then SURVIVES every vcpu init).
     /// `false` on kernels without the ioctl — then EVERY vcpu init must
@@ -381,7 +383,7 @@ pub(crate) struct SharedVmHandle {
     next_slot: Arc<AtomicU32>,
     /// Shared parked-vcpu pool (see [`KvmVcpu::fd`]) — exited siblings park
     /// their vcpu here for reuse; ids are a finite per-VM resource.
-    vcpu_pool: Arc<Mutex<Vec<VcpuFd>>>,
+    vcpu_pool: Arc<Mutex<Vec<ParkedVcpu>>>,
     /// Whether the VM-wide counter offset is pinned (see [`KvmVm::counter_locked`]).
     counter_locked: bool,
     /// Shared x86 CPUID table for sibling vCPUs on the same VM.
@@ -400,7 +402,41 @@ pub struct KvmVcpu {
     /// re-initializes it (KVM_ARM_VCPU_INIT is a full architectural reset)
     /// before handing it out — same UNPROGRAMMED contract as a fresh vcpu.
     fd: Option<VcpuFd>,
-    recycle: Option<Arc<Mutex<Vec<VcpuFd>>>>,
+    recycle: Option<Arc<Mutex<Vec<ParkedVcpu>>>>,
+    #[cfg(target_arch = "x86_64")]
+    fault_slot: u64,
+    #[cfg(target_arch = "x86_64")]
+    last_x86_restore: Option<KvmX86RestoreState>,
+}
+
+struct ParkedVcpu {
+    fd: VcpuFd,
+    #[cfg(target_arch = "x86_64")]
+    fault_slot: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub(crate) struct KvmX86RestoreState {
+    pub(crate) rip: u64,
+    pub(crate) rsp: u64,
+    pub(crate) rflags: u64,
+    pub(crate) rax: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rdi: u64,
+    pub(crate) r8: u64,
+    pub(crate) r11: u64,
+    pub(crate) fs_base: u64,
+    pub(crate) gs_base: u64,
+    pub(crate) cr0: u64,
+    pub(crate) cr3: u64,
+    pub(crate) cr4: u64,
+    pub(crate) efer: u64,
+    pub(crate) rcx_walk: [u64; 4],
+    pub(crate) rdx_walk: [u64; 4],
+    pub(crate) rsp_walk: [u64; 4],
+    pub(crate) fs_walk: [u64; 4],
 }
 
 impl KvmVcpu {
@@ -434,6 +470,121 @@ impl KvmVcpu {
     /// alive past image replacement.
     pub(crate) fn close_on_drop(&mut self) {
         self.recycle = None;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn record_x86_restore_state(&mut self, state: KvmX86RestoreState) {
+        self.last_x86_restore = Some(state);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn x86_fault_slot(&self) -> u64 {
+        self.fault_slot
+    }
+
+    pub(crate) fn append_debug_state(&self, msg: &mut String) {
+        append_vcpu_state(self.fd(), msg);
+        #[cfg(target_arch = "x86_64")]
+        if let Some(s) = self.last_x86_restore {
+            msg.push_str(&format!(
+                " last_restore={{rip=0x{:x} rsp=0x{:x} rflags=0x{:x} rax=0x{:x} \
+                 rcx=0x{:x} rdx=0x{:x} rdi=0x{:x} r8=0x{:x} r11=0x{:x} fs=0x{:x} gs=0x{:x} \
+                 cr0=0x{:x} cr3=0x{:x} cr4=0x{:x} efer=0x{:x} \
+                 rcx_walk=[0x{:x},0x{:x},0x{:x},0x{:x}] \
+                 rdx_walk=[0x{:x},0x{:x},0x{:x},0x{:x}] \
+                 rsp_walk=[0x{:x},0x{:x},0x{:x},0x{:x}] \
+                 fs_walk=[0x{:x},0x{:x},0x{:x},0x{:x}]}}",
+                s.rip,
+                s.rsp,
+                s.rflags,
+                s.rax,
+                s.rcx,
+                s.rdx,
+                s.rdi,
+                s.r8,
+                s.r11,
+                s.fs_base,
+                s.gs_base,
+                s.cr0,
+                s.cr3,
+                s.cr4,
+                s.efer,
+                s.rcx_walk[0],
+                s.rcx_walk[1],
+                s.rcx_walk[2],
+                s.rcx_walk[3],
+                s.rdx_walk[0],
+                s.rdx_walk[1],
+                s.rdx_walk[2],
+                s.rdx_walk[3],
+                s.rsp_walk[0],
+                s.rsp_walk[1],
+                s.rsp_walk[2],
+                s.rsp_walk[3],
+                s.fs_walk[0],
+                s.fs_walk[1],
+                s.fs_walk[2],
+                s.fs_walk[3]
+            ));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn append_kvm_internal_state(&mut self, msg: &mut String) {
+        use kvm_bindings::{
+            KVM_INTERNAL_ERROR_DELIVERY_EV, KVM_INTERNAL_ERROR_EMULATION,
+            KVM_INTERNAL_ERROR_EMULATION_FLAG_INSTRUCTION_BYTES, KVM_INTERNAL_ERROR_SIMUL_EX,
+            KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON,
+        };
+
+        fn suberror_name(suberror: u32) -> &'static str {
+            match suberror {
+                KVM_INTERNAL_ERROR_EMULATION => "EMULATION",
+                KVM_INTERNAL_ERROR_SIMUL_EX => "SIMUL_EX",
+                KVM_INTERNAL_ERROR_DELIVERY_EV => "DELIVERY_EV",
+                KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON => "UNEXPECTED_EXIT_REASON",
+                _ => "UNKNOWN",
+            }
+        }
+
+        let run = self.fd_mut().get_kvm_run();
+        // SAFETY: KVM_EXIT_INTERNAL_ERROR selects the `internal` union member.
+        let internal = unsafe { run.__bindgen_anon_1.internal };
+        let ndata = internal.ndata.min(internal.data.len() as u32) as usize;
+        msg.push_str(&format!(
+            " kvm_internal={{suberror={}({}) ndata={} data={:x?}}}",
+            internal.suberror,
+            suberror_name(internal.suberror),
+            internal.ndata,
+            &internal.data[..ndata]
+        ));
+        // SAFETY: when KVM_CAP_EXIT_ON_EMULATION_FAILURE is enabled,
+        // KVM_EXIT_INTERNAL_ERROR overlays the emulation_failure union member.
+        let emulation = unsafe { run.__bindgen_anon_1.emulation_failure };
+        let has_insn =
+            emulation.flags & u64::from(KVM_INTERNAL_ERROR_EMULATION_FLAG_INSTRUCTION_BYTES) != 0;
+        if has_insn {
+            // SAFETY: the instruction-byte flag marks this union arm valid.
+            let insn = unsafe { emulation.__bindgen_anon_1.__bindgen_anon_1 };
+            let size = usize::from(insn.insn_size).min(insn.insn_bytes.len());
+            msg.push_str(&format!(
+                " emulation_failure={{suberror={}({}) ndata={} flags=0x{:x} insn_size={} insn_bytes={:02x?}}}",
+                emulation.suberror,
+                suberror_name(emulation.suberror),
+                emulation.ndata,
+                emulation.flags,
+                insn.insn_size,
+                &insn.insn_bytes[..size],
+            ));
+        } else {
+            msg.push_str(&format!(
+                " emulation_failure={{suberror={}({}) ndata={} flags=0x{:x}}}",
+                emulation.suberror,
+                suberror_name(emulation.suberror),
+                emulation.ndata,
+                emulation.flags,
+            ));
+        }
     }
 }
 
@@ -481,7 +632,11 @@ impl Drop for KvmVcpu {
         if let (Some(fd), Some(pool)) = (self.fd.take(), self.recycle.as_deref())
             && let Ok(mut parked) = pool.lock()
         {
-            parked.push(fd);
+            parked.push(ParkedVcpu {
+                fd,
+                #[cfg(target_arch = "x86_64")]
+                fault_slot: self.fault_slot,
+            });
         }
         // No pool (or a poisoned lock): the fd just closes — correct for VM
         // teardown, merely forgoing reuse.
@@ -541,6 +696,15 @@ impl KvmVm {
         // uses TSC-based timekeeping which does not need this calibration.
         #[cfg(not(target_arch = "aarch64"))]
         let counter_locked = false;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let cap = kvm_enable_cap {
+                cap: KVM_CAP_EXIT_ON_EMULATION_FAILURE,
+                args: [1, 0, 0, 0],
+                ..Default::default()
+            };
+            let _ = vm.enable_cap(&cap);
+        }
         Ok(Self {
             _kvm: Some(kvm),
             vm: Arc::new(vm),
@@ -619,8 +783,15 @@ impl KvmVm {
         // the id space is spent) unless vcpus are recycled. The vcpu_init below
         // fully resets a recycled vcpu — same UNPROGRAMMED contract either way.
         let parked = self.vcpu_pool.lock().ok().and_then(|mut p| p.pop());
-        let fd = match parked {
-            Some(mut fd) => {
+        let fd: VcpuFd;
+        #[cfg(target_arch = "x86_64")]
+        let fault_slot: u64;
+        match parked {
+            Some(mut parked) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    fault_slot = parked.fault_slot;
+                }
                 // A parked fd was dropped while its OLD guest thread sat at a
                 // trapped syscall — i.e. mid `KVM_EXIT_MMIO` on the sentinel
                 // store (thread exit parks exactly there). The in-kernel
@@ -642,10 +813,10 @@ impl KvmVm {
                 // overwritten OLD PC) and returns EINTR before ever entering
                 // the guest. The caller's snapshot restore then programs the
                 // real entry state onto a clean vcpu.
-                fd.set_kvm_immediate_exit(1);
-                let _ = fd.run(); // -EINTR; consumes any stale MMIO completion
-                fd.set_kvm_immediate_exit(0);
-                fd
+                parked.fd.set_kvm_immediate_exit(1);
+                let _ = parked.fd.run(); // -EINTR; consumes any stale MMIO completion
+                parked.fd.set_kvm_immediate_exit(0);
+                fd = parked.fd;
             }
             None => {
                 // Draw a UNIQUE vcpu_id from the shared allocator. The owning
@@ -655,15 +826,28 @@ impl KvmVm {
                 // that deadlocked the threaded loop (no sibling ever
                 // materialised, so `pthread_join`'s futex never woke).
                 let vcpu_id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
-                let fd = self
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if vcpu_id >= carrick_x86::X86_FAULT_SLOTS {
+                        return Err(os_err(
+                            "allocate x86 fault table slot",
+                            format!(
+                                "vcpu id {vcpu_id} exceeds X86_FAULT_SLOTS={}",
+                                carrick_x86::X86_FAULT_SLOTS
+                            ),
+                        ));
+                    }
+                    fault_slot = vcpu_id;
+                }
+                let new_fd = self
                     .vm
                     .create_vcpu(vcpu_id)
                     .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
                 #[cfg(target_arch = "x86_64")]
-                self.install_x86_cpuid(&fd)?;
-                fd
+                self.install_x86_cpuid(&new_fd)?;
+                fd = new_fd;
             }
-        };
+        }
         // aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT + counter align.
         // x86_64: no ARM-specific init; the x86 bring-up path (guest_setup_x86.rs)
         // programs registers via KVM_SET_SREGS/KVM_SET_REGS/KVM_SET_MSRS instead.
@@ -702,6 +886,10 @@ impl KvmVm {
         Ok(KvmVcpu {
             fd: Some(fd),
             recycle: Some(Arc::clone(&self.vcpu_pool)),
+            #[cfg(target_arch = "x86_64")]
+            fault_slot,
+            #[cfg(target_arch = "x86_64")]
+            last_x86_restore: None,
         })
     }
 
@@ -845,7 +1033,7 @@ impl HvVcpu for KvmVcpu {
             Err(e) if e.errno() == libc::EINTR => return Ok(VcpuExit::Kicked),
             Err(e) => {
                 let mut msg = "KVM_RUN".to_string();
-                append_vcpu_state(self.fd(), &mut msg);
+                self.append_debug_state(&mut msg);
                 return Err(os_err(&msg, e));
             }
         };
@@ -877,10 +1065,16 @@ impl HvVcpu for KvmVcpu {
             KvmExit::Debug(debug) => Err(os_err("unexpected KVM_RUN exit", format!("{debug:?}"))),
             KvmExit::InternalError => {
                 let mut msg = "InternalError".to_string();
-                append_vcpu_state(self.fd(), &mut msg);
+                self.append_debug_state(&mut msg);
+                #[cfg(target_arch = "x86_64")]
+                self.append_kvm_internal_state(&mut msg);
                 Err(os_err("unexpected KVM_RUN exit", msg))
             }
-            other => Err(os_err("unexpected KVM_RUN exit", format!("{other:?}"))),
+            other => {
+                let mut msg = format!("{other:?}");
+                self.append_debug_state(&mut msg);
+                Err(os_err("unexpected KVM_RUN exit", msg))
+            }
         }
     }
 

@@ -11,7 +11,7 @@
 //!
 //! The CR/EFER/segment/MSR *values* are ISA constants (from
 //! [`carrick_hal::x8664_arch::X8664BootSysregs`]). The GPAs the kernel-only
-//! structures (LSTAR trampoline, GDT, PML4 root = CR3) live at are a genuine
+//! structures (LSTAR trampoline, GDT, PML4 root = CR3, fault tables) live at are a genuine
 //! per-backend choice: KVM places them in a low 256 MiB window (the host
 //! 36-bit physical-address ceiling caps CR3 there), bhyve folds them into its
 //! single contiguous lowmem segment at different offsets. So the layout GPAs
@@ -157,8 +157,8 @@ pub struct BringupLayout {
 
 /// Walk an image's regions into the shared [`WindowPlan`] (the §2.5a union the
 /// backend realizes as N slots (KVM) or one contiguous segment (bhyve)). Image-
-/// based, no vCPU. User regions cover the full address-space extent; the three
-/// kernel-only structures (trampoline/GDT/PML4) are appended as supervisor-only
+/// based, no vCPU. User regions cover the full address-space extent; the
+/// kernel-only structures (trampoline/GDT/PML4/fault tables) are appended as supervisor-only
 /// regions at the `layout` GPAs.
 pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<WindowPlan, TrapError> {
     let mut regions: Vec<WindowRegion> = Vec::new();
@@ -184,7 +184,8 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
         });
     }
 
-    // Kernel window: trampoline (exec, RO), GDT (RO), PML4 (RW) — supervisor-only.
+    // Kernel window: trampoline (exec, RO), GDT (RO), PML4 (RW), and
+    // exception-doorbell tables — supervisor-only.
     regions.push(WindowRegion {
         va: layout.trampoline_base,
         gpa: layout.trampoline_base,
@@ -212,6 +213,7 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
         exec: false,
         user: false,
     });
+    crate::fault::add_fault_windows(&mut regions, layout);
 
     Ok(WindowPlan { regions })
 }
@@ -285,9 +287,10 @@ pub fn program_longmode_entry<C: X86Vcpu>(
     vcpu.set_segment(X86Seg::Tr, 0, 0xFFFF_FFFF, segs.tr_ar)?;
     vcpu.set_segment(X86Seg::Ldtr, 0, 0, segs.ldtr_ar)?;
 
-    // GDT / IDT (descriptor-table registers): base + limit, no AR.
+    // GDT / fault IDT + TSS. Slot 0 is the initial vCPU; backends with sibling
+    // vCPUs reprogram IDTR/TR to that vCPU's private slot on restore.
     vcpu.set_segment(X86Seg::Gdtr, layout.gdt_base, segs.gdt_limit, 0)?;
-    vcpu.set_segment(X86Seg::Idtr, 0, 0, 0)?;
+    crate::fault::program_fault_segments(vcpu, layout, 0)?;
 
     // ── Entry GPRs ────────────────────────────────────────────────────────────
     vcpu.set_gpr(X86Reg::Rip, entry_rip)?;
@@ -298,9 +301,18 @@ pub fn program_longmode_entry<C: X86Vcpu>(
     vcpu.set_syscall_msrs(layout.trampoline_base, boot.star, boot.sfmask)
 }
 
-/// Write the bring-up byte images (LSTAR trampoline, GDT, PML4) into guest RAM
-/// via the [`crate::X86Vmm`] memory surface. Call before `add_vcpu`/the first
-/// run so the trampoline is present. `pml4_bytes` is from [`build_pml4`].
+pub fn program_user_segments<C: X86Vcpu>(vcpu: &mut C) -> Result<(), TrapError> {
+    let segs = long_mode_segment_state();
+    vcpu.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
+    vcpu.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    vcpu.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    vcpu.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)
+}
+
+/// Write the bring-up byte images (LSTAR trampoline, GDT, PML4, fault tables)
+/// into guest RAM via the [`crate::X86Vmm`] memory surface. Call before
+/// `add_vcpu`/the first run so the trampoline and exception stubs are present.
+/// `pml4_bytes` is from [`build_pml4`].
 pub fn write_bringup_images<V: crate::X86Vmm>(
     vm: &V,
     layout: BringupLayout,
@@ -314,6 +326,7 @@ pub fn write_bringup_images<V: crate::X86Vmm>(
     let gdt_bytes: Vec<u8> = boot.gdt.iter().flat_map(|e| e.to_le_bytes()).collect();
     vm.write_gpa(layout.gdt_base, &gdt_bytes)?;
     vm.write_gpa(layout.pml4_base, pml4_bytes)?;
+    crate::fault::write_fault_tables(vm, layout)?;
     Ok(())
 }
 
@@ -365,6 +378,11 @@ const GPR_ORDER: [X86Reg; 16] = [
     X86Reg::R14,
     X86Reg::R15,
 ];
+const GPR_RAX: usize = 0;
+const GPR_RCX: usize = 2;
+const GPR_RSP: usize = 7;
+const GPR_R11: usize = 11;
+const RFLAGS_RESERVED_BIT: u64 = 0x2;
 
 /// Capture the vCPU's full dynamic state at a syscall trap.
 pub fn snapshot<C: X86Vcpu>(c: &C) -> Result<X86VcpuSnapshot, TrapError> {
@@ -413,10 +431,9 @@ pub fn restore<C: X86Vcpu>(
     c.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)?;
     c.set_segment(X86Seg::Fs, 0, 0xFFFF_FFFF, segs.data_ar)?;
     c.set_segment(X86Seg::Gs, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    c.set_segment(X86Seg::Tr, 0, 0xFFFF_FFFF, segs.tr_ar)?;
     c.set_segment(X86Seg::Ldtr, 0, 0, segs.ldtr_ar)?;
     c.set_segment(X86Seg::Gdtr, layout.gdt_base, segs.gdt_limit, 0)?;
-    c.set_segment(X86Seg::Idtr, 0, 0, 0)?;
+    crate::fault::program_fault_segments(c, layout, 0)?;
 
     // GPRs.
     for (val, reg) in s.gprs.iter().zip(GPR_ORDER) {
@@ -443,30 +460,27 @@ pub fn restore<C: X86Vcpu>(
 
 /// Seed a freshly-built vCPU's register file from the ISA-neutral
 /// [`GuestEntryRegs`], for BOTH a `clone(CLONE_THREAD)` sibling and a `fork(2)`
-/// child (x86 fork and clone both resume at the `SYSRETQ` after the doorbell).
-/// Starts from the parent snapshot (same CR3/segments/long-mode → same address
-/// space) and applies:
+/// child. Starts from the parent snapshot (same CR3/segments/long-mode → same
+/// address space) and applies the user-visible clone/fork return state:
 ///   - `rax = entry.return_value`     — clone()/fork() return value (0 for child).
 ///   - `rsp = entry.stack` (if `Some`) — new user stack; `None` inherits (fork).
 ///   - `fs_base = entry.tls` (if `Some`) — TLS base; `None` inherits (fork).
-///   - `rip = resume_rip`             — the `SYSRETQ` after the LSTAR doorbell.
+///   - `rip = parent.rcx`             — the user RIP saved by SYSCALL.
+///   - `rflags = parent.r11`          — the user RFLAGS saved by SYSCALL.
 ///
 /// FP is carried verbatim (correct for fork; harmless for a new thread).
-pub fn seed_entry(
-    parent: &X86VcpuSnapshot,
-    entry: GuestEntryRegs,
-    resume_rip: u64,
-) -> X86VcpuSnapshot {
+pub fn seed_entry(parent: &X86VcpuSnapshot, entry: GuestEntryRegs) -> X86VcpuSnapshot {
     let mut snap = parent.clone();
-    snap.gprs[0] = entry.return_value; // Rax is GPR_ORDER[0]
+    snap.gprs[GPR_RAX] = entry.return_value;
     if let Some(stack) = entry.stack {
         snap.rsp = stack;
-        snap.gprs[7] = stack; // Rsp is GPR_ORDER[7]
+        snap.gprs[GPR_RSP] = stack;
     }
     if let Some(tls) = entry.tls {
         snap.fs_base = tls;
     }
-    snap.rip = resume_rip;
+    snap.rip = parent.gprs[GPR_RCX];
+    snap.rflags = parent.gprs[GPR_R11] | RFLAGS_RESERVED_BIT;
     snap
 }
 
@@ -807,6 +821,8 @@ mod tests {
             fp: None,
         };
         parent.gprs[0] = 0xdead; // Rax
+        parent.gprs[2] = 0x4000_1234; // Rcx: user RIP saved by SYSCALL
+        parent.gprs[11] = 0x246; // R11: user RFLAGS saved by SYSCALL
         let child = seed_entry(
             &parent,
             GuestEntryRegs {
@@ -814,13 +830,13 @@ mod tests {
                 stack: Some(0xCAFE_0000),
                 tls: Some(0xBEEF_0000),
             },
-            0xABCD,
         );
         assert_eq!(child.gprs[0], 0, "child clone() returns 0");
         assert_eq!(child.rsp, 0xCAFE_0000, "rsp = child stack");
         assert_eq!(child.gprs[7], 0xCAFE_0000, "Rsp GPR = child stack");
         assert_eq!(child.fs_base, 0xBEEF_0000, "fs_base = tls");
-        assert_eq!(child.rip, 0xABCD, "rip = resume_rip");
+        assert_eq!(child.rip, 0x4000_1234, "rip = saved user RCX");
+        assert_eq!(child.rflags, 0x246, "rflags = saved user R11");
     }
 
     #[test]
@@ -839,10 +855,13 @@ mod tests {
             fp: None,
         };
         parent.gprs[0] = 0xdead;
+        parent.gprs[2] = 0x4000_5678;
         parent.gprs[7] = 0x1111;
-        let child = seed_entry(&parent, GuestEntryRegs::default(), 0xABCD);
+        parent.gprs[11] = 0x244;
+        let child = seed_entry(&parent, GuestEntryRegs::default());
         assert_eq!(child.gprs[0], 0);
-        assert_eq!(child.rip, 0xABCD);
+        assert_eq!(child.rip, 0x4000_5678);
+        assert_eq!(child.rflags, 0x246);
         assert_eq!(child.rsp, 0x1111, "fork child inherits parent rsp");
         assert_eq!(child.fs_base, 0x2222, "fork child inherits parent fs_base");
     }

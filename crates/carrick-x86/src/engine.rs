@@ -117,13 +117,6 @@ impl<V: X86Vmm> X86EngineCore<V> {
     pub fn vcpu_mut(&mut self) -> &mut V::Vcpu {
         &mut self.vcpu
     }
-
-    /// The resume RIP a freshly-built fork-child / clone-sibling vCPU starts at:
-    /// the `SYSRETQ` immediately after the LSTAR `out` doorbell. (The trampoline
-    /// is `out %al, $port` (2 bytes) + `sysretq`.)
-    fn sysret_resume_rip(&self) -> u64 {
-        self.layout.trampoline_base + 2
-    }
 }
 
 // ─── SegmentBaseRegs (arch_prctl FS/GS base) ─────────────────────────────────
@@ -483,11 +476,13 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
             sigreturn_trampoline_base: 0,
         };
         <Self as ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        bringup_fns::program_user_segments(&mut self.vcpu)?;
         Ok(())
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         let restored = <Self as ThreadedEngine>::Arch::restore_sigframe(self, true)?;
+        bringup_fns::program_user_segments(&mut self.vcpu)?;
         Ok(restored.sigmask)
     }
 }
@@ -531,8 +526,7 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
         .vm
         .rebuild_child_after_fork(&mut engine.vcpu, &frozen)?;
     let layout = engine.layout;
-    let child_snap =
-        bringup_fns::seed_entry(&snap, GuestEntryRegs::default(), engine.sysret_resume_rip());
+    let child_snap = bringup_fns::seed_entry(&snap, GuestEntryRegs::default());
     engine
         .vm
         .restore_vcpu(&mut engine.vcpu, layout, &child_snap)?;
@@ -578,7 +572,7 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
 
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {
         let parent = bringup_fns::snapshot(&self.vcpu)?;
-        let snapshot = bringup_fns::seed_entry(&parent, entry, self.sysret_resume_rip());
+        let snapshot = bringup_fns::seed_entry(&parent, entry);
         let builder = self.vm.build_sibling_builder()?;
         Ok(X86SiblingSpec {
             builder,
