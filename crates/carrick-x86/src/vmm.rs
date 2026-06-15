@@ -17,6 +17,8 @@ use std::sync::Arc;
 use carrick_guest_mem::{MemoryError, X8664SyscallFrame};
 use carrick_hal::{TrapError, VcpuKick, VcpuRegistry};
 
+use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
+
 /// The shared x86 register view the engine reads/writes through the backend. The
 /// union of KVM's `kvm_regs` named fields, bhyve's `vm_reg_name` ordinals, and
 /// NVMM's `NvmmX64State.gprs[]` array — every backend marshals these to/from its
@@ -238,6 +240,22 @@ pub trait X86Vmm: Sized {
         Ok(())
     }
 
+    /// Back a dynamic high-VA mapping and install the VA→GPA page-table path.
+    /// Backends that can receive `DispatchOutcome::MapHostAlias` override this.
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    ) -> Result<(), TrapError> {
+        let _ = (ipa, payload, file);
+        Err(TrapError::Hypervisor(format!(
+            "carrick-x86: map_host_alias not implemented for this backend (va=0x{va:x} len=0x{len:x})"
+        )))
+    }
+
     /// Create a fresh vCPU bound to this VM.
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError>;
 
@@ -258,6 +276,32 @@ pub trait X86Vmm: Sized {
         Ok(())
     }
 
+    /// Child-side VM/vCPU rebuild after the host `fork(2)`. The default preserves
+    /// the original eager-copy seam (bhyve swaps the vCPU through its shared
+    /// handle inside `rebuild_child_vm`); KVM overrides this because inherited
+    /// vCPU fds are not usable in the child and the engine's separate vCPU field
+    /// must be replaced explicitly.
+    fn rebuild_child_after_fork(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+        frozen: &[u8],
+    ) -> Result<(), TrapError> {
+        self.rebuild_child_vm(frozen)
+    }
+
+    /// Restore a generic x86 vCPU snapshot onto a backend vCPU. The default
+    /// uses the shared trait-level register writers; backends with stricter
+    /// ioctl grouping requirements can override while keeping the x86 snapshot
+    /// format shared.
+    fn restore_vcpu(
+        &self,
+        vcpu: &mut Self::Vcpu,
+        layout: BringupLayout,
+        snapshot: &X86VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        bringup_fns::restore(vcpu, layout, snapshot)
+    }
+
     /// Replace the live guest image with `new_image` (`execve(2)`). The default
     /// is NYI — KVM/NVMM Phase-2 hello never execve. A backend that supports
     /// execve (bhyve) rebuilds a fresh VM from `new_image` and re-points its live
@@ -266,6 +310,7 @@ pub trait X86Vmm: Sized {
     /// engine policy, because the rebuild is backend mechanism.)
     fn execve_rebuild(
         &mut self,
+        _vcpu: &mut Self::Vcpu,
         _new_image: &carrick_mem::memory::AddressSpace,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
