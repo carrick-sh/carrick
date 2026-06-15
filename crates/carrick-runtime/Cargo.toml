@@ -9,7 +9,7 @@ name = "carrick_runtime"
 path = "src/lib.rs"
 
 # Phase B real-dispatch KVM driver: runs an aarch64 ELF under KVM through the
-# FULL dispatcher (vs the thin `carrick-linux` shim). Only built in the
+# FULL dispatcher (vs the thin `carrick-vmm-kvm` shim). Only built in the
 # platform-linux configuration; on macOS the default build skips it.
 [[bin]]
 name = "carrick-kvm"
@@ -45,7 +45,7 @@ trace-elf = ["carrick-mem/trace-elf"]
 # The `dep:` syntax keeps the optional crates from auto-becoming implicit
 # features, so the only way to pull in carrick-hvf is via `platform-macos`.
 platform-macos = ["dep:carrick-hvf", "dep:carrick-host-bsd"]
-platform-linux = ["dep:carrick-linux"]
+platform-linux = ["dep:carrick-vmm-kvm", "dep:carrick-host-linux"]
 # FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2 — see
 # docs/superpowers/adr/2026-06-06-bhyve-backend-design.md). Mirrors platform-linux.
 # Pulls in carrick-host-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
@@ -63,7 +63,10 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-thread = { path = "../carrick-thread" }
 carrick-hvf = { path = "../carrick-hvf", optional = true }
 carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
-carrick-linux = { path = "../carrick-linux", optional = true }
+carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
+# The Linux host-OS layer (epoll EventMultiplexer + errno identity), split out
+# of the KVM backend. Pulled in alongside carrick-vmm-kvm by platform-linux.
+carrick-host-linux = { path = "../carrick-host-linux", optional = true }
 carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }

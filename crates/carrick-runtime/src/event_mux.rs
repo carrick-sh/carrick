@@ -18,7 +18,7 @@ pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
     }
     #[cfg(feature = "platform-linux")]
     {
-        Ok(Box::new(carrick_linux::EpollMultiplexer::new()?))
+        Ok(Box::new(carrick_host_linux::EpollMultiplexer::new()?))
     }
     // FreeBSD shares the macOS kqueue multiplexer: `carrick_bsd` is gated
     // `cfg(any(macos, freebsd))`, so the same `KqueueMultiplexer` compiles and

@@ -1452,7 +1452,7 @@ pub struct SyscallDispatcher {
 ///
 /// The backend is a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer):
 /// kqueue-backed on macOS (`carrick_host_bsd::KqueueMultiplexer`), epoll-backed on
-/// Linux (`carrick_linux::EpollMultiplexer`). `epoll_ctl` registers host-fd
+/// Linux (`carrick_host_linux::EpollMultiplexer`). `epoll_ctl` registers host-fd
 /// interest through the trait and `epoll_pwait` drains it. The mux is wrapped in
 /// a `Mutex` because the instance is shared via `Arc` (so a dup'd epoll fd refers
 /// to the same backend) yet the trait's mutating methods need `&mut`; every call

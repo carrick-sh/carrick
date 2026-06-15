@@ -152,7 +152,7 @@ fn reap_exited_watches() {
             continue;
         }
         // WNOHANG with no ready child returns 0 with si_pid == 0 (still running).
-        // carrick-linux is a Linux-only crate, so `siginfo_t::si_pid()` (the libc
+        // carrick-vmm-kvm is a Linux-only crate, so `siginfo_t::si_pid()` (the libc
         // accessor over the anonymous union) is available directly.
         // SAFETY: reads the POSIX-defined `si_pid` union member; libc marks the
         // accessor `unsafe` only because it reads a union.

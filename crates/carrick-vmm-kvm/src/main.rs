@@ -1,7 +1,7 @@
-//! `carrick-linux` binary — the KVM MVP entry point.
+//! `carrick-vmm-kvm` binary — the KVM MVP entry point.
 //!
-//! On aarch64: `carrick-linux run-elf <freestanding-aarch64-elf>`
-//! On x86_64:  `carrick-linux run-elf <freestanding-x86_64-elf>` (Task 4).
+//! On aarch64: `carrick-vmm-kvm run-elf <freestanding-aarch64-elf>`
+//! On x86_64:  `carrick-vmm-kvm run-elf <freestanding-x86_64-elf>` (Task 4).
 //!
 //! Self-contained (no `carrick-runtime` dependency) so it compiles and links
 //! for `aarch64-unknown-linux-gnu` independently of the macOS dispatch layer.
@@ -14,19 +14,19 @@ fn main() {
     match args.next().as_deref() {
         Some("run-elf") => {
             let Some(path) = args.next() else {
-                eprintln!("usage: carrick-linux run-elf <aarch64-elf>");
+                eprintln!("usage: carrick-vmm-kvm run-elf <aarch64-elf>");
                 std::process::exit(2);
             };
-            match carrick_linux::run_elf_kvm(&path) {
+            match carrick_vmm_kvm::run_elf_kvm(&path) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
-                    eprintln!("carrick-linux: {e}");
+                    eprintln!("carrick-vmm-kvm: {e}");
                     std::process::exit(127);
                 }
             }
         }
         _ => {
-            eprintln!("usage: carrick-linux run-elf <aarch64-elf>");
+            eprintln!("usage: carrick-vmm-kvm run-elf <aarch64-elf>");
             std::process::exit(2);
         }
     }
@@ -39,19 +39,19 @@ fn main() {
     match args.next().as_deref() {
         Some("run-elf") => {
             let Some(path) = args.next() else {
-                eprintln!("usage: carrick-linux run-elf <x86_64-elf>");
+                eprintln!("usage: carrick-vmm-kvm run-elf <x86_64-elf>");
                 std::process::exit(2);
             };
-            match carrick_linux::run_elf_x86::run_elf_kvm_x86(&path) {
+            match carrick_vmm_kvm::run_elf_x86::run_elf_kvm_x86(&path) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
-                    eprintln!("carrick-linux: {e}");
+                    eprintln!("carrick-vmm-kvm: {e}");
                     std::process::exit(127);
                 }
             }
         }
         _ => {
-            eprintln!("usage: carrick-linux run-elf <x86_64-elf>");
+            eprintln!("usage: carrick-vmm-kvm run-elf <x86_64-elf>");
             std::process::exit(2);
         }
     }
@@ -59,6 +59,6 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("carrick-linux is a Linux/KVM-only binary");
+    eprintln!("carrick-vmm-kvm is a Linux/KVM-only binary");
     std::process::exit(1);
 }

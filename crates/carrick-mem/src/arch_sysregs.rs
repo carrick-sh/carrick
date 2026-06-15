@@ -6,7 +6,7 @@
 //! path literally read "as HVF" / "identical bootstrap value to the HVF path".
 //! These four constants are the neutral, byte-identical core; they were
 //! previously hardcoded VERBATIM in two places
-//! (`carrick-linux::guest_setup::program_sysregs` and
+//! (`carrick-vmm-kvm::guest_setup::program_sysregs` and
 //! `carrick-hvf::trap`), a boot-critical duplication where a one-sided edit
 //! would silently desync the two backends' MMU setup.
 //!

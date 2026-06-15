@@ -1,5 +1,5 @@
 //! bhyve glue for mirroring guest signal DISPOSITIONS onto real HOST routed
-//! handlers — the FreeBSD mirror of [`carrick_linux::kvm_disposition`] (SP4.2).
+//! handlers — the FreeBSD mirror of [`carrick_vmm_kvm::kvm_disposition`] (SP4.2).
 //!
 //! ## The gap this closes
 //!

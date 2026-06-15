@@ -1,18 +1,18 @@
 [package]
-name = "carrick-linux"
+name = "carrick-vmm-kvm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "carrick_linux"
+name = "carrick_vmm_kvm"
 path = "src/lib.rs"
 
 # The MVP `run-elf` entry point. Self-contained (no carrick-runtime dep), so it
 # links for aarch64-linux independently of the macOS dispatch layer. On non-Linux
 # hosts `main` is a stub (the lib is empty there), so the workspace still builds.
 [[bin]]
-name = "carrick-linux"
+name = "carrick-vmm-kvm"
 path = "src/main.rs"
 
 [lints]

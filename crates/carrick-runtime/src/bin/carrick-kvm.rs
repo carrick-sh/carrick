@@ -3,7 +3,7 @@
 //!
 //! Usage: `carrick-kvm run-elf <aarch64-elf>`
 //!
-//! Unlike the thin `carrick-linux run-elf` shim (which services only
+//! Unlike the thin `carrick-vmm-kvm run-elf` shim (which services only
 //! `write`/`writev`/`exit` directly, with no `carrick-runtime` dependency),
 //! this drives `KvmTrapEngine` through the real `SyscallDispatcher` — the same
 //! dispatch layer the macOS/HVF backend uses. Built only with

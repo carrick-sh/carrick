@@ -25,7 +25,7 @@ workspace = true
 # already); the crate's own code is `#![cfg(target_os = "netbsd")]`, so the
 # libnvmm link line only appears on NetBSD and the default macOS/Linux workspace
 # build stays green. It FFIs to the system **libnvmm** (`#[link(name = "nvmm")]`,
-# /usr/lib/libnvmm.so), and like carrick-linux/bhyve depends only on the leaf
+# /usr/lib/libnvmm.so), and like carrick-vmm-kvm/bhyve depends only on the leaf
 # crates (NOT carrick-runtime) so it cross-compiles independently.
 [dependencies]
 carrick-hal = { path = "../carrick-hal" }

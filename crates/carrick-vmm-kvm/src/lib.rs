@@ -1,4 +1,4 @@
-//! carrick-linux: the KVM aarch64 MVP backend.
+//! carrick-vmm-kvm: the Linux/KVM VMM backend.
 //!
 //! Proves the `carrick-hal` seam end-to-end on real hardware KVM by booting a
 //! freestanding aarch64 ELF, servicing its syscalls via the MMIO-sentinel trap
@@ -8,10 +8,13 @@
 //! ~200 macOS-isms ported out of the dispatch layer). All hypervisor code is
 //! `cfg(target_os = "linux")`; on any other host this crate is intentionally
 //! empty.
+//!
+//! The Linux host-OS glue that used to live here (the native epoll
+//! `EventMultiplexer` and the `host_to_linux_errno` identity hook) was split
+//! out into the VMM-agnostic `carrick-host-linux` crate; carrick-runtime wires
+//! both together under the `platform-linux` feature.
 #![cfg(target_os = "linux")]
 
-pub mod epoll_mux;
-pub mod errno;
 pub mod guest_setup;
 pub mod kvm;
 pub mod kvm_disposition;
@@ -36,7 +39,6 @@ pub mod run_elf;
 #[cfg(target_arch = "aarch64")]
 pub mod trap_engine;
 
-pub use epoll_mux::EpollMultiplexer;
 pub use kvm::{KvmVcpu, KvmVm};
 pub use kvm_fork_coord::KvmForkCoordinator;
 pub use kvm_futex::{KvmFutex, make_kvm_futex};

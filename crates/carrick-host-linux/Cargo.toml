@@ -1,0 +1,25 @@
+[package]
+name = "carrick-host-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_host_linux"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# The Linux host-OS layer (the sibling of carrick-host-bsd). Holds the host-OS
+# glue that is Linux-specific but VMM-agnostic: the native epoll
+# `EventMultiplexer` (`EpollMultiplexer`, the Linux counterpart of the BSD
+# `KqueueMultiplexer`) and the Linux `host_to_linux_errno` identity hook. The
+# whole crate is `#![cfg(target_os = "linux")]`; on any other host the lib
+# compiles to an empty crate, so the default macOS workspace build stays green.
+# Depends only on the trait crate `carrick-hal` (NO VMM backend dependency); the
+# KVM backend (carrick-vmm-kvm) and this host layer are wired together by
+# carrick-runtime under the `platform-linux` feature.
+[dependencies]
+carrick-hal = { path = "../carrick-hal" }
+libc.workspace = true
