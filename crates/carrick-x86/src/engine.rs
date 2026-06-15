@@ -35,8 +35,15 @@ const X86_PFEC_PRESENT: u64 = 1 << 0;
 
 fn x86_fault_signal(kind: X86FaultKind, error_code: u64) -> Option<(i32, i32)> {
     const SIGSEGV: i32 = libc::SIGSEGV;
+    const SIGBUS: i32 = libc::SIGBUS;
+    const SIGFPE: i32 = libc::SIGFPE;
+    const SIGILL: i32 = libc::SIGILL;
     const SEGV_MAPERR: i32 = 1;
     const SEGV_ACCERR: i32 = 2;
+    const SI_KERNEL: i32 = 128;
+    const BUS_ADRALN: i32 = 1;
+    const FPE_INTDIV: i32 = 1;
+    const ILL_ILLOPN: i32 = 2;
     match kind {
         X86FaultKind::PageFault => {
             let si_code = if error_code & X86_PFEC_PRESENT != 0 {
@@ -46,7 +53,10 @@ fn x86_fault_signal(kind: X86FaultKind, error_code: u64) -> Option<(i32, i32)> {
             };
             Some((SIGSEGV, si_code))
         }
-        X86FaultKind::Protection => Some((SIGSEGV, SEGV_MAPERR)),
+        X86FaultKind::DivideError => Some((SIGFPE, FPE_INTDIV)),
+        X86FaultKind::InvalidOpcode => Some((SIGILL, ILL_ILLOPN)),
+        X86FaultKind::GeneralProtection => Some((SIGSEGV, SI_KERNEL)),
+        X86FaultKind::AlignmentCheck => Some((SIGBUS, BUS_ADRALN)),
         X86FaultKind::Other => None,
     }
 }
@@ -336,12 +346,12 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                 }
                 X86Exit::Fault {
                     kind,
-                    gpa,
+                    fault_addr,
                     error_code,
                 } => {
-                    // Deliver as an ISA-neutral guest fault. CR2 (the faulting
-                    // VA) rides in `gpa`. For #PF, PFEC.P selects MAPERR vs
-                    // ACCERR exactly like Linux.
+                    // Deliver as an ISA-neutral guest fault. For #PF, PFEC.P
+                    // selects MAPERR vs ACCERR exactly like Linux; other x86
+                    // vectors use the backend-resolved Linux si_addr.
                     let (signum, si_code) =
                         x86_fault_signal(kind, error_code).ok_or_else(|| {
                             TrapError::Hypervisor(format!("unsupported x86 fault kind {kind:?}"))
@@ -349,7 +359,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                     return Err(TrapError::GuestFault {
                         signum,
                         si_code,
-                        fault_addr: gpa,
+                        fault_addr,
                     });
                 }
             }
@@ -584,6 +594,25 @@ mod tests {
             x86_fault_signal(X86FaultKind::PageFault, X86_PFEC_PRESENT),
             Some((libc::SIGSEGV, 2)),
             "present-page protection #PF is SEGV_ACCERR"
+        );
+    }
+
+    #[test]
+    fn x86_non_page_fault_vectors_match_linux_oracle() {
+        assert_eq!(
+            x86_fault_signal(X86FaultKind::InvalidOpcode, 0),
+            Some((libc::SIGILL, 2)),
+            "UD2 is SIGILL/ILL_ILLOPN on Docker linux/amd64"
+        );
+        assert_eq!(
+            x86_fault_signal(X86FaultKind::DivideError, 0),
+            Some((libc::SIGFPE, 1)),
+            "integer divide error is SIGFPE/FPE_INTDIV on Docker linux/amd64"
+        );
+        assert_eq!(
+            x86_fault_signal(X86FaultKind::GeneralProtection, 0),
+            Some((libc::SIGSEGV, 128)),
+            "user CLI #GP is SIGSEGV/SI_KERNEL on Docker linux/amd64"
         );
     }
 }

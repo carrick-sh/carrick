@@ -1,0 +1,21 @@
+[package]
+name = "carrick-bhyve-sigill"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP4.4 fixture: UD2 (#UD) -> SIGILL/ILL_ILLOPN with si_addr at RIP.
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC).
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-sigill"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

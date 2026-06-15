@@ -519,13 +519,24 @@ impl X86Vcpu for BhyveX86Vcpu {
                     self.set_raw(VM_REG_GUEST_RSP, context.rsp)?;
                     self.set_raw(VM_REG_GUEST_RFLAGS, context.rflags)?;
                     let kind = match record.vector() {
+                        0 => X86FaultKind::DivideError,
+                        6 => X86FaultKind::InvalidOpcode,
+                        13 => X86FaultKind::GeneralProtection,
                         14 => X86FaultKind::PageFault,
-                        13 | 17 => X86FaultKind::Protection,
+                        17 => X86FaultKind::AlignmentCheck,
                         _ => X86FaultKind::Other,
+                    };
+                    let fault_addr = match kind {
+                        X86FaultKind::PageFault => cr2,
+                        X86FaultKind::GeneralProtection => 0,
+                        X86FaultKind::DivideError
+                        | X86FaultKind::InvalidOpcode
+                        | X86FaultKind::AlignmentCheck
+                        | X86FaultKind::Other => context.rip,
                     };
                     return Ok(X86Exit::Fault {
                         kind,
-                        gpa: cr2,
+                        fault_addr,
                         error_code: context.error_code,
                     });
                 }
