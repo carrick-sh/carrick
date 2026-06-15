@@ -55,6 +55,14 @@ pub const NVMM_X64_GPR_RSP: usize = 4;
 pub const NVMM_X64_GPR_RBP: usize = 5;
 pub const NVMM_X64_GPR_RSI: usize = 6;
 pub const NVMM_X64_GPR_RDI: usize = 7;
+pub const NVMM_X64_GPR_R8: usize = 8;
+pub const NVMM_X64_GPR_R9: usize = 9;
+pub const NVMM_X64_GPR_R10: usize = 10;
+pub const NVMM_X64_GPR_R11: usize = 11;
+pub const NVMM_X64_GPR_R12: usize = 12;
+pub const NVMM_X64_GPR_R13: usize = 13;
+pub const NVMM_X64_GPR_R14: usize = 14;
+pub const NVMM_X64_GPR_R15: usize = 15;
 pub const NVMM_X64_GPR_RIP: usize = 16;
 pub const NVMM_X64_GPR_RFLAGS: usize = 17;
 pub const NVMM_X64_NGPR: usize = 18;
@@ -481,10 +489,21 @@ pub struct NvmmVcpu {
 impl NvmmVcpu {
     /// Fetch the requested state sub-areas from the kernel into the comm page,
     /// then return a copy of the full state struct.
-    pub fn get_state(&mut self, flags: u64) -> NvmmResult<NvmmX64State> {
+    ///
+    /// Takes `&self` (the idiomatic FFI-handle pattern): `nvmm_vcpu_getstate`
+    /// mutates only the kernel-owned comm page reached through the interior
+    /// `raw.state` pointer — it does not mutate any Rust-visible field of
+    /// `NvmmVcpuRaw` that a concurrent `&self` reader would observe. This lets
+    /// the `&self` register getters on the `carrick_x86::X86Vcpu` impl read state
+    /// without an unsound `&self`→`&mut` transmute. (libnvmm is not thread-safe
+    /// per-vCPU, but a single vCPU is only ever driven from its owning thread.)
+    pub fn get_state(&self, flags: u64) -> NvmmResult<NvmmX64State> {
+        // SAFETY: the C API takes `*mut nvmm_vcpu`; the boxed `raw` is a valid,
+        // owned vCPU struct and the call mutates only the kernel comm page.
+        let raw = self.raw.as_ref() as *const NvmmVcpuRaw as *mut NvmmVcpuRaw;
         // SAFETY: `mach`/`raw` are live; getstate fills the comm-page state.
         check("nvmm_vcpu_getstate", unsafe {
-            nvmm_vcpu_getstate(self.mach, self.raw.as_mut(), flags)
+            nvmm_vcpu_getstate(self.mach, raw, flags)
         })?;
         let state_ptr = self.raw.state;
         debug_assert!(!state_ptr.is_null(), "comm-page state pointer is NULL");
@@ -509,8 +528,9 @@ impl NvmmVcpu {
     }
 
     /// Run the vCPU until a VM exit. The exit info is filled into the comm-page
-    /// exit struct; a copy is returned.
-    pub fn run(&mut self) -> NvmmResult<NvmmX86Exit> {
+    /// exit struct; a copy is returned. (Named `run_until_exit` to avoid clashing
+    /// with the `carrick_x86::X86Vcpu::run` trait method that wraps it.)
+    pub fn run_until_exit(&mut self) -> NvmmResult<NvmmX86Exit> {
         // SAFETY: `mach`/`raw` are live; run fills the comm-page exit struct.
         check("nvmm_vcpu_run", unsafe {
             nvmm_vcpu_run(self.mach, self.raw.as_mut())
