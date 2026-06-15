@@ -27,6 +27,23 @@ fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
 }
 
+fn append_vcpu_state(fd: &VcpuFd, msg: &mut String) {
+    match fd.get_regs() {
+        Ok(r) => msg.push_str(&format!(
+            " rip=0x{:x} rsp=0x{:x} rflags=0x{:x} rax=0x{:x}",
+            r.rip, r.rsp, r.rflags, r.rax
+        )),
+        Err(e) => msg.push_str(&format!(" regs=<KVM_GET_REGS failed: {e}>")),
+    }
+    match fd.get_sregs() {
+        Ok(s) => msg.push_str(&format!(
+            " cr0=0x{:x} cr2=0x{:x} cr3=0x{:x} cr4=0x{:x} efer=0x{:x}",
+            s.cr0, s.cr2, s.cr3, s.cr4, s.efer
+        )),
+        Err(e) => msg.push_str(&format!(" sregs=<KVM_GET_SREGS failed: {e}>")),
+    }
+}
+
 /// Process-global count of live KVM vCPUs (created-or-in-flight minus
 /// dropped) — the Linux implementation of the `crate::trap::VCPU_LIVE` drain
 /// contract the shared threaded run loop relies on (carrick-runtime
@@ -826,7 +843,11 @@ impl HvVcpu for KvmVcpu {
         let exit = match self.fd_mut().run() {
             Ok(e) => e,
             Err(e) if e.errno() == libc::EINTR => return Ok(VcpuExit::Kicked),
-            Err(e) => return Err(os_err("KVM_RUN", e)),
+            Err(e) => {
+                let mut msg = "KVM_RUN".to_string();
+                append_vcpu_state(self.fd(), &mut msg);
+                return Err(os_err(&msg, e));
+            }
         };
         match exit {
             KvmExit::MmioWrite(gpa, data) => {
@@ -855,21 +876,8 @@ impl HvVcpu for KvmVcpu {
             KvmExit::Intr => Ok(VcpuExit::Kicked),
             KvmExit::Debug(debug) => Err(os_err("unexpected KVM_RUN exit", format!("{debug:?}"))),
             KvmExit::InternalError => {
-                let regs = self.fd().get_regs().ok();
-                let sregs = self.fd().get_sregs().ok();
                 let mut msg = "InternalError".to_string();
-                if let Some(r) = regs {
-                    msg.push_str(&format!(
-                        " rip=0x{:x} rsp=0x{:x} rflags=0x{:x} rax=0x{:x}",
-                        r.rip, r.rsp, r.rflags, r.rax
-                    ));
-                }
-                if let Some(s) = sregs {
-                    msg.push_str(&format!(
-                        " cr0=0x{:x} cr2=0x{:x} cr3=0x{:x} cr4=0x{:x} efer=0x{:x}",
-                        s.cr0, s.cr2, s.cr3, s.cr4, s.efer
-                    ));
-                }
+                append_vcpu_state(self.fd(), &mut msg);
                 Err(os_err("unexpected KVM_RUN exit", msg))
             }
             other => Err(os_err("unexpected KVM_RUN exit", format!("{other:?}"))),
