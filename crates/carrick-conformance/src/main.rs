@@ -47,7 +47,8 @@ struct Args {
     /// Which tier to run: `smoke` (fast gate) or `full` (everything).
     #[arg(long, default_value = "full")]
     tier: String,
-    /// Execution lane: `hvf` (local signed binary, default) or `kvm` (carrick in the lima guest).
+    /// Execution lane: `hvf` (local signed binary, default), `kvm` (carrick in
+    /// the lima guest), or `kvm-local` (direct platform-linux carrick on this host).
     #[arg(long, default_value = "hvf")]
     lane: String,
     /// lima VM name for `--lane kvm`.
@@ -180,8 +181,10 @@ fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let docker_platform = lane.docker_platform();
+
     if let Some(results) = &args.seed_oracle {
-        seed_oracle(&args.manifest, results, &args.oracle_cache)?;
+        seed_oracle(&args.manifest, results, &args.oracle_cache, docker_platform)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -209,7 +212,11 @@ fn run() -> anyhow::Result<ExitCode> {
                 &format!("conf-{}-cN", std::process::id()),
                 &lane,
             );
-            let d = engine::docker_dry_run(s, &format!("conf-{}-dN", std::process::id()));
+            let d = engine::docker_dry_run(
+                s,
+                &format!("conf-{}-dN", std::process::id()),
+                docker_platform,
+            );
             println!("# {} [{}, {:?}]", s.name, s.ecosystem.as_str(), s.tier);
             println!("  carrick: {}", c.join(" "));
             println!("  docker:  {}", d.join(" "));
@@ -220,8 +227,10 @@ fn run() -> anyhow::Result<ExitCode> {
     // Binary preflight (abort on unsigned/missing; warn on stale). The local-binary
     // checks (codesign, exists) are HVF-only — the KVM binary lives in the guest and
     // is validated by the lima preflight instead.
-    if lane.is_kvm() {
+    if lane.is_lima_kvm() {
         preflight_kvm(&lane, &args.carrick_bin)?;
+    } else if matches!(lane, lane::Lane::KvmLocal(_)) {
+        preflight_kvm_local(&args.carrick_bin)?;
     } else {
         preflight(&args.carrick_bin)?;
     }
@@ -274,7 +283,10 @@ fn run() -> anyhow::Result<ExitCode> {
     let cached: Vec<Option<parsers::SuiteResult>> = if args.refresh_oracle {
         vec![None; n]
     } else {
-        selected.iter().map(|s| cache.get(s)).collect()
+        selected
+            .iter()
+            .map(|s| cache.get(s, docker_platform))
+            .collect()
     };
     let need_docker: Vec<usize> = (0..n).filter(|&i| cached[i].is_none()).collect();
     eprintln!(
@@ -292,7 +304,7 @@ fn run() -> anyhow::Result<ExitCode> {
         let s = &selected[i];
         let _lane = lanes.acquire(s);
         let run_id = format!("conf-{pid}-d{i:02}");
-        let out = engine::run_docker(s, &run_id);
+        let out = engine::run_docker(s, &run_id, docker_platform);
         eprintln!("  [docker]  {}", s.name);
         out
     });
@@ -307,7 +319,7 @@ fn run() -> anyhow::Result<ExitCode> {
         let side = match out.and_then(|r| r.ok()) {
             Some(o) => {
                 let res = parsers::parse(verdict_kind(s), &o.raw());
-                cache.insert(s, res.clone()); // refuses to cache a non-comparable oracle
+                cache.insert(s, docker_platform, res.clone()); // refuses to cache a non-comparable oracle
                 DockerSide {
                     result: res,
                     run_id: o.run_id,
@@ -317,7 +329,7 @@ fn run() -> anyhow::Result<ExitCode> {
             None => DockerSide {
                 result: parsers::SuiteResult::empty(),
                 run_id: String::new(),
-                argv: engine::docker_dry_run(s, "spawn-failed"),
+                argv: engine::docker_dry_run(s, "spawn-failed", docker_platform),
             },
         };
         fresh.insert(i, side);
@@ -341,7 +353,7 @@ fn run() -> anyhow::Result<ExitCode> {
             Some(res) => DockerSide {
                 result: res.clone(),
                 run_id: "<cached>".to_string(),
-                argv: engine::docker_dry_run(s, "<cached>"),
+                argv: engine::docker_dry_run(s, "<cached>", docker_platform),
             },
             None => fresh.remove(&i).ok_or_else(|| {
                 anyhow::anyhow!("every non-cached suite has a fresh docker side (suite {i})")
@@ -476,7 +488,12 @@ fn verdict_kind(s: &Suite) -> manifest::VerdictKind {
 /// `results.jsonl` — so the (expensive) docker work of a finished run is captured
 /// without re-running a single container. Suites whose report has no comparable
 /// docker data (crash/timeout/oracle-fail) are skipped: they must be re-run.
-fn seed_oracle(manifest_path: &Path, results: &Path, cache_path: &Path) -> anyhow::Result<()> {
+fn seed_oracle(
+    manifest_path: &Path,
+    results: &Path,
+    cache_path: &Path,
+    docker_platform: lane::DockerPlatform,
+) -> anyhow::Result<()> {
     // Operator-controlled CLI paths in a local dev tool — same trust model as the
     // other IO helpers below; not untrusted/network input.
     let manifest = Manifest::from_toml(&std::fs::read_to_string(manifest_path)?)?; // nosemgrep
@@ -495,7 +512,7 @@ fn seed_oracle(manifest_path: &Path, results: &Path, cache_path: &Path) -> anyho
         };
         match oracle::docker_result_from_report(r) {
             Some(res) => {
-                if cache.insert(s, res) {
+                if cache.insert(s, docker_platform, res) {
                     seeded += 1;
                 } else {
                     skipped += 1;
@@ -903,6 +920,42 @@ fn preflight(bin: &Path) -> anyhow::Result<()> {
         eprintln!(
             "WARNING: {} looks STALE (older than a runtime-crate source) — \
              run `just build` to be sure you are testing HEAD. Continuing.",
+            bin.display()
+        );
+    }
+    Ok(())
+}
+
+/// Local Linux/KVM preflight: the binary is built for platform-linux and runs
+/// on this host, so macOS codesign is irrelevant. Validate only the local
+/// executable and `/dev/kvm` before the suite fan-out starts.
+fn preflight_kvm_local(bin: &Path) -> anyhow::Result<()> {
+    let meta = match std::fs::metadata(bin) {
+        Ok(m) => m,
+        Err(_) => anyhow::bail!(
+            "{} is missing — build carrick-cli with `--no-default-features --features platform-linux` first",
+            bin.display()
+        ),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        anyhow::ensure!(
+            meta.permissions().mode() & 0o111 != 0,
+            "{} exists but is not executable",
+            bin.display()
+        );
+    }
+    anyhow::ensure!(
+        std::path::Path::new("/dev/kvm").exists(),
+        "/dev/kvm is missing — `--lane kvm-local` must run on a Linux host with KVM"
+    );
+    if let (Ok(bin_t), Some(src_t)) = (meta.modified(), newest_runtime_src_mtime())
+        && bin_t < src_t
+    {
+        eprintln!(
+            "WARNING: {} looks STALE (older than a runtime-crate source) — \
+             rebuild the platform-linux carrick binary to be sure you are testing HEAD. Continuing.",
             bin.display()
         );
     }

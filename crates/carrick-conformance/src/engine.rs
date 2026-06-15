@@ -88,15 +88,15 @@ pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Ve
     a
 }
 
-/// Build the docker argv: `run --name conf-<id> --platform linux/arm64 <flags> <image> <cmd...>`.
-fn docker_argv(suite: &Suite, run_id: &str) -> Vec<String> {
+/// Build the docker argv: `run --name conf-<id> --platform <platform> <flags> <image> <cmd...>`.
+fn docker_argv(suite: &Suite, run_id: &str, platform: crate::lane::DockerPlatform) -> Vec<String> {
     let mut a = vec![
         "docker".to_string(),
         "run".to_string(),
         "--name".to_string(),
         run_id.to_string(), // already `conf-<pid>-<seq>` from the orchestrator
         "--platform".to_string(),
-        "linux/arm64".to_string(),
+        platform.as_str().to_string(),
     ];
     a.extend(suite.docker_flags.iter().cloned());
     if let Some(ep) = suite.entrypoint.as_ref().and_then(|e| e.for_docker()) {
@@ -125,8 +125,12 @@ pub fn carrick_dry_run(
 ) -> Vec<String> {
     crate::lane::carrick_invocation_argv(suite, carrick_bin, run_id, lane)
 }
-pub fn docker_dry_run(suite: &Suite, run_id: &str) -> Vec<String> {
-    docker_argv(suite, run_id)
+pub fn docker_dry_run(
+    suite: &Suite,
+    run_id: &str,
+    platform: crate::lane::DockerPlatform,
+) -> Vec<String> {
+    docker_argv(suite, run_id, platform)
 }
 
 pub fn run_carrick(
@@ -145,15 +149,12 @@ pub fn run_carrick(
     // proctitle/kill id from it) — no bespoke CARRICK_RUN_ID env needed.
     // Hvf still sets the insecure-registry env on the LOCAL process; Kvm already
     // carried it INTO the guest argv (`env …`), so only set it for Hvf.
-    if !lane.is_kvm()
+    if lane.needs_local_registry_env()
         && let Some(host) = suite.registry_host()
     {
         cmd.env("CARRICK_INSECURE_REGISTRIES", host);
     }
-    let lima = match lane {
-        crate::lane::Lane::Kvm(cfg) => Some(cfg.clone()),
-        crate::lane::Lane::Hvf => None,
-    };
+    let cleanup = CarrickCleanup::from_lane(lane);
     // Lane-scaled deadline: nested-KVM runs get a stretched budget (the gate
     // asserts correctness parity with docker, not speed parity); docker
     // oracles below keep the unscaled suite budget.
@@ -163,11 +164,15 @@ pub fn run_carrick(
         lane.scaled_timeout(suite.timeout_s),
         run_id,
         Engine::Carrick,
-        lima,
+        Some(cleanup),
     )
 }
 
-pub fn run_docker(suite: &Suite, run_id: &str) -> anyhow::Result<RunOutput> {
+pub fn run_docker(
+    suite: &Suite,
+    run_id: &str,
+    platform: crate::lane::DockerPlatform,
+) -> anyhow::Result<RunOutput> {
     // Idempotent pre-clean: a prior crashed run with the same deterministic id
     // may have left the container around; free the name before `docker run --name`.
     let container = run_id.to_string();
@@ -176,7 +181,7 @@ pub fn run_docker(suite: &Suite, run_id: &str) -> anyhow::Result<RunOutput> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let argv = docker_argv(suite, run_id);
+    let argv = docker_argv(suite, run_id, platform);
     // SAFE: see run_carrick — argv is from the trusted manifest; `Command::args` is shell-free.
     let mut cmd = Command::new(&argv[0]); // nosemgrep
     cmd.args(&argv[1..]);
@@ -197,13 +202,30 @@ enum Engine {
     Docker,
 }
 
+#[derive(Clone)]
+enum CarrickCleanup {
+    Hvf,
+    KvmLima(crate::lane::LimaConfig),
+    KvmLocal,
+}
+
+impl CarrickCleanup {
+    fn from_lane(lane: &crate::lane::Lane) -> Self {
+        match lane {
+            crate::lane::Lane::Hvf => CarrickCleanup::Hvf,
+            crate::lane::Lane::Kvm(cfg) => CarrickCleanup::KvmLima(cfg.clone()),
+            crate::lane::Lane::KvmLocal(_) => CarrickCleanup::KvmLocal,
+        }
+    }
+}
+
 fn run_one(
     mut cmd: Command,
     argv: Vec<String>,
     timeout_s: u64,
     run_id: &str,
     engine: Engine,
-    lima: Option<crate::lane::LimaConfig>,
+    cleanup: Option<CarrickCleanup>,
 ) -> anyhow::Result<RunOutput> {
     std::fs::create_dir_all(raw_dir())?;
     let stdout_path = raw_dir().join(format!("{run_id}.out"));
@@ -227,7 +249,7 @@ fn run_one(
             None => {
                 if start.elapsed() >= deadline {
                     timed_out = true;
-                    kill_scoped(pid, run_id, engine, lima.as_ref());
+                    kill_scoped(pid, run_id, engine, cleanup.as_ref());
                     // Reap whatever is left.
                     let _ = child.wait();
                     break -1;
@@ -248,13 +270,13 @@ fn run_one(
 }
 
 /// Kill exactly this run — never an unscoped reap.
-fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane::LimaConfig>) {
+fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickCleanup>) {
     // Group kill of the direct child tree (cheap, scoped to our spawned pid).
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
-    match (engine, lima) {
-        (Engine::Carrick, Some(cfg)) => {
+    match (engine, cleanup) {
+        (Engine::Carrick, Some(CarrickCleanup::KvmLima(cfg))) => {
             // KVM lane: the group kill above only reached the MAC side (limactl/
             // ssh); the carrick tree lives in the GUEST and carrick escapes its
             // process group there (it manages guest pgids), so reap it with a
@@ -279,7 +301,17 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane
                 .stderr(Stdio::null())
                 .status();
         }
-        (Engine::Carrick, None) => {
+        (Engine::Carrick, Some(CarrickCleanup::KvmLocal)) => {
+            // Local Linux/KVM: carrick may have escaped its original process
+            // group, and Linux builds keep the original argv instead of macOS
+            // proctitle rewriting. Reap only this run's named process tree.
+            let _ = Command::new("pkill")
+                .args(["-9", "-f", &format!("run --name {run_id} ")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        (Engine::Carrick, Some(CarrickCleanup::Hvf) | None) => {
             // Belt for a guest that escaped its group (setpgid/setsid): the
             // SCOPED kill.sh, which matches only `carrick:<run-id>` and refuses
             // a global reap. Best-effort (needs the sudoers entry).
@@ -297,5 +329,24 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, lima: Option<&crate::lane
                 .stderr(Stdio::null())
                 .status();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lane::DockerPlatform;
+
+    #[test]
+    fn docker_argv_uses_requested_platform() {
+        let suite = Suite::for_test("localhost:5050/ltp:amd64", &["true"]);
+
+        let argv = docker_dry_run(&suite, "conf-1", DockerPlatform::LinuxAmd64);
+
+        let platform = argv
+            .windows(2)
+            .find(|w| w[0] == "--platform")
+            .map(|w| w[1].as_str());
+        assert_eq!(platform, Some("linux/amd64"));
     }
 }
