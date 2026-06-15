@@ -33,6 +33,10 @@ carrick-thread = { path = "../carrick-thread" }
 # `carrick_host::umtx` is the FreeBSD `_umtx_op` shared-futex wrapper used by
 # BhyveFutex's shared half. (cfg(target_os = "freebsd") inside carrick-host.)
 carrick-host = { path = "../carrick-host" }
+# The BSD-family host layer: the one shared `SIGNUM_XLATE` signal-number table
+# (`carrick_bsd::signum`), shared verbatim with the HVF/macOS backend. Gated on
+# `carrick_bsd_family` (includes freebsd), so it is present on the bhyve host.
+carrick-bsd = { path = "../carrick-bsd" }
 # Neutral timer slot bookkeeping (BhyveTimerDelivery) + per-thread pending store
 # (the timer firing thread publishes here then kicks). Mirrors carrick-linux.
 carrick-timer-core = { path = "../carrick-timer-core" }
