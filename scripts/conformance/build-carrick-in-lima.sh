@@ -15,7 +15,7 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
   # The carrick CLI is carrick-cli built for platform-linux (== the real
   # `carrick run <image>` path: carrick-engine -> run_oci -> KVM). `--no-default-
   # features` is REQUIRED: the default feature is platform-macos, which pulls in
-  # carrick-hvf/applevisor and fails to build on Linux (E0433). The platform-linux
+  # carrick-vmm-hvf/applevisor and fails to build on Linux (E0433). The platform-linux
   # closure is HVF-free (scripts/closure-assert-no-hvf.sh), matching kvm-smoke-lima.sh.
   cargo build --release -p carrick-cli --no-default-features --features platform-linux \
     --target-dir "$HOME/ct" --locked >&2

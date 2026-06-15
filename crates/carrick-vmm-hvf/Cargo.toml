@@ -1,11 +1,11 @@
 [package]
-name = "carrick-hvf"
+name = "carrick-vmm-hvf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "carrick_hvf"
+name = "carrick_vmm_hvf"
 path = "src/lib.rs"
 
 [lints]

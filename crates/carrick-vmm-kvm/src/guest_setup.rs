@@ -1177,7 +1177,7 @@ pub(crate) fn program_sysregs(vcpu: &mut KvmVcpu, image: &AddressSpace) -> Resul
 
     // The trampoline ends in `eret`, which loads PC <- ELR_EL1 and
     // PSTATE <- SPSR_EL1. Program both so the eret drops to EL0 at the image
-    // entry. (Mirrors the HVF path at carrick-hvf/src/trap.rs:1462-1476.)
+    // entry. (Mirrors the HVF path at carrick-vmm-hvf/src/trap.rs:1462-1476.)
     vcpu.set_reg(Reg::SpsrEl1, PSTATE_M_EL0T | DAIF_MASKED)?;
     vcpu.set_reg(Reg::ElrEl1, image.entry())?;
 

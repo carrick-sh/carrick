@@ -13,7 +13,7 @@ workspace = true
 
 # Per-process thread registry + private futex table + fork/page-table quiesce
 # barriers. Hypervisor-AGNOSTIC (compiles on macOS/Linux/FreeBSD); depends only
-# on the lowest leaf crates so both carrick-hvf and carrick-vmm-kvm can use it
+# on the lowest leaf crates so both carrick-vmm-hvf and carrick-vmm-kvm can use it
 # without depending on each other.
 [dependencies]
 carrick-hal = { path = "../carrick-hal" }

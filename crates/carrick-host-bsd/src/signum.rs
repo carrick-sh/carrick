@@ -15,7 +15,7 @@
 //!
 //! macOS, FreeBSD, NetBSD, OpenBSD and DragonFly all share the SAME BSD signal
 //! numbering, so this is ONE table for the family — previously triplicated as
-//! `carrick_hvf::host_signal::SIGNUM_XLATE` (macOS) and
+//! `carrick_vmm_hvf::host_signal::SIGNUM_XLATE` (macOS) and
 //! `carrick_vmm_bhyve::bhyve_signum::SIGNUM_XLATE` (FreeBSD), entry-for-entry equal.
 //! Derived clean-room from the BSD host header `<sys/signal.h>` (host-API side —
 //! allowed) and the Linux numbers from `signal(7)` (already baked into carrick).

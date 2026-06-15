@@ -8,7 +8,7 @@
 //! per-platform:
 //!
 //! - `crate::host_signal::linux_to_host_signum` — the Darwin signal-number
-//!   mapping on macOS (via `carrick_hvf`), the identity function on Linux (the
+//!   mapping on macOS (via `carrick_vmm_hvf`), the identity function on Linux (the
 //!   stub in `lib.rs`).
 //! - `crate::guest_cpu::{record_child_exit, total_ns}` — always from
 //!   `carrick_host` (an unconditional dependency on both platforms).

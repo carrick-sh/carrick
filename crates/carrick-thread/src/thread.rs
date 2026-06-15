@@ -123,7 +123,7 @@ pub fn current_thread_name(tid: ThreadId) -> Option<[u8; 16]> {
 }
 
 /// This process's live `(tid, port)` pairs, or empty if unset. Used by
-/// platform-specific code (carrick-hvf) to query the kernel for thread states
+/// platform-specific code (carrick-vmm-hvf) to query the kernel for thread states
 /// via mach port, since that API is Darwin-only and cannot live here.
 pub fn current_thread_ports() -> Vec<(ThreadId, ThreadPort)> {
     CURRENT_REGISTRY
@@ -242,7 +242,7 @@ impl ThreadRegistry {
     }
 
     /// Raw `(tid, port)` snapshot for every live thread. The caller (platform-
-    /// specific code in carrick-hvf) maps each port to a kernel run-state char
+    /// specific code in carrick-vmm-hvf) maps each port to a kernel run-state char
     /// via `thread_run_state_char`; that API is Darwin-only so it cannot live
     /// here. Replaces the former `thread_states()` method that embedded the
     /// Darwin syscall inside the registry.

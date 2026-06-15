@@ -11,7 +11,7 @@
 // off-macOS where the casts are genuinely redundant.
 #![cfg_attr(not(target_os = "macos"), allow(clippy::unnecessary_cast))]
 // Same shape story for `CompatReporter::default()`: the reporter is a real
-// fielded struct on macOS (carrick-hvf) but a unit struct in the non-macOS
+// fielded struct on macOS (carrick-vmm-hvf) but a unit struct in the non-macOS
 // fallback, so `default_constructed_unit_structs` fires only off-macOS. Keep it
 // STRICT on macOS.
 #![cfg_attr(
@@ -37,7 +37,7 @@
 //! This crate is the union of those two roles. The split between them is
 //! reflected in the module layout:
 //!
-//! - **The exec engine** (the leaf crate `carrick-hvf`, re-exported below under
+//! - **The exec engine** (the leaf crate `carrick-vmm-hvf`, re-exported below under
 //!   `crate::trap`, `crate::thread`, `crate::io_wait`, …): the HVF trap engine
 //!   that owns the vCPUs, fork/exec address-space surgery, the SIMD/FP restore
 //!   shim, cross-thread vCPU coordination (the kicker, the fork/page-table
@@ -65,7 +65,7 @@
 //! re-exported below under their *original* `crate::<module>` paths, so every
 //! call site across the runtime — and every `carrick_runtime::<module>` path the
 //! CLI/engine crates use — is unchanged. When you see `crate::trap::…` or
-//! `crate::memory::…` in this crate, the code physically lives in `carrick-hvf`
+//! `crate::memory::…` in this crate, the code physically lives in `carrick-vmm-hvf`
 //! / `carrick-mem` / `carrick-host` / `carrick-abi`; the boundary is a build
 //! optimisation, not a semantic one.
 //!
@@ -83,7 +83,7 @@
 //! - **One vCPU per guest thread, one process VM.** Stage-2 mappings are shared
 //!   across all vCPUs, but stage-1 page-table edits (mmap/mprotect/munmap) and
 //!   forks are stop-the-world events coordinated through the quiesce barriers in
-//!   `carrick-hvf::fork_quiesce`.
+//!   `carrick-vmm-hvf::fork_quiesce`.
 
 // carrick-runtime is an INTERNAL crate (consumed only by carrick-engine and
 // carrick-cli), and its rustdoc is built with `--document-private-items` so the
@@ -149,7 +149,7 @@ pub use carrick_mem::{elf, memory, page_table, vdso};
 // / `crate::guest_cpu::…` / `crate::ulock::…` site is unchanged.
 pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 // The dispatch-free vCPU / exec-engine cluster was lifted into the leaf crate
-// `carrick-hvf` (report item #1): the HVF trap engine (`trap`, incl. the
+// `carrick-vmm-hvf` (report item #1): the HVF trap engine (`trap`, incl. the
 // `SyscallTrap` contract + SIMD/FP C shim), cross-thread vCPU coordination
 // (`thread`/`vcpu_kick`/`io_wait`/`itimer`/`fork_quiesce`/`fork_coord`), the
 // shared-aperture allocator, the Darwin `kqueue` wrapper, host-signal capture,
@@ -158,7 +158,7 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 // their original `crate::trap::…` / `crate::thread::…` / … paths so every call
 // site across the runtime is unchanged.
 #[cfg(feature = "platform-macos")]
-pub use carrick_hvf::{
+pub use carrick_vmm_hvf::{
     fork_coord, host_signal, io_wait, itimer, posix_timer, probes, signal_arrival, threaded_impl,
     trap, vcpu_kick,
 };
@@ -166,7 +166,7 @@ pub use carrick_hvf::{
 // `timer_delivery` name is the runtime's own register/deliver module above), so
 // the macOS run-loop startup can name `HvfTimerDelivery`.
 #[cfg(feature = "platform-macos")]
-pub use carrick_hvf::timer_delivery as timer_delivery_impl;
+pub use carrick_vmm_hvf::timer_delivery as timer_delivery_impl;
 // The syscall-compat reporter is platform-neutral; it lives in
 // carrick-observability so every backend shares the REAL recorder (the Linux/KVM
 // arm was a no-op unit-struct stub; bhyve would have inherited it). DTrace
@@ -191,10 +191,10 @@ pub use carrick_mem::shared_aperture;
 pub use carrick_thread::{fork_quiesce, thread};
 // `current_thread_states` queries the kernel for per-thread run-state via the
 // Mach port recorded by each vCPU thread. On macOS the real implementation
-// (in carrick-hvf::thread) issues `thread_info`; on Linux there are no Mach
+// (in carrick-vmm-hvf::thread) issues `thread_info`; on Linux there are no Mach
 // ports, so we return every registered thread with state 'R' (running).
 #[cfg(feature = "platform-macos")]
-pub use carrick_hvf::thread::current_thread_states;
+pub use carrick_vmm_hvf::thread::current_thread_states;
 #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
     thread::current_thread_ports()
@@ -203,7 +203,7 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
         .collect()
 }
 
-// Under platform-linux there is no carrick-hvf to re-export `trap` from; the
+// Under platform-linux there is no carrick-vmm-hvf to re-export `trap` from; the
 // SyscallTrap/TrapError/ForkOutcome contract lives in carrick-hal (section
 // HAL). Re-export a `trap` shim so `crate::trap::{SyscallTrap, …}` resolves on
 // both platforms. The concrete engine (HvfTrapEngine / KvmTrapEngine) is
@@ -218,7 +218,7 @@ pub mod trap {
     // Linux (the generic threaded loop drives them on both backends since the
     // Phase 2 KVM bring-up); what differs is how much host-side VM surgery
     // each backend needs. On HVF these hooks coordinate the stop-the-world VM
-    // teardown/rebuild (carrick-hvf::trap); KVM forks by rebuilding a fresh VM
+    // teardown/rebuild (carrick-vmm-hvf::trap); KVM forks by rebuilding a fresh VM
     // in the CHILD only, so the HVF-specific hooks below stay inert no-ops —
     // same pattern as the `host_signal` / `probes` Linux stubs below.
 
@@ -1352,7 +1352,7 @@ pub mod host_signal {
     /// them from scratch as it boots its own guest.
     ///
     /// NEUTRAL vs GLUE (mirrors the HVF arm's rationale,
-    /// `carrick_hvf::host_signal::reset_after_supervisor_fork`). The load-bearing
+    /// `carrick_vmm_hvf::host_signal::reset_after_supervisor_fork`). The load-bearing
     /// CORRECTNESS clears are the platform-NEUTRAL `carrick-signal-core` state —
     /// the same pending / disposition / child-watch the HVF arm clears — so the
     /// child starts with an empty pending set and re-derives its own host
@@ -1837,7 +1837,7 @@ pub mod io_wait {
         // shared kill path marks the slot BEFORE raising) is waitable NOW: the
         // re-dispatched wait4 skips the park and its blocking host wait observes
         // the WIFSTOPPED status. Mirrors the HVF waiter's identical pre-check
-        // (carrick-hvf io_wait::child_status_ready).
+        // (carrick-vmm-hvf io_wait::child_status_ready).
         if pid > 0 && crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32) {
             return true;
         }

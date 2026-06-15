@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-// No-op USDT probe stubs. The real probes live in carrick-hvf's probes module;
+// No-op USDT probe stubs. The real probes live in carrick-vmm-hvf's probes module;
 // carrick-thread must not depend on that crate. These probe calls are
 // observability-only (they do not gate behavior): replacing them with no-ops
 // changes nothing except traceability.

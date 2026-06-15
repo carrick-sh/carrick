@@ -888,7 +888,7 @@ impl SyscallTrap for KvmTrapEngine {
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
         // In-place image replacement on the LIVE VM (no teardown, unlike HVF
         // which rebuilds the VM). Mirrors the HVF structure
-        // (carrick-hvf/src/trap.rs:3764-3913): build the new layout up front,
+        // (carrick-vmm-hvf/src/trap.rs:3764-3913): build the new layout up front,
         // remap the slots, reprogram the registers, preserve is_forked_child.
         //
         // 1. Build the new image's guest RAM (fresh host mmaps + image segments +

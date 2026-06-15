@@ -167,7 +167,7 @@
 
 // The hub types live in the leaf crate carrick-guest-mem (A2); import them from
 // there, not via `crate::dispatch`, so trap.rs has NO dependency on the
-// dispatcher — the last edge blocking a future carrick-hvf crate (A3).
+// dispatcher — the last edge blocking a future carrick-vmm-hvf crate (A3).
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
 use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
@@ -183,7 +183,7 @@ use carrick_mem::protections::MemoryProtections;
 
 // SyscallTrap/TrapError/ForkOutcome moved down into the carrick-hal leaf crate
 // (the runtime↔engine contract is platform-agnostic). Re-export them here so
-// existing `crate::trap::…` paths in carrick-hvf and carrick-runtime are
+// existing `crate::trap::…` paths in carrick-vmm-hvf and carrick-runtime are
 // unchanged. HvfTrapEngine below implements the trait from its new home.
 use carrick_hal::aarch64::ExecLevel;
 // The ESR exception-class decode surface (classifier fns + the SVC/HVC class

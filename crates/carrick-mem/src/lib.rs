@@ -11,7 +11,7 @@
 //! would already have set up: page tables, exception vectors, the entry path
 //! into EL0, and the vDSO. That is this crate. It produces an [`memory::AddressSpace`]
 //! (a list of [`memory::MemoryRegion`]s plus an entry point and the EL1 control
-//! registers to program); the trap engine in `carrick-hvf` `hv_vm_map`s those
+//! registers to program); the trap engine in `carrick-vmm-hvf` `hv_vm_map`s those
 //! regions and starts the vCPU.
 //!
 //! ## The four problems this crate solves

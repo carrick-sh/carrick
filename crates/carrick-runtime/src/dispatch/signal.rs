@@ -5,7 +5,7 @@
 //! Signal handling in carrick is split across three places, and this file owns
 //! the MIDDLE one — the bookkeeping. It is worth being precise about the seam:
 //!
-//!   - **carrick-hvf** (`host_signal`) owns the host↔guest signum translation
+//!   - **carrick-vmm-hvf** (`host_signal`) owns the host↔guest signum translation
 //!     (`SIGNUM_XLATE` / `host_to_linux_signum`): a macOS host signal that the
 //!     runtime catches must be mapped to its Linux number before this layer
 //!     reasons about it, because the numbers differ above the POSIX core (e.g.
