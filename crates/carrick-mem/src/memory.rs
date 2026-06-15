@@ -679,7 +679,7 @@ impl AddressSpace {
         let path = path.as_ref();
         let plan = plan_elf_load_for(path, machine)?;
         let file = fs::read(path)?;
-        Self::load_elf_segments_with_interpreter(&file, plan, &|p| fs::read(p).ok())
+        Self::load_elf_segments_with_interpreter(&file, plan, machine, &|p| fs::read(p).ok())
     }
 
     pub fn load_elf_bytes(bytes: &[u8]) -> Result<Self, AddressSpaceError> {
@@ -716,7 +716,7 @@ impl AddressSpace {
         machine: u16,
     ) -> Result<Self, AddressSpaceError> {
         let plan = plan_elf_load_bytes_for(file, machine)?;
-        Self::load_elf_segments_with_interpreter(file, plan, read_interp)
+        Self::load_elf_segments_with_interpreter(file, plan, machine, read_interp)
     }
 
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
@@ -732,6 +732,7 @@ impl AddressSpace {
     fn load_elf_segments_with_interpreter(
         file: &[u8],
         plan: LoadPlan,
+        machine: u16,
         read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Result<Self, AddressSpaceError> {
         let mut regions = regions_from_load_plan(file, &plan)?;
@@ -741,8 +742,8 @@ impl AddressSpace {
         if let Some(interpreter_path) = plan.interpreter.as_deref() {
             let interpreter = read_interp(interpreter_path)
                 .ok_or_else(|| AddressSpaceError::Io(std::io::ErrorKind::NotFound.into()))?;
-            let interpreter_plan =
-                plan_elf_load_bytes(&interpreter)?.with_load_bias(LINUX_INTERPRETER_BASE);
+            let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)?
+                .with_load_bias(LINUX_INTERPRETER_BASE);
             regions.extend(regions_from_load_plan(&interpreter, &interpreter_plan)?);
             entry = interpreter_plan.entry;
             interpreter_base = Some(LINUX_INTERPRETER_BASE);
@@ -2304,6 +2305,61 @@ mod loader_tests {
     use super::*;
     use crate::elf::{ElfType, LoadPlan, LoadSegment};
 
+    const ET_EXEC_TYPE: u16 = 2;
+    const ET_DYN_TYPE: u16 = 3;
+    const EM_X86_64: u16 = 62;
+    const PT_LOAD: u32 = 1;
+    const PT_INTERP: u32 = 3;
+    const PF_R: u32 = 4;
+    const PF_X: u32 = 1;
+
+    fn synthetic_elf(
+        e_type: u16,
+        machine: u16,
+        entry: u64,
+        segment_vaddr: u64,
+        interp: Option<&str>,
+    ) -> Vec<u8> {
+        let phnum = if interp.is_some() { 2_u16 } else { 1_u16 };
+        let interp_offset = 64 + usize::from(phnum) * 56;
+        let load_offset = 0x1000_usize;
+        let mut elf = vec![0_u8; load_offset + 4];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&e_type.to_le_bytes());
+        elf[18..20].copy_from_slice(&machine.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&entry.to_le_bytes());
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&phnum.to_le_bytes());
+
+        let ph = 64;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&(load_offset as u64).to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&segment_vaddr.to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&segment_vaddr.to_le_bytes());
+        elf[ph + 32..ph + 40].copy_from_slice(&4_u64.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[load_offset..load_offset + 4].copy_from_slice(&[0xc3, 0, 0, 0]);
+
+        if let Some(interp) = interp {
+            let interp_bytes = interp.as_bytes();
+            let ph = 64 + 56;
+            elf[ph..ph + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+            elf[ph + 8..ph + 16].copy_from_slice(&(interp_offset as u64).to_le_bytes());
+            elf[ph + 32..ph + 40].copy_from_slice(&(interp_bytes.len() as u64).to_le_bytes());
+            elf[interp_offset..interp_offset + interp_bytes.len()].copy_from_slice(interp_bytes);
+        }
+
+        elf
+    }
+
     #[test]
     fn merges_segments_that_overlap_after_hvf_page_rounding() {
         let mut file = vec![0_u8; 0x9000];
@@ -2457,6 +2513,30 @@ mod loader_tests {
             ]
         );
         assert_eq!(LINUX_SIGRETURN_TRAMPOLINE_BASE, 0x30_0000_0000);
+    }
+
+    #[test]
+    fn load_elf_bytes_with_reader_for_applies_machine_to_interpreter() {
+        let main = synthetic_elf(
+            ET_EXEC_TYPE,
+            EM_X86_64,
+            0x400000,
+            0x400000,
+            Some("/lib/ld-x86_64.so.1\0"),
+        );
+        let interp = synthetic_elf(ET_DYN_TYPE, EM_X86_64, 0x120, 0, None);
+
+        let image = AddressSpace::load_elf_bytes_with_reader_for(
+            &main,
+            &|path| {
+                assert_eq!(path, "/lib/ld-x86_64.so.1");
+                Some(interp.clone())
+            },
+            EM_X86_64,
+        )
+        .expect("x86_64 interpreter should load with x86_64 machine");
+
+        assert_eq!(image.entry(), LINUX_INTERPRETER_BASE + 0x120);
     }
 
     #[test]
