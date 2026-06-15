@@ -53,15 +53,16 @@ use carrick_hal::OsError;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
 use carrick_x86::{
-    BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86Reg, X86Seg,
-    X86Vcpu, X86Vmm,
+    BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86FaultKind,
+    X86Reg, X86Seg, X86Vcpu, X86Vmm,
 };
 
 use crate::bhyve_kicker::{BhyveKickHandle, BhyveKicker};
 use crate::guest_setup_x86::{
-    BhyveGuestRam, BroughtUpX86, FP_STUB_DOORBELL_PORT, PROT_RWX, SYSCALL_DOORBELL_PORT,
-    VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA, X86_FP_STUB_GPA, X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_GPA,
-    bring_up_x86_elf, program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
+    BhyveGuestRam, BroughtUpX86, FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultScratchRecord,
+    PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA, X86_FP_STUB_GPA,
+    X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_GPA, bring_up_x86_elf, fault_scratch_gpa,
+    fault_scratch_record_from_bytes, program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
 };
 use crate::vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm, Vcpu};
 use crate::vmm_x86::{
@@ -395,8 +396,8 @@ impl X86Vcpu for BhyveX86Vcpu {
         if !self.h.started.load(Ordering::SeqCst) {
             return Ok(Some([0u8; 512]));
         }
-        // SP4.1 CPL gate: `fxsave` can only run at CPL 0 (at ring 3 it #UDs the
-        // empty IDT → triple fault). The syscall-boundary path (raise/intra-proc
+        // SP4.1 CPL gate: `fxsave` can only run at CPL 0 (at ring 3 it #UDs and
+        // enters the fault path). The syscall-boundary path (raise/intra-proc
         // signals + rt_sigreturn) enters via SYSCALL → the LSTAR stub leaves the
         // vCPU in ring 0, so the stub runs. An async (cross-thread kick) signal
         // parks the vCPU at an arbitrary ring-3 PC; there we cannot fxsave, so
@@ -488,6 +489,32 @@ impl X86Vcpu for BhyveX86Vcpu {
                     is_in: false,
                     ..
                 } => return Ok(X86Exit::FpDoorbell),
+                // SP4.3 synchronous-fault doorbell (OUT 0xC7): the guest IDT
+                // stub stored vector/error-code in the per-vCPU scratch page,
+                // and CR2 carries the faulting linear address for #PF.
+                NativeExit::Inout {
+                    port: FAULT_DOORBELL_PORT,
+                    is_in: false,
+                    ..
+                } => {
+                    let id = self.h.slot().id;
+                    let scratch_gpa = fault_scratch_gpa(id).map_err(Self::reg_err)?;
+                    let scratch =
+                        self.read_gpa(scratch_gpa, std::mem::size_of::<FaultScratchRecord>())?;
+                    let record =
+                        fault_scratch_record_from_bytes(&scratch).map_err(Self::reg_err)?;
+                    let cr2 = self.get_raw(VM_REG_GUEST_CR2)?;
+                    let kind = match record.vector() {
+                        14 => X86FaultKind::PageFault,
+                        13 | 17 => X86FaultKind::Protection,
+                        _ => X86FaultKind::Other,
+                    };
+                    return Ok(X86Exit::Fault {
+                        kind,
+                        gpa: cr2,
+                        error_code: record.error_code(),
+                    });
+                }
                 // A requested kick surfaces as BOGUS (astpending), not EINTR. If WE
                 // raised the kick, surface Kicked so the loop re-checks pending;
                 // a spurious VT-x BOGUS just re-runs the guest.
@@ -510,8 +537,8 @@ impl X86Vcpu for BhyveX86Vcpu {
                     let cs = self.get_raw(VM_REG_GUEST_CS).unwrap_or(u64::MAX);
                     return Err(TrapError::Hypervisor(format!(
                         "bhyve-x86: VM_EXITCODE_SUSPENDED how={how} (4=TRIPLEFAULT) \
-                     rip={rip:#x} cs={cs:#x} (cpl={}); the guest faulted with the \
-                     empty IDT before reaching a syscall doorbell",
+                     rip={rip:#x} cs={cs:#x} (cpl={}); the guest suspended before \
+                     reaching a handled syscall/fault doorbell",
                         cs & 3
                     )));
                 }

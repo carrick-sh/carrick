@@ -45,6 +45,7 @@ carrick-signal-core = { path = "../carrick-signal-core" }
 # (bhyve_x86_engine) are the thin per-VMM trait pair `X86EngineCore<V>` is
 # parameterized over — the same crate carrick-vmm-kvm (KVM) and carrick-vmm-nvmm build on.
 carrick-x86 = { path = "../carrick-x86" }
+bitflags.workspace = true
 libc.workspace = true
 
 [features]
