@@ -153,17 +153,11 @@ pub struct BringupLayout {
     pub pml4_base: u64,
 }
 
-/// Per-region cap so a multi-GiB pre-allocated arena never gets fully mapped /
-/// registered. The M2 bump allocators (heap ≤ 8 MiB, mmap ≤ 64 MiB) stay well
-/// inside this; the shared apertures are empty for the MVP. Matches the KVM and
-/// bhyve copies' 64 MiB cap.
-pub const MAX_WINDOW_LEN: u64 = 64 * 1024 * 1024;
-
 // ─── plan_windows ────────────────────────────────────────────────────────────
 
 /// Walk an image's regions into the shared [`WindowPlan`] (the §2.5a union the
 /// backend realizes as N slots (KVM) or one contiguous segment (bhyve)). Image-
-/// based, no vCPU. Each user region is capped at [`MAX_WINDOW_LEN`]; the three
+/// based, no vCPU. User regions cover the full address-space extent; the three
 /// kernel-only structures (trampoline/GDT/PML4) are appended as supervisor-only
 /// regions at the `layout` GPAs.
 pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<WindowPlan, TrapError> {
@@ -178,12 +172,11 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
         if raw_len == 0 {
             continue;
         }
-        let len = raw_len.min(MAX_WINDOW_LEN);
         // Identity GPA = VA for every image region.
         regions.push(WindowRegion {
             va: region.start,
             gpa: region.start,
-            len,
+            len: raw_len,
             read: region.perms.read,
             write: region.perms.write,
             exec: region.perms.execute,
@@ -701,6 +694,90 @@ fn host_write(fd: i32, buf: &[u8]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_mem::memory::{LINUX_MMAP_BASE, mmap_arena_size};
+
+    fn test_layout() -> BringupLayout {
+        BringupLayout {
+            trampoline_base: 0x1000_0000,
+            gdt_base: 0x1000_1000,
+            pml4_base: 0x1000_2000,
+        }
+    }
+
+    fn synthetic_x86_elf() -> Vec<u8> {
+        const ET_EXEC: u16 = 2;
+        const PT_LOAD: u32 = 1;
+        const PF_X: u32 = 1;
+        const PF_R: u32 = 4;
+
+        let mut elf = vec![0u8; 0x1004];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&X8664GuestArch::elf_machine().to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+        let ph = 64;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[0x1000] = 0xc3; // ret
+        elf
+    }
+
+    fn synthetic_x86_image() -> AddressSpace {
+        let elf = synthetic_x86_elf();
+        AddressSpace::load_elf_bytes_with_reader_for(&elf, &|_| None, X8664GuestArch::elf_machine())
+            .expect("synthetic x86 ELF should load")
+    }
+
+    #[test]
+    fn plan_windows_covers_full_runtime_mmap_arena() {
+        let image = synthetic_x86_image();
+        let plan = plan_windows(&image, test_layout()).expect("window plan");
+        let mmap = plan
+            .regions
+            .iter()
+            .find(|region| region.va == LINUX_MMAP_BASE)
+            .expect("mmap arena region");
+
+        assert_eq!(mmap.gpa, LINUX_MMAP_BASE);
+        assert_eq!(mmap.len, mmap_arena_size());
+        assert!(
+            mmap.len > 64 * 1024 * 1024,
+            "generic x86 plan must not carry the old MVP 64 MiB cap"
+        );
+    }
+
+    #[test]
+    fn build_pml4_translates_full_runtime_mmap_arena() {
+        let image = synthetic_x86_image();
+        let layout = test_layout();
+        let plan = plan_windows(&image, layout).expect("window plan");
+        let bytes = build_pml4(&plan, layout).expect("build PML4");
+        let mgr = carrick_mem::pml4::Pml4Manager::new(bytes, layout.pml4_base);
+        let arena_end = LINUX_MMAP_BASE + mmap_arena_size();
+
+        assert_eq!(mgr.translate(LINUX_MMAP_BASE), Some(LINUX_MMAP_BASE));
+        assert_eq!(
+            mgr.translate(arena_end - 1),
+            Some(arena_end - 1),
+            "last byte of the mmap arena must be mapped"
+        );
+        assert_eq!(mgr.translate(arena_end), None);
+    }
 
     #[test]
     fn seg_ar_packs_user_cs() {
