@@ -508,7 +508,7 @@ impl GuestArch for X8664GuestArch {
 
         // ── ucontext. ──
         let mut uc = X8664Ucontext::empty();
-        uc.uc_sigmask[0] = p.saved_sigmask;
+        uc.uc_sigmask = p.saved_sigmask;
         if let Some((ss_sp, ss_size)) = p.altstack {
             uc.uc_stack = carrick_abi::LinuxSignalStack {
                 ss_sp,
@@ -582,7 +582,7 @@ impl GuestArch for X8664GuestArch {
         // fields of a #[repr(C, packed)] value).
         let uc = frame.uc;
         let mc = uc.uc_mcontext;
-        let sigmask = { uc.uc_sigmask }[0];
+        let sigmask = uc.uc_sigmask;
         let fp = frame.fpstate;
 
         // Validate the resume RIP is canonical (bits 47..63 sign-extended) — a

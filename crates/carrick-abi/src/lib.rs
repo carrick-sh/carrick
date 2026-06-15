@@ -1468,8 +1468,11 @@ impl X8664Sigcontext {
     }
 }
 
-/// x86-64 `struct ucontext` (424 bytes). `uc_sigmask` is a 128-byte sigset_t;
-/// only `[0]` (the low 64 signals) is live for Linux.
+/// x86-64 signal-frame `ucontext` prefix (304 bytes). The live Linux/amd64
+/// signal frame places the one-word kernel sigmask at offset 296, followed
+/// immediately by `siginfo` in the enclosing `rt_sigframe`; userspace runtimes
+/// model a larger `ucontext_t`, but the extra bytes overlap following frame
+/// fields in the kernel-provided stack image.
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1479,7 +1482,7 @@ pub struct X8664Ucontext {
     pub uc_link: u64,
     pub uc_stack: LinuxSignalStack,
     pub uc_mcontext: X8664Sigcontext,
-    pub uc_sigmask: [u64; 16],
+    pub uc_sigmask: u64,
 }
 
 impl X8664Ucontext {
@@ -1489,15 +1492,16 @@ impl X8664Ucontext {
             uc_link: 0,
             uc_stack: LinuxSignalStack::empty(),
             uc_mcontext: X8664Sigcontext::empty(),
-            uc_sigmask: [0; 16],
+            uc_sigmask: 0,
         }
     }
 }
 
 /// The Linux x86-64 `struct rt_sigframe` written to the guest stack at the new
 /// RSP. `pretcode` is the address the handler RETs to (the restorer →
-/// rt_sigreturn). The FXSAVE area lives at the tail; `uc.uc_mcontext.fpstate`
-/// points to it. Kernel field order: pretcode, uc, info, fpstate.
+/// rt_sigreturn). Live Linux/amd64 places `siginfo` at `ucontext+304`, and the
+/// 16-byte-aligned FXSAVE area at `ucontext+448`; `uc.uc_mcontext.fpstate`
+/// points to that FXSAVE area.
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1506,6 +1510,7 @@ pub struct X8664Rtsigframe {
     pub pretcode: u64,
     pub uc: X8664Ucontext,
     pub info: LinuxSiginfo,
+    pub fpstate_pad: [u8; 16],
     pub fpstate: X8664Fpstate,
 }
 
@@ -1515,6 +1520,7 @@ impl X8664Rtsigframe {
             pretcode: 0,
             uc: X8664Ucontext::empty(),
             info: LinuxSiginfo::empty(),
+            fpstate_pad: [0; 16],
             fpstate: X8664Fpstate::empty(),
         }
     }
@@ -1524,7 +1530,8 @@ impl X8664Rtsigframe {
 // the BUILD rather than producing a silently-wrong guest signal frame.
 const _: () = assert!(core::mem::size_of::<X8664Fpstate>() == 512);
 const _: () = assert!(core::mem::size_of::<X8664Sigcontext>() == 256);
-const _: () = assert!(core::mem::size_of::<X8664Ucontext>() == 424);
+const _: () = assert!(core::mem::size_of::<X8664Ucontext>() == 304);
+const _: () = assert!(core::mem::size_of::<X8664Rtsigframe>() == 968);
 
 #[cfg(test)]
 mod x8664_sigframe_tests {
@@ -1548,17 +1555,15 @@ mod x8664_sigframe_tests {
         assert_eq!(core::mem::offset_of!(X8664Sigcontext, cs), 18 * 8);
     }
 
-    /// Kernel `struct rt_sigframe` field order: pretcode(0), uc, info, fpstate.
+    /// Kernel `struct rt_sigframe` field order observed on Linux/amd64:
+    /// pretcode(0), ucontext after the return address, siginfo at ucontext+304,
+    /// and fpstate at ucontext+448.
     #[test]
     fn rtsigframe_field_order() {
         assert_eq!(core::mem::offset_of!(X8664Rtsigframe, pretcode), 0);
         assert_eq!(core::mem::offset_of!(X8664Rtsigframe, uc), 8);
-        // uc is 424 bytes → info immediately after.
-        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, info), 8 + 424);
-        assert_eq!(
-            core::mem::offset_of!(X8664Rtsigframe, fpstate),
-            8 + 424 + 128
-        );
+        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, info), 8 + 304);
+        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, fpstate), 8 + 448);
     }
 
     /// `ucontext`: uc_mcontext follows uc_flags(8) + uc_link(8) + uc_stack(24).
@@ -1568,6 +1573,17 @@ mod x8664_sigframe_tests {
             core::mem::offset_of!(X8664Ucontext, uc_mcontext),
             8 + 8 + 24
         );
+        assert_eq!(core::mem::offset_of!(X8664Ucontext, uc_sigmask), 296);
+    }
+
+    #[test]
+    fn rtsigframe_offsets_match_linux_amd64_oracle() {
+        let uc = core::mem::offset_of!(X8664Rtsigframe, uc);
+        assert_eq!(uc, 8);
+        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, info) - uc, 304);
+        assert_eq!(core::mem::offset_of!(X8664Rtsigframe, fpstate) - uc, 448);
+        assert_eq!(core::mem::offset_of!(X8664Ucontext, uc_sigmask), 296);
+        assert_eq!(core::mem::size_of::<X8664Ucontext>(), 304);
     }
 }
 
