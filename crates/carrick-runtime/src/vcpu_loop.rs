@@ -1986,6 +1986,7 @@ where
             let outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;
 
             let mut last_syscall_retval: Option<i64> = None;
+            let mut signal_interrupted_pc: Option<u64> = None;
 
             match outcome {
                 DispatchOutcome::WaitOnFds { .. }
@@ -2129,7 +2130,12 @@ where
                     kernel
                         .dispatcher
                         .restore_signal_mask(state.this_tid, restored_sigmask);
-                    // Deliver the next pending signal (if any) before resuming.
+                    // Deliver the next pending signal (if any) before resuming,
+                    // but at the just-restored user PC, not as another
+                    // syscall-boundary signal. On x86, `rt_sigreturn` restores
+                    // RCX as an ordinary caller-clobbered register; treating this
+                    // as a syscall boundary would use that RCX as the resume RIP.
+                    signal_interrupted_pc = Some(engine.current_pc()?);
                 }
                 DispatchOutcome::Fork {
                     pidfd_out,
@@ -2175,7 +2181,7 @@ where
                 &mut engine,
                 state.this_tid,
                 last_syscall_retval,
-                None,
+                signal_interrupted_pc,
                 traps,
             )? {
                 return Ok(outcome);
