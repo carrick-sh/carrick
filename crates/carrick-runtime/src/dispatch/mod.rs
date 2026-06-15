@@ -509,6 +509,7 @@ use crate::linux_abi::{
     LinuxFdFlags,
     LinuxFdPair,
     LinuxFutexFlags,
+    LinuxGuestAbi,
     LinuxIfAddrMsg,
     LinuxIfInfoMsg,
     LinuxIovec,
@@ -541,6 +542,7 @@ use crate::linux_abi::{
     LinuxTms,
     LinuxUtsname,
     LinuxWinsize,
+    LinuxX8664EpollEvent,
     align_up_u64,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
@@ -699,6 +701,7 @@ fn threaded_independent_dispatch_supports(number: u64) -> bool {
 pub struct SyscallRequest {
     pub number: u64,
     pub args: SyscallArgs,
+    pub guest_abi: LinuxGuestAbi,
 }
 
 /// Uniform context handed to every *normalized* syscall handler, so all
@@ -729,6 +732,11 @@ impl<M: GuestMemory> SyscallCtx<'_, M> {
     #[inline]
     pub fn raw_args(&self) -> SyscallArgs {
         self.request.args
+    }
+
+    #[inline]
+    pub fn guest_abi(&self) -> LinuxGuestAbi {
+        self.request.guest_abi
     }
 
     /// The current guest thread's Linux tid, as keyed by the signal/IO-wait
@@ -778,7 +786,16 @@ pub use carrick_guest_mem::{GuestMemory, MemoryError};
 
 impl SyscallRequest {
     pub fn new(number: u64, args: SyscallArgs) -> Self {
-        Self { number, args }
+        Self {
+            number,
+            args,
+            guest_abi: LinuxGuestAbi::Aarch64,
+        }
+    }
+
+    pub fn with_guest_abi(mut self, guest_abi: LinuxGuestAbi) -> Self {
+        self.guest_abi = guest_abi;
+        self
     }
 
     pub fn arg(&self, index: usize) -> u64 {
@@ -793,6 +810,7 @@ impl SyscallRequest {
         Self {
             number: raw.number,
             args: SyscallArgs::from(raw.args),
+            guest_abi: LinuxGuestAbi::Aarch64,
         }
     }
 }

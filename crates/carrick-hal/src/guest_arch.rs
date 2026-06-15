@@ -96,6 +96,8 @@ pub trait GuestArch: Copy + 'static {
     fn elf_machine() -> u16;
     /// `uname(2)` machine string for this ISA (aarch64: `"aarch64"`).
     fn uname_machine() -> &'static str;
+    /// Guest Linux UAPI struct layout family for syscall marshalling.
+    fn linux_guest_abi() -> carrick_abi::LinuxGuestAbi;
 
     /// vDSO image bytes for this ISA. Computed (not a `'static` slice) — the
     /// aarch64 image is assembled at boot from `carrick-mem::vdso`, so this
@@ -195,6 +197,9 @@ mod tests {
         }
         fn uname_machine() -> &'static str {
             "fake"
+        }
+        fn linux_guest_abi() -> carrick_abi::LinuxGuestAbi {
+            carrick_abi::LinuxGuestAbi::Aarch64
         }
         fn vdso_bytes() -> Vec<u8> {
             Vec::new()

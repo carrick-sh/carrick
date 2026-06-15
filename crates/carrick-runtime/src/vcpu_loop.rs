@@ -778,7 +778,8 @@ where
         // preserved across quiesce-park re-dispatch so the sleep isn't restarted.
         let mut sleep_deadline: Option<Instant> = None;
         loop {
-            let request = SyscallRequest::from_raw(frame);
+            let request = SyscallRequest::from_raw(frame)
+                .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi());
             let outcome = dispatch_with_panic_backstop(request.number, self.this_tid, || {
                 kernel.dispatcher.dispatch_threaded(
                     request,

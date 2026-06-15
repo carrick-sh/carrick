@@ -119,6 +119,10 @@ impl GuestArch for Aarch64GuestArch {
         "aarch64"
     }
 
+    fn linux_guest_abi() -> carrick_abi::LinuxGuestAbi {
+        carrick_abi::LinuxGuestAbi::Aarch64
+    }
+
     fn vdso_bytes() -> Vec<u8> {
         carrick_mem::vdso::vdso_image_bytes()
     }

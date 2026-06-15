@@ -1349,7 +1349,7 @@ impl SyscallDispatcher {
 
             match operation {
                 LINUX_EPOLL_CTL_ADD => {
-                    let event = read_epoll_event(memory, event_address)?;
+                    let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
                     // The kernel rejects ADD of a target that has no ->poll support
                     // (regular files, directories) with EPERM. (LTP epoll_ctl02/05.)
                     if !this.fd_is_epollable(fd) {
@@ -1389,7 +1389,7 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_MOD => {
-                    let event = read_epoll_event(memory, event_address)?;
+                    let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
                     let Some(slot) = interest.get_mut(&fd) else {
                         return Ok(LINUX_ENOENT.into());
                     };
@@ -1480,6 +1480,7 @@ impl SyscallDispatcher {
 
             let epfd = epfd.0;
             let events_address = events.0;
+            let guest_abi = cx.guest_abi();
             // maxevents is a signed int; the kernel rejects <= 0 with EINVAL. A
             // negative value arrives as a huge u64, so check the signed form.
             // (LTP epoll_wait03.)
@@ -1535,7 +1536,7 @@ impl SyscallDispatcher {
             };
             if !ready.is_empty() {
                 crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-                return write_epoll_events(memory, events_address, &ready);
+                return write_epoll_events(memory, events_address, &ready, guest_abi);
             }
 
             // Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The
@@ -1814,8 +1815,8 @@ impl SyscallDispatcher {
             }
 
             crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-            write_epoll_events(memory, events_address, &ready)
-            }
+            write_epoll_events(memory, events_address, &ready, guest_abi)
+        }
 
         }
 

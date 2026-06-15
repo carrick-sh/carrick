@@ -150,8 +150,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(20, "writev", 66),
     // x86_64=21 access: LEGACY (asm-generic has faccessat=48). access(path,mode)
     // vs faccessat(dfd,path,mode,flags) → LEFT OUT. (see deferred block)
-    // x86_64=22 pipe: LEGACY (asm-generic has pipe2=59). pipe(fd[2]) vs
-    // pipe2(fd[2],flags) → LEFT OUT. (see deferred block)
+    // x86_64=22 pipe: LEGACY (asm-generic has pipe2=59). Handled in
+    // x8664_arch::normalize_syscall as pipe2(fd, flags=0).
     // x86_64=23 select: LEGACY (asm-generic has pselect6=72). DIFFERENT shape →
     // LEFT OUT. (see deferred block)
     // x86_64=24 sched_yield → canonical sched_yield=124 (SAME name+shape)
@@ -846,7 +846,6 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   5   fstat       → fstat(80):      x86-64 struct stat layout ≠ asm-generic (field offsets)
     //   6   lstat       → newfstatat(79): AT_FDCWD + AT_SYMLINK_NOFOLLOW
     //   21  access      → faccessat(48):  prepend AT_FDCWD; append flags=0
-    //   22  pipe        → pipe2(59):      append flags=0
     //   23  select      → pselect6(72):   timeval→timespec; no sigmask arg
     //   33  dup2        → dup3(24):       dup2(fd,fd)=success no-op vs dup3 EINVAL; no flags arg
     //   78  getdents    → getdents64(61): 32-bit linux_dirent vs 64-bit linux_dirent64

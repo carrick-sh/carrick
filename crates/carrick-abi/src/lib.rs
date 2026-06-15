@@ -102,6 +102,12 @@
 use bitflags::bitflags;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum LinuxGuestAbi {
+    Aarch64,
+    X86_64,
+}
+
 /// Static AArch64 syscall metadata (number → name/subsystem/support-level). Pure
 /// compile-time ABI data shared by every backend's compat reporter + the CLI's
 /// `syscalls` command; was carrick-vmm-hvf-private (so the Linux/KVM arm only had a
@@ -491,6 +497,21 @@ pub struct LinuxEventfdValue {
 pub struct LinuxEpollEvent {
     pub events: u32,
     pub _pad: u32,
+    pub data: u64,
+}
+
+/// Linux/x86_64 `struct epoll_event`.
+///
+/// The x86_64 UAPI packs `data` immediately after the 32-bit event mask, so
+/// guest-visible epoll arrays have a 12-byte stride. Keep this separate from
+/// [`LinuxEpollEvent`], whose 16-byte asm-generic/aarch64 layout remains the
+/// internal canonical representation for dispatcher state.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxX8664EpollEvent {
+    pub events: u32,
     pub data: u64,
 }
 
@@ -1703,6 +1724,11 @@ kernel_abi!(
     "aarch64 epoll_event = u32 events + u32 pad + u64 data"
 );
 kernel_abi!(
+    LinuxX8664EpollEvent,
+    12,
+    "x86_64 epoll_event = packed u32 events + u64 data"
+);
+kernel_abi!(
     LinuxPollFd,
     8,
     "pollfd is fd:i32 + events:i16 + revents:i16"
@@ -2817,9 +2843,8 @@ pub const LINUX_IORING_FEAT_NODROP: u32 = 1 << 1;
 // docs/conformance-testing.md). None of these checks is reachable at runtime,
 // so the crate-wide no-panic clippy gate is unaffected.
 //
-// The fixed-layout UAPI structs below are the asm-generic layouts, which are
-// identical on aarch64 and x86_64 (both little-endian LP64); arch-specific
-// notes are inline where they apply.
+// The fixed-layout UAPI structs below are the asm-generic layouts unless an
+// arch-specific companion type is called out inline.
 
 // ----- message / clone / scatter-gather / poll structs -----
 assert_layout!(LinuxMsghdr, size = 56,
@@ -2831,6 +2856,7 @@ assert_layout!(LinuxCloneArgs, size = 88,
     stack @ 40, stack_size @ 48, tls @ 56);
 assert_layout!(LinuxIovec, size = 16, iov_base @ 0, iov_len @ 8);
 assert_layout!(LinuxEpollEvent, size = 16, events @ 0, data @ 8);
+assert_layout!(LinuxX8664EpollEvent, size = 12, events @ 0, data @ 4);
 assert_layout!(LinuxPollFd, size = 8, fd @ 0, events @ 4, revents @ 6);
 
 // ----- stat (the struct whose 44-vs-128-byte cousins crashed glibc) -----
@@ -3044,6 +3070,10 @@ mod kernel_abi_tests {
         assert!(<LinuxStatx as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxStatx>());
         assert!(<LinuxRusage as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxRusage>());
         assert!(<LinuxUtsname as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxUtsname>());
+        assert!(
+            <LinuxX8664EpollEvent as KernelAbi>::ABI_SIZE
+                <= core::mem::size_of::<LinuxX8664EpollEvent>()
+        );
         assert!(
             <LinuxSigaltstack as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaltstack>()
         );
