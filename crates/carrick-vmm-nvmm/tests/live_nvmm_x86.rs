@@ -14,7 +14,7 @@
 //! Run on VM 201 (root, for `/dev/nvmm`; `modload nvmm` if ENXIO):
 //! ```
 //! CARRICK_NVMM_FIXTURE=/root/fixtures/hello \
-//!   cargo test -p carrick-nvmm --test live_nvmm_x86 -- --nocapture
+//!   cargo test -p carrick-vmm-nvmm --test live_nvmm_x86 -- --nocapture
 //! ```
 #![cfg(target_os = "netbsd")]
 #![allow(clippy::expect_used)]
@@ -65,7 +65,7 @@ fn hello_runs_to_zero() {
         return;
     };
 
-    let (result, stdout) = capture_stdout(|| carrick_nvmm::run_elf_nvmm(&path));
+    let (result, stdout) = capture_stdout(|| carrick_vmm_nvmm::run_elf_nvmm(&path));
     let exit = result.expect("run_elf_nvmm failed");
     let out = String::from_utf8_lossy(&stdout);
 

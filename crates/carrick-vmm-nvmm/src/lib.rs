@@ -1,4 +1,4 @@
-//! carrick-nvmm: the NetBSD/NVMM HAL backend (the fourth platform, after
+//! carrick-vmm-nvmm: the NetBSD/NVMM HAL backend (the fourth platform, after
 //! macOS/HVF, Linux/KVM, and FreeBSD/bhyve).
 //!
 //! Mirrors `carrick-bhyve`'s shape — a raw-hypervisor layer over the host

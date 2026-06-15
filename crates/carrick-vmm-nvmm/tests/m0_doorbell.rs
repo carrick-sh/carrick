@@ -15,7 +15,7 @@
 //! test is absent) on the default macOS/Linux workspace build.
 #![cfg(target_os = "netbsd")]
 
-use carrick_nvmm::nvmm::{
+use carrick_vmm_nvmm::nvmm::{
     self, NVMM_PROT_EXEC, NVMM_PROT_READ, NVMM_PROT_WRITE, NVMM_VCPU_EXIT_HALTED,
     NVMM_VCPU_EXIT_IO, NVMM_VCPU_EXIT_NONE, NVMM_X64_GPR_RIP, NVMM_X64_NSEG, NVMM_X64_SEG_CS,
     NVMM_X64_SEG_DS, NVMM_X64_SEG_ES, NVMM_X64_SEG_FS, NVMM_X64_SEG_GS, NVMM_X64_SEG_SS,
