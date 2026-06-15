@@ -1,6 +1,6 @@
-//! OS-family `cfg` emitter for `carrick-bsd`.
+//! OS-family `cfg` emitter for `carrick-host-bsd`.
 //!
-//! `carrick-bsd` is the BSD-family host layer: the shared `KqueueMultiplexer`,
+//! `carrick-host-bsd` is the BSD-family host layer: the shared `KqueueMultiplexer`,
 //! the `bsd_to_linux_errno` table, the `BsdFutex` shared-page futex, and the
 //! one BSD `SIGNUM_XLATE` signal-number table (`signum`). Everything in this
 //! crate is host-NEUTRAL across the BSD family; per-host kernel-call divergence

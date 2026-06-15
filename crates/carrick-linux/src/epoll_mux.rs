@@ -1,7 +1,7 @@
 //! Native Linux [`EventMultiplexer`] backed by a single epoll set.
 //!
 //! One `epoll` instance services every event class the runtime needs, mirroring
-//! the contract of the BSD sibling (`carrick_bsd::multiplexer::KqueueMultiplexer`)
+//! the contract of the BSD sibling (`carrick_host_bsd::multiplexer::KqueueMultiplexer`)
 //! kqueue-for-everything design:
 //!
 //!   * **IO readiness** — fds added directly with `EPOLLIN`/`EPOLLOUT`/`EPOLLPRI`

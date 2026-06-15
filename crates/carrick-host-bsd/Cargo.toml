@@ -1,11 +1,11 @@
 [package]
-name = "carrick-bsd"
+name = "carrick-host-bsd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "carrick_bsd"
+name = "carrick_host_bsd"
 path = "src/lib.rs"
 
 [lints]

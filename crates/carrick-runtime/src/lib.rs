@@ -1275,7 +1275,7 @@ pub(crate) const fn syscall_shim_enabled() -> bool {
 }
 
 #[cfg(feature = "platform-macos")]
-pub use carrick_bsd::bsd_to_linux_errno as host_to_linux_errno;
+pub use carrick_host_bsd::bsd_to_linux_errno as host_to_linux_errno;
 
 #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub fn host_to_linux_errno(host: i32) -> i32 {

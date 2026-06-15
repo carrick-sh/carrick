@@ -1886,7 +1886,7 @@ mod tests {
     // The epoll interest-mask → multiplexer `Interest` mapping preserves the
     // HUP/ERR-observability read-fallback (a mask with neither IN nor OUT still
     // arms read) and routes RDHUP/PRI onto read; the actual kqueue filter
-    // selection now lives in (and is tested by) `carrick-bsd`'s multiplexer.
+    // selection now lives in (and is tested by) `carrick-host-bsd`'s multiplexer.
     #[cfg(feature = "platform-macos")]
     #[test]
     fn epoll_interest_selection_preserves_hup_err_observability() {

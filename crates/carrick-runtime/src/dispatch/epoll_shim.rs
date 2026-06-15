@@ -32,14 +32,14 @@ pub(crate) fn unregister_epoll_kqueue(fd: i32) {
 /// macOS that is the kqueue fd, whose `register_user(0)` armed the
 /// `EVFILT_USER(0)` channel; firing it is exactly what
 /// `KqueueMultiplexer::trigger_user` does, so we drive the same underlying
-/// `carrick_bsd::kqueue::trigger_user` on it. On Linux that is the user-wake
+/// `carrick_host_bsd::kqueue::trigger_user` on it. On Linux that is the user-wake
 /// `eventfd`; writing its 8-byte counter makes the epoll `poll_fd` readable and
 /// pops the parked waiter (reaching the instance's mux without threading a
 /// handle through the registry).
 pub(crate) fn notify_inmem_epoll() {
     for &fd in EPOLL_INMEM_KQUEUES.lock().iter() {
         #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
-        let _ = carrick_bsd::kqueue::trigger_user(fd, 0);
+        let _ = carrick_host_bsd::kqueue::trigger_user(fd, 0);
         #[cfg(feature = "platform-linux")]
         carrick_linux::epoll_mux::trigger_user_eventfd(fd);
         #[cfg(not(any(
