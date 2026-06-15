@@ -7,10 +7,14 @@
 # zoneinfo.zip), tzdata, and the source tree all resolve from the normal fs
 # backend when run via `carrick run`. No bind mounts, no scratch loader tar.
 #
-# Build (arm64, the arch carrick executes):
+# Build (arm64, the arch macOS/HVF carrick executes):
 #   docker build --platform linux/arm64 -t localhost:5005/carrick-go-conformance:1.24 \
 #     docker/go-conformance
 #   docker push localhost:5005/carrick-go-conformance:1.24
+#
+# Build for x86_64 Linux/KVM:
+#   docker build --platform linux/amd64 --build-arg GOARCH=amd64 \
+#     -t localhost:5005/carrick-go-conformance:1.24 docker/go-conformance
 #
 # Run a package's tests under carrick (cwd = the package source dir so the
 # test's relative file reads resolve):
@@ -19,7 +23,8 @@
 #     localhost:5005/carrick-go-conformance:1.24 \
 #     /conformance/sync.test -test.run Test -test.short -test.v
 FROM golang:1.24-bookworm
-ENV CGO_ENABLED=1 GOOS=linux GOARCH=arm64
+ARG GOARCH=arm64
+ENV CGO_ENABLED=1 GOOS=linux GOARCH=${GOARCH}
 # Prebuild a `.test` binary for EVERY std package that has tests (full
 # conformance coverage). Packages without test files produce no binary (skipped);
 # any that fail the static-pie compile are tolerated and dropped, so the image
