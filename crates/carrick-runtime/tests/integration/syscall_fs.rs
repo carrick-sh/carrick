@@ -1610,6 +1610,41 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
 }
 
 #[test]
+fn faccessat2_dotdot_after_missing_intermediate_returns_enoent() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "work/.keep",
+        b"".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"abc/..\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    dispatcher.set_cwd("/work");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        LINUX_X_OK,
+                        LINUX_AT_EACCESS,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+}
+
+#[test]
 fn statfs_writes_packed_linux_statfs_for_rootfs_path() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

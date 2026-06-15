@@ -2231,9 +2231,9 @@ impl SyscallDispatcher {
     /// "a/../c" with `a -> b/c` lands in `b` (then `b/c`), matching Linux — not
     /// the lexical `/c` that `join_rootfs_path` would produce. The FINAL component
     /// is NOT followed (the caller decides lstat-vs-stat). A non-directory
-    /// intermediate is ENOTDIR; a symlink cycle propagates ELOOP; a not-yet-
-    /// existent intermediate is appended verbatim so the final lookup surfaces
-    /// ENOENT. Only invoked when a ".." is actually present.
+    /// intermediate is ENOTDIR; a symlink cycle propagates ELOOP; a missing
+    /// intermediate propagates ENOENT before any later `..` can collapse it.
+    /// Only invoked when a ".." is actually present.
     fn resolve_dotdot_symlink_aware(&self, anchor: &str, path: &str) -> Result<String, i32> {
         let mut all: Vec<&str> = Vec::new();
         if !Path::new(path).is_absolute() {
@@ -2279,9 +2279,10 @@ impl SyscallDispatcher {
                 // An existing non-directory intermediate (regular file, device,
                 // FIFO) can't be traversed → ENOTDIR.
                 Ok(_) => return Err(LINUX_ENOTDIR),
-                // Not-yet-existent intermediate: append verbatim; the downstream
-                // lookup yields the correct ENOENT.
-                Err(_) => base = candidate,
+                // A missing or otherwise inaccessible intermediate stops path
+                // resolution immediately. In particular, `missing/..` is ENOENT
+                // on Linux; it must not collapse back to the parent.
+                Err(errno) => return Err(errno),
             }
         }
         Ok(if base.is_empty() {
