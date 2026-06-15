@@ -408,6 +408,29 @@ impl Pml4Manager {
         Ok(off)
     }
 
+    /// Byte offset of a covering 2 MiB PD leaf for `va`, when the path exists
+    /// and the leaf is still large. Used by full-large-page edits so mmap
+    /// `PROT_NONE` reservations do not explode the table arena into 4 KiB PTs.
+    fn large_2m_leaf_offset_for_edit(&self, va: u64) -> Result<Option<usize>, Pml4Error> {
+        let idx = indices(va);
+        let mut table_off = 0usize;
+        for (level, &slot) in idx.iter().take(3).enumerate() {
+            let off = table_off + slot * 8;
+            if off + 8 > self.bytes.len() {
+                return Err(Pml4Error::BadAddress);
+            }
+            let desc = self.read_desc(off);
+            if level == 2 {
+                return Ok((desc & PML4_PS != 0).then_some(off));
+            }
+            if desc & PML4_P == 0 || desc & PML4_PS != 0 {
+                return Err(Pml4Error::BadAddress);
+            }
+            table_off = self.pa_to_off(desc & PML4_ADDR_MASK)?;
+        }
+        Ok(None)
+    }
+
     /// Translate a guest VA to its GPA, walking the descriptors exactly as
     /// the hardware would (modulo access checks). `None` if any level is
     /// non-present/out-of-range or the VA is non-canonical. PS large leaves
@@ -464,6 +487,19 @@ impl Pml4Manager {
         let mut changed = false;
         let mut cur = va;
         while cur < end {
+            if cur & LARGE_2M_MASK == 0
+                && end - cur >= LARGE_2M
+                && let Some(off) = self.large_2m_leaf_offset_for_edit(cur)?
+            {
+                let desc = self.read_desc(off);
+                let new = edit(desc)?;
+                if new != desc {
+                    write_desc(&mut self.bytes, off, new);
+                    changed = true;
+                }
+                cur += LARGE_2M;
+                continue;
+            }
             let off = self.leaf_offset_for_edit(cur)?;
             let desc = self.read_desc(off);
             let new = edit(desc)?;
@@ -820,6 +856,37 @@ mod tests {
         assert_eq!(mgr.set_rw(va, 0x1000, false), Ok(false));
         assert_eq!(mgr.set_prot_none(va, 0x1000), Ok(true));
         assert_eq!(mgr.set_prot_none(va, 0x1000), Ok(false));
+    }
+
+    #[test]
+    fn whole_large_leaf_edits_preserve_2m_entries() {
+        let va = 0x60_0000_0000;
+        let len = 512 * 1024 * 1024;
+        let bytes = pml4_tables(&[user_rw_nx(va, va, len)], BASE, 4 * PT_PAGE)
+            .expect("large leaves keep this mapping compact");
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        let before = walk_descriptors(mgr.bytes(), BASE, va);
+        assert_ne!(before[2] & PML4_PS, 0, "mapping starts as a 2 MiB leaf");
+
+        assert_eq!(mgr.set_prot_none(va, len as usize), Ok(true));
+        assert_eq!(mgr.translate(va), None, "large leaf is non-present");
+        assert_eq!(
+            mgr.translate(va + LARGE_2M - 1),
+            None,
+            "entire large leaf faults"
+        );
+        let none = walk_descriptors(mgr.bytes(), BASE, va);
+        assert_ne!(none[2] & PML4_PS, 0, "large leaf was not split");
+        assert_eq!(none[2] & PML4_P, 0, "present bit cleared on large leaf");
+        assert_eq!(none[3], 0, "walk still stops at the 2 MiB leaf");
+
+        assert_eq!(mgr.set_rw(va, len as usize, false), Ok(true));
+        assert_eq!(mgr.translate(va), Some(va), "large leaf restored");
+        let rw = walk_descriptors(mgr.bytes(), BASE, va);
+        assert_ne!(rw[2] & PML4_PS, 0, "large leaf stayed compact");
+        assert_ne!(rw[2] & PML4_P, 0, "present bit restored");
+        assert_ne!(rw[2] & PML4_RW, 0, "writable bit restored");
+        assert_eq!(rw[3], 0, "no 4 KiB table was allocated");
     }
 
     #[test]

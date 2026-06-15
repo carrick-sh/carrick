@@ -31,6 +31,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use carrick_abi::LinuxProtFlags;
+use carrick_guest_mem::MemoryError;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::Pml4Manager;
@@ -82,6 +84,30 @@ impl KvmVmm {
             page_tables,
         }
     }
+
+    fn edit_page_tables(
+        &mut self,
+        address: u64,
+        len: usize,
+        edit: impl FnOnce(&mut Pml4Manager) -> Result<bool, carrick_mem::pml4::Pml4Error>,
+    ) -> Result<(), MemoryError> {
+        let pt_host = self
+            .ram
+            .host_ptr(X86_PML4_BASE, carrick_x86::X86_PML4_CAPACITY as usize)
+            .ok_or_else(|| MemoryError::HostMap("kvm-x86: PML4 backing not mapped".into()))?;
+        let mut page_tables = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = edit(&mut page_tables).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: len,
+        })?;
+        if changed {
+            let bytes = page_tables.bytes();
+            // SAFETY: `pt_host` backs the full PML4 table region in the live guest;
+            // `bytes` is the manager's table image for exactly that arena.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pt_host, bytes.len()) };
+        }
+        Ok(())
+    }
 }
 
 /// The `Send` payload a sibling thread materializes into a fresh vCPU on the SAME
@@ -123,6 +149,28 @@ impl X86Vmm for KvmVmm {
 
     fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
         self.ram.host_ptr(gpa, len)
+    }
+
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        let prot = LinuxProtFlags::from_bits_truncate(prot);
+        let exec = prot.contains(LinuxProtFlags::EXEC);
+        self.edit_page_tables(address, len, |mgr| {
+            if prot.is_empty() {
+                mgr.set_prot_none(address, len)
+            } else if prot.contains(LinuxProtFlags::WRITE) {
+                mgr.set_rw(address, len, exec)
+            } else {
+                mgr.set_readonly(address, len, exec)
+            }
+        })
+    }
+
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.edit_page_tables(address, len, |mgr| mgr.set_prot_none(address, len))
+    }
+
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.unmap_range(address, len)
     }
 
     fn map_host_alias(
