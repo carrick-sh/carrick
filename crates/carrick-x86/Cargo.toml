@@ -24,4 +24,5 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 # the run-elf service loop + fault delivery call host `read(2)`/`write(2)` and
 # reference `libc` signal/errno numbers.
 carrick-abi = { path = "../carrick-abi" }
+bitflags.workspace = true
 libc.workspace = true

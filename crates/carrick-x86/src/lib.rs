@@ -22,15 +22,22 @@
 pub mod bringup;
 pub mod bringup_fns;
 pub mod engine;
+pub mod fault;
 pub mod vmm;
 
 pub use bringup::{fp_stub_bytes, msr_init_blob, run_fp_stub};
 pub use bringup_fns::{
     BringupLayout, LongModeSegmentState, X86VcpuSnapshot, build_pml4, long_mode_segment_state,
-    plan_windows, program_longmode_entry, restore, run_elf_service_loop, seed_entry, snapshot,
-    write_bringup_images,
+    plan_windows, program_longmode_entry, program_user_segments, restore, run_elf_service_loop,
+    seed_entry, snapshot, write_bringup_images,
 };
 pub use engine::X86EngineCore;
+pub use fault::{
+    FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultDoorbellRecord, X86_FAULT_RECORD_U32_WORDS,
+    X86_FAULT_SLOTS, add_fault_windows, fault_idt_base, fault_slot_gpa, fault_stack_base,
+    fault_stub_base, fault_tss_base, program_fault_segments, write_fault_tables,
+    write_fault_tables_with,
+};
 pub use vmm::{
     ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion, X86_PML4_CAPACITY, X86Exit,
     X86FaultKind, X86Reg, X86Seg, X86Vcpu, X86Vmm,

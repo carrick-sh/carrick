@@ -35,10 +35,11 @@ use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::MemoryError;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
-use carrick_mem::pml4::Pml4Manager;
+use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
 use carrick_x86::{
-    BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86Reg, X86Seg,
-    X86Vcpu, X86VcpuSnapshot, X86Vmm,
+    BringupLayout, FAULT_DOORBELL_PORT, FaultDoorbellRecord, ForkRamStrategy, MsrInstall,
+    WindowPlan, X86_FAULT_RECORD_U32_WORDS, X86EngineCore, X86Exit, X86Reg, X86Seg, X86Vcpu,
+    X86VcpuSnapshot, X86Vmm,
 };
 use kvm_bindings::{Msrs, kvm_dtable, kvm_msr_entry, kvm_segment};
 
@@ -260,7 +261,18 @@ impl X86Vmm for KvmVmm {
         layout: BringupLayout,
         snapshot: &X86VcpuSnapshot,
     ) -> Result<(), TrapError> {
-        restore_kvm_vcpu(vcpu, layout, snapshot)
+        let (rcx_walk, rdx_walk, rsp_walk, fs_walk) = {
+            let page_tables = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                walk_descriptors(page_tables.bytes(), layout.pml4_base, snapshot.gprs[2]),
+                walk_descriptors(page_tables.bytes(), layout.pml4_base, snapshot.gprs[3]),
+                walk_descriptors(page_tables.bytes(), layout.pml4_base, snapshot.rsp),
+                walk_descriptors(page_tables.bytes(), layout.pml4_base, snapshot.fs_base),
+            )
+        };
+        restore_kvm_vcpu(
+            vcpu, layout, snapshot, rcx_walk, rdx_walk, rsp_walk, fs_walk,
+        )
     }
 
     fn execve_rebuild(
@@ -368,6 +380,10 @@ fn restore_kvm_vcpu(
     vcpu: &mut KvmVcpu,
     layout: BringupLayout,
     s: &X86VcpuSnapshot,
+    rcx_walk: [u64; 4],
+    rdx_walk: [u64; 4],
+    rsp_walk: [u64; 4],
+    fs_walk: [u64; 4],
 ) -> Result<(), TrapError> {
     use carrick_hal::guest_arch::GuestArch as _;
     use carrick_hal::x8664_arch::X8664GuestArch;
@@ -401,7 +417,13 @@ fn restore_kvm_vcpu(
     sregs.es = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
     sregs.fs = data(s.fs_base);
     sregs.gs = data(s.gs_base);
-    sregs.tr = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.tr_ar, seg_selector(X86Seg::Tr));
+    let fault_slot = vcpu.x86_fault_slot();
+    sregs.tr = ar_to_kvm_segment(
+        carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(layout), fault_slot)?,
+        carrick_x86::fault::X86_TSS64_LIMIT,
+        segs.tr_ar,
+        seg_selector(X86Seg::Tr),
+    );
     sregs.ldt = ar_to_kvm_segment(0, 0, segs.ldtr_ar, seg_selector(X86Seg::Ldtr));
     sregs.gdt = kvm_dtable {
         base: layout.gdt_base,
@@ -409,8 +431,8 @@ fn restore_kvm_vcpu(
         ..Default::default()
     };
     sregs.idt = kvm_dtable {
-        base: 0,
-        limit: 0,
+        base: carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(layout), fault_slot)?,
+        limit: (carrick_x86::fault::X86_IDT_BYTES - 1) as u16,
         ..Default::default()
     };
     vcpu.fd()
@@ -447,7 +469,126 @@ fn restore_kvm_vcpu(
         let _ = vcpu.set_fp(fx)?;
     }
     vcpu.set_syscall_msrs(layout.trampoline_base, boot.star, boot.sfmask)?;
+    vcpu.record_x86_restore_state(crate::kvm::KvmX86RestoreState {
+        rip: s.rip,
+        rsp: s.rsp,
+        rflags: s.rflags,
+        rax: s.gprs[0],
+        rcx: s.gprs[2],
+        rdx: s.gprs[3],
+        rdi: s.gprs[5],
+        r8: s.gprs[8],
+        r11: s.gprs[11],
+        fs_base: s.fs_base,
+        gs_base: s.gs_base,
+        cr0: s.cr0,
+        cr3: s.cr3,
+        cr4: s.cr4,
+        efer: s.efer,
+        rcx_walk,
+        rdx_walk,
+        rsp_walk,
+        fs_walk,
+    });
     Ok(())
+}
+
+impl KvmVcpu {
+    fn collect_x86_fault_record(&mut self, first_data: &[u8]) -> Result<X86Exit, TrapError> {
+        use carrick_hal::{HvVcpu, VcpuExit};
+
+        let mut words = Vec::with_capacity(X86_FAULT_RECORD_U32_WORDS);
+        words.push(fault_out_word(first_data)?);
+        while words.len() < X86_FAULT_RECORD_U32_WORDS {
+            match <Self as HvVcpu>::run(self).map_err(|e| TrapError::Hypervisor(e.to_string()))? {
+                VcpuExit::IoOut { port, data } if port == FAULT_DOORBELL_PORT => {
+                    words.push(fault_out_word(&data)?);
+                }
+                VcpuExit::Kicked => continue,
+                other => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "kvm-x86: fault doorbell record interrupted by {}",
+                        vcpu_exit_name(&other)
+                    )));
+                }
+            }
+        }
+
+        let record = FaultDoorbellRecord::from_u32_words(&words)?;
+        if std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
+            eprintln!("[KVM-X86-FAULT] {record:?}");
+        }
+        if record.cs & 3 != 3 {
+            return Err(TrapError::Hypervisor(format!(
+                "kvm-x86: ring-0 fault vector={} error=0x{:x} rip=0x{:x} cs=0x{:x} cr2=0x{:x}",
+                record.vector, record.error_code, record.rip, record.cs, record.cr2
+            )));
+        }
+        self.restore_user_after_x86_fault(record)?;
+        Ok(X86Exit::Fault {
+            kind: record.kind(),
+            fault_addr: record.fault_addr(),
+            error_code: record.error_code,
+        })
+    }
+
+    fn restore_user_after_x86_fault(
+        &mut self,
+        record: FaultDoorbellRecord,
+    ) -> Result<(), TrapError> {
+        use carrick_hal::guest_arch::GuestArch as _;
+        use carrick_hal::x8664_arch::X8664GuestArch;
+
+        let boot = X8664GuestArch::bootstrap_sysregs();
+        let segs = carrick_x86::long_mode_segment_state();
+        let user_base = ((boot.star >> 48) & 0xFFFF) as u16;
+        let user_ss = user_base.wrapping_add(8);
+        let user_cs = user_base.wrapping_add(16);
+
+        let mut sregs = self
+            .fd()
+            .get_sregs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(fault): {e}")))?;
+        sregs.cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.cs_ar, user_cs);
+        sregs.ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
+        sregs.ds = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
+        sregs.es = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
+        self.fd()
+            .set_sregs(&sregs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(fault): {e}")))?;
+
+        let mut regs = self
+            .fd()
+            .get_regs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(fault): {e}")))?;
+        regs.rax = record.saved_rax;
+        regs.rip = record.rip;
+        regs.rsp = record.rsp;
+        regs.rflags = record.rflags | 0x2;
+        self.fd()
+            .set_regs(&regs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(fault): {e}")))
+    }
+}
+
+fn fault_out_word(data: &[u8]) -> Result<u32, TrapError> {
+    let bytes: [u8; 4] = data.try_into().map_err(|_| {
+        TrapError::Hypervisor(format!(
+            "kvm-x86: fault doorbell OUT expected 4 bytes, got {}",
+            data.len()
+        ))
+    })?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn vcpu_exit_name(exit: &carrick_hal::VcpuExit) -> &'static str {
+    match exit {
+        carrick_hal::VcpuExit::MmioWrite { .. } => "MMIO write",
+        carrick_hal::VcpuExit::Exception { .. } => "exception",
+        carrick_hal::VcpuExit::Kicked => "kick",
+        carrick_hal::VcpuExit::Halt => "halt",
+        carrick_hal::VcpuExit::IoOut { .. } => "I/O out",
+    }
 }
 
 impl X86Vcpu for KvmVcpu {
@@ -719,9 +860,14 @@ impl X86Vcpu for KvmVcpu {
                     resume_pc: regs.rip,
                 })
             }
-            VcpuExit::IoOut { port, .. } => Err(TrapError::Hypervisor(format!(
-                "kvm-x86: unexpected OUT to port 0x{port:04X}"
-            ))),
+            VcpuExit::IoOut { port, data } if port == FAULT_DOORBELL_PORT => {
+                self.collect_x86_fault_record(&data)
+            }
+            VcpuExit::IoOut { port, .. } => {
+                let mut msg = format!("kvm-x86: unexpected OUT to port 0x{port:04X}");
+                self.append_debug_state(&mut msg);
+                Err(TrapError::Hypervisor(msg))
+            }
             VcpuExit::Halt => Ok(X86Exit::Halt),
             VcpuExit::Kicked => Ok(X86Exit::Kicked),
             VcpuExit::MmioWrite { gpa, .. } => Err(TrapError::Hypervisor(format!(
@@ -864,5 +1010,9 @@ fn write_bringup_images_via_ram(ram: &mut GuestRam, pml4_bytes: &[u8]) -> Result
         .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
     ram.write_gpa(X86_PML4_BASE, pml4_bytes)
         .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+    carrick_x86::write_fault_tables_with(KVM_X86_LAYOUT, |gpa, bytes| {
+        ram.write_gpa(gpa, bytes)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+    })?;
     Ok(())
 }
