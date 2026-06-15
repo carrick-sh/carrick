@@ -4,14 +4,14 @@
 //! bit layout differs. Descriptor bits per OSDev "Paging" / Intel SDM vol. 3
 //! (ISA references — NOT kernel source): P=bit0 (present), R/W=bit1 (needs
 //! CR0.WP for ring-0 honoring), U/S=bit2 (must be set at EVERY level of a
-//! user walk), PS=bit7 (large leaf at PDPT/PD; carrick builds 4 KiB leaves
-//! only), NX=bit63 (needs EFER.NXE), physical address bits 51:12.
+//! user walk), PS=bit7 (large leaf at PDPT/PD; carrick uses 2 MiB leaves for
+//! aligned bulk mappings), NX=bit63 (needs EFER.NXE), physical address bits
+//! 51:12.
 //!
 //! Deliberately absent vs the aarch64 sibling (`page_table.rs`): block
-//! split/coalesce, the spare-table free list, and the multi-vCPU coalescing
-//! gate. The Phase 2 bring-up builds every low-VA leaf at 4 KiB up front via
-//! [`pml4_tables`], so protection edits only flip bits on existing leaves.
-//! Dynamic high aliases are the one exception: [`Pml4Manager::map_aliased`]
+//! coalesce, the spare-table free list, and the multi-vCPU coalescing gate.
+//! The Phase 2 bring-up maps aligned low-VA regions with 2 MiB leaves and splits
+//! them lazily when protection edits need 4 KiB precision. Dynamic high aliases
 //! can allocate missing 4 KiB page-table pages from the same sequential table
 //! arena and install VA→GPA leaves.
 
@@ -35,7 +35,7 @@ pub const PML4_RW: u64 = 1 << 1;
 /// level of the walk.
 pub const PML4_US: u64 = 1 << 2;
 /// PS (page size), bit 7: a large leaf at PDPT (1 GiB) / PD (2 MiB). carrick
-/// builds 4 KiB leaves only; the walkers still recognize PS defensively.
+/// builds 2 MiB leaves for aligned bulk mappings and splits them on demand.
 pub const PML4_PS: u64 = 1 << 7;
 /// NX/XD (no-execute), bit 63. Effective only with EFER.NXE; NX at ANY level
 /// makes the whole subtree non-executable, so intermediates keep it clear and
@@ -47,6 +47,8 @@ pub const PML4_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 const PT_PAGE: usize = 1 << PML4_PAGE_SHIFT; // 4 KiB
 const PAGE_MASK: u64 = (PT_PAGE as u64) - 1;
+const LARGE_2M: u64 = 1 << 21;
+const LARGE_2M_MASK: u64 = LARGE_2M - 1;
 /// carrick's guest layout is low-half canonical: every VA sits below 2^47
 /// (x86-64 canonical-address rule; the high half is sign-extended kernel
 /// space carrick never maps).
@@ -110,8 +112,9 @@ fn write_desc(bytes: &mut [u8], off: usize, desc: u64) {
 /// first page). Returns exactly `capacity` bytes (unused tail pages stay
 /// zero, i.e. all-non-present). Mirrors the aarch64
 /// `stage1_identity_page_tables` role but takes explicit VA→GPA pairs.
-/// Every leaf is a 4 KiB PT entry (no PS large pages), so the runtime editor
-/// never needs to split.
+/// Aligned bulk spans use 2 MiB PD leaves; unaligned edges and small mappings
+/// use 4 KiB PT leaves. The runtime editor splits 2 MiB leaves lazily when a
+/// protection edit needs page precision.
 pub fn pml4_tables(maps: &[Pml4MapSpec], base: u64, capacity: usize) -> Result<Vec<u8>, Pml4Error> {
     if base & PAGE_MASK != 0 || !capacity.is_multiple_of(PT_PAGE) || capacity == 0 {
         return Err(Pml4Error::Misaligned);
@@ -140,16 +143,75 @@ pub fn pml4_tables(maps: &[Pml4MapSpec], base: u64, capacity: usize) -> Result<V
             | if m.write { PML4_RW } else { 0 }
             | if m.user { PML4_US } else { 0 }
             | if m.exec { 0 } else { PML4_NX };
-        let pages = m.len / PT_PAGE as u64;
-        for i in 0..pages {
-            let va = m.va + i * PT_PAGE as u64;
-            let gpa = m.gpa + i * PT_PAGE as u64;
-            let pt_off = descend_creating(&mut bytes, &mut next_free, base, va, m.user)?;
-            let leaf_off = pt_off + indices(va)[3] * 8;
-            write_desc(&mut bytes, leaf_off, (gpa & PML4_ADDR_MASK) | leaf_bits);
+        let mut va = m.va;
+        let mut gpa = m.gpa;
+        let mut remaining = m.len;
+        while remaining > 0 {
+            if va & LARGE_2M_MASK == 0 && gpa & LARGE_2M_MASK == 0 && remaining >= LARGE_2M {
+                let pd_off = pd_offset_creating(&mut bytes, &mut next_free, base, va, m.user)?;
+                let leaf_off = pd_off + indices(va)[2] * 8;
+                write_desc(
+                    &mut bytes,
+                    leaf_off,
+                    (gpa & PML4_ADDR_MASK) | leaf_bits | PML4_PS,
+                );
+                va += LARGE_2M;
+                gpa += LARGE_2M;
+                remaining -= LARGE_2M;
+            } else {
+                let pt_off = descend_creating(&mut bytes, &mut next_free, base, va, m.user)?;
+                let leaf_off = pt_off + indices(va)[3] * 8;
+                write_desc(&mut bytes, leaf_off, (gpa & PML4_ADDR_MASK) | leaf_bits);
+                va += PT_PAGE as u64;
+                gpa += PT_PAGE as u64;
+                remaining -= PT_PAGE as u64;
+            }
         }
     }
     Ok(bytes)
+}
+
+/// Descend PML4→PDPT for `va`, creating any missing intermediate table, and
+/// return the byte offset of the PD table whose entries can be 2 MiB leaves.
+fn pd_offset_creating(
+    bytes: &mut [u8],
+    next_free: &mut usize,
+    base: u64,
+    va: u64,
+    user: bool,
+) -> Result<usize, Pml4Error> {
+    let idx = indices(va);
+    let mut table_off = 0usize;
+    for &slot in idx.iter().take(2) {
+        let off = table_off + slot * 8;
+        let desc = read_desc(bytes, off);
+        if desc & PML4_P != 0 {
+            if desc & PML4_PS != 0 {
+                return Err(Pml4Error::BadAddress);
+            }
+            if user && desc & PML4_US == 0 {
+                write_desc(bytes, off, desc | PML4_US);
+            }
+            let child = desc & PML4_ADDR_MASK;
+            let child_off = child.checked_sub(base).ok_or(Pml4Error::BadAddress)? as usize;
+            if child_off + PT_PAGE > bytes.len() {
+                return Err(Pml4Error::BadAddress);
+            }
+            table_off = child_off;
+            continue;
+        }
+        let new_off = *next_free;
+        if new_off + PT_PAGE > bytes.len() {
+            return Err(Pml4Error::OutOfTables);
+        }
+        *next_free += PT_PAGE;
+        let child_gpa = base + new_off as u64;
+        let inter =
+            (child_gpa & PML4_ADDR_MASK) | PML4_P | PML4_RW | if user { PML4_US } else { 0 };
+        write_desc(bytes, off, inter);
+        table_off = new_off;
+    }
+    Ok(table_off)
 }
 
 /// Descend PML4→PDPT→PD for `va`, creating any missing intermediate table
@@ -219,7 +281,7 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
             break; // non-present, or the PT leaf: walk ends here
         }
         if desc & PML4_PS != 0 {
-            break; // PS large leaf at PDPT/PD (carrick never builds one)
+            break; // PS large leaf at PDPT/PD.
         }
         let Some(child_off) = (desc & PML4_ADDR_MASK).checked_sub(base) else {
             break;
@@ -231,10 +293,10 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
 
 /// Runtime editor over a byte image of the PML4 tables rooted at `base` —
 /// the x86-64 sibling of [`crate::page_table::PageTableManager`], minus the
-/// M3-era machinery (see the module docs). Every leaf is a 4 KiB PT entry
-/// built by [`pml4_tables`], so edits only flip P/R\/W/NX bits in place;
-/// `set_prot_none` PRESERVES the recorded GPA in the non-present descriptor
-/// so `set_rw` can restore the same (possibly non-identity) mapping.
+/// M3-era machinery (see the module docs). Bulk mappings may start as 2 MiB
+/// leaves; edits split them to 4 KiB leaves when needed and then flip P/R\/W/NX
+/// bits in place. `set_prot_none` PRESERVES the recorded GPA in the non-present
+/// descriptor so `set_rw` can restore the same (possibly non-identity) mapping.
 #[derive(Clone)]
 pub struct Pml4Manager {
     bytes: Vec<u8>,
@@ -277,6 +339,41 @@ impl Pml4Manager {
         read_desc(&self.bytes, off)
     }
 
+    fn alloc_table_page(&mut self) -> Result<usize, Pml4Error> {
+        let new_off = self.next_free;
+        if new_off + PT_PAGE > self.bytes.len() {
+            return Err(Pml4Error::OutOfTables);
+        }
+        self.next_free += PT_PAGE;
+        self.bytes[new_off..new_off + PT_PAGE].fill(0);
+        Ok(new_off)
+    }
+
+    fn split_2m_leaf(&mut self, pd_leaf_off: usize) -> Result<usize, Pml4Error> {
+        let desc = self.read_desc(pd_leaf_off);
+        if desc & PML4_PS == 0 {
+            return Err(Pml4Error::BadAddress);
+        }
+        let new_pt_off = self.alloc_table_page()?;
+        let base_gpa = desc & PML4_ADDR_MASK & !LARGE_2M_MASK;
+        let leaf_flags = desc & (PML4_P | PML4_RW | PML4_US | PML4_NX);
+        for index in 0..512usize {
+            let gpa = base_gpa + (index as u64) * PT_PAGE as u64;
+            write_desc(
+                &mut self.bytes,
+                new_pt_off + index * 8,
+                (gpa & PML4_ADDR_MASK) | leaf_flags,
+            );
+        }
+        let table_flags = PML4_P | PML4_RW | if desc & PML4_US != 0 { PML4_US } else { 0 };
+        write_desc(
+            &mut self.bytes,
+            pd_leaf_off,
+            ((self.base + new_pt_off as u64) & PML4_ADDR_MASK) | table_flags,
+        );
+        Ok(new_pt_off)
+    }
+
     /// Byte offset of the PT (level-3) table for `va`, creating missing
     /// intermediates from the sequential table arena. Used only for fresh alias
     /// mappings; ordinary protection edits require the leaf path to exist.
@@ -284,18 +381,21 @@ impl Pml4Manager {
         descend_creating(&mut self.bytes, &mut self.next_free, self.base, va, user)
     }
 
-    /// Byte offset of the PT (level-3) leaf descriptor for `va`. Errors if an
-    /// intermediate is non-present or points outside the region, or if a PS
-    /// large leaf terminates the walk early (carrick never builds one).
-    fn leaf_offset(&self, va: u64) -> Result<usize, Pml4Error> {
+    /// Byte offset of the PT (level-3) leaf descriptor for `va`, splitting a
+    /// covering 2 MiB PD leaf when the caller needs 4 KiB edit precision.
+    fn leaf_offset_for_edit(&mut self, va: u64) -> Result<usize, Pml4Error> {
         let idx = indices(va);
         let mut table_off = 0usize;
-        for &slot in idx.iter().take(3) {
+        for (level, &slot) in idx.iter().take(3).enumerate() {
             let off = table_off + slot * 8;
             if off + 8 > self.bytes.len() {
                 return Err(Pml4Error::BadAddress);
             }
             let desc = self.read_desc(off);
+            if level == 2 && desc & PML4_PS != 0 {
+                table_off = self.split_2m_leaf(off)?;
+                continue;
+            }
             if desc & PML4_P == 0 || desc & PML4_PS != 0 {
                 return Err(Pml4Error::BadAddress);
             }
@@ -364,7 +464,7 @@ impl Pml4Manager {
         let mut changed = false;
         let mut cur = va;
         while cur < end {
-            let off = self.leaf_offset(cur)?;
+            let off = self.leaf_offset_for_edit(cur)?;
             let desc = self.read_desc(off);
             let new = edit(desc)?;
             if new != desc {
@@ -612,6 +712,67 @@ mod tests {
         assert_eq!(mgr.translate(va + 0x1234), Some(gpa + 0x1234));
         assert_eq!(mgr.translate(va + 0x1000), Some(gpa + 0x1000));
         assert_eq!(mgr.translate(va + 0x2000), None);
+    }
+
+    #[test]
+    fn aligned_bulk_map_uses_2m_leaf() {
+        let va = 0x40_0000;
+        let bytes = build(&[user_rw_nx(va, va, LARGE_2M)]);
+        let mgr = Pml4Manager::new(bytes.clone(), BASE);
+
+        assert_eq!(mgr.translate(va), Some(va));
+        assert_eq!(mgr.translate(va + 0x1234), Some(va + 0x1234));
+        assert_eq!(mgr.translate(va + LARGE_2M - 1), Some(va + LARGE_2M - 1));
+        assert_eq!(mgr.translate(va + LARGE_2M), None);
+
+        let walk = walk_descriptors(&bytes, BASE, va);
+        assert_ne!(walk[2] & PML4_PS, 0, "PD leaf must be a 2 MiB page");
+        assert_eq!(walk[3], 0, "walk stops at the 2 MiB leaf");
+        assert_ne!(walk[2] & PML4_NX, 0, "large non-exec leaf is NX");
+        assert_ne!(walk[2] & PML4_RW, 0, "large writable leaf is RW");
+    }
+
+    #[test]
+    fn editing_large_leaf_splits_to_4k_and_restores() {
+        let va = 0x40_0000;
+        let bytes = build(&[user_rw_nx(va, va, LARGE_2M)]);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+
+        assert_eq!(mgr.set_prot_none(va + 0x1000, 0x1000), Ok(true));
+
+        assert_eq!(mgr.translate(va), Some(va), "preceding page remains mapped");
+        assert_eq!(mgr.translate(va + 0x1000), None, "edited page is unmapped");
+        assert_eq!(
+            mgr.translate(va + 0x2000),
+            Some(va + 0x2000),
+            "following page remains mapped"
+        );
+        let walk = walk_descriptors(mgr.bytes(), BASE, va + 0x1000);
+        assert_ne!(walk[2] & PML4_P, 0, "PD entry now points to a PT");
+        assert_eq!(walk[2] & PML4_PS, 0, "2 MiB leaf was split");
+        assert_eq!(walk[3] & PML4_P, 0, "4 KiB leaf is non-present");
+        assert_eq!(
+            walk[3] & PML4_ADDR_MASK,
+            va + 0x1000,
+            "split leaf preserved GPA for restoration"
+        );
+
+        assert_eq!(mgr.set_rw(va + 0x1000, 0x1000, false), Ok(true));
+        assert_eq!(mgr.translate(va + 0x1000), Some(va + 0x1000));
+    }
+
+    #[test]
+    fn full_mmap_arena_sized_region_fits_with_large_leaves() {
+        let va = 0x60_0000_0000;
+        let len = 32 * 1024 * 1024 * 1024u64;
+        let bytes = pml4_tables(&[user_rw_nx(va, va, len)], BASE, 64 * PT_PAGE)
+            .expect("large leaves keep the table footprint bounded");
+        let mgr = Pml4Manager::new(bytes, BASE);
+
+        assert_eq!(mgr.translate(va), Some(va));
+        assert_eq!(mgr.translate(va + 0x4000_0000), Some(va + 0x4000_0000));
+        assert_eq!(mgr.translate(va + len - 1), Some(va + len - 1));
+        assert_eq!(mgr.translate(va + len), None);
     }
 
     #[test]
