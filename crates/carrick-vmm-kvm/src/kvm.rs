@@ -14,6 +14,8 @@ use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES};
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit as KvmExit, VcpuFd, VmFd};
 use libc;
@@ -342,6 +344,11 @@ pub struct KvmVm {
     /// re-align the counter via the `TIMER_CNT` fallback (vcpu init zeroes
     /// the VM-wide CNTVOFF). Set once at `create_empty`; immutable after.
     counter_locked: bool,
+    /// The host-supported x86 CPUID table installed onto each freshly-created
+    /// vCPU. Without this, KVM exposes an empty/default CPUID model and modern
+    /// glibc rejects Debian amd64 userland before `main`.
+    #[cfg(target_arch = "x86_64")]
+    cpuid: Arc<CpuId>,
 }
 
 /// A `Send`-safe handle to the SHARED VM state a `clone(CLONE_THREAD)` sibling
@@ -360,6 +367,9 @@ pub(crate) struct SharedVmHandle {
     vcpu_pool: Arc<Mutex<Vec<VcpuFd>>>,
     /// Whether the VM-wide counter offset is pinned (see [`KvmVm::counter_locked`]).
     counter_locked: bool,
+    /// Shared x86 CPUID table for sibling vCPUs on the same VM.
+    #[cfg(target_arch = "x86_64")]
+    cpuid: Arc<CpuId>,
 }
 pub struct KvmVcpu {
     /// `Some` until drop. On drop the fd is PARKED into `recycle` instead of
@@ -400,6 +410,45 @@ impl KvmVcpu {
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_tests {
+    use super::*;
+    use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+
+    fn cpuid_entry(
+        cpuid: &kvm_bindings::CpuId,
+        function: u32,
+        index: u32,
+    ) -> Option<kvm_bindings::kvm_cpuid_entry2> {
+        cpuid
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|entry| entry.function == function && entry.index == index)
+    }
+
+    #[test]
+    fn x86_vcpu_exposes_glibc_x86_64_v2_cpuid_bits() {
+        let mut vm = KvmVm::create_empty().expect("create kvm vm");
+        let vcpu = vm.add_vcpu().expect("create kvm vcpu");
+        let cpuid = vcpu
+            .fd()
+            .get_cpuid2(KVM_MAX_CPUID_ENTRIES)
+            .expect("get vcpu cpuid");
+
+        let leaf1 = cpuid_entry(&cpuid, 1, 0).expect("CPUID leaf 1");
+        assert_ne!(leaf1.ecx & (1 << 0), 0, "SSE3");
+        assert_ne!(leaf1.ecx & (1 << 9), 0, "SSSE3");
+        assert_ne!(leaf1.ecx & (1 << 13), 0, "CMPXCHG16B");
+        assert_ne!(leaf1.ecx & (1 << 19), 0, "SSE4.1");
+        assert_ne!(leaf1.ecx & (1 << 20), 0, "SSE4.2");
+        assert_ne!(leaf1.ecx & (1 << 23), 0, "POPCNT");
+
+        let ext1 = cpuid_entry(&cpuid, 0x8000_0001, 0).expect("CPUID leaf 0x80000001");
+        assert_ne!(ext1.ecx & 1, 0, "LAHF/SAHF");
+    }
+}
+
 impl Drop for KvmVcpu {
     fn drop(&mut self) {
         if let (Some(fd), Some(pool)) = (self.fd.take(), self.recycle.as_deref())
@@ -426,6 +475,11 @@ impl KvmVm {
     /// bring-up without the unused parameter.)
     pub(crate) fn create_empty() -> Result<Self, OsError> {
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
+        #[cfg(target_arch = "x86_64")]
+        let cpuid = Arc::new(
+            kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+                .map_err(|e| os_err("KVM_GET_SUPPORTED_CPUID", e))?,
+        );
         let vm = kvm.create_vm().map_err(|e| os_err("KVM_CREATE_VM", e))?;
         // EPOCH INVARIANT: the shared dispatcher (clock_nanosleep TIMER_ABSTIME,
         // absolute FUTEX_WAIT_BITSET deadlines, timer/timerfd ABSTIME) compares
@@ -468,6 +522,8 @@ impl KvmVm {
             next_slot: Arc::new(AtomicU32::new(0)),
             vcpu_pool: Arc::new(Mutex::new(Vec::new())),
             counter_locked,
+            #[cfg(target_arch = "x86_64")]
+            cpuid,
         })
     }
 
@@ -484,6 +540,8 @@ impl KvmVm {
             next_slot: Arc::clone(&self.next_slot),
             vcpu_pool: Arc::clone(&self.vcpu_pool),
             counter_locked: self.counter_locked,
+            #[cfg(target_arch = "x86_64")]
+            cpuid: Arc::clone(&self.cpuid),
         }
     }
 
@@ -505,6 +563,8 @@ impl KvmVm {
             next_slot: handle.next_slot,
             vcpu_pool: handle.vcpu_pool,
             counter_locked: handle.counter_locked,
+            #[cfg(target_arch = "x86_64")]
+            cpuid: handle.cpuid,
         }
     }
 
@@ -568,9 +628,13 @@ impl KvmVm {
                 // that deadlocked the threaded loop (no sibling ever
                 // materialised, so `pthread_join`'s futex never woke).
                 let vcpu_id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
-                self.vm
+                let fd = self
+                    .vm
                     .create_vcpu(vcpu_id)
-                    .map_err(|e| os_err("KVM_CREATE_VCPU", e))?
+                    .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
+                #[cfg(target_arch = "x86_64")]
+                self.install_x86_cpuid(&fd)?;
+                fd
             }
         };
         // aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT + counter align.
@@ -669,6 +733,12 @@ impl KvmVm {
     /// teardown sweep is safe across holes.
     pub(crate) fn slot_count(&self) -> u32 {
         self.next_slot.load(Ordering::SeqCst)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn install_x86_cpuid(&self, fd: &VcpuFd) -> Result<(), OsError> {
+        fd.set_cpuid2(&self.cpuid)
+            .map_err(|e| os_err("KVM_SET_CPUID2", e))
     }
 }
 
