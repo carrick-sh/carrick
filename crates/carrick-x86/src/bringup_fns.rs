@@ -75,6 +75,70 @@ const CODE_SEG_TYPE: u32 = 11;
 /// Data segment type nibble: 0x3 = read/write/ACCESSED.
 const DATA_SEG_TYPE: u32 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongModeSegmentState {
+    pub cs_ar: u32,
+    pub data_ar: u32,
+    pub kernel_cs_ar: u32,
+    pub kernel_data_ar: u32,
+    pub tr_ar: u32,
+    pub ldtr_ar: u32,
+    pub gdt_limit: u32,
+}
+
+pub fn long_mode_segment_state() -> LongModeSegmentState {
+    LongModeSegmentState {
+        // User CS64: GDT[4] sel 0x23, DPL3, L=1, exec/read/accessed.
+        cs_ar: seg_ar(
+            CODE_SEG_TYPE,
+            1,
+            3,
+            1,
+            /*l*/ 1,
+            /*db*/ 0,
+            /*g*/ 1,
+            0,
+        ),
+        // User SS/DS/ES/FS/GS: GDT[3] sel 0x1B, DPL3, data/write/accessed, db=1.
+        data_ar: seg_ar(
+            DATA_SEG_TYPE,
+            1,
+            3,
+            1,
+            /*l*/ 0,
+            /*db*/ 1,
+            /*g*/ 1,
+            0,
+        ),
+        // Kernel CS64/SS used while parked in the LSTAR stub before SYSRETQ.
+        kernel_cs_ar: seg_ar(
+            CODE_SEG_TYPE,
+            1,
+            0,
+            1,
+            /*l*/ 1,
+            /*db*/ 0,
+            /*g*/ 1,
+            0,
+        ),
+        kernel_data_ar: seg_ar(
+            DATA_SEG_TYPE,
+            1,
+            0,
+            1,
+            /*l*/ 0,
+            /*db*/ 1,
+            /*g*/ 1,
+            0,
+        ),
+        // TR: minimal valid 32-bit busy TSS (type 11, system, DPL0, present, g=1).
+        tr_ar: seg_ar(11, /*s*/ 0, 0, 1, 0, 0, 1, 0),
+        // LDTR: unusable.
+        ldtr_ar: seg_ar(0, 0, 0, 0, 0, 0, 0, /*unusable*/ 1),
+        gdt_limit: (X8664GuestArch::bootstrap_sysregs().gdt.len() as u32) * 8 - 1,
+    }
+}
+
 /// Where the kernel-only bring-up structures (LSTAR trampoline, GDT, PML4 root)
 /// live in guest-physical space, and the resulting CR3. Per-backend (§ module
 /// doc): the *values* programmed are ISA constants; only these GPAs vary.
@@ -217,49 +281,19 @@ pub fn program_longmode_entry<C: X86Vcpu>(
 
     // ── Long-mode segments (must match CR0/EFER long-mode state) ──────────────
     //
-    // User CS64: GDT[4] sel 0x23, DPL3, L=1, exec/read/accessed.
-    let cs_ar = seg_ar(
-        CODE_SEG_TYPE,
-        1,
-        3,
-        1,
-        /*l*/ 1,
-        /*db*/ 0,
-        /*g*/ 1,
-        0,
-    );
-    vcpu.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, cs_ar)?;
-    // User SS/DS/ES: GDT[3] sel 0x1B, DPL3, data/write/accessed, db=1.
-    let ss_ar = seg_ar(
-        DATA_SEG_TYPE,
-        1,
-        3,
-        1,
-        /*l*/ 0,
-        /*db*/ 1,
-        /*g*/ 1,
-        0,
-    );
-    vcpu.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, ss_ar)?;
-    vcpu.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, ss_ar)?;
-    vcpu.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, ss_ar)?;
+    let segs = long_mode_segment_state();
+    vcpu.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
+    vcpu.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    vcpu.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    vcpu.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)?;
     // FS/GS: base only is significant in 64-bit mode; arch_prctl sets the base.
-    vcpu.set_segment(X86Seg::Fs, 0, 0xFFFF_FFFF, ss_ar)?;
-    vcpu.set_segment(X86Seg::Gs, 0, 0xFFFF_FFFF, ss_ar)?;
-    // TR: minimal valid 32-bit busy TSS (type 11, system, DPL0, present, g=1).
-    let tr_ar = seg_ar(11, /*s*/ 0, 0, 1, 0, 0, 1, 0);
-    vcpu.set_segment(X86Seg::Tr, 0, 0xFFFF_FFFF, tr_ar)?;
-    // LDTR: unusable.
-    vcpu.set_segment(
-        X86Seg::Ldtr,
-        0,
-        0,
-        seg_ar(0, 0, 0, 0, 0, 0, 0, /*unusable*/ 1),
-    )?;
+    vcpu.set_segment(X86Seg::Fs, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    vcpu.set_segment(X86Seg::Gs, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    vcpu.set_segment(X86Seg::Tr, 0, 0xFFFF_FFFF, segs.tr_ar)?;
+    vcpu.set_segment(X86Seg::Ldtr, 0, 0, segs.ldtr_ar)?;
 
     // GDT / IDT (descriptor-table registers): base + limit, no AR.
-    let gdt_limit = (X8664GuestArch::bootstrap_sysregs().gdt.len() as u32) * 8 - 1;
-    vcpu.set_segment(X86Seg::Gdtr, layout.gdt_base, gdt_limit, 0)?;
+    vcpu.set_segment(X86Seg::Gdtr, layout.gdt_base, segs.gdt_limit, 0)?;
     vcpu.set_segment(X86Seg::Idtr, 0, 0, 0)?;
 
     // ── Entry GPRs ────────────────────────────────────────────────────────────
@@ -379,19 +413,16 @@ pub fn restore<C: X86Vcpu>(
     c.set_gpr(X86Reg::Efer, s.efer)?;
 
     // Long-mode segments (same encoding as program_longmode_entry).
-    let cs_ar = seg_ar(CODE_SEG_TYPE, 1, 3, 1, 1, 0, 1, 0);
-    c.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, cs_ar)?;
-    let ss_ar = seg_ar(DATA_SEG_TYPE, 1, 3, 1, 0, 1, 1, 0);
-    c.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, ss_ar)?;
-    c.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, ss_ar)?;
-    c.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, ss_ar)?;
-    c.set_segment(X86Seg::Fs, 0, 0xFFFF_FFFF, ss_ar)?;
-    c.set_segment(X86Seg::Gs, 0, 0xFFFF_FFFF, ss_ar)?;
-    let tr_ar = seg_ar(11, 0, 0, 1, 0, 0, 1, 0);
-    c.set_segment(X86Seg::Tr, 0, 0xFFFF_FFFF, tr_ar)?;
-    c.set_segment(X86Seg::Ldtr, 0, 0, seg_ar(0, 0, 0, 0, 0, 0, 0, 1))?;
-    let gdt_limit = (X8664GuestArch::bootstrap_sysregs().gdt.len() as u32) * 8 - 1;
-    c.set_segment(X86Seg::Gdtr, layout.gdt_base, gdt_limit, 0)?;
+    let segs = long_mode_segment_state();
+    c.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
+    c.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    c.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    c.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    c.set_segment(X86Seg::Fs, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    c.set_segment(X86Seg::Gs, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    c.set_segment(X86Seg::Tr, 0, 0xFFFF_FFFF, segs.tr_ar)?;
+    c.set_segment(X86Seg::Ldtr, 0, 0, segs.ldtr_ar)?;
+    c.set_segment(X86Seg::Gdtr, layout.gdt_base, segs.gdt_limit, 0)?;
     c.set_segment(X86Seg::Idtr, 0, 0, 0)?;
 
     // GPRs.

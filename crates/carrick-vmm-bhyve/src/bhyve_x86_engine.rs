@@ -855,7 +855,11 @@ impl X86Vmm for BhyveVmm {
         self.vm.destroy_in_place();
     }
 
-    fn execve_rebuild(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+    fn execve_rebuild(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError> {
         // Replace the live image (execve). Build a fresh OWNED VM FIRST (so a
         // bring-up error leaves the old image running — Linux semantics), swap it
         // in, tear down the old VM, and re-point the shared vCPU handle at the

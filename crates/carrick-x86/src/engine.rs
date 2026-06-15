@@ -404,9 +404,20 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         // `X86Vmm::execve_rebuild` is NYI (KVM/NVMM Phase-2 hello do not execve);
         // bhyve overrides it. Clear the pending-syscall state — the fresh image
         // resumes at its own entry, not the old doorbell resume.
-        self.vm.execve_rebuild(new_image)?;
+        self.vm.execve_rebuild(&mut self.vcpu, new_image)?;
         self.pending_resume_pc = None;
         Ok(())
+    }
+
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    ) -> Result<(), TrapError> {
+        self.vm.map_host_alias(va, ipa, len, payload, file)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -464,9 +475,8 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
 /// host `libc::fork`, and on the child side rebuilds the guest per
 /// `fork_ram_strategy`:
 ///   - `Cow` (KVM/NVMM): the child inherits RAM via COW; the backend's
-///     `add_vcpu` on a rebuilt VM is reached through the per-backend fork
-///     re-entry (KVM rebuilds via its own VM constructor — see the backend's
-///     `X86Vmm`). For the generic path we re-seed the inherited vCPU directly.
+///     `rebuild_child_after_fork` may still replace VMM objects whose fds are not
+///     valid in the fork child (KVM), then the generic engine re-seeds the vCPU.
 ///   - `EagerCopy` (bhyve): freeze the segment, rebuild a fresh named child VM
 ///     from it (`freeze_ram` / `rebuild_child_vm`), then re-seed.
 fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, TrapError> {
@@ -496,13 +506,15 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     }
 
     // CHILD.
-    if let ForkRamStrategy::EagerCopy = strategy {
-        engine.vm.rebuild_child_vm(&frozen)?;
-    }
+    engine
+        .vm
+        .rebuild_child_after_fork(&mut engine.vcpu, &frozen)?;
     let layout = engine.layout;
     let child_snap =
         bringup_fns::seed_entry(&snap, GuestEntryRegs::default(), engine.sysret_resume_rip());
-    bringup_fns::restore(&mut engine.vcpu, layout, &child_snap)?;
+    engine
+        .vm
+        .restore_vcpu(&mut engine.vcpu, layout, &child_snap)?;
     engine.is_forked_child = true;
     Ok(ForkOutcome::Child)
 }
@@ -535,6 +547,10 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         V::wait_for_vcpu_slot();
     }
 
+    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
+        crate::engine::fork_x86(self)
+    }
+
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {
         let parent = bringup_fns::snapshot(&self.vcpu)?;
         let snapshot = bringup_fns::seed_entry(&parent, entry, self.sysret_resume_rip());
@@ -548,7 +564,7 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
 
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError> {
         let (vm, mut vcpu) = V::materialize_sibling(spec.builder)?;
-        bringup_fns::restore(&mut vcpu, spec.layout, &spec.snapshot)?;
+        vm.restore_vcpu(&mut vcpu, spec.layout, &spec.snapshot)?;
         Ok(Self::from_parts(vm, vcpu, spec.layout))
     }
 
