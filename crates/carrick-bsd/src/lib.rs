@@ -1,9 +1,14 @@
-//! macOS/FreeBSD host-primitive implementations of the `carrick-hal` traits.
+//! BSD-family host-primitive implementations of the `carrick-hal` traits.
 //!
-//! Gated `cfg(any(target_os = "macos", target_os = "freebsd"))`. This crate
-//! holds the BSD-family implementations lifted out of `carrick-runtime`
-//! (errno translation here; kqueue/sendfile/futex added in the BSDIO section).
-#![cfg(any(target_os = "macos", target_os = "freebsd"))]
+//! Gated `cfg(carrick_bsd_family)` (emitted by `build.rs` for macOS / FreeBSD /
+//! NetBSD / OpenBSD / DragonFly — all the kqueue + BSD-numbered hosts). This
+//! crate holds the BSD-family implementations lifted out of `carrick-runtime`:
+//! the errno translation, the kqueue multiplexer, the shared-page `BsdFutex`,
+//! and the one BSD `SIGNUM_XLATE` signal-number table (`signum`). A new BSD host
+//! is a one-line addition to `build.rs`, not a per-arm `cfg` audit — only the
+//! actual kernel-call divergence (`__ulock`/`_umtx_op`/`__futex`) stays a
+//! per-host arm, and that is pushed behind `carrick-host`.
+#![cfg(carrick_bsd_family)]
 
 pub mod errno;
 pub use errno::bsd_to_linux_errno;
@@ -15,3 +20,7 @@ pub use multiplexer::KqueueMultiplexer;
 
 pub mod futex;
 pub use futex::BsdFutex;
+
+/// The one BSD-family `linux <-> host` signal-number translation table (shared
+/// by the HVF/macOS and bhyve/FreeBSD backends; previously triplicated).
+pub mod signum;

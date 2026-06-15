@@ -301,6 +301,7 @@ name = "carrick-bhyve"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-bsd",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",

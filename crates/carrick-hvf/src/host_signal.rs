@@ -113,45 +113,15 @@ pub use carrick_signal_core::xsig::{
     xsig_has_unblocked_for_self, xsig_init,
 };
 
-/// `(linux_signum, host_signum)` pairs that DIFFER between Linux and macOS.
-/// Signals not listed (HUP/INT/QUIT/ILL/TRAP/ABRT/FPE/KILL/SEGV/PIPE/ALRM/
-/// TERM/TTIN/TTOU/XCPU/XFSZ/VTALRM/PROF/WINCH) share the same number on both
-/// and translate as identity. Cross-process signals must be translated on the
-/// send side (`libc::kill`), the receive side (host handler -> guest), and in
-/// the `wait4` status, or e.g. a guest SIGUSR1 (10) would be sent to macOS as
-/// signal 10 (SIGBUS).
-const SIGNUM_XLATE: &[(i32, i32)] = &[
-    (7, 10),  // SIGBUS
-    (10, 30), // SIGUSR1
-    (12, 31), // SIGUSR2
-    (17, 20), // SIGCHLD
-    (18, 19), // SIGCONT
-    (19, 17), // SIGSTOP
-    (20, 18), // SIGTSTP
-    (23, 16), // SIGURG
-    (29, 23), // SIGIO / SIGPOLL
-    (31, 12), // SIGSYS
-];
-
-/// Translate a Linux signal number to the macOS host number. Identity for
-/// signals that share a number.
-pub fn linux_to_host_signum(linux: i32) -> i32 {
-    SIGNUM_XLATE
-        .iter()
-        .find(|(l, _)| *l == linux)
-        .map(|(_, h)| *h)
-        .unwrap_or(linux)
-}
-
-/// Translate a macOS host signal number to the Linux number. Identity for
-/// signals that share a number.
-pub fn host_to_linux_signum(host: i32) -> i32 {
-    SIGNUM_XLATE
-        .iter()
-        .find(|(_, h)| *h == host)
-        .map(|(l, _)| *l)
-        .unwrap_or(host)
-}
+// The `(linux, host)` signal-number translation table that DIFFERS between Linux
+// and the BSDs (SIGUSR1/SIGCHLD/SIGSTOP/SIGURG/…) is the ONE BSD-family table in
+// `carrick_bsd::signum` — macOS shares BSD signal numbering with FreeBSD, so the
+// table that was duplicated here (and again in `carrick_bhyve::bhyve_signum`)
+// now lives once. Cross-process signals must be translated on the send side
+// (`libc::kill`), the receive side (host handler -> guest), and in the `wait4`
+// status, or e.g. a guest SIGUSR1 (10) would be sent to macOS as signal 10
+// (SIGBUS). Re-exported so HVF's many call sites are unchanged.
+pub use carrick_bsd::signum::{host_to_linux_signum, linux_to_host_signum};
 
 fn hvf_private_thread_signal_set(set: &mut libc::sigset_t) {
     unsafe {
