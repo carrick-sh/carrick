@@ -456,10 +456,10 @@ pub mod runtime {
         // (`vcpu_loop::handle_fork`) without the generic loop naming `KvmFutex`.
         let futex = Arc::new(FutexTable::new());
         let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
-            Arc::new(carrick_linux::KvmFutex(Arc::clone(&futex)));
+            Arc::new(carrick_linux::make_kvm_futex(Arc::clone(&futex)));
         let platform_futex_factory: PlatformFutexFactory = Arc::new(
             |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
-                Arc::new(carrick_linux::KvmFutex(table))
+                Arc::new(carrick_linux::make_kvm_futex(table))
             },
         );
         // The KVM host-fork coordinator (lean — no pump thread), boxed object-safe.
@@ -479,7 +479,7 @@ pub mod runtime {
         // value only carries the kicker + futex wake path). Held object-safe in
         // `KernelState`.
         let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
-            Arc::new(carrick_linux::KvmSignalArrival {
+            Arc::new(carrick_hal::GenericSignalArrival {
                 kicker: Arc::clone(&kicker),
                 futex: Arc::clone(&platform_futex),
             });
@@ -577,10 +577,10 @@ pub mod runtime {
 
         let futex = Arc::new(FutexTable::new());
         let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
-            Arc::new(carrick_bhyve::BhyveFutex(Arc::clone(&futex)));
+            Arc::new(carrick_bhyve::make_bhyve_futex(Arc::clone(&futex)));
         let platform_futex_factory: PlatformFutexFactory = Arc::new(
             |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
-                Arc::new(carrick_bhyve::BhyveFutex(table))
+                Arc::new(carrick_bhyve::make_bhyve_futex(table))
             },
         );
         let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
@@ -588,7 +588,7 @@ pub mod runtime {
         let kicker: Arc<dyn carrick_hal::VcpuRegistry> =
             Arc::new(carrick_bhyve::BhyveKicker::new());
         let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
-            Arc::new(carrick_bhyve::BhyveSignalArrival {
+            Arc::new(carrick_hal::GenericSignalArrival {
                 kicker: Arc::clone(&kicker),
                 futex: Arc::clone(&platform_futex),
             });

@@ -14,3 +14,28 @@ pub trait SignalArrival: Send + Sync {
     /// Wake ALL parked waiters (fork/exec quiesce, process-directed arrival).
     fn wake_all_waiters(&self);
 }
+
+/// The one `SignalArrival` impl shared by every backend whose "wake all" is
+/// "kick every live vCPU out of its run ioctl, then nudge the private futex so
+/// parked threads re-check pending state." This was byte-identical across the
+/// KVM (`KvmSignalArrival`) and bhyve (`BhyveSignalArrival`) copies; it is now
+/// one struct any backend constructs with its kicker + futex trait objects.
+///
+/// (HVF's wake-all is its kqueue-pump self-pipe + per-thread waiter wakes — a
+/// genuinely different mechanism — so HVF keeps its own `HvfSignalArrival`; this
+/// generic is for the kick+futex hosts.)
+pub struct GenericSignalArrival {
+    /// The live-vCPU registry: `kick_all()` forces every guest thread out of its
+    /// run ioctl so the trap loop can deliver a pending signal promptly.
+    pub kicker: std::sync::Arc<dyn crate::VcpuRegistry>,
+    /// The process-private futex: `notify_signal_pending()` wakes parked threads
+    /// to re-check their interrupt predicate.
+    pub futex: std::sync::Arc<dyn crate::PlatformFutex>,
+}
+
+impl SignalArrival for GenericSignalArrival {
+    fn wake_all_waiters(&self) {
+        self.kicker.kick_all();
+        self.futex.notify_signal_pending();
+    }
+}

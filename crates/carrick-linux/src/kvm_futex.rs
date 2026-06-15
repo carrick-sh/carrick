@@ -1,38 +1,25 @@
-//! `PlatformFutex` implementation for KVM.
+//! KVM's shared-page futex syscall shim.
 //!
-//! `KvmFutex` wraps the process-private `carrick_thread::thread::FutexTable`
-//! (parking-lot-backed) for private-anonymous futex operations, and services
-//! the `MAP_SHARED` / cross-process futex operations with the REAL host
-//! `SYS_futex` syscall (`FUTEX_WAIT` / `FUTEX_WAKE`, **no** `FUTEX_PRIVATE_FLAG`)
-//! on the shared-aperture HOST address.
+//! The whole `PlatformFutex` impl is now the shared
+//! [`carrick_thread::platform_futex::FutexTableFutex<S>`]; KVM supplies only the
+//! one per-host divergence — the `MAP_SHARED` (cross-process) futex kernel call —
+//! as a [`SharedFutexSyscall`] shim. On Linux that is the REAL host `SYS_futex`
+//! (`FUTEX_WAIT`/`FUTEX_WAKE`, **no** `FUTEX_PRIVATE_FLAG`) on the shared-aperture
+//! HOST address: both forked carrick processes hold the SAME `MAP_SHARED|
+//! MAP_ANONYMOUS` physical page at the same host VA (the aperture is inherited,
+//! not copied), so a bare `FUTEX_WAIT`/`FUTEX_WAKE` rendezvouses across the
+//! process boundary, and the errno values ARE Linux's (this is Linux) so no
+//! cross-OS errno translation is needed.
 //!
-//! This is the KVM analogue of `carrick_hvf::HvfFutex`: the **private** path is
-//! identical (verbatim delegation to the wrapped `FutexTable`), and only the
-//! **shared** path differs — HVF routes through the macOS `os_sync` ulock API
-//! keyed on the physical page, whereas KVM runs on a real Linux host whose
-//! kernel `SYS_futex` keys the same `MAP_SHARED|MAP_ANONYMOUS` physical page
-//! across `fork(2)` for free. Because both forked carrick processes hold the
-//! SAME physical page at the same host VA (the shared aperture is inherited, not
-//! copied), a bare `FUTEX_WAIT`/`FUTEX_WAKE` on that host address rendezvouses
-//! across the process boundary correctly.
-//!
-//! As with `HvfFutex`, this file is a forwarding shim only: all private-futex
-//! semantics are owned by the existing `FutexTable`; the shared path just names
-//! the `carrick_hal::PlatformFutex` surface and routes each method to the right
-//! `SYS_futex` call.
+//! `KvmFutex` is now a thin alias for `FutexTableFutex<KvmSharedFutex>`; build it
+//! with [`make_kvm_futex`]. The private path, the ≤20 ms slice loop, and the
+//! `notify_signal_pending` wakes all live in the shared crate.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-// The shared_wait loop now returns these via carrick_hal::shared_wait_sliced;
-// only the tests still name them (to assert the interrupt/timeout returns).
-#[cfg(test)]
-use carrick_abi::{LINUX_EINTR, LINUX_ETIMEDOUT};
-use carrick_hal::{FutexOutcome, PlatformFutex, ThreadId};
-use carrick_thread::thread::{FutexTable, FutexWaitOutcome};
-
-// The ≤20 ms shared-futex slice cap + the deadline/slice/interrupt loop now live
-// in `carrick_hal::shared_wait_sliced` (shared with HVF/bhyve); see `shared_wait`.
+use carrick_hal::SharedWaitStep;
+use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexSyscall};
+use carrick_thread::thread::FutexTable;
 
 /// Wait on a cross-process futex via the host `SYS_futex(FUTEX_WAIT, ...)`.
 ///
@@ -46,8 +33,8 @@ use carrick_thread::thread::{FutexTable, FutexWaitOutcome};
 /// errno; Linux errno values, since this IS Linux).
 ///
 /// SAFETY: `host_addr` must be a valid, mapped, 4-byte-aligned host address of
-/// the shared-aperture word; the caller (`shared_wait`) only ever passes the
-/// host VA the GPA→host translation produced for a `MAP_SHARED` aperture page.
+/// the shared-aperture word; the caller only ever passes the host VA the
+/// GPA→host translation produced for a `MAP_SHARED` aperture page.
 fn futex_wait_on_address(host_addr: usize, val: u32, timeout_ns: Option<i64>) -> i64 {
     let ts = timeout_ns.map(|ns| libc::timespec {
         tv_sec: (ns / 1_000_000_000) as libc::time_t,
@@ -106,130 +93,63 @@ fn futex_wake_by_address(host_addr: usize, n: u32) -> i64 {
     }
 }
 
-/// The KVM `PlatformFutex` implementation.
-///
-/// Wraps the per-process `FutexTable` for private futex ops and services
-/// `MAP_SHARED` / cross-process futex ops with the host `SYS_futex` syscall.
-pub struct KvmFutex(pub Arc<FutexTable>);
+/// KVM's per-host shared-page futex shim: bare `SYS_futex`.
+pub struct KvmSharedFutex;
 
-impl PlatformFutex for KvmFutex {
-    /// Park the calling thread on a private (anonymous) futex.
-    ///
-    /// VERBATIM the `HvfFutex` private path: the value-equality check was already
-    /// performed by the dispatcher BEFORE it returned `DispatchOutcome::FutexWait`,
-    /// so we do NOT re-check here — we `prepare_wait` (capturing the generation)
-    /// then `wait_prepared_for_thread`, so a thread-directed signal (tgkill) can
-    /// wake this specific parked thread via its `ParkToken(tid)`.
-    fn private_wait(
-        &self,
-        addr: u64,
-        _val: u32,
-        tid: ThreadId,
-        timeout: Option<Duration>,
-        interrupted: &dyn Fn() -> bool,
-    ) -> FutexOutcome {
-        let wait = self.0.prepare_wait(addr);
-        match self
-            .0
-            .wait_prepared_for_thread(wait, timeout, tid, interrupted)
-        {
-            FutexWaitOutcome::Woken => FutexOutcome::Woken,
-            FutexWaitOutcome::TimedOut => FutexOutcome::TimedOut,
-            FutexWaitOutcome::Interrupted => FutexOutcome::Interrupted,
+impl SharedFutexSyscall for KvmSharedFutex {
+    fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
+        let r = futex_wait_on_address(host_addr, val, Some(slice_ns));
+        if r == 0 {
+            // Woken, or the word already differed from `val`. Linux FUTEX_WAIT
+            // returns 0 on a successful wake; the caller re-checks.
+            return SharedWaitStep::Woken;
         }
+        let host_errno = (-r) as i32;
+        // EAGAIN/EWOULDBLOCK: the word != `val` at entry — the wait would not
+        // have blocked; surface as 0 (the guest re-reads + re-evaluates),
+        // matching Linux FUTEX_WAIT's value-mismatch semantics.
+        if host_errno == libc::EAGAIN {
+            return SharedWaitStep::Woken;
+        }
+        // ETIMEDOUT (≤20 ms slice expiry) / EINTR (signal nudge): re-check at the
+        // loop top — only a real deadline or pending interrupt terminates.
+        if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
+            return SharedWaitStep::Retry;
+        }
+        // Any other error (e.g. EFAULT on a bad address) is returned directly.
+        SharedWaitStep::Error(r)
     }
 
-    fn private_wake(&self, addr: u64, n: u32) -> u32 {
-        self.0.wake(addr, n)
-    }
-
-    /// Wait on a `MAP_SHARED` (cross-process) futex via the host `SYS_futex`.
-    ///
-    /// Slices each kernel `FUTEX_WAIT` to ≤20 ms, re-checks `interrupted()`
-    /// between slices, and returns the raw `i64` (`-EINTR`/`-ETIMEDOUT` for the
-    /// interrupt/timeout terminations, `0` on woken-or-value-mismatch, `-errno`
-    /// for any other kernel error) that the run loop translates back to a Linux
-    /// `FUTEX_WAIT` return. Mirrors `HvfFutex::shared_wait` exactly EXCEPT the
-    /// kernel call is host `SYS_futex` instead of the macOS `os_sync` ulock —
-    /// and the errno values ARE Linux's (this is Linux), so no cross-OS errno
-    /// translation is needed.
-    fn shared_wait(
-        &self,
-        host_addr: usize,
-        value: u32,
-        timeout: Option<Duration>,
-        interrupted: &dyn Fn() -> bool,
-    ) -> i64 {
-        // The deadline/slice/interrupt loop is shared (carrick_hal); only the
-        // single kernel wait + its host-errno classification is KVM-specific.
-        carrick_hal::shared_wait_sliced(timeout, interrupted, &|slice_ns| {
-            let r = futex_wait_on_address(host_addr, value, Some(slice_ns));
-            if r == 0 {
-                // Woken, or the word already differed from `value`. Linux
-                // FUTEX_WAIT returns 0 on a successful wake; the caller re-checks.
-                return carrick_hal::SharedWaitStep::Woken;
-            }
-            let host_errno = (-r) as i32;
-            // EAGAIN/EWOULDBLOCK: the word != `value` at entry — the wait would
-            // not have blocked; surface as a 0 return (the guest re-reads + re-
-            // evaluates), matching Linux FUTEX_WAIT's value-mismatch semantics.
-            if host_errno == libc::EAGAIN {
-                return carrick_hal::SharedWaitStep::Woken;
-            }
-            // ETIMEDOUT (≤20 ms slice expiry) / EINTR (signal nudge): re-check at
-            // the loop top — only a real deadline or pending interrupt terminates.
-            if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
-                return carrick_hal::SharedWaitStep::Retry;
-            }
-            // Any other error (e.g. EFAULT on a bad address) is returned directly.
-            carrick_hal::SharedWaitStep::Error(r)
-        })
-    }
-
-    /// Wake up to `n` waiters on a `MAP_SHARED` (cross-process) futex via the
-    /// host `SYS_futex(FUTEX_WAKE, ...)`.
-    ///
-    /// Unlike `HvfFutex::shared_wake` (which wakes ONE-AT-A-TIME with a
-    /// `sched_yield` between iterations to defeat macOS `os_sync_wake_by_address`'s
-    /// spurious back-to-back successes on a SHARED address), the Linux kernel's
+    /// Unlike macOS `os_sync_wake_by_address` (which needs a one-at-a-time +
+    /// `sched_yield` workaround on a SHARED address), the Linux kernel's
     /// `FUTEX_WAKE` is atomic and correct: a single `SYS_futex(FUTEX_WAKE, addr,
-    /// n)` wakes up to `n` real waiters and returns the exact count, with no
-    /// spurious-success problem to work around. So the natural one-shot form is
-    /// used. Returns the count woken (`i64`); a kernel error surfaces as `-errno`.
-    fn shared_wake(&self, host_addr: usize, n: u32) -> i64 {
+    /// n)` wakes up to `n` real waiters and returns the exact count.
+    fn wake(&self, host_addr: usize, n: u32) -> i64 {
         futex_wake_by_address(host_addr, n)
     }
+}
 
-    fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
-        self.0.requeue(from, to, wake, requeue)
-    }
+/// The KVM `PlatformFutex`: the shared `FutexTableFutex` over the bare-`SYS_futex`
+/// shim. Construct with [`make_kvm_futex`].
+pub type KvmFutex = FutexTableFutex<KvmSharedFutex>;
 
-    #[inline]
-    fn notify_signal_pending(&self) {
-        self.0.notify_signal_pending();
-    }
-
-    #[inline]
-    fn notify_signal_pending_for(&self, tid: ThreadId) {
-        self.0.notify_signal_pending_for(tid);
-    }
+/// Pair the process-private `FutexTable` with KVM's shared-page shim.
+pub fn make_kvm_futex(table: Arc<FutexTable>) -> KvmFutex {
+    FutexTableFutex::new(table, KvmSharedFutex)
 }
 
 #[cfg(test)]
 mod tests {
     //! Host-runnable unit tests (no `/dev/kvm`, no guest). They exercise BOTH
-    //! futex paths `KvmFutex` exposes:
+    //! futex paths the shared `FutexTableFutex` exposes over KVM's shim:
     //!   * the PRIVATE path delegates verbatim to the wrapped `FutexTable`
     //!     (cross-THREAD round-trip + a timeout case), and
     //!   * the SHARED path drives the REAL host `SYS_futex` on a plain
     //!     `mmap(MAP_SHARED|MAP_ANONYMOUS)` word (cross-THREAD wake round-trip, a
-    //!     value-mismatch fast return, and a timeout case).
-    //!
-    //! These run on any Linux host (the crate is `cfg(target_os = "linux")`), so
-    //! they execute on the lima L2 lane / a native aarch64 Linux host. The
-    //! cross-PROCESS (fork) rendezvous and the threaded-loop integration are
-    //! validated at Task 7 (see the report).
+    //!     value-mismatch fast return, a timeout, and an interrupt case).
     use super::*;
+    use carrick_abi::{LINUX_EINTR, LINUX_ETIMEDOUT};
+    use carrick_hal::{FutexOutcome, PlatformFutex};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
     use std::time::Duration;
@@ -242,14 +162,12 @@ mod tests {
     /// `private_wake` from another thread (delegated straight to `FutexTable`).
     #[test]
     fn private_wait_woken_by_other_thread() {
-        let futex = Arc::new(KvmFutex(Arc::new(FutexTable::new())));
+        let futex = Arc::new(make_kvm_futex(Arc::new(FutexTable::new())));
         const ADDR: u64 = 0x4000;
         let f2 = Arc::clone(&futex);
         let waiter = thread::spawn(move || {
-            // tid 1 is the parked thread's park-token id; any non-zero is fine.
             f2.private_wait(ADDR, 0, 1, Some(Duration::from_secs(5)), &|| false)
         });
-        // Give the waiter time to park, then wake exactly one waiter.
         thread::sleep(Duration::from_millis(50));
         let woke = futex.private_wake(ADDR, 1);
         assert_eq!(woke, 1, "private_wake must report one waiter woken");
@@ -261,11 +179,10 @@ mod tests {
         );
     }
 
-    /// PRIVATE path: with no waker, `private_wait` returns `TimedOut` once its
-    /// timeout elapses (delegation of the `FutexTable` timeout path).
+    /// PRIVATE path: with no waker, `private_wait` returns `TimedOut`.
     #[test]
     fn private_wait_times_out() {
-        let futex = KvmFutex(Arc::new(FutexTable::new()));
+        let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let outcome = futex.private_wait(
             0x5000,
             0,
@@ -280,12 +197,10 @@ mod tests {
         );
     }
 
-    /// PRIVATE path: a pending interrupt terminates `private_wait` with
-    /// `Interrupted` (the `interrupted()` predicate the loop uses to surface a
-    /// pending signal / fork quiesce).
+    /// PRIVATE path: a pending interrupt terminates `private_wait`.
     #[test]
     fn private_wait_interrupted() {
-        let futex = KvmFutex(Arc::new(FutexTable::new()));
+        let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let outcome = futex.private_wait(0x6000, 0, 1, Some(Duration::from_secs(5)), &|| true);
         assert_eq!(
             outcome,
@@ -294,9 +209,8 @@ mod tests {
         );
     }
 
-    /// Allocate one `MAP_SHARED|MAP_ANONYMOUS` page (the same flags the KVM
-    /// shared aperture uses) and return the host address of its first word. The
-    /// page leaks for the test process's life (fine for a unit test).
+    /// Allocate one `MAP_SHARED|MAP_ANONYMOUS` page (the flags the KVM shared
+    /// aperture uses) and return the host address of its first word.
     fn shared_word() -> *mut AtomicU32 {
         // SAFETY: a fresh 4 KiB anonymous shared mapping; we own it.
         let p = unsafe {
@@ -313,27 +227,18 @@ mod tests {
         p.cast::<AtomicU32>()
     }
 
-    /// SHARED path: thread A `shared_wait(addr, expected)` blocks on the host
-    /// `SYS_futex`; thread B stores a new value + `shared_wake(addr, 1)` → A
-    /// returns `0` (woken). This is the cross-THREAD analogue of the
-    /// cross-PROCESS rendezvous; both use the identical bare `SYS_futex` path, so
-    /// the wake-reaches-waiter mechanism is what this asserts.
+    /// SHARED path: thread A `shared_wait` blocks on host `SYS_futex`; thread B
+    /// stores a new value + `shared_wake` → A returns `0` (woken).
     #[test]
     fn shared_wait_woken_by_shared_wake() {
         let word = shared_word() as usize;
-        // SAFETY: `word` is our mapped AtomicU32.
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(0, Ordering::SeqCst);
 
-        let futex = Arc::new(KvmFutex(Arc::new(FutexTable::new())));
+        let futex = Arc::new(make_kvm_futex(Arc::new(FutexTable::new())));
         let f2 = Arc::clone(&futex);
-        let waiter = thread::spawn(move || {
-            // Wait while *word == 0, with a generous timeout so a missed wake
-            // still terminates the test (it would then return -ETIMEDOUT, failing
-            // the assert below rather than hanging).
-            f2.shared_wait(word, 0, Some(Duration::from_secs(5)), &|| false)
-        });
-        // Let the waiter block in FUTEX_WAIT, then change the word and wake it.
+        let waiter =
+            thread::spawn(move || f2.shared_wait(word, 0, Some(Duration::from_secs(5)), &|| false));
         thread::sleep(Duration::from_millis(50));
         atom.store(1, Ordering::SeqCst);
         let woke = futex.shared_wake(word, 1);
@@ -342,19 +247,16 @@ mod tests {
         assert_eq!(r, 0, "shared_wait must return 0 (woken) after shared_wake");
     }
 
-    /// SHARED path value-mismatch: if `*word != value` at entry, the kernel
-    /// `FUTEX_WAIT` returns EAGAIN immediately and `shared_wait` maps that to a
-    /// `0` (no blocking) so the guest re-reads + re-evaluates. The wait must
-    /// return promptly (well under its 5 s timeout).
+    /// SHARED path value-mismatch: `*word != value` at entry → immediate EAGAIN
+    /// → `0` (no block), promptly.
     #[test]
     fn shared_wait_value_mismatch_returns_immediately() {
         let word = shared_word() as usize;
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(42, Ordering::SeqCst);
 
-        let futex = KvmFutex(Arc::new(FutexTable::new()));
+        let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let start = std::time::Instant::now();
-        // Expected value 0, but the word holds 42 → immediate EAGAIN → 0.
         let r = futex.shared_wait(word, 0, Some(Duration::from_secs(5)), &never_interrupted());
         let elapsed = start.elapsed();
         assert_eq!(r, 0, "value-mismatch shared_wait must return 0 (no block)");
@@ -364,17 +266,14 @@ mod tests {
         );
     }
 
-    /// SHARED path timeout: with the word matching `value` and no waker, the
-    /// sliced loop runs out the deadline and returns `-ETIMEDOUT`.
+    /// SHARED path timeout: word matches `value`, no waker → `-ETIMEDOUT`.
     #[test]
     fn shared_wait_times_out() {
         let word = shared_word() as usize;
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(7, Ordering::SeqCst);
 
-        let futex = KvmFutex(Arc::new(FutexTable::new()));
-        // Word matches `value` (7) so FUTEX_WAIT blocks; no waker → the ≤20 ms
-        // slices accumulate until the 120 ms deadline → -ETIMEDOUT.
+        let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let r = futex.shared_wait(
             word,
             7,
@@ -388,15 +287,14 @@ mod tests {
         );
     }
 
-    /// SHARED path interrupt: a pending `interrupted()` terminates `shared_wait`
-    /// with `-EINTR` before it blocks (the loop checks the predicate at the top).
+    /// SHARED path interrupt: a pending `interrupted()` terminates with `-EINTR`.
     #[test]
     fn shared_wait_interrupted_returns_eintr() {
         let word = shared_word() as usize;
         let atom = unsafe { &*(word as *const AtomicU32) };
         atom.store(0, Ordering::SeqCst);
 
-        let futex = KvmFutex(Arc::new(FutexTable::new()));
+        let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let r = futex.shared_wait(word, 0, Some(Duration::from_secs(5)), &|| true);
         assert_eq!(
             r,
@@ -405,12 +303,11 @@ mod tests {
         );
     }
 
-    /// SHARED path wake with no waiter: `shared_wake` returns 0 (the kernel
-    /// `FUTEX_WAKE` woke nobody) — not an error.
+    /// SHARED path wake with no waiter: returns 0 (woke nobody), not an error.
     #[test]
     fn shared_wake_no_waiter_returns_zero() {
         let word = shared_word() as usize;
-        let futex = KvmFutex(Arc::new(FutexTable::new()));
+        let futex = make_kvm_futex(Arc::new(FutexTable::new()));
         let woke = futex.shared_wake(word, 1);
         assert_eq!(woke, 0, "shared_wake with no waiter must return 0");
     }

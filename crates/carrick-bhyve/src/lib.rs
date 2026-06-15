@@ -59,7 +59,7 @@ pub mod run_elf;
 #[cfg(target_arch = "x86_64")]
 mod bhyve_futex;
 #[cfg(target_arch = "x86_64")]
-pub use bhyve_futex::BhyveFutex;
+pub use bhyve_futex::{BhyveFutex, make_bhyve_futex};
 
 #[cfg(target_arch = "x86_64")]
 mod bhyve_kicker;
@@ -79,7 +79,7 @@ pub mod bhyve_xsig;
 #[cfg(target_arch = "x86_64")]
 mod bhyve_threaded_glue;
 #[cfg(target_arch = "x86_64")]
-pub use bhyve_threaded_glue::{BhyveForkCoordinator, BhyveSignalArrival, BhyveTimerDelivery};
+pub use bhyve_threaded_glue::{BhyveForkCoordinator, BhyveTimerDelivery};
 
 #[cfg(target_arch = "x86_64")]
 pub use bhyve_x86_engine::{BhyveVmm, BhyveX86Vcpu, bring_up as bring_up_x86_engine};
