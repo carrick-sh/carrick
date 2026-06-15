@@ -26,7 +26,6 @@ use crate::verdict::{Baseline, SideSummary, SuiteReport, Verdict, classify};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// Runtime crates whose change should out-date the signed binary (the soft
@@ -263,9 +262,9 @@ fn run() -> anyhow::Result<ExitCode> {
 
     // ---- Phase 1: ALL carrick (weight-aware; never overlapping docker). ----
     eprintln!("phase 1/3: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers})");
-    let carrick_outs = fan_out(n, workers, |i| {
+    let all_indices: Vec<usize> = (0..n).collect();
+    let carrick_outs = fan_out_scheduled(&all_indices, &selected, workers, &lanes, |i| {
         let s = &selected[i];
-        let _lane = lanes.acquire(s);
         // Zero-pad the index so no run-id is a prefix of another (c01 vs c10);
         // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
         // collision-free id is defense in depth against any unanchored grep.
@@ -299,10 +298,8 @@ fn run() -> anyhow::Result<ExitCode> {
             ""
         },
     );
-    let fresh_outs = fan_out(need_docker.len(), workers, |j| {
-        let i = need_docker[j];
+    let fresh_outs = fan_out_scheduled(&need_docker, &selected, workers, &lanes, |i| {
         let s = &selected[i];
-        let _lane = lanes.acquire(s);
         let run_id = format!("conf-{pid}-d{i:02}");
         let out = engine::run_docker(s, &run_id, docker_platform);
         eprintln!("  [docker]  {}", s.name);
@@ -579,21 +576,63 @@ fn bless(
 }
 
 /// Hand-rolled work-stealing pool (std only; mirrors conformance.rs::fan_out_indexed
-/// but returns `Option<T>` to stay clear of the no-panic gate). Each `f(i)` may
-/// acquire the shared heavy-lock itself to serialize heavy suites within a phase.
-fn fan_out<T: Send>(n: usize, workers: usize, f: impl Fn(usize) -> T + Sync) -> Vec<Option<T>> {
-    let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    let next = AtomicUsize::new(0);
+/// but returns `Option<T>` to stay clear of the no-panic gate). Lane permits are
+/// acquired before dispatch so blocked heavy suites do not monopolize workers
+/// while other suites are runnable.
+fn fan_out_scheduled<T: Send>(
+    indices: &[usize],
+    suites: &[Suite],
+    workers: usize,
+    lanes: &SchedulerLanes,
+    f: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    let slots: Vec<Mutex<Option<T>>> = (0..indices.len()).map(|_| Mutex::new(None)).collect();
+    let state = Mutex::new(ScheduleState {
+        claimed: vec![false; indices.len()],
+        completed: 0,
+    });
+    let changed = Condvar::new();
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1) {
             scope.spawn(|| {
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
+                    let job = {
+                        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if state.completed == indices.len() {
+                                break None;
+                            }
+
+                            let mut selected = None;
+                            for (slot, suite_index) in indices.iter().copied().enumerate() {
+                                if state.claimed[slot] {
+                                    continue;
+                                }
+                                let Some(permit) = lanes.try_acquire(&suites[suite_index]) else {
+                                    continue;
+                                };
+                                state.claimed[slot] = true;
+                                selected = Some((slot, suite_index, permit));
+                                break;
+                            }
+                            if selected.is_some() {
+                                break selected;
+                            }
+
+                            state = changed.wait(state).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let Some((slot, suite_index, permit)) = job else {
                         break;
-                    }
-                    let v = f(i);
-                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+                    };
+
+                    let v = f(suite_index);
+                    *slots[slot].lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+                    drop(permit);
+
+                    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.completed += 1;
+                    changed.notify_all();
                 }
             });
         }
@@ -602,6 +641,11 @@ fn fan_out<T: Send>(n: usize, workers: usize, f: impl Fn(usize) -> T + Sync) -> 
         .into_iter()
         .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
         .collect()
+}
+
+struct ScheduleState {
+    claimed: Vec<bool>,
+    completed: usize,
 }
 
 /// Retry-on-flake. A gating verdict on a suite that flips between identical-binary
@@ -665,18 +709,18 @@ impl SchedulerLanes {
         }
     }
 
-    fn acquire(&self, suite: &Suite) -> Option<SchedulerPermit<'_>> {
+    fn try_acquire(&self, suite: &Suite) -> Option<Option<SchedulerPermit<'_>>> {
         if suite.weight != Weight::Heavy {
-            return None;
+            return Some(None);
         }
         let semaphore = if suite.ecosystem == Ecosystem::Cpython {
             &self.cpython_heavy
         } else {
             &self.generic_heavy
         };
-        Some(SchedulerPermit {
-            _permit: semaphore.acquire(),
-        })
+        semaphore
+            .try_acquire()
+            .map(|permit| Some(SchedulerPermit { _permit: permit }))
     }
 }
 
@@ -687,7 +731,6 @@ struct SchedulerPermit<'a> {
 struct Semaphore {
     max: usize,
     active: Mutex<usize>,
-    changed: Condvar,
 }
 
 impl Semaphore {
@@ -695,23 +738,21 @@ impl Semaphore {
         Self {
             max: max.max(1),
             active: Mutex::new(0),
-            changed: Condvar::new(),
         }
     }
 
-    fn acquire(&self) -> SemaphorePermit<'_> {
+    fn try_acquire(&self) -> Option<SemaphorePermit<'_>> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        while *active >= self.max {
-            active = self.changed.wait(active).unwrap_or_else(|e| e.into_inner());
+        if *active >= self.max {
+            return None;
         }
         *active += 1;
-        SemaphorePermit { semaphore: self }
+        Some(SemaphorePermit { semaphore: self })
     }
 
     fn release(&self) {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         *active = active.saturating_sub(1);
-        self.changed.notify_one();
     }
 }
 
@@ -1047,6 +1088,7 @@ fn walk_newest(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -1187,12 +1229,44 @@ mod tests {
         assert_eq!(max_observed_concurrency(&suites, &lanes, 4), 1);
     }
 
+    #[test]
+    fn blocked_generic_heavy_suites_do_not_starve_cpython_lane() {
+        let lanes = SchedulerLanes::new(2);
+        let mut suites: Vec<Suite> = (0..4)
+            .map(|i| suite(&format!("go-{i}"), Ecosystem::Go, Weight::Heavy))
+            .collect();
+        suites.extend(
+            (0..2).map(|i| suite(&format!("cpython-{i}"), Ecosystem::Cpython, Weight::Heavy)),
+        );
+
+        let first_generic_done = AtomicBool::new(false);
+        let cpython_started_before_generic_finished = AtomicBool::new(false);
+
+        let indices: Vec<usize> = (0..suites.len()).collect();
+        let _ = fan_out_scheduled(&indices, &suites, 4, &lanes, |i| {
+            if suites[i].ecosystem == Ecosystem::Cpython {
+                if !first_generic_done.load(Ordering::SeqCst) {
+                    cpython_started_before_generic_finished.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            } else {
+                std::thread::sleep(Duration::from_millis(150));
+                first_generic_done.store(true, Ordering::SeqCst);
+            }
+        });
+
+        assert!(
+            cpython_started_before_generic_finished.load(Ordering::SeqCst),
+            "blocked generic-heavy suites should not stop eligible CPython-heavy suites from starting"
+        );
+    }
+
     fn max_observed_concurrency(suites: &[Suite], lanes: &SchedulerLanes, workers: usize) -> usize {
         let active = AtomicUsize::new(0);
         let max_active = AtomicUsize::new(0);
 
-        let _ = fan_out(suites.len(), workers, |i| {
-            let _lane = lanes.acquire(&suites[i]);
+        let indices: Vec<usize> = (0..suites.len()).collect();
+        let _ = fan_out_scheduled(&indices, suites, workers, lanes, |_i| {
             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
             max_active.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(50));
