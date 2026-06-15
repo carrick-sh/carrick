@@ -97,6 +97,7 @@ pub(crate) fn load_execve_image(
     // execve point of no return (image fully built): reset CAUGHT signal
     // handlers to SIG_DFL as the kernel does, so the new image never inherits
     // the old image's handler addresses (SIG_IGN/mask/pending are preserved).
+    dispatcher.reset_memory_state_on_execve();
     dispatcher.reset_signal_handlers_on_execve();
     Ok(image)
 }
