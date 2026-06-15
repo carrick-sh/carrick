@@ -515,6 +515,10 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     engine
         .vm
         .restore_vcpu(&mut engine.vcpu, layout, &child_snap)?;
+    // Runtime still completes the clone syscall once this returns. The child has
+    // already been restored at the syscall-return point, so completion must only
+    // write RAX=0 and must not reuse the parent's pending resume PC.
+    engine.pending_resume_pc = None;
     engine.is_forked_child = true;
     Ok(ForkOutcome::Child)
 }
