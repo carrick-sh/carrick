@@ -617,9 +617,11 @@ dependencies = [
 name = "carrick-x86"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-mem",
+ "libc",
 ]
 
 [[package]]
