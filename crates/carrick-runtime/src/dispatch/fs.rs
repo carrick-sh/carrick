@@ -1307,6 +1307,89 @@ impl SyscallDispatcher {
         }
     }
 
+    fn duplicate_fd_to(
+        &self,
+        old_fd: i32,
+        new_fd: i32,
+        fd_flags: u64,
+        same_fd_is_noop: bool,
+    ) -> DispatchOutcome {
+        let nofile_cur = self.nofile_limit();
+        if !(0..nofile_cur).contains(&new_fd) {
+            return DispatchOutcome::errno(LINUX_EBADF);
+        }
+        if old_fd == new_fd {
+            if !same_fd_is_noop {
+                return DispatchOutcome::errno(LINUX_EINVAL);
+            }
+            return if self.fd_is_valid(old_fd) {
+                DispatchOutcome::Returned {
+                    value: new_fd as i64,
+                }
+            } else {
+                DispatchOutcome::errno(LINUX_EBADF)
+            };
+        }
+
+        let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
+            Some(open_file) => (
+                Arc::clone(&open_file.description),
+                open_file.host_fd_owner.clone(),
+            ),
+            None if is_stdio_fd(old_fd) && self.stdio_is_closed(old_fd) => {
+                return DispatchOutcome::errno(LINUX_EBADF);
+            }
+            None if is_stdio_fd(old_fd) => {
+                let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
+                    Ok(duped) => duped,
+                    Err(errno) => return DispatchOutcome::errno(errno),
+                };
+                crate::dispatch::net::set_host_nonblocking(duped);
+                let write_kind = HostWriteKind::for_host_fd(duped);
+                let pty = self.dup_stdio_pty_role(old_fd);
+                (
+                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                        host_fd: duped,
+                        is_read_end: old_fd == 0,
+                        base: OpenDescriptionBase::new(0),
+                        pty,
+                        bidirectional: false,
+                        write_kind,
+                    })),
+                    Some(HostFdRef::new(duped)),
+                )
+            }
+            None => return DispatchOutcome::errno(LINUX_EBADF),
+        };
+
+        let replaced_existing;
+        {
+            let mut table = self.io.open_files.write();
+            replaced_existing = if let Some(replaced) = table.remove(&new_fd) {
+                self.close_open_file_and_free_pty(&replaced);
+                true
+            } else {
+                false
+            };
+            retain_open_file(&description);
+            table.insert(
+                new_fd,
+                OpenFile {
+                    description,
+                    fd_flags,
+                    host_fd_owner,
+                },
+            );
+        }
+        self.clear_closed_stdio(new_fd);
+        if replaced_existing {
+            self.detach_fd_from_epolls(new_fd);
+        }
+        DispatchOutcome::Returned {
+            value: new_fd as i64,
+        }
+    }
+
     /// Try to satisfy an open via the VFS mount table. Returns
     /// `Installed(fd)` when a mount handled it, `Errno(e)` when a
     /// mount explicitly failed, and `FallThrough` when no mount
@@ -2750,72 +2833,20 @@ impl SyscallDispatcher {
             if old_fd.0 == new_fd.0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let (description, host_fd_owner) = match this.open_file(old_fd.0).as_ref() {
-                Some(open_file) => (
-                    Arc::clone(&open_file.description),
-                    open_file.host_fd_owner.clone(),
-                ),
-                None if is_stdio_fd(old_fd.0) && this.stdio_is_closed(old_fd.0) => {
-                    // The source stdio fd was explicitly closed and not
-                    // reopened: dup3 from a closed fd is EBADF.
-                    return Ok(LINUX_EBADF.into());
-                }
-                None if is_stdio_fd(old_fd.0) => {
-                    // Shell `2>&1` style redirects: the source fd is the
-                    // process's real host fd 0/1/2 (no OpenDescription was
-                    // ever created for them — writes go straight through
-                    // stream_stdio). dup3 onto a different fd needs to
-                    // capture that host fd so future writes/reads also
-                    // reach the same host endpoint. Duplicate the host fd
-                    // and wrap it as a HostPipe so the write path picks it
-                    // up before the bare-stdio fallback.
-                    let duped = (unsafe { libc::dup(old_fd.0) }).host_syscall_errno()?;
-                    crate::dispatch::net::set_host_nonblocking(duped);
-                    let write_kind = HostWriteKind::for_host_fd(duped);
-                    let pty = this.dup_stdio_pty_role(old_fd.0);
-                    (
-                        Arc::new(RwLock::new(OpenDescription::HostPipe {
-                            host_fd: duped,
-                            is_read_end: old_fd.0 == 0,
-                            base: OpenDescriptionBase::new(0),
-                            pty,
-                            bidirectional: false,
-                            write_kind,
-                        })),
-                        Some(HostFdRef::new(duped)),
-                    )
-                }
-                None => return Ok(LINUX_EBADF.into()),
-            };
-            let replaced_existing;
-            {
-                let mut table = this.io.open_files.write();
-                replaced_existing = if let Some(replaced) = table.remove(&new_fd.0) {
-                    this.close_open_file_and_free_pty(&replaced);
-                    true
-                } else {
-                    false
-                };
-                retain_open_file(&description);
-                table.insert(
-                    new_fd.0,
-                    OpenFile {
-                        description,
-                        fd_flags: linux_fd_flags_from_open_flags(flags),
-                        host_fd_owner,
-                    },
-                );
-            }
-            if replaced_existing {
-                // dup2/dup3 over an open fd closes its old occupant; Linux
-                // auto-removes that (now-closed) fd from epoll interest sets.
-                // Done after dropping the open_files lock (detach takes a read
-                // lock); the freshly-installed dup at new_fd is not in any epoll.
-                this.detach_fd_from_epolls(new_fd.0);
-            }
-            Ok(DispatchOutcome::Returned {
-                value: new_fd.0 as i64,
-            })
+            Ok(this.duplicate_fd_to(
+                old_fd.0,
+                new_fd.0,
+                linux_fd_flags_from_open_flags(flags),
+                false,
+            ))
+
+        }
+
+        fn dup2(this, cx, oldfd: Fd, newfd: Fd) {
+
+            let old_fd: Fd = oldfd;
+            let new_fd: Fd = newfd;
+            Ok(this.duplicate_fd_to(old_fd.0, new_fd.0, 0, true))
 
         }
 

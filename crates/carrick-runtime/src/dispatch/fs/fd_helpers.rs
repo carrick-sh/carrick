@@ -39,7 +39,7 @@ impl SyscallDispatcher {
     }
 
     /// Clear the "closed" flag for a reused stdio fd (it is open again).
-    fn clear_closed_stdio(&self, fd: i32) {
+    pub(in crate::dispatch) fn clear_closed_stdio(&self, fd: i32) {
         if (0..3).contains(&fd) {
             self.io.closed_stdio.lock()[fd as usize] = false;
         }

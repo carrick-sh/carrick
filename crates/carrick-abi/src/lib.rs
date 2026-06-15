@@ -2026,6 +2026,13 @@ pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
 pub const LINUX_F_ADD_SEALS: u64 = 1033;
 pub const LINUX_F_GET_SEALS: u64 = 1034;
 pub const LINUX_FD_CLOEXEC: u64 = 1;
+/// Carrick-internal normalized syscall number for x86_64 `dup2(2)`.
+///
+/// The asm-generic/canonical table has `dup3(2)` but no `dup2(2)`, and using
+/// canonical number 33 would collide with `mknodat(2)`. Keep this outside the
+/// Linux syscall-number range so x86 normalization can preserve `dup2` semantics
+/// without weakening canonical `dup3(oldfd, oldfd, flags)` handling.
+pub const CARRICK_PRIVATE_X86_DUP2: u64 = u64::MAX - 0x20;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;

@@ -141,6 +141,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::fs_backend::FsBackend;
 use crate::linux_abi::{
+    CARRICK_PRIVATE_X86_DUP2,
     KernelAbi,
     // ABI constants moved from dispatch.rs (Goal #3, private set)
     LINUX_AF_INET,
@@ -1615,6 +1616,7 @@ impl SyscallDispatcher {
         22 => epoll_pwait,
         23 => dup,
         24 => dup3,
+        CARRICK_PRIVATE_X86_DUP2 => dup2,
         25 => fcntl,
         26 => inotify_init1,
         27 => inotify_add_watch,
