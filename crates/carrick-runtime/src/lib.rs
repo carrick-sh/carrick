@@ -1094,19 +1094,33 @@ pub mod runtime {
         fill("/etc/hostname", format!("{host}\n").into_bytes());
     }
 
-    /// Phase 5 entry: run an OCI container under KVM. The macOS sibling of this is
-    /// `Runtime::execute`'s `FsBackendKind::Host` path (execute.rs): extract the
-    /// image layers onto a scratch rootfs, root the dispatcher there, set
-    /// cwd/uid/gid, load the entrypoint FROM the rootfs, and run it with the OCI
-    /// argv/env. The only divergence is the run-loop entry: this drives
-    /// `KvmTrapEngine` through `run_threaded_kvm_loop` instead of the HVF loop.
-    ///
-    /// NOTE: the entrypoint must be a FULL-PATH ELF (`/bin/echo`). PATH-resolution
-    /// of a bare command and `#!`-shebang resolution live in the macOS-gated
-    /// `resolve_entrypoint_program`; sharing them is a follow-up.
     #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
     pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
+        run_oci_kvm_with_engine(spec, carrick_vmm_kvm::KvmTrapEngine::new)
+    }
+
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
+        run_oci_kvm_with_engine(spec, carrick_vmm_kvm::kvm_x86_engine::bring_up)
+    }
+
+    /// Phase 5 entry helper: run an OCI container under KVM. The macOS sibling
+    /// of this is `Runtime::execute`'s `FsBackendKind::Host` path (execute.rs):
+    /// extract the image layers onto a scratch rootfs, root the dispatcher there,
+    /// set cwd/uid/gid, load the entrypoint FROM the rootfs, and run it with the
+    /// OCI argv/env. The only divergence is the run-loop entry: this drives the
+    /// selected KVM engine through `run_threaded_kvm_loop` instead of the HVF loop.
+    #[cfg(feature = "platform-linux")]
+    fn run_oci_kvm_with_engine<E>(
+        spec: &carrick_spec::RunSpec,
+        build_engine: fn(&crate::memory::AddressSpace) -> Result<E, carrick_hal::TrapError>,
+    ) -> Result<RunResult, RuntimeError>
+    where
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_vmm_kvm::KvmKickHandle> + 'static,
+        E::SiblingSpec: 'static,
+    {
         use crate::fs_backend::HostFsBackend;
+        use carrick_hal::GuestArch as _;
         use std::path::PathBuf;
 
         // 0. Docker's container init is a SESSION LEADER (runc setsid()s before
@@ -1206,50 +1220,28 @@ pub mod runtime {
                 resolved.clone(),
             )))
         })?;
-        let image = crate::exec_helpers::build_run_image(
+        let vdso = E::Arch::vdso_bytes();
+        let vdso_enabled = !vdso.is_empty();
+        let mut image = crate::exec_helpers::build_run_image_for(
             &bytes,
             argv,
             &spec.envp,
             &dispatcher,
-            true,
+            vdso_enabled,
             None,
+            E::Arch::elf_machine(),
         )?;
-        // Materialise the vvar+vDSO regions so the auxv's AT_SYSINFO_EHDR
-        // (= LINUX_VDSO_BASE, set by load_elf and kept by build_run_image's
-        // with_vdso_auxv(true)) resolves to real KVM-backed slots. A STATIC CRT
-        // can skip AT_SYSINFO_EHDR, but a DYNAMIC loader (ld-musl/ld-linux)
-        // ALWAYS dereferences it to bind vDSO symbols — without the region that
-        // read stage-2-faults to KVM_EXIT_MMIO at LINUX_VDSO_BASE (the busybox
-        // MmioRead at 0x2E_0001_0020). `build_for_image` backs each high region
-        // as its own slot. The macOS/HVF run path adds these regions later in
-        // `finish_and_run_image`; the KVM run-elf/execve paths add them inline
-        // (lib.rs:601, vcpu_loop.rs:144) — run_oci was the last KVM path missing
-        // it. `with_vdso` preserves the already-serialised stack + auxv image, so
-        // adding it after `with_linux_initial_stack` is equivalent to the run-elf
-        // vdso-then-stack order. The vDSO clock fast path reads `cntvct_el0` at
-        // EL0; `bring_up` enables that (CNTKCTL_EL1) and fills the vvar with the
-        // freq + realtime offset so the read is correct (see `populate_vdso_vvar`).
-        // Per-ISA vDSO bytes come from the engine's GuestArch (the x86_64 seam);
-        // this is the Linux/KVM path.
-        use carrick_hal::GuestArch as _;
-        let image = image.with_vdso_bytes(
-            <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::vdso_bytes(),
-        )?;
+        // Materialise the vvar+vDSO regions when this ISA provides real bytes.
+        // The initial stack must be built with the same decision, otherwise
+        // x86_64 would serialize a stale AT_SYSINFO_EHDR pointing at unmapped
+        // vDSO space before stripping auxv metadata.
+        if vdso_enabled {
+            image = image.with_vdso_bytes(vdso)?;
+        }
 
         // 4. Run on KVM through the same generic threaded loop as run-elf.
-        let engine = carrick_vmm_kvm::KvmTrapEngine::new(&image)?;
+        let engine = build_engine(&image)?;
         run_threaded_kvm_loop(engine, dispatcher, spec.max_traps)
-    }
-
-    /// OCI container run on x86_64 is not yet wired: audit #1 M1 covers bare-ELF
-    /// `run-elf` through the dispatcher; the OCI rootfs/entrypoint path on x86
-    /// follows. Exists so the `carrick-kvm` bin compiles on an x86_64 host.
-    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-    pub fn run_oci(_spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
-        Err(RuntimeError::Unsupported(
-            "OCI run on x86_64 is not yet wired (M1 = bare-ELF run-elf through the dispatcher)"
-                .to_string(),
-        ))
     }
 }
 

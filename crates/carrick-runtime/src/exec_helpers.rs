@@ -134,9 +134,32 @@ pub(crate) fn build_run_image(
     vdso_enabled: bool,
     at_base: Option<u64>,
 ) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
-    let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader(bytes, &|p| {
-        dispatcher.read_exec_file(p)
-    })?
+    use goblin::elf::header::EM_AARCH64;
+    build_run_image_for(
+        bytes,
+        argv,
+        env,
+        dispatcher,
+        vdso_enabled,
+        at_base,
+        EM_AARCH64,
+    )
+}
+
+pub(crate) fn build_run_image_for(
+    bytes: &[u8],
+    argv: Vec<Vec<u8>>,
+    env: &[String],
+    dispatcher: &SyscallDispatcher,
+    vdso_enabled: bool,
+    at_base: Option<u64>,
+    machine: u16,
+) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
+    let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader_for(
+        bytes,
+        &|p| dispatcher.read_exec_file(p),
+        machine,
+    )?
     .with_vdso_auxv(vdso_enabled);
     if let Some(base) = at_base {
         image = image.with_auxv_base(base);
@@ -249,5 +272,58 @@ pub(crate) fn stop_by_signal(signum: i32) {
 pub(crate) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
     if dispatcher.is_ptrace_traceme() {
         stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EM_X86_64: u16 = 62;
+
+    fn synthetic_elf(machine: u16) -> Vec<u8> {
+        const ET_EXEC: u16 = 2;
+        const PT_LOAD: u32 = 1;
+        let mut elf = vec![0u8; 0x1000];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&machine.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&0x400000u64.to_le_bytes());
+        let len = elf.len() as u64;
+        elf[ph + 32..ph + 40].copy_from_slice(&len.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&len.to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf
+    }
+
+    #[test]
+    fn build_run_image_for_accepts_x86_64_machine() {
+        let dispatcher = SyscallDispatcher::new();
+        let image = build_run_image_for(
+            &synthetic_elf(EM_X86_64),
+            vec![b"/bin/true".to_vec()],
+            &[],
+            &dispatcher,
+            false,
+            None,
+            EM_X86_64,
+        )
+        .expect("x86_64 ELF accepted when requested");
+
+        assert_eq!(image.entry(), 0x400000);
     }
 }
