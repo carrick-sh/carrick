@@ -7,12 +7,13 @@
 //! user walk), PS=bit7 (large leaf at PDPT/PD; carrick builds 4 KiB leaves
 //! only), NX=bit63 (needs EFER.NXE), physical address bits 51:12.
 //!
-//! Deliberately absent vs the aarch64 sibling (`page_table.rs`):
-//! `map_aliased`, block split/coalesce, the spare-table pool bookkeeping, and
-//! the multi-vCPU gating — all M3-era machinery (fork/shared-aperture). The
-//! Phase 2 bring-up builds every leaf at 4 KiB up front via [`pml4_tables`],
-//! so the runtime editor ([`Pml4Manager`]) only ever flips bits on existing
-//! leaves and never allocates.
+//! Deliberately absent vs the aarch64 sibling (`page_table.rs`): block
+//! split/coalesce, the spare-table free list, and the multi-vCPU coalescing
+//! gate. The Phase 2 bring-up builds every low-VA leaf at 4 KiB up front via
+//! [`pml4_tables`], so protection edits only flip bits on existing leaves.
+//! Dynamic high aliases are the one exception: [`Pml4Manager::map_aliased`]
+//! can allocate missing 4 KiB page-table pages from the same sequential table
+//! arena and install VA→GPA leaves.
 
 // ─── Granule (the spec §4.4 symmetry: identical to aarch64 stage-1) ─────────
 
@@ -234,15 +235,23 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
 /// built by [`pml4_tables`], so edits only flip P/R\/W/NX bits in place;
 /// `set_prot_none` PRESERVES the recorded GPA in the non-present descriptor
 /// so `set_rw` can restore the same (possibly non-identity) mapping.
+#[derive(Clone)]
 pub struct Pml4Manager {
     bytes: Vec<u8>,
     /// GPA mapped at byte offset 0 (the CR3 target).
     base: u64,
+    /// Byte offset of the next free table page in the sequential arena.
+    next_free: usize,
 }
 
 impl Pml4Manager {
     pub fn new(bytes: Vec<u8>, base: u64) -> Self {
-        Self { bytes, base }
+        let next_free = discover_next_free_table(&bytes);
+        Self {
+            bytes,
+            base,
+            next_free,
+        }
     }
 
     /// The live table image (e.g. for the backend's host write-back or a
@@ -266,6 +275,13 @@ impl Pml4Manager {
 
     fn read_desc(&self, off: usize) -> u64 {
         read_desc(&self.bytes, off)
+    }
+
+    /// Byte offset of the PT (level-3) table for `va`, creating missing
+    /// intermediates from the sequential table arena. Used only for fresh alias
+    /// mappings; ordinary protection edits require the leaf path to exist.
+    fn leaf_offset_creating(&mut self, va: u64, user: bool) -> Result<usize, Pml4Error> {
+        descend_creating(&mut self.bytes, &mut self.next_free, self.base, va, user)
     }
 
     /// Byte offset of the PT (level-3) leaf descriptor for `va`. Errors if an
@@ -406,6 +422,62 @@ impl Pml4Manager {
             Ok(new)
         })
     }
+
+    /// Install a user VA→GPA alias mapping at 4 KiB granularity, allocating any
+    /// missing intermediate page tables from the existing table arena. Mirrors
+    /// the aarch64 alias editor: aliases are user-executable, and `writable`
+    /// controls only the R/W bit.
+    pub fn map_aliased(
+        &mut self,
+        va: u64,
+        gpa: u64,
+        len: u64,
+        writable: bool,
+    ) -> Result<(), Pml4Error> {
+        if va & PAGE_MASK != 0 || gpa & PAGE_MASK != 0 {
+            return Err(Pml4Error::Misaligned);
+        }
+        let aligned_len = len.div_ceil(PT_PAGE as u64) * PT_PAGE as u64;
+        let va_end = va.checked_add(aligned_len).ok_or(Pml4Error::NonCanonical)?;
+        if va_end > VA_LIMIT {
+            return Err(Pml4Error::NonCanonical);
+        }
+        if gpa
+            .checked_add(aligned_len)
+            .is_none_or(|end| end > PA_LIMIT)
+        {
+            return Err(Pml4Error::Misaligned);
+        }
+
+        let leaf_bits = PML4_P | PML4_US | if writable { PML4_RW } else { 0 };
+        let pages = aligned_len / PT_PAGE as u64;
+        for i in 0..pages {
+            let cur_va = va + i * PT_PAGE as u64;
+            let cur_gpa = gpa + i * PT_PAGE as u64;
+            let pt_off = self.leaf_offset_creating(cur_va, true)?;
+            let leaf_off = pt_off + indices(cur_va)[3] * 8;
+            write_desc(
+                &mut self.bytes,
+                leaf_off,
+                (cur_gpa & PML4_ADDR_MASK) | leaf_bits,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Reconstruct the sequential allocator cursor from a PML4 image produced by
+/// [`pml4_tables`]: page 0 is the root, and allocated child tables are written
+/// contiguously until the first all-zero spare page.
+fn discover_next_free_table(bytes: &[u8]) -> usize {
+    let mut next = PT_PAGE;
+    while next + PT_PAGE <= bytes.len() {
+        if bytes[next..next + PT_PAGE].iter().all(|&b| b == 0) {
+            break;
+        }
+        next += PT_PAGE;
+    }
+    next
 }
 
 #[cfg(test)]
@@ -540,6 +612,30 @@ mod tests {
         assert_eq!(mgr.translate(va + 0x1234), Some(gpa + 0x1234));
         assert_eq!(mgr.translate(va + 0x1000), Some(gpa + 0x1000));
         assert_eq!(mgr.translate(va + 0x2000), None);
+    }
+
+    #[test]
+    fn map_aliased_allocates_missing_high_va_tables() {
+        let low_va = 0x40_0000;
+        let bytes = build(&[user_rw_nx(low_va, low_va, 0x1000)]);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        let high_va = 0x1_0000_0000_00 + 0x20_0000;
+        let alias_gpa = 0xA0_0000_0000;
+
+        mgr.map_aliased(high_va, alias_gpa, 0x2000, true)
+            .expect("map high alias");
+
+        assert_eq!(mgr.translate(high_va), Some(alias_gpa));
+        assert_eq!(mgr.translate(high_va + 0x1000), Some(alias_gpa + 0x1000));
+        assert_eq!(mgr.translate(high_va + 0x2000), None);
+        let walk = walk_descriptors(mgr.bytes(), BASE, high_va);
+        for (level, desc) in walk.iter().enumerate() {
+            assert_ne!(desc & PML4_P, 0, "alias level {level} present");
+            assert_ne!(desc & PML4_US, 0, "alias level {level} user-accessible");
+        }
+        assert_ne!(walk[3] & PML4_RW, 0, "writable alias leaf");
+        assert_eq!(walk[3] & PML4_NX, 0, "alias leaf is executable");
+        assert_eq!(walk[3] & PML4_ADDR_MASK, alias_gpa);
     }
 
     #[test]
