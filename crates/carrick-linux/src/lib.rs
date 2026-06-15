@@ -20,7 +20,9 @@ pub mod kvm_futex;
 pub mod kvm_kicker;
 pub mod kvm_signal_pump;
 pub mod kvm_xsig;
-pub mod signal_arrival;
+// `KvmSignalArrival` was byte-identical to bhyve's; both collapsed into the
+// shared `carrick_hal::GenericSignalArrival` (kicker + futex wake). The KVM run
+// loop constructs that directly, so this backend has no SignalArrival module.
 pub mod timer_delivery;
 
 // aarch64-only modules: fork snapshot/restore, the MMIO-sentinel trap engine,
@@ -37,9 +39,8 @@ pub mod trap_engine;
 pub use epoll_mux::EpollMultiplexer;
 pub use kvm::{KvmVcpu, KvmVm};
 pub use kvm_fork_coord::KvmForkCoordinator;
-pub use kvm_futex::KvmFutex;
+pub use kvm_futex::{KvmFutex, make_kvm_futex};
 pub use kvm_kicker::{KvmKickHandle, KvmKicker, install_kvm_kick_handler};
-pub use signal_arrival::KvmSignalArrival;
 pub use timer_delivery::KvmTimerDelivery;
 
 #[cfg(target_arch = "aarch64")]

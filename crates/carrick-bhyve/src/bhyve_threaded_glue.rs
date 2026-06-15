@@ -12,9 +12,7 @@
 
 use std::sync::Arc;
 
-use carrick_hal::{
-    HostForkCoordinator, PlatformFutex, PreparedHostFork, SignalArrival, VcpuRegistry,
-};
+use carrick_hal::{HostForkCoordinator, PlatformFutex, PreparedHostFork, VcpuRegistry};
 
 use crate::bhyve_kicker::install_bhyve_kick_handler;
 
@@ -107,17 +105,9 @@ impl HostForkCoordinator for BhyveForkCoordinator {
     }
 }
 
-pub struct BhyveSignalArrival {
-    pub kicker: Arc<dyn VcpuRegistry>,
-    pub futex: Arc<dyn PlatformFutex>,
-}
-
-impl SignalArrival for BhyveSignalArrival {
-    fn wake_all_waiters(&self) {
-        self.kicker.kick_all();
-        self.futex.notify_signal_pending();
-    }
-}
+// `BhyveSignalArrival` was byte-identical to KVM's; both collapsed into the
+// shared `carrick_hal::GenericSignalArrival` (kicker + futex wake). The bhyve run
+// loop constructs that directly.
 
 pub struct BhyveTimerDelivery {
     pub kicker: Arc<dyn VcpuRegistry>,
