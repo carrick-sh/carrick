@@ -23,8 +23,8 @@ use std::sync::Arc;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
 use carrick_x86::{
-    BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion, X86EngineCore, X86Exit,
-    X86Reg, X86Seg, X86Vcpu, X86Vmm,
+    BringupLayout, FAULT_DOORBELL_PORT, ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion,
+    X86EngineCore, X86Exit, X86Reg, X86Seg, X86Vcpu, X86Vmm,
 };
 
 use crate::nvmm::{
@@ -389,6 +389,14 @@ impl X86Vcpu for NvmmVcpu {
                 }
                 NVMM_VCPU_EXIT_IO => {
                     let io = exit.io();
+                    if io.port == FAULT_DOORBELL_PORT {
+                        return Err(TrapError::Hypervisor(format!(
+                            "nvmm-x86: fault doorbell reached at npc=0x{:x}, but NVMM IO exits \
+                             expose only port/width metadata, not the OUT payload; use a \
+                             memory-backed fault record before enabling NVMM fault delivery",
+                            io.npc
+                        )));
+                    }
                     if io.port != carrick_hal::SYSCALL_DOORBELL_PORT {
                         return Err(TrapError::Hypervisor(format!(
                             "nvmm-x86: unexpected OUT to port 0x{:04X}",

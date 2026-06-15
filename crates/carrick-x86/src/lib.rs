@@ -34,8 +34,8 @@ pub use bringup_fns::{
 pub use engine::X86EngineCore;
 pub use fault::{
     FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultDoorbellRecord, X86_FAULT_RECORD_U32_WORDS,
-    X86_FAULT_SLOTS, add_fault_windows, fault_idt_base, fault_slot_gpa, fault_stack_base,
-    fault_stub_base, fault_tss_base, program_fault_segments, write_fault_tables,
+    X86_FAULT_SLOTS, add_fault_windows, fault_exit_from_record, fault_idt_base, fault_slot_gpa,
+    fault_stack_base, fault_stub_base, fault_tss_base, program_fault_segments, write_fault_tables,
     write_fault_tables_with,
 };
 pub use vmm::{

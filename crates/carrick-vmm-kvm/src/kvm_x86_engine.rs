@@ -39,7 +39,7 @@ use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
 use carrick_x86::{
     BringupLayout, FAULT_DOORBELL_PORT, FaultDoorbellRecord, ForkRamStrategy, MsrInstall,
     WindowPlan, X86_FAULT_RECORD_U32_WORDS, X86EngineCore, X86Exit, X86Reg, X86Seg, X86Vcpu,
-    X86VcpuSnapshot, X86Vmm,
+    X86VcpuSnapshot, X86Vmm, fault_exit_from_record,
 };
 use kvm_bindings::{Msrs, kvm_dtable, kvm_msr_entry, kvm_segment};
 
@@ -518,56 +518,7 @@ impl KvmVcpu {
         if std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
             eprintln!("[KVM-X86-FAULT] {record:?}");
         }
-        if record.cs & 3 != 3 {
-            return Err(TrapError::Hypervisor(format!(
-                "kvm-x86: ring-0 fault vector={} error=0x{:x} rip=0x{:x} cs=0x{:x} cr2=0x{:x}",
-                record.vector, record.error_code, record.rip, record.cs, record.cr2
-            )));
-        }
-        self.restore_user_after_x86_fault(record)?;
-        Ok(X86Exit::Fault {
-            kind: record.kind(),
-            fault_addr: record.fault_addr(),
-            error_code: record.error_code,
-        })
-    }
-
-    fn restore_user_after_x86_fault(
-        &mut self,
-        record: FaultDoorbellRecord,
-    ) -> Result<(), TrapError> {
-        use carrick_hal::guest_arch::GuestArch as _;
-        use carrick_hal::x8664_arch::X8664GuestArch;
-
-        let boot = X8664GuestArch::bootstrap_sysregs();
-        let segs = carrick_x86::long_mode_segment_state();
-        let user_base = ((boot.star >> 48) & 0xFFFF) as u16;
-        let user_ss = user_base.wrapping_add(8);
-        let user_cs = user_base.wrapping_add(16);
-
-        let mut sregs = self
-            .fd()
-            .get_sregs()
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(fault): {e}")))?;
-        sregs.cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.cs_ar, user_cs);
-        sregs.ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
-        sregs.ds = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
-        sregs.es = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
-        self.fd()
-            .set_sregs(&sregs)
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(fault): {e}")))?;
-
-        let mut regs = self
-            .fd()
-            .get_regs()
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(fault): {e}")))?;
-        regs.rax = record.saved_rax;
-        regs.rip = record.rip;
-        regs.rsp = record.rsp;
-        regs.rflags = record.rflags | 0x2;
-        self.fd()
-            .set_regs(&regs)
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(fault): {e}")))
+        fault_exit_from_record(self, record, "kvm-x86")
     }
 }
 
