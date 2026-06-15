@@ -557,14 +557,18 @@ fn install_iretq_ring3_entry(
     frame[32..40].copy_from_slice(&0x1Bu64.to_le_bytes());
     vmm.write_gpa(frame_gpa, &frame)?;
 
-    // Enter in ring-0: CS=GDT[1] kCS64 (DPL0, L=1, exec/read, g=1), SS=kSS, at the
-    // stub, RSP = the frame. The VMX-packed access-rights (the shared `seg_ar`
-    // layout `set_segment` consumes): ring-0 CS64 type=0xB|S|P|L|G, ring-0 SS
-    // type=3|S|P|D/B|G.
+    // Enter in ring-0: CS=GDT[1] kCS64 sel 0x08 (DPL0, L=1, exec/read, g=1),
+    // SS=GDT[2] kSS sel 0x10, at the stub, RSP = the frame. The VMX-packed
+    // access-rights (the shared `seg_ar` layout): ring-0 CS64 type=0xB|S|P|L|G,
+    // ring-0 SS type=3|S|P|D/B|G. The selector must be the ring-0 (RPL0)
+    // selector, so write the segs directly (the generic set_segment hardcodes the
+    // ring-3 selectors).
     let cs0_ar = 0xB | (1 << 4) | (1 << 7) | (1 << 13) | (1 << 15);
     let ss0_ar = 0x3 | (1 << 4) | (1 << 7) | (1 << 14) | (1 << 15);
-    vcpu.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, cs0_ar)?;
-    vcpu.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, ss0_ar)?;
+    let mut st = vcpu.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?;
+    st.segs[NVMM_X64_SEG_CS] = seg_to_nvmm(0x08, 0, 0xFFFF_FFFF, cs0_ar);
+    st.segs[NVMM_X64_SEG_SS] = seg_to_nvmm(0x10, 0, 0xFFFF_FFFF, ss0_ar);
+    vcpu.set_state(&st, NVMM_X64_STATE_SEGS).map_err(map_err)?;
     vcpu.set_gpr(X86Reg::Rip, stub_gpa)?;
     vcpu.set_gpr(X86Reg::Rsp, frame_gpa)?;
     Ok(())
