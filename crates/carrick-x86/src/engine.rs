@@ -294,7 +294,17 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                     }
                 }
                 X86Exit::Halt => return Ok(None),
-                X86Exit::Kicked => continue,
+                // A cross-thread kick forced the vCPU out of the guest with no
+                // syscall pending. Return `Ok(None)` so the run loop's kick path
+                // delivers any pending async signal at the interrupted PC, then
+                // re-enters (vcpu_loop.rs `Ok(None)` arm). Returning here (rather
+                // than `continue`) is REQUIRED for async host→guest signal
+                // delivery to a vCPU spinning in a syscall-free loop — a spurious
+                // (un-requested) kick is harmless: the loop finds no pending
+                // signal and resumes. (The backend already distinguishes a
+                // requested kick from a spurious VT-x re-entry before surfacing
+                // `Kicked`.)
+                X86Exit::Kicked => return Ok(None),
                 X86Exit::FpDoorbell => {
                     // The FP doorbell is only meaningful while `run_fp_stub` is
                     // driving the stub (it consumes the exit itself); reaching it
@@ -325,6 +335,14 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         self.vcpu.get_gpr(X86Reg::Rip)
     }
 
+    fn process_exit_cleanup(&mut self) {
+        // Delegate to the backend (§2.5c): a HOOK, not Drop — the forked child
+        // `_exit`s skipping Drops. Default is a no-op (KVM/NVMM RAM is released by
+        // the OS on `_exit`); bhyve overrides it to tear down its `/dev/vmm` node
+        // (and skip a vfork-shared/borrowed VM).
+        self.vm.process_exit_cleanup();
+    }
+
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         // Write RAX = return value and resume at the stashed SYSRETQ. For KVM the
         // resume_pc equals the RIP KVM already advanced to past the OUT, so the
@@ -345,10 +363,15 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         crate::engine::fork_x86(self)
     }
 
-    fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "carrick-x86: execve_into is not implemented in Phase 2 (M3+; spec N1)".into(),
-        ))
+    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+        // Delegate the image replacement to the backend (it rebuilds a fresh VM
+        // from `new_image` and re-points the live vCPU). The default
+        // `X86Vmm::execve_rebuild` is NYI (KVM/NVMM Phase-2 hello do not execve);
+        // bhyve overrides it. Clear the pending-syscall state — the fresh image
+        // resumes at its own entry, not the old doorbell resume.
+        self.vm.execve_rebuild(new_image)?;
+        self.pending_resume_pc = None;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

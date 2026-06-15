@@ -245,6 +245,30 @@ pub trait X86Vmm: Sized {
         Ok(())
     }
 
+    /// Replace the live guest image with `new_image` (`execve(2)`). The default
+    /// is NYI — KVM/NVMM Phase-2 hello never execve. A backend that supports
+    /// execve (bhyve) rebuilds a fresh VM from `new_image` and re-points its live
+    /// vCPU; the generic engine's `execve_into` calls this then clears the
+    /// pending-syscall state. (§2.5c sibling: a HOOK on the backend, not a fixed
+    /// engine policy, because the rebuild is backend mechanism.)
+    fn execve_rebuild(
+        &mut self,
+        _new_image: &carrick_mem::memory::AddressSpace,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "carrick-x86: execve_rebuild not implemented for this backend".into(),
+        ))
+    }
+
+    /// Tear down per-process VM resources on a guest process `_exit` (§2.5c). A
+    /// HOOK, not `Drop` — the forked child `_exit`s skipping Rust Drops. Default
+    /// no-op (KVM `MAP_PRIVATE` / NVMM host-fork RAM is reclaimed by the OS on
+    /// `_exit`); bhyve overrides it to `vm_destroy` its `/dev/vmm` node (skipping
+    /// a vfork-shared/borrowed VM the parent still owns). The run loop's
+    /// child-exit path calls the engine's `process_exit_cleanup`, which delegates
+    /// here.
+    fn process_exit_cleanup(&mut self) {}
+
     // ── Threaded-lifecycle surface (the generic ThreadedEngine drives these) ──
 
     /// A kick handle for the current vCPU thread (the engine's `kick_handle`).
