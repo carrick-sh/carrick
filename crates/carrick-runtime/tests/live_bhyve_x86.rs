@@ -270,6 +270,29 @@ fn signal_handler_runs_to_zero() {
 }
 
 #[test]
+fn sigsegv_handler_receives_fault_siginfo() {
+    // SP4.4 first fault-signal acceptance: a guest null store must become a
+    // Linux SIGSEGV/SEGV_MAPERR with si_addr=0, delivered to an SA_SIGINFO
+    // handler via the shared x86 sigframe path.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGSEGV") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGSEGV to the sigsegv ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "sigsegv guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("sigsegv-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
 fn async_signal_interrupts_tight_loop() {
     // SP4.1: a guest spins in a tight ALU loop with NO syscalls while a SIBLING
     // guest thread tgkills it. The signal must interrupt the running vCPU at an

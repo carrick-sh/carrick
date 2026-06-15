@@ -62,7 +62,8 @@ use crate::guest_setup_x86::{
     BhyveGuestRam, BroughtUpX86, FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultScratchRecord,
     PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA, X86_FP_STUB_GPA,
     X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_GPA, bring_up_x86_elf, fault_scratch_gpa,
-    fault_scratch_record_from_bytes, program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
+    fault_scratch_record_from_bytes, fault_stack_frame_len, fault_user_context_from_bytes,
+    program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
 };
 use crate::vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm, Vcpu};
 use crate::vmm_x86::{
@@ -503,7 +504,17 @@ impl X86Vcpu for BhyveX86Vcpu {
                         self.read_gpa(scratch_gpa, std::mem::size_of::<FaultScratchRecord>())?;
                     let record =
                         fault_scratch_record_from_bytes(&scratch).map_err(Self::reg_err)?;
+                    let ring0_rsp = self.get_raw(VM_REG_GUEST_RSP)?;
+                    let frame_len =
+                        fault_stack_frame_len(record.vector()).map_err(Self::reg_err)?;
+                    let frame = self.read_gpa(ring0_rsp, frame_len)?;
+                    let context = fault_user_context_from_bytes(record.vector(), &frame)
+                        .map_err(Self::reg_err)?;
                     let cr2 = self.get_raw(VM_REG_GUEST_CR2)?;
+                    self.set_raw(VM_REG_GUEST_RAX, context.saved_rax)?;
+                    self.set_raw(VM_REG_GUEST_RIP, context.rip)?;
+                    self.set_raw(VM_REG_GUEST_RSP, context.rsp)?;
+                    self.set_raw(VM_REG_GUEST_RFLAGS, context.rflags)?;
                     let kind = match record.vector() {
                         14 => X86FaultKind::PageFault,
                         13 | 17 => X86FaultKind::Protection,
@@ -512,7 +523,7 @@ impl X86Vcpu for BhyveX86Vcpu {
                     return Ok(X86Exit::Fault {
                         kind,
                         gpa: cr2,
-                        error_code: record.error_code(),
+                        error_code: context.error_code,
                     });
                 }
                 // A requested kick surfaces as BOGUS (astpending), not EINTR. If WE
