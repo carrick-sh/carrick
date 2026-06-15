@@ -12,13 +12,11 @@
 
 use std::sync::Mutex;
 
-use carrick_hal::SyscallTrap as _;
-use carrick_vmm_bhyve::BhyveTrapEngine;
 use carrick_vmm_bhyve::X86Exit;
 use carrick_vmm_bhyve::guest_setup_x86::{
     BroughtUpM0, GDT_LEN, PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_GDT_GPA,
     X86_INIT_BLOB_GPA, X86_MEM_SIZE, X86_PML4_GPA, X86_STACK_TOP_GPA, bring_up_m0, bring_up_x86,
-    bring_up_x86_m1, complete_inout,
+    complete_inout,
 };
 use carrick_vmm_bhyve::vmm::BhyveVm;
 use carrick_vmm_bhyve::vmm_x86::{
@@ -337,120 +335,12 @@ fn t6_register_diff_oracle() {
     );
 }
 
-/// M1 — ring-3 SYSCALL hello (plan T7 pass condition):
-///
-/// The guest blob issues `write(1, "hello\n", 6)` via a real `SYSCALL`
-/// instruction (x86_64 number 1), then `exit_group(0)` (x86_64 number 231).
-/// The trap engine remaps both to their canonical numbers (64 and 94), services
-/// `write` by reading the guest buffer and writing it to a capture buffer, then
-/// breaks on `exit_group`.
-///
-/// **Pass condition:** captured output == `b"hello\n"` AND exit code 0.
-///
-/// This test is the empirical proof of the ring-0-WRMSR mechanism:
-/// if the SYSCALL trap never arrives (vCPU wedges or triple-faults), the
-/// WRMSR→iretq→ring-3→SYSCALL chain failed and the blocker will be the first
-/// non-`Bogus` exit reported.
-#[test]
-fn m1_ring3_syscall_hello() {
-    if !vmm_available() {
-        eprintln!("SKIP: vmm not available (/dev/vmm missing and kldstat -q -m vmm failed)");
-        return;
-    }
-    let _guard = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    let bux = bring_up_x86_m1().expect("M1 bring-up");
-    let mut engine = BhyveTrapEngine::new(bux);
-
-    // Canonical syscall numbers (post-remap):
-    //   write      = 64  (x86_64 1  → SyscallRemap::Direct(64))
-    //   exit_group = 94  (x86_64 231 → SyscallRemap::Direct(94))
-    //   exit       = 93  (x86_64 60  → SyscallRemap::Direct(93))
-    const SYS_WRITE: u64 = 64;
-    const SYS_EXIT_GROUP: u64 = 94;
-    const SYS_EXIT: u64 = 93;
-
-    let mut captured_output: Vec<u8> = Vec::new();
-    let mut exit_code: Option<i64> = None;
-
-    // Bounded loop: the blob fires one write(1,…) syscall and one exit_group;
-    // anything past 16 iterations means the loop is wedged.
-    for iter in 0..16 {
-        match engine.next_syscall().expect("next_syscall") {
-            None => {
-                eprintln!("M1: vCPU exited cleanly (Hlt/Suspended) at iteration {iter}");
-                break;
-            }
-            Some(raw) => match raw.number {
-                SYS_WRITE => {
-                    // args: [fd, buf_va, count, …]
-                    let _fd = raw.args[0];
-                    let buf_va = raw.args[1];
-                    let count = raw.args[2] as usize;
-                    // Read the guest buffer through BhyveTrapEngine::read_bytes.
-                    use carrick_guest_mem::GuestMemory as _;
-                    let bytes = engine
-                        .read_bytes(buf_va, count)
-                        .expect("read guest write buffer");
-                    captured_output.extend_from_slice(&bytes);
-                    // Return the byte count written (Linux write(2) contract).
-                    engine
-                        .complete_syscall(count as i64)
-                        .expect("complete write");
-                }
-                SYS_EXIT_GROUP | SYS_EXIT => {
-                    exit_code = Some(raw.args[0] as i64);
-                    // Exit does not return; complete with 0 as a formality so
-                    // the vCPU can be cleanly destroyed (the guest will not
-                    // execute again after exit_group).
-                    engine.complete_syscall(0).expect("complete exit_group");
-                    break;
-                }
-                other => {
-                    // Any other canonical number: answer -ENOSYS and log the
-                    // x86_64 name for diagnostics (the §8 contract).
-                    use carrick_hal::guest_arch::SyscallTable as _;
-                    let name = carrick_hal::x8664_arch::X8664SyscallTable::name(other)
-                        .unwrap_or("<unknown>");
-                    eprintln!(
-                        "M1: unhandled syscall canonical={other} name={name} \
-                         args={:x?} → -ENOSYS",
-                        &raw.args
-                    );
-                    engine.complete_syscall(-38).expect("complete enosys");
-                }
-            },
-        }
-    }
-
-    // ── Pass conditions ───────────────────────────────────────────────────────
-
-    assert_eq!(
-        captured_output, b"hello\n",
-        "M1 PASS: captured stdout must be b\"hello\\n\"; got {:?}",
-        captured_output
-    );
-    assert_eq!(
-        exit_code,
-        Some(0),
-        "M1 PASS: guest exit_group status must be 0; got {exit_code:?}"
-    );
-
-    eprintln!(
-        "M1 PASS: captured={:?} exit_code={exit_code:?} \
-         (ring-0-WRMSR mechanism CONFIRMED: SYSCALL trap delivered correctly)",
-        String::from_utf8_lossy(&captured_output)
-    );
-
-    engine.destroy().expect("clean vm_destroy (m1)");
-}
-
 /// SPIKE (SP1.1): does `minherit(INHERIT_COPY)` give a forked child a
 /// COW-FROZEN view of a bhyve guest-RAM (`vm_map_gpa`) host mapping, or does the
 /// device/SG VM pager silently force INHERIT_SHARE (the child then ALIASES the
 /// parent's LIVE pages)?
 ///
-/// `BhyveTrapEngine::fork()` currently freezes the parent's whole guest RAM into
+/// `BhyveVmm::freeze_ram()` currently freezes the parent's whole guest RAM into
 /// a heap `Vec<u8>` BEFORE `libc::fork`, because bhyve guest RAM is kernel-owned
 /// and (unlike KVM's MAP_PRIVATE|ANON) is NOT copy-on-write across fork — the
 /// inherited mapping aliases the parent's live pages, so a post-fork parent that
@@ -584,7 +474,7 @@ fn minherit_cow_frozen_across_fork() {
         code, 0,
         "minherit(INHERIT_COPY) did NOT give a frozen child view of bhyve \
          vm_map_gpa memory (verdict: {verdict}); the eager pre-fork heap freeze \
-         in BhyveTrapEngine::fork() is required and must not be removed"
+         in BhyveVmm::freeze_ram() is required and must not be removed"
     );
 }
 

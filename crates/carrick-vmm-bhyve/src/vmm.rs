@@ -205,8 +205,8 @@ fn reg_id(r: Reg) -> Result<c_int, OsError> {
                  EL1 init stub programs it (ELR/SPSR for the eret to EL0)"
             )));
         }
-        // The x86_64 Reg variants are a disjoint ISA view; the bhyve x86 backend
-        // (BhyveTrapEngine) uses its own register access, not this aarch64 path.
+        // The x86_64 Reg variants are a disjoint ISA view; the shared x86 bhyve
+        // backend uses its own register access, not this aarch64 path.
         _ => {
             return Err(OsError::new(format!(
                 "bhyve: {r:?} is an x86_64 register, not valid on the aarch64 lane"
@@ -232,7 +232,7 @@ fn sysreg_id(r: SysReg) -> Result<c_int, OsError> {
                  EL1 init stub programs it"
             )));
         }
-        // x86_64 FsBase/GsBase are a disjoint ISA view (BhyveTrapEngine's own path).
+        // x86_64 FsBase/GsBase are a disjoint ISA view (the shared x86 backend's path).
         _ => {
             return Err(OsError::new(format!(
                 "bhyve: {r:?} is an x86_64 sysreg, not valid on the aarch64 lane"

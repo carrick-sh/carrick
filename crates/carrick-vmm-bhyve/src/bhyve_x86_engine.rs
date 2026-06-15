@@ -4,7 +4,7 @@
 //! `BhyveVmm` (+ `impl X86Vcpu for BhyveX86Vcpu`) is the thin per-VMM trait pair
 //! the generic [`carrick_x86::X86EngineCore`] is parameterized over — mirroring
 //! `carrick-vmm-kvm`'s `kvm_x86_engine` and `carrick-vmm-nvmm`'s `nvmm_x86_engine`,
-//! NOT a copy of the old hand-rolled `BhyveTrapEngine`. The trap loop, register
+//! not a backend-local trap engine. The trap loop, register
 //! walk, guest-memory access, snapshot triple, long-mode bring-up, sigframe
 //! glue, and run-elf loop all now live ONCE in `carrick-x86`; this module
 //! supplies only the bhyve-specific marshalling and the three quirk seams.

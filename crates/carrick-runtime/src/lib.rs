@@ -689,10 +689,10 @@ pub mod runtime {
 
     /// x86_64 bhyve run through the FULL `SyscallDispatcher` on the canonical loop
     /// (M2 Tier 1). Mirrors the x86_64 arm of `run_elf_real_dispatch`: build a
-    /// `BhyveTrapEngine` via `carrick_vmm_bhyve::run_elf::build_x86_engine` and drive it
+    /// shared `X86EngineCore<BhyveVmm>` via `build_x86_engine_shared` and drive it
     /// through `run_threaded_bhyve_loop`. `CARRICK_NO_THREADS` falls back to the M1
-    /// single-threaded `carrick_vmm_bhyve::run_elf::run_elf_bhyve` (which writes guest
-    /// stdout/stderr straight to the host — hence empty buffers in the RunResult).
+    /// single-threaded `run_elf_bhyve` helper (which writes guest stdout/stderr
+    /// straight to the host — hence empty buffers in the RunResult).
     /// The carrick-vmm-bhyve helpers return `Result<_, String>`; map those to
     /// `RuntimeError::Unsupported` (the variant the codebase uses for opaque
     /// backend messages).
@@ -710,22 +710,9 @@ pub mod runtime {
                 trap_limit_hit: false,
             });
         }
-        // Stage-4 default: the shared `X86EngineCore<BhyveVmm>`. The
-        // `bhyve-legacy-engine` instant-revert flag falls back to the hand-rolled
-        // `BhyveTrapEngine` (kept one cycle). Both satisfy the loop's
-        // `ThreadedEngine<KickHandle = BhyveKickHandle>` bound.
-        #[cfg(not(feature = "bhyve-legacy-engine"))]
-        {
-            let engine = carrick_vmm_bhyve::run_elf::build_x86_engine_shared(path)
-                .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine_shared: {e}")))?;
-            run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
-        }
-        #[cfg(feature = "bhyve-legacy-engine")]
-        {
-            let engine = carrick_vmm_bhyve::run_elf::build_x86_engine(path)
-                .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine: {e}")))?;
-            run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
-        }
+        let engine = carrick_vmm_bhyve::run_elf::build_x86_engine_shared(path)
+            .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine_shared: {e}")))?;
+        run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
     }
 
     /// Dispatch one syscall, servicing any blocking-I/O outcome inline via the
