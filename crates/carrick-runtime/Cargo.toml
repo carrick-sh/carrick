@@ -50,6 +50,10 @@ platform-linux = ["dep:carrick-linux"]
 # docs/superpowers/adr/2026-06-06-bhyve-backend-design.md). Mirrors platform-linux.
 # Pulls in carrick-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
 platform-freebsd = ["dep:carrick-bhyve", "dep:carrick-bsd"]
+# Stage-4 instant-revert: route the bhyve run path through the OLD hand-rolled
+# `BhyveTrapEngine` instead of the shared `X86EngineCore<BhyveVmm>`. Off by
+# default (the shared engine is the blessed path).
+bhyve-legacy-engine = ["carrick-bhyve/bhyve-legacy-engine"]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }

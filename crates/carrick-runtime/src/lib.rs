@@ -662,9 +662,22 @@ pub mod runtime {
                 trap_limit_hit: false,
             });
         }
-        let engine = carrick_bhyve::run_elf::build_x86_engine(path)
-            .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine: {e}")))?;
-        run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+        // Stage-4 default: the shared `X86EngineCore<BhyveVmm>`. The
+        // `bhyve-legacy-engine` instant-revert flag falls back to the hand-rolled
+        // `BhyveTrapEngine` (kept one cycle). Both satisfy the loop's
+        // `ThreadedEngine<KickHandle = BhyveKickHandle>` bound.
+        #[cfg(not(feature = "bhyve-legacy-engine"))]
+        {
+            let engine = carrick_bhyve::run_elf::build_x86_engine_shared(path)
+                .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine_shared: {e}")))?;
+            run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+        }
+        #[cfg(feature = "bhyve-legacy-engine")]
+        {
+            let engine = carrick_bhyve::run_elf::build_x86_engine(path)
+                .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine: {e}")))?;
+            run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+        }
     }
 
     /// Dispatch one syscall, servicing any blocking-I/O outcome inline via the
