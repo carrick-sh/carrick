@@ -27,6 +27,9 @@
 #![cfg(target_os = "netbsd")]
 
 pub mod nvmm;
+pub mod nvmm_kicker;
+pub mod nvmm_x86_engine;
+pub mod run_elf;
 
 pub use nvmm::{
     NVMM_PROT_EXEC, NVMM_PROT_READ, NVMM_PROT_WRITE, NVMM_VCPU_EXIT_HALTED, NVMM_VCPU_EXIT_IO,
@@ -36,3 +39,5 @@ pub use nvmm::{
 pub use nvmm::{
     NvmmCapability, NvmmError, NvmmMachine, NvmmResult, NvmmVcpu, NvmmX64State, NvmmX86ExitIo,
 };
+pub use nvmm_x86_engine::{NVMM_X86_LAYOUT, NvmmVmm, bring_up};
+pub use run_elf::run_elf_nvmm;

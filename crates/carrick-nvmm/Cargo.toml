@@ -17,10 +17,19 @@ workspace = true
 # default macOS workspace build (and Linux CI) stay green without libnvmm on
 # the link line.
 #
-# M0 keeps deps minimal: std + libc only. It FFIs to the system **libnvmm**
-# (linked via `#[link(name = "nvmm")]`, found at /usr/lib/libnvmm.so). The
-# carrick-hal trait impls + the shared x86_64 ISA layer are M1/M2 — they are
-# deliberately NOT pulled in here yet (carrick-hal on the box's pkgsrc rust is
-# untested; M0 is a leaf de-risk of state-programming + the run loop).
+# M1 builds the thin per-VMM `X86Vmm`/`X86Vcpu` trait pair over the SHARED
+# `carrick-x86` engine (the portability Stage-5 acceptance test): the trap loop,
+# long-mode bring-up, snapshot triple, and run-elf service loop all live ONCE in
+# carrick-x86. carrick-nvmm supplies only the NVMM marshalling + the run_elf
+# wiring. The deps are unconditional (these leaf crates build on every host
+# already); the crate's own code is `#![cfg(target_os = "netbsd")]`, so the
+# libnvmm link line only appears on NetBSD and the default macOS/Linux workspace
+# build stays green. It FFIs to the system **libnvmm** (`#[link(name = "nvmm")]`,
+# /usr/lib/libnvmm.so), and like carrick-linux/bhyve depends only on the leaf
+# crates (NOT carrick-runtime) so it cross-compiles independently.
 [dependencies]
+carrick-hal = { path = "../carrick-hal" }
+carrick-x86 = { path = "../carrick-x86" }
+carrick-mem = { path = "../carrick-mem" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
 libc.workspace = true
