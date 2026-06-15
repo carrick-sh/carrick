@@ -43,9 +43,10 @@ use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
 
 /// The `OUT` port the LSTAR stub uses as the SYSCALL doorbell.
 ///
-/// Matches the immediate in `X8664GuestArch::entry_trampoline_bytes()`:
-/// `0xE6 0xC5` = `OUT imm8($0xC5), %al`.  Source: AMD64 ISA / OSDev "OUT".
-pub const SYSCALL_DOORBELL_PORT: u16 = 0xC5;
+/// Single-sourced from `carrick_hal::x8664_arch` (the same const the
+/// `entry_trampoline_bytes` emitter derives its immediate from), re-exported here
+/// so KVM-local call sites keep referring to it by this name.
+pub use carrick_hal::SYSCALL_DOORBELL_PORT;
 
 // The x86-64 syscall normalization constants (CANONICAL_CLONE, fork/vfork
 // numbers, clone flag values) now live in carrick_hal::x8664_arch (defined once,

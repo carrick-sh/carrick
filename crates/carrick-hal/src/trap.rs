@@ -195,6 +195,13 @@ pub enum TrapError {
     /// An EL0 sync exception other than `svc #0` reached the EL1 vector
     /// trampoline (e.g. instruction abort at PC=0, data abort, undef). Surfaces
     /// the original syndrome/ELR/FAR so the runtime can map it to a Linux signal.
+    ///
+    /// This variant is **aarch64-internal**: the aarch64 engines (HVF, KVM
+    /// aarch64) raise it carrying raw `ESR_EL1`, and the runtime loop *lowers* it
+    /// to the ISA-neutral [`TrapError::GuestFault`] at the loop boundary (it
+    /// resolves the raw ESR to the `(signum, si_code, fault_addr)` triple,
+    /// covering both abort and debug classes). x86 backends never raise it; they
+    /// emit `GuestFault` directly.
     #[error(
         "EL0 fault not handled by trap path: esr=0x{syndrome:x} elr=0x{elr:x} far=0x{far:x} x16=0x{x16:x} x17=0x{x17:x} x29=0x{x29:x} x30=0x{x30:x} sp=0x{sp:x}"
     )]
@@ -208,6 +215,22 @@ pub enum TrapError {
         x30: u64,
         sp: u64,
         from_el0_direct: bool,
+    },
+    /// An ISA-neutral synchronous guest fault, carrying the **already-resolved**
+    /// Linux signal triple (NOT a raw architectural syndrome). The runtime's
+    /// fault arm delivers `signum`/`si_code` to the guest with `si_addr =
+    /// fault_addr`.
+    ///
+    /// - aarch64 lowers [`TrapError::EL0Fault`] to this at the loop boundary
+    ///   (resolving `ESR_EL1` → SIGSEGV/SIGBUS/SIGTRAP + `si_code`, and
+    ///   `fault_addr` from `FAR_EL1`/`ELR_EL1`).
+    /// - x86 backends emit it directly, filling `fault_addr` from **CR2** for the
+    ///   SIGSEGV `si_addr`.
+    #[error("guest fault: signum={signum} si_code={si_code} fault_addr=0x{fault_addr:x}")]
+    GuestFault {
+        signum: i32,
+        si_code: i32,
+        fault_addr: u64,
     },
 }
 
