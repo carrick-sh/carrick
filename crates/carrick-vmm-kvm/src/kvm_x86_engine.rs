@@ -128,24 +128,25 @@ impl X86Vmm for KvmVmm {
     fn map_host_alias(
         &mut self,
         va: u64,
-        _ipa: u64,
+        ipa: u64,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        use crate::guest_setup::{AliasBacking, KVM_ALIAS_GPA_BASE, KVM_ALIAS_GPA_SIZE};
-        use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
+        use crate::guest_setup::AliasBacking;
+        use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
 
-        let off = va
-            .checked_sub(LINUX_HIGH_VA_THRESHOLD)
-            .filter(|&o| o < KVM_ALIAS_GPA_SIZE)
-            .ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "KVM x86 map_host_alias: VA 0x{va:x} outside the alias arena \
-                     [1 TiB, 1 TiB+64 GiB)"
-                ))
-            })?;
-        let gpa = KVM_ALIAS_GPA_BASE + off;
+        let alias_end = ipa.checked_add(len).ok_or_else(|| {
+            TrapError::Hypervisor(format!("KVM x86 alias 0x{ipa:x}+{len} overflows"))
+        })?;
+        let alias_limit = LINUX_ALIAS_IPA_BASE + LINUX_ALIAS_IPA_SIZE;
+        if ipa < LINUX_ALIAS_IPA_BASE || alias_end > alias_limit {
+            return Err(TrapError::Hypervisor(format!(
+                "KVM x86 map_host_alias: dispatcher IPA 0x{ipa:x}..0x{alias_end:x} \
+                 outside alias GPA arena 0x{LINUX_ALIAS_IPA_BASE:x}..0x{alias_limit:x}"
+            )));
+        }
+        let gpa = ipa;
         let writable = match file {
             Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
             None => true,

@@ -182,14 +182,15 @@ impl SyscallDispatcher {
         }
 
         if requested != 0 {
-            let valid_hint = requested.is_multiple_of(LINUX_PAGE_SIZE)
+            let aligned_hint = requested.is_multiple_of(LINUX_PAGE_SIZE);
+            let arena_hint = aligned_hint
                 && range_within(
                     requested,
                     length,
                     LINUX_MMAP_BASE,
                     crate::memory::mmap_arena_size(),
                 );
-            if valid_hint {
+            if arena_hint {
                 let mut mem = self.mem.lock();
                 let end = requested.checked_add(length)?;
                 if requested >= mem.mmap_next {
@@ -202,6 +203,10 @@ impl SyscallDispatcher {
                     mem.mmap_dirty_high = mem.mmap_dirty_high.max(end);
                     return Some((requested, stale));
                 }
+            }
+            let canonical_alias_hint = aligned_hint && mmap_address_uses_alias(requested, length);
+            if canonical_alias_hint {
+                return Some((requested, false));
             }
         }
 
@@ -558,7 +563,7 @@ impl SyscallDispatcher {
 
                 let fixed_anonymous = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                     && map_flags.contains(LinuxMmapFlags::FIXED);
-                if (reused || fixed_anonymous) && !crate::memory::is_high_va(address) {
+                if (reused || fixed_anonymous) && !mmap_address_uses_alias(address, length) {
                     // Scrub the reused region's PHYSICAL backing. MUST bypass the
                     // guest-visible permission: a region just reclaimed from munmap
                     // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
@@ -590,7 +595,7 @@ impl SyscallDispatcher {
                 }
 
                 if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                    && !crate::memory::is_high_va(address)
+                    && !mmap_address_uses_alias(address, length)
                 {
                     memory.set_no_access(address, length_usize, false);
                     if in_arena && memory.protect_range(address, length_usize, prot).is_err() {
@@ -641,14 +646,13 @@ impl SyscallDispatcher {
                     bytes
                 };
 
-                // A high guest VA (>= 1 TiB) can't be identity-mapped (HVF IPA is 40
-                // bits). Reserve a low alias IPA and hand the runtime a MapHostAlias
-                // outcome that hv_vm_maps it, builds the VA->IPA page-table path, and
-                // copies file-backed `bytes` in. Anonymous aliases carry no payload:
-                // the host anon alias mapping is already zeroed. Apple Rosetta maps
-                // both its anon translation arena (240 TiB) and the x86 binary this
-                // way.
-                if crate::memory::is_high_va(address) {
+                // Guest-chosen mmap addresses outside Carrick's low identity arenas
+                // use alias backing. VAs >= 1 TiB need this because HVF's IPA is
+                // 40 bits; lower canonical hints in the free gap above the shared
+                // aperture use the same machinery so Linux-style advisory hints
+                // (notably Go's 0xc000000000 arena probe) are preserved instead of
+                // being relocated into the low mmap arena.
+                if mmap_address_uses_alias(address, length) {
                     // Reject a genuinely non-canonical hint (bits 55:48 of the
                     // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
                     // canonicality is decided by bits 55:48, not 63:48. A canonical
@@ -672,13 +676,14 @@ impl SyscallDispatcher {
                     let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
                         return Ok(LINUX_ENOMEM.into());
                     };
-                    // A high-VA mmap frequently overlays an earlier PROT_NONE
+                    // Alias mappings frequently overlay an earlier PROT_NONE
                     // reservation (Rosetta reserves the x86 stack/binary span anon
-                    // PROT_NONE, then MAP_FIXEDs RW/file segments in). The guest's own
-                    // accesses translate via the page tables map_aliased installs, but
-                    // carrick's syscall-path EFAULT check consults `no_access` — clear
-                    // it here, or reads/writes of guest buffers in this range (e.g.
-                    // getrandom's output on the x86 stack) wrongly EFAULT.
+                    // PROT_NONE, then MAP_FIXEDs RW/file segments in; Go probes its
+                    // arena with PROT_NONE before mapping usable pages). The guest's
+                    // own accesses translate via the page tables map_aliased installs,
+                    // but carrick's syscall-path EFAULT check consults `no_access` —
+                    // clear it here, or reads/writes of guest buffers in this range
+                    // wrongly EFAULT.
                     memory.set_no_access(address, length_usize, prot_none);
                     return Ok(DispatchOutcome::MapHostAlias {
                         va: address,
@@ -734,23 +739,20 @@ impl SyscallDispatcher {
                     this.writeback_shared(cx, &alloc, true);
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                // A canonical high guest VA (>= 1 TiB, < 2^48) is a dynamic alias
-                // mapping: either a MAP_SHARED file region (carrick-chosen VA in the
-                // narrow alias window, backed LIVE by the host page cache, so no
-                // writeback is owed) OR a MAP_FIXED mapping at a guest-chosen high VA
-                // (Apple Rosetta maps its translated ELF + arenas in the x86-64 high
-                // half; the 16-bit pointer tag was stripped at mmap time, so the VA
-                // carrick mapped — and the guest munmaps — is a canonical 48-bit
-                // address). Both are valid mappings, so munmap must succeed (LTP
-                // munmap01/02 also unmapped a MAP_SHARED file region and carrick
-                // wrongly returned EINVAL when the alias VA was in neither the shared
-                // aperture nor the mmap arena). Best-effort stage-1 invalidate so
-                // use-after-munmap faults; arm64 HVF has no stage-2 unmap, so the
-                // alias IPA + any dup fd are reclaimed at process teardown.
+                // A canonical alias-window guest VA is a dynamic alias mapping:
+                // either a MAP_SHARED file region (carrick-chosen VA in the narrow
+                // alias window, backed LIVE by the host page cache, so no writeback
+                // is owed), a MAP_FIXED mapping at a guest-chosen high VA (Apple
+                // Rosetta maps its translated ELF + arenas in the x86-64 high half),
+                // or a Linux-style advisory hint in the free gap above Carrick's
+                // shared aperture. All are valid mappings/reservations, so munmap
+                // must succeed. Best-effort stage-1 invalidate so use-after-munmap
+                // faults; arm64 HVF has no stage-2 unmap, so the alias IPA + any dup
+                // fd are reclaimed at process teardown.
                 // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
                 // to assert EINVAL) are already rejected by the alignment gate above;
                 // addresses >= 2^48 stay EINVAL via the range check below.
-                if crate::memory::is_high_va(address.0) && address.0 < (1u64 << 48) {
+                if mmap_address_uses_alias(address.0, length) {
                     if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
                         && let Ok(len_usize) = usize::try_from(len)
                     {
@@ -1220,6 +1222,23 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
     address >= base && end <= limit
 }
 
+fn mmap_address_uses_alias(address: u64, length: u64) -> bool {
+    let Some(end) = address.checked_add(length) else {
+        return false;
+    };
+    if end > (1u64 << 48) {
+        return false;
+    }
+    if crate::memory::is_high_va(address) {
+        return true;
+    }
+
+    let alias_low_base =
+        crate::memory::LINUX_SHARED_FILE_BASE + crate::memory::LINUX_SHARED_FILE_SIZE;
+    let stack_base = crate::memory::LINUX_STACK_TOP - crate::memory::LINUX_STACK_SIZE;
+    range_within(address, length, alias_low_base, stack_base - alias_low_base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1503,5 +1522,90 @@ mod tests {
         assert_eq!(memory.write_calls.get(), 0);
         assert_eq!(memory.zero_backing_calls.get(), 0);
         assert_eq!(memory.protect_calls.get(), 0);
+    }
+
+    #[test]
+    fn alias_window_advisory_hint_is_honored_without_consuming_low_arena() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MUNMAP: u64 = 215;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+        let va = 0xc000000000;
+        let len = 0x4000000;
+        let request = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                va,
+                len,
+                0,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+
+        let outcome = dispatcher
+            .dispatch(request, &mut memory, &reporter)
+            .expect("mmap dispatch should succeed");
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: va as i64 });
+        let unmap = SyscallRequest::new(SYS_MUNMAP, SyscallArgs([va, len, 0, 0, 0, 0]));
+        let unmap_outcome = dispatcher
+            .dispatch(unmap, &mut memory, &reporter)
+            .expect("munmap dispatch should succeed");
+        assert_eq!(unmap_outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(
+            dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0),
+            Some((LINUX_MMAP_BASE, false)),
+            "alias-window advisory reservations must not consume the low mmap arena"
+        );
+    }
+
+    #[test]
+    fn alias_window_advisory_hint_with_protection_maps_alias() {
+        const SYS_MMAP: u64 = 222;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+        let va = 0xc000000000;
+        let len = LINUX_PAGE_SIZE;
+        let request = SyscallRequest::new(
+            SYS_MMAP,
+            SyscallArgs([
+                va,
+                len,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0,
+            ]),
+        );
+
+        let outcome = dispatcher
+            .dispatch(request, &mut memory, &reporter)
+            .expect("mmap dispatch should succeed");
+
+        let DispatchOutcome::MapHostAlias {
+            va: mapped_va,
+            len: mapped_len,
+            payload,
+            file,
+            ..
+        } = outcome
+        else {
+            panic!("expected protected high advisory hint to map an alias, got {outcome:?}");
+        };
+        assert_eq!(mapped_va, va);
+        assert_eq!(mapped_len, len);
+        assert!(payload.is_empty());
+        assert!(file.is_none());
+        assert_eq!(
+            dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0),
+            Some((LINUX_MMAP_BASE, false)),
+            "alias-window advisory aliases must not consume the low mmap arena"
+        );
     }
 }
