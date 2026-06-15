@@ -3089,6 +3089,70 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
 }
 
 #[test]
+fn x86_private_dup2_installs_requested_fd_and_allows_same_fd_noop() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    carrick_runtime::linux_abi::CARRICK_PRIVATE_X86_DUP2,
+                    SyscallArgs::from([3, 1, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    carrick_runtime::linux_abi::CARRICK_PRIVATE_X86_DUP2,
+                    SyscallArgs::from([1, 1, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(24, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn writev_writes_stdout_from_packed_iovecs() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4200, b"hello ").unwrap();

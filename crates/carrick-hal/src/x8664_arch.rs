@@ -639,13 +639,13 @@ impl GuestArch for X8664GuestArch {
 
 // ─── x86-64 syscall normalization (shared by every x86 backend) ──────────────
 //
-// fork(57)/vfork(58)→clone(220) desugar + the clone(220) tls↔child_tid arg-swap
-// + the arch_prctl dispatch are PURE guest-ISA ABI (host/VMM-agnostic). They were
-// duplicated in the KVM-x86 and bhyve `next_syscall`; hoisted here so both call
-// one function. Sources (clean-room, man-pages / psABI only): clone(2) "C
-// library/kernel differences" (x86-64 raw arg order; CLONE_VM=0x100,
-// CLONE_VFORK=0x4000; exit-signal in the low byte), signal(7) (SIGCHLD=17),
-// syscalls(2) (x86-64 fork=57/vfork=58).
+// fork(57)/vfork(58)→clone(220), legacy dup2(33)→private dispatcher shim, the
+// clone(220) tls↔child_tid arg-swap, and arch_prctl dispatch are PURE guest-ISA
+// ABI (host/VMM-agnostic). They were duplicated in the KVM-x86 and bhyve
+// `next_syscall`; hoisted here so both call one function. Sources (clean-room,
+// man-pages / psABI only): clone(2) "C library/kernel differences" (x86-64 raw
+// arg order; CLONE_VM=0x100, CLONE_VFORK=0x4000; exit-signal in the low byte),
+// signal(7) (SIGCHLD=17), syscalls(2) (x86-64 fork=57/vfork=58/dup2=33).
 
 /// Canonical (asm-generic / aarch64) `clone` number. x86-64 raw clone (56) and
 /// fork(57)/vfork(58) all normalize to this; clone3 (435) does NOT.
@@ -655,6 +655,9 @@ pub const CANONICAL_CLONE: u64 = 220;
 const X86_NR_FORK: u64 = 57;
 /// x86-64 `vfork(2)` (syscalls(2)). Desugars to clone(220)+CLONE_VM|CLONE_VFORK|SIGCHLD.
 const X86_NR_VFORK: u64 = 58;
+/// x86-64 `dup2(2)` (syscalls(2)). Desugars to a private dispatcher shim because
+/// canonical/asm-generic has `dup3(2)` but no `dup2(2)`.
+const X86_NR_DUP2: u64 = 33;
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -702,6 +705,12 @@ impl X8664GuestArch {
                     0,
                     0,
                 ],
+            });
+        }
+        if x86_number == X86_NR_DUP2 {
+            return SyscallNorm::Plain(RawSyscall {
+                number: carrick_abi::CARRICK_PRIVATE_X86_DUP2,
+                args: [args[0], args[1], 0, 0, 0, 0],
             });
         }
 
@@ -815,6 +824,19 @@ mod normalize_tests {
                 assert_eq!(rs.args, [1, 0x100, 5, 0, 0, 0]);
             }
             _ => panic!("write must be Plain"),
+        }
+    }
+
+    #[test]
+    fn dup2_normalizes_to_private_legacy_dispatch_number() {
+        // x86 dup2 = 33. Canonical 33 is mknodat, so dup2 needs a private
+        // normalized number plus a dispatcher shim preserving dup2(fd,fd).
+        match X8664GuestArch::normalize_syscall(&frame(33, [3, 1, 0xBAD, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_DUP2);
+                assert_eq!(rs.args, [3, 1, 0, 0, 0, 0]);
+            }
+            _ => panic!("dup2 must be Plain"),
         }
     }
 }
