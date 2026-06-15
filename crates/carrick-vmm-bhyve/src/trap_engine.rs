@@ -1,6 +1,6 @@
 //! `BhyveTrapEngine` — the bhyve x86_64 `SyscallTrap` + `GuestMemory` impl.
 //!
-//! This is the structural analogue of `KvmTrapEngine` in `carrick-linux`, but
+//! This is the structural analogue of `KvmTrapEngine` in `carrick-vmm-kvm`, but
 //! over the bhyve INOUT vehicle instead of KVM's MMIO sentinel.  A ring-3
 //! `SYSCALL` instruction enters the LSTAR stub (`out %al, $0xC5` + `sysretq`),
 //! which surfaces as `VM_EXITCODE_INOUT` on port `SYSCALL_DOORBELL_PORT`.

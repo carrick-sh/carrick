@@ -1062,7 +1062,7 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
 /// epoch alignment) for the same reason.
 // compile error recorded when building for x86_64 before this gate was added:
 //   error: instruction requires: aarch64
-//   --> crates/carrick-linux/src/guest_setup.rs:1050:9
+//   --> crates/carrick-vmm-kvm/src/guest_setup.rs:1050:9
 //   note: `mrs {}, cntfrq_el0` is an AArch64-only system-register read
 // and in kvm.rs:
 //   error[E0432]: unresolved import `kvm_bindings::KVM_ARM_VCPU_PSCI_0_2`

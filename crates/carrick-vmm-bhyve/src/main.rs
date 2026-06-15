@@ -3,7 +3,7 @@
 //! Usage: `carrick-vmm-bhyve run-elf <static-x86_64-elf>`
 //!
 //! FreeBSD/x86_64 only (the binary is a no-op stub on all other hosts).
-//! Mirrors `carrick-linux`'s `main.rs` pattern verbatim.
+//! Mirrors `carrick-vmm-kvm`'s `main.rs` pattern verbatim.
 
 #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 fn main() {

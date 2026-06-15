@@ -1,5 +1,5 @@
 //! bhyve async host-signal pump — the FreeBSD mirror of
-//! [`carrick_linux::kvm_signal_pump`] (SP4.2). Catches host-delivered
+//! [`carrick_vmm_kvm::kvm_signal_pump`] (SP4.2). Catches host-delivered
 //! PROCESS-directed signals (`SIGTERM`/`SIGINT`/`SIGHUP`/`SIGQUIT` — the ones a
 //! supervisor or a tty sends, and which carrick NEVER injects into a guest
 //! itself) and turns them into a guest-deliverable pending signal; ALSO runs the

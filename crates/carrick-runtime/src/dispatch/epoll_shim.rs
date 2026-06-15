@@ -41,7 +41,7 @@ pub(crate) fn notify_inmem_epoll() {
         #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
         let _ = carrick_host_bsd::kqueue::trigger_user(fd, 0);
         #[cfg(feature = "platform-linux")]
-        carrick_linux::epoll_mux::trigger_user_eventfd(fd);
+        carrick_host_linux::epoll_mux::trigger_user_eventfd(fd);
         #[cfg(not(any(
             feature = "platform-macos",
             feature = "platform-linux",

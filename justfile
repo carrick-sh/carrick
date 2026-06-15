@@ -102,7 +102,7 @@ bench PROFILE="quick":
 
 # Build the freestanding hello-aarch64 KVM-MVP fixture (Mac-native: clang + rust-lld).
 build-fixture:
-    ./crates/carrick-linux/fixtures/hello-aarch64/build.sh
+    ./crates/carrick-vmm-kvm/fixtures/hello-aarch64/build.sh
 
 # Build the static x86_64 musl M2 fixture (Mac-native: rustup + rust-lld, no C/Docker).
 build-x86-fixture:
@@ -112,18 +112,18 @@ build-x86-fixture:
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).
 # Runs on the Mac (no nested VM needed) — matches the CI cross-check job.
 check-linux:
-    cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-linux
+    cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm
     ./scripts/closure-assert-no-hvf.sh
 
 # Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
 closure-linux:
     ./scripts/closure-assert-no-hvf.sh
 
-# LOCAL: native release build of carrick-linux INSIDE the nested-KVM Linux VM.
+# LOCAL: native release build of carrick-vmm-kvm INSIDE the nested-KVM Linux VM.
 # The full CLI can't cross-compile from macOS (ring/oci-client need a C cross
 # toolchain), so the real Linux binary is built natively here.
 build-linux:
-    cargo build --release -p carrick-linux
+    cargo build --release -p carrick-vmm-kvm
 
 # ONE-TIME (Apple M3+/macOS 15+): create the lima `vz` nested-KVM Ubuntu VM that
 # serves as the local L2 lane. qemu's HVF backend can't provide nested virt;
@@ -131,21 +131,21 @@ build-linux:
 lima-up:
     ./scripts/lima-up.sh
 
-# TURNKEY L2 (run on the macOS host): build carrick-linux natively inside the
+# TURNKEY L2 (run on the macOS host): build carrick-vmm-kvm natively inside the
 # lima nested-KVM guest and run hello-aarch64 against real /dev/kvm. This is the
 # MVP success gate on Apple Silicon. Run `just lima-up` once first.
 kvm-smoke-lima:
     ./scripts/kvm-smoke-lima.sh
 
-# LOCAL (L2): run the freestanding hello-aarch64 under carrick-linux on real
+# LOCAL (L2): run the freestanding hello-aarch64 under carrick-vmm-kvm on real
 # /dev/kvm and diff stdout + exit code against the oracle. This is the MVP
 # success gate when you ALREADY have /dev/kvm (e.g. inside the nested-KVM VM, or
 # a native Linux/aarch64 host). On a macOS host use `just kvm-smoke-lima` instead.
 kvm-smoke: build-linux build-fixture
     #!/usr/bin/env bash
     set -euo pipefail
-    fix=crates/carrick-linux/fixtures/hello-aarch64
-    bin=target/release/carrick-linux
+    fix=crates/carrick-vmm-kvm/fixtures/hello-aarch64
+    bin=target/release/carrick-vmm-kvm
     got="$("$bin" run-elf "$fix/hello-aarch64")"
     code=$?
     if [[ "$got" != "$(cat "$fix/oracle.expected")" ]]; then
@@ -160,15 +160,15 @@ kvm-smoke: build-linux build-fixture
     fi
     echo "OK: hello-aarch64 printed 'ok' and exited 0 under KVM."
 
-# LOCAL, NON-GATING stretch: run a musl-static binary under carrick-linux and
+# LOCAL, NON-GATING stretch: run a musl-static binary under carrick-vmm-kvm and
 # RECORD the first syscall it dies on (scopes the full-Linux-backend spec).
 # Never a pass/fail — logs the failing __NR_* and always exits 0.
 musl-record BIN:
     #!/usr/bin/env bash
     set -uo pipefail
-    bin=target/release/carrick-linux
-    echo "musl-record: running {{BIN}} under carrick-linux (non-gating)..."
-    RUST_LOG=carrick_linux=debug "$bin" run-elf "{{BIN}}" || true
+    bin=target/release/carrick-vmm-kvm
+    echo "musl-record: running {{BIN}} under carrick-vmm-kvm (non-gating)..."
+    RUST_LOG=carrick_vmm_kvm=debug "$bin" run-elf "{{BIN}}" || true
     echo "musl-record: see the last UnsupportedPlatform / ENOSYS syscall above."
     echo "musl-record: this is informational only — recorded, never gating."
     exit 0

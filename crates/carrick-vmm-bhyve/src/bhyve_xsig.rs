@@ -1,5 +1,5 @@
 //! bhyve glue for the cross-process explicit-signal ring ("xsignal ring") — the
-//! FreeBSD mirror of [`carrick_linux::kvm_xsig`] (SP4.2).
+//! FreeBSD mirror of [`carrick_vmm_kvm::kvm_xsig`] (SP4.2).
 //!
 //! ## Why a ring, not a native cross-process queue
 //!

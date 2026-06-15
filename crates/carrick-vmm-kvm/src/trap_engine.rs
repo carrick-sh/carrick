@@ -754,7 +754,7 @@ impl SyscallTrap for KvmTrapEngine {
 
         // 2. Real host fork.
         //
-        // SAFETY: the carrick-linux thin-shim run loop spawns no threads, so the
+        // SAFETY: the carrick-vmm-kvm thin-shim run loop spawns no threads, so the
         // process is SINGLE-THREADED at this point.  That is the load-bearing
         // invariant: because no other thread exists, no other thread can be
         // holding the malloc lock (or any other process-global lock) at fork

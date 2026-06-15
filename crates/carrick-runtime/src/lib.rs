@@ -230,7 +230,7 @@ pub mod trap {
     /// / KvmVcpu::drop); only non-linux scaffolding (bhyve) gets an inert
     /// always-0 stub (no drain) until it implements the same contract.
     #[cfg(feature = "platform-linux")]
-    pub use carrick_linux::kvm::VCPU_LIVE;
+    pub use carrick_vmm_kvm::kvm::VCPU_LIVE;
     #[cfg(not(feature = "platform-linux"))]
     pub static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
@@ -309,7 +309,7 @@ pub use execute::Runtime;
 #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub mod runtime {
     //! Linux (KVM) run path. The full macOS run loop lives in `runtime.rs`
-    //! (`cfg(platform-macos)`); on Linux we drive `carrick_linux::KvmTrapEngine`
+    //! (`cfg(platform-macos)`); on Linux we drive `carrick_vmm_kvm::KvmTrapEngine`
     //! through the REAL `SyscallDispatcher` on the SAME generic threaded
     //! `vcpu_loop` the HVF backend uses, via `run_threaded_kvm_loop` (which
     //! `run_oci` / `run_elf_real_dispatch` invoke). It mirrors the macOS loop's
@@ -583,15 +583,15 @@ pub mod runtime {
             &self,
             table: std::sync::Arc<crate::thread::FutexTable>,
         ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex> {
-            std::sync::Arc::new(carrick_linux::make_kvm_futex(table))
+            std::sync::Arc::new(carrick_vmm_kvm::make_kvm_futex(table))
         }
 
         fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator> {
-            Box::new(carrick_linux::KvmForkCoordinator::new())
+            Box::new(carrick_vmm_kvm::KvmForkCoordinator::new())
         }
 
         fn make_kicker(&self) -> std::sync::Arc<dyn carrick_hal::VcpuRegistry> {
-            std::sync::Arc::new(carrick_linux::KvmKicker::new())
+            std::sync::Arc::new(carrick_vmm_kvm::KvmKicker::new())
         }
 
         fn make_timer_delivery(
@@ -599,7 +599,7 @@ pub mod runtime {
             kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
             main_tid: crate::thread::ThreadId,
         ) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
-            std::sync::Arc::new(carrick_linux::KvmTimerDelivery { kicker, main_tid })
+            std::sync::Arc::new(carrick_vmm_kvm::KvmTimerDelivery { kicker, main_tid })
         }
     }
 
@@ -663,7 +663,7 @@ pub mod runtime {
         max_traps: usize,
     ) -> Result<RunResult, RuntimeError>
     where
-        E: carrick_hal::ThreadedEngine<KickHandle = carrick_linux::KvmKickHandle> + 'static,
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_vmm_kvm::KvmKickHandle> + 'static,
         E::SiblingSpec: 'static,
     {
         run_threaded_loop(engine, dispatcher, KvmHostBackend, max_traps)
@@ -895,7 +895,7 @@ pub mod runtime {
         // explicitly (same idiom as `guest_setup::program_sysregs`).
         use carrick_hal::GuestArch as _;
         let vdso_bytes =
-            <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::vdso_bytes();
+            <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::vdso_bytes();
         // `AddressSpaceError` and `TrapError` are absorbed by the unified
         // RuntimeError via `#[from]`, so `?` carries each through directly.
         let image = crate::memory::AddressSpace::load_elf(path)?
@@ -915,7 +915,7 @@ pub mod runtime {
                     b"TERM=dumb".as_slice(),
                 ],
             )?;
-        let mut engine = carrick_linux::KvmTrapEngine::new(&image)?;
+        let mut engine = carrick_vmm_kvm::KvmTrapEngine::new(&image)?;
         // Phase 2 Task 7: drive the generic MULTI-THREADED loop by default so
         // fork/execve/threads/futex guests run (handle_fork, sibling vCPUs, the
         // private/shared futex paths). The single-threaded thin loop
@@ -961,7 +961,7 @@ pub mod runtime {
         // replaced the hand-rolled `KvmX86TrapEngine`. It satisfies the same
         // `GuestMemory + SyscallTrap` (single-threaded) and `ThreadedEngine`
         // (multi-threaded) bounds, so the loop wiring below is unchanged.
-        let mut engine = carrick_linux::kvm_x86_engine::bring_up(&image)?;
+        let mut engine = carrick_vmm_kvm::kvm_x86_engine::bring_up(&image)?;
         // Default: the canonical multi-threaded loop, now SHARED with aarch64-KVM
         // and HVF (M3). `CARRICK_NO_THREADS` keeps the M1 single-threaded combined
         // loop reachable as an A/B fallback (mirrors the aarch64 arm). fork/clone/
@@ -1246,11 +1246,11 @@ pub mod runtime {
         // this is the Linux/KVM path.
         use carrick_hal::GuestArch as _;
         let image = image.with_vdso_bytes(
-            <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::vdso_bytes(),
+            <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::vdso_bytes(),
         )?;
 
         // 4. Run on KVM through the same generic threaded loop as run-elf.
-        let engine = carrick_linux::KvmTrapEngine::new(&image)?;
+        let engine = carrick_vmm_kvm::KvmTrapEngine::new(&image)?;
         run_threaded_kvm_loop(engine, dispatcher, spec.max_traps)
     }
 
@@ -1306,7 +1306,7 @@ pub mod host_signal {
 
     // `has_pending_for` / `has_unblocked_pending_for` are NOT pure re-exports on
     // KVM: a cross-process guest signal may be sitting in the shared xsignal ring
-    // (see `carrick_linux::kvm_xsig`), so a waiter must also peek the ring. These
+    // (see `carrick_vmm_kvm::kvm_xsig`), so a waiter must also peek the ring. These
     // wrappers fold the ring check over the neutral-core pending check, mirroring
     // the HVF backend's `host_signal::has_pending_for` / `has_unblocked_pending_for`.
 
@@ -1386,7 +1386,7 @@ pub mod host_signal {
         // re-arms a working pump (spawn-free — the spawn is the caller's
         // subsequent `start_signal_pump`). ----
         #[cfg(feature = "platform-linux")]
-        carrick_linux::kvm_signal_pump::reset_state_for_supervisor_fork();
+        carrick_vmm_kvm::kvm_signal_pump::reset_state_for_supervisor_fork();
         #[cfg(not(feature = "platform-linux"))]
         carrick_vmm_bhyve::bhyve_signal_pump::reset_state_for_supervisor_fork();
     }
@@ -1434,15 +1434,15 @@ pub mod host_signal {
     /// indexed by bit `signum` — the dispatcher's caller ABI). Because carrick
     /// does not host-exec, the host process would otherwise keep catching/ignoring
     /// those signals after the emulated disposition was replaced. Delegates to the
-    /// carrick-linux glue (parallels HVF's reset).
+    /// carrick-vmm-kvm glue (parallels HVF's reset).
     pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
         #[cfg(feature = "platform-linux")]
-        carrick_linux::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
+        carrick_vmm_kvm::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
         #[cfg(not(feature = "platform-linux"))]
         carrick_vmm_bhyve::bhyve_disposition::reset_routed_handlers_after_execve(ignored_mask);
     }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
-    /// neutral ring core (the nudge handler in `carrick_linux::kvm_xsig` set the
+    /// neutral ring core (the nudge handler in `carrick_vmm_kvm::kvm_xsig` set the
     /// dirty flag).
     pub fn xsig_has_pending() -> bool {
         carrick_signal_core::xsig::xsig_has_pending()
@@ -1478,10 +1478,10 @@ pub mod host_signal {
     /// host default action and TERMINATING the receiver (CPython
     /// test_interprocess_signal / LTP kill02). Idempotent; no-op for non-routable
     /// or KVM-claimed (pump/kick/nudge/SIGCHLD) signals. Delegates to the
-    /// carrick-linux glue, whose policy is the shared neutral host_disposition.
+    /// carrick-vmm-kvm glue, whose policy is the shared neutral host_disposition.
     pub fn ensure_host_handler(sig: i32) {
         #[cfg(feature = "platform-linux")]
-        carrick_linux::kvm_disposition::ensure_host_handler(sig);
+        carrick_vmm_kvm::kvm_disposition::ensure_host_handler(sig);
         #[cfg(not(feature = "platform-linux"))]
         carrick_vmm_bhyve::bhyve_disposition::ensure_host_handler(sig);
     }
@@ -1490,7 +1490,7 @@ pub mod host_signal {
     /// host-default-terminating us. No-op for non-routable / KVM-claimed signals.
     pub fn set_host_ignore(sig: i32) {
         #[cfg(feature = "platform-linux")]
-        carrick_linux::kvm_disposition::set_host_ignore(sig);
+        carrick_vmm_kvm::kvm_disposition::set_host_ignore(sig);
         #[cfg(not(feature = "platform-linux"))]
         carrick_vmm_bhyve::bhyve_disposition::set_host_ignore(sig);
     }
@@ -1499,7 +1499,7 @@ pub mod host_signal {
     /// possibly INHERITED across fork, so the host no longer swallows the signal.
     pub fn set_host_default(linux_signum: i32) {
         #[cfg(feature = "platform-linux")]
-        carrick_linux::kvm_disposition::set_host_default(linux_signum);
+        carrick_vmm_kvm::kvm_disposition::set_host_default(linux_signum);
         #[cfg(not(feature = "platform-linux"))]
         carrick_vmm_bhyve::bhyve_disposition::set_host_default(linux_signum);
     }
@@ -1517,10 +1517,10 @@ pub mod host_signal {
     }
     /// Nudge `target_host` (a sibling carrick process) to drain its xsignal ring
     /// — host `SIGRTMIN+1`, a pure wakeup whose handler marks the ring dirty +
-    /// kicks the target's vCPUs out of `KVM_RUN` (see `carrick_linux::kvm_xsig`).
+    /// kicks the target's vCPUs out of `KVM_RUN` (see `carrick_vmm_kvm::kvm_xsig`).
     pub fn xsig_nudge(target_host: i32) {
         #[cfg(feature = "platform-linux")]
-        carrick_linux::kvm_xsig::xsig_nudge(target_host);
+        carrick_vmm_kvm::kvm_xsig::xsig_nudge(target_host);
         #[cfg(not(feature = "platform-linux"))]
         carrick_vmm_bhyve::bhyve_xsig::xsig_nudge(target_host);
     }
@@ -1753,14 +1753,14 @@ pub mod io_wait {
     }
 
     /// Signals carrick reserves for its own cross-thread/cross-process plumbing
-    /// on the Linux lane: the vCPU kick (`carrick-linux`'s
+    /// on the Linux lane: the vCPU kick (`carrick-vmm-kvm`'s
     /// `kvm_kicker::kick_signal()` = `SIGRTMIN`) and the xsignal-ring nudge
     /// (`kvm_xsig::xsig_nudge_signal()` = `SIGRTMIN+1`). Guest signals never
     /// travel as these host numbers (guest RT signals ride the xsig ring; the
     /// shared kill path raises a host `SIGSTOP` carrier for RT/SIGCONT), so a
     /// traced child stopped on one of these is ALWAYS an implementation
     /// artifact, never guest-visible state. Mirrored by an equality test in
-    /// `carrick-linux` (`kvm_disposition`'s claimed-signal tests).
+    /// `carrick-vmm-kvm` (`kvm_disposition`'s claimed-signal tests).
     pub fn is_internal_kick_signal(signum: i32) -> bool {
         #[cfg(feature = "platform-linux")]
         {
@@ -1938,7 +1938,7 @@ pub mod io_wait {
                 // through to the re-arm retry below.
                 // A cross-process guest signal may instead be sitting in the
                 // shared xsignal ring (a SIGRTMIN+1 nudge marked it dirty — see
-                // `carrick_linux::kvm_xsig`): peek the ring (without consuming) so
+                // `carrick_vmm_kvm::kvm_xsig`): peek the ring (without consuming) so
                 // an `Interrupted` lets `deliver_pending_signal` drain it and
                 // re-inject the guest signal with the sender's siginfo. The
                 // `block_mask` keeps a genuinely-blocked ring signal parked.
@@ -1992,10 +1992,10 @@ pub mod io_wait {
         #[test]
         fn whitelist_matches_kvm_reserved_signals() {
             assert!(super::is_internal_kick_signal(
-                carrick_linux::kvm_kicker::kick_signal()
+                carrick_vmm_kvm::kvm_kicker::kick_signal()
             ));
             assert!(super::is_internal_kick_signal(
-                carrick_linux::kvm_xsig::nudge_signum()
+                carrick_vmm_kvm::kvm_xsig::nudge_signum()
             ));
             // Every standard signal (incl. the SIGSTOP RT/SIGCONT carrier the
             // shared kill path raises) stays guest-visible.

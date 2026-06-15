@@ -26,7 +26,7 @@ const HELLO: &[u8] = b"hello from carrick\n";
 fn runtime_loop_dispatches_static_elf_write_and_exit() {
     build_linux_fixture();
     let mut image = AddressSpace::load_elf(
-        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello",
+        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-vmm-kvm-aarch64-hello",
     )
     .unwrap();
     let message = image.find_bytes(HELLO).unwrap();

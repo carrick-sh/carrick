@@ -7,7 +7,7 @@
 //!
 //! Run on container 104 (root@<lab-ip>, x86_64 Ubuntu 24.04 with /dev/kvm):
 //! ```
-//! cargo test -p carrick-linux --test live_vcpu_x86 -- --nocapture
+//! cargo test -p carrick-vmm-kvm --test live_vcpu_x86 -- --nocapture
 //! ```
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -22,21 +22,21 @@ fn kvm_available() -> bool {
     Path::new("/dev/kvm").exists()
 }
 
-/// Locate the `carrick-linux` binary relative to the test executable.
+/// Locate the `carrick-vmm-kvm` binary relative to the test executable.
 ///
 /// `cargo test` places the test binary at `target/{profile}/deps/<name>-<hash>`;
-/// the carrick-linux binary is at `target/{profile}/carrick-linux` (one directory
+/// the carrick-vmm-kvm binary is at `target/{profile}/carrick-vmm-kvm` (one directory
 /// up, sibling of `deps/`).  This avoids relying on a CWD that is not
 /// guaranteed to be the workspace root.
 fn carrick_linux_bin_path() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     // target/{profile}/deps/live_vcpu_x86-<hash>
-    //   -> target/{profile}/carrick-linux
+    //   -> target/{profile}/carrick-vmm-kvm
     let profile_dir = exe
         .parent() // deps/
         .and_then(|p| p.parent()) // {profile}/
         .expect("unexpected test binary path structure");
-    profile_dir.join("carrick-linux")
+    profile_dir.join("carrick-vmm-kvm")
 }
 
 /// Locate the workspace root relative to the test executable.
@@ -174,7 +174,7 @@ fn test_m01_syscall_round_trip() {
         return;
     }
 
-    use carrick_linux::guest_setup_x86::{M01_BLOB_VA, m01_blob};
+    use carrick_vmm_kvm::guest_setup_x86::{M01_BLOB_VA, m01_blob};
 
     // Build the blob and wrap it in a minimal x86_64 ELF.
     let blob = m01_blob();
@@ -184,17 +184,22 @@ fn test_m01_syscall_round_trip() {
     let tmp_path = "/tmp/carrick_m01_blob.elf";
     std::fs::write(tmp_path, &elf_bytes).expect("write m01 elf");
 
-    // Run via the carrick-linux binary (routes to run_elf_kvm_x86 on x86_64).
+    // Run via the carrick-vmm-kvm binary (routes to run_elf_kvm_x86 on x86_64).
     // Derive the binary path from the test executable's location:
     //   test binary: target/{profile}/deps/live_vcpu_x86-<hash>
-    //   carrick-linux binary: target/{profile}/carrick-linux
+    //   carrick-vmm-kvm binary: target/{profile}/carrick-vmm-kvm
     let bin = carrick_linux_bin_path();
 
     eprintln!("[M0/M1] running blob ELF via {}", bin.display());
     let out = Command::new(&bin)
         .args(["run-elf", tmp_path])
         .output()
-        .unwrap_or_else(|e| panic!("carrick-linux binary must exist at {}: {e}", bin.display()));
+        .unwrap_or_else(|e| {
+            panic!(
+                "carrick-vmm-kvm binary must exist at {}: {e}",
+                bin.display()
+            )
+        });
 
     eprintln!(
         "[M0/M1] stdout={:?} stderr={:?} status={:?}",
@@ -256,7 +261,12 @@ fn test_m2_musl_static_hello() {
     let out = Command::new(&bin)
         .args(["run-elf", fixture.to_str().unwrap()])
         .output()
-        .unwrap_or_else(|e| panic!("carrick-linux binary must exist at {}: {e}", bin.display()));
+        .unwrap_or_else(|e| {
+            panic!(
+                "carrick-vmm-kvm binary must exist at {}: {e}",
+                bin.display()
+            )
+        });
 
     eprintln!(
         "[M2] stdout={:?} stderr={:?} status={:?}",

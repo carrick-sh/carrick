@@ -1,7 +1,7 @@
 //! Lean bhyve impls of the threaded-loop coordinator traits — the FreeBSD mirror
 //! of the KVM coordinator + pump lifecycle (SP4.2).
 //!
-//! Like the KVM [`carrick_linux::kvm_fork_coord::KvmForkCoordinator`], the bhyve
+//! Like the KVM [`carrick_vmm_kvm::kvm_fork_coord::KvmForkCoordinator`], the bhyve
 //! coordinator must STOP + JOIN the async host-signal pump daemon thread
 //! ([`crate::bhyve_signal_pump`]) before `libc::fork` and recreate it after: the
 //! pump takes process-global locks (signal-core pending table, child-watch table,

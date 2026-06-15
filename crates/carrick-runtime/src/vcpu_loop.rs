@@ -172,7 +172,7 @@ mod macos_helper_stubs {
         #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
         let image = {
             use carrick_hal::GuestArch as _;
-            type KvmArch = <carrick_linux::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
+            type KvmArch = <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
             raw.with_vdso_bytes(KvmArch::vdso_bytes())
                 .and_then(|a| a.with_linux_initial_stack(argv, env))
                 .map_err(|_| LINUX_ENOENT)?

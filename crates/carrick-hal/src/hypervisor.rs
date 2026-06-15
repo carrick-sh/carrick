@@ -1,6 +1,6 @@
 //! The raw hypervisor layer: a backend-agnostic vCPU/VM surface.
 //!
-//! KVM implements these in `carrick-linux`. HVF adoption is deferred —
+//! KVM implements these in `carrick-vmm-kvm`. HVF adoption is deferred —
 //! `HvfTrapEngine` keeps driving `applevisor` directly — so on macOS these
 //! traits are defined but unimplemented in this spec.
 

@@ -4,7 +4,7 @@
 # Builds two KVM drivers natively inside the guest and runs the freestanding
 # hello-aarch64 fixture against real /dev/kvm, diffing stdout + exit vs oracle:
 #
-#   1. carrick-linux (thin shim) — services write/exit directly, no dispatcher.
+#   1. carrick-vmm-kvm (thin shim) — services write/exit directly, no dispatcher.
 #      Kept for A/B comparison and as the closure-assert subject.
 #   2. carrick-kvm (REAL dispatch, Phase B) — drives KvmTrapEngine through the
 #      full carrick-runtime SyscallDispatcher. THIS is the Phase B gate.
@@ -31,7 +31,7 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
   set -euo pipefail
   source "$HOME/.cargo/env"
   cd "$REPO"
-  fixdir="$REPO/crates/carrick-linux/fixtures"
+  fixdir="$REPO/crates/carrick-vmm-kvm/fixtures"
 
   run_case() {
     # $1 = label, $2 = binary path, $3 = fixture name (dir == elf name)
@@ -47,8 +47,8 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
   }
 
   # 1. Thin shim (existing MVP path): freestanding hello, no dispatcher.
-  cargo build --release -p carrick-linux --target-dir "$HOME/ct" --locked
-  shim="$HOME/ct/release/carrick-linux"
+  cargo build --release -p carrick-vmm-kvm --target-dir "$HOME/ct" --locked
+  shim="$HOME/ct/release/carrick-vmm-kvm"
   run_case "thin-shim" "$shim" "hello-aarch64"
 
   # 1b. Phase 2 / Task 2: fork(2) — the load-bearing fork primitive, on the THIN
@@ -360,7 +360,7 @@ CEOF
     #     FUTEX_CMP_REQUEUE, which the dispatcher routes to the KvmFutex
     #     private_wait/private_wake/requeue methods (delegated to the in-process
     #     FutexTable). KvmFutex (Task 6) is COMPLETE and host-unit-tested
-    #     (`cargo test -p carrick-linux kvm_futex`); driving a condvar needs
+    #     (`cargo test -p carrick-vmm-kvm kvm_futex`); driving a condvar needs
     #     MULTIPLE vCPU threads (the generic threaded run loop), wired to KVM in
     #     Task 7 (run_threaded_kvm_loop). Now a REQUIRED gate (fatal on failure).
     cat > /tmp/ccv.c <<CEOF
@@ -406,7 +406,7 @@ CEOF
     #     shared-aperture address to KvmFutex::shared_wait/shared_wake (bare host
     #     SYS_futex on the inherited shared page). KvmFutex (Task 6) is COMPLETE
     #     and host-unit-tested for this round-trip (the cross-THREAD analogue runs
-    #     in `cargo test -p carrick-linux kvm_futex`). Driving it end-to-end
+    #     in `cargo test -p carrick-vmm-kvm kvm_futex`). Driving it end-to-end
     #     through the GUEST needs the full dispatcher shared_futex_host_addr
     #     GPA->host translation on the live VM AND the threaded run loop blocking
     #     futex re-dispatch -- both Task 7 (run_threaded_kvm_loop). The parent and

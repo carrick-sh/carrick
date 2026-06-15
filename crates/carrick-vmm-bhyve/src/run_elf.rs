@@ -1,6 +1,6 @@
 //! `run_elf_bhyve` — the M2 static-ELF startup service loop.
 //!
-//! Mirrors [`carrick_linux::run_elf_kvm`] exactly in structure: no
+//! Mirrors [`carrick_vmm_kvm::run_elf_kvm`] exactly in structure: no
 //! `carrick-runtime` dependency (the crate stays cycle-free and FreeBSD-
 //! compilable).  Services the x86_64 musl-static startup syscall set
 //! discovered trap-driven on the FreeBSD box.

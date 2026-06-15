@@ -1,6 +1,6 @@
 //! `BhyveVm` / `BhyveVcpu`: the raw-hypervisor layer on FreeBSD/bhyve via the
 //! userspace **libvmmapi** (`/usr/lib/libvmmapi.so`). The KVM analog is
-//! `carrick-linux::kvm`.
+//! `carrick-vmm-kvm::kvm`.
 //!
 //! Arch split: the opaque handles, VM/vCPU lifecycle, guest-RAM calls
 //! (`vm_setup_memory`/`vm_mmap_memseg`/`vm_map_gpa`), and the extern block are
@@ -494,7 +494,7 @@ impl BhyveVm {
 
     /// Host pointer into guest-physical `[gpa, gpa+len)` (bhyve owns the
     /// backing). Used by the bhyve GuestMemory to read/write syscall buffers —
-    /// the analog of carrick-linux's host mmap. `None` if the GPA is unmapped.
+    /// the analog of carrick-vmm-kvm's host mmap. `None` if the GPA is unmapped.
     pub fn map_gpa(&self, gpa: u64, len: usize) -> Option<*mut u8> {
         // SAFETY: `self.inner.ctx` is live; vm_map_gpa returns NULL for an unmapped GPA.
         let p = unsafe { vm_map_gpa(self.inner.ctx, gpa, len) };

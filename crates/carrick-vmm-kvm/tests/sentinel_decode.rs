@@ -1,6 +1,6 @@
-//! Pure-logic tests for carrick-linux guest_setup (no KVM needed).
+//! Pure-logic tests for carrick-vmm-kvm guest_setup (no KVM needed).
 #![cfg(target_os = "linux")]
-use carrick_linux::guest_setup::{SENTINEL_GPA, el1_vectors_sentinel_bytes};
+use carrick_vmm_kvm::guest_setup::{SENTINEL_GPA, el1_vectors_sentinel_bytes};
 
 fn op_at(bytes: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
