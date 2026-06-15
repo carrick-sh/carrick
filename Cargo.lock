@@ -558,6 +558,7 @@ dependencies = [
 name = "carrick-vmm-bhyve"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
  "carrick-abi",
  "carrick-guest-mem",
  "carrick-hal",

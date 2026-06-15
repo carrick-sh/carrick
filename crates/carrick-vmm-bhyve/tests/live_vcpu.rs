@@ -14,14 +14,15 @@ use std::sync::Mutex;
 
 use carrick_vmm_bhyve::X86Exit;
 use carrick_vmm_bhyve::guest_setup_x86::{
-    BroughtUpM0, GDT_LEN, PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_GDT_GPA,
-    X86_INIT_BLOB_GPA, X86_MEM_SIZE, X86_PML4_GPA, X86_STACK_TOP_GPA, bring_up_m0, bring_up_x86,
-    complete_inout,
+    BroughtUpM0, FAULT_DOORBELL_PORT, FaultScratchRecord, GDT_LEN, M1_BLOB_VA, PROT_RWX,
+    SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_GDT_GPA, X86_INIT_BLOB_GPA, X86_MEM_SIZE,
+    X86_PML4_GPA, X86_STACK_TOP_GPA, bring_up_m0, bring_up_x86, bring_up_x86_m1, complete_inout,
+    fault_scratch_gpa, fault_scratch_record_from_bytes,
 };
 use carrick_vmm_bhyve::vmm::BhyveVm;
 use carrick_vmm_bhyve::vmm_x86::{
-    VM_REG_GUEST_CR0, VM_REG_GUEST_CR3, VM_REG_GUEST_CR4, VM_REG_GUEST_CS, VM_REG_GUEST_EFER,
-    VM_REG_GUEST_GDTR, VM_REG_GUEST_RAX, VM_REG_GUEST_RIP, VM_REG_GUEST_SS,
+    VM_REG_GUEST_CR0, VM_REG_GUEST_CR2, VM_REG_GUEST_CR3, VM_REG_GUEST_CR4, VM_REG_GUEST_CS,
+    VM_REG_GUEST_EFER, VM_REG_GUEST_GDTR, VM_REG_GUEST_RAX, VM_REG_GUEST_RIP, VM_REG_GUEST_SS,
 };
 
 /// Serialize the live tests (pid-derived VM names; see module docs).
@@ -333,6 +334,70 @@ fn t6_register_diff_oracle() {
          M0-GDTR-limit={m0_gdtr_limit} cx-GDTR-limit={cx_gdtr_limit} \
          cx-GDTR-base={cx_gdtr_base:#x} cx-CR3={cx_cr3:#x} cx-RIP={cx_rip:#x}"
     );
+}
+
+/// SP4.3 gate: a ring-3 page fault must vector through carrick's guest IDT,
+/// switch to a real TSS.RSP0 stack, and reach the ring-0 fault doorbell
+/// (`OUT %al,$0xC7`) instead of triple-faulting through the empty IDT.
+#[test]
+fn sp4_page_fault_reaches_fault_doorbell() {
+    if !vmm_available() {
+        eprintln!("SKIP: vmm not available (/dev/vmm missing and kldstat -q -m vmm failed)");
+        return;
+    }
+    let _guard = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut bux = bring_up_x86_m1().expect("M1 bring-up for #PF probe");
+    let probe_gpa = bux
+        .ram
+        .windows
+        .iter()
+        .find(|w| w.va == M1_BLOB_VA)
+        .map(|w| w.gpa)
+        .expect("M1 blob window");
+    let probe = [
+        0x31, 0xC0, // xor %eax,%eax
+        0x48, 0x89, 0x00, // mov %rax,(%rax) => #PF at VA 0
+        0xEB, 0xFE, // jmp .
+    ];
+    let host = bux
+        .vm
+        .map_gpa(probe_gpa, probe.len())
+        .expect("map probe blob GPA");
+    // SAFETY: vm_map_gpa proved [host, host+probe.len()) is live guest RAM.
+    unsafe { std::ptr::copy_nonoverlapping(probe.as_ptr(), host, probe.len()) };
+
+    let mut saw_fault_doorbell = false;
+    for _ in 0..16 {
+        match bux.vcpu.run_x86().expect("vm_run #PF probe") {
+            X86Exit::Inout {
+                port: FAULT_DOORBELL_PORT,
+                is_in: false,
+                bytes: 1,
+                ..
+            } => {
+                saw_fault_doorbell = true;
+                break;
+            }
+            X86Exit::Bogus => continue,
+            other => panic!("expected #PF fault doorbell on 0xC7, got {other:?}"),
+        }
+    }
+
+    assert!(saw_fault_doorbell, "#PF probe did not reach fault doorbell");
+    let scratch_gpa = fault_scratch_gpa(0).expect("fault scratch GPA");
+    let mut scratch = [0u8; std::mem::size_of::<FaultScratchRecord>()];
+    let scratch_host = bux
+        .vm
+        .map_gpa(scratch_gpa, scratch.len())
+        .expect("map fault scratch GPA");
+    // SAFETY: vm_map_gpa proved [scratch_host, scratch_host+len) is live guest RAM.
+    unsafe { std::ptr::copy_nonoverlapping(scratch_host, scratch.as_mut_ptr(), scratch.len()) };
+    let scratch = fault_scratch_record_from_bytes(&scratch).expect("decode fault scratch");
+    assert_eq!(scratch.vector(), 14, "#PF probe must report vector 14");
+    let cr2 = bux.vcpu.get_reg_raw(VM_REG_GUEST_CR2).expect("CR2");
+    assert_eq!(cr2, 0, "#PF probe CR2 must be the null VA");
+    bux.vm.destroy().expect("clean vm_destroy (#PF probe)");
 }
 
 /// SPIKE (SP1.1): does `minherit(INHERIT_COPY)` give a forked child a

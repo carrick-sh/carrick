@@ -236,6 +236,160 @@ pub const MAINT_DOORBELL_PORT: u16 = 0xC6;
 /// two. Shares the `0xC6` ordinal with the (still-unused, M3-reserved)
 /// `MAINT_DOORBELL_PORT`; SP3.2 is the first live user of `0xC6`.
 pub const FP_STUB_DOORBELL_PORT: u16 = 0xC6;
+/// The SP4.3 synchronous-fault doorbell port. Guest IDT stubs report fault
+/// vectors through `OUT %al,$0xC7`, leaving the vector/error-code record in the
+/// per-vCPU scratch page and CR2 in the hardware register.
+pub const FAULT_DOORBELL_PORT: u16 = 0xC7;
+
+/// Per-vCPU guest IDT pages. Each vCPU gets a private IDT so later per-vCPU
+/// fault scratch/stub addresses can diverge without cross-vCPU races.
+pub const X86_FAULT_IDT_GPA: u64 = 0x10_C000;
+/// Per-vCPU ring-0 fault stub pages.
+pub const X86_FAULT_STUB_GPA: u64 = 0x11_4000;
+/// Per-vCPU scratch pages; offset 0 = vector (u64), offset 8 = error code (u64).
+pub const X86_FAULT_SCRATCH_GPA: u64 = 0x11_C000;
+/// Per-vCPU 64-bit TSS pages. The TSS has a real RSP0 for ring-3 faults.
+pub const X86_FAULT_TSS_GPA: u64 = 0x12_4000;
+/// Per-vCPU ring-0 fault stacks used through TSS.RSP0.
+pub const X86_FAULT_STACK_GPA: u64 = 0x12_C000;
+/// Number of per-vCPU fault slots. Matches the FP scratch slot count.
+pub const X86_FAULT_SLOTS: u64 = 8;
+
+const X86_IDT_ENTRIES: usize = 256;
+const X86_IDT_BYTES: usize = X86_IDT_ENTRIES * 16;
+const X86_FAULT_STUB_STRIDE: u64 = 64;
+const X86_TSS64_BYTES: usize = 104;
+const X86_TSS64_LIMIT: u32 = (X86_TSS64_BYTES - 1) as u32;
+const X86_FAULT_VECTORS: &[u8] = &[0, 6, 8, 10, 11, 12, 13, 14, 16, 17, 19];
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct IdtGateAttrs: u8 {
+        const INTERRUPT_GATE_64 = 0x0E;
+        const PRESENT = 0x80;
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct IdtGate64 {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,
+    attrs: u8,
+    offset_mid: u16,
+    offset_high: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<IdtGate64>() == 16);
+
+impl IdtGate64 {
+    fn interrupt(offset: u64) -> Self {
+        Self {
+            offset_low: offset as u16,
+            selector: KERN_CS64_SEL as u16,
+            ist: 0,
+            attrs: (IdtGateAttrs::PRESENT | IdtGateAttrs::INTERRUPT_GATE_64).bits(),
+            offset_mid: (offset >> 16) as u16,
+            offset_high: (offset >> 32) as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Idt64 {
+    gates: [IdtGate64; X86_IDT_ENTRIES],
+}
+
+const _: () = assert!(std::mem::size_of::<Idt64>() == X86_IDT_BYTES);
+
+impl Default for Idt64 {
+    fn default() -> Self {
+        Self {
+            gates: [IdtGate64::default(); X86_IDT_ENTRIES],
+        }
+    }
+}
+
+/// Raw SP4.3 fault-doorbell record written by the guest fault stub.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+pub struct FaultScratchRecord {
+    vector: u64,
+    error_code: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<FaultScratchRecord>() == 16);
+
+impl FaultScratchRecord {
+    pub fn new(vector: u64, error_code: u64) -> Self {
+        Self { vector, error_code }
+    }
+
+    pub fn vector(self) -> u64 {
+        self.vector
+    }
+
+    pub fn error_code(self) -> u64 {
+        self.error_code
+    }
+}
+
+pub fn fault_scratch_record_from_bytes(bytes: &[u8]) -> Result<FaultScratchRecord, OsError> {
+    let size = std::mem::size_of::<FaultScratchRecord>();
+    if bytes.len() < size {
+        return Err(OsError::new(format!(
+            "bhyve: fault scratch record too short: {} < {size}",
+            bytes.len()
+        )));
+    }
+    // SAFETY: FaultScratchRecord is repr(C, packed) POD integer fields, and
+    // read_unaligned copies exactly the record prefix from the byte slice.
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<FaultScratchRecord>()) })
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Tss64 {
+    reserved0: u32,
+    rsp: [u64; 3],
+    reserved1: u64,
+    ist: [u64; 7],
+    reserved2: u64,
+    reserved3: u16,
+    iopb: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<Tss64>() == X86_TSS64_BYTES);
+
+impl Tss64 {
+    fn new(rsp0: u64) -> Self {
+        Self {
+            reserved0: 0,
+            rsp: [rsp0, 0, 0],
+            reserved1: 0,
+            ist: [0; 7],
+            reserved2: 0,
+            reserved3: 0,
+            iopb: X86_TSS64_BYTES as u16,
+        }
+    }
+}
+
+fn bytes_of<T>(value: &T) -> &[u8] {
+    // SAFETY: callers pass plain repr(C, packed) integer-only structs/arrays
+    // that are copied immediately into guest RAM. The returned slice is tied to
+    // `value` and never outlives it.
+    unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(value).cast::<u8>(),
+            std::mem::size_of::<T>(),
+        )
+    }
+}
 
 /// M0 guest RAM: 32 MiB, all lowmem (≤ 3 GiB ⇒ a single `[0, len)` sysmem
 /// mapping; see the module docs).
@@ -448,6 +602,168 @@ pub fn fp_stub_bytes() -> [u8; 16] {
 /// Write the SP3.2 FXSAVE/FXRSTOR stubs into [`X86_FP_STUB_GPA`].
 fn write_fp_stub(vm: &BhyveVm) -> Result<(), OsError> {
     write_gpa(vm, X86_FP_STUB_GPA, &fp_stub_bytes())
+}
+
+fn add_fault_windows(ram: &mut BhyveGuestRam) {
+    let slots_len = (X86_FAULT_SLOTS as usize) * 4096;
+    ram.add_fixed(
+        X86_FAULT_IDT_GPA,
+        X86_FAULT_IDT_GPA,
+        slots_len,
+        false,
+        false,
+        false,
+    );
+    ram.add_fixed(
+        X86_FAULT_STUB_GPA,
+        X86_FAULT_STUB_GPA,
+        slots_len,
+        false,
+        false,
+        true,
+    );
+    ram.add_fixed(
+        X86_FAULT_SCRATCH_GPA,
+        X86_FAULT_SCRATCH_GPA,
+        slots_len,
+        false,
+        true,
+        false,
+    );
+    ram.add_fixed(
+        X86_FAULT_TSS_GPA,
+        X86_FAULT_TSS_GPA,
+        slots_len,
+        false,
+        true,
+        false,
+    );
+    ram.add_fixed(
+        X86_FAULT_STACK_GPA,
+        X86_FAULT_STACK_GPA,
+        slots_len,
+        false,
+        true,
+        false,
+    );
+}
+
+fn fault_slot_gpa(base: u64, id: c_int) -> Result<u64, OsError> {
+    let id = u64::try_from(id).map_err(|_| OsError::new("bhyve: negative vCPU id"))?;
+    if id >= X86_FAULT_SLOTS {
+        return Err(OsError::new(format!(
+            "bhyve: vCPU id {id} exceeds X86_FAULT_SLOTS={X86_FAULT_SLOTS}"
+        )));
+    }
+    Ok(base + id * 4096)
+}
+
+/// Return the per-vCPU fault scratch GPA. Tests use this to pin the raw SP4.3
+/// doorbell record.
+pub fn fault_scratch_gpa(id: c_int) -> Result<u64, OsError> {
+    fault_slot_gpa(X86_FAULT_SCRATCH_GPA, id)
+}
+
+fn vector_has_error_code(vector: u8) -> bool {
+    matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17)
+}
+
+fn fault_idt(stub_base: u64) -> Idt64 {
+    let mut idt = Idt64::default();
+    for &vector in X86_FAULT_VECTORS {
+        let offset = stub_base + u64::from(vector) * X86_FAULT_STUB_STRIDE;
+        idt.gates[usize::from(vector)] = IdtGate64::interrupt(offset);
+    }
+    idt
+}
+
+fn push_store_rax_riprel(stub: &mut Vec<u8>, insn_va: u64, target: u64) -> Result<(), OsError> {
+    // mov %rax, disp32(%rip)
+    let next = insn_va + 7;
+    let disp = i64::try_from(target)
+        .and_then(|t| i64::try_from(next).map(|n| t - n))
+        .map_err(|_| OsError::new("bhyve: fault stub RIP-relative target overflow"))?;
+    let disp = i32::try_from(disp)
+        .map_err(|_| OsError::new("bhyve: fault stub RIP-relative displacement overflow"))?;
+    stub.extend_from_slice(&[0x48, 0x89, 0x05]);
+    stub.extend_from_slice(&disp.to_le_bytes());
+    Ok(())
+}
+
+fn fault_stub_for_vector(
+    stub_start: u64,
+    scratch_gpa: u64,
+    vector: u8,
+) -> Result<Vec<u8>, OsError> {
+    let mut stub = Vec::with_capacity(X86_FAULT_STUB_STRIDE as usize);
+
+    // scratch[0] = vector as u64
+    stub.extend_from_slice(&[0x48, 0xB8]); // movabs imm64,%rax
+    stub.extend_from_slice(&u64::from(vector).to_le_bytes());
+    let store_vector_va = stub_start + stub.len() as u64;
+    push_store_rax_riprel(&mut stub, store_vector_va, scratch_gpa)?;
+
+    // scratch[8] = CPU-pushed error code, or 0 for vectors without one.
+    if vector_has_error_code(vector) {
+        stub.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov (%rsp),%rax
+    } else {
+        stub.extend_from_slice(&[0x31, 0xC0]); // xor %eax,%eax
+    }
+    let store_error_va = stub_start + stub.len() as u64;
+    push_store_rax_riprel(&mut stub, store_error_va, scratch_gpa + 8)?;
+
+    // Report the vector and park. The host consumes the INOUT exit.
+    stub.extend_from_slice(&[0xB0, vector, 0xE6, FAULT_DOORBELL_PORT as u8, 0xEB, 0xFE]);
+
+    if stub.len() > X86_FAULT_STUB_STRIDE as usize {
+        return Err(OsError::new(format!(
+            "bhyve: fault stub for vector {vector} is {} bytes, stride is {}",
+            stub.len(),
+            X86_FAULT_STUB_STRIDE
+        )));
+    }
+    Ok(stub)
+}
+
+fn fault_stub_page(stub_base: u64, scratch_gpa: u64) -> Result<[u8; 4096], OsError> {
+    let mut page = [0u8; 4096];
+    for &vector in X86_FAULT_VECTORS {
+        let off = usize::from(vector) * X86_FAULT_STUB_STRIDE as usize;
+        let stub = fault_stub_for_vector(stub_base + off as u64, scratch_gpa, vector)?;
+        page[off..off + stub.len()].copy_from_slice(&stub);
+    }
+    Ok(page)
+}
+
+fn write_fault_tables(vm: &BhyveVm, id: c_int) -> Result<(), OsError> {
+    let idt_gpa = fault_slot_gpa(X86_FAULT_IDT_GPA, id)?;
+    let stub_gpa = fault_slot_gpa(X86_FAULT_STUB_GPA, id)?;
+    let scratch_gpa = fault_slot_gpa(X86_FAULT_SCRATCH_GPA, id)?;
+    let tss_gpa = fault_slot_gpa(X86_FAULT_TSS_GPA, id)?;
+    let stack_gpa = fault_slot_gpa(X86_FAULT_STACK_GPA, id)?;
+
+    let idt = fault_idt(stub_gpa);
+    write_gpa(vm, idt_gpa, bytes_of(&idt))?;
+
+    let stubs = fault_stub_page(stub_gpa, scratch_gpa)?;
+    write_gpa(vm, stub_gpa, &stubs)?;
+
+    let scratch = FaultScratchRecord::default();
+    write_gpa(vm, scratch_gpa, bytes_of(&scratch))?;
+
+    let tss = Tss64::new(stack_gpa + 4096);
+    write_gpa(vm, tss_gpa, bytes_of(&tss))?;
+    Ok(())
+}
+
+fn program_fault_tables(vcpu: &mut BhyveVcpu, vm: &BhyveVm, id: c_int) -> Result<(), OsError> {
+    write_fault_tables(vm, id)?;
+    let idt_gpa = fault_slot_gpa(X86_FAULT_IDT_GPA, id)?;
+    let tss_gpa = fault_slot_gpa(X86_FAULT_TSS_GPA, id)?;
+    vcpu.set_desc(VM_REG_GUEST_IDTR, idt_gpa, (X86_IDT_BYTES - 1) as u32, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_TR, tss_gpa, X86_TSS64_LIMIT, ACCESS_TSS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+    Ok(())
 }
 
 /// A brought-up M0 VM: the doorbell blob is loaded, the identity PML4 + boot
@@ -867,17 +1183,11 @@ pub struct BroughtUpX86 {
 /// 4. Program vCPU via `vm_set_register` + `vm_set_desc`:
 ///    - CR0/CR4/EFER from `X8664GuestArch::bootstrap_sysregs()` (EFER = 0xD01,
 ///      overriding `vm_setup_freebsd_registers`'s 0x1500 — adds SCE+NXE).
-///    - CS = uCS64 (0x23, ring-3 pre-loaded for VT-x iretq); SS = uSS (0x1B,
-///      ring-3); DS/ES/FS/GS = user data (0x1B, ACCESS_RING3_DATA).  VT-x
-///      requires the hidden descriptor fields for any iretq-loaded selector to
-///      be programmed BEFORE vm_run (Intel SDM vol. 3 §21.3.1.2); setting them
-///      to ring-3 values here is idempotent — the init blob only executes
-///      WRMSRs then iretq (no data-segment access at ring-0).
+///    - Initial CS/SS/DS/ES/FS/GS are ring-0 descriptors so the init blob can
+///      WRMSR; the blob's iretq frame loads user CS/SS (0x23/0x1B) from the GDT.
 ///    - GDTR = carrick's 5-entry GDT (base = `X86_GDT_GPA`, limit = 5*8-1 = 39).
-///    - IDTR = base 0, limit 0 (valid-but-empty; SFMASK masks IF; ring-3
-///      exceptions become VM exits per spec §4.3/§6; real IDT is M3).
-///    - TR = TSS64 at base 0, limit 0x67 (minimum 64-bit TSS size per Intel
-///      SDM vol. 3 §7.2.1 — vmm.ko requires a valid TSS).
+///    - IDTR = carrick's SP4.3 fault IDT; exception gates doorbell on 0xC7.
+///    - TR = per-vCPU TSS64 with a real RSP0 for ring-3 fault stack switches.
 ///    - LDTR = unusable (no LDT in Phase 2).
 ///    - RIP = `X86_INIT_BLOB_GPA`; RSP = `LINUX_STACK_TOP` (guest VA); RFLAGS = 0x2.
 ///    - CR3 = `X86_PML4_GPA` (the PML4 root GPA).
@@ -951,6 +1261,7 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
         true,
         false,
     );
+    add_fault_windows(&mut ram);
 
     // PML4 tables: supervisor, no user bit, read-write.
     ram.add_fixed(
@@ -1074,18 +1385,12 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
     // limit = GDT_LEN * 8 - 1 = 5*8-1 = 39 (Intel SDM vol. 3 §2.4.3).
     vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
 
-    // IDTR: valid-but-empty (base=0, limit=0; no real IDT in Phase 2).
-    // ring-3 exceptions surface as VM exits (spec §4.3); SFMASK masks IF.
-    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
-
     // LDTR: unusable (no LDT in Phase 2).
     vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
     vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
 
-    // TR: 64-bit TSS available (VT-x requires a valid TSS; Intel SDM vol. 3
-    // §7.2.1 minimum size = 0x67 bytes; use base=0 with the dummy GPA).
-    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
-    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+    // IDTR + TR: real SP4.3 fault IDT and 64-bit TSS with RSP0.
+    program_fault_tables(&mut vcpu, &vm, 0)?;
 
     // ── Step 4b: ring-3 segment descriptors ──────────────────────────────
     //
@@ -1163,6 +1468,7 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
         true,
         false,
     );
+    add_fault_windows(&mut ram);
     ram.add_fixed(
         LINUX_PAGE_TABLES_BASE,
         X86_PML4_GPA,
@@ -1257,11 +1563,9 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
     }
 
     vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
-    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
     vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
     vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
-    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
-    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+    program_fault_tables(&mut vcpu, &vm, 0)?;
 
     vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
 
@@ -1363,6 +1667,7 @@ pub fn bring_up_x86_elf(
         true,
         false,
     );
+    add_fault_windows(&mut ram);
     ram.add_fixed(
         LINUX_PAGE_TABLES_BASE,
         X86_PML4_GPA,
@@ -1515,11 +1820,9 @@ pub fn bring_up_x86_elf(
     }
 
     vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
-    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
     vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
     vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
-    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
-    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+    program_fault_tables(&mut vcpu, &vm, 0)?;
 
     vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
 
@@ -1812,12 +2115,9 @@ pub fn program_x86_vcpu_longmode_entry(
         vcpu.set_reg_raw(reg, KERN_SS_SEL)?;
     }
     vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
-    vcpu.set_desc(VM_REG_GUEST_IDTR, 0, 0, 0)?;
     vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
     vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
-    // TR: VT-x requires a usable 64-bit TSS for VM entry (base 0, limit 0x67).
-    vcpu.set_desc(VM_REG_GUEST_TR, 0, 0x67, ACCESS_TSS64)?;
-    vcpu.set_reg_raw(VM_REG_GUEST_TR, 0)?;
+    program_fault_tables(vcpu, vm, id)?;
 
     // FS/GS bases — set LAST, via vm_set_desc (the FS/GS descriptor overrides
     // above set base = 0; rewrite them with the inherited bases, preserving the
