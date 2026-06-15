@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 /// reproducible and usable verbatim as the cache key.
 #[derive(Serialize)]
 struct OracleKey<'a> {
+    docker_platform: &'a str,
     image: &'a str,
     cmd: &'a [String],
     docker_flags: &'a [String],
@@ -42,12 +43,13 @@ struct OracleKey<'a> {
 /// Canonical determinant key for a suite's docker oracle. Carrick-only fields
 /// (`carrick_flags`, `env_carrick`, `entrypoint.carrick`) and the per-run
 /// `--name`/run-id are deliberately excluded — they cannot change docker output.
-pub fn oracle_key(suite: &Suite) -> String {
+pub fn oracle_key(suite: &Suite, platform: crate::lane::DockerPlatform) -> String {
     let mut env: Vec<String> = Vec::new();
     for kv in suite.env.iter().chain(suite.env_docker.iter()) {
         env.push(format!("{}={}", kv.key, kv.val));
     }
     let key = OracleKey {
+        docker_platform: platform.as_str(),
         image: &suite.image,
         cmd: &suite.cmd,
         docker_flags: &suite.docker_flags,
@@ -113,8 +115,12 @@ impl OracleCache {
     /// phantom REGRESSION. Normalizing at load keeps every old cache
     /// comparable without a re-bless. Fail dominates on a collision, matching
     /// the parser's own merge rule.
-    pub fn get(&self, suite: &Suite) -> Option<SuiteResult> {
-        let mut result = self.by_key.get(&oracle_key(suite))?.result.clone();
+    pub fn get(&self, suite: &Suite, platform: crate::lane::DockerPlatform) -> Option<SuiteResult> {
+        let mut result = self
+            .by_key
+            .get(&oracle_key(suite, platform))?
+            .result
+            .clone();
         if suite.verdict == VerdictKind::Gotest {
             let mut ids: BTreeMap<String, Outcome> = BTreeMap::new();
             for (id, o) in std::mem::take(&mut result.ids) {
@@ -138,11 +144,16 @@ impl OracleCache {
     /// Cache a freshly-run docker result. Refuses a non-comparable (crashed /
     /// empty) oracle so a broken run is retried next time, never frozen. Returns
     /// whether it was stored.
-    pub fn insert(&mut self, suite: &Suite, result: SuiteResult) -> bool {
+    pub fn insert(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        result: SuiteResult,
+    ) -> bool {
         if !is_cacheable(&result) {
             return false;
         }
-        let key = oracle_key(suite);
+        let key = oracle_key(suite, platform);
         self.by_key.insert(
             key.clone(),
             OracleRecord {
@@ -288,8 +299,8 @@ mod tests {
         b.timeout_s = 999;
         b.known_gaps = vec!["g".into()];
         assert_eq!(
-            oracle_key(&a),
-            oracle_key(&b),
+            oracle_key(&a, crate::lane::DockerPlatform::LinuxArm64),
+            oracle_key(&b, crate::lane::DockerPlatform::LinuxArm64),
             "carrick-only deltas must not change the key"
         );
     }
@@ -313,11 +324,21 @@ mod tests {
             let mut b = base_suite();
             mutate(&mut b);
             assert_ne!(
-                oracle_key(&a),
-                oracle_key(&b),
+                oracle_key(&a, crate::lane::DockerPlatform::LinuxArm64),
+                oracle_key(&b, crate::lane::DockerPlatform::LinuxArm64),
                 "a docker-affecting field must change the key"
             );
         }
+    }
+
+    #[test]
+    fn key_differs_when_docker_platform_differs() {
+        let s = base_suite();
+        assert_ne!(
+            oracle_key(&s, crate::lane::DockerPlatform::LinuxArm64),
+            oracle_key(&s, crate::lane::DockerPlatform::LinuxAmd64),
+            "linux/arm64 and linux/amd64 oracles must not share cache keys"
+        );
     }
 
     #[test]
@@ -331,13 +352,17 @@ mod tests {
         );
 
         let mut cache = OracleCache::load(&path);
-        assert!(cache.get(&s).is_none(), "empty cache must miss");
-        assert!(cache.insert(&s, r.clone()), "comparable result must store");
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        assert!(cache.get(&s, platform).is_none(), "empty cache must miss");
+        assert!(
+            cache.insert(&s, platform, r.clone()),
+            "comparable result must store"
+        );
         assert!(cache.dirty());
         cache.save().expect("save");
 
         let reloaded = OracleCache::load(&path);
-        let got = reloaded.get(&s).expect("hit after reload");
+        let got = reloaded.get(&s, platform).expect("hit after reload");
         assert_eq!(got.result, SuiteOutcome::Failure);
         assert_eq!(got.totals.n, 2);
         assert_eq!(got.ids.get("t1").copied(), Some(Outcome::Ok));
@@ -351,14 +376,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let s = base_suite();
         let mut cache = OracleCache::load(&path);
-        cache.insert(&s, result(&[("t", Outcome::Ok)], SuiteOutcome::Success));
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        cache.insert(
+            &s,
+            platform,
+            result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
+        );
         cache.save().unwrap();
 
         let reloaded = OracleCache::load(&path);
         let mut changed = base_suite();
         changed.cmd.push("--new-arg".into());
-        assert!(reloaded.get(&changed).is_none(), "changed cmd must miss");
-        assert!(reloaded.get(&s).is_some(), "unchanged suite still hits");
+        assert!(
+            reloaded.get(&changed, platform).is_none(),
+            "changed cmd must miss"
+        );
+        assert!(
+            reloaded.get(&s, platform).is_some(),
+            "unchanged suite still hits"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -479,10 +515,11 @@ mod tests {
         let s = base_suite();
         let mut cache = OracleCache::load(&path);
         // docker hung / crashed -> result None, must NOT be cached.
-        assert!(!cache.insert(&s, result(&[], SuiteOutcome::None)));
-        assert!(!cache.insert(&s, result(&[], SuiteOutcome::Empty)));
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        assert!(!cache.insert(&s, platform, result(&[], SuiteOutcome::None)));
+        assert!(!cache.insert(&s, platform, result(&[], SuiteOutcome::Empty)));
         assert!(!cache.dirty(), "nothing stored");
-        assert!(cache.get(&s).is_none());
+        assert!(cache.get(&s, platform).is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -2,7 +2,8 @@
 //! local signed binary (the existing behavior); `Kvm` wraps the SAME carrick
 //! argv as `limactl shell <vm> -- env … <carrick-in-guest> run …`, rewriting the
 //! `localhost` conformance-registry host to the lima gateway so the guest can
-//! pull from the mac registry.
+//! pull from the mac registry. `KvmLocal` runs a platform-linux carrick binary
+//! directly on a Linux host with `/dev/kvm`.
 
 use crate::engine::carrick_argv;
 use crate::manifest::Suite;
@@ -23,16 +24,51 @@ pub struct LimaConfig {
     pub timeout_scale: f64,
 }
 
+/// Direct Linux/KVM lane configuration. The timeout scale is kept separate from
+/// Lima: a native x86_64 KVM host should be faster than nested Lima by default,
+/// but the operator can still stretch deadlines for loaded hosts.
+#[derive(Clone, Debug)]
+pub struct LocalKvmConfig {
+    pub timeout_scale: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockerPlatform {
+    LinuxArm64,
+    LinuxAmd64,
+}
+
+impl DockerPlatform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DockerPlatform::LinuxArm64 => "linux/arm64",
+            DockerPlatform::LinuxAmd64 => "linux/amd64",
+        }
+    }
+}
+
 /// The selected lane. `Kvm` carries the lima wiring.
 #[derive(Clone, Debug)]
 pub enum Lane {
     Hvf,
     Kvm(LimaConfig),
+    KvmLocal(LocalKvmConfig),
 }
 
 impl Lane {
-    pub fn is_kvm(&self) -> bool {
+    pub fn is_lima_kvm(&self) -> bool {
         matches!(self, Lane::Kvm(_))
+    }
+
+    pub fn needs_local_registry_env(&self) -> bool {
+        matches!(self, Lane::Hvf | Lane::KvmLocal(_))
+    }
+
+    pub fn docker_platform(&self) -> DockerPlatform {
+        match self {
+            Lane::Hvf | Lane::Kvm(_) => DockerPlatform::LinuxArm64,
+            Lane::KvmLocal(_) => DockerPlatform::LinuxAmd64,
+        }
     }
 
     /// The carrick-run deadline for a suite on this lane: `timeout_s` as-is on
@@ -42,6 +78,7 @@ impl Lane {
         match self {
             Lane::Hvf => timeout_s,
             Lane::Kvm(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
+            Lane::KvmLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
         }
     }
 }
@@ -88,6 +125,9 @@ pub fn carrick_invocation_argv(
     let base = carrick_argv(suite, carrick_bin, run_id); // [carrick_bin, "run", …flags…, image, …cmd]
     match lane {
         Lane::Hvf => base,
+        Lane::KvmLocal(_) => {
+            carrick_argv_with_platform(base, &suite.image, DockerPlatform::LinuxAmd64)
+        }
         Lane::Kvm(cfg) => {
             // Build the inner command: `env CARRICK_INSECURE_REGISTRIES=<host>
             // <carrick-in-guest> run … <rewritten image> … <cmd>`. The env is
@@ -153,6 +193,28 @@ pub fn carrick_invocation_argv(
     }
 }
 
+fn carrick_argv_with_platform(
+    mut argv: Vec<String>,
+    image: &str,
+    platform: DockerPlatform,
+) -> Vec<String> {
+    if let Some(i) = argv.iter().position(|tok| tok == "--platform")
+        && let Some(value) = argv.get_mut(i + 1)
+    {
+        *value = platform.as_str().to_string();
+        return argv;
+    }
+    let image_idx = argv
+        .iter()
+        .position(|tok| tok == image)
+        .unwrap_or(argv.len());
+    argv.splice(
+        image_idx..image_idx,
+        ["--platform".to_string(), platform.as_str().to_string()],
+    );
+    argv
+}
+
 /// POSIX shell single-quote: a bareword of safe chars is returned as-is; anything
 /// else is wrapped in `'…'` with embedded `'` escaped as `'\''`. Used to rebuild
 /// the exact in-guest argv inside `sg kvm -c '<argv>'`.
@@ -185,6 +247,7 @@ pub fn lane_from_args(lane: &str, lima_vm: &str, lima_gateway: &str, timeout_sca
             gateway: lima_gateway.to_string(),
             timeout_scale,
         }),
+        "kvm-local" | "linux-kvm" => Lane::KvmLocal(LocalKvmConfig { timeout_scale }),
         _ => Lane::Hvf,
     }
 }
@@ -284,6 +347,23 @@ mod tests {
     }
 
     #[test]
+    fn kvm_local_invocation_runs_carrick_directly() {
+        let s = demo_suite();
+        let lane = Lane::KvmLocal(LocalKvmConfig { timeout_scale: 1.0 });
+        let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
+
+        assert_eq!(argv[0], "/root/ct/release/carrick");
+        assert_eq!(argv[1], "run");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--platform" && w[1] == "linux/amd64"),
+            "kvm-local carrick side must request the amd64 OCI platform: {argv:?}"
+        );
+        assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
+        assert!(!argv.contains(&"limactl".to_string()));
+    }
+
+    #[test]
     fn shell_quote_handles_barewords_and_metachars() {
         assert_eq!(shell_quote("simple"), "simple");
         assert_eq!(shell_quote("/usr/local/go/bin"), "/usr/local/go/bin");
@@ -305,6 +385,10 @@ mod tests {
                 assert_eq!(cfg.timeout_scale, 2.0);
             }
             _ => panic!("expected Kvm"),
+        }
+        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0) {
+            Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 3.0),
+            _ => panic!("expected KvmLocal"),
         }
     }
 

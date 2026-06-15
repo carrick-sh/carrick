@@ -61,6 +61,9 @@ fn sidecar_path(lane: &crate::lane::Lane) -> PathBuf {
     match lane {
         crate::lane::Lane::Hvf => PathBuf::from("target/conformance/image-digests.json"),
         crate::lane::Lane::Kvm(_) => PathBuf::from("target/conformance/image-digests.kvm.json"),
+        crate::lane::Lane::KvmLocal(_) => {
+            PathBuf::from("target/conformance/image-digests.kvm-local.json")
+        }
     }
 }
 
@@ -143,7 +146,7 @@ pub fn refresh_stale_images(
         // rmi (ignore "no such image") then pull — `carrick pull` short-circuits
         // on a present cache, so the rmi is what forces a fresh fetch.
         let ok = match lane {
-            crate::lane::Lane::Hvf => {
+            crate::lane::Lane::Hvf | crate::lane::Lane::KvmLocal(_) => {
                 let _ = Command::new(carrick_bin)
                     .args(["rmi", image])
                     .stdout(Stdio::null())
