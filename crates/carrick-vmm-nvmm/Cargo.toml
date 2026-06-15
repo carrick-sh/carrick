@@ -1,11 +1,11 @@
 [package]
-name = "carrick-nvmm"
+name = "carrick-vmm-nvmm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "carrick_nvmm"
+name = "carrick_vmm_nvmm"
 path = "src/lib.rs"
 
 [lints]
@@ -20,7 +20,7 @@ workspace = true
 # M1 builds the thin per-VMM `X86Vmm`/`X86Vcpu` trait pair over the SHARED
 # `carrick-x86` engine (the portability Stage-5 acceptance test): the trap loop,
 # long-mode bring-up, snapshot triple, and run-elf service loop all live ONCE in
-# carrick-x86. carrick-nvmm supplies only the NVMM marshalling + the run_elf
+# carrick-x86. carrick-vmm-nvmm supplies only the NVMM marshalling + the run_elf
 # wiring. The deps are unconditional (these leaf crates build on every host
 # already); the crate's own code is `#![cfg(target_os = "netbsd")]`, so the
 # libnvmm link line only appears on NetBSD and the default macOS/Linux workspace

@@ -14,7 +14,7 @@ workspace = true
 [dependencies]
 # The shared x86 engine scaffold sits ABOVE carrick-hal/carrick-mem/
 # carrick-guest-mem and BELOW the per-VMM backend crates (carrick-bhyve /
-# carrick-linux / carrick-nvmm). It reuses the ISA-neutral error type
+# carrick-linux / carrick-vmm-nvmm). It reuses the ISA-neutral error type
 # (`TrapError`), the syscall-frame type, and the PML4 map-spec from those leaves;
 # it pulls in NO backend crate (those depend on IT, once Stage 2+ wires callers).
 carrick-hal = { path = "../carrick-hal" }

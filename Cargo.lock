@@ -494,17 +494,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "carrick-nvmm"
-version = "0.1.0"
-dependencies = [
- "carrick-guest-mem",
- "carrick-hal",
- "carrick-mem",
- "carrick-x86",
- "libc",
-]
-
-[[package]]
 name = "carrick-observability"
 version = "0.1.0"
 dependencies = [
@@ -618,6 +607,17 @@ dependencies = [
  "carrick-abi",
  "carrick-host",
  "carrick-portable",
+]
+
+[[package]]
+name = "carrick-vmm-nvmm"
+version = "0.1.0"
+dependencies = [
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-mem",
+ "carrick-x86",
+ "libc",
 ]
 
 [[package]]

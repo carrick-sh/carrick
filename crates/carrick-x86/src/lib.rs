@@ -2,7 +2,7 @@
 //!
 //! This crate sits ABOVE `carrick-hal`/`carrick-mem`/`carrick-guest-mem` and
 //! BELOW the per-VMM backend crates (`carrick-bhyve`, `carrick-linux`'s KVM
-//! lane, `carrick-nvmm`). Its job is to own — ONCE — everything the x86 VMM
+//! lane, `carrick-vmm-nvmm`). Its job is to own — ONCE — everything the x86 VMM
 //! backends currently re-implement by copy: the trap loop, the register walk,
 //! the long-mode bring-up, the snapshot/restore triple, and the run-elf service
 //! loop, all parameterized over the thin [`X86Vmm`] + [`X86Vcpu`] trait pair.

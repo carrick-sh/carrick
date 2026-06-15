@@ -43,7 +43,7 @@ carrick-timer-core = { path = "../carrick-timer-core" }
 carrick-signal-core = { path = "../carrick-signal-core" }
 # The shared x86_64 VMM-backend engine scaffold (Axis 2). `BhyveVmm`/`BhyveX86Vcpu`
 # (bhyve_x86_engine) are the thin per-VMM trait pair `X86EngineCore<V>` is
-# parameterized over — the same crate carrick-linux (KVM) and carrick-nvmm build on.
+# parameterized over — the same crate carrick-linux (KVM) and carrick-vmm-nvmm build on.
 carrick-x86 = { path = "../carrick-x86" }
 libc.workspace = true
 
