@@ -3,7 +3,7 @@
 //! This is the second `GuestArch` impl (after [`crate::aarch64_arch`]). It lives
 //! in `carrick-hal` (host-OS-independent) so it compiles and unit-tests on
 //! macOS, lima, and FreeBSD alike. Nothing wires it to an engine yet (that is
-//! Task 7's `BhyveTrapEngine` in `carrick-bhyve`); this task establishes the
+//! Task 7's `BhyveTrapEngine` in `carrick-vmm-bhyve`); this task establishes the
 //! standalone impl validated by unit tests.
 //!
 //! ## Implemented surface
@@ -355,7 +355,7 @@ pub fn entry_trampoline_bytes() -> Vec<u8> {
 /// The x86_64 [`GuestArch`] impl.
 ///
 /// Standalone — validates by unit tests here. The bhyve backend
-/// (`crates/carrick-bhyve`) wires this as its trap-engine arch in Task 7
+/// (`crates/carrick-vmm-bhyve`) wires this as its trap-engine arch in Task 7
 /// (`BhyveTrapEngine`). It is host-OS-independent (pure struct + const data)
 /// so it builds on macOS, lima Linux, and FreeBSD equally.
 #[derive(Clone, Copy, Debug, Default)]

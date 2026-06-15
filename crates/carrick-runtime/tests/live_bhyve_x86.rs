@@ -6,7 +6,7 @@
 //!
 //! Fixtures are static-musl x86_64 ELFs provided by absolute path via env
 //! (cross-built off-box; the FreeBSD box has no musl cross-target):
-//!   * `CARRICK_BHYVE_FIXTURE` → a hello-world (`crates/carrick-bhyve/fixtures/hello-x86_64`)
+//!   * `CARRICK_BHYVE_FIXTURE` → a hello-world (`crates/carrick-vmm-bhyve/fixtures/hello-x86_64`)
 //!   * `CARRICK_BHYVE_FSPROBE` → the `uname(2)` differential (`crates/carrick-linux/fixtures/x86-fsprobe`)
 //!
 //! Run on the FreeBSD box (root, for `/dev/vmm`):

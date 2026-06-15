@@ -1,6 +1,6 @@
 //! `NvmmMachine` / `NvmmVcpu`: the raw-hypervisor layer on NetBSD/NVMM via the
 //! userspace **libnvmm** (`/usr/lib/libnvmm.so`). The KVM analog is
-//! `carrick-linux::kvm`; the bhyve analog is `carrick-bhyve::vmm`.
+//! `carrick-linux::kvm`; the bhyve analog is `carrick-vmm-bhyve::vmm`.
 //!
 //! Layouts are transcribed from the on-box headers (confirmed via a C
 //! `offsetof`/`sizeof` probe on VM 201, NetBSD 10.1 amd64):

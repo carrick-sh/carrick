@@ -297,23 +297,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "carrick-bhyve"
-version = "0.1.0"
-dependencies = [
- "carrick-abi",
- "carrick-guest-mem",
- "carrick-hal",
- "carrick-host",
- "carrick-host-bsd",
- "carrick-mem",
- "carrick-signal-core",
- "carrick-thread",
- "carrick-timer-core",
- "carrick-x86",
- "libc",
-]
-
-[[package]]
 name = "carrick-cli"
 version = "0.1.0"
 dependencies = [
@@ -523,7 +506,6 @@ dependencies = [
  "camino",
  "cap-std",
  "carrick-abi",
- "carrick-bhyve",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
@@ -539,6 +521,7 @@ dependencies = [
  "carrick-test-support",
  "carrick-thread",
  "carrick-timer-core",
+ "carrick-vmm-bhyve",
  "clap",
  "fd-lock",
  "flate2",
@@ -607,6 +590,23 @@ dependencies = [
  "carrick-abi",
  "carrick-host",
  "carrick-portable",
+]
+
+[[package]]
+name = "carrick-vmm-bhyve"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-host",
+ "carrick-host-bsd",
+ "carrick-mem",
+ "carrick-signal-core",
+ "carrick-thread",
+ "carrick-timer-core",
+ "carrick-x86",
+ "libc",
 ]
 
 [[package]]

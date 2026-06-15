@@ -1,5 +1,5 @@
 //! `run_elf_nvmm` — the M1 thin static-ELF run path (mirrors
-//! `carrick_linux::run_elf_kvm_x86`, NOT copied from carrick-bhyve).
+//! `carrick_linux::run_elf_kvm_x86`, NOT copied from carrick-vmm-bhyve).
 //!
 //! Loads a static x86_64 Linux ELF, brings up the generic
 //! [`carrick_x86::X86EngineCore`]`<`[`crate::nvmm_x86_engine::NvmmVmm`]`>` over

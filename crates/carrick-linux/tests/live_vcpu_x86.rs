@@ -218,12 +218,12 @@ fn test_m01_syscall_round_trip() {
 
 /// M2: run the pre-built static x86_64 musl-linked `hello` fixture under KVM.
 ///
-/// The fixture is `crates/carrick-bhyve/fixtures/hello-x86_64/target/
+/// The fixture is `crates/carrick-vmm-bhyve/fixtures/hello-x86_64/target/
 /// x86_64-unknown-linux-musl/release/hello` — the same binary the bhyve
 /// plan builds.  Build it first if absent:
 /// ```
 /// cargo build --release \
-///   --manifest-path crates/carrick-bhyve/fixtures/hello-x86_64/Cargo.toml \
+///   --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
 ///   --target x86_64-unknown-linux-musl
 /// ```
 ///
@@ -237,14 +237,14 @@ fn test_m2_musl_static_hello() {
 
     let root = workspace_root();
     let fixture = root.join(
-        "crates/carrick-bhyve/fixtures/hello-x86_64/\
+        "crates/carrick-vmm-bhyve/fixtures/hello-x86_64/\
          target/x86_64-unknown-linux-musl/release/carrick-hello-x86_64",
     );
     if !fixture.exists() {
         eprintln!(
             "SKIP: fixture not built — run: \
              cargo build --release \
-             --manifest-path crates/carrick-bhyve/fixtures/hello-x86_64/Cargo.toml \
+             --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
              --target x86_64-unknown-linux-musl"
         );
         return;
@@ -266,7 +266,7 @@ fn test_m2_musl_static_hello() {
     );
 
     // oracle.expected is a plain text file (no trailing newline added by git).
-    let expected = include_bytes!("../../carrick-bhyve/fixtures/hello-x86_64/oracle.expected");
+    let expected = include_bytes!("../../carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected");
     assert_eq!(
         out.stdout,
         expected,

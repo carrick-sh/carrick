@@ -12,19 +12,19 @@
 
 use std::sync::Mutex;
 
-use carrick_bhyve::BhyveTrapEngine;
-use carrick_bhyve::X86Exit;
-use carrick_bhyve::guest_setup_x86::{
+use carrick_hal::SyscallTrap as _;
+use carrick_vmm_bhyve::BhyveTrapEngine;
+use carrick_vmm_bhyve::X86Exit;
+use carrick_vmm_bhyve::guest_setup_x86::{
     BroughtUpM0, GDT_LEN, PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_GDT_GPA,
     X86_INIT_BLOB_GPA, X86_MEM_SIZE, X86_PML4_GPA, X86_STACK_TOP_GPA, bring_up_m0, bring_up_x86,
     bring_up_x86_m1, complete_inout,
 };
-use carrick_bhyve::vmm::BhyveVm;
-use carrick_bhyve::vmm_x86::{
+use carrick_vmm_bhyve::vmm::BhyveVm;
+use carrick_vmm_bhyve::vmm_x86::{
     VM_REG_GUEST_CR0, VM_REG_GUEST_CR3, VM_REG_GUEST_CR4, VM_REG_GUEST_CS, VM_REG_GUEST_EFER,
     VM_REG_GUEST_GDTR, VM_REG_GUEST_RAX, VM_REG_GUEST_RIP, VM_REG_GUEST_SS,
 };
-use carrick_hal::SyscallTrap as _;
 
 /// Serialize the live tests (pid-derived VM names; see module docs).
 static VM_LOCK: Mutex<()> = Mutex::new(());

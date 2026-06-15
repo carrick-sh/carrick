@@ -1,7 +1,7 @@
 //! carrick-vmm-nvmm: the NetBSD/NVMM HAL backend (the fourth platform, after
 //! macOS/HVF, Linux/KVM, and FreeBSD/bhyve).
 //!
-//! Mirrors `carrick-bhyve`'s shape — a raw-hypervisor layer over the host
+//! Mirrors `carrick-vmm-bhyve`'s shape — a raw-hypervisor layer over the host
 //! VMM, eventually paired with a `SyscallTrap`/`GuestMemory` trap engine and
 //! driven by the shared platform-agnostic run loop + dispatcher. The
 //! hypervisor layer here FFIs to NetBSD's userspace **libnvmm** instead of

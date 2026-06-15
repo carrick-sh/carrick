@@ -116,7 +116,7 @@ pub use carrick_signal_core::xsig::{
 // The `(linux, host)` signal-number translation table that DIFFERS between Linux
 // and the BSDs (SIGUSR1/SIGCHLD/SIGSTOP/SIGURG/…) is the ONE BSD-family table in
 // `carrick_host_bsd::signum` — macOS shares BSD signal numbering with FreeBSD, so the
-// table that was duplicated here (and again in `carrick_bhyve::bhyve_signum`)
+// table that was duplicated here (and again in `carrick_vmm_bhyve::bhyve_signum`)
 // now lives once. Cross-process signals must be translated on the send side
 // (`libc::kill`), the receive side (host handler -> guest), and in the `wait4`
 // status, or e.g. a guest SIGUSR1 (10) would be sent to macOS as signal 10

@@ -1,7 +1,7 @@
 //! Thin MVP run path: boot a static x86_64 Linux ELF under KVM on Linux x86_64
 //! and service its syscalls via the shared [`carrick_x86::run_elf_service_loop`].
 //!
-//! Mirrors `run_elf_bhyve` (carrick-bhyve) in structure: no `carrick-runtime`
+//! Mirrors `run_elf_bhyve` (carrick-vmm-bhyve) in structure: no `carrick-runtime`
 //! dependency — keeps the crate cycle-free and container-104-compilable.
 //!
 //! Since portability Stage 4-KVM the KVM lane is the generic

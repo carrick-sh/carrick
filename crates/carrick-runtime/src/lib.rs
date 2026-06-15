@@ -615,15 +615,15 @@ pub mod runtime {
             &self,
             table: std::sync::Arc<crate::thread::FutexTable>,
         ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex> {
-            std::sync::Arc::new(carrick_bhyve::make_bhyve_futex(table))
+            std::sync::Arc::new(carrick_vmm_bhyve::make_bhyve_futex(table))
         }
 
         fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator> {
-            Box::new(carrick_bhyve::BhyveForkCoordinator::new())
+            Box::new(carrick_vmm_bhyve::BhyveForkCoordinator::new())
         }
 
         fn make_kicker(&self) -> std::sync::Arc<dyn carrick_hal::VcpuRegistry> {
-            std::sync::Arc::new(carrick_bhyve::BhyveKicker::new())
+            std::sync::Arc::new(carrick_vmm_bhyve::BhyveKicker::new())
         }
 
         fn make_timer_delivery(
@@ -631,7 +631,7 @@ pub mod runtime {
             kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
             main_tid: crate::thread::ThreadId,
         ) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
-            std::sync::Arc::new(carrick_bhyve::BhyveTimerDelivery { kicker, main_tid })
+            std::sync::Arc::new(carrick_vmm_bhyve::BhyveTimerDelivery { kicker, main_tid })
         }
     }
 
@@ -681,7 +681,7 @@ pub mod runtime {
         max_traps: usize,
     ) -> Result<RunResult, RuntimeError>
     where
-        E: carrick_hal::ThreadedEngine<KickHandle = carrick_bhyve::BhyveKickHandle> + 'static,
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_vmm_bhyve::BhyveKickHandle> + 'static,
         E::SiblingSpec: 'static,
     {
         run_threaded_loop(engine, dispatcher, BhyveHostBackend, max_traps)
@@ -689,17 +689,17 @@ pub mod runtime {
 
     /// x86_64 bhyve run through the FULL `SyscallDispatcher` on the canonical loop
     /// (M2 Tier 1). Mirrors the x86_64 arm of `run_elf_real_dispatch`: build a
-    /// `BhyveTrapEngine` via `carrick_bhyve::run_elf::build_x86_engine` and drive it
+    /// `BhyveTrapEngine` via `carrick_vmm_bhyve::run_elf::build_x86_engine` and drive it
     /// through `run_threaded_bhyve_loop`. `CARRICK_NO_THREADS` falls back to the M1
-    /// single-threaded `carrick_bhyve::run_elf::run_elf_bhyve` (which writes guest
+    /// single-threaded `carrick_vmm_bhyve::run_elf::run_elf_bhyve` (which writes guest
     /// stdout/stderr straight to the host — hence empty buffers in the RunResult).
-    /// The carrick-bhyve helpers return `Result<_, String>`; map those to
+    /// The carrick-vmm-bhyve helpers return `Result<_, String>`; map those to
     /// `RuntimeError::Unsupported` (the variant the codebase uses for opaque
     /// backend messages).
     #[cfg(feature = "platform-freebsd")]
     pub fn run_elf_bhyve_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         if std::env::var_os("CARRICK_NO_THREADS").is_some() {
-            let code = carrick_bhyve::run_elf::run_elf_bhyve(path)
+            let code = carrick_vmm_bhyve::run_elf::run_elf_bhyve(path)
                 .map_err(|e| RuntimeError::Unsupported(format!("run_elf_bhyve: {e}")))?;
             return Ok(RunResult {
                 exit_code: code,
@@ -716,13 +716,13 @@ pub mod runtime {
         // `ThreadedEngine<KickHandle = BhyveKickHandle>` bound.
         #[cfg(not(feature = "bhyve-legacy-engine"))]
         {
-            let engine = carrick_bhyve::run_elf::build_x86_engine_shared(path)
+            let engine = carrick_vmm_bhyve::run_elf::build_x86_engine_shared(path)
                 .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine_shared: {e}")))?;
             run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
         }
         #[cfg(feature = "bhyve-legacy-engine")]
         {
-            let engine = carrick_bhyve::run_elf::build_x86_engine(path)
+            let engine = carrick_vmm_bhyve::run_elf::build_x86_engine(path)
                 .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine: {e}")))?;
             run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
         }
@@ -1388,7 +1388,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_signal_pump::reset_state_for_supervisor_fork();
         #[cfg(not(feature = "platform-linux"))]
-        carrick_bhyve::bhyve_signal_pump::reset_state_for_supervisor_fork();
+        carrick_vmm_bhyve::bhyve_signal_pump::reset_state_for_supervisor_fork();
     }
     /// Translate a Linux (guest) signal number to the host kernel's number. On a
     /// Linux host this is identity (the numbers match); on a FreeBSD host the BSD
@@ -1401,7 +1401,7 @@ pub mod host_signal {
         }
         #[cfg(not(feature = "platform-linux"))]
         {
-            carrick_bhyve::bhyve_signum::linux_to_host_signum(sig)
+            carrick_vmm_bhyve::bhyve_signum::linux_to_host_signum(sig)
         }
     }
     /// Translate a host kernel signal number back to its Linux (guest) number.
@@ -1413,7 +1413,7 @@ pub mod host_signal {
         }
         #[cfg(not(feature = "platform-linux"))]
         {
-            carrick_bhyve::bhyve_signum::host_to_linux_signum(sig)
+            carrick_vmm_bhyve::bhyve_signum::host_to_linux_signum(sig)
         }
     }
     /// Resolve + REMOVE a child's `(parent_tid, exit_signal)` watch. Called by
@@ -1439,7 +1439,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
         #[cfg(not(feature = "platform-linux"))]
-        carrick_bhyve::bhyve_disposition::reset_routed_handlers_after_execve(ignored_mask);
+        carrick_vmm_bhyve::bhyve_disposition::reset_routed_handlers_after_execve(ignored_mask);
     }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
     /// neutral ring core (the nudge handler in `carrick_linux::kvm_xsig` set the
@@ -1483,7 +1483,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::ensure_host_handler(sig);
         #[cfg(not(feature = "platform-linux"))]
-        carrick_bhyve::bhyve_disposition::ensure_host_handler(sig);
+        carrick_vmm_bhyve::bhyve_disposition::ensure_host_handler(sig);
     }
     /// Mirror a guest `SIG_IGN` onto the HOST disposition so a sibling guest
     /// process's host `kill` is DROPPED (honoring the guest's ignore) instead of
@@ -1492,7 +1492,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::set_host_ignore(sig);
         #[cfg(not(feature = "platform-linux"))]
-        carrick_bhyve::bhyve_disposition::set_host_ignore(sig);
+        carrick_vmm_bhyve::bhyve_disposition::set_host_ignore(sig);
     }
     /// Reset a mirrored signal's HOST disposition to `SIG_DFL` (the guest reset it
     /// to default): clear any host SIG_IGN / routed handler mirrored earlier and
@@ -1501,7 +1501,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_disposition::set_host_default(linux_signum);
         #[cfg(not(feature = "platform-linux"))]
-        carrick_bhyve::bhyve_disposition::set_host_default(linux_signum);
+        carrick_vmm_bhyve::bhyve_disposition::set_host_default(linux_signum);
     }
     /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
     /// ring (inherited across `fork`, so every carrick process shares ONE ring).
@@ -1522,7 +1522,7 @@ pub mod host_signal {
         #[cfg(feature = "platform-linux")]
         carrick_linux::kvm_xsig::xsig_nudge(target_host);
         #[cfg(not(feature = "platform-linux"))]
-        carrick_bhyve::bhyve_xsig::xsig_nudge(target_host);
+        carrick_vmm_bhyve::bhyve_xsig::xsig_nudge(target_host);
     }
     /// No kqueue signal pump on Linux. Returning -1 makes the `setitimer`
     /// dispatch path (the only caller) skip the EVFILT_TIMER arming and use the

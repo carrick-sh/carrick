@@ -1,7 +1,7 @@
 //! `carrick-x86` — the shared x86_64 VMM-backend engine scaffold (Axis 2).
 //!
 //! This crate sits ABOVE `carrick-hal`/`carrick-mem`/`carrick-guest-mem` and
-//! BELOW the per-VMM backend crates (`carrick-bhyve`, `carrick-linux`'s KVM
+//! BELOW the per-VMM backend crates (`carrick-vmm-bhyve`, `carrick-linux`'s KVM
 //! lane, `carrick-vmm-nvmm`). Its job is to own — ONCE — everything the x86 VMM
 //! backends currently re-implement by copy: the trap loop, the register walk,
 //! the long-mode bring-up, the snapshot/restore triple, and the run-elf service
