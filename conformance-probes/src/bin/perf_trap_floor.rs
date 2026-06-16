@@ -22,8 +22,10 @@ fn nproc() -> usize {
 }
 
 fn main() {
-    // aarch64 Linux: __NR_getpid = 172. carrick answers from cached creds.
-    let getpid = || unsafe { libc::syscall(172) };
+    // Raw getpid by syscall number, arch-correct (aarch64 __NR_getpid=172,
+    // x86_64=39): `libc::SYS_getpid` resolves per target. carrick answers from
+    // cached creds, so this measures the bare guest->host trap round trip.
+    let getpid = || unsafe { libc::syscall(libc::SYS_getpid) };
 
     for _ in 0..WARMUP {
         let _ = getpid();
