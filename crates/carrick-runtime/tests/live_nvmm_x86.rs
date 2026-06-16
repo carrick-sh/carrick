@@ -8,11 +8,17 @@
 //! (cross-built off-box; the NetBSD box has no musl cross-target):
 //!   * `CARRICK_NVMM_FIXTURE` -> hello-world
 //!   * `CARRICK_NVMM_FORK_RAW` -> raw fork + wait4 bisection fixture
+//!   * `CARRICK_NVMM_EXECVE` -> execve caller fixture
+//!   * `CARRICK_NVMM_SIGSEGV` -> handled null-store SIGSEGV fixture
+//!   * `CARRICK_NVMM_SIGSEGV_DEFAULT` -> default-action null-store SIGSEGV fixture
 //!
 //! Run on the NetBSD box (root, for `/dev/nvmm`):
 //! ```
 //! CARRICK_NVMM_FIXTURE=/root/fixtures/hello \
 //! CARRICK_NVMM_FORK_RAW=/root/fixtures/fork-raw \
+//! CARRICK_NVMM_EXECVE=/root/fixtures/execve \
+//! CARRICK_NVMM_SIGSEGV=/root/fixtures/nvmm-sigsegv \
+//! CARRICK_NVMM_SIGSEGV_DEFAULT=/root/fixtures/nvmm-sigsegv-default \
 //!   cargo test -p carrick-runtime --no-default-features --features platform-netbsd \
 //!   --test live_nvmm_x86 -- --nocapture
 //! ```
@@ -95,5 +101,45 @@ fn execve_runs_second_image() {
         String::from_utf8_lossy(&result.stdout).contains("execd ok"),
         "the execve'd second image must print 'execd ok'; stdout: {:?}",
         String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
+fn handled_sigsegv_receives_linux_siginfo() {
+    // The synchronous-fault acceptance: the guest installs a SA_SIGINFO
+    // SIGSEGV handler, performs a null store, and exits 0 only when Linux-shaped
+    // siginfo reports SIGSEGV/SEGV_MAPERR with si_addr == NULL.
+    let Some(path) = fixture("CARRICK_NVMM_SIGSEGV") else {
+        eprintln!("skip: set CARRICK_NVMM_SIGSEGV to the handled SIGSEGV ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_nvmm_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "handled SIGSEGV fixture must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("sigsegv-ok"),
+        "handled SIGSEGV fixture must print sigsegv-ok; stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
+fn default_sigsegv_action_exits_139() {
+    // Same null-store fault with SIG_DFL left in place. The runtime should
+    // apply Linux's default SIGSEGV termination status.
+    let Some(path) = fixture("CARRICK_NVMM_SIGSEGV_DEFAULT") else {
+        eprintln!("skip: set CARRICK_NVMM_SIGSEGV_DEFAULT to the default SIGSEGV ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_nvmm_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        139,
+        "default SIGSEGV fixture must terminate as 128+SIGSEGV (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
     );
 }
