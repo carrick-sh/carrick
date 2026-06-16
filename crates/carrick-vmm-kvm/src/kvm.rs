@@ -19,6 +19,8 @@ use kvm_bindings::{
     CpuId, KVM_CAP_EXIT_ON_EMULATION_FAILURE, KVM_MAX_CPUID_ENTRIES, kvm_enable_cap,
 };
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
+#[cfg(target_arch = "x86_64")]
+use kvm_ioctls::{Cap, SyncReg};
 use kvm_ioctls::{Kvm, VcpuExit as KvmExit, VcpuFd, VmFd};
 use libc;
 
@@ -468,6 +470,17 @@ fn sysreg_to_id(r: SysReg) -> u64 {
     }
 }
 
+/// Whether this host's KVM supports `KVM_CAP_SYNC_REGS` (`KVM_SYNC_X86_REGS`), so
+/// the syscall doorbell frame can be read from the mmap'd `kvm_run.s.regs` page
+/// instead of a per-syscall `KVM_GET_REGS` ioctl. Populated once at VM creation.
+#[cfg(target_arch = "x86_64")]
+static SYNC_REGS_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn sync_regs_supported() -> bool {
+    SYNC_REGS_OK.get().copied().unwrap_or(false)
+}
+
 pub struct KvmVm {
     /// `Some` for a VM this engine OWNS (it opened `/dev/kvm` itself, via
     /// [`Self::create_empty`]); `None` for a SIBLING vCPU's VM handle, which
@@ -845,6 +858,13 @@ impl KvmVm {
     pub(crate) fn create_empty() -> Result<Self, OsError> {
         reset_kvm_stats_for_new_vm();
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
+        // Probe KVM_CAP_SYNC_REGS once: it lets the syscall doorbell read the
+        // guest frame from the mmap'd kvm_run page instead of a KVM_GET_REGS
+        // ioctl. We only ever SET kvm_valid_regs (read-out mirror), never
+        // kvm_dirty_regs, so the kernel registers stay authoritative for every
+        // ioctl path — no coherence change.
+        #[cfg(target_arch = "x86_64")]
+        let _ = SYNC_REGS_OK.get_or_init(|| kvm.check_extension(Cap::SyncRegs));
         #[cfg(target_arch = "x86_64")]
         let cpuid = Arc::new(
             kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
@@ -1217,6 +1237,14 @@ impl HvVcpu for KvmVcpu {
         // EINTR from the ioctl means a signal (KICK_SIGNAL via pthread_kill) interrupted
         // KVM_RUN before any guest exit — this is the cross-thread kick path.
         record_kvm_stat(KvmStat::Run);
+        // Mirror the GPRs into kvm_run.s.regs on exit so the syscall doorbell can
+        // read the frame without a KVM_GET_REGS ioctl. Read-only mirror: we set
+        // kvm_valid_regs (sync-out) but never kvm_dirty_regs, so kernel registers
+        // remain authoritative for every ioctl path. Idempotent + ioctl-free.
+        #[cfg(target_arch = "x86_64")]
+        if sync_regs_supported() {
+            self.fd_mut().set_sync_valid_reg(SyncReg::Register);
+        }
         let exit = match self.fd_mut().run() {
             Ok(e) => e,
             Err(e) if e.errno() == libc::EINTR => {

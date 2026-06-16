@@ -895,11 +895,17 @@ impl X86Vcpu for KvmVcpu {
             // completes the PIO step when userspace re-enters. The shared x86
             // engine treats either trampoline address as syscall-return state.
             VcpuExit::IoOut { port, .. } if port == carrick_hal::SYSCALL_DOORBELL_PORT => {
-                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
-                let regs = self
-                    .fd()
-                    .get_regs()
-                    .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(doorbell): {e}")))?;
+                // With KVM_CAP_SYNC_REGS the kernel already mirrored the GPRs into
+                // kvm_run.s.regs on this exit (kvm_valid_regs was set before the
+                // run), so read the frame from the mmap page — no KVM_GET_REGS.
+                let regs = if crate::kvm::sync_regs_supported() {
+                    self.fd().sync_regs().regs
+                } else {
+                    crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
+                    self.fd().get_regs().map_err(|e| {
+                        TrapError::Hypervisor(format!("KVM_GET_REGS(doorbell): {e}"))
+                    })?
+                };
                 let frame = carrick_guest_mem::X8664SyscallFrame {
                     rax: regs.rax,
                     rdi: regs.rdi,
