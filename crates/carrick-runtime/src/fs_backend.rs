@@ -1561,9 +1561,9 @@ impl HostFsBackend {
             uid: uid.unwrap_or(0),
             gid: gid.unwrap_or(0),
             size: st.st_size as u64,
-            atime: (st.st_atime, st.st_atime_nsec),
-            mtime: (st.st_mtime, st.st_mtime_nsec),
-            ctime: (st.st_ctime, st.st_ctime_nsec),
+            atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
+            mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
+            ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
         })
     }
 
@@ -1634,8 +1634,8 @@ impl HostFsBackend {
             let typ = st.st_mode as u32 & libc::S_IFMT as u32;
             if ok
                 && st.st_ino == ino
-                && (st.st_ctime, st.st_ctime_nsec) == ctime
-                && (st.st_mtime, st.st_mtime_nsec) == mtime
+                && (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)) == ctime
+                && (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)) == mtime
                 && st.st_size == size
                 && typ != libc::S_IFLNK as u32
             {
@@ -1646,9 +1646,9 @@ impl HostFsBackend {
                     ino: st.st_ino,
                     nlink: st.st_nlink as u32,
                     size: st.st_size as u64,
-                    atime: (st.st_atime, st.st_atime_nsec),
-                    mtime: (st.st_mtime, st.st_mtime_nsec),
-                    ctime: (st.st_ctime, st.st_ctime_nsec),
+                    atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
+                    mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
+                    ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
                     ..real
                 });
             }
@@ -1737,9 +1737,9 @@ impl HostFsBackend {
             uid: uid.unwrap_or(0),
             gid: gid.unwrap_or(0),
             size: st.st_size as u64,
-            atime: (st.st_atime, st.st_atime_nsec),
-            mtime: (st.st_mtime, st.st_mtime_nsec),
-            ctime: (st.st_ctime, st.st_ctime_nsec),
+            atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
+            mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
+            ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
         };
         let mut map = self.stat_cache.lock();
         // Bounded: a pathological working set just resets the cache (correctness
@@ -1752,8 +1752,8 @@ impl HostFsBackend {
             StatCacheEntry {
                 parent_fd: std::sync::Arc::new(parent_fd),
                 ino: st.st_ino,
-                ctime: (st.st_ctime, st.st_ctime_nsec),
-                mtime: (st.st_mtime, st.st_mtime_nsec),
+                ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
+                mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
                 size: st.st_size,
                 real,
             },

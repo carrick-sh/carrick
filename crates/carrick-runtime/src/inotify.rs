@@ -25,40 +25,100 @@ use std::os::fd::RawFd;
 
 use parking_lot::Mutex;
 
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 use carrick_hal::event::{EventMultiplexer, PollEvent, VnodeEvents};
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 use std::collections::HashSet;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 use std::time::Duration;
 
 // Linux inotify event/mask bits (asm-generic, shared by aarch64). Only the
 // macOS emulation needs the individual event bits (to translate kqueue
 // `NOTE_*` ↔ Linux mask); the native Linux backend passes the guest mask to the
 // kernel verbatim, so they are macOS-gated to stay dead-code-clean off-macOS.
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_ACCESS: u32 = 0x0000_0001;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_MODIFY: u32 = 0x0000_0002;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_ATTRIB: u32 = 0x0000_0004;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_CREATE: u32 = 0x0000_0100;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_DELETE: u32 = 0x0000_0200;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_DELETE_SELF: u32 = 0x0000_0400;
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) const IN_MOVE_SELF: u32 = 0x0000_0800;
 
 // inotify_init1 / open flags carried in the `flags` argument.
@@ -77,7 +137,11 @@ const LINUX_ENOSPC: i32 = 28;
 /// register API consumes. Requests the kqueue `NOTE_*` set corresponding to the
 /// Linux watch mask; a mask with no recognized data-changing bit falls back to
 /// the common set so a broad `IN_ALL_EVENTS` watch behaves sensibly.
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 fn linux_mask_to_vnode_events(mask: u32) -> VnodeEvents {
     let mut ev = VnodeEvents::default();
     if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS | IN_CREATE | IN_DELETE) != 0 {
@@ -105,7 +169,11 @@ fn linux_mask_to_vnode_events(mask: u32) -> VnodeEvents {
 
 /// Translate the `NOTE_*` fflags of a fired vnode event back into a Linux
 /// inotify event mask, restricted to the bits the watch actually requested.
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 fn note_to_linux_mask(fflags: u32, requested: u32) -> u32 {
     let mut mask = 0;
     if fflags & (carrick_portable::NOTE_WRITE | carrick_portable::NOTE_EXTEND) != 0 {
@@ -131,7 +199,11 @@ struct Watch {
     mask: u32,
 }
 
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 #[derive(Clone, Debug)]
 struct ScannedDir {
     path: PathBuf,
@@ -141,9 +213,17 @@ struct ScannedDir {
 #[derive(Clone, Debug)]
 struct WatchedFd {
     wd: i32,
-    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     name: Option<Vec<u8>>,
-    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     scan_dir: Option<ScannedDir>,
 }
 
@@ -175,7 +255,11 @@ pub(crate) struct InotifyState {
     /// methods need `&mut` yet `InotifyState` is shared via `Arc` and exposes
     /// `&self` methods; the lock is only ever held for a non-blocking kqueue
     /// change or a zero-timeout drain.
-    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     mux: Mutex<Box<dyn EventMultiplexer>>,
     /// The native Linux inotify fd (`IN_NONBLOCK | IN_CLOEXEC`). Pollable
     /// directly; `read(2)` returns native `inotify_event` records.
@@ -196,7 +280,11 @@ impl std::fmt::Debug for InotifyState {
 }
 
 impl InotifyState {
-    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     pub(crate) fn new() -> Option<Self> {
         let mux = crate::event_mux::make_event_multiplexer().ok()?;
         let poll_fd = mux.poll_fd();
@@ -300,7 +388,11 @@ impl InotifyState {
         Ok(wd)
     }
 
-    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     pub(crate) fn add_watch_fds(
         &self,
         watch_fds: Vec<crate::vfs::WatchFd>,
@@ -371,7 +463,11 @@ impl InotifyState {
         };
         for host_fd in watch.host_fds {
             inner.wd_by_fd.remove(&host_fd);
-            #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+            #[cfg(any(
+                feature = "platform-macos",
+                feature = "platform-freebsd",
+                feature = "platform-netbsd"
+            ))]
             {
                 let _ = self.mux.lock().deregister(host_fd);
             }
@@ -457,7 +553,11 @@ impl InotifyState {
         drain_pending(&mut inner, max_bytes)
     }
 
-    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
         // Non-blocking drain of newly-ready vnode changes, normalized to a list
         // of `(watched host fd, fired NOTE_* fflags)`.
@@ -499,7 +599,11 @@ impl InotifyState {
         drain_pending(&mut inner, max_bytes)
     }
 
-    #[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     fn scan_directory_records(
         inner: &mut Inner,
         fd: RawFd,
@@ -599,7 +703,11 @@ fn native_add_watch(inotify_fd: RawFd, host_fd: RawFd, mask: u32) -> Result<i32,
     if wd < 0 { Err(()) } else { Ok(wd) }
 }
 
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
     let name_len = name.map(|name| align4(name.len() + 1)).unwrap_or(0);
     let mut record = Vec::with_capacity(INOTIFY_EVENT_HEADER_SIZE + name_len);
@@ -614,12 +722,20 @@ fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
     record
 }
 
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 fn align4(len: usize) -> usize {
     (len + 3) & !3
 }
 
-#[cfg(any(feature = "platform-macos", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 fn scan_dir_entries(path: &Path) -> std::io::Result<HashSet<Vec<u8>>> {
     let mut entries = HashSet::new();
     for entry in std::fs::read_dir(path)? {

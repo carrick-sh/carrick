@@ -195,7 +195,11 @@ pub use carrick_thread::{fork_quiesce, thread};
 // ports, so we return every registered thread with state 'R' (running).
 #[cfg(feature = "platform-macos")]
 pub use carrick_vmm_hvf::thread::current_thread_states;
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
     thread::current_thread_ports()
         .into_iter()
@@ -208,7 +212,11 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
 // HAL). Re-export a `trap` shim so `crate::trap::{SyscallTrap, …}` resolves on
 // both platforms. The concrete engine (HvfTrapEngine / KvmTrapEngine) is
 // selected by the run-loop, which is itself platform-gated.
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod trap {
     pub use carrick_hal::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
     pub const HVF_PAGE_SIZE: u64 = 0x4000;
@@ -273,7 +281,11 @@ pub mod vfs;
 #[cfg(feature = "platform-macos")]
 pub use execute::Runtime;
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod execute {
     // Shared on the non-macOS lane (used by /proc + uname on every backend).
     pub fn guest_hostname() -> &'static str {
@@ -290,10 +302,18 @@ pub mod execute {
     /// the macOS `Runtime::execute` shape.
     // Non-macOS run entry: Linux drives the KVM OCI path; FreeBSD drives the
     // bhyve OCI path. guest_hostname above stays shared.
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     pub struct Runtime;
 
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     impl Runtime {
         pub fn execute(
             spec: &carrick_spec::RunSpec,
@@ -303,10 +323,18 @@ pub mod execute {
     }
 }
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub use execute::Runtime;
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod runtime {
     //! Linux (KVM) run path. The full macOS run loop lives in `runtime.rs`
     //! (`cfg(platform-macos)`); on Linux we drive `carrick_vmm_kvm::KvmTrapEngine`
@@ -421,7 +449,11 @@ pub mod runtime {
     /// [`carrick_hal::GenericSignalArrival`] (kicker + futex wake) for every
     /// `HostBackend` host; HVF's kqueue-pump wake is a different mechanism, so HVF
     /// keeps its own loop (`runtime.rs`) — it is migrated last / deferrable.
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     pub trait HostBackend: Send + Sync + 'static {
         /// Wrap a process-private `FutexTable` as this host's `PlatformFutex`
         /// (its shared-page futex shim — Linux `SYS_futex` / FreeBSD `_umtx_op`).
@@ -456,7 +488,11 @@ pub mod runtime {
     /// `vcpu_loop::run_vcpu_until_exit`. `handle_fork` (real `libc::fork` + child VM
     /// rebuild), `spawn_clone_thread` (sibling vCPUs), and the private/shared futex
     /// paths all flow through the shared loop.
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     pub fn run_threaded_loop<E, H>(
         engine: E,
         dispatcher: SyscallDispatcher,
@@ -635,6 +671,37 @@ pub mod runtime {
         }
     }
 
+    /// NVMM's [`HostBackend`]: NetBSD `__futex`, `NvmmForkCoordinator`, and
+    /// `NvmmTimerDelivery`.
+    #[cfg(feature = "platform-netbsd")]
+    pub struct NvmmHostBackend;
+
+    #[cfg(feature = "platform-netbsd")]
+    impl HostBackend for NvmmHostBackend {
+        fn make_futex(
+            &self,
+            table: std::sync::Arc<crate::thread::FutexTable>,
+        ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex> {
+            std::sync::Arc::new(carrick_vmm_nvmm::make_nvmm_futex(table))
+        }
+
+        fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator> {
+            Box::new(carrick_vmm_nvmm::NvmmForkCoordinator::new())
+        }
+
+        fn make_kicker(&self) -> std::sync::Arc<dyn carrick_hal::VcpuRegistry> {
+            std::sync::Arc::new(carrick_vmm_nvmm::nvmm_kicker::NvmmKicker::new())
+        }
+
+        fn make_timer_delivery(
+            &self,
+            kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
+            main_tid: crate::thread::ThreadId,
+        ) -> std::sync::Arc<dyn carrick_hal::TimerDelivery> {
+            std::sync::Arc::new(carrick_vmm_nvmm::NvmmTimerDelivery { kicker, main_tid })
+        }
+    }
+
     /// Multi-threaded KVM run loop (Phase 2 Task 7) — the Linux analog of the
     /// macOS `run_threaded_hvf_loop` (`runtime.rs`). Constructs the KVM trait
     /// objects (the concrete private `FutexTable`, the `KvmFutex` as
@@ -687,6 +754,20 @@ pub mod runtime {
         run_threaded_loop(engine, dispatcher, BhyveHostBackend, max_traps)
     }
 
+    #[cfg(feature = "platform-netbsd")]
+    pub fn run_threaded_nvmm_loop<E>(
+        engine: E,
+        dispatcher: SyscallDispatcher,
+        max_traps: usize,
+    ) -> Result<RunResult, RuntimeError>
+    where
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_vmm_nvmm::nvmm_kicker::NvmmKickHandle>
+            + 'static,
+        E::SiblingSpec: 'static,
+    {
+        run_threaded_loop(engine, dispatcher, NvmmHostBackend, max_traps)
+    }
+
     /// x86_64 bhyve run through the FULL `SyscallDispatcher` on the canonical loop
     /// (M2 Tier 1). Mirrors the x86_64 arm of `run_elf_real_dispatch`: build a
     /// shared `X86EngineCore<BhyveVmm>` via `build_x86_engine_shared` and drive it
@@ -713,6 +794,25 @@ pub mod runtime {
         let engine = carrick_vmm_bhyve::run_elf::build_x86_engine_shared(path)
             .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine_shared: {e}")))?;
         run_threaded_bhyve_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+    }
+
+    #[cfg(feature = "platform-netbsd")]
+    pub fn run_elf_nvmm_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
+        if std::env::var_os("CARRICK_NO_THREADS").is_some() {
+            let code = carrick_vmm_nvmm::run_elf::run_elf_nvmm(path)
+                .map_err(|e| RuntimeError::Unsupported(format!("run_elf_nvmm: {e}")))?;
+            return Ok(RunResult {
+                exit_code: code,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                traps: 0,
+                report: crate::compat::CompatReport::default(),
+                trap_limit_hit: false,
+            });
+        }
+        let engine = carrick_vmm_nvmm::run_elf::build_x86_engine_shared(path)
+            .map_err(|e| RuntimeError::Unsupported(format!("build_x86_engine_shared: {e}")))?;
+        run_threaded_nvmm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
     }
 
     /// Dispatch one syscall, servicing any blocking-I/O outcome inline via the
@@ -962,6 +1062,11 @@ pub mod runtime {
         run_threaded_kvm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
     }
 
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
+    pub fn run_elf_real_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
+        run_elf_nvmm_dispatch(path)
+    }
+
     /// Build the dispatcher for the bare KVM ELF runner with a real, writable
     /// guest filesystem. A bare ELF has no OCI rootfs, so a fresh
     /// `SyscallDispatcher` has an empty VFS and every guest `open` fails. We root
@@ -970,7 +1075,11 @@ pub mod runtime {
     /// and seed a minimal Linux baseline (`/tmp`, `/etc/{passwd,group,hosts,…}`),
     /// mirroring carrick-cli's `--fs host`. If the backend can't be created the
     /// guest simply has no filesystem (the runner still works for fs-free code).
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     fn make_linux_dispatcher() -> SyscallDispatcher {
         use crate::fs_backend::{FsBackend, HostFsBackend};
 
@@ -993,7 +1102,11 @@ pub mod runtime {
 
     /// Pre-create the standard Linux directories and a few `/etc` databases a
     /// raw static binary assumes exist (it has no OCI rootfs to supply them).
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     fn seed_linux_baseline(backend: &mut dyn crate::fs_backend::FsBackend) {
         for dir in [
             "/tmp",
@@ -1040,7 +1153,11 @@ pub mod runtime {
     /// `PATH`, etc.; clobbering them (as `seed_linux_baseline` does for the bare
     /// run-elf runner) would silently override the image. Mirrors the macOS
     /// `seed_guest_baseline` + `set_baseline_file_if_missing` (execute.rs).
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     // Used by the OCI run_oci path on non-macOS VMM backends.
     #[cfg_attr(
         all(feature = "platform-linux", target_arch = "x86_64"),
@@ -1122,13 +1239,29 @@ pub mod runtime {
         )
     }
 
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
+    pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
+        run_oci_with_engine(
+            spec,
+            |image| {
+                carrick_vmm_nvmm::run_elf::build_x86_engine_from_image(image)
+                    .map_err(|e| RuntimeError::Unsupported(format!("build nvmm engine: {e}")))
+            },
+            |engine, dispatcher, max_traps| run_threaded_nvmm_loop(engine, dispatcher, max_traps),
+        )
+    }
+
     /// Phase 5 entry helper: run an OCI container under KVM. The macOS sibling
     /// of this is `Runtime::execute`'s `FsBackendKind::Host` path (execute.rs):
     /// extract the image layers onto a scratch rootfs, root the dispatcher there,
     /// set cwd/uid/gid, load the entrypoint FROM the rootfs, and run it with the
     /// OCI argv/env. The only divergence is the run-loop entry: this drives the
     /// selected KVM engine through `run_threaded_kvm_loop` instead of the HVF loop.
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     fn run_oci_with_engine<E, Build, Run>(
         spec: &carrick_spec::RunSpec,
         build_engine: Build,
@@ -1276,15 +1409,23 @@ pub(crate) const fn syscall_shim_enabled() -> bool {
     cfg!(feature = "syscall-shim")
 }
 
-#[cfg(feature = "platform-macos")]
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub use carrick_host_bsd::bsd_to_linux_errno as host_to_linux_errno;
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(feature = "platform-linux")]
 pub fn host_to_linux_errno(host: i32) -> i32 {
     host
 }
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod host_signal {
     // The platform-NEUTRAL pending bookkeeping (the THREAD_PENDING/PROC_PENDING
     // store, SENDER_PID, and their pure operations) lives in
@@ -1389,8 +1530,10 @@ pub mod host_signal {
         // subsequent `start_signal_pump`). ----
         #[cfg(feature = "platform-linux")]
         carrick_vmm_kvm::kvm_signal_pump::reset_state_for_supervisor_fork();
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         carrick_vmm_bhyve::bhyve_signal_pump::reset_state_for_supervisor_fork();
+        #[cfg(feature = "platform-netbsd")]
+        carrick_vmm_nvmm::nvmm_signal_pump::reset_state_for_supervisor_fork();
     }
     /// Translate a Linux (guest) signal number to the host kernel's number. On a
     /// Linux host this is identity (the numbers match); on a FreeBSD host the BSD
@@ -1401,9 +1544,13 @@ pub mod host_signal {
         {
             sig
         }
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         {
             carrick_vmm_bhyve::bhyve_signum::linux_to_host_signum(sig)
+        }
+        #[cfg(feature = "platform-netbsd")]
+        {
+            carrick_vmm_nvmm::nvmm_signum::linux_to_host_signum(sig)
         }
     }
     /// Translate a host kernel signal number back to its Linux (guest) number.
@@ -1413,9 +1560,13 @@ pub mod host_signal {
         {
             sig
         }
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         {
             carrick_vmm_bhyve::bhyve_signum::host_to_linux_signum(sig)
+        }
+        #[cfg(feature = "platform-netbsd")]
+        {
+            carrick_vmm_nvmm::nvmm_signum::host_to_linux_signum(sig)
         }
     }
     /// Resolve + REMOVE a child's `(parent_tid, exit_signal)` watch. Called by
@@ -1450,8 +1601,10 @@ pub mod host_signal {
     pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
         #[cfg(feature = "platform-linux")]
         carrick_vmm_kvm::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         carrick_vmm_bhyve::bhyve_disposition::reset_routed_handlers_after_execve(ignored_mask);
+        #[cfg(feature = "platform-netbsd")]
+        carrick_vmm_nvmm::nvmm_disposition::reset_routed_handlers_after_execve(ignored_mask);
     }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
     /// neutral ring core (the nudge handler in `carrick_vmm_kvm::kvm_xsig` set the
@@ -1494,8 +1647,10 @@ pub mod host_signal {
     pub fn ensure_host_handler(sig: i32) {
         #[cfg(feature = "platform-linux")]
         carrick_vmm_kvm::kvm_disposition::ensure_host_handler(sig);
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         carrick_vmm_bhyve::bhyve_disposition::ensure_host_handler(sig);
+        #[cfg(feature = "platform-netbsd")]
+        carrick_vmm_nvmm::nvmm_disposition::ensure_host_handler(sig);
     }
     /// Mirror a guest `SIG_IGN` onto the HOST disposition so a sibling guest
     /// process's host `kill` is DROPPED (honoring the guest's ignore) instead of
@@ -1503,8 +1658,10 @@ pub mod host_signal {
     pub fn set_host_ignore(sig: i32) {
         #[cfg(feature = "platform-linux")]
         carrick_vmm_kvm::kvm_disposition::set_host_ignore(sig);
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         carrick_vmm_bhyve::bhyve_disposition::set_host_ignore(sig);
+        #[cfg(feature = "platform-netbsd")]
+        carrick_vmm_nvmm::nvmm_disposition::set_host_ignore(sig);
     }
     /// Reset a mirrored signal's HOST disposition to `SIG_DFL` (the guest reset it
     /// to default): clear any host SIG_IGN / routed handler mirrored earlier and
@@ -1512,8 +1669,10 @@ pub mod host_signal {
     pub fn set_host_default(linux_signum: i32) {
         #[cfg(feature = "platform-linux")]
         carrick_vmm_kvm::kvm_disposition::set_host_default(linux_signum);
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         carrick_vmm_bhyve::bhyve_disposition::set_host_default(linux_signum);
+        #[cfg(feature = "platform-netbsd")]
+        carrick_vmm_nvmm::nvmm_disposition::set_host_default(linux_signum);
     }
     /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
     /// ring (inherited across `fork`, so every carrick process shares ONE ring).
@@ -1533,8 +1692,10 @@ pub mod host_signal {
     pub fn xsig_nudge(target_host: i32) {
         #[cfg(feature = "platform-linux")]
         carrick_vmm_kvm::kvm_xsig::xsig_nudge(target_host);
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         carrick_vmm_bhyve::bhyve_xsig::xsig_nudge(target_host);
+        #[cfg(feature = "platform-netbsd")]
+        carrick_vmm_nvmm::nvmm_xsig::xsig_nudge(target_host);
     }
     /// No kqueue signal pump on Linux. Returning -1 makes the `setitimer`
     /// dispatch path (the only caller) skip the EVFILT_TIMER arming and use the
@@ -1589,7 +1750,11 @@ pub mod host_signal {
     pub fn wake_all_waiters() {}
 }
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod io_wait {
     use std::os::fd::RawFd;
     use std::time::{Duration, Instant};
@@ -1778,12 +1943,15 @@ pub mod io_wait {
         {
             signum == libc::SIGRTMIN() || signum == libc::SIGRTMIN() + 1
         }
-        // BSD lane: bhyve's kick-signal reservation is wired in #1; nothing is
-        // reserved yet, so no host signum is carrick-internal.
-        #[cfg(not(feature = "platform-linux"))]
+        #[cfg(feature = "platform-freebsd")]
         {
-            let _ = signum;
-            false
+            signum == carrick_vmm_bhyve::kick_signal()
+                || signum == carrick_vmm_bhyve::bhyve_xsig::nudge_signum()
+        }
+        #[cfg(feature = "platform-netbsd")]
+        {
+            signum == carrick_vmm_nvmm::nvmm_kicker::kick_signal()
+                || signum == carrick_vmm_nvmm::nvmm_xsig::nudge_signum()
         }
     }
 
@@ -1828,12 +1996,7 @@ pub mod io_wait {
         // SAFETY: PT_CONTINUE with addr 1 ("resume where stopped") and the
         // signal to re-inject; same shape as the dispatch ptrace(PTRACE_CONT).
         unsafe {
-            libc::ptrace(
-                carrick_portable::PT_CONTINUE,
-                pid,
-                std::ptr::without_provenance_mut::<libc::c_char>(1),
-                sig,
-            );
+            carrick_portable::ptrace(carrick_portable::PT_CONTINUE, pid, 1, sig);
         }
     }
 
@@ -2024,7 +2187,11 @@ pub mod io_wait {
 // to the deadline and then PUBLISHES the timer signal into the per-thread pending
 // table and KICKS the target vCPU so the generic loop runs delivery. The target
 // is registered once when the run loop starts (`register`).
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod timer_delivery {
     use crate::thread::ThreadId;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -2120,7 +2287,11 @@ pub mod timer_delivery {
     }
 }
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod itimer {
     //! KVM/Linux interval-timer glue. The neutral per-`which` slot state, the
     //! CPU-due math, the ident/signum mapping, and the fallback-thread timing
@@ -2160,7 +2331,11 @@ pub mod itimer {
     }
 }
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod posix_timer {
     //! KVM/Linux POSIX per-process timer glue. The neutral spec/registry
     //! bookkeeping + remaining math now live in [`carrick_timer_core::posix`];
@@ -2209,7 +2384,11 @@ pub mod posix_timer {
     }
 }
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub mod probes {
     macro_rules! stub {
         ($name:ident($($param:ident: $ty:ty),* $(,)?)) => {

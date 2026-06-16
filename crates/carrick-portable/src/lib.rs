@@ -88,6 +88,222 @@ pub fn set_errno(value: i32) {
     }
 }
 
+/// Nanosecond fields in `struct stat`. NetBSD's libc names these
+/// `st_*timensec`; the other supported hosts expose `st_*time_nsec`.
+#[inline]
+pub fn stat_atime_nsec(st: &libc::stat) -> i64 {
+    #[cfg(target_os = "netbsd")]
+    {
+        st.st_atimensec as i64
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    {
+        st.st_atime_nsec as i64
+    }
+}
+
+#[inline]
+pub fn stat_mtime_nsec(st: &libc::stat) -> i64 {
+    #[cfg(target_os = "netbsd")]
+    {
+        st.st_mtimensec as i64
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    {
+        st.st_mtime_nsec as i64
+    }
+}
+
+#[inline]
+pub fn stat_ctime_nsec(st: &libc::stat) -> i64 {
+    #[cfg(target_os = "netbsd")]
+    {
+        st.st_ctimensec as i64
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    {
+        st.st_ctime_nsec as i64
+    }
+}
+
+/// Assign the input/output speed fields in `struct termios`. NetBSD's fields
+/// are `c_int` while `libc::speed_t` is `u32`.
+#[inline]
+pub fn set_termios_speeds(t: &mut libc::termios, ispeed: u32, ospeed: u32) {
+    #[cfg(target_os = "netbsd")]
+    {
+        t.c_ispeed = ispeed as libc::c_int;
+        t.c_ospeed = ospeed as libc::c_int;
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    {
+        t.c_ispeed = ispeed as libc::speed_t;
+        t.c_ospeed = ospeed as libc::speed_t;
+    }
+}
+
+/// `ptrace(2)` wrapper with a portable integer address argument. NetBSD's libc
+/// binding takes `*mut c_void`; Darwin/FreeBSD's binding takes `*mut c_char`.
+#[inline]
+pub unsafe fn ptrace(
+    request: libc::c_int,
+    pid: libc::pid_t,
+    addr: usize,
+    data: libc::c_int,
+) -> libc::c_int {
+    #[cfg(target_os = "netbsd")]
+    {
+        let ptr = if addr == 0 {
+            std::ptr::null_mut::<libc::c_void>()
+        } else {
+            std::ptr::without_provenance_mut::<libc::c_void>(addr)
+        };
+        unsafe { libc::ptrace(request, pid, ptr, data) }
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    {
+        let ptr = if addr == 0 {
+            std::ptr::null_mut::<libc::c_char>()
+        } else {
+            std::ptr::without_provenance_mut::<libc::c_char>(addr)
+        };
+        unsafe { libc::ptrace(request, pid, ptr, data) }
+    }
+}
+
+#[cfg(target_os = "netbsd")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Sembuf {
+    pub sem_num: libc::c_ushort,
+    pub sem_op: libc::c_short,
+    pub sem_flg: libc::c_short,
+}
+
+#[cfg(not(target_os = "netbsd"))]
+pub type Sembuf = libc::sembuf;
+
+#[cfg(target_os = "netbsd")]
+#[repr(C)]
+pub struct SemidDs {
+    sem_perm: [u8; 32],
+    pub sem_nsems: libc::c_ushort,
+    _pad: [u8; 6],
+    sem_otime: libc::time_t,
+    sem_ctime: libc::time_t,
+    sem_base: *mut libc::c_void,
+}
+
+#[cfg(not(target_os = "netbsd"))]
+pub type SemidDs = libc::semid_ds;
+
+/// `semget(2)` wrapper. Rust libc currently omits NetBSD SysV semaphore
+/// bindings, so the NetBSD declarations live in this portability crate.
+#[inline]
+pub unsafe fn semget(key: libc::key_t, nsems: libc::c_int, semflg: libc::c_int) -> libc::c_int {
+    #[cfg(target_os = "netbsd")]
+    unsafe {
+        unsafe extern "C" {
+            fn semget(key: libc::key_t, nsems: libc::c_int, semflg: libc::c_int) -> libc::c_int;
+        }
+        semget(key, nsems, semflg)
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    unsafe {
+        libc::semget(key, nsems, semflg)
+    }
+}
+
+#[inline]
+pub unsafe fn semop(semid: libc::c_int, sops: *mut Sembuf, nsops: usize) -> libc::c_int {
+    #[cfg(target_os = "netbsd")]
+    unsafe {
+        unsafe extern "C" {
+            fn semop(semid: libc::c_int, sops: *mut Sembuf, nsops: usize) -> libc::c_int;
+        }
+        semop(semid, sops, nsops)
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    unsafe {
+        libc::semop(semid, sops, nsops)
+    }
+}
+
+#[inline]
+pub unsafe fn semctl0(semid: libc::c_int, semnum: libc::c_int, cmd: libc::c_int) -> libc::c_int {
+    #[cfg(target_os = "netbsd")]
+    unsafe {
+        unsafe extern "C" {
+            fn semctl(
+                semid: libc::c_int,
+                semnum: libc::c_int,
+                cmd: libc::c_int,
+                ...
+            ) -> libc::c_int;
+        }
+        semctl(semid, semnum, cmd)
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    unsafe {
+        libc::semctl(semid, semnum, cmd)
+    }
+}
+
+#[inline]
+pub unsafe fn semctl_val(
+    semid: libc::c_int,
+    semnum: libc::c_int,
+    cmd: libc::c_int,
+    val: libc::c_int,
+) -> libc::c_int {
+    #[cfg(target_os = "netbsd")]
+    unsafe {
+        unsafe extern "C" {
+            fn semctl(
+                semid: libc::c_int,
+                semnum: libc::c_int,
+                cmd: libc::c_int,
+                ...
+            ) -> libc::c_int;
+        }
+        semctl(semid, semnum, cmd, val)
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    unsafe {
+        libc::semctl(semid, semnum, cmd, val)
+    }
+}
+
+#[inline]
+pub unsafe fn semctl_ptr<T>(
+    semid: libc::c_int,
+    semnum: libc::c_int,
+    cmd: libc::c_int,
+    ptr: *mut T,
+) -> libc::c_int {
+    #[cfg(target_os = "netbsd")]
+    unsafe {
+        unsafe extern "C" {
+            fn semctl(
+                semid: libc::c_int,
+                semnum: libc::c_int,
+                cmd: libc::c_int,
+                ...
+            ) -> libc::c_int;
+        }
+        semctl(semid, semnum, cmd, ptr)
+    }
+    #[cfg(not(target_os = "netbsd"))]
+    unsafe {
+        libc::semctl(semid, semnum, cmd, ptr)
+    }
+}
+
+#[inline]
+pub fn sem_nsems(ds: &SemidDs) -> usize {
+    ds.sem_nsems as usize
+}
+
 // ---- extended attributes ----
 // Darwin's f*xattr take a trailing `position` (resource-fork offset, always 0
 // for the xattrs carrick uses) that Linux lacks; the `flags`/`options` arg also

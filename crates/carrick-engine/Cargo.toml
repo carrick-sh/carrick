@@ -16,6 +16,7 @@ default = ["platform-macos"]
 platform-macos = ["carrick-runtime/platform-macos"]
 platform-linux = ["carrick-runtime/platform-linux"]
 platform-freebsd = ["carrick-runtime/platform-freebsd"]
+platform-netbsd = ["carrick-runtime/platform-netbsd"]
 # In-memory fs backend selection (default OFF; control point is carrick-cli).
 fs-memory = ["carrick-spec/fs-memory", "carrick-runtime/fs-memory"]
 

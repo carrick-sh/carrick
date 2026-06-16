@@ -89,7 +89,11 @@ use crate::runtime::hardware_tso_for_debug;
 // `load_execve_image` (HVF AddressSpace builder) and `hardware_tso_for_debug`
 // (Apple TSO) stay genuinely macOS-only stubs — the KVM execve path builds its
 // own image (Task 7d) and KVM has no Rosetta TSO toggle.
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 #[allow(unused_variables, clippy::needless_pass_by_value)]
 mod macos_helper_stubs {
     use super::{AddressSpace, SyscallDispatcher};
@@ -210,7 +214,11 @@ mod macos_helper_stubs {
         unreachable!("Apple-Silicon hardware TSO toggle is HVF-only; KVM has no Rosetta TSO")
     }
 }
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 use macos_helper_stubs::{
     forked_child_die_by_signal, forked_child_exit, hardware_tso_for_debug, load_execve_image,
     stop_after_traced_exec, stop_by_signal,
