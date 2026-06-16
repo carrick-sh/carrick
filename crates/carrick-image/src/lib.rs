@@ -858,9 +858,8 @@ impl ImageStore {
     ///
     /// Tags are written for the host-native default platform (the docker-archive
     /// format carries no platform descriptor; the bytes are whatever the
-    /// producer built). v1 supports the first image entry of the archive; every
-    /// `RepoTag` on that entry is tagged (blobs are shared, only the per-tag
-    /// metadata dir differs).
+    /// producer built). Use [`Self::load_docker_archive_for_platform`] when the
+    /// producer is known to have emitted a non-default platform.
     ///
     /// # Security
     ///
@@ -873,8 +872,18 @@ impl ImageStore {
         &self,
         tar_path: &Path,
     ) -> Result<Vec<PullSummary>, OciBootstrapError> {
-        let target = PlatformTarget::default_target();
+        self.load_docker_archive_for_platform(tar_path, &PlatformTarget::default_target())
+    }
 
+    /// Ingest a docker-archive image tarball into the store under an explicit
+    /// platform key. This is required when a host imports a tar produced
+    /// elsewhere, such as a NetBSD/NVMM conformance lane loading an amd64 oracle
+    /// image exported from a Linux host.
+    pub fn load_docker_archive_for_platform(
+        &self,
+        tar_path: &Path,
+        target: &PlatformTarget,
+    ) -> Result<Vec<PullSummary>, OciBootstrapError> {
         // Pass 1: index every entry name -> bytes for the entries the manifest
         // names. A docker-archive is small relative to a registry pull and the
         // `tar` crate is single-pass forward-only, so we buffer what we need.
@@ -996,7 +1005,7 @@ impl ImageStore {
         let mut summaries = Vec::with_capacity(image_entry.repo_tags.len());
         for tag in &image_entry.repo_tags {
             let image = ImageReference::parse(tag)?;
-            let image_dir = self.image_dir_for(&image, &target);
+            let image_dir = self.image_dir_for(&image, target);
             std::fs::create_dir_all(&image_dir)?;
             std::fs::write(image_dir.join("config.json"), config_bytes)?;
             std::fs::write(image_dir.join("manifest.json"), &manifest_bytes)?;
@@ -1570,6 +1579,38 @@ mod tests {
         // The store now resolves the tag with no further work, and the layer
         // ordering re-derived from manifest.json matches.
         assert_eq!(store.list_images().len(), 1);
+    }
+
+    #[test]
+    fn load_docker_archive_can_target_non_default_platform() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+
+        let layer = gzip_layer("hello.txt", b"hello from amd64");
+        let config = br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["/bin/sh"]}}"#;
+        let archive = docker_archive(
+            &["trivial:latest"],
+            "amd64-config.json",
+            config,
+            "amd64/layer.tar.gz",
+            &layer,
+        );
+        let tar_path = tmp.path().join("amd64.tar");
+        std::fs::write(&tar_path, &archive).unwrap();
+
+        let target = PlatformTarget::parse("linux/amd64").unwrap();
+        let summaries = store
+            .load_docker_archive_for_platform(&tar_path, &target)
+            .unwrap();
+
+        let image = ImageReference::parse("trivial:latest").unwrap();
+        let platform_summary = store.image_summary_path_for(&image, &target);
+        assert_eq!(summaries[0].image_dir, store.image_dir_for(&image, &target));
+        assert!(platform_summary.exists());
+        assert!(
+            !store.image_summary_path(&image).exists(),
+            "non-default platform load must not masquerade as the host-default image"
+        );
     }
 
     #[test]
