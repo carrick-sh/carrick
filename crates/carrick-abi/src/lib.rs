@@ -322,6 +322,38 @@ pub struct LinuxStat {
     pub __unused5: u32,
 }
 
+/// Linux x86_64 `struct stat` written by legacy syscalls `stat(2)`,
+/// `fstat(2)`, and `lstat(2)`.
+///
+/// This is deliberately separate from [`LinuxStat`], which is carrick's
+/// canonical asm-generic/aarch64 layout. The two layouts place `st_mode` and
+/// `st_nlink` at different offsets, so x86 legacy metadata syscalls must use
+/// this record writer instead of the canonical `newfstatat(2)` writer.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxX8664Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: i32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub __reserved: [i64; 3],
+}
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1725,6 +1757,23 @@ macro_rules! assert_layout {
 }
 
 kernel_abi!(LinuxStat, 128, "Linux struct stat for aarch64 is 128 bytes");
+kernel_abi!(LinuxX8664Stat, 144, "Linux x86_64 struct stat is 144 bytes");
+const _: () = assert!(
+    core::mem::offset_of!(LinuxX8664Stat, st_nlink) == 16,
+    "LinuxX8664Stat.st_nlink offset mismatch"
+);
+const _: () = assert!(
+    core::mem::offset_of!(LinuxX8664Stat, st_mode) == 24,
+    "LinuxX8664Stat.st_mode offset mismatch"
+);
+const _: () = assert!(
+    core::mem::offset_of!(LinuxX8664Stat, st_size) == 48,
+    "LinuxX8664Stat.st_size offset mismatch"
+);
+const _: () = assert!(
+    core::mem::offset_of!(LinuxX8664Stat, st_atime) == 72,
+    "LinuxX8664Stat.st_atime offset mismatch"
+);
 kernel_abi!(LinuxStatfs, 120, "Linux struct statfs64 is 120 bytes");
 kernel_abi!(LinuxStatx, 256, "Linux struct statx is 256 bytes");
 kernel_abi!(LinuxWinsize, 8, "TIOCGWINSZ struct is 8 bytes");
@@ -2075,6 +2124,29 @@ pub const LINUX_FD_CLOEXEC: u64 = 1;
 /// Linux syscall-number range so x86 normalization can preserve `dup2` semantics
 /// without weakening canonical `dup3(oldfd, oldfd, flags)` handling.
 pub const CARRICK_PRIVATE_X86_DUP2: u64 = u64::MAX - 0x20;
+/// Carrick-internal normalized syscall number for x86_64 `stat(2)`.
+///
+/// The path lookup is equivalent to `newfstatat(AT_FDCWD, path, flags=0)`, but
+/// the guest-visible output buffer is x86_64's 144-byte `struct stat`, not the
+/// canonical asm-generic/aarch64 layout. Keep it private so the dispatcher can
+/// select the x86 ABI writer without changing canonical `newfstatat`.
+pub const CARRICK_PRIVATE_X86_STAT: u64 = u64::MAX - 0x21;
+/// Carrick-internal normalized syscall number for x86_64 `fstat(2)`.
+///
+/// Canonical syscall 80 is also named `fstat`, but it writes the
+/// asm-generic/aarch64 `struct stat` layout. x86_64 legacy `fstat` needs the
+/// same fd lookup with a LinuxX8664Stat writer.
+pub const CARRICK_PRIVATE_X86_FSTAT: u64 = u64::MAX - 0x22;
+/// Carrick-internal normalized syscall number for x86_64 `lstat(2)`.
+///
+/// Semantically this is `newfstatat(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW)` with
+/// x86_64's legacy `struct stat` output layout.
+pub const CARRICK_PRIVATE_X86_LSTAT: u64 = u64::MAX - 0x23;
+/// Carrick-internal normalized syscall number for x86_64 `newfstatat(2)`.
+///
+/// The arguments match canonical `newfstatat`, but x86_64 still expects the
+/// legacy 144-byte `struct stat` output layout.
+pub const CARRICK_PRIVATE_X86_NEWFSTATAT: u64 = u64::MAX - 0x24;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
