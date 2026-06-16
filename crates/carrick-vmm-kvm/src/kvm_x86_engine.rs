@@ -634,13 +634,29 @@ impl X86Vcpu for KvmVcpu {
         let segs = carrick_x86::long_mode_segment_state();
         let kernel_cs = ((boot.star >> 32) & 0xFFFF) as u16;
         let kernel_ss = kernel_cs.wrapping_add(8);
-        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
-        let mut sregs = self
-            .fd()
-            .get_sregs()
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(sysret): {e}")))?;
-        sregs.cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_cs_ar, kernel_cs);
-        sregs.ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_data_ar, kernel_ss);
+        let want_cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_cs_ar, kernel_cs);
+        let want_ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_data_ar, kernel_ss);
+
+        // Read sregs from the mmap'd kvm_run.s.regs (the kernel synced it out on
+        // the doorbell exit; kvm_valid_regs requests SREGS too) instead of a
+        // KVM_GET_SREGS ioctl. Read-only mirror — kernel sregs stay authoritative.
+        let mut sregs = if crate::kvm::sync_regs_supported() {
+            self.fd().sync_regs().sregs
+        } else {
+            crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
+            self.fd()
+                .get_sregs()
+                .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(sysret): {e}")))?
+        };
+        // A guest SYSCALL already loaded kernel CS/SS — selector AND the fixed
+        // hidden descriptor (base 0, 4 GiB limit, kernel AR) — from STAR, so the
+        // reprogram is normally a no-op. Skip the KVM_SET_SREGS when CS/SS already
+        // match; only the first sysret after a fresh/forked vCPU needs the write.
+        if sregs.cs == want_cs && sregs.ss == want_ss {
+            return Ok(());
+        }
+        sregs.cs = want_cs;
+        sregs.ss = want_ss;
         crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetSregs);
         self.fd()
             .set_sregs(&sregs)
