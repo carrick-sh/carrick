@@ -73,7 +73,8 @@ pub enum X86Seg {
 ///
 /// `resume_pc` is the next-RIP to continue at after a syscall doorbell:
 ///   - auto-advancing VMMs (NVMM `io.npc`) fill it directly;
-///   - KVM fills it = current RIP (sysretq already advanced it);
+///   - KVM fills it from the native current RIP (observed as the trampoline
+///     `out` address on Linux/KVM; KVM completes the PIO step on re-entry);
 ///   - bhyve computes it = `exit.rip + exit.inst_length` at decode time (its
 ///     native `VmExit` carries `rip` + `inst_length` separately; the
 ///     `inst_length` is consumed HERE, not retained by the backend).
@@ -377,6 +378,14 @@ pub trait X86Vcpu {
 
     /// Write a GPR / control register.
     fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError>;
+
+    /// Prepare backend-hidden segment state for resuming inside the shared
+    /// syscall trampoline. Backends whose SYSCALL exit already preserves kernel
+    /// CS/SS can keep the default; KVM must reprogram the hidden descriptors
+    /// explicitly before re-entering the `out; sysretq` stub.
+    fn prepare_sysret_resume(&mut self, _layout: BringupLayout) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     /// Program a segment/system descriptor (`base`/`limit`/access-rights).
     fn set_segment(&mut self, seg: X86Seg, base: u64, limit: u32, ar: u32)

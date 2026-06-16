@@ -590,6 +590,25 @@ impl X86Vcpu for KvmVcpu {
         })
     }
 
+    fn prepare_sysret_resume(&mut self, _layout: BringupLayout) -> Result<(), TrapError> {
+        use carrick_hal::guest_arch::GuestArch as _;
+        use carrick_hal::x8664_arch::X8664GuestArch;
+
+        let boot = X8664GuestArch::bootstrap_sysregs();
+        let segs = carrick_x86::long_mode_segment_state();
+        let kernel_cs = ((boot.star >> 32) & 0xFFFF) as u16;
+        let kernel_ss = kernel_cs.wrapping_add(8);
+        let mut sregs = self
+            .fd()
+            .get_sregs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(sysret): {e}")))?;
+        sregs.cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_cs_ar, kernel_cs);
+        sregs.ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_data_ar, kernel_ss);
+        self.fd()
+            .set_sregs(&sregs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(sysret): {e}")))
+    }
+
     fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError> {
         match reg {
             X86Reg::Cr0 | X86Reg::Cr2 | X86Reg::Cr3 | X86Reg::Cr4 | X86Reg::Efer => {
@@ -790,8 +809,10 @@ impl X86Vcpu for KvmVcpu {
         use carrick_hal::{HvVcpu, VcpuExit};
 
         match <Self as HvVcpu>::run(self).map_err(|e| TrapError::Hypervisor(e.to_string()))? {
-            // SYSCALL doorbell: OUT 0xC5 → KVM_EXIT_IO. KVM already advanced RIP
-            // past the OUT, so resume_pc = current RIP (the SYSRETQ).
+            // SYSCALL doorbell: OUT 0xC5 → KVM_EXIT_IO. KVM reports the native
+            // current RIP (observed as the OUT address on Linux/KVM); it
+            // completes the PIO step when userspace re-enters. The shared x86
+            // engine treats either trampoline address as syscall-return state.
             VcpuExit::IoOut { port, .. } if port == carrick_hal::SYSCALL_DOORBELL_PORT => {
                 let regs = self
                     .fd()
