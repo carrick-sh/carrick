@@ -341,13 +341,120 @@ impl std::fmt::Display for NvmmError {
 impl std::error::Error for NvmmError {}
 
 fn check(op: &'static str, rc: c_int) -> NvmmResult<()> {
-    if rc == 0 {
-        Ok(())
+    if rc == 0 { Ok(()) } else { Err(last_error(op)) }
+}
+
+fn last_error(op: &'static str) -> NvmmError {
+    NvmmError {
+        op,
+        errno: io::Error::last_os_error(),
+    }
+}
+
+fn invalid_error(op: &'static str) -> NvmmError {
+    NvmmError {
+        op,
+        errno: io::Error::from_raw_os_error(libc::EINVAL),
+    }
+}
+
+/// Host backing policy for an NVMM guest RAM region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvmmRamBacking {
+    /// Per-process anonymous COW backing.
+    Private,
+    /// Fork-shared file-backed mapping. NetBSD `__futex` does not rendezvous
+    /// across `MAP_SHARED|MAP_ANON`, so shared guest futex pages need this.
+    Shared,
+}
+
+fn map_private_host_ram(size: usize) -> NvmmResult<*mut c_void> {
+    // SAFETY: standard anonymous mmap; checked for MAP_FAILED below.
+    let hva = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if hva == libc::MAP_FAILED {
+        Err(last_error("mmap"))
     } else {
-        Err(NvmmError {
-            op,
-            errno: io::Error::last_os_error(),
-        })
+        Ok(hva)
+    }
+}
+
+fn map_shared_host_ram(size: usize) -> NvmmResult<*mut c_void> {
+    let Ok(file_len) = libc::off_t::try_from(size) else {
+        return Err(invalid_error("ftruncate"));
+    };
+
+    let mut template = *b"/tmp/carrick-nvmm-ram.XXXXXX\0";
+    // SAFETY: mkstemp mutates the template in place and returns an owned fd.
+    let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast::<libc::c_char>()) };
+    if fd < 0 {
+        return Err(last_error("mkstemp"));
+    }
+
+    // SAFETY: unlink the just-created path; the fd keeps the object alive.
+    if unsafe { libc::unlink(template.as_ptr().cast::<libc::c_char>()) } != 0 {
+        let err = last_error("unlink");
+        // SAFETY: best-effort cleanup for the owned fd.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+    // SAFETY: size the temporary backing file before mmap.
+    if unsafe { libc::ftruncate(fd, file_len) } != 0 {
+        let err = last_error("ftruncate");
+        // SAFETY: best-effort cleanup for the owned fd.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+
+    // SAFETY: map the unlinked temporary file; checked for MAP_FAILED below.
+    let hva = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if hva == libc::MAP_FAILED {
+        let err = last_error("mmap");
+        // SAFETY: best-effort cleanup for the owned fd.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+
+    // SAFETY: the mmap now owns a reference to the file object; close the fd.
+    if unsafe { libc::close(fd) } != 0 {
+        let err = last_error("close");
+        // SAFETY: unmap the region on the error path.
+        unsafe {
+            libc::munmap(hva, size);
+        }
+        return Err(err);
+    }
+
+    Ok(hva)
+}
+
+fn map_host_ram(size: usize, backing: NvmmRamBacking) -> NvmmResult<*mut c_void> {
+    match backing {
+        NvmmRamBacking::Private => map_private_host_ram(size),
+        NvmmRamBacking::Shared => map_shared_host_ram(size),
     }
 }
 
@@ -397,7 +504,7 @@ impl NvmmMachine {
         self.raw.as_mut()
     }
 
-    /// `mmap` an anonymous region, register it as a shareable HVA via
+    /// `mmap` a private anonymous region, register it as a shareable HVA via
     /// `nvmm_hva_map`, then link it into the guest physical space at `gpa` via
     /// `nvmm_gpa_map`. Returns the host pointer to the region (the HVA), which
     /// the caller may read/write directly to populate/observe guest RAM.
@@ -405,23 +512,19 @@ impl NvmmMachine {
     /// `size` must be page-multiple. The region is leaked for the machine's
     /// lifetime (M0 simplicity; M1+ will track it for COW fork).
     pub fn map_guest_ram(&mut self, gpa: u64, size: usize, prot: c_int) -> NvmmResult<*mut u8> {
-        // SAFETY: standard anonymous mmap; checked for MAP_FAILED below.
-        let hva = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-        if hva == libc::MAP_FAILED {
-            return Err(NvmmError {
-                op: "mmap",
-                errno: io::Error::last_os_error(),
-            });
-        }
+        self.map_guest_ram_with_backing(gpa, size, prot, NvmmRamBacking::Private)
+    }
+
+    /// Variant of [`Self::map_guest_ram`] that preserves shared/private host
+    /// backing intent from the generic x86 window plan.
+    pub fn map_guest_ram_with_backing(
+        &mut self,
+        gpa: u64,
+        size: usize,
+        prot: c_int,
+        backing: NvmmRamBacking,
+    ) -> NvmmResult<*mut u8> {
+        let hva = map_host_ram(size, backing)?;
         let hva_addr = hva as usize;
         let m = self.raw_mut();
         // SAFETY: `hva_addr`/`size` describe the region just mmaped; `m` is a
@@ -472,6 +575,95 @@ impl Drop for NvmmMachine {
         unsafe {
             nvmm_machine_destroy(self.raw.as_mut());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NvmmRamBacking, map_host_ram};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const SYS___FUTEX: libc::c_int = 166;
+
+    fn futex_wait(host_addr: usize, value: u32) -> i64 {
+        let ts = libc::timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
+        // SAFETY: raw NetBSD __futex wait on a live 4-byte shared word.
+        let rc = unsafe {
+            libc::syscall(
+                SYS___FUTEX,
+                host_addr as *mut libc::c_int,
+                libc::FUTEX_WAIT,
+                value as libc::c_int,
+                &ts as *const libc::timespec,
+                std::ptr::null_mut::<libc::c_int>(),
+                0 as libc::c_int,
+                0 as libc::c_int,
+            )
+        };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL);
+            -i64::from(e)
+        } else {
+            rc as i64
+        }
+    }
+
+    fn futex_wake(host_addr: usize) -> i64 {
+        // SAFETY: raw NetBSD __futex wake on a live 4-byte shared word.
+        let rc = unsafe {
+            libc::syscall(
+                SYS___FUTEX,
+                host_addr as *mut libc::c_int,
+                libc::FUTEX_WAKE,
+                1 as libc::c_int,
+                std::ptr::null::<libc::timespec>(),
+                std::ptr::null_mut::<libc::c_int>(),
+                0 as libc::c_int,
+                0 as libc::c_int,
+            )
+        };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL);
+            -i64::from(e)
+        } else {
+            rc as i64
+        }
+    }
+
+    #[test]
+    fn shared_host_ram_mapping_wakes_across_fork_with_netbsd_futex() {
+        let page = map_host_ram(4096, NvmmRamBacking::Shared).expect("shared host RAM");
+        let word = unsafe { &*(page as *const AtomicU32) };
+        word.store(0, Ordering::SeqCst);
+        let addr = page as usize;
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            word.store(1, Ordering::SeqCst);
+            let rc = futex_wake(addr);
+            unsafe { libc::_exit(if rc == 1 { 0 } else { 10 }) };
+        }
+
+        let rc = futex_wait(addr, 0);
+        let observed = word.load(Ordering::SeqCst);
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+            libc::munmap(page, 4096);
+        }
+
+        assert_eq!(rc, 0, "parent wait should be woken");
+        assert_eq!(status, 0, "child wake should report one waiter");
+        assert_eq!(observed, 1);
     }
 }
 
