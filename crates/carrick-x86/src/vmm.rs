@@ -242,6 +242,12 @@ pub trait X86Vmm: Sized {
     /// engine's `GuestMemory` impl copies through this.
     fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8>;
 
+    /// Mutable variant of [`Self::host_ptr`]. Backends with sparse/lazy backing
+    /// may materialize the requested range before returning the host pointer.
+    fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
+        self.host_ptr(gpa, len)
+    }
+
     /// Change the guest-visible protection for a VA range. Backends with real
     /// page tables override this; simple bring-up backends can keep the default.
     fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
