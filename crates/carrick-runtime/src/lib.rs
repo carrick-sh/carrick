@@ -929,20 +929,19 @@ pub mod runtime {
     /// combined loop through the real ~209-handler dispatcher (vs the standalone
     /// ~15-syscall `run_elf_kvm_x86` loop). fork/clone/futex/signal outcomes
     /// surface `Unsupported` here; full multithreading is M3 (`ThreadedEngine`).
-    /// No vDSO on x86 yet (musl falls back to real `SYSCALL`; mirrors
-    /// `run_elf_kvm_x86`'s `with_vdso_auxv(false)`).
     #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
     pub fn run_elf_real_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         use carrick_hal::GuestArch as _;
         let argv0 = path.to_string_lossy().into_owned();
-        // Mirror run_elf_kvm_x86's image build EXACTLY (empty env) — a non-empty
-        // env is a separate variable to introduce only once the bare path is proven.
+        // Mirror run_elf_kvm_x86's image build EXACTLY (empty env, x86 vDSO) — a
+        // non-empty env is a separate variable to introduce only once the bare
+        // path is proven.
         let image = crate::memory::AddressSpace::load_elf_for(
             path,
             carrick_hal::X8664GuestArch::elf_machine(),
         )?
-        .with_linux_initial_stack([argv0.as_bytes()], std::iter::empty::<&[u8]>())?
-        .with_vdso_auxv(false);
+        .with_vdso_bytes(carrick_hal::X8664GuestArch::vdso_bytes())?
+        .with_linux_initial_stack([argv0.as_bytes()], std::iter::empty::<&[u8]>())?;
         // Stage-4 KVM migration: the x86 engine is now the shared
         // `X86EngineCore<KvmVmm>` (built by `kvm_x86_engine::bring_up`), which
         // replaced the hand-rolled `KvmX86TrapEngine`. It satisfies the same
