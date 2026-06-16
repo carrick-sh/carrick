@@ -1,36 +1,54 @@
-//! Thin safe wrapper around Darwin/FreeBSD `kqueue`/`kevent`.
+//! Thin safe wrapper around BSD-family `kqueue`/`kevent`.
 
 use std::os::fd::RawFd;
 
-/// Darwin's exceptional-condition filter. The `libc` crate version (0.2.186)
-/// does not expose this SDK constant for Darwin.
+#[cfg(target_os = "netbsd")]
+pub type KeventFilter = u32;
+#[cfg(not(target_os = "netbsd"))]
+pub type KeventFilter = i16;
+
+#[cfg(target_os = "netbsd")]
+pub type KeventFlags = u32;
+#[cfg(not(target_os = "netbsd"))]
+pub type KeventFlags = u16;
+
+#[cfg(target_os = "netbsd")]
+type KeventCount = usize;
+#[cfg(not(target_os = "netbsd"))]
+type KeventCount = libc::c_int;
+
+fn kevent_count(len: usize) -> KeventCount {
+    len as KeventCount
+}
+
+/// Exceptional-condition filter for hosts that expose OOB socket readiness
+/// through kqueue.
 ///
 /// **IMPORTANT platform difference:** On Darwin, `-15` is `EVFILT_EXCEPT` (OOB
 /// socket events). On FreeBSD, `-15` is `EVFILT_JAILDESC` (jail-descriptor
-/// events) — an entirely different filter. FreeBSD has **no** `EVFILT_EXCEPT`
-/// equivalent; OOB socket readiness is not exposed through kqueue on FreeBSD.
-/// The FreeBSD constant is therefore a positive sentinel (`i16::MAX`) that can
-/// never match any real kqueue filter (all real filters are negative), so the
-/// `Kevent::oob` constructor compiles on FreeBSD but kevent(2) rejects it with
-/// `EINVAL`, which callers propagate as "OOB unsupported".
+/// events) — an entirely different filter. FreeBSD and NetBSD have no
+/// `EVFILT_EXCEPT` equivalent; their constants are therefore impossible
+/// sentinels so `Kevent::oob` compiles but kevent(2) rejects it, which callers
+/// propagate as "OOB unsupported".
 #[cfg(target_os = "macos")]
-pub const EVFILT_EXCEPT: i16 = -15;
-/// FreeBSD has no `EVFILT_EXCEPT`. Use a positive sentinel that can never match
-/// a real kqueue filter (all filters are negative ints) so an accidental
-/// registration returns EINVAL rather than silently matching EVFILT_JAILDESC.
-#[cfg(target_os = "freebsd")]
-pub const EVFILT_EXCEPT: i16 = i16::MAX;
+pub const EVFILT_EXCEPT: KeventFilter = -15;
+#[cfg(any(target_os = "openbsd", target_os = "dragonfly"))]
+pub const EVFILT_EXCEPT: KeventFilter = libc::EVFILT_EXCEPT;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+pub const EVFILT_EXCEPT: KeventFilter = KeventFilter::MAX;
 
-/// `EVFILT_EXCEPT` hint for socket out-of-band data (Darwin only).
+/// `EVFILT_EXCEPT` hint for socket out-of-band data.
 ///
 /// On Darwin, registering `EVFILT_EXCEPT` with `NOTE_OOB` delivers OOB/urgent
-/// data readiness. On FreeBSD this feature does not exist; `NOTE_OOB` is
-/// defined as `0` so it is a no-op fflags addition (consistent with
-/// `NOTE_EXITSTATUS` on FreeBSD).
+/// data readiness. OpenBSD and DragonFly expose their own `NOTE_OOB` values.
+/// FreeBSD and NetBSD do not have this feature; `NOTE_OOB` is defined as `0` so
+/// it is a no-op fflags addition (consistent with `NOTE_EXITSTATUS` there).
 #[cfg(target_os = "macos")]
 pub const NOTE_OOB: u32 = 0x0000_0002;
-/// FreeBSD has no `EVFILT_EXCEPT`/`NOTE_OOB`; defined as 0 (no-op fflags).
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "openbsd", target_os = "dragonfly"))]
+pub const NOTE_OOB: u32 = libc::NOTE_OOB;
+/// Host has no `EVFILT_EXCEPT`/`NOTE_OOB`; defined as 0 (no-op fflags).
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 pub const NOTE_OOB: u32 = 0;
 /// macOS `EVFILT_PROC` fflag that requests the exit status be delivered in
 /// `data`. FreeBSD has no such fflag — but its `NOTE_EXIT` already delivers the
@@ -40,7 +58,7 @@ pub const NOTE_OOB: u32 = 0;
 /// REAL status, not 0.
 #[cfg(target_os = "macos")]
 pub use libc::NOTE_EXITSTATUS;
-#[cfg(target_os = "freebsd")]
+#[cfg(not(target_os = "macos"))]
 pub const NOTE_EXITSTATUS: u32 = 0;
 
 // Internal-fd relocation is platform-neutral POSIX (F_DUPFD_CLOEXEC above a
@@ -89,7 +107,7 @@ impl Kqueue {
             libc::kevent(
                 self.fd,
                 changes.as_ptr().cast::<libc::kevent>(),
-                changes.len() as libc::c_int,
+                kevent_count(changes.len()),
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null(),
@@ -118,9 +136,9 @@ impl Kqueue {
             libc::kevent(
                 self.fd,
                 changes_ptr,
-                changes.len() as libc::c_int,
+                kevent_count(changes.len()),
                 events.as_mut_ptr().cast::<libc::kevent>(),
-                events.len() as libc::c_int,
+                kevent_count(events.len()),
                 timeout_ptr,
             )
         };
@@ -162,15 +180,15 @@ impl Kevent {
         })
     }
 
-    pub fn read(fd: RawFd, flags: u16) -> Self {
+    pub fn read(fd: RawFd, flags: KeventFlags) -> Self {
         Self::new(fd as usize, libc::EVFILT_READ, flags, 0)
     }
 
-    pub fn write(fd: RawFd, flags: u16) -> Self {
+    pub fn write(fd: RawFd, flags: KeventFlags) -> Self {
         Self::new(fd as usize, libc::EVFILT_WRITE, flags, 0)
     }
 
-    pub fn oob(fd: RawFd, flags: u16) -> Self {
+    pub fn oob(fd: RawFd, flags: KeventFlags) -> Self {
         Self::new(fd as usize, EVFILT_EXCEPT, flags, NOTE_OOB)
     }
 
@@ -217,12 +235,12 @@ impl Kevent {
     }
 
     /// The kqueue filter (`EVFILT_READ`/`EVFILT_WRITE`/`EVFILT_USER`/…).
-    pub fn filter(self) -> i16 {
+    pub fn filter(self) -> KeventFilter {
         self.0.filter
     }
 
     /// The event flags (`EV_EOF`, `EV_ERROR`, …) on a returned event.
-    pub fn flags(self) -> u16 {
+    pub fn flags(self) -> KeventFlags {
         self.0.flags
     }
 
@@ -233,10 +251,10 @@ impl Kevent {
     }
 
     pub fn data(self) -> i64 {
-        // macOS: `data` is `isize`; FreeBSD: `data` is `i64`. Cast only when needed.
-        #[cfg(target_os = "macos")]
+        // macOS/DragonFly: `data` is pointer-sized; the others use `i64`.
+        #[cfg(any(target_os = "macos", target_os = "dragonfly"))]
         return self.0.data as i64;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "dragonfly")))]
         return self.0.data;
     }
 
@@ -250,7 +268,7 @@ impl Kevent {
         self.0.udata as u64
     }
 
-    pub fn user(ident: usize, flags: u16) -> Self {
+    pub fn user(ident: usize, flags: KeventFlags) -> Self {
         Self::new(ident, libc::EVFILT_USER, flags, 0)
     }
 
@@ -281,14 +299,14 @@ impl Kevent {
     /// `EV_ADD` for a repeating timer, and `EV_DELETE` (with `interval_ns` 0)
     /// to disarm. The `ident` lives in the EVFILT_TIMER namespace, distinct
     /// from EVFILT_READ fds and EVFILT_USER idents.
-    pub fn timer(ident: usize, flags: u16, interval_ns: i64) -> Self {
+    pub fn timer(ident: usize, flags: KeventFlags, interval_ns: i64) -> Self {
         let mut ev = Self::new(ident, libc::EVFILT_TIMER, flags, libc::NOTE_NSECONDS);
-        // macOS: data is `isize`; FreeBSD: data is `i64`.
-        #[cfg(target_os = "macos")]
+        // macOS/DragonFly: data is pointer-sized; the others use `i64`.
+        #[cfg(any(target_os = "macos", target_os = "dragonfly"))]
         {
             ev.0.data = interval_ns as isize;
         }
-        #[cfg(target_os = "freebsd")]
+        #[cfg(not(any(target_os = "macos", target_os = "dragonfly")))]
         {
             ev.0.data = interval_ns;
         }
@@ -321,7 +339,7 @@ impl Kevent {
         self.0.ident as RawFd
     }
 
-    fn new(ident: usize, filter: i16, flags: u16, fflags: u32) -> Self {
+    fn new(ident: usize, filter: KeventFilter, flags: KeventFlags, fflags: u32) -> Self {
         Self(libc::kevent {
             ident,
             filter,
@@ -358,7 +376,7 @@ impl Kevent {
 
     /// Return the raw filter value of this event. Used in tests only.
     #[cfg(test)]
-    pub fn raw_filter(self) -> i16 {
+    pub fn raw_filter(self) -> KeventFilter {
         self.0.filter
     }
 }
@@ -369,7 +387,7 @@ pub fn trigger_user(kq: RawFd, ident: usize) -> Result<(), i32> {
         libc::kevent(
             kq,
             std::ptr::from_ref(&trigger).cast::<libc::kevent>(),
-            1,
+            kevent_count(1),
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
@@ -390,7 +408,7 @@ pub fn apply_changes(kq: RawFd, changes: &[Kevent]) -> Result<(), i32> {
         libc::kevent(
             kq,
             changes.as_ptr().cast::<libc::kevent>(),
-            changes.len() as libc::c_int,
+            kevent_count(changes.len()),
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
