@@ -58,6 +58,8 @@ pub const NVMM_X86_LAYOUT: BringupLayout = BringupLayout {
 /// full guest arena, but the NetBSD eager-GPA debug module faults every mapped
 /// GPA page, so large windows are realized lazily in bounded chunks.
 const SPARSE_WINDOW_CHUNK_LEN: u64 = 64 * 1024 * 1024;
+const NVMM_PRIVATE_ARENA_LEN: usize = 1024 * 1024 * 1024;
+const NVMM_PRIVATE_ARENA_ALIGN: usize = 0x1000;
 const X86_2M: u64 = 2 * 1024 * 1024;
 const X86_1G: u64 = 1024 * 1024 * 1024;
 
@@ -92,6 +94,144 @@ unsafe impl Sync for Region {}
 
 type SharedRegions = Arc<RwLock<Vec<Region>>>;
 type SharedPageTables = Arc<Mutex<Option<carrick_mem::pml4::Pml4Manager>>>;
+type SharedAliasChunks = Arc<Mutex<AliasChunkState>>;
+type SharedPrivateArenas = Arc<Mutex<PrivateArenaState>>;
+
+#[derive(Default)]
+struct PrivateArenaState {
+    arenas: Vec<PrivateArena>,
+}
+
+struct PrivateArena {
+    base: *mut u8,
+    size: usize,
+    cursor: usize,
+}
+
+// SAFETY: an arena describes a process-wide HVA that NVMM has replaced with a
+// shareable UAO mapping. Allocation is serialized by `SharedPrivateArenas`.
+unsafe impl Send for PrivateArena {}
+unsafe impl Sync for PrivateArena {}
+
+impl PrivateArena {
+    fn allocate(&mut self, len: usize) -> Option<*mut u8> {
+        let offset = self.cursor.next_multiple_of(NVMM_PRIVATE_ARENA_ALIGN);
+        let end = offset.checked_add(len)?;
+        if end > self.size {
+            return None;
+        }
+        self.cursor = end;
+        // SAFETY: `end <= self.size` proves the returned pointer is inside the
+        // registered arena.
+        Some(unsafe { self.base.add(offset) })
+    }
+}
+
+fn allocate_private_hva(
+    mach: &mut NvmmMachine,
+    arenas: &mut PrivateArenaState,
+    len: usize,
+) -> Result<*mut u8, TrapError> {
+    if let Some(hva) = arenas
+        .arenas
+        .iter_mut()
+        .find_map(|arena| arena.allocate(len))
+    {
+        return Ok(hva);
+    }
+
+    let arena_size = NVMM_PRIVATE_ARENA_LEN.max(len);
+    let base = mach
+        .map_registered_ram_arena(arena_size, NvmmRamBacking::Private)
+        .map_err(map_err)?;
+    let mut arena = PrivateArena {
+        base,
+        size: arena_size,
+        cursor: 0,
+    };
+    let hva = arena.allocate(len).ok_or_else(|| {
+        TrapError::Hypervisor(format!(
+            "nvmm-x86: private arena could not allocate 0x{len:x} bytes from 0x{arena_size:x}"
+        ))
+    })?;
+    if std::env::var_os("CARRICK_NVMM_MAP_STATS").is_some() {
+        eprintln!(
+            "[NVMM-X86-ARENA] hva=0x{:x} len=0x{:x} arenas={}",
+            base as usize,
+            arena_size,
+            arenas.arenas.len() + 1
+        );
+    }
+    arenas.arenas.push(arena);
+    Ok(hva)
+}
+
+fn map_private_ram_on_machine(
+    mach: &mut NvmmMachine,
+    arenas: &mut PrivateArenaState,
+    gpa: u64,
+    len: usize,
+    prot: libc::c_int,
+    reason: &'static str,
+) -> Result<*mut u8, TrapError> {
+    let hva = allocate_private_hva(mach, arenas, len)?;
+    mach.map_registered_host_ram(hva, gpa, len, prot)
+        .map_err(map_err)?;
+    if std::env::var_os("CARRICK_NVMM_MAP_STATS").is_some() {
+        eprintln!(
+            "[NVMM-X86-GPA-MAP] reason={reason} gpa=0x{gpa:x} len=0x{len:x} hva=0x{:x}",
+            hva as usize
+        );
+    }
+    Ok(hva)
+}
+
+/// Compact GPA window used only by NVMM's read-only file-alias snapshots. NVMM
+/// reports a 128 GiB max GPA on the target hosts; the generic alias IPA range is
+/// 96..160 GiB, so using it directly eventually crosses the backend ceiling and
+/// can collide with compacted runtime windows. Keep the actual NVMM GPAs in the
+/// top 16 GiB below that ceiling and map the guest VA to these GPAs in PML4.
+const NVMM_ALIAS_COMPACT_BASE: u64 = 0x1c_0000_0000; // 112 GiB
+const NVMM_ALIAS_COMPACT_LIMIT: u64 = 0x20_0000_0000; // 128 GiB
+
+#[derive(Clone)]
+struct AliasChunkState {
+    next_gpa: u64,
+    chunks: Vec<(u64, u64)>,
+}
+
+impl AliasChunkState {
+    fn new() -> Self {
+        Self {
+            next_gpa: NVMM_ALIAS_COMPACT_BASE,
+            chunks: Vec::new(),
+        }
+    }
+
+    fn compact_gpa_for(&mut self, original_chunk: u64, len: usize) -> Result<u64, TrapError> {
+        if let Some((_, compact)) = self
+            .chunks
+            .iter()
+            .find(|(original, _)| *original == original_chunk)
+        {
+            return Ok(*compact);
+        }
+        let len = u64::try_from(len)
+            .map_err(|_| TrapError::Hypervisor("nvmm-x86: alias chunk len overflows".into()))?;
+        let compact = self.next_gpa.next_multiple_of(SPARSE_WINDOW_CHUNK_LEN);
+        let end = compact
+            .checked_add(len)
+            .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: alias chunk GPA overflows".into()))?;
+        if end > NVMM_ALIAS_COMPACT_LIMIT {
+            return Err(TrapError::Hypervisor(format!(
+                "nvmm-x86: compact alias GPA arena exhausted at 0x{compact:x}+0x{len:x}"
+            )));
+        }
+        self.next_gpa = end;
+        self.chunks.push((original_chunk, compact));
+        Ok(compact)
+    }
+}
 
 fn read_regions(table: &SharedRegions) -> std::sync::RwLockReadGuard<'_, Vec<Region>> {
     table.read().unwrap_or_else(|e| e.into_inner())
@@ -107,6 +247,16 @@ fn lock_page_tables(
     table.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn lock_alias_chunks(chunks: &SharedAliasChunks) -> std::sync::MutexGuard<'_, AliasChunkState> {
+    chunks.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_private_arenas(
+    arenas: &SharedPrivateArenas,
+) -> std::sync::MutexGuard<'_, PrivateArenaState> {
+    arenas.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The NVMM `X86Vmm`: an `NvmmMachine` plus the VA-keyed host-HVA region table
 /// the engine reads/writes guest memory through (NVMM is the N-mapping model —
 /// `hva_map` + `gpa_map` per region — not bhyve's single segment).
@@ -115,6 +265,8 @@ pub struct NvmmVmm {
     windows: Vec<WindowRegion>,
     regions: SharedRegions,
     page_tables: SharedPageTables,
+    alias_chunks: SharedAliasChunks,
+    private_arenas: SharedPrivateArenas,
 }
 
 pub struct NvmmSiblingBuilder {
@@ -122,6 +274,8 @@ pub struct NvmmSiblingBuilder {
     windows: Vec<WindowRegion>,
     regions: SharedRegions,
     page_tables: SharedPageTables,
+    alias_chunks: SharedAliasChunks,
+    private_arenas: SharedPrivateArenas,
 }
 
 // SAFETY: the builder carries a shared NVMM machine handle plus raw HVAs that
@@ -143,6 +297,17 @@ impl NvmmVmm {
 
     fn translate_va(&self, va: u64) -> Option<u64> {
         lock_page_tables(&self.page_tables).as_ref()?.translate(va)
+    }
+
+    fn map_private_ram(
+        &mut self,
+        gpa: u64,
+        len: usize,
+        prot: libc::c_int,
+        reason: &'static str,
+    ) -> Result<*mut u8, TrapError> {
+        let mut arenas = lock_private_arenas(&self.private_arenas);
+        map_private_ram_on_machine(&mut self.mach, &mut arenas, gpa, len, prot, reason)
     }
 
     fn map_window_chunk(&mut self, chunk: WindowRegion) -> Result<(), TrapError> {
@@ -167,10 +332,14 @@ impl NvmmVmm {
         } else {
             NvmmRamBacking::Private
         };
-        let hva = self
-            .mach
-            .map_guest_ram_with_backing(chunk.gpa, len, prot, backing)
-            .map_err(map_err)?;
+        let hva = if backing == NvmmRamBacking::Private {
+            let mut arenas = lock_private_arenas(&self.private_arenas);
+            map_private_ram_on_machine(&mut self.mach, &mut arenas, chunk.gpa, len, prot, "window")?
+        } else {
+            self.mach
+                .map_guest_ram_with_backing(chunk.gpa, len, prot, backing)
+                .map_err(map_err)?
+        };
         regions.push(Region {
             va: chunk.va,
             gpa: chunk.gpa,
@@ -194,6 +363,46 @@ impl NvmmVmm {
         };
         self.map_window_chunk(chunk)?;
         Ok(true)
+    }
+
+    fn map_private_alias_chunk_for_ipa(&mut self, ipa: u64) -> Result<u64, TrapError> {
+        let Some((chunk_ipa, len)) = private_alias_chunk_for_ipa(ipa) else {
+            return Err(TrapError::Hypervisor(format!(
+                "nvmm-x86: alias IPA 0x{ipa:x} outside private alias arena"
+            )));
+        };
+        let compact_chunk =
+            lock_alias_chunks(&self.alias_chunks).compact_gpa_for(chunk_ipa, len)?;
+        let mapped_gpa = compact_chunk
+            .checked_add(ipa.checked_sub(chunk_ipa).ok_or_else(|| {
+                TrapError::Hypervisor("nvmm-x86: alias IPA chunk underflow".into())
+            })?)
+            .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: alias mapped GPA overflow".into()))?;
+        let mut regions = write_regions(&self.regions);
+        if resolve_region_gpa(&regions, compact_chunk, 1).is_some() {
+            return Ok(mapped_gpa);
+        }
+        let prot = NVMM_PROT_READ | NVMM_PROT_WRITE | NVMM_PROT_EXEC;
+        let hva = {
+            let mut arenas = lock_private_arenas(&self.private_arenas);
+            map_private_ram_on_machine(
+                &mut self.mach,
+                &mut arenas,
+                compact_chunk,
+                len,
+                prot,
+                "readonly-file-alias",
+            )?
+        };
+        regions.push(Region {
+            va: compact_chunk,
+            gpa: compact_chunk,
+            hva,
+            len,
+            prot,
+            backing: NvmmRamBacking::Private,
+        });
+        Ok(mapped_gpa)
     }
 }
 
@@ -268,6 +477,22 @@ fn sparse_chunk_for_va(windows: &[WindowRegion], va: u64) -> Option<WindowRegion
         len,
         ..window
     })
+}
+
+fn private_alias_chunk_for_ipa(ipa: u64) -> Option<(u64, usize)> {
+    use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
+
+    if !(LINUX_ALIAS_IPA_BASE..LINUX_ALIAS_IPA_BASE + LINUX_ALIAS_IPA_SIZE).contains(&ipa) {
+        return None;
+    }
+    let offset = ipa.checked_sub(LINUX_ALIAS_IPA_BASE)?;
+    let chunk_offset = (offset / SPARSE_WINDOW_CHUNK_LEN) * SPARSE_WINDOW_CHUNK_LEN;
+    let remaining = LINUX_ALIAS_IPA_SIZE.checked_sub(chunk_offset)?;
+    let len = remaining.min(SPARSE_WINDOW_CHUNK_LEN);
+    Some((
+        LINUX_ALIAS_IPA_BASE + chunk_offset,
+        usize::try_from(len).ok()?,
+    ))
 }
 
 fn compact_region_alignment(region: WindowRegion) -> u64 {
@@ -422,76 +647,99 @@ impl X86Vmm for NvmmVmm {
                 carrick_x86::X86_PML4_CAPACITY as usize,
             )
             .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: PML4 backing not mapped".into()))?;
-        let (hva, prot, backing, writable, register_existing) = match file {
-            Some((fd, offset, host_prot)) => {
-                let mut prot = 0;
-                if host_prot & libc::PROT_READ != 0 {
-                    prot |= NVMM_PROT_READ;
-                }
-                if host_prot & libc::PROT_WRITE != 0 {
-                    prot |= NVMM_PROT_WRITE;
-                }
-                if host_prot & libc::PROT_EXEC != 0 {
-                    prot |= NVMM_PROT_EXEC;
-                }
-                let writable = host_prot & libc::PROT_WRITE != 0;
-                if !writable {
-                    // NetBSD/NVMM registers regular file HVAs successfully but
-                    // exposes zero-filled pages to the guest. Read-only shared
-                    // mappings are safe to snapshot; writable MAP_SHARED needs a
-                    // separate writeback/coherency path before it can use this.
-                    let hva = self
-                        .mach
-                        .map_guest_ram_with_backing(ipa, aligned_len, prot, NvmmRamBacking::Private)
-                        .map_err(map_err)?;
-                    if let Err(e) = copy_file_mapping_payload(hva, aligned_len, fd, offset) {
+        let (mapped_ipa, hva, prot, backing, writable, register_existing, record_region) =
+            match file {
+                Some((fd, offset, host_prot)) => {
+                    let mut prot = 0;
+                    if host_prot & libc::PROT_READ != 0 {
+                        prot |= NVMM_PROT_READ;
+                    }
+                    if host_prot & libc::PROT_WRITE != 0 {
+                        prot |= NVMM_PROT_WRITE;
+                    }
+                    if host_prot & libc::PROT_EXEC != 0 {
+                        prot |= NVMM_PROT_EXEC;
+                    }
+                    let writable = host_prot & libc::PROT_WRITE != 0;
+                    if !writable {
+                        // NetBSD/NVMM registers regular file HVAs successfully but
+                        // exposes zero-filled pages to the guest. Read-only shared
+                        // mappings are safe to snapshot. Keep those snapshots in
+                        // reusable alias chunks so package-import-heavy workloads do
+                        // not exhaust NVMM's HVA registration slots one tiny mmap at
+                        // a time. Writable MAP_SHARED still needs a separate
+                        // writeback/coherency path before it can use this.
+                        let mapped_ipa = self.map_private_alias_chunk_for_ipa(ipa)?;
+                        let hva = {
+                            let regions = read_regions(&self.regions);
+                            resolve_region_gpa(&regions, mapped_ipa, aligned_len).ok_or_else(|| {
+                            TrapError::Hypervisor(format!(
+                                "nvmm-x86: read-only file alias ipa=0x{mapped_ipa:x} unmapped"
+                            ))
+                        })?
+                        };
+                        if let Err(e) = copy_file_mapping_payload(hva, aligned_len, fd, offset) {
+                            unsafe {
+                                libc::close(fd);
+                            }
+                            return Err(e);
+                        }
                         unsafe {
                             libc::close(fd);
                         }
-                        return Err(e);
-                    }
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    (hva, prot, NvmmRamBacking::Private, writable, false)
-                } else {
-                    let h = unsafe {
-                        libc::mmap(
+                        (
+                            mapped_ipa,
                             std::ptr::null_mut(),
-                            aligned_len,
-                            host_prot,
-                            libc::MAP_SHARED,
-                            fd,
-                            offset,
+                            0,
+                            NvmmRamBacking::Private,
+                            writable,
+                            false,
+                            false,
                         )
-                    };
-                    if h == libc::MAP_FAILED {
+                    } else {
+                        let h = unsafe {
+                            libc::mmap(
+                                std::ptr::null_mut(),
+                                aligned_len,
+                                host_prot,
+                                libc::MAP_SHARED,
+                                fd,
+                                offset,
+                            )
+                        };
+                        if h == libc::MAP_FAILED {
+                            unsafe {
+                                libc::close(fd);
+                            }
+                            return Err(TrapError::Hypervisor(format!(
+                                "nvmm-x86: alias MAP_SHARED file fd={fd} off={offset} size={aligned_len} prot={host_prot} failed"
+                            )));
+                        }
                         unsafe {
                             libc::close(fd);
                         }
-                        return Err(TrapError::Hypervisor(format!(
-                            "nvmm-x86: alias MAP_SHARED file fd={fd} off={offset} size={aligned_len} prot={host_prot} failed"
-                        )));
+                        (
+                            ipa,
+                            h.cast::<u8>(),
+                            prot,
+                            NvmmRamBacking::Shared,
+                            writable,
+                            true,
+                            true,
+                        )
                     }
-                    unsafe {
-                        libc::close(fd);
+                }
+                None => {
+                    let prot = NVMM_PROT_READ | NVMM_PROT_WRITE | NVMM_PROT_EXEC;
+                    let hva =
+                        self.map_private_ram(ipa, aligned_len, prot, "private-payload-alias")?;
+                    if !payload.is_empty() {
+                        let n = payload.len().min(aligned_len);
+                        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), hva, n) };
                     }
-                    (h.cast::<u8>(), prot, NvmmRamBacking::Shared, writable, true)
+                    (ipa, hva, prot, NvmmRamBacking::Private, true, false, true)
                 }
-            }
-            None => {
-                let prot = NVMM_PROT_READ | NVMM_PROT_WRITE | NVMM_PROT_EXEC;
-                let hva = self
-                    .mach
-                    .map_guest_ram_with_backing(ipa, aligned_len, prot, NvmmRamBacking::Private)
-                    .map_err(map_err)?;
-                if !payload.is_empty() {
-                    let n = payload.len().min(aligned_len);
-                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), hva, n) };
-                }
-                (hva, prot, NvmmRamBacking::Private, true, false)
-            }
-        };
+            };
         if register_existing
             && let Err(e) = self
                 .mach
@@ -503,20 +751,22 @@ impl X86Vmm for NvmmVmm {
             }
             return Err(e);
         }
-        write_regions(&self.regions).push(Region {
-            va,
-            gpa: ipa,
-            hva,
-            len: aligned_len,
-            prot,
-            backing,
-        });
+        if record_region {
+            write_regions(&self.regions).push(Region {
+                va,
+                gpa: ipa,
+                hva,
+                len: aligned_len,
+                prot,
+                backing,
+            });
+        }
         let mut page_tables_guard = lock_page_tables(&self.page_tables);
         let page_tables = page_tables_guard
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: page tables not initialized".into()))?;
         page_tables
-            .map_aliased(va, ipa, len, writable)
+            .map_aliased(va, mapped_ipa, len, writable)
             .map_err(|e| TrapError::Hypervisor(format!("nvmm-x86: PML4 map_aliased: {e:?}")))?;
         let bytes = page_tables.bytes();
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pt_host, bytes.len()) };
@@ -575,6 +825,7 @@ impl X86Vmm for NvmmVmm {
         let mut child_mach = NvmmMachine::create().map_err(map_err)?;
         let parent_regions = read_regions(&self.regions);
         let mut child_regions = Vec::with_capacity(parent_regions.len());
+        let mut child_private_arenas = PrivateArenaState::default();
         let mut frozen_cursor = 0usize;
         for region in parent_regions.iter() {
             let child_hva = match region.backing {
@@ -588,14 +839,14 @@ impl X86Vmm for NvmmVmm {
                             region.va
                         )));
                     };
-                    let dst = child_mach
-                        .map_guest_ram_with_backing(
-                            region.gpa,
-                            region.len,
-                            region.prot,
-                            NvmmRamBacking::Private,
-                        )
-                        .map_err(map_err)?;
+                    let dst = map_private_ram_on_machine(
+                        &mut child_mach,
+                        &mut child_private_arenas,
+                        region.gpa,
+                        region.len,
+                        region.prot,
+                        "fork-private",
+                    )?;
                     // SAFETY: `src` and `dst` both span `region.len`; the
                     // child mapping is fresh and disjoint.
                     unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, region.len) };
@@ -633,6 +884,9 @@ impl X86Vmm for NvmmVmm {
         self.regions = Arc::new(RwLock::new(child_regions));
         let page_tables = lock_page_tables(&self.page_tables).clone();
         self.page_tables = Arc::new(Mutex::new(page_tables));
+        let alias_chunks = lock_alias_chunks(&self.alias_chunks).clone();
+        self.alias_chunks = Arc::new(Mutex::new(alias_chunks));
+        self.private_arenas = Arc::new(Mutex::new(child_private_arenas));
         *vcpu = child_vcpu;
         Ok(())
     }
@@ -657,6 +911,8 @@ impl X86Vmm for NvmmVmm {
             windows: self.windows.clone(),
             regions: Arc::clone(&self.regions),
             page_tables: Arc::clone(&self.page_tables),
+            alias_chunks: Arc::clone(&self.alias_chunks),
+            private_arenas: Arc::clone(&self.private_arenas),
         })
     }
 
@@ -672,6 +928,8 @@ impl X86Vmm for NvmmVmm {
             windows: builder.windows,
             regions: builder.regions,
             page_tables: builder.page_tables,
+            alias_chunks: builder.alias_chunks,
+            private_arenas: builder.private_arenas,
         };
         Ok((vmm, vcpu))
     }
@@ -707,6 +965,8 @@ impl X86Vmm for NvmmVmm {
             windows: new_windows,
             regions: new_regions,
             page_tables: new_page_tables,
+            alias_chunks: new_alias_chunks,
+            private_arenas: new_private_arenas,
         } = new_vmm;
 
         *vcpu = new_vcpu;
@@ -715,6 +975,8 @@ impl X86Vmm for NvmmVmm {
         self.windows = new_windows;
         self.regions = new_regions;
         self.page_tables = new_page_tables;
+        self.alias_chunks = new_alias_chunks;
+        self.private_arenas = new_private_arenas;
         Ok(())
     }
 }
@@ -1103,6 +1365,8 @@ fn bring_up_parts(image: &AddressSpace) -> Result<(NvmmVmm, NvmmX86Vcpu), TrapEr
         windows: Vec::new(),
         regions: Arc::new(RwLock::new(Vec::new())),
         page_tables: Arc::new(Mutex::new(None)),
+        alias_chunks: Arc::new(Mutex::new(AliasChunkState::new())),
+        private_arenas: Arc::new(Mutex::new(PrivateArenaState::default())),
     };
 
     // 1. Shared region walk (identity), then remap to compact GPAs + map them.
