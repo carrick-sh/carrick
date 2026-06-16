@@ -32,6 +32,13 @@ use crate::vmm::{X86Exit, X86FaultKind, X86Reg, X86Vcpu, X86Vmm};
 const FXSAVE_MXCSR_OFF: usize = 24;
 const FXSAVE_XMM0_OFF: usize = 160;
 const X86_PFEC_PRESENT: u64 = 1 << 0;
+const X86_TRAMPOLINE_SYSRET_OFFSET: u64 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SysretResume {
+    user_pc: u64,
+    user_rflags: u64,
+}
 
 fn x86_fault_signal(kind: X86FaultKind, error_code: u64) -> Option<(i32, i32)> {
     const SIGSEGV: i32 = libc::SIGSEGV;
@@ -79,6 +86,9 @@ pub struct X86EngineCore<V: X86Vmm> {
     /// overwrites RAX with the retval. SA_RESTART restores it so a restarted
     /// syscall re-executes with its number intact.
     last_orig_rax: u64,
+    /// User-mode state saved by SYSCALL while the live RIP is parked on the
+    /// trampoline SYSRET.
+    sysret_resume: Option<SysretResume>,
     /// `true` on the child side of a guest `fork(2)`.
     is_forked_child: bool,
 }
@@ -93,8 +103,31 @@ impl<V: X86Vmm> X86EngineCore<V> {
             layout,
             pending_resume_pc: None,
             last_orig_rax: 0,
+            sysret_resume: None,
             is_forked_child: false,
         }
+    }
+
+    fn sysret_pc(&self) -> u64 {
+        self.layout.trampoline_base + X86_TRAMPOLINE_SYSRET_OFFSET
+    }
+
+    fn is_syscall_trampoline_pc(&self, pc: u64) -> bool {
+        pc == self.layout.trampoline_base || pc == self.sysret_pc()
+    }
+
+    fn sysret_resume_at(&self, live_rip: u64) -> Option<SysretResume> {
+        self.is_syscall_trampoline_pc(live_rip)
+            .then_some(self.sysret_resume)
+            .flatten()
+    }
+
+    fn interrupted_rflags(&self) -> Result<u64, TrapError> {
+        let live_rip = self.vcpu.get_gpr(X86Reg::Rip)?;
+        if let Some(resume) = self.sysret_resume_at(live_rip) {
+            return Ok(resume.user_rflags);
+        }
+        self.vcpu.get_gpr(X86Reg::Rflags)
     }
 
     fn flush_current_tlb(&mut self) -> Result<(), MemoryError> {
@@ -327,6 +360,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         loop {
             match self.vcpu.run()? {
                 X86Exit::Syscall { frame, resume_pc } => {
+                    self.sysret_resume = None;
                     // The engine — not the backend — owns the pending state.
                     self.pending_resume_pc = Some(resume_pc);
                     self.last_orig_rax = frame.rax;
@@ -340,7 +374,10 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                         SyscallNorm::Plain(raw) => return Ok(Some(raw)),
                     }
                 }
-                X86Exit::Halt => return Ok(None),
+                X86Exit::Halt => {
+                    self.sysret_resume = None;
+                    return Ok(None);
+                }
                 // A cross-thread kick forced the vCPU out of the guest with no
                 // syscall pending. Return `Ok(None)` so the run loop's kick path
                 // delivers any pending async signal at the interrupted PC, then
@@ -353,6 +390,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                 // `Kicked`.)
                 X86Exit::Kicked => return Ok(None),
                 X86Exit::FpDoorbell => {
+                    self.sysret_resume = None;
                     // The FP doorbell is only meaningful while `run_fp_stub` is
                     // driving the stub (it consumes the exit itself); reaching it
                     // here is a spurious re-entry — re-run the guest.
@@ -363,6 +401,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                     fault_addr,
                     error_code,
                 } => {
+                    self.sysret_resume = None;
                     // Deliver as an ISA-neutral guest fault. For #PF, PFEC.P
                     // selects MAPERR vs ACCERR exactly like Linux; other x86
                     // vectors use the backend-resolved Linux si_addr.
@@ -381,7 +420,10 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
     }
 
     fn current_pc(&self) -> Result<u64, TrapError> {
-        self.vcpu.get_gpr(X86Reg::Rip)
+        let live_rip = self.vcpu.get_gpr(X86Reg::Rip)?;
+        Ok(self
+            .sysret_resume_at(live_rip)
+            .map_or(live_rip, |resume| resume.user_pc))
     }
 
     fn process_exit_cleanup(&mut self) {
@@ -393,12 +435,21 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
-        // Write RAX = return value and resume at the stashed SYSRETQ. For KVM the
-        // resume_pc equals the RIP KVM already advanced to past the OUT, so the
-        // RIP write is a no-op; for bhyve it is `rip + inst_length`. Either way
-        // the engine owns the resume.
+        // Write RAX = return value and resume inside the stashed syscall
+        // trampoline. KVM reports the native current RIP (observed as the OUT
+        // address); bhyve reports `rip + inst_length` (the SYSRETQ). Either way
+        // the engine owns the user PC/RFLAGS to expose if a kick lands before
+        // SYSRET gets back to ring 3.
+        self.sysret_resume = None;
         self.vcpu.set_gpr(X86Reg::Rax, return_value as u64)?;
         if let Some(pc) = self.pending_resume_pc.take() {
+            if self.is_syscall_trampoline_pc(pc) {
+                self.sysret_resume = Some(SysretResume {
+                    user_pc: self.vcpu.get_gpr(X86Reg::Rcx)?,
+                    user_rflags: self.vcpu.get_gpr(X86Reg::R11)? | 0x2,
+                });
+                self.vcpu.prepare_sysret_resume(self.layout)?;
+            }
             self.vcpu.set_gpr(X86Reg::Rip, pc)?;
         }
         Ok(())
@@ -420,6 +471,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         // resumes at its own entry, not the old doorbell resume.
         self.vm.execve_rebuild(&mut self.vcpu, new_image)?;
         self.pending_resume_pc = None;
+        self.sysret_resume = None;
         Ok(())
     }
 
@@ -448,11 +500,10 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
-        use carrick_hal::RegAccess as _;
         // The interrupted RFLAGS, saved into the frame's eflags and restored
         // verbatim by rt_sigreturn (x86 has no privilege-latched SPSR analogue).
         let pstate_source = self
-            .get_reg(Reg::Rflags)
+            .interrupted_rflags()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         let params = carrick_hal::sigframe::InjectParams {
             signum,
@@ -476,12 +527,14 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
             sigreturn_trampoline_base: 0,
         };
         <Self as ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        self.sysret_resume = None;
         bringup_fns::program_user_segments(&mut self.vcpu)?;
         Ok(())
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         let restored = <Self as ThreadedEngine>::Arch::restore_sigframe(self, true)?;
+        self.sysret_resume = None;
         bringup_fns::program_user_segments(&mut self.vcpu)?;
         Ok(restored.sigmask)
     }
@@ -534,6 +587,7 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     // already been restored at the syscall-return point, so completion must only
     // write RAX=0 and must not reuse the parent's pending resume PC.
     engine.pending_resume_pc = None;
+    engine.sysret_resume = None;
     engine.is_forked_child = true;
     Ok(ForkOutcome::Child)
 }
@@ -617,6 +671,169 @@ unsafe impl<V: X86Vmm> Send for X86EngineCore<V> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use carrick_hal::threaded::{GenericVcpuRegistry, VcpuKick, VcpuRegistry};
+
+    use crate::vmm::{ForkRamStrategy, MsrInstall, WindowPlan, X86Seg};
+
+    #[derive(Clone)]
+    struct TestKick;
+
+    impl VcpuKick for TestKick {
+        fn kick(&self) {}
+
+        fn target_in_guest(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Default)]
+    struct TestVmm;
+
+    #[derive(Default)]
+    struct TestVcpu {
+        rcx: u64,
+        r11: u64,
+        rip: u64,
+        rflags: u64,
+        prepared_sysret: bool,
+    }
+
+    impl X86Vmm for TestVmm {
+        type KickHandle = TestKick;
+        type SiblingBuilder = ();
+        type Vcpu = TestVcpu;
+
+        fn setup_memory(&mut self, _plan: &WindowPlan) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn write_gpa(&self, _gpa: u64, _bytes: &[u8]) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn host_ptr(&self, _gpa: u64, _len: usize) -> Option<*mut u8> {
+            None
+        }
+
+        fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
+            Ok(TestVcpu::default())
+        }
+
+        fn fork_ram_strategy(&self) -> ForkRamStrategy {
+            ForkRamStrategy::Cow
+        }
+
+        fn kick_handle(&self) -> Self::KickHandle {
+            TestKick
+        }
+
+        fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
+            Ok(())
+        }
+
+        fn materialize_sibling(
+            _builder: Self::SiblingBuilder,
+        ) -> Result<(Self, Self::Vcpu), TrapError> {
+            Ok((Self, TestVcpu::default()))
+        }
+
+        fn set_guest_sp(&self, _vcpu: &Self::Vcpu, _sp: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
+            Arc::new(GenericVcpuRegistry::default())
+        }
+    }
+
+    impl X86Vcpu for TestVcpu {
+        fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
+            Ok(match reg {
+                X86Reg::Rcx => self.rcx,
+                X86Reg::R11 => self.r11,
+                X86Reg::Rip => self.rip,
+                X86Reg::Rflags => self.rflags,
+                _ => 0,
+            })
+        }
+
+        fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError> {
+            match reg {
+                X86Reg::Rcx => self.rcx = v,
+                X86Reg::R11 => self.r11 = v,
+                X86Reg::Rip => self.rip = v,
+                X86Reg::Rflags => self.rflags = v,
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn prepare_sysret_resume(&mut self, _layout: BringupLayout) -> Result<(), TrapError> {
+            self.prepared_sysret = true;
+            Ok(())
+        }
+
+        fn set_segment(
+            &mut self,
+            _seg: X86Seg,
+            _base: u64,
+            _limit: u32,
+            _ar: u32,
+        ) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn get_fs_base(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn set_fs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn get_gs_base(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+
+        fn set_gs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn set_syscall_msrs(
+            &mut self,
+            _lstar: u64,
+            _star: u64,
+            _sfmask: u64,
+        ) -> Result<MsrInstall, TrapError> {
+            Ok(MsrInstall::Direct)
+        }
+
+        fn get_fp(&self) -> Result<Option<[u8; 512]>, TrapError> {
+            Ok(Some([0; 512]))
+        }
+
+        fn set_fp(&mut self, _fx: &[u8; 512]) -> Result<bool, TrapError> {
+            Ok(true)
+        }
+
+        fn run(&mut self) -> Result<X86Exit, TrapError> {
+            Ok(X86Exit::Halt)
+        }
+
+        fn enable_halt_exit(&mut self) -> Result<(), TrapError> {
+            Ok(())
+        }
+    }
+
+    fn test_layout() -> BringupLayout {
+        BringupLayout {
+            trampoline_base: 0x1000_0000,
+            gdt_base: 0x1000_1000,
+            pml4_base: 0x1000_2000,
+        }
+    }
 
     #[test]
     fn x86_page_fault_present_bit_selects_accerr() {
@@ -649,5 +866,82 @@ mod tests {
             Some((libc::SIGSEGV, 128)),
             "user CLI #GP is SIGSEGV/SI_KERNEL on Docker linux/amd64"
         );
+    }
+
+    #[test]
+    fn current_pc_reports_user_rcx_while_parked_at_sysret() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_1234,
+            r11: 0x246,
+            rip: layout.trampoline_base + 2,
+            rflags: 0x2,
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.pending_resume_pc = Some(layout.trampoline_base + 2);
+
+        engine.complete_syscall(0).expect("complete syscall");
+
+        assert_eq!(engine.current_pc().expect("current pc"), 0x0040_1234);
+        assert!(
+            engine.vcpu.prepared_sysret,
+            "backend must prepare hidden segment state for SYSRET"
+        );
+    }
+
+    #[test]
+    fn current_pc_reports_user_rcx_after_kvm_trampoline_base_resume() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_5678,
+            r11: 0x246,
+            rip: layout.trampoline_base,
+            rflags: 0x2,
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.pending_resume_pc = Some(layout.trampoline_base);
+
+        engine.complete_syscall(0).expect("complete syscall");
+        engine.vcpu.rip = layout.trampoline_base + 2;
+
+        assert_eq!(engine.current_pc().expect("current pc"), 0x0040_5678);
+    }
+
+    #[test]
+    fn current_pc_does_not_rewrite_plain_user_rip_at_trampoline_address() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_1234,
+            r11: 0x246,
+            rip: layout.trampoline_base + 2,
+            rflags: 0x2,
+            ..Default::default()
+        };
+        let engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+
+        assert_eq!(
+            engine.current_pc().expect("current pc"),
+            layout.trampoline_base + 2
+        );
+    }
+
+    #[test]
+    fn interrupted_rflags_reports_user_r11_while_parked_at_sysret() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_1234,
+            r11: 0x646,
+            rip: layout.trampoline_base + 2,
+            rflags: 0x2,
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.pending_resume_pc = Some(layout.trampoline_base + 2);
+
+        engine.complete_syscall(0).expect("complete syscall");
+
+        assert_eq!(engine.interrupted_rflags().expect("rflags"), 0x646);
     }
 }
