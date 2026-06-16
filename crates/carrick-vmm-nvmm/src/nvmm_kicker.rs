@@ -15,12 +15,16 @@
 
 use std::sync::Once;
 
-/// The signal NVMM uses to force a vCPU out of `nvmm_vcpu_run` (`SIGUSR2`, never
-/// routed to the guest in M1; the runtime maps guest signals through its own
-/// layer and installs no disposition for `SIGUSR2` on the host).
+/// NetBSD's `<sys/signal.h>` defines `SIGRTMIN` as 33. The Rust `libc` crate does
+/// not expose that constant consistently, so keep the backend-local value here.
+/// A real-time signal is reserved for carrick's own vCPU kick so it does not
+/// collide with standard guest-routable signals like SIGUSR1/SIGUSR2.
+const NETBSD_SIGRTMIN: i32 = 33;
+
+/// The signal NVMM uses to force a vCPU out of `nvmm_vcpu_run`.
 #[inline]
-fn kick_signal() -> i32 {
-    libc::SIGUSR2
+pub fn kick_signal() -> i32 {
+    NETBSD_SIGRTMIN
 }
 
 /// Empty handler: its only purpose is to interrupt an in-progress
@@ -29,7 +33,7 @@ extern "C" fn nvmm_kick_noop(_signum: libc::c_int) {}
 
 static KICK_HANDLER_INSTALLED: Once = Once::new();
 
-fn install_kick_handler() {
+pub fn install_nvmm_kick_handler() {
     KICK_HANDLER_INSTALLED.call_once(|| {
         // SAFETY: a zeroed sigaction is the documented "no flags, empty mask"
         // form; we set the handler fn, an empty mask, and sa_flags = 0 (NO
@@ -53,7 +57,7 @@ pub struct NvmmKickHandle {
 impl NvmmKickHandle {
     /// Build a handle for the CURRENT thread (call on the owning vCPU thread).
     pub fn for_current_thread() -> Self {
-        install_kick_handler();
+        install_nvmm_kick_handler();
         // SAFETY: `pthread_self` is always safe; returns this thread's id.
         let tid = unsafe { libc::pthread_self() };
         Self { tid }

@@ -713,7 +713,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             let rc = unsafe {
-                libc::semget(key as i32 as libc::key_t, nsems as i32, semflg as i32)
+                carrick_portable::semget(key as i32 as libc::key_t, nsems as i32, semflg as i32)
             };
             match rc.host_syscall_errno() {
                 Ok(id) => Ok(DispatchOutcome::Returned { value: id as i64 }),
@@ -796,10 +796,10 @@ fn sysv_semop<M: GuestMemory>(
         Ok(b) => b,
         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
     };
-    let mut sops: Vec<libc::sembuf> = Vec::with_capacity(nsops);
+    let mut sops: Vec<carrick_portable::Sembuf> = Vec::with_capacity(nsops);
     for i in 0..nsops {
         let o = i * 6;
-        sops.push(libc::sembuf {
+        sops.push(carrick_portable::Sembuf {
             sem_num: u16::from_le_bytes([bytes[o], bytes[o + 1]]),
             sem_op: i16::from_le_bytes([bytes[o + 2], bytes[o + 3]]),
             sem_flg: i16::from_le_bytes([bytes[o + 4], bytes[o + 5]]),
@@ -807,7 +807,7 @@ fn sysv_semop<M: GuestMemory>(
     }
 
     if timeout.is_none() {
-        let rc = unsafe { libc::semop(semid, sops.as_mut_ptr(), nsops) };
+        let rc = unsafe { carrick_portable::semop(semid, sops.as_mut_ptr(), nsops) };
         return match rc.host_syscall_errno() {
             Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -832,7 +832,7 @@ fn sysv_semop<M: GuestMemory>(
     }
     loop {
         let mut attempt = nowait.clone();
-        let rc = unsafe { libc::semop(semid, attempt.as_mut_ptr(), nsops) };
+        let rc = unsafe { carrick_portable::semop(semid, attempt.as_mut_ptr(), nsops) };
         match rc.host_syscall_errno() {
             Ok(_) => return Ok(DispatchOutcome::Returned { value: 0 }),
             Err(e) if e == LINUX_EAGAIN => {
@@ -852,21 +852,21 @@ fn linux_semctl_cmd_to_host(cmd: u64) -> Option<i32> {
     // FreeBSD's libc bindings omit the GET*/SET* semctl cmd consts (though the
     // kernel has them); supply them from the host <sys/sem.h> (host ABI).
     // IPC_RMID/SET/STAT exist in libc on every host.
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     const GETNCNT: i32 = 3;
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     const GETPID: i32 = 4;
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     const GETVAL: i32 = 5;
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     const GETALL: i32 = 6;
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     const GETZCNT: i32 = 7;
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     const SETVAL: i32 = 8;
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     const SETALL: i32 = 9;
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
     use libc::{GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, SETALL, SETVAL};
     Some(match cmd {
         LINUX_IPC_RMID => libc::IPC_RMID,
@@ -898,7 +898,7 @@ fn sysv_semctl<M: GuestMemory>(
     // Commands that take NO arg or return a value directly.
     match cmd {
         LINUX_IPC_RMID | LINUX_GETPID | LINUX_GETVAL | LINUX_GETNCNT | LINUX_GETZCNT => {
-            let rc = unsafe { libc::semctl(semid, semnum, host_cmd) };
+            let rc = unsafe { carrick_portable::semctl0(semid, semnum, host_cmd) };
             match rc.host_syscall_errno() {
                 Ok(v) => Ok(DispatchOutcome::Returned { value: v as i64 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -913,7 +913,7 @@ fn sysv_semctl<M: GuestMemory>(
             if !(0..=SEMVMX).contains(&val) {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
             }
-            let rc = unsafe { libc::semctl(semid, semnum, host_cmd, val) };
+            let rc = unsafe { carrick_portable::semctl_val(semid, semnum, host_cmd, val) };
             match rc.host_syscall_errno() {
                 Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -940,7 +940,7 @@ fn sysv_semctl<M: GuestMemory>(
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
                 }
             }
-            let rc = unsafe { libc::semctl(semid, 0, host_cmd, vals.as_mut_ptr()) };
+            let rc = unsafe { carrick_portable::semctl_ptr(semid, 0, host_cmd, vals.as_mut_ptr()) };
             match rc.host_syscall_errno() {
                 Ok(_) => {
                     if cmd == LINUX_GETALL {
@@ -986,7 +986,8 @@ fn sysv_semctl<M: GuestMemory>(
 
 /// Number of semaphores in the set, via host IPC_STAT.
 fn host_sem_nsems(semid: i32) -> Result<usize, i32> {
-    let mut ds: libc::semid_ds = unsafe { core::mem::zeroed() };
-    let rc = unsafe { libc::semctl(semid, 0, libc::IPC_STAT, &mut ds as *mut libc::semid_ds) };
-    rc.host_syscall_errno().map(|_| ds.sem_nsems as usize)
+    let mut ds: carrick_portable::SemidDs = unsafe { core::mem::zeroed() };
+    let rc = unsafe { carrick_portable::semctl_ptr(semid, 0, libc::IPC_STAT, &mut ds) };
+    rc.host_syscall_errno()
+        .map(|_| carrick_portable::sem_nsems(&ds))
 }

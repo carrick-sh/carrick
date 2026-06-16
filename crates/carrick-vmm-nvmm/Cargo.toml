@@ -29,7 +29,17 @@ workspace = true
 # crates (NOT carrick-runtime) so it cross-compiles independently.
 [dependencies]
 carrick-hal = { path = "../carrick-hal" }
+carrick-abi = { path = "../carrick-abi" }
 carrick-x86 = { path = "../carrick-x86" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+# The hypervisor-agnostic private-futex table; NVMM supplies only the NetBSD
+# `__futex` shared-page syscall shim.
+carrick-thread = { path = "../carrick-thread" }
+carrick-host = { path = "../carrick-host" }
+# BSD-family signal-number translation and kqueue host glue used by the NetBSD
+# runtime integration.
+carrick-host-bsd = { path = "../carrick-host-bsd" }
+carrick-timer-core = { path = "../carrick-timer-core" }
+carrick-signal-core = { path = "../carrick-signal-core" }
 libc.workspace = true

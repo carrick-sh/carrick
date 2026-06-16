@@ -1542,7 +1542,11 @@ impl EpollKqueue {
     /// On macOS this is a no-op: the shared kqueue reaches parked waiters
     /// natively and the in-memory broadcast drives `trigger_user(0)` directly via
     /// `notify_inmem_epoll`, so the historical macOS behavior is preserved.
-    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    #[cfg(any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
     pub(crate) fn wake_parked(&self) {
         self.with_mux(|mux| {
             let _ = mux.trigger_user(0);
@@ -3669,9 +3673,9 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealSta
         uid: 0,
         gid: 0,
         size: st.st_size as u64,
-        atime: (st.st_atime, st.st_atime_nsec),
-        mtime: (st.st_mtime, st.st_mtime_nsec),
-        ctime: (st.st_ctime, st.st_ctime_nsec),
+        atime: (st.st_atime, carrick_portable::stat_atime_nsec(st)),
+        mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
+        ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(st)),
     }
 }
 

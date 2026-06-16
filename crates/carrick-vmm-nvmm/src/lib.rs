@@ -27,8 +27,14 @@
 #![cfg(target_os = "netbsd")]
 
 pub mod nvmm;
+pub mod nvmm_disposition;
+mod nvmm_futex;
 pub mod nvmm_kicker;
+pub mod nvmm_signal_pump;
+pub mod nvmm_signum;
+pub mod nvmm_threaded_glue;
 pub mod nvmm_x86_engine;
+pub mod nvmm_xsig;
 pub mod run_elf;
 
 pub use nvmm::{
@@ -39,5 +45,7 @@ pub use nvmm::{
 pub use nvmm::{
     NvmmCapability, NvmmError, NvmmMachine, NvmmResult, NvmmVcpu, NvmmX64State, NvmmX86ExitIo,
 };
+pub use nvmm_futex::{NvmmFutex, make_nvmm_futex};
+pub use nvmm_threaded_glue::{NvmmForkCoordinator, NvmmTimerDelivery};
 pub use nvmm_x86_engine::{NVMM_X86_LAYOUT, NvmmVmm, bring_up};
 pub use run_elf::run_elf_nvmm;

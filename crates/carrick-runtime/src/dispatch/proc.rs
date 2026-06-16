@@ -1517,19 +1517,14 @@ impl SyscallDispatcher {
 
             let result = match request {
                 0 => unsafe {
-                    libc::ptrace(
-                        carrick_portable::PT_TRACE_ME,
-                        0,
-                        std::ptr::null_mut::<libc::c_char>(),
-                        0,
-                    )
+                    carrick_portable::ptrace(carrick_portable::PT_TRACE_ME, 0, 0, 0)
                 },
                 7 => match host_pid(pid) {
                     Some(pid) => unsafe {
-                        libc::ptrace(
+                        carrick_portable::ptrace(
                             carrick_portable::PT_CONTINUE,
                             pid.0,
-                            std::ptr::without_provenance_mut::<libc::c_char>(1),
+                            1,
                             host_signal_data(),
                         )
                     },
@@ -1537,21 +1532,16 @@ impl SyscallDispatcher {
                 },
                 8 => match host_pid(pid) {
                     Some(pid) => unsafe {
-                        libc::ptrace(
-                            carrick_portable::PT_KILL,
-                            pid.0,
-                            std::ptr::null_mut::<libc::c_char>(),
-                            0,
-                        )
+                        carrick_portable::ptrace(carrick_portable::PT_KILL, pid.0, 0, 0)
                     },
                     None => return Ok(LINUX_ESRCH.into()),
                 },
                 17 => match host_pid(pid) {
                     Some(pid) => unsafe {
-                        libc::ptrace(
+                        carrick_portable::ptrace(
                             carrick_portable::PT_DETACH,
                             pid.0,
-                            std::ptr::without_provenance_mut::<libc::c_char>(1),
+                            1,
                             host_signal_data(),
                         )
                     },
@@ -1952,12 +1942,7 @@ impl SyscallDispatcher {
                 crate::guest_cpu::clear_child_ptrace_stop_pending(result as u32);
                 let host_sigkill = crate::host_signal::linux_to_host_signum(LINUX_SIGKILL);
                 let cont = unsafe {
-                    libc::ptrace(
-                        carrick_portable::PT_CONTINUE,
-                        result,
-                        std::ptr::without_provenance_mut::<libc::c_char>(1),
-                        host_sigkill,
-                    )
+                    carrick_portable::ptrace(carrick_portable::PT_CONTINUE, result, 1, host_sigkill)
                 };
                 cont.host_syscall_errno()?;
                 loop {
@@ -2240,12 +2225,7 @@ fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
     // tracee died meanwhile) is benign — the caller's re-wait surfaces the
     // real state.
     unsafe {
-        libc::ptrace(
-            carrick_portable::PT_CONTINUE,
-            pid,
-            std::ptr::without_provenance_mut::<libc::c_char>(1),
-            sig,
-        );
+        carrick_portable::ptrace(carrick_portable::PT_CONTINUE, pid, 1, sig);
     }
     true
 }
