@@ -832,6 +832,7 @@ mod tests {
         rip: u64,
         rflags: u64,
         prepared_sysret: bool,
+        get_gprs_calls: std::cell::Cell<u32>,
     }
 
     impl X86Vmm for TestVmm {
@@ -900,6 +901,14 @@ mod tests {
                 X86Reg::Rip => self.rip = v,
                 X86Reg::Rflags => self.rflags = v,
                 _ => {}
+            }
+            Ok(())
+        }
+
+        fn get_gprs(&self, regs: &[X86Reg], out: &mut [u64]) -> Result<(), TrapError> {
+            self.get_gprs_calls.set(self.get_gprs_calls.get() + 1);
+            for (slot, reg) in out.iter_mut().zip(regs) {
+                *slot = self.get_gpr(*reg)?;
             }
             Ok(())
         }
@@ -1059,6 +1068,33 @@ mod tests {
             engine.current_pc().expect("current pc"),
             layout.trampoline_base + 2
         );
+    }
+
+    #[test]
+    fn complete_sysret_batches_rcx_r11_into_one_get_gprs() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_1234,
+            r11: 0x246,
+            rip: layout.trampoline_base + 2,
+            rflags: 0x2,
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.pending_resume_pc = Some(layout.trampoline_base + 2);
+
+        engine.complete_syscall(0).expect("complete syscall");
+
+        // The user RCX/R11 must be fetched via a SINGLE batched get_gprs so a
+        // whole-register-file backend issues one ioctl, not two.
+        assert_eq!(
+            engine.vcpu.get_gprs_calls.get(),
+            1,
+            "complete_sysret must batch the RCX/R11 read into one get_gprs"
+        );
+        // Behavior preserved: parked user PC = RCX, user RFLAGS = R11 | 0x2.
+        assert_eq!(engine.current_pc().expect("pc"), 0x0040_1234);
+        assert_eq!(engine.interrupted_rflags().expect("rflags"), 0x246);
     }
 
     #[test]

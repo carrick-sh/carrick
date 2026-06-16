@@ -296,6 +296,22 @@ impl X86Vcpu for BhyveX86Vcpu {
         self.set_raw(x86reg_to_vmreg(reg), v)
     }
 
+    fn get_gprs(&self, regs: &[X86Reg], out: &mut [u64]) -> Result<(), TrapError> {
+        // One `VM_GET_REGISTER_SET` ioctl for the whole slice (the shared
+        // `complete_sysret` fetches RCX+R11 together) instead of one
+        // `vm_get_register` per register.
+        let ids: Vec<c_int> = regs.iter().map(|&r| x86reg_to_vmreg(r)).collect();
+        let vals = self
+            .h
+            .as_bhyve()
+            .get_register_set(&ids)
+            .map_err(Self::reg_err)?;
+        for (slot, v) in out.iter_mut().zip(vals) {
+            *slot = v;
+        }
+        Ok(())
+    }
+
     fn set_segment(
         &mut self,
         _seg: X86Seg,
