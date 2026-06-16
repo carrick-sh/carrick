@@ -104,7 +104,7 @@ fn pml4_region_covers_observed_nested_fault_gpa_before_first_run() {
 }
 
 #[test]
-#[ignore = "nested NetBSD/NVMM currently pauses QEMU with internal-error in svm_vmrun"]
+#[ignore = "stock NetBSD/NVMM lazy GPA faults pause QEMU under nested SVM; safe with eager-fault nvmm.kmod"]
 fn long_mode_ring0_doorbell_reaches_io_exit() {
     let Some(path) = fixture("CARRICK_NVMM_FIXTURE") else {
         eprintln!("skip: set CARRICK_NVMM_FIXTURE to a static x86_64 ELF");
