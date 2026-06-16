@@ -98,6 +98,31 @@ use crate::runtime::hardware_tso_for_debug;
 mod macos_helper_stubs {
     use super::{AddressSpace, SyscallDispatcher};
 
+    fn execve_trace_filter() -> Option<Option<String>> {
+        static FILTER: std::sync::OnceLock<Option<Option<String>>> = std::sync::OnceLock::new();
+        FILTER
+            .get_or_init(|| {
+                std::env::var_os("CARRICK_EXECVE_TRACE").map(|value| {
+                    let value = value.to_string_lossy();
+                    if value.is_empty() || value == "1" {
+                        None
+                    } else {
+                        Some(value.into_owned())
+                    }
+                })
+            })
+            .clone()
+    }
+
+    fn trace_execve(path: &str, args: std::fmt::Arguments<'_>) {
+        let Some(filter) = execve_trace_filter() else {
+            return;
+        };
+        if filter.as_ref().is_none_or(|needle| path.contains(needle)) {
+            eprintln!("[EXECVE] {args}");
+        }
+    }
+
     /// KVM execve image builder — the Linux twin of `crate::runtime::exec::
     /// load_execve_image`. It resolves the target through the dispatcher's
     /// exec-file reader (overlay/rootfs first, then the host fs) and shebangs,
@@ -127,6 +152,7 @@ mod macos_helper_stubs {
             dispatcher.resolve_exec_path(path),
             argv,
         )?;
+        trace_execve(&path, format_args!("load path={path}"));
         // Read the binary overlay-first. Fall back to the literal host fs ONLY
         // for a bare run-elf boot (host-staged target, no container fs). In a
         // container run the fallback is OFF, so a target absent from the rootfs
@@ -141,10 +167,22 @@ mod macos_helper_stubs {
                 None
             }
         };
-        let raw_bytes = dispatcher
+        let raw_bytes = match dispatcher
             .read_exec_file(&path)
             .or_else(|| host_read(&path))
-            .ok_or(LINUX_ENOENT)?;
+        {
+            Some(bytes) => {
+                trace_execve(
+                    &path,
+                    format_args!("main path={path} bytes={}", bytes.len()),
+                );
+                bytes
+            }
+            None => {
+                trace_execve(&path, format_args!("main path={path} missing"));
+                return Err(LINUX_ENOENT);
+            }
+        };
         // The ELF machine this lane accepts. The byte-based loader otherwise
         // defaults to EM_AARCH64 (the aarch64 KVM lane); the x86_64 lanes
         // (KVM-x86, bhyve) MUST pass EM_X86_64 or an x86_64 execve target is
@@ -160,12 +198,26 @@ mod macos_helper_stubs {
         #[cfg(not(target_arch = "x86_64"))]
         let machine = goblin::elf::header::EM_AARCH64;
         // Load the ELF, resolving a dynamic interpreter through the same reader.
-        let raw = AddressSpace::load_elf_bytes_with_reader_for(
+        let raw = match AddressSpace::load_elf_bytes_with_reader_for(
             &raw_bytes,
-            &|p| dispatcher.read_exec_file(p).or_else(|| host_read(p)),
+            &|p| {
+                let bytes = dispatcher.read_exec_file(p).or_else(|| host_read(p));
+                match bytes.as_ref() {
+                    Some(found) => {
+                        trace_execve(&path, format_args!("interp path={p} bytes={}", found.len()));
+                    }
+                    None => trace_execve(&path, format_args!("interp path={p} missing")),
+                }
+                bytes
+            },
             machine,
-        )
-        .map_err(|_| LINUX_ENOENT)?;
+        ) {
+            Ok(raw) => raw,
+            Err(err) => {
+                trace_execve(&path, format_args!("elf-load path={path} err={err:?}"));
+                return Err(LINUX_ENOENT);
+            }
+        };
         // KVM boot-image shape: vdso (so AT_SYSINFO_EHDR resolves) + the Linux
         // initial stack (argc/argv/envp/auxv). `build_for_image` adds the
         // trampoline / page-tables / sentinel vectors. Matches the boot chain in
@@ -176,16 +228,30 @@ mod macos_helper_stubs {
         let image = {
             use carrick_hal::GuestArch as _;
             type KvmArch = <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
-            raw.with_vdso_bytes(KvmArch::vdso_bytes())
+            match raw
+                .with_vdso_bytes(KvmArch::vdso_bytes())
                 .and_then(|a| a.with_linux_initial_stack(argv, env))
-                .map_err(|_| LINUX_ENOENT)?
+            {
+                Ok(image) => image,
+                Err(err) => {
+                    trace_execve(&path, format_args!("image-build path={path} err={err:?}"));
+                    return Err(LINUX_ENOENT);
+                }
+            }
         };
         #[cfg(target_arch = "x86_64")]
         let image = {
             use carrick_hal::GuestArch as _;
-            raw.with_vdso_bytes(carrick_hal::x8664_arch::X8664GuestArch::vdso_bytes())
+            match raw
+                .with_vdso_bytes(carrick_hal::x8664_arch::X8664GuestArch::vdso_bytes())
                 .and_then(|a| a.with_linux_initial_stack(argv, env))
-                .map_err(|_| LINUX_ENOENT)?
+            {
+                Ok(image) => image,
+                Err(err) => {
+                    trace_execve(&path, format_args!("image-build path={path} err={err:?}"));
+                    return Err(LINUX_ENOENT);
+                }
+            }
         };
         #[cfg(all(
             not(target_arch = "x86_64"),
