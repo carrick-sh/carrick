@@ -3,8 +3,9 @@
 //! argv as `limactl shell <vm> -- env … <carrick-in-guest> run …`, rewriting the
 //! `localhost` conformance-registry host to the lima gateway so the guest can
 //! pull from the mac registry. `KvmLocal` runs a platform-linux carrick binary
-//! directly on a Linux host with `/dev/kvm`. `BhyveLocal` does the same for a
-//! platform-freebsd carrick binary on a FreeBSD host with `/dev/vmm`.
+//! directly on a Linux host with `/dev/kvm`. `BhyveLocal` and `NvmmLocal` do the
+//! same for platform-freebsd/platform-netbsd carrick binaries on hosts with
+//! `/dev/vmm` or `/dev/nvmm`.
 
 use crate::engine::carrick_argv;
 use crate::manifest::Suite;
@@ -41,6 +42,13 @@ pub struct LocalBhyveConfig {
     pub timeout_scale: f64,
 }
 
+/// Direct NetBSD/NVMM lane configuration. Kept VMM-specific so preflight and
+/// timeout cleanup do not grow ambiguous BSD conditionals.
+#[derive(Clone, Debug)]
+pub struct LocalNvmmConfig {
+    pub timeout_scale: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockerPlatform {
     LinuxArm64,
@@ -63,6 +71,7 @@ pub enum Lane {
     Kvm(LimaConfig),
     KvmLocal(LocalKvmConfig),
     BhyveLocal(LocalBhyveConfig),
+    NvmmLocal(LocalNvmmConfig),
 }
 
 impl Lane {
@@ -71,13 +80,18 @@ impl Lane {
     }
 
     pub fn needs_local_registry_env(&self) -> bool {
-        matches!(self, Lane::Hvf | Lane::KvmLocal(_) | Lane::BhyveLocal(_))
+        matches!(
+            self,
+            Lane::Hvf | Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_)
+        )
     }
 
     pub fn docker_platform(&self) -> DockerPlatform {
         match self {
             Lane::Hvf | Lane::Kvm(_) => DockerPlatform::LinuxArm64,
-            Lane::KvmLocal(_) | Lane::BhyveLocal(_) => DockerPlatform::LinuxAmd64,
+            Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
+                DockerPlatform::LinuxAmd64
+            }
         }
     }
 
@@ -90,6 +104,7 @@ impl Lane {
             Lane::Kvm(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::KvmLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::BhyveLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
+            Lane::NvmmLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
         }
     }
 }
@@ -136,7 +151,7 @@ pub fn carrick_invocation_argv(
     let base = carrick_argv(suite, carrick_bin, run_id); // [carrick_bin, "run", …flags…, image, …cmd]
     match lane {
         Lane::Hvf => base,
-        Lane::KvmLocal(_) | Lane::BhyveLocal(_) => {
+        Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
             carrick_argv_with_platform(base, &suite.image, DockerPlatform::LinuxAmd64)
         }
         Lane::Kvm(cfg) => {
@@ -271,6 +286,9 @@ pub fn lane_from_args(
         "bhyve-local" | "freebsd-bhyve" => Lane::BhyveLocal(LocalBhyveConfig {
             timeout_scale: local_timeout_scale,
         }),
+        "nvmm-local" | "netbsd-nvmm" => Lane::NvmmLocal(LocalNvmmConfig {
+            timeout_scale: local_timeout_scale,
+        }),
         _ => Lane::Hvf,
     }
 }
@@ -400,6 +418,25 @@ mod tests {
             argv.windows(2)
                 .any(|w| w[0] == "--platform" && w[1] == "linux/amd64"),
             "bhyve-local carrick side must request the amd64 OCI platform: {argv:?}"
+        );
+        assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
+        assert!(!argv.contains(&"limactl".to_string()));
+    }
+
+    #[test]
+    fn nvmm_local_invocation_runs_carrick_directly_as_amd64() {
+        let s = demo_suite();
+        let lane = lane_from_args("nvmm-local", "carrick", "host.lima.internal", 2.0, 1.5);
+        let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
+
+        assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
+        assert_eq!(lane.scaled_timeout(s.timeout_s), 2);
+        assert_eq!(argv[0], "/root/ct/release/carrick");
+        assert_eq!(argv[1], "run");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--platform" && w[1] == "linux/amd64"),
+            "nvmm-local carrick side must request the amd64 OCI platform: {argv:?}"
         );
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));

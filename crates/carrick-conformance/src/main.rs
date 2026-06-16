@@ -33,7 +33,13 @@ use std::sync::{Condvar, Mutex};
 const RUNTIME_CRATES: &[&str] = &[
     "carrick-runtime",
     "carrick-vmm-hvf",
+    "carrick-vmm-kvm",
+    "carrick-vmm-bhyve",
+    "carrick-vmm-nvmm",
+    "carrick-x86",
     "carrick-host",
+    "carrick-host-bsd",
+    "carrick-host-linux",
     "carrick-abi",
     "carrick-mem",
     "carrick-guest-mem",
@@ -48,7 +54,8 @@ struct Args {
     tier: String,
     /// Execution lane: `hvf` (local signed binary, default), `kvm` (carrick in
     /// the lima guest), `kvm-local` (direct platform-linux carrick on this host),
-    /// or `bhyve-local` (direct platform-freebsd carrick on this host).
+    /// `bhyve-local` (direct platform-freebsd carrick on this host), or
+    /// `nvmm-local` (direct platform-netbsd carrick on this host).
     #[arg(long, default_value = "hvf")]
     lane: String,
     /// lima VM name for `--lane kvm`.
@@ -64,8 +71,9 @@ struct Args {
     #[arg(long, default_value_t = 2.0)]
     lima_timeout_scale: f64,
     /// Timeout multiplier for direct local x86_64 lanes (`kvm-local`,
-    /// `bhyve-local`). Defaults to 1.0: on same-host x86_64, Carrick should be
-    /// close to Docker; a timeout is a bug signal, not expected nested overhead.
+    /// `bhyve-local`, `nvmm-local`). Defaults to 1.0: on same-host x86_64,
+    /// Carrick should be close to Docker; a timeout is a bug signal, not
+    /// expected nested overhead.
     #[arg(
         long,
         default_value_t = 1.0,
@@ -249,6 +257,8 @@ fn run() -> anyhow::Result<ExitCode> {
         preflight_kvm_local(&args.carrick_bin)?;
     } else if matches!(lane, lane::Lane::BhyveLocal(_)) {
         preflight_bhyve_local(&args.carrick_bin)?;
+    } else if matches!(lane, lane::Lane::NvmmLocal(_)) {
+        preflight_nvmm_local(&args.carrick_bin)?;
     } else {
         preflight(&args.carrick_bin)?;
     }
@@ -1052,6 +1062,42 @@ fn preflight_bhyve_local(bin: &Path) -> anyhow::Result<()> {
         eprintln!(
             "WARNING: {} looks STALE (older than a runtime-crate source) — \
              rebuild the platform-freebsd carrick binary to be sure you are testing HEAD. Continuing.",
+            bin.display()
+        );
+    }
+    Ok(())
+}
+
+/// Local NetBSD/NVMM preflight: the binary is built for platform-netbsd and runs
+/// on this host, so macOS codesign is irrelevant. Validate only the local
+/// executable and NVMM device before the suite fan-out starts.
+fn preflight_nvmm_local(bin: &Path) -> anyhow::Result<()> {
+    let meta = match std::fs::metadata(bin) {
+        Ok(m) => m,
+        Err(_) => anyhow::bail!(
+            "{} is missing — build carrick-cli with `--no-default-features --features platform-netbsd` first",
+            bin.display()
+        ),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        anyhow::ensure!(
+            meta.permissions().mode() & 0o111 != 0,
+            "{} exists but is not executable",
+            bin.display()
+        );
+    }
+    anyhow::ensure!(
+        std::path::Path::new("/dev/nvmm").exists(),
+        "/dev/nvmm is missing — `--lane nvmm-local` must run on a NetBSD host with NVMM"
+    );
+    if let (Ok(bin_t), Some(src_t)) = (meta.modified(), newest_runtime_src_mtime())
+        && bin_t < src_t
+    {
+        eprintln!(
+            "WARNING: {} looks STALE (older than a runtime-crate source) — \
+             rebuild the platform-netbsd carrick binary to be sure you are testing HEAD. Continuing.",
             bin.display()
         );
     }
