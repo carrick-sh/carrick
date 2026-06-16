@@ -2161,6 +2161,14 @@ pub const CARRICK_PRIVATE_X86_LSTAT: u64 = u64::MAX - 0x23;
 /// The arguments match canonical `newfstatat`, but x86_64 still expects the
 /// legacy 144-byte `struct stat` output layout.
 pub const CARRICK_PRIVATE_X86_NEWFSTATAT: u64 = u64::MAX - 0x24;
+/// Carrick-internal sink for unsupported x86_64 syscalls after normalization.
+///
+/// Leaving an x86-only number unchanged is unsafe: the canonical asm-generic
+/// dispatcher may implement a different syscall at that numeric slot (for
+/// example x86_64 `mkdir`=83 collides with canonical `fdatasync`=83). Normalize
+/// unsupported x86 syscalls to this out-of-range number so they return ENOSYS
+/// instead of mis-dispatching with the wrong argument shape.
+pub const CARRICK_PRIVATE_X86_UNSUPPORTED: u64 = u64::MAX - 0x25;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;

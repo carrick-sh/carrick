@@ -694,6 +694,11 @@ const CANONICAL_PIPE2: u64 = 59;
 const X86_NR_READLINK: u64 = 89;
 /// Canonical (asm-generic / aarch64) `readlinkat` number.
 const CANONICAL_READLINKAT: u64 = 78;
+/// x86-64 `mkdir(2)` (syscalls(2)). Desugars to canonical `mkdirat(2)` with
+/// `AT_FDCWD` because asm-generic only exposes `mkdirat`.
+const X86_NR_MKDIR: u64 = 83;
+/// Canonical (asm-generic / aarch64) `mkdirat` number.
+const CANONICAL_MKDIRAT: u64 = 34;
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -791,10 +796,17 @@ impl X8664GuestArch {
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
         }
+        if x86_number == X86_NR_MKDIR {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_MKDIRAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
+            });
+        }
 
         let canonical = match X8664SyscallTable::remap(x86_number) {
             SyscallRemap::Direct(c) => c,
-            SyscallRemap::Native | SyscallRemap::Unknown => x86_number,
+            SyscallRemap::Native => x86_number,
+            SyscallRemap::Unknown => carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED,
         };
         // x86-64 raw clone(2) arg order (flags, stack, ptid, child_tid, tls) vs
         // the asm-generic order the dispatcher binds (.., tls, child_tid): swap
@@ -959,6 +971,36 @@ mod normalize_tests {
                 assert_eq!(rs.args, [carrick_abi::LINUX_AT_FDCWD, 0x1000, 4, 0, 0, 0]);
             }
             _ => panic!("access must be Plain"),
+        }
+    }
+
+    #[test]
+    fn mkdir_normalizes_to_mkdirat_at_fdcwd() {
+        // x86 mkdir = 83, but canonical asm-generic 83 is fdatasync. Normalize
+        // mkdir(path, mode) through mkdirat(AT_FDCWD, path, mode) so the path
+        // pointer is not misinterpreted as a file descriptor.
+        match X8664GuestArch::normalize_syscall(&frame(83, [0x1000, 0o755, 0xAA, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 34);
+                assert_eq!(
+                    rs.args,
+                    [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0o755, 0, 0, 0]
+                );
+            }
+            _ => panic!("mkdir must be Plain"),
+        }
+    }
+
+    #[test]
+    fn unknown_x86_syscall_normalizes_to_private_unsupported() {
+        // x86 select = 23, while canonical asm-generic 23 is dup. Unknown x86
+        // numbers must not fall through to the canonical dispatcher by number.
+        match X8664GuestArch::normalize_syscall(&frame(23, [0x1000, 3, 4, 5, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED);
+                assert_eq!(rs.args, [0x1000, 3, 4, 5, 0, 0]);
+            }
+            _ => panic!("unknown x86 syscall must be Plain unsupported"),
         }
     }
 
