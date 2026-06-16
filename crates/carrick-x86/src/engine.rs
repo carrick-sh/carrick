@@ -15,6 +15,9 @@
 //! `complete_syscall` writes RAX and resumes at it. The backend's `run()` is
 //! stateless w.r.t. the pending syscall.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
+
 use carrick_guest_mem::{GuestMemory, MemoryError};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
@@ -33,6 +36,98 @@ const FXSAVE_MXCSR_OFF: usize = 24;
 const FXSAVE_XMM0_OFF: usize = 160;
 const X86_PFEC_PRESENT: u64 = 1 << 0;
 const X86_TRAMPOLINE_SYSRET_OFFSET: u64 = 2;
+const X86_SYSCALL_STAT_SLOTS: usize = 512;
+const X86_SYSCALL_STAT_PRINT_LIMIT: usize = 32;
+
+static X86_SYSCALL_STATS_PRINTED: AtomicBool = AtomicBool::new(false);
+static X86_SYSCALL_STATS: [AtomicU64; X86_SYSCALL_STAT_SLOTS] =
+    [const { AtomicU64::new(0) }; X86_SYSCALL_STAT_SLOTS];
+static X86_SYSCALL_STATS_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+fn x86_syscall_stats_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CARRICK_X86_SYSCALL_STATS").is_some())
+}
+
+fn install_x86_syscall_stats_atexit() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // SAFETY: register a process-exit diagnostic printer. The function
+        // captures no stack state and remains valid until process exit.
+        unsafe {
+            let _ = libc::atexit(print_x86_syscall_stats_at_exit);
+        }
+    });
+}
+
+extern "C" fn print_x86_syscall_stats_at_exit() {
+    print_x86_syscall_stats_once("atexit");
+}
+
+#[inline]
+fn record_x86_syscall_stat(number: u64) {
+    if !x86_syscall_stats_enabled() {
+        return;
+    }
+    install_x86_syscall_stats_atexit();
+    match usize::try_from(number) {
+        Ok(idx) if idx < X86_SYSCALL_STAT_SLOTS => {
+            X86_SYSCALL_STATS[idx].fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            X86_SYSCALL_STATS_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn reset_x86_syscall_stats_for_fork_child() {
+    if !x86_syscall_stats_enabled() {
+        return;
+    }
+    X86_SYSCALL_STATS_PRINTED.store(false, Ordering::Relaxed);
+    X86_SYSCALL_STATS_OVERFLOW.store(0, Ordering::Relaxed);
+    for counter in &X86_SYSCALL_STATS {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+fn print_x86_syscall_stats_once(reason: &str) {
+    if !x86_syscall_stats_enabled() || X86_SYSCALL_STATS_PRINTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut total = X86_SYSCALL_STATS_OVERFLOW.load(Ordering::Relaxed);
+    let mut entries = Vec::new();
+    for (number, counter) in X86_SYSCALL_STATS.iter().enumerate() {
+        let count = counter.load(Ordering::Relaxed);
+        total = total.saturating_add(count);
+        if count != 0 {
+            entries.push((number, count));
+        }
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    eprintln!(
+        "[carrick-x86-syscall-stats pid={} reason={reason}] total={} overflow={} unique={} top={}",
+        std::process::id(),
+        total,
+        X86_SYSCALL_STATS_OVERFLOW.load(Ordering::Relaxed),
+        entries.len(),
+        X86_SYSCALL_STAT_PRINT_LIMIT,
+    );
+    for (number, count) in entries.into_iter().take(X86_SYSCALL_STAT_PRINT_LIMIT) {
+        let name =
+            <<X8664GuestArch as carrick_hal::GuestArch>::Table as carrick_hal::SyscallTable>::name(
+                number as u64,
+            )
+            .unwrap_or("<unknown>");
+        eprintln!(
+            "[carrick-x86-syscall-stat pid={} nr={} name={} count={}]",
+            std::process::id(),
+            number,
+            name,
+            count,
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SysretResume {
@@ -361,6 +456,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
             match self.vcpu.run()? {
                 X86Exit::Syscall { frame, resume_pc } => {
                     self.sysret_resume = None;
+                    record_x86_syscall_stat(frame.rax);
                     // The engine — not the backend — owns the pending state.
                     self.pending_resume_pc = Some(resume_pc);
                     self.last_orig_rax = frame.rax;
@@ -431,6 +527,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         // `_exit`s skipping Drops. Default is a no-op (KVM/NVMM RAM is released by
         // the OS on `_exit`); bhyve overrides it to tear down its `/dev/vmm` node
         // (and skip a vfork-shared/borrowed VM).
+        print_x86_syscall_stats_once("process-exit");
         self.vm.process_exit_cleanup();
     }
 
@@ -579,6 +676,7 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     }
 
     // CHILD.
+    reset_x86_syscall_stats_for_fork_child();
     engine
         .vm
         .rebuild_child_after_fork(&mut engine.vcpu, &frozen)?;
