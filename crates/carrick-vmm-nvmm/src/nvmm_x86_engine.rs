@@ -280,6 +280,62 @@ fn compact_region_alignment(region: WindowRegion) -> u64 {
     }
 }
 
+fn file_backed_len(fd: libc::c_int, len: usize, offset: libc::off_t) -> Result<usize, TrapError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(TrapError::Hypervisor(format!(
+            "nvmm-x86: fstat file alias fd={fd} failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let file_size = i128::from(stat.st_size);
+    let offset = i128::from(offset);
+    if offset < 0 || file_size <= offset {
+        return Ok(0);
+    }
+
+    usize::try_from((file_size - offset).min(len as i128)).map_err(|_| {
+        TrapError::Hypervisor("nvmm-x86: file alias backed length overflows usize".into())
+    })
+}
+
+fn copy_file_mapping_payload(
+    hva: *mut u8,
+    len: usize,
+    fd: libc::c_int,
+    offset: libc::off_t,
+) -> Result<(), TrapError> {
+    let backed_len = file_backed_len(fd, len, offset)?;
+    let mut copied = 0usize;
+    while copied < backed_len {
+        let chunk = (backed_len - copied).min(1024 * 1024);
+        let Some(read_offset) = (offset as i128)
+            .checked_add(copied as i128)
+            .and_then(|value| libc::off_t::try_from(value).ok())
+        else {
+            return Err(TrapError::Hypervisor(
+                "nvmm-x86: file alias read offset overflows off_t".into(),
+            ));
+        };
+        let n = unsafe { libc::pread(fd, hva.add(copied).cast(), chunk, read_offset) };
+        if n < 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "nvmm-x86: pread file alias fd={fd} failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if n == 0 {
+            break;
+        }
+        copied += usize::try_from(n).map_err(|_| {
+            TrapError::Hypervisor("nvmm-x86: pread byte count overflows usize".into())
+        })?;
+    }
+    Ok(())
+}
+
 impl X86Vmm for NvmmVmm {
     type Vcpu = NvmmX86Vcpu;
     type KickHandle = NvmmKickHandle;
@@ -366,26 +422,8 @@ impl X86Vmm for NvmmVmm {
                 carrick_x86::X86_PML4_CAPACITY as usize,
             )
             .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: PML4 backing not mapped".into()))?;
-        let (hva, prot, backing, writable) = match file {
+        let (hva, prot, backing, writable, register_existing) = match file {
             Some((fd, offset, host_prot)) => {
-                let h = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        aligned_len,
-                        host_prot,
-                        libc::MAP_SHARED,
-                        fd,
-                        offset,
-                    )
-                };
-                unsafe {
-                    libc::close(fd);
-                }
-                if h == libc::MAP_FAILED {
-                    return Err(TrapError::Hypervisor(format!(
-                        "nvmm-x86: alias MAP_SHARED file fd={fd} off={offset} size={aligned_len} prot={host_prot} failed"
-                    )));
-                }
                 let mut prot = 0;
                 if host_prot & libc::PROT_READ != 0 {
                     prot |= NVMM_PROT_READ;
@@ -396,12 +434,50 @@ impl X86Vmm for NvmmVmm {
                 if host_prot & libc::PROT_EXEC != 0 {
                     prot |= NVMM_PROT_EXEC;
                 }
-                (
-                    h.cast::<u8>(),
-                    prot,
-                    NvmmRamBacking::Shared,
-                    host_prot & libc::PROT_WRITE != 0,
-                )
+                let writable = host_prot & libc::PROT_WRITE != 0;
+                if !writable {
+                    // NetBSD/NVMM registers regular file HVAs successfully but
+                    // exposes zero-filled pages to the guest. Read-only shared
+                    // mappings are safe to snapshot; writable MAP_SHARED needs a
+                    // separate writeback/coherency path before it can use this.
+                    let hva = self
+                        .mach
+                        .map_guest_ram_with_backing(ipa, aligned_len, prot, NvmmRamBacking::Private)
+                        .map_err(map_err)?;
+                    if let Err(e) = copy_file_mapping_payload(hva, aligned_len, fd, offset) {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        return Err(e);
+                    }
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    (hva, prot, NvmmRamBacking::Private, writable, false)
+                } else {
+                    let h = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            aligned_len,
+                            host_prot,
+                            libc::MAP_SHARED,
+                            fd,
+                            offset,
+                        )
+                    };
+                    if h == libc::MAP_FAILED {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        return Err(TrapError::Hypervisor(format!(
+                            "nvmm-x86: alias MAP_SHARED file fd={fd} off={offset} size={aligned_len} prot={host_prot} failed"
+                        )));
+                    }
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    (h.cast::<u8>(), prot, NvmmRamBacking::Shared, writable, true)
+                }
             }
             None => {
                 let prot = NVMM_PROT_READ | NVMM_PROT_WRITE | NVMM_PROT_EXEC;
@@ -413,10 +489,10 @@ impl X86Vmm for NvmmVmm {
                     let n = payload.len().min(aligned_len);
                     unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), hva, n) };
                 }
-                (hva, prot, NvmmRamBacking::Private, true)
+                (hva, prot, NvmmRamBacking::Private, true, false)
             }
         };
-        if file.is_some()
+        if register_existing
             && let Err(e) = self
                 .mach
                 .map_existing_host_ram(hva, ipa, aligned_len, prot)
