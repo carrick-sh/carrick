@@ -426,8 +426,7 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
         }
     }
 
-    d.c_ispeed = l.c_ispeed as libc::speed_t;
-    d.c_ospeed = l.c_ospeed as libc::speed_t;
+    carrick_portable::set_termios_speeds(d, l.c_ispeed, l.c_ospeed);
 }
 
 /// Per-fd snapshot of termios captured before the guest (or `make_raw`)

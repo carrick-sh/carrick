@@ -50,6 +50,7 @@ platform-linux = ["dep:carrick-vmm-kvm", "dep:carrick-host-linux"]
 # docs/superpowers/adr/2026-06-06-bhyve-backend-design.md). Mirrors platform-linux.
 # Pulls in carrick-host-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
 platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd"]
+platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }
@@ -63,6 +64,7 @@ carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
 # of the KVM backend. Pulled in alongside carrick-vmm-kvm by platform-linux.
 carrick-host-linux = { path = "../carrick-host-linux", optional = true }
 carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
+carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-observability = { path = "../carrick-observability" }

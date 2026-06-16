@@ -123,7 +123,11 @@ pub(crate) fn resolve_entrypoint_program(
 /// is the run-loop entry that consumes the returned image (HVF `finish_and_run_
 /// image` vs KVM `KvmTrapEngine::new` + `run_threaded_kvm_loop`).
 #[cfg_attr(
-    any(feature = "platform-linux", feature = "platform-freebsd"),
+    any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
     allow(dead_code)
 )]
 pub(crate) fn build_run_image(
@@ -146,7 +150,10 @@ pub(crate) fn build_run_image(
     )
 }
 
-#[cfg_attr(feature = "platform-freebsd", allow(dead_code))]
+#[cfg_attr(
+    any(feature = "platform-freebsd", feature = "platform-netbsd"),
+    allow(dead_code)
+)]
 pub(crate) fn build_run_image_for(
     bytes: &[u8],
     argv: Vec<Vec<u8>>,
@@ -168,7 +175,11 @@ pub(crate) fn build_run_image_for(
     image.with_linux_initial_stack(argv, env.iter().map(|s| s.as_bytes()))
 }
 
-#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
 pub(crate) fn build_run_image_for_execfn(
     bytes: &[u8],
     argv: Vec<Vec<u8>>,
