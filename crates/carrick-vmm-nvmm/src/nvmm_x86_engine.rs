@@ -12,8 +12,9 @@
 //!     EFER/STAR/LSTAR/SFMASK directly — NO ring-0 WRMSR blob).
 //!   - `get_fp` → `Some` (`getstate(STATE_FPU)` ↔ `struct fxsave fpu`, native —
 //!     NO FXSAVE stub).
-//!   - `fork_ram_strategy` → `Cow` (userspace-HVA RAM → host `libc::fork` is COW
-//!     — NEVER freezes RAM / rebuilds the child VM).
+//!   - `fork_ram_strategy` → [`ForkRamStrategy::EagerCopy`] (NVMM's hypervisor
+//!     writes race host COW snapshots; fork children rebuild a fresh machine
+//!     from a pre-fork private-RAM snapshot).
 //!
 //! The IO doorbell exit returns `io.npc` (the next-PC; the kernel does NOT
 //! advance RIP — proven in M0), so `run()` fills `resume_pc = exit.io.npc`.
@@ -296,6 +297,28 @@ impl X86Vmm for NvmmVmm {
 
     fn process_exit_cleanup(&mut self) {
         self.mach.destroy_in_place();
+    }
+
+    fn execve_rebuild(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError> {
+        // Replace the live image (execve). Build the fresh NVMM machine/vCPU
+        // first so a bring-up error leaves the old image running, matching Linux
+        // execve failure semantics. On success, destroy the old vCPU before the
+        // old machine, then publish the fresh machine/regions.
+        let (new_vmm, new_vcpu) = bring_up_parts(new_image)?;
+        let NvmmVmm {
+            mach: new_mach,
+            regions: new_regions,
+        } = new_vmm;
+
+        *vcpu = new_vcpu;
+        let mut old_mach = std::mem::replace(&mut self.mach, new_mach);
+        old_mach.destroy_in_place();
+        self.regions = new_regions;
+        Ok(())
     }
 }
 
@@ -599,7 +622,7 @@ fn compact_plan(plan: &WindowPlan, layout: BringupLayout) -> WindowPlan {
 /// abort-on-overflow `gpa_map`), mmap+hva_map+gpa_map's every region, writes the
 /// ELF bytes + the trampoline/GDT/PML4 images, creates the vCPU, and programs
 /// long mode via the shared [`carrick_x86::program_longmode_entry`].
-pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<NvmmVmm>, TrapError> {
+fn bring_up_parts(image: &AddressSpace) -> Result<(NvmmVmm, NvmmVcpu), TrapError> {
     nvmm::init().map_err(map_err)?;
     let mach = NvmmMachine::create().map_err(map_err)?;
     let mut vmm = NvmmVmm {
@@ -648,6 +671,11 @@ pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<NvmmVmm>, TrapErro
     //    accepts. (bhyve needed an analogous ring-0 init blob for VT-x reasons.)
     install_iretq_ring3_entry(&vmm, &mut vcpu, image.entry(), rsp)?;
 
+    Ok((vmm, vcpu))
+}
+
+pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<NvmmVmm>, TrapError> {
+    let (vmm, vcpu) = bring_up_parts(image)?;
     Ok(X86EngineCore::from_parts(vmm, vcpu, NVMM_X86_LAYOUT))
 }
 
