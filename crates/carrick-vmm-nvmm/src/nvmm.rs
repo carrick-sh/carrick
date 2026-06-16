@@ -202,7 +202,11 @@ pub struct Fxsave {
 
 impl Default for Fxsave {
     fn default() -> Self {
-        Fxsave { bytes: [0u8; 512] }
+        let mut bytes = [0u8; 512];
+        bytes[0..2].copy_from_slice(&0x037f_u16.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0x1f80_u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&0xffbf_u32.to_le_bytes());
+        Fxsave { bytes }
     }
 }
 
@@ -237,6 +241,19 @@ pub struct NvmmX86ExitIo {
     pub npc: u64,
 }
 
+/// `struct nvmm_x86_exit_memory` (32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NvmmX86ExitMemory {
+    pub prot: c_int,
+    _pad0: u32,
+    pub gpa: u64,
+    pub inst_len: u8,
+    pub inst_bytes: [u8; 15],
+}
+
+const _: () = assert!(std::mem::size_of::<NvmmX86ExitMemory>() == 32);
+
 /// `struct nvmm_x86_exit` (64 bytes). The union `u` (32 bytes — the largest
 /// member is `nvmm_x86_exit_memory`) starts at offset 8; `exitstate` at 40.
 /// We model the union as a fixed byte blob and reinterpret it per `reason`.
@@ -249,6 +266,14 @@ pub struct NvmmX86Exit {
 }
 
 impl NvmmX86Exit {
+    /// Reinterpret the union as the memory-exit member. Only valid when
+    /// `reason == NVMM_VCPU_EXIT_MEMORY`.
+    pub fn mem(&self) -> NvmmX86ExitMemory {
+        // SAFETY: `nvmm_x86_exit_memory` exactly matches the 32-byte union blob
+        // and shares the union's start offset; only call when reason == MEMORY.
+        unsafe { ptr::read_unaligned(self.u.as_ptr() as *const NvmmX86ExitMemory) }
+    }
+
     /// Reinterpret the union as the IO exit member. Only valid when
     /// `reason == NVMM_VCPU_EXIT_IO`.
     pub fn io(&self) -> NvmmX86ExitIo {
@@ -630,10 +655,26 @@ impl Drop for NvmmMachine {
 
 #[cfg(test)]
 mod tests {
-    use super::{NvmmRamBacking, map_host_ram};
+    use super::{Fxsave, NvmmRamBacking, map_host_ram};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const SYS___FUTEX: libc::c_int = 166;
+
+    #[test]
+    fn fxsave_default_matches_x86_reset_masks() {
+        let fx = Fxsave::default();
+        let fcw = u16::from_le_bytes([fx.bytes[0], fx.bytes[1]]);
+        let mxcsr = u32::from_le_bytes([fx.bytes[24], fx.bytes[25], fx.bytes[26], fx.bytes[27]]);
+        let mxcsr_mask =
+            u32::from_le_bytes([fx.bytes[28], fx.bytes[29], fx.bytes[30], fx.bytes[31]]);
+
+        assert_eq!(fcw, 0x037f, "x87 control word should mask exceptions");
+        assert_eq!(mxcsr, 0x1f80, "MXCSR should mask SIMD FP exceptions");
+        assert_eq!(
+            mxcsr_mask, 0xffbf,
+            "MXCSR_MASK must preserve the initial mask bits through NVMM"
+        );
+    }
 
     fn futex_wait(host_addr: usize, value: u32) -> i64 {
         let ts = libc::timespec {
