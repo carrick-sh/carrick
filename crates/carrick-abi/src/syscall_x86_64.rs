@@ -23,7 +23,7 @@
 //! (`open` vs `openat`, `access` vs `faccessat`, `dup2` vs `dup3`, `readlink` vs `readlinkat`,
 //! `stat`/`fstat`/`lstat` vs `newfstatat`, `select` vs `pselect6`, `poll` is
 //! the lone exception below as musl calls it with timeout 0) are deliberately
-//! LEFT OUT (→ `Unknown` → -ENOSYS); adding a naive `Direct` for them would
+//! LEFT OUT (→ `Unknown` → private unsupported sink → -ENOSYS); adding a naive `Direct` for them would
 //! silently mis-dispatch the wrong arg shape, which is worse than an honest
 //! ENOSYS. Those are either handled in `normalize_syscall` or listed in a
 //! clearly-marked comment block at the end of the table as needing a future
@@ -295,7 +295,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(81, "fchdir", 50),
     // x86_64=82 rename: LEGACY (asm-generic has renameat=38). rename(old,new) vs
     // renameat(odfd,old,ndfd,new) → LEFT OUT. (see deferred block)
-    // x86_64=83 mkdir: LEGACY (asm-generic has mkdirat=34) → LEFT OUT.
+    // x86_64=83 mkdir: LEGACY. Normalized in x8664_arch::normalize_syscall to
+    // mkdirat(AT_FDCWD, path, mode).
     // x86_64=84 rmdir: LEGACY (asm-generic has unlinkat=35 w/ AT_REMOVEDIR) →
     // LEFT OUT. (see deferred block)
     // x86_64=85 creat: LEGACY x86_64-only (asm-generic uses openat) → LEFT OUT.
