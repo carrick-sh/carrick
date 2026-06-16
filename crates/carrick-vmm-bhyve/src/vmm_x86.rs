@@ -16,7 +16,7 @@ use carrick_hal::OsError;
 use crate::vmm::{
     BhyveVcpu, VmRun, os_err, vm_get_desc, vm_get_register, vm_get_register_set,
     vm_restart_instruction, vm_run, vm_set_capability, vm_set_desc, vm_set_register,
-    vm_setup_freebsd_registers,
+    vm_set_register_set, vm_setup_freebsd_registers,
 };
 
 // amd64 `enum vm_reg_name` (machine/vmm.h:56-107; values are the plain enum
@@ -342,6 +342,22 @@ impl BhyveVcpu {
             return Err(os_err("vm_get_register_set", rc));
         }
         Ok(vals)
+    }
+
+    /// Batched register write (vmmapi.h:156): one ioctl for a batch of registers
+    /// instead of N `vm_set_register` round-trips. `ids` and `vals` must be the
+    /// same length. `&self` is sound for the same single-thread-ownership reason
+    /// as [`Self::set_reg_raw_shared`].
+    pub fn set_register_set(&self, ids: &[c_int], vals: &[u64]) -> Result<(), OsError> {
+        debug_assert_eq!(ids.len(), vals.len());
+        // SAFETY: `self.vcpu` is live; `ids`/`vals` are `count` elements each.
+        let rc = unsafe {
+            vm_set_register_set(self.vcpu, ids.len() as c_uint, ids.as_ptr(), vals.as_ptr())
+        };
+        if rc != 0 {
+            return Err(os_err("vm_set_register_set", rc));
+        }
+        Ok(())
     }
 
     /// Program a segment descriptor's hidden state (vmmapi.h:148): `reg` is a

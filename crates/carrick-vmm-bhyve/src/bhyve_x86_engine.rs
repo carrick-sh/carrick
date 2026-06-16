@@ -312,6 +312,32 @@ impl X86Vcpu for BhyveX86Vcpu {
         Ok(())
     }
 
+    fn set_gprs(&mut self, writes: &[(X86Reg, u64)]) -> Result<(), TrapError> {
+        // One `VM_SET_REGISTER_SET` ioctl for the slice (the shared
+        // `complete_sysret` writes RAX+RIP together). Preserve the one-shot
+        // fork-entry RIP suppression from `set_gpr`: if a RIP write is pending
+        // suppression, drop it from the batch so it cannot clobber the ring-0
+        // MSR-blob entry after a fork/clone-restore.
+        let suppress_rip = writes.iter().any(|(r, _)| *r == X86Reg::Rip)
+            && self.h.fork_entry_pending.swap(false, Ordering::SeqCst);
+        let mut ids: Vec<c_int> = Vec::with_capacity(writes.len());
+        let mut vals: Vec<u64> = Vec::with_capacity(writes.len());
+        for (r, v) in writes {
+            if *r == X86Reg::Rip && suppress_rip {
+                continue;
+            }
+            ids.push(x86reg_to_vmreg(*r));
+            vals.push(*v);
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.h
+            .as_bhyve()
+            .set_register_set(&ids, &vals)
+            .map_err(Self::reg_err)
+    }
+
     fn set_segment(
         &mut self,
         _seg: X86Seg,

@@ -420,6 +420,19 @@ pub trait X86Vcpu {
         Ok(())
     }
 
+    /// Batched register write: apply each `(reg, value)`. The default loops over
+    /// [`Self::set_gpr`] (one ioctl per register); a whole-register-file backend
+    /// (bhyve `VM_SET_REGISTER_SET`, NVMM one `setstate`) overrides this to commit
+    /// the slice in ONE ioctl. Writes are applied in order. Used on the hot
+    /// syscall-completion path ([`complete_sysret`]) to write `RAX`+`RIP`
+    /// together.
+    fn set_gprs(&mut self, writes: &[(X86Reg, u64)]) -> Result<(), TrapError> {
+        for (reg, v) in writes {
+            self.set_gpr(*reg, *v)?;
+        }
+        Ok(())
+    }
+
     /// Read a guest MSR. Optional: the default reports "unsupported", which the
     /// shared vDSO calibration ([`crate::vdso::populate_vdso_vvar`]) treats as
     /// "fall back to the host TSC". A backend overrides this to read the guest
@@ -444,18 +457,23 @@ pub trait X86Vcpu {
         return_value: i64,
         resume_pc: u64,
     ) -> Result<(u64, u64), TrapError> {
-        self.set_gpr(X86Reg::Rax, return_value as u64)?;
         // Fetch the user RCX (return address) and R11 (saved RFLAGS) together —
-        // one ioctl on a whole-register-file backend. Read AT completion time
-        // (NOT the doorbell-time snapshot, which is not safe for SYSRET
-        // bookkeeping), preserving the original RAX-write-before-RCX/R11-read
-        // order.
+        // one ioctl on a whole-register-file backend — AT completion time (the
+        // safe read point, NOT the doorbell-time snapshot). RAX/RIP are
+        // independent of RCX/R11 and the guest is paused, so reading first lets
+        // the two writes also batch into one ioctl below.
+        // Fetch the user RCX (return address) and R11 (saved RFLAGS) together —
+        // one ioctl on a whole-register-file backend — AT completion time (the
+        // safe read point, NOT the doorbell-time snapshot). RAX/RIP are
+        // independent of RCX/R11 and the guest is paused, so reading first lets
+        // the two writes also batch into one ioctl below.
         let mut user = [0u64; 2];
         self.get_gprs(&[X86Reg::Rcx, X86Reg::R11], &mut user)?;
         let user_pc = user[0];
         let user_rflags = user[1] | 0x2;
         self.prepare_sysret_resume(layout)?;
-        self.set_gpr(X86Reg::Rip, resume_pc)?;
+        // Write the syscall return value (RAX) and the resume RIP together.
+        self.set_gprs(&[(X86Reg::Rax, return_value as u64), (X86Reg::Rip, resume_pc)])?;
         Ok((user_pc, user_rflags))
     }
 
