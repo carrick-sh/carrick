@@ -177,6 +177,9 @@ pub struct FaultMemoryRecord {
 const _: () = assert!(std::mem::size_of::<FaultMemoryRecord>() == 64);
 
 impl FaultMemoryRecord {
+    // One argument per record field (the x86 fault frame); a builder would only
+    // add ceremony.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vector: u64,
         error_code: u64,

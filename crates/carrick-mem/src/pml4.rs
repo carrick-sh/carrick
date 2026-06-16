@@ -816,7 +816,7 @@ mod tests {
         let low_va = 0x40_0000;
         let bytes = build(&[user_rw_nx(low_va, low_va, 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
-        let high_va = 0x1_0000_0000_00 + 0x20_0000;
+        let high_va = 0x0100_0000_0000 + 0x20_0000;
         let alias_gpa = 0xA0_0000_0000;
 
         mgr.map_aliased(high_va, alias_gpa, 0x2000, true)
