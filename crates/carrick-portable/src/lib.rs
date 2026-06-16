@@ -89,8 +89,11 @@ pub fn set_errno(value: i32) {
 }
 
 /// Nanosecond fields in `struct stat`. NetBSD's libc names these
-/// `st_*timensec`; the other supported hosts expose `st_*time_nsec`.
+/// `st_*timensec`; the other supported hosts expose `st_*time_nsec`. The field
+/// is `c_long` (== `i64` on carrick's 64-bit hosts); the cast spells out the
+/// width and is a no-op there, so the lint is allowed rather than dropped.
 #[inline]
+#[allow(clippy::unnecessary_cast)]
 pub fn stat_atime_nsec(st: &libc::stat) -> i64 {
     #[cfg(target_os = "netbsd")]
     {
@@ -103,6 +106,7 @@ pub fn stat_atime_nsec(st: &libc::stat) -> i64 {
 }
 
 #[inline]
+#[allow(clippy::unnecessary_cast)]
 pub fn stat_mtime_nsec(st: &libc::stat) -> i64 {
     #[cfg(target_os = "netbsd")]
     {
@@ -115,6 +119,7 @@ pub fn stat_mtime_nsec(st: &libc::stat) -> i64 {
 }
 
 #[inline]
+#[allow(clippy::unnecessary_cast)]
 pub fn stat_ctime_nsec(st: &libc::stat) -> i64 {
     #[cfg(target_os = "netbsd")]
     {
@@ -144,6 +149,11 @@ pub fn set_termios_speeds(t: &mut libc::termios, ispeed: u32, ospeed: u32) {
 
 /// `ptrace(2)` wrapper with a portable integer address argument. NetBSD's libc
 /// binding takes `*mut c_void`; Darwin/FreeBSD's binding takes `*mut c_char`.
+///
+/// # Safety
+/// Thin FFI wrapper over `ptrace(2)`: the caller must uphold that syscall's
+/// contract for the given `request`/`data`, and `addr` is reinterpreted as the
+/// platform pointer argument.
 #[inline]
 pub unsafe fn ptrace(
     request: libc::c_int,
@@ -199,6 +209,10 @@ pub type SemidDs = libc::semid_ds;
 
 /// `semget(2)` wrapper. Rust libc currently omits NetBSD SysV semaphore
 /// bindings, so the NetBSD declarations live in this portability crate.
+///
+/// # Safety
+/// Thin FFI wrapper over `semget(2)`; the arguments must be valid for that
+/// syscall.
 #[inline]
 pub unsafe fn semget(key: libc::key_t, nsems: libc::c_int, semflg: libc::c_int) -> libc::c_int {
     #[cfg(target_os = "netbsd")]
@@ -214,6 +228,11 @@ pub unsafe fn semget(key: libc::key_t, nsems: libc::c_int, semflg: libc::c_int) 
     }
 }
 
+/// `semop(2)` wrapper (see [`semget`]).
+///
+/// # Safety
+/// `sops` must point to `nsops` valid `Sembuf` entries for the duration of the
+/// call.
 #[inline]
 pub unsafe fn semop(semid: libc::c_int, sops: *mut Sembuf, nsops: usize) -> libc::c_int {
     #[cfg(target_os = "netbsd")]
@@ -229,6 +248,11 @@ pub unsafe fn semop(semid: libc::c_int, sops: *mut Sembuf, nsops: usize) -> libc
     }
 }
 
+/// `semctl(2)` wrapper for commands that take no fourth argument (`IPC_RMID`,
+/// `GETVAL`, …).
+///
+/// # Safety
+/// Thin FFI wrapper over `semctl(2)`; the arguments must be valid for `cmd`.
 #[inline]
 pub unsafe fn semctl0(semid: libc::c_int, semnum: libc::c_int, cmd: libc::c_int) -> libc::c_int {
     #[cfg(target_os = "netbsd")]
@@ -249,6 +273,10 @@ pub unsafe fn semctl0(semid: libc::c_int, semnum: libc::c_int, cmd: libc::c_int)
     }
 }
 
+/// `semctl(2)` wrapper for commands taking an `int` fourth argument (`SETVAL`).
+///
+/// # Safety
+/// Thin FFI wrapper over `semctl(2)`; the arguments must be valid for `cmd`.
 #[inline]
 pub unsafe fn semctl_val(
     semid: libc::c_int,
@@ -274,6 +302,12 @@ pub unsafe fn semctl_val(
     }
 }
 
+/// `semctl(2)` wrapper for commands taking a pointer fourth argument
+/// (`IPC_STAT`/`IPC_SET`/`SETALL`/`GETALL`).
+///
+/// # Safety
+/// `ptr` must be valid for the `semctl(2)` `cmd` (e.g. a `semid_ds` or
+/// `semun`-style buffer) for the duration of the call.
 #[inline]
 pub unsafe fn semctl_ptr<T>(
     semid: libc::c_int,
