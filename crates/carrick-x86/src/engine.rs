@@ -49,6 +49,17 @@ fn x86_syscall_stats_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("CARRICK_X86_SYSCALL_STATS").is_some())
 }
 
+fn x86_efault_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CARRICK_X86_EFAULT_TRACE").is_some())
+}
+
+fn trace_x86_efault(op: &str, address: u64, length: usize) {
+    if x86_efault_trace_enabled() {
+        eprintln!("[X86-EFAULT] op={op} va=0x{address:x} len=0x{length:x}");
+    }
+}
+
 fn install_x86_syscall_stats_atexit() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -268,10 +279,10 @@ impl<V: X86Vmm> SegmentBaseRegs for X86EngineCore<V> {
 
 impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        let host = self
-            .vm
-            .host_ptr(address, length)
-            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        let Some(host) = self.vm.host_ptr(address, length) else {
+            trace_x86_efault("read", address, length);
+            return Err(MemoryError::OutOfBounds { address, length });
+        };
         let mut out = vec![0u8; length];
         // SAFETY: `host_ptr` proved [host, host+length) is within a live window;
         // the destination slice is disjoint.
@@ -281,10 +292,10 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
-        let host = self
-            .vm
-            .host_ptr_mut(address, length)
-            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        let Some(host) = self.vm.host_ptr_mut(address, length) else {
+            trace_x86_efault("write", address, length);
+            return Err(MemoryError::OutOfBounds { address, length });
+        };
         // SAFETY: `host_ptr_mut` proved [host, host+length) is within a live
         // window; the source slice is disjoint.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, length) };
