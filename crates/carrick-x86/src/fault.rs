@@ -14,6 +14,7 @@ const X86_TSS64_BYTES: usize = 104;
 pub const X86_TSS64_LIMIT: u32 = (X86_TSS64_BYTES - 1) as u32;
 const X86_FAULT_VECTORS: &[u8] = &[0, 6, 8, 10, 11, 12, 13, 14, 16, 17, 19];
 pub const X86_FAULT_RECORD_U32_WORDS: usize = 15;
+pub const X86_FAULT_MEMORY_RECORD_BYTES: usize = std::mem::size_of::<FaultMemoryRecord>();
 
 const KERN_CS64_SEL: u16 = 0x08;
 
@@ -156,6 +157,87 @@ impl FaultDoorbellRecord {
     }
 }
 
+/// Memory-backed SP4.3 fault record written by guest IDT stubs for VMMs whose
+/// PIO exits do not expose the `OUT` payload. All fields are u64 so the guest
+/// stub can use plain 64-bit stores and the host can convert to the compact
+/// [`FaultDoorbellRecord`] used by the shared trap engine.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+pub struct FaultMemoryRecord {
+    vector: u64,
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rsp: u64,
+    rflags: u64,
+    saved_rax: u64,
+    cr2: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<FaultMemoryRecord>() == 64);
+
+impl FaultMemoryRecord {
+    pub fn new(
+        vector: u64,
+        error_code: u64,
+        rip: u64,
+        cs: u64,
+        rsp: u64,
+        rflags: u64,
+        saved_rax: u64,
+        cr2: u64,
+    ) -> Self {
+        Self {
+            vector,
+            error_code,
+            rip,
+            cs,
+            rsp,
+            rflags,
+            saved_rax,
+            cr2,
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TrapError> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return Err(fault_error(format!(
+                "memory fault record too short: {} < {}",
+                bytes.len(),
+                std::mem::size_of::<Self>()
+            )));
+        }
+        let mut record = Self::default();
+        // SAFETY: `record` is a plain packed integer struct and `bytes` was
+        // length-checked. Copying into it avoids creating references to packed
+        // fields.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                std::ptr::addr_of_mut!(record).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            );
+        }
+        Ok(record)
+    }
+
+    pub fn to_doorbell_record(self) -> Result<FaultDoorbellRecord, TrapError> {
+        let vector = self.vector;
+        let vector = u8::try_from(vector)
+            .map_err(|_| fault_error(format!("fault vector does not fit in u8: {vector}")))?;
+        Ok(FaultDoorbellRecord {
+            vector,
+            error_code: self.error_code,
+            rip: self.rip,
+            cs: self.cs,
+            rsp: self.rsp,
+            rflags: self.rflags,
+            saved_rax: self.saved_rax,
+            cr2: self.cr2,
+        })
+    }
+}
+
 fn fault_error(msg: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(format!("x86 fault tables: {}", msg.into()))
 }
@@ -174,6 +256,10 @@ pub fn fault_tss_base(layout: BringupLayout) -> u64 {
 
 pub fn fault_stack_base(layout: BringupLayout) -> u64 {
     fault_tss_base(layout) + X86_FAULT_SLOTS * 4096
+}
+
+pub fn fault_record_base(layout: BringupLayout) -> u64 {
+    fault_stack_base(layout) + X86_FAULT_SLOTS * 4096
 }
 
 pub fn fault_slot_gpa(base: u64, slot: u64) -> Result<u64, TrapError> {
@@ -227,6 +313,16 @@ pub fn add_fault_windows(regions: &mut Vec<WindowRegion>, layout: BringupLayout)
         user: false,
         shared: false,
     });
+    regions.push(WindowRegion {
+        va: fault_record_base(layout),
+        gpa: fault_record_base(layout),
+        len: slots_len,
+        read: true,
+        write: true,
+        exec: false,
+        user: false,
+        shared: false,
+    });
 }
 
 pub fn write_fault_tables<V: crate::X86Vmm>(
@@ -254,6 +350,46 @@ where
 
         let tss = Tss64::new(stack_gpa + 4096);
         write(tss_gpa, bytes_of(&tss))?;
+    }
+    Ok(())
+}
+
+/// Write fault tables whose stubs publish the full fault record into a
+/// per-vCPU memory page, then ring one `OUT` doorbell. Backends whose native PIO
+/// exits include the payload can keep using [`write_fault_tables`]; this variant
+/// is for backends like NVMM that expose only port/width metadata.
+pub fn write_memory_record_fault_tables<V: crate::X86Vmm>(
+    vm: &V,
+    layout: BringupLayout,
+) -> Result<(), TrapError> {
+    write_memory_record_fault_tables_with(layout, |gpa, bytes| vm.write_gpa(gpa, bytes))
+}
+
+pub fn write_memory_record_fault_tables_with<F>(
+    layout: BringupLayout,
+    mut write: F,
+) -> Result<(), TrapError>
+where
+    F: FnMut(u64, &[u8]) -> Result<(), TrapError>,
+{
+    for slot in 0..X86_FAULT_SLOTS {
+        let idt_gpa = fault_slot_gpa(fault_idt_base(layout), slot)?;
+        let stub_gpa = fault_slot_gpa(fault_stub_base(layout), slot)?;
+        let tss_gpa = fault_slot_gpa(fault_tss_base(layout), slot)?;
+        let stack_gpa = fault_slot_gpa(fault_stack_base(layout), slot)?;
+        let record_gpa = fault_slot_gpa(fault_record_base(layout), slot)?;
+
+        let idt = fault_idt(stub_gpa);
+        write(idt_gpa, bytes_of(&idt))?;
+
+        let stubs = fault_memory_record_stub_page(stub_gpa, record_gpa)?;
+        write(stub_gpa, &stubs)?;
+
+        let tss = Tss64::new(stack_gpa + 4096);
+        write(tss_gpa, bytes_of(&tss))?;
+
+        let record = FaultMemoryRecord::default();
+        write(record_gpa, bytes_of(&record))?;
     }
     Ok(())
 }
@@ -379,8 +515,74 @@ fn fault_stub_for_vector(vector: u8) -> Result<Vec<u8>, TrapError> {
     Ok(stub)
 }
 
+fn fault_memory_record_stub_page(stub_base: u64, record_gpa: u64) -> Result<[u8; 4096], TrapError> {
+    let mut page = [0u8; 4096];
+    for &vector in X86_FAULT_VECTORS {
+        let off = usize::from(vector) * X86_FAULT_STUB_STRIDE as usize;
+        let stub = fault_memory_record_stub_for_vector(stub_base + off as u64, record_gpa, vector)?;
+        if stub.len() > X86_FAULT_STUB_STRIDE as usize {
+            return Err(fault_error(format!(
+                "memory fault stub for vector {vector} is {} bytes, stride is {}",
+                stub.len(),
+                X86_FAULT_STUB_STRIDE
+            )));
+        }
+        page[off..off + stub.len()].copy_from_slice(&stub);
+    }
+    Ok(page)
+}
+
+fn fault_memory_record_stub_for_vector(
+    stub_start: u64,
+    record_gpa: u64,
+    vector: u8,
+) -> Result<Vec<u8>, TrapError> {
+    let mut stub = Vec::with_capacity(X86_FAULT_STUB_STRIDE as usize);
+    let has_error = vector_has_error_code(vector);
+    let error_off = if has_error { 8 } else { 0 };
+    let rip_off = if has_error { 16 } else { 8 };
+    let cs_off = if has_error { 24 } else { 16 };
+    let rflags_off = if has_error { 32 } else { 24 };
+    let rsp_off = if has_error { 40 } else { 32 };
+
+    stub.push(0x50); // push %rax; preserve interrupted RAX at (%rsp)
+    emit_load_imm64_rax(&mut stub, u64::from(vector));
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa)?;
+
+    if has_error {
+        emit_load_stack_qword(&mut stub, error_off);
+    } else {
+        stub.extend_from_slice(&[0x31, 0xC0]); // xor %eax,%eax
+    }
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa + 8)?;
+
+    emit_load_stack_qword(&mut stub, rip_off);
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa + 16)?;
+    emit_load_stack_qword(&mut stub, cs_off);
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa + 24)?;
+    emit_load_stack_qword(&mut stub, rsp_off);
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa + 32)?;
+    emit_load_stack_qword(&mut stub, rflags_off);
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa + 40)?;
+    emit_load_stack_qword(&mut stub, 0);
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa + 48)?;
+    stub.extend_from_slice(&[0x0F, 0x20, 0xD0]); // mov %cr2,%rax
+    emit_store_rax_riprel_current(&mut stub, stub_start, record_gpa + 56)?;
+
+    emit_load_stack_qword(&mut stub, 0);
+    emit_out_eax(&mut stub);
+    stub.extend_from_slice(&[0xEB, 0xFE]); // jmp .
+
+    Ok(stub)
+}
+
 fn emit_load_stack_qword(stub: &mut Vec<u8>, offset: u8) {
     stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, offset]); // mov off(%rsp),%rax
+}
+
+fn emit_load_imm64_rax(stub: &mut Vec<u8>, value: u64) {
+    stub.extend_from_slice(&[0x48, 0xB8]); // movabs imm64,%rax
+    stub.extend_from_slice(&value.to_le_bytes());
 }
 
 fn emit_send_imm32(stub: &mut Vec<u8>, value: u32) {
@@ -402,6 +604,27 @@ fn emit_send_rax_qword(stub: &mut Vec<u8>) {
 
 fn emit_out_eax(stub: &mut Vec<u8>) {
     stub.extend_from_slice(&[0xE7, FAULT_DOORBELL_PORT as u8]); // out %eax,imm8
+}
+
+fn emit_store_rax_riprel_current(
+    stub: &mut Vec<u8>,
+    stub_start: u64,
+    target: u64,
+) -> Result<(), TrapError> {
+    let insn_va = stub_start + stub.len() as u64;
+    emit_store_rax_riprel(stub, insn_va, target)
+}
+
+fn emit_store_rax_riprel(stub: &mut Vec<u8>, insn_va: u64, target: u64) -> Result<(), TrapError> {
+    let next = insn_va + 7;
+    let disp = i64::try_from(target)
+        .and_then(|t| i64::try_from(next).map(|n| t - n))
+        .map_err(|_| fault_error("fault stub RIP-relative target overflow"))?;
+    let disp = i32::try_from(disp)
+        .map_err(|_| fault_error("fault stub RIP-relative displacement overflow"))?;
+    stub.extend_from_slice(&[0x48, 0x89, 0x05]); // mov %rax, disp32(%rip)
+    stub.extend_from_slice(&disp.to_le_bytes());
+    Ok(())
 }
 
 fn bytes_of<T>(value: &T) -> &[u8] {
@@ -461,5 +684,41 @@ mod tests {
         assert_eq!(record.cr2, 0xee_0000_00dd);
         assert_eq!(record.kind(), X86FaultKind::PageFault);
         assert_eq!(record.fault_addr(), record.cr2);
+    }
+
+    #[test]
+    fn memory_record_fault_stub_writes_record_and_rings_once() {
+        let layout = test_layout();
+        let stub_base = fault_stub_base(layout);
+        let record_gpa = fault_record_base(layout);
+        let stub = fault_memory_record_stub_for_vector(
+            stub_base + 14 * X86_FAULT_STUB_STRIDE,
+            record_gpa,
+            14,
+        )
+        .expect("memory-backed page-fault stub");
+
+        let outs = stub
+            .windows(2)
+            .filter(|w| *w == [0xE7, FAULT_DOORBELL_PORT as u8])
+            .count();
+        let stores = stub.windows(3).filter(|w| *w == [0x48, 0x89, 0x05]).count();
+
+        assert_eq!(outs, 1, "memory-backed records need only one doorbell");
+        assert_eq!(stores, 8, "stub must write every packed fault-record field");
+        assert!(stub.len() <= X86_FAULT_STUB_STRIDE as usize);
+    }
+
+    #[test]
+    fn memory_record_decodes_packed_bytes() {
+        let record = FaultMemoryRecord::new(14, 0x22, 0x44, 0x66, 0x88, 0xaa, 0xcc, 0xee);
+        let decoded =
+            FaultMemoryRecord::from_bytes(bytes_of(&record)).expect("decode packed memory record");
+
+        assert_eq!(decoded.to_doorbell_record().expect("doorbell").vector, 14);
+        assert_eq!(
+            decoded.to_doorbell_record().expect("doorbell").fault_addr(),
+            0xee
+        );
     }
 }
