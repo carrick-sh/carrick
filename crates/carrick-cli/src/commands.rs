@@ -325,9 +325,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 println!("Status: Downloaded newer image for {}", image.canonical());
             }
         }
-        Commands::Load { input } => {
+        Commands::Load { input, platform } => {
+            let target = platform
+                .as_deref()
+                .and_then(carrick_image::PlatformTarget::parse)
+                .unwrap_or_else(carrick_image::PlatformTarget::default_target);
             let summaries = store
-                .load_docker_archive(&input)
+                .load_docker_archive_for_platform(&input, &target)
                 .with_context(|| format!("failed to load image from {}", input.display()))?;
             // docker prints `Loaded image: <tag>` per tag loaded.
             for summary in &summaries {
