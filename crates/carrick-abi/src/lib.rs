@@ -1215,6 +1215,20 @@ impl LinuxSiginfo {
         s._pad[0..8].copy_from_slice(&si_value.to_le_bytes());
         s
     }
+
+    /// Build a child-exit siginfo (`CLD_*`) carrying
+    /// `{ si_pid, si_uid, si_status }` at Linux's 64-bit offsets 16/20/24.
+    pub fn child_exit(
+        si_signo: i32,
+        si_pid: i32,
+        si_uid: u32,
+        si_code: i32,
+        si_status: i32,
+    ) -> Self {
+        let mut s = Self::kill(si_signo, si_code, si_pid, si_uid);
+        s._pad[0..4].copy_from_slice(&si_status.to_le_bytes());
+        s
+    }
 }
 
 #[repr(C, packed)]

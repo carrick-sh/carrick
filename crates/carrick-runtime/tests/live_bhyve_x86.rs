@@ -8,6 +8,7 @@
 //! (cross-built off-box; the FreeBSD box has no musl cross-target):
 //!   * `CARRICK_BHYVE_FIXTURE` → a hello-world (`crates/carrick-vmm-bhyve/fixtures/hello-x86_64`)
 //!   * `CARRICK_BHYVE_FSPROBE` → the `uname(2)` differential (`crates/carrick-vmm-kvm/fixtures/x86-fsprobe`)
+//!   * `CARRICK_BHYVE_SIGCHLD` → child-exit SIGCHLD (`crates/carrick-vmm-bhyve/fixtures/bhyve-sigchld`)
 //!
 //! Run on the FreeBSD box (root, for `/dev/vmm`):
 //! ```
@@ -488,6 +489,30 @@ fn cross_process_kill_sigusr2_delivers_with_sender_pid() {
         "parent must wait4 the cross-process-SIGUSR2'd child to exit 0; stdout: {:?}, stderr: {:?}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn sigchld_handler_reaps_child_exit() {
+    // SP4.2 child-exit acceptance: a guest parent installs an SA_SIGINFO SIGCHLD
+    // handler, forks a child, and does NOT block in wait4 first. The backend's
+    // async child-exit reaper must publish SIGCHLD to the parent while leaving
+    // the zombie visible so the guest handler's waitpid(WNOHANG) can reap it.
+    let Some(path) = fixture("CARRICK_BHYVE_SIGCHLD") else {
+        eprintln!("skip: set CARRICK_BHYVE_SIGCHLD to the sigchld ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_bhyve_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "sigchld guest must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("sigchld-ok"),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
     );
 }
 
