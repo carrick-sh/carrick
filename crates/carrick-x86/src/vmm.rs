@@ -406,6 +406,20 @@ pub trait X86Vcpu {
     /// Write a GPR / control register.
     fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError>;
 
+    /// Batched register read: fill `out[i]` with `regs[i]`'s value. The default
+    /// loops over [`Self::get_gpr`] (one ioctl per register); a backend with a
+    /// whole-register-file read (bhyve `VM_GET_REGISTER_SET`, NVMM one
+    /// `getstate`, KVM one `KVM_GET_REGS`) overrides this to satisfy the whole
+    /// slice from ONE ioctl. `out` must be at least `regs.len()` long. Used on
+    /// the hot syscall-completion path ([`complete_sysret`]) to fetch
+    /// `RCX`/`R11` together.
+    fn get_gprs(&self, regs: &[X86Reg], out: &mut [u64]) -> Result<(), TrapError> {
+        for (slot, reg) in out.iter_mut().zip(regs) {
+            *slot = self.get_gpr(*reg)?;
+        }
+        Ok(())
+    }
+
     /// Read a guest MSR. Optional: the default reports "unsupported", which the
     /// shared vDSO calibration ([`crate::vdso::populate_vdso_vvar`]) treats as
     /// "fall back to the host TSC". A backend overrides this to read the guest
@@ -431,8 +445,15 @@ pub trait X86Vcpu {
         resume_pc: u64,
     ) -> Result<(u64, u64), TrapError> {
         self.set_gpr(X86Reg::Rax, return_value as u64)?;
-        let user_pc = self.get_gpr(X86Reg::Rcx)?;
-        let user_rflags = self.get_gpr(X86Reg::R11)? | 0x2;
+        // Fetch the user RCX (return address) and R11 (saved RFLAGS) together —
+        // one ioctl on a whole-register-file backend. Read AT completion time
+        // (NOT the doorbell-time snapshot, which is not safe for SYSRET
+        // bookkeeping), preserving the original RAX-write-before-RCX/R11-read
+        // order.
+        let mut user = [0u64; 2];
+        self.get_gprs(&[X86Reg::Rcx, X86Reg::R11], &mut user)?;
+        let user_pc = user[0];
+        let user_rflags = user[1] | 0x2;
         self.prepare_sysret_resume(layout)?;
         self.set_gpr(X86Reg::Rip, resume_pc)?;
         Ok((user_pc, user_rflags))
