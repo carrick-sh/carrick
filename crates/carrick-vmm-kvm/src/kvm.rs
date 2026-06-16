@@ -802,6 +802,41 @@ impl Drop for KvmVcpu {
 }
 
 impl KvmVm {
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn x86_tsc_hz(&self) -> Option<u64> {
+        fn cpuid_entry(
+            cpuid: &kvm_bindings::CpuId,
+            function: u32,
+            index: u32,
+        ) -> Option<kvm_bindings::kvm_cpuid_entry2> {
+            cpuid
+                .as_slice()
+                .iter()
+                .copied()
+                .find(|entry| entry.function == function && entry.index == index)
+        }
+
+        if let Some(leaf) = cpuid_entry(&self.cpuid, 0x15, 0) {
+            let denom = u64::from(leaf.eax);
+            let numer = u64::from(leaf.ebx);
+            let crystal_hz = u64::from(leaf.ecx);
+            if denom != 0
+                && numer != 0
+                && crystal_hz != 0
+                && let Some(product) = crystal_hz.checked_mul(numer)
+            {
+                return Some(product / denom);
+            }
+        }
+        if let Some(leaf) = cpuid_entry(&self.cpuid, 0x16, 0) {
+            let base_mhz = u64::from(leaf.eax);
+            if base_mhz != 0 {
+                return base_mhz.checked_mul(1_000_000);
+            }
+        }
+        None
+    }
+
     /// Open `/dev/kvm` and `KVM_CREATE_VM` with no address space — the child
     /// side of `fork(2)` rebuilds its VM over the parent's already-built
     /// `GuestRam` windows, so there is no `AddressSpace` to thread through.

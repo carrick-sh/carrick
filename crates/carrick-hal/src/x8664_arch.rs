@@ -13,8 +13,8 @@
 //!
 //! ## Phase 2 non-goals (deferred)
 //!
-//! - A real x86_64 vDSO: `vdso_bytes()` returns `Vec::new()` (spec §4.6). The
-//!   guest libc falls back to real SYSCALL instructions per `vdso(7)`.
+//! - A minimal x86_64 vDSO: `vdso_bytes()` exports the clock symbols the Go
+//!   runtime and libc look up, with `clock_gettime`/`clock_getres` fast paths.
 //! - CR3: NOT in `X8664BootSysregs` — the bhyve backend computes it from the
 //!   PML4 root (the TTBR analogue), exactly as the aarch64 backend computes
 //!   TTBR0_EL1 from the stage-1 tables.
@@ -392,9 +392,7 @@ impl GuestArch for X8664GuestArch {
     }
 
     fn vdso_bytes() -> Vec<u8> {
-        // No vDSO in Phase 2 (spec §4.6). AT_SYSINFO_EHDR is omitted; the
-        // guest libc falls back to real SYSCALL instructions per vdso(7).
-        Vec::new()
+        carrick_mem::vdso::x8664_vdso_image_bytes()
     }
 
     fn entry_trampoline_bytes() -> Vec<u8> {
@@ -1116,10 +1114,10 @@ mod tests {
     // ── vDSO empty (spec §4.6 no-vDSO decision) ───────────────────────────
 
     #[test]
-    fn vdso_bytes_is_empty() {
+    fn vdso_bytes_exports_x86_clock_symbols() {
         assert!(
-            X8664GuestArch::vdso_bytes().is_empty(),
-            "no vDSO in Phase 2 (spec §4.6); AT_SYSINFO_EHDR omitted"
+            !X8664GuestArch::vdso_bytes().is_empty(),
+            "x86_64 vDSO should be materialized for clock-heavy workloads"
         );
     }
 

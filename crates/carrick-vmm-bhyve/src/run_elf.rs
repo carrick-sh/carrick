@@ -37,12 +37,13 @@ pub fn build_x86_engine_shared(path: impl AsRef<Path>) -> Result<BhyveX86Engine,
     let path = path.as_ref();
     let image = AddressSpace::load_elf_for(path, X8664GuestArch::elf_machine())
         .map_err(|e| format!("load_elf_for: {e}"))?
+        .with_vdso_bytes(X8664GuestArch::vdso_bytes())
+        .map_err(|e| format!("with_vdso_bytes: {e}"))?
         .with_linux_initial_stack(
             [path.as_os_str().as_encoded_bytes()],
             std::iter::empty::<&[u8]>(),
         )
-        .map_err(|e| format!("with_linux_initial_stack: {e}"))?
-        .with_vdso_auxv(false);
+        .map_err(|e| format!("with_linux_initial_stack: {e}"))?;
 
     build_x86_engine_from_image(&image)
 }
