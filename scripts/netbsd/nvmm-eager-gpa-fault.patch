@@ -1,0 +1,46 @@
+--- sys/dev/nvmm/nvmm.c
++++ sys/dev/nvmm/nvmm.c
+@@ -854,6 +854,8 @@
+ 	struct nvmm_machine *mach;
+ 	struct uvm_object *uobj;
+ 	gpaddr_t gpa;
++	gpaddr_t fault_gpa, fault_end;
++	vm_prot_t fault_prot;
+ 	size_t off;
+ 	int error;
+ 
+@@ -911,6 +913,34 @@
+ 		printf("[!] uvm_map problem\n");
+ 		error = EINVAL;
+ 		goto out;
++	}
++
++	/*
++	 * Carrick's nested NetBSD/NVMM bring-up under KVM/QEMU can pause the L1
++	 * before nvmm_do_vcpu_run() can service the first lazy machine-vmspace
++	 * memory exit. Populate the machine pmap when the GPA mapping is created
++	 * so the first VMRUN does not require that round trip.
++	 */
++	fault_end = args->gpa + args->size;
++	if (args->prot != 0) {
++		if ((args->prot & PROT_WRITE) != 0)
++			fault_prot = PROT_WRITE;
++		else if ((args->prot & PROT_READ) != 0)
++			fault_prot = PROT_READ;
++		else
++			fault_prot = PROT_EXEC;
++
++		for (fault_gpa = args->gpa; fault_gpa < fault_end;
++		    fault_gpa += PAGE_SIZE) {
++			error = uvm_fault(&mach->vm->vm_map, fault_gpa,
++			    fault_prot);
++			if (error) {
++				uvm_unmap(&mach->vm->vm_map, args->gpa,
++				    fault_end);
++				uao_detach(uobj);
++				goto out;
++			}
++		}
+ 	}
+ 
+ out:
