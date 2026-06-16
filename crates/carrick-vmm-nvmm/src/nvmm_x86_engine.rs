@@ -1,6 +1,6 @@
 //! The NVMM x86_64 backend on the shared `carrick-x86` scaffold (portability S5).
 //!
-//! `NvmmVmm` (+ `impl X86Vcpu for NvmmVcpu`) is the thin per-VMM trait pair the
+//! `NvmmVmm` (+ `impl X86Vcpu for NvmmX86Vcpu`) is the thin per-VMM trait pair the
 //! generic [`carrick_x86::X86EngineCore`] is parameterized over — mirroring
 //! `carrick-vmm-kvm`'s `kvm_x86_engine`, NOT copied from carrick-vmm-bhyve. The trap
 //! loop, register walk, guest-memory access, snapshot triple, long-mode
@@ -90,18 +90,37 @@ pub struct NvmmVmm {
 impl NvmmVmm {
     /// Find the host pointer for guest-VA `[va, va+len)` within a region.
     fn resolve(&self, va: u64, len: usize) -> Option<*mut u8> {
-        for r in &self.regions {
-            if va >= r.va && va + len as u64 <= r.va + r.len as u64 {
-                // SAFETY: bounds proven above; offset stays within the region.
-                return Some(unsafe { r.hva.add((va - r.va) as usize) });
-            }
-        }
-        None
+        resolve_region(&self.regions, va, len)
     }
 }
 
+fn resolve_region(regions: &[Region], va: u64, len: usize) -> Option<*mut u8> {
+    for r in regions {
+        if va >= r.va && va + len as u64 <= r.va + r.len as u64 {
+            // SAFETY: bounds proven above; offset stays within the region.
+            return Some(unsafe { r.hva.add((va - r.va) as usize) });
+        }
+    }
+    None
+}
+
+fn fault_record_hva(regions: &[Region]) -> Result<*mut u8, TrapError> {
+    let record_va =
+        carrick_x86::fault_slot_gpa(carrick_x86::fault_record_base(NVMM_X86_LAYOUT), 0)?;
+    resolve_region(
+        regions,
+        record_va,
+        carrick_x86::X86_FAULT_MEMORY_RECORD_BYTES,
+    )
+    .ok_or_else(|| {
+        TrapError::Hypervisor(format!(
+            "nvmm-x86: fault record page va=0x{record_va:x} unmapped"
+        ))
+    })
+}
+
 impl X86Vmm for NvmmVmm {
-    type Vcpu = NvmmVcpu;
+    type Vcpu = NvmmX86Vcpu;
     type KickHandle = NvmmKickHandle;
     type SiblingBuilder = ();
 
@@ -164,7 +183,9 @@ impl X86Vmm for NvmmVmm {
     }
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
-        self.mach.create_vcpu(0).map_err(map_err)
+        let fault_record_hva = fault_record_hva(&self.regions)?;
+        let vcpu = self.mach.create_vcpu(0).map_err(map_err)?;
+        Ok(NvmmX86Vcpu::new(vcpu, fault_record_hva))
     }
 
     fn fork_ram_strategy(&self) -> ForkRamStrategy {
@@ -260,7 +281,11 @@ impl X86Vmm for NvmmVmm {
                 frozen.len() - frozen_cursor
             )));
         }
-        let child_vcpu = child_mach.create_vcpu(0).map_err(map_err)?;
+        let fault_record_hva = fault_record_hva(&child_regions)?;
+        let child_vcpu = NvmmX86Vcpu::new(
+            child_mach.create_vcpu(0).map_err(map_err)?,
+            fault_record_hva,
+        );
 
         self.mach = child_mach;
         self.regions = child_regions;
@@ -327,7 +352,41 @@ impl X86Vmm for NvmmVmm {
 // KVM/bhyve backends' `Send` over their VM handle.
 unsafe impl Send for NvmmVmm {}
 
-// ─── impl X86Vcpu for NvmmVcpu ───────────────────────────────────────────────
+// ─── impl X86Vcpu for NvmmX86Vcpu ────────────────────────────────────────────
+
+/// NVMM's x86 vCPU handle plus the HVA of slot-0's memory-backed fault record.
+/// The low-level [`NvmmVcpu`] stays a VMM-neutral FFI wrapper; this type carries
+/// only the x86 backend state needed to decode NVMM's payload-less IO exits.
+pub struct NvmmX86Vcpu {
+    inner: NvmmVcpu,
+    fault_record_hva: *mut u8,
+}
+
+impl NvmmX86Vcpu {
+    fn new(inner: NvmmVcpu, fault_record_hva: *mut u8) -> Self {
+        Self {
+            inner,
+            fault_record_hva,
+        }
+    }
+
+    fn disarm_destroy(&mut self) {
+        self.inner.disarm_destroy();
+    }
+
+    fn read_fault_record(&self) -> Result<carrick_x86::FaultDoorbellRecord, TrapError> {
+        // SAFETY: `fault_record_hva` points at a live mapped page for this vCPU
+        // slot. The guest fault stub writes the packed record before ringing
+        // the doorbell, and the vCPU is stopped while we read it.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.fault_record_hva,
+                carrick_x86::X86_FAULT_MEMORY_RECORD_BYTES,
+            )
+        };
+        carrick_x86::FaultMemoryRecord::from_bytes(bytes)?.to_doorbell_record()
+    }
+}
 
 /// Pack an `X86Seg` (long-mode `base`/`limit`/packed-`ar`) into an
 /// `NvmmX64StateSeg`.
@@ -417,11 +476,12 @@ impl NvmmVcpu {
     }
 }
 
-impl X86Vcpu for NvmmVcpu {
+impl X86Vcpu for NvmmX86Vcpu {
     fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
         // get_state is `&self` (FFI-handle pattern). One fetch of all three
         // sub-areas; pick the field per `reg_loc`.
         let st = self
+            .inner
             .get_state(NVMM_X64_STATE_CRS | NVMM_X64_STATE_MSRS | NVMM_X64_STATE_GPRS)
             .map_err(map_err)?;
         Ok(match reg_loc(reg) {
@@ -439,13 +499,13 @@ impl X86Vcpu for NvmmVcpu {
             RegLoc::Efer => NVMM_X64_STATE_MSRS,
             RegLoc::Gpr(_) => NVMM_X64_STATE_GPRS,
         };
-        let mut st = self.get_state(flag).map_err(map_err)?;
+        let mut st = self.inner.get_state(flag).map_err(map_err)?;
         match reg_loc(reg) {
             RegLoc::Cr(i) => st.crs[i] = v,
             RegLoc::Efer => st.msrs[NVMM_X64_MSR_EFER] = v,
             RegLoc::Gpr(i) => st.gprs[i] = v,
         }
-        self.set_state(&st, flag).map_err(map_err)
+        self.inner.set_state(&st, flag).map_err(map_err)
     }
 
     fn set_segment(
@@ -455,7 +515,7 @@ impl X86Vcpu for NvmmVcpu {
         limit: u32,
         ar: u32,
     ) -> Result<(), TrapError> {
-        let mut st = self.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?;
+        let mut st = self.inner.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?;
         // Selector is cosmetic in long mode (hidden base/limit/ar drive it);
         // keep CS=0x23, SS/DS/ES=0x1B self-describing, others 0.
         let sel = match seg {
@@ -464,23 +524,35 @@ impl X86Vcpu for NvmmVcpu {
             _ => 0,
         };
         st.segs[seg_index(seg)] = seg_to_nvmm(sel, base, limit, ar);
-        self.set_state(&st, NVMM_X64_STATE_SEGS).map_err(map_err)
+        self.inner
+            .set_state(&st, NVMM_X64_STATE_SEGS)
+            .map_err(map_err)
     }
 
     fn get_fs_base(&self) -> Result<u64, TrapError> {
-        Ok(self.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?.segs[NVMM_X64_SEG_FS].base)
+        Ok(self
+            .inner
+            .get_state(NVMM_X64_STATE_SEGS)
+            .map_err(map_err)?
+            .segs[NVMM_X64_SEG_FS]
+            .base)
     }
 
     fn set_fs_base(&mut self, v: u64) -> Result<(), TrapError> {
-        self.set_seg_base(NVMM_X64_SEG_FS, v)
+        self.inner.set_seg_base(NVMM_X64_SEG_FS, v)
     }
 
     fn get_gs_base(&self) -> Result<u64, TrapError> {
-        Ok(self.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?.segs[NVMM_X64_SEG_GS].base)
+        Ok(self
+            .inner
+            .get_state(NVMM_X64_STATE_SEGS)
+            .map_err(map_err)?
+            .segs[NVMM_X64_SEG_GS]
+            .base)
     }
 
     fn set_gs_base(&mut self, v: u64) -> Result<(), TrapError> {
-        self.set_seg_base(NVMM_X64_SEG_GS, v)
+        self.inner.set_seg_base(NVMM_X64_SEG_GS, v)
     }
 
     fn set_syscall_msrs(
@@ -491,24 +563,28 @@ impl X86Vcpu for NvmmVcpu {
     ) -> Result<MsrInstall, TrapError> {
         // Direct MSR install: setstate(STATE_MSRS) writes STAR/LSTAR/SFMASK
         // (EFER is set separately). NO ring-0 WRMSR blob.
-        let mut st = self.get_state(NVMM_X64_STATE_MSRS).map_err(map_err)?;
+        let mut st = self.inner.get_state(NVMM_X64_STATE_MSRS).map_err(map_err)?;
         st.msrs[NVMM_X64_MSR_STAR] = star;
         st.msrs[NVMM_X64_MSR_LSTAR] = lstar;
         st.msrs[NVMM_X64_MSR_SFMASK] = sfmask;
-        self.set_state(&st, NVMM_X64_STATE_MSRS).map_err(map_err)?;
+        self.inner
+            .set_state(&st, NVMM_X64_STATE_MSRS)
+            .map_err(map_err)?;
         Ok(MsrInstall::Direct)
     }
 
     fn get_fp(&self) -> Result<Option<[u8; 512]>, TrapError> {
         // Native FP: getstate(STATE_FPU) ↔ struct fxsave (512 bytes). NO stub.
-        let st = self.get_state(NVMM_X64_STATE_FPU).map_err(map_err)?;
+        let st = self.inner.get_state(NVMM_X64_STATE_FPU).map_err(map_err)?;
         Ok(Some(st.fpu.bytes))
     }
 
     fn set_fp(&mut self, fx: &[u8; 512]) -> Result<bool, TrapError> {
-        let mut st = self.get_state(NVMM_X64_STATE_FPU).map_err(map_err)?;
+        let mut st = self.inner.get_state(NVMM_X64_STATE_FPU).map_err(map_err)?;
         st.fpu.bytes = *fx;
-        self.set_state(&st, NVMM_X64_STATE_FPU).map_err(map_err)?;
+        self.inner
+            .set_state(&st, NVMM_X64_STATE_FPU)
+            .map_err(map_err)?;
         Ok(true)
     }
 
@@ -517,7 +593,7 @@ impl X86Vcpu for NvmmVcpu {
         // surfaces as an error instead of spinning the (nested) host forever.
         let mut spurious = 0u32;
         loop {
-            let exit = self.run_until_exit().map_err(map_err)?;
+            let exit = self.inner.run_until_exit().map_err(map_err)?;
             match exit.reason {
                 NVMM_VCPU_EXIT_NONE => {
                     spurious += 1;
@@ -531,12 +607,11 @@ impl X86Vcpu for NvmmVcpu {
                 NVMM_VCPU_EXIT_IO => {
                     let io = exit.io();
                     if io.port == FAULT_DOORBELL_PORT {
-                        return Err(TrapError::Hypervisor(format!(
-                            "nvmm-x86: fault doorbell reached at npc=0x{:x}, but NVMM IO exits \
-                             expose only port/width metadata, not the OUT payload; use a \
-                             memory-backed fault record before enabling NVMM fault delivery",
-                            io.npc
-                        )));
+                        let record = self.read_fault_record()?;
+                        if std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
+                            eprintln!("[NVMM-X86-FAULT] {record:?}");
+                        }
+                        return carrick_x86::fault_exit_from_record(self, record, "nvmm-x86");
                     }
                     if io.port != carrick_hal::SYSCALL_DOORBELL_PORT {
                         return Err(TrapError::Hypervisor(format!(
@@ -546,7 +621,7 @@ impl X86Vcpu for NvmmVcpu {
                     }
                     // The IO exit hands back io.npc (the next-PC; the kernel does
                     // NOT advance RIP — proven in M0). Resume there directly.
-                    let st = self.get_state(NVMM_X64_STATE_GPRS).map_err(map_err)?;
+                    let st = self.inner.get_state(NVMM_X64_STATE_GPRS).map_err(map_err)?;
                     let frame = carrick_guest_mem::X8664SyscallFrame {
                         rax: st.gprs[NVMM_X64_GPR_RAX],
                         rdi: st.gprs[NVMM_X64_GPR_RDI],
@@ -566,6 +641,7 @@ impl X86Vcpu for NvmmVcpu {
                     // Enrich with RIP (and the raw union head) so a long-mode /
                     // ring-3-entry fault is diagnosable (spec risk #2).
                     let rip = self
+                        .inner
                         .get_state(NVMM_X64_STATE_GPRS)
                         .map(|s| s.gprs[NVMM_X64_GPR_RIP])
                         .unwrap_or(0);
@@ -622,7 +698,7 @@ fn compact_plan(plan: &WindowPlan, layout: BringupLayout) -> WindowPlan {
 /// abort-on-overflow `gpa_map`), mmap+hva_map+gpa_map's every region, writes the
 /// ELF bytes + the trampoline/GDT/PML4 images, creates the vCPU, and programs
 /// long mode via the shared [`carrick_x86::program_longmode_entry`].
-fn bring_up_parts(image: &AddressSpace) -> Result<(NvmmVmm, NvmmVcpu), TrapError> {
+fn bring_up_parts(image: &AddressSpace) -> Result<(NvmmVmm, NvmmX86Vcpu), TrapError> {
     nvmm::init().map_err(map_err)?;
     let mach = NvmmMachine::create().map_err(map_err)?;
     let mut vmm = NvmmVmm {
@@ -652,6 +728,7 @@ fn bring_up_parts(image: &AddressSpace) -> Result<(NvmmVmm, NvmmVcpu), TrapError
     //    each guest VA → its compact GPA; CR3 = the (compact, low) pml4_base.
     let pml4_bytes = carrick_x86::build_pml4(&plan, NVMM_X86_LAYOUT)?;
     carrick_x86::write_bringup_images(&vmm, NVMM_X86_LAYOUT, &pml4_bytes)?;
+    carrick_x86::write_memory_record_fault_tables(&vmm, NVMM_X86_LAYOUT)?;
 
     // 4. Create the vCPU and program long mode (CR/EFER/segs/GDTR/MSRs).
     let mut vcpu = vmm.add_vcpu()?;
@@ -692,7 +769,7 @@ const IRETQ_FRAME_OFF: u64 = 0x800;
 /// vm-enters in ring-0 and `iretq`s into the user entry.
 fn install_iretq_ring3_entry(
     vmm: &NvmmVmm,
-    vcpu: &mut NvmmVcpu,
+    vcpu: &mut NvmmX86Vcpu,
     user_entry: u64,
     user_rsp: u64,
 ) -> Result<(), TrapError> {
@@ -719,10 +796,12 @@ fn install_iretq_ring3_entry(
     // ring-3 selectors).
     let cs0_ar = 0xB | (1 << 4) | (1 << 7) | (1 << 13) | (1 << 15);
     let ss0_ar = 0x3 | (1 << 4) | (1 << 7) | (1 << 14) | (1 << 15);
-    let mut st = vcpu.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?;
+    let mut st = vcpu.inner.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?;
     st.segs[NVMM_X64_SEG_CS] = seg_to_nvmm(0x08, 0, 0xFFFF_FFFF, cs0_ar);
     st.segs[NVMM_X64_SEG_SS] = seg_to_nvmm(0x10, 0, 0xFFFF_FFFF, ss0_ar);
-    vcpu.set_state(&st, NVMM_X64_STATE_SEGS).map_err(map_err)?;
+    vcpu.inner
+        .set_state(&st, NVMM_X64_STATE_SEGS)
+        .map_err(map_err)?;
     vcpu.set_gpr(X86Reg::Rip, stub_gpa)?;
     vcpu.set_gpr(X86Reg::Rsp, frame_gpa)?;
     Ok(())
