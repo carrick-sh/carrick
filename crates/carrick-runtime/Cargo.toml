@@ -16,6 +16,13 @@ name = "carrick-kvm"
 path = "src/bin/carrick-kvm.rs"
 required-features = ["platform-linux"]
 
+# NetBSD/NVMM real-dispatch driver: runs an x86_64 ELF or OCI rootfs through the
+# FULL dispatcher, parallel to carrick-kvm.
+[[bin]]
+name = "carrick-nvmm"
+path = "src/bin/carrick-nvmm.rs"
+required-features = ["platform-netbsd"]
+
 [lints]
 workspace = true
 
