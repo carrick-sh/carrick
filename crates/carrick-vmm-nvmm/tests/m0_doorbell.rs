@@ -33,21 +33,27 @@ const EAX_PAYLOAD_STUB: &[u8] = &[0xb8, 0x78, 0x56, 0x34, 0x12, 0x66, 0xe7, 0xc7
 const GUEST_GPA: u64 = 0x1000;
 const RAM_SIZE: usize = 0x1000; // one page is enough for the stub
 
-/// Build a flat 16-bit real-mode data/code segment descriptor (base 0, 64K
-/// limit). For real mode NVMM mainly cares about the hidden base/limit; the
-/// attrib bits set a present, accessed, read/write, 16-bit segment.
-fn real_mode_seg(selector: u16) -> NvmmX64StateSeg {
-    // attrib bitfield: type:4, s:1, dpl:2, p:1, avl:1, l:1, def:1, g:1, rsvd:4
-    // type=0b0011 (data, accessed, writable), s=1, dpl=0, p=1 → 0x93 in the
-    // classic packed layout (type|s<<4|dpl<<5|p<<7). For code we still use a
-    // generic present r/w segment; real-mode fetch only needs base/limit/p.
-    let attrib: u16 = 0x0093;
+/// Build a flat 16-bit real-mode segment descriptor (base 0, 64K limit).
+fn real_mode_seg(selector: u16, attrib: u16) -> NvmmX64StateSeg {
     NvmmX64StateSeg {
         selector,
         attrib,
         limit: 0xFFFF,
         base: 0,
     }
+}
+
+/// Present, accessed, readable real-mode code segment.
+fn real_mode_code_seg(selector: u16) -> NvmmX64StateSeg {
+    // attrib bitfield: type:4, s:1, dpl:2, p:1, avl:1, l:1, def:1, g:1, rsvd:4.
+    // type=0b1011 (code, accessed, readable), s=1, dpl=0, p=1 => 0x9B.
+    real_mode_seg(selector, 0x009B)
+}
+
+/// Present, accessed, writable real-mode data segment.
+fn real_mode_data_seg(selector: u16) -> NvmmX64StateSeg {
+    // type=0b0011 (data, accessed, writable), s=1, dpl=0, p=1 => 0x93.
+    real_mode_seg(selector, 0x0093)
 }
 
 fn program_real_mode_stub(stub: &[u8]) -> (nvmm::NvmmMachine, carrick_vmm_nvmm::nvmm::NvmmVcpu) {
@@ -72,16 +78,16 @@ fn program_real_mode_stub(stub: &[u8]) -> (nvmm::NvmmMachine, carrick_vmm_nvmm::
         .get_state(NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS)
         .expect("nvmm_vcpu_getstate (initial)");
 
-    let flat = real_mode_seg(0);
+    let flat = real_mode_data_seg(0);
     for i in 0..NVMM_X64_NSEG {
         state.segs[i] = flat;
     }
-    state.segs[NVMM_X64_SEG_CS] = real_mode_seg(0xf000);
-    state.segs[NVMM_X64_SEG_SS] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_DS] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_ES] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_FS] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_GS] = real_mode_seg(0);
+    state.segs[NVMM_X64_SEG_CS] = real_mode_code_seg(0xf000);
+    state.segs[NVMM_X64_SEG_SS] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_DS] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_ES] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_FS] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_GS] = real_mode_data_seg(0);
     state.gprs[NVMM_X64_GPR_RIP] = GUEST_GPA;
 
     vcpu.set_state(&state, NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS)
@@ -132,17 +138,17 @@ fn m0_doorbell_out_0xc5() {
         .expect("nvmm_vcpu_getstate (initial)");
 
     // Flat real-mode segments so a near fetch at linear == RIP works.
-    let flat = real_mode_seg(0);
+    let flat = real_mode_data_seg(0);
     for i in 0..NVMM_X64_NSEG {
         state.segs[i] = flat;
     }
     // CS/SS/DS/ES/FS/GS all flat base-0 (selectors are cosmetic in real mode).
-    state.segs[NVMM_X64_SEG_CS] = real_mode_seg(0xf000);
-    state.segs[NVMM_X64_SEG_SS] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_DS] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_ES] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_FS] = real_mode_seg(0);
-    state.segs[NVMM_X64_SEG_GS] = real_mode_seg(0);
+    state.segs[NVMM_X64_SEG_CS] = real_mode_code_seg(0xf000);
+    state.segs[NVMM_X64_SEG_SS] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_DS] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_ES] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_FS] = real_mode_data_seg(0);
+    state.segs[NVMM_X64_SEG_GS] = real_mode_data_seg(0);
 
     // RIP = GPA of the stub (CS.base == 0 → linear == RIP).
     state.gprs[NVMM_X64_GPR_RIP] = GUEST_GPA;
