@@ -288,12 +288,12 @@ pub mod execute {
     /// the CLI call site is byte-identical across platforms — only symbol
     /// resolution flips per feature. Mirrors how `runtime::run_oci` already mirrors
     /// the macOS `Runtime::execute` shape.
-    // Linux-lane run entry (drives the KVM OCI path via run_oci); the BSD/bhyve
-    // run entry is wired in #1. guest_hostname above stays shared.
-    #[cfg(feature = "platform-linux")]
+    // Non-macOS run entry: Linux drives the KVM OCI path; FreeBSD drives the
+    // bhyve OCI path. guest_hostname above stays shared.
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
     pub struct Runtime;
 
-    #[cfg(feature = "platform-linux")]
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
     impl Runtime {
         pub fn execute(
             spec: &carrick_spec::RunSpec,
@@ -303,7 +303,7 @@ pub mod execute {
     }
 }
 
-#[cfg(feature = "platform-linux")]
+#[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
 pub use execute::Runtime;
 
 #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
@@ -1041,9 +1041,8 @@ pub mod runtime {
     /// `PATH`, etc.; clobbering them (as `seed_linux_baseline` does for the bare
     /// run-elf runner) would silently override the image. Mirrors the macOS
     /// `seed_guest_baseline` + `set_baseline_file_if_missing` (execute.rs).
-    #[cfg(feature = "platform-linux")]
-    // Used by the OCI run_oci path (aarch64-KVM); x86-KVM's run_oci is a stub until
-    // OCI-x86 lands, so this is unused only on the x86_64 platform-linux build.
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    // Used by the OCI run_oci path on non-macOS VMM backends.
     #[cfg_attr(
         all(feature = "platform-linux", target_arch = "x86_64"),
         allow(dead_code)
@@ -1096,12 +1095,32 @@ pub mod runtime {
 
     #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
     pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
-        run_oci_kvm_with_engine(spec, carrick_vmm_kvm::KvmTrapEngine::new)
+        run_oci_with_engine(
+            spec,
+            |image| carrick_vmm_kvm::KvmTrapEngine::new(image).map_err(RuntimeError::from),
+            |engine, dispatcher, max_traps| run_threaded_kvm_loop(engine, dispatcher, max_traps),
+        )
     }
 
     #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
     pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
-        run_oci_kvm_with_engine(spec, carrick_vmm_kvm::kvm_x86_engine::bring_up)
+        run_oci_with_engine(
+            spec,
+            |image| carrick_vmm_kvm::kvm_x86_engine::bring_up(image).map_err(RuntimeError::from),
+            |engine, dispatcher, max_traps| run_threaded_kvm_loop(engine, dispatcher, max_traps),
+        )
+    }
+
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
+        run_oci_with_engine(
+            spec,
+            |image| {
+                carrick_vmm_bhyve::run_elf::build_x86_engine_from_image(image)
+                    .map_err(|e| RuntimeError::Unsupported(format!("build bhyve engine: {e}")))
+            },
+            |engine, dispatcher, max_traps| run_threaded_bhyve_loop(engine, dispatcher, max_traps),
+        )
     }
 
     /// Phase 5 entry helper: run an OCI container under KVM. The macOS sibling
@@ -1110,14 +1129,17 @@ pub mod runtime {
     /// set cwd/uid/gid, load the entrypoint FROM the rootfs, and run it with the
     /// OCI argv/env. The only divergence is the run-loop entry: this drives the
     /// selected KVM engine through `run_threaded_kvm_loop` instead of the HVF loop.
-    #[cfg(feature = "platform-linux")]
-    fn run_oci_kvm_with_engine<E>(
+    #[cfg(any(feature = "platform-linux", feature = "platform-freebsd"))]
+    fn run_oci_with_engine<E, Build, Run>(
         spec: &carrick_spec::RunSpec,
-        build_engine: fn(&crate::memory::AddressSpace) -> Result<E, carrick_hal::TrapError>,
+        build_engine: Build,
+        run_engine: Run,
     ) -> Result<RunResult, RuntimeError>
     where
-        E: carrick_hal::ThreadedEngine<KickHandle = carrick_vmm_kvm::KvmKickHandle> + 'static,
+        E: carrick_hal::ThreadedEngine + 'static,
         E::SiblingSpec: 'static,
+        Build: FnOnce(&crate::memory::AddressSpace) -> Result<E, RuntimeError>,
+        Run: FnOnce(E, SyscallDispatcher, usize) -> Result<RunResult, RuntimeError>,
     {
         use crate::fs_backend::HostFsBackend;
         use carrick_hal::GuestArch as _;
@@ -1240,9 +1262,10 @@ pub mod runtime {
             image = image.with_vdso_bytes(vdso)?;
         }
 
-        // 4. Run on KVM through the same generic threaded loop as run-elf.
+        // 4. Run through the backend-specific engine on the same generic
+        // threaded loop as run-elf.
         let engine = build_engine(&image)?;
-        run_threaded_kvm_loop(engine, dispatcher, spec.max_traps)
+        run_engine(engine, dispatcher, spec.max_traps)
     }
 }
 

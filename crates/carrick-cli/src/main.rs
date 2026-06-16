@@ -142,7 +142,7 @@ fn configure_process_environment() {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        const WANT: u64 = 65536;
+        const WANT: libc::rlim_t = 65536;
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < WANT {
             rl.rlim_cur = if rl.rlim_max != libc::RLIM_INFINITY && rl.rlim_max < WANT {
                 rl.rlim_max

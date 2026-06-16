@@ -47,7 +47,8 @@ struct Args {
     #[arg(long, default_value = "full")]
     tier: String,
     /// Execution lane: `hvf` (local signed binary, default), `kvm` (carrick in
-    /// the lima guest), or `kvm-local` (direct platform-linux carrick on this host).
+    /// the lima guest), `kvm-local` (direct platform-linux carrick on this host),
+    /// or `bhyve-local` (direct platform-freebsd carrick on this host).
     #[arg(long, default_value = "hvf")]
     lane: String,
     /// lima VM name for `--lane kvm`.
@@ -62,6 +63,15 @@ struct Args {
     /// 1.0, which makes the gate flaky.
     #[arg(long, default_value_t = 2.0)]
     lima_timeout_scale: f64,
+    /// Timeout multiplier for direct local x86_64 lanes (`kvm-local`,
+    /// `bhyve-local`). Defaults to 1.0: on same-host x86_64, Carrick should be
+    /// close to Docker; a timeout is a bug signal, not expected nested overhead.
+    #[arg(
+        long,
+        default_value_t = 1.0,
+        env = "CARRICK_CONFORMANCE_LOCAL_TIMEOUT_SCALE"
+    )]
+    local_timeout_scale: f64,
     /// Filter to these ecosystems (repeatable): cpython|go|node|ltp.
     #[arg(long)]
     ecosystem: Vec<String>,
@@ -153,6 +163,12 @@ fn run() -> anyhow::Result<ExitCode> {
             args.lima_timeout_scale
         );
     }
+    if !args.local_timeout_scale.is_finite() || args.local_timeout_scale < 1.0 {
+        anyhow::bail!(
+            "--local-timeout-scale must be finite and >= 1.0 (got {})",
+            args.local_timeout_scale
+        );
+    }
 
     // Execution lane for the carrick side, built from the CLI args. `hvf` (the
     // default) runs the local signed binary unchanged; `kvm` wraps carrick in the
@@ -162,6 +178,7 @@ fn run() -> anyhow::Result<ExitCode> {
         &args.lima_vm,
         &args.lima_gateway,
         args.lima_timeout_scale,
+        args.local_timeout_scale,
     );
 
     if args.render_matrix {
@@ -230,6 +247,8 @@ fn run() -> anyhow::Result<ExitCode> {
         preflight_kvm(&lane, &args.carrick_bin)?;
     } else if matches!(lane, lane::Lane::KvmLocal(_)) {
         preflight_kvm_local(&args.carrick_bin)?;
+    } else if matches!(lane, lane::Lane::BhyveLocal(_)) {
+        preflight_bhyve_local(&args.carrick_bin)?;
     } else {
         preflight(&args.carrick_bin)?;
     }
@@ -997,6 +1016,42 @@ fn preflight_kvm_local(bin: &Path) -> anyhow::Result<()> {
         eprintln!(
             "WARNING: {} looks STALE (older than a runtime-crate source) — \
              rebuild the platform-linux carrick binary to be sure you are testing HEAD. Continuing.",
+            bin.display()
+        );
+    }
+    Ok(())
+}
+
+/// Local FreeBSD/bhyve preflight: the binary is built for platform-freebsd and
+/// runs on this host, so macOS codesign is irrelevant. Validate only the local
+/// executable and bhyve device directory before the suite fan-out starts.
+fn preflight_bhyve_local(bin: &Path) -> anyhow::Result<()> {
+    let meta = match std::fs::metadata(bin) {
+        Ok(m) => m,
+        Err(_) => anyhow::bail!(
+            "{} is missing — build carrick-cli with `--no-default-features --features platform-freebsd` first",
+            bin.display()
+        ),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        anyhow::ensure!(
+            meta.permissions().mode() & 0o111 != 0,
+            "{} exists but is not executable",
+            bin.display()
+        );
+    }
+    anyhow::ensure!(
+        std::path::Path::new("/dev/vmm").exists(),
+        "/dev/vmm is missing — `--lane bhyve-local` must run on a FreeBSD host with bhyve"
+    );
+    if let (Ok(bin_t), Some(src_t)) = (meta.modified(), newest_runtime_src_mtime())
+        && bin_t < src_t
+    {
+        eprintln!(
+            "WARNING: {} looks STALE (older than a runtime-crate source) — \
+             rebuild the platform-freebsd carrick binary to be sure you are testing HEAD. Continuing.",
             bin.display()
         );
     }
