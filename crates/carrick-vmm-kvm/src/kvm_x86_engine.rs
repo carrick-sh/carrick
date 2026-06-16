@@ -127,6 +127,12 @@ impl X86Vmm for KvmVmm {
     type KickHandle = KvmKickHandle;
     type SiblingBuilder = KvmSiblingBuilder;
 
+    /// KVM can report the guest TSC frequency directly, so the shared vDSO
+    /// calibration uses it instead of timing the host TSC.
+    fn tsc_hz(&self) -> Option<u64> {
+        self.vm.x86_tsc_hz()
+    }
+
     fn setup_memory(&mut self, _plan: &WindowPlan) -> Result<(), TrapError> {
         // KVM realizes the plan as N MAP_NORESERVE slots; that registration is
         // done by `bring_up` (it builds the `GuestRam` window table + registers
@@ -549,6 +555,28 @@ fn vcpu_exit_name(exit: &carrick_hal::VcpuExit) -> &'static str {
 }
 
 impl X86Vcpu for KvmVcpu {
+    fn read_msr(&self, index: u32) -> Result<u64, TrapError> {
+        let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index,
+            ..Default::default()
+        }])
+        .map_err(|e| TrapError::Hypervisor(format!("Msrs::from_entries({index:#x}): {e}")))?;
+        if self
+            .fd()
+            .get_msrs(&mut msrs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_MSRS({index:#x}): {e}")))?
+            != 1
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "KVM_GET_MSRS({index:#x}) returned no entry"
+            )));
+        }
+        msrs.as_slice()
+            .first()
+            .map(|entry| entry.data)
+            .ok_or_else(|| TrapError::Hypervisor(format!("KVM_GET_MSRS({index:#x}) empty")))
+    }
+
     fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
         // GPRs/RIP/RSP/RFLAGS via KVM_GET_REGS; control regs/EFER via KVM_GET_SREGS.
         Ok(match reg {
@@ -961,109 +989,6 @@ fn fxsave_into_kvm_fpu(fx: &[u8; 512], fpu: &mut kvm_bindings::kvm_fpu) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn host_clock_ns(clock_id: libc::clockid_t) -> Option<u64> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` writes a timespec for the requested host clock.
-    if unsafe { libc::clock_gettime(clock_id, &mut ts) } != 0 {
-        return None;
-    }
-    let sec = u64::try_from(ts.tv_sec).ok()?;
-    let nsec = u64::try_from(ts.tv_nsec).ok()?;
-    sec.checked_mul(1_000_000_000)?.checked_add(nsec)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn host_rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    // SAFETY: `rdtsc` is an unprivileged x86_64 instruction. It has no memory
-    // side effects; `lfence` serializes the read enough for calibration.
-    unsafe {
-        core::arch::asm!(
-            "lfence",
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    (u64::from(hi) << 32) | u64::from(lo)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn calibrate_host_tsc_hz() -> Option<u64> {
-    let start_tsc = host_rdtsc();
-    let start = std::time::Instant::now();
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    let elapsed = start.elapsed().as_nanos();
-    if elapsed == 0 {
-        return None;
-    }
-    let delta = host_rdtsc().wrapping_sub(start_tsc) as u128;
-    Some((delta * 1_000_000_000u128 / elapsed) as u64)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn read_guest_tsc(vcpu: &KvmVcpu) -> Option<u64> {
-    const MSR_IA32_TSC: u32 = 0x10;
-    let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
-        index: MSR_IA32_TSC,
-        ..Default::default()
-    }])
-    .ok()?;
-    if vcpu.fd().get_msrs(&mut msrs).ok()? != 1 {
-        return None;
-    }
-    msrs.as_slice().first().map(|entry| entry.data)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn populate_x86_vdso_vvar(vm: &KvmVm, vcpu: &KvmVcpu, ram: &mut GuestRam) -> Result<(), TrapError> {
-    use carrick_mem::vdso::{
-        LINUX_VVAR_BASE, LINUX_VVAR_SIZE, VVAR_OFF_FREQ, VVAR_OFF_MONOTONIC_OFF_NS,
-        VVAR_OFF_REALTIME_OFF_NS,
-    };
-
-    if ram
-        .host_ptr(LINUX_VVAR_BASE, LINUX_VVAR_SIZE as usize)
-        .is_none()
-    {
-        return Ok(());
-    }
-    let Some(freq) = vm.x86_tsc_hz().or_else(calibrate_host_tsc_hz) else {
-        return Ok(());
-    };
-    if freq == 0 {
-        return Ok(());
-    }
-    let tsc = read_guest_tsc(vcpu).unwrap_or_else(host_rdtsc);
-    let tsc_ns = ((tsc as u128) * 1_000_000_000u128 / (freq as u128)) as u64;
-    let realtime_off = host_clock_ns(libc::CLOCK_REALTIME)
-        .unwrap_or(0)
-        .wrapping_sub(tsc_ns);
-    let monotonic_off = host_clock_ns(libc::CLOCK_MONOTONIC_RAW)
-        .unwrap_or(0)
-        .wrapping_sub(tsc_ns);
-
-    ram.write_gpa(LINUX_VVAR_BASE + VVAR_OFF_FREQ as u64, &freq.to_le_bytes())
-        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-    ram.write_gpa(
-        LINUX_VVAR_BASE + VVAR_OFF_REALTIME_OFF_NS as u64,
-        &realtime_off.to_le_bytes(),
-    )
-    .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-    ram.write_gpa(
-        LINUX_VVAR_BASE + VVAR_OFF_MONOTONIC_OFF_NS as u64,
-        &monotonic_off.to_le_bytes(),
-    )
-    .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-    Ok(())
-}
-
 // ─── bring_up ────────────────────────────────────────────────────────────────
 
 /// Bring up a KVM x86 guest for `image` and wrap it in the generic
@@ -1117,8 +1042,8 @@ fn build_kvm_x86_guest(
     let _install =
         carrick_x86::program_longmode_entry(&mut vcpu, KVM_X86_LAYOUT, image.entry(), rsp)?;
     // KVM is MsrInstall::Direct — the SYSCALL MSRs are already live; no ring-0 blob.
-    #[cfg(target_arch = "x86_64")]
-    populate_x86_vdso_vvar(&vm, &vcpu, &mut ram)?;
+    // The vDSO clock page is calibrated by the shared engine (`from_parts` calls
+    // `carrick_x86::vdso::populate_vdso_vvar`), so there is no KVM-private copy.
 
     Ok((vm, ram, page_tables, vcpu))
 }
