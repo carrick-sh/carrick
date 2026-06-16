@@ -34,6 +34,8 @@ pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16; // wall_ns - monotonic_ns
 /// snapshot it COW-inherited from its parent, forcing a reseed (no keystream
 /// reuse across fork). See docs/archive/vdso-getrandom-design.md.
 pub const VVAR_OFF_RNG_GENERATION: usize = 24;
+/// x86_64 vDSO only: `CLOCK_MONOTONIC` offset from guest TSC nanoseconds.
+pub const VVAR_OFF_MONOTONIC_OFF_NS: usize = 32;
 
 /// The assembled clock functions (aarch64). Offsets within this blob:
 /// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x84,
@@ -65,6 +67,34 @@ const VDSO_CODE: &[u8] = &[
     0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
 ];
 
+/// Minimal x86_64 vDSO code. Generated from hand-written assembly and checked in
+/// as bytes so normal builds do not depend on an assembler. Offsets:
+/// `__vdso_clock_gettime` @ 0x00, `__vdso_clock_getres` @ 0x74,
+/// `__vdso_gettimeofday` @ 0xa2, `__vdso_time` @ 0xaa.
+///
+/// The clock fast path reads the fixed carrick vvar page:
+/// - `VVAR_OFF_FREQ`: guest TSC Hz
+/// - `VVAR_OFF_REALTIME_OFF_NS`: realtime offset from TSC nanoseconds
+/// - `VVAR_OFF_MONOTONIC_OFF_NS`: monotonic offset from TSC nanoseconds
+///
+/// Unsupported clocks and zero frequency fall back to the real x86_64 syscalls
+/// (`clock_gettime`=228, `clock_getres`=229). `gettimeofday` and `time` are
+/// syscall stubs for now; the Go-build hot path is `clock_gettime`.
+const X8664_VDSO_CODE: &[u8] = &[
+    0x48, 0x85, 0xf6, 0x74, 0x0f, 0x83, 0xff, 0x00, 0x74, 0x12, 0x83, 0xff, 0x01, 0x74, 0x1c, 0x83,
+    0xff, 0x04, 0x74, 0x17, 0xb8, 0xe4, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc3, 0x49, 0xbb, 0x10, 0x00,
+    0x00, 0x00, 0x2e, 0x00, 0x00, 0x00, 0x4d, 0x8b, 0x0b, 0xeb, 0x0d, 0x49, 0xbb, 0x20, 0x00, 0x00,
+    0x00, 0x2e, 0x00, 0x00, 0x00, 0x4d, 0x8b, 0x0b, 0x49, 0xbb, 0x08, 0x00, 0x00, 0x00, 0x2e, 0x00,
+    0x00, 0x00, 0x4d, 0x8b, 0x03, 0x4d, 0x85, 0xc0, 0x74, 0xca, 0x0f, 0xae, 0xe8, 0x0f, 0x31, 0x48,
+    0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0x41, 0xba, 0x00, 0xca, 0x9a, 0x3b, 0x49, 0xf7, 0xe2, 0x49,
+    0xf7, 0xf0, 0x4c, 0x01, 0xc8, 0x31, 0xd2, 0x49, 0xf7, 0xf2, 0x48, 0x89, 0x06, 0x48, 0x89, 0x56,
+    0x08, 0x31, 0xc0, 0xc3, 0x48, 0x85, 0xf6, 0x74, 0x26, 0x83, 0xff, 0x00, 0x74, 0x12, 0x83, 0xff,
+    0x01, 0x74, 0x0d, 0x83, 0xff, 0x04, 0x74, 0x08, 0xb8, 0xe5, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc3,
+    0x48, 0xc7, 0x06, 0x00, 0x00, 0x00, 0x00, 0x48, 0xc7, 0x46, 0x08, 0x01, 0x00, 0x00, 0x00, 0x31,
+    0xc0, 0xc3, 0xb8, 0x60, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc3, 0xb8, 0xc9, 0x00, 0x00, 0x00, 0x0f,
+    0x05, 0xc3,
+];
+
 /// __kernel_getrandom (P2): the position-independent, zero-relocation blob
 /// produced by tools/build-vdso-getrandom.sh from the no_std Rust source
 /// (vdso_getrandom_blob.rs + the host-tested ChaCha/state-machine core). Its
@@ -83,6 +113,9 @@ const SYM_CLOCK_GETRES_SYSCALL: u64 = 0xfc;
 const RT_SIGRETURN_LEN: u64 = 8;
 const SYM_RT_SIGRETURN: u64 = VDSO_CODE.len() as u64 - RT_SIGRETURN_LEN;
 const GETRANDOM_LEN: u64 = GETRANDOM_BLOB.len() as u64;
+const X8664_SYM_CLOCK_GETRES: u64 = 0x74;
+const X8664_SYM_GETTIMEOFDAY: u64 = 0xa2;
+const X8664_SYM_TIME: u64 = 0xaa;
 const GETTIMEOFDAY_SYSCALL_STUB: &[u8] = &[
     0x28, 0x15, 0x80, 0xd2, // mov x8, #169 (__NR_gettimeofday)
     0x01, 0x00, 0x00, 0xd4, // svc #0
@@ -90,6 +123,7 @@ const GETTIMEOFDAY_SYSCALL_STUB: &[u8] = &[
 ];
 
 const EM_AARCH64: u16 = 183;
+const EM_X86_64: u16 = 62;
 const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -102,11 +136,14 @@ const DT_STRTAB: i64 = 5;
 const DT_SYMTAB: i64 = 6;
 const DT_STRSZ: i64 = 10;
 const DT_SYMENT: i64 = 11;
+const DT_SONAME: i64 = 14;
 const DT_VERSYM: i64 = 0x6fff_fff0;
 const DT_VERDEF: i64 = 0x6fff_fffc;
 const DT_VERDEFNUM: i64 = 0x6fff_fffd;
 /// vd_hash of "LINUX_2.6.39" — Go's `vdsoLinuxVersion.verHash`.
 const LINUX_2_6_39_HASH: u32 = 0x75f_cb89;
+/// vd_hash of "LINUX_2.6" — the x86_64 vDSO version native Linux exports.
+const LINUX_2_6_HASH: u32 = 0x03ae_75f6;
 
 fn align_up(n: usize, a: usize) -> usize {
     (n + a - 1) & !(a - 1)
@@ -129,6 +166,234 @@ pub fn vdso_image_bytes_without_fastpaths() -> Vec<u8> {
 
 pub fn vdso_image_bytes_with_clock_syscalls() -> Vec<u8> {
     vdso_image_bytes_with_symbols(true, true, true)
+}
+
+pub fn x8664_vdso_image_bytes() -> Vec<u8> {
+    let mut dynstr = Vec::new();
+    dynstr.push(0u8);
+    let name_soname = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"linux-vdso.so.1\0");
+    let name_clock_gettime = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"__vdso_clock_gettime\0");
+    let name_clock_getres = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"__vdso_clock_getres\0");
+    let name_gettimeofday = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"__vdso_gettimeofday\0");
+    let name_time = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"__vdso_time\0");
+    let name_version = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"LINUX_2.6\0");
+
+    const EHDR: usize = 64;
+    const PHENT: usize = 56;
+    const NPH: usize = 2;
+    const SYMENT: usize = 24;
+    const NSYM: usize = 5;
+    const SHENT: usize = 64;
+    const NSH: usize = 4;
+    const VERDEF_SZ: usize = 20 + 8;
+
+    let off_phdr = EHDR;
+    let off_dynsym = off_phdr + NPH * PHENT;
+    let off_dynstr = off_dynsym + NSYM * SYMENT;
+    let off_hash = align_up(off_dynstr + dynstr.len(), 4);
+    let hash = [1u32, NSYM as u32, 1, 0, 2, 3, 4, 0];
+    let off_versym = off_hash + hash.len() * 4;
+    let versym = [0u16, 1, 1, 1, 1];
+    let off_verdef = align_up(off_versym + versym.len() * 2, 4);
+    let off_dyn = align_up(off_verdef + VERDEF_SZ, 8);
+    let dyn_entries: &[(i64, u64)] = &[
+        (DT_SONAME, name_soname as u64),
+        (DT_HASH, off_hash as u64),
+        (DT_STRTAB, off_dynstr as u64),
+        (DT_SYMTAB, off_dynsym as u64),
+        (DT_SYMENT, SYMENT as u64),
+        (DT_STRSZ, dynstr.len() as u64),
+        (DT_VERSYM, off_versym as u64),
+        (DT_VERDEF, off_verdef as u64),
+        (DT_VERDEFNUM, 1),
+        (DT_NULL, 0),
+    ];
+    let off_dyn_end = off_dyn + dyn_entries.len() * 16;
+    let off_code = align_up(off_dyn_end, 16);
+    let off_code_end = off_code + X8664_VDSO_CODE.len();
+
+    let mut shstr = Vec::new();
+    shstr.push(0u8);
+    let sh_name_dynsym = shstr.len() as u32;
+    shstr.extend_from_slice(b".dynsym\0");
+    let sh_name_dynstr = shstr.len() as u32;
+    shstr.extend_from_slice(b".dynstr\0");
+    let sh_name_shstrtab = shstr.len() as u32;
+    shstr.extend_from_slice(b".shstrtab\0");
+    let off_shstrtab = align_up(off_code_end, 4);
+    let off_shdr = align_up(off_shstrtab + shstr.len(), 8);
+    let total = off_shdr + NSH * SHENT;
+
+    let mut buf = vec![0u8; total];
+    buf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    buf[4] = 2;
+    buf[5] = 1;
+    buf[6] = 1;
+    w16(&mut buf, 16, ET_DYN);
+    w16(&mut buf, 18, EM_X86_64);
+    w32(&mut buf, 20, 1);
+    w64(&mut buf, 24, 0);
+    w64(&mut buf, 32, off_phdr as u64);
+    w64(&mut buf, 40, off_shdr as u64);
+    w32(&mut buf, 48, 0);
+    w16(&mut buf, 52, EHDR as u16);
+    w16(&mut buf, 54, PHENT as u16);
+    w16(&mut buf, 56, NPH as u16);
+    w16(&mut buf, 58, SHENT as u16);
+    w16(&mut buf, 60, NSH as u16);
+    w16(&mut buf, 62, 3);
+
+    let p0 = off_phdr;
+    w32(&mut buf, p0, PT_LOAD);
+    w32(&mut buf, p0 + 4, 0x5);
+    w64(&mut buf, p0 + 8, 0);
+    w64(&mut buf, p0 + 16, 0);
+    w64(&mut buf, p0 + 24, 0);
+    w64(&mut buf, p0 + 32, total as u64);
+    w64(&mut buf, p0 + 40, total as u64);
+    w64(&mut buf, p0 + 48, 0x1000);
+    let p1 = off_phdr + PHENT;
+    w32(&mut buf, p1, PT_DYNAMIC);
+    w32(&mut buf, p1 + 4, 0x4);
+    w64(&mut buf, p1 + 8, off_dyn as u64);
+    w64(&mut buf, p1 + 16, off_dyn as u64);
+    w64(&mut buf, p1 + 24, off_dyn as u64);
+    w64(&mut buf, p1 + 32, (off_dyn_end - off_dyn) as u64);
+    w64(&mut buf, p1 + 40, (off_dyn_end - off_dyn) as u64);
+    w64(&mut buf, p1 + 48, 8);
+
+    let sym = |buf: &mut [u8], idx: usize, name: u32, value: u64, size: u64| {
+        let o = off_dynsym + idx * SYMENT;
+        w32(buf, o, name);
+        buf[o + 4] = STB_GLOBAL_FUNC;
+        buf[o + 5] = 0;
+        w16(buf, o + 6, 1);
+        w64(buf, o + 8, value);
+        w64(buf, o + 16, size);
+    };
+    sym(
+        &mut buf,
+        1,
+        name_clock_gettime,
+        off_code as u64,
+        X8664_SYM_CLOCK_GETRES,
+    );
+    sym(
+        &mut buf,
+        2,
+        name_clock_getres,
+        off_code as u64 + X8664_SYM_CLOCK_GETRES,
+        X8664_SYM_GETTIMEOFDAY - X8664_SYM_CLOCK_GETRES,
+    );
+    sym(
+        &mut buf,
+        3,
+        name_gettimeofday,
+        off_code as u64 + X8664_SYM_GETTIMEOFDAY,
+        X8664_SYM_TIME - X8664_SYM_GETTIMEOFDAY,
+    );
+    sym(
+        &mut buf,
+        4,
+        name_time,
+        off_code as u64 + X8664_SYM_TIME,
+        X8664_VDSO_CODE.len() as u64 - X8664_SYM_TIME,
+    );
+
+    buf[off_dynstr..off_dynstr + dynstr.len()].copy_from_slice(&dynstr);
+    for (i, v) in hash.iter().enumerate() {
+        w32(&mut buf, off_hash + i * 4, *v);
+    }
+    for (i, v) in versym.iter().enumerate() {
+        w16(&mut buf, off_versym + i * 2, *v);
+    }
+    let vd = off_verdef;
+    w16(&mut buf, vd, 1);
+    w16(&mut buf, vd + 2, 0);
+    w16(&mut buf, vd + 4, 1);
+    w16(&mut buf, vd + 6, 1);
+    w32(&mut buf, vd + 8, LINUX_2_6_HASH);
+    w32(&mut buf, vd + 12, 20);
+    w32(&mut buf, vd + 16, 0);
+    w32(&mut buf, vd + 20, name_version);
+    w32(&mut buf, vd + 24, 0);
+    for (i, (tag, val)) in dyn_entries.iter().enumerate() {
+        let o = off_dyn + i * 16;
+        w64(&mut buf, o, *tag as u64);
+        w64(&mut buf, o + 8, *val);
+    }
+    buf[off_code..off_code + X8664_VDSO_CODE.len()].copy_from_slice(X8664_VDSO_CODE);
+    buf[off_shstrtab..off_shstrtab + shstr.len()].copy_from_slice(&shstr);
+
+    const SHT_STRTAB: u32 = 3;
+    const SHT_DYNSYM: u32 = 11;
+    const SHF_ALLOC: u64 = 0x2;
+    let mut shdr = |idx: usize,
+                    name: u32,
+                    sh_type: u32,
+                    flags: u64,
+                    addr_off: u64,
+                    size: u64,
+                    link: u32,
+                    info: u32,
+                    align: u64,
+                    entsize: u64| {
+        let o = off_shdr + idx * SHENT;
+        w32(&mut buf, o, name);
+        w32(&mut buf, o + 4, sh_type);
+        w64(&mut buf, o + 8, flags);
+        w64(&mut buf, o + 16, addr_off);
+        w64(&mut buf, o + 24, addr_off);
+        w64(&mut buf, o + 32, size);
+        w32(&mut buf, o + 40, link);
+        w32(&mut buf, o + 44, info);
+        w64(&mut buf, o + 48, align);
+        w64(&mut buf, o + 56, entsize);
+    };
+    shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    shdr(
+        1,
+        sh_name_dynsym,
+        SHT_DYNSYM,
+        SHF_ALLOC,
+        off_dynsym as u64,
+        (NSYM * SYMENT) as u64,
+        2,
+        1,
+        8,
+        SYMENT as u64,
+    );
+    shdr(
+        2,
+        sh_name_dynstr,
+        SHT_STRTAB,
+        SHF_ALLOC,
+        off_dynstr as u64,
+        dynstr.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
+    shdr(
+        3,
+        sh_name_shstrtab,
+        SHT_STRTAB,
+        0,
+        off_shstrtab as u64,
+        shstr.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
+    buf
 }
 
 fn vdso_image_bytes_with_symbols(
@@ -530,6 +795,26 @@ mod tests {
             }
         }
         assert!(found, "__kernel_clock_gettime not exported");
+    }
+
+    #[test]
+    fn x8664_vdso_elf_parses_and_exports_clock_symbols() {
+        let img = x8664_vdso_image_bytes();
+        let elf = goblin::elf::Elf::parse(&img).expect("x86_64 vDSO must be a valid ELF");
+        assert_eq!(elf.header.e_machine, EM_X86_64);
+        let mut found = [false; 4];
+        for sym in elf.dynsyms.iter() {
+            if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                match name {
+                    "__vdso_clock_gettime" => found[0] = sym.st_value != 0,
+                    "__vdso_clock_getres" => found[1] = sym.st_value != 0,
+                    "__vdso_gettimeofday" => found[2] = sym.st_value != 0,
+                    "__vdso_time" => found[3] = sym.st_value != 0,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(found, [true, true, true, true]);
     }
 
     /// The aarch64 vDSO symbol set carrick exports, matching the LinuxKit 6.x

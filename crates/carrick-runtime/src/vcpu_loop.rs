@@ -166,9 +166,8 @@ mod macos_helper_stubs {
         // initial stack (argc/argv/envp/auxv). `build_for_image` adds the
         // trampoline / page-tables / sentinel vectors. Matches the boot chain in
         // `run_elf_real_dispatch`. Per-ISA vDSO bytes come from the engine's
-        // GuestArch. Only the aarch64 KVM lane materializes a vDSO today; the
-        // x86_64 KVM lane and the BSD lane build the stack without one (x86 musl
-        // falls back to real `SYSCALL`; mirrors `run_elf_real_dispatch`'s x86 arm).
+        // GuestArch; the x86_64 lanes now materialize the shared x86 clock vDSO
+        // as well, so execve children do not fall back to real clock syscalls.
         #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
         let image = {
             use carrick_hal::GuestArch as _;
@@ -177,7 +176,17 @@ mod macos_helper_stubs {
                 .and_then(|a| a.with_linux_initial_stack(argv, env))
                 .map_err(|_| LINUX_ENOENT)?
         };
-        #[cfg(not(all(feature = "platform-linux", target_arch = "aarch64")))]
+        #[cfg(target_arch = "x86_64")]
+        let image = {
+            use carrick_hal::GuestArch as _;
+            raw.with_vdso_bytes(carrick_hal::x8664_arch::X8664GuestArch::vdso_bytes())
+                .and_then(|a| a.with_linux_initial_stack(argv, env))
+                .map_err(|_| LINUX_ENOENT)?
+        };
+        #[cfg(all(
+            not(target_arch = "x86_64"),
+            not(all(feature = "platform-linux", target_arch = "aarch64"))
+        ))]
         let image = raw
             .with_vdso_auxv(false)
             .with_linux_initial_stack(argv, env)
