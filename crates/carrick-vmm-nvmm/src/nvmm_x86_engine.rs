@@ -71,8 +71,11 @@ fn map_err(e: nvmm::NvmmError) -> TrapError {
 /// `gpa` for `gpa_map`. (Kernel-window regions are identity: `va == gpa`.)
 struct Region {
     va: u64,
+    gpa: u64,
     hva: *mut u8,
     len: usize,
+    prot: libc::c_int,
+    backing: NvmmRamBacking,
 }
 
 /// The NVMM `X86Vmm`: an `NvmmMachine` plus the VA-keyed host-HVA region table
@@ -132,7 +135,14 @@ impl X86Vmm for NvmmVmm {
                 .mach
                 .map_guest_ram_with_backing(r.gpa, len, prot, backing)
                 .map_err(map_err)?;
-            self.regions.push(Region { va: r.va, hva, len });
+            self.regions.push(Region {
+                va: r.va,
+                gpa: r.gpa,
+                hva,
+                len,
+                prot,
+                backing,
+            });
         }
         Ok(())
     }
@@ -157,8 +167,104 @@ impl X86Vmm for NvmmVmm {
     }
 
     fn fork_ram_strategy(&self) -> ForkRamStrategy {
-        // Userspace-HVA RAM (MAP_PRIVATE|MAP_ANON) → host libc::fork is COW.
-        ForkRamStrategy::Cow
+        // NVMM vCPU writes land through the hypervisor's registered HVA view,
+        // not ordinary host stores that participate cleanly in process COW. The
+        // parent can run ahead after host fork and mutate pages before the child
+        // rematerializes its machine, so freeze private windows before fork.
+        ForkRamStrategy::EagerCopy
+    }
+
+    fn freeze_ram(&self) -> Result<Vec<u8>, TrapError> {
+        let total = self
+            .regions
+            .iter()
+            .filter(|r| r.backing == NvmmRamBacking::Private)
+            .map(|r| r.len)
+            .sum();
+        let mut frozen = Vec::with_capacity(total);
+        for region in &self.regions {
+            if region.backing != NvmmRamBacking::Private {
+                continue;
+            }
+            // SAFETY: `region.hva` spans `region.len` bytes for the live
+            // private window; the parent vCPU is suspended at the syscall trap.
+            let bytes = unsafe { std::slice::from_raw_parts(region.hva, region.len) };
+            frozen.extend_from_slice(bytes);
+        }
+        Ok(frozen)
+    }
+
+    fn rebuild_child_after_fork(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        frozen: &[u8],
+    ) -> Result<(), TrapError> {
+        // CHILD side of a guest fork(2). Private windows are rebuilt from the
+        // pre-fork frozen buffer; shared file-backed windows are re-registered
+        // with the fresh machine. NetBSD's inherited NVMM machine and vCPU
+        // kernel objects are not usable from the child. Also, dropping them in
+        // the child would destroy the parent's machine, so disarm them before
+        // any fallible rebuild work.
+        self.mach.disarm_destroy();
+        vcpu.disarm_destroy();
+
+        let mut child_mach = NvmmMachine::create().map_err(map_err)?;
+        let mut child_regions = Vec::with_capacity(self.regions.len());
+        let mut frozen_cursor = 0usize;
+        for region in &self.regions {
+            let child_hva = match region.backing {
+                NvmmRamBacking::Private => {
+                    let end = frozen_cursor.checked_add(region.len).ok_or_else(|| {
+                        TrapError::Hypervisor("nvmm-x86: frozen RAM cursor overflow".into())
+                    })?;
+                    let Some(src) = frozen.get(frozen_cursor..end) else {
+                        return Err(TrapError::Hypervisor(format!(
+                            "nvmm-x86: frozen RAM too short for private region va=0x{:x}",
+                            region.va
+                        )));
+                    };
+                    let dst = child_mach
+                        .map_guest_ram_with_backing(
+                            region.gpa,
+                            region.len,
+                            region.prot,
+                            NvmmRamBacking::Private,
+                        )
+                        .map_err(map_err)?;
+                    // SAFETY: `src` and `dst` both span `region.len`; the
+                    // child mapping is fresh and disjoint.
+                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, region.len) };
+                    frozen_cursor = end;
+                    dst
+                }
+                NvmmRamBacking::Shared => {
+                    child_mach
+                        .map_existing_host_ram(region.hva, region.gpa, region.len, region.prot)
+                        .map_err(map_err)?;
+                    region.hva
+                }
+            };
+            child_regions.push(Region {
+                va: region.va,
+                gpa: region.gpa,
+                hva: child_hva,
+                len: region.len,
+                prot: region.prot,
+                backing: region.backing,
+            });
+        }
+        if frozen_cursor != frozen.len() {
+            return Err(TrapError::Hypervisor(format!(
+                "nvmm-x86: unused frozen RAM bytes: {}",
+                frozen.len() - frozen_cursor
+            )));
+        }
+        let child_vcpu = child_mach.create_vcpu(0).map_err(map_err)?;
+
+        self.mach = child_mach;
+        self.regions = child_regions;
+        *vcpu = child_vcpu;
+        Ok(())
     }
 
     fn kick_handle(&self) -> Self::KickHandle {
@@ -186,6 +292,10 @@ impl X86Vmm for NvmmVmm {
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
         Arc::new(NvmmKicker::new())
+    }
+
+    fn process_exit_cleanup(&mut self) {
+        self.mach.destroy_in_place();
     }
 }
 
@@ -563,8 +673,8 @@ fn install_iretq_ring3_entry(
 
     // `iretq` = 48 CF. Pops RIP, CS, RFLAGS, RSP, SS (low→high).
     vmm.write_gpa(stub_gpa, &[0x48, 0xCF])?;
-    // Ring-3 iretq frame: user CS=0x23 (GDT[4] uCS64), user SS=0x1B (GDT[3] uSS),
-    // RFLAGS=0x2 (reserved bit only).
+    // Ring-3 iretq frame: user CS=0x23 (GDT[4] uCS64), user SS=0x1B
+    // (GDT[3] uSS), RFLAGS=0x2 (reserved bit only).
     let mut frame = [0u8; 40];
     frame[0..8].copy_from_slice(&user_entry.to_le_bytes());
     frame[8..16].copy_from_slice(&0x23u64.to_le_bytes());

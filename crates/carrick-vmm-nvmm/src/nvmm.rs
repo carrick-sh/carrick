@@ -482,6 +482,7 @@ pub fn capability() -> NvmmResult<NvmmCapability> {
 /// An NVMM virtual machine (RAII: `nvmm_machine_destroy` on drop).
 pub struct NvmmMachine {
     raw: Box<NvmmMachineRaw>,
+    destroyed: bool,
 }
 
 impl NvmmMachine {
@@ -493,7 +494,10 @@ impl NvmmMachine {
         check("nvmm_machine_create", unsafe {
             nvmm_machine_create(raw.as_mut())
         })?;
-        Ok(NvmmMachine { raw })
+        Ok(NvmmMachine {
+            raw,
+            destroyed: false,
+        })
     }
 
     pub fn machid(&self) -> u32 {
@@ -502,6 +506,25 @@ impl NvmmMachine {
 
     fn raw_mut(&mut self) -> *mut NvmmMachineRaw {
         self.raw.as_mut()
+    }
+
+    /// Prevent Drop from destroying this machine. Used in a `fork(2)` child for
+    /// inherited parent handles: the child owns duplicated userspace structs, but
+    /// `nvmm_machine_destroy` addresses the parent-visible kernel machine.
+    pub(crate) fn disarm_destroy(&mut self) {
+        self.destroyed = true;
+    }
+
+    /// Destroy the machine now and make later Drop a no-op.
+    pub(crate) fn destroy_in_place(&mut self) {
+        if self.destroyed {
+            return;
+        }
+        // SAFETY: `raw` is a live machine owned by this struct.
+        unsafe {
+            nvmm_machine_destroy(self.raw.as_mut());
+        }
+        self.destroyed = true;
     }
 
     /// `mmap` a private anonymous region, register it as a shareable HVA via
@@ -551,6 +574,36 @@ impl NvmmMachine {
         Ok(hva as *mut u8)
     }
 
+    /// Register an already-mapped host RAM window with this fresh machine and
+    /// link it into guest physical space at `gpa`. The caller retains ownership
+    /// of the HVA mapping; failures only unregister from NVMM, never `munmap`.
+    pub(crate) fn map_existing_host_ram(
+        &mut self,
+        hva: *mut u8,
+        gpa: u64,
+        size: usize,
+        prot: c_int,
+    ) -> NvmmResult<()> {
+        let hva_addr = hva as usize;
+        let m = self.raw_mut();
+        // SAFETY: `hva_addr`/`size` describe a live inherited host mapping; `m`
+        // is a live fresh machine.
+        if let Err(e) = check("nvmm_hva_map", unsafe { nvmm_hva_map(m, hva_addr, size) }) {
+            return Err(e);
+        }
+        // SAFETY: `hva_addr` was registered with this machine above.
+        if let Err(e) = check("nvmm_gpa_map", unsafe {
+            nvmm_gpa_map(m, hva_addr, gpa, size, prot)
+        }) {
+            // SAFETY: best-effort teardown of this machine's HVA registration.
+            unsafe {
+                nvmm_hva_unmap(m, hva_addr, size);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Create vCPU 0 (or `cpuid`) in this machine.
     pub fn create_vcpu(&mut self, cpuid: u32) -> NvmmResult<NvmmVcpu> {
         let mut raw = Box::new(NvmmVcpuRaw::zeroed());
@@ -571,10 +624,7 @@ impl NvmmMachine {
 
 impl Drop for NvmmMachine {
     fn drop(&mut self) {
-        // SAFETY: `raw` is a live machine owned by this struct; destroy it.
-        unsafe {
-            nvmm_machine_destroy(self.raw.as_mut());
-        }
+        self.destroy_in_place();
     }
 }
 
@@ -679,6 +729,12 @@ pub struct NvmmVcpu {
 }
 
 impl NvmmVcpu {
+    /// Prevent Drop from destroying this vCPU. Used in a `fork(2)` child for an
+    /// inherited parent vCPU whose kernel object still belongs to the parent.
+    pub(crate) fn disarm_destroy(&mut self) {
+        self.destroyed = true;
+    }
+
     /// Fetch the requested state sub-areas from the kernel into the comm page,
     /// then return a copy of the full state struct.
     ///
