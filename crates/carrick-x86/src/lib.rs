@@ -33,10 +33,12 @@ pub use bringup_fns::{
 };
 pub use engine::X86EngineCore;
 pub use fault::{
-    FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultDoorbellRecord, X86_FAULT_RECORD_U32_WORDS,
-    X86_FAULT_SLOTS, add_fault_windows, fault_exit_from_record, fault_idt_base, fault_slot_gpa,
-    fault_stack_base, fault_stub_base, fault_tss_base, program_fault_segments, write_fault_tables,
-    write_fault_tables_with,
+    FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultDoorbellRecord, FaultMemoryRecord,
+    X86_FAULT_MEMORY_RECORD_BYTES, X86_FAULT_RECORD_U32_WORDS, X86_FAULT_SLOTS, add_fault_windows,
+    fault_exit_from_record, fault_idt_base, fault_record_base, fault_slot_gpa, fault_stack_base,
+    fault_stub_base, fault_tss_base, program_fault_segments, write_fault_tables,
+    write_fault_tables_with, write_memory_record_fault_tables,
+    write_memory_record_fault_tables_with,
 };
 pub use vmm::{
     ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion, X86_PML4_CAPACITY, X86Exit,
