@@ -29,7 +29,7 @@
 //! the sigframe carries). `KERNEL_GS_BASE` (the SWAPGS shadow) is not used by
 //! the ring-3-only guest, so `get/set_gs_base` operate on `sregs.gs.base`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::MemoryError;
@@ -73,7 +73,7 @@ impl KvmVmm {
     /// `clone(CLONE_THREAD)` sibling shares every slot — no re-registration).
     fn from_sibling(
         handle: SharedVmHandle,
-        windows: &[WindowDesc],
+        windows: Arc<RwLock<Vec<WindowDesc>>>,
         protections: Arc<carrick_mem::protections::MemoryProtections>,
         page_tables: Arc<Mutex<Pml4Manager>>,
     ) -> Self {
@@ -116,7 +116,7 @@ impl KvmVmm {
 /// the seeded snapshot in `X86SiblingSpec`).
 pub struct KvmSiblingBuilder {
     vm: SharedVmHandle,
-    windows: Vec<WindowDesc>,
+    windows: Arc<RwLock<Vec<WindowDesc>>>,
     protections: Arc<carrick_mem::protections::MemoryProtections>,
     page_tables: Arc<Mutex<Pml4Manager>>,
     ticket: VcpuLiveTicket,
@@ -312,7 +312,7 @@ impl X86Vmm for KvmVmm {
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
         let vmm = Self::from_sibling(
             builder.vm,
-            &builder.windows,
+            builder.windows,
             builder.protections,
             builder.page_tables,
         );

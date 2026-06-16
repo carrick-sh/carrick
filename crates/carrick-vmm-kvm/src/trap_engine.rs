@@ -2,7 +2,7 @@
 //! `SyscallTrap` contract. `next_syscall` runs KVM_RUN until the EL1 vector's
 //! sentinel store surfaces as `VcpuExit::MmioWrite { gpa: SENTINEL_GPA, .. }`,
 //! reads x0..x5,x8 into an `Aarch64SyscallFrame`, and returns it.
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
@@ -317,7 +317,7 @@ impl KvmTrapEngine {
     /// ([`carrick_mem::memory::needs_stage1_translation`]) walks the live stage-1
     /// tables to find the overlay IPA whose backing the guest's OWN EL0 accesses
     /// hit (the VA-keyed window still resolves to the STALE shared aperture).
-    /// High-VA aliases are EXCLUDED: their KVM `Window::base == va`, so identity
+    /// High-VA aliases are EXCLUDED: their KVM `WindowDesc::base == va`, so identity
     /// is correct and re-basing on the IPA would miss the window. A walk miss
     /// falls back to `va` (identity), preserving prior behaviour for an unmapped
     /// VA.
@@ -1142,7 +1142,7 @@ pub struct KvmSiblingSpec {
     /// `Send`-safe descriptors of the parent's host windows (raw `*mut u8`
     /// carried as `usize`; same VA in the sibling thread — no fork). The sibling
     /// builds a NON-OWNING `GuestRam` view over these (Task 5 unknown #2).
-    windows: Vec<WindowDesc>,
+    windows: Arc<RwLock<Vec<WindowDesc>>>,
     /// The parent's register file, already seeded for the new thread
     /// (x0=0, sp_el0=child stack, tpidr_el0=tls, pc=post-svc).
     snapshot: VcpuSnapshot,
@@ -1272,7 +1272,7 @@ impl carrick_hal::ThreadedEngine for KvmTrapEngine {
         // writes syscall buffers through the SAME backing but NEVER munmaps it
         // (the owning parent frees it at process exit). It SHARES the parent's
         // PROT_NONE bookkeeping so cross-thread mprotect is coherent.
-        let ram = GuestRam::from_shared_windows(&spec.windows, Arc::clone(&spec.protections));
+        let ram = GuestRam::from_shared_windows(spec.windows, Arc::clone(&spec.protections));
         Ok(Self {
             vm,
             vcpu,

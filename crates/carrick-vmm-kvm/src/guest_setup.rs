@@ -7,7 +7,7 @@
 // program_sysregs, BroughtUp) are cfg-gated.  Suppress dead_code/unused-import
 // warnings on x86_64 to keep `cargo clippy -- -D warnings` clean.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
 use carrick_mem::memory::{
@@ -291,37 +291,6 @@ pub(crate) enum WindowKind {
     Shared,
 }
 
-/// One host-backed guest-physical window: [base, base+len) of guest-physical
-/// space backed by a single host `mmap`. Each becomes one
-/// `KVM_SET_USER_MEMORY_REGION` slot.
-struct Window {
-    base: u64,
-    host: *mut u8,
-    len: usize,
-    /// Host mmap kind for this window. Read by
-    /// [`GuestRam::shared_futex_host_addr`] (Task 7) to decide whether a guest
-    /// futex word is a cross-process `MAP_SHARED` rendezvous (→ bare host
-    /// `SYS_futex`) or a private in-process one (→ the parking-lot table).
-    ///
-    /// `rebuild_vm_for_child` (Task 2) re-registers ALL windows uniformly via
-    /// `map_memory` — it does NOT branch on `kind`.  This is correct: `libc::fork`
-    /// has already settled the memory semantics before `rebuild_vm_for_child` runs.
-    /// Private (`MAP_PRIVATE|MAP_ANONYMOUS`) windows become Linux COW copies;
-    /// the MAP_SHARED aperture continues to alias the same host pages.  Both
-    /// simply reuse the inherited host VA that the parent's `Window::host` recorded
-    /// — no re-mmap is needed.
-    kind: WindowKind,
-    /// For a dynamic ALIAS window (a guest `mmap(MAP_SHARED, fd)` / high-VA
-    /// mapping whose dispatcher-chosen VA is >= 1 TiB and so cannot itself be a
-    /// KVM GPA under the 40-bit nested-KVM IPA limit): the GPA the KVM slot is
-    /// registered at (a free identity hole < 1 TiB), which DIFFERS from `base`
-    /// (the guest VA used for the syscall-path `locate`). `None` for an ordinary
-    /// identity window (`base` IS the GPA). The guest reaches the backing via
-    /// stage-1 (VA -> this GPA, built by `map_aliased`) then stage-2 (the slot);
-    /// the host syscall path reaches the SAME backing by `locate(VA)`.
-    slot_gpa: Option<u64>,
-}
-
 /// Multi-window host-backed guest RAM. The MVP used a single low window; a real
 /// binary additionally needs the high runtime regions (stack near 1 TiB,
 /// heap @ 256 GiB, mmap arena @ 384 GiB, sigreturn @ 192 GiB), which sit far
@@ -331,7 +300,7 @@ struct Window {
 /// on it faulting to stage-2). All windows are MAP_PRIVATE for now (no fork; the
 /// host-MAP_SHARED fork-coherence model is the full-backend Phase D work).
 pub struct GuestRam {
-    windows: Vec<Window>,
+    windows: Arc<RwLock<Vec<WindowDesc>>>,
     /// Guest-physical ranges the guest has made PROT_NONE (mmap(PROT_NONE)/
     /// mprotect/munmap). carrick backs the whole arena with accessible host
     /// memory, so a PROT_NONE buffer is otherwise readable on the syscall path —
@@ -383,21 +352,23 @@ impl Drop for GuestRam {
         if !self.owns_windows {
             return;
         }
-        for w in &self.windows {
+        let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
+        for w in windows.iter() {
             // SAFETY: `host`..`host+len` is the mmap this window owns (created in
             // `add_window`); it is unmapped exactly once, on drop. KVM slots over
             // it were already deleted by the execve caller.
             unsafe {
-                libc::munmap(w.host.cast::<libc::c_void>(), w.len);
+                libc::munmap((w.host as *mut u8).cast::<libc::c_void>(), w.len);
             }
         }
+        windows.clear();
     }
 }
 
 impl GuestRam {
     pub(crate) fn new() -> Self {
         Self {
-            windows: Vec::new(),
+            windows: Arc::new(RwLock::new(Vec::new())),
             protections: Arc::new(MemoryProtections::default()),
             owns_windows: true,
         }
@@ -481,13 +452,16 @@ impl GuestRam {
                 "kvm: guest RAM mmap failed for 0x{base:x}+{len}"
             )));
         }
-        self.windows.push(Window {
-            base,
-            host: host.cast::<u8>(),
-            len,
-            kind,
-            slot_gpa: None,
-        });
+        self.windows
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(WindowDesc {
+                base,
+                host: host.cast::<u8>() as usize,
+                len,
+                kind,
+                slot_gpa: None,
+            });
         Ok(())
     }
 
@@ -574,40 +548,57 @@ impl GuestRam {
             unsafe { libc::munmap(host.cast::<libc::c_void>(), size) };
             return Err(e);
         }
-        self.windows.push(Window {
-            base: va,
-            host,
-            len: size,
-            kind,
-            slot_gpa: Some(gpa),
-        });
+        self.windows
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(WindowDesc {
+                base: va,
+                host: host as usize,
+                len: size,
+                kind,
+                slot_gpa: Some(gpa),
+            });
         Ok(())
     }
 
     /// The window whose [base, base+len) wholly contains [gpa, gpa+len), with
     /// the host offset of `gpa` within it.
-    fn locate(&self, gpa: u64, len: usize) -> Option<(&Window, usize)> {
-        self.windows.iter().find_map(|w| {
-            let off = gpa.checked_sub(w.base)?;
-            ((off as usize).checked_add(len)? <= w.len).then_some((w, off as usize))
-        })
+    fn locate(&self, gpa: u64, len: usize) -> Option<(WindowDesc, usize)> {
+        self.windows
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find_map(|w| {
+                let off = gpa.checked_sub(w.base)?;
+                ((off as usize).checked_add(len)? <= w.len).then_some((*w, off as usize))
+            })
     }
 
     /// Project each window into the neutral [`carrick_guest_mem::region::GuestMemoryRegion`]
-    /// keyed on `Window::base` (the SAME value `locate` keys on — the guest-VA
+    /// keyed on `WindowDesc::base` (the SAME value `locate` keys on — the guest-VA
     /// the host syscall path uses, NOT `slot_gpa`). Yielded BY VALUE so the gate
     /// can iterate without allocating; the `slot_gpa` <1 TiB-alias handling stays
     /// glue (it never enters the projection — `base` is always the lookup key).
-    fn projected_windows(
+    fn safe_access_projected(
         &self,
-    ) -> impl Iterator<Item = carrick_guest_mem::region::GuestMemoryRegion> + '_ {
-        self.windows
-            .iter()
-            .map(|w| carrick_guest_mem::region::GuestMemoryRegion {
-                base: w.base,
-                len: w.len,
-                host_addr: w.host,
-            })
+        va: u64,
+        ipa: u64,
+        len: usize,
+    ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
+        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+        carrick_guest_mem::region::safe_guest_access_translated_in(
+            |g, l| self.protections.range_no_access(g, l),
+            windows
+                .iter()
+                .map(|w| carrick_guest_mem::region::GuestMemoryRegion {
+                    base: w.base,
+                    len: w.len,
+                    host_addr: w.host as *mut u8,
+                }),
+            va,
+            ipa,
+            len,
+        )
     }
 
     /// The COMBINED syscall-buffer gate: the PROT_NONE check THEN the single-
@@ -645,13 +636,7 @@ impl GuestRam {
         if len > 0 && va < LINUX_NULL_GUARD_END {
             return Err(carrick_guest_mem::region::GuestAccessError::OutOfBounds);
         }
-        carrick_guest_mem::region::safe_guest_access_translated_in(
-            |g, l| self.protections.range_no_access(g, l),
-            self.projected_windows(),
-            va,
-            ipa,
-            len,
-        )
+        self.safe_access_projected(va, ipa, len)
     }
 
     /// Copy `data` to guest-physical `gpa` (must lie wholly within one window).
@@ -667,7 +652,7 @@ impl GuestRam {
         };
         // SAFETY: bounds checked by `locate`; host points at `len` writable bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), host.add(off), data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), (host as *mut u8).add(off), data.len());
         }
         Ok(())
     }
@@ -686,7 +671,8 @@ impl GuestRam {
     /// the caller restores the parent's [`VcpuSnapshot`] onto it.
     pub(crate) fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
         let mut vm = KvmVm::create_empty()?;
-        for w in &self.windows {
+        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+        for w in windows.iter() {
             // An ALIAS window's KVM slot lives at `slot_gpa` (a <1 TiB hole), NOT
             // at `w.base` (the guest VA, e.g. 1 TiB — at/above the 40-bit nested
             // IPA cap, which KVM rejects with EFAULT). Mirror the boot/sibling
@@ -697,7 +683,7 @@ impl GuestRam {
             // KVM_SET_USER_MEMORY_REGION(gpa=1 TiB): Bad address.
             vm.map_memory(
                 w.slot_gpa.unwrap_or(w.base),
-                w.host,
+                w.host as *mut u8,
                 w.len,
                 MemPerms::ReadWriteExec,
             )?;
@@ -716,7 +702,7 @@ impl GuestRam {
         let mut out = vec![0u8; len];
         // SAFETY: bounds checked by `locate`; host points at `len` readable bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(w.host.add(off), out.as_mut_ptr(), len);
+            std::ptr::copy_nonoverlapping((w.host as *mut u8).add(off), out.as_mut_ptr(), len);
         }
         Ok(out)
     }
@@ -738,8 +724,8 @@ impl GuestRam {
             })
             .map(|(s, e)| format!("[0x{s:x}..0x{e:x})"))
             .collect();
-        let mut wins: Vec<String> = self
-            .windows
+        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+        let mut wins: Vec<String> = windows
             .iter()
             .map(|w| {
                 format!(
@@ -762,7 +748,7 @@ impl GuestRam {
             } else {
                 near.join(" ")
             },
-            self.windows.len(),
+            windows.len(),
             wins.join(" ")
         )
     }
@@ -777,7 +763,7 @@ impl GuestRam {
         let (w, off) = self.locate(gpa, len)?;
         // SAFETY: `locate` proved [gpa, gpa+len) ⊆ this window, so `host + off`
         // points at `len` valid bytes of that window's backing.
-        Some(unsafe { w.host.add(off) })
+        Some(unsafe { (w.host as *mut u8).add(off) })
     }
 
     /// Host virtual address of the `len`-byte word at guest-physical `gpa`, but
@@ -796,7 +782,7 @@ impl GuestRam {
         }
         // SAFETY: `locate` proved [gpa, gpa+len) ⊆ this window, so `host + off`
         // points at `len` valid bytes of the shared aperture backing.
-        Some(unsafe { w.host.add(off) } as usize)
+        Some(unsafe { (w.host as *mut u8).add(off) } as usize)
     }
 }
 
@@ -905,12 +891,15 @@ impl GuestRam {
     /// Iterate every window as `(base, host, len)` for `KVM_SET_USER_MEMORY_REGION`
     /// registration, in slot order. Used by both bring-up and execve to publish
     /// the windows onto a (fresh or live) VM via [`KvmVm::map_memory`].
-    pub(crate) fn windows_for_kvm(&self) -> impl Iterator<Item = (u64, *mut u8, usize)> + '_ {
+    pub(crate) fn windows_for_kvm(&self) -> Vec<(u64, *mut u8, usize)> {
         // An alias window registers its KVM slot at `slot_gpa` (a low identity
         // hole), NOT `base` (its high guest VA); an ordinary window has base==gpa.
         self.windows
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|w| (w.slot_gpa.unwrap_or(w.base), w.host, w.len))
+            .map(|w| (w.slot_gpa.unwrap_or(w.base), w.host as *mut u8, w.len))
+            .collect()
     }
 
     /// Number of windows in THIS view. Test-only: execve now unregisters by the
@@ -919,26 +908,15 @@ impl GuestRam {
     /// GuestRam view, so this undercounts the VM's live slots.
     #[cfg(test)]
     pub(crate) fn window_count(&self) -> usize {
-        self.windows.len()
+        self.windows.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// `Send`-safe descriptors of this RAM's host-backed windows, for handing a
-    /// `clone(CLONE_THREAD)` sibling a VIEW of the SAME backing on another host
-    /// thread. The host pointer is carried as a `usize` (raw `*mut u8` is not
-    /// `Send`) — valid because threads share the address space (no fork), so the
-    /// host VA is the same in the sibling thread. Reconstituted by
-    /// [`Self::from_shared_windows`].
-    pub(crate) fn window_descriptors(&self) -> Vec<WindowDesc> {
-        self.windows
-            .iter()
-            .map(|w| WindowDesc {
-                base: w.base,
-                host: w.host as usize,
-                len: w.len,
-                kind: w.kind,
-                slot_gpa: w.slot_gpa,
-            })
-            .collect()
+    /// Shared, `Send`-safe descriptors of this RAM's host-backed windows.
+    /// `clone(CLONE_THREAD)` siblings receive the SAME handle, so high-VA alias
+    /// windows added by any thread are immediately visible to every sibling's
+    /// syscall-buffer path.
+    pub(crate) fn window_descriptors(&self) -> Arc<RwLock<Vec<WindowDesc>>> {
+        Arc::clone(&self.windows)
     }
 
     /// Build a NON-OWNING `GuestRam` view over windows another thread owns (a
@@ -955,24 +933,39 @@ impl GuestRam {
     /// observe its. A fresh per-thread set would diverge (the Go-on-KVM EFAULT
     /// crash); see [`MemoryProtections`]'s sharing contract.
     pub(crate) fn from_shared_windows(
-        descs: &[WindowDesc],
+        windows: Arc<RwLock<Vec<WindowDesc>>>,
         protections: Arc<MemoryProtections>,
     ) -> Self {
-        let windows = descs
-            .iter()
-            .map(|d| Window {
-                base: d.base,
-                host: d.host as *mut u8,
-                len: d.len,
-                kind: d.kind,
-                slot_gpa: d.slot_gpa,
-            })
-            .collect();
         Self {
             windows,
             protections,
             owns_windows: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_window_views_observe_late_insertions() {
+        let mut parent = GuestRam::new();
+        parent
+            .add_window(0x1000, 0x1000, WindowKind::Private)
+            .expect("initial window");
+        let sibling =
+            GuestRam::from_shared_windows(parent.window_descriptors(), parent.shared_protections());
+
+        assert!(sibling.host_ptr(0x1000, 1).is_some());
+
+        parent
+            .add_window(0x9000, 0x1000, WindowKind::Private)
+            .expect("late window");
+        assert!(
+            sibling.host_ptr(0x9000, 1).is_some(),
+            "sibling views must observe high-VA aliases added after clone"
+        );
     }
 }
 
@@ -987,7 +980,7 @@ pub(crate) struct WindowDesc {
     pub len: usize,
     pub kind: WindowKind,
     /// Alias windows: the KVM-slot GPA (differs from `base`). `None` for ordinary
-    /// identity windows. See [`Window::slot_gpa`].
+    /// identity windows.
     pub slot_gpa: Option<u64>,
 }
 
@@ -1326,7 +1319,13 @@ mod window_kind_tests {
         ram.add_window(0xC0_0000_0000, 0x10000, WindowKind::Private)
             .expect("high private window");
 
-        let kinds: Vec<WindowKind> = ram.windows.iter().map(|w| w.kind).collect();
+        let kinds: Vec<WindowKind> = ram
+            .windows
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|w| w.kind)
+            .collect();
         assert_eq!(kinds[0], WindowKind::Private, "low window must be Private");
         assert_eq!(
             kinds[1],
