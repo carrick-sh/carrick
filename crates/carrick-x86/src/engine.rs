@@ -203,6 +203,11 @@ impl<V: X86Vmm> X86EngineCore<V> {
     /// Build an engine around an already-constructed VM + vCPU (the backend's
     /// bring-up produces these). `layout` is the GPA layout the bring-up used.
     pub fn from_parts(vm: V, vcpu: V::Vcpu, layout: BringupLayout) -> Self {
+        // Calibrate the x86 vDSO clock page once, here in the shared construction
+        // path, so EVERY backend gets the userspace clock fast path with no
+        // per-backend bring-up code. Best-effort: a no-op until the vvar page is
+        // mapped (so unit-test backends and pre-memory construction are safe).
+        let _ = crate::vdso::populate_vdso_vvar(&vm, &vcpu);
         Self {
             vm,
             vcpu,
@@ -591,6 +596,9 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         // bhyve overrides it. Clear the pending-syscall state — the fresh image
         // resumes at its own entry, not the old doorbell resume.
         self.vm.execve_rebuild(&mut self.vcpu, new_image)?;
+        // The fresh image has its own RAM; re-calibrate the vDSO clock page
+        // (shared, so no backend re-implements it).
+        let _ = crate::vdso::populate_vdso_vvar(&self.vm, &self.vcpu);
         self.pending_resume_pc = None;
         self.sysret_resume = None;
         Ok(())
@@ -705,6 +713,10 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     engine
         .vm
         .restore_vcpu(&mut engine.vcpu, layout, &child_snap)?;
+    // The child's RAM diverged from the parent (COW / eager copy), so the
+    // inherited vvar realtime_off no longer matches this process — re-calibrate
+    // the vDSO clock page (shared, no per-backend code).
+    let _ = crate::vdso::populate_vdso_vvar(&engine.vm, &engine.vcpu);
     // Runtime still completes the clone syscall once this returns. The child has
     // already been restored at the syscall-return point, so completion must only
     // write RAX=0 and must not reuse the parent's pending resume PC.
