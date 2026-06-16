@@ -1,0 +1,24 @@
+[package]
+name = "carrick-bhyve-sigchld"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# SP4.2 child-exit fixture: parent installs an SA_SIGINFO SIGCHLD handler,
+# forks a child that exits 7, and the handler reaps that child with
+# waitpid(WNOHANG). Prints "sigchld-ok" only if SIGCHLD was delivered
+# asynchronously and the backend left the zombie for the guest handler to reap.
+# Cross-compiled static x86_64-unknown-linux-musl (non-PIE ET_EXEC).
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "carrick-bhyve-sigchld"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

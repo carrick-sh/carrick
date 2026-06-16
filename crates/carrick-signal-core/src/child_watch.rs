@@ -28,7 +28,7 @@
 //! a child reaped synchronously is removed before any async reaper could publish,
 //! and a `take` removes the entry so a later async wake can't re-deliver it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 /// Linux SIGCHLD. The canonical definition is `carrick_abi::LINUX_SIGCHLD` (this
@@ -45,12 +45,41 @@ const LINUX_SIGCHLD: i32 = 17;
 /// `lib.rs`'s `THREAD_PENDING`); lazily filled on first `register`.
 static CHILD_WATCHES: Mutex<Option<HashMap<i32, (i32, i32)>>> = Mutex::new(None);
 
+/// Raw host-observed child-exit payload, captured by backend glue from
+/// `waitid(WNOWAIT|WNOHANG)` and consumed by runtime delivery to build the
+/// guest's Linux `siginfo_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildExitSiginfo {
+    pub si_code: i32,
+    pub host_pid: i32,
+    pub host_uid: u32,
+    pub host_status: i32,
+}
+
+/// Child-exit siginfo payloads awaiting delivery, keyed by `(parent_tid,
+/// exit_signal)`. This intentionally sits beside the watch table instead of in a
+/// VMM backend: KVM and bhyve observe exits differently but need one neutral
+/// place to hand the CLD_* payload to the runtime's signal-frame builder.
+type ChildSiginfoQueue = HashMap<(i32, i32), VecDeque<ChildExitSiginfo>>;
+
+static CHILD_SIGINFOS: Mutex<Option<ChildSiginfoQueue>> = Mutex::new(None);
+
 /// Lock the watch table, lazily initialising it, recovering the guard if a
 /// panicking thread poisoned the mutex (the contents are a plain map of small
 /// integers, never left half-updated — and a poisoned watch table must not crash
 /// child-exit delivery).
 fn lock() -> std::sync::MutexGuard<'static, Option<HashMap<i32, (i32, i32)>>> {
     let mut guard = CHILD_WATCHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard
+}
+
+fn lock_siginfos() -> std::sync::MutexGuard<'static, Option<ChildSiginfoQueue>> {
+    let mut guard = CHILD_SIGINFOS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if guard.is_none() {
@@ -89,6 +118,36 @@ pub fn take(child_pid: i32) -> Option<(i32, i32)> {
     lock().as_mut().and_then(|map| map.remove(&child_pid))
 }
 
+/// Queue the raw `waitid` payload for the next delivery of `exit_signal` to
+/// `parent_tid`. Standard signals coalesce to one payload, mirroring normal
+/// pending-signal semantics; real-time exit signals append.
+pub fn record_siginfo(parent_tid: i32, exit_signal: i32, info: ChildExitSiginfo) {
+    if parent_tid <= 0 || !(1..=64).contains(&exit_signal) {
+        return;
+    }
+    let mut guard = lock_siginfos();
+    let queue = guard
+        .get_or_insert_with(HashMap::new)
+        .entry((parent_tid, exit_signal))
+        .or_default();
+    if exit_signal < 32 {
+        queue.clear();
+    }
+    queue.push_back(info);
+}
+
+/// Pop the queued child-exit payload for `(parent_tid, exit_signal)`, if any.
+/// Runtime delivery uses this before falling back to synthesized `SI_USER`.
+pub fn take_siginfo(parent_tid: i32, exit_signal: i32) -> Option<ChildExitSiginfo> {
+    let mut guard = lock_siginfos();
+    let queue = guard.as_mut()?.get_mut(&(parent_tid, exit_signal))?;
+    let front = queue.pop_front();
+    if queue.is_empty() {
+        guard.as_mut()?.remove(&(parent_tid, exit_signal));
+    }
+    front
+}
+
 /// True iff `child_pid` is a tracked guest child (without consuming the mapping).
 /// Lets a backend distinguish a child-exit event from its other wake sources.
 pub fn is_tracked(child_pid: i32) -> bool {
@@ -112,6 +171,9 @@ pub fn tracked_pids() -> Vec<i32> {
 /// children are registered on its own re-armed watch glue.
 pub fn clear() {
     if let Some(map) = lock().as_mut() {
+        map.clear();
+    }
+    if let Some(map) = lock_siginfos().as_mut() {
         map.clear();
     }
 }
@@ -198,9 +260,64 @@ mod tests {
         clear();
         register(501, 1, 17);
         register(502, 2, 17);
+        record_siginfo(
+            1,
+            17,
+            ChildExitSiginfo {
+                si_code: 1,
+                host_pid: 501,
+                host_uid: 0,
+                host_status: 7,
+            },
+        );
         assert!(!tracked_pids().is_empty());
+        assert!(take_siginfo(1, 17).is_some());
+        record_siginfo(
+            1,
+            17,
+            ChildExitSiginfo {
+                si_code: 1,
+                host_pid: 502,
+                host_uid: 0,
+                host_status: 9,
+            },
+        );
         clear();
         assert!(tracked_pids().is_empty());
         assert!(!is_tracked(501));
+        assert_eq!(take_siginfo(1, 17), None);
+    }
+
+    #[test]
+    fn child_exit_siginfo_queues_and_coalesces() {
+        let _g = guard();
+        clear();
+        let first = ChildExitSiginfo {
+            si_code: 1,
+            host_pid: 601,
+            host_uid: 0,
+            host_status: 7,
+        };
+        let second = ChildExitSiginfo {
+            si_code: 1,
+            host_pid: 602,
+            host_uid: 0,
+            host_status: 8,
+        };
+        record_siginfo(9, 17, first);
+        record_siginfo(9, 17, second);
+        assert_eq!(
+            take_siginfo(9, 17),
+            Some(second),
+            "standard exit signals coalesce to the newest payload"
+        );
+        assert_eq!(take_siginfo(9, 17), None);
+
+        record_siginfo(9, 34, first);
+        record_siginfo(9, 34, second);
+        assert_eq!(take_siginfo(9, 34), Some(first));
+        assert_eq!(take_siginfo(9, 34), Some(second));
+        assert_eq!(take_siginfo(9, 34), None);
+        clear();
     }
 }

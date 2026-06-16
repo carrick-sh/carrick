@@ -168,6 +168,18 @@ fn reap_exited_watches() {
         if let Some((parent_tid, exit_signal)) = carrick_signal_core::child_watch::take(pid)
             && exit_signal != 0
         {
+            carrick_signal_core::child_watch::record_siginfo(
+                parent_tid,
+                exit_signal,
+                carrick_signal_core::child_watch::ChildExitSiginfo {
+                    si_code: info.si_code,
+                    host_pid: si_pid,
+                    // SAFETY: POSIX siginfo child-exit payload fields.
+                    host_uid: unsafe { info.si_uid() },
+                    // SAFETY: POSIX siginfo child-exit payload fields.
+                    host_status: unsafe { info.si_status() },
+                },
+            );
             carrick_signal_core::publish_pending_for(parent_tid, exit_signal);
         }
     }

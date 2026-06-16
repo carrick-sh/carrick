@@ -1404,6 +1404,16 @@ pub mod host_signal {
     pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
         carrick_signal_core::child_watch::take(child_pid)
     }
+    /// Pop a backend-recorded child-exit `waitid` payload for the next delivery
+    /// of `exit_signal` to `parent_tid`. The runtime converts host pid/status
+    /// into the guest namespace and Linux signal numbering when building the
+    /// final `siginfo_t`.
+    pub fn take_child_exit_siginfo(
+        parent_tid: i32,
+        exit_signal: i32,
+    ) -> Option<carrick_signal_core::child_watch::ChildExitSiginfo> {
+        carrick_signal_core::child_watch::take_siginfo(parent_tid, exit_signal)
+    }
     /// True iff `child_pid` is a tracked guest child (without consuming the
     /// mapping). Delegates to the neutral child-watch registry.
     pub fn is_tracked_child(child_pid: i32) -> bool {
