@@ -144,6 +144,15 @@ unsafe extern "C" {
         regnums: *const c_int,
         regvals: *mut u64,
     ) -> c_int;
+    /// vmmapi.h:156-157: `int vm_set_register_set(struct vcpu *vcpu,
+    /// unsigned int count, const int *regnums, uint64_t *regvals);` — the write
+    /// twin of `vm_get_register_set` (one ioctl for a batch of registers).
+    pub(crate) fn vm_set_register_set(
+        vcpu: *mut Vcpu,
+        count: c_uint,
+        regnums: *const c_int,
+        regvals: *const u64,
+    ) -> c_int;
     /// vmmapi.h:148-149 (inside `#ifdef __amd64__`, vmmapi.h:147 — amd64-only
     /// in the header, hence the cfg): `int vm_set_desc(struct vcpu *vcpu,
     /// int reg, uint64_t base, uint32_t limit, uint32_t access);`
