@@ -21,6 +21,8 @@
 //! (`fs_backend::sweep_orphans`, which only reaps lock-bearing dirs) leaves it
 //! alone — it is intentionally persistent.
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -127,6 +129,14 @@ fn clone_children_into(entry: &Path, scratch: &Path) -> std::io::Result<bool> {
         return Ok(false);
     }
     let mut cloned: Vec<PathBuf> = Vec::new();
+    // Hardlink identity map (Linux replicate path only): the cache tree can
+    // contain hardlinked files (the extractor reproduces tar hardlinks), and a
+    // naive per-file copy would break them into independent inodes. Track
+    // (dev,ino) of the first occurrence so later siblings `link(2)` to it,
+    // preserving link identity AND space. macOS `clonefile` recurses a whole
+    // subtree in one syscall and needs no such bookkeeping.
+    #[cfg(target_os = "linux")]
+    let mut links: HashMap<(u64, u64), PathBuf> = HashMap::new();
     // `entry` is a cache dir built solely by our own OCI-layer extraction; each
     // child name is validated `Normal` below before being joined onto scratch.
     // (Generic web path-traversal rule misfires on this fs code.)
@@ -148,7 +158,14 @@ fn clone_children_into(entry: &Path, scratch: &Path) -> std::io::Result<bool> {
         }
         let src = child.path();
         let dst = scratch.join(&name);
-        if clonefile(&src, &dst).is_err() {
+        #[cfg(target_os = "linux")]
+        let replicated = replicate_tree(&src, &dst, &mut links);
+        #[cfg(target_os = "macos")]
+        let replicated = clonefile(&src, &dst);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let replicated: std::io::Result<()> =
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        if replicated.is_err() {
             // Roll back any partial clones so the scratch is empty for the
             // caller's fallback extraction.
             for p in &cloned {
@@ -159,6 +176,201 @@ fn clone_children_into(entry: &Path, scratch: &Path) -> std::io::Result<bool> {
         cloned.push(dst);
     }
     Ok(true)
+}
+
+/// Faithfully replicate the cache-entry subtree `src` to `dst` (which must not
+/// yet exist), preferring an `FICLONE` reflink for file data and falling back to
+/// a byte copy when the scratch filesystem has no reflink support. This is what
+/// makes the digest-keyed layer cache effective on **Linux**: instead of a full
+/// OCI-tar re-extraction on every `--fs host` run (gzip-decompress + cap-std
+/// per-component re-walk for every file), each run seeds its fresh scratch from
+/// the once-extracted cache — O(1) on btrfs/XFS/bcachefs/ZFS-bclone (reflink),
+/// and a fast metadata-preserving copy everywhere else (ext4, restricted ZFS).
+///
+/// Preserves exactly what the extractor (`rootfs::apply_tar_to_dir`) set: dir
+/// and file permission bits, symlink targets (verbatim, never followed),
+/// hardlink identity within the tree, and every `user.*` xattr (carrick stores
+/// the guest mode/uid/gid/socket state there). The extractor writes no uid/gid
+/// (single carrick uid) and no other xattr namespaces, so neither does this.
+#[cfg(target_os = "linux")]
+fn replicate_tree(
+    src: &Path,
+    dst: &Path,
+    links: &mut HashMap<(u64, u64), PathBuf>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let md = std::fs::symlink_metadata(src)?;
+    let ft = md.file_type();
+
+    // `src` is always inside our own digest-keyed cache (built solely by our OCI
+    // extraction) and `dst` is inside the scratch under a top-level child whose
+    // name `clone_children_into` already validated as a single `Normal`
+    // component; the recursion descends only through that trusted tree. The
+    // generic web path-traversal rule misfires on this local fs replication.
+    if ft.is_symlink() {
+        let target = std::fs::read_link(src)?; // nosemgrep
+        std::os::unix::fs::symlink(&target, dst)?; // nosemgrep
+        // lsetxattr on the link itself (symlinks rarely carry xattrs, but be
+        // faithful). Mode of a symlink is ignored by Linux, so skip set_perm.
+        copy_user_xattrs(src, dst);
+        return Ok(());
+    }
+
+    if ft.is_dir() {
+        std::fs::create_dir(dst)?; // nosemgrep
+        let entries = std::fs::read_dir(src)?; // nosemgrep
+        for child in entries {
+            let child = child?;
+            replicate_tree(&child.path(), &dst.join(child.file_name()), links)?; // nosemgrep
+        }
+        // Copy xattrs while the dir is still writable, THEN apply its mode last:
+        // a read/search-denied mode (e.g. 0500/0000, possible in odd images) must
+        // not lock us out while we still need to create children or set xattrs
+        // (a non-root run cannot setxattr on a write-denied inode).
+        copy_user_xattrs(src, dst);
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(md.mode()))?;
+        return Ok(());
+    }
+
+    // Regular file. A hardlinked file (nlink > 1) seen before re-links to the
+    // first occurrence (shares its inode, mode, and xattrs).
+    if md.nlink() > 1 {
+        let key = (md.dev(), md.ino());
+        if let Some(first) = links.get(&key) {
+            std::fs::hard_link(first, dst)?;
+            return Ok(());
+        }
+        links.insert(key, dst.to_path_buf());
+    }
+    reflink_or_copy_file(src, dst)?;
+    // xattrs before the (possibly read-only) mode — see the dir branch above.
+    copy_user_xattrs(src, dst);
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(md.mode()))?;
+    Ok(())
+}
+
+/// Copy file *data* from `src` to `dst` via an `FICLONE` reflink (O(1),
+/// copy-on-write, on btrfs/XFS/bcachefs/ZFS-bclone), falling back to a byte copy
+/// when the kernel/filesystem rejects the clone (EOPNOTSUPP/EXDEV/EPERM — e.g.
+/// ext4, or a container that blocks the ioctl). Mode and xattrs are applied by
+/// the caller, so only the bytes matter here.
+#[cfg(target_os = "linux")]
+fn reflink_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    // FICLONE = _IOW(0x94, 9, int): clone the whole src file into dst.
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let s = std::fs::File::open(src)?; // nosemgrep
+    {
+        let d = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dst)?;
+        // SAFETY: both fds are open and valid; FICLONE takes the source fd as
+        // its (by-value int) argument and only reads from it.
+        let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+        if rc == 0 {
+            return Ok(());
+        }
+    }
+    // Reflink unavailable on this volume — `std::fs::copy` overwrites the empty
+    // file the failed clone left behind (it create/truncates the destination).
+    std::fs::copy(src, dst)?; // nosemgrep
+    Ok(())
+}
+
+/// Copy every `user.*` extended attribute from `src` to `dst` (the symlink/file
+/// itself — the `l*xattr` variants never follow links). carrick's guest
+/// mode/uid/gid/socket state lives under `user.carrick.*`; preserving it keeps a
+/// cache-seeded scratch identical to a freshly extracted one. Best-effort: any
+/// individual list/get/set failure is skipped (a missing or unsettable attr is
+/// not worth failing the whole O(1) seed over).
+#[cfg(target_os = "linux")]
+fn copy_user_xattrs(src: &Path, dst: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(csrc) = std::ffi::CString::new(src.as_os_str().as_bytes()) else {
+        return;
+    };
+    let Ok(cdst) = std::ffi::CString::new(dst.as_os_str().as_bytes()) else {
+        return;
+    };
+    // Enumerate the names (llistxattr: NUL-separated names; the symlink itself).
+    let mut name_buf = vec![0u8; 1024];
+    let len = loop {
+        // SAFETY: csrc is a valid C string; name_buf is a valid writable buffer
+        // of the passed length. llistxattr returns the byte length or -1/errno.
+        let rc = unsafe {
+            libc::llistxattr(
+                csrc.as_ptr(),
+                name_buf.as_mut_ptr() as *mut libc::c_char,
+                name_buf.len(),
+            )
+        };
+        if rc >= 0 {
+            break rc as usize;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ERANGE) {
+            // Buffer too small — grow and retry (size query then re-list).
+            let need =
+                unsafe { libc::llistxattr(csrc.as_ptr(), std::ptr::null_mut::<libc::c_char>(), 0) };
+            if need <= 0 {
+                return;
+            }
+            name_buf = vec![0u8; need as usize];
+            continue;
+        }
+        return; // ENOTSUP / ENODATA / etc. — nothing to copy.
+    };
+
+    for raw in name_buf[..len].split(|&b| b == 0) {
+        if raw.is_empty() || !raw.starts_with(b"user.") {
+            continue;
+        }
+        let Ok(cname) = std::ffi::CString::new(raw) else {
+            continue;
+        };
+        // Value: size query, then read.
+        // SAFETY: csrc/cname are valid C strings; a null value pointer with
+        // size 0 asks the kernel for the attribute's length.
+        let vlen = unsafe {
+            libc::lgetxattr(
+                csrc.as_ptr(),
+                cname.as_ptr(),
+                std::ptr::null_mut::<libc::c_void>(),
+                0,
+            )
+        };
+        if vlen < 0 {
+            continue;
+        }
+        let mut val = vec![0u8; vlen as usize];
+        let got = unsafe {
+            libc::lgetxattr(
+                csrc.as_ptr(),
+                cname.as_ptr(),
+                val.as_mut_ptr() as *mut libc::c_void,
+                val.len(),
+            )
+        };
+        if got < 0 {
+            continue;
+        }
+        val.truncate(got as usize);
+        // SAFETY: cdst/cname are valid C strings; val is a valid buffer of the
+        // passed length. Best-effort — ignore the result.
+        unsafe {
+            libc::lsetxattr(
+                cdst.as_ptr(),
+                cname.as_ptr(),
+                val.as_ptr() as *const libc::c_void,
+                val.len(),
+                0,
+            );
+        }
+    }
 }
 
 /// Whether two paths live on the same device (a precondition for `clonefile`).
@@ -177,37 +389,27 @@ fn same_device(a: &Path, b: &Path) -> Option<bool> {
 /// aborts ("/bin is a directory, but should be a symbolic link"), so `apt
 /// full-upgrade` fails. NOFOLLOW is a no-op for directory sources (they clone
 /// recursively with their inner symlinks preserved either way).
-// `clonefile(2)` is macOS-only; the sole consumer below is `#[cfg(macos)]`, so
-// this flag is dead on other targets.
-#[allow(dead_code)]
+#[cfg(target_os = "macos")]
 const CLONE_NOFOLLOW: u32 = 0x0001;
 
+/// macOS: COW-clone the whole subtree `src` into `dst` in one `clonefile(2)`
+/// syscall (APFS). The single-syscall recursive clone is strictly faster than a
+/// per-file walk, so macOS keeps using it; Linux (no APFS) uses [`replicate_tree`]
+/// (FICLONE reflink, else a fast metadata-preserving copy) instead.
+#[cfg(target_os = "macos")]
 fn clonefile(src: &Path, dst: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CString;
-        let csrc = CString::new(src.as_os_str().as_encoded_bytes())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        let cdst = CString::new(dst.as_os_str().as_encoded_bytes())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        // SAFETY: both pointers are valid NUL-terminated C strings. CLONE_NOFOLLOW
-        // clones a symlink child as a symlink instead of following it (see above).
-        let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), CLONE_NOFOLLOW) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-    // Linux has no APFS `clonefile`. Report Unsupported so the caller takes its
-    // designed fallback (`clone_children_into` -> `Ok(false)` -> a clean direct
-    // extraction). The clone cache is a COW optimization, not a correctness
-    // requirement, so disabling it on Linux is fine. A reflink (FICLONE ioctl)
-    // on btrfs/XFS could re-enable the fast path later.
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (src, dst);
-        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    use std::ffi::CString;
+    let csrc = CString::new(src.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let cdst = CString::new(dst.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both pointers are valid NUL-terminated C strings. CLONE_NOFOLLOW
+    // clones a symlink child as a symlink instead of following it (see above).
+    let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), CLONE_NOFOLLOW) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -286,5 +488,129 @@ mod tests {
             std::fs::read_link(scratch.join("bin")).unwrap(),
             std::path::Path::new("usrbin")
         );
+    }
+
+    /// Linux reflink-or-copy seed (`replicate_tree` via `clone_children_into`)
+    /// must reproduce the cache tree faithfully: nested dirs + files with their
+    /// permission bits, a verbatim symlink, the `user.carrick.*` mode xattr, and
+    /// hardlink identity. This is the property that lets the digest-keyed cache
+    /// replace a full tar re-extraction on every Linux `--fs host` run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replicate_tree_preserves_modes_symlinks_xattrs_hardlinks() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let set_user_xattr = |p: &Path, name: &str, val: &[u8]| -> bool {
+            let cp = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            let cn = std::ffi::CString::new(name).unwrap();
+            // SAFETY: valid C strings + a valid value buffer of the given length.
+            unsafe {
+                libc::lsetxattr(
+                    cp.as_ptr(),
+                    cn.as_ptr(),
+                    val.as_ptr() as *const libc::c_void,
+                    val.len(),
+                    0,
+                ) == 0
+            }
+        };
+        let get_user_xattr = |p: &Path, name: &str| -> Option<Vec<u8>> {
+            let cp = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            let cn = std::ffi::CString::new(name).unwrap();
+            let mut buf = vec![0u8; 256];
+            // SAFETY: valid C strings + a writable buffer of the given length.
+            let n = unsafe {
+                libc::lgetxattr(
+                    cp.as_ptr(),
+                    cn.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                return None;
+            }
+            buf.truncate(n as usize);
+            Some(buf)
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = tmp.path().join("entry");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir(&entry).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+
+        // Nested dir (mode 0750) holding a file (mode 0640, content).
+        std::fs::create_dir(entry.join("dir")).unwrap();
+        std::fs::write(entry.join("dir/file.txt"), b"hello-carrick").unwrap();
+        std::fs::set_permissions(
+            entry.join("dir/file.txt"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::fs::set_permissions(entry.join("dir"), std::fs::Permissions::from_mode(0o750))
+            .unwrap();
+        // Top-level symlink (merged-/usr style).
+        symlink("dir", entry.join("link")).unwrap();
+        // A file carrying the guest mode xattr.
+        std::fs::write(entry.join("oddmode"), b"x").unwrap();
+        let xattr_ok = set_user_xattr(&entry.join("oddmode"), "user.carrick.mode", b"0600");
+        // A hardlink pair (same inode).
+        std::fs::write(entry.join("h1"), b"shared").unwrap();
+        std::fs::hard_link(entry.join("h1"), entry.join("h2")).unwrap();
+
+        assert!(
+            clone_children_into(&entry, &scratch).unwrap(),
+            "linux reflink-or-copy seed must succeed (it never declines like the old clonefile stub)"
+        );
+
+        // Content + permission bits.
+        assert_eq!(
+            std::fs::read(scratch.join("dir/file.txt")).unwrap(),
+            b"hello-carrick"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(scratch.join("dir/file.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(scratch.join("dir"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        // Symlink reproduced verbatim (never followed).
+        let lm = std::fs::symlink_metadata(scratch.join("link")).unwrap();
+        assert!(
+            lm.file_type().is_symlink(),
+            "scratch/link must stay a symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(scratch.join("link")).unwrap(),
+            std::path::Path::new("dir")
+        );
+        // Guest mode xattr preserved (only assert when the temp fs supports it).
+        if xattr_ok {
+            assert_eq!(
+                get_user_xattr(&scratch.join("oddmode"), "user.carrick.mode").as_deref(),
+                Some(&b"0600"[..]),
+                "user.carrick.mode xattr must survive the seed"
+            );
+        }
+        // Hardlink identity preserved (same inode, shared content).
+        let i1 = std::fs::symlink_metadata(scratch.join("h1")).unwrap().ino();
+        let i2 = std::fs::symlink_metadata(scratch.join("h2")).unwrap().ino();
+        assert_eq!(
+            i1, i2,
+            "hardlinked files must share one inode in the scratch"
+        );
+        assert_eq!(std::fs::read(scratch.join("h1")).unwrap(), b"shared");
     }
 }
