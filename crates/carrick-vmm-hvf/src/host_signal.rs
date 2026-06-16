@@ -351,6 +351,16 @@ pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
     carrick_signal_core::child_watch::take(child_pid)
 }
 
+/// Pop a backend-recorded child-exit `waitid` payload for the next delivery of
+/// `exit_signal` to `parent_tid`. HVF's kqueue path currently does not record a
+/// payload here, but the runtime host-signal surface is shared with KVM/bhyve.
+pub fn take_child_exit_siginfo(
+    parent_tid: i32,
+    exit_signal: i32,
+) -> Option<carrick_signal_core::child_watch::ChildExitSiginfo> {
+    carrick_signal_core::child_watch::take_siginfo(parent_tid, exit_signal)
+}
+
 /// True iff `child_pid` is a tracked guest child (a fired `EVFILT_PROC` event's
 /// `ident`). Lets the pump distinguish a child-exit event from its other wake
 /// sources without consuming the mapping.

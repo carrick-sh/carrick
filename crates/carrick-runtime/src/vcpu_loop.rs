@@ -2316,20 +2316,41 @@ where
             // If rt_sigqueueinfo queued a caller-supplied siginfo for this (tid,
             // signum), pop it now and hand it to inject_signal. Failing that,
             // synthesise an SI_USER siginfo with the sender's ns-pid.
-            let queued_siginfo = dispatcher.take_pending_siginfo(tid, pending).or_else(|| {
-                let sender_host = crate::host_signal::last_sender_for(pending);
-                (sender_host > 0).then(|| {
-                    let ns_pid =
-                        crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
-                    let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
-                    crate::linux_abi::LinuxSiginfo::kill(
-                        pending,
-                        crate::linux_abi::LINUX_SI_USER,
-                        ns_pid,
-                        uid,
-                    )
+            let queued_siginfo = dispatcher
+                .take_pending_siginfo(tid, pending)
+                .or_else(|| {
+                    crate::host_signal::take_child_exit_siginfo(tid, pending).map(|info| {
+                        const CLD_EXITED: i32 = 1;
+                        let ns_pid =
+                            crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32) as i32;
+                        let linux_status = if info.si_code == CLD_EXITED {
+                            info.host_status
+                        } else {
+                            crate::host_signal::host_to_linux_signum(info.host_status)
+                        };
+                        crate::linux_abi::LinuxSiginfo::child_exit(
+                            pending,
+                            ns_pid,
+                            info.host_uid,
+                            info.si_code,
+                            linux_status,
+                        )
+                    })
                 })
-            });
+                .or_else(|| {
+                    let sender_host = crate::host_signal::last_sender_for(pending);
+                    (sender_host > 0).then(|| {
+                        let ns_pid =
+                            crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
+                        let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
+                        crate::linux_abi::LinuxSiginfo::kill(
+                            pending,
+                            crate::linux_abi::LINUX_SI_USER,
+                            ns_pid,
+                            uid,
+                        )
+                    })
+                });
             match trap.inject_signal(
                 pending,
                 action.sa_handler,
