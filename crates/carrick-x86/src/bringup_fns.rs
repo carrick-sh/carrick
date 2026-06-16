@@ -181,6 +181,7 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
             write: region.perms.write,
             exec: region.perms.execute,
             user: true,
+            shared: region.shared,
         });
     }
 
@@ -194,6 +195,7 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
         write: false,
         exec: true,
         user: false,
+        shared: false,
     });
     regions.push(WindowRegion {
         va: layout.gdt_base,
@@ -203,6 +205,7 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
         write: false,
         exec: false,
         user: false,
+        shared: false,
     });
     regions.push(WindowRegion {
         va: layout.pml4_base,
@@ -212,6 +215,7 @@ pub fn plan_windows(image: &AddressSpace, layout: BringupLayout) -> Result<Windo
         write: true,
         exec: false,
         user: false,
+        shared: false,
     });
     crate::fault::add_fault_windows(&mut regions, layout);
 
@@ -708,7 +712,9 @@ fn host_write(fd: i32, buf: &[u8]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_mem::memory::{LINUX_MMAP_BASE, mmap_arena_size};
+    use carrick_mem::memory::{
+        LINUX_HEAP_BASE, LINUX_MMAP_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size,
+    };
 
     fn test_layout() -> BringupLayout {
         BringupLayout {
@@ -773,6 +779,25 @@ mod tests {
             mmap.len > 64 * 1024 * 1024,
             "generic x86 plan must not carry the old MVP 64 MiB cap"
         );
+    }
+
+    #[test]
+    fn plan_windows_preserves_shared_aperture_backing() {
+        let image = synthetic_x86_image();
+        let plan = plan_windows(&image, test_layout()).expect("window plan");
+        let shared = plan
+            .regions
+            .iter()
+            .find(|region| region.va == LINUX_SHARED_FILE_BASE)
+            .expect("shared aperture region");
+        let heap = plan
+            .regions
+            .iter()
+            .find(|region| region.va == LINUX_HEAP_BASE)
+            .expect("heap region");
+
+        assert!(shared.shared, "shared aperture must stay marked shared");
+        assert!(!heap.shared, "ordinary private regions must stay private");
     }
 
     #[test]

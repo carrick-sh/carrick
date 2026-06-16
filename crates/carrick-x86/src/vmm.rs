@@ -175,6 +175,9 @@ pub struct WindowRegion {
     pub exec: bool,
     /// User-accessible (ring 3) vs kernel-only.
     pub user: bool,
+    /// Whether the source guest region requires shared host backing across
+    /// fork. Used for the boot-mapped shared aperture.
+    pub shared: bool,
 }
 
 /// The ordered region list the bring-up hands every backend. The PML4
