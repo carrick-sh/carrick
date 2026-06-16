@@ -653,6 +653,46 @@ impl NvmmMachine {
         Ok(hva as *mut u8)
     }
 
+    /// Register a host RAM arena with NVMM without mapping it to guest physical
+    /// memory yet. Later `nvmm_gpa_map` calls may target page-aligned subranges
+    /// of this HVA; NetBSD's NVMM resolves those subranges back to the arena's
+    /// one host-mapping slot.
+    pub(crate) fn map_registered_ram_arena(
+        &mut self,
+        size: usize,
+        backing: NvmmRamBacking,
+    ) -> NvmmResult<*mut u8> {
+        let hva = map_host_ram(size, backing)?;
+        let hva_addr = hva as usize;
+        let _guard = self.inner.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.inner.raw_ptr();
+        if let Err(e) = check("nvmm_hva_map", unsafe { nvmm_hva_map(m, hva_addr, size) }) {
+            // SAFETY: unmap the region we just created on the error path.
+            unsafe {
+                libc::munmap(hva, size);
+            }
+            return Err(e);
+        }
+        Ok(hva.cast::<u8>())
+    }
+
+    /// Link a page-aligned range from a previously registered HVA arena into
+    /// guest physical memory.
+    pub(crate) fn map_registered_host_ram(
+        &mut self,
+        hva: *mut u8,
+        gpa: u64,
+        size: usize,
+        prot: c_int,
+    ) -> NvmmResult<()> {
+        let hva_addr = hva as usize;
+        let _guard = self.inner.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.inner.raw_ptr();
+        check("nvmm_gpa_map", unsafe {
+            nvmm_gpa_map(m, hva_addr, gpa, size, prot)
+        })
+    }
+
     /// Register an already-mapped host RAM window with this fresh machine and
     /// link it into guest physical space at `gpa`. The caller retains ownership
     /// of the HVA mapping; failures only unregister from NVMM, never `munmap`.
