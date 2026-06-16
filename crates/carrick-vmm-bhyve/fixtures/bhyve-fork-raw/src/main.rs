@@ -9,9 +9,12 @@
 //! carrick is setting the child's return register wrong.
 //!
 //! Static-musl x86_64 (same loader requirements as the other bhyve fixtures).
+/// Linux x86_64 `fork` syscall number.
+const SYS_FORK: libc::c_long = 57;
+
 fn main() {
     // SAFETY: a single raw fork(2) in a single-threaded program.
-    let ret = unsafe { libc::syscall(libc::SYS_fork) };
+    let ret = unsafe { libc::syscall(SYS_FORK) };
     if ret < 0 {
         unsafe { libc::_exit(1) };
     }
