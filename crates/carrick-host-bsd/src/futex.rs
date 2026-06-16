@@ -1,4 +1,4 @@
-//! macOS/FreeBSD CrossProcessFutex implementation.
+//! BSD-family CrossProcessFutex implementation.
 
 use carrick_hal::futex::CrossProcessFutex;
 
@@ -14,7 +14,11 @@ impl CrossProcessFutex for BsdFutex {
         {
             carrick_host::umtx::wait(host_addr, expected, timeout_us)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        #[cfg(target_os = "netbsd")]
+        {
+            carrick_host::netbsd_futex::wait(host_addr, expected, timeout_us)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
         {
             let _ = (host_addr, expected, timeout_us);
             -(libc::ENOSYS as i64)
@@ -30,7 +34,11 @@ impl CrossProcessFutex for BsdFutex {
         {
             carrick_host::umtx::wake(host_addr, all)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        #[cfg(target_os = "netbsd")]
+        {
+            carrick_host::netbsd_futex::wake(host_addr, all)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
         {
             let _ = (host_addr, all);
             -(libc::ENOSYS as i64)
@@ -38,22 +46,58 @@ impl CrossProcessFutex for BsdFutex {
     }
 }
 
-#[cfg(all(test, target_os = "freebsd"))]
+#[cfg(all(test, any(target_os = "freebsd", target_os = "netbsd")))]
 mod tests {
     use super::BsdFutex;
     use carrick_hal::futex::CrossProcessFutex;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn shared_futex_page() -> *mut libc::c_void {
+        #[cfg(target_os = "netbsd")]
+        {
+            // NetBSD's __futex shared key resolves file-backed MAP_SHARED
+            // mappings across fork; MAP_SHARED|MAP_ANON stores are coherent but
+            // FUTEX_WAKE reports no waiter in the child.
+            let mut template = *b"/tmp/carrick-futex.XXXXXX\0";
+            let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast::<libc::c_char>()) };
+            assert!(fd >= 0, "mkstemp failed");
+            let unlink_rc = unsafe { libc::unlink(template.as_ptr().cast::<libc::c_char>()) };
+            assert_eq!(unlink_rc, 0, "unlink failed");
+            let truncate_rc = unsafe { libc::ftruncate(fd, 4096) };
+            assert_eq!(truncate_rc, 0, "ftruncate failed");
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            let close_rc = unsafe { libc::close(fd) };
+            assert_eq!(close_rc, 0, "close failed");
+            page
+        }
+        #[cfg(not(target_os = "netbsd"))]
+        {
+            unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            }
+        }
+    }
+
     #[test]
     fn shared_futex_wakes_across_fork() {
         unsafe {
-            let page = libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
-                0,
-            );
+            let page = shared_futex_page();
             assert_ne!(page, libc::MAP_FAILED, "mmap failed");
             let word = &*(page as *const AtomicU32);
             word.store(0, Ordering::SeqCst);
