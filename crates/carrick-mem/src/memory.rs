@@ -1203,6 +1203,28 @@ impl AddressSpace {
         self.with_linux_initial_stack_at(argv, env, LINUX_STACK_TOP, LINUX_STACK_SIZE)
     }
 
+    pub fn with_linux_initial_stack_execfn<A, E, X>(
+        self,
+        argv: A,
+        env: E,
+        execfn: X,
+    ) -> Result<Self, AddressSpaceError>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<[u8]>,
+        E: IntoIterator,
+        E::Item: AsRef<[u8]>,
+        X: AsRef<[u8]>,
+    {
+        self.with_linux_initial_stack_at_execfn(
+            argv,
+            env,
+            Some(execfn.as_ref().to_vec()),
+            LINUX_STACK_TOP,
+            LINUX_STACK_SIZE,
+        )
+    }
+
     // argv/env items are AsRef<[u8]> (not String): Linux argv/env are OPAQUE
     // byte strings, not UTF-8 (e.g. CPython's regrtest sets a non-UTF-8
     // PYTHONREGRTEST_UNICODE_GUARD env var). The execve path passes Vec<u8>; the
@@ -1211,6 +1233,23 @@ impl AddressSpace {
         self,
         argv: A,
         env: E,
+        stack_top: u64,
+        stack_size: u64,
+    ) -> Result<Self, AddressSpaceError>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<[u8]>,
+        E: IntoIterator,
+        E::Item: AsRef<[u8]>,
+    {
+        self.with_linux_initial_stack_at_execfn(argv, env, None, stack_top, stack_size)
+    }
+
+    fn with_linux_initial_stack_at_execfn<A, E>(
+        self,
+        argv: A,
+        env: E,
+        execfn: Option<Vec<u8>>,
         stack_top: u64,
         stack_size: u64,
     ) -> Result<Self, AddressSpaceError>
@@ -1237,8 +1276,14 @@ impl AddressSpace {
             .into_iter()
             .map(|s| s.as_ref().to_vec())
             .collect::<Vec<Vec<u8>>>();
-        let (region, stack_pointer, auxv_image) =
-            build_linux_initial_stack(argv, env, &linux_auxv, stack_top, stack_size)?;
+        let (region, stack_pointer, auxv_image) = build_linux_initial_stack(
+            argv,
+            env,
+            &linux_auxv,
+            execfn.as_deref(),
+            stack_top,
+            stack_size,
+        )?;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = Some(stack_pointer);
         image.linux_auxv = linux_auxv;
@@ -1268,6 +1313,7 @@ fn build_linux_initial_stack(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     auxv: &[LinuxAuxvEntry],
+    execfn: Option<&[u8]>,
     stack_top: u64,
     stack_size: u64,
 ) -> Result<(MemoryRegion, u64, Vec<u8>), AddressSpaceError> {
@@ -1287,8 +1333,7 @@ fn build_linux_initial_stack(
     let env_addrs = write_stack_strings(&mut bytes, stack_start, &mut cursor, &env, stack_size)?;
 
     // AT_EXECFN, AT_PLATFORM bytes (NUL-terminated strings on the stack).
-    let execfn_addr = if let Some(first) = argv.first() {
-        let s = first.as_slice();
+    let execfn_addr = if let Some(s) = execfn.or_else(|| argv.first().map(Vec::as_slice)) {
         if cursor < s.len() + 1 {
             return Err(AddressSpaceError::InitialStackTooLarge { stack_size });
         }
@@ -3075,6 +3120,28 @@ mod el1_shim_tests {
         );
     }
 
+    #[test]
+    fn linux_initial_stack_can_set_execfn_distinct_from_argv0() {
+        let mut image = minimal_image();
+        image
+            .linux_auxv
+            .push(LinuxAuxvEntry::new(LINUX_AT_EXECFN, 0));
+        let image = image
+            .with_linux_initial_stack_execfn(
+                [b"go".as_slice()],
+                Vec::<&[u8]>::new(),
+                b"/usr/local/go/bin/go".as_slice(),
+            )
+            .expect("initial stack");
+
+        let execfn_addr = auxv_value(image.linux_auxv_image(), LINUX_AT_EXECFN)
+            .expect("AT_EXECFN must be present");
+        assert_eq!(
+            c_string_at(&image, execfn_addr).as_deref(),
+            Some(b"/usr/local/go/bin/go".as_slice())
+        );
+    }
+
     /// `with_el1_vectors_shim` installs the vector region with the dispatcher at
     /// the sync slot (records `el1_vectors_base` just like the legacy builder).
     #[test]
@@ -3091,6 +3158,31 @@ mod el1_shim_tests {
             enc_cmp_x8_imm(172),
             "sync slot must start with `cmp x8,#172` (getpid)"
         );
+    }
+
+    fn auxv_value(auxv: &[u8], key: u64) -> Option<u64> {
+        for chunk in auxv.chunks_exact(16) {
+            let tag = u64::from_le_bytes(chunk[0..8].try_into().ok()?);
+            let value = u64::from_le_bytes(chunk[8..16].try_into().ok()?);
+            if tag == key {
+                return Some(value);
+            }
+            if tag == LINUX_AT_NULL {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn c_string_at(image: &AddressSpace, addr: u64) -> Option<Vec<u8>> {
+        let region = image
+            .regions()
+            .iter()
+            .find(|region| addr >= region.start && addr < region.end)?;
+        let offset = usize::try_from(addr - region.start).ok()?;
+        let tail = region.bytes().get(offset..)?;
+        let len = tail.iter().position(|b| *b == 0)?;
+        Some(tail[..len].to_vec())
     }
 
     /// `with_identity_page` installs a per-process, read-only kernel-hole region

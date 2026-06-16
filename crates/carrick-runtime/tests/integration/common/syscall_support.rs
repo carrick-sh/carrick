@@ -17,13 +17,15 @@ pub use carrick_runtime::dispatch::{
 };
 pub use carrick_runtime::elf::SegmentPerms;
 pub use carrick_runtime::linux_abi::{
-    LINUX_AF_INET, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_EPOLLET, LINUX_S_IFCHR,
-    LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_S_IFSOCK,
-    LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_TIOCGPTN, LINUX_TIOCSPTLCK, LinuxCapabilityData,
-    LinuxCapabilityHeader, LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair,
-    LinuxIovec, LinuxItimerspec, LinuxItimerval, LinuxPollFd, LinuxRlimit, LinuxRusage,
-    LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxTermios, LinuxTimerfdExpirations,
-    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms, LinuxUtsname, LinuxWinsize,
+    CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_LSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT,
+    CARRICK_PRIVATE_X86_STAT, LINUX_AF_INET, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG,
+    LINUX_EPOLLET, LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFMT,
+    LINUX_S_IFREG, LINUX_S_IFSOCK, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_TIOCGPTN,
+    LINUX_TIOCSPTLCK, LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header,
+    LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxItimerval,
+    LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx,
+    LinuxTermios, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
+    LinuxUtsname, LinuxWinsize, LinuxX8664Stat,
 };
 pub use carrick_runtime::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
@@ -105,6 +107,14 @@ pub fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
         .read_bytes(address, std::mem::size_of::<LinuxStat>())
         .unwrap();
     let (stat, _) = LinuxStat::read_from_prefix(&bytes).unwrap();
+    stat
+}
+
+pub fn read_x8664_stat(memory: &impl GuestMemory, address: u64) -> LinuxX8664Stat {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxX8664Stat>())
+        .unwrap();
+    let (stat, _) = LinuxX8664Stat::read_from_prefix(&bytes).unwrap();
     stat
 }
 
