@@ -4155,6 +4155,103 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
 }
 
 #[test]
+fn x86_stat_writes_x8664_stat_layout() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "usr/local/go/bin/go",
+        b"stub".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    memory.write_bytes(0x4000, b"/usr/local/go\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    CARRICK_PRIVATE_X86_STAT,
+                    SyscallArgs::from([0x4000, 0x4100, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_x8664_stat(&memory, 0x4100);
+    let mode = stat.st_mode;
+    let nlink = stat.st_nlink;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+    assert_eq!(mode & 0o777, 0o755);
+    assert_eq!(nlink, 2);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    CARRICK_PRIVATE_X86_LSTAT,
+                    SyscallArgs::from([0x4000, 0x4180, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_x8664_stat(&memory, 0x4180);
+    let mode = stat.st_mode;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    CARRICK_PRIVATE_X86_NEWFSTATAT,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x41c0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_x8664_stat(&memory, 0x41c0);
+    let mode = stat.st_mode;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    CARRICK_PRIVATE_X86_FSTAT,
+                    SyscallArgs::from([3, 0x4200, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_x8664_stat(&memory, 0x4200);
+    let mode = stat.st_mode;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+}
+
+#[test]
 fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
         [("etc/motd", b"rootfs says hello\n".as_slice())],

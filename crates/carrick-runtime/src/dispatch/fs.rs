@@ -507,6 +507,96 @@ impl SyscallDispatcher {
         (is_stdio_fd(fd) && !self.stdio_is_closed(fd)) || self.fd_table_contains(fd)
     }
 
+    fn path_stat_record(&self, dirfd: u64, path: &str, flags: u64) -> Result<StatRecord, i32> {
+        if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
+            return self.fd_stat_record(dirfd as i32);
+        }
+
+        // A trailing "/" or "/." forces directory semantics on the FINAL
+        // component: the symlink is FOLLOWED even under AT_SYMLINK_NOFOLLOW
+        // (lstat("link/") of a symlink-to-dir reports the directory, not the
+        // link), and a non-directory final is ENOTDIR. Capture this from the
+        // raw path before resolve_at_path normalizes the slash away.
+        let requires_dir = path.ends_with('/') || path.ends_with("/.");
+
+        // Dispatch-level stat-cache fast path (default on; CARRICK_FS_STATCACHE=0
+        // opts out): a repeat stat of a plain absolute path is served by one
+        // revalidating fstatat through a cached, contained parent fd. Gated so
+        // normalize(path) equals the resolved path (the cache key).
+        if !requires_dir
+            && dirfd == LINUX_AT_FDCWD
+            && path.starts_with('/')
+            && !path.starts_with("/proc")
+            && !path.starts_with("/sys")
+            && !path.split('/').any(|c| c == "..")
+            && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
+        {
+            return Ok(StatRecord::from_real(path, &real));
+        }
+
+        let path = self.resolve_at_path(dirfd, path)?;
+        if let Some(contents) =
+            crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context())
+        {
+            return Ok(StatRecord::synthetic(
+                &path,
+                contents.len(),
+                LINUX_S_IFREG | 0o444,
+            ));
+        }
+        if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
+            return Ok(StatRecord::synthetic(
+                &path,
+                contents.len(),
+                LINUX_S_IFREG | 0o444,
+            ));
+        }
+
+        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
+        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+            if requires_dir && real.kind != RootFsEntryKind::Directory {
+                return Err(LINUX_ENOTDIR);
+            }
+            return Ok(StatRecord::from_real(&path, &real));
+        }
+        if follow
+            && let Some(link) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
+            && link.kind == RootFsEntryKind::Symlink
+        {
+            return Err(LINUX_ENOENT);
+        }
+
+        let path = if follow {
+            self.canonicalize_following(&path).unwrap_or(path)
+        } else {
+            path
+        };
+        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+            return Ok(StatRecord::from_real(&path, &real));
+        }
+
+        use crate::vfs::Vfs as _;
+        if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+            if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
+                return Ok(StatRecord::from_real(&path, &real));
+            }
+            if let Ok(md) = if follow {
+                m.vfs.lookup(&m.full_path)
+            } else {
+                m.vfs.lookup_nofollow(&m.full_path)
+            } {
+                return Ok(StatRecord::from_metadata(&vfs_md_to_rootfs_md(&path, &md)));
+            }
+        }
+
+        let lookup = if follow {
+            self.fs.rootfs_vfs.lookup(&path)
+        } else {
+            self.fs.rootfs_vfs.lookup_nofollow(&path)
+        };
+        lookup.map(|md| StatRecord::from_metadata(&vfs_md_to_rootfs_md(&path, &md)))
+    }
+
     fn statfs(
         &self,
         pathname: GuestPtr,
@@ -7334,136 +7424,58 @@ impl SyscallDispatcher {
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
             let path = read_guest_c_string(memory, pathname)?;
-
-            if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
-                return Ok(this.write_fd_stat(dirfd as i32, statbuf, memory));
+            match this.path_stat_record(dirfd, &path, flags) {
+                Ok(record) => Ok(write_stat_record(memory, statbuf, &record)),
+                Err(errno) => Ok(errno.into()),
             }
 
-            // A trailing "/" or "/." forces directory semantics on the FINAL
-            // component: the symlink is FOLLOWED even under AT_SYMLINK_NOFOLLOW
-            // (lstat("link/") of a symlink-to-dir reports the directory, not the
-            // link — Go os TestSymlinkWithTrailingSlash; TestRootConsistency*
-            // symlink_slash), and a non-directory final → ENOTDIR. Captured from
-            // the raw path before resolve_at_path normalizes the slash away.
-            let requires_dir = path.ends_with('/') || path.ends_with("/.");
+        }
 
-            // Dispatch-level stat-cache fast path (default on; CARRICK_FS_STATCACHE=0
-            // opts out): a repeat stat of a plain absolute path is served by one revalidating
-            // fstatat through a cached, contained parent fd — skipping
-            // resolve_at_path's parent-containment openat. Gated so normalize(path)
-            // equals the resolved path (the cache key): AT_FDCWD, absolute, no
-            // "..", not /proc//sys, no trailing slash. Any miss (symlink, escape,
-            // cross-mount, /proc, error) returns None → the full resolve-and-stat
-            // below. write_stat_real's `path` only feeds the type bits (from
-            // real.kind), so a hit is byte-identical to the slow path.
-            if !requires_dir
-                && dirfd == LINUX_AT_FDCWD
-                && path.starts_with('/')
-                && !path.starts_with("/proc")
-                && !path.starts_with("/sys")
-                && !path.split('/').any(|c| c == "..")
-                && let Some(real) = this.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
-            {
-                return Ok(write_stat_real(memory, statbuf, &path, &real));
+        fn x86_stat(this, cx, pathname: GuestPtr, statbuf: GuestPtr) {
+
+            let pathname = pathname.0;
+            let statbuf = statbuf.0;
+            let memory = &mut *cx.memory;
+            let path = read_guest_c_string(memory, pathname)?;
+            match this.path_stat_record(LINUX_AT_FDCWD, &path, 0) {
+                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
+                Err(errno) => Ok(errno.into()),
             }
 
-            let path = this.resolve_at_path(dirfd, &path)?;
-            // Synthetic /proc /sys paths first.
-            if let Some(contents) =
-                crate::vfs::proc::synthetic_file(&path, &this.synthetic_proc_context())
-            {
-                return Ok(write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    &path,
-                    contents.len(),
-                    LINUX_S_IFREG | 0o444,
-                ));
+        }
+
+        fn x86_fstat(this, cx, fd: Fd, statbuf: GuestPtr) {
+
+            let statbuf = statbuf.0;
+            let memory = &mut *cx.memory;
+            match this.fd_stat_record(fd.0) {
+                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
+                Err(errno) => Ok(errno.into()),
             }
-            if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
-                return Ok(write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    &path,
-                    contents.len(),
-                    LINUX_S_IFREG | 0o444,
-                ));
+
+        }
+
+        fn x86_lstat(this, cx, pathname: GuestPtr, statbuf: GuestPtr) {
+
+            let pathname = pathname.0;
+            let statbuf = statbuf.0;
+            let memory = &mut *cx.memory;
+            let path = read_guest_c_string(memory, pathname)?;
+            match this.path_stat_record(LINUX_AT_FDCWD, &path, LINUX_AT_SYMLINK_NOFOLLOW) {
+                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
+                Err(errno) => Ok(errno.into()),
             }
-            // Disk-backed overlay (--fs host): prefer the REAL on-disk stat
-            // so the type bits (S_IFLNK for a symlink) and st_nlink (a true
-            // hard link reports >1) reflect what the kernel would report.
-            // `AT_SYMLINK_NOFOLLOW` selects lstat (report the link) vs stat
-            // (report the target) semantics.
-            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
-            if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
-                if requires_dir && real.kind != RootFsEntryKind::Directory {
-                    return Ok(LINUX_ENOTDIR.into());
-                }
-                return Ok(write_stat_real(memory, statbuf, &path, &real));
-            }
-            // DANGLING SYMLINK: a following stat() whose `real_stat` came back
-            // empty, while the no-follow stat shows the path itself IS a
-            // symlink, means the link's target does not exist. Linux returns
-            // ENOENT here; carrick must NOT fall through to the layered lookup,
-            // which reports the dead symlink as a present (regular) file —
-            // os.path.exists(dangling) then wrongly returned True and
-            // shutil.copytree silently copied a dead link instead of raising
-            // shutil.Error (test_copytree_dangling_symlinks).
-            if follow
-                && let Some(link) = this.fs.rootfs_vfs.overlay.real_stat(&path, false)
-                && link.kind == RootFsEntryKind::Symlink
-            {
-                return Ok(LINUX_ENOENT.into());
-            }
-            // real_stat couldn't answer. If following and `path` is a symlink
-            // whose target lands in ANOTHER mount, resolve it through the full
-            // VFS and stat the target — so its dev/ino matches a direct stat of
-            // the target (Go os.Getwd's $PWD trust check stats $PWD and ".", and
-            // a /tmp-scratch link → /run-bind-mount target must agree). No-op for
-            // non-symlinks and AT_SYMLINK_NOFOLLOW (lstat).
-            let path = if follow {
-                this.canonicalize_following(&path).unwrap_or(path)
-            } else {
-                path
-            };
-            // Retry the fast path in case the resolved target is in the scratch.
-            if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
-                return Ok(write_stat_real(memory, statbuf, &path, &real));
-            }
-            use crate::vfs::Vfs as _;
-            // VFS mounts (/dev, /dev/pts, /proc, /sys): stat their nodes so e.g.
-            // /dev/ptmx, /dev/pts/N, /dev/tty resolve (mirrors the open path).
-            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-                if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
-                    return Ok(write_stat_real(memory, statbuf, &path, &real));
-                }
-                if let Ok(md) = if follow {
-                    m.vfs.lookup(&m.full_path)
-                } else {
-                    m.vfs.lookup_nofollow(&m.full_path)
-                } {
-                    // RootFsEntryKind::CharDevice → S_IFCHR via linux_mode, so e.g.
-                    // /dev/pts/N reports a char device (ttyname(3)'s chardev check).
-                    return Ok(write_stat(
-                        memory,
-                        statbuf,
-                        &vfs_md_to_rootfs_md(&path, &md),
-                    ));
-                }
-            }
-            // Layered overlay+rootfs lookup via RootFsVfs. Honour
-            // AT_SYMLINK_NOFOLLOW (lstat) on backends without real_stat.
-            let lookup = if follow {
-                this.fs.rootfs_vfs.lookup(&path)
-            } else {
-                this.fs.rootfs_vfs.lookup_nofollow(&path)
-            };
-            match lookup {
-                Ok(md) => Ok(write_stat(
-                    memory,
-                    statbuf,
-                    &vfs_md_to_rootfs_md(&path, &md),
-                )),
+
+        }
+
+        fn x86_newfstatat(this, cx, dirfd: u64, pathname: GuestPtr, statbuf: GuestPtr, flags: u64) {
+
+            let pathname = pathname.0;
+            let statbuf = statbuf.0;
+            let memory = &mut *cx.memory;
+            let path = read_guest_c_string(memory, pathname)?;
+            match this.path_stat_record(dirfd, &path, flags) {
+                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(errno.into()),
             }
 

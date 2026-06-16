@@ -142,6 +142,10 @@ use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::fs_backend::FsBackend;
 use crate::linux_abi::{
     CARRICK_PRIVATE_X86_DUP2,
+    CARRICK_PRIVATE_X86_FSTAT,
+    CARRICK_PRIVATE_X86_LSTAT,
+    CARRICK_PRIVATE_X86_NEWFSTATAT,
+    CARRICK_PRIVATE_X86_STAT,
     KernelAbi,
     // ABI constants moved from dispatch.rs (Goal #3, private set)
     LINUX_AF_INET,
@@ -543,6 +547,7 @@ use crate::linux_abi::{
     LinuxUtsname,
     LinuxWinsize,
     LinuxX8664EpollEvent,
+    LinuxX8664Stat,
     align_up_u64,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
@@ -1635,6 +1640,10 @@ impl SyscallDispatcher {
         23 => dup,
         24 => dup3,
         CARRICK_PRIVATE_X86_DUP2 => dup2,
+        CARRICK_PRIVATE_X86_STAT => x86_stat,
+        CARRICK_PRIVATE_X86_FSTAT => x86_fstat,
+        CARRICK_PRIVATE_X86_LSTAT => x86_lstat,
+        CARRICK_PRIVATE_X86_NEWFSTATAT => x86_newfstatat,
         25 => fcntl,
         26 => inotify_init1,
         27 => inotify_add_watch,
@@ -3555,14 +3564,6 @@ fn linux_timeval_from_duration(duration: Duration) -> LinuxTimeval {
     )
 }
 
-fn write_stat(
-    memory: &mut impl GuestMemory,
-    statbuf: u64,
-    metadata: &RootFsMetadata,
-) -> DispatchOutcome {
-    write_stat_record(memory, statbuf, &StatRecord::from_metadata(metadata))
-}
-
 fn write_stat_record(
     memory: &mut impl GuestMemory,
     statbuf: u64,
@@ -3590,6 +3591,42 @@ fn write_stat_record(
         st_ctime_nsec: record.ctime.1 as u64,
         __unused4: 0,
         __unused5: 0,
+    };
+
+    if write_kernel_struct_raw(memory, statbuf, &stat).is_err() {
+        DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        }
+    } else {
+        DispatchOutcome::Returned { value: 0 }
+    }
+}
+
+fn write_x8664_stat_record(
+    memory: &mut impl GuestMemory,
+    statbuf: u64,
+    record: &StatRecord,
+) -> DispatchOutcome {
+    let size = record.size_usize();
+    let stat = LinuxX8664Stat {
+        st_dev: 1,
+        st_ino: record.ino,
+        st_nlink: record.nlink as u64,
+        st_mode: record.mode,
+        st_uid: record.uid,
+        st_gid: record.gid,
+        __pad0: 0,
+        st_rdev: 0,
+        st_size: record.size as i64,
+        st_blksize: 4096,
+        st_blocks: blocks_512(size),
+        st_atime: record.atime.0,
+        st_atime_nsec: record.atime.1,
+        st_mtime: record.mtime.0,
+        st_mtime_nsec: record.mtime.1,
+        st_ctime: record.ctime.0,
+        st_ctime_nsec: record.ctime.1,
+        __reserved: [0; 3],
     };
 
     if write_kernel_struct_raw(memory, statbuf, &stat).is_err() {
@@ -3638,16 +3675,7 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealSta
     }
 }
 
-fn write_stat_real(
-    memory: &mut impl GuestMemory,
-    statbuf: u64,
-    path: &str,
-    real: &crate::fs_backend::RealStat,
-) -> DispatchOutcome {
-    write_stat_record(memory, statbuf, &StatRecord::from_real(path, real))
-}
-
-/// `statx` counterpart of [`write_stat_real`].
+/// Build and write a `statx` record from a real backing stat.
 fn write_statx_real(
     memory: &mut impl GuestMemory,
     statxbuf: u64,
@@ -3711,16 +3739,6 @@ fn write_statx_record(
         __spare3: [0; 8],
     };
     write_kernel_struct(memory, statxbuf, &statx)
-}
-
-fn write_synthetic_stat(
-    memory: &mut impl GuestMemory,
-    statbuf: u64,
-    path: &str,
-    size: usize,
-    mode: u32,
-) -> DispatchOutcome {
-    write_stat_record(memory, statbuf, &StatRecord::synthetic(path, size, mode))
 }
 
 fn write_synthetic_statx(

@@ -20,13 +20,14 @@
 //! every x86_64 syscall whose NAME also appears in `AARCH64_SYSCALLS` with a
 //! matching argument shape is a `Direct(canonical)`. Legacy x86_64-only
 //! syscalls whose arg shape differs from their asm-generic successor
-//! (`open` vs `openat`, `dup2` vs `dup3`, `stat`/`fstat`/`lstat` vs
-//! `newfstatat`, `select` vs `pselect6`, `poll` is the lone exception below as
-//! musl calls it with timeout 0) are deliberately LEFT OUT (→ `Unknown` →
-//! -ENOSYS); adding a naive `Direct` for them would silently mis-dispatch the
-//! wrong arg shape, which is worse than an honest ENOSYS. Those are listed in
-//! a clearly-marked comment block at the end of the table as needing a
-//! `normalize_syscall` arg-translation shim (deferred, oracle-gated).
+//! (`open` vs `openat`, `dup2` vs `dup3`, `readlink` vs `readlinkat`,
+//! `stat`/`fstat`/`lstat` vs `newfstatat`, `select` vs `pselect6`, `poll` is
+//! the lone exception below as musl calls it with timeout 0) are deliberately
+//! LEFT OUT (→ `Unknown` → -ENOSYS); adding a naive `Direct` for them would
+//! silently mis-dispatch the wrong arg shape, which is worse than an honest
+//! ENOSYS. Those are either handled in `normalize_syscall` or listed in a
+//! clearly-marked comment block at the end of the table as needing a future
+//! arg-translation shim.
 //!
 //! `arch_prctl`=158 stays `native` (the backend services FS/GS base). fork(57)
 //! and vfork(58) are NOT table entries — they are desugared to clone(220)
@@ -110,9 +111,13 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // LEFT OUT, needs a normalize shim. (see deferred block below)
     // x86_64=3 (syscalls(2)/filippo) → canonical close=57
     direct(3, "close", 57),
-    // x86_64=4 stat, 5 fstat, 6 lstat: LEGACY (asm-generic has newfstatat=79,
-    // fstat=80, statx=291). stat/lstat have no 1:1; even fstat differs in
-    // struct layout — LEFT OUT. (see deferred block below)
+    // x86_64=4 stat: LEGACY (asm-generic has newfstatat=79) with x86_64's
+    // 144-byte struct stat layout. Normalized in x8664_arch::normalize_syscall
+    // to a private dispatcher shim that writes LinuxX8664Stat.
+    // x86_64=5 fstat: LEGACY. Normalized in x8664_arch::normalize_syscall to a
+    // private dispatcher shim that writes LinuxX8664Stat.
+    // x86_64=6 lstat: LEGACY. Normalized in x8664_arch::normalize_syscall to a
+    // private dispatcher shim that writes LinuxX8664Stat with AT_SYMLINK_NOFOLLOW.
     // x86_64=7 (syscalls(2)/filippo) → canonical ppoll=73.
     // musl calls poll(fds, n, 0) at startup to probe fd validity (non-blocking).
     // NOTE: poll(fds,n,timeout_ms) vs ppoll(fds,n,*timespec,*sigmask,size) is a
@@ -297,7 +302,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=86 link: LEGACY (asm-generic has linkat=37) → LEFT OUT.
     // x86_64=87 unlink: LEGACY (asm-generic has unlinkat=35) → LEFT OUT.
     // x86_64=88 symlink: LEGACY (asm-generic has symlinkat=36) → LEFT OUT.
-    // x86_64=89 readlink: LEGACY (asm-generic has readlinkat=78) → LEFT OUT.
+    // x86_64=89 readlink: LEGACY (asm-generic has readlinkat=78) → normalized
+    // in x8664_arch::normalize_syscall as readlinkat(AT_FDCWD, path, buf, size).
     // x86_64=90 chmod: LEGACY (asm-generic has fchmodat=53) → LEFT OUT.
     // x86_64=91 fchmod → canonical fchmod=52 (SAME name+shape)
     direct(91, "fchmod", 52),
@@ -623,8 +629,9 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=261 futimesat: LEGACY x86_64-only (asm-generic has utimensat=88).
     // futimesat(dfd,path,*timeval[2]) vs utimensat(dfd,path,*timespec[2],flags) →
     // LEFT OUT. (see deferred block)
-    // x86_64=262 newfstatat → canonical newfstatat=79 (SAME name+shape)
-    direct(262, "newfstatat", 79),
+    // x86_64=262 newfstatat: same argument shape as canonical newfstatat=79,
+    // but it writes x86_64's 144-byte struct stat layout. Normalized in
+    // x8664_arch::normalize_syscall to a private dispatcher shim.
     // x86_64=263 unlinkat → canonical unlinkat=35 (SAME name+shape)
     direct(263, "unlinkat", 35),
     // x86_64=264 renameat → canonical renameat=38 (SAME name+shape)
@@ -842,9 +849,6 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // oracle-gated). All numbers from syscalls(2)/filippo/OSDev.
     //
     //   2   open        → openat(56):     prepend AT_FDCWD; (path,flags,mode)→(dfd,path,flags,mode)
-    //   4   stat        → newfstatat(79): prepend AT_FDCWD + flags=0; statbuf layout differs
-    //   5   fstat       → fstat(80):      x86-64 struct stat layout ≠ asm-generic (field offsets)
-    //   6   lstat       → newfstatat(79): AT_FDCWD + AT_SYMLINK_NOFOLLOW
     //   21  access      → faccessat(48):  prepend AT_FDCWD; append flags=0
     //   23  select      → pselect6(72):   timeval→timespec; no sigmask arg
     //   33  dup2        → dup3(24):       dup2(fd,fd)=success no-op vs dup3 EINVAL; no flags arg
@@ -856,7 +860,6 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   86  link        → linkat(37):     prepend AT_FDCWD to both; flags=0
     //   87  unlink      → unlinkat(35):   prepend AT_FDCWD; flags=0
     //   88  symlink     → symlinkat(36):  insert AT_FDCWD before newpath
-    //   89  readlink    → readlinkat(78): prepend AT_FDCWD
     //   90  chmod       → fchmodat(53):   prepend AT_FDCWD; append flags=0
     //   92  chown       → fchownat(54):   prepend AT_FDCWD; append flags=0
     //   94  lchown      → fchownat(54):   prepend AT_FDCWD; flags=AT_SYMLINK_NOFOLLOW

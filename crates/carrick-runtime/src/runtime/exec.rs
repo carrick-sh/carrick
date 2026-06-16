@@ -92,7 +92,7 @@ pub(crate) fn load_execve_image(
         .and_then(vectors_and_id)
         .and_then(|a| a.with_stage1_page_tables())
         .and_then(with_optional_vdso::<HvfArch>)
-        .and_then(|a| a.with_linux_initial_stack(argv, env))
+        .and_then(|a| a.with_linux_initial_stack_execfn(argv, env, path.as_bytes()))
         .map_err(|_| LINUX_ENOENT)?;
     // execve point of no return (image fully built): reset CAUGHT signal
     // handlers to SIG_DFL as the kernel does, so the new image never inherits

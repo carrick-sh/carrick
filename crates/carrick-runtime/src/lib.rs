@@ -1222,10 +1222,11 @@ pub mod runtime {
         })?;
         let vdso = E::Arch::vdso_bytes();
         let vdso_enabled = !vdso.is_empty();
-        let mut image = crate::exec_helpers::build_run_image_for(
+        let mut image = crate::exec_helpers::build_run_image_for_execfn(
             &bytes,
             argv,
             &spec.envp,
+            resolved.as_bytes(),
             &dispatcher,
             vdso_enabled,
             None,

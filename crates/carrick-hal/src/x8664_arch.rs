@@ -643,13 +643,16 @@ impl GuestArch for X8664GuestArch {
 
 // ─── x86-64 syscall normalization (shared by every x86 backend) ──────────────
 //
-// fork(57)/vfork(58)→clone(220), legacy dup2(33)→private dispatcher shim, the
-// clone(220) tls↔child_tid arg-swap, and arch_prctl dispatch are PURE guest-ISA
-// ABI (host/VMM-agnostic). They were duplicated in the KVM-x86 and bhyve
-// `next_syscall`; hoisted here so both call one function. Sources (clean-room,
-// man-pages / psABI only): clone(2) "C library/kernel differences" (x86-64 raw
-// arg order; CLONE_VM=0x100, CLONE_VFORK=0x4000; exit-signal in the low byte),
-// signal(7) (SIGCHLD=17), syscalls(2) (x86-64 fork=57/vfork=58/dup2=33).
+// fork(57)/vfork(58)→clone(220), legacy dup2(33)→private dispatcher shim,
+// stat(4)/fstat(5)/lstat(6)/newfstatat(262)→private x86 ABI writers,
+// readlink(89)→readlinkat(78), the clone(220) tls↔child_tid arg-swap, and
+// arch_prctl dispatch are PURE guest-ISA ABI
+// (host/VMM-agnostic). They were duplicated in the KVM-x86 and bhyve
+// `next_syscall`; hoisted here so both call one function. Sources
+// (clean-room, man-pages / psABI only): clone(2) "C library/kernel differences"
+// (x86-64 raw arg order; CLONE_VM=0x100, CLONE_VFORK=0x4000; exit-signal in
+// the low byte), signal(7) (SIGCHLD=17), syscalls(2) (x86-64
+// stat=4/fstat=5/lstat=6/fork=57/vfork=58/dup2=33/readlink=89/newfstatat=262).
 
 /// Canonical (asm-generic / aarch64) `clone` number. x86-64 raw clone (56) and
 /// fork(57)/vfork(58) all normalize to this; clone3 (435) does NOT.
@@ -662,11 +665,29 @@ const X86_NR_VFORK: u64 = 58;
 /// x86-64 `dup2(2)` (syscalls(2)). Desugars to a private dispatcher shim because
 /// canonical/asm-generic has `dup3(2)` but no `dup2(2)`.
 const X86_NR_DUP2: u64 = 33;
+/// x86-64 `stat(2)` (syscalls(2)). It follows paths like
+/// `newfstatat(AT_FDCWD, path, flags=0)` but writes x86_64's legacy stat
+/// layout, so it normalizes to a private dispatcher shim.
+const X86_NR_STAT: u64 = 4;
+/// x86-64 `fstat(2)` (syscalls(2)). It shares fd lookup semantics with
+/// canonical `fstat` but writes x86_64's legacy stat layout.
+const X86_NR_FSTAT: u64 = 5;
+/// x86-64 `lstat(2)` (syscalls(2)). It is `stat` with
+/// `AT_SYMLINK_NOFOLLOW`, but writes x86_64's legacy stat layout.
+const X86_NR_LSTAT: u64 = 6;
+/// x86-64 `newfstatat(2)` (syscalls(2)). Its args match canonical
+/// `newfstatat`, but it writes x86_64's legacy stat layout.
+const X86_NR_NEWFSTATAT: u64 = 262;
 /// x86-64 `pipe(2)` (syscalls(2)). Desugars to canonical `pipe2(2)` with
 /// flags=0 because asm-generic only exposes `pipe2`.
 const X86_NR_PIPE: u64 = 22;
 /// Canonical (asm-generic / aarch64) `pipe2` number.
 const CANONICAL_PIPE2: u64 = 59;
+/// x86-64 `readlink(2)` (syscalls(2)). Desugars to canonical `readlinkat(2)`
+/// with `AT_FDCWD` because asm-generic only exposes `readlinkat`.
+const X86_NR_READLINK: u64 = 89;
+/// Canonical (asm-generic / aarch64) `readlinkat` number.
+const CANONICAL_READLINKAT: u64 = 78;
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -722,10 +743,40 @@ impl X8664GuestArch {
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
         }
+        if x86_number == X86_NR_STAT {
+            return SyscallNorm::Plain(RawSyscall {
+                number: carrick_abi::CARRICK_PRIVATE_X86_STAT,
+                args: [args[0], args[1], 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_FSTAT {
+            return SyscallNorm::Plain(RawSyscall {
+                number: carrick_abi::CARRICK_PRIVATE_X86_FSTAT,
+                args: [args[0], args[1], 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_LSTAT {
+            return SyscallNorm::Plain(RawSyscall {
+                number: carrick_abi::CARRICK_PRIVATE_X86_LSTAT,
+                args: [args[0], args[1], 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_NEWFSTATAT {
+            return SyscallNorm::Plain(RawSyscall {
+                number: carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT,
+                args: [args[0], args[1], args[2], args[3], 0, 0],
+            });
+        }
         if x86_number == X86_NR_PIPE {
             return SyscallNorm::Plain(RawSyscall {
                 number: CANONICAL_PIPE2,
                 args: [args[0], 0, 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_READLINK {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_READLINKAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
         }
 
@@ -865,6 +916,84 @@ mod normalize_tests {
                 assert_eq!(rs.args, [0x4000, 0, 0, 0, 0, 0]);
             }
             _ => panic!("pipe must be Plain"),
+        }
+    }
+
+    #[test]
+    fn readlink_normalizes_to_readlinkat_at_fdcwd() {
+        // x86 readlink = 89, but canonical asm-generic only exposes
+        // readlinkat(78). Normalize readlink(path, buf, bufsiz) through
+        // readlinkat(AT_FDCWD, path, buf, bufsiz).
+        match X8664GuestArch::normalize_syscall(&frame(89, [0x1000, 0x2000, 64, 0xAA, 0xBB, 0xCC]))
+        {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 78);
+                assert_eq!(
+                    rs.args,
+                    [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0x2000, 64, 0, 0]
+                );
+            }
+            _ => panic!("readlink must be Plain"),
+        }
+    }
+
+    #[test]
+    fn stat_normalizes_to_private_x86_stat_writer() {
+        // x86 stat = 4 writes x86_64's 144-byte struct stat, which is a
+        // different layout than canonical/aarch64 newfstatat's LinuxStat.
+        // Normalize to a private dispatcher number so the x86 ABI writer is
+        // selected without weakening canonical newfstatat.
+        match X8664GuestArch::normalize_syscall(&frame(4, [0x1000, 0x2000, 0xAA, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_STAT);
+                assert_eq!(rs.args, [0x1000, 0x2000, 0, 0, 0, 0]);
+            }
+            _ => panic!("stat must be Plain"),
+        }
+    }
+
+    #[test]
+    fn fstat_normalizes_to_private_x86_stat_writer() {
+        // x86 fstat = 5 uses fd lookup but still writes x86_64's 144-byte
+        // struct stat, not canonical/aarch64 LinuxStat.
+        match X8664GuestArch::normalize_syscall(&frame(5, [3, 0x2000, 0xAA, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_FSTAT);
+                assert_eq!(rs.args, [3, 0x2000, 0, 0, 0, 0]);
+            }
+            _ => panic!("fstat must be Plain"),
+        }
+    }
+
+    #[test]
+    fn lstat_normalizes_to_private_x86_stat_writer() {
+        // x86 lstat = 6 follows newfstatat-style path lookup with
+        // AT_SYMLINK_NOFOLLOW but writes x86_64's 144-byte struct stat.
+        match X8664GuestArch::normalize_syscall(&frame(6, [0x1000, 0x2000, 0xAA, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_LSTAT);
+                assert_eq!(rs.args, [0x1000, 0x2000, 0, 0, 0, 0]);
+            }
+            _ => panic!("lstat must be Plain"),
+        }
+    }
+
+    #[test]
+    fn newfstatat_normalizes_to_private_x86_stat_writer() {
+        // x86 newfstatat = 262 has canonical argument shape, but its statbuf
+        // still uses the x86_64 struct stat layout.
+        match X8664GuestArch::normalize_syscall(&frame(
+            262,
+            [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0x2000, 0x100, 0xAA, 0],
+        )) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT);
+                assert_eq!(
+                    rs.args,
+                    [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0x2000, 0x100, 0, 0]
+                );
+            }
+            _ => panic!("newfstatat must be Plain"),
         }
     }
 }
