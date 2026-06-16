@@ -7,8 +7,8 @@
 // Tasks 2–4 wire the x86 paths.  Suppress dead_code warnings on non-aarch64
 // targets to keep `cargo clippy -- -D warnings` clean on container-104.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, VcpuExit};
 use carrick_mem::memory::AddressSpace;
@@ -66,6 +66,158 @@ pub(crate) fn append_vcpu_state(fd: &VcpuFd, msg: &mut String) {
 /// access. A fork CHILD inherits the parent's value (plain static, copied by
 /// `libc::fork`) but owns exactly one vCPU; the fork child path re-stores 1.
 pub static VCPU_LIVE: AtomicI64 = AtomicI64::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) enum KvmStat {
+    Run,
+    RunEintr,
+    ExitMmio,
+    ExitIoSyscall,
+    ExitIoFault,
+    ExitIoOther,
+    ExitHalt,
+    ExitKicked,
+    ExitDebug,
+    ExitInternal,
+    ExitOther,
+    GetRegs,
+    SetRegs,
+    GetSregs,
+    SetSregs,
+    GetFpu,
+    SetFpu,
+    SetMsrs,
+}
+
+static KVM_STATS_PRINTED: AtomicBool = AtomicBool::new(false);
+static KVM_RUNS: AtomicU64 = AtomicU64::new(0);
+static KVM_RUN_EINTRS: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_MMIO: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_IO_SYSCALL: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_IO_FAULT: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_IO_OTHER: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_HALT: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_KICKED: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_DEBUG: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_INTERNAL: AtomicU64 = AtomicU64::new(0);
+static KVM_EXIT_OTHER: AtomicU64 = AtomicU64::new(0);
+static KVM_GET_REGS: AtomicU64 = AtomicU64::new(0);
+static KVM_SET_REGS: AtomicU64 = AtomicU64::new(0);
+static KVM_GET_SREGS: AtomicU64 = AtomicU64::new(0);
+static KVM_SET_SREGS: AtomicU64 = AtomicU64::new(0);
+static KVM_GET_FPU: AtomicU64 = AtomicU64::new(0);
+static KVM_SET_FPU: AtomicU64 = AtomicU64::new(0);
+static KVM_SET_MSRS: AtomicU64 = AtomicU64::new(0);
+
+fn kvm_stats_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_KVM_STATS").is_some()
+            || std::env::var_os("CARRICK_KVM_EXIT_STATS").is_some()
+    })
+}
+
+fn install_kvm_stats_atexit() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // SAFETY: register a process-exit diagnostic printer. The function does
+        // not capture stack state and is valid until process exit.
+        unsafe {
+            let _ = libc::atexit(print_kvm_stats_at_exit);
+        }
+    });
+}
+
+extern "C" fn print_kvm_stats_at_exit() {
+    print_kvm_stats_once("atexit");
+}
+
+#[inline]
+pub(crate) fn record_kvm_stat(stat: KvmStat) {
+    if !kvm_stats_enabled() {
+        return;
+    }
+    install_kvm_stats_atexit();
+    match stat {
+        KvmStat::Run => &KVM_RUNS,
+        KvmStat::RunEintr => &KVM_RUN_EINTRS,
+        KvmStat::ExitMmio => &KVM_EXIT_MMIO,
+        KvmStat::ExitIoSyscall => &KVM_EXIT_IO_SYSCALL,
+        KvmStat::ExitIoFault => &KVM_EXIT_IO_FAULT,
+        KvmStat::ExitIoOther => &KVM_EXIT_IO_OTHER,
+        KvmStat::ExitHalt => &KVM_EXIT_HALT,
+        KvmStat::ExitKicked => &KVM_EXIT_KICKED,
+        KvmStat::ExitDebug => &KVM_EXIT_DEBUG,
+        KvmStat::ExitInternal => &KVM_EXIT_INTERNAL,
+        KvmStat::ExitOther => &KVM_EXIT_OTHER,
+        KvmStat::GetRegs => &KVM_GET_REGS,
+        KvmStat::SetRegs => &KVM_SET_REGS,
+        KvmStat::GetSregs => &KVM_GET_SREGS,
+        KvmStat::SetSregs => &KVM_SET_SREGS,
+        KvmStat::GetFpu => &KVM_GET_FPU,
+        KvmStat::SetFpu => &KVM_SET_FPU,
+        KvmStat::SetMsrs => &KVM_SET_MSRS,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn reset_kvm_stats_for_new_vm() {
+    if !kvm_stats_enabled() {
+        return;
+    }
+    install_kvm_stats_atexit();
+    KVM_STATS_PRINTED.store(false, Ordering::Relaxed);
+    for counter in [
+        &KVM_RUNS,
+        &KVM_RUN_EINTRS,
+        &KVM_EXIT_MMIO,
+        &KVM_EXIT_IO_SYSCALL,
+        &KVM_EXIT_IO_FAULT,
+        &KVM_EXIT_IO_OTHER,
+        &KVM_EXIT_HALT,
+        &KVM_EXIT_KICKED,
+        &KVM_EXIT_DEBUG,
+        &KVM_EXIT_INTERNAL,
+        &KVM_EXIT_OTHER,
+        &KVM_GET_REGS,
+        &KVM_SET_REGS,
+        &KVM_GET_SREGS,
+        &KVM_SET_SREGS,
+        &KVM_GET_FPU,
+        &KVM_SET_FPU,
+        &KVM_SET_MSRS,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn print_kvm_stats_once(reason: &str) {
+    if !kvm_stats_enabled() || KVM_STATS_PRINTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "[carrick-kvm-stats pid={} reason={reason}] runs={} eintr={} io_syscall={} io_fault={} io_other={} mmio={} halt={} kicked={} debug={} internal={} other={} get_regs={} set_regs={} get_sregs={} set_sregs={} get_fpu={} set_fpu={} set_msrs={}",
+        std::process::id(),
+        KVM_RUNS.load(Ordering::Relaxed),
+        KVM_RUN_EINTRS.load(Ordering::Relaxed),
+        KVM_EXIT_IO_SYSCALL.load(Ordering::Relaxed),
+        KVM_EXIT_IO_FAULT.load(Ordering::Relaxed),
+        KVM_EXIT_IO_OTHER.load(Ordering::Relaxed),
+        KVM_EXIT_MMIO.load(Ordering::Relaxed),
+        KVM_EXIT_HALT.load(Ordering::Relaxed),
+        KVM_EXIT_KICKED.load(Ordering::Relaxed),
+        KVM_EXIT_DEBUG.load(Ordering::Relaxed),
+        KVM_EXIT_INTERNAL.load(Ordering::Relaxed),
+        KVM_EXIT_OTHER.load(Ordering::Relaxed),
+        KVM_GET_REGS.load(Ordering::Relaxed),
+        KVM_SET_REGS.load(Ordering::Relaxed),
+        KVM_GET_SREGS.load(Ordering::Relaxed),
+        KVM_SET_SREGS.load(Ordering::Relaxed),
+        KVM_GET_FPU.load(Ordering::Relaxed),
+        KVM_SET_FPU.load(Ordering::Relaxed),
+        KVM_SET_MSRS.load(Ordering::Relaxed),
+    );
+}
 
 /// A reserved slot in [`VCPU_LIVE`] for a sibling that is IN FLIGHT — its
 /// guest `clone()` has returned but its host thread has not yet constructed
@@ -656,6 +808,7 @@ impl KvmVm {
     /// (`HvVm::create` ignores its `&AddressSpace` argument; this is the same
     /// bring-up without the unused parameter.)
     pub(crate) fn create_empty() -> Result<Self, OsError> {
+        reset_kvm_stats_for_new_vm();
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
         #[cfg(target_arch = "x86_64")]
         let cpuid = Arc::new(
@@ -1028,9 +1181,13 @@ impl HvVcpu for KvmVcpu {
     fn run(&mut self) -> Result<VcpuExit, OsError> {
         // EINTR from the ioctl means a signal (KICK_SIGNAL via pthread_kill) interrupted
         // KVM_RUN before any guest exit — this is the cross-thread kick path.
+        record_kvm_stat(KvmStat::Run);
         let exit = match self.fd_mut().run() {
             Ok(e) => e,
-            Err(e) if e.errno() == libc::EINTR => return Ok(VcpuExit::Kicked),
+            Err(e) if e.errno() == libc::EINTR => {
+                record_kvm_stat(KvmStat::RunEintr);
+                return Ok(VcpuExit::Kicked);
+            }
             Err(e) => {
                 let mut msg = "KVM_RUN".to_string();
                 self.append_debug_state(&mut msg);
@@ -1039,6 +1196,7 @@ impl HvVcpu for KvmVcpu {
         };
         match exit {
             KvmExit::MmioWrite(gpa, data) => {
+                record_kvm_stat(KvmStat::ExitMmio);
                 // KVM hands us the bytes written and the length via the slice.
                 let len = data.len() as u8;
                 let mut buf = [0u8; 8];
@@ -1055,15 +1213,37 @@ impl HvVcpu for KvmVcpu {
             // KVM auto-advances RIP past the OUT instruction on KVM_EXIT_IO
             // (Linux KVM API §4.35), so no RIP fixup is needed in complete_syscall.
             // Source: kvm-ioctls 0.22.1 `VcpuExit::IoOut(port, data_slice)`.
-            KvmExit::IoOut(port, data) => Ok(VcpuExit::IoOut {
-                port,
-                data: data.to_vec(),
-            }),
-            KvmExit::SystemEvent(_, _) => Ok(VcpuExit::Halt),
-            KvmExit::Shutdown | KvmExit::Hlt => Ok(VcpuExit::Halt),
-            KvmExit::Intr => Ok(VcpuExit::Kicked),
-            KvmExit::Debug(debug) => Err(os_err("unexpected KVM_RUN exit", format!("{debug:?}"))),
+            KvmExit::IoOut(port, data) => {
+                if port == carrick_hal::SYSCALL_DOORBELL_PORT {
+                    record_kvm_stat(KvmStat::ExitIoSyscall);
+                } else if port == carrick_x86::FAULT_DOORBELL_PORT {
+                    record_kvm_stat(KvmStat::ExitIoFault);
+                } else {
+                    record_kvm_stat(KvmStat::ExitIoOther);
+                }
+                Ok(VcpuExit::IoOut {
+                    port,
+                    data: data.to_vec(),
+                })
+            }
+            KvmExit::SystemEvent(_, _) => {
+                record_kvm_stat(KvmStat::ExitHalt);
+                Ok(VcpuExit::Halt)
+            }
+            KvmExit::Shutdown | KvmExit::Hlt => {
+                record_kvm_stat(KvmStat::ExitHalt);
+                Ok(VcpuExit::Halt)
+            }
+            KvmExit::Intr => {
+                record_kvm_stat(KvmStat::ExitKicked);
+                Ok(VcpuExit::Kicked)
+            }
+            KvmExit::Debug(debug) => {
+                record_kvm_stat(KvmStat::ExitDebug);
+                Err(os_err("unexpected KVM_RUN exit", format!("{debug:?}")))
+            }
             KvmExit::InternalError => {
+                record_kvm_stat(KvmStat::ExitInternal);
                 let mut msg = "InternalError".to_string();
                 self.append_debug_state(&mut msg);
                 #[cfg(target_arch = "x86_64")]
@@ -1071,6 +1251,7 @@ impl HvVcpu for KvmVcpu {
                 Err(os_err("unexpected KVM_RUN exit", msg))
             }
             other => {
+                record_kvm_stat(KvmStat::ExitOther);
                 let mut msg = format!("{other:?}");
                 self.append_debug_state(&mut msg);
                 Err(os_err("unexpected KVM_RUN exit", msg))

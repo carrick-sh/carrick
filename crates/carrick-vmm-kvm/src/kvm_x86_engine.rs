@@ -255,6 +255,10 @@ impl X86Vmm for KvmVmm {
         Ok(())
     }
 
+    fn process_exit_cleanup(&mut self) {
+        crate::kvm::print_kvm_stats_once("process-exit");
+    }
+
     fn restore_vcpu(
         &self,
         vcpu: &mut Self::Vcpu,
@@ -328,11 +332,13 @@ impl X86Vmm for KvmVmm {
 
     fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError> {
         // &self read-modify-write of RSP (KVM_SET_REGS is &self on VcpuFd).
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
         let mut regs = vcpu
             .fd()
             .get_regs()
             .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(set_rsp): {e}")))?;
         regs.rsp = sp;
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetRegs);
         vcpu.fd()
             .set_regs(&regs)
             .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(rsp): {e}")))
@@ -547,6 +553,7 @@ impl X86Vcpu for KvmVcpu {
         // GPRs/RIP/RSP/RFLAGS via KVM_GET_REGS; control regs/EFER via KVM_GET_SREGS.
         Ok(match reg {
             X86Reg::Cr0 | X86Reg::Cr2 | X86Reg::Cr3 | X86Reg::Cr4 | X86Reg::Efer => {
+                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
                 let s = self
                     .fd()
                     .get_sregs()
@@ -561,6 +568,7 @@ impl X86Vcpu for KvmVcpu {
                 }
             }
             _ => {
+                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
                 let r = self
                     .fd()
                     .get_regs()
@@ -598,12 +606,14 @@ impl X86Vcpu for KvmVcpu {
         let segs = carrick_x86::long_mode_segment_state();
         let kernel_cs = ((boot.star >> 32) & 0xFFFF) as u16;
         let kernel_ss = kernel_cs.wrapping_add(8);
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
         let mut sregs = self
             .fd()
             .get_sregs()
             .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(sysret): {e}")))?;
         sregs.cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_cs_ar, kernel_cs);
         sregs.ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_data_ar, kernel_ss);
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetSregs);
         self.fd()
             .set_sregs(&sregs)
             .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(sysret): {e}")))
@@ -612,6 +622,7 @@ impl X86Vcpu for KvmVcpu {
     fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError> {
         match reg {
             X86Reg::Cr0 | X86Reg::Cr2 | X86Reg::Cr3 | X86Reg::Cr4 | X86Reg::Efer => {
+                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
                 let mut s = self
                     .fd()
                     .get_sregs()
@@ -624,11 +635,13 @@ impl X86Vcpu for KvmVcpu {
                     X86Reg::Efer => s.efer = v,
                     _ => unreachable!(),
                 }
+                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetSregs);
                 self.fd()
                     .set_sregs(&s)
                     .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS: {e}")))
             }
             _ => {
+                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
                 let mut r = self
                     .fd()
                     .get_regs()
@@ -654,6 +667,7 @@ impl X86Vcpu for KvmVcpu {
                     X86Reg::Rflags => r.rflags = v,
                     _ => unreachable!(),
                 }
+                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetRegs);
                 self.fd()
                     .set_regs(&r)
                     .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS: {e}")))
@@ -668,6 +682,7 @@ impl X86Vcpu for KvmVcpu {
         limit: u32,
         ar: u32,
     ) -> Result<(), TrapError> {
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
         let mut s = self
             .fd()
             .get_sregs()
@@ -702,12 +717,14 @@ impl X86Vcpu for KvmVcpu {
                 }
             }
         }
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetSregs);
         self.fd()
             .set_sregs(&s)
             .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(seg): {e}")))
     }
 
     fn get_fs_base(&self) -> Result<u64, TrapError> {
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
         let s = self
             .fd()
             .get_sregs()
@@ -716,17 +733,20 @@ impl X86Vcpu for KvmVcpu {
     }
 
     fn set_fs_base(&mut self, v: u64) -> Result<(), TrapError> {
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
         let mut s = self
             .fd()
             .get_sregs()
             .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(fs): {e}")))?;
         s.fs.base = v;
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetSregs);
         self.fd()
             .set_sregs(&s)
             .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(fs.base): {e}")))
     }
 
     fn get_gs_base(&self) -> Result<u64, TrapError> {
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
         let s = self
             .fd()
             .get_sregs()
@@ -735,11 +755,13 @@ impl X86Vcpu for KvmVcpu {
     }
 
     fn set_gs_base(&mut self, v: u64) -> Result<(), TrapError> {
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
         let mut s = self
             .fd()
             .get_sregs()
             .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(gs): {e}")))?;
         s.gs.base = v;
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetSregs);
         self.fd()
             .set_sregs(&s)
             .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(gs.base): {e}")))
@@ -770,6 +792,7 @@ impl X86Vcpu for KvmVcpu {
             }, // SFMASK
         ])
         .map_err(|e| TrapError::Hypervisor(format!("kvm-x86: Msrs::from_entries: {e}")))?;
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetMsrs);
         let n = self
             .fd()
             .set_msrs(&msrs)
@@ -786,6 +809,7 @@ impl X86Vcpu for KvmVcpu {
         // KVM_GET_FPU yields the native 512-byte fxsave area. The `kvm_fpu`
         // struct's first 512 bytes ARE the legacy fxsave region (fpr/xmm/mxcsr/
         // control words at the architectural offsets), so we serialize it.
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetFpu);
         let fpu = self
             .fd()
             .get_fpu()
@@ -794,11 +818,13 @@ impl X86Vcpu for KvmVcpu {
     }
 
     fn set_fp(&mut self, fx: &[u8; 512]) -> Result<bool, TrapError> {
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetFpu);
         let mut fpu = self
             .fd()
             .get_fpu()
             .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_FPU(set): {e}")))?;
         fxsave_into_kvm_fpu(fx, &mut fpu);
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetFpu);
         self.fd()
             .set_fpu(&fpu)
             .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_FPU: {e}")))?;
@@ -814,6 +840,7 @@ impl X86Vcpu for KvmVcpu {
             // completes the PIO step when userspace re-enters. The shared x86
             // engine treats either trampoline address as syscall-return state.
             VcpuExit::IoOut { port, .. } if port == carrick_hal::SYSCALL_DOORBELL_PORT => {
+                crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
                 let regs = self
                     .fd()
                     .get_regs()
