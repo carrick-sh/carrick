@@ -207,6 +207,7 @@ enum CarrickCleanup {
     Hvf,
     KvmLima(crate::lane::LimaConfig),
     KvmLocal,
+    BhyveLocal,
 }
 
 impl CarrickCleanup {
@@ -215,6 +216,7 @@ impl CarrickCleanup {
             crate::lane::Lane::Hvf => CarrickCleanup::Hvf,
             crate::lane::Lane::Kvm(cfg) => CarrickCleanup::KvmLima(cfg.clone()),
             crate::lane::Lane::KvmLocal(_) => CarrickCleanup::KvmLocal,
+            crate::lane::Lane::BhyveLocal(_) => CarrickCleanup::BhyveLocal,
         }
     }
 }
@@ -301,10 +303,11 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
                 .stderr(Stdio::null())
                 .status();
         }
-        (Engine::Carrick, Some(CarrickCleanup::KvmLocal)) => {
-            // Local Linux/KVM: carrick may have escaped its original process
-            // group, and Linux builds keep the original argv instead of macOS
-            // proctitle rewriting. Reap only this run's named process tree.
+        (Engine::Carrick, Some(CarrickCleanup::KvmLocal | CarrickCleanup::BhyveLocal)) => {
+            // Local Linux/KVM and FreeBSD/bhyve: carrick may have escaped its
+            // original process group, and non-macOS builds keep the original
+            // argv instead of macOS proctitle rewriting. Reap only this run's
+            // named process tree.
             let _ = Command::new("pkill")
                 .args(["-9", "-f", &format!("run --name {run_id} ")])
                 .stdout(Stdio::null())

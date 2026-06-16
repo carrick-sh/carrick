@@ -311,6 +311,7 @@ dependencies = [
  "carrick-runtime",
  "carrick-spec",
  "carrick-test-support",
+ "carrick-vmm-bhyve",
  "carrick-vmm-hvf",
  "carrick-vmm-kvm",
  "chrono",

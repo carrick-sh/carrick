@@ -3,7 +3,8 @@
 //! argv as `limactl shell <vm> -- env … <carrick-in-guest> run …`, rewriting the
 //! `localhost` conformance-registry host to the lima gateway so the guest can
 //! pull from the mac registry. `KvmLocal` runs a platform-linux carrick binary
-//! directly on a Linux host with `/dev/kvm`.
+//! directly on a Linux host with `/dev/kvm`. `BhyveLocal` does the same for a
+//! platform-freebsd carrick binary on a FreeBSD host with `/dev/vmm`.
 
 use crate::engine::carrick_argv;
 use crate::manifest::Suite;
@@ -32,6 +33,14 @@ pub struct LocalKvmConfig {
     pub timeout_scale: f64,
 }
 
+/// Direct FreeBSD/bhyve lane configuration. It is separate from KVM because the
+/// preflight and timeout cleanup are VMM-specific, even though both lanes run
+/// x86_64 Linux containers and therefore share the amd64 OCI platform.
+#[derive(Clone, Debug)]
+pub struct LocalBhyveConfig {
+    pub timeout_scale: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockerPlatform {
     LinuxArm64,
@@ -53,6 +62,7 @@ pub enum Lane {
     Hvf,
     Kvm(LimaConfig),
     KvmLocal(LocalKvmConfig),
+    BhyveLocal(LocalBhyveConfig),
 }
 
 impl Lane {
@@ -61,13 +71,13 @@ impl Lane {
     }
 
     pub fn needs_local_registry_env(&self) -> bool {
-        matches!(self, Lane::Hvf | Lane::KvmLocal(_))
+        matches!(self, Lane::Hvf | Lane::KvmLocal(_) | Lane::BhyveLocal(_))
     }
 
     pub fn docker_platform(&self) -> DockerPlatform {
         match self {
             Lane::Hvf | Lane::Kvm(_) => DockerPlatform::LinuxArm64,
-            Lane::KvmLocal(_) => DockerPlatform::LinuxAmd64,
+            Lane::KvmLocal(_) | Lane::BhyveLocal(_) => DockerPlatform::LinuxAmd64,
         }
     }
 
@@ -79,6 +89,7 @@ impl Lane {
             Lane::Hvf => timeout_s,
             Lane::Kvm(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::KvmLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
+            Lane::BhyveLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
         }
     }
 }
@@ -125,7 +136,7 @@ pub fn carrick_invocation_argv(
     let base = carrick_argv(suite, carrick_bin, run_id); // [carrick_bin, "run", …flags…, image, …cmd]
     match lane {
         Lane::Hvf => base,
-        Lane::KvmLocal(_) => {
+        Lane::KvmLocal(_) | Lane::BhyveLocal(_) => {
             carrick_argv_with_platform(base, &suite.image, DockerPlatform::LinuxAmd64)
         }
         Lane::Kvm(cfg) => {
@@ -238,16 +249,28 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Map the `--lane`/`--lima-vm`/`--lima-gateway`/`--lima-timeout-scale` CLI
-/// strings to a `Lane`.
-pub fn lane_from_args(lane: &str, lima_vm: &str, lima_gateway: &str, timeout_scale: f64) -> Lane {
+/// Map the lane CLI strings to a `Lane`. Lima gets its own timeout scale
+/// because nested virtualization can be slower; direct local x86_64 lanes use a
+/// separate scale that defaults to 1.0.
+pub fn lane_from_args(
+    lane: &str,
+    lima_vm: &str,
+    lima_gateway: &str,
+    lima_timeout_scale: f64,
+    local_timeout_scale: f64,
+) -> Lane {
     match lane {
         "kvm" => Lane::Kvm(LimaConfig {
             vm: lima_vm.to_string(),
             gateway: lima_gateway.to_string(),
-            timeout_scale,
+            timeout_scale: lima_timeout_scale,
         }),
-        "kvm-local" | "linux-kvm" => Lane::KvmLocal(LocalKvmConfig { timeout_scale }),
+        "kvm-local" | "linux-kvm" => Lane::KvmLocal(LocalKvmConfig {
+            timeout_scale: local_timeout_scale,
+        }),
+        "bhyve-local" | "freebsd-bhyve" => Lane::BhyveLocal(LocalBhyveConfig {
+            timeout_scale: local_timeout_scale,
+        }),
         _ => Lane::Hvf,
     }
 }
@@ -364,6 +387,25 @@ mod tests {
     }
 
     #[test]
+    fn bhyve_local_invocation_runs_carrick_directly_as_amd64() {
+        let s = demo_suite();
+        let lane = lane_from_args("bhyve-local", "carrick", "host.lima.internal", 2.0, 1.5);
+        let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
+
+        assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
+        assert_eq!(lane.scaled_timeout(s.timeout_s), 2);
+        assert_eq!(argv[0], "/root/ct/release/carrick");
+        assert_eq!(argv[1], "run");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--platform" && w[1] == "linux/amd64"),
+            "bhyve-local carrick side must request the amd64 OCI platform: {argv:?}"
+        );
+        assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
+        assert!(!argv.contains(&"limactl".to_string()));
+    }
+
+    #[test]
     fn shell_quote_handles_barewords_and_metachars() {
         assert_eq!(shell_quote("simple"), "simple");
         assert_eq!(shell_quote("/usr/local/go/bin"), "/usr/local/go/bin");
@@ -375,10 +417,10 @@ mod tests {
     #[test]
     fn lane_from_args_builds_kvm_with_defaults() {
         assert!(matches!(
-            lane_from_args("hvf", "carrick", "host.lima.internal", 2.0),
+            lane_from_args("hvf", "carrick", "host.lima.internal", 2.0, 1.0),
             Lane::Hvf
         ));
-        match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0) {
+        match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0, 1.0) {
             Lane::Kvm(cfg) => {
                 assert_eq!(cfg.vm, "carrick");
                 assert_eq!(cfg.gateway, "host.lima.internal");
@@ -386,8 +428,12 @@ mod tests {
             }
             _ => panic!("expected Kvm"),
         }
-        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0) {
-            Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 3.0),
+        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.0) {
+            Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.0),
+            _ => panic!("expected KvmLocal"),
+        }
+        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.5) {
+            Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.5),
             _ => panic!("expected KvmLocal"),
         }
     }
