@@ -643,7 +643,8 @@ impl GuestArch for X8664GuestArch {
 
 // ─── x86-64 syscall normalization (shared by every x86 backend) ──────────────
 //
-// fork(57)/vfork(58)→clone(220), legacy dup2(33)→private dispatcher shim,
+// fork(57)/vfork(58)→clone(220), access(21)→faccessat(48),
+// legacy dup2(33)→private dispatcher shim,
 // stat(4)/fstat(5)/lstat(6)/newfstatat(262)→private x86 ABI writers,
 // readlink(89)→readlinkat(78), the clone(220) tls↔child_tid arg-swap, and
 // arch_prctl dispatch are PURE guest-ISA ABI
@@ -652,7 +653,7 @@ impl GuestArch for X8664GuestArch {
 // (clean-room, man-pages / psABI only): clone(2) "C library/kernel differences"
 // (x86-64 raw arg order; CLONE_VM=0x100, CLONE_VFORK=0x4000; exit-signal in
 // the low byte), signal(7) (SIGCHLD=17), syscalls(2) (x86-64
-// stat=4/fstat=5/lstat=6/fork=57/vfork=58/dup2=33/readlink=89/newfstatat=262).
+// stat=4/fstat=5/lstat=6/access=21/fork=57/vfork=58/dup2=33/readlink=89/newfstatat=262).
 
 /// Canonical (asm-generic / aarch64) `clone` number. x86-64 raw clone (56) and
 /// fork(57)/vfork(58) all normalize to this; clone3 (435) does NOT.
@@ -665,6 +666,11 @@ const X86_NR_VFORK: u64 = 58;
 /// x86-64 `dup2(2)` (syscalls(2)). Desugars to a private dispatcher shim because
 /// canonical/asm-generic has `dup3(2)` but no `dup2(2)`.
 const X86_NR_DUP2: u64 = 33;
+/// x86-64 `access(2)` (syscalls(2)). Desugars to canonical `faccessat(2)` with
+/// `AT_FDCWD` and flags=0 because asm-generic only exposes `faccessat`.
+const X86_NR_ACCESS: u64 = 21;
+/// Canonical (asm-generic / aarch64) `faccessat` number.
+const CANONICAL_FACCESSAT: u64 = 48;
 /// x86-64 `stat(2)` (syscalls(2)). It follows paths like
 /// `newfstatat(AT_FDCWD, path, flags=0)` but writes x86_64's legacy stat
 /// layout, so it normalizes to a private dispatcher shim.
@@ -741,6 +747,12 @@ impl X8664GuestArch {
             return SyscallNorm::Plain(RawSyscall {
                 number: carrick_abi::CARRICK_PRIVATE_X86_DUP2,
                 args: [args[0], args[1], 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_ACCESS {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_FACCESSAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
         }
         if x86_number == X86_NR_STAT {
@@ -934,6 +946,19 @@ mod normalize_tests {
                 );
             }
             _ => panic!("readlink must be Plain"),
+        }
+    }
+
+    #[test]
+    fn access_normalizes_to_faccessat_at_fdcwd() {
+        // x86 access = 21, but canonical asm-generic only exposes faccessat(48).
+        // Normalize access(path, mode) through faccessat(AT_FDCWD, path, mode).
+        match X8664GuestArch::normalize_syscall(&frame(21, [0x1000, 4, 0xAA, 0xBB, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 48);
+                assert_eq!(rs.args, [carrick_abi::LINUX_AT_FDCWD, 0x1000, 4, 0, 0, 0]);
+            }
+            _ => panic!("access must be Plain"),
         }
     }
 

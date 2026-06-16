@@ -20,7 +20,7 @@
 //! every x86_64 syscall whose NAME also appears in `AARCH64_SYSCALLS` with a
 //! matching argument shape is a `Direct(canonical)`. Legacy x86_64-only
 //! syscalls whose arg shape differs from their asm-generic successor
-//! (`open` vs `openat`, `dup2` vs `dup3`, `readlink` vs `readlinkat`,
+//! (`open` vs `openat`, `access` vs `faccessat`, `dup2` vs `dup3`, `readlink` vs `readlinkat`,
 //! `stat`/`fstat`/`lstat` vs `newfstatat`, `select` vs `pselect6`, `poll` is
 //! the lone exception below as musl calls it with timeout 0) are deliberately
 //! LEFT OUT (→ `Unknown` → -ENOSYS); adding a naive `Direct` for them would
@@ -153,8 +153,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(19, "readv", 65),
     // x86_64=20 (syscalls(2)/filippo) → canonical writev=66
     direct(20, "writev", 66),
-    // x86_64=21 access: LEGACY (asm-generic has faccessat=48). access(path,mode)
-    // vs faccessat(dfd,path,mode,flags) → LEFT OUT. (see deferred block)
+    // x86_64=21 access: LEGACY (asm-generic has faccessat=48). Normalized in
+    // x8664_arch::normalize_syscall to faccessat(AT_FDCWD, path, mode, flags=0).
     // x86_64=22 pipe: LEGACY (asm-generic has pipe2=59). Handled in
     // x8664_arch::normalize_syscall as pipe2(fd, flags=0).
     // x86_64=23 select: LEGACY (asm-generic has pselect6=72). DIFFERENT shape →
@@ -849,7 +849,6 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // oracle-gated). All numbers from syscalls(2)/filippo/OSDev.
     //
     //   2   open        → openat(56):     prepend AT_FDCWD; (path,flags,mode)→(dfd,path,flags,mode)
-    //   21  access      → faccessat(48):  prepend AT_FDCWD; append flags=0
     //   23  select      → pselect6(72):   timeval→timespec; no sigmask arg
     //   33  dup2        → dup3(24):       dup2(fd,fd)=success no-op vs dup3 EINVAL; no flags arg
     //   78  getdents    → getdents64(61): 32-bit linux_dirent vs 64-bit linux_dirent64
