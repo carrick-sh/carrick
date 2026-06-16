@@ -195,6 +195,7 @@ pub fn add_fault_windows(regions: &mut Vec<WindowRegion>, layout: BringupLayout)
         write: false,
         exec: false,
         user: false,
+        shared: false,
     });
     regions.push(WindowRegion {
         va: fault_stub_base(layout),
@@ -204,6 +205,7 @@ pub fn add_fault_windows(regions: &mut Vec<WindowRegion>, layout: BringupLayout)
         write: false,
         exec: true,
         user: false,
+        shared: false,
     });
     regions.push(WindowRegion {
         va: fault_tss_base(layout),
@@ -213,6 +215,7 @@ pub fn add_fault_windows(regions: &mut Vec<WindowRegion>, layout: BringupLayout)
         write: true,
         exec: false,
         user: false,
+        shared: false,
     });
     regions.push(WindowRegion {
         va: fault_stack_base(layout),
@@ -222,6 +225,7 @@ pub fn add_fault_windows(regions: &mut Vec<WindowRegion>, layout: BringupLayout)
         write: true,
         exec: false,
         user: false,
+        shared: false,
     });
 }
 
