@@ -1149,6 +1149,46 @@ impl X86Vcpu for NvmmX86Vcpu {
         self.inner.set_state(&st, flag).map_err(map_err)
     }
 
+    fn get_gprs(&self, regs: &[X86Reg], out: &mut [u64]) -> Result<(), TrapError> {
+        // One getstate for the whole slice (the shared complete_sysret fetches
+        // RCX+R11 together) instead of one full getstate per register.
+        let st = self
+            .inner
+            .get_state(NVMM_X64_STATE_CRS | NVMM_X64_STATE_MSRS | NVMM_X64_STATE_GPRS)
+            .map_err(map_err)?;
+        for (slot, reg) in out.iter_mut().zip(regs) {
+            *slot = match reg_loc(*reg) {
+                RegLoc::Cr(i) => st.crs[i],
+                RegLoc::Efer => st.msrs[NVMM_X64_MSR_EFER],
+                RegLoc::Gpr(i) => st.gprs[i],
+            };
+        }
+        Ok(())
+    }
+
+    fn set_gprs(&mut self, writes: &[(X86Reg, u64)]) -> Result<(), TrapError> {
+        // One get-then-set over the union of touched sub-areas (the shared
+        // complete_sysret writes RAX+RIP together) instead of one getstate +
+        // setstate per register.
+        let mut flags = 0u64;
+        for (reg, _) in writes {
+            flags |= match reg_loc(*reg) {
+                RegLoc::Cr(_) => NVMM_X64_STATE_CRS,
+                RegLoc::Efer => NVMM_X64_STATE_MSRS,
+                RegLoc::Gpr(_) => NVMM_X64_STATE_GPRS,
+            };
+        }
+        let mut st = self.inner.get_state(flags).map_err(map_err)?;
+        for (reg, v) in writes {
+            match reg_loc(*reg) {
+                RegLoc::Cr(i) => st.crs[i] = *v,
+                RegLoc::Efer => st.msrs[NVMM_X64_MSR_EFER] = *v,
+                RegLoc::Gpr(i) => st.gprs[i] = *v,
+            }
+        }
+        self.inner.set_state(&st, flags).map_err(map_err)
+    }
+
     fn set_segment(
         &mut self,
         seg: X86Seg,
