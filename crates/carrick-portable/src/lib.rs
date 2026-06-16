@@ -147,8 +147,12 @@ pub fn set_termios_speeds(t: &mut libc::termios, ispeed: u32, ospeed: u32) {
     }
 }
 
-/// `ptrace(2)` wrapper with a portable integer address argument. NetBSD's libc
-/// binding takes `*mut c_void`; Darwin/FreeBSD's binding takes `*mut c_char`.
+/// `ptrace(2)` wrapper with a portable integer address argument. The `request`
+/// constants differ in libc type across platforms — glibc/musl bind the Linux
+/// `PTRACE_*` enum values as `c_uint`, while the BSD/Darwin `PT_*` values are
+/// `c_int` — so `request` is accepted as anything convertible to `i64` and cast
+/// to each platform's expected type. NetBSD's libc binding takes `*mut c_void`;
+/// Darwin/FreeBSD's binding takes `*mut c_char`; Linux's is variadic.
 ///
 /// # Safety
 /// Thin FFI wrapper over `ptrace(2)`: the caller must uphold that syscall's
@@ -156,11 +160,12 @@ pub fn set_termios_speeds(t: &mut libc::termios, ispeed: u32, ospeed: u32) {
 /// platform pointer argument.
 #[inline]
 pub unsafe fn ptrace(
-    request: libc::c_int,
+    request: impl Into<i64>,
     pid: libc::pid_t,
     addr: usize,
     data: libc::c_int,
 ) -> libc::c_int {
+    let request: i64 = request.into();
     #[cfg(target_os = "netbsd")]
     {
         let ptr = if addr == 0 {
@@ -168,16 +173,32 @@ pub unsafe fn ptrace(
         } else {
             std::ptr::without_provenance_mut::<libc::c_void>(addr)
         };
-        unsafe { libc::ptrace(request, pid, ptr, data) }
+        unsafe { libc::ptrace(request as libc::c_int, pid, ptr, data) }
     }
-    #[cfg(not(target_os = "netbsd"))]
+    #[cfg(target_os = "linux")]
     {
+        // glibc/musl bind `ptrace` variadically as `ptrace(c_uint, ...) -> c_long`
+        // for `long ptrace(enum __ptrace_request, pid_t, void *addr, void *data)`.
+        // `addr` carries our integer address; `data` carries a signal number for
+        // PT_CONTINUE/PT_DETACH, passed as the pointer-sized data word. The wide
+        // result is truncated back to this shim's `c_int` return.
+        let aptr = if addr == 0 {
+            std::ptr::null_mut::<libc::c_void>()
+        } else {
+            std::ptr::without_provenance_mut::<libc::c_void>(addr)
+        };
+        let dptr = std::ptr::without_provenance_mut::<libc::c_void>(data as usize);
+        unsafe { libc::ptrace(request as libc::c_uint, pid, aptr, dptr) as libc::c_int }
+    }
+    #[cfg(not(any(target_os = "netbsd", target_os = "linux")))]
+    {
+        // Darwin/FreeBSD: `int ptrace(int request, pid_t, caddr_t addr, int data)`.
         let ptr = if addr == 0 {
             std::ptr::null_mut::<libc::c_char>()
         } else {
             std::ptr::without_provenance_mut::<libc::c_char>(addr)
         };
-        unsafe { libc::ptrace(request, pid, ptr, data) }
+        unsafe { libc::ptrace(request as libc::c_int, pid, ptr, data) }
     }
 }
 
