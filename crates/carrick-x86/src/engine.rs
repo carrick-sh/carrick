@@ -833,6 +833,7 @@ mod tests {
         rflags: u64,
         prepared_sysret: bool,
         get_gprs_calls: std::cell::Cell<u32>,
+        set_gprs_calls: u32,
     }
 
     impl X86Vmm for TestVmm {
@@ -909,6 +910,14 @@ mod tests {
             self.get_gprs_calls.set(self.get_gprs_calls.get() + 1);
             for (slot, reg) in out.iter_mut().zip(regs) {
                 *slot = self.get_gpr(*reg)?;
+            }
+            Ok(())
+        }
+
+        fn set_gprs(&mut self, writes: &[(X86Reg, u64)]) -> Result<(), TrapError> {
+            self.set_gprs_calls += 1;
+            for (reg, v) in writes {
+                self.set_gpr(*reg, *v)?;
             }
             Ok(())
         }
@@ -1093,6 +1102,32 @@ mod tests {
             "complete_sysret must batch the RCX/R11 read into one get_gprs"
         );
         // Behavior preserved: parked user PC = RCX, user RFLAGS = R11 | 0x2.
+        assert_eq!(engine.current_pc().expect("pc"), 0x0040_1234);
+        assert_eq!(engine.interrupted_rflags().expect("rflags"), 0x246);
+    }
+
+    #[test]
+    fn complete_sysret_batches_rax_rip_into_one_set_gprs() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_1234,
+            r11: 0x246,
+            rip: layout.trampoline_base + 2,
+            rflags: 0x2,
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.pending_resume_pc = Some(layout.trampoline_base + 2);
+
+        engine.complete_syscall(0).expect("complete syscall");
+
+        // RAX (return value) and RIP (resume) must be written via a SINGLE
+        // batched set_gprs so a whole-register-file backend issues one ioctl.
+        assert_eq!(
+            engine.vcpu.set_gprs_calls, 1,
+            "complete_sysret must batch the RAX+RIP write into one set_gprs"
+        );
+        // Behavior preserved.
         assert_eq!(engine.current_pc().expect("pc"), 0x0040_1234);
         assert_eq!(engine.interrupted_rflags().expect("rflags"), 0x246);
     }
