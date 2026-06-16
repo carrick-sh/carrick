@@ -709,24 +709,31 @@ impl X86Vcpu for KvmVcpu {
         return_value: i64,
         resume_pc: u64,
     ) -> Result<(u64, u64), TrapError> {
-        // Preserve the old architectural order up to the RCX/R11 read point:
-        // complete_syscall first wrote RAX, then read RCX and R11, then prepared
-        // hidden SYSRET segment state, then wrote RIP. KVM's whole `kvm_regs`
-        // API lets the RCX/R11 reads and final RIP write share one snapshot.
-        self.set_gpr(X86Reg::Rax, return_value as u64)?;
-        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
-        let mut regs = self
-            .fd()
-            .get_regs()
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(sysret): {e}")))?;
+        // Read the whole GPR snapshot ONCE (RCX/R11 for the parked user PC/RFLAGS,
+        // and as the base for the RAX/RIP writes), then flush it in ONE
+        // KVM_SET_REGS. With KVM_CAP_SYNC_REGS the snapshot is the mmap'd
+        // kvm_run.s.regs the kernel synced out on the doorbell exit — no
+        // KVM_GET_REGS at all. The snapshot is a READ-ONLY mirror (we never set
+        // kvm_dirty_regs), so the kernel registers stay authoritative and every
+        // other accessor (get_gpr/set_gpr) is unaffected. RAX/RIP are independent
+        // of RCX/R11, so reading first preserves their values.
+        let mut regs = if crate::kvm::sync_regs_supported() {
+            self.fd().sync_regs().regs
+        } else {
+            crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
+            self.fd()
+                .get_regs()
+                .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(sysret): {e}")))?
+        };
         let user_pc = regs.rcx;
         let user_rflags = regs.r11 | 0x2;
         self.prepare_sysret_resume(layout)?;
+        regs.rax = return_value as u64;
         regs.rip = resume_pc;
         crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetRegs);
         self.fd()
             .set_regs(&regs)
-            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(sysret.rip): {e}")))?;
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(sysret): {e}")))?;
         Ok((user_pc, user_rflags))
     }
 
