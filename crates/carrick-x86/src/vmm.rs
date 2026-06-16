@@ -103,6 +103,10 @@ pub enum X86Exit {
     /// (`get_fp() == None`) ever surfaces this, and only while
     /// [`crate::bringup::run_fp_stub`] is driving the stub.
     FpDoorbell,
+    /// Backend-specific memory exit. Most VMMs never surface this to the shared
+    /// engine; sparse backends can ask their VMM half to realize the missing GPA
+    /// and then re-enter the guest.
+    Memory { gpa: u64 },
     /// A synchronous guest fault -> the runtime delivers it as
     /// [`carrick_hal::TrapError::GuestFault`]. `fault_addr` is the Linux
     /// `siginfo.si_addr` value already resolved by the backend (CR2 for #PF,
@@ -271,6 +275,12 @@ pub trait X86Vmm: Sized {
         Err(TrapError::Hypervisor(format!(
             "carrick-x86: map_host_alias not implemented for this backend (va=0x{va:x} len=0x{len:x})"
         )))
+    }
+
+    /// Handle a backend memory exit. Return `true` when the VMM resolved the
+    /// missing backing and the engine should retry the same guest instruction.
+    fn handle_memory_exit(&mut self, _gpa: u64) -> Result<bool, TrapError> {
+        Ok(false)
     }
 
     /// Create a fresh vCPU bound to this VM.
