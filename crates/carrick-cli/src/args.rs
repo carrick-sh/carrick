@@ -123,6 +123,10 @@ pub(crate) enum Commands {
         /// Read the archive from a tar file instead of STDIN.
         #[arg(short = 'i', long = "input", value_name = "FILE")]
         input: PathBuf,
+        /// Platform key to store the archive under, e.g. `linux/amd64`.
+        /// Defaults to the host-native Carrick platform.
+        #[arg(long, value_name = "OS/ARCH")]
+        platform: Option<String>,
     },
     /// List images in the local store (like `docker images`).
     Images {
