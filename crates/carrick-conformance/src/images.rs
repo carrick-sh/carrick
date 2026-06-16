@@ -67,6 +67,9 @@ fn sidecar_path(lane: &crate::lane::Lane) -> PathBuf {
         crate::lane::Lane::BhyveLocal(_) => {
             PathBuf::from("target/conformance/image-digests.bhyve-local.json")
         }
+        crate::lane::Lane::NvmmLocal(_) => {
+            PathBuf::from("target/conformance/image-digests.nvmm-local.json")
+        }
     }
 }
 
@@ -151,7 +154,8 @@ pub fn refresh_stale_images(
         let ok = match lane {
             crate::lane::Lane::Hvf
             | crate::lane::Lane::KvmLocal(_)
-            | crate::lane::Lane::BhyveLocal(_) => {
+            | crate::lane::Lane::BhyveLocal(_)
+            | crate::lane::Lane::NvmmLocal(_) => {
                 let _ = Command::new(carrick_bin)
                     .args(["rmi", image])
                     .stdout(Stdio::null())
