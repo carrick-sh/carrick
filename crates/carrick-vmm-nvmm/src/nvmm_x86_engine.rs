@@ -25,7 +25,7 @@ use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
 use carrick_x86::{
     BringupLayout, FAULT_DOORBELL_PORT, ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion,
-    X86EngineCore, X86Exit, X86Reg, X86Seg, X86Vcpu, X86Vmm,
+    X86EngineCore, X86Exit, X86Reg, X86Seg, X86Vcpu, X86VcpuSnapshot, X86Vmm,
 };
 
 use crate::nvmm::{
@@ -74,6 +74,7 @@ fn map_err(e: nvmm::NvmmError) -> TrapError {
 /// PML4 decouple the guest VA from it. The engine queries guest memory by VA
 /// (`GuestMemory::read_bytes(va)`), so we record + resolve by `va` and only use
 /// `gpa` for `gpa_map`. (Kernel-window regions are identity: `va == gpa`.)
+#[derive(Clone, Copy)]
 struct Region {
     va: u64,
     gpa: u64,
@@ -92,6 +93,18 @@ pub struct NvmmVmm {
     regions: Vec<Region>,
     page_tables: Option<carrick_mem::pml4::Pml4Manager>,
 }
+
+pub struct NvmmSiblingBuilder {
+    mach: NvmmMachine,
+    windows: Vec<WindowRegion>,
+    regions: Vec<Region>,
+    page_tables: Option<carrick_mem::pml4::Pml4Manager>,
+}
+
+// SAFETY: the builder carries a shared NVMM machine handle plus raw HVAs that
+// point into this process' address space. The materialized sibling moves it
+// into one host thread before running.
+unsafe impl Send for NvmmSiblingBuilder {}
 
 impl NvmmVmm {
     /// Find the host pointer for guest-VA `[va, va+len)` within a region.
@@ -160,9 +173,9 @@ fn resolve_region(regions: &[Region], va: u64, len: usize) -> Option<*mut u8> {
     None
 }
 
-fn fault_record_hva(regions: &[Region]) -> Result<*mut u8, TrapError> {
+fn fault_record_hva(regions: &[Region], slot: u64) -> Result<*mut u8, TrapError> {
     let record_va =
-        carrick_x86::fault_slot_gpa(carrick_x86::fault_record_base(NVMM_X86_LAYOUT), 0)?;
+        carrick_x86::fault_slot_gpa(carrick_x86::fault_record_base(NVMM_X86_LAYOUT), slot)?;
     resolve_region(
         regions,
         record_va,
@@ -205,7 +218,7 @@ fn compact_region_alignment(region: WindowRegion) -> u64 {
 impl X86Vmm for NvmmVmm {
     type Vcpu = NvmmX86Vcpu;
     type KickHandle = NvmmKickHandle;
-    type SiblingBuilder = ();
+    type SiblingBuilder = NvmmSiblingBuilder;
 
     /// Realize the plan as N compact-GPA regions. The plan's `gpa` is the
     /// (already compact) GPA the PML4 maps `va` to; `hva_map`+`gpa_map` backs it
@@ -351,8 +364,8 @@ impl X86Vmm for NvmmVmm {
     }
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
-        let fault_record_hva = fault_record_hva(&self.regions)?;
         let vcpu = self.mach.create_vcpu(0).map_err(map_err)?;
+        let fault_record_hva = fault_record_hva(&self.regions, u64::from(vcpu.cpuid()))?;
         NvmmX86Vcpu::new(vcpu, fault_record_hva)
     }
 
@@ -449,11 +462,9 @@ impl X86Vmm for NvmmVmm {
                 frozen.len() - frozen_cursor
             )));
         }
-        let fault_record_hva = fault_record_hva(&child_regions)?;
-        let child_vcpu = NvmmX86Vcpu::new(
-            child_mach.create_vcpu(0).map_err(map_err)?,
-            fault_record_hva,
-        )?;
+        let raw_child_vcpu = child_mach.create_vcpu(0).map_err(map_err)?;
+        let fault_record_hva = fault_record_hva(&child_regions, u64::from(raw_child_vcpu.cpuid()))?;
+        let child_vcpu = NvmmX86Vcpu::new(raw_child_vcpu, fault_record_hva)?;
 
         self.mach = child_mach;
         self.regions = child_regions;
@@ -461,27 +472,49 @@ impl X86Vmm for NvmmVmm {
         Ok(())
     }
 
+    fn restore_vcpu(
+        &self,
+        vcpu: &mut Self::Vcpu,
+        layout: BringupLayout,
+        snapshot: &X86VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        carrick_x86::restore(vcpu, layout, snapshot)?;
+        carrick_x86::fault::program_fault_segments(vcpu, layout, u64::from(vcpu.cpuid()))
+    }
+
     fn kick_handle(&self) -> Self::KickHandle {
         NvmmKickHandle::for_current_thread()
     }
 
     fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
-        // M2: sibling vCPUs on the shared NVMM machine (clone(CLONE_THREAD)).
-        Err(TrapError::Hypervisor(
-            "nvmm-x86: sibling vCPUs are M2 (not in M1 hello)".into(),
-        ))
+        Ok(NvmmSiblingBuilder {
+            mach: self.mach.clone(),
+            windows: self.windows.clone(),
+            regions: self.regions.clone(),
+            page_tables: self.page_tables.clone(),
+        })
     }
 
-    fn materialize_sibling(_builder: ()) -> Result<(Self, Self::Vcpu), TrapError> {
-        Err(TrapError::Hypervisor(
-            "nvmm-x86: sibling vCPUs are M2 (not in M1 hello)".into(),
-        ))
+    fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
+        let raw_vcpu = builder.mach.create_sibling_vcpu().map_err(map_err)?;
+        let slot = u64::from(raw_vcpu.cpuid());
+        let fault_record_hva = fault_record_hva(&builder.regions, slot)?;
+        let vcpu = NvmmX86Vcpu::new(raw_vcpu, fault_record_hva)?;
+        let vmm = Self {
+            mach: builder.mach,
+            windows: builder.windows,
+            regions: builder.regions,
+            page_tables: builder.page_tables,
+        };
+        Ok((vmm, vcpu))
     }
 
-    fn set_guest_sp(&self, _vcpu: &Self::Vcpu, _sp: u64) -> Result<(), TrapError> {
-        Err(TrapError::Hypervisor(
-            "nvmm-x86: set_guest_sp is M2 (vfork; not in M1 hello)".into(),
-        ))
+    fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError> {
+        let mut st = vcpu.inner.get_state(NVMM_X64_STATE_GPRS).map_err(map_err)?;
+        st.gprs[NVMM_X64_GPR_RSP] = sp;
+        vcpu.inner
+            .set_state(&st, NVMM_X64_STATE_GPRS)
+            .map_err(map_err)
     }
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
@@ -535,7 +568,7 @@ pub struct NvmmX86Vcpu {
 }
 
 impl NvmmX86Vcpu {
-    fn new(mut inner: NvmmVcpu, fault_record_hva: *mut u8) -> Result<Self, TrapError> {
+    fn new(inner: NvmmVcpu, fault_record_hva: *mut u8) -> Result<Self, TrapError> {
         let mut st = inner.get_state(NVMM_X64_STATE_FPU).map_err(map_err)?;
         st.fpu = Fxsave::default();
         inner.set_state(&st, NVMM_X64_STATE_FPU).map_err(map_err)?;
@@ -547,6 +580,10 @@ impl NvmmX86Vcpu {
 
     fn disarm_destroy(&mut self) {
         self.inner.disarm_destroy();
+    }
+
+    fn cpuid(&self) -> u32 {
+        self.inner.cpuid()
     }
 
     fn read_fault_record(&self) -> Result<carrick_x86::FaultDoorbellRecord, TrapError> {
