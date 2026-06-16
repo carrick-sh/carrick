@@ -73,3 +73,27 @@ fn fork_raw_runs_to_zero() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[test]
+fn execve_runs_second_image() {
+    // The execve(2) acceptance: the caller fixture execve's the deployed
+    // `/root/fixtures/execd` target, which prints `execd ok` and exits 0.
+    // This is the focused tripwire for the NVMM backend's `execve_rebuild`
+    // hook, which the OCI conformance `go-build` smoke reaches through `/bin/sh`.
+    let Some(path) = fixture("CARRICK_NVMM_EXECVE") else {
+        eprintln!("skip: set CARRICK_NVMM_EXECVE to the execve-caller ELF");
+        return;
+    };
+    let result = carrick_runtime::runtime::run_elf_nvmm_dispatch(&path).expect("dispatch run");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "execve target must exit 0 (stderr: {:?})",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("execd ok"),
+        "the execve'd second image must print 'execd ok'; stdout: {:?}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
