@@ -292,6 +292,14 @@ pub trait X86Vmm: Sized {
     /// Create a fresh vCPU bound to this VM.
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError>;
 
+    /// The guest TSC frequency in Hz, if the backend can report it directly
+    /// (KVM `KVM_GET_TSC_KHZ`). `None` (the default) makes the shared vDSO
+    /// calibration fall back to timing the host TSC — see
+    /// [`crate::vdso::populate_vdso_vvar`].
+    fn tsc_hz(&self) -> Option<u64> {
+        None
+    }
+
     /// POLICY: whether `fork(2)` can inherit RAM via COW or must eagerly copy
     /// the whole segment (§2.5b).
     fn fork_ram_strategy(&self) -> ForkRamStrategy;
@@ -397,6 +405,17 @@ pub trait X86Vcpu {
 
     /// Write a GPR / control register.
     fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError>;
+
+    /// Read a guest MSR. Optional: the default reports "unsupported", which the
+    /// shared vDSO calibration ([`crate::vdso::populate_vdso_vvar`]) treats as
+    /// "fall back to the host TSC". A backend overrides this to read the guest
+    /// `IA32_TSC` precisely (KVM `KVM_GET_MSRS`, etc.) when its guest runs with a
+    /// non-zero TSC offset.
+    fn read_msr(&self, index: u32) -> Result<u64, TrapError> {
+        Err(TrapError::Hypervisor(format!(
+            "read_msr({index:#x}) not implemented for this backend"
+        )))
+    }
 
     /// Complete a syscall that must resume through the shared SYSRET
     /// trampoline. Returns the guest user `(RCX, RFLAGS)` values that the engine

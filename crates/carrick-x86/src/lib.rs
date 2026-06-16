@@ -23,6 +23,7 @@ pub mod bringup;
 pub mod bringup_fns;
 pub mod engine;
 pub mod fault;
+pub mod vdso;
 pub mod vmm;
 
 pub use bringup::{fp_stub_bytes, msr_init_blob, run_fp_stub};
