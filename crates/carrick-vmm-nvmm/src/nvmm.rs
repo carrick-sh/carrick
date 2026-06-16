@@ -23,8 +23,13 @@
 //!   `str:bool` @8, `npc:u64` @16. **`npc` is the next-PC** delivered on the IO
 //!   exit (the M1 RIP-advance answer: resume at `npc`, no manual +inst_len).
 
+use std::cell::UnsafeCell;
 use std::io;
 use std::ptr;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 
 use libc::{c_int, c_void};
 
@@ -504,52 +509,100 @@ pub fn capability() -> NvmmResult<NvmmCapability> {
     })
 }
 
-/// An NVMM virtual machine (RAII: `nvmm_machine_destroy` on drop).
+struct NvmmMachineInner {
+    raw: UnsafeCell<NvmmMachineRaw>,
+    destroyed: AtomicBool,
+    next_cpuid: AtomicU32,
+    op_lock: Mutex<()>,
+}
+
+// SAFETY: `raw` is a libnvmm handle for a process-owned VM. Mutating libnvmm
+// metadata calls (`vcpu_create/destroy`, `hva_map`, `gpa_map`, destroy) take
+// `op_lock`; concurrent vCPU getstate/run calls use distinct comm pages.
+unsafe impl Send for NvmmMachineInner {}
+unsafe impl Sync for NvmmMachineInner {}
+
+impl NvmmMachineInner {
+    fn raw_ptr(&self) -> *mut NvmmMachineRaw {
+        self.raw.get()
+    }
+
+    fn destroy_in_place(&self) {
+        if self.destroyed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _guard = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `raw` is the live machine for this handle and destruction is
+        // one-shot via `destroyed`.
+        unsafe {
+            nvmm_machine_destroy(self.raw_ptr());
+        }
+    }
+
+    fn bump_next_cpuid_past(&self, cpuid: u32) {
+        let target = cpuid.saturating_add(1);
+        let mut current = self.next_cpuid.load(Ordering::Relaxed);
+        while current < target {
+            match self.next_cpuid.compare_exchange_weak(
+                current,
+                target,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl Drop for NvmmMachineInner {
+    fn drop(&mut self) {
+        self.destroy_in_place();
+    }
+}
+
+/// An NVMM virtual machine (RAII: `nvmm_machine_destroy` when the last VM/vCPU
+/// handle drops).
+#[derive(Clone)]
 pub struct NvmmMachine {
-    raw: Box<NvmmMachineRaw>,
-    destroyed: bool,
+    inner: Arc<NvmmMachineInner>,
 }
 
 impl NvmmMachine {
     /// Create a fresh machine.
     pub fn create() -> NvmmResult<Self> {
-        let mut raw = Box::new(NvmmMachineRaw::zeroed());
+        let mut raw = NvmmMachineRaw::zeroed();
         // SAFETY: `raw` is a valid, owned, sized machine struct; libnvmm
         // initializes its fields.
         check("nvmm_machine_create", unsafe {
-            nvmm_machine_create(raw.as_mut())
+            nvmm_machine_create(&mut raw)
         })?;
         Ok(NvmmMachine {
-            raw,
-            destroyed: false,
+            inner: Arc::new(NvmmMachineInner {
+                raw: UnsafeCell::new(raw),
+                destroyed: AtomicBool::new(false),
+                next_cpuid: AtomicU32::new(0),
+                op_lock: Mutex::new(()),
+            }),
         })
     }
 
     pub fn machid(&self) -> u32 {
-        self.raw.machid
-    }
-
-    fn raw_mut(&mut self) -> *mut NvmmMachineRaw {
-        self.raw.as_mut()
+        // SAFETY: `machid` is immutable after `nvmm_machine_create`.
+        unsafe { (*self.inner.raw_ptr()).machid }
     }
 
     /// Prevent Drop from destroying this machine. Used in a `fork(2)` child for
     /// inherited parent handles: the child owns duplicated userspace structs, but
     /// `nvmm_machine_destroy` addresses the parent-visible kernel machine.
     pub(crate) fn disarm_destroy(&mut self) {
-        self.destroyed = true;
+        self.inner.destroyed.store(true, Ordering::Release);
     }
 
     /// Destroy the machine now and make later Drop a no-op.
     pub(crate) fn destroy_in_place(&mut self) {
-        if self.destroyed {
-            return;
-        }
-        // SAFETY: `raw` is a live machine owned by this struct.
-        unsafe {
-            nvmm_machine_destroy(self.raw.as_mut());
-        }
-        self.destroyed = true;
+        self.inner.destroy_in_place();
     }
 
     /// `mmap` a private anonymous region, register it as a shareable HVA via
@@ -574,7 +627,8 @@ impl NvmmMachine {
     ) -> NvmmResult<*mut u8> {
         let hva = map_host_ram(size, backing)?;
         let hva_addr = hva as usize;
-        let m = self.raw_mut();
+        let _guard = self.inner.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.inner.raw_ptr();
         // SAFETY: `hva_addr`/`size` describe the region just mmaped; `m` is a
         // live machine. nvmm_hva_map makes the area shareable (rw, not exec).
         if let Err(e) = check("nvmm_hva_map", unsafe { nvmm_hva_map(m, hva_addr, size) }) {
@@ -610,7 +664,8 @@ impl NvmmMachine {
         prot: c_int,
     ) -> NvmmResult<()> {
         let hva_addr = hva as usize;
-        let m = self.raw_mut();
+        let _guard = self.inner.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.inner.raw_ptr();
         // SAFETY: `hva_addr`/`size` describe a live inherited host mapping; `m`
         // is a live fresh machine.
         if let Err(e) = check("nvmm_hva_map", unsafe { nvmm_hva_map(m, hva_addr, size) }) {
@@ -630,26 +685,28 @@ impl NvmmMachine {
     }
 
     /// Create vCPU 0 (or `cpuid`) in this machine.
-    pub fn create_vcpu(&mut self, cpuid: u32) -> NvmmResult<NvmmVcpu> {
+    pub fn create_vcpu(&self, cpuid: u32) -> NvmmResult<NvmmVcpu> {
         let mut raw = Box::new(NvmmVcpuRaw::zeroed());
-        let m = self.raw_mut();
+        let _guard = self.inner.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.inner.raw_ptr();
         // SAFETY: `m` is a live machine; `raw` is a valid, owned vCPU struct
         // that libnvmm initializes (incl mapping the comm page + filling the
         // state/exit pointers).
         check("nvmm_vcpu_create", unsafe {
             nvmm_vcpu_create(m, cpuid, raw.as_mut())
         })?;
+        self.inner.bump_next_cpuid_past(cpuid);
         Ok(NvmmVcpu {
-            mach: m,
+            mach: Arc::clone(&self.inner),
             raw,
             destroyed: false,
         })
     }
-}
 
-impl Drop for NvmmMachine {
-    fn drop(&mut self) {
-        self.destroy_in_place();
+    /// Create a fresh sibling vCPU on this same machine with a unique cpuid.
+    pub fn create_sibling_vcpu(&self) -> NvmmResult<NvmmVcpu> {
+        let cpuid = self.inner.next_cpuid.fetch_add(1, Ordering::SeqCst);
+        self.create_vcpu(cpuid)
     }
 }
 
@@ -764,7 +821,7 @@ mod tests {
 /// /run/destroy can be issued. The `NvmmMachine` must outlive the `NvmmVcpu`
 /// (enforced by usage: the vCPU is created from and used alongside the machine).
 pub struct NvmmVcpu {
-    mach: *mut NvmmMachineRaw,
+    mach: Arc<NvmmMachineInner>,
     raw: Box<NvmmVcpuRaw>,
     destroyed: bool,
 }
@@ -792,7 +849,7 @@ impl NvmmVcpu {
         let raw = self.raw.as_ref() as *const NvmmVcpuRaw as *mut NvmmVcpuRaw;
         // SAFETY: `mach`/`raw` are live; getstate fills the comm-page state.
         check("nvmm_vcpu_getstate", unsafe {
-            nvmm_vcpu_getstate(self.mach, raw, flags)
+            nvmm_vcpu_getstate(self.mach.raw_ptr(), raw, flags)
         })?;
         let state_ptr = self.raw.state;
         debug_assert!(!state_ptr.is_null(), "comm-page state pointer is NULL");
@@ -803,16 +860,17 @@ impl NvmmVcpu {
 
     /// Write `state` into the comm page and push the requested sub-areas into
     /// the kernel via `nvmm_vcpu_setstate`.
-    pub fn set_state(&mut self, state: &NvmmX64State, flags: u64) -> NvmmResult<()> {
+    pub fn set_state(&self, state: &NvmmX64State, flags: u64) -> NvmmResult<()> {
         let state_ptr = self.raw.state;
         debug_assert!(!state_ptr.is_null(), "comm-page state pointer is NULL");
         // SAFETY: copy the caller's state into the comm page, then push.
         unsafe {
             *state_ptr = *state;
         }
+        let raw = self.raw.as_ref() as *const NvmmVcpuRaw as *mut NvmmVcpuRaw;
         // SAFETY: `mach`/`raw` are live; setstate reads the comm-page state.
         check("nvmm_vcpu_setstate", unsafe {
-            nvmm_vcpu_setstate(self.mach, self.raw.as_mut(), flags)
+            nvmm_vcpu_setstate(self.mach.raw_ptr(), raw, flags)
         })
     }
 
@@ -822,7 +880,7 @@ impl NvmmVcpu {
     pub fn run_until_exit(&mut self) -> NvmmResult<NvmmX86Exit> {
         // SAFETY: `mach`/`raw` are live; run fills the comm-page exit struct.
         check("nvmm_vcpu_run", unsafe {
-            nvmm_vcpu_run(self.mach, self.raw.as_mut())
+            nvmm_vcpu_run(self.mach.raw_ptr(), self.raw.as_mut())
         })?;
         let exit_ptr = self.raw.exit;
         debug_assert!(!exit_ptr.is_null(), "comm-page exit pointer is NULL");
@@ -838,10 +896,14 @@ impl NvmmVcpu {
 impl Drop for NvmmVcpu {
     fn drop(&mut self) {
         if !self.destroyed {
-            // SAFETY: `mach`/`raw` are live and not yet destroyed.
-            unsafe {
-                nvmm_vcpu_destroy(self.mach, self.raw.as_mut());
+            let _guard = self.mach.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.mach.destroyed.load(Ordering::Acquire) {
+                // SAFETY: `mach`/`raw` are live and not yet destroyed.
+                unsafe {
+                    nvmm_vcpu_destroy(self.mach.raw_ptr(), self.raw.as_mut());
+                }
             }
+            self.destroyed = true;
         }
     }
 }
