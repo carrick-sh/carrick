@@ -675,6 +675,33 @@ impl X86Vcpu for KvmVcpu {
         }
     }
 
+    fn complete_sysret(
+        &mut self,
+        layout: BringupLayout,
+        return_value: i64,
+        resume_pc: u64,
+    ) -> Result<(u64, u64), TrapError> {
+        // Preserve the old architectural order up to the RCX/R11 read point:
+        // complete_syscall first wrote RAX, then read RCX and R11, then prepared
+        // hidden SYSRET segment state, then wrote RIP. KVM's whole `kvm_regs`
+        // API lets the RCX/R11 reads and final RIP write share one snapshot.
+        self.set_gpr(X86Reg::Rax, return_value as u64)?;
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
+        let mut regs = self
+            .fd()
+            .get_regs()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_REGS(sysret): {e}")))?;
+        let user_pc = regs.rcx;
+        let user_rflags = regs.r11 | 0x2;
+        self.prepare_sysret_resume(layout)?;
+        regs.rip = resume_pc;
+        crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetRegs);
+        self.fd()
+            .set_regs(&regs)
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(sysret.rip): {e}")))?;
+        Ok((user_pc, user_rflags))
+    }
+
     fn set_segment(
         &mut self,
         seg: X86Seg,

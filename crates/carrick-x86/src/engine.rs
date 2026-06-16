@@ -441,16 +441,20 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         // the engine owns the user PC/RFLAGS to expose if a kick lands before
         // SYSRET gets back to ring 3.
         self.sysret_resume = None;
-        self.vcpu.set_gpr(X86Reg::Rax, return_value as u64)?;
         if let Some(pc) = self.pending_resume_pc.take() {
             if self.is_syscall_trampoline_pc(pc) {
+                let (user_pc, user_rflags) =
+                    self.vcpu.complete_sysret(self.layout, return_value, pc)?;
                 self.sysret_resume = Some(SysretResume {
-                    user_pc: self.vcpu.get_gpr(X86Reg::Rcx)?,
-                    user_rflags: self.vcpu.get_gpr(X86Reg::R11)? | 0x2,
+                    user_pc,
+                    user_rflags,
                 });
-                self.vcpu.prepare_sysret_resume(self.layout)?;
+            } else {
+                self.vcpu.set_gpr(X86Reg::Rax, return_value as u64)?;
+                self.vcpu.set_gpr(X86Reg::Rip, pc)?;
             }
-            self.vcpu.set_gpr(X86Reg::Rip, pc)?;
+        } else {
+            self.vcpu.set_gpr(X86Reg::Rax, return_value as u64)?;
         }
         Ok(())
     }

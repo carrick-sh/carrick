@@ -379,6 +379,27 @@ pub trait X86Vcpu {
     /// Write a GPR / control register.
     fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError>;
 
+    /// Complete a syscall that must resume through the shared SYSRET
+    /// trampoline. Returns the guest user `(RCX, RFLAGS)` values that the engine
+    /// should expose while the live RIP is parked in the trampoline.
+    ///
+    /// The default preserves the original per-register sequence. Backends with
+    /// whole-register-file APIs may override this to batch reads/writes without
+    /// moving the RCX/R11 read point.
+    fn complete_sysret(
+        &mut self,
+        layout: BringupLayout,
+        return_value: i64,
+        resume_pc: u64,
+    ) -> Result<(u64, u64), TrapError> {
+        self.set_gpr(X86Reg::Rax, return_value as u64)?;
+        let user_pc = self.get_gpr(X86Reg::Rcx)?;
+        let user_rflags = self.get_gpr(X86Reg::R11)? | 0x2;
+        self.prepare_sysret_resume(layout)?;
+        self.set_gpr(X86Reg::Rip, resume_pc)?;
+        Ok((user_pc, user_rflags))
+    }
+
     /// Prepare backend-hidden segment state for resuming inside the shared
     /// syscall trampoline. Backends whose SYSCALL exit already preserves kernel
     /// CS/SS can keep the default; KVM must reprogram the hidden descriptors
