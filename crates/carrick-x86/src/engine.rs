@@ -283,10 +283,10 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         let length = bytes.len();
         let host = self
             .vm
-            .host_ptr(address, length)
+            .host_ptr_mut(address, length)
             .ok_or(MemoryError::OutOfBounds { address, length })?;
-        // SAFETY: `host_ptr` proved [host, host+length) is within a live window;
-        // the source slice is disjoint.
+        // SAFETY: `host_ptr_mut` proved [host, host+length) is within a live
+        // window; the source slice is disjoint.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, length) };
         Ok(())
     }

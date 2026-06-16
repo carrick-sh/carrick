@@ -19,7 +19,7 @@
 //! The IO doorbell exit returns `io.npc` (the next-PC; the kernel does NOT
 //! advance RIP — proven in M0), so `run()` fills `resume_pc = exit.io.npc`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
@@ -84,21 +84,44 @@ struct Region {
     backing: NvmmRamBacking,
 }
 
+// SAFETY: `Region` describes a guest-RAM mapping whose HVA is valid for every
+// host thread in this process. Access to the descriptor table is synchronized
+// separately; the pointed-to guest RAM is the shared VM backing by design.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
+type SharedRegions = Arc<RwLock<Vec<Region>>>;
+type SharedPageTables = Arc<Mutex<Option<carrick_mem::pml4::Pml4Manager>>>;
+
+fn read_regions(table: &SharedRegions) -> std::sync::RwLockReadGuard<'_, Vec<Region>> {
+    table.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_regions(table: &SharedRegions) -> std::sync::RwLockWriteGuard<'_, Vec<Region>> {
+    table.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_page_tables(
+    table: &SharedPageTables,
+) -> std::sync::MutexGuard<'_, Option<carrick_mem::pml4::Pml4Manager>> {
+    table.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The NVMM `X86Vmm`: an `NvmmMachine` plus the VA-keyed host-HVA region table
 /// the engine reads/writes guest memory through (NVMM is the N-mapping model —
 /// `hva_map` + `gpa_map` per region — not bhyve's single segment).
 pub struct NvmmVmm {
     mach: NvmmMachine,
     windows: Vec<WindowRegion>,
-    regions: Vec<Region>,
-    page_tables: Option<carrick_mem::pml4::Pml4Manager>,
+    regions: SharedRegions,
+    page_tables: SharedPageTables,
 }
 
 pub struct NvmmSiblingBuilder {
     mach: NvmmMachine,
     windows: Vec<WindowRegion>,
-    regions: Vec<Region>,
-    page_tables: Option<carrick_mem::pml4::Pml4Manager>,
+    regions: SharedRegions,
+    page_tables: SharedPageTables,
 }
 
 // SAFETY: the builder carries a shared NVMM machine handle plus raw HVAs that
@@ -109,11 +132,22 @@ unsafe impl Send for NvmmSiblingBuilder {}
 impl NvmmVmm {
     /// Find the host pointer for guest-VA `[va, va+len)` within a region.
     fn resolve(&self, va: u64, len: usize) -> Option<*mut u8> {
-        resolve_region(&self.regions, va, len)
+        let regions = read_regions(&self.regions);
+        if let Some(gpa) = self.translate_va(va)
+            && let Some(host) = resolve_region_gpa(&regions, gpa, len)
+        {
+            return Some(host);
+        }
+        resolve_region_va(&regions, va, len)
+    }
+
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        lock_page_tables(&self.page_tables).as_ref()?.translate(va)
     }
 
     fn map_window_chunk(&mut self, chunk: WindowRegion) -> Result<(), TrapError> {
-        if chunk.len == 0 || self.resolve(chunk.va, 1).is_some() {
+        let mut regions = write_regions(&self.regions);
+        if chunk.len == 0 || resolve_region_gpa(&regions, chunk.gpa, 1).is_some() {
             return Ok(());
         }
         let len = usize::try_from(chunk.len)
@@ -137,7 +171,7 @@ impl NvmmVmm {
             .mach
             .map_guest_ram_with_backing(chunk.gpa, len, prot, backing)
             .map_err(map_err)?;
-        self.regions.push(Region {
+        regions.push(Region {
             va: chunk.va,
             gpa: chunk.gpa,
             hva,
@@ -164,10 +198,24 @@ impl NvmmVmm {
 }
 
 fn resolve_region(regions: &[Region], va: u64, len: usize) -> Option<*mut u8> {
+    resolve_region_va(regions, va, len)
+}
+
+fn resolve_region_va(regions: &[Region], va: u64, len: usize) -> Option<*mut u8> {
     for r in regions {
         if va >= r.va && va + len as u64 <= r.va + r.len as u64 {
             // SAFETY: bounds proven above; offset stays within the region.
             return Some(unsafe { r.hva.add((va - r.va) as usize) });
+        }
+    }
+    None
+}
+
+fn resolve_region_gpa(regions: &[Region], gpa: u64, len: usize) -> Option<*mut u8> {
+    for r in regions {
+        if gpa >= r.gpa && gpa + len as u64 <= r.gpa + r.len as u64 {
+            // SAFETY: bounds proven above; offset stays within the region.
+            return Some(unsafe { r.hva.add((gpa - r.gpa) as usize) });
         }
     }
     None
@@ -194,6 +242,23 @@ fn sparse_chunk_for_gpa(windows: &[WindowRegion], gpa: u64) -> Option<WindowRegi
         .copied()
         .find(|r| gpa >= r.gpa && gpa < r.gpa.saturating_add(r.len))?;
     let offset = gpa.checked_sub(window.gpa)?;
+    let chunk_offset = (offset / SPARSE_WINDOW_CHUNK_LEN) * SPARSE_WINDOW_CHUNK_LEN;
+    let remaining = window.len.checked_sub(chunk_offset)?;
+    let len = remaining.min(SPARSE_WINDOW_CHUNK_LEN);
+    Some(WindowRegion {
+        va: window.va + chunk_offset,
+        gpa: window.gpa + chunk_offset,
+        len,
+        ..window
+    })
+}
+
+fn sparse_chunk_for_va(windows: &[WindowRegion], va: u64) -> Option<WindowRegion> {
+    let window = windows
+        .iter()
+        .copied()
+        .find(|r| va >= r.va && va < r.va.saturating_add(r.len))?;
+    let offset = va.checked_sub(window.va)?;
     let chunk_offset = (offset / SPARSE_WINDOW_CHUNK_LEN) * SPARSE_WINDOW_CHUNK_LEN;
     let remaining = window.len.checked_sub(chunk_offset)?;
     let len = remaining.min(SPARSE_WINDOW_CHUNK_LEN);
@@ -246,6 +311,25 @@ impl X86Vmm for NvmmVmm {
 
     fn host_ptr(&self, va: u64, len: usize) -> Option<*mut u8> {
         self.resolve(va, len)
+    }
+
+    fn host_ptr_mut(&mut self, va: u64, len: usize) -> Option<*mut u8> {
+        if let Some(host) = self.resolve(va, len) {
+            return Some(host);
+        }
+        let len = u64::try_from(len).ok()?;
+        let end = va.checked_add(len)?;
+        let mut cursor = va;
+        while cursor < end {
+            let chunk = sparse_chunk_for_va(&self.windows, cursor)?;
+            let chunk_end = chunk.va.checked_add(chunk.len)?;
+            if chunk_end <= cursor {
+                return None;
+            }
+            self.map_window_chunk(chunk).ok()?;
+            cursor = chunk_end.min(end);
+        }
+        self.resolve(va, usize::try_from(len).ok()?)
     }
 
     fn handle_memory_exit(&mut self, gpa: u64) -> Result<bool, TrapError> {
@@ -343,7 +427,7 @@ impl X86Vmm for NvmmVmm {
             }
             return Err(e);
         }
-        self.regions.push(Region {
+        write_regions(&self.regions).push(Region {
             va,
             gpa: ipa,
             hva,
@@ -351,8 +435,8 @@ impl X86Vmm for NvmmVmm {
             prot,
             backing,
         });
-        let page_tables = self
-            .page_tables
+        let mut page_tables_guard = lock_page_tables(&self.page_tables);
+        let page_tables = page_tables_guard
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: page tables not initialized".into()))?;
         page_tables
@@ -365,7 +449,8 @@ impl X86Vmm for NvmmVmm {
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         let vcpu = self.mach.create_vcpu(0).map_err(map_err)?;
-        let fault_record_hva = fault_record_hva(&self.regions, u64::from(vcpu.cpuid()))?;
+        let regions = read_regions(&self.regions);
+        let fault_record_hva = fault_record_hva(&regions, u64::from(vcpu.cpuid()))?;
         NvmmX86Vcpu::new(vcpu, fault_record_hva)
     }
 
@@ -378,14 +463,14 @@ impl X86Vmm for NvmmVmm {
     }
 
     fn freeze_ram(&self) -> Result<Vec<u8>, TrapError> {
-        let total = self
-            .regions
+        let regions = read_regions(&self.regions);
+        let total = regions
             .iter()
             .filter(|r| r.backing == NvmmRamBacking::Private)
             .map(|r| r.len)
             .sum();
         let mut frozen = Vec::with_capacity(total);
-        for region in &self.regions {
+        for region in regions.iter() {
             if region.backing != NvmmRamBacking::Private {
                 continue;
             }
@@ -412,9 +497,10 @@ impl X86Vmm for NvmmVmm {
         vcpu.disarm_destroy();
 
         let mut child_mach = NvmmMachine::create().map_err(map_err)?;
-        let mut child_regions = Vec::with_capacity(self.regions.len());
+        let parent_regions = read_regions(&self.regions);
+        let mut child_regions = Vec::with_capacity(parent_regions.len());
         let mut frozen_cursor = 0usize;
-        for region in &self.regions {
+        for region in parent_regions.iter() {
             let child_hva = match region.backing {
                 NvmmRamBacking::Private => {
                     let end = frozen_cursor.checked_add(region.len).ok_or_else(|| {
@@ -456,6 +542,7 @@ impl X86Vmm for NvmmVmm {
                 backing: region.backing,
             });
         }
+        drop(parent_regions);
         if frozen_cursor != frozen.len() {
             return Err(TrapError::Hypervisor(format!(
                 "nvmm-x86: unused frozen RAM bytes: {}",
@@ -467,7 +554,9 @@ impl X86Vmm for NvmmVmm {
         let child_vcpu = NvmmX86Vcpu::new(raw_child_vcpu, fault_record_hva)?;
 
         self.mach = child_mach;
-        self.regions = child_regions;
+        self.regions = Arc::new(RwLock::new(child_regions));
+        let page_tables = lock_page_tables(&self.page_tables).clone();
+        self.page_tables = Arc::new(Mutex::new(page_tables));
         *vcpu = child_vcpu;
         Ok(())
     }
@@ -490,15 +579,17 @@ impl X86Vmm for NvmmVmm {
         Ok(NvmmSiblingBuilder {
             mach: self.mach.clone(),
             windows: self.windows.clone(),
-            regions: self.regions.clone(),
-            page_tables: self.page_tables.clone(),
+            regions: Arc::clone(&self.regions),
+            page_tables: Arc::clone(&self.page_tables),
         })
     }
 
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
         let raw_vcpu = builder.mach.create_sibling_vcpu().map_err(map_err)?;
         let slot = u64::from(raw_vcpu.cpuid());
-        let fault_record_hva = fault_record_hva(&builder.regions, slot)?;
+        let regions = read_regions(&builder.regions);
+        let fault_record_hva = fault_record_hva(&regions, slot)?;
+        drop(regions);
         let vcpu = NvmmX86Vcpu::new(raw_vcpu, fault_record_hva)?;
         let vmm = Self {
             mach: builder.mach,
@@ -934,8 +1025,8 @@ fn bring_up_parts(image: &AddressSpace) -> Result<(NvmmVmm, NvmmX86Vcpu), TrapEr
     let mut vmm = NvmmVmm {
         mach,
         windows: Vec::new(),
-        regions: Vec::new(),
-        page_tables: None,
+        regions: Arc::new(RwLock::new(Vec::new())),
+        page_tables: Arc::new(Mutex::new(None)),
     };
 
     // 1. Shared region walk (identity), then remap to compact GPAs + map them.
@@ -961,7 +1052,7 @@ fn bring_up_parts(image: &AddressSpace) -> Result<(NvmmVmm, NvmmX86Vcpu), TrapEr
     let pml4_bytes = carrick_x86::build_pml4(&plan, NVMM_X86_LAYOUT)?;
     let page_tables = carrick_mem::pml4::Pml4Manager::new(pml4_bytes, NVMM_X86_LAYOUT.pml4_base);
     carrick_x86::write_bringup_images(&vmm, NVMM_X86_LAYOUT, page_tables.bytes())?;
-    vmm.page_tables = Some(page_tables);
+    *lock_page_tables(&vmm.page_tables) = Some(page_tables);
     carrick_x86::write_memory_record_fault_tables(&vmm, NVMM_X86_LAYOUT)?;
 
     // 4. Create the vCPU and program long mode (CR/EFER/segs/GDTR/MSRs).
@@ -1134,6 +1225,29 @@ mod tests {
 
         assert_eq!(chunk.gpa, COMPACT_GPA_BASE + 0x4400_0000);
         assert_eq!(chunk.va, LINUX_MMAP_BASE + 0x4400_0000);
+        assert_eq!(chunk.len, SPARSE_WINDOW_CHUNK_LEN);
+    }
+
+    #[test]
+    fn sparse_chunk_for_va_selects_matching_compact_chunk() {
+        let plan = WindowPlan {
+            regions: vec![WindowRegion {
+                va: LINUX_MMAP_BASE,
+                gpa: COMPACT_GPA_BASE,
+                len: mmap_arena_size(),
+                read: true,
+                write: true,
+                exec: false,
+                user: true,
+                shared: false,
+            }],
+        };
+        let fault_offset = 0x4496_0000;
+        let chunk = sparse_chunk_for_va(&plan.regions, LINUX_MMAP_BASE + fault_offset)
+            .expect("fault VA should resolve to sparse mmap chunk");
+
+        assert_eq!(chunk.va, LINUX_MMAP_BASE + 0x4400_0000);
+        assert_eq!(chunk.gpa, COMPACT_GPA_BASE + 0x4400_0000);
         assert_eq!(chunk.len, SPARSE_WINDOW_CHUNK_LEN);
     }
 }
