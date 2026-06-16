@@ -58,5 +58,6 @@ pub mod host_facts;
 pub mod host_mapping;
 pub mod host_proc;
 pub mod internal_fd;
+pub mod netbsd_futex;
 pub mod ulock;
 pub mod umtx;
