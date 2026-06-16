@@ -37,8 +37,8 @@ use crate::nvmm::{
     NVMM_X64_MSR_LSTAR, NVMM_X64_MSR_SFMASK, NVMM_X64_MSR_STAR, NVMM_X64_SEG_CS, NVMM_X64_SEG_DS,
     NVMM_X64_SEG_ES, NVMM_X64_SEG_FS, NVMM_X64_SEG_GDT, NVMM_X64_SEG_GS, NVMM_X64_SEG_IDT,
     NVMM_X64_SEG_LDT, NVMM_X64_SEG_SS, NVMM_X64_SEG_TR, NVMM_X64_STATE_CRS, NVMM_X64_STATE_FPU,
-    NVMM_X64_STATE_GPRS, NVMM_X64_STATE_MSRS, NVMM_X64_STATE_SEGS, NvmmMachine, NvmmVcpu,
-    NvmmX64StateSeg,
+    NVMM_X64_STATE_GPRS, NVMM_X64_STATE_MSRS, NVMM_X64_STATE_SEGS, NvmmMachine, NvmmRamBacking,
+    NvmmVcpu, NvmmX64StateSeg,
 };
 use crate::nvmm_kicker::{NvmmKickHandle, NvmmKicker};
 
@@ -122,8 +122,16 @@ impl X86Vmm for NvmmVmm {
             if r.exec {
                 prot |= NVMM_PROT_EXEC;
             }
-            // hva_map + gpa_map a fresh anonymous host region at the compact GPA.
-            let hva = self.mach.map_guest_ram(r.gpa, len, prot).map_err(map_err)?;
+            // hva_map + gpa_map a fresh host region at the compact GPA.
+            let backing = if r.shared {
+                NvmmRamBacking::Shared
+            } else {
+                NvmmRamBacking::Private
+            };
+            let hva = self
+                .mach
+                .map_guest_ram_with_backing(r.gpa, len, prot, backing)
+                .map_err(map_err)?;
             self.regions.push(Region { va: r.va, hva, len });
         }
         Ok(())
