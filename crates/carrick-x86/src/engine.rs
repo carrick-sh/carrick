@@ -492,6 +492,15 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                     // here is a spurious re-entry — re-run the guest.
                     continue;
                 }
+                X86Exit::Memory { gpa } => {
+                    self.sysret_resume = None;
+                    if self.vm.handle_memory_exit(gpa)? {
+                        continue;
+                    }
+                    return Err(TrapError::Hypervisor(format!(
+                        "x86 backend did not handle memory exit for gpa=0x{gpa:x}"
+                    )));
+                }
                 X86Exit::Fault {
                     kind,
                     fault_addr,
