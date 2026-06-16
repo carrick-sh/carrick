@@ -1244,6 +1244,7 @@ impl HvVcpu for KvmVcpu {
         #[cfg(target_arch = "x86_64")]
         if sync_regs_supported() {
             self.fd_mut().set_sync_valid_reg(SyncReg::Register);
+            self.fd_mut().set_sync_valid_reg(SyncReg::SystemRegister);
         }
         let exit = match self.fd_mut().run() {
             Ok(e) => e,
