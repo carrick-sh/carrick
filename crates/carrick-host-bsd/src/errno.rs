@@ -51,9 +51,17 @@ pub mod linux_errno {
 /// - macOS/FreeBSD: <sys/errno.h>
 /// - Linux: asm-generic/errno-base.h + asm-generic/errno.h
 pub fn bsd_to_linux_errno(host: i32) -> i32 {
-    use linux_errno::*;
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     {
+        use linux_errno::*;
+
         match host {
             x if x == libc::EAGAIN => EAGAIN,
             x if x == libc::EINPROGRESS => EINPROGRESS,
@@ -115,14 +123,28 @@ pub fn bsd_to_linux_errno(host: i32) -> i32 {
             _ => EIO,
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
     {
         host
     }
 }
 
 #[cfg(test)]
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 mod tests {
     use super::{bsd_to_linux_errno, linux_errno};
 

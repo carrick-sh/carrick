@@ -1,10 +1,10 @@
-//! macOS/FreeBSD EventMultiplexer implementation based on kqueue.
+//! BSD-family EventMultiplexer implementation based on kqueue.
 
 #[cfg(target_os = "macos")]
 use crate::kqueue::NOTE_EXITSTATUS;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly"))]
 use crate::kqueue::{EVFILT_EXCEPT, NOTE_OOB};
-use crate::kqueue::{Kevent, Kqueue};
+use crate::kqueue::{Kevent, KeventFlags, Kqueue};
 use carrick_hal::error::OsError;
 use carrick_hal::event::{
     EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents,
@@ -48,7 +48,7 @@ impl EventMultiplexer for KqueueMultiplexer {
         interest: Interest,
         mode: TriggerMode,
     ) -> Result<(), OsError> {
-        let edge: u16 = match mode {
+        let edge: KeventFlags = match mode {
             TriggerMode::Edge => libc::EV_CLEAR,
             TriggerMode::Level => 0,
         };
@@ -156,38 +156,39 @@ impl EventMultiplexer for KqueueMultiplexer {
 
             let mut readiness = Readiness::empty();
             let mut is_eof = false;
-            #[cfg_attr(target_os = "freebsd", allow(unused_mut))]
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut exit_status = None;
             let mut vnode = None;
 
             match filter {
-                libc::EVFILT_READ => {
+                f if f == libc::EVFILT_READ => {
                     readiness.read = true;
                     if eof {
                         is_eof = true;
                     }
                 }
-                libc::EVFILT_WRITE => {
+                f if f == libc::EVFILT_WRITE => {
                     readiness.write = true;
                     if eof {
                         is_eof = true;
                     }
                 }
-                // EVFILT_EXCEPT/NOTE_OOB is Darwin-only; FreeBSD has no OOB
-                // socket filter and NOTE_OOB is defined as 0 there (no-op).
-                #[cfg(target_os = "macos")]
+                // EVFILT_EXCEPT/NOTE_OOB exists on Darwin/OpenBSD/DragonFly;
+                // FreeBSD/NetBSD use an impossible sentinel and reject OOB
+                // registration as unsupported.
+                #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly"))]
                 f if f == EVFILT_EXCEPT => {
                     if fflags & NOTE_OOB != 0 {
                         readiness.oob = true;
                     }
                 }
-                libc::EVFILT_VNODE => {
+                f if f == libc::EVFILT_VNODE => {
                     readiness.read = true;
                     // Carry the precise filesystem events so the inotify
                     // emulation can derive the exact Linux `inotify_event` mask.
                     vnode = Some(VnodeEvents::from_note(fflags));
                 }
-                libc::EVFILT_PROC => {
+                f if f == libc::EVFILT_PROC => {
                     readiness.read = true;
                     if fflags & libc::NOTE_EXIT != 0 {
                         is_eof = true;
@@ -214,8 +215,8 @@ impl EventMultiplexer for KqueueMultiplexer {
                 // read-readiness would make an epoll consumer report a spurious
                 // EPOLLIN on the wake's `token`. (Matches the epoll path's old
                 // `kevent_to_epoll`, which returned 0 for EVFILT_USER.)
-                libc::EVFILT_USER => {}
-                libc::EVFILT_TIMER => {
+                f if f == libc::EVFILT_USER => {}
+                f if f == libc::EVFILT_TIMER => {
                     readiness.read = true;
                 }
                 _ => {}
