@@ -123,15 +123,39 @@ pub fn populate_vdso_vvar<V: X86Vmm>(vm: &V, vcpu: &V::Vcpu) -> Result<(), TrapE
     let monotonic_ns = host_clock_ns(MONOTONIC_REF).unwrap_or(0);
     let (realtime_off, monotonic_off) = vvar_offsets(freq, guest_tsc, realtime_ns, monotonic_ns);
 
-    vm.write_gpa(LINUX_VVAR_BASE + VVAR_OFF_FREQ as u64, &freq.to_le_bytes())?;
-    vm.write_gpa(
+    // Write through the VA-consistent `host_ptr` the guest itself uses, NOT
+    // `write_gpa`: the engine's memory model is keyed on the guest VA, and
+    // backends resolve it differently (KVM identity GPA==VA; bhyve a VA→GPA
+    // window table). `write_gpa` takes a literal GPA, so writing the vvar's high
+    // VA (LINUX_VVAR_BASE) through it lands on an unbacked GPA on a folded-segment
+    // backend. `host_ptr(va)` resolves the VA on every backend.
+    write_vvar_field(
+        vm,
+        LINUX_VVAR_BASE + VVAR_OFF_FREQ as u64,
+        &freq.to_le_bytes(),
+    )?;
+    write_vvar_field(
+        vm,
         LINUX_VVAR_BASE + VVAR_OFF_REALTIME_OFF_NS as u64,
         &realtime_off.to_le_bytes(),
     )?;
-    vm.write_gpa(
+    write_vvar_field(
+        vm,
         LINUX_VVAR_BASE + VVAR_OFF_MONOTONIC_OFF_NS as u64,
         &monotonic_off.to_le_bytes(),
     )?;
+    Ok(())
+}
+
+/// Write a vvar field through the backend's VA-keyed `host_ptr` (the same path
+/// the guest's vDSO reads it back through), so calibration lands correctly on
+/// both identity (KVM) and VA→GPA-window (bhyve) memory models.
+fn write_vvar_field<V: X86Vmm>(vm: &V, va: u64, bytes: &[u8]) -> Result<(), TrapError> {
+    let dst = vm
+        .host_ptr(va, bytes.len())
+        .ok_or_else(|| TrapError::Hypervisor(format!("vdso vvar host_ptr 0x{va:x} unmapped")))?;
+    // SAFETY: `host_ptr` proved `[dst, dst + bytes.len())` is a live guest window.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
     Ok(())
 }
 
