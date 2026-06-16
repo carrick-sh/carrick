@@ -309,11 +309,12 @@ pub fn sem_nsems(ds: &SemidDs) -> usize {
 // for the xattrs carrick uses) that Linux lacks; the `flags`/`options` arg also
 // shifts position. These wrappers expose the common (Linux-shaped) signature.
 
-/// On FreeBSD, parse a Linux-style xattr name (`"user.foo"`, `"system.foo"`, …)
+/// On BSD extattr hosts, parse a Linux-style xattr name (`"user.foo"`,
+/// `"system.foo"`, …)
 /// into a `(namespace, attr_name)` pair for the `extattr_*_fd` API.
 /// Unmapped prefixes fall back to `EXTATTR_NAMESPACE_USER`.
-#[cfg(target_os = "freebsd")]
-fn freebsd_xattr_ns(name: &std::ffi::CStr) -> (libc::c_int, std::ffi::CString) {
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+fn bsd_extattr_ns(name: &std::ffi::CStr) -> (libc::c_int, std::ffi::CString) {
     let bytes = name.to_bytes();
     for (prefix, ns) in [
         (&b"user."[..], libc::EXTATTR_NAMESPACE_USER as libc::c_int),
@@ -360,15 +361,20 @@ pub unsafe fn fsetxattr(
     {
         unsafe { libc::fsetxattr(fd, name, value, size, flags) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
-        // extattr_set_fd has no flags parameter; xattr flags are ignored on FreeBSD.
+        // extattr_set_fd has no flags parameter; xattr flags are ignored here.
         let _ = flags;
-        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
         let rc = unsafe { libc::extattr_set_fd(fd, ns, attr.as_ptr(), value, size) };
         if rc >= 0 { 0 } else { -1 }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (fd, name, value, size, flags);
         -libc::ENOSYS
@@ -394,12 +400,17 @@ pub unsafe fn fgetxattr(
     {
         unsafe { libc::fgetxattr(fd, name, value, size) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
-        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
         unsafe { libc::extattr_get_fd(fd, ns, attr.as_ptr(), value, size) }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (fd, name, value, size);
         -libc::ENOSYS as isize
@@ -420,11 +431,12 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
     {
         unsafe { libc::flistxattr(fd, list, size) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
-        // FreeBSD extattr_list_fd returns per-namespace `[u8 len][name bytes]` entries
-        // (no NUL terminator on each entry). Merge USER+SYSTEM namespaces and re-emit
-        // Linux-style NUL-terminated `"prefix.name\0"` entries.
+        // BSD extattr_list_fd returns per-namespace `[u8 len][name bytes]`
+        // entries (no NUL terminator on each entry). Merge USER+SYSTEM
+        // namespaces and re-emit Linux-style NUL-terminated `"prefix.name\0"`
+        // entries.
         let mut out: Vec<u8> = Vec::new();
         for (ns, prefix) in [
             (libc::EXTATTR_NAMESPACE_USER as libc::c_int, &b"user."[..]),
@@ -466,7 +478,12 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
         unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), list.cast::<u8>(), out.len()) };
         out.len() as isize
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (fd, list, size);
         -libc::ENOSYS as isize
@@ -487,13 +504,18 @@ pub unsafe fn fremovexattr(fd: i32, name: *const libc::c_char) -> libc::c_int {
     {
         unsafe { libc::fremovexattr(fd, name) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
-        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
         let rc = unsafe { libc::extattr_delete_fd(fd, ns, attr.as_ptr()) };
         if rc >= 0 { 0 } else { -1 }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (fd, name);
         -libc::ENOSYS
@@ -502,12 +524,12 @@ pub unsafe fn fremovexattr(fd: i32, name: *const libc::c_char) -> libc::c_int {
 
 // ---- path-based extended attributes ----
 // Linux exposes path-based `{l,}{get,set}xattr`; macOS folds no-follow into a
-// `XATTR_NOFOLLOW` option on `{get,set}xattr`; FreeBSD uses `extattr_*_file`
-// (follow) / `extattr_*_link` (no-follow). These wrappers expose the common
-// Linux-shaped signature so call sites stay cfg-free.
+// `XATTR_NOFOLLOW` option on `{get,set}xattr`; FreeBSD/NetBSD use
+// `extattr_*_file` (follow) / `extattr_*_link` (no-follow). These wrappers
+// expose the common Linux-shaped signature so call sites stay cfg-free.
 
-/// Linux xattr flags, portable. FreeBSD `extattr` has no create/replace flags;
-/// the FreeBSD shims accept and ignore them (matching the fd-based shims).
+/// Linux xattr flags, portable. BSD `extattr` has no create/replace flags; the
+/// extattr shims accept and ignore them (matching the fd-based shims).
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const XATTR_CREATE: libc::c_int = libc::XATTR_CREATE;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -540,12 +562,17 @@ pub unsafe fn getxattr(
     {
         unsafe { libc::getxattr(path, name, value, size) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
-        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
         unsafe { libc::extattr_get_file(path, ns, attr.as_ptr(), value, size) }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (path, name, value, size);
         -libc::ENOSYS as isize
@@ -571,12 +598,17 @@ pub unsafe fn lgetxattr(
     {
         unsafe { libc::lgetxattr(path, name, value, size) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
-        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
         unsafe { libc::extattr_get_link(path, ns, attr.as_ptr(), value, size) }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (path, name, value, size);
         -libc::ENOSYS as isize
@@ -603,15 +635,20 @@ pub unsafe fn setxattr(
     {
         unsafe { libc::setxattr(path, name, value, size, flags) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
-        // extattr_set_file has no flags parameter; xattr flags are ignored on FreeBSD.
+        // extattr_set_file has no flags parameter; xattr flags are ignored here.
         let _ = flags;
-        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
         let rc = unsafe { libc::extattr_set_file(path, ns, attr.as_ptr(), value, size) };
         if rc >= 0 { 0 } else { -1 }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (path, name, value, size, flags);
         -libc::ENOSYS
@@ -638,14 +675,19 @@ pub unsafe fn lsetxattr(
     {
         unsafe { libc::lsetxattr(path, name, value, size, flags) }
     }
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
     {
         let _ = flags;
-        let (ns, attr) = freebsd_xattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
+        let (ns, attr) = bsd_extattr_ns(unsafe { std::ffi::CStr::from_ptr(name) });
         let rc = unsafe { libc::extattr_set_link(path, ns, attr.as_ptr(), value, size) };
         if rc >= 0 { 0 } else { -1 }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd"
+    )))]
     {
         let _ = (path, name, value, size, flags);
         -libc::ENOSYS
@@ -993,10 +1035,14 @@ mod freebsd_const_tests {
     }
 }
 
-#[cfg(all(test, target_os = "freebsd"))]
-mod freebsd_xattr_tests {
+#[cfg(all(test, any(target_os = "freebsd", target_os = "netbsd")))]
+mod bsd_extattr_tests {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
+
+    fn xattr_unsupported(errno: i32) -> bool {
+        errno == libc::EOPNOTSUPP || errno == libc::ENOTSUP || errno == libc::ENOSYS
+    }
 
     #[test]
     fn user_namespace_xattr_round_trip() {
@@ -1005,6 +1051,17 @@ mod freebsd_xattr_tests {
         let name = CString::new("user.carrick.test").unwrap();
         let val = b"42";
         let rc = unsafe { super::fsetxattr(fd, name.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
+        if rc < 0 {
+            let errno = super::errno();
+            assert!(
+                xattr_unsupported(errno),
+                "fsetxattr failed with unexpected errno {errno}"
+            );
+            let mut list = [0u8; 256];
+            let ln = unsafe { super::flistxattr(fd, list.as_mut_ptr().cast(), list.len()) };
+            assert_eq!(ln, 0, "unsupported flistxattr should be empty");
+            return;
+        }
         assert!(rc >= 0, "fsetxattr failed: {rc}");
         let mut buf = [0u8; 16];
         let got =
@@ -1041,6 +1098,19 @@ mod freebsd_xattr_tests {
                 0,
             )
         };
+        if rc < 0 {
+            let errno = super::errno();
+            assert!(
+                xattr_unsupported(errno),
+                "setxattr failed with unexpected errno {errno}"
+            );
+            let f = std::fs::File::open(path).unwrap();
+            let mut list = [0u8; 256];
+            let ln =
+                unsafe { super::flistxattr(f.as_raw_fd(), list.as_mut_ptr().cast(), list.len()) };
+            assert_eq!(ln, 0, "unsupported flistxattr should be empty");
+            return;
+        }
         assert_eq!(rc, 0, "setxattr failed: errno {}", super::errno());
         let mut out = [0u8; 4];
         let n = unsafe {
