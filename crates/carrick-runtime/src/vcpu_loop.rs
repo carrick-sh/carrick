@@ -1509,8 +1509,12 @@ where
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Clear any VM published by a previous fork so siblings that release their
-        // vCPUs this round see only THIS fork's republished VM.
+        // vCPUs this round see only THIS fork's republished VM. Also reset the
+        // sibling-mapping registry so this round collects a clean set (siblings
+        // publish their regions in release_vcpu_for_fork, AFTER the kick below, so
+        // clearing here can't race a publish).
         crate::trap::clear_rebuilt_vm_for_fork();
+        crate::trap::clear_sibling_fork_mappings();
         // Stop-the-world: a multithreaded guest can fork only if every OTHER guest
         // vCPU thread is first paused at its lock-safe run-loop top.
         let mut others = self.kicker.count().saturating_sub(1);

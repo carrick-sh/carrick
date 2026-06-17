@@ -245,6 +245,10 @@ pub mod trap {
     /// Clear any VM republished by a previous fork. No-op on Linux.
     pub fn clear_rebuilt_vm_for_fork() {}
 
+    /// Reset the per-fork sibling-mapping registry. No-op on Linux (the KVM fork
+    /// rebuilds a fresh VM in the child only; no shared-VM union to collect).
+    pub fn clear_sibling_fork_mappings() {}
+
     /// Publish the guest arena high-water so a child snapshot's mincore scan is
     /// bounded. No-op on Linux (no host-side CoW snapshot).
     pub fn set_guest_arena_high_water(_addr: u64) {}
