@@ -1362,12 +1362,22 @@ impl SyscallDispatcher {
                     if interest.contains_key(&fd) {
                         return Ok(LINUX_EEXIST.into());
                     }
+                    // Generational handle: the multiplexer IDENT is the host fd
+                    // (the kernel's stable key, auto-removed on close); the udata
+                    // is `(guest_fd, reg_gen)`. Guest AND host fd numbers recycle
+                    // rapidly under churn, so a drained event keyed by a bare fd is
+                    // an ABA hazard — by delivery time the fd may name a different
+                    // registration. `epoll_pwait` routes by the udata's guest fd
+                    // and requires `reg_gen` to match the live interest, so a stale
+                    // edge for a recycled fd is dropped, not mis-delivered.
+                    // (epoll_et_pipe_eof_not_lost.)
+                    let reg_gen = next_epoll_reg_gen();
                     if let Some(host_fd) = host_fd {
                         let ev_events = event.events;
                         kqueue.with_mux(|mux| {
                             let _ = mux.register_io(
                                 host_fd,
-                                fd as u64,
+                                pack_epoll_udata(fd, reg_gen),
                                 epoll_interest_for(ev_events),
                                 epoll_trigger_mode(ev_events),
                             );
@@ -1384,6 +1394,7 @@ impl SyscallDispatcher {
                         EpollInterest {
                             event,
                             last_ready: 0,
+                            reg_gen,
                         },
                     );
                     // A waiter parked on this instance's ppoll snapshot does
@@ -1401,12 +1412,15 @@ impl SyscallDispatcher {
                     // EV_DELETEs the ones no longer present in a single call, so the
                     // old "add new, then delete removed" sequence — which avoided a
                     // no-interest gap where a readiness edge could be lost — is now
-                    // atomic per direction (no transient gap at all).
+                    // atomic per direction (no transient gap at all). MOD keeps the
+                    // SAME registration, so it preserves `reg_gen` (the generational
+                    // handle is unchanged — see EPOLL_CTL_ADD).
+                    let reg_gen = slot.reg_gen;
                     if let Some(host_fd) = host_fd {
                         kqueue.with_mux(|mux| {
                             let _ = mux.register_io(
                                 host_fd,
-                                fd as u64,
+                                pack_epoll_udata(fd, reg_gen),
                                 epoll_interest_for(event.events),
                                 epoll_trigger_mode(event.events),
                             );
@@ -1416,6 +1430,7 @@ impl SyscallDispatcher {
                     *slot = EpollInterest {
                         event,
                         last_ready: 0,
+                        reg_gen,
                     };
                     // Re-arm visible to a parked waiter: rebuild its park set.
                     kqueue.wake_parked();
@@ -1442,23 +1457,24 @@ impl SyscallDispatcher {
                         // per-fd and auto-removes on close, but a *dup* keeps the host
                         // fd alive, so the host-fd-keyed registration must be rebound
                         // rather than dropped — identical to the kqueue case.
-                        let mut survivor: Option<i32> = None;
+                        let mut survivor: Option<(i32, u32)> = None;
                         let mut union_events: u32 = 0;
                         for (&other, slot) in interest.iter() {
                             if this.host_fd_for_poll(other) == Some(host_fd) {
-                                survivor.get_or_insert(other);
+                                survivor.get_or_insert((other, slot.reg_gen));
                                 union_events |= slot.event.events;
                             }
                         }
                         // With a survivor: re-arm the host registration to the
                         // surviving fd carrying the UNION of all survivors' masks
                         // (register_io also clears interest classes no survivor still
-                        // wants). With none: drop the host registration entirely.
+                        // wants), re-using THAT fd's generational handle. With none:
+                        // drop the host registration entirely.
                         kqueue.with_mux(|mux| match survivor {
-                            Some(sfd) => {
+                            Some((sfd, sgen)) => {
                                 let _ = mux.register_io(
                                     host_fd,
-                                    sfd as u64,
+                                    pack_epoll_udata(sfd, sgen),
                                     epoll_interest_for(union_events),
                                     epoll_trigger_mode(union_events),
                                 );
@@ -1594,77 +1610,108 @@ impl SyscallDispatcher {
                     .is_ok()
                 {
                     let acc_before = acc.len();
-                    // Count only REAL host-fd events (read/write/oob → nonzero
-                    // epoll bits). A consumed EVFILT_USER(0) in-memory wake
-                    // (bits == 0, registered EV_CLEAR so it auto-resets on this
-                    // drain) must NOT count toward `kq_drained_all_filtered`: it is
-                    // gone now, so polling kq_fd will not spin, whereas the
-                    // all-filtered path parks on the signal pipe only — which
-                    // strands an indefinite epoll_pwait that can no longer be
-                    // reached by the next notify_inmem_epoll / host-fd readiness
-                    // edge (the Node worker-teardown loop-thread hang).
+                    // Each drained event's udata is a GENERATIONAL handle
+                    // `(guest_fd, reg_gen)` (the multiplexer IDENT stays the host
+                    // fd). Guest AND host fd numbers recycle rapidly under churn, so
+                    // routing by a bare fd is an ABA hazard; the gen lets us confirm
+                    // the edge belongs to the CURRENT registration of guest_fd and
+                    // drop a stale edge for a recycled fd (see below). For each valid
+                    // edge we RE-POLL the live owner(s) rather than trust the drained
+                    // bits, which stays correct even when the host fd was recycled
+                    // mid-drain. bits==0 is an EVFILT_USER(0) in-memory wake or a
+                    // filter with no translatable bits — in-memory readiness is
+                    // recomputed in step (2), so it is skipped (and must NOT count
+                    // toward `kq_drained_all_filtered`: it auto-resets, so polling
+                    // kq_fd won't spin, whereas the all-filtered path parks on the
+                    // signal pipe — the Node worker-teardown hang).
                     let mut translatable_events = 0usize;
-                    for ev in &poll_events {
-                        let bits = pollevent_to_epoll(ev);
-                        if bits == 0 {
-                            // EVFILT_USER(0) in-memory wake, or a filter with no
-                            // translatable bits — recompute below covers in-memory.
-                            continue;
-                        }
-                        translatable_events += 1;
-                        let guest_fd = ev.token as i32;
-                        // The kqueue filter is keyed by HOST fd, but several guest
-                        // fds can be dups of one socket/pipe sharing that host fd,
-                        // and Linux wakes EACH fd's pollDesc independently. The
-                        // event carries only one `udata`, so fan the readiness out
-                        // to every interested guest fd that shares this host fd —
-                        // otherwise a dup the app is actually waiting on (e.g. the
-                        // FileListener while the original listener is also
-                        // registered) never wakes. (Go `net` TestFileListener.)
-                        let event_host_fd = this.host_fd_for_poll(guest_fd);
-                        let mut reported_any = false;
-                        for (ifd, slot) in interests.iter() {
-                            let shares = *ifd == guest_fd
-                                || (event_host_fd.is_some()
-                                    && this.host_fd_for_poll(*ifd) == event_host_fd);
-                            if !shares {
+                    if !poll_events.is_empty() {
+                        // Build the per-wait routing tables from the LIVE interest map
+                        // (NOT the pre-drain snapshot): an fd ADDed by another thread
+                        // AFTER the snapshot whose edge is already in THIS batch must
+                        // still be routable — its single EV_CLEAR/EPOLLET edge is
+                        // consumed and will not re-fire. `gfd_info` resolves a guest
+                        // fd to its (host_fd, mask, data, reg_gen); `host_to_gfds` is
+                        // the reverse index for dup fan-out (one host fd may back
+                        // several guest fds — Linux wakes each pollDesc). Built once
+                        // here, then the epoll lock is dropped before the per-fd
+                        // re-poll so a concurrent epoll_ctl isn't blocked on syscalls.
+                        // gfd_info: guest fd -> (host_fd, requested events,
+                        // epoll_data, reg_gen). host_to_gfds: host fd -> guest fds
+                        // sharing it (dup fan-out). Types inferred from the inserts.
+                        let (gfd_info, host_to_gfds) = {
+                            let open = open_file.description.read();
+                            let mut info: HashMap<i32, (i32, u32, u64, u32)> = HashMap::new();
+                            let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
+                            if let OpenDescription::Epoll { interest, .. } = &*open {
+                                for (gfd, slot) in interest.iter() {
+                                    if let Some(hfd) = this.host_fd_for_poll(*gfd) {
+                                        info.insert(
+                                            *gfd,
+                                            (hfd, slot.event.events, slot.event.data, slot.reg_gen),
+                                        );
+                                        rev.entry(hfd).or_default().push(*gfd);
+                                    }
+                                }
+                            }
+                            (info, rev)
+                        };
+                        // Resolve each drained event through its generational handle.
+                        // The udata is (guest_fd, gen); trust it only if the live
+                        // interest for guest_fd carries the SAME gen — otherwise the
+                        // fd was recycled (ABA) and this is a stale edge for a gone
+                        // registration: drop it (the current owner, if any, gets its
+                        // own edge) and probe so the race stays observable. A valid
+                        // hit fans out to every guest fd currently sharing that host
+                        // fd (dups). bits==0 is an EVFILT_USER(0) wake / untranslatable
+                        // filter — in-memory readiness is recomputed in step (2).
+                        let mut deliver: std::collections::HashSet<i32> =
+                            std::collections::HashSet::new();
+                        for ev in &poll_events {
+                            if pollevent_to_epoll(ev) == 0 {
                                 continue;
                             }
-                            reported_any = true;
-                            let masked =
-                                bits & (slot.event.events | LINUX_EPOLLHUP | LINUX_EPOLLERR);
-                            if masked != 0 {
-                                let entry = acc.entry(*ifd).or_insert((0, slot.event.data));
-                                entry.0 |= masked;
+                            let (guest_fd, generation) = unpack_epoll_udata(ev.token);
+                            match gfd_info.get(&guest_fd) {
+                                Some(&(hfd, _, _, reg_gen)) if reg_gen == generation => {
+                                    translatable_events += 1;
+                                    if let Some(siblings) = host_to_gfds.get(&hfd) {
+                                        deliver.extend(siblings.iter().copied());
+                                    }
+                                }
+                                _ => {
+                                    crate::probes::epoll_stale_edge(
+                                        ev.token,
+                                        guest_fd,
+                                        generation,
+                                    );
+                                }
                             }
                         }
-                        if !reported_any {
-                            // Concurrent-ADD race: the udata fd isn't in this
-                            // snapshot yet. Fall back to the live map for it alone.
-                            let live = {
-                                let open = open_file.description.read();
-                                match &*open {
-                                    OpenDescription::Epoll { interest, .. } => interest
-                                        .get(&guest_fd)
-                                        .map(|slot| (slot.event.events, slot.event.data)),
-                                    _ => None,
-                                }
-                            };
-                            if let Some((requested, data)) = live {
-                                let masked = bits & (requested | LINUX_EPOLLHUP | LINUX_EPOLLERR);
-                                if masked != 0 {
-                                    acc.entry(guest_fd).or_insert((0, data)).0 |= masked;
+                        // Deliver each owner's CURRENT readiness. RE-POLLING (rather
+                        // than trusting the drained bits) keeps delivery correct even
+                        // when the host fd was recycled between the edge and now — the
+                        // live poll(2) state is always the truth. illumos devpoll
+                        // model: the edge only FLAGS the fd; we re-poll just the
+                        // flagged owners (polling ALL registered fds was O(nfds) and
+                        // too slow).
+                        for gfd in deliver {
+                            if let Some(&(_, requested, data, _)) = gfd_info.get(&gfd) {
+                                let raw = this.epoll_ready_events(gfd, requested);
+                                if raw != 0 {
+                                    acc.entry(gfd).or_insert((0, data)).0 |= raw;
                                 }
                             }
                         }
                     }
-                    // A REAL host-fd readiness event fired but our interest masks
-                    // let none of them through (the events=0-with-data case).
-                    // Polling kq_fd would just see the same (level-triggered)
-                    // readiness and spin, so park on the signal pipe instead. A
-                    // pure EVFILT_USER drain is excluded (translatable_events == 0):
-                    // it auto-resets, so the kqueue-poll path is correct and keeps
-                    // the waiter reachable by later wakes.
+                    // A REAL, CURRENT host-fd readiness event fired but the interest
+                    // masks let none through (the events=0-with-data case): polling
+                    // kq_fd would see the same level readiness and spin, so park on
+                    // the signal pipe instead. Stale (recycled-fd) edges are excluded
+                    // from `translatable_events`: their host edge was consumed, so
+                    // kq_fd won't spin and the kqueue-poll path stays reachable by the
+                    // current owner's own later edge. A pure EVFILT_USER drain is
+                    // likewise excluded — it auto-resets.
                     kq_drained_all_filtered = translatable_events > 0 && acc.len() == acc_before;
                 }
             }

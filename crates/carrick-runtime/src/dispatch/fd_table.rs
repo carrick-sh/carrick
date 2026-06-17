@@ -60,6 +60,15 @@ use super::{EpollKqueue, Fd, GuestPtr, inode_for_path, linux_mode};
 pub(super) struct EpollInterest {
     pub(super) event: LinuxEpollEvent,
     pub(super) last_ready: u32,
+    /// Per-registration generation, the high half of this fd's multiplexer
+    /// `udata` handle (`pack_epoll_udata`). Guest fd numbers AND host fd numbers
+    /// are recycled rapidly under churn, so a drained kqueue/epoll event keyed by
+    /// a bare fd is an ABA hazard: the fd it names may already belong to a
+    /// different registration by delivery time. The udata carries
+    /// `(guest_fd, reg_gen)`; on delivery we look up `interest[guest_fd]` and
+    /// require its `reg_gen` to match, so a stale event for a recycled fd is
+    /// rejected instead of mis-delivered. (epoll_et_pipe_eof_not_lost.)
+    pub(super) reg_gen: u32,
 }
 
 #[derive(Debug)]

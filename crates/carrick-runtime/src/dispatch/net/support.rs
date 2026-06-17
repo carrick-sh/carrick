@@ -124,6 +124,40 @@ pub(super) fn epoll_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode
     }
 }
 
+/// Monotonic source of epoll-registration generations (the high half of a
+/// multiplexer `udata` handle). A generation makes `(guest_fd, gen)` a
+/// generational index — the standard defence against the ABA hazard of recycled
+/// fd numbers: a drained event whose generation no longer matches the live
+/// `interest[guest_fd]` is a stale edge for a since-recycled fd and is dropped
+/// rather than mis-delivered. u32 wrap needs 2^32 registrations *and* a stale
+/// event surviving that long (it is consumed within one `epoll_pwait`), so it is
+/// not a practical ABA window. See [`EpollInterest::reg_gen`].
+static EPOLL_REG_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Allocate the next registration generation (never 0, so 0 can mean "unset").
+pub(super) fn next_epoll_reg_gen() -> u32 {
+    let g = EPOLL_REG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if g == 0 {
+        EPOLL_REG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    } else {
+        g
+    }
+}
+
+/// Pack a multiplexer `udata` handle: low 32 bits = guest fd, high 32 = the
+/// registration generation. The kqueue/epoll IDENT stays the host fd (the
+/// kernel's stable key, auto-removed on close); the udata carries the routing
+/// identity so a drained event resolves to its CURRENT owner directly
+/// (`interest[guest_fd]`) without re-deriving it from the racy host-fd map.
+pub(super) fn pack_epoll_udata(guest_fd: i32, generation: u32) -> u64 {
+    ((generation as u64) << 32) | (guest_fd as u32 as u64)
+}
+
+/// Inverse of [`pack_epoll_udata`]: `(guest_fd, generation)`.
+pub(super) fn unpack_epoll_udata(udata: u64) -> (i32, u32) {
+    ((udata & 0xFFFF_FFFF) as u32 as i32, (udata >> 32) as u32)
+}
+
 pub(super) fn clear_pending_epoll_ready(
     pending_ready: &mut VecDeque<(i32, LinuxEpollEvent)>,
     guest_fd: i32,
