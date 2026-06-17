@@ -189,6 +189,11 @@ mod carrick_usdt {
     /// epoll_pwait result decision. `kind` is 0 for immediate guest return and
     /// 1 for WaitOnFds handoff.
     fn epoll__result(_: i32, _: i32, _: i32, _: i32, _: i32) {}
+    /// A drained multiplexer edge whose `(guest_fd, generation)` udata handle no
+    /// longer matches any live interest — a stale edge for a recycled fd (the
+    /// ABA hazard). Dropped, not mis-delivered; fires here so the recycle race is
+    /// observable rather than silent.
+    fn epoll__stale__edge(_: u64, _: i32, _: u32) {}
     /// Runtime blocking-I/O wait begin. `tid` is the guest thread id,
     /// `timeout_ms` is -1 for infinite, and fd0/events0 + fd1/events1 are the
     /// first two host fd wait targets.
@@ -411,6 +416,10 @@ pub fn epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout
 
 pub fn epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32) {
     carrick_usdt::epoll__result!(|| (epfd, ready_count, wait_count, timeout_ms, kind));
+}
+
+pub fn epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32) {
+    carrick_usdt::epoll__stale__edge!(|| (udata, guest_fd, generation));
 }
 
 pub fn io_wait_begin(tid: i32, fd_count: i32, timeout_ms: i64, fd0: i32, events0: i32, fd1: i32) {

@@ -4256,9 +4256,18 @@ impl SyscallDispatcher {
             if fd.0 >= 0 && fd.0 < 3 {
                 this.io.closed_stdio.lock()[fd.0 as usize] = true;
             }
-            // Bind `removed` in a `let` so the open_files write lock is released
-            // before close_open_file_and_free_pty / detach_fd_from_epolls run
-            // (detach takes a read lock; holding write here would deadlock).
+            // Auto-remove this fd from every epoll interest set BEFORE freeing
+            // the fd number from open_files. ORDER IS LOAD-BEARING: the instant
+            // the fd leaves open_files another thread's open/pipe/dup can recycle
+            // that number and `epoll_ctl(ADD)` it; if the detach ran AFTER the
+            // free it would rip out the NEW owner's freshly-added interest, whose
+            // EPOLLET edge then never re-fires (the Go-netpoller hang reproduced
+            // by epoll_et_pipe_eof_not_lost — a worker's close raced a sibling's
+            // reuse+ADD of the same fd number). While the fd is still in the table
+            // the allocator cannot hand it out, so detaching first scopes the
+            // removal to THIS registration. detach takes only a read lock, so it
+            // does not deadlock with the separate write below.
+            this.detach_fd_from_epolls(fd.0);
             let removed = this.io.open_files.write().remove(&fd.0);
             Ok(
                 if let Some(open_file) = removed {
@@ -4268,8 +4277,6 @@ impl SyscallDispatcher {
                     // used by close_range and close_cloexec_fds so every close path
                     // stays in sync.
                     this.close_open_file_and_free_pty(&open_file);
-                    // Linux auto-removes a closed fd from every epoll interest set.
-                    this.detach_fd_from_epolls(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 } else if is_stdio_fd(fd.0) {
                     // Guest closing its own stdio at exit: there's nothing for
@@ -4306,29 +4313,29 @@ impl SyscallDispatcher {
                 .copied()
                 .filter(|fd| (*fd as u64) >= first && (*fd as u64) <= last)
                 .collect();
-            let mut detached: Vec<i32> = Vec::new();
-            {
+            if cloexec_only {
                 let mut table = this.io.open_files.write();
                 for fd in fds {
-                    if cloexec_only {
-                        if let Some(open_file) = table.get_mut(&fd) {
-                            open_file.fd_flags |= LINUX_FD_CLOEXEC;
-                        }
-                    } else if let Some(open_file) = table.remove(&fd) {
-                        // Use the centralised helper so pty masters freed via
-                        // close_range also drop their /dev/pts/N table entry.
-                        // open_files write lock and pty_table Mutex are independent
-                        // locks; nothing acquires pty_table while holding open_files,
-                        // so the nesting order is deadlock-free.
-                        this.close_open_file_and_free_pty(&open_file);
-                        detached.push(fd);
+                    if let Some(open_file) = table.get_mut(&fd) {
+                        open_file.fd_flags |= LINUX_FD_CLOEXEC;
                     }
                 }
-            }
-            // Auto-remove each closed fd from epoll interest sets (after dropping
-            // the open_files lock — detach_fd_from_epolls takes a read lock).
-            for fd in detached {
-                this.detach_fd_from_epolls(fd);
+            } else {
+                // Detach BEFORE freeing each fd number — same ordering rule as
+                // `close` (a freed number is instantly reusable, and a
+                // detach-after-free would rip out a sibling's reused-fd interest;
+                // see `close`). Detach (read lock) and remove (write lock) are
+                // separate per fd, so the fd is still in the table — hence not
+                // reallocatable — across its own detach.
+                for fd in fds {
+                    this.detach_fd_from_epolls(fd);
+                    if let Some(open_file) = this.io.open_files.write().remove(&fd) {
+                        // Centralised close so pty masters freed via close_range
+                        // also drop their /dev/pts/N entry. open_files and pty_table
+                        // are independent locks (no nesting), so deadlock-free.
+                        this.close_open_file_and_free_pty(&open_file);
+                    }
+                }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 

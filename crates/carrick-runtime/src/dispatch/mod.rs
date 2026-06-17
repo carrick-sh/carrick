@@ -5475,6 +5475,449 @@ mod overlay_dispatch_tests {
         }
     }
 
+    /// GROUNDED REGRESSION GATE (Rust, in-tree, cross-platform: macOS kqueue +
+    /// Linux epoll-emulation) for the epoll EPOLLET edge-loss hang. It drives the
+    /// REAL `epoll_pwait`/`epoll_ctl`/`pipe2` handlers through the threaded
+    /// dispatch path, mirroring the Go netpoller + os/exec pipe churn that hung
+    /// `go build`: worker threads concurrently create a pipe, register the
+    /// read-end EPOLLET in a SHARED epoll, write+close the write-end (EOF), and
+    /// wait for a netpoller thread's `epoll_pwait` loop to report it. A pipe
+    /// read-end at EOF MUST eventually be reported (EPOLLHUP/EPOLLIN); a lost edge
+    /// ⇒ the worker times out ⇒ this test FAILS.
+    ///
+    /// ROOT CAUSE (fixed): `close(fd)` freed the fd number from `open_files` and
+    /// only THEN detached it from epoll interest sets. In the window between, a
+    /// sibling thread recycled that fd number and `epoll_ctl(ADD)`d it, and the
+    /// late detach ripped out the NEW registration's interest — whose EPOLLET edge
+    /// then never re-fired. Fixed by detaching BEFORE freeing the fd number (see
+    /// `close` in dispatch/fs.rs). Routing is hardened with a generational udata
+    /// handle (`EpollInterest::reg_gen`) against the residual drain-then-recycle
+    /// ABA. Was RED on every run pre-fix (~3-5s); GREEN in ~0.1s after.
+    #[cfg(unix)]
+    #[test]
+    fn epoll_et_pipe_eof_not_lost_under_concurrent_churn() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        const NWORKERS: usize = 6;
+        const TOTAL: usize = 600;
+        const EPOLLIN: u32 = 0x1;
+        const EPOLLHUP: u32 = 0x10;
+        const EPOLLERR: u32 = 0x8;
+        const EPOLLET: u32 = 0x8000_0000;
+        const CTL_ADD: u64 = 1;
+        const CTL_DEL: u64 = 2;
+        const EV_STRIDE: u64 = 16; // aarch64 LinuxEpollEvent stride
+
+        let dispatcher = SyscallDispatcher::with_rootfs(empty_rootfs());
+        let reporter = CompatReporter::default();
+        let registry = crate::thread::ThreadRegistry::new(1000);
+        let futex = crate::thread::FutexTable::new();
+
+        // Create the shared epoll instance up front.
+        let epfd = {
+            let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+            let out = dispatcher
+                .dispatch_threaded(
+                    SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
+                    &mut mem,
+                    &reporter,
+                    1,
+                    &registry,
+                    &futex,
+                )
+                .expect("epoll_create1");
+            returned(out) as u64
+        };
+
+        let eof_seen: Vec<AtomicBool> = (0..TOTAL).map(|_| AtomicBool::new(false)).collect();
+        let next_slot = AtomicUsize::new(0);
+        let active = AtomicUsize::new(NWORKERS);
+        let stop = AtomicBool::new(false);
+        let failed = AtomicI64::new(-1);
+
+        let dispatcher = &dispatcher;
+        let reporter = &reporter;
+        let registry = &registry;
+        let futex = &futex;
+        let eof_seen = &eof_seen;
+        let next_slot = &next_slot;
+        let active = &active;
+        let stop = &stop;
+        let failed = &failed;
+
+        std::thread::scope(|s| {
+            // ---- netpoller ----
+            s.spawn(move || {
+                let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+                let ev_buf = MEM_BASE + 0x800;
+                let max = 32u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let out = dispatcher
+                        .dispatch_threaded(
+                            SyscallRequest::new(
+                                22,
+                                SyscallArgs::from([epfd, ev_buf, max, 50, 0, 0]),
+                            ),
+                            &mut mem,
+                            reporter,
+                            2,
+                            registry,
+                            futex,
+                        )
+                        .expect("epoll_pwait");
+                    match out {
+                        DispatchOutcome::Returned { value } if value > 0 => {
+                            for i in 0..(value as u64) {
+                                let off = ev_buf + i * EV_STRIDE;
+                                let b = mem.read_bytes(off, 16).unwrap();
+                                let events = u32::from_le_bytes(b[0..4].try_into().unwrap());
+                                let data = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                                let slot = data as usize;
+                                if events & (EPOLLHUP | EPOLLIN | EPOLLERR) != 0 && slot < TOTAL {
+                                    eof_seen[slot].store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        DispatchOutcome::Returned { .. } => {}
+                        DispatchOutcome::WaitOnPollFds { fds, timeout, .. } => {
+                            if let Some((fd, events)) = fds.first() {
+                                let mut pfd = libc::pollfd {
+                                    fd,
+                                    events,
+                                    revents: 0,
+                                };
+                                let ms =
+                                    timeout.map(|d| d.as_millis().min(50) as i32).unwrap_or(50);
+                                // SAFETY: one valid pollfd, bounded non-blocking wait.
+                                unsafe {
+                                    libc::poll(&mut pfd, 1, ms);
+                                }
+                            }
+                        }
+                        DispatchOutcome::WaitOnFds { timeout, .. } => {
+                            let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
+                            std::thread::sleep(Duration::from_millis(ms));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            // ---- workers ----
+            for w in 0..NWORKERS {
+                s.spawn(move || {
+                    let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+                    let tid = 100 + w as crate::thread::ThreadId;
+                    let pipe_out = MEM_BASE + 0x100;
+                    let ev_in = MEM_BASE + 0x120;
+                    let wbuf = MEM_BASE + 0x140;
+                    mem.write_bytes(wbuf, b"x").unwrap();
+                    let call =
+                        |mem: &mut LinearMemory, num: u64, args: [u64; 6]| -> DispatchOutcome {
+                            dispatcher
+                                .dispatch_threaded(
+                                    SyscallRequest::new(num, SyscallArgs::from(args)),
+                                    mem,
+                                    reporter,
+                                    tid,
+                                    registry,
+                                    futex,
+                                )
+                                .expect("dispatch")
+                        };
+                    loop {
+                        if stop.load(Ordering::Relaxed) || failed.load(Ordering::Relaxed) >= 0 {
+                            break;
+                        }
+                        let slot = next_slot.fetch_add(1, Ordering::Relaxed);
+                        if slot >= TOTAL {
+                            break;
+                        }
+                        // pipe2(0): carrick makes the host ends non-blocking itself.
+                        if !matches!(
+                            call(&mut mem, 59, [pipe_out, 0, 0, 0, 0, 0]),
+                            DispatchOutcome::Returned { value: 0 }
+                        ) {
+                            continue;
+                        }
+                        let fp = mem.read_bytes(pipe_out, 8).unwrap();
+                        let rd = i32::from_le_bytes(fp[0..4].try_into().unwrap()) as u64;
+                        let wr = i32::from_le_bytes(fp[4..8].try_into().unwrap()) as u64;
+                        // epoll_ctl ADD rd, EPOLLIN|EPOLLET, data=slot
+                        let mut ev = [0u8; 16];
+                        ev[0..4].copy_from_slice(&(EPOLLIN | EPOLLET).to_le_bytes());
+                        ev[8..16].copy_from_slice(&(slot as u64).to_le_bytes());
+                        mem.write_bytes(ev_in, &ev).unwrap();
+                        call(&mut mem, 21, [epfd, CTL_ADD, rd, ev_in, 0, 0]);
+                        // write a byte, then close the write end (EOF).
+                        call(&mut mem, 64, [wr, wbuf, 1, 0, 0, 0]);
+                        call(&mut mem, 57, [wr, 0, 0, 0, 0, 0]);
+                        // The read-end is now at EOF — the netpoller MUST report it.
+                        let t0 = Instant::now();
+                        while !eof_seen[slot].load(Ordering::Relaxed) {
+                            if t0.elapsed() > Duration::from_secs(3) {
+                                failed.store(slot as i64, Ordering::Relaxed);
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                        call(&mut mem, 21, [epfd, CTL_DEL, rd, 0, 0, 0]);
+                        call(&mut mem, 57, [rd, 0, 0, 0, 0, 0]);
+                    }
+                    if active.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let f = failed.load(Ordering::Relaxed);
+        assert!(
+            f < 0,
+            "epoll LOST the EOF edge for slot {f} under concurrent churn \
+             (the Go-netpoller hang); native epoll never does this"
+        );
+    }
+
+    /// FOCUSED regression gate for the close/reuse/detach ORDERING race that
+    /// caused the edge-loss above. It isolates the exact mechanism: dedicated
+    /// "recycler" threads `epoll_ctl(ADD)` a pipe read-end and immediately
+    /// `close()` it with NO `EPOLL_CTL_DEL`, so `close`'s `detach_fd_from_epolls`
+    /// is the sole remover AND the freed fd number is fed straight back to a
+    /// victim's next `pipe2`. If `close` frees the fd number before detaching,
+    /// the recycler's late detach rips out the victim's freshly-registered
+    /// interest for that recycled fd and its EOF edge is lost. Distinct from the
+    /// symmetric stress test above, which uses DEL+close; here close-detach is the
+    /// only path under test. Was RED pre-fix; GREEN after detach-before-free.
+    #[cfg(unix)]
+    #[test]
+    fn epoll_close_recycle_does_not_drop_interest() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        const VICTIMS: usize = 4;
+        const RECYCLERS: usize = 2;
+        const TOTAL: usize = 400;
+        const EPOLLIN: u32 = 0x1;
+        const EPOLLHUP: u32 = 0x10;
+        const EPOLLERR: u32 = 0x8;
+        const EPOLLET: u32 = 0x8000_0000;
+        const CTL_ADD: u64 = 1;
+        const CTL_DEL: u64 = 2;
+        const EV_STRIDE: u64 = 16;
+
+        let dispatcher = SyscallDispatcher::with_rootfs(empty_rootfs());
+        let reporter = CompatReporter::default();
+        let registry = crate::thread::ThreadRegistry::new(1000);
+        let futex = crate::thread::FutexTable::new();
+
+        let epfd = {
+            let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+            let out = dispatcher
+                .dispatch_threaded(
+                    SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
+                    &mut mem,
+                    &reporter,
+                    1,
+                    &registry,
+                    &futex,
+                )
+                .expect("epoll_create1");
+            returned(out) as u64
+        };
+
+        let eof_seen: Vec<AtomicBool> = (0..TOTAL).map(|_| AtomicBool::new(false)).collect();
+        let next_slot = AtomicUsize::new(0);
+        let active = AtomicUsize::new(VICTIMS);
+        let stop = AtomicBool::new(false);
+        let failed = AtomicI64::new(-1);
+
+        let dispatcher = &dispatcher;
+        let reporter = &reporter;
+        let registry = &registry;
+        let futex = &futex;
+        let eof_seen = &eof_seen;
+        let next_slot = &next_slot;
+        let active = &active;
+        let stop = &stop;
+        let failed = &failed;
+
+        std::thread::scope(|s| {
+            // ---- netpoller ----
+            s.spawn(move || {
+                let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+                let ev_buf = MEM_BASE + 0x800;
+                let max = 32u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let out = dispatcher
+                        .dispatch_threaded(
+                            SyscallRequest::new(
+                                22,
+                                SyscallArgs::from([epfd, ev_buf, max, 50, 0, 0]),
+                            ),
+                            &mut mem,
+                            reporter,
+                            2,
+                            registry,
+                            futex,
+                        )
+                        .expect("epoll_pwait");
+                    match out {
+                        DispatchOutcome::Returned { value } if value > 0 => {
+                            for i in 0..(value as u64) {
+                                let off = ev_buf + i * EV_STRIDE;
+                                let b = mem.read_bytes(off, 16).unwrap();
+                                let events = u32::from_le_bytes(b[0..4].try_into().unwrap());
+                                let data = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                                let slot = data as usize;
+                                if events & (EPOLLHUP | EPOLLIN | EPOLLERR) != 0 && slot < TOTAL {
+                                    eof_seen[slot].store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        DispatchOutcome::Returned { .. } => {}
+                        DispatchOutcome::WaitOnPollFds { fds, timeout, .. } => {
+                            if let Some((fd, events)) = fds.first() {
+                                let mut pfd = libc::pollfd {
+                                    fd,
+                                    events,
+                                    revents: 0,
+                                };
+                                let ms =
+                                    timeout.map(|d| d.as_millis().min(50) as i32).unwrap_or(50);
+                                // SAFETY: one valid pollfd, bounded non-blocking wait.
+                                unsafe {
+                                    libc::poll(&mut pfd, 1, ms);
+                                }
+                            }
+                        }
+                        DispatchOutcome::WaitOnFds { timeout, .. } => {
+                            let ms = timeout.map(|d| d.as_millis().min(50) as u64).unwrap_or(50);
+                            std::thread::sleep(Duration::from_millis(ms));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            // ---- recyclers: ADD a read-end then close it (NO DEL) to churn fd
+            // numbers through close()'s detach path while victims reuse them. ----
+            for r in 0..RECYCLERS {
+                s.spawn(move || {
+                    let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+                    let tid = 200 + r as crate::thread::ThreadId;
+                    let pipe_out = MEM_BASE + 0x100;
+                    let ev_in = MEM_BASE + 0x120;
+                    let call =
+                        |mem: &mut LinearMemory, num: u64, args: [u64; 6]| -> DispatchOutcome {
+                            dispatcher
+                                .dispatch_threaded(
+                                    SyscallRequest::new(num, SyscallArgs::from(args)),
+                                    mem,
+                                    reporter,
+                                    tid,
+                                    registry,
+                                    futex,
+                                )
+                                .expect("dispatch")
+                        };
+                    let mut ev = [0u8; 16];
+                    ev[0..4].copy_from_slice(&(EPOLLIN | EPOLLET).to_le_bytes());
+                    while !stop.load(Ordering::Relaxed) {
+                        if !matches!(
+                            call(&mut mem, 59, [pipe_out, 0, 0, 0, 0, 0]),
+                            DispatchOutcome::Returned { value: 0 }
+                        ) {
+                            continue;
+                        }
+                        let fp = mem.read_bytes(pipe_out, 8).unwrap();
+                        let rd = i32::from_le_bytes(fp[0..4].try_into().unwrap()) as u64;
+                        let wr = i32::from_le_bytes(fp[4..8].try_into().unwrap()) as u64;
+                        mem.write_bytes(ev_in, &ev).unwrap();
+                        call(&mut mem, 21, [epfd, CTL_ADD, rd, ev_in, 0, 0]);
+                        // close the read-end WITHOUT DEL: close()'s detach is the
+                        // remover, and rd's number is now free for a victim's pipe2.
+                        call(&mut mem, 57, [rd, 0, 0, 0, 0, 0]);
+                        call(&mut mem, 57, [wr, 0, 0, 0, 0, 0]);
+                    }
+                });
+            }
+
+            // ---- victims ----
+            for w in 0..VICTIMS {
+                s.spawn(move || {
+                    let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+                    let tid = 100 + w as crate::thread::ThreadId;
+                    let pipe_out = MEM_BASE + 0x100;
+                    let ev_in = MEM_BASE + 0x120;
+                    let wbuf = MEM_BASE + 0x140;
+                    mem.write_bytes(wbuf, b"x").unwrap();
+                    let call =
+                        |mem: &mut LinearMemory, num: u64, args: [u64; 6]| -> DispatchOutcome {
+                            dispatcher
+                                .dispatch_threaded(
+                                    SyscallRequest::new(num, SyscallArgs::from(args)),
+                                    mem,
+                                    reporter,
+                                    tid,
+                                    registry,
+                                    futex,
+                                )
+                                .expect("dispatch")
+                        };
+                    loop {
+                        if stop.load(Ordering::Relaxed) || failed.load(Ordering::Relaxed) >= 0 {
+                            break;
+                        }
+                        let slot = next_slot.fetch_add(1, Ordering::Relaxed);
+                        if slot >= TOTAL {
+                            break;
+                        }
+                        if !matches!(
+                            call(&mut mem, 59, [pipe_out, 0, 0, 0, 0, 0]),
+                            DispatchOutcome::Returned { value: 0 }
+                        ) {
+                            continue;
+                        }
+                        let fp = mem.read_bytes(pipe_out, 8).unwrap();
+                        let rd = i32::from_le_bytes(fp[0..4].try_into().unwrap()) as u64;
+                        let wr = i32::from_le_bytes(fp[4..8].try_into().unwrap()) as u64;
+                        let mut ev = [0u8; 16];
+                        ev[0..4].copy_from_slice(&(EPOLLIN | EPOLLET).to_le_bytes());
+                        ev[8..16].copy_from_slice(&(slot as u64).to_le_bytes());
+                        mem.write_bytes(ev_in, &ev).unwrap();
+                        call(&mut mem, 21, [epfd, CTL_ADD, rd, ev_in, 0, 0]);
+                        call(&mut mem, 64, [wr, wbuf, 1, 0, 0, 0]);
+                        call(&mut mem, 57, [wr, 0, 0, 0, 0, 0]);
+                        let t0 = Instant::now();
+                        while !eof_seen[slot].load(Ordering::Relaxed) {
+                            if t0.elapsed() > Duration::from_secs(3) {
+                                failed.store(slot as i64, Ordering::Relaxed);
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                        call(&mut mem, 21, [epfd, CTL_DEL, rd, 0, 0, 0]);
+                        call(&mut mem, 57, [rd, 0, 0, 0, 0, 0]);
+                    }
+                    if active.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let f = failed.load(Ordering::Relaxed);
+        assert!(
+            f < 0,
+            "epoll lost the EOF edge for slot {f}: a sibling close() recycled the \
+             fd number and a detach-after-free dropped the victim's new interest"
+        );
+    }
+
     #[test]
     fn read_kernel_struct_accepts_unaligned_abi_reads_and_rejects_bad_pointers() {
         let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
