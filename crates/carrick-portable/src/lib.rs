@@ -773,7 +773,20 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
                 0,
             )
         };
-        if rc == 0 { len as isize } else { rc as isize }
+        let err = errno();
+        if rc == 0 {
+            len as isize
+        } else if len > 0 && (err == libc::EAGAIN || err == libc::EINTR) {
+            // Partial transfer on a non-blocking socket (or a signal): Darwin set
+            // `len` to the bytes actually sent but still returned -1/EAGAIN. Surface
+            // the partial count (Linux returns it directly) so the caller advances
+            // the offset by exactly what reached the wire. Returning -1 here makes
+            // the caller re-send from the same offset and duplicate the bytes
+            // already buffered — see `macos_sendfile_tests`.
+            len as isize
+        } else {
+            rc as isize
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -798,7 +811,14 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
                 0,
             )
         };
+        let err = errno();
         if rc == 0 {
+            sbytes as isize
+        } else if sbytes > 0 && (err == libc::EAGAIN || err == libc::EINTR) {
+            // Partial transfer on a non-blocking socket (or a signal): FreeBSD set
+            // `*sbytes` to the bytes actually sent but returned -1/EAGAIN. Surface
+            // the partial count (Linux shape) so the caller advances the offset
+            // rather than re-sending and duplicating data already on the wire.
             sbytes as isize
         } else {
             rc as isize
@@ -1087,6 +1107,70 @@ mod freebsd_const_tests {
             libc::close(sv[0]);
             libc::close(sv[1]);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_sendfile_tests {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    /// macOS `sendfile(2)` on a NON-BLOCKING socket whose send buffer fills
+    /// transfers only a PARTIAL amount: it sets `*len` to the bytes actually
+    /// sent AND returns -1 with errno `EAGAIN`. The wrapper must surface that
+    /// partial count (Linux shape: bytes transferred), NOT -1 — otherwise the
+    /// caller treats the call as "0 bytes sent", waits for `POLLOUT`, and
+    /// re-sends from the SAME offset, duplicating everything already on the wire.
+    /// (Repro: CPython `test_socket SendfileUsingSendfileTest` — a 10 MiB file
+    /// puts hundreds of MiB on the wire and the guest spins.) carrick marks every
+    /// host socket non-blocking, so this is the common case, not an edge case.
+    #[test]
+    fn partial_send_on_nonblocking_socket_reports_bytes_not_eagain() {
+        // Far larger than any default socket send buffer, so the transfer is
+        // guaranteed to be partial (nobody drains the peer).
+        let size: usize = 16 * 1024 * 1024;
+        let path = std::env::temp_dir().join(format!(
+            "carrick_sendfile_partial_{}.bin",
+            std::process::id()
+        ));
+        let mut tmp = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        tmp.write_all(&vec![b'x'; size]).unwrap();
+        tmp.flush().unwrap();
+
+        let mut sv = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+            0
+        );
+        // Send side non-blocking; peer sv[1] is never read, so the buffer fills.
+        unsafe {
+            let fl = libc::fcntl(sv[0], libc::F_GETFL);
+            assert_eq!(libc::fcntl(sv[0], libc::F_SETFL, fl | libc::O_NONBLOCK), 0);
+        }
+
+        let n = unsafe { super::sendfile_to_socket(tmp.as_raw_fd(), sv[0], 0, size) };
+        let err = super::errno();
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            n > 0,
+            "expected the partial byte count (>0), got {n} (errno={err}); \
+             macOS reported a partial transfer via EAGAIN and the wrapper discarded it"
+        );
+        assert!(
+            (n as usize) < size,
+            "expected a PARTIAL send (< {size}) on a filled non-blocking socket, got {n}"
+        );
     }
 }
 
