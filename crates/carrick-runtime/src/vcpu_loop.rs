@@ -1525,6 +1525,20 @@ where
             self.kicker.kick_all_except(self.this_tid);
             self.platform_futex.notify_signal_pending();
             kernel.signal_arrival.wake_all_waiters();
+            // Bound the drain. This loop used to spin FOREVER if a sibling never
+            // unregistered (i.e. it is stuck in a blocking host wait whose
+            // interrupt predicate omits `is_quiescing()`, so a kick/notify never
+            // returns it to the run-loop-top barrier). On HVF that ate ~10 min at
+            // 100% CPU with every other sibling parked (sample-confirmed under
+            // concurrent os/exec); on KVM it hangs eternally (no VCPU_LIVE abort
+            // below). A deadline turns that into a bounded, LOGGED abort whose
+            // core (bt all) names the stranded thread — the only way to pin which
+            // wait arm is missing the predicate. The window is generous (the
+            // normal drain is sub-millisecond) so a merely-slow sibling never
+            // trips it. (fork_quiesce_no_lost_wakeup_* proves the barrier
+            // coordination itself is sound, so a stall here is a stranded sibling,
+            // not a lost wake.)
+            let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 // The quiesce is complete only when the KICKER COUNT itself
                 // drains to 1 (just this forker). A parking sibling UNREGISTERS
@@ -1546,6 +1560,20 @@ where
                 others = self.kicker.count().saturating_sub(1);
                 if others == 0 {
                     break;
+                }
+                if std::time::Instant::now() >= drain_deadline {
+                    tracing::error!(
+                        others,
+                        kicker = self.kicker.count(),
+                        paused = barrier.paused_count(),
+                        pid = std::process::id(),
+                        forker_tid = self.this_tid,
+                        "fork quiesce drain: {others} sibling vCPU(s) failed to reach the \
+                         run-loop barrier in 10s — a blocking wait arm is not surfacing \
+                         is_quiescing(). Aborting (core: `bt all` names the stranded thread) \
+                         rather than spinning forever.",
+                    );
+                    std::process::abort();
                 }
                 crate::probes::fork_quiesce(
                     1,
