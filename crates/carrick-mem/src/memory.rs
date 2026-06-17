@@ -258,6 +258,14 @@ const AARCH64_HVC1_OPCODE: u32 = AARCH64_HVC0_OPCODE | (1 << 5);
 // `hvc #0` can be consumed as an SMCCC hypercall before HVF reports an exit
 // when x0 looks like a function ID (V8 mmap hints can have low32=0xc1000000).
 const AARCH64_HVC_SYSCALL_OPCODE: u32 = AARCH64_HVC0_OPCODE | (2 << 5);
+// AArch64 `hvc #3` — the EL1 vector's "unexpected current-EL synchronous
+// exception" fail-loud trap. carrick's guest only runs at EL0, so a synchronous
+// exception taken WHILE AT EL1 (the EL1 vector / syscall-shim trampoline) is
+// always carrick state corruption (e.g. a signal handler entered at EL1h, whose
+// PXN instruction fetch aborts). The current-EL synchronous vector slots issue
+// this so the host sees ESR_EL1/ELR_EL1/FAR_EL1 and FAILS LOUD, instead of the
+// old bare `eret` that silently re-faulted at 100 % CPU forever.
+const AARCH64_HVC_FAULT_OPCODE: u32 = AARCH64_HVC0_OPCODE | (3 << 5);
 // AArch64 `mov x8, #139`, the Linux aarch64 rt_sigreturn syscall number.
 const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 // AArch64 `svc #0`, used by the user-mode sigreturn trampoline.
@@ -287,6 +295,13 @@ pub const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
 // Offset of the "Lower EL using AArch64, synchronous" slot in the vector
 // table. EL0 `svc #0` from AArch64 lands here.
 const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
+// Offsets of the two "Current EL" SYNCHRONOUS slots: SP_EL0 (0x000) and SP_ELx
+// (0x200). A synchronous exception here means carrick's own EL1 trampoline code
+// faulted — only possible if the guest was wrongly left at EL1 (the fail-loud
+// case). These slots issue `hvc #3` instead of a bare `eret` so the host traps
+// it loudly rather than spinning on the re-faulting instruction.
+const AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET: usize = 0x000;
+const AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET: usize = 0x200;
 
 pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
 pub const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
@@ -1960,6 +1975,7 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
     let size = LINUX_EL1_VECTORS_SIZE as usize;
     let mut bytes = vec![0_u8; size];
     let hvc = AARCH64_HVC_SYSCALL_OPCODE.to_le_bytes();
+    let hvc_fault = AARCH64_HVC_FAULT_OPCODE.to_le_bytes();
     let eret = AARCH64_ERET_OPCODE.to_le_bytes();
     let nop = AARCH64_NOP_OPCODE.to_le_bytes();
 
@@ -1974,6 +1990,16 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
             cursor += hvc.len();
             bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
             cursor += eret.len();
+        } else if slot_offset == AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET
+            || slot_offset == AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET
+        {
+            // Fail loud: a synchronous exception at EL1 is carrick corruption,
+            // never a legitimate guest event. Trap to the host (`hvc #3`) so it
+            // reports ESR_EL1/ELR_EL1/FAR_EL1 instead of bare-`eret` spinning on
+            // the re-faulting instruction. The host never resumes past this, so
+            // the rest of the slot is harmless `nop` padding (filled below).
+            bytes[cursor..cursor + hvc_fault.len()].copy_from_slice(&hvc_fault);
+            cursor += hvc_fault.len();
         } else {
             bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
             cursor += eret.len();
@@ -2947,6 +2973,7 @@ mod el1_shim_tests {
 
     const ERET: u32 = 0xD69F_03E0;
     const HVC2: u32 = 0xD400_0042;
+    const HVC3: u32 = 0xD400_0062; // hvc #3 — fail-loud unexpected-EL1 trap
     const MRS_TPIDR_EL1_X0: u32 = 0xD538_D080; // mrs x0, TPIDR_EL1
 
     /// The shim dispatcher must service EXACTLY the per-process identity syscalls
@@ -3043,10 +3070,34 @@ mod el1_shim_tests {
         );
     }
 
-    /// Other slots are untouched (slot 0 stays a bare eret).
+    /// Current-EL SYNCHRONOUS slots (0x000 SP_EL0, 0x200 SP_ELx) fail loud via
+    /// `hvc #3`: a synchronous exception at EL1 is always carrick corruption
+    /// (e.g. a signal handler entered at EL1h → PXN instruction abort), and must
+    /// trap to the host instead of bare-`eret` spinning. The spurious NON-sync
+    /// slots (IRQ/FIQ/SError) stay bare `eret` — those can fire harmlessly and
+    /// are correctly ignored. Asserted on BOTH the legacy and shim pages (the
+    /// shim inherits these slots from the legacy builder).
     #[test]
-    fn shim_leaves_spurious_slots_as_bare_eret() {
-        assert_eq!(rd_u32(&el1_vectors_bytes_shim(), 0), ERET);
+    fn current_el_sync_slots_fail_loud_via_hvc3() {
+        for page in [el1_vectors_bytes(), el1_vectors_bytes_shim()] {
+            assert_eq!(
+                rd_u32(&page, AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET),
+                HVC3,
+                "current-EL SP_EL0 sync slot (0x000) must trap loud"
+            );
+            assert_eq!(
+                rd_u32(&page, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET),
+                HVC3,
+                "current-EL SP_ELx sync slot (0x200) must trap loud"
+            );
+            // A non-sync spurious slot (0x080 = current-EL SP_EL0 IRQ) is still a
+            // bare eret — harmless interrupts are ignored, not aborted.
+            assert_eq!(
+                rd_u32(&page, 0x080),
+                ERET,
+                "spurious IRQ slot must stay a bare eret"
+            );
+        }
     }
 
     /// Regression guard: the default (non-shim) vector page keeps the flat
