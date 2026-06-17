@@ -48,6 +48,16 @@ split-debuginfo = "unpacked"
 # the explicit checked_* added at hot sites. (audit M0)
 [profile.release]
 overflow-checks = true
+# Ship DWARF line tables in release builds so a `sample`/`atos`/lldb backtrace
+# (and a SIGABRT core post-mortem — e.g. the fork-quiesce drain abort) resolves
+# to file:line, not just symbol+offset. Line tables have ZERO runtime cost (they
+# don't change codegen) — only a larger build output + slightly longer link —
+# which is the right trade for a hypervisor we routinely post-mortem. Bump to
+# `debug = true` if you also want `frame variable` / local inspection in a core.
+debug = "line-tables-only"
+# Keep the debug info in a sidecar .dSYM (auto-found by atos/lldb/dtrace) so the
+# runtime binary itself stays lean.
+split-debuginfo = "packed"
 
 [workspace.dependencies]
 chrono = "0.4.44"
