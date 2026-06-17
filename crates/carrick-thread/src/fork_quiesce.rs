@@ -426,4 +426,133 @@ mod tests {
         assert!(!barrier.wait_quiesced(1, Duration::from_millis(100)));
         barrier.end_quiesce();
     }
+
+    /// Hermetic stress of the REAL fork-quiesce protocol — the coordination that
+    /// stranded every vCPU thread in `park_if_quiescing` under concurrent
+    /// fork()/os-exec (the Go deadlock; sample: all siblings parked in
+    /// `release_and_park_vcpu_for_fork -> park_if_quiescing -> pthread_cond_wait`,
+    /// never released, one thread spinning). It mirrors the runtime EXACTLY:
+    ///   * a fake kicker COUNT (vcpu_loop drains `kicker.count()` to 1, not the
+    ///     `paused` count — so a `paused`-only stress would miss the skew);
+    ///   * each sibling, on seeing `is_quiescing()`, UNREGISTERS from the count
+    ///     THEN parks (the order `release_and_park_vcpu_for_fork` uses), and
+    ///     re-registers on resume;
+    ///   * a forker that loses `try_begin_fork` also unregisters+parks at the
+    ///     in-flight barrier (vcpu_loop.rs:1501-1506) before retrying;
+    ///   * the winner `set_quiescing`, spins the drain until only it remains
+    ///     (mirrors the unbounded drain at vcpu_loop.rs:1528-1565), holds
+    ///     `lock_paused_across_fork` across a no-op "fork", then
+    ///     `end_quiesce`/`end_fork`.
+    /// A lost `end_quiesce` wake (the flag is lowered OUTSIDE the `paused` lock)
+    /// would leave a parker in `cv.wait` forever; a watchdog deadline turns that
+    /// eternal hang into a test failure. RED if the coordination loses a wake;
+    /// GREEN proves the barrier coordination is sound (so a real hang lives in a
+    /// vcpu-loop wait arm that omits `is_quiescing()`, not here).
+    fn fork_quiesce_stress(forkers: usize) {
+        use std::sync::mpsc;
+        const SIBLINGS: usize = 8;
+        const ROUNDS: usize = 20_000;
+
+        let barrier = Arc::new(QuiesceBarrier::new());
+        // Registered-thread count: the forkers + the live siblings. A thread
+        // unregisters before parking and re-registers on resume — exactly the
+        // kicker count the runtime drains to 1.
+        let kicker = Arc::new(AtomicUsize::new(forkers + SIBLINGS));
+        let stop = Arc::new(AtomicBool::new(false));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..SIBLINGS {
+            let (b, k, s) = (Arc::clone(&barrier), Arc::clone(&kicker), Arc::clone(&stop));
+            handles.push(std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) {
+                    if b.is_quiescing() {
+                        k.fetch_sub(1, Ordering::SeqCst);
+                        b.park_if_quiescing();
+                        k.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        for _ in 0..forkers {
+            let (b, k, s, r) = (
+                Arc::clone(&barrier),
+                Arc::clone(&kicker),
+                Arc::clone(&stop),
+                Arc::clone(&rounds),
+            );
+            handles.push(std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) && r.load(Ordering::Relaxed) < ROUNDS {
+                    if !b.try_begin_fork() {
+                        // Lost the token: park at the in-flight barrier (like the
+                        // runtime) so the winner can count us as quiesced.
+                        if b.is_quiescing() {
+                            k.fetch_sub(1, Ordering::SeqCst);
+                            b.park_if_quiescing();
+                            k.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    b.set_quiescing();
+                    // Drain until only this winner remains registered.
+                    while k.load(Ordering::SeqCst) > 1 && !s.load(Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                    {
+                        let _g = b.lock_paused_across_fork(); // no-op "fork" window
+                    }
+                    b.end_quiesce();
+                    b.end_fork();
+                    r.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // Watchdog: the workload runs on the spawned threads; this thread fails
+        // the test if ROUNDS don't complete within a hard wall-clock deadline.
+        let (tx, rx) = mpsc::channel();
+        {
+            let (r, s) = (Arc::clone(&rounds), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while r.load(Ordering::Relaxed) < ROUNDS && !s.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let _ = tx.send(());
+            });
+        }
+        let ok = rx.recv_timeout(Duration::from_secs(30)).is_ok();
+
+        // Tear down cleanly even on the deadlock path: stop everyone, then lower
+        // the flag so any parked sibling wakes and exits, so join() returns.
+        stop.store(true, Ordering::Relaxed);
+        for _ in 0..4 {
+            barrier.end_fork();
+            barrier.end_quiesce();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+
+        assert!(
+            ok,
+            "fork-quiesce deadlocked with {forkers} forker(s): a parker stuck in \
+             park_if_quiescing or a forker spinning the drain (only {}/{ROUNDS} \
+             rounds completed)",
+            rounds.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn fork_quiesce_no_lost_wakeup_single_forker() {
+        fork_quiesce_stress(1);
+    }
+
+    #[test]
+    fn fork_quiesce_no_lost_wakeup_concurrent_forkers() {
+        fork_quiesce_stress(2);
+    }
 }
