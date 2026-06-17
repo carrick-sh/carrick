@@ -87,6 +87,35 @@ mod support;
 use support::*;
 pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
 
+/// Resolve a host `connect` that reported SUCCESS (`rc==0` or `EISCONN`) into the
+/// guest result, consulting `SO_ERROR` first. carrick makes the host socket
+/// non-blocking before `connect` (so it never blocks the dispatcher under the
+/// lock), so a "success" return does NOT prove the connection completed: an async
+/// connect that FAILED (e.g. `ECONNREFUSED` to a non-listening port) is reported
+/// by macOS as `EISCONN` on the POLLOUT re-dispatch, deferring the real error to
+/// the first `recv`. A BLOCKING guest `connect(2)` must surface that error at
+/// connect time — otherwise `socket.create_connection`'s address fallback
+/// (IPv6 `::1` → IPv4 `127.0.0.1`) never triggers and CPython's network suites
+/// (ftplib/httplib/imaplib/docxmlrpc) wrongly fail. `SO_ERROR` is the
+/// authoritative async-connect result; a healthy socket reports 0.
+fn connect_success_or_pending_error(host_fd: i32) -> DispatchOutcome {
+    let mut host_err: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            host_fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&mut host_err as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 && host_err != 0 {
+        return crate::host_to_linux_errno(host_err).into();
+    }
+    DispatchOutcome::Returned { value: 0 }
+}
+
 fn guest_unix_pathname(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> Option<String> {
     memory
         .read_bytes(addr, addrlen as usize)
@@ -1109,11 +1138,11 @@ impl SyscallDispatcher {
             )
         };
         if rc == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return connect_success_or_pending_error(host_fd);
         }
         let e = HostSyscallError::last().linux_errno();
         if e == LINUX_EISCONN {
-            return DispatchOutcome::Returned { value: 0 };
+            return connect_success_or_pending_error(host_fd);
         }
         if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
             return DispatchOutcome::WaitOnFds {
@@ -2780,13 +2809,19 @@ impl SyscallDispatcher {
                 );
             }
             if rc == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                // A non-blocking host connect reporting success does not prove the
+                // connection completed — consult SO_ERROR (see
+                // connect_success_or_pending_error).
+                return Ok(connect_success_or_pending_error(host_fd));
             }
             let e = HostSyscallError::last().linux_errno();
-            // EISCONN: the connection completed (we're back here via the POLLOUT
-            // re-dispatch). Success.
+            // EISCONN: the async connect completed (we're back via the POLLOUT
+            // re-dispatch). macOS reports EISCONN even when it FAILED, so the real
+            // result is in SO_ERROR — surface ECONNREFUSED etc. at connect time
+            // instead of deferring it to the first recv (which breaks a blocking
+            // guest connect + create_connection's IPv6->IPv4 address fallback).
             if e == LINUX_EISCONN {
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                return Ok(connect_success_or_pending_error(host_fd));
             }
             if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
                 if nonblocking {
