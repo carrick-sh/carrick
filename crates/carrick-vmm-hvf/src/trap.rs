@@ -483,6 +483,69 @@ impl AliasRemapLimiter {
     }
 }
 
+/// A sibling vCPU's mapping, published during a fork quiesce so the forking
+/// thread can re-map the UNION of every sibling's regions into the rebuilt
+/// PARENT VM — not just its own. Threads share ONE `hv_vm`, but `fork()` rebuilds
+/// it from only the forking thread's `mappings`; a per-thread alias a SIBLING
+/// established (e.g. a Go heap-arena chunk mmap'd at high-VA on that thread) is
+/// otherwise dropped from the rebuilt VM and the parent translation-faults on it
+/// (DC ZVA on a missing stage-2 entry — the concurrent-os/exec crash).
+///
+/// `host_addr`/`perms` are stored as `usize`/`u64` (not the raw pointer / MemPerms)
+/// so the registry is `Send` across the publishing siblings and the consuming
+/// forker. Safe because publication happens in `release_vcpu_for_fork`, after
+/// which the sibling PARKS (holding its `OwnedHostMapping` alive) until the fork
+/// completes — so the forker always re-maps a live backing (no use-after-free).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct SiblingForkMapping {
+    start: u64,
+    ipa: u64,
+    end: u64,
+    host_addr: usize,
+    size: usize,
+    perms: u64,
+    guest_shared: bool,
+    guest_writable: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn sibling_fork_mappings() -> &'static parking_lot::Mutex<Vec<SiblingForkMapping>> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<Vec<SiblingForkMapping>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Drop all published sibling mappings. Called by the forker at quiesce start
+/// (before kicking siblings) so each fork round starts from a clean set.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn clear_sibling_fork_mappings() {
+    sibling_fork_mappings().lock().clear();
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn clear_sibling_fork_mappings() {}
+
+/// Publish a quiescing sibling's regions so the forker re-maps them into the
+/// rebuilt parent VM.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_sibling_fork_mappings(regions: &[HvfMappedRegion]) {
+    let mut reg = sibling_fork_mappings().lock();
+    reg.reserve(regions.len());
+    for m in regions {
+        reg.push(SiblingForkMapping {
+            start: m.start,
+            ipa: m.ipa,
+            end: m.end,
+            host_addr: m.host_addr as usize,
+            size: m.size,
+            perms: u64::from(m.perms),
+            guest_shared: m.guest_shared,
+            guest_writable: m.guest_writable,
+        });
+    }
+}
+
 /// Process-global count of live HVF vCPUs (created minus destroyed). Pure
 /// diagnostic: reported in the fork__quiesce phase-2 probe so a `carrick trace`
 /// shows exactly how many vCPUs are alive when the forker calls hv_vm_destroy.
@@ -3412,6 +3475,12 @@ impl HvfInner {
     /// thread can `hv_vm_destroy` before `libc::fork` (which fails HV_BUSY while
     /// any vCPU is alive). The wrapper is left stale until `rebuild_vcpu_after_fork`.
     fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
+        // Publish this sibling's regions so the forking thread re-maps them into
+        // the rebuilt parent VM (the rebuild otherwise replays only the forker's
+        // own mappings, dropping this thread's per-thread aliases). We then park
+        // (caller: release_and_park_vcpu_for_fork) holding our OwnedHostMappings
+        // alive, so the forker re-maps live backings.
+        publish_sibling_fork_mappings(&self.mappings);
         let snap = self.snapshot_vcpu()?;
         FORK_VCPU_SNAPSHOT.with(|s| *s.borrow_mut() = Some(snap));
         let rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu.id()) };
@@ -3677,6 +3746,60 @@ impl HvfInner {
                 host_mapping: desc.host.into_owned(),
                 guest_shared: desc.guest_shared,
             });
+        }
+
+        // PARENT only: re-map the UNION of all quiesced siblings' regions that
+        // the forking thread's `mapping_descs` lacked. Threads share one VM but
+        // this rebuild replays only the forker's mappings, so a per-thread alias
+        // a SIBLING established (e.g. a Go heap-arena chunk at high-VA) is missing
+        // from the rebuilt stage-2 — the parent then DC-ZVA-faults on it
+        // (translation fault, mapped_here=false). The shared stage-1 page tables
+        // (kept by Arc above) already carry the VA->IPA entry; only the stage-2
+        // `hv_vm_map` is absent, so re-map each sibling region by IPA (deduped
+        // against what we just mapped; alias IPAs are process-global + unique).
+        // The backing is alive: every publisher PARKED in
+        // release_and_park_vcpu_for_fork after publishing and stays parked until
+        // we end the quiesce, holding its OwnedHostMapping. The region is UNOWNED
+        // here (memory/host_mapping = None) so the parent never frees a buffer the
+        // sibling owns. The CHILD is single-threaded post-fork (uses child_descs),
+        // so it must NOT inherit sibling aliases — hence pid != 0 only.
+        if pid != 0 {
+            let mut mapped_ipas: std::collections::HashSet<u64> =
+                self.mappings.iter().map(|m| m.ipa).collect();
+            let siblings = sibling_fork_mappings().lock().clone();
+            for sm in siblings {
+                if !mapped_ipas.insert(sm.ipa) {
+                    continue;
+                }
+                let r = unsafe {
+                    applevisor_sys::hv_vm_map(
+                        sm.host_addr as *mut std::ffi::c_void,
+                        sm.ipa,
+                        sm.size,
+                        sm.perms,
+                    )
+                };
+                if r != 0 {
+                    return Err(TrapError::ChildMapFailed {
+                        host_addr: sm.host_addr as u64,
+                        guest_start: sm.ipa,
+                        size: sm.size,
+                        code: r as u32,
+                    });
+                }
+                self.mappings.push(HvfMappedRegion {
+                    start: sm.start,
+                    ipa: sm.ipa,
+                    end: sm.end,
+                    host_addr: sm.host_addr as *mut u8,
+                    size: sm.size,
+                    perms: applevisor::memory::MemPerms::from(sm.perms),
+                    guest_writable: sm.guest_writable,
+                    memory: None,
+                    host_mapping: None,
+                    guest_shared: sm.guest_shared,
+                });
+            }
         }
 
         // Restore vCPU register state from the pre-fork snapshot. Both
