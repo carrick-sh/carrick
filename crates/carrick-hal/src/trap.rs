@@ -216,6 +216,24 @@ pub enum TrapError {
         sp: u64,
         from_el0_direct: bool,
     },
+    /// carrick's guest took a SYNCHRONOUS exception while the CPU was at EL1.
+    /// The guest itself only ever runs at EL0, and carrick's EL1 trampoline is
+    /// just `hvc`/`eret`/shim code — so this is always carrick state corruption
+    /// (a guest resume that left PSTATE at EL1, e.g. a signal handler entered
+    /// with SPSR_EL1=EL1h whose PXN instruction fetch then aborts). The
+    /// current-EL synchronous vector slots trap it via `hvc #3` so it FAILS LOUD
+    /// here, instead of the guest spinning forever on a bare-`eret` that
+    /// re-enters the faulting instruction at 100 % CPU. The raw EL1 fault
+    /// registers (ESR/ELR/FAR/SPSR) pin the cause for post-mortem.
+    #[error(
+        "guest executed at EL1 (carrick state corruption): esr_el1=0x{esr_el1:x} elr_el1=0x{elr_el1:x} far_el1=0x{far_el1:x} spsr_el1=0x{spsr_el1:x}"
+    )]
+    GuestAtEl1 {
+        esr_el1: u64,
+        elr_el1: u64,
+        far_el1: u64,
+        spsr_el1: u64,
+    },
     /// An ISA-neutral synchronous guest fault, carrying the **already-resolved**
     /// Linux signal triple (NOT a raw architectural syndrome). The runtime's
     /// fault arm delivers `signum`/`si_code` to the guest with `si_addr =

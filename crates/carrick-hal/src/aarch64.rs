@@ -38,6 +38,23 @@ pub fn is_aarch64_hvc_maintenance(syndrome: u64) -> bool {
     is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == 1
 }
 
+/// HVC immediate reserved for the EL1 vector's "unexpected current-EL
+/// synchronous exception" trap (`hvc #3`). carrick's guest only ever runs at
+/// EL0; a *synchronous* exception taken while the CPU is at EL1 (inside the EL1
+/// vector / syscall-shim trampoline) is therefore always a carrick state
+/// corruption — e.g. a signal handler entered with SPSR_EL1=EL1h, whose PXN
+/// instruction fetch aborts. The current-EL synchronous vector slots issue this
+/// `hvc #3` so the host SEES the fault and fails LOUD, instead of the old bare
+/// `eret` that silently re-entered the faulting instruction at 100% CPU forever.
+pub const AARCH64_HVC_FAULT_IMM: u64 = 3;
+
+/// True for the EL1 vector's `hvc #3` unexpected-current-EL-exception trap.
+/// Distinct immediate from `hvc #1` (maintenance) and `hvc #2` (syscall) so the
+/// host never confuses a fail-loud EL1 fault with a real syscall forward.
+pub fn is_aarch64_hvc_fault(syndrome: u64) -> bool {
+    is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_FAULT_IMM
+}
+
 /// True for syscall-shaped traps a host can dispatch identically: EL0 `svc #0`
 /// (`EC = 0x15`) and an EL1 vector's `hvc #2` re-trap (`EC = 0x16`). Both
 /// deliver the syscall ABI registers unchanged.
@@ -92,6 +109,15 @@ mod tests {
         assert!(is_aarch64_hvc_maintenance(esr(0x16, 1)));
         assert!(!is_aarch64_hvc_maintenance(esr(0x16, 2)));
         assert!(!is_aarch64_hvc_maintenance(esr(0x15, 1)));
+        // hvc #3 is the unexpected-current-EL-exception (fail-loud) marker,
+        // distinct from the maintenance (#1) and syscall (#2) immediates.
+        assert!(is_aarch64_hvc_fault(esr(0x16, 3)));
+        assert!(!is_aarch64_hvc_fault(esr(0x16, 1)));
+        assert!(!is_aarch64_hvc_fault(esr(0x16, 2)));
+        assert!(!is_aarch64_hvc_fault(esr(0x15, 3)));
+        // A #3 HVC must NOT be mistaken for the maintenance marker, and vice
+        // versa — the run loop dispatches on these to wholly different paths.
+        assert!(!is_aarch64_hvc_maintenance(esr(0x16, 3)));
         // A data abort (EC=0x24) is neither.
         assert!(!is_aarch64_syscall_exception(esr(0x24, 0)));
     }
