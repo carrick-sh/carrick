@@ -194,8 +194,8 @@ use carrick_hal::aarch64::ExecLevel;
 // (E0603/E0432 in tests/trap_hvf.rs).
 pub use carrick_hal::aarch64::{
     AARCH64_HVC_EXCEPTION_CLASS, AARCH64_SVC_EXCEPTION_CLASS, aarch64_exception_class,
-    is_aarch64_hvc_exception, is_aarch64_hvc_maintenance, is_aarch64_svc_exception,
-    is_aarch64_syscall_exception,
+    is_aarch64_hvc_exception, is_aarch64_hvc_fault, is_aarch64_hvc_maintenance,
+    is_aarch64_svc_exception, is_aarch64_syscall_exception,
 };
 pub use carrick_hal::trap::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
 
@@ -1297,11 +1297,31 @@ impl HvfTrapEngine {
             }
         }
 
-        // Engine-supplied values the shared builder must not recompute. PSTATE
-        // source: kick path → live CPSR (Reg::Pstate); syscall path →
-        // SPSR_EL1, where the `svc` exception latched the EL0 PSTATE.
+        // Choose the resume mechanism by the LIVE exception level, NOT by whether
+        // the caller supplied an interrupted_pc. When the vCPU is at EL1 (inside
+        // the EL1 trampoline — a syscall boundary OR a just-serviced
+        // rt_sigreturn), the interrupted USER context is latched in
+        // ELR_EL1/SPSR_EL1 and the handler must enter via the pending `eret`
+        // (which drops to EL0t). A caller-supplied interrupted_pc is the x86
+        // rt_sigreturn resume-RIP workaround (vcpu_loop sets signal_interrupted_pc
+        // after SigReturn); on aarch64 it is an EL1 trampoline PC, and taking the
+        // "kick" path for it (overwrite Reg::PC, keep the EL1 PSTATE) ran the
+        // handler AT EL1 → its first PXN instruction fetch aborted → the
+        // current-EL fail-loud trap (a SIGURG/SIGCHLD stacked on a sigreturn,
+        // hit under concurrent os/exec). Normalising interrupted_pc to None when
+        // at EL1 routes saved_pc/PSTATE/handler-entry through the eret path so the
+        // handler runs at EL0t. Genuine EL0 kicks (CANCELED handler guarantees
+        // is_guest) keep the live-CPSR kick path unchanged.
+        let live_cpsr = self.get_reg(carrick_hal::Reg::Pstate)?;
+        let interrupted_pc = if ExecLevel::from_pstate(live_cpsr).is_guest() {
+            interrupted_pc
+        } else {
+            None
+        };
+        // PSTATE source: kick path (EL0) → live CPSR; eret path (EL1) → SPSR_EL1,
+        // where the `svc`/sigreturn-svc latched the EL0 PSTATE.
         let pstate_source = if interrupted_pc.is_some() {
-            self.get_reg(carrick_hal::Reg::Pstate)?
+            live_cpsr
         } else {
             self.get_reg(carrick_hal::Reg::SpsrEl1)?
         };
@@ -2420,6 +2440,37 @@ impl HvfInner {
                 true,
                 Some((true_pc, exception.virtual_address)),
             ));
+        }
+        // Fail loud on the EL1 vector's `hvc #3` (current-EL synchronous slot):
+        // carrick's guest took a synchronous exception WHILE AT EL1, which only
+        // happens when a guest resume left PSTATE at EL1 (e.g. a signal handler
+        // entered with SPSR_EL1=EL1h, whose PXN instruction fetch aborts). The
+        // bare-`eret` vectors used to spin on this forever at 100 % CPU with no
+        // host exit; the `hvc #3` trap surfaces it here. ESR_EL1/ELR_EL1/FAR_EL1
+        // still hold the ORIGINAL EL1 fault (the `hvc` left them untouched), so
+        // report them verbatim. This is a carrick bug, not a guest fault — do not
+        // deliver it to the guest as a signal; terminate loudly with the cause.
+        if is_aarch64_hvc_fault(exception.syndrome) {
+            let esr_el1 = self.vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
+            let elr_el1 = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+            let far_el1 = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+            let spsr_el1 = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+            let ec = (esr_el1 >> 26) & 0x3f;
+            eprintln!(
+                "FAIL-LOUD pid={pid}: guest executed at EL1 and faulted \
+                 (current-EL sync vector) — carrick state corruption (a guest \
+                 resume left PSTATE at EL1, commonly a signal handler entered \
+                 with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the \
+                 hvc #3 vector trap. esr_el1={esr_el1:#x} ec={ec:#x} \
+                 elr_el1={elr_el1:#x} far_el1={far_el1:#x} spsr_el1={spsr_el1:#x}",
+                pid = unsafe { libc::getpid() },
+            );
+            return Err(TrapError::GuestAtEl1 {
+                esr_el1,
+                elr_el1,
+                far_el1,
+                spsr_el1,
+            });
         }
         if !is_aarch64_syscall_exception(exception.syndrome) {
             return Err(TrapError::UnexpectedException {
