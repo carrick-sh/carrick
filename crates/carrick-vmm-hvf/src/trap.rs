@@ -416,13 +416,35 @@ fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
 /// backing is a `MAP_SHARED` mmap that stays valid across fork and threads, so
 /// re-`hv_vm_map`'ing the SAME host address is coherent. Private/anon aliases
 /// are per-thread-snapshotted by the fork path and must NOT be re-shared here.
+/// A high-VA alias's IPA window → host backing, registered PROCESS-GLOBALLY. Two
+/// roles: (1) the stage-2 lazy on-fault re-map (a vCPU whose forked VM lost an
+/// alias re-establishes it), and (2) the SYSCALL-PATH cross-thread fallback —
+/// `mapping_for_range` consults this when a guest buffer lives in a high-VA alias
+/// ANOTHER thread mapped (each `HvfInner.mappings` is per-thread; Go's heap arenas
+/// are shared across goroutines, so a sibling-mapped arena was invisible to a
+/// thread's syscall and EFAULTed). The VA→IPA half is already process-shared
+/// (`translate_va` over the Arc-shared page tables); this supplies the IPA→host
+/// half. Stores a NON-OWNING raw `host_addr` only (never an OwnedHostMapping), so
+/// it never participates in Drop / double-free; the backing's lifetime stays with
+/// the owning thread's `mappings` Vec and this entry is removed on `munmap`
+/// (`unregister_alias`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
 struct AliasBacking {
+    /// Guest VIRTUAL start of the alias (the syscall-path region key).
+    start: u64,
     ipa: u64,
     host_addr: usize,
     size: usize,
     perms: u64,
+    /// Whether the guest may WRITE the alias (a PROT_READ MAP_SHARED file alias
+    /// must EFAULT a syscall write, not SIGBUS the host through the raw pointer).
+    guest_writable: bool,
+    /// True for a genuine guest `MAP_SHARED` FILE alias (cross-process coherent).
+    /// Gates `shared_futex_host_addr`: only a guest_shared alias is a valid
+    /// cross-process futex word — an anon arena alias resolved via the same index
+    /// must NOT be treated as one.
+    guest_shared: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -436,8 +458,11 @@ fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Record a `guest_shared` alias so any vCPU whose VM lost it (post-fork) can
-/// re-establish it. Idempotent per IPA.
+/// Record an alias (any `map_host_alias` region — file OR private anon) so the
+/// stage-2 lazy remap and the syscall-path cross-thread fallback can resolve it
+/// from any thread. Idempotent per IPA: a re-register (e.g. a forked child
+/// overwriting the inherited PARENT host_addr with its private snapshot pointer)
+/// replaces the entry.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_shared_alias(b: AliasBacking) {
     let mut reg = alias_registry().lock();
@@ -456,6 +481,20 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
         .iter()
         .find(|e| ipa >= e.ipa && ipa < e.ipa.saturating_add(e.size as u64))
         .copied()
+}
+
+/// Drop the index entry for any alias whose guest-VA window overlaps
+/// `[va, va+len)` — called on a guest `munmap` of a high-VA alias (the only point
+/// the backing is actually freed), BEFORE the stage-1 invalidate, so a stale
+/// `host_addr` is never resolved after the OwnedHostMapping unmaps it. A thread
+/// exit LEAKS the backing (HvfTrapEngine::Drop is a no-op), so no unregister is
+/// needed there. Keyed on the VA `start` because `munmap` supplies a VA.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unregister_alias(va: u64, len: usize) {
+    let end = va.saturating_add(len as u64);
+    alias_registry()
+        .lock()
+        .retain(|e| e.start.saturating_add(e.size as u64) <= va || e.start >= end);
 }
 
 /// Bounds lazy alias remaps per backing IPA, not per guest-run interval.
@@ -901,6 +940,27 @@ struct HvfMappedRegion {
     /// a PROT_READ MAP_SHARED file alias) or corrupting a carrick-owned
     /// `write:false` region. (audit M1; probe `rosharedbus`)
     guest_writable: bool,
+}
+
+/// A copyable projection of the scalar fields of an [`HvfMappedRegion`] that the
+/// syscall-path accessors actually read (`start`/`end`/`ipa`/`host_addr`/`size`/
+/// `guest_writable`/`guest_shared`). [`HvfInner::mapping_for_range`] returns this
+/// by value instead of `&HvfMappedRegion` so a lookup that resolves through the
+/// PROCESS-SHARED `alias_registry` fallback (a high-VA alias another thread
+/// mapped, absent from THIS thread's per-thread `mappings`) can synthesize a view
+/// with no borrow into `self.mappings`. The copy loops compute
+/// `host_addr + (addr - start)`, so a synthetic view sets `start` to the alias VA
+/// base and `host_addr` to its backing base — identical offset math to a real
+/// region.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct MappingView {
+    start: u64,
+    end: u64,
+    ipa: u64,
+    host_addr: *mut u8,
+    guest_writable: bool,
+    guest_shared: bool,
 }
 
 /// Snapshot of vCPU register state captured before fork(2). The child
@@ -2083,6 +2143,10 @@ impl HvfInner {
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        // Drop any process-shared alias index entry for this VA range BEFORE the
+        // stage-1 invalidate (no-op for the common low-VA arena case — aliases are
+        // high-VA — but munmap can route a high-VA alias here too).
+        unregister_alias(address, len);
         self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
     }
 
@@ -2090,6 +2154,9 @@ impl HvfInner {
     /// sub-table(s) back to the spare pool (vs `unmap_range`, which keeps the
     /// table for the low-VA arena's in-place reuse). See `unmap_aliased`.
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        // The backing is freed here; drop the process-shared index entry first so
+        // a cross-thread fallback never resolves a now-munmap'd host_addr.
+        unregister_alias(address, len);
         self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
     }
 
@@ -2188,19 +2255,24 @@ impl HvfInner {
         }
         pt_res.map_err(|e| TrapError::Hypervisor(format!("alias page-table build failed: {e}")))?;
         let guest_shared = host_mapping.guest_shared();
-        // Register guest_shared (MAP_SHARED-file) aliases process-globally so a
-        // sibling vCPU whose shared VM lost this mapping after a fork rebuild can
-        // re-establish it lazily on fault (see `alias_registry`). The host backing
-        // is a MAP_SHARED mmap valid across threads + fork, so re-`hv_vm_map`'ing
-        // the SAME host address into the rebuilt VM is coherent.
-        if guest_shared {
-            register_shared_alias(AliasBacking {
-                ipa,
-                host_addr: host as usize,
-                size,
-                perms: u64::from(perms),
-            });
-        }
+        // Register EVERY alias (MAP_SHARED file AND private anon — Go's high-VA
+        // heap arenas) process-globally in `alias_registry`. Two consumers: the
+        // stage-2 lazy on-fault re-map (a forked VM that lost the alias), and the
+        // SYSCALL-PATH cross-thread fallback in `mapping_for_range` (a sibling
+        // thread whose per-thread `mappings` never saw this alias — the
+        // "read/wait: bad address" EFAULT). Was guest_shared-only; widening it to
+        // anon is safe because the index is non-owning (raw host_addr) and removed
+        // on munmap. guest_writable is carried so a PROT_READ file alias still
+        // EFAULTs a syscall write via the fallback instead of SIGBUS-ing the host.
+        register_shared_alias(AliasBacking {
+            start: va,
+            ipa,
+            host_addr: host as usize,
+            size,
+            perms: u64::from(perms),
+            guest_writable: alias_guest_writable,
+            guest_shared,
+        });
         self.mappings.push(HvfMappedRegion {
             start: va,
             ipa,
@@ -3249,26 +3321,39 @@ impl HvfInner {
         self.protections.set_no_access(address, len, no_access);
     }
 
-    fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
+    /// Resolve a guest VA range to a [`MappingView`] (host pointer + bounds +
+    /// writability). THE single chokepoint every syscall-path memory accessor
+    /// (read/write_guest_bytes, host_ptr_for_read/write, validate_guest_write_range,
+    /// zero_guest_backing) routes through.
+    ///
+    /// Fast path: THIS thread's per-thread `mappings`. Cross-thread FALLBACK: when
+    /// that misses for a high-VA address, the VA→IPA half is already process-shared
+    /// (`translate_va` walks the Arc-shared page tables, which `map_aliased` edits
+    /// for EVERY thread's alias), so resolve IPA→host from the process-shared
+    /// `alias_registry` — fixing a syscall buffer that lives in a high-VA alias
+    /// (Go heap arena) ANOTHER goroutine mmap'd, invisible to this thread's list
+    /// (the "read/wait: bad address" EFAULT). Both `_range` and `_range_mut`
+    /// resolve identically — no accessor mutates the region itself.
+    fn mapping_for_range(&self, address: u64, length: usize) -> Option<MappingView> {
         let address = strip_pointer_tag(address);
         let stage1_ipa = crate::memory::is_high_va(address)
             .then(|| self.translate_va(address))
             .flatten();
-        Self::mapping_index_for_range(&self.mappings, address, length, stage1_ipa)
-            .map(|idx| &self.mappings[idx])
+        if let Some(idx) =
+            Self::mapping_index_for_range(&self.mappings, address, length, stage1_ipa)
+        {
+            return Some(self.mappings[idx].view());
+        }
+        // Cross-thread fallback (high-VA aliases only — low-VA regions are all
+        // boot-mapped into every thread's list). Key on the guest's OWN stage-1
+        // IPA so an overlapping MAP_FIXED alias resolves to the backing the guest
+        // actually sees.
+        let ipa = stage1_ipa?;
+        lookup_shared_alias(ipa).map(|b| MappingView::from_alias(&b))
     }
 
-    fn mapping_for_range_mut(
-        &mut self,
-        address: u64,
-        length: usize,
-    ) -> Option<&mut HvfMappedRegion> {
-        let address = strip_pointer_tag(address);
-        let stage1_ipa = crate::memory::is_high_va(address)
-            .then(|| self.translate_va(address))
-            .flatten();
-        let idx = Self::mapping_index_for_range(&self.mappings, address, length, stage1_ipa)?;
-        self.mappings.get_mut(idx)
+    fn mapping_for_range_mut(&mut self, address: u64, length: usize) -> Option<MappingView> {
+        self.mapping_for_range(address, length)
     }
 
     /// The address the per-chunk region lookup + offset should use for a syscall
@@ -3730,6 +3815,26 @@ impl HvfInner {
                     code: r as u32,
                 });
             }
+            // Re-register every high-VA alias into the process-shared index with
+            // THIS rebuild's host_addr. Critical for the CHILD: the index is
+            // COW-inherited from the parent pointing at the PARENT's backings, but
+            // a PRIVATE alias was just re-snapshotted to a NEW child buffer
+            // (child_descs / clone_region_for_child) — without this overwrite a
+            // child syscall would read/write the parent's backing (cross-process
+            // corruption) instead of its own copy. For the parent it's idempotent
+            // (same host_addr). Low-VA boot regions are not aliases (every thread
+            // has them) and are never in the index.
+            if crate::memory::is_high_va(desc.start) {
+                register_shared_alias(AliasBacking {
+                    start: desc.start,
+                    ipa: desc.ipa,
+                    host_addr: host_addr as usize,
+                    size: desc.size,
+                    perms: perms_raw,
+                    guest_writable: desc.guest_writable,
+                    guest_shared: desc.guest_shared,
+                });
+            }
             self.mappings.push(HvfMappedRegion {
                 start: desc.start,
                 ipa: desc.ipa,
@@ -3988,6 +4093,12 @@ impl HvfInner {
         // before we destroy the current HVF state.
         let plan = GuestMappingPlan::from_address_space(address_space)?;
 
+        // execve replaces the WHOLE address space: drop every process-shared alias
+        // index entry so a stale pre-exec high-VA `host_addr` can never be resolved
+        // by a syscall in the new image. (execve already killed sibling threads, so
+        // no other thread is mid-lookup against these entries.)
+        alias_registry().lock().clear();
+
         // Tear down the current HVF VM. Same dance as fork(): destroy
         // vCPU then VM via raw API (applevisor's Drop is bypassed by
         // the `ManuallyDrop` wrapper around `HvfInner`).
@@ -4154,6 +4265,38 @@ impl HvfMappedRegion {
             host_addr: self.host_addr,
         }
         .contains_range(address, length)
+    }
+
+    fn view(&self) -> MappingView {
+        MappingView {
+            start: self.start,
+            end: self.end,
+            ipa: self.ipa,
+            host_addr: self.host_addr,
+            guest_writable: self.guest_writable,
+            guest_shared: self.guest_shared,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MappingView {
+    /// Synthesize a view from a process-shared `alias_registry` entry (the
+    /// cross-thread fallback). The alias is a contiguous VA→IPA→host window, so
+    /// the VA base + backing base reproduce the same `host_addr + (addr - start)`
+    /// offset math a real region uses.
+    fn from_alias(b: &AliasBacking) -> Self {
+        MappingView {
+            start: b.start,
+            end: b.start.saturating_add(b.size as u64),
+            ipa: b.ipa,
+            host_addr: b.host_addr as *mut u8,
+            guest_writable: b.guest_writable,
+            // Preserve guest_shared so a MAP_SHARED-file alias resolved via this
+            // fallback is still recognized as a cross-process futex word by
+            // shared_futex_host_addr (an anon arena alias must NOT be).
+            guest_shared: b.guest_shared,
+        }
     }
 }
 
