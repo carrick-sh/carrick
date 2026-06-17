@@ -701,6 +701,69 @@ mod tests {
         Ok(())
     }
 
+    /// GROUNDING (empirical, not assumed): the `EpollMultiplexer` is carrick's
+    /// epoll-emulation primitive on Linux. carrick's `epoll_pwait` mirrors the
+    /// guest's `EPOLLET` onto this multiplexer (`TriggerMode::Edge`) and relies on
+    /// the host edge to deliver EOF to the guest. This test OBSERVES, against the
+    /// real kernel, how many times a peer-close HUP on a pipe read-end is reported
+    /// across repeated non-blocking `wait()`s under Edge vs Level — i.e. whether a
+    /// HUP edge fires exactly once (so a drain that fails to deliver it loses it
+    /// forever — the Go-netpoller hang) or re-reports (level). The `assert`s
+    /// codify what the kernel actually does so a regression is caught.
+    fn hup_reports(mode: TriggerMode) -> usize {
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe2 fills a 2-element fd array.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(rc, 0, "pipe2 failed");
+        let (rd, wr) = (fds[0], fds[1]);
+        let mut mux = EpollMultiplexer::new().expect("mux");
+        mux.register_io(rd, 0xEE, Interest::READ, mode)
+            .expect("register");
+        // Peer closes the write-end: the read-end is now at permanent EOF (HUP).
+        // SAFETY: closing the write-end this test owns.
+        unsafe {
+            libc::close(wr);
+        }
+        // Count how many of three back-to-back NON-BLOCKING drains report it.
+        let mut reports = 0usize;
+        for _ in 0..3 {
+            let mut out = Vec::new();
+            let n = mux.wait(&mut out, Some(Duration::ZERO)).unwrap_or(0);
+            if n > 0 {
+                reports += 1;
+            }
+        }
+        // SAFETY: closing the read-end this test owns.
+        unsafe {
+            libc::close(rd);
+        }
+        reports
+    }
+
+    #[test]
+    fn edge_hup_fires_once_level_re_reports() {
+        let edge = hup_reports(TriggerMode::Edge);
+        let level = hup_reports(TriggerMode::Level);
+        eprintln!(
+            "HUP-after-peer-close reports over 3 non-blocking drains: edge={edge} level={level}"
+        );
+        // The whole edge-loss bug class: an EDGE registration reports the EOF/HUP
+        // exactly ONCE — if carrick's drain consumes that single report without
+        // delivering it to the guest (a concurrency race), it is gone forever. A
+        // LEVEL registration re-reports the persistent HUP on every drain, so a
+        // dropped report self-heals. This is WHY the emulation must register the
+        // multiplexer LEVEL-triggered and apply the guest's edge semantics in
+        // software (matching illumos's bitmap-latch + level-wakeup model).
+        assert_eq!(
+            edge, 1,
+            "EDGE HUP must fire exactly once (the lost-edge risk)"
+        );
+        assert_eq!(
+            level, 3,
+            "LEVEL HUP must re-report on every drain (self-healing)"
+        );
+    }
+
     #[test]
     fn register_user_and_trigger() -> Result<(), OsError> {
         let mut mux = EpollMultiplexer::new()?;
