@@ -594,13 +594,15 @@ impl SyscallDispatcher {
             LINUX_IORING_OP_CLOSE => {
                 // Same path as close(2): drop the fd from the table and free its
                 // host fd / pty entry. Also clear any io_uring side-table entry
-                // (closing a ring fd this way).
+                // (closing a ring fd this way). Detach from epolls BEFORE freeing
+                // the fd number (same ordering rule as close(2): a freed number is
+                // instantly reusable, and a detach-after-free would rip out a
+                // sibling's reused-fd interest).
+                self.detach_fd_from_epolls(sqe.fd);
                 let removed = self.io.open_files.write().remove(&sqe.fd);
                 match removed {
                     Some(open_file) => {
                         self.close_open_file_and_free_pty(&open_file);
-                        // Linux auto-removes a closed fd from every epoll interest set.
-                        self.detach_fd_from_epolls(sqe.fd);
                         self.io.io_uring_instances.write().remove(&sqe.fd);
                         0
                     }
