@@ -403,8 +403,8 @@ mod tests {
         let boot = X8664GuestArch::bootstrap_sysregs();
         // CR0 = 0x8001_0033: PE(0)|MP(1)|ET(4)|NE(5)|WP(16)|PG(31).
         assert_eq!(boot.cr0, 0x8001_0033, "CR0");
-        // CR4 = 0x0000_0620: PAE(5)|OSFXSR(9)|OSXMMEXCPT(10).
-        assert_eq!(boot.cr4, 0x0000_0620, "CR4");
+        // CR4 = 0x0004_0620: PAE(5)|OSFXSR(9)|OSXMMEXCPT(10)|OSXSAVE(18).
+        assert_eq!(boot.cr4, 0x0004_0620, "CR4");
         // EFER = 0x0000_0D01: SCE(0)|LME(8)|LMA(10)|NXE(11).
         assert_eq!(boot.efer, 0x0000_0D01, "EFER");
     }

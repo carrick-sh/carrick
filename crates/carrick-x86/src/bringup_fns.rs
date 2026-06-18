@@ -357,10 +357,12 @@ pub struct X86VcpuSnapshot {
     /// FS/GS/KERNEL_GS base.
     pub fs_base: u64,
     pub gs_base: u64,
-    /// The 512-byte fxsave area iff the backend has a native FP getter
-    /// (`get_fp() == Some`); `None` for a no-FP-getter backend (the FP state is
-    /// carried via the ring-3 stub on restore instead).
-    pub fp: Option<[u8; 512]>,
+    /// The full XSAVE area ([`crate::vmm::XSAVE_LEN`] — FXSAVE + AVX YMM_Hi) iff
+    /// the backend has a native FP getter (`get_xsave() == Some`); `None` for a
+    /// no-FP-getter backend (the FP state rides the ring-3 stub on restore
+    /// instead). Carrying the full XSAVE (not the 512-byte FXSAVE) preserves a
+    /// guest's AVX YMM upper halves across fork/clone/execve.
+    pub xsave: Option<[u8; crate::vmm::XSAVE_LEN]>,
 }
 
 /// The 16 GPRs in canonical order (matches [`X86VcpuSnapshot::gprs`]).
@@ -405,7 +407,7 @@ pub fn snapshot<C: X86Vcpu>(c: &C) -> Result<X86VcpuSnapshot, TrapError> {
         efer: c.get_gpr(X86Reg::Efer)?,
         fs_base: c.get_fs_base()?,
         gs_base: c.get_gs_base()?,
-        fp: c.get_fp()?,
+        xsave: c.get_xsave()?,
     })
 }
 
@@ -451,9 +453,10 @@ pub fn restore<C: X86Vcpu>(
     c.set_fs_base(s.fs_base)?;
     c.set_gs_base(s.gs_base)?;
 
-    // FP state, iff the backend has a native FP setter and we captured an area.
-    if let Some(fx) = &s.fp {
-        let _ = c.set_fp(fx)?;
+    // FP state (full XSAVE incl AVX YMM_Hi), iff the backend has a native FP
+    // setter and we captured an area.
+    if let Some(xs) = &s.xsave {
+        let _ = c.set_xsave(xs)?;
     }
 
     // Re-apply the static SYSCALL config (LSTAR = trampoline GPA).
@@ -843,7 +846,7 @@ mod tests {
             efer: 0,
             fs_base: 0x2222,
             gs_base: 0,
-            fp: None,
+            xsave: None,
         };
         parent.gprs[0] = 0xdead; // Rax
         parent.gprs[2] = 0x4000_1234; // Rcx: user RIP saved by SYSCALL
@@ -877,7 +880,7 @@ mod tests {
             efer: 0,
             fs_base: 0x2222,
             gs_base: 0,
-            fp: None,
+            xsave: None,
         };
         parent.gprs[0] = 0xdead;
         parent.gprs[2] = 0x4000_5678;
