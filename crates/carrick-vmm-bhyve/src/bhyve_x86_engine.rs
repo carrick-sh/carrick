@@ -749,6 +749,97 @@ impl X86Vmm for BhyveVmm {
         Ok(())
     }
 
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        _ipa: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    ) -> Result<(), TrapError> {
+        // bhyve IGNORES the dispatcher's `ipa` (it bumps its own GPA in the single
+        // sysmem segment, which is already kernel-backed and host-visible via
+        // map_gpa). The alias content is COPIED into that backing RAM: an anon
+        // payload directly, or a file's current bytes via a transient host mmap.
+        //
+        // LIMITATION: this copy gives NO MAP_SHARED write-back — a guest's writes
+        // to a file-backed alias stay in sysmem, never reach the host file, and are
+        // not coherent across a COW fork. The vmmapi memseg model can't back a
+        // guest segment with a host fd from userspace, so durable/shared-aperture
+        // coherence on bhyve is a known follow-up. Enough for a guest that READS
+        // its initial aperture content (the common startup case).
+        let writable = match file {
+            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+            None => true,
+        };
+        let gpa = self
+            .ram
+            .add_bump(va, len as usize, true, writable, false)
+            .map_err(|e| TrapError::Hypervisor(format!("bhyve map_host_alias: GPA alloc: {e}")))?;
+        let host = self.vm.map_gpa(gpa, len as usize).ok_or_else(|| {
+            TrapError::Hypervisor(format!("bhyve map_host_alias: map_gpa 0x{gpa:x} unmapped"))
+        })?;
+        match file {
+            Some((fd, offset, _prot)) => {
+                // mmap the file's current content read-only in the host, copy it
+                // into the backing RAM, then drop the transient host view.
+                let src = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len as usize,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        fd,
+                        offset,
+                    )
+                };
+                if src == libc::MAP_FAILED {
+                    return Err(TrapError::Hypervisor(format!(
+                        "bhyve map_host_alias: mmap file fd={fd} off={offset} len=0x{len:x}: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                // SAFETY: `src` is a len-byte PROT_READ mapping; `host` is live
+                // sysmem of `len`; the regions don't overlap.
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, host, len as usize) };
+                // SAFETY: drop the transient host view of the file.
+                unsafe { libc::munmap(src, len as usize) };
+            }
+            None => {
+                let n = payload.len().min(len as usize);
+                // SAFETY: `host` is live sysmem of `len`; n ≤ len.
+                unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), host, n) };
+            }
+        }
+        // Install the VA→GPA path in the live PML4 (the same copy-edit-copy +
+        // CR3 reload as `protect_range`; map_aliased uses bounded 2 MiB block
+        // leaves for large spans).
+        let host = self
+            .vm
+            .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "bhyve map_host_alias: PML4 map_gpa 0x{X86_PML4_GPA:x} unmapped"
+                ))
+            })?;
+        let mut tables = vec![0u8; X86_PML4_CAPACITY];
+        // SAFETY: map_gpa proved the live PML4 window is mapped.
+        unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
+        let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
+        mgr.map_aliased(va, gpa, len, writable).map_err(|_| {
+            TrapError::Hypervisor(format!(
+                "bhyve map_host_alias: map_aliased va=0x{va:x} gpa=0x{gpa:x} len=0x{len:x}"
+            ))
+        })?;
+        // SAFETY: both windows are X86_PML4_CAPACITY bytes.
+        unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
+        self.h
+            .as_bhyve()
+            .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
+            .map_err(|e| TrapError::Hypervisor(format!("bhyve map_host_alias: reload CR3: {e}")))?;
+        Ok(())
+    }
+
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         // The engine only calls add_vcpu on a freshly-constructed VMM; bhyve's
         // `bring_up` already created vCPU 0 and stored it in the shared handle, so
