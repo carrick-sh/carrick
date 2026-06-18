@@ -1333,6 +1333,19 @@ pub fn msr_init_blob(
     b.extend_from_slice(&[0x0F, 0xAE, 0x14, 0x24]);
     b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
 
+    // Enable AVX: program XCR0 = x87(0)|SSE(1)|AVX(2) = 0x7 via XSETBV, so the
+    // guest's AVX instructions (glibc/Go emit VZEROUPPER / VMOVDQA ymm) don't
+    // #UD. CR4.OSXSAVE is already set (snap.cr4 = 0x4_0620, OSXSAVE bit 18), and
+    // the blob runs in ring 0 where XSETBV is legal. SSE(1) MUST accompany AVX(2)
+    // or XSETBV #GPs. Mirrors KVM's KVM_SET_XCRS (commit d1414d37); bhyve has no
+    // host XCR0 API, so we do it from guest code. ECX/EAX/EDX are already clobbered
+    // by the WRMSRs above; RAX is reloaded by the iretq-frame pushes below.
+    //   xor ecx,ecx ; mov eax,7 ; xor edx,edx ; xsetbv
+    b.extend_from_slice(&[0x31, 0xC9]);
+    b.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+    b.extend_from_slice(&[0x31, 0xD2]);
+    b.extend_from_slice(&[0x0F, 0x01, 0xD1]);
+
     // Build iretq frame.  push imm32 sign-extends; push rax from imm64 for
     // large values (user_rip and user_rsp can exceed 0x7FFF_FFFF).
     let push_u64 = |b: &mut Vec<u8>, val: u64| {
@@ -2440,7 +2453,7 @@ pub fn seed_entry_snapshot_bhyve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_mem::pml4::{PML4_NX, PML4_P, PML4_US, walk_descriptors};
+    use carrick_mem::pml4::{PML4_NX, PML4_P, PML4_PS, PML4_US, walk_descriptors};
 
     /// Byte-pin the M0 blob (the `el1_vectors_sentinel_bytes` pattern):
     /// `mov $N, %al` = B0 ib; `out %al, imm8` = E6 ib; `hlt` = F4
@@ -2534,9 +2547,12 @@ mod tests {
         assert_eq!(tables.len(), M0_PML4_CAPACITY);
         for gpa in [M0_BLOB_GPA, M0_PML4_GPA, M0_GDT_GPA, M0_STACK_TOP - 0x1000] {
             let walk = walk_descriptors(&tables, M0_PML4_GPA, gpa);
-            assert_ne!(walk[3] & PML4_P, 0, "leaf present for {gpa:#x}");
-            assert_eq!(walk[3] & PML4_NX, 0, "NX clear for {gpa:#x} (NXE off)");
-            assert_eq!(walk[3] & PML4_US, 0, "supervisor leaf for {gpa:#x}");
+            // pml4_tables maps aligned bulk regions with 2 MiB leaves, so the leaf
+            // is the PD entry (walk[2], PS set), not a 4 KiB PT entry (walk[3]).
+            assert_ne!(walk[2] & PML4_P, 0, "leaf present for {gpa:#x}");
+            assert_ne!(walk[2] & PML4_PS, 0, "2 MiB leaf for {gpa:#x}");
+            assert_eq!(walk[2] & PML4_NX, 0, "NX clear for {gpa:#x} (NXE off)");
+            assert_eq!(walk[2] & PML4_US, 0, "supervisor leaf for {gpa:#x}");
         }
         let _ = M0_STACK_SIZE; // layout documentation const
     }
@@ -2650,13 +2666,16 @@ mod tests {
     #[test]
     fn msr_init_blob_encodes_ring3_selectors() {
         let blob = msr_init_blob(0, 0, 0, 0, 0, 0x2, false);
-        // Three WRMSRs each = 5 (mov ecx,imm32: B9 id) + 5 (mov eax: B8 id)
-        // + 5 (mov edx: BA id) + 2 (wrmsr: 0F 30) = 17 bytes.
-        let after_wrmsr = 3 * 17;
-        // push imm32 for SS (68 + 4 bytes) at after_wrmsr.
-        assert_eq!(blob[after_wrmsr], 0x68, "push SS selector opcode");
-        let ss_val = u32::from_le_bytes(blob[after_wrmsr + 1..after_wrmsr + 5].try_into().unwrap());
-        assert_eq!(ss_val, USER_SS_SEL as u32, "SS selector in iretq frame");
+        // The iretq frame's first push is the SS selector: `push imm32` (0x68)
+        // followed by USER_SS_SEL (LE). Search for it rather than asserting a
+        // fixed offset — the pre-frame setup (3 WRMSRs, then the MXCSR mask and
+        // the XSETBV that enables AVX) shifts its position as the blob evolves.
+        let mut needle = vec![0x68u8];
+        needle.extend_from_slice(&(USER_SS_SEL as u32).to_le_bytes());
+        assert!(
+            blob.windows(needle.len()).any(|w| w == needle.as_slice()),
+            "iretq frame must push USER_SS_SEL as imm32"
+        );
     }
 
     /// msr_init_blob with `clear_rax = true` emits `xor eax, eax` (31 C0)
