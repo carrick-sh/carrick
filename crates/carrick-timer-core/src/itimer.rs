@@ -20,7 +20,7 @@
 //! so a disarm that races the pump's one-time periodic re-arm self-heals after
 //! at most one spurious fire instead of leaving a runaway periodic timer.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// The 3 itimer `which` values (REAL=0, VIRTUAL=1, PROF=2).
@@ -61,6 +61,10 @@ struct ItimerSlot {
     /// Guest CPU-time total at which a CPU timer should next fire. Wall-time
     /// `ITIMER_REAL` leaves this zero.
     cpu_due_ns: AtomicU64,
+    /// The fresh EVFILT_TIMER ident this arm registered (see [`next_ident`]).
+    /// Stored so disarm/fork-replay act on the SAME ident the arm used, not a
+    /// recomputed (and possibly poisoned) base ident. 0 = never armed.
+    live_ident: AtomicUsize,
 }
 
 impl ItimerSlot {
@@ -72,6 +76,7 @@ impl ItimerSlot {
             armed: AtomicBool::new(false),
             needs_periodic: AtomicBool::new(false),
             cpu_due_ns: AtomicU64::new(0),
+            live_ident: AtomicUsize::new(0),
         }
     }
 }
@@ -84,10 +89,25 @@ pub fn ident_for(which: usize) -> usize {
 }
 
 /// The `which` an EVFILT_TIMER ident belongs to, or `None` if out of range.
+/// Idents are `TIMER_IDENT_BASE + epoch*WHICH_COUNT + which`, so `which` is the
+/// offset mod `WHICH_COUNT`; the `epoch` term gives every arm a fresh ident (a
+/// recently-fired EV_ONESHOT ident on Darwin cannot be re-armed — see
+/// [`next_ident`]).
 pub fn which_for_ident(ident: usize) -> Option<usize> {
-    ident
-        .checked_sub(TIMER_IDENT_BASE)
-        .filter(|&which| which < WHICH_COUNT)
+    ident.checked_sub(TIMER_IDENT_BASE).map(|d| d % WHICH_COUNT)
+}
+
+/// A fresh, never-before-used EVFILT_TIMER ident for `which`. Darwin poisons an
+/// ident after its EV_ONESHOT timer fires: re-`EV_ADD`ing that ident (even after
+/// `EV_DELETE`) silently never counts down. Each arm therefore takes a new ident
+/// from a monotonic epoch, striding by `WHICH_COUNT` so `which_for_ident` still
+/// decodes `which` by modulo. The old (fired) ident is abandoned — EV_ONESHOT
+/// already removed its knote, so nothing leaks.
+pub fn next_ident(which: usize) -> usize {
+    use std::sync::atomic::AtomicUsize;
+    static EPOCH: AtomicUsize = AtomicUsize::new(0);
+    let epoch = EPOCH.fetch_add(1, Ordering::Relaxed);
+    TIMER_IDENT_BASE + epoch.wrapping_mul(WHICH_COUNT) + which
 }
 
 /// Linux signal number delivered when `which`'s timer expires.
@@ -118,6 +138,19 @@ pub struct TimerArm {
     pub ident: usize,
     pub flags: u16,
     pub delay_ns: i64,
+    /// Arm generation, stamped into the kevent `udata`. A fire whose `udata`
+    /// generation no longer matches the slot's current generation is a stale
+    /// late fire from a superseded arm and must be dropped — an invariant the
+    /// pump asserts on every timer event (see `which_for_ident`/fresh idents).
+    pub generation: u64,
+}
+
+/// The current arm generation of `which` (bumped on every arm/disarm). Used to
+/// validate a fired timer's `udata` against the live arm.
+pub fn generation(which: usize) -> u64 {
+    SLOTS
+        .get(which)
+        .map_or(0, |slot| slot.generation.load(Ordering::SeqCst))
 }
 
 /// Mark `which` armed with the given repeat interval (0 = one-shot) and whether
@@ -138,12 +171,33 @@ pub fn arm(which: usize, value_ns: u64, interval_ns: u64, needs_periodic: bool) 
             0
         };
         slot.cpu_due_ns.store(cpu_due_ns, Ordering::SeqCst);
+        // Allocate a FRESH ident for this arm (Darwin poisons a fired EV_ONESHOT
+        // ident — re-arming it never counts down). disarm/fork-replay read this
+        // back so they act on the ident actually registered.
+        slot.live_ident.store(next_ident(which), Ordering::SeqCst);
         // Publish `armed` last so a pump fire that observes `armed` also sees
-        // the interval/needs_periodic written above.
+        // the interval/needs_periodic + live_ident written above.
         slot.armed.store(true, Ordering::SeqCst);
         generation
     } else {
         0
+    }
+}
+
+/// The EVFILT_TIMER ident the current arm of `which` registered, or the base
+/// ident if `which` was never armed. disarm + fork-replay use this so they touch
+/// the SAME ident the live arm registered (see [`next_ident`]).
+pub fn live_ident(which: usize) -> usize {
+    match SLOTS.get(which) {
+        Some(slot) => {
+            let stored = slot.live_ident.load(Ordering::SeqCst);
+            if stored == 0 {
+                ident_for(which)
+            } else {
+                stored
+            }
+        }
+        None => ident_for(which),
     }
 }
 
@@ -157,6 +211,10 @@ pub fn disarm(which: usize) {
         slot.interval_ns.store(0, Ordering::SeqCst);
         slot.needs_periodic.store(false, Ordering::SeqCst);
         slot.cpu_due_ns.store(0, Ordering::SeqCst);
+        // Forget the live ident — `live_ident` falls back to the base ident when
+        // disarmed. (HVF disarm reads the ident BEFORE calling disarm, so this
+        // does not race the EV_DELETE.)
+        slot.live_ident.store(0, Ordering::SeqCst);
     }
 }
 
@@ -259,9 +317,10 @@ pub fn current_arm(which: usize) -> Option<TimerArm> {
         value_ns
     };
     Some(TimerArm {
-        ident: ident_for(which),
+        ident: live_ident(which),
         flags,
         delay_ns: i64::try_from(delay_ns).unwrap_or(i64::MAX),
+        generation: generation(which),
     })
 }
 
@@ -498,10 +557,57 @@ mod tests {
     }
 
     #[test]
+    fn epoch_extended_idents_decode_to_their_which() {
+        // Idents are TIMER_IDENT_BASE + epoch*WHICH_COUNT + which, so every
+        // epoch's ident for a `which` decodes back to that `which` by modulo.
+        for epoch in [0usize, 1, 2, 7, 1_000_000] {
+            for which in 0..WHICH_COUNT {
+                let ident = TIMER_IDENT_BASE + epoch * WHICH_COUNT + which;
+                assert_eq!(which_for_ident(ident), Some(which));
+            }
+        }
+    }
+
+    #[test]
     fn out_of_range_ident_is_none() {
+        // Only idents BELOW the timer base are out of range; at/above the base
+        // they are valid epoch-extended timer idents (decoded by modulo).
         assert_eq!(which_for_ident(TIMER_IDENT_BASE - 1), None);
-        assert_eq!(which_for_ident(TIMER_IDENT_BASE + WHICH_COUNT), None);
         assert_eq!(which_for_ident(0), None);
+    }
+
+    #[test]
+    fn next_ident_is_fresh_and_decodes_to_which() {
+        // Consecutive arms must NOT reuse an ident (Darwin poisons a fired
+        // EV_ONESHOT ident), yet every fresh ident still decodes to its `which`.
+        let a = next_ident(0);
+        let b = next_ident(0);
+        assert_ne!(a, b, "consecutive arms must take distinct idents");
+        assert_eq!(which_for_ident(a), Some(0));
+        assert_eq!(which_for_ident(b), Some(0));
+    }
+
+    #[test]
+    fn arm_publishes_fresh_live_ident_disarm_resets_it() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        let which = 0;
+        // Disarmed (clear): live_ident falls back to the base ident.
+        assert_eq!(live_ident(which), ident_for(which));
+        arm(which, 1_000_000, 0, false);
+        let armed_ident = live_ident(which);
+        assert!(armed_ident >= TIMER_IDENT_BASE);
+        assert_eq!(which_for_ident(armed_ident), Some(which));
+        // A second arm takes a DIFFERENT (fresh) ident — never the poisoned one.
+        arm(which, 1_000_000, 0, false);
+        assert_ne!(
+            live_ident(which),
+            armed_ident,
+            "re-arm must use a fresh ident"
+        );
+        // Disarm forgets the live ident (back to the base fallback).
+        disarm(which);
+        assert_eq!(live_ident(which), ident_for(which));
     }
 
     #[test]
@@ -601,9 +707,10 @@ mod tests {
         assert_eq!(
             current_arm(which),
             Some(TimerArm {
-                ident: ident_for(which),
+                ident: live_ident(which),
                 flags: carrick_portable::EV_ADD | carrick_portable::EV_ONESHOT,
                 delay_ns: 50_000_000,
+                generation: generation(which),
             })
         );
         disarm(which);
@@ -618,9 +725,10 @@ mod tests {
         assert_eq!(
             current_arm(which),
             Some(TimerArm {
-                ident: ident_for(which),
+                ident: live_ident(which),
                 flags: carrick_portable::EV_ADD,
                 delay_ns: 25_000_000,
+                generation: generation(which),
             })
         );
         disarm(which);
@@ -636,9 +744,10 @@ mod tests {
         assert_eq!(
             current_arm(which),
             Some(TimerArm {
-                ident: ident_for(which),
+                ident: live_ident(which),
                 flags: carrick_portable::EV_ADD | carrick_portable::EV_ONESHOT,
                 delay_ns: 1_000_000,
+                generation: generation(which),
             })
         );
         disarm(which);
