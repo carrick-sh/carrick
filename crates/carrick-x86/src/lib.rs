@@ -43,5 +43,5 @@ pub use fault::{
 };
 pub use vmm::{
     ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion, X86_PML4_CAPACITY, X86Exit,
-    X86FaultKind, X86Reg, X86Seg, X86Vcpu, X86Vmm,
+    X86FaultKind, X86Reg, X86Seg, X86Vcpu, X86Vmm, XSAVE_AVX_OFFSET, XSAVE_LEN, fxsave_to_xsave,
 };

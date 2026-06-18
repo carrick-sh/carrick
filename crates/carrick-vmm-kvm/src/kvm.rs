@@ -1056,6 +1056,28 @@ impl KvmVm {
                 fd = new_fd;
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Enable AVX state on EVERY x86 vCPU: XCR0 = x87(0)|SSE(1)|AVX(2) so
+            // the guest's XGETBV reports AVX available (CR4.OSXSAVE is set in the
+            // boot regs). Only KVM does this — it is the only backend that carries
+            // the full XSAVE (incl YMM) across fork/clone/execve and signals (see
+            // X86Vcpu::get_xsave); without that an AVX-using guest (Go's runtime
+            // uses AVX memmove once it sees AVX) would lose YMM upper halves at a
+            // fork/signal boundary. SSE(1) MUST be set alongside AVX(2) or XSETBV
+            // faults. Best-effort: a host without AVX leaves the guest Base-only.
+            let mut xcrs = kvm_bindings::kvm_xcrs {
+                nr_xcrs: 1,
+                ..Default::default()
+            };
+            xcrs.xcrs[0].xcr = 0;
+            xcrs.xcrs[0].value = 0x7;
+            if let Err(e) = fd.set_xcrs(&xcrs) {
+                eprintln!(
+                    "carrick-kvm: KVM_SET_XCRS(XCR0=0x7) failed: {e} — guest stays SSE/Base-only"
+                );
+            }
+        }
         // aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT + counter align.
         // x86_64: no ARM-specific init; the x86 bring-up path (guest_setup_x86.rs)
         // programs registers via KVM_SET_SREGS/KVM_SET_REGS/KVM_SET_MSRS instead.

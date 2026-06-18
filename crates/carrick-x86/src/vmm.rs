@@ -397,6 +397,27 @@ pub trait X86Vmm: Sized {
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry>;
 }
 
+/// Length of the x86 XSAVE area carried by [`X86Vcpu::get_xsave`] for
+/// `XCR0 = x87|SSE|AVX`: the 512-byte legacy FXSAVE region, a 64-byte XSAVE
+/// header (`xstate_bv` @ 512, `xcomp_bv` @ 520), and the 256-byte AVX `YMM_Hi`
+/// component (16 × 16 bytes) at the standard-format offset 576. (We never enable
+/// AVX-512, so no larger components follow.)
+pub const XSAVE_LEN: usize = 832;
+
+/// Byte offset of the AVX `YMM_Hi` component within the standard XSAVE area.
+pub const XSAVE_AVX_OFFSET: usize = 576;
+
+/// Pad a 512-byte FXSAVE area into an [`XSAVE_LEN`] XSAVE area that advertises
+/// ONLY x87+SSE (no AVX): the legacy region verbatim, `xstate_bv = 0b11`, the
+/// AVX component zeroed. Used as the default `get_xsave` for backends that never
+/// enable AVX (their guests never touch YMM, so the upper halves are always 0).
+pub fn fxsave_to_xsave(fx: [u8; 512]) -> [u8; XSAVE_LEN] {
+    let mut xs = [0u8; XSAVE_LEN];
+    xs[..512].copy_from_slice(&fx);
+    xs[512] = 0x03; // xstate_bv low byte: x87(0) | SSE(1)
+    xs
+}
+
 /// Per-vCPU register/run surface. The ONLY thing genuinely per-VMM.
 pub trait X86Vcpu {
     /// Read a GPR / control register (`Rax..R15`/`Rip`/`Rsp`/`Rflags`/
@@ -514,6 +535,26 @@ pub trait X86Vcpu {
     /// Apply a 512-byte fxsave area. `Ok(true)` = applied natively; `Ok(false)`
     /// = "no native FP setter, the caller must drive the ring-3 FXRSTOR stub".
     fn set_fp(&mut self, fx: &[u8; 512]) -> Result<bool, TrapError>;
+
+    /// The full XSAVE area ([`XSAVE_LEN`]) — the legacy FXSAVE region PLUS the
+    /// AVX `YMM_Hi` component — for fork/clone/execve snapshots and signal
+    /// save/restore. The FXSAVE-only [`get_fp`] drops the YMM upper halves, which
+    /// silently corrupts a guest's AVX state across those boundaries (Go's
+    /// runtime uses AVX memmove once `CR4.OSXSAVE` is set). The DEFAULT pads
+    /// [`get_fp`]'s FXSAVE into a no-AVX XSAVE; a backend that enables AVX
+    /// (CR4.OSXSAVE + XCR0) MUST override this with a real XSAVE getter.
+    fn get_xsave(&self) -> Result<Option<[u8; XSAVE_LEN]>, TrapError> {
+        Ok(self.get_fp()?.map(fxsave_to_xsave))
+    }
+
+    /// Apply a full XSAVE area. The DEFAULT extracts the FXSAVE prefix and calls
+    /// [`set_fp`] (dropping AVX — correct for a backend that never enables it);
+    /// an AVX-enabled backend MUST override with a real XSAVE setter.
+    fn set_xsave(&mut self, xs: &[u8; XSAVE_LEN]) -> Result<bool, TrapError> {
+        let mut fx = [0u8; 512];
+        fx.copy_from_slice(&xs[..512]);
+        self.set_fp(&fx)
+    }
 
     /// Run the vCPU until the next exit and decode it into [`X86Exit`]. The
     /// backend fills `resume_pc` at decode time; the ENGINE owns the

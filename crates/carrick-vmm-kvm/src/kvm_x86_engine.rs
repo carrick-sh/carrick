@@ -477,8 +477,8 @@ fn restore_kvm_vcpu(
         .set_regs(&regs)
         .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_REGS(restore): {e}")))?;
 
-    if let Some(fx) = &s.fp {
-        let _ = vcpu.set_fp(fx)?;
+    if let Some(xs) = &s.xsave {
+        let _ = vcpu.set_xsave(xs)?;
     }
     vcpu.set_syscall_msrs(layout.trampoline_base, boot.star, boot.sfmask)?;
     vcpu.record_x86_restore_state(crate::kvm::KvmX86RestoreState {
@@ -906,6 +906,43 @@ impl X86Vcpu for KvmVcpu {
         self.fd()
             .set_fpu(&fpu)
             .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_FPU: {e}")))?;
+        Ok(true)
+    }
+
+    fn get_xsave(&self) -> Result<Option<[u8; carrick_x86::XSAVE_LEN]>, TrapError> {
+        // KVM_GET_XSAVE yields the standard-format XSAVE area (legacy FXSAVE +
+        // 64-byte header + AVX YMM_Hi at offset 576). Copy our XSAVE_LEN-byte
+        // prefix out of the 4 KiB `kvm_xsave` region — this is what preserves a
+        // guest's AVX upper halves across fork/clone/execve and signals (the
+        // FXSAVE-only get_fp drops them, corrupting AVX state).
+        let xsave = self
+            .fd()
+            .get_xsave()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_XSAVE: {e}")))?;
+        let mut out = [0u8; carrick_x86::XSAVE_LEN];
+        for (i, chunk) in out.chunks_mut(4).enumerate() {
+            chunk.copy_from_slice(&xsave.region[i].to_ne_bytes());
+        }
+        Ok(Some(out))
+    }
+
+    fn set_xsave(&mut self, xs: &[u8; carrick_x86::XSAVE_LEN]) -> Result<bool, TrapError> {
+        // Read-modify-write: preserve any `kvm_xsave` bytes beyond our window
+        // (none with XCR0 = x87|SSE|AVX), overwrite the standard prefix.
+        let mut xsave = self
+            .fd()
+            .get_xsave()
+            .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_XSAVE(set): {e}")))?;
+        for (i, chunk) in xs.chunks(4).enumerate() {
+            xsave.region[i] = u32::from_ne_bytes(chunk.try_into().unwrap_or([0u8; 4]));
+        }
+        // SAFETY: `xsave` is a fully-initialized kvm_xsave whose standard-format
+        // region we populated from a valid XSAVE image; KVM validates xstate_bv.
+        unsafe {
+            self.fd()
+                .set_xsave(&xsave)
+                .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_XSAVE: {e}")))?;
+        }
         Ok(true)
     }
 
