@@ -517,7 +517,26 @@ impl X86Vcpu for BhyveX86Vcpu {
         // return a CLEAN (zeroed) FP image.
         let cpl0 = (self.get_raw(VM_REG_GUEST_CS)? & 3) == 0;
         if !cpl0 {
-            return Ok(Some(masked));
+            // Async ring-3 signal: capture the LIVE FP WITHOUT leaving ring 3.
+            // The FP stub + scratch are user-mapped, so the guest runs them at
+            // CPL 3; the only obstacle is the stub's OUT doorbell, which #GPs at
+            // ring 3 unless CPL <= IOPL — so raise IOPL to 3 for the stub run and
+            // restore it after. No CPL/segment switch, hence no VT-x guest-state
+            // inconsistency (unlike the reverted CS/SS-switch attempt). Falls back
+            // to the masked placeholder if the stub run fails, so signal delivery
+            // never EIOs.
+            let saved_rflags = self.get_raw(VM_REG_GUEST_RFLAGS)?;
+            self.set_raw(VM_REG_GUEST_RFLAGS, saved_rflags | 0x3000)?; // IOPL = 3
+            let mut me = self.clone();
+            let r = carrick_x86::run_fp_stub(&mut me, X86_FP_STUB_GPA, self.fp_scratch_gpa());
+            self.set_raw(VM_REG_GUEST_RFLAGS, saved_rflags)?;
+            if r.is_err() {
+                return Ok(Some(masked));
+            }
+            let blob = self.read_gpa(self.fp_scratch_gpa(), 512)?;
+            let mut fx = [0u8; 512];
+            fx.copy_from_slice(&blob);
+            return Ok(Some(fx));
         }
         // Drive the guest-side FXSAVE stub. `run_fp_stub` takes `&mut C`, but all
         // mutation is through the raw `*mut Vcpu` behind the shared handle, not
