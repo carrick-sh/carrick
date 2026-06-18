@@ -147,7 +147,10 @@ pub const X86_FP_STUB_GPA: u64 = 0x10_3000;
 /// FP scratch region: one 4 KiB page PER vCPU (FXSAVE needs a 16-byte-aligned
 /// 512B operand; a page-per-vCPU is trivially aligned and race-free across
 /// sibling vCPUs that share this VM). 8 slots = hw.vmm.maxcpu. vCPU i uses
-/// `X86_FP_SCRATCH_GPA + i*0x1000`. Identity-mapped supervisor read-write. SP3.2.
+/// `X86_FP_SCRATCH_GPA + i*0x1000`. Identity-mapped USER read-write — and the FP
+/// stub at X86_FP_STUB_GPA is USER-exec — so the FXSAVE stub can capture the live
+/// FP at CPL 3 (async ring-3 signal FP capture; the guest only ever runs it under
+/// carrick's control, and its OUT doorbell #GPs at ring 3 without IOPL=3). SP3.2.
 pub const X86_FP_SCRATCH_GPA: u64 = 0x10_4000;
 /// Number of per-vCPU FP scratch slots (one 4 KiB page each).
 pub const X86_FP_SCRATCH_SLOTS: u64 = 8;
@@ -1492,18 +1495,20 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
         true,
     );
 
-    // SP3.2 FP stub code: identity-mapped supervisor exec. Runs at the CURRENT
-    // CPL when run_fp_stub redirects RIP here. run_fp_stub only invokes it from a
-    // CPL-0 boundary (the SP3 syscall path; the SP4.1 async path is CPL 3 and
-    // SKIPS FP capture — fxsave #UDs at ring 3, see the run_fp_stub gate), so a
-    // supervisor mapping is correct.
-    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
-    // SP3.2 FP scratch: identity-mapped supervisor read-write, one page per vCPU.
+    // SP3.2 FP stub code: identity-mapped USER exec. Runs at the CURRENT CPL when
+    // run_fp_stub redirects RIP here — the SP3 syscall path drives it at CPL 0;
+    // the SP4.1 async path now drives it at CPL 3 too (get_fp raises IOPL=3 so the
+    // stub's OUT doorbell fires) to capture the goroutine's live FP across an async
+    // preemption. USER (not supervisor) so that CPL-3 run can exec/fxsave it;
+    // harmless to the guest — the OUT #GPs at ring 3 without IOPL, and the scratch
+    // it writes is the guest's own FP.
+    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, true, false, true);
+    // SP3.2 FP scratch: identity-mapped USER read-write, one page per vCPU.
     ram.add_fixed(
         X86_FP_SCRATCH_GPA,
         X86_FP_SCRATCH_GPA,
         (X86_FP_SCRATCH_SLOTS as usize) * 4096,
-        false,
+        true,
         true,
         false,
     );
@@ -1705,12 +1710,12 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
         true,
     );
     // SP3.2 FP stub + scratch windows (identity-mapped supervisor).
-    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
+    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, true, false, true);
     ram.add_fixed(
         X86_FP_SCRATCH_GPA,
         X86_FP_SCRATCH_GPA,
         (X86_FP_SCRATCH_SLOTS as usize) * 4096,
-        false,
+        true,
         true,
         false,
     );
@@ -1904,12 +1909,12 @@ pub fn bring_up_x86_elf(
     );
     // SP3.2 FP stub + scratch windows (identity-mapped supervisor; see the FP
     // overlay in the shared x86 signal inject / restore path.
-    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, false, false, true);
+    ram.add_fixed(X86_FP_STUB_GPA, X86_FP_STUB_GPA, 4096, true, false, true);
     ram.add_fixed(
         X86_FP_SCRATCH_GPA,
         X86_FP_SCRATCH_GPA,
         (X86_FP_SCRATCH_SLOTS as usize) * 4096,
-        false,
+        true,
         true,
         false,
     );
