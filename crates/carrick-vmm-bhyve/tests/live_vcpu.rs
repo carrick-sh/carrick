@@ -350,7 +350,7 @@ fn sp4_page_fault_reaches_fault_doorbell() {
     let mut bux = bring_up_x86_m1().expect("M1 bring-up for #PF probe");
     let probe_gpa = bux
         .ram
-        .windows
+        .windows_snapshot()
         .iter()
         .find(|w| w.va == M1_BLOB_VA)
         .map(|w| w.gpa)
