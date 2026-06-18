@@ -1311,6 +1311,19 @@ pub fn msr_init_blob(
     // SF_MASK WRMSR
     wrmsr(MSR_SF_MASK, sfmask);
 
+    // Mask all SIMD-FP exceptions before entering user code. A freshly-activated
+    // sibling vCPU starts with MXCSR=0 (every SSE exception UNMASKED), so a
+    // maskable exception in the guest (the Go compiler trips one; the lighter
+    // `go version` does not) raises #XF. Linux clone inherits the parent's masked
+    // MXCSR (0x1F80); replicate that here — we run in ring 0 with CR4.OSFXSR
+    // already set (inherited snap.cr4). RSP is the ring-0 scratch stack and the
+    // push/ldmxcsr/add is RSP-balanced, so the iretq frame below lands unchanged.
+    // (Harmless for the main vCPU — its own runtime overwrites MXCSR.)
+    //   push 0x1F80 ; ldmxcsr [rsp] ; add rsp, 8
+    b.extend_from_slice(&[0x68, 0x80, 0x1F, 0x00, 0x00]);
+    b.extend_from_slice(&[0x0F, 0xAE, 0x14, 0x24]);
+    b.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+
     // Build iretq frame.  push imm32 sign-extends; push rax from imm64 for
     // large values (user_rip and user_rsp can exceed 0x7FFF_FFFF).
     let push_u64 = |b: &mut Vec<u8>, val: u64| {

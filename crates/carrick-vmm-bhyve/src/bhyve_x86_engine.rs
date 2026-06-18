@@ -488,12 +488,26 @@ impl X86Vcpu for BhyveX86Vcpu {
         // The FP stub needs a fully-running long-mode vCPU. A fork-child / clone
         // sibling re-seeded by `restore` has not run its init blob yet (and a
         // fresh `vcpu_reset` vCPU does not reliably read back its CS DPL), so the
-        // stub would mis-fire there; return a clean (zeroed) FP image until the
-        // vCPU has trapped at a real syscall (the `started` gate). The engine's
+        // stub would mis-fire there; return a placeholder FP image until the vCPU
+        // has trapped at a real syscall (the `started` gate). The engine's
         // sigframe reader needs `Some` either way (a `None` would EIO
         // build_sigframe).
+        //
+        // The placeholder is MASKED (MXCSR=0x1F80, FCW=0x037F), NOT zeroed:
+        // `set_fp` restores it verbatim on rt_sigreturn, and a zeroed MXCSR=0
+        // leaves every SIMD exception UNMASKED → a maskable SSE exception in the
+        // guest (the Go compiler trips one) then raises #XF (vector 19).
+        // `go version` is lighter and never trips one, which is why it passed
+        // with the old all-zero image.
+        let masked = {
+            let mut fx = [0u8; 512];
+            fx[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
+            fx[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+            fx[28..32].copy_from_slice(&0x0000_FFFFu32.to_le_bytes()); // MXCSR_MASK
+            fx
+        };
         if !self.h.started.load(Ordering::SeqCst) {
-            return Ok(Some([0u8; 512]));
+            return Ok(Some(masked));
         }
         // SP4.1 CPL gate: `fxsave` can only run at CPL 0 (at ring 3 it #UDs and
         // enters the fault path). The syscall-boundary path (raise/intra-proc
@@ -503,7 +517,7 @@ impl X86Vcpu for BhyveX86Vcpu {
         // return a CLEAN (zeroed) FP image.
         let cpl0 = (self.get_raw(VM_REG_GUEST_CS)? & 3) == 0;
         if !cpl0 {
-            return Ok(Some([0u8; 512]));
+            return Ok(Some(masked));
         }
         // Drive the guest-side FXSAVE stub. `run_fp_stub` takes `&mut C`, but all
         // mutation is through the raw `*mut Vcpu` behind the shared handle, not
