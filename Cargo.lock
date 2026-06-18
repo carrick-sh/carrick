@@ -445,10 +445,12 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "clap",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
  "thiserror",
+ "usdt",
 ]
 
 [[package]]
