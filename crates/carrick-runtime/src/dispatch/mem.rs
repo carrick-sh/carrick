@@ -586,7 +586,14 @@ impl SyscallDispatcher {
                 if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                     memory.set_no_access(address, length_usize, false);
                     memory.set_no_access(address, length_usize, true);
-                    if in_arena && memory.protect_range(address, length_usize, 0).is_err() {
+                    // protect_range runs UNCONDITIONALLY so a demand-paged backend
+                    // (bhyve) records a reservation across the WHOLE mmap arena,
+                    // not just the first `mmap_arena_size()` bytes — Go's page
+                    // allocator bumps its summary mmaps well past that. The error
+                    // is fatal only inside the eager arena (where eager backends
+                    // must succeed); an out-of-arena protect_range failure is
+                    // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
+                    if memory.protect_range(address, length_usize, 0).is_err() && in_arena {
                         return Ok(LINUX_ENOMEM.into());
                     }
                     return Ok(DispatchOutcome::Returned {
@@ -598,7 +605,9 @@ impl SyscallDispatcher {
                     && !mmap_address_uses_alias(address, length)
                 {
                     memory.set_no_access(address, length_usize, false);
-                    if in_arena && memory.protect_range(address, length_usize, prot).is_err() {
+                    // Unconditional (see the PROT_NONE arm above): reserve across
+                    // the whole arena for demand-paged backends; fatal only in-arena.
+                    if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
                         return Ok(LINUX_ENOMEM.into());
                     }
                     return Ok(DispatchOutcome::Returned {
@@ -701,7 +710,8 @@ impl SyscallDispatcher {
                 }
                 // Make the requested protection guest-visible (also restores RW for
                 // a reused range). prot==0 here means file-backed PROT_NONE.
-                if in_arena && memory.protect_range(address, length_usize, prot).is_err() {
+                // Unconditional: reserve across the whole arena; fatal only in-arena.
+                if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
                     return Ok(LINUX_ENOMEM.into());
                 }
                 Ok(DispatchOutcome::Returned {
