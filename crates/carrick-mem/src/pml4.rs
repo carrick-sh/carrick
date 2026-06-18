@@ -586,6 +586,44 @@ impl Pml4Manager {
         }
 
         let leaf_bits = PML4_P | PML4_US | if writable { PML4_RW } else { 0 };
+        let base = self.base;
+        // 2 MiB-aligned aliases (every large file/anon alias: the IPA is
+        // 2 MiB-block-aligned and the alias VA is derived 2 MiB-aligned) map the
+        // bulk as PD 2 MiB PS block leaves — ONE descriptor per 2 MiB, ZERO PT
+        // pages — and only the sub-2-MiB tail as 4 KiB PT pages. The old
+        // all-4-KiB loop allocated one PT page per 2 MiB (~512/GiB), exhausting
+        // the fixed table arena (LINUX_PAGE_TABLES_SIZE ≈ 448 pages) on a
+        // multi-GiB alias → OutOfTables, leaving a half-built mapping the sibling
+        // vCPU re-faults on forever. Mirrors aarch64 `page_table::map_aliased`.
+        if va & LARGE_2M_MASK == 0 && gpa & LARGE_2M_MASK == 0 {
+            let blocks = aligned_len / LARGE_2M;
+            for i in 0..blocks {
+                let cur_va = va + i * LARGE_2M;
+                let cur_gpa = gpa + i * LARGE_2M;
+                let pd_off =
+                    pd_offset_creating(&mut self.bytes, &mut self.next_free, base, cur_va, true)?;
+                let leaf_off = pd_off + indices(cur_va)[2] * 8;
+                write_desc(
+                    &mut self.bytes,
+                    leaf_off,
+                    (cur_gpa & PML4_ADDR_MASK) | leaf_bits | PML4_PS,
+                );
+            }
+            let tail = blocks * LARGE_2M;
+            let tail_pages = (aligned_len - tail) / PT_PAGE as u64;
+            for j in 0..tail_pages {
+                let cur_va = va + tail + j * PT_PAGE as u64;
+                let cur_gpa = gpa + tail + j * PT_PAGE as u64;
+                let pt_off = self.leaf_offset_creating(cur_va, true)?;
+                let leaf_off = pt_off + indices(cur_va)[3] * 8;
+                write_desc(
+                    &mut self.bytes,
+                    leaf_off,
+                    (cur_gpa & PML4_ADDR_MASK) | leaf_bits,
+                );
+            }
+            return Ok(());
+        }
         let pages = aligned_len / PT_PAGE as u64;
         for i in 0..pages {
             let cur_va = va + i * PT_PAGE as u64;
@@ -833,6 +871,46 @@ mod tests {
         assert_ne!(walk[3] & PML4_RW, 0, "writable alias leaf");
         assert_eq!(walk[3] & PML4_NX, 0, "alias leaf is executable");
         assert_eq!(walk[3] & PML4_ADDR_MASK, alias_gpa);
+    }
+
+    #[test]
+    fn map_aliased_large_2m_alias_uses_block_leaves_not_per_2m_tables() {
+        // A multi-GiB 2 MiB-aligned alias must map as 2 MiB PD block leaves (one
+        // descriptor per 2 MiB, a handful of PD/PDPT tables total) and only the
+        // sub-2-MiB tail as 4 KiB PT pages. The old all-4-KiB loop allocated one
+        // PT page per 2 MiB (~1024 for 2 GiB) and exhausts this 32-page table
+        // arena -> Pml4Error::OutOfTables. Go's gob TestLargeSlice hit exactly
+        // this on the x86 KVM backend.
+        let arena = 32 * PT_PAGE;
+        let bytes = pml4_tables(&[], BASE, arena).expect("empty root image");
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        let va = 0x0100_0000_0000u64; // high, 2 MiB-aligned
+        let gpa = 0xA0_0000_0000u64; // 2 MiB-aligned
+        let two_gib = 2 * 1024 * 1024 * 1024u64;
+        let len = two_gib + 0x4000; // 2 GiB + a 16 KiB sub-2-MiB tail
+
+        mgr.map_aliased(va, gpa, len, true)
+            .expect("2 GiB+tail 2 MiB-aligned alias must fit via PD block leaves");
+
+        assert_eq!(mgr.translate(va), Some(gpa));
+        assert_eq!(
+            mgr.translate(va + 0x4000_0000),
+            Some(gpa + 0x4000_0000),
+            "1 GiB into the bulk"
+        );
+        assert_eq!(
+            mgr.translate(va + two_gib),
+            Some(gpa + two_gib),
+            "first tail 4 KiB page"
+        );
+        assert_eq!(
+            mgr.translate(va + len),
+            None,
+            "one past the end is unmapped"
+        );
+        // The bulk is a 2 MiB PD block leaf (PS set at level 2), not a PT page.
+        let walk = walk_descriptors(mgr.bytes(), BASE, va);
+        assert_ne!(walk[2] & PML4_PS, 0, "bulk maps as a 2 MiB PD block leaf");
     }
 
     #[test]
