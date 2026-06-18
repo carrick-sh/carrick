@@ -252,18 +252,42 @@ pub fn spawn_signal_pump(
             // pump learned its kqueue, so a fast-exiting child still yields
             // SIGCHLD. New children are armed directly by register_child_exit_watch.
             crate::host_signal::rearm_child_watches(kq_fd);
-            // A freshly forked process can run `setitimer` before this pump
-            // thread publishes its kqueue. Replay any already-armed timers so
-            // their pending SIGALRM/SIGVTALRM/SIGPROF delivery is not lost.
-            for arm in crate::itimer::current_arms() {
-                let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
-                    arm.ident,
-                    arm.flags,
-                    arm.delay_ns,
-                )]);
-            }
+            // Per-`which` EVFILT_TIMER ident this pump has registered, so the
+            // reconcile below registers each new arm exactly once. A timer must
+            // be EV_ADDed FROM THIS pump thread (the one calling kevent): a timer
+            // registered by the dispatcher thread while the pump is blocked in
+            // kevent() is not monitored by that wait. `setitimer` arms the neutral
+            // slot + wakes the pump (EVFILT_USER), and the reconcile here does the
+            // actual kqueue registration. Idents are fresh per arm (see
+            // itimer::next_ident), so a changed live_ident == a new arm.
+            let mut registered_timer_ident = [0usize; crate::itimer::ITIMER_COUNT];
             let mut out = [crate::darwin_kqueue::Kevent::empty()];
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
+                // Reconcile registered timers with the armed slots BEFORE waiting,
+                // so a just-armed (or re-armed) timer is registered in this
+                // thread's kevent context and fires into the wait below. The
+                // kevent carries the arm's generation in `udata` so a stale late
+                // fire from a superseded arm can be rejected on delivery.
+                for (which, registered) in registered_timer_ident.iter_mut().enumerate() {
+                    let target = if crate::itimer::is_armed(which) {
+                        crate::itimer::live_ident(which)
+                    } else {
+                        0
+                    };
+                    if target != *registered {
+                        if target != 0
+                            && let Some(arm) = crate::itimer::current_arm(which)
+                        {
+                            let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                                arm.ident,
+                                arm.flags,
+                                arm.delay_ns,
+                            )
+                            .with_udata_u64(arm.generation)]);
+                        }
+                        *registered = target;
+                    }
+                }
                 let n = match kq.wait(&[], &mut out, None) {
                     Ok(n) => n,
                     Err(errno) => {
@@ -306,11 +330,15 @@ pub fn spawn_signal_pump(
                     }
                     if let Some(ident) = event.timer_ident() {
                         if let Some(which) = crate::itimer::which_for_ident(ident) {
-                            if !crate::itimer::is_armed(which) {
-                                // Stale fire: the timer was disarmed (or a disarm
-                                // raced a one-time periodic re-arm and resurrected
-                                // it). Delete the kevent and drop the signal — this
-                                // self-heals a resurrected periodic timer.
+                            // Invariant check: the fire's `udata` carries the arm
+                            // generation it was registered with. If it no longer
+                            // matches the slot's live generation, this is a stale
+                            // late fire from a superseded arm (disarmed, or
+                            // re-armed onto a fresh ident) — drop it and delete the
+                            // dead knote. Guards against an extra/duplicate signal.
+                            if !crate::itimer::is_armed(which)
+                                || event.udata_u64() != crate::itimer::generation(which)
+                            {
                                 let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
                                     ident,
                                     libc::EV_DELETE,
@@ -327,7 +355,8 @@ pub fn spawn_signal_pump(
                                     ident,
                                     libc::EV_ADD | libc::EV_ONESHOT,
                                     i64::try_from(delay_ns.max(1)).unwrap_or(i64::MAX),
-                                )]);
+                                )
+                                .with_udata_u64(crate::itimer::generation(which))]);
                                 continue;
                             }
                             let signum = crate::itimer::signum_for(which);
@@ -342,7 +371,8 @@ pub fn spawn_signal_pump(
                                         ident,
                                         libc::EV_ADD | libc::EV_ONESHOT,
                                         i64::try_from(delay_ns).unwrap_or(i64::MAX),
-                                    )]);
+                                    )
+                                    .with_udata_u64(crate::itimer::generation(which))]);
                                 }
                                 continue;
                             }
@@ -359,7 +389,8 @@ pub fn spawn_signal_pump(
                                         ident,
                                         libc::EV_ADD,
                                         interval as i64,
-                                    )]);
+                                    )
+                                    .with_udata_u64(crate::itimer::generation(which))]);
                                 }
                             }
                         }
