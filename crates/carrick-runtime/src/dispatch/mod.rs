@@ -2022,6 +2022,13 @@ impl SyscallDispatcher {
         self.creds.lock().seed_identity(uid, gid);
     }
 
+    /// Record whether the guest's native ISA is x86_64 so `uname(2)` (and other
+    /// arch-dependent syscalls) report it. Set once at run-image setup from
+    /// `E::Arch::elf_machine()`; native aarch64 guests leave it false.
+    pub fn set_native_x86_64(&self, native_x86_64: bool) {
+        self.proc.lock().native_x86_64 = native_x86_64;
+    }
+
     pub fn set_executable_identity(
         &self,
         path: impl Into<String>,
