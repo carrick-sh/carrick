@@ -261,6 +261,22 @@ pub trait X86Vmm: Sized {
         self.protect_range(address, len, 0)
     }
 
+    /// Demand-commit a single page for a not-present (`#PF` MAPERR) fault at
+    /// `fault_addr`. Returns `Ok(true)` if the backend had LAZILY RESERVED this
+    /// VA (e.g. a guest PROT_NONE mmap the backend chose not to back eagerly) and
+    /// has now committed the page — the engine then flushes the TLB and re-runs
+    /// the faulting instruction (the `#PF` did not advance RIP). Returns
+    /// `Ok(false)` if the VA is not a known reservation, leaving the engine to
+    /// raise a genuine guest fault (SIGSEGV).
+    ///
+    /// Default: `Ok(false)`. KVM/NVMM back guest RAM with a `MAP_NORESERVE` host
+    /// mapping, so the host kernel demand-pages and there is nothing to commit;
+    /// only bhyve — whose sysmem is a fixed pool with no host demand-paging —
+    /// overrides this.
+    fn demand_commit(&mut self, _fault_addr: u64) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+
     /// Tear down an alias VA range. Backends may reclaim alias-specific table
     /// storage; the default invalidates the leaves like an ordinary unmap.
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {

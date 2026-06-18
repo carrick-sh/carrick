@@ -970,6 +970,11 @@ pub struct BhyveGuestRam {
     pub windows: Vec<BhyveWindow>,
     /// Bump cursor: next available GPA (starts at `X86_GPA_CURSOR_START`).
     cursor: u64,
+    /// Lazily-reserved (guest PROT_NONE) VA ranges — backed on demand by the
+    /// `#PF` path (`demand_commit`), never eagerly GPA-mapped. Sorted + coalesced.
+    /// Carried across fork by the `Clone` derive (the child replays its windows
+    /// and inherits these reservations).
+    reservations: Vec<(u64, u64)>,
 }
 
 /// Starting point for the bump allocator: 1 MiB (below the reserved 1 MiB
@@ -985,7 +990,62 @@ impl BhyveGuestRam {
         Self {
             windows: Vec::new(),
             cursor: X86_GPA_CURSOR_START,
+            reservations: Vec::new(),
         }
+    }
+
+    /// Record a lazily-reserved (guest PROT_NONE) VA range. The bhyve backend
+    /// does NOT eagerly GPA-back it; the `#PF` path commits a page on first
+    /// touch via [`Self::find_reservation`] + a one-page [`Self::add_bump`].
+    /// Page-aligned, then coalesced into the sorted reservation list.
+    pub fn reserve(&mut self, va: u64, len: usize) {
+        let start = va & !0xFFF;
+        let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
+        if end <= start {
+            return;
+        }
+        self.reservations.push((start, end));
+        self.reservations.sort_by_key(|&(s, _)| s);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.reservations.len());
+        for &(s, e) in &self.reservations {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        self.reservations = merged;
+    }
+
+    /// True iff the page containing `va` lies in a reservation range. The
+    /// caller (`demand_commit`) first checks `host_ptr` so an already-committed
+    /// page is handled before this is consulted.
+    pub fn find_reservation(&self, va: u64) -> bool {
+        let page = va & !0xFFF;
+        self.reservations
+            .iter()
+            .any(|&(s, e)| page >= s && page < e)
+    }
+
+    /// Remove a (possibly partial) reservation range — called on `munmap` of a
+    /// still-reserved range, and after committing a page so a re-fault doesn't
+    /// re-commit. Splits any straddled range.
+    pub fn drop_reservation(&mut self, va: u64, len: usize) {
+        let start = va & !0xFFF;
+        let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(self.reservations.len() + 1);
+        for &(s, e) in &self.reservations {
+            if end <= s || start >= e {
+                out.push((s, e)); // disjoint — keep
+            } else {
+                if s < start {
+                    out.push((s, start)); // left remainder
+                }
+                if end < e {
+                    out.push((end, e)); // right remainder
+                }
+            }
+        }
+        self.reservations = out;
     }
 
     /// Allocate a compact GPA for a window of `len` bytes (page-aligned).
@@ -1781,6 +1841,17 @@ pub fn bring_up_x86_elf(
 
         // Skip the PML4 tables and LSTAR windows: already added above as fixed.
         if va == LINUX_PAGE_TABLES_BASE || va == LINUX_EL0_TRAMPOLINE_BASE {
+            continue;
+        }
+
+        // The anonymous mmap arena is DEMAND-PAGED, not eagerly backed: skip its
+        // window so guest mmaps into it allocate no GPA up front. The bhyve
+        // GuestMemory::protect_range override records each fresh mmap as a
+        // reservation and the #PF path (demand_commit) backs one page on first
+        // touch — this is what lets the Go runtime's GROWING PROT_NONE
+        // page-summary reservations (64 MiB, 512 MiB, …) succeed without
+        // exhausting the fixed sysmem.
+        if va == LINUX_MMAP_BASE {
             continue;
         }
 
