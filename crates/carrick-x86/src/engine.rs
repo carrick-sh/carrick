@@ -341,6 +341,12 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         let mut off = 0usize;
         while off < length {
             let addr = address + off as u64;
+            // Let a lazy/sparse backend materialize the range before we probe
+            // run lengths: `host_run_len` uses the immutable `host_ptr`, which
+            // reads 0 for a not-yet-backed reservation, so a host-side write into
+            // one (file-backed mmap content, stack/auxv) would wrongly EFAULT.
+            // On eager backends `host_ptr_mut` defaults to `host_ptr` → no-op.
+            let _ = self.vm.host_ptr_mut(addr, length - off);
             let run = host_run_len(&self.vm, addr, length - off);
             if run == 0 {
                 trace_x86_efault("write", addr, length - off);
@@ -612,6 +618,25 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                     error_code,
                 } => {
                     self.sysret_resume = None;
+                    // Demand-paging: a NOT-PRESENT (#PF MAPERR) fault at a VA the
+                    // backend lazily reserved (e.g. Go's PROT_NONE page-summary
+                    // arena, which bhyve does not back eagerly) is committed on
+                    // first touch — the backend allocates a page + maps the leaf,
+                    // we flush the TLB, and `continue` re-runs the faulting
+                    // instruction (the #PF did NOT advance RIP). Eager backends
+                    // (KVM/NVMM/HVF) keep the `Ok(false)` default → genuine fault.
+                    if kind == X86FaultKind::PageFault
+                        && error_code & X86_PFEC_PRESENT == 0
+                        && self
+                            .vm
+                            .demand_commit(fault_addr)
+                            .map_err(|e| TrapError::Hypervisor(format!("demand_commit: {e:?}")))?
+                    {
+                        self.flush_current_tlb().map_err(|e| {
+                            TrapError::Hypervisor(format!("demand-page TLB flush: {e:?}"))
+                        })?;
+                        continue;
+                    }
                     // Deliver as an ISA-neutral guest fault. For #PF, PFEC.P
                     // selects MAPERR vs ACCERR exactly like Linux; other x86
                     // vectors use the backend-resolved Linux si_addr.

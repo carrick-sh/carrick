@@ -242,6 +242,59 @@ impl BhyveX86Vcpu {
         Ok(out)
     }
 
+    /// Walk the guest's 4-level page tables to translate a guest VA → GPA.
+    /// A fault frame is at the guest RSP, which is GPA-identity only for a
+    /// ring-3 fault landing on the low RSP0 fault stack; a ring-0 stub fault
+    /// leaves RSP on the (non-identity, window-mapped) user/goroutine stack,
+    /// where `read_gpa`'s direct mapping is wrong. Handles 2 MiB / 1 GiB pages.
+    fn translate_va(&self, va: u64) -> Result<u64, TrapError> {
+        const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+        let rd = |table_gpa: u64, idx: usize| -> Result<u64, TrapError> {
+            let b = self.read_gpa(table_gpa + (idx as u64) * 8, 8)?;
+            Ok(u64::from_le_bytes(b.try_into().unwrap()))
+        };
+        let e4 = rd(X86_PML4_GPA, ((va >> 39) & 0x1FF) as usize)?;
+        let nx = |lvl: &str| TrapError::Hypervisor(format!("translate_va 0x{va:x}: {lvl} absent"));
+        if e4 & 1 == 0 {
+            return Err(nx("PML4E"));
+        }
+        let e3 = rd(e4 & PTE_ADDR, ((va >> 30) & 0x1FF) as usize)?;
+        if e3 & 1 == 0 {
+            return Err(nx("PDPTE"));
+        }
+        if e3 & (1 << 7) != 0 {
+            return Ok((e3 & 0x000F_FFFF_C000_0000) + (va & 0x3FFF_FFFF)); // 1 GiB page
+        }
+        let e2 = rd(e3 & PTE_ADDR, ((va >> 21) & 0x1FF) as usize)?;
+        if e2 & 1 == 0 {
+            return Err(nx("PDE"));
+        }
+        if e2 & (1 << 7) != 0 {
+            return Ok((e2 & 0x000F_FFFF_FFE0_0000) + (va & 0x1F_FFFF)); // 2 MiB page
+        }
+        let e1 = rd(e2 & PTE_ADDR, ((va >> 12) & 0x1FF) as usize)?;
+        if e1 & 1 == 0 {
+            return Err(nx("PTE"));
+        }
+        Ok((e1 & PTE_ADDR) + (va & 0xFFF))
+    }
+
+    /// Read `len` bytes at a guest VA, translating page-by-page (a fault frame
+    /// can straddle a page boundary).
+    fn read_va(&self, va: u64, len: usize) -> Result<Vec<u8>, TrapError> {
+        let mut out = vec![0u8; len];
+        let mut off = 0usize;
+        while off < len {
+            let cur = va + off as u64;
+            let gpa = self.translate_va(cur)?;
+            let n = ((0x1000 - (cur & 0xFFF)) as usize).min(len - off);
+            let chunk = self.read_gpa(gpa, n)?;
+            out[off..off + n].copy_from_slice(&chunk);
+            off += n;
+        }
+        Ok(out)
+    }
+
     fn fp_scratch_gpa(&self) -> u64 {
         let id = self.h.slot().id;
         X86_FP_SCRATCH_GPA + (id as u64) * 0x1000
@@ -552,7 +605,10 @@ impl X86Vcpu for BhyveX86Vcpu {
                     let ring0_rsp = self.get_raw(VM_REG_GUEST_RSP)?;
                     let frame_len =
                         fault_stack_frame_len(record.vector()).map_err(Self::reg_err)?;
-                    let frame = self.read_gpa(ring0_rsp, frame_len)?;
+                    // The frame VA is GPA-identity only on the low RSP0 fault
+                    // stack (ring-3 fault); a ring-0 stub fault leaves RSP on the
+                    // window-mapped user stack, so translate VA→GPA.
+                    let frame = self.read_va(ring0_rsp, frame_len)?;
                     let context = fault_user_context_from_bytes(record.vector(), &frame)
                         .map_err(Self::reg_err)?;
                     let cr2 = self.get_raw(VM_REG_GUEST_CR2)?;
@@ -671,6 +727,70 @@ pub struct BhyveSiblingBuilder {
 // materialized engine touches single-threaded.
 unsafe impl Send for BhyveSiblingBuilder {}
 
+impl BhyveVmm {
+    /// Read the live guest PML4 into a scratch buffer, let `edit` mutate it via a
+    /// `Pml4Manager`, write it back, and reload CR3 (the single-vCPU TLB flush) —
+    /// the copy-edit-copy idiom shared by the demand-paging commit (and a future
+    /// refactor of `protect_range` / `map_host_alias`). `edit` returns whether it
+    /// changed the tables (no change ⇒ skip the write-back + CR3 reload).
+    fn with_live_pml4<F>(&mut self, edit: F) -> Result<(), MemoryError>
+    where
+        F: FnOnce(&mut Pml4Manager) -> Result<bool, MemoryError>,
+    {
+        let host = self
+            .vm
+            .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
+            .ok_or_else(|| {
+                MemoryError::HostMap(format!(
+                    "bhyve-x86: PML4 map_gpa 0x{X86_PML4_GPA:x} unmapped"
+                ))
+            })?;
+        let mut tables = vec![0u8; X86_PML4_CAPACITY];
+        // SAFETY: map_gpa proved the live PML4 window is mapped.
+        unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
+        let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
+        if !edit(&mut mgr)? {
+            return Ok(());
+        }
+        // SAFETY: both windows are X86_PML4_CAPACITY bytes.
+        unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
+        self.h
+            .as_bhyve()
+            .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
+            .map_err(|e| MemoryError::HostMap(format!("bhyve-x86: reload CR3: {e}")))
+    }
+
+    /// Back a lazily-reserved VA range NOW: allocate a compact GPA span,
+    /// zero-fill it (Linux anon), map the leaves in the live PML4, and drop the
+    /// reservation. Used by `demand_commit` (one page, on a guest #PF) and
+    /// `host_ptr_mut` (a whole range, when carrick itself must WRITE into a
+    /// reserved region — file-backed mmap content, stack/auxv).
+    fn commit_range(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
+        let start = va & !0xFFF;
+        let end = va.wrapping_add(len as u64).wrapping_add(0xFFF) & !0xFFF;
+        let span = (end - start) as usize;
+        let gpa = self
+            .ram
+            .add_bump(start, span, true, true, false)
+            .map_err(|e| MemoryError::HostMap(format!("bhyve commit_range: GPA alloc: {e}")))?;
+        let host = self.vm.map_gpa(gpa, span).ok_or_else(|| {
+            MemoryError::HostMap(format!("bhyve commit_range: map_gpa 0x{gpa:x} unmapped"))
+        })?;
+        // SAFETY: `host` is live sysmem of `span` bytes — zero the new anon pages.
+        unsafe { std::ptr::write_bytes(host, 0, span) };
+        self.with_live_pml4(|mgr| {
+            mgr.map_aliased(start, gpa, span as u64, true)
+                .map_err(|_| MemoryError::OutOfBounds {
+                    address: start,
+                    length: span,
+                })?;
+            Ok(true)
+        })?;
+        self.ram.drop_reservation(start, span);
+        Ok(())
+    }
+}
+
 impl X86Vmm for BhyveVmm {
     type Vcpu = BhyveX86Vcpu;
     type KickHandle = BhyveKickHandle;
@@ -708,7 +828,36 @@ impl X86Vmm for BhyveVmm {
         None
     }
 
+    fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
+        // A carrick-side WRITE into a lazily-reserved arena range — the
+        // file-backed mmap content copy, stack/auxv staging — must materialize
+        // the backing NOW. (A guest store faults page-by-page through
+        // `demand_commit`; a host-side write goes straight to the host pointer,
+        // so there is no #PF to drive the commit.) Commit the range, then
+        // resolve. Best-effort: a wild/oversized VA fails `commit_range`
+        // (plan_gpa/map_gpa overflow) and falls through to `None` — same as the
+        // pre-demand-paging behavior. Eager/committed VAs short-circuit (the
+        // first `host_ptr` hits).
+        if self.host_ptr(gpa, len).is_none() {
+            let _ = self.commit_range(gpa, len);
+        }
+        self.host_ptr(gpa, len)
+    }
+
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        // Demand-paged anon arena: a protection request for a VA the bhyve
+        // backend has NOT eagerly GPA-backed (no window covers it) is a fresh
+        // anon-mmap reservation — record it and return WITHOUT a GPA/leaf. The
+        // #PF path (`demand_commit`) backs one page on first touch, re-running
+        // the faulting instruction. Only VAs already backed by a window (the
+        // eager kernel/ELF/stack regions, or an already-committed page) take the
+        // real page-table edit below. `prot` is irrelevant for a reservation —
+        // the committed page is mapped RW and Linux faults on PROT_NONE access
+        // are not the workload here (Go reserves then commits before touching).
+        if self.host_ptr(address, 1).is_none() {
+            self.ram.reserve(address, len);
+            return Ok(());
+        }
         let host = self
             .vm
             .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
@@ -747,6 +896,35 @@ impl X86Vmm for BhyveVmm {
             .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
             .map_err(|e| MemoryError::HostMap(format!("bhyve-x86: reload CR3: {e}")))?;
         Ok(())
+    }
+
+    fn demand_commit(&mut self, fault_addr: u64) -> Result<bool, MemoryError> {
+        let page = fault_addr & !0xFFF;
+        // Already backed (a sibling, or an earlier fault on the same page, won
+        // the race): just re-run the faulting instruction.
+        if self.host_ptr(page, 1).is_some() {
+            return Ok(true);
+        }
+        // Not a lazily-reserved VA → a genuine fault; let the engine SIGSEGV.
+        if !self.ram.find_reservation(page) {
+            return Ok(false);
+        }
+        // Back one page (compact GPA, zero-filled, leaf mapped, reservation
+        // dropped) via the shared range-commit helper, then re-run.
+        self.commit_range(page, 4096)?;
+        Ok(true)
+    }
+
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        // Drop any lazy reservation first, so a freed-but-never-faulted range is
+        // not resurrected by the default `protect_range(0)` → reserve path. A
+        // committed page (a window covers it) still gets its present bits cleared.
+        self.ram.drop_reservation(address, len);
+        if self.host_ptr(address, 1).is_some() {
+            self.protect_range(address, len, 0)
+        } else {
+            Ok(())
+        }
     }
 
     fn map_host_alias(
