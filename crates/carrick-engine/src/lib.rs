@@ -199,9 +199,25 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         .collect();
     envp.sort();
 
-    // 3. Resolve working directory
+    // 3. Resolve working directory. A relative `--workdir` resolves against the
+    //    image's WorkingDir (Docker semantics), not the filesystem root —
+    //    carrick's `set_cwd` silently drops a non-absolute path, so without this
+    //    join a relative `-w` (e.g. `-w os`) would leave the guest cwd at `/` and
+    //    break every relative-path lookup.
     let cwd = match req.workdir {
-        Some(w) => Some(Utf8PathBuf::from(w)),
+        Some(w) => {
+            let p = Utf8PathBuf::from(&w);
+            if p.is_absolute() {
+                Some(p)
+            } else {
+                let base = image
+                    .config
+                    .working_dir
+                    .clone()
+                    .unwrap_or_else(|| Utf8PathBuf::from("/"));
+                Some(base.join(p))
+            }
+        }
         None => image.config.working_dir.clone(),
     }
     .or_else(|| Some(Utf8PathBuf::from("/")));
@@ -581,5 +597,48 @@ mod tests {
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.cwd.unwrap().as_str(), "/user/app");
+    }
+
+    #[test]
+    fn relative_workdir_resolves_against_image_workingdir() {
+        // A RELATIVE `--workdir` joins onto the image WorkingDir (Docker
+        // semantics), not `/`; an absolute one still wins verbatim.
+        let mk = |img_wd: Option<&str>, wd: Option<&str>| {
+            let image = make_test_image(None, None, vec![], img_wd.map(Utf8PathBuf::from));
+            let req = CliRunRequest {
+                image_ref: "alpine".to_string(),
+                platform: None,
+                args: vec!["/bin/ls".to_string()],
+                env_overrides: vec![],
+                mounts: vec![],
+                workdir: wd.map(|s| s.to_string()),
+                user: None,
+                entrypoint_override: None,
+                tty: false,
+                interactive: false,
+                rm: false,
+                name: None,
+                max_traps: 100,
+                debug_state_path: None,
+                fs: Some(FsBackendKind::Host),
+                pid: PidMode::default(),
+                stop_signal: None,
+                stop_timeout: None,
+            };
+            resolve_run_spec(req, image)
+                .unwrap()
+                .cwd
+                .unwrap()
+                .to_string()
+        };
+        // relative joins onto the image WorkingDir (the go-conformance case)
+        assert_eq!(
+            mk(Some("/usr/local/go/src"), Some("os")),
+            "/usr/local/go/src/os"
+        );
+        // relative with no image WorkingDir is anchored at root
+        assert_eq!(mk(None, Some("os")), "/os");
+        // absolute --workdir still wins verbatim
+        assert_eq!(mk(Some("/image/app"), Some("/user/app")), "/user/app");
     }
 }
