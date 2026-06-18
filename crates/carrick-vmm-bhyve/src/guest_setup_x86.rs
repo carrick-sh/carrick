@@ -1715,7 +1715,7 @@ pub fn bring_up_x86_elf(
 ) -> Result<BroughtUpX86, OsError> {
     use carrick_mem::memory::{
         LINUX_HEAP_BASE, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_PRIVATE_OVERLAY_BASE,
-        LINUX_SHARED_FILE_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE, LINUX_STACK_TOP,
+        LINUX_SHARED_FILE_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE,
     };
 
     let regs = X8664GuestArch::bootstrap_sysregs();
@@ -1880,7 +1880,7 @@ pub fn bring_up_x86_elf(
         .map_err(|e| OsError::new(format!("bhyve: ELF PML4 build failed: {e:?}")))?;
     write_gpa(&vm, X86_PML4_GPA, &tables)?;
 
-    // ── Step 4: program vCPU registers (identical to bring_up_x86_m1) ────────
+    // ── Step 4: program vCPU registers ───────────────────────────────────────
 
     let mut vcpu = vm.add_vcpu()?;
 
@@ -1890,7 +1890,18 @@ pub fn bring_up_x86_elf(
     vcpu.set_reg_raw(VM_REG_GUEST_EFER, regs.efer)?;
 
     vcpu.set_reg_raw(VM_REG_GUEST_RIP, X86_INIT_BLOB_GPA)?;
-    vcpu.set_reg_raw(VM_REG_GUEST_RSP, LINUX_STACK_TOP)?;
+    // Ring-0 scratch stack for the init blob's iretq-frame `push`es = the tail of
+    // slot 0 of the init-blob page (identity-mapped, RW, user=false), NOT
+    // LINUX_STACK_TOP. The M1 path used the user stack top, but with a REAL guest
+    // the argv/envp strings are packed at the very top of the user stack, and the
+    // 5-qword iretq frame pushed at [STACK_TOP-40, STACK_TOP) silently clobbers
+    // argv[1] et al — so `echo HELLO` saw an empty argument. The blob still
+    // iretqs to the user RSP (initial_rsp) carried in its own frame, so the user
+    // stack pointer is unaffected. This mirrors the sibling/clone entry
+    // (`program_x86_vcpu_longmode_entry`: ring0_rsp = blob_gpa + 256). The blob
+    // code is ~80 bytes at the slot base; the push lands in [216, 256), clear of
+    // both the code and the user stack.
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, X86_INIT_BLOB_GPA + 256)?;
     vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, regs.rflags)?;
 
     // Initial segments: kernel (DPL 0) — the init blob runs at CPL 0 to WRMSR.
