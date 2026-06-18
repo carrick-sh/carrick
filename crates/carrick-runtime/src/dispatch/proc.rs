@@ -270,6 +270,12 @@ pub(super) struct ProcState {
     /// program — `uname(2)` reporting `x86_64` — key off this flag instead of
     /// inspecting `executable_path`.
     pub binfmt_interpreted: bool,
+    /// `true` when the guest's NATIVE ISA is x86_64 (the bhyve / KVM-x86
+    /// backends), as opposed to a binfmt-translated x86_64 guest
+    /// (`binfmt_interpreted`) or a native aarch64 guest. Set once at run-image
+    /// setup from `E::Arch::elf_machine()`. `uname(2)` reports `x86_64` when
+    /// EITHER this or `binfmt_interpreted` holds.
+    pub native_x86_64: bool,
     /// Current guest environment (`KEY=VALUE` entries) as OPAQUE BYTES, surfaced
     /// as NUL-separated bytes through `/proc/self/environ`. Kept as raw bytes —
     /// env values are not required to be UTF-8, and a lossy String round-trip
@@ -438,6 +444,7 @@ impl ProcState {
             executable_path: "/proc/self/exe".to_owned(),
             argv: vec!["/proc/self/exe".to_owned()],
             binfmt_interpreted: false,
+            native_x86_64: false,
             env: Vec::new(),
             personality: 0,
             dumpable: 1,
@@ -1488,7 +1495,11 @@ impl SyscallDispatcher {
             // identity (executable_path stays the target, as on real Linux). Both
             // carry the resolved nodename.
             let nodename = crate::execute::guest_hostname();
-            let uts = if this.proc.lock().binfmt_interpreted {
+            let x86_64 = {
+                let p = this.proc.lock();
+                p.binfmt_interpreted || p.native_x86_64
+            };
+            let uts = if x86_64 {
                 LinuxUtsname::carrick_x86_64_with_nodename(nodename)
             } else {
                 LinuxUtsname::carrick_aarch64_with_nodename(nodename)

@@ -1405,6 +1405,12 @@ pub mod runtime {
             image = image.with_vdso_bytes(vdso)?;
         }
 
+        // uname(2) and other arch-dependent syscalls report the guest's NATIVE
+        // ISA (x86_64 on the bhyve / KVM-x86 backends; aarch64 otherwise). Keyed
+        // off the engine's GuestArch, not the host, so a native x86_64 guest no
+        // longer reports "aarch64" the way only binfmt-translated guests used to.
+        dispatcher.set_native_x86_64(E::Arch::elf_machine() == 62 /* EM_X86_64 */);
+
         // 4. Run through the backend-specific engine on the same generic
         // threaded loop as run-elf.
         let engine = build_engine(&image)?;
