@@ -964,17 +964,33 @@ pub struct BhyveWindow {
 /// SAME guest physical memory via the shared ctx — exactly what a sibling vCPU
 /// on the same VM needs. (Contrast the KVM lane, which owns host mmaps and so
 /// needs a non-owning `from_shared_windows` view; bhyve's clone is sufficient.)
+/// Shared, mutable demand-paging state (VA→GPA windows + GPA bump cursor +
+/// reservation list). Behind a `Mutex` in [`BhyveGuestRam`] so every sibling
+/// vCPU mutates ONE table — demand_commit MUTATES these at runtime, and a
+/// per-vCPU copy would let two threads commit the same page to divergent GPAs
+/// (the shared one-CR3 PML4 leaf then stops matching each vCPU's host_ptr → heap
+/// corruption, observed as Go's "bad sweepgen").
+struct RamInner {
+    windows: Vec<BhyveWindow>,
+    cursor: u64,
+    reservations: Vec<(u64, u64)>,
+}
+
+/// A handle to the shared guest-RAM plan. `Clone` shares the `Arc`, NOT the
+/// table — so all sibling vCPUs see one set of windows/reservations.
 #[derive(Clone)]
 pub struct BhyveGuestRam {
-    /// Planned VA→GPA windows (immutable after `map`).
-    pub windows: Vec<BhyveWindow>,
-    /// Bump cursor: next available GPA (starts at `X86_GPA_CURSOR_START`).
-    cursor: u64,
-    /// Lazily-reserved (guest PROT_NONE) VA ranges — backed on demand by the
-    /// `#PF` path (`demand_commit`), never eagerly GPA-mapped. Sorted + coalesced.
-    /// Carried across fork by the `Clone` derive (the child replays its windows
-    /// and inherits these reservations).
-    reservations: Vec<(u64, u64)>,
+    inner: std::sync::Arc<std::sync::Mutex<RamInner>>,
+}
+
+/// Outcome of an atomic [`BhyveGuestRam::commit_if_absent`].
+pub enum CommitOutcome {
+    /// A window already covers the page (a sibling won the race) — just re-run.
+    AlreadyMapped,
+    /// Not a known reservation — a genuine fault (deliver SIGSEGV).
+    NotReserved,
+    /// Freshly allocated this GPA + window; the caller maps the leaf + zero-fills.
+    Committed(u64),
 }
 
 /// Starting point for the bump allocator: 1 MiB (below the reserved 1 MiB
@@ -984,21 +1000,8 @@ pub struct BhyveGuestRam {
 /// from `plan_gpa` start here and advance monotonically.
 pub const X86_GPA_CURSOR_START: u64 = 0x40_0000; // 4 MiB — above init blob/GDT/LSTAR/PML4
 
-impl BhyveGuestRam {
-    /// Create an empty RAM plan.
-    pub fn new() -> Self {
-        Self {
-            windows: Vec::new(),
-            cursor: X86_GPA_CURSOR_START,
-            reservations: Vec::new(),
-        }
-    }
-
-    /// Record a lazily-reserved (guest PROT_NONE) VA range. The bhyve backend
-    /// does NOT eagerly GPA-back it; the `#PF` path commits a page on first
-    /// touch via [`Self::find_reservation`] + a one-page [`Self::add_bump`].
-    /// Page-aligned, then coalesced into the sorted reservation list.
-    pub fn reserve(&mut self, va: u64, len: usize) {
+impl RamInner {
+    fn reserve(&mut self, va: u64, len: usize) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
         if end <= start {
@@ -1016,20 +1019,14 @@ impl BhyveGuestRam {
         self.reservations = merged;
     }
 
-    /// True iff the page containing `va` lies in a reservation range. The
-    /// caller (`demand_commit`) first checks `host_ptr` so an already-committed
-    /// page is handled before this is consulted.
-    pub fn find_reservation(&self, va: u64) -> bool {
+    fn find_reservation(&self, va: u64) -> bool {
         let page = va & !0xFFF;
         self.reservations
             .iter()
             .any(|&(s, e)| page >= s && page < e)
     }
 
-    /// Remove a (possibly partial) reservation range — called on `munmap` of a
-    /// still-reserved range, and after committing a page so a re-fault doesn't
-    /// re-commit. Splits any straddled range.
-    pub fn drop_reservation(&mut self, va: u64, len: usize) {
+    fn drop_reservation(&mut self, va: u64, len: usize) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
         let mut out: Vec<(u64, u64)> = Vec::with_capacity(self.reservations.len() + 1);
@@ -1048,13 +1045,7 @@ impl BhyveGuestRam {
         self.reservations = out;
     }
 
-    /// Allocate a compact GPA for a window of `len` bytes (page-aligned).
-    ///
-    /// The returned GPA is within `[X86_GPA_CURSOR_START, X86_MEM_SIZE)`. If
-    /// the bump cursor would exceed `X86_MEM_SIZE`, the function returns an
-    /// error (the total footprint is small in Phase 2; this is a static guard,
-    /// not a policy decision).
-    pub fn plan_gpa(&mut self, len: usize) -> Result<u64, OsError> {
+    fn plan_gpa(&mut self, len: usize) -> Result<u64, OsError> {
         // Round len up to the next 4 KiB boundary.
         let len_aligned = (len as u64 + 0xFFF) & !0xFFF;
         let gpa = self.cursor;
@@ -1071,29 +1062,7 @@ impl BhyveGuestRam {
         Ok(gpa)
     }
 
-    /// Add a window with a pre-chosen GPA (for fixed-GPA placements like the
-    /// init blob, GDT, LSTAR stub, and PML4 tables).
-    pub fn add_fixed(
-        &mut self,
-        va: u64,
-        gpa: u64,
-        len: usize,
-        user: bool,
-        write: bool,
-        exec: bool,
-    ) {
-        self.windows.push(BhyveWindow {
-            va,
-            gpa,
-            len,
-            user,
-            write,
-            exec,
-        });
-    }
-
-    /// Add a window at the next bump-cursor GPA, returning the assigned GPA.
-    pub fn add_bump(
+    fn add_bump(
         &mut self,
         va: u64,
         len: usize,
@@ -1113,9 +1082,116 @@ impl BhyveGuestRam {
         Ok(gpa)
     }
 
-    /// The total GPA footprint (exclusive end of the highest window).
+    /// Resolve a guest VA → backing GPA via the window table (the host_ptr scan).
+    /// `None` if no single window covers `[va, va+len)`.
+    fn resolve(&self, va: u64, len: usize) -> Option<u64> {
+        for w in &self.windows {
+            let w_end = w.va + w.len as u64;
+            if va >= w.va && va < w_end {
+                let offset = (va - w.va) as usize;
+                if w.len.saturating_sub(offset) < len {
+                    return None;
+                }
+                return Some(w.gpa + offset as u64);
+            }
+        }
+        None
+    }
+}
+
+impl BhyveGuestRam {
+    /// Create an empty RAM plan.
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(RamInner {
+                windows: Vec::new(),
+                cursor: X86_GPA_CURSOR_START,
+                reservations: Vec::new(),
+            })),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RamInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a lazily-reserved (guest PROT_NONE) VA range — backed on demand by
+    /// the `#PF` path, never eagerly GPA-mapped.
+    pub fn reserve(&self, va: u64, len: usize) {
+        self.lock().reserve(va, len);
+    }
+
+    /// True iff the page containing `va` lies in a reservation range.
+    pub fn find_reservation(&self, va: u64) -> bool {
+        self.lock().find_reservation(va)
+    }
+
+    /// Remove a (possibly partial) reservation range (munmap, or after a commit).
+    pub fn drop_reservation(&self, va: u64, len: usize) {
+        self.lock().drop_reservation(va, len);
+    }
+
+    /// Allocate a compact GPA for a window of `len` bytes (page-aligned).
+    pub fn plan_gpa(&self, len: usize) -> Result<u64, OsError> {
+        self.lock().plan_gpa(len)
+    }
+
+    /// Add a window with a pre-chosen GPA (fixed placements: init blob, GDT,
+    /// LSTAR stub, PML4 tables).
+    pub fn add_fixed(&self, va: u64, gpa: u64, len: usize, user: bool, write: bool, exec: bool) {
+        self.lock().windows.push(BhyveWindow {
+            va,
+            gpa,
+            len,
+            user,
+            write,
+            exec,
+        });
+    }
+
+    /// Add a window at the next bump-cursor GPA, returning the assigned GPA.
+    pub fn add_bump(
+        &self,
+        va: u64,
+        len: usize,
+        user: bool,
+        write: bool,
+        exec: bool,
+    ) -> Result<u64, OsError> {
+        self.lock().add_bump(va, len, user, write, exec)
+    }
+
+    /// Resolve a guest VA → backing GPA (used by the engine's host_ptr).
+    pub fn resolve(&self, va: u64, len: usize) -> Option<u64> {
+        self.lock().resolve(va, len)
+    }
+
+    /// Snapshot the window table (boot-time PML4 build + tests read it).
+    pub fn windows_snapshot(&self) -> Vec<BhyveWindow> {
+        self.lock().windows.clone()
+    }
+
+    /// The total GPA footprint (the bump cursor).
     pub fn total_size(&self) -> usize {
-        self.cursor as usize
+        self.lock().cursor as usize
+    }
+
+    /// ATOMIC demand-commit. Under ONE lock: `AlreadyMapped` if a window already
+    /// covers `va` (a sibling won the race — re-run), `NotReserved` if it is not
+    /// a reservation (genuine fault → SIGSEGV), else allocate one GPA span +
+    /// window, drop the reservation, and return `Committed(gpa)`. Keeps two
+    /// sibling vCPUs from committing the same page to divergent GPAs.
+    pub fn commit_if_absent(&self, va: u64, len: usize) -> Result<CommitOutcome, OsError> {
+        let mut inner = self.lock();
+        if inner.resolve(va, 1).is_some() {
+            return Ok(CommitOutcome::AlreadyMapped);
+        }
+        if !inner.find_reservation(va) {
+            return Ok(CommitOutcome::NotReserved);
+        }
+        let gpa = inner.add_bump(va & !0xFFF, len, true, true, false)?;
+        inner.drop_reservation(va, len);
+        Ok(CommitOutcome::Committed(gpa))
     }
 }
 
@@ -1285,7 +1361,7 @@ pub fn msr_init_blob(
 /// compact low GPAs assigned in `ram`.  Called after all windows have been
 /// planned.
 pub fn pml4_map_specs(ram: &BhyveGuestRam) -> Vec<Pml4MapSpec> {
-    ram.windows
+    ram.windows_snapshot()
         .iter()
         .map(|w| Pml4MapSpec {
             va: w.va,
@@ -1665,7 +1741,7 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
 
     // M1 ring-3 blob at its bump GPA (resolved through the PML4).
     let m1_gpa = ram
-        .windows
+        .windows_snapshot()
         .iter()
         .find(|w| w.va == M1_BLOB_VA)
         .map(|w| w.gpa)
@@ -1937,7 +2013,8 @@ pub fn bring_up_x86_elf(
             continue;
         }
         // Find the window for this VA to get its GPA.
-        if let Some(w) = ram.windows.iter().find(|w| w.va == va) {
+        let planned = ram.windows_snapshot();
+        if let Some(w) = planned.iter().find(|w| w.va == va) {
             let write_len = bytes.len().min(w.len);
             if write_len > 0 {
                 write_gpa(&vm, w.gpa, &bytes[..write_len])?;
@@ -2490,21 +2567,23 @@ mod tests {
     /// add_fixed / add_bump store the window with the correct VA/GPA/flags.
     #[test]
     fn bhyve_guest_ram_add_fixed_and_bump_store_windows() {
-        let mut ram = BhyveGuestRam::new();
+        let ram = BhyveGuestRam::new();
         ram.add_fixed(0xDEAD_0000, 0x1000, 4096, true, false, true);
-        assert_eq!(ram.windows.len(), 1);
-        assert_eq!(ram.windows[0].va, 0xDEAD_0000);
-        assert_eq!(ram.windows[0].gpa, 0x1000);
-        assert!(ram.windows[0].user);
-        assert!(ram.windows[0].exec);
+        let windows = ram.windows_snapshot();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].va, 0xDEAD_0000);
+        assert_eq!(windows[0].gpa, 0x1000);
+        assert!(windows[0].user);
+        assert!(windows[0].exec);
 
         let gpa = ram.add_bump(0xBEEF_0000, 8192, false, true, false).unwrap();
-        assert_eq!(ram.windows.len(), 2);
-        assert_eq!(ram.windows[1].va, 0xBEEF_0000);
-        assert_eq!(ram.windows[1].gpa, gpa);
+        let windows = ram.windows_snapshot();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[1].va, 0xBEEF_0000);
+        assert_eq!(windows[1].gpa, gpa);
         assert_eq!(gpa, X86_GPA_CURSOR_START);
-        assert!(ram.windows[1].write);
-        assert!(!ram.windows[1].exec);
+        assert!(windows[1].write);
+        assert!(!windows[1].exec);
     }
 
     /// msr_init_blob: smoke-check that the blob is non-empty, fits in 128 bytes,
