@@ -35,10 +35,14 @@ pub use carrick_mem::{elf, memory, page_table, vdso};
 
 // The syscall-compat reporter is platform-neutral; it lives in carrick-observability
 // (every backend shares it instead of the old HVF-impl-vs-Linux-stub cfg split).
-// Re-exported as `crate::compat` so the probes provider's `crate::compat::{…}`
-// uses are unchanged. The macOS probe-fire hook is installed in
-// `probes::register_dtrace_probes`.
+// Re-exported as `crate::compat` so call sites are unchanged. The macOS probe-fire
+// hook is installed in `probes::register_dtrace_probes`.
 pub use carrick_observability::compat;
+// The USDT (DTrace) probe provider was hoisted into carrick-observability too, so
+// the FreeBSD/bhyve build gets the REAL provider (Linux/NetBSD get the no-op stub).
+// Re-exported as `crate::probes` so the HVF trap engine's `crate::probes::…` call
+// sites are unchanged on macOS.
+pub use carrick_observability::probes;
 #[cfg(target_os = "macos")]
 pub mod darwin_kqueue;
 pub mod fork_coord;
@@ -47,7 +51,6 @@ pub mod host_signal;
 pub mod io_wait;
 pub mod itimer;
 pub mod posix_timer;
-pub mod probes;
 // AArch64 syscall metadata is platform-neutral ABI data — hoisted to carrick-abi
 // (shared by KVM/bhyve, which used to get a `lookup → None` stub). Re-exported as
 // `crate::syscall` so HVF's compat reporter + the probes provider are unchanged.
