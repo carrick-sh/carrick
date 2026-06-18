@@ -159,8 +159,8 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 // site across the runtime is unchanged.
 #[cfg(feature = "platform-macos")]
 pub use carrick_vmm_hvf::{
-    fork_coord, host_signal, io_wait, itimer, posix_timer, probes, signal_arrival, threaded_impl,
-    trap, vcpu_kick,
+    fork_coord, host_signal, io_wait, itimer, posix_timer, signal_arrival, threaded_impl, trap,
+    vcpu_kick,
 };
 // The HVF `TimerDelivery` impl. Re-exported under `timer_delivery_impl` (the
 // `timer_delivery` name is the runtime's own register/deliver module above), so
@@ -174,6 +174,13 @@ pub use carrick_vmm_hvf::timer_delivery as timer_delivery_impl;
 // their probe registration; Linux/bhyve leave it unset. Re-exported at
 // `crate::compat` so all call sites are unchanged.
 pub use carrick_observability::compat;
+// The USDT (DTrace) probe provider is likewise platform-neutral now: it lives in
+// carrick-observability so macOS AND FreeBSD fire the REAL `usdt` provider, while
+// Linux/NetBSD link a no-op stub with identical signatures (replacing the old
+// inline `pub mod probes` stub that lived here, and the macOS-only
+// carrick-vmm-hvf re-export). Re-exported at `crate::probes` on EVERY platform so
+// the dispatcher's call sites are unchanged.
+pub use carrick_observability::probes;
 // AArch64 syscall metadata is platform-neutral ABI data, hoisted to carrick-abi
 // so every backend shares ONE table (the Linux/KVM arm was a `lookup → None`
 // stub; bhyve would have inherited it). Re-exported at `crate::syscall` so the
@@ -2385,73 +2392,5 @@ pub mod posix_timer {
                 });
         }
         Some(armed.old)
-    }
-}
-
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-pub mod probes {
-    macro_rules! stub {
-        ($name:ident($($param:ident: $ty:ty),* $(,)?)) => {
-            #[allow(dead_code, unused_variables)]
-            #[inline(always)]
-            pub fn $name($($param: $ty),*) {}
-        };
-    }
-
-    stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));
-    stub!(path_open(path: &str, result_size: u64, errno: i32));
-    stub!(itimer_fire(signum: i32, generation: u64));
-    stub!(futex_route(addr: u64, op: i32, shared: i32, host_addr: u64));
-    stub!(ulock_wait(host_addr: u64, value: u32, timeout_us: u32, phase: i32, rc: i64));
-    stub!(ulock_wake(host_addr: u64, iter: i32, rc: i64));
-    stub!(guest_exit(code: i32));
-    stub!(lifecycle(phase: u32));
-    stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
-    stub!(fs_op(op: &str, path: &str, errno: i32));
-    stub!(host_pipe_io(host_fd: i32, dir: i32, n: i64));
-    stub!(epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32));
-    stub!(epoll_interest(epfd: i32, fd: i32, requested: u32, raw_ready: u32, last_ready: u32, ready: u32));
-    stub!(epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32));
-    stub!(epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32));
-    stub!(epoll_stale_edge(udata: u64, guest_fd: i32, generation: u32));
-    stub!(io_wait_begin(tid: i32, fd_count: i32, timeout_ms: i64, fd0: i32, events0: i32, fd1: i32));
-    stub!(io_wait_end(tid: i32, result: i32, fd_count: i32, fd0: i32, fd1: i32, fd2: i32));
-    stub!(fork_quiesce(phase: i32, a: i64, b: i64, tid: i32));
-    stub!(fork_post(pid: i32, pc: u64, elr: u64));
-    stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
-    stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
-    stub!(kick_in_kernel(pc: u64, el: u32));
-    stub!(kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64));
-    stub!(mem_watch(syscall_nr: u64, addr: u64, value: u64));
-    stub!(sigaction_read(signum: i32, w0: u64, w1: u64, w2: u64, w3: u64));
-    stub!(supervisor_fork(child_pid: i32));
-    stub!(supervisor_child_ready(runtime_pid: i32));
-    stub!(supervisor_foreground_pgrp(pgid: i32, errno: i32));
-    stub!(supervisor_child_exit(pid: i32, status: i32));
-    stub!(pt_pause_begin(tid: i32, others_in_guest: i32, count: i32));
-    stub!(pt_pause_ready(tid: i32, spins: i32, wait_us: i64));
-    stub!(pt_pause_timeout(tid: i32, wait_us: i64));
-    stub!(pt_pause_end(tid: i32));
-    stub!(pt_pool(in_use: u32, free_list: u32, capacity: u32, changed: i32));
-    stub!(pt_fault_walk(far: u64, l0: u64, l1: u64, l2: u64, l3: u64));
-    stub!(guest_mem_bytes(direction: u32, address: u64, bytes: &[u8]));
-    stub!(vcpu_trap(regs: &crate::compat::GuestRegs));
-    stub!(execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64));
-    stub!(execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64));
-    stub!(vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32));
-    stub!(vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64));
-    stub!(pt_alias_walk(va: u64, descs: [u64; 4], flag: i32));
-    stub!(hv_vm_map_alias(va: u64, ipa: u64, size: u64, rc: i32, forked: i32));
-    stub!(signal_publish(target_tid: i32, signum: i32, kind: i32));
-    stub!(signal_deliver(tid: i32, pending: i32));
-    stub!(fire(event: &crate::compat::CompatEvent));
-
-    #[allow(dead_code)]
-    pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
-        Ok(())
     }
 }
