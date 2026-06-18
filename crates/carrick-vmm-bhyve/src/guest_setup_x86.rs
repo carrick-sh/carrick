@@ -119,8 +119,14 @@ use crate::vmm_x86::{
 // (LINUX_EL0_TRAMPOLINE_BASE = 0x2D_0000_0000, stack at 0xFF_FFFF_0000, etc.)
 // map to compact low GPAs.
 
-/// Total VM RAM for carrick's X86 bring-up: 64 MiB.
-pub const X86_MEM_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+/// Total VM RAM for carrick's X86 bring-up. Raised from 64 MiB to 512 MiB once
+/// the mmap arena became demand-paged: only COMMITTED pages consume this pool
+/// (PROT_NONE reservations do not), and bhyve's sysmem is a lazy host mmap, so a
+/// larger pool is cheap. Bounded by the 448-page PML4 (maps ~896 MiB of 4 KiB
+/// leaves). The Go compiler commits >60 MiB, overflowing the old 64 MiB. (The
+/// earlier crude bump failed because backing was still EAGER then — see the
+/// demand-paging history.)
+pub const X86_MEM_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
 
 /// GPA of the ring-0 MSR init blob (also the initial vCPU RIP). The blob
 /// WRMSRs LSTAR/STAR/SFMASK (Experiment 3: no vm_set_register path exists for
