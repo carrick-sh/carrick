@@ -1963,7 +1963,23 @@ where
     // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
     let result: Result<VcpuLoopOutcome, RuntimeError> = (|| {
-        for traps in 1..=state.max_traps {
+        // Progress-aware trap watchdog: bound the traps SINCE THE LAST DELIVERED
+        // SIGNAL HANDLER, not the lifetime total. A guest legitimately spinning
+        // while it waits for a signal (CPython test_io's reentrant-write tests
+        // busy-loop ~1s for a SIGALRM, ~600k syscalls per cycle) is responsive,
+        // not hung — each handler delivery resets the budget. A genuinely stuck
+        // guest delivers no handlers and still trips the limit.
+        let mut budget_floor = 0usize;
+        let mut seen_signal_progress = signal_progress_count();
+        for traps in 1.. {
+            let progress = signal_progress_count();
+            if progress != seen_signal_progress {
+                seen_signal_progress = progress;
+                budget_floor = traps - 1;
+            }
+            if traps - budget_floor > state.max_traps {
+                break;
+            }
             if kernel.exec_replacing_other_thread(state.this_tid) {
                 return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
             }
@@ -2367,6 +2383,26 @@ impl PendingSignalAction {
     }
 }
 
+thread_local! {
+    // Per-vCPU-thread count of signal HANDLERS delivered to the guest. The vCPU
+    // loop's trap watchdog measures traps since this last advanced (not lifetime
+    // total): a guest legitimately busy-waiting for a signal makes millions of
+    // syscalls but is responsive, so each delivered handler resets the budget. A
+    // genuinely stuck guest delivers no handlers and still trips the watchdog.
+    static SIGNAL_PROGRESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Note that a signal handler was delivered to the guest on this vCPU thread —
+/// progress that resets the trap watchdog (see the vCPU loop).
+pub(crate) fn note_signal_progress() {
+    SIGNAL_PROGRESS.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// This vCPU thread's running count of delivered signal handlers.
+pub(crate) fn signal_progress_count() -> u64 {
+    SIGNAL_PROGRESS.with(std::cell::Cell::get)
+}
+
 /// Drain whatever signal is sitting in the host pending slot and dispatch it to
 /// the guest. Returns `Ok(None)` when nothing was pending.
 pub(crate) fn deliver_pending_signal<T>(
@@ -2406,6 +2442,9 @@ where
     }
     match dispatcher.registered_signal_handler(pending) {
         Some(action) => {
+            // A handler is about to run in the guest: real progress, resets the
+            // trap watchdog (a busy-wait-for-signal loop is not a hang).
+            note_signal_progress();
             // Block the signal (+ its sa_mask) for the duration of the handler, as
             // the kernel does — restored by rt_sigreturn.
             let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
