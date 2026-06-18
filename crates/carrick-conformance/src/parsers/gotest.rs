@@ -25,7 +25,14 @@ const LINE: &str = r"^\s*--- (PASS|FAIL|SKIP): (\S+)";
 impl VerdictParser for GotestParser {
     fn parse(&self, raw: &Raw) -> SuiteResult {
         let text = super::strip_carrick_banners(&raw.combined());
-        let crashed = CRASH_SIGNATURES.iter().any(|sig| text.contains(sig));
+        // A Go test binary exits 0 (all passed) or 1 (some failed) ONLY when it
+        // ran to completion; any OTHER code is a panic/fatal/signal death
+        // mid-run (e.g. the docker `os.test` oracle fatals at
+        // TestSpliceFile/TCP-To-TTY → exit 2, truncating at 104/727). Treat that
+        // as a crash so a partial run becomes ORACLE_FAIL (oracle side) /
+        // CARRICK_CRASH (carrick side) instead of gating against half a suite.
+        let crashed = CRASH_SIGNATURES.iter().any(|sig| text.contains(sig))
+            || !matches!(raw.exit_code, 0 | 1);
 
         let Ok(re) = Regex::new(LINE) else {
             return SuiteResult::empty();
@@ -195,5 +202,24 @@ PASS";
         let r = GotestParser.parse(&raw(out));
         assert_eq!(r.result, SuiteOutcome::Success);
         assert_eq!(r.totals.passed, 2);
+    }
+
+    #[test]
+    fn nonzero_exit_is_crash_not_partial() {
+        // 104 PASS then the binary dies mid-run (exit 2), no top-level summary —
+        // the docker os.test panic at TestSpliceFile/TCP-To-TTY. Must be `None`
+        // (→ ORACLE_FAIL) not a partial Success that gates carrick. Exit 1 (some
+        // tests failed but ran to completion) stays a real Failure.
+        let out =
+            "--- PASS: TestA (0.0s)\n--- PASS: TestB (0.0s)\n=== RUN   TestSpliceFile/TCP-To-TTY";
+        let mut crashed = raw(out);
+        crashed.exit_code = 2;
+        assert_eq!(GotestParser.parse(&crashed).result, SuiteOutcome::None);
+        let mut killed = raw(out);
+        killed.exit_code = 137; // SIGKILL (timeout)
+        assert_eq!(GotestParser.parse(&killed).result, SuiteOutcome::None);
+        let mut failed = raw("--- FAIL: TestA (0.0s)\nFAIL");
+        failed.exit_code = 1;
+        assert_eq!(GotestParser.parse(&failed).result, SuiteOutcome::Failure);
     }
 }
