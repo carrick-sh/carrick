@@ -680,13 +680,24 @@ fn write_gpa(vm: &BhyveVm, gpa: u64, bytes: &[u8]) -> Result<(), OsError> {
 ///   out %al,$0xC6     E6 C6        ; FP doorbell (FP_STUB_DOORBELL_PORT)
 ///   jmp .             EB FE        ; park (never reached: host restores RIP)
 /// ```
-/// `fxsave_stub` at +0, `fxrstor_stub` at +8 (each padded to 8 bytes).
-pub fn fp_stub_bytes() -> [u8; 16] {
-    let mut b = [0u8; 16];
-    // fxsave (%rdi); out %al,$0xC6; jmp .
+/// `fxsave_stub` at +0, `fxrstor_stub` at +8, `xsave_stub` at +16, `xrstor_stub`
+/// at +32. The XSAVE pair carries the AVX `YMM_Hi` component (so YMM upper halves
+/// survive a signal save/restore); the FXSAVE pair stays for the 512-byte path.
+/// MUST match carrick_x86::bringup::fp_stub_bytes (asserted by a test).
+pub fn fp_stub_bytes() -> [u8; 48] {
+    let mut b = [0u8; 48];
+    // +0: fxsave (%rdi); out %al,$0xC6; jmp .
     b[0..7].copy_from_slice(&[0x0F, 0xAE, 0x07, 0xE6, 0xC6, 0xEB, 0xFE]);
-    // fxrstor (%rdi); out %al,$0xC6; jmp .
+    // +8: fxrstor (%rdi); out %al,$0xC6; jmp .
     b[8..15].copy_from_slice(&[0x0F, 0xAE, 0x0F, 0xE6, 0xC6, 0xEB, 0xFE]);
+    // +16: mov eax,7; xor edx,edx; xsave (%rdi); out %al,$0xC6; jmp .
+    b[16..30].copy_from_slice(&[
+        0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xD2, 0x0F, 0xAE, 0x27, 0xE6, 0xC6, 0xEB, 0xFE,
+    ]);
+    // +32: mov eax,7; xor edx,edx; xrstor (%rdi); out %al,$0xC6; jmp .
+    b[32..46].copy_from_slice(&[
+        0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xD2, 0x0F, 0xAE, 0x2F, 0xE6, 0xC6, 0xEB, 0xFE,
+    ]);
     b
 }
 
