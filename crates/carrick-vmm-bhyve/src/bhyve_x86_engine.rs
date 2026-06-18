@@ -622,7 +622,13 @@ impl X86Vcpu for BhyveX86Vcpu {
                         13 => X86FaultKind::GeneralProtection,
                         14 => X86FaultKind::PageFault,
                         17 => X86FaultKind::AlignmentCheck,
-                        _ => X86FaultKind::Other,
+                        v => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "bhyve: unhandled guest fault vector {v} \
+                                 (err=0x{:x} rip=0x{:x} cr2=0x{:x})",
+                                context.error_code, context.rip, cr2
+                            )));
+                        }
                     };
                     let fault_addr = match kind {
                         X86FaultKind::PageFault => cr2,
@@ -1146,6 +1152,23 @@ impl X86Vmm for BhyveVmm {
         // draws a DISTINCT id from the shared allocator.
         let (sibling, id) = builder.vm.add_sibling_vcpu().map_err(map_err)?;
         let vm = BhyveVm::from_shared(builder.vm.clone());
+        // Seed the sibling's FP scratch with a MASKED FXSAVE image (FCW=0x037F,
+        // MXCSR=0x1F80). A new vCPU's scratch is zeroed sysmem, so the FP stub's
+        // first fxrstor would load MXCSR=0 — all SIMD exceptions UNMASKED — and a
+        // maskable SSE exception in the guest (Go's compiler trips one; the
+        // lighter `go version` does not) then raises #XF (vector 19). Linux clone
+        // inherits the parent's FP state; a masked default suffices here (a new Go
+        // M starts with fresh FP regs, and what matters for #XF is the MXCSR mask).
+        if let Some(host) = vm.map_gpa(X86_FP_SCRATCH_GPA + (id as u64) * 0x1000, 512) {
+            // SAFETY: map_gpa proved 512 live sysmem bytes for this vCPU's slot;
+            // offsets 0/24/28 are the FXSAVE FCW / MXCSR / MXCSR_MASK fields.
+            unsafe {
+                std::ptr::write_bytes(host, 0, 512);
+                std::ptr::write_unaligned(host as *mut u16, 0x037F);
+                std::ptr::write_unaligned(host.add(24) as *mut u32, 0x1F80);
+                std::ptr::write_unaligned(host.add(28) as *mut u32, 0x0000_FFFF);
+            }
+        }
         let h = Arc::new(VcpuHandle {
             vcpu: AtomicPtr::new(sibling.vcpu),
             slot: Mutex::new(VcpuSlot { vm: builder.vm, id }),
