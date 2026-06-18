@@ -30,7 +30,10 @@ impl TimerDelivery for HvfTimerDelivery {
         if kq < 0 {
             return false;
         }
-        let ident = crate::itimer::ident_for(which);
+        // The fresh ident this arm allocated (itimer::arm ran first, in the
+        // setitimer dispatch). A recently-fired EV_ONESHOT ident is poisoned on
+        // Darwin — re-arming it never counts down — so each arm uses a new ident.
+        let ident = crate::itimer::live_ident(which);
         let cpu_timer = crate::itimer::is_cpu_timer(which);
         // CPU timers can't fire on a wall-clock deadline; arm a recheck one-shot
         // so the pump re-evaluates guest-CPU progress instead of consuming it.
@@ -50,15 +53,25 @@ impl TimerDelivery for HvfTimerDelivery {
         } else {
             (libc::EV_ADD | libc::EV_ONESHOT, value_i64)
         };
-        crate::darwin_kqueue::apply_changes(
+        let res = crate::darwin_kqueue::apply_changes(
             kq,
-            &[crate::darwin_kqueue::Kevent::timer(ident, flags, data)],
-        )
-        .is_ok()
+            &[crate::darwin_kqueue::Kevent::timer(ident, flags, data)
+                .with_udata_u64(crate::itimer::generation(which))],
+        );
+        // Wake the pump so it re-registers this arm FROM ITS OWN kevent context
+        // (see the pump reconcile loop). A timer EV_ADDed from this (dispatcher)
+        // thread while the pump is blocked in kevent() is not reliably monitored
+        // by that wait; the pump thread owns the authoritative registration. Both
+        // registrations carry the same generation in udata.
+        crate::host_signal::wake_signal_pump_all();
+        res.is_ok()
     }
 
     fn disarm_itimer(&self, which: usize) {
-        let ident = crate::itimer::ident_for(which);
+        // Read the live ident BEFORE disarm — disarm forgets it (resets the slot
+        // to the base-ident fallback), so this must run first to EV_DELETE the
+        // ident the arm actually registered.
+        let ident = crate::itimer::live_ident(which);
         crate::itimer::disarm(which);
         let kq = crate::host_signal::pump_kqueue();
         if kq >= 0 {
