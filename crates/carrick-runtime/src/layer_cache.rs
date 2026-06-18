@@ -53,6 +53,80 @@ pub fn try_seed_scratch(layer_paths: &[PathBuf], scratch: &Path) -> std::io::Res
     clone_children_into(&entry, scratch)
 }
 
+/// Linux-only: compose the per-run rootfs as an overlayfs mount instead of a
+/// byte-copy. `lowerdir` = the digest-keyed cached extraction (read-only, shared
+/// across runs, NEVER copied); `upperdir`/`workdir` = fresh per-run dirs under
+/// `scratch`; the merged view is mounted at `scratch/merged`. Returns
+/// `Ok(Some(merged))` to hand the caller the mountpoint (it opens the cap-std
+/// `Dir` there and unmounts on Drop), `Ok(None)` to fall back to clone/copy.
+#[cfg(target_os = "linux")]
+pub fn overlay_seed_scratch(
+    layer_paths: &[PathBuf],
+    scratch: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    if layer_paths.is_empty() {
+        return Ok(None);
+    }
+    let Some(scratch_root) = scratch.parent() else {
+        return Ok(None);
+    };
+    let cache_root = scratch_root.join(CACHE_DIR);
+    let entry = cache_root.join(stack_key(layer_paths)?);
+    if !entry.exists() && !build_cache_entry(layer_paths, &cache_root, &entry)? {
+        return Ok(None);
+    }
+    let upper = scratch.join("upper");
+    let work = scratch.join("work");
+    let merged = scratch.join("merged");
+    for d in [&upper, &work, &merged] {
+        std::fs::create_dir_all(d)?;
+    }
+    if mount_overlay(&entry, &upper, &work, &merged).is_err() {
+        // Leave the scratch empty so the clone/copy fallback can seed it.
+        let _ = std::fs::remove_dir_all(&merged);
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&upper);
+        return Ok(None);
+    }
+    Ok(Some(merged))
+}
+
+/// `mount(2)` an overlayfs at `merged` (lower RO, upper+work writable). The
+/// `userxattr` option makes whiteouts/opaque markers use `user.overlay.*` xattrs
+/// (settable from an unprivileged user namespace) rather than `trusted.*`
+/// (CAP_SYS_ADMIN-only) or 0:0 char-device whiteouts (CAP_MKNOD-only) — so it
+/// works for an unprivileged-container guest. The lower extraction already has
+/// OCI whiteouts applied, so the overlay only ever adds the guest's own writes.
+#[cfg(target_os = "linux")]
+fn mount_overlay(lower: &Path, upper: &Path, work: &Path, merged: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(b"lowerdir=");
+    data.extend_from_slice(lower.as_os_str().as_bytes());
+    data.extend_from_slice(b",upperdir=");
+    data.extend_from_slice(upper.as_os_str().as_bytes());
+    data.extend_from_slice(b",workdir=");
+    data.extend_from_slice(work.as_os_str().as_bytes());
+    data.extend_from_slice(b",userxattr\0");
+    let target = std::ffi::CString::new(merged.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("NUL in overlay mountpoint"))?;
+    // SAFETY: all args are valid NUL-terminated C strings (`data` ends in NUL);
+    // the kernel copies them in. A failed mount returns -1 / errno, no UB.
+    let rc = unsafe {
+        libc::mount(
+            c"overlay".as_ptr(),
+            target.as_ptr(),
+            c"overlay".as_ptr(),
+            0,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Stable cache key for an ordered layer stack: SHA-256 over each layer's
 /// (file name, byte length). The blob file names are already content digests;
 /// folding in the length is belt-and-suspenders against a truncated blob.
