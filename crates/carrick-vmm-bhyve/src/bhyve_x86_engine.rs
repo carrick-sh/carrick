@@ -570,6 +570,62 @@ impl X86Vcpu for BhyveX86Vcpu {
         Ok(true)
     }
 
+    fn get_xsave(&self) -> Result<Option<[u8; carrick_x86::XSAVE_LEN]>, TrapError> {
+        // Like get_fp, but drives the XSAVE stub (+16) to capture the full
+        // 832-byte XSAVE area INCLUDING the AVX YMM_Hi component, so a signal's
+        // FP save/restore preserves YMM upper halves. get_fp's 512-byte FXSAVE
+        // path drops them (ymmtest: a handler that clobbers YMM0 then returns ->
+        // YMM_BAD on bhyve, YMM_OK on Docker). The engine reads YMM via
+        // get_ymm_hi -> get_xsave for the sigframe + fork/clone snapshot.
+        let placeholder = {
+            let mut fx = [0u8; 512];
+            fx[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
+            fx[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+            fx[28..32].copy_from_slice(&0x0000_FFFFu32.to_le_bytes()); // MXCSR_MASK
+            carrick_x86::fxsave_to_xsave(fx)
+        };
+        if !self.h.started.load(Ordering::SeqCst) {
+            return Ok(Some(placeholder));
+        }
+        let cpl0 = (self.get_raw(VM_REG_GUEST_CS)? & 3) == 0;
+        if !cpl0 {
+            // Async ring-3 signal: raise IOPL=3 so the stub's OUT doorbell fires
+            // at CPL 3 (the stub + scratch are user-mapped); restore IOPL after.
+            let saved_rflags = self.get_raw(VM_REG_GUEST_RFLAGS)?;
+            self.set_raw(VM_REG_GUEST_RFLAGS, saved_rflags | 0x3000)?;
+            let mut me = self.clone();
+            let r = carrick_x86::run_fp_stub(&mut me, X86_FP_STUB_GPA + 16, self.fp_scratch_gpa());
+            self.set_raw(VM_REG_GUEST_RFLAGS, saved_rflags)?;
+            if r.is_err() {
+                return Ok(Some(placeholder));
+            }
+        } else {
+            let mut me = self.clone();
+            carrick_x86::run_fp_stub(&mut me, X86_FP_STUB_GPA + 16, self.fp_scratch_gpa())?;
+        }
+        let blob = self.read_gpa(self.fp_scratch_gpa(), carrick_x86::XSAVE_LEN)?;
+        let mut xs = [0u8; carrick_x86::XSAVE_LEN];
+        xs.copy_from_slice(&blob);
+        Ok(Some(xs))
+    }
+
+    fn set_xsave(&mut self, xs: &[u8; carrick_x86::XSAVE_LEN]) -> Result<bool, TrapError> {
+        // Inverse of get_xsave: drive the XRSTOR stub (+32) with the full XSAVE
+        // area so YMM upper halves are restored on rt_sigreturn / clone. Same
+        // started + CPL gates as set_fp (rt_sigreturn enters at CPL 0 via SYSCALL).
+        if !self.h.started.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        let cpl0 = (self.get_raw(VM_REG_GUEST_CS)? & 3) == 0;
+        if !cpl0 {
+            return Ok(true);
+        }
+        let scratch = self.fp_scratch_gpa();
+        self.write_gpa(scratch, xs)?;
+        carrick_x86::run_fp_stub(self, X86_FP_STUB_GPA + 32, scratch)?;
+        Ok(true)
+    }
+
     fn run(&mut self) -> Result<X86Exit, TrapError> {
         // `run_x86` takes `&mut BhyveVcpu`; build a transient view over the live
         // raw handle and decode its native exit into the shared `X86Exit`. Loop
