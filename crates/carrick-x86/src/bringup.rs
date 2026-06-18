@@ -153,13 +153,24 @@ pub fn msr_init_blob(
 ///   out %al,$0xC6     E6 C6        ; FP doorbell (FP_STUB_DOORBELL_PORT)
 ///   jmp .             EB FE        ; park (never reached: host restores RIP)
 /// ```
-/// `fxsave_stub` at +0, `fxrstor_stub` at +8 (each padded to 8 bytes).
-pub fn fp_stub_bytes() -> [u8; 16] {
-    let mut b = [0u8; 16];
-    // fxsave (%rdi); out %al,$0xC6; jmp .
+/// `fxsave_stub` at +0, `fxrstor_stub` at +8, `xsave_stub` at +16, `xrstor_stub`
+/// at +32. The XSAVE pair carries the AVX `YMM_Hi` component (so YMM upper halves
+/// survive a signal save/restore); the FXSAVE pair stays for the 512-byte path.
+pub fn fp_stub_bytes() -> [u8; 48] {
+    let mut b = [0u8; 48];
+    // +0: fxsave (%rdi); out %al,$0xC6; jmp .
     b[0..7].copy_from_slice(&[0x0F, 0xAE, 0x07, 0xE6, 0xC6, 0xEB, 0xFE]);
-    // fxrstor (%rdi); out %al,$0xC6; jmp .
+    // +8: fxrstor (%rdi); out %al,$0xC6; jmp .
     b[8..15].copy_from_slice(&[0x0F, 0xAE, 0x0F, 0xE6, 0xC6, 0xEB, 0xFE]);
+    // +16: mov eax,7; xor edx,edx; xsave (%rdi); out %al,$0xC6; jmp .
+    //   EDX:EAX = 0x0..0x7 = the x87|SSE|AVX feature mask XSAVE writes.
+    b[16..30].copy_from_slice(&[
+        0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xD2, 0x0F, 0xAE, 0x27, 0xE6, 0xC6, 0xEB, 0xFE,
+    ]);
+    // +32: mov eax,7; xor edx,edx; xrstor (%rdi); out %al,$0xC6; jmp .
+    b[32..46].copy_from_slice(&[
+        0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xD2, 0x0F, 0xAE, 0x2F, 0xE6, 0xC6, 0xEB, 0xFE,
+    ]);
     b
 }
 
@@ -183,6 +194,10 @@ pub fn run_fp_stub<C: X86Vcpu>(
     let saved_rip = vcpu.get_gpr(X86Reg::Rip)?;
     let saved_rax = vcpu.get_gpr(X86Reg::Rax)?;
     let saved_rdi = vcpu.get_gpr(X86Reg::Rdi)?;
+    // The XSAVE/XRSTOR stubs load EDX=0 for the feature-mask high half; save RDX
+    // so they stay as non-destructive as the FXSAVE/FXRSTOR stubs (which don't
+    // touch it).
+    let saved_rdx = vcpu.get_gpr(X86Reg::Rdx)?;
     let saved_rflags = vcpu.get_gpr(X86Reg::Rflags)?;
 
     vcpu.set_gpr(X86Reg::Rdi, scratch_gpa)?;
@@ -202,11 +217,12 @@ pub fn run_fp_stub<C: X86Vcpu>(
         }
     }
 
-    // Restore the four touched regs (the RIP override cancels the backend's
+    // Restore the touched regs (the RIP override cancels the backend's
     // auto-advance past the `out`).
     vcpu.set_gpr(X86Reg::Rip, saved_rip)?;
     vcpu.set_gpr(X86Reg::Rax, saved_rax)?;
     vcpu.set_gpr(X86Reg::Rdi, saved_rdi)?;
+    vcpu.set_gpr(X86Reg::Rdx, saved_rdx)?;
     vcpu.set_gpr(X86Reg::Rflags, saved_rflags)?;
     Ok(())
 }
