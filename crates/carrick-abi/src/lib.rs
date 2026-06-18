@@ -1558,6 +1558,14 @@ pub struct X8664Rtsigframe {
     pub info: LinuxSiginfo,
     pub fpstate_pad: [u8; 16],
     pub fpstate: X8664Fpstate,
+    /// Carrick-internal AVX `YMM_Hi` (NOT part of the Linux ABI frame the guest
+    /// reads — trailing bytes beyond `fpstate`, which `uc.uc_mcontext.fpstate`
+    /// never points at). Preserves the interrupted thread's AVX upper halves
+    /// across a signal+sigreturn; the FXSAVE `fpstate` carries only XMM (the low
+    /// 128 bits). 16 × 16 bytes = YMM0_Hi..YMM15_Hi, little-endian. Travelling
+    /// WITH the frame keeps it correct under siglongjmp (no separate bookkeeping
+    /// to leak). Zero on a backend without AVX.
+    pub ymm_hi: [u8; 256],
 }
 
 impl X8664Rtsigframe {
@@ -1568,6 +1576,7 @@ impl X8664Rtsigframe {
             info: LinuxSiginfo::empty(),
             fpstate_pad: [0; 16],
             fpstate: X8664Fpstate::empty(),
+            ymm_hi: [0; 256],
         }
     }
 }
@@ -1577,7 +1586,9 @@ impl X8664Rtsigframe {
 const _: () = assert!(core::mem::size_of::<X8664Fpstate>() == 512);
 const _: () = assert!(core::mem::size_of::<X8664Sigcontext>() == 256);
 const _: () = assert!(core::mem::size_of::<X8664Ucontext>() == 304);
-const _: () = assert!(core::mem::size_of::<X8664Rtsigframe>() == 968);
+// 968-byte Linux ABI frame (pretcode/uc/info/fpstate) + 256-byte carrick-internal
+// trailing YMM_Hi (see the field doc) = 1224.
+const _: () = assert!(core::mem::size_of::<X8664Rtsigframe>() == 1224);
 
 #[cfg(test)]
 mod x8664_sigframe_tests {

@@ -256,10 +256,17 @@ impl X8664BootSysregs {
             // CR0: PE|MP|ET|NE|WP|PG — protected mode + paging + WP for U/S
             // bit-field integrity. 0x8001_0033 per Intel SDM vol. 3 §2.5.
             cr0: 0x8001_0033,
-            // CR4: PAE(5)|OSFXSR(9)|OSXMMEXCPT(10) = 0x0620.
+            // CR4: PAE(5)|OSFXSR(9)|OSXMMEXCPT(10)|OSXSAVE(18) = 0x0004_0620.
             // PAE required for IA-32e paging (Intel SDM vol. 3 §4.1.1).
-            // OSFXSR+OSXMMEXCPT enable SSE for musl-static builtins.
-            cr4: 0x0000_0620,
+            // OSFXSR+OSXMMEXCPT enable SSE for musl-static builtins. OSXSAVE lets
+            // the guest run XGETBV (so Go reads XCR0 to decide AVX availability).
+            // AVX itself is gated on XCR0[AVX], which only the KVM backend
+            // programs (KVM_SET_XCRS) — and only KVM carries the full XSAVE (incl
+            // YMM) across fork/signal — so a backend that leaves XCR0 at its reset
+            // default (0x1) shows OSXSAVE but XGETBV reports no AVX, keeping the
+            // guest SSE/Base-only (no YMM ⇒ no FXSAVE truncation). See
+            // `X86Vcpu::get_xsave`.
+            cr4: 0x0004_0620,
             // EFER: SCE(0)|LME(8)|LMA(10)|NXE(11) = 0x0D01.
             // SCE: enables SYSCALL/SYSRET (AMD APM vol. 2 §3.1.7).
             // LME+LMA: IA-32e long mode active.
@@ -471,8 +478,11 @@ impl GuestArch for X8664GuestArch {
         // fpstate pointer = the FXSAVE area's address within the frame.
         mc.fpstate = new_sp + core::mem::offset_of!(X8664Rtsigframe, fpstate) as u64;
 
-        // ── FXSAVE area: MXCSR + XMM0–15. ──
+        // ── FXSAVE area: MXCSR + XMM0–15, plus the AVX YMM_Hi (carrick-internal,
+        //    trailing the frame) so the interrupted thread's AVX upper halves
+        //    survive the handler+sigreturn — FXSAVE holds only the low 128 bits. ──
         let mut fp = X8664Fpstate::empty();
+        let mut ymm_hi = [0u8; 256];
         if p.fpsimd_enabled {
             fp.mxcsr = engine.get_fpcr()? as u32;
             let mut xmm = [0u32; 64];
@@ -483,6 +493,8 @@ impl GuestArch for X8664GuestArch {
                     xmm[b + j] =
                         u32::from_le_bytes([v[j * 4], v[j * 4 + 1], v[j * 4 + 2], v[j * 4 + 3]]);
                 }
+                let hi = engine.get_ymm_hi(n)?.to_le_bytes();
+                ymm_hi[n as usize * 16..n as usize * 16 + 16].copy_from_slice(&hi);
             }
             fp.xmm_space = xmm;
         }
@@ -529,6 +541,7 @@ impl GuestArch for X8664GuestArch {
         frame.uc = uc;
         frame.info = siginfo;
         frame.fpstate = fp;
+        frame.ymm_hi = ymm_hi;
         engine
             .write_bytes(new_sp, frame.as_bytes())
             .map_err(|_| TrapError::SignalDeliveryFault)?;
@@ -627,6 +640,16 @@ impl GuestArch for X8664GuestArch {
                     raw[j * 4..j * 4 + 4].copy_from_slice(&xmm[b + j].to_le_bytes());
                 }
                 engine.set_vreg(n, u128::from_le_bytes(raw))?;
+            }
+            // Restore the AVX YMM_Hi (carrick-internal trailing area) AFTER the
+            // XMM writes above: set_ymm_hi read-modify-writes the XSAVE, so the
+            // just-restored low halves are preserved alongside the upper halves.
+            let ymm_hi = frame.ymm_hi;
+            for n in 0..16u32 {
+                let off = n as usize * 16;
+                let mut raw = [0u8; 16];
+                raw.copy_from_slice(&ymm_hi[off..off + 16]);
+                engine.set_ymm_hi(n, u128::from_le_bytes(raw))?;
             }
         }
 
@@ -1214,8 +1237,10 @@ mod tests {
         assert_ne!(boot.cr4 & (1 << 5), 0, "CR4.PAE must be set");
         // OSFXSR (bit 9): OS SSE support (musl uses SSE).
         assert_ne!(boot.cr4 & (1 << 9), 0, "CR4.OSFXSR must be set");
+        // OSXSAVE (bit 18): lets the guest XGETBV to discover AVX (gated on XCR0).
+        assert_ne!(boot.cr4 & (1 << 18), 0, "CR4.OSXSAVE must be set");
         // Full value pin.
-        assert_eq!(boot.cr4, 0x0000_0620);
+        assert_eq!(boot.cr4, 0x0004_0620);
     }
 
     #[test]
@@ -1443,6 +1468,111 @@ mod tests {
             Err(other) => panic!("expected TrapError::Hypervisor, got {other:?}"),
             Ok(_) => panic!("codec must fail against the Unsupported memory stub"),
         }
+    }
+
+    /// A round-trippable signal-frame engine: sparse guest memory + a stateful
+    /// RSP + per-register YMM_Hi storage, enough to drive build→restore through
+    /// real `write_bytes`/`read_bytes`.
+    struct SigframeRoundtrip {
+        mem: std::collections::HashMap<u64, u8>,
+        rsp: u64,
+        ymm: [u128; 16],
+    }
+
+    impl carrick_guest_mem::GuestMemory for SigframeRoundtrip {
+        fn read_bytes(&self, a: u64, l: usize) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            Ok((0..l as u64)
+                .map(|i| *self.mem.get(&a.wrapping_add(i)).unwrap_or(&0))
+                .collect())
+        }
+        fn write_bytes(&mut self, a: u64, b: &[u8]) -> Result<(), carrick_guest_mem::MemoryError> {
+            for (i, &byte) in b.iter().enumerate() {
+                self.mem.insert(a.wrapping_add(i as u64), byte);
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::RegAccess for SigframeRoundtrip {
+        fn get_reg(&self, r: crate::Reg) -> Result<u64, crate::OsError> {
+            Ok(if matches!(r, crate::Reg::Rsp) {
+                self.rsp
+            } else {
+                0
+            })
+        }
+        fn set_reg(&mut self, r: crate::Reg, v: u64) -> Result<(), crate::OsError> {
+            if matches!(r, crate::Reg::Rsp) {
+                self.rsp = v;
+            }
+            Ok(())
+        }
+        fn get_sys_reg(&self, _: crate::SysReg) -> Result<u64, crate::OsError> {
+            Ok(0)
+        }
+        fn set_sys_reg(&mut self, _: crate::SysReg, _: u64) -> Result<(), crate::OsError> {
+            Ok(())
+        }
+        fn get_vreg(&self, _: u32) -> Result<u128, crate::OsError> {
+            Ok(0)
+        }
+        fn set_vreg(&mut self, _: u32, _: u128) -> Result<(), crate::OsError> {
+            Ok(())
+        }
+        fn get_ymm_hi(&self, n: u32) -> Result<u128, crate::OsError> {
+            Ok(self.ymm[n as usize])
+        }
+        fn set_ymm_hi(&mut self, n: u32, v: u128) -> Result<(), crate::OsError> {
+            self.ymm[n as usize] = v;
+            Ok(())
+        }
+        fn get_fpcr(&self) -> Result<u64, crate::OsError> {
+            Ok(0)
+        }
+        fn set_fpcr(&mut self, _: u64) -> Result<(), crate::OsError> {
+            Ok(())
+        }
+        fn get_fpsr(&self) -> Result<u64, crate::OsError> {
+            Ok(0)
+        }
+        fn set_fpsr(&mut self, _: u64) -> Result<(), crate::OsError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sigframe_preserves_avx_ymm_hi_across_build_and_restore() {
+        // An async SIGURG mid-AVX must not corrupt the interrupted thread's AVX
+        // upper halves: the FXSAVE area in the frame carries only XMM, so the
+        // YMM_Hi rides the carrick-internal trailing area. This drives the real
+        // build→restore codec through sparse guest memory and asserts the upper
+        // halves survive a handler that clobbered the live YMM regs.
+        let mut m = SigframeRoundtrip {
+            mem: std::collections::HashMap::new(),
+            rsp: 0x10_0000,
+            ymm: [0; 16],
+        };
+        for n in 0..16u32 {
+            m.ymm[n as usize] = ((n as u128) << 96) | 0xCAFE_F00D_0000_0001;
+        }
+        let saved = m.ymm;
+
+        let mut params = make_inject_params();
+        params.fpsimd_enabled = true;
+        let built = X8664GuestArch::build_sigframe(&mut m, params)
+            .expect("build_sigframe writes the frame to the roundtrip memory");
+
+        // The handler ran: it popped the 8-byte pretcode (RSP += 8) and clobbered
+        // the live YMM registers. Only the frame's saved copy can restore them.
+        m.rsp = built.new_sp.wrapping_add(8);
+        m.ymm = [0; 16];
+
+        X8664GuestArch::restore_sigframe(&mut m, true).expect("restore_sigframe");
+
+        assert_eq!(
+            m.ymm, saved,
+            "AVX YMM_Hi must round-trip through the signal frame"
+        );
     }
 
     // ── LSTAR value matches the trampoline slot ───────────────────────────

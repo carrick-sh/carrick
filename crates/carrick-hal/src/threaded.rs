@@ -266,6 +266,18 @@ pub trait RegAccess {
     fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), OsError>;
     fn get_vreg(&self, n: u32) -> Result<u128, OsError>;
     fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), OsError>;
+    /// The upper 128 bits of YMM\[n\] (the AVX `YMM_Hi` XSAVE component). Used by
+    /// the x86 signal frame to preserve a thread's AVX upper halves across a
+    /// signal+sigreturn — the FXSAVE area `get_vreg` reads holds only the low
+    /// 128 bits (XMM). DEFAULT 0: a backend without AVX state (aarch64's 128-bit
+    /// V-regs are fully covered by `get_vreg`) has no upper half to report.
+    fn get_ymm_hi(&self, _n: u32) -> Result<u128, OsError> {
+        Ok(0)
+    }
+    /// Set the upper 128 bits of YMM\[n\]. DEFAULT no-op (no AVX state).
+    fn set_ymm_hi(&mut self, _n: u32, _v: u128) -> Result<(), OsError> {
+        Ok(())
+    }
     fn get_fpcr(&self) -> Result<u64, OsError>;
     fn set_fpcr(&mut self, v: u64) -> Result<(), OsError>;
     fn get_fpsr(&self) -> Result<u64, OsError>;

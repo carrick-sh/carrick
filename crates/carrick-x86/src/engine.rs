@@ -480,6 +480,44 @@ impl<V: X86Vmm> carrick_hal::RegAccess for X86EngineCore<V> {
             .map_err(|_| OsError::from_raw(libc::EIO))
     }
 
+    fn get_ymm_hi(&self, n: u32) -> Result<u128, OsError> {
+        if n >= 16 {
+            return Err(OsError::from_raw(libc::EINVAL));
+        }
+        // YMM upper halves live in the XSAVE AVX component (offset 576), NOT the
+        // FXSAVE area get_vreg reads. A backend whose get_xsave is the FXSAVE-pad
+        // default returns 0 here (no AVX) — correct, that guest never set YMM.
+        let xs = self
+            .vcpu
+            .get_xsave()
+            .map_err(|_| OsError::from_raw(libc::EIO))?
+            .ok_or_else(|| OsError::from_raw(libc::EIO))?;
+        let off = crate::vmm::XSAVE_AVX_OFFSET + (n as usize) * 16;
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&xs[off..off + 16]);
+        Ok(u128::from_le_bytes(b))
+    }
+
+    fn set_ymm_hi(&mut self, n: u32, v: u128) -> Result<(), OsError> {
+        if n >= 16 {
+            return Err(OsError::from_raw(libc::EINVAL));
+        }
+        let mut xs = self
+            .vcpu
+            .get_xsave()
+            .map_err(|_| OsError::from_raw(libc::EIO))?
+            .ok_or_else(|| OsError::from_raw(libc::EIO))?;
+        let off = crate::vmm::XSAVE_AVX_OFFSET + (n as usize) * 16;
+        xs[off..off + 16].copy_from_slice(&v.to_le_bytes());
+        // Advertise AVX in xstate_bv (bit 2) so the setter restores the YMM_Hi
+        // component rather than treating it as "in init state" (zeroed).
+        xs[512] |= 0x04;
+        self.vcpu
+            .set_xsave(&xs)
+            .map(|_| ())
+            .map_err(|_| OsError::from_raw(libc::EIO))
+    }
+
     fn get_fpcr(&self) -> Result<u64, OsError> {
         // x86 has no FPCR; MXCSR is the nearest control word.
         let fx = self
