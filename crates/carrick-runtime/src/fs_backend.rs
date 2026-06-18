@@ -1197,6 +1197,12 @@ pub struct HostFsBackend {
     cache_pid: std::sync::atomic::AtomicU32,
     /// `CARRICK_FS_STATCACHE` enabled (default ON — see `stat_cache`).
     use_stat_cache: bool,
+    /// `Some(merged)` when this scratch is composed as an overlayfs mount
+    /// (lowerdir = the shared cached extraction, upperdir = this run's writes)
+    /// instead of a byte-copy — the `dir` is opened on `merged`, and `Drop`
+    /// `umount2(MNT_DETACH)`s it before the `TempDir` removes the scratch.
+    /// Linux-only; always `None` on macOS (clonefile is already O(1)).
+    overlay_mount: Option<std::path::PathBuf>,
 }
 
 /// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
@@ -1293,15 +1299,47 @@ fn stat_cache_enabled() -> bool {
     )
 }
 
+/// `--fs host` overlayfs rootfs composition (Linux). OPT-IN
+/// (`CARRICK_FS_OVERLAY=1`): each per-run scratch becomes an overlay over the
+/// shared cached extraction instead of a full byte-copy — the per-run latency
+/// floor on a no-reflink filesystem (ext4, or ZFS in an unprivileged container
+/// where FICLONE is denied). Off by default until the conformance gate has
+/// A/B-validated byte-identical verdicts against the blessed baseline.
+#[cfg(target_os = "linux")]
+fn overlay_enabled() -> bool {
+    matches!(
+        std::env::var("CARRICK_FS_OVERLAY").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 impl Drop for HostFsBackend {
     fn drop(&mut self) {
         let current = unsafe { libc::getpid() as u32 };
         if current != self.owner_pid {
             // Forked descendant: leak the TempDir so its Drop does NOT
             // delete the shared scratch directory. `into_path` consumes
-            // the TempDir without scheduling removal.
+            // the TempDir without scheduling removal. Don't touch the overlay
+            // mount either — the OWNER unmounts it.
             if let Some(scratch) = self._scratch.take() {
                 let _ = scratch.keep();
+            }
+            return;
+        }
+        // Owner: detach an overlayfs scratch mount (if any) BEFORE the `TempDir`
+        // Drop removes the scratch tree. MNT_DETACH (lazy) so the still-open
+        // cap-std `dir` fd — a field dropped right after this `drop` returns —
+        // doesn't cause EBUSY; the mount finalizes when that fd closes, leaving
+        // an empty `merged/` for the TempDir to remove.
+        #[cfg(target_os = "linux")]
+        if let Some(mp) = self.overlay_mount.take() {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(c) = std::ffi::CString::new(mp.as_os_str().as_bytes()) {
+                // SAFETY: `c` is a valid NUL-terminated path; MNT_DETACH never
+                // blocks on open fds.
+                unsafe {
+                    libc::umount2(c.as_ptr(), libc::MNT_DETACH);
+                }
             }
         }
     }
@@ -1352,6 +1390,7 @@ impl HostFsBackend {
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
+            overlay_mount: None,
         })
     }
 
@@ -1390,6 +1429,7 @@ impl HostFsBackend {
             stat_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_pid: std::sync::atomic::AtomicU32::new(0),
             use_stat_cache: stat_cache_enabled(),
+            overlay_mount: None,
         }
     }
 
@@ -1778,6 +1818,28 @@ impl HostFsBackend {
         &mut self,
         paths: &[std::path::PathBuf],
     ) -> std::io::Result<crate::rootfs::ExtractStats> {
+        // Fastest path (Linux, opt-in via CARRICK_FS_OVERLAY): compose the rootfs
+        // as an overlayfs mount — lowerdir = the shared digest-keyed cached
+        // extraction (read-only, never copied), upperdir = this run's writes —
+        // instead of cloning/copying the whole tree per run. On a filesystem
+        // without reflink (e.g. ext4, or ZFS in an unprivileged container where
+        // FICLONE is denied) the clone path degrades to a full byte-copy, which
+        // dominates per-run latency; an overlay mount is O(1) and keeps per-run
+        // isolation (each run's writes land in its own upperdir).
+        #[cfg(target_os = "linux")]
+        if overlay_enabled()
+            && let Some(scratch) = self._scratch.as_ref().map(|t| t.path().to_path_buf())
+        {
+            if let Ok(Some(merged)) = crate::layer_cache::overlay_seed_scratch(paths, &scratch) {
+                let dir =
+                    cap_std::fs::Dir::open_ambient_dir(&merged, cap_std::ambient_authority())?;
+                self.root_prefix = host_root_prefix(&dir);
+                self.dir = dir;
+                self.overlay_mount = Some(merged);
+                return Ok(crate::rootfs::ExtractStats::default());
+            }
+            // overlay unavailable/failed → fall through to the clone/copy path.
+        }
         // Fast path: seed the scratch from the digest-keyed clonefile cache (an
         // O(1) COW clone of a once-extracted layer stack) instead of re-doing a
         // full byte-copy extraction. Only when we own a real scratch TempDir
@@ -3857,9 +3919,28 @@ fn sweep_orphans(scratch_root: &Path) {
         };
         let mut lock = fd_lock::RwLock::new(file);
         if lock.try_write().is_ok() {
-            // No other process holds the lock; orphan from a prior
-            // crashed run. Reap it.
+            // No other process holds the lock; orphan from a prior crashed run
+            // OR a run that exited via process::exit (which skips Drop, so an
+            // overlay-composed scratch left its `merged` overlay mounted). Detach
+            // that mount BEFORE remove_dir_all, or the recursive remove descends
+            // into the live overlay. Best-effort: umount2 of a non-mount is a
+            // harmless EINVAL.
+            #[cfg(target_os = "linux")]
+            unmount_overlay_at(&path.join("merged"));
             let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Best-effort lazy unmount of an overlay left at `merged` (see `sweep_orphans`
+/// and `HostFsBackend`'s `overlay_mount`). MNT_DETACH never blocks on open fds.
+#[cfg(target_os = "linux")]
+fn unmount_overlay_at(merged: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    if let Ok(c) = std::ffi::CString::new(merged.as_os_str().as_bytes()) {
+        // SAFETY: `c` is a valid NUL-terminated path; MNT_DETACH is non-blocking.
+        unsafe {
+            libc::umount2(c.as_ptr(), libc::MNT_DETACH);
         }
     }
 }
