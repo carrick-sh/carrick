@@ -282,28 +282,79 @@ impl<V: X86Vmm> SegmentBaseRegs for X86EngineCore<V> {
 
 // ─── GuestMemory ─────────────────────────────────────────────────────────────
 
+/// Largest `n` in `1..=max` such that `[addr, addr+n)` lies within a single host
+/// window (so one `host_ptr` copy is valid); `0` if even the first byte is
+/// unmapped. Probes with `host_ptr` and binary-searches the run.
+///
+/// A syscall buffer can straddle two ADJACENT but NON-contiguous guest windows:
+/// the Go amd64 runtime commits its `0xc0..` heap arena in separate `mmap`
+/// pieces, each backed by an independent host alias window, so a bulk syscall
+/// copy (e.g. a 40 MiB `getrandom`) crossing a window boundary cannot be served
+/// by one `host_ptr`. Callers copy window-by-window using this run length.
+fn host_run_len<V: X86Vmm>(vm: &V, addr: u64, max: usize) -> usize {
+    if max == 0 {
+        return 0;
+    }
+    if vm.host_ptr(addr, max).is_some() {
+        return max; // fast path: whole span in one window
+    }
+    if vm.host_ptr(addr, 1).is_none() {
+        return 0; // first byte unmapped
+    }
+    let (mut lo, mut hi) = (1usize, max); // lo maps, hi does not
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if vm.host_ptr(addr, mid).is_some() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        let Some(host) = self.vm.host_ptr(address, length) else {
-            trace_x86_efault("read", address, length);
-            return Err(MemoryError::OutOfBounds { address, length });
-        };
         let mut out = vec![0u8; length];
-        // SAFETY: `host_ptr` proved [host, host+length) is within a live window;
-        // the destination slice is disjoint.
-        unsafe { std::ptr::copy_nonoverlapping(host, out.as_mut_ptr(), length) };
+        let mut off = 0usize;
+        while off < length {
+            let addr = address + off as u64;
+            let run = host_run_len(&self.vm, addr, length - off);
+            if run == 0 {
+                trace_x86_efault("read", addr, length - off);
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            let host = self
+                .vm
+                .host_ptr(addr, run)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            // SAFETY: `host_run_len`/`host_ptr` proved [host, host+run) is within
+            // a live window; the destination slice is disjoint.
+            unsafe { std::ptr::copy_nonoverlapping(host, out.as_mut_ptr().add(off), run) };
+            off += run;
+        }
         Ok(out)
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
-        let Some(host) = self.vm.host_ptr_mut(address, length) else {
-            trace_x86_efault("write", address, length);
-            return Err(MemoryError::OutOfBounds { address, length });
-        };
-        // SAFETY: `host_ptr_mut` proved [host, host+length) is within a live
-        // window; the source slice is disjoint.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, length) };
+        let mut off = 0usize;
+        while off < length {
+            let addr = address + off as u64;
+            let run = host_run_len(&self.vm, addr, length - off);
+            if run == 0 {
+                trace_x86_efault("write", addr, length - off);
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            let host = self
+                .vm
+                .host_ptr_mut(addr, run)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            // SAFETY: `host_run_len`/`host_ptr_mut` proved [host, host+run) is
+            // within a live window; the source slice is disjoint.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(off), host, run) };
+            off += run;
+        }
         Ok(())
     }
 
