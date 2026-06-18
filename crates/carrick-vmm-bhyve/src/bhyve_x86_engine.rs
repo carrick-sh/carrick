@@ -62,9 +62,9 @@ use carrick_x86::{
 
 use crate::bhyve_kicker::{BhyveKickHandle, BhyveKicker};
 use crate::guest_setup_x86::{
-    BhyveGuestRam, BroughtUpX86, FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultScratchRecord,
-    PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA, X86_FP_STUB_GPA,
-    X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_CAPACITY, X86_PML4_GPA, bring_up_x86_elf,
+    BhyveGuestRam, BroughtUpX86, CommitOutcome, FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT,
+    FaultScratchRecord, PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA,
+    X86_FP_STUB_GPA, X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_CAPACITY, X86_PML4_GPA, bring_up_x86_elf,
     fault_scratch_gpa, fault_scratch_record_from_bytes, fault_stack_frame_len,
     fault_user_context_from_bytes, program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
 };
@@ -709,6 +709,12 @@ pub struct BhyveVmm {
     /// child sharing the parent's VM). Carried verbatim from the old engine's
     /// `vm_borrowed`; `process_exit_cleanup` must NOT destroy a borrowed VM.
     vm_borrowed: bool,
+    /// Serializes the live-PML4 copy-edit-copy across sibling vCPUs. The guest
+    /// page tables are shared (one CR3, in the shared sysmem); two vCPUs editing
+    /// different leaves concurrently would each write back a whole-table image
+    /// and drop the other's edit (a lost leaf → an unbreakable #PF loop). Shared
+    /// via the sibling builder so all vCPUs take the SAME lock.
+    pml4_lock: Arc<std::sync::Mutex<()>>,
 }
 
 // SAFETY: BhyveVmm owns the VM ctx + a single-thread-driven vCPU handle; the run
@@ -721,6 +727,7 @@ pub struct BhyveSiblingBuilder {
     vm: BhyveSharedVm,
     ram: BhyveGuestRam,
     kick_pending: Arc<AtomicBool>,
+    pml4_lock: Arc<std::sync::Mutex<()>>,
 }
 
 // SAFETY: BhyveSharedVm is Send+Sync; the RAM payload is plain bookkeeping the
@@ -737,6 +744,11 @@ impl BhyveVmm {
     where
         F: FnOnce(&mut Pml4Manager) -> Result<bool, MemoryError>,
     {
+        // Serialize the whole copy-edit-copy across sibling vCPUs: the PML4 is
+        // shared (one CR3), so a concurrent edit of a different leaf would write
+        // back a stale whole-table image and drop this edit (a lost leaf → an
+        // unbreakable #PF loop).
+        let _pml4 = self.pml4_lock.lock().unwrap_or_else(|e| e.into_inner());
         let host = self
             .vm
             .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
@@ -814,18 +826,9 @@ impl X86Vmm for BhyveVmm {
 
     fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
         // The engine's GuestMemory passes a guest VA; resolve VA→GPA through the
-        // window table, then the contiguous segment via map_gpa.
-        for w in &self.ram.windows {
-            let w_end = w.va + w.len as u64;
-            if gpa >= w.va && gpa < w_end {
-                let offset = (gpa - w.va) as usize;
-                if w.len.saturating_sub(offset) < len {
-                    return None; // straddles the window end
-                }
-                return self.vm.map_gpa(w.gpa + offset as u64, len);
-            }
-        }
-        None
+        // shared window table, then the contiguous segment via map_gpa.
+        let target_gpa = self.ram.resolve(gpa, len)?;
+        self.vm.map_gpa(target_gpa, len)
     }
 
     fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
@@ -900,19 +903,36 @@ impl X86Vmm for BhyveVmm {
 
     fn demand_commit(&mut self, fault_addr: u64) -> Result<bool, MemoryError> {
         let page = fault_addr & !0xFFF;
-        // Already backed (a sibling, or an earlier fault on the same page, won
-        // the race): just re-run the faulting instruction.
-        if self.host_ptr(page, 1).is_some() {
-            return Ok(true);
+        // ATOMIC across sibling vCPUs (shared ram, one lock): AlreadyMapped means
+        // another thread already committed this page — just re-run; NotReserved
+        // is a genuine fault → SIGSEGV; Committed(gpa) means WE won and must zero
+        // + map the leaf. This is what stops two Go threads committing one page
+        // to divergent GPAs (the "bad sweepgen" heap corruption).
+        match self
+            .ram
+            .commit_if_absent(page, 4096)
+            .map_err(|e| MemoryError::HostMap(format!("bhyve demand_commit: {e}")))?
+        {
+            CommitOutcome::AlreadyMapped => Ok(true),
+            CommitOutcome::NotReserved => Ok(false),
+            CommitOutcome::Committed(gpa) => {
+                let host = self.vm.map_gpa(gpa, 4096).ok_or_else(|| {
+                    MemoryError::HostMap(format!("bhyve demand_commit: map_gpa 0x{gpa:x} unmapped"))
+                })?;
+                // SAFETY: live sysmem of 4096 bytes — Linux anon zero-fill.
+                unsafe { std::ptr::write_bytes(host, 0, 4096) };
+                self.with_live_pml4(|mgr| {
+                    mgr.map_aliased(page, gpa, 4096, true).map_err(|_| {
+                        MemoryError::OutOfBounds {
+                            address: page,
+                            length: 4096,
+                        }
+                    })?;
+                    Ok(true)
+                })?;
+                Ok(true)
+            }
         }
-        // Not a lazily-reserved VA → a genuine fault; let the engine SIGSEGV.
-        if !self.ram.find_reservation(page) {
-            return Ok(false);
-        }
-        // Back one page (compact GPA, zero-filled, leaf mapped, reservation
-        // dropped) via the shared range-commit helper, then re-run.
-        self.commit_range(page, 4096)?;
-        Ok(true)
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -1116,6 +1136,7 @@ impl X86Vmm for BhyveVmm {
             vm: self.vm.shared_handle(),
             ram: self.ram.clone(),
             kick_pending: Arc::new(AtomicBool::new(false)),
+            pml4_lock: self.pml4_lock.clone(),
         })
     }
 
@@ -1138,6 +1159,7 @@ impl X86Vmm for BhyveVmm {
             ram: builder.ram,
             h,
             vm_borrowed: false,
+            pml4_lock: builder.pml4_lock,
         };
         Ok((vmm, vcpu))
     }
@@ -1247,6 +1269,7 @@ pub fn engine_from_brought_up(bux: BroughtUpX86) -> X86EngineCore<BhyveVmm> {
         ram: bux.ram,
         h,
         vm_borrowed: false,
+        pml4_lock: Arc::new(std::sync::Mutex::new(())),
     };
     X86EngineCore::from_parts(vmm, vcpu, BHYVE_X86_LAYOUT)
 }
