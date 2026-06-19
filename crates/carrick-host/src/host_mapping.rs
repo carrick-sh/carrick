@@ -217,6 +217,118 @@ mod tests {
         );
     }
 
+    /// Count the process's currently-open file descriptors by probing the fd
+    /// table directly with `fcntl(F_GETFD)`. Portable across macOS and Linux (no
+    /// `/proc` dependency) and — unlike a lowest-free-fd sample — detects a leak
+    /// at ANY descriptor number, not just contiguous low slots. The scan ceiling
+    /// is bounded by `RLIMIT_NOFILE` (clamped) so it terminates even if the soft
+    /// limit is large.
+    #[cfg(unix)]
+    fn open_fd_count() -> usize {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let ceiling = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+            // Clamp: the soft limit can be huge (or RLIM_INFINITY); 4096 is far
+            // above anything this single-threaded test opens, and bounds the scan.
+            (rl.rlim_cur as usize).min(4096)
+        } else {
+            4096
+        };
+        (0..ceiling)
+            .filter(|&fd| unsafe { libc::fcntl(fd as libc::c_int, libc::F_GETFD) } != -1)
+            .count()
+    }
+
+    /// Regression guard for the `mmap(MAP_SHARED, fd)` alias-window host-fd leak
+    /// (cpython multiprocessing.Pool semaphore churn): `map_shared_file` retains
+    /// its OWN kernel reference to the file, so a caller (the per-engine
+    /// `map_host_alias`) MUST close the dup'd fd it was handed once the mapping
+    /// exists — and doing so must NOT leak. This asserts both halves: the dup is
+    /// safe to close immediately after the map (the mapping stays valid), and
+    /// repeated map→close→drop cycles do not grow the process's open-fd count.
+    ///
+    /// The bug this catches: an engine that forgets the `close(fd)` (or a future
+    /// refactor that drops it) leaks one host fd per guest mmap of a /dev/shm
+    /// semaphore, climbing unbounded in a long-lived guest until per-cycle time
+    /// degrades and the forkserver test module blows its 300 s budget.
+    #[cfg(unix)]
+    #[test]
+    fn map_shared_file_does_not_leak_host_fds_across_cycles() {
+        // A real backing file (mmap of an anonymous/closed fd is not portable);
+        // 16 KiB so it is a single HVF granule.
+        let len = 16 * 1024usize;
+        let path = std::env::temp_dir().join(format!(
+            "carrick-host-mapping-leak-{}-{}.bin",
+            std::process::id(),
+            // a per-run salt so concurrent test binaries never collide
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        {
+            let data = vec![0xABu8; len];
+            std::fs::write(&path, &data).expect("write backing file");
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes())
+            .expect("path has no interior NUL");
+
+        // Warm one cycle first so any one-time lazy allocations (page-cache
+        // structures, etc.) are already paid before we sample the baseline.
+        let warm_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+        assert!(warm_fd >= 0, "open backing file");
+        {
+            let dup = unsafe { libc::dup(warm_fd) };
+            assert!(dup >= 0, "dup");
+            let m =
+                OwnedHostMapping::map_shared_file(dup, 0, len, libc::PROT_READ | libc::PROT_WRITE)
+                    .expect("map_shared_file");
+            // Contract: the dup may be closed immediately — the mapping retains
+            // its own reference and stays valid.
+            assert_eq!(unsafe { libc::close(dup) }, 0, "close dup after map");
+            assert_eq!(
+                unsafe { libc::msync(m.as_ptr().cast(), len, libc::MS_ASYNC) },
+                0,
+                "mapping must outlive the closed dup"
+            );
+            drop(m);
+        }
+        unsafe { libc::close(warm_fd) };
+
+        // Baseline open-fd count after warm-up.
+        let base = open_fd_count();
+
+        // N map→close-dup→drop cycles. Each mirrors what the per-engine
+        // `map_host_alias` does with the dispatcher's dup'd fd.
+        const N: usize = 64;
+        for _ in 0..N {
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+            assert!(fd >= 0, "open backing file in loop");
+            let dup = unsafe { libc::dup(fd) };
+            assert!(dup >= 0, "dup in loop");
+            let m =
+                OwnedHostMapping::map_shared_file(dup, 0, len, libc::PROT_READ | libc::PROT_WRITE)
+                    .expect("map_shared_file in loop");
+            assert_eq!(unsafe { libc::close(dup) }, 0, "close dup in loop");
+            // The guest fd (`fd`) is also closed by the guest on Linux; mirror it.
+            assert_eq!(unsafe { libc::close(fd) }, 0, "close guest fd in loop");
+            drop(m);
+        }
+
+        let after = open_fd_count();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            after, base,
+            "open-fd count grew across {N} map_shared_file cycles \
+             ({base} -> {after}): the alias-window MAP_SHARED file path is \
+             leaking host fds (an engine's map_host_alias likely forgot to \
+             close the dispatcher's dup'd fd)"
+        );
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn cow_snapshot_isolates_source_and_clone_writes() {
