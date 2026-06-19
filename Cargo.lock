@@ -649,6 +649,7 @@ dependencies = [
  "carrick-abi",
  "carrick-guest-mem",
  "carrick-hal",
+ "carrick-host",
  "carrick-mem",
  "libc",
 ]
