@@ -258,6 +258,23 @@ pub trait FsBackend: Send + Sync {
     /// (the dispatcher pairs each with metadata via `metadata`).
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind)>;
 
+    /// Like [`child_names`](Self::child_names) but also carries each entry's
+    /// real inode number when the backend already knows it from the directory
+    /// read itself (`d_ino` from `getdirentries`/`getdents`), so the
+    /// getdents64/glob hot path does NOT pay a separate per-child `real_stat`
+    /// (which re-walks the whole path component-by-component under cap-std on
+    /// macOS — the dominant cost in a deep recursive `glob('**/*')`, see
+    /// docs/fs-host-capstd-amplification.md). The default implementation maps
+    /// `child_names` with `ino = 0`, meaning "unknown — caller must stat";
+    /// the disk-backed `HostFsBackend` overrides it to thread the readdir ino
+    /// through. `ino == 0` is the sentinel for "not provided".
+    fn child_entries(&self, dir: &str) -> Vec<(String, RootFsEntryKind, u64)> {
+        self.child_names(dir)
+            .into_iter()
+            .map(|(name, kind)| (name, kind, 0u64))
+            .collect()
+    }
+
     /// Immediate children of `dir` that are tombstoned. The dispatcher
     /// uses this to filter rootfs-supplied entries.
     fn deleted_child_names(&self, dir: &str) -> Vec<String>;
@@ -1557,6 +1574,49 @@ impl HostFsBackend {
             .map(|(_fd, st, kind)| (st, kind))
     }
 
+    /// cap-std fallback for the `FsBackend::child_entries` raw-fd fast read,
+    /// used when that read can't be applied (no sandbox root prefix, or a
+    /// containment-rejected escape that cap-std re-roots correctly). Same shape
+    /// as the pre-fast code path: name + kind (cap-std FileType, FIFO via one
+    /// dirfd-relative stat) + the readdir inode.
+    #[cfg(target_os = "macos")]
+    fn child_entries_capstd(&self, normalized: &Path) -> Vec<(String, RootFsEntryKind, u64)> {
+        use cap_std::fs::MetadataExt;
+        let read = match Self::rel_path(normalized) {
+            Some(rel) => match self.at(rel) {
+                Ok((dir, at_rel)) => dir.read_dir(&at_rel),
+                Err(e) => Err(e),
+            },
+            None => self.dir.entries(),
+        };
+        let Ok(read) = read else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let entry_md = entry.metadata().ok();
+            let kind = match entry.file_type() {
+                Ok(ft) if ft.is_dir() => RootFsEntryKind::Directory,
+                Ok(ft) if ft.is_symlink() => RootFsEntryKind::Symlink,
+                _ => {
+                    let is_fifo = entry_md
+                        .as_ref()
+                        .map(|m| m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32)
+                        .unwrap_or(false);
+                    if is_fifo {
+                        RootFsEntryKind::Fifo
+                    } else {
+                        RootFsEntryKind::File
+                    }
+                }
+            };
+            let ino = entry_md.as_ref().map(|m| m.ino()).unwrap_or(0);
+            out.push((name, kind, ino));
+        }
+        out
+    }
+
     #[cfg(target_os = "macos")]
     fn fast_real_stat(&self, normalized: &Path, follow: bool) -> Option<RealStat> {
         use std::os::fd::AsRawFd;
@@ -2547,6 +2607,63 @@ impl FsBackend for HostFsBackend {
         None
     }
 
+    /// Fast no-follow metadata for the disk-backed backend. This is THE hot
+    /// path for `RootFsVfs::lookup_nofollow`, which `layered_lstat` calls for
+    /// EVERY intermediate component during path resolution
+    /// (`validate_intermediate_dirs` + `resolve_intermediate_symlinks`). The
+    /// default trait impl returns `None`, which forced `lookup_nofollow` to
+    /// fall through to `lookup_kind`'s cap-std `symlink_metadata` — a
+    /// component-by-component re-walk of the whole path (no `openat2` on macOS),
+    /// so a depth-D stat cost O(D) opens and the per-ancestor resolver loop made
+    /// it O(D²) host opens per guest stat. On a deep recursive `glob('**/*')`
+    /// (CPython test_tarfile's extractall trees) that was ~190 host `openat`s
+    /// per guest path op and timed the suite out. Routing the common
+    /// directory/regular-file case through the single-`openat` `O_EVTONLY`
+    /// `fast_open_contained` (one in-kernel path walk, F_GETPATH containment,
+    /// no atime bump) collapses that. Symlink leaves / FIFOs / sockets / sandbox
+    /// escapes return `None` → the existing cap-std fallthrough handles them.
+    /// See docs/fs-host-capstd-amplification.md.
+    #[cfg(target_os = "macos")]
+    fn fast_nofollow_metadata(&self, path: &str) -> Option<RootFsMetadata> {
+        use std::os::fd::AsRawFd;
+        let normalized = normalize(path)?;
+        if normalized.as_os_str().is_empty() {
+            // The sandbox root is always a directory.
+            return Some(RootFsMetadata {
+                path: std::path::Path::new("/").to_path_buf(),
+                kind: RootFsEntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+            });
+        }
+        let rel = Self::rel_path(&normalized)?;
+        // O_NOFOLLOW (the `false` here) so a symlink leaf is NOT traversed —
+        // `fast_open_contained` returns None for it, and we fall through to the
+        // cap-std path (which reports the link). Same one-open-serves-all
+        // pattern as `metadata()`.
+        let (fd, st, kind) = self.fast_open_contained(rel, false)?;
+        // Byte-exact existence guard (Unicode-normalization aliasing), matching
+        // every other fast path before it trusts the host lookup.
+        if !self.name_matches_on_disk(rel) {
+            return None;
+        }
+        let is_dir = kind == RootFsEntryKind::Directory;
+        let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
+        let kind = if !is_dir && is_socket {
+            RootFsEntryKind::Socket
+        } else {
+            kind
+        };
+        let on_disk = st.st_mode as u32 & 0o7777;
+        let default = if is_dir { 0o755 } else { 0o644 };
+        Some(RootFsMetadata {
+            path: normalized,
+            kind,
+            mode: override_mode.unwrap_or(if on_disk == 0 { default } else { on_disk }),
+            size: if is_dir { 0 } else { st.st_size as usize },
+        })
+    }
+
     fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
         let normalized = normalize(path)?;
         if normalized.as_os_str().is_empty() {
@@ -2706,6 +2823,54 @@ impl FsBackend for HostFsBackend {
     }
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+        // Fast path (macOS): ONE in-kernel `openat` (O_RDONLY|O_NOFOLLOW)
+        // resolves the whole path and reads the file, replacing the TWO cap-std
+        // per-component re-walks the slow path costs (`resolve_following`'s
+        // symlink probe + `self.at`+`dir.open`). O_NOFOLLOW so a symlink LEAF
+        // falls back to the hand-rolled `resolve_following` (which re-roots an
+        // absolute target cap-std refuses); the F_GETPATH containment check
+        // rejects any intermediate-symlink escape. This is the dominant
+        // file-open cost on a glob/extract-heavy workload (CPython test_tarfile).
+        // See docs/fs-host-capstd-amplification.md.
+        #[cfg(target_os = "macos")]
+        if self.fast_fs
+            && let Some(root_prefix) = self.root_prefix.as_deref()
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            if let Some(normalized) = normalize(path)
+                && let Some(rel) = Self::rel_path(&normalized)
+                && self.name_matches_on_disk(rel)
+                && let Ok(rel_c) = std::ffi::CString::new(rel.as_os_str().as_bytes())
+            {
+                let oflags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+                let fd = unsafe { libc::openat(self.dir.as_raw_fd(), rel_c.as_ptr(), oflags, 0) };
+                if fd >= 0 {
+                    // Only a regular file is readable as contents; reject dirs/
+                    // FIFOs/etc and (crucially) verify sandbox containment.
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    let is_reg = unsafe { libc::fstat(fd, &mut st) } == 0
+                        && (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFREG as u32;
+                    if is_reg && fd_contained_under(fd, root_prefix) {
+                        let mut buf = Vec::with_capacity(st.st_size.max(0) as usize);
+                        // SAFETY: fd is an owned, open regular-file fd.
+                        let mut file =
+                            unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+                        let ok = file.read_to_end(&mut buf).is_ok();
+                        // `file` drop closes fd.
+                        if ok {
+                            return Some(buf);
+                        }
+                        return None;
+                    }
+                    unsafe { libc::close(fd) };
+                    // Non-regular or escape → fall through to the slow path,
+                    // which handles symlink leaves / re-rooting correctly.
+                }
+                // openat failed (symlink leaf via O_NOFOLLOW→ELOOP, or ENOENT) →
+                // slow path below resolves it.
+            }
+        }
         // Follow symlinks by hand so an absolute target resolves under the
         // guest root (cap-std won't traverse it). See `resolve_following`.
         let normalized = self.resolve_following(path)?;
@@ -2992,6 +3157,169 @@ impl FsBackend for HostFsBackend {
                 }
             };
             out.push((name, kind));
+        }
+        out
+    }
+
+    /// Disk-backed `child_entries`: name, kind, AND inode for every immediate
+    /// child, carried straight from one directory read.
+    ///
+    /// On macOS this opens the directory with a SINGLE in-kernel `openat`
+    /// (O_DIRECTORY, contained under the sandbox root via F_GETPATH) and reads
+    /// the dirents with `readdir(3)` — taking each entry's name, `d_type`
+    /// (kind), and `d_ino` (inode) directly from the stream. This replaces
+    /// cap-std's `read_dir`, whose `manually::open` resolver re-walks the path
+    /// component-by-component to open the directory (one `openat` PER ancestor,
+    /// no `openat2`/`RESOLVE_BENEATH` on macOS) and then would cost a further
+    /// per-child stat. A guest `openat(O_DIRECTORY)` materializes the whole
+    /// listing here (see [`layered_directory_entries`]/`open_for_dispatch`), so
+    /// a deep recursive `glob('**/*')` (CPython test_tarfile's extractall trees)
+    /// paid that re-walk for every directory and timed the suite out. The raw
+    /// read is ONE openat + N dirents = O(depth + width), not O(depth × width).
+    /// `d_type == DT_UNKNOWN` (rare; some FS don't fill it) falls back to one
+    /// `fstatat` for that entry only. See docs/fs-host-capstd-amplification.md.
+    #[cfg(target_os = "macos")]
+    fn child_entries(&self, dir: &str) -> Vec<(String, RootFsEntryKind, u64)> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let Some(normalized) = normalize(dir) else {
+            return Vec::new();
+        };
+        let dir_fd = self.dir.as_raw_fd();
+        // ONE openat resolves the whole path in-kernel. The scratch root ("/")
+        // is rel "." . O_NOFOLLOW is intentionally NOT set: an intermediate
+        // symlink-to-dir is legal, and the F_GETPATH containment below rejects
+        // any escape out of the sandbox root.
+        let rel = Self::rel_path(&normalized);
+        let rel_c = match rel {
+            Some(r) => std::ffi::CString::new(r.as_os_str().as_bytes()).ok(),
+            None => std::ffi::CString::new(".").ok(),
+        };
+        let Some(rel_c) = rel_c else {
+            return Vec::new();
+        };
+        let oflags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        let fd = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), oflags, 0) };
+        if fd < 0 {
+            return Vec::new();
+        }
+        // Containment: the opened directory's real host path must live under the
+        // sandbox root (catches an intermediate symlink the kernel followed
+        // out). On failure, fall back to the cap-std path (which re-roots
+        // absolute-symlink targets correctly).
+        if let Some(root_prefix) = self.root_prefix.as_deref() {
+            if !fd_contained_under(fd, root_prefix) {
+                unsafe { libc::close(fd) };
+                return self.child_entries_capstd(&normalized);
+            }
+        } else {
+            unsafe { libc::close(fd) };
+            return self.child_entries_capstd(&normalized);
+        }
+        // `fdopendir` takes ownership of `fd`; `closedir` closes it.
+        let dirp = unsafe { libc::fdopendir(fd) };
+        if dirp.is_null() {
+            unsafe { libc::close(fd) };
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        loop {
+            // `readdir` returns a pointer into static/internal storage; copy
+            // what we need before the next call.
+            let ent = unsafe { libc::readdir(dirp) };
+            if ent.is_null() {
+                break;
+            }
+            let ent = unsafe { &*ent };
+            // d_name is a NUL-terminated array; read up to d_namlen bytes.
+            let namlen = ent.d_namlen as usize;
+            let name_bytes =
+                unsafe { std::slice::from_raw_parts(ent.d_name.as_ptr() as *const u8, namlen) };
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            let ino = ent.d_ino;
+            let kind = match ent.d_type {
+                libc::DT_DIR => RootFsEntryKind::Directory,
+                libc::DT_LNK => RootFsEntryKind::Symlink,
+                libc::DT_FIFO => RootFsEntryKind::Fifo,
+                libc::DT_SOCK => RootFsEntryKind::Socket,
+                libc::DT_CHR => RootFsEntryKind::CharDevice,
+                libc::DT_REG => RootFsEntryKind::File,
+                _ => {
+                    // DT_UNKNOWN (or DT_BLK): one dirfd-relative fstatat resolves
+                    // the real type — no path re-walk.
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    let name_c = std::ffi::CString::new(name_bytes).ok();
+                    let typ = name_c
+                        .as_ref()
+                        .map(|c| unsafe {
+                            libc::fstatat(
+                                libc::dirfd(dirp),
+                                c.as_ptr(),
+                                &mut st,
+                                libc::AT_SYMLINK_NOFOLLOW,
+                            )
+                        })
+                        .filter(|&rc| rc == 0)
+                        .map(|_| st.st_mode as u32 & libc::S_IFMT as u32);
+                    match typ {
+                        Some(t) if t == libc::S_IFDIR as u32 => RootFsEntryKind::Directory,
+                        Some(t) if t == libc::S_IFLNK as u32 => RootFsEntryKind::Symlink,
+                        Some(t) if t == libc::S_IFIFO as u32 => RootFsEntryKind::Fifo,
+                        Some(t) if t == libc::S_IFSOCK as u32 => RootFsEntryKind::Socket,
+                        Some(t) if t == libc::S_IFCHR as u32 => RootFsEntryKind::CharDevice,
+                        _ => RootFsEntryKind::File,
+                    }
+                }
+            };
+            out.push((name, kind, ino));
+        }
+        unsafe { libc::closedir(dirp) };
+        out
+    }
+
+    /// Non-macOS disk-backed `child_entries`: cap-std `read_dir` (cheap on Linux
+    /// — `openat2`/`RESOLVE_BENEATH` resolves the path in one syscall) carrying
+    /// the readdir inode per entry.
+    #[cfg(not(target_os = "macos"))]
+    fn child_entries(&self, dir: &str) -> Vec<(String, RootFsEntryKind, u64)> {
+        use cap_std::fs::MetadataExt;
+        let Some(normalized) = normalize(dir) else {
+            return Vec::new();
+        };
+        let read = match Self::rel_path(&normalized) {
+            Some(rel) => match self.at(rel) {
+                Ok((dir, at_rel)) => dir.read_dir(&at_rel),
+                Err(e) => Err(e),
+            },
+            None => self.dir.entries(),
+        };
+        let Ok(read) = read else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let entry_md = entry.metadata().ok();
+            let kind = match entry.file_type() {
+                Ok(ft) if ft.is_dir() => RootFsEntryKind::Directory,
+                Ok(ft) if ft.is_symlink() => RootFsEntryKind::Symlink,
+                _ => {
+                    let is_fifo = entry_md
+                        .as_ref()
+                        .map(|m| m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32)
+                        .unwrap_or(false);
+                    if is_fifo {
+                        RootFsEntryKind::Fifo
+                    } else {
+                        RootFsEntryKind::File
+                    }
+                }
+            };
+            let ino = entry_md.as_ref().map(|m| m.ino()).unwrap_or(0);
+            out.push((name, kind, ino));
         }
         out
     }
@@ -3995,7 +4323,7 @@ pub fn layered_directory_entries(
         }
     }
 
-    for (name, kind) in overlay.child_names(dir) {
+    for (name, kind, readdir_ino) in overlay.child_entries(dir) {
         if seen.contains(&name) || deleted.contains(&name) {
             continue;
         }
@@ -4061,9 +4389,17 @@ pub fn layered_directory_entries(
         };
         seen.insert(name.clone());
         // Real host inode so getdents64 d_ino == a later stat's st_ino (scandir
-        // DirEntry.inode()). lstat (follow=false) names the entry itself. 0 if
-        // unavailable (in-memory backend) → getdents64 hashes the path instead.
-        let ino = overlay.real_stat(&path, false).map(|s| s.ino).unwrap_or(0);
+        // DirEntry.inode()). lstat (follow=false) names the entry itself. The
+        // disk-backed backend supplies the inode straight from the directory
+        // read (`d_ino`), so the common case costs NO extra syscall; only when
+        // the backend can't (in-memory map, or a `d_ino` of 0) do we fall back
+        // to a `real_stat` — which on macOS re-walks the whole path. 0 stays 0
+        // → getdents64 hashes the path instead.
+        let ino = if readdir_ino != 0 {
+            readdir_ino
+        } else {
+            overlay.real_stat(&path, false).map(|s| s.ino).unwrap_or(0)
+        };
         out.push(RootFsDirEntry {
             name,
             metadata,
@@ -4150,6 +4486,21 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["lists".to_owned()]);
+    }
+
+    // child_entries default impl (MemoryBackend): same names/kinds as
+    // child_names, with ino == 0 (the "unknown — caller must stat" sentinel).
+    #[test]
+    fn memory_child_entries_default_ino_zero() {
+        let b = MemoryBackend::new();
+        b.make_dir("/d").unwrap();
+        b.set_file_contents("/d/f", b"x".to_vec()).unwrap();
+        let entries = b.child_entries("/d");
+        assert_eq!(entries.len(), 1, "got {entries:?}");
+        let (name, kind, ino) = &entries[0];
+        assert_eq!(name, "f");
+        assert_eq!(*kind, RootFsEntryKind::File);
+        assert_eq!(*ino, 0, "memory backend has no real inode → sentinel 0");
     }
 
     // -- MemoryBackend ------------------------------------------------
@@ -4359,6 +4710,33 @@ mod tests {
     fn host_child_names_only_immediate() {
         let (mut b, _scratch) = host_backend();
         scenario_child_names_only_immediate(&mut b);
+    }
+
+    // child_entries on the disk-backed backend carries the REAL inode straight
+    // from the directory read (`d_ino`), so getdents64/glob never needs a
+    // per-child `real_stat` for the inode. Lock the contract: the readdir ino
+    // is non-zero and equals the entry's own `real_stat` ino.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_child_entries_carries_readdir_ino() {
+        let (b, _scratch) = host_backend();
+        b.make_dir("/d").unwrap();
+        b.create_file("/d/f").unwrap();
+        let entries = b.child_entries("/d");
+        let (_name, kind, ino) = entries
+            .iter()
+            .find(|(n, _, _)| n == "f")
+            .expect("child f present");
+        assert_eq!(*kind, RootFsEntryKind::File);
+        assert_ne!(
+            *ino, 0,
+            "readdir must supply a real d_ino, not the sentinel"
+        );
+        let stat_ino = b.real_stat("/d/f", false).expect("real_stat").ino;
+        assert_eq!(
+            *ino, stat_ino,
+            "getdents d_ino must equal a later stat's st_ino"
+        );
     }
 
     #[cfg(target_os = "macos")]
