@@ -1318,27 +1318,28 @@ impl Drop for HostFsBackend {
         let current = unsafe { libc::getpid() as u32 };
         if current != self.owner_pid {
             // Forked descendant: leak the TempDir so its Drop does NOT
-            // delete the shared scratch directory. `into_path` consumes
-            // the TempDir without scheduling removal. Don't touch the overlay
+            // delete the shared scratch directory. `keep` consumes the
+            // TempDir without scheduling removal. Don't touch the overlay
             // mount either — the OWNER unmounts it.
             if let Some(scratch) = self._scratch.take() {
                 let _ = scratch.keep();
             }
-            return;
-        }
-        // Owner: detach an overlayfs scratch mount (if any) BEFORE the `TempDir`
-        // Drop removes the scratch tree. MNT_DETACH (lazy) so the still-open
-        // cap-std `dir` fd — a field dropped right after this `drop` returns —
-        // doesn't cause EBUSY; the mount finalizes when that fd closes, leaving
-        // an empty `merged/` for the TempDir to remove.
-        #[cfg(target_os = "linux")]
-        if let Some(mp) = self.overlay_mount.take() {
-            use std::os::unix::ffi::OsStrExt;
-            if let Ok(c) = std::ffi::CString::new(mp.as_os_str().as_bytes()) {
-                // SAFETY: `c` is a valid NUL-terminated path; MNT_DETACH never
-                // blocks on open fds.
-                unsafe {
-                    libc::umount2(c.as_ptr(), libc::MNT_DETACH);
+        } else {
+            // Owner: detach an overlayfs scratch mount (if any) BEFORE the
+            // `TempDir` Drop removes the scratch tree. MNT_DETACH (lazy) so the
+            // still-open cap-std `dir` fd — a field dropped right after this
+            // `drop` returns — doesn't cause EBUSY; the mount finalizes when
+            // that fd closes, leaving an empty `merged/` for the TempDir to
+            // remove.
+            #[cfg(target_os = "linux")]
+            if let Some(mp) = self.overlay_mount.take() {
+                use std::os::unix::ffi::OsStrExt;
+                if let Ok(c) = std::ffi::CString::new(mp.as_os_str().as_bytes()) {
+                    // SAFETY: `c` is a valid NUL-terminated path; MNT_DETACH
+                    // never blocks on open fds.
+                    unsafe {
+                        libc::umount2(c.as_ptr(), libc::MNT_DETACH);
+                    }
                 }
             }
         }
