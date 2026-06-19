@@ -47,6 +47,16 @@
 //! the Darwin `copyfile`/`fclonefileat` fast path), `access` (DAC checks),
 //! and `xattr`.
 use super::*;
+
+syscall_table! {
+    /// Per-module syscall routing for the `fs` subsystem (Task A1).
+    ///
+    /// Owns the `number → handler` arms for every syscall this module
+    /// implements. `resolve_handler` in `dispatch/mod.rs` chains this with
+    /// the other modules' tables. Add a `fs` syscall by adding an arm
+    /// HERE — no shared routing table to edit.
+    pub(crate) fn dispatch_fs;
+}
 mod access;
 mod fd_helpers;
 mod pathres;

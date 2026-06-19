@@ -30,6 +30,16 @@
 
 use super::*;
 
+syscall_table! {
+    /// Per-module syscall routing for the `sysv` subsystem (Task A1).
+    ///
+    /// Owns the `number → handler` arms for every syscall this module
+    /// implements. `resolve_handler` in `dispatch/mod.rs` chains this with
+    /// the other modules' tables. Add a `sysv` syscall by adding an arm
+    /// HERE — no shared routing table to edit.
+    pub(crate) fn dispatch_sysv;
+}
+
 // The `libc` crate exposes the SysV semaphore family on macOS but NOT the
 // message-queue family, so declare those externs ourselves. Signatures per
 // macOS <sys/msg.h>.
