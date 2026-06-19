@@ -26,7 +26,7 @@ const XSIG_SLOTS: usize = 256;
 
 #[repr(C)]
 struct XSigSlot {
-    used: AtomicU32, // 0 = free, 1 = claiming (payload not yet valid), 2 = ready
+    used: AtomicU32, // 0 = free, 1 = claiming (payload not yet valid), 2 = ready, 3 = draining (one consumer claimed it)
     target_host_pid: AtomicI32,
     signum: AtomicI32, // Linux signum
     sender_ns_pid: AtomicI32,
@@ -165,16 +165,36 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
     };
     let me = std::process::id() as i32;
     for slot in ring.slots.iter() {
-        if slot.used.load(Ordering::Acquire) == 2
-            && slot.target_host_pid.load(Ordering::Acquire) == me
-        {
-            let signum = slot.signum.load(Ordering::Relaxed);
-            let sp = slot.sender_ns_pid.load(Ordering::Relaxed);
-            let su = slot.sender_uid.load(Ordering::Relaxed);
-            let v = slot.value.load(Ordering::Acquire);
-            slot.used.store(0, Ordering::Release); // free the slot
-            out.push((signum, sp, su, v));
+        // Only consider published entries (`== 2`) targeting THIS process. The
+        // target check happens BEFORE the claim so a thread never claims a slot
+        // destined for another process; a `== 2` slot's target is immutable until
+        // it is freed (a producer can only re-claim from state 0), so this read is
+        // stable across the compare_exchange below.
+        if slot.used.load(Ordering::Acquire) != 2 {
+            continue;
         }
+        if slot.target_host_pid.load(Ordering::Acquire) != me {
+            continue;
+        }
+        // CLAIM the slot for draining (2 -> 3), mirroring the producer's
+        // 0 -> 1 claim. Exactly one of several concurrent sibling-thread drainers
+        // wins the compare_exchange; the losers see it fail and skip the slot, so
+        // a process-directed signal is delivered EXACTLY ONCE rather than once per
+        // racing drainer. State 3 is disjoint from the producer (which only ever
+        // touches 0/1/2), so claim and publish never collide.
+        if slot
+            .used
+            .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        let signum = slot.signum.load(Ordering::Relaxed);
+        let sp = slot.sender_ns_pid.load(Ordering::Relaxed);
+        let su = slot.sender_uid.load(Ordering::Relaxed);
+        let v = slot.value.load(Ordering::Acquire);
+        slot.used.store(0, Ordering::Release); // free the slot for reuse
+        out.push((signum, sp, su, v));
     }
     out
 }
@@ -303,6 +323,58 @@ mod tests {
         // The slot was freed back to 0 by the drain, so a second drain is empty
         // (no stale ready slot lingers at `used == 2`).
         assert!(xsig_drain_for_self().is_empty());
+        reset_ring();
+    }
+
+    #[test]
+    fn concurrent_drain_delivers_each_entry_exactly_once() {
+        use std::sync::{Arc, Barrier};
+
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        let me = std::process::id() as i32;
+
+        // Sibling vCPU threads of one guest process all reach their signal
+        // safe-point and call xsig_drain_for_self concurrently (the nudge handler
+        // broadcasts a wake to every parked thread). A process-directed entry must
+        // be delivered to EXACTLY ONE of them. With an unguarded load(==2)+store(0)
+        // drain, two threads can both observe the single ready slot, both read the
+        // payload, and both return it — a duplicate (extra) delivery.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(4, 16);
+        const ROUNDS: usize = 1000;
+
+        let mut total_deliveries = 0usize;
+        for round in 0..ROUNDS {
+            // Publish exactly ONE entry targeting this process.
+            assert!(xsig_enqueue(me, 20, round as i32, 0, round as i64));
+
+            // Release all drainers together so they contend on the single slot.
+            let barrier = Arc::new(Barrier::new(threads));
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let b = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        b.wait();
+                        xsig_drain_for_self().len()
+                    })
+                })
+                .collect();
+            let delivered: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            total_deliveries += delivered;
+
+            reset_ring();
+        }
+
+        assert_eq!(
+            total_deliveries,
+            ROUNDS,
+            "each published entry must be drained exactly once across all sibling \
+             threads; {} extra deliveries reveal the load-then-free drain race",
+            total_deliveries.saturating_sub(ROUNDS),
+        );
         reset_ring();
     }
 
