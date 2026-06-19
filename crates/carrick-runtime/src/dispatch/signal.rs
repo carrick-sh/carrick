@@ -78,6 +78,19 @@ syscall_table! {
     /// the other modules' tables. Add a `signal` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_signal;
+    74 => signalfd4,
+    129 => kill,
+    130 => tkill,
+    131 => tgkill,
+    132 => sigaltstack,
+    133 => rt_sigsuspend,
+    134 => rt_sigaction,
+    135 => rt_sigprocmask,
+    136 => rt_sigpending,
+    137 => rt_sigtimedwait,
+    138 => rt_sigqueueinfo,
+    139 => rt_sigreturn,
+    240 => rt_tgsigqueueinfo,
 }
 use crate::linux_abi::LinuxSiginfo;
 use std::collections::VecDeque;
