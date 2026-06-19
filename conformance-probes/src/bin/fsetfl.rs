@@ -28,8 +28,7 @@ fn main() {
         let before = libc::fcntl(fd, libc::F_GETFL);
         // Attempt to flip the access mode (WRONLY->RDWR), set creation-only
         // bits (O_CREAT/O_TRUNC), and a legitimate status bit (O_NONBLOCK).
-        let arg =
-            libc::O_RDWR | libc::O_APPEND | libc::O_NONBLOCK | libc::O_CREAT | libc::O_TRUNC;
+        let arg = libc::O_RDWR | libc::O_APPEND | libc::O_NONBLOCK | libc::O_CREAT | libc::O_TRUNC;
         let setfl_rc = libc::fcntl(fd, libc::F_SETFL, arg);
         let after = libc::fcntl(fd, libc::F_GETFL);
 

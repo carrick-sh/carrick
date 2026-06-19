@@ -49,7 +49,10 @@ fn main() {
     }
 
     // readlinkat on a REGULAR file -> EINVAL(22) on Linux.
-    println!("readlinkat_regfile_errno={}", readlinkat_errno("/etc/hostname"));
+    println!(
+        "readlinkat_regfile_errno={}",
+        readlinkat_errno("/etc/hostname")
+    );
 
     // readlinkat on a DIRECTORY -> EINVAL(22).
     println!("readlinkat_dir_errno={}", readlinkat_errno("/etc"));
@@ -170,9 +173,7 @@ fn main() {
     // socketpair AF_UNIX -> "sock".
     {
         let mut sv = [0i32; 2];
-        let rc = unsafe {
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr())
-        };
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
         if rc != 0 {
             println!("fstat_socket=ERR:{}", errno());
         } else {
@@ -224,7 +225,12 @@ fn main() {
         {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             let rc = unsafe {
-                libc::fstatat(libc::AT_FDCWD, lc.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+                libc::fstatat(
+                    libc::AT_FDCWD,
+                    lc.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
             };
             if rc != 0 {
                 println!("c_fstatat_nofollow=ERR:{}", errno());

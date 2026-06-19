@@ -26,7 +26,10 @@ fn main() {
 
     // access("/var/cache/apt", W_OK) — the exact check apt performs and the bug
     // under investigation. Root-owned dir → rc=0 for root.
-    println!("access_varcacheapt_w={}", access("/var/cache/apt", libc::W_OK));
+    println!(
+        "access_varcacheapt_w={}",
+        access("/var/cache/apt", libc::W_OK)
+    );
 
     // access("/etc", W_OK) and access("/usr", W_OK) — root-owned dirs → rc=0.
     println!("access_etc_w={}", access("/etc", libc::W_OK));
@@ -40,7 +43,10 @@ fn main() {
 
     // faccessat(AT_FDCWD, "/var/cache/apt", W_OK, 0) and with AT_EACCESS —
     // both rc=0 for root.
-    println!("faccessat_varcacheapt_w={}", faccessat("/var/cache/apt", libc::W_OK, 0));
+    println!(
+        "faccessat_varcacheapt_w={}",
+        faccessat("/var/cache/apt", libc::W_OK, 0)
+    );
     println!(
         "faccessat_varcacheapt_w_eaccess={}",
         faccessat("/var/cache/apt", libc::W_OK, libc::AT_EACCESS)
@@ -73,7 +79,10 @@ fn main() {
     println!("access_hostname_f={}", access("/etc/hostname", libc::F_OK));
 
     // faccessat(AT_FDCWD, "/nonexistent", F_OK, 0) — ENOENT(2).
-    println!("faccessat_missing_f={}", faccessat("/nonexistent", libc::F_OK, 0));
+    println!(
+        "faccessat_missing_f={}",
+        faccessat("/nonexistent", libc::F_OK, 0)
+    );
 
     // access with an invalid mode (mode=0xff) — EINVAL(22) on Linux.
     println!("access_invalid_mode={}", access("/etc/hostname", 0xff));

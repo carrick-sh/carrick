@@ -17,7 +17,7 @@ unsafe fn sockaddr_in(octets: [u8; 4], port_be: u16) -> libc::sockaddr_in {
     let mut sa: libc::sockaddr_in = core::mem::zeroed();
     sa.sin_family = libc::AF_INET as _;
     sa.sin_port = port_be; // network byte order
-    // s_addr is network byte order; `octets` are already in network order.
+                           // s_addr is network byte order; `octets` are already in network order.
     sa.sin_addr.s_addr = u32::from_ne_bytes(octets);
     sa
 }

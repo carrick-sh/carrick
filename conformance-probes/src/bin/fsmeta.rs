@@ -65,7 +65,11 @@ fn main() {
     // create + stat a fresh file (mode after umask), then chmod, re-stat.
     fs::write("/tmp/probe/f", b"hello").ok();
     if let Ok(m) = fs::metadata("/tmp/probe/f") {
-        println!("newfile size={} mode={:o}", m.len(), m.permissions().mode() & 0o7777);
+        println!(
+            "newfile size={} mode={:o}",
+            m.len(),
+            m.permissions().mode() & 0o7777
+        );
     }
     fs::set_permissions("/tmp/probe/f", fs::Permissions::from_mode(0o640)).ok();
     if let Ok(m) = fs::metadata("/tmp/probe/f") {

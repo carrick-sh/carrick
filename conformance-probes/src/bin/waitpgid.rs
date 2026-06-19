@@ -10,15 +10,24 @@ fn main() {
     unsafe {
         // pid < -1 naming a nonexistent process group → ESRCH.
         let r1 = libc::waitpid(i32::MIN, std::ptr::null_mut(), 0);
-        println!("waitpid_intmin_esrch={}", r1 == -1 && errno() == libc::ESRCH);
+        println!(
+            "waitpid_intmin_esrch={}",
+            r1 == -1 && errno() == libc::ESRCH
+        );
 
         // invalid options → EINVAL.
         let r2 = libc::waitpid(-1, std::ptr::null_mut(), -1);
-        println!("waitpid_badflags_einval={}", r2 == -1 && errno() == libc::EINVAL);
+        println!(
+            "waitpid_badflags_einval={}",
+            r2 == -1 && errno() == libc::EINVAL
+        );
 
         // no children → ECHILD.
         let r3 = libc::waitpid(-1, std::ptr::null_mut(), 0);
-        println!("waitpid_nochild_echild={}", r3 == -1 && errno() == libc::ECHILD);
+        println!(
+            "waitpid_nochild_echild={}",
+            r3 == -1 && errno() == libc::ECHILD
+        );
 
         let _ = errno;
     }

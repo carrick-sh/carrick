@@ -95,8 +95,8 @@ fn main() {
             ptrace_cont_errno_zero = cont_errno == 0,
             final_reaped = final_rc == pid,
             final_exited = libc::WIFEXITED(final_status),
-            final_exit_status_is_42 = libc::WIFEXITED(final_status)
-                && libc::WEXITSTATUS(final_status) == 42,
+            final_exit_status_is_42 =
+                libc::WIFEXITED(final_status) && libc::WEXITSTATUS(final_status) == 42,
         );
     }
 }

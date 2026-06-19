@@ -85,8 +85,14 @@ fn main() {
     // Stamp a known mtime FIRST (via futimens on the fd) so all three views
     // have a fixed, comparable timestamp regardless of wall-clock.
     let times = [
-        libc::timespec { tv_sec: SET_MTIME, tv_nsec: 0 }, // atime
-        libc::timespec { tv_sec: SET_MTIME, tv_nsec: 0 }, // mtime
+        libc::timespec {
+            tv_sec: SET_MTIME,
+            tv_nsec: 0,
+        }, // atime
+        libc::timespec {
+            tv_sec: SET_MTIME,
+            tv_nsec: 0,
+        }, // mtime
     ];
     let ut = unsafe { libc::futimens(fd, times.as_ptr()) };
     if ut != 0 {

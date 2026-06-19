@@ -10,10 +10,12 @@
 //!
 //! Deterministic booleans. (carrick models this in the kill/raise path; Linux
 //! enforces it in the kernel.)
-use conformance_probes::{report, errno};
+use conformance_probes::{errno, report};
 use std::sync::atomic::{AtomicBool, Ordering};
 static GOT: AtomicBool = AtomicBool::new(false);
-extern "C" fn on_term(_: i32) { GOT.store(true, Ordering::SeqCst); }
+extern "C" fn on_term(_: i32) {
+    GOT.store(true, Ordering::SeqCst);
+}
 fn main() {
     unsafe {
         // (1) Send SIGTERM to pid 1 (the init) with no handler installed there.
@@ -24,7 +26,10 @@ fn main() {
         let kill_errno = if rc < 0 { errno() } else { 0 };
         // Give any (erroneous) teardown a moment to manifest; if the init died
         // we'd be killed here and produce no output.
-        let ts = libc::timespec { tv_sec: 0, tv_nsec: 200_000_000 };
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 200_000_000,
+        };
         libc::nanosleep(&ts, core::ptr::null_mut());
 
         // (2) Control: a member WITH a handler receives its own signal.

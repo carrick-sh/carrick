@@ -21,8 +21,8 @@
 //! ids. The assertion is the RELATIONSHIP "every spawned thread ran and joined".
 
 use conformance_probes::report;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 const N: u32 = 96;
 

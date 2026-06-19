@@ -19,8 +19,13 @@ fn main() {
                 // bounded so a bug fails fast instead of hanging.
                 let mut ppid = libc::getppid();
                 for _ in 0..500 {
-                    if ppid == 1 { break; }
-                    let ts = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
+                    if ppid == 1 {
+                        break;
+                    }
+                    let ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 5_000_000,
+                    };
                     libc::nanosleep(&ts, core::ptr::null_mut());
                     ppid = libc::getppid();
                 }

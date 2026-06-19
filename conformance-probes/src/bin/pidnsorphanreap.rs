@@ -14,7 +14,10 @@ fn main() {
             if grand == 0 {
                 // Grandchild: sleep briefly so the child exits first (we become
                 // an orphan reparented to the init/this process), then exit 42.
-                let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 100_000_000,
+                };
                 libc::nanosleep(&ts, core::ptr::null_mut());
                 libc::_exit(42);
             }
@@ -28,14 +31,22 @@ fn main() {
         loop {
             let mut st = 0i32;
             let r = libc::wait4(-1, &mut st, 0, core::ptr::null_mut());
-            if r <= 0 { break; }
+            if r <= 0 {
+                break;
+            }
             reaped += 1;
             if libc::WIFEXITED(st) {
                 let code = libc::WEXITSTATUS(st);
-                if code == 42 { saw_42 = true; }
-                if code == 0 { saw_child_exit0 = true; }
+                if code == 42 {
+                    saw_42 = true;
+                }
+                if code == 0 {
+                    saw_child_exit0 = true;
+                }
             }
-            if reaped >= 2 { break; }
+            if reaped >= 2 {
+                break;
+            }
         }
         report!(
             reaped_two = reaped == 2,

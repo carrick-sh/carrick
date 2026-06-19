@@ -19,7 +19,10 @@ fn main() {
 
         // SETVAL with a value > SEMVMX(32767) → ERANGE.
         let r2 = libc::semctl(semid, 0, libc::SETVAL, 300000i32);
-        println!("setval_toobig_erange={}", r2 == -1 && errno() == libc::ERANGE);
+        println!(
+            "setval_toobig_erange={}",
+            r2 == -1 && errno() == libc::ERANGE
+        );
 
         // SETVAL with a valid value → success.
         let r3 = libc::semctl(semid, 0, libc::SETVAL, 5i32);

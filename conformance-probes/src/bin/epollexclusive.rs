@@ -29,8 +29,7 @@
 //! `true` into a `false` instead of hanging the harness.
 
 use conformance_probes::{
-    arm_alarm_ms, block_signal, disarm_alarm, errno, install_handler, pipe2, report,
-    unblock_signal,
+    arm_alarm_ms, block_signal, disarm_alarm, errno, install_handler, pipe2, report, unblock_signal,
 };
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -44,7 +43,10 @@ extern "C" fn on_alrm(_: i32) {
 /// Helper: build an `epoll_event` with the requested events mask, naming the
 /// fd in the user-data slot for symmetry (we don't compare it back).
 fn ev(mask: u32, fd: i32) -> libc::epoll_event {
-    libc::epoll_event { events: mask, u64: fd as u64 }
+    libc::epoll_event {
+        events: mask,
+        u64: fd as u64,
+    }
 }
 
 fn case_create_and_exclusive_add() {

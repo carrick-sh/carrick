@@ -101,8 +101,7 @@ fn main() {
             let addr = shmat(shmid as i32, core::ptr::null(), SHM_RDONLY);
             let attached = addr as isize != -1 && !addr.is_null();
             // Read coherence: the parent's sentinel is visible read-side.
-            let read_ok =
-                attached && core::ptr::read_volatile(addr as *const u8) == SENTINEL;
+            let read_ok = attached && core::ptr::read_volatile(addr as *const u8) == SENTINEL;
             // Tell the parent the pre-fault state (bit0=attached, bit1=read_ok),
             // flushed BEFORE the store so the byte survives even if the store
             // crashes us instantly.

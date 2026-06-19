@@ -39,7 +39,12 @@ fn main() {
         let snd_errno = if snd < 0 { errno() } else { 0 };
 
         // Confirm the queue is still usable with a sane size.
-        let ok = libc::msgsnd(qid, buf.as_ptr() as *const libc::c_void, 2, libc::IPC_NOWAIT);
+        let ok = libc::msgsnd(
+            qid,
+            buf.as_ptr() as *const libc::c_void,
+            2,
+            libc::IPC_NOWAIT,
+        );
 
         report!(
             huge_msgsnd_failed = snd < 0,

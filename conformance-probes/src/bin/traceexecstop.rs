@@ -126,8 +126,8 @@ fn main() {
             ptrace_cont_errno = cont_errno,
             final_reaped = final_wait.rc == pid,
             final_exited = libc::WIFEXITED(final_wait.status),
-            final_exit_status_is_77 = libc::WIFEXITED(final_wait.status)
-                && libc::WEXITSTATUS(final_wait.status) == 77,
+            final_exit_status_is_77 =
+                libc::WIFEXITED(final_wait.status) && libc::WEXITSTATUS(final_wait.status) == 77,
         );
     }
 }

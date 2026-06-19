@@ -21,19 +21,31 @@ fn main() {
 
         // NULL attr → EINVAL.
         let r2 = libc::syscall(libc::SYS_sched_getattr, 0i64, 0i64, 48i64, 0i64);
-        println!("getattr_null_einval={}", r2 == -1 && errno() == libc::EINVAL);
+        println!(
+            "getattr_null_einval={}",
+            r2 == -1 && errno() == libc::EINVAL
+        );
 
         // size < 48 → EINVAL.
         let r3 = libc::syscall(libc::SYS_sched_getattr, 0i64, p, 47i64, 0i64);
-        println!("getattr_small_size_einval={}", r3 == -1 && errno() == libc::EINVAL);
+        println!(
+            "getattr_small_size_einval={}",
+            r3 == -1 && errno() == libc::EINVAL
+        );
 
         // unknown flags → EINVAL.
         let r4 = libc::syscall(libc::SYS_sched_getattr, 0i64, p, 48i64, 1000i64);
-        println!("getattr_bad_flags_einval={}", r4 == -1 && errno() == libc::EINVAL);
+        println!(
+            "getattr_bad_flags_einval={}",
+            r4 == -1 && errno() == libc::EINVAL
+        );
 
         // non-existent pid → ESRCH.
         let r5 = libc::syscall(libc::SYS_sched_getattr, 4_000_000i64, p, 48i64, 0i64);
-        println!("getattr_bad_pid_esrch={}", r5 == -1 && errno() == libc::ESRCH);
+        println!(
+            "getattr_bad_pid_esrch={}",
+            r5 == -1 && errno() == libc::ESRCH
+        );
 
         let _ = errno;
     }

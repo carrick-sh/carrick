@@ -54,8 +54,14 @@ unsafe fn run() {
         let epfd = libc::epoll_create1(0);
         if epfd >= 0 {
             // Register both read ends with TOKEN data (data.u64 != fd).
-            let mut ev_a = libc::epoll_event { events: EPOLLIN, u64: TOKEN_A };
-            let mut ev_b = libc::epoll_event { events: EPOLLIN, u64: TOKEN_B };
+            let mut ev_a = libc::epoll_event {
+                events: EPOLLIN,
+                u64: TOKEN_A,
+            };
+            let mut ev_b = libc::epoll_event {
+                events: EPOLLIN,
+                u64: TOKEN_B,
+            };
             let add_a = libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, rd_a, &mut ev_a);
             let add_b = libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, rd_b, &mut ev_b);
 
@@ -69,15 +75,12 @@ unsafe fn run() {
             let n1 = libc::epoll_pwait(epfd, out1.as_mut_ptr(), 1, 200, std::ptr::null());
             first_returned_one = n1 == 1;
             // The returned event must carry a TOKEN, never a raw fd number.
-            first_data_is_token =
-                n1 == 1 && (out1[0].u64 == TOKEN_A || out1[0].u64 == TOKEN_B);
+            first_data_is_token = n1 == 1 && (out1[0].u64 == TOKEN_A || out1[0].u64 == TOKEN_B);
 
             // DEL BOTH fds: Linux interest set is now empty regardless of which
             // fd overflowed. A correct runtime purges any deferred event too.
-            let del_a =
-                libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, rd_a, std::ptr::null_mut());
-            let del_b =
-                libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, rd_b, std::ptr::null_mut());
+            let del_a = libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, rd_a, std::ptr::null_mut());
+            let del_b = libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, rd_b, std::ptr::null_mut());
 
             setup_ok = add_a == 0 && add_b == 0 && del_a == 0 && del_b == 0;
 

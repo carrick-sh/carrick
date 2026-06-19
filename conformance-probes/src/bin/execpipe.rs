@@ -92,7 +92,11 @@ fn main() {
         let mut status = 0;
         while libc::waitpid(pid, &mut status, 0) < 0 && errno() == libc::EINTR {}
         let exited = libc::WIFEXITED(status);
-        let code = if exited { libc::WEXITSTATUS(status) } else { -1 };
+        let code = if exited {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
 
         report!(
             child_exited_zero = exited && code == 0,

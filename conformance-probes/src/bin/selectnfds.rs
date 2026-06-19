@@ -52,7 +52,15 @@ fn main() {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let rc3 = libc::syscall(libc::SYS_pselect6, 0i64, 0i64, 0i64, 0i64, &mut ts0 as *mut _ as i64, 0i64);
+        let rc3 = libc::syscall(
+            libc::SYS_pselect6,
+            0i64,
+            0i64,
+            0i64,
+            0i64,
+            &mut ts0 as *mut _ as i64,
+            0i64,
+        );
         println!("pselect6_zero_nfds_returns_0={}", rc3 == 0);
     }
 }

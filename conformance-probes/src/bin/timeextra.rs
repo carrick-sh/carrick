@@ -110,7 +110,10 @@ fn case_clock_settime_eperm() {
         // We are NOT CAP_SYS_TIME (Docker default + carrick guest). Setting
         // CLOCK_REALTIME must fail with EPERM. Using an arbitrary value
         // (1 second past epoch) — never actually applied.
-        let ts = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+        let ts = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
         let rc = libc::clock_settime(libc::CLOCK_REALTIME, &ts);
         let e = errno();
         report!(

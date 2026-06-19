@@ -20,8 +20,14 @@ fn main() {
     {
         let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
         if unsafe { libc::uname(&mut uts) } == 0 {
-            println!("uname_sysname_linux={}", cstr_field(&uts.sysname) == "Linux");
-            println!("uname_machine_aarch64={}", cstr_field(&uts.machine) == "aarch64");
+            println!(
+                "uname_sysname_linux={}",
+                cstr_field(&uts.sysname) == "Linux"
+            );
+            println!(
+                "uname_machine_aarch64={}",
+                cstr_field(&uts.machine) == "aarch64"
+            );
         } else {
             println!("uname=ERR:{}", errno());
         }
@@ -106,14 +112,28 @@ fn main() {
     // kernel buffer is 16 bytes including NUL; "probename" fits.
     {
         let set_name = b"probename\0";
-        let set_rc =
-            unsafe { libc::prctl(libc::PR_SET_NAME, set_name.as_ptr() as libc::c_ulong, 0, 0, 0) };
+        let set_rc = unsafe {
+            libc::prctl(
+                libc::PR_SET_NAME,
+                set_name.as_ptr() as libc::c_ulong,
+                0,
+                0,
+                0,
+            )
+        };
         if set_rc != 0 {
             println!("prctl_name=ERR:{}", errno());
         } else {
             let mut buf = [0u8; 16];
-            let get_rc =
-                unsafe { libc::prctl(libc::PR_GET_NAME, buf.as_mut_ptr() as libc::c_ulong, 0, 0, 0) };
+            let get_rc = unsafe {
+                libc::prctl(
+                    libc::PR_GET_NAME,
+                    buf.as_mut_ptr() as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                )
+            };
             if get_rc != 0 {
                 println!("prctl_name=ERR:{}", errno());
             } else {
@@ -133,10 +153,20 @@ fn main() {
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];
         let n1 = unsafe {
-            libc::syscall(libc::SYS_getrandom, a.as_mut_ptr() as *mut libc::c_void, a.len(), 0)
+            libc::syscall(
+                libc::SYS_getrandom,
+                a.as_mut_ptr() as *mut libc::c_void,
+                a.len(),
+                0,
+            )
         };
         let n2 = unsafe {
-            libc::syscall(libc::SYS_getrandom, b.as_mut_ptr() as *mut libc::c_void, b.len(), 0)
+            libc::syscall(
+                libc::SYS_getrandom,
+                b.as_mut_ptr() as *mut libc::c_void,
+                b.len(),
+                0,
+            )
         };
         if n1 < 0 || n2 < 0 {
             println!("getrandom=ERR:{}", errno());
@@ -150,12 +180,14 @@ fn main() {
     // varies between machines so is not printed.
     {
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
-        };
+        let rc =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
         if rc == 0 {
             println!("sched_getaffinity_ok={}", rc == 0);
-            println!("sched_getaffinity_has_cpu={}", unsafe { libc::CPU_COUNT(&set) } > 0);
+            println!(
+                "sched_getaffinity_has_cpu={}",
+                unsafe { libc::CPU_COUNT(&set) } > 0
+            );
         } else {
             println!("sched_getaffinity=ERR:{}", errno());
         }
@@ -232,8 +264,15 @@ fn main() {
             inheritable: u32,
         }
         // _LINUX_CAPABILITY_VERSION_3
-        let mut hdr = CapHeader { version: 0x20080522, pid: 0 };
-        let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+        let mut hdr = CapHeader {
+            version: 0x20080522,
+            pid: 0,
+        };
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_capget,

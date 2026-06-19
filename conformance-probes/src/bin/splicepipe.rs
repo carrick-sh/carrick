@@ -29,13 +29,20 @@ fn splice_pipe_to_file() {
     let w = unsafe { libc::write(wr, payload.as_ptr() as *const _, payload.len()) };
     if w != payload.len() as isize {
         println!("splice_f_write=ERR:{}", errno());
-        unsafe { libc::close(rd); libc::close(wr) };
+        unsafe {
+            libc::close(rd);
+            libc::close(wr)
+        };
         return;
     }
     // Close the write-end so the pipe has a bounded amount of data.
     unsafe { libc::close(wr) };
 
-    let fd = open("/tmp/splice_out", libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
+    let fd = open(
+        "/tmp/splice_out",
+        libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+        0o644,
+    );
     if fd < 0 {
         println!("splice_f_open=ERR:{}", errno());
         unsafe { libc::close(rd) };
@@ -66,7 +73,10 @@ fn splice_pipe_to_file() {
     let got = &buf[..r.max(0) as usize];
     println!("splice_pipe_to_file_match={}", got == payload);
 
-    unsafe { libc::close(fd); libc::close(rd) };
+    unsafe {
+        libc::close(fd);
+        libc::close(rd)
+    };
 }
 
 /// Write "p2p-data" to pipe A, splice() A→B, then read it out of pipe B.

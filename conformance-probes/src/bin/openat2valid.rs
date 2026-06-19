@@ -78,6 +78,9 @@ fn main() {
         // bad dirfd → EBADF.
         let how = [o_rdwr | o_creat, 0o644, 0];
         let r = openat2(-1, p.as_ptr(), &how, SIZEOF_HOW);
-        println!("openat2_bad_dfd_ebadf={}", r == -1 && errno() == libc::EBADF);
+        println!(
+            "openat2_bad_dfd_ebadf={}",
+            r == -1 && errno() == libc::EBADF
+        );
     }
 }

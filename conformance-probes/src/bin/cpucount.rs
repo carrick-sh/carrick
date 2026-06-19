@@ -85,12 +85,10 @@ fn main() {
     // requested mask even though Apple Silicon scheduling is advisory.
     {
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let got = unsafe {
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
-        };
-        let set_rc = unsafe {
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
-        };
+        let got =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        let set_rc =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
         println!("setaffinity_full_ok={}", got == 0 && set_rc == 0);
         // Read back: still the same count.
         let mut set2: libc::cpu_set_t = unsafe { std::mem::zeroed() };
@@ -98,18 +96,23 @@ fn main() {
             libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set2)
         };
         let back = unsafe { libc::CPU_COUNT(&set2) } as usize;
-        println!("setaffinity_full_roundtrip={}", got2 == 0 && back == affinity);
+        println!(
+            "setaffinity_full_roundtrip={}",
+            got2 == 0 && back == affinity
+        );
     }
 
     // sched_setaffinity with an EMPTY mask is rejected with EINVAL on Linux
     // (a task must be allowed to run on at least one CPU).
     {
         let empty: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &empty)
-        };
+        let rc =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &empty) };
         let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        println!("setaffinity_empty_einval={}", rc == -1 && err == libc::EINVAL);
+        println!(
+            "setaffinity_empty_einval={}",
+            rc == -1 && err == libc::EINVAL
+        );
     }
 }
 

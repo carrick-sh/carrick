@@ -76,7 +76,10 @@ fn main() {
     unsafe {
         // 1. FUTEX_WAIT with mismatched expected → -1/EAGAIN, immediately.
         WORD.store(1, Ordering::SeqCst);
-        let ts = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
         let rc = futex_op(
             addr,
             FUTEX_WAIT | FUTEX_PRIVATE_FLAG,

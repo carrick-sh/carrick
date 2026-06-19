@@ -57,7 +57,10 @@ fn main() {
         let mut rb = [0u8; 1];
         libc::read(done[0], rb.as_mut_ptr() as *mut libc::c_void, 1);
         // Give delivery a beat (handler runs asynchronously).
-        let ts = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 };
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 50_000_000,
+        };
         libc::nanosleep(&ts, std::ptr::null_mut());
         let mut status = 0;
         libc::waitpid(pid, &mut status, 0);

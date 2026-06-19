@@ -59,8 +59,7 @@ fn main() {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, LINUX_SIGCHLD);
         libc::sigaddset(&mut set, LINUX_SIGUSR1);
-        let block_ok =
-            libc::sigprocmask(libc::SIG_BLOCK, &set, core::ptr::null_mut()) == 0;
+        let block_ok = libc::sigprocmask(libc::SIG_BLOCK, &set, core::ptr::null_mut()) == 0;
 
         let mut clone_rc_positive = false;
         let mut got_usr1 = false;
@@ -87,7 +86,10 @@ fn main() {
                 // at 5s so a runtime that delivers nothing reports false instead
                 // of hanging.
                 let mut info: libc::siginfo_t = MaybeUninit::zeroed().assume_init();
-                let ts = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+                let ts = libc::timespec {
+                    tv_sec: 5,
+                    tv_nsec: 0,
+                };
                 let sig = libc::sigtimedwait(&set, &mut info, &ts);
                 // EINTR (interrupted by some other signal) — retry once within
                 // the bound.

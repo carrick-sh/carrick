@@ -30,7 +30,11 @@ unsafe fn set_blocked(sig: i32, block: bool) {
     let mut set: libc::sigset_t = std::mem::zeroed();
     libc::sigemptyset(&mut set);
     libc::sigaddset(&mut set, sig);
-    let how = if block { libc::SIG_BLOCK } else { libc::SIG_UNBLOCK };
+    let how = if block {
+        libc::SIG_BLOCK
+    } else {
+        libc::SIG_UNBLOCK
+    };
     libc::sigprocmask(how, &set, std::ptr::null_mut());
 }
 
@@ -54,7 +58,13 @@ fn main() {
         set_blocked(std_sig, false);
         set_blocked(rt_sig, false);
 
-        println!("standard_coalesced_to_one={}", STD.load(Ordering::SeqCst) == 1);
-        println!("realtime_queued_all_three={}", RT.load(Ordering::SeqCst) == 3);
+        println!(
+            "standard_coalesced_to_one={}",
+            STD.load(Ordering::SeqCst) == 1
+        );
+        println!(
+            "realtime_queued_all_three={}",
+            RT.load(Ordering::SeqCst) == 3
+        );
     }
 }

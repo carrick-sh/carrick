@@ -73,7 +73,11 @@ fn epoll_probe() {
     let add = unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, rd, &mut ev) };
     if add != 0 {
         println!("epoll_ctl_add=ERR:{}", errno());
-        unsafe { libc::close(ep); libc::close(rd); libc::close(wr) };
+        unsafe {
+            libc::close(ep);
+            libc::close(rd);
+            libc::close(wr)
+        };
         return;
     }
 
@@ -101,7 +105,11 @@ fn epoll_probe() {
         println!("epoll_wait_timeout={}", n2);
     }
 
-    unsafe { libc::close(ep); libc::close(rd); libc::close(wr) };
+    unsafe {
+        libc::close(ep);
+        libc::close(rd);
+        libc::close(wr)
+    };
 }
 
 /// poll on an epoll fd: registering a readable pipe in the epoll instance makes
@@ -198,22 +206,21 @@ fn poll_probe() {
     let mut buf = [0u8; 16];
     unsafe { libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len()) };
     pfd.revents = 0;
-    let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
-    let rcp = unsafe {
-        libc::ppoll(
-            &mut pfd as *mut _,
-            1,
-            &ts as *const _,
-            std::ptr::null(),
-        )
+    let ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
     };
+    let rcp = unsafe { libc::ppoll(&mut pfd as *mut _, 1, &ts as *const _, std::ptr::null()) };
     if rcp < 0 {
         println!("ppoll_empty=ERR:{}", errno());
     } else {
         println!("ppoll_empty_rc={}", rcp);
     }
 
-    unsafe { libc::close(rd); libc::close(wr) };
+    unsafe {
+        libc::close(rd);
+        libc::close(wr)
+    };
 }
 
 /// select / pselect6: a pipe read-end with a short timeout. Nothing written →
@@ -230,7 +237,10 @@ fn select_probe() {
     let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
     unsafe { libc::FD_ZERO(&mut set) };
     unsafe { libc::FD_SET(rd, &mut set) };
-    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 10_000 };
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 10_000,
+    };
     let rc0 = unsafe {
         libc::select(
             rd + 1,
@@ -251,7 +261,10 @@ fn select_probe() {
     unsafe { libc::write(wr, msg.as_ptr() as *const _, msg.len()) };
     unsafe { libc::FD_ZERO(&mut set) };
     unsafe { libc::FD_SET(rd, &mut set) };
-    let ts = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 };
+    let ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 50_000_000,
+    };
     let rc1 = unsafe {
         libc::pselect(
             rd + 1,
@@ -268,7 +281,10 @@ fn select_probe() {
         println!("pselect_ready_rc={}", rc1);
     }
 
-    unsafe { libc::close(rd); libc::close(wr) };
+    unsafe {
+        libc::close(rd);
+        libc::close(wr)
+    };
 }
 
 /// timerfd: CLOCK_MONOTONIC one-shot 1ms timer; block-read the expiration count
@@ -281,12 +297,16 @@ fn timerfd_probe() {
         return;
     }
     let spec = libc::itimerspec {
-        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-        it_value: libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 },
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        },
     };
-    let set = unsafe {
-        libc::timerfd_settime(tfd, 0, &spec as *const _, std::ptr::null_mut())
-    };
+    let set = unsafe { libc::timerfd_settime(tfd, 0, &spec as *const _, std::ptr::null_mut()) };
     if set != 0 {
         println!("timerfd_settime=ERR:{}", errno());
         unsafe { libc::close(tfd) };
@@ -374,15 +394,30 @@ fn poll_multi_probe() {
     let mut p2 = [0i32; 2];
     if unsafe { libc::pipe2(p2.as_mut_ptr(), 0) } != 0 {
         println!("poll_multi_pipe2=ERR:{}", errno());
-        unsafe { libc::close(rd1); libc::close(wr1) };
+        unsafe {
+            libc::close(rd1);
+            libc::close(wr1)
+        };
         return;
     }
     let (rd2, wr2) = (p2[0], p2[1]);
 
     let mut pfds = [
-        libc::pollfd { fd: rd1, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: wr2, events: libc::POLLOUT, revents: 0 },
-        libc::pollfd { fd: 9999, events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: rd1,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wr2,
+            events: libc::POLLOUT,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: 9999,
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 3, 50) };
     if rc < 0 {
@@ -391,7 +426,10 @@ fn poll_multi_probe() {
         // All three fds report a revent → poll counts 3.
         println!("poll_multi_ready_count={}", rc);
         println!("poll_multi_rd_in={}", (pfds[0].revents & libc::POLLIN) != 0);
-        println!("poll_multi_wr_out={}", (pfds[1].revents & libc::POLLOUT) != 0);
+        println!(
+            "poll_multi_wr_out={}",
+            (pfds[1].revents & libc::POLLOUT) != 0
+        );
         println!(
             "poll_multi_bad_nval={}",
             (pfds[2].revents & libc::POLLNVAL) != 0

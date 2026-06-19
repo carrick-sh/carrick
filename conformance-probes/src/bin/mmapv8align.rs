@@ -74,8 +74,7 @@ fn main() {
     let mut prefix_suffix_unmap_ok = true;
 
     for i in 0..64usize {
-        let hint = ((0x2000_0000usize + i * 0x1f00_0000usize) & 0x3fff_fff000usize)
-            as *mut c_void;
+        let hint = ((0x2000_0000usize + i * 0x1f00_0000usize) & 0x3fff_fff000usize) as *mut c_void;
         let ptr = unsafe {
             syscall6(
                 SYS_MMAP,
@@ -96,8 +95,14 @@ fn main() {
             no_low32_success = false;
         }
 
-        if unsafe { syscall3(SYS_MADVISE, ptr as u64, REQUEST_SIZE as u64, MADV_DONTFORK as u64) }
-            != 0
+        if unsafe {
+            syscall3(
+                SYS_MADVISE,
+                ptr as u64,
+                REQUEST_SIZE as u64,
+                MADV_DONTFORK as u64,
+            )
+        } != 0
         {
             madv_dontfork_accepted = false;
         }

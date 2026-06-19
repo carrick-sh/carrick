@@ -21,14 +21,20 @@ fn main() {
         libc::mkdir(b"/tmp/odir_dir\0".as_ptr() as *const _, 0o755);
 
         // O_DIRECTORY on a regular file → ENOTDIR.
-        let rc = libc::open(b"/tmp/odir_file\0".as_ptr() as *const _, libc::O_RDONLY | libc::O_DIRECTORY);
+        let rc = libc::open(
+            b"/tmp/odir_file\0".as_ptr() as *const _,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        );
         println!(
             "odirectory_on_file_enotdir={}",
             rc == -1 && errno() == libc::ENOTDIR
         );
 
         // O_DIRECTORY on a directory → success.
-        let d = libc::open(b"/tmp/odir_dir\0".as_ptr() as *const _, libc::O_RDONLY | libc::O_DIRECTORY);
+        let d = libc::open(
+            b"/tmp/odir_dir\0".as_ptr() as *const _,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        );
         println!("odirectory_on_dir_ok={}", d >= 0);
         if d >= 0 {
             libc::close(d);

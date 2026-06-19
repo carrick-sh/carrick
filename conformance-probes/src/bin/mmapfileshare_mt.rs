@@ -22,8 +22,8 @@
 //! diff carrick vs docker line-for-line. On a coherent VM every reader sees the
 //! header (`readers_match=K/K`); a sibling-vCPU coherence gap shows `<K`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const HEADER: u64 = 0x4361_7272_6963_6b21; // "Carrick!"
 const K: usize = 4;
