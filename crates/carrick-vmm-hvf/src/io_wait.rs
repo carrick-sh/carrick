@@ -1079,7 +1079,7 @@ mod tests {
         };
         let capped = super::clamp_timespec_to_slice(ten_s, SLICE_NS);
         assert_eq!(capped.tv_sec, 0);
-        assert_eq!(capped.tv_nsec as i64, SLICE_NS);
+        assert_eq!(capped.tv_nsec, SLICE_NS);
 
         // Just over a slice → capped to a slice.
         let over = libc::timespec {
@@ -1087,7 +1087,7 @@ mod tests {
             tv_nsec: SLICE_NS as libc::c_long + 1,
         };
         let capped = super::clamp_timespec_to_slice(over, SLICE_NS);
-        assert_eq!(capped.tv_nsec as i64, SLICE_NS);
+        assert_eq!(capped.tv_nsec, SLICE_NS);
 
         // A remaining wait shorter than a slice is left untouched (last slice).
         let short = libc::timespec {
@@ -1104,7 +1104,7 @@ mod tests {
             tv_nsec: SLICE_NS as libc::c_long,
         };
         let kept = super::clamp_timespec_to_slice(exact, SLICE_NS);
-        assert_eq!(kept.tv_nsec as i64, SLICE_NS);
+        assert_eq!(kept.tv_nsec, SLICE_NS);
     }
 
     /// A wake pipe whose write end is closed (EOF) must not re-fire its
