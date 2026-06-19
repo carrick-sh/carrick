@@ -749,6 +749,46 @@ const X86_NR_OPEN: u64 = 2;
 const X86_NR_CREAT: u64 = 85;
 /// Canonical (asm-generic / aarch64) `openat` number (shared by open + creat).
 const CANONICAL_OPENAT: u64 = 56;
+/// x86-64 `openat(2)` (syscalls(2)). Canonical openat IS 56 (same name+shape),
+/// but x86_64 and asm-generic disagree on four high O_* flag bits, so openat's
+/// flags word must be translated (NOT a bare table Direct).
+const X86_NR_OPENAT: u64 = 257;
+
+/// Convert an x86_64 `open`/`openat` flags word to the canonical (asm-generic)
+/// layout. The low O_* bits (O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK,
+/// O_CLOEXEC, O_TMPFILE, ...) are identical across the two ABIs and pass
+/// through; only four high bits differ and form two swapped pairs:
+///   x86 O_DIRECT(0x4000)    <-> asm-generic O_DIRECT(0x10000)
+///   x86 O_DIRECTORY(0x10000)<-> asm-generic O_DIRECTORY(0x4000)
+///   x86 O_LARGEFILE(0x8000) <-> asm-generic O_LARGEFILE(0x20000)
+///   x86 O_NOFOLLOW(0x20000) <-> asm-generic O_NOFOLLOW(0x8000)
+/// Without this, an x86 guest's O_DIRECTORY is misread as O_DIRECT (open of a
+/// file then never ENOTDIRs) and O_NOFOLLOW as O_LARGEFILE (symlink follow/
+/// create misbehaves). Derived from the libc per-arch constants + oracle strace.
+fn translate_x86_open_flags(flags: u64) -> u64 {
+    const X86_O_DIRECT: u64 = 0x4000;
+    const X86_O_LARGEFILE: u64 = 0x8000;
+    const X86_O_DIRECTORY: u64 = 0x10000;
+    const X86_O_NOFOLLOW: u64 = 0x20000;
+    const CANON_O_DIRECTORY: u64 = 0x4000;
+    const CANON_O_NOFOLLOW: u64 = 0x8000;
+    const CANON_O_DIRECT: u64 = 0x10000;
+    const CANON_O_LARGEFILE: u64 = 0x20000;
+    let mut out = flags & !(X86_O_DIRECT | X86_O_LARGEFILE | X86_O_DIRECTORY | X86_O_NOFOLLOW);
+    if flags & X86_O_DIRECT != 0 {
+        out |= CANON_O_DIRECT;
+    }
+    if flags & X86_O_DIRECTORY != 0 {
+        out |= CANON_O_DIRECTORY;
+    }
+    if flags & X86_O_LARGEFILE != 0 {
+        out |= CANON_O_LARGEFILE;
+    }
+    if flags & X86_O_NOFOLLOW != 0 {
+        out |= CANON_O_NOFOLLOW;
+    }
+    out
+}
 /// x86-64 `unlink(2)` (syscalls(2)). Desugars to `unlinkat(AT_FDCWD, path, 0)`.
 const X86_NR_UNLINK: u64 = 87;
 /// x86-64 `rmdir(2)` (syscalls(2)). Desugars to
@@ -929,12 +969,34 @@ impl X8664GuestArch {
         // These run BEFORE the table-remap fallthrough so their (different)
         // x86_64 numbers never reach the table (where some collide with unrelated
         // canonical syscalls: 2=io_submit, 85=timerfd_create, 87=timerfd_gettime).
-        // open/creat → openat(56)
+        // open/openat/creat → openat(56), translating the x86 O_* flag bits.
         if x86_number == X86_NR_OPEN {
             // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode).
             return SyscallNorm::Plain(RawSyscall {
                 number: CANONICAL_OPENAT,
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
+                args: [
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[0],
+                    translate_x86_open_flags(args[1]),
+                    args[2],
+                    0,
+                    0,
+                ],
+            });
+        }
+        if x86_number == X86_NR_OPENAT {
+            // openat(dirfd, path, flags, mode) — same shape as canonical openat,
+            // but the x86 flags word needs the O_* bit translation.
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_OPENAT,
+                args: [
+                    args[0],
+                    args[1],
+                    translate_x86_open_flags(args[2]),
+                    args[3],
+                    0,
+                    0,
+                ],
             });
         }
         if x86_number == X86_NR_CREAT {
@@ -1224,6 +1286,34 @@ mod normalize_tests {
                 assert_eq!(rs.args, [0, 0, 0, 0, 0, 0]); // ppoll(NULL,0,NULL,NULL,0)
             }
             _ => panic!("pause must be Plain"),
+        }
+    }
+
+    #[test]
+    fn x86_open_flags_translate_to_asm_generic() {
+        // The two swapped high bit-pairs (x86 value -> asm-generic value).
+        assert_eq!(translate_x86_open_flags(0x10000), 0x4000); // O_DIRECTORY
+        assert_eq!(translate_x86_open_flags(0x4000), 0x10000); // O_DIRECT
+        assert_eq!(translate_x86_open_flags(0x20000), 0x8000); // O_NOFOLLOW
+        assert_eq!(translate_x86_open_flags(0x8000), 0x20000); // O_LARGEFILE
+        // Low bits are identical across ABIs and pass through unchanged
+        // (O_WRONLY=1, O_CREAT=0o100, O_CLOEXEC=0o2000000).
+        assert_eq!(
+            translate_x86_open_flags(1 | 0o100 | 0o2000000),
+            1 | 0o100 | 0o2000000
+        );
+        // Combined O_DIRECTORY|O_CLOEXEC translates only the high bit.
+        assert_eq!(
+            translate_x86_open_flags(0x10000 | 0o2000000),
+            0x4000 | 0o2000000
+        );
+        // openat(257) -> canonical openat(56), flags arg (a2) translated.
+        match X8664GuestArch::normalize_syscall(&frame(257, [5, 0x1000, 0x10000, 0o644, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 56);
+                assert_eq!(rs.args, [5, 0x1000, 0x4000, 0o644, 0, 0]);
+            }
+            _ => panic!("openat must be Plain"),
         }
     }
 
