@@ -1918,6 +1918,10 @@ impl SyscallDispatcher {
             let timeout_addr = timeout.0;
             let sigmask_addr = sigmask.0;
             let request_number = cx.number();
+            // x86_64 select(2) reaches this handler via CARRICK_PRIVATE_X86_SELECT:
+            // its timeout (arg4) is a *timeval (tv_usec), not pselect6's *timespec
+            // (tv_nsec), and it has no sigmask. pselect6(72) keeps the decode below.
+            let is_select = request_number == carrick_abi::CARRICK_PRIVATE_X86_SELECT;
             let request_args = cx.raw_args();
             let memory = &mut *cx.memory;
             let reporter = cx.reporter;
@@ -1954,6 +1958,27 @@ impl SyscallDispatcher {
             // Decode timespec → millis for libc::poll. NULL = block forever (-1).
             let timeout_ms: i32 = if timeout_addr == 0 {
                 -1
+            } else if is_select {
+                // select(2): the timeout is a *timeval (tv_sec + tv_usec), not a
+                // *timespec. Linux rejects sec<0 or usec out of [0,1e6) → EINVAL.
+                match read_kernel_struct::<LinuxTimeval>(memory, timeout_addr) {
+                    Ok(tv) => {
+                        let sec = tv.tv_sec;
+                        let usec = tv.tv_usec;
+                        if sec < 0 || !(0..1_000_000).contains(&usec) {
+                            return Ok(LINUX_EINVAL.into());
+                        }
+                        let ms = sec.saturating_mul(1000).saturating_add(usec / 1000);
+                        if ms <= 0 {
+                            0
+                        } else if ms > i32::MAX as i64 {
+                            i32::MAX
+                        } else {
+                            ms as i32
+                        }
+                    }
+                    _ => 0,
+                }
             } else {
                 match read_kernel_struct::<LinuxTimespec>(memory, timeout_addr) {
                     Ok(timespec) => {

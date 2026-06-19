@@ -2206,6 +2206,15 @@ pub const CARRICK_PRIVATE_X86_UTIMES: u64 = u64::MAX - 0x27;
 /// then wedges the guest). This private number routes `poll` to the ppoll
 /// handler's poll branch, which reads arg2 as `timeout_ms` and uses no sigmask.
 pub const CARRICK_PRIVATE_X86_POLL: u64 = u64::MAX - 0x28;
+/// Carrick-internal normalized syscall number for x86_64 `select(2)`.
+///
+/// x86_64 `select(nfds, r, w, e, *timeval)` carries a `*timeval` timeout
+/// (tv_sec + tv_usec). The asm-generic/aarch64 canonical has only `pselect6`,
+/// whose timeout is a `*timespec` (tv_sec + tv_nsec) plus a sigmask — folding
+/// select in would mis-read the timeval's tv_usec as tv_nsec. This private
+/// number routes select to the pselect6 handler's select branch, which reads
+/// the timeout as a timeval and uses no sigmask.
+pub const CARRICK_PRIVATE_X86_SELECT: u64 = u64::MAX - 0x29;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
