@@ -1,33 +1,47 @@
-//! W^X / NX enforcement for guest mmap memory. On Linux, instruction fetch from
-//! a page mapped without PROT_EXEC faults SIGSEGV; a PROT_EXEC page executes.
-//! carrick maps all guest user pages EL0-executable (stage-1 UXN=0 uniformly)
-//! and never sets UXN from mmap/mprotect prot, so a non-exec page executes —
-//! diverging from Linux (no W^X). Each case runs in a forked child and the
-//! parent reports the child's exit shape (crash-class probe; deterministic).
+//! W^X / NX enforcement for guest mmap memory. On Linux, an instruction fetch
+//! from a page mapped without PROT_EXEC faults SIGSEGV; a PROT_EXEC page
+//! executes. carrick has historically mapped all guest user pages executable
+//! (aarch64: stage-1 UXN=0 uniformly; x86_64: the PTE NX bit not set from mmap
+//! prot) so a non-exec page executes — diverging from Linux (no W^X). Each case
+//! runs in a forked child and the parent reports the child's exit shape
+//! (crash-class probe; deterministic). Portable across aarch64/x86_64 (the page
+//! is filled with the arch's one-instruction `ret`).
 //!
-//! A page is filled with `ret` (0xd65f03c0) and the data/instruction caches are
-//! synced so that on the NO-NX path the fetch reliably executes a `ret` (returns
-//! cleanly) rather than faulting on stale icache — making "fetch faulted" mean
-//! exactly "NX enforced", not "cache incoherent".
+//! Known x86_64 gap (2026-06-18): `nonexec_mmap_faults` is FALSE on carrick — a
+//! fresh non-exec mmap page executes — while `mprotect_drop_exec_faults` is TRUE,
+//! i.e. carrick sets the PTE NX bit on the mprotect path but NOT from the initial
+//! mmap prot. Linux: all four true.
 
 use conformance_probes::report;
 
-const RET: u32 = 0xd65f_03c0; // aarch64 `ret`
-
+/// Fill the page with the architecture's one-instruction `ret` so a `call` to
+/// offset 0 returns cleanly on the EXEC-permitted paths, then make the deposited
+/// code fetchable. We detect execute permission purely by SIGSEGV-vs-not below,
+/// so the only requirement is that the FETCH (not the bytes' cache coherence) is
+/// what gates execution.
+#[cfg(target_arch = "aarch64")]
 unsafe fn fill_ret_and_sync(p: *mut u8, len: usize) {
-    let words = len / 4;
+    const RET: u32 = 0xd65f_03c0; // aarch64 `ret`
     let w = p as *mut u32;
-    for i in 0..words {
+    for i in 0..len / 4 {
         w.add(i).write(RET);
     }
     // Only EL0-legal barriers (dsb/isb) — NOT `dc cvau`/`ic ivau`, which require
     // SCTLR_EL1.UCI and would TRAP at EL0 on a host that doesn't enable it,
-    // confounding "fetch blocked by NX" with "cache-op trapped". We detect
-    // execute permission purely by SIGSEGV-vs-not below, so we don't depend on
-    // the `ret` bytes being i-cache-coherent — only on whether the FETCH is
-    // permitted. (A fresh never-executed page has no stale i-cache line anyway.)
+    // confounding "fetch blocked by NX" with "cache-op trapped". A fresh
+    // never-executed page has no stale i-cache line anyway.
     core::arch::asm!("dsb ish");
     core::arch::asm!("isb");
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn fill_ret_and_sync(p: *mut u8, len: usize) {
+    // x86-64 `ret` = 0xC3 (single byte): a `call` to offset 0 returns at once.
+    // x86 has a coherent unified/instruction cache for a fresh, never-executed
+    // page, so no explicit i-cache sync is needed before the first fetch.
+    for i in 0..len {
+        p.add(i).write(0xC3);
+    }
 }
 
 /// Run `prot`-mapped, optionally mprotect'd, then jump. Returns the child's
@@ -82,10 +96,7 @@ fn main() {
         // Case 1: mmap PROT_READ|WRITE (no EXEC) → jump must fault SIGSEGV (NX).
         let rw = child_exec(libc::PROT_READ | libc::PROT_WRITE, None);
         // Case 2: mmap PROT_READ|WRITE|EXEC → jump executes, child exits 0.
-        let rwx = child_exec(
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            None,
-        );
+        let rwx = child_exec(libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, None);
         // Case 3: mmap RWX, then mprotect to RW (drop EXEC) → jump faults.
         let drop_exec = child_exec(
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
