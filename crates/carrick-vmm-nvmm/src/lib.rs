@@ -1,21 +1,16 @@
-//! carrick-vmm-nvmm: the NetBSD/NVMM HAL backend (the fourth platform, after
-//! macOS/HVF, Linux/KVM, and FreeBSD/bhyve).
+//! carrick-vmm-nvmm: the NetBSD/NVMM VMM backend.
 //!
-//! Mirrors `carrick-vmm-bhyve`'s shape — a raw-hypervisor layer over the host
-//! VMM, eventually paired with a `SyscallTrap`/`GuestMemory` trap engine and
-//! driven by the shared platform-agnostic run loop + dispatcher. The
-//! hypervisor layer here FFIs to NetBSD's userspace **libnvmm** instead of
-//! KVM's ioctls or bhyve's libvmmapi.
+//! Mirrors `carrick-vmm-bhyve`'s x86_64 shape: a raw-hypervisor layer over the
+//! host VMM, backend glue for the platform runtime loop, and integration with
+//! the shared `carrick-x86` engine. The hypervisor layer here FFIs to NetBSD's
+//! userspace **libnvmm** instead of KVM's ioctls or bhyve's libvmmapi.
 //!
-//! # Status: M0 — core bring-up smoke (see
-//! `docs/superpowers/specs/2026-06-14-nvmm-backend-bringup-design.md`).
+//! # Status
 //!
-//! M0 is the foundational de-risk: open NVMM, create a machine + vCPU, map a
-//! guest RAM region (userspace HVA), program a minimal vCPU context whose RIP
-//! points at a hand-built `out %al,$0xC5` stub, run the vCPU, and assert the
-//! exit is `NVMM_VCPU_EXIT_IO` with `port == 0xC5`. This proves
-//! state-programming, the syscall doorbell, and the run loop on real nested
-//! NVMM. No ELF, no dispatcher, no trait impls yet (those are M1/M2).
+//! M0/M1-style bring-up code exists in-tree, but the live NetBSD/NVMM lane is
+//! sensitive to target-host behavior, especially nested NVMM under KVM/QEMU.
+//! Verify the exact target host before treating a green historical note as
+//! current truth.
 //!
 //! Clean-room note: NVMM is a HOST API. The bindings in `nvmm` are transcribed
 //! from the on-box headers (`/usr/include/nvmm.h`,

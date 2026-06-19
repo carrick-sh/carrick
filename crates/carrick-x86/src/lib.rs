@@ -7,17 +7,13 @@
 //! the long-mode bring-up, the snapshot/restore triple, and the run-elf service
 //! loop, all parameterized over the thin [`X86Vmm`] + [`X86Vcpu`] trait pair.
 //!
-//! ## Status: Stage 1 — scaffold only, NO callers
+//! ## Status
 //!
-//! Per the portability staging plan (design doc §5), Stage 1 defines the trait
-//! pair, the value types ([`X86Exit`]/[`MsrInstall`]/[`ForkRamStrategy`]/
-//! [`WindowPlan`]/[`X86Reg`]/[`X86Seg`]), and hoists the pure ISA byte-emitters
-//! ([`msr_init_blob`]/[`fp_stub_bytes`]) plus the [`run_fp_stub`] driving logic.
-//!
-//! NOTHING consumes this crate yet — it compiles standalone. The engine itself
-//! (`X86EngineCore<V>` implementing `SyscallTrap`/`RegAccess`/`GuestMemory`/
-//! `ThreadedEngine`) and the backend impls land in Stages 2–5; no backend is
-//! migrated here, so all four live backends keep building unchanged.
+//! This is no longer a compile-only scaffold. The shared [`X86EngineCore`] and
+//! bring-up helpers are consumed by the x86_64 KVM, bhyve, and NVMM backend
+//! lanes. Backend crates still own the raw VMM operations and host glue, but
+//! the long-mode setup, register/snapshot model, fault tables, and service loop
+//! live here so those lanes do not reimplement the same x86 mechanics by copy.
 
 pub mod bringup;
 pub mod bringup_fns;

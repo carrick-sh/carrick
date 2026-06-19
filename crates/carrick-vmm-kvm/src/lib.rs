@@ -1,13 +1,10 @@
 //! carrick-vmm-kvm: the Linux/KVM VMM backend.
 //!
-//! Proves the `carrick-hal` seam end-to-end on real hardware KVM by booting a
-//! freestanding aarch64 ELF, servicing its syscalls via the MMIO-sentinel trap
-//! vehicle, and exiting cleanly. For the MVP the syscalls (`write`/`writev`,
-//! `exit`/`exit_group`) are serviced directly in the `run_elf` module — reusing the full
-//! `carrick-runtime` dispatch on Linux is the full-backend spec's job (it needs
-//! ~200 macOS-isms ported out of the dispatch layer). All hypervisor code is
-//! `cfg(target_os = "linux")`; on any other host this crate is intentionally
-//! empty.
+//! Provides the Linux/KVM VMM backend for carrick. The aarch64 lane owns the
+//! KVM machine/vCPU wrappers and aarch64-specific bring-up/trap pieces; the
+//! x86_64 lane plugs KVM into the shared `carrick-x86` engine. All hypervisor
+//! code is `cfg(target_os = "linux")`; on any other host this crate is
+//! intentionally empty.
 //!
 //! The Linux host-OS glue that used to live here (the native epoll
 //! `EventMultiplexer` and the `host_to_linux_errno` identity hook) was split

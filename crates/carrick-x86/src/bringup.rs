@@ -34,9 +34,9 @@ const MSR_SF_MASK: u32 = 0xC000_0084;
 // GDT order: null[0x00] / kCS[0x08] / kSS[0x10] / uSS[0x18] / uCS[0x20]. The
 // RPL=3 user selectors are 0x20|3 = 0x23 (CS) and 0x18|3 = 0x1B (SS).
 
-/// User CS selector (RPL=3): GDT[4]=0x20 | 3.
+/// User CS selector (RPL=3): GDT entry 4 = 0x20 | 3.
 const USER_CS64_SEL: u64 = 0x23;
-/// User SS selector (RPL=3): GDT[3]=0x18 | 3.
+/// User SS selector (RPL=3): GDT entry 3 = 0x18 | 3.
 const USER_SS_SEL: u64 = 0x1B;
 
 /// Emit the ring-0 MSR-init blob: a WRMSR sequence for LSTAR/STAR/SFMASK

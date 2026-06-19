@@ -4,14 +4,14 @@
 //! THEORY OF OPERATION
 //!
 //! This is a compile-time table — `AARCH64_SYSCALLS`, kept sorted by number so
-//! [`lookup_aarch64`] can binary-search it — that maps each Linux/aarch64 syscall
-//! number to its name, the [`SyscallHandler`] subsystem that owns it, a
-//! [`SupportLevel`] (`BringUp`/`Planned`/`Deferred`), and an optional compat
+//! [`crate::syscall::lookup_aarch64`] can binary-search it — that maps each Linux/aarch64 syscall
+//! number to its name, the [`crate::syscall::SyscallHandler`] subsystem that owns it, a
+//! [`crate::syscall::SupportLevel`] (`BringUp`/`Planned`/`Deferred`), and an optional compat
 //! note. It is pure metadata: it does NOT dispatch anything itself. Two
 //! consumers read it. The compat reporter cross-references it to turn
 //! raw event counters into a coverage report ("of the N syscalls a real kernel
 //! exposes, which has carrick actually serviced, and at what support level").
-//! And the handler grouping ([`handler_for_aarch64`]) is the canonical
+//! And the handler grouping ([`crate::syscall::handler_for_aarch64`]) is the canonical
 //! number→subsystem partition that keeps the report's buckets aligned with how
 //! the dispatcher is actually carved up.
 //!

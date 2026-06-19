@@ -1,18 +1,18 @@
-//! The Linux AArch64 kernel-ABI wire-format boundary.
+//! The Linux kernel-ABI wire-format boundary.
 //!
 //! # The problem this crate exists to solve
 //!
-//! Carrick runs an unmodified Linux ELF binary as a native macOS process. There
-//! is no guest Linux kernel: when the guest executes an `svc #0` the trap lands
-//! in carrick's dispatcher, which must produce *exactly* the bytes the real
-//! Linux kernel would have produced. The guest's libc (glibc, musl), its
-//! language runtime (the Go scheduler, the CPython interpreter), and the guest
-//! program itself were all compiled against the Linux UAPI headers and will
-//! read carrick's output back with `#[repr(C)]`-equivalent struct definitions
-//! they baked in at *their* compile time. We do not control that read; we only
-//! control the write. So this crate's single job is to define, once and
-//! authoritatively, the Linux/aarch64 side of every value that crosses the
-//! syscall boundary — the constants the guest passes in (`O_*`, `AF_*`, `SIG*`,
+//! Carrick runs unmodified Linux ELF binaries without a guest Linux kernel:
+//! when the guest issues a syscall, the trap lands in carrick's dispatcher,
+//! which must produce *exactly* the bytes the real Linux kernel would have
+//! produced. The guest's libc (glibc, musl), its language runtime (the Go
+//! scheduler, the CPython interpreter), and the guest program itself were all
+//! compiled against the Linux UAPI headers and will read carrick's output back
+//! with `#[repr(C)]`-equivalent struct definitions they baked in at *their*
+//! compile time. We do not control that read; we only control the write. So
+//! this crate's single job is to define, once and authoritatively, the Linux ABI
+//! side of every value that crosses the syscall boundary — the constants the
+//! guest passes in (`O_*`, `AF_*`, `SIG*`,
 //! errno numbers, ioctl request codes, `CLONE_*` flags) and the structs the
 //! guest reads back (`struct stat`, `struct termios`, `siginfo_t`, the
 //! `rt_sigframe`, the io_uring rings).
@@ -2183,18 +2183,18 @@ pub const CARRICK_PRIVATE_X86_UNSUPPORTED: u64 = u64::MAX - 0x25;
 /// Carrick-internal normalized syscall number for x86_64 `utime(2)`.
 ///
 /// `utime(path, *utimbuf)` differs from canonical `utimensat(dfd, path,
-/// *timespec[2], flags)` in BOTH arg0 (path vs dirfd) AND struct layout (16-byte
+/// two `timespec` values, flags)` in BOTH arg0 (path vs dirfd) AND struct layout (16-byte
 /// `utimbuf{actime,modtime}` in whole seconds vs 32-byte `timespec[2]`). A plain
 /// `Direct(88)` would mis-dispatch the path pointer into the dirfd slot and feed
 /// the wrong struct, so it routes to a private handler that converts utimbuf ->
-/// timespec[2] (tv_nsec=0) then calls `utimensat(AT_FDCWD, path, &times, 0)`.
+/// `timespec[2]` (tv_nsec=0) then calls `utimensat(AT_FDCWD, path, &times, 0)`.
 pub const CARRICK_PRIVATE_X86_UTIME: u64 = u64::MAX - 0x26;
 /// Carrick-internal normalized syscall number for x86_64 `utimes(2)`.
 ///
 /// `utimes(path, *timeval[2])` carries microsecond timevals; the private handler
-/// converts timeval[2] -> timespec[2] (tv_nsec = tv_usec*1000) then calls
+/// converts `timeval[2]` -> `timespec[2]` (tv_nsec = tv_usec*1000) then calls
 /// `utimensat(AT_FDCWD, path, &times, flags=0)`. Out-of-range tv_usec
-/// (outside [0,999999]) -> -EINVAL; an unreadable guest pointer -> -EFAULT.
+/// (outside `0..=999999`) -> -EINVAL; an unreadable guest pointer -> -EFAULT.
 pub const CARRICK_PRIVATE_X86_UTIMES: u64 = u64::MAX - 0x27;
 /// Carrick-internal normalized syscall number for x86_64 `poll(2)`.
 ///

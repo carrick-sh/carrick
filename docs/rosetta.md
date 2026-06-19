@@ -88,7 +88,7 @@ cargo test -p carrick-cli --test conformance conformance -- --exact --nocapture
 cargo test -p carrick-cli --test conformance conformance_probes -- --nocapture
 cargo test -p carrick-runtime --test integration futex_ -- --nocapture
 cargo test -p carrick-mem --lib alias -- --nocapture
-cargo test -p carrick-hvf --lib mapping_lookup -- --nocapture
+cargo test -p carrick-vmm-hvf --lib mapping_lookup -- --nocapture
 ```
 
 ## Known limitations
