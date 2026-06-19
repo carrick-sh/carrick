@@ -4,10 +4,17 @@
 //! long-mode bring-up, but overwrite the ring-0 entry stub with a local
 //! `out %al,$0xC5; hlt` doorbell.
 //!
-//! Keep this ignored until the nested-SVM blocker is fixed. Under a hypervisor
-//! `kvm_amd`, this currently pauses QEMU with `internal-error` before
-//! NetBSD/NVMM returns from `nvmm_vcpu_run`; see the 2026-06-15 monitor-capture
-//! note under `docs/superpowers/notes/`.
+//! Box-capability gated. On stock NetBSD/NVMM under a hypervisor `kvm_amd`, the
+//! first `nvmm_vcpu_run` of a long-mode guest pauses QEMU with `internal-error`
+//! before the kernel returns (lazy GPA faults under nested SVM; see the
+//! 2026-06-15 monitor-capture note under `docs/superpowers/notes/`). A box with
+//! the eager-fault `nvmm.kmod` (e.g. `<lab-ip>`) faults every mapped GPA
+//! page up front and runs this path cleanly — verified 2026-06-19: the live
+//! `hello_runs_to_zero` acceptance test exercises the same long-mode IO-exit
+//! path to completion. So this test is gated on `CARRICK_NVMM_EAGER_FAULT=1`
+//! (opt-in, set on eager-fault boxes) rather than unconditionally `#[ignore]`d,
+//! so the capable box actually asserts the ring-0 → IO-exit baseline while
+//! stock boxes still skip it. Same env-gate pattern as `CARRICK_NVMM_FIXTURE`.
 #![cfg(target_os = "netbsd")]
 #![allow(clippy::expect_used)]
 
@@ -104,8 +111,14 @@ fn pml4_region_covers_observed_nested_fault_gpa_before_first_run() {
 }
 
 #[test]
-#[ignore = "stock NetBSD/NVMM lazy GPA faults pause QEMU under nested SVM; safe with eager-fault nvmm.kmod"]
 fn long_mode_ring0_doorbell_reaches_io_exit() {
+    // Gated on the eager-fault nvmm.kmod (opt-in via env): the first long-mode
+    // `nvmm_vcpu_run` deadlocks QEMU on stock NetBSD/NVMM under nested SVM, so
+    // only run where the box advertises the eager-fault module.
+    if std::env::var_os("CARRICK_NVMM_EAGER_FAULT").is_none() {
+        eprintln!("skip: set CARRICK_NVMM_EAGER_FAULT=1 on a box with the eager-fault nvmm.kmod");
+        return;
+    }
     let Some(path) = fixture("CARRICK_NVMM_FIXTURE") else {
         eprintln!("skip: set CARRICK_NVMM_FIXTURE to a static x86_64 ELF");
         return;
