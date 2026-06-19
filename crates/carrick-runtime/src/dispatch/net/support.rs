@@ -1099,6 +1099,17 @@ pub(super) fn autobind_unix_host_path() -> std::path::PathBuf {
     host
 }
 
+/// Durable, out-of-process reverse-translation for AF_UNIX host nodes. The
+/// in-memory `unix_path_registry` is per-process, so a peer socket bound by
+/// ANOTHER carrick process (or by this process AFTER a fork diverged) is absent
+/// from a querying process's registry, and getsockname/getpeername would leak
+/// the raw host `<hash>.sock` node path. To cover that, `bind` stamps the guest
+/// `sun_path` into this xattr on the real host node; `host_to_linux_sockaddr`
+/// falls back to reading it when the registry misses. `user.carrick.`-prefixed
+/// so it is hidden from the guest's listxattr (is_internal_carrick_xattr) and
+/// valid on Linux hosts too; fork-coherent because it lives on the on-disk node.
+const CARRICK_UNIX_PATH_XATTR: &[u8] = b"user.carrick.unix_path\0";
+
 /// Process-global host-socket-path → original-guest-`sun_path` map, populated by
 /// `unix_socket_host_path` at every bind/connect/sendto translation and consumed
 /// by `host_to_linux_sockaddr` to undo the hash. Process-global (not fork-shared):
@@ -1121,6 +1132,71 @@ fn guest_unix_path_for(host_path: &[u8]) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStringExt;
     let key = std::path::PathBuf::from(std::ffi::OsString::from_vec(host_path[..nul].to_vec()));
     unix_path_registry().lock().ok()?.get(&key).cloned()
+}
+
+/// NUL-trim a host path and turn it into a C string (`Vec<u8>` ending in NUL)
+/// for the path-based xattr syscalls. Returns `None` for an empty path.
+fn host_path_cstring(host_path: &[u8]) -> Option<Vec<u8>> {
+    let nul = host_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(host_path.len());
+    if nul == 0 {
+        return None;
+    }
+    let mut c = host_path[..nul].to_vec();
+    c.push(0);
+    Some(c)
+}
+
+/// Stamp the guest `sun_path` for a just-bound AF_UNIX host node into the
+/// `user.carrick.unix_path` xattr, so a DIFFERENT carrick process whose
+/// in-memory registry lacks this bind can still reverse-translate the node in
+/// getsockname/getpeername. The host node is created by `bind(2)`, so this must
+/// run AFTER the bind succeeds. Best-effort: on failure (or an unknown node)
+/// callers simply fall back to the per-process registry / raw host path.
+pub(super) fn persist_unix_path_xattr(host_path: &[u8]) {
+    let Some(cpath) = host_path_cstring(host_path) else {
+        return;
+    };
+    // The guest bytes were recorded in the registry by this same process when it
+    // translated the bind address (unix_socket_host_path). Only persist what we
+    // actually know; never write the raw host path as a "guest" path.
+    let Some(guest) = guest_unix_path_for(host_path) else {
+        return;
+    };
+    unsafe {
+        carrick_portable::lsetxattr(
+            cpath.as_ptr() as *const libc::c_char,
+            CARRICK_UNIX_PATH_XATTR.as_ptr() as *const libc::c_char,
+            guest.as_ptr() as *const libc::c_void,
+            guest.len(),
+            0,
+        );
+    }
+}
+
+/// The guest `sun_path` stored in the `user.carrick.unix_path` xattr on a host
+/// AF_UNIX node, for cross-process reverse-translation when the per-process
+/// registry misses (the peer was bound by another carrick process). `None` if
+/// the node has no such xattr.
+fn xattr_unix_path_for(host_path: &[u8]) -> Option<Vec<u8>> {
+    let cpath = host_path_cstring(host_path)?;
+    // A Linux sun_path is at most 108 bytes; 128 is a comfortable ceiling.
+    let mut buf = [0u8; 128];
+    let n = unsafe {
+        carrick_portable::lgetxattr(
+            cpath.as_ptr() as *const libc::c_char,
+            CARRICK_UNIX_PATH_XATTR.as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if n > 0 {
+        Some(buf[..n as usize].to_vec())
+    } else {
+        None
+    }
 }
 
 /// Translate a Linux-formatted sockaddr (read from guest memory) into the
@@ -1289,9 +1365,13 @@ pub(super) fn host_to_linux_sockaddr(
                 return out;
             }
             // Reverse the guest→host hash so the guest sees the path/abstract name
-            // IT used (not carrick's <hash>.sock host node); an unknown host node
-            // (a peer bound by another process) passes the host path through.
-            let path_out = guest_unix_path_for(&host_path[..nul]);
+            // IT used (not carrick's <hash>.sock host node). Try this process's
+            // registry first; on a miss (a peer bound by ANOTHER carrick process,
+            // so its mapping isn't in our memory) read the guest path the binder
+            // stamped into the node's user.carrick.unix_path xattr; only a node
+            // with neither passes the raw host path through.
+            let path_out = guest_unix_path_for(&host_path[..nul])
+                .or_else(|| xattr_unix_path_for(&host_path[..nul]));
             let path_bytes: &[u8] = path_out.as_deref().unwrap_or(&host_path[..nul]);
             let mut out = vec![0u8; 2 + path_bytes.len()];
             out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
@@ -1709,6 +1789,52 @@ pub(in crate::dispatch) fn parse_host_scm_rights_fds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes() {
+        use std::os::unix::ffi::OsStrExt;
+        // Simulate a peer AF_UNIX socket bound by ANOTHER carrick process: the
+        // host <hash>.sock node exists with the guest sun_path stored in the
+        // user.carrick.unix_path xattr, but THIS process's in-memory
+        // unix_path_registry has no entry for it (we never call
+        // unix_socket_host_path on this node). getsockname/getpeername must still
+        // reverse-translate to the guest path via the xattr, NOT leak the raw
+        // host node path.
+        let guest_path: &[u8] = b"/run/app/server.sock";
+        let pid = std::process::id();
+        let node = std::env::temp_dir().join(format!("carrick-xattr-unixpath-test-{pid}.sock"));
+        std::fs::write(&node, b"").expect("create temp host node");
+        let mut cpath = node.as_os_str().as_bytes().to_vec();
+        cpath.push(0);
+        let rc = unsafe {
+            carrick_portable::lsetxattr(
+                cpath.as_ptr() as *const libc::c_char,
+                CARRICK_UNIX_PATH_XATTR.as_ptr() as *const libc::c_char,
+                guest_path.as_ptr() as *const libc::c_void,
+                guest_path.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "setxattr on temp host node must succeed");
+
+        // macOS-form AF_UNIX sockaddr (sa_len, sa_family=AF_UNIX, then path).
+        let mut bytes = vec![0u8, libc::AF_UNIX as u8];
+        bytes.extend_from_slice(node.as_os_str().as_bytes());
+        bytes.push(0);
+
+        let out = host_to_linux_sockaddr(&bytes, 0, false);
+        let _ = std::fs::remove_file(&node);
+
+        assert!(
+            out.len() >= 2 + guest_path.len(),
+            "sockaddr too short: {out:?}"
+        );
+        assert_eq!(
+            &out[2..2 + guest_path.len()],
+            guest_path,
+            "must reverse-translate the host node to the guest sun_path via the xattr"
+        );
+    }
 
     #[test]
     fn scm_rights_guest_buffer_roundtrips() {
