@@ -21,7 +21,7 @@
 //! (`fs_backend::sweep_orphans`, which only reaps lock-bearing dirs) leaves it
 //! alone — it is intentionally persistent.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -209,7 +209,7 @@ fn clone_children_into(entry: &Path, scratch: &Path) -> std::io::Result<bool> {
     // (dev,ino) of the first occurrence so later siblings `link(2)` to it,
     // preserving link identity AND space. macOS `clonefile` recurses a whole
     // subtree in one syscall and needs no such bookkeeping.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let mut links: HashMap<(u64, u64), PathBuf> = HashMap::new();
     // `entry` is a cache dir built solely by our own OCI-layer extraction; each
     // child name is validated `Normal` below before being joined onto scratch.
@@ -232,11 +232,11 @@ fn clone_children_into(entry: &Path, scratch: &Path) -> std::io::Result<bool> {
         }
         let src = child.path();
         let dst = scratch.join(&name);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let replicated = replicate_tree(&src, &dst, &mut links);
         #[cfg(target_os = "macos")]
         let replicated = clonefile(&src, &dst);
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         let replicated: std::io::Result<()> =
             Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
         if replicated.is_err() {
@@ -266,7 +266,7 @@ fn clone_children_into(entry: &Path, scratch: &Path) -> std::io::Result<bool> {
 /// hardlink identity within the tree, and every `user.*` xattr (carrick stores
 /// the guest mode/uid/gid/socket state there). The extractor writes no uid/gid
 /// (single carrick uid) and no other xattr namespaces, so neither does this.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn replicate_tree(
     src: &Path,
     dst: &Path,
@@ -330,11 +330,8 @@ fn replicate_tree(
 /// when the kernel/filesystem rejects the clone (EOPNOTSUPP/EXDEV/EPERM — e.g.
 /// ext4, or a container that blocks the ioctl). Mode and xattrs are applied by
 /// the caller, so only the bytes matter here.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn reflink_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    // FICLONE = _IOW(0x94, 9, int): clone the whole src file into dst.
-    const FICLONE: libc::c_ulong = 0x4004_9409;
     let s = std::fs::File::open(src)?; // nosemgrep
     {
         let d = std::fs::OpenOptions::new()
@@ -342,17 +339,26 @@ fn reflink_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
             .create(true)
             .truncate(true)
             .open(dst)?;
-        // SAFETY: both fds are open and valid; FICLONE takes the source fd as
-        // its (by-value int) argument and only reads from it.
-        let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
-        if rc == 0 {
-            return Ok(());
+        // Linux: try an FICLONE reflink first (whole-file COW on btrfs/XFS/ZFS).
+        // FreeBSD has no FICLONE — its COW comes from copy_file_range below (ZFS
+        // block_cloning).
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            // FICLONE = _IOW(0x94, 9, int): clone the whole src file into dst.
+            const FICLONE: libc::c_ulong = 0x4004_9409;
+            // SAFETY: both fds are open and valid; FICLONE takes the source fd as
+            // its (by-value int) argument and only reads from it.
+            let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+            if rc == 0 {
+                return Ok(());
+            }
         }
         // FICLONE requires CAP_SYS_RAWIO — denied in unprivileged containers,
-        // where it returns EPERM — and is unsupported on some filesystems.
-        // copy_file_range(2) needs no capability and still performs a reflink/COW
-        // on btrfs/XFS/bcachefs and ZFS with block_cloning (an efficient in-kernel
-        // copy otherwise), so try it before falling back to a userspace byte copy.
+        // where it returns EPERM — and isn't supported on every fs. copy_file_range(2)
+        // needs no capability and still reflinks/COWs on btrfs/XFS/bcachefs and ZFS
+        // with block_cloning (Linux AND FreeBSD; an efficient in-kernel copy
+        // otherwise), so try it before falling back to a userspace byte copy.
         if copy_file_range_whole(&s, &d).is_ok() {
             return Ok(());
         }
@@ -367,9 +373,9 @@ fn reflink_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// the filesystem supports it (incl. unprivileged ZFS block_cloning, where
 /// `FICLONE` is denied) and an efficient in-kernel copy otherwise. `d` was just
 /// create/truncated, so both fds sit at offset 0; NULL offsets let the kernel
-/// advance them. (The FreeBSD seed path, which has no `FICLONE`, will reuse this
-/// once its `replicate_tree`/extattr counterpart is wired.)
-#[cfg(target_os = "linux")]
+/// advance them. Shared by the Linux and FreeBSD seed paths (FreeBSD has no
+/// `FICLONE`, so this is its sole COW primitive via ZFS block_cloning).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn copy_file_range_whole(s: &std::fs::File, d: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
     let mut remaining = s.metadata()?.len();
@@ -487,6 +493,89 @@ fn copy_user_xattrs(src: &Path, dst: &Path) {
                 val.as_ptr() as *const libc::c_void,
                 val.len(),
                 0,
+            );
+        }
+    }
+}
+
+/// FreeBSD counterpart of the Linux [`copy_user_xattrs`]: copy every
+/// USER-namespace extended attribute (carrick's `carrick.*` guest
+/// mode/uid/gid/socket state) from `src` to `dst` via the `extattr_*_link` API
+/// (operates on the link itself; never follows). FreeBSD's extattr list is
+/// length-prefixed (`[u8 len][name]…`) and the namespace is implicit, so names
+/// carry no `user.` prefix. Best-effort — individual failures are skipped.
+#[cfg(target_os = "freebsd")]
+fn copy_user_xattrs(src: &Path, dst: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(csrc) = std::ffi::CString::new(src.as_os_str().as_bytes()) else {
+        return;
+    };
+    let Ok(cdst) = std::ffi::CString::new(dst.as_os_str().as_bytes()) else {
+        return;
+    };
+    let ns = libc::EXTATTR_NAMESPACE_USER as libc::c_int;
+    // SAFETY: csrc is a valid C string; a null buffer with size 0 queries the
+    // total length of the (length-prefixed) attribute-name list.
+    let need = unsafe { libc::extattr_list_link(csrc.as_ptr(), ns, std::ptr::null_mut(), 0) };
+    if need <= 0 {
+        return; // no user attrs, or ENOTSUP/error.
+    }
+    let mut buf = vec![0u8; need as usize];
+    // SAFETY: csrc valid; buf is a writable buffer of the passed length.
+    let got = unsafe {
+        libc::extattr_list_link(
+            csrc.as_ptr(),
+            ns,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if got <= 0 {
+        return;
+    }
+    let buf = &buf[..got as usize];
+    let mut i = 0usize;
+    while i < buf.len() {
+        let nlen = buf[i] as usize; // 1-byte length prefix
+        i += 1;
+        if nlen == 0 || i + nlen > buf.len() {
+            break;
+        }
+        let name = &buf[i..i + nlen];
+        i += nlen;
+        let Ok(cname) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        // SAFETY: csrc/cname valid; null value buffer with size 0 queries length.
+        let vlen = unsafe {
+            libc::extattr_get_link(csrc.as_ptr(), ns, cname.as_ptr(), std::ptr::null_mut(), 0)
+        };
+        if vlen < 0 {
+            continue;
+        }
+        let mut val = vec![0u8; vlen as usize];
+        // SAFETY: csrc/cname valid; val is a writable buffer of the passed length.
+        let vgot = unsafe {
+            libc::extattr_get_link(
+                csrc.as_ptr(),
+                ns,
+                cname.as_ptr(),
+                val.as_mut_ptr() as *mut libc::c_void,
+                val.len(),
+            )
+        };
+        if vgot < 0 {
+            continue;
+        }
+        val.truncate(vgot as usize);
+        // SAFETY: cdst/cname valid; val is a buffer of the passed length.
+        unsafe {
+            libc::extattr_set_link(
+                cdst.as_ptr(),
+                ns,
+                cname.as_ptr(),
+                val.as_ptr() as *const libc::c_void,
+                val.len(),
             );
         }
     }
