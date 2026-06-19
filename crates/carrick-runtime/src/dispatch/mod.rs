@@ -1885,6 +1885,17 @@ impl SyscallDispatcher {
         293 => sys_rseq,
     }
 
+    /// Characterization seam for the per-module routing refactor (Task A1).
+    ///
+    /// Returns whether the (chained) normalized routing claims `number` — i.e.
+    /// whether some dispatch module owns a handler for it. This is the single
+    /// membership oracle the `routing_tests` characterization test pins against,
+    /// so the refactor that moves arms out of the central table and into each
+    /// module's `dispatch_<area>` cannot silently drop or re-route a number.
+    pub(crate) fn resolves(&self, number: u64) -> bool {
+        Self::dispatch_normalized_known(number)
+    }
+
     pub fn new() -> Self {
         Self {
             io: fs::IoState::new(),
@@ -5078,6 +5089,310 @@ fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String
     Ok(crate::pathcodec::encode_bytes(&read_guest_c_string_bytes(
         memory, address,
     )?))
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! Characterization test for the per-module syscall routing refactor
+    //! (Task A1). `ROUTED_NUMBERS` is the COMPLETE set of syscall numbers the
+    //! dispatcher routed at the start of the refactor — every arm of the
+    //! original central `normalized_dispatch!` table, with multi-number arms
+    //! expanded and the carrick-private x86 numbers included by their constant
+    //! values. The refactor moves these arms out of the central table and into
+    //! each dispatch module's own `dispatch_<area>` routing fn; chaining those
+    //! fns must keep routing IDENTICAL. `resolves(n)` must hold for every
+    //! number here at every step, and a known-unrouted number must NOT resolve.
+    use super::*;
+    use crate::linux_abi::{
+        CARRICK_PRIVATE_X86_DUP2, CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_LSTAT,
+        CARRICK_PRIVATE_X86_NEWFSTATAT, CARRICK_PRIVATE_X86_POLL, CARRICK_PRIVATE_X86_SELECT,
+        CARRICK_PRIVATE_X86_STAT,
+    };
+
+    /// Every syscall number routed by the dispatcher, enumerated from the full
+    /// original routing table (multi-number arms expanded). If the refactor
+    /// drops or re-routes any number, the membership assertion below fails.
+    const ROUTED_NUMBERS: &[u64] = &[
+        // --- fs ---
+        17,
+        23,
+        24,
+        CARRICK_PRIVATE_X86_DUP2,
+        CARRICK_PRIVATE_X86_STAT,
+        CARRICK_PRIVATE_X86_FSTAT,
+        CARRICK_PRIVATE_X86_LSTAT,
+        CARRICK_PRIVATE_X86_NEWFSTATAT,
+        25,
+        26,
+        27,
+        28,
+        29,
+        32,
+        33,
+        46,
+        47,
+        48,
+        34,
+        35,
+        36,
+        37,
+        38,
+        49,
+        50,
+        52,
+        53,
+        452,
+        54,
+        55,
+        56,
+        57,
+        59,
+        61,
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        76,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        88,
+        267,
+        84,
+        451,
+        276,
+        279,
+        285,
+        286,
+        287,
+        291,
+        436,
+        437,
+        439,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        43,
+        44,
+        45,
+        75,
+        77,
+        // --- net ---
+        19,
+        20,
+        21,
+        22,
+        CARRICK_PRIVATE_X86_POLL,
+        CARRICK_PRIVATE_X86_SELECT,
+        72,
+        73,
+        198,
+        199,
+        200,
+        201,
+        202,
+        203,
+        204,
+        205,
+        206,
+        207,
+        208,
+        209,
+        210,
+        211,
+        212,
+        242,
+        243,
+        269,
+        // --- mem ---
+        214,
+        215,
+        216,
+        222,
+        223,
+        226,
+        227,
+        228,
+        229,
+        230,
+        231,
+        232,
+        233,
+        425,
+        426,
+        427,
+        283,
+        // --- proc ---
+        30,
+        31,
+        58,
+        92,
+        95,
+        96,
+        97,
+        98,
+        99,
+        100,
+        117,
+        118,
+        119,
+        120,
+        121,
+        122,
+        123,
+        124,
+        125,
+        126,
+        127,
+        142,
+        154,
+        155,
+        156,
+        157,
+        160,
+        161,
+        162,
+        167,
+        168,
+        220,
+        221,
+        281,
+        260,
+        277,
+        275,
+        278,
+        424,
+        434,
+        93,
+        94,
+        178,
+        435,
+        293,
+        // --- signal ---
+        74,
+        129,
+        130,
+        131,
+        132,
+        133,
+        134,
+        135,
+        136,
+        137,
+        138,
+        139,
+        240,
+        // --- time ---
+        85,
+        86,
+        87,
+        101,
+        102,
+        103,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112,
+        113,
+        114,
+        115,
+        153,
+        163,
+        165,
+        169,
+        170,
+        171,
+        179,
+        261,
+        266,
+        // --- creds ---
+        90,
+        91,
+        140,
+        141,
+        143,
+        144,
+        145,
+        146,
+        147,
+        148,
+        149,
+        150,
+        158,
+        166,
+        151,
+        152,
+        159,
+        172,
+        173,
+        174,
+        175,
+        176,
+        177,
+        // --- sysv ---
+        186,
+        187,
+        188,
+        189,
+        190,
+        191,
+        192,
+        193,
+        194,
+        195,
+        196,
+        197,
+    ];
+
+    #[test]
+    fn every_routed_number_resolves() {
+        // `resolves` is independent of dispatcher instance state, but matches the
+        // brief's `&self` signature so a future per-instance routing could hook in.
+        let d = SyscallDispatcher::new();
+        for &n in ROUTED_NUMBERS {
+            assert!(
+                d.resolves(n),
+                "syscall number {n} (0x{n:x}) lost its handler — routing changed!"
+            );
+        }
+        // The full set is large; guard against accidental list truncation. This
+        // is the count of INDIVIDUAL numbers (multi-number arms like `5 | 6`
+        // expanded), which exceeds the original table's 235 arms.
+        assert_eq!(
+            ROUTED_NUMBERS.len(),
+            241,
+            "ROUTED_NUMBERS lost entries — the characterization set must stay complete"
+        );
+    }
+
+    #[test]
+    fn unrouted_number_does_not_resolve() {
+        let d = SyscallDispatcher::new();
+        // 9999 is not a Linux syscall and is not claimed by any module.
+        assert!(!d.resolves(9999), "an unclaimed number must not resolve");
+        // u64::MAX (no carrick-private constant uses it) is also unclaimed.
+        assert!(!d.resolves(u64::MAX), "u64::MAX must not resolve");
+    }
 }
 
 #[cfg(test)]
