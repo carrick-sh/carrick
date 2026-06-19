@@ -15,12 +15,10 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
-# The FreeBSD/bhyve HAL backend (the third platform, after macOS/HVF and
-# Linux/KVM). The whole crate is `#![cfg(target_os = "freebsd")]`; on any other
+# The FreeBSD/bhyve VMM backend. The whole crate is `#![cfg(target_os = "freebsd")]`; on any other
 # host the lib is empty, so the workspace still builds on macOS/Linux. It FFIs
-# to the system `libvmmapi` (linked via `#[link(name = "vmmapi")]`) and, like
-# carrick-vmm-kvm, depends only on the leaf crates (NOT carrick-runtime), so it
-# cross-compiles for aarch64-freebsd independently of the dispatch layer.
+# to the system `libvmmapi` (linked via `#[link(name = "vmmapi")]`) and depends
+# on the shared leaf crates plus x86 engine, not on carrick-runtime.
 [dependencies]
 carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }

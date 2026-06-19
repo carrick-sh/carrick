@@ -10,7 +10,7 @@
 //! events natively.
 //!
 //! On **macOS** there is no inotify, so [`InotifyState`] bridges to Darwin
-//! kqueue `EVFILT_VNODE` through the [`EventMultiplexer`](carrick_hal::event::EventMultiplexer):
+//! kqueue `EVFILT_VNODE` through the [`EventMultiplexer`]:
 //! Linux inotify is watch-descriptor based (one fd, many path watches) while
 //! kqueue is fd-based (one kevent per open fd). Each `inotify_add_watch` opens
 //! the target and registers an `EVFILT_VNODE` filter, keyed by watch descriptor
@@ -247,7 +247,7 @@ struct Inner {
 /// One inotify instance: a readiness backend plus its watch-descriptor table.
 /// Owns every watched fd and closes them on `rm_watch`/drop.
 ///
-/// On macOS the backend is a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
+/// On macOS the backend is a boxed [`EventMultiplexer`]
 /// (kqueue-backed via `EVFILT_VNODE`); the watch register/drain go through the
 /// trait. On Linux the backend is a native `inotify` fd read directly.
 pub(crate) struct InotifyState {

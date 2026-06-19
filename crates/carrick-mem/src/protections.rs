@@ -20,8 +20,9 @@
 //! outer lock and `set_no_access`/`range_no_access` both take `&self`. The HVF
 //! and KVM backends both hold an `Arc<MemoryProtections>` and clone it into each
 //! sibling; a `fork(2)` child gets an INDEPENDENT copy (the Linux COW of the
-//! whole process duplicates the underlying `Vec`, or [`Self::from_ranges`] over
-//! a [`Self::snapshot`]); `execve` starts fresh ([`Self::default`]).
+//! whole process duplicates the underlying `Vec`, or `MemoryProtections::from_ranges`
+//! over a `MemoryProtections::snapshot`); `execve` starts fresh
+//! (`MemoryProtections::default`).
 
 /// Sorted, merged, non-overlapping `[start, end)` guest-address ranges that are
 /// currently `PROT_NONE`. See the module docs for the sharing contract.

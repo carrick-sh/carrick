@@ -4,7 +4,7 @@
 //! copies (`carrick-vmm-kvm/src/{guest_setup_x86,trap_engine_x86,run_elf_x86}.rs`
 //! and bhyve's analogues): the window plan, the long-mode programming sequence,
 //! the snapshot/restore/seed triple, and the M2 run-elf service loop. Each is
-//! generic over the thin [`X86Vcpu`]/[`X86Vmm`] trait pair, so a backend that
+//! generic over the thin [`crate::X86Vcpu`]/[`crate::X86Vmm`] trait pair, so a backend that
 //! implements the pair gets all of this for free.
 //!
 //! ## Why a [`BringupLayout`]

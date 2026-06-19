@@ -3,8 +3,8 @@
 //! THEORY OF OPERATION
 //!
 //! Every carrick syscall handler reads its arguments from, and writes its
-//! results back into, *guest* memory — the AArch64 Linux process's address
-//! space — and it does so through one narrow trait, [`GuestMemory`]. This crate
+//! results back into, *guest* memory — the Linux process's address space — and
+//! it does so through one narrow trait, [`GuestMemory`]. This crate
 //! owns that trait, the syscall-argument register frame ([`Aarch64SyscallFrame`])
 //! the trap engine hands the dispatcher, and the [`MemoryError`] those accesses
 //! fail with. Nothing else. It is the seam between "how the bytes are stored"
@@ -13,10 +13,10 @@
 //! The single most important design fact here is that [`GuestMemory`] is
 //! polymorphic over TWO backends that look nothing alike:
 //!
-//!  - the real HVF-backed address space, where guest memory is a host `mmap`
-//!    region published into the VM via `hv_vm_map`, protections live in EL1
-//!    stage-1 page-table descriptors, and a bad guest pointer must surface as a
-//!    real fault; and
+//!  - the real backend-backed address space, where guest memory is host-backed
+//!    memory published to the active VMM, protections live in backend page-table
+//!    or memory-slot state, and a bad guest pointer must surface as a real
+//!    fault; and
 //!  - an in-memory `LinearMemory` used by unit tests, which is a flat byte
 //!    buffer modelling NO protections, NO page tables, and NO host mapping.
 //!

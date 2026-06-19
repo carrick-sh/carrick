@@ -1,6 +1,6 @@
 //! Backend selection for the readiness multiplexer (Part C).
 //!
-//! Hands the runtime a boxed [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
+//! Hands the runtime a boxed [`EventMultiplexer`]
 //! implementation appropriate for the host platform: kqueue-backed on macOS and
 //! FreeBSD/NetBSD (the same `carrick_host_bsd::KqueueMultiplexer`, whose `to_note`/`from_note`
 //! helpers already carry FreeBSD cfg gates), epoll-backed on Linux. The dispatch

@@ -11,7 +11,7 @@
 //! Responsibilities (all in userspace, because macOS has no namespaces):
 //! - **Orphan reparenting** (§3.6): macOS reparents an orphan to launchd, not
 //!   to the ns-init. The supervisor watches every member for exit through the
-//!   platform [`EventMultiplexer`](carrick_hal::event::EventMultiplexer)
+//!   platform [`EventMultiplexer`]
 //!   (kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS, a real pidfd on Linux); when a
 //!   parent dies it flags the surviving children `MEMBER_ORPHANED` so their
 //!   `getppid()` reports ns-pid 1.

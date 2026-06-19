@@ -100,7 +100,7 @@ pub(super) fn read_epoll_event(
     }
 }
 
-/// Translate the epoll interest mask into the [`Interest`] the multiplexer
+/// Translate the epoll interest mask into the [`carrick_hal::event::Interest`] the multiplexer
 /// registers. A mask with neither IN nor OUT still requests `read` so the
 /// always-reported EPOLLHUP/EPOLLERR edges (which ride the read filter) are
 /// observed; RDHUP/PRI also ride the read/oob filters. (Mirrors the old
@@ -219,7 +219,7 @@ pub(super) fn write_epoll_events<M: GuestMemory>(
     })
 }
 
-/// Translate one multiplexer [`PollEvent`] to Linux epoll event bits.
+/// Translate one multiplexer [`carrick_hal::event::PollEvent`] to Linux epoll event bits.
 /// Direction-sensitive (jiixyj/epoll-shim model): the multiplexer reports one
 /// readiness direction per event, so read readiness -> EPOLLIN (read EOF ->
 /// EPOLLRDHUP), write readiness -> EPOLLOUT (write EOF -> EPOLLHUP), oob ->
@@ -320,7 +320,7 @@ fn host_to_linux_af(host_family: u16) -> u16 {
 /// Address family of a HOST sockaddr held as raw bytes. The 2-byte header is
 /// the ONLY layout divergence between the hosts: macOS/BSD is `sa_len(u8)
 /// sa_family(u8)`, Linux is `sa_family(u16)`. Everything past offset 2
-/// (sin_port/sin_addr, sun_path, …) lines up on both. Decoding bytes[1] as the
+/// (sin_port/sin_addr, sun_path, …) lines up on both. Decoding byte 1 as the
 /// family on a Linux host read the high byte of the u16 — 0 for every real
 /// family — so getsockname/getpeername/accept/recvfrom reported AF_UNSPEC and
 /// libuv's `uv_guess_handle` classified a socketpair stdio fd as

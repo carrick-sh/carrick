@@ -461,7 +461,7 @@ pub trait X86Vcpu {
     /// whole-register-file read (bhyve `VM_GET_REGISTER_SET`, NVMM one
     /// `getstate`, KVM one `KVM_GET_REGS`) overrides this to satisfy the whole
     /// slice from ONE ioctl. `out` must be at least `regs.len()` long. Used on
-    /// the hot syscall-completion path ([`complete_sysret`]) to fetch
+    /// the hot syscall-completion path (`complete_sysret`) to fetch
     /// `RCX`/`R11` together.
     fn get_gprs(&self, regs: &[X86Reg], out: &mut [u64]) -> Result<(), TrapError> {
         for (slot, reg) in out.iter_mut().zip(regs) {
@@ -474,7 +474,7 @@ pub trait X86Vcpu {
     /// [`Self::set_gpr`] (one ioctl per register); a whole-register-file backend
     /// (bhyve `VM_SET_REGISTER_SET`, NVMM one `setstate`) overrides this to commit
     /// the slice in ONE ioctl. Writes are applied in order. Used on the hot
-    /// syscall-completion path ([`complete_sysret`]) to write `RAX`+`RIP`
+    /// syscall-completion path (`complete_sysret`) to write `RAX`+`RIP`
     /// together.
     fn set_gprs(&mut self, writes: &[(X86Reg, u64)]) -> Result<(), TrapError> {
         for (reg, v) in writes {
@@ -567,17 +567,17 @@ pub trait X86Vcpu {
 
     /// The full XSAVE area ([`XSAVE_LEN`]) — the legacy FXSAVE region PLUS the
     /// AVX `YMM_Hi` component — for fork/clone/execve snapshots and signal
-    /// save/restore. The FXSAVE-only [`get_fp`] drops the YMM upper halves, which
+    /// save/restore. The FXSAVE-only [`X86Vcpu::get_fp`] drops the YMM upper halves, which
     /// silently corrupts a guest's AVX state across those boundaries (Go's
     /// runtime uses AVX memmove once `CR4.OSXSAVE` is set). The DEFAULT pads
-    /// [`get_fp`]'s FXSAVE into a no-AVX XSAVE; a backend that enables AVX
+    /// [`X86Vcpu::get_fp`]'s FXSAVE into a no-AVX XSAVE; a backend that enables AVX
     /// (CR4.OSXSAVE + XCR0) MUST override this with a real XSAVE getter.
     fn get_xsave(&self) -> Result<Option<[u8; XSAVE_LEN]>, TrapError> {
         Ok(self.get_fp()?.map(fxsave_to_xsave))
     }
 
     /// Apply a full XSAVE area. The DEFAULT extracts the FXSAVE prefix and calls
-    /// [`set_fp`] (dropping AVX — correct for a backend that never enables it);
+    /// [`X86Vcpu::set_fp`] (dropping AVX — correct for a backend that never enables it);
     /// an AVX-enabled backend MUST override with a real XSAVE setter.
     fn set_xsave(&mut self, xs: &[u8; XSAVE_LEN]) -> Result<bool, TrapError> {
         let mut fx = [0u8; 512];

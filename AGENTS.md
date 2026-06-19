@@ -12,13 +12,20 @@ first, then follow the pointers.
 
 ## What Carrick is
 
-Carrick runs **unmodified Linux binaries on macOS / Apple Silicon as native
-processes**, not as VM guests. Each guest *thread* gets its own
-`Hypervisor.framework` (HVF) vCPU running the guest's own AArch64 instructions at
-EL0; every `svc #0` traps into a host-side Rust translation layer that
-re-expresses each Linux syscall as Darwin primitives. There is no guest kernel,
-no second scheduler, no separate hypervisor RAM pool. The runtime is BKL-free
-(per-subsystem locks, not a global lock).
+Carrick runs **unmodified Linux binaries as host-native processes**, with a
+hardware-virtualized vCPU per guest thread and a Rust syscall translation layer
+instead of a guest Linux kernel. The mature default path is macOS / Apple
+Silicon with `Hypervisor.framework` (HVF) running AArch64 Linux guests: every
+`svc #0` traps to the host, and carrick re-expresses Linux syscalls as Darwin
+primitives. There is no guest kernel, no second scheduler, no separate
+hypervisor RAM pool, and the runtime is BKL-free (per-subsystem locks, not a
+global lock).
+
+The portability work splits that model across host/VMM and guest-ISA axes:
+macOS/HVF, Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM, and active x86_64 guest
+bring-up through the shared `carrick-x86` engine. Treat the macOS/HVF path as
+the release-quality reference lane; treat non-macOS and x86_64 paths as active
+bring-up unless the exact target-host gate proves otherwise.
 
 **Status — experimental, not production-ready.** Be honest in code, comments,
 docs, and commit messages: syscall coverage is partial (~210 emulated, ~130
@@ -88,18 +95,20 @@ sync with `rustup update stable`.
 
 ## Repository map
 
-24-crate Cargo workspace under [`crates/`](crates/). Dependency direction:
-`cli → engine → {image, runtime} → spec`. A HAL refactor
-([`docs/hal.md`](docs/hal.md)) is splitting the runtime into platform-neutral
-cores + per-OS backends so KVM/bhyve/NVMM can join HVF — hence the crate naming
-(`carrick-vmm-hvf`, not `carrick-hvf`).
+24-crate Cargo workspace under [`crates/`](crates/) (see
+[`crates/README.md`](crates/README.md)). Dependency direction:
+`cli → engine → {image, runtime} → spec`. The HAL/platform split
+([`docs/hal.md`](docs/hal.md)) separates platform-neutral contracts from
+per-VMM and per-host implementations so KVM/bhyve/NVMM can share the runtime
+without pulling in HVF/applevisor. Use the `carrick-vmm-*` names for VMM crates
+(`carrick-vmm-hvf`, not the historical `carrick-hvf`).
 
-**VMM backends** (hypervisor impls over `carrick-hal`)
+**VMM backends** (hypervisor implementations over `carrick-hal`)
 - `carrick-vmm-hvf` — macOS Hypervisor.framework backend; the mature one (trap loop, vCPU cluster).
-- `carrick-vmm-kvm` — Linux/KVM backend (proves the HAL seam on real hardware).
-- `carrick-vmm-bhyve` — FreeBSD/bhyve backend.
-- `carrick-vmm-nvmm` — NetBSD/NVMM backend.
-- `carrick-x86` — shared x86_64 VMM-backend engine scaffold.
+- `carrick-vmm-kvm` — Linux/KVM backend (AArch64 path plus x86_64 lane).
+- `carrick-vmm-bhyve` — FreeBSD/bhyve backend (x86_64 lane on FreeBSD/amd64).
+- `carrick-vmm-nvmm` — NetBSD/NVMM backend (x86_64 lane; target-host behavior matters).
+- `carrick-x86` — shared x86_64 VMM-backend engine used by KVM/bhyve/NVMM.
 
 **Host backends** (host-primitive impls)
 - `carrick-host` — Darwin host-primitive helpers for the runtime.
@@ -109,8 +118,8 @@ cores + per-OS backends so KVM/bhyve/NVMM can join HVF — hence the crate namin
 
 **Core runtime & contracts**
 - `carrick-runtime` — the core (~41k lines): ELF loading, syscall dispatch, VFS, fs backends, `execute(&RunSpec)`.
-- `carrick-hal` — traits-only leaf crate, zero OS/hypervisor deps (hypervisor, errno, event, futex, sendfile, pty, host_info).
-- `carrick-abi` — Linux AArch64 ABI constants + wire structs with compile-time size/offset/uniqueness asserts.
+- `carrick-hal` — traits-only leaf crate, zero OS/hypervisor deps (trap, hypervisor, guest-arch, event, futex, threaded-loop contracts).
+- `carrick-abi` — Linux ABI constants + wire structs with compile-time size/offset/uniqueness asserts.
 - `carrick-mem` / `carrick-guest-mem` — guest address-space construction (page tables, vectors, trampolines, ELF layout) / shared guest-memory hub types.
 - `carrick-spec` — vocabulary nouns (`RunSpec`, `ContainerSpec`, `ImageConfig`, `Mount`, `NamespaceConfig`).
 - `carrick-image` — OCI image acquisition + content store. `carrick-engine` — lowers a docker-style request into a `RunSpec`. `carrick-cli` — the `carrick` binary.
@@ -123,12 +132,12 @@ cores + per-OS backends so KVM/bhyve/NVMM can join HVF — hence the crate namin
 **Support:** `carrick-conformance` (harness), `carrick-test-support` (integration/CLI helpers, rootfs assembly).
 
 ### Where key subsystems live
-- **Trap loop / syscall dispatch** — `crates/carrick-vmm-hvf/src/trap.rs`; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall table `crates/carrick-vmm-hvf/src/syscall.rs`.
+- **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-vmm-hvf/src/syscall.rs` and guest-arch tables under `carrick-hal`.
 - **VFS / rootfs** — `crates/carrick-runtime/src/dispatch/fs.rs`, `crates/carrick-runtime/src/vfs/` (in-memory OCI layer merge; `--fs host` cap-std backend — see [`docs/fs-host-capstd-amplification.md`](docs/fs-host-capstd-amplification.md)).
 - **Memory / paging** — `crates/carrick-mem/src/memory.rs` (stage-1 identity map, EL0 trampoline, FEAT_PAN3 workaround); mmap arena `crates/carrick-runtime/src/dispatch/mem.rs`.
 - **Signals** — `crates/carrick-runtime/src/dispatch/signal.rs` (Linux↔macOS signum translation, sigreturn trampoline).
 - **Threads / futex** — `carrick-thread`; fork barrier `crates/carrick-vmm-hvf/src/fork_quiesce.rs` (one pthread = one vCPU).
-- **epoll / sockets** — Linux epoll onto Darwin kqueue (`crates/carrick-vmm-hvf/src/darwin_kqueue.rs`); sockets `crates/carrick-runtime/src/dispatch/net.rs` (synthetic `AF_NETLINK`, AF_UNIX path-hash registry).
+- **epoll / sockets** — event backends in `carrick-host-bsd` (kqueue) and `carrick-host-linux` (epoll); sockets `crates/carrick-runtime/src/dispatch/net.rs` (synthetic `AF_NETLINK`, AF_UNIX path-hash registry).
 - **ptrace / pty** — `docs/ptrace-darwin-design.md` (Phase 1 only); pty `crates/carrick-runtime/src/pty_relay.rs` + `interactive_supervisor.rs`, `vfs/devpts.rs`.
 - **x86 / Rosetta** — `linux/amd64` images via Apple's in-guest Linux Rosetta (`docs/rosetta.md`).
 - **Event ring (debug)** — always-on lock-free fork/socket/epoll ring `crates/carrick-runtime/src/event_ring.rs`, read via `scripts/carrick_lldb.py`.

@@ -1,58 +1,101 @@
 # Carrick
 
-Carrick is a high-performance, fully concurrent Linux binary compatibility layer for macOS on Apple Silicon. Unmodified Linux processes run as native macOS processes, with syscalls trapped via `Hypervisor.framework` and translated directly to Darwin host primitives. Unlike traditional virtual machines, Carrick requires no guest Linux kernel, no separate hypervisor memory pool, and no slow snapshot-restore loops for process lifecycle management.
+Carrick is an experimental Linux binary compatibility layer. Its mature path
+runs unmodified Linux binaries on macOS / Apple Silicon as native host
+processes: each guest thread owns a hardware-virtualized vCPU, every guest
+syscall traps into Rust, and the runtime re-expresses Linux behavior with host
+kernel primitives. There is no guest Linux kernel, no second scheduler, and no
+separate VM process for each container.
 
-The name refers to a type of knot used to join two heavy ropes of different sizes.
+The same runtime is being split along two explicit axes:
+
+- **Host/VMM backends:** macOS/HVF, Linux/KVM, FreeBSD/bhyve, and NetBSD/NVMM.
+- **Guest ISAs:** AArch64 on the mature macOS/HVF path, plus active x86_64
+  bring-up through KVM, bhyve, and NVMM.
+
+The name refers to a type of knot used to join two heavy ropes of different
+sizes.
 
 > [!NOTE]
-> **Status — an ambitious work in progress, not production-ready.** Carrick already runs real, complex workloads end-to-end — `apt-get install`, `python3 -m http.server`, and the Go / Node.js / CPython conformance suites — on a BKL-free, fully multi-threaded runtime with native socket translation and interactive pseudo-terminals (`/dev/pts`). But it is **experimental**: syscall coverage is partial ([the emulation map](docs/syscalls-emulation-map.md) lists on the order of 210 syscalls emulated, ~130 still deferred, and several only partially implemented), guest behaviour is not complete, and the runtime has had **no adversarial security review** — a guest is not a hardened trust boundary, so don't run untrusted code under it. It's built for running and studying Linux binaries on macOS, not for production.
+> **Status: ambitious, experimental, not production-ready.** Carrick already
+> runs real workloads end-to-end on the macOS/HVF path, including `apt-get
+> install`, `python3 -m http.server`, and Go / Node.js / CPython conformance
+> slices. The non-macOS and x86_64 lanes are under active bring-up and are not
+> equivalent to the default macOS release path. Syscall coverage is partial
+> ([the emulation map](docs/syscalls-emulation-map.md) lists the current table),
+> guest behavior is incomplete, and the runtime has had **no adversarial security
+> review**. A guest is not a hardened trust boundary; do not run untrusted code
+> under it.
 
 ---
 
 ## Install
 
-Apple Silicon macOS only.
+The packaged install path is Apple Silicon macOS only.
 
 ```sh
 brew tap carrick-sh/carrick
 brew install --HEAD carrick
 ```
 
-carrick is built from source and ad-hoc codesigned with the
-`com.apple.security.hypervisor` entitlement during install, so it can run Linux
-guests via Hypervisor.framework. To build from source instead, see Quick Start.
+The formula builds from source and ad-hoc codesigns the `carrick` binary with
+the `com.apple.security.hypervisor` entitlement so Hypervisor.framework can run
+guests. Non-macOS backends are source builds for target hosts today.
 
 ---
 
 ## Quick Start
 
 ```sh
-just build                                  # build + codesign the release binary (required to run a guest)
-just run run ubuntu:24.04 /bin/echo hi      # docker-style: pull an image + run a command in it
+just build                                  # build + codesign the release binary
+just run run ubuntu:24.04 /bin/echo hi      # docker-style: pull an image + run it
 ./target/release/carrick run python:3.12-slim python3 -m http.server 8000
 ```
 
 > [!IMPORTANT]
-> A guest can only run from a **codesigned** binary. `cargo build` strips the
-> signature on macOS, so a bare build fails every run with `HV_DENIED`
-> (`0xfae94007`). `just build` (i.e. [`scripts/build-signed.sh`](scripts/build-signed.sh))
-> re-applies the `com.apple.security.hypervisor` entitlement after linking.
-> Use plain `cargo build`/`cargo test` only for compile-checking, never to run.
+> On macOS, a guest can only run from a **codesigned** binary. `cargo build`
+> strips the signature, so a bare build fails every run with `HV_DENIED`
+> (`0xfae94007`). `just build` uses
+> [`scripts/build-signed.sh`](scripts/build-signed.sh) to re-apply the
+> entitlement after linking. Use plain `cargo build`/`cargo test` for
+> compile-checking only, never to run a guest.
 
 ---
 
-## Implemented Now
+## What Works Today
 
-Carrick provides a robust translation layer and lifecycle supervisor covering the following features:
+Carrick's most complete path is `platform-macos`: AArch64 Linux guests running
+on macOS/Apple Silicon through `carrick-vmm-hvf`. It includes:
 
-* **ELF Loading & Address-Space Mapping:** Parses static and dynamic AArch64 Linux ELF binaries (`goblin`), layouts the memory regions, and populates the initial guest stack with `argc`, `argv`, `envp`, and target auxiliary vectors (e.g., `AT_BASE` for dynamic interpreters).
-* **VFS & Rootfs Composition:** Merges OCI container layers in-memory at runtime to provide a virtual root filesystem (supporting Whiteouts, symlinks, and opaque directories) without physical disk extraction.
-* **Fully Concurrent Dispatcher (BKL Retired):** Decodes and services guest syscalls in host Rust code. Since the Big Kernel Lock (BKL) retirement, vCPU threads run concurrently against per-subsystem thread-safe locks (`Mutex`/`RwLock` over `fs`, `creds`, `proc`, `signal`, and `mem`), avoiding global serialization.
-* **Socket Networking Subsystem:** Translates Linux socket calls (`socket`, `bind`, `connect`, `listen`, `accept`, `sendto`/`recvfrom`, `setsockopt`/`getsockopt`, `shutdown`) directly onto native Darwin sockets, and synthesizes `AF_NETLINK` sockets locally to satisfy routing table audits (like glibc's `__check_pf`).
-* **kqueue-Backed Event Multiplexing:** Maps Linux `epoll` boundaries (`epoll_create1`, `epoll_ctl`, `epoll_pwait`) onto native Darwin `kqueue` descriptors, alongside custom userspace implementations of `eventfd2` and `timerfd`.
-* **Interactive Pseudo-Terminals (`carrick run -t`):** Bridges the host terminal and guest `/dev/pts/N` using a dedicated poll-based thread multiplexing terminal inputs and PTY master events, enabling job control (Ctrl-C, Ctrl-Z) and live size resize (`SIGWINCH`) propagation.
-* **Synthetic procfs & sysfs:** Populates expected nodes like `/proc/self/maps`, `/proc/cpuinfo`, `/proc/version`, and `/sys/devices/system/cpu/...` to fulfill assertions made during Musl/Glibc and language runtime (e.g., Go, Rust) startup sequences.
-* **DTrace Loop (USDT Probes):** Wires static USDT probes at translation boundaries. Running `carrick compat-report -- <cmd>` uses these probes to collect and aggregate unhandled or partially-implemented syscalls or `/proc` paths.
+- **ELF loading and address-space setup:** static and dynamic Linux ELF loading,
+  guest stack/auxv construction, interpreter setup, page tables, trampolines,
+  and runtime memory-management updates.
+- **OCI rootfs and VFS:** image pull/cache, OCI layer composition, an in-memory
+  rootfs, and a `--fs host` cap-std backend for case-sensitive host storage.
+- **Concurrent syscall dispatch:** one host thread and one vCPU per guest
+  thread, with per-subsystem locks instead of a global Big Kernel Lock.
+- **Process and thread lifecycle:** host `fork`/`wait4` mirroring, guest threads,
+  futexes, signal delivery, exec, and synthetic `/proc` state.
+- **Networking and readiness:** BSD sockets with Linux sockaddr/option
+  translation, synthetic `AF_NETLINK`, and Linux `epoll`/`poll`/`select`
+  behavior over host event mechanisms.
+- **Interactive terminals:** `carrick run -t` bridges a host terminal to guest
+  `/dev/pts` with job-control and resize propagation.
+- **Diagnostics:** `carrick trace`, static USDT probes, `compat-report`, and the
+  always-on event ring for post-mortem debugging.
+
+The cross-platform work is source-visible and partially live:
+
+- `platform-linux` wires Linux/KVM plus `carrick-host-linux`; x86_64 local
+  conformance lanes exist for Linux hosts.
+- `platform-freebsd` wires FreeBSD/bhyve plus `carrick-host-bsd`; x86_64 bhyve
+  runtime tests and conformance plumbing exist, with target-host logistics still
+  important.
+- `platform-netbsd` wires NetBSD/NVMM plus `carrick-host-bsd`; M0/M1 bring-up is
+  blocked by known nested-NVMM host behavior unless the target host is prepared
+  accordingly.
+
+See [docs/hal.md](docs/hal.md) for the current backend architecture and status.
 
 ---
 
@@ -62,97 +105,118 @@ Start here, then follow the map:
 
 | Document | What's in it |
 | --- | --- |
-| [docs/architecture-overview.md](docs/architecture-overview.md) | The architectural deep-dive: the HVF trap boundary & CPU mode switch, the stage-1 identity mapping & `FEAT_PAN3` workaround, the BKL-free concurrency model, and the interactive `PtyRelay`. |
-| [docs/syscalls-emulation-map.md](docs/syscalls-emulation-map.md) | The supported-syscall map — categorized, with each call's emulation quality and the Darwin host mechanism backing it (`kqueue`, `os_sync_wait_on_address`, `parking_lot`, native BSD sockets, `sendfile`, …). |
-| [docs/diagnostics-and-debugging.md](docs/diagnostics-and-debugging.md) | The diagnostic toolbox: `carrick trace` (USDT + custom DTrace scripts), the always-on in-memory event ring + the `carrick_lldb.py` plugin, the `carrick debug` subcommands, and the compile-time debug-trace Cargo features. |
-| [docs/conformance-testing.md](docs/conformance-testing.md) | How to run and interpret the host, differential-probe, and language-runtime (Go/Node/CPython) suites; the local registry setup; and the **compile-time** ABI conformance checks. |
-| [docs/conformance-coverage.md](docs/conformance-coverage.md) | The active probe-gate coverage map — which carrick-owned invariant each probe pins down. |
-| [docs/archive/](docs/archive/) | A few longer-form design-rationale notes still referenced from code comments (crate decomposition, the vDSO getrandom path, the multithreaded-fork quiesce, the epoll↔kqueue mapping). |
+| [docs/architecture-overview.md](docs/architecture-overview.md) | The mature macOS/HVF architecture: trap boundary, stage-1 paging, BKL-free concurrency, process model, and PTY handling. |
+| [docs/hal.md](docs/hal.md) | Current platform split: HAL traits, host-primitive crates, VMM backend crates, x86_64 engine scaffold, and build features. |
+| [crates/README.md](crates/README.md) | Workspace crate map grouped by role. |
+| [docs/syscalls-emulation-map.md](docs/syscalls-emulation-map.md) | Supported-syscall map and the host mechanism backing each category. |
+| [docs/conformance-testing.md](docs/conformance-testing.md) | How to run and interpret host tests, differential probes, language suites, oracle cache, and local backend lanes. |
+| [docs/conformance-coverage.md](docs/conformance-coverage.md) | Active probe-gate coverage: which carrick-owned invariant each probe pins down. |
+| [docs/diagnostics-and-debugging.md](docs/diagnostics-and-debugging.md) | `carrick trace`, event ring, lldb helpers, debug commands, and runtime diagnostic env vars. |
+| [docs/superpowers/2026-06-15-portability-session-handoff.md](docs/superpowers/2026-06-15-portability-session-handoff.md) | Recent portability handoff notes. Treat as a verification map, not ground truth. |
+| [docs/archive/](docs/archive/) | Older design-rationale notes still referenced from code comments. |
 
-For the per-crate and per-subsystem **Big Theory Statements** (the theory-of-operation `rustdoc`), build the API docs:
+For per-crate and per-subsystem theory statements, build the private API docs:
 
 ```sh
 cargo doc --workspace --no-deps --document-private-items --open
 ```
 
-`--document-private-items` is intentional — carrick is an internal workspace, so most of its substance (and most of its theory statements) live on private items. A CI gate keeps this rustdoc warning-free.
+`--document-private-items` is intentional. Carrick is an internal workspace, so
+most of the theory statements live on private modules and types.
 
 ---
 
 ## Build Workflows
 
-A [`justfile`](justfile) wraps the common workflows (`just --list` to see them all):
+The [`justfile`](justfile) is the source of truth:
 
 ```sh
-just build          # build + codesign the release binary (the only runnable build)
+just build          # macOS release build + codesign; required before running guests
 just run run ubuntu:24.04 /bin/echo hi
-just clippy         # the no-panic lint gate
-just test           # host unit/integration tests (no HVF/Docker needed)
-just conformance    # differential suite vs Docker
+just check          # unsigned cargo build; compile-check only on macOS
+just clippy         # workspace lint gate
+just test           # host lib tests, no HVF/Docker
+just ci             # fmt-check, clippy, check, doc, test, integration tests
+just conformance    # differential suites vs Docker
+just matrix         # re-render docs/support-matrix.md
 ```
 
-See [docs/conformance-testing.md](docs/conformance-testing.md) for the full testing
-story (host tests, the differential probe gate, the language-runtime suites, and the
-compile-time ABI checks).
+Non-macOS target builds select exactly one platform feature and avoid the
+default macOS/HVF dependency closure:
+
+```sh
+cargo build -p carrick-cli --no-default-features --features platform-linux
+cargo build -p carrick-cli --no-default-features --features platform-freebsd
+cargo build -p carrick-cli --no-default-features --features platform-netbsd
+```
+
+See [docs/conformance-testing.md](docs/conformance-testing.md) for the full
+runtime testing story and backend lane requirements.
 
 ### Build performance
 
-`carrick-runtime` is a single large crate (~41k lines), and the workspace links
-27 integration-test binaries plus the cli, each statically linking its rlib.
-With macOS's default `ld64`, an incremental rebuild after a one-line runtime
-edit spends ~37s of its ~57s wall time in the linker.
+`carrick-runtime` remains a large crate, and many integration-test binaries link
+it. On macOS the default Apple `ld64` linker preserves the USDT/DTrace section
+that `carrick trace` needs.
 
 > [!WARNING]
-> Do **not** switch the linker to LLVM `lld` globally. `lld`'s Mach-O port
-> drops the `__DATA,__dof_carrick` section that the `usdt` crate's
-> `register_probes()` reads, so `carrick trace`'s USDT probes silently stop
-> firing (the provider registers empty; `dtrace -l` shows nothing). `ld64`
-> preserves the section. A faster linker can be re-introduced only if it keeps
-> `__dof_carrick` — verify with `otool -l target/release/carrick | grep dof`
-> and confirm `carrick trace` still emits syscall events.
-
-The remaining incremental cost is rustc recompiling the monolithic runtime
-crate; that is inherent to keeping the runtime as one crate (its
-dispatch/memory/trap internals are too coupled to split cheaply).
+> Do **not** switch the linker to LLVM `lld` globally. `lld`'s Mach-O port drops
+> the `__DATA,__dof_carrick` section that the `usdt` crate's `register_probes()`
+> reads, so `carrick trace` silently stops firing events. Keep Apple `ld64`.
+> Verify with `otool -l target/release/carrick | grep dof`.
 
 ### No-panic gate
 
-The supervisor must never crash on guest input, so `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!` are denied crate-wide via `[lints.clippy]` in `Cargo.toml` (test code is exempt via `clippy.toml`). A handful of audited, provably-infallible sites carry a targeted `#[allow(...)]` with an `// INVARIANT:` comment. Run the gate with:
+The supervisor must not crash on guest input. The workspace denies
+`unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!` in non-test code through
+`[workspace.lints.clippy]` in [Cargo.toml](Cargo.toml); tests are exempt via
+[clippy.toml](clippy.toml). Run the gate with:
 
 ```sh
-cargo clippy --all-targets
+just clippy
 ```
 
-This exits non-zero on any *new* unguarded panic/unwrap. (Do **not** add `-D warnings`: that promotes unrelated pre-existing style lints to errors; the `Cargo.toml` deny levels are what enforce the no-panic gate.) Structural ABI invariants are enforced separately, at **compile time** — see the `const _: () = assert!(…)` / `assert_layout!` blocks in `crates/carrick-abi/src/lib.rs` and [docs/conformance-testing.md](docs/conformance-testing.md).
+Structural ABI invariants are enforced at compile time in
+[`crates/carrick-abi`](crates/carrick-abi/src/lib.rs) and the syscall metadata
+tables. See [docs/conformance-testing.md](docs/conformance-testing.md).
 
 ---
 
 ## Directory Map
 
-Carrick is a Cargo workspace:
+Carrick is a 24-crate Cargo workspace under [`crates/`](crates/). The high-level
+dependency direction is:
 
-| Crate | Responsibility |
-| --- | --- |
-| `carrick-spec` | Pure vocabulary types (`RunSpec`, `ContainerSpec`, `ImageConfig`, `Mount`, `NamespaceConfig`) shared across layers. |
-| `carrick-abi` | Linux AArch64 ABI constants and wire-format structs, with their compile-time size/offset/uniqueness assertions. |
-| `carrick-image` | OCI image references, pull/store, image-config parsing, layer + config resolution. |
-| `carrick-runtime` | The HVF runtime: ELF loading, syscall dispatch, VFS, fs backends, and the `execute(&RunSpec)` seam. |
-| `carrick-engine` | The container layer: docker `run` merge semantics, lowering a `CliRunRequest` into a `RunSpec`. |
-| `carrick-cli` | The `carrick` binary (docker-compatible `run` + diagnostic subcommands). |
+```text
+carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
+```
 
-The dependency direction is `cli → engine → {image, runtime} → spec`; `runtime` and `image` never depend on each other or on `engine`.
+The runtime also depends on platform-selected VMM and host crates:
+
+```text
+platform-macos   -> carrick-vmm-hvf   + carrick-host-bsd + carrick-host
+platform-linux   -> carrick-vmm-kvm   + carrick-host-linux
+platform-freebsd -> carrick-vmm-bhyve + carrick-host-bsd
+platform-netbsd  -> carrick-vmm-nvmm  + carrick-host-bsd
+```
+
+The x86_64 VMM backends share `carrick-x86`; platform-neutral state lives in
+`carrick-hal`, `carrick-thread`, `carrick-signal-core`, `carrick-timer-core`,
+`carrick-guest-mem`, and `carrick-observability`.
 
 ```
 .
-├── crates/            # the Cargo workspace (see table above)
-├── docs/              # architecture, syscall map, diagnostics, conformance (+ archive/)
-├── conformance-probes/# differential carrick-vs-Linux probe binaries
-├── scripts/           # build-signed.sh, carrick_lldb.py, *.d DTrace scripts, suite drivers
-└── justfile           # common workflows
+├── crates/             # Cargo workspace; see crates/README.md
+├── docs/               # architecture, HAL, syscall map, diagnostics, conformance
+├── conformance-probes/ # differential carrick-vs-Linux probe binaries
+├── scripts/            # build, tracing, conformance, target-host helpers
+└── justfile            # common workflows
 ```
 
 ---
 
 ## License Policy
 
-The crate is dual licensed as `Apache-2.0 OR MIT`. Dependencies are selected from permissive Rust ecosystem crates. `deny.toml` records the allowed dependency licenses for `cargo-deny`; the current resolved dependency graph uses permissive licenses such as MIT, Apache-2.0, BSD, ISC, Unicode-3.0, Zlib, Unlicense, 0BSD, BSL-1.0, and CDLA-Permissive-2.0.
+The crate is dual licensed as `Apache-2.0 OR MIT`. Dependencies are selected
+from permissive Rust ecosystem crates. `deny.toml` records the allowed
+dependency licenses.

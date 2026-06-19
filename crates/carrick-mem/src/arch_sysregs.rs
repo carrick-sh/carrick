@@ -12,7 +12,7 @@
 //!
 //! **What is NOT shared (per-backend glue):** PSTATE/PAN handling. Apple HVF
 //! starts vCPUs with PSTATE.PAN=1 (FEAT_PAN3 turns any EL1 fetch from an
-//! AP[1]=1 page into a permission fault), whereas KVM clears PAN so the EL1
+//! `AP[1]=1` page into a permission fault), whereas KVM clears PAN so the EL1
 //! sentinel store reaches MMIO. SCTLR_EL1.SPAN (bit 23) is the register face of
 //! that divergence — see [`SCTLR_EL1_BOOTSTRAP`] — so it stays in each backend.
 

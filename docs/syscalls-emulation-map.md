@@ -1,14 +1,16 @@
 # carrick syscall emulation map
 
-Carrick traps each guest `svc #0` at EL1, decodes `x8`/`x0..x5`, and dispatches
-to a Rust handler that re-expresses the Linux syscall in terms of Darwin host
-primitives — there is no guest Linux kernel. This document enumerates which of
-the aarch64 generic syscalls are emulated, at what fidelity, and what host
-mechanism backs each category.
+On the mature macOS/HVF path, Carrick traps each guest `svc #0` at EL1, decodes
+`x8`/`x0..x5`, and dispatches to a Rust handler that re-expresses the Linux
+syscall in terms of host primitives. There is no guest Linux kernel. This
+document enumerates which Linux syscalls are emulated, at what fidelity, and
+what host mechanism backs each category. The syscall numbers below are the
+AArch64 generic table; x86_64 backends remap their guest ABI into the same
+runtime handler model.
 
 The authority for *which* numbers exist and their support level is the static
 table `AARCH64_SYSCALLS` in
-[`crates/carrick-hvf/src/syscall.rs`](../crates/carrick-hvf/src/syscall.rs) —
+[`crates/carrick-vmm-hvf/src/syscall.rs`](../crates/carrick-vmm-hvf/src/syscall.rs) —
 every assigned aarch64 number `0..=462` is listed (gaps `244..=259`,
 `295..=402`, `415` are unassigned on aarch64 and intentionally absent), so
 `lookup_aarch64()` can name *any* syscall a guest issues. The table is the input
@@ -26,7 +28,7 @@ Each row carries a `SupportLevel`, which maps to the **Quality** column below:
 
 **~210 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
 the remaining 127 table rows are `Deferred`. Counts are from the table itself
-(`rg 'SupportLevel::BringUp' crates/carrick-hvf/src/syscall.rs | wc -l`).
+(`rg 'SupportLevel::BringUp' crates/carrick-vmm-hvf/src/syscall.rs | wc -l`).
 
 > [!NOTE]
 > "Deferred → ENOSYS" is deliberate and load-bearing: glibc/musl and most
@@ -35,22 +37,24 @@ the remaining 127 table rows are `Deferred`. Counts are from the table itself
 > trap) is what lets `userfaultfd`, `io_uring_register`, `landlock_*`, the
 > `*_time64` variants, etc. degrade gracefully.
 
-## Darwin backing at a glance
+## Host backing at a glance
 
 Handlers are grouped by `handler_for_aarch64()` into the `SyscallHandler`
 subsystems, each dispatched through a narrow borrow of one subsystem lock on the
 BKL-free `SyscallDispatcher` (`crates/carrick-runtime/src/dispatch/mod.rs:929` —
 `io: IoState`, `mem: Mutex<MemState>`, `proc: Mutex<ProcState>`,
 `creds: Mutex<CredState>`, `signal: Mutex<SignalState>`, `sysv: Mutex<…>`). The
-host mechanism per category:
+host mechanism per category. Most rows describe the macOS/HVF implementation;
+Linux/FreeBSD/NetBSD host backends use the corresponding `carrick-host-*` and
+`carrick-vmm-*` primitives where those lanes are wired.
 
-| Category | Darwin backing |
+| Category | Host backing |
 |---|---|
 | File & directory I/O | Native host fds via the VFS mount table; per-fd `OpenDescription` behind an `RwLock`; `sendfile(2)`, `copy_file_range`→host copy, FIFOs via `mkfifoat` + non-blocking `HostPipe`. |
 | Memory | `hv_vm_map` of a per-process aperture + a bump arena (`mmap_next`); `mprotect`/`munmap` re-permission/unmap; `brk` tracks a guest heap end. |
 | Process & thread | `libc::fork` for `fork`/`clone(SIGCHLD)`; a thread-flag `clone` spawns a native `pthread` running a **fresh per-thread HVF vCPU** over the shared address space; `wait4`/`waitid` over host `waitpid` + a kqueue `EVFILT_PROC` park. |
 | Scheduling / futex | PRIVATE futex → in-process `parking_lot_core` park/unpark; SHARED (cross-process, `MAP_SHARED`) futex → `os_sync_wait_on_address` (the public macOS 14.4+ physical-page-keyed primitive, successor to the private `__ulock`). |
-| Signals | Real host signals + a Linux↔macOS signum translation table (`SIGNUM_XLATE` in `crates/carrick-hvf/src/host_signal.rs:47`); guest handlers entered by building a Linux sigframe, returned via the `rt_sigreturn` trampoline. |
+| Signals | Real host signals + Linux↔host signum translation (`carrick-vmm-hvf` for macOS; BSD-family tables in `carrick-host-bsd`); guest handlers entered by building a Linux sigframe, returned via the `rt_sigreturn` trampoline. |
 | Time & timers | Darwin clocks (`clock_gettime_nsec_np`, `gettimeofday`); a guest vDSO `vvar` fast page seeds `__kernel_clock_gettime`; `timerfd`/`setitimer` ride a kqueue `EVFILT_TIMER`. |
 | Networking & sockets | Native BSD sockets, with AF/sockaddr translation in `crates/carrick-abi` + `dispatch/net`; `AF_NETLINK` is synthesized locally (no host socket). |
 | IPC | `eventfd2` userspace counter + epoll-shim wake; SysV shm/sem/msg backed by host files under `/tmp/carrick-shm`, host POSIX sems, host msg queues. |
@@ -100,9 +104,10 @@ guest.
 
 ## Memory
 
-A per-process guest aperture is `hv_vm_map`'d once at boot; `mmap` carves
-sub-ranges from a bump arena (`mmap_next`), with lazy zero-fill of pristine
-pages (`mmap_dirty_high` guards the munmap-lowers-the-cursor reuse hazard).
+A per-process guest aperture is mapped once at boot (`hv_vm_map` on the HVF
+path; backend-specific memory registration elsewhere); `mmap` carves sub-ranges
+from a bump arena (`mmap_next`), with lazy zero-fill of pristine pages
+(`mmap_dirty_high` guards the munmap-lowers-the-cursor reuse hazard).
 
 | Syscall(s) | nr | Quality | Darwin backing | Notes |
 |---|---|---|---|---|
@@ -120,8 +125,8 @@ pages (`mmap_dirty_high` guards the munmap-lowers-the-cursor reuse hazard).
 ## Process & thread lifecycle
 
 `fork` and `clone(SIGCHLD)` are `libc::fork`; a thread-creating `clone` spawns a
-native `pthread` that brings up its **own** HVF vCPU over the shared guest
-address space. The process tree is mirrored on the macOS host so PID/PPID,
+native thread that brings up its **own** backend vCPU over the shared guest
+address space. The process tree is mirrored on the host so PID/PPID,
 reparent-to-init, and `wait4`/`waitid` status all match Linux semantics.
 
 | Syscall(s) | nr | Quality | Darwin backing | Notes |
@@ -168,11 +173,10 @@ PRIVATE/anonymous futexes park in-process via `parking_lot_core`
 
 ## Signals
 
-Guest signal handling rides real host signals. A Linux↔macOS signum translation
-table (`SIGNUM_XLATE`, `crates/carrick-hvf/src/host_signal.rs:47`) maps numbers
-in both directions; on delivery carrick builds a Linux sigframe on the guest
-(alt) stack and the handler returns through the `rt_sigreturn` trampoline
-(glibc-aarch64 leaves `sa_restorer=0`, so carrick supplies it).
+Guest signal handling rides real host signals. Linux↔host signum translation
+maps numbers in both directions; on delivery carrick builds a Linux sigframe on
+the guest (alt) stack and the handler returns through the `rt_sigreturn`
+trampoline (glibc-aarch64 leaves `sa_restorer=0`, so carrick supplies it).
 
 | Syscall(s) | nr | Quality | Darwin backing | Notes |
 |---|---|---|---|---|
@@ -288,9 +292,9 @@ remaining unassigned/reserved numbers.
 - To regenerate the BringUp/Planned/Deferred split from source:
 
   ```sh
-  rg 'SupportLevel::BringUp'  crates/carrick-hvf/src/syscall.rs | wc -l
-  rg 'SupportLevel::Planned'  crates/carrick-hvf/src/syscall.rs
-  rg 'SupportLevel::Deferred' crates/carrick-hvf/src/syscall.rs | wc -l
+  rg 'SupportLevel::BringUp'  crates/carrick-vmm-hvf/src/syscall.rs | wc -l
+  rg 'SupportLevel::Planned'  crates/carrick-vmm-hvf/src/syscall.rs
+  rg 'SupportLevel::Deferred' crates/carrick-vmm-hvf/src/syscall.rs | wc -l
   ```
 
 - To see what a *specific workload* actually exercises (and which calls fell
@@ -312,8 +316,8 @@ remaining unassigned/reserved numbers.
 
 ## See also
 
-- [../README.md](../README.md) — quickstart, the HVF trap deep-dive, and the
-  crate layout.
+- [../README.md](../README.md) — quickstart, platform status, and the crate
+  layout.
 - [architecture-overview.md](architecture-overview.md) — the `svc`→`hvc` trap
   path, stage-1 identity paging, the BKL-free dispatcher, and per-thread vCPUs.
 - [conformance-coverage.md](conformance-coverage.md) — the owned-probe gate:
