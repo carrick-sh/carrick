@@ -605,7 +605,14 @@ impl SyscallDispatcher {
             };
             let rusage = match who {
                 LINUX_RUSAGE_THREAD => {
-                    let (user_us, system_us) = crate::host_proc::self_thread_cpu_us().unwrap_or((0, 0));
+                    // Per-thread guest CPU: the guest's getrusage traps out and runs
+                    // this dispatch ON its own vCPU thread, so guest_cpu's per-thread
+                    // slot IS this thread's user CPU. Guest cycles (HVF/KVM/bhyve)
+                    // don't accrue to the host thread's rusage, so self_thread_cpu_us
+                    // is only carrick-side overhead — take the larger.
+                    let (host_user, system_us) =
+                        crate::host_proc::self_thread_cpu_us().unwrap_or((0, 0));
+                    let user_us = crate::guest_cpu::this_thread_us().max(host_user);
                     rusage_from(user_us, system_us, host.maxrss_bytes, host.majflt)
                 }
                 LINUX_RUSAGE_CHILDREN => rusage_from(
