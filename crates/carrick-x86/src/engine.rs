@@ -321,6 +321,16 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             let addr = address + off as u64;
             let run = host_run_len(&self.vm, addr, length - off);
             if run == 0 {
+                // A reserved-but-uncommitted page (a lazily-zeroed anonymous
+                // mmap/brk page the guest never touched — e.g. a calloc/
+                // alloc_zeroed buffer): the kernel reads it as zeros, so skip it
+                // (`out` is already zero-filled) instead of faulting. Only a VA
+                // that is NOT a reservation is a genuine EFAULT.
+                if self.vm.is_guest_reserved(addr) {
+                    let page_rem = (0x1000 - (addr as usize & 0xfff)).min(length - off);
+                    off += page_rem;
+                    continue;
+                }
                 trace_x86_efault("read", addr, length - off);
                 return Err(MemoryError::OutOfBounds { address, length });
             }

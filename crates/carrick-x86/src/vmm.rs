@@ -248,6 +248,19 @@ pub trait X86Vmm: Sized {
         self.host_ptr(gpa, len)
     }
 
+    /// Whether `va` lies in a guest memory RESERVATION that is not yet committed
+    /// (a lazily-backed `mmap`/`brk` page the guest has never touched). On a
+    /// demand-paged backend (bhyve), such a page has no `host_ptr` until first
+    /// access, but a READ of it must yield zeros — the kernel's lazy zero-fill
+    /// for anonymous memory — NOT EFAULT (e.g. `write(fd, calloc'd buf, n)`,
+    /// where glibc/Rust `alloc_zeroed` returns untouched `MAP_ANONYMOUS` pages).
+    /// Backends whose host mmap is itself lazily backed (KVM's `MAP_NORESERVE`)
+    /// never hit this — a `None` `host_ptr` there is a genuine fault — so the
+    /// default is `false`.
+    fn is_guest_reserved(&self, _va: u64) -> bool {
+        false
+    }
+
     /// Change the guest-visible protection for a VA range. Backends with real
     /// page tables override this; simple bring-up backends can keep the default.
     fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
