@@ -22,6 +22,13 @@ This page is the architectural deep-dive. For the syscall-by-syscall translation
 [syscalls-emulation-map.md](syscalls-emulation-map.md); for how to observe any of the
 machinery below at runtime see [diagnostics-and-debugging.md](diagnostics-and-debugging.md).
 
+> [!NOTE]
+> This document describes the mature macOS/HVF AArch64 execution path. The
+> platform split for Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM, and the shared
+> x86_64 engine is covered in [hal.md](hal.md). Those backends reuse the same
+> runtime contract but differ in their raw VMM entry, register, memory, and host
+> primitive mechanics.
+
 ---
 
 ## 1. The HVF Trap Boundary & CPU Mode Switch
@@ -56,7 +63,7 @@ execution and the syscall trap work; it never emulates instructions on the hot p
    A direct EL0 `svc` surfaces as `EC=0x15` (`AARCH64_SVC_EXCEPTION_CLASS`); the EL1 vector's
    `hvc` re-trap surfaces as `EC=0x16` (`AARCH64_HVC_EXCEPTION_CLASS`), in which case carrick
    reads `ESR_EL1` to confirm an underlying SVC and otherwise treats it as a fault
-   (`run_until_syscall`, `crates/carrick-hvf/src/trap.rs:1956`). On a confirmed syscall it
+   (`run_until_syscall`, `crates/carrick-vmm-hvf/src/trap.rs:1956`). On a confirmed syscall it
    snapshots `x0..x5` and `x8` into an `Aarch64SyscallFrame` (`trap.rs:2068`) — `x8` is the
    syscall number, `x0..x5` the six arguments — dispatches to the matching Rust handler, and
    writes the return value back into `x0` (`complete_syscall`, `trap.rs:994`) before resuming
@@ -170,7 +177,7 @@ concurrently, with no global serialization point.
 Each guest thread maps to a native macOS `pthread`, and each pthread builds and owns its **own
 HVF vCPU** for its whole lifetime. When the guest issues a thread-creating `clone`/`clone3`,
 the runtime spawns a `guest-tid-N` thread (`crates/carrick-runtime/src/runtime.rs:1768`) which
-calls `HvfTrapEngine::from_thread_spec` (`crates/carrick-hvf/src/trap.rs:3496`) to create a
+calls `HvfTrapEngine::from_thread_spec` (`crates/carrick-vmm-hvf/src/trap.rs:3496`) to create a
 fresh vCPU **in the same process VM**. `hv_vm_map` is VM-global on HVF, so the new vCPU
 already sees every region the parent mapped — all sibling vCPUs translate the *same* guest
 address space through the *same* page tables. The new vCPU is seeded at the EL0 trampoline
@@ -218,7 +225,7 @@ across guest execution.
 ### Where the threads *do* synchronize
 
 Two operations are genuinely process-global and use explicit stop-the-world barriers rather
-than the per-subsystem locks (`crates/carrick-hvf/src/fork_quiesce.rs`):
+than the per-subsystem locks (`crates/carrick-vmm-hvf/src/fork_quiesce.rs`):
 
 * **`fork(2)`** must snapshot a coherent address space. The forking thread raises a quiesce
   flag and kicks every sibling vCPU out of `hv_vcpu_run`; each sibling parks at the lock-safe

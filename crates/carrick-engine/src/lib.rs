@@ -3,7 +3,7 @@
 //!
 //! # Theory of operation
 //!
-//! Three crates sit between the CLI and the HVF runtime, each owning one
+//! Three crates sit between the CLI and the platform-selected runtime, each owning one
 //! transform. `carrick-image` answers *what bytes make up this image*
 //! (ordered layer blobs + the OCI config). `carrick-runtime` answers *how do I
 //! run this exact process* (it consumes a fully resolved [`RunSpec`] and knows

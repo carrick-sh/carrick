@@ -602,7 +602,7 @@ const CLONE_NOFOLLOW: u32 = 0x0001;
 
 /// macOS: COW-clone the whole subtree `src` into `dst` in one `clonefile(2)`
 /// syscall (APFS). The single-syscall recursive clone is strictly faster than a
-/// per-file walk, so macOS keeps using it; Linux (no APFS) uses [`replicate_tree`]
+/// per-file walk, so macOS keeps using it; Linux (no APFS) uses `replicate_tree`
 /// (FICLONE reflink, else a fast metadata-preserving copy) instead.
 #[cfg(target_os = "macos")]
 fn clonefile(src: &Path, dst: &Path) -> std::io::Result<()> {

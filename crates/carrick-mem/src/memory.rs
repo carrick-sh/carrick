@@ -688,7 +688,7 @@ impl AddressSpace {
     /// Load a guest ELF image from `path`, accepting only the given `machine`
     /// type (`EM_AARCH64 = 183`, `EM_X86_64 = 62` per elf(5)/psABI §4.1).
     /// The bhyve x86_64 backend calls this with `X8664GuestArch::elf_machine()`
-    /// (= 62). All existing callers continue to use [`load_elf`] which
+    /// (= 62). All existing callers continue to use [`AddressSpace::load_elf`] which
     /// delegates here with `EM_AARCH64` — the aarch64 path is byte-identical.
     pub fn load_elf_for(path: impl AsRef<Path>, machine: u16) -> Result<Self, AddressSpaceError> {
         let path = path.as_ref();
@@ -718,11 +718,11 @@ impl AddressSpace {
         Self::load_elf_bytes_with_reader_for(file, read_interp, EM_AARCH64)
     }
 
-    /// Like [`load_elf_bytes_with_reader`] but accepts only the given `machine`
+    /// Like [`AddressSpace::load_elf_bytes_with_reader`] but accepts only the given `machine`
     /// type (`EM_X86_64 = 62`, `EM_AARCH64 = 183` per elf(5)/psABI §4.1) — the
     /// execve image builder on the x86_64 lanes (KVM-x86 / bhyve) passes
     /// `X8664GuestArch::elf_machine()` so an x86_64 ELF is not rejected as an
-    /// aarch64-machine mismatch. [`load_elf_bytes_with_reader`] delegates here
+    /// aarch64-machine mismatch. [`AddressSpace::load_elf_bytes_with_reader`] delegates here
     /// with `EM_AARCH64`, preserving byte-identical behaviour for the aarch64
     /// lane.
     pub fn load_elf_bytes_with_reader_for(

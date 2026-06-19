@@ -2,7 +2,7 @@
 //!
 //! Holds the Linux-specific, VMM-agnostic host glue: the native epoll
 //! [`EventMultiplexer`](carrick_hal::event::EventMultiplexer) implementation
-//! ([`EpollMultiplexer`], the Linux counterpart of carrick-host-bsd's
+//! (`EpollMultiplexer`, the Linux counterpart of carrick-host-bsd's
 //! `KqueueMultiplexer`) and the Linux `host_to_linux_errno` identity hook.
 //!
 //! All code is `cfg(target_os = "linux")`; on any other host this crate is

@@ -129,7 +129,7 @@ mirrors the guest tree*. Guest pid is currently the **host pid** (`std::process:
   guest descendants; `pid_info(pid)` reads identity/state from the host kernel
   (`proc_pidinfo`). `set_root_guest_pid()` records the root guest's host pid at startup
   (`runtime.rs:1937`, `vfs/proc.rs:964`).
-- `crates/carrick-hvf/src/thread.rs`: `ThreadId = i32`; `ThreadRegistry.next_tid` is an
+- `crates/carrick-thread/src/thread.rs`: `ThreadId = i32`; `ThreadRegistry.next_tid` is an
   `AtomicI32` seeded at `main_tid + 1` and bumped per thread (`register_child`). tids are
   per-process, *above* the main tid (which equals the host pid). Threads are an
   in-process concern; this registry does NOT cross fork.
@@ -172,7 +172,7 @@ which *does* span the namespace flag bits (so clone3 with a NEW* flag is accepte
 but silently ignored — it forks an ordinary child). Legacy `clone` (`proc.rs:1431`) only
 inspects the thread mask. `unshare(2)` (nr 97) and `setns(2)` (nr 268) are **not in the
 dispatch table** (`dispatch/mod.rs`) and currently return `ENOSYS` (catalogued
-`Deferred` in `carrick-hvf/src/syscall.rs:244,414`).
+`Deferred` in `carrick-vmm-hvf/src/syscall.rs:244,414`).
 
 Namespace-flag constants we will add (man-page `clone(2)` values, NOT from headers):
 `CLONE_NEWNS=0x00020000`, `CLONE_NEWCGROUP=0x02000000`, `CLONE_NEWUTS=0x04000000`,
@@ -209,7 +209,7 @@ with no macOS equivalent:
   documented as non-functional on modern Darwin. Each new namespace member must be
   individually registered with `EVFILT_PROC`/`NOTE_EXIT` — there is no way to say "watch
   all descendants." (The existing `register_child_exit_watch` in
-  `carrick-hvf/src/host_signal.rs:200` already arms per-pid watches for exactly this
+  `carrick-vmm-hvf/src/host_signal.rs:200` already arms per-pid watches for exactly this
   reason.)
 
 The original design (now §5.6) distributed these responsibilities across every guest process's

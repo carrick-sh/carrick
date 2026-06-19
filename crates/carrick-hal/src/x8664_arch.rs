@@ -8,8 +8,8 @@
 //!
 //! ## Implemented surface
 //!
-//! - Full x86_64 `rt_sigframe` build/restore ([`build_sigframe`] /
-//!   [`restore_sigframe`]) — the codec is implemented, not deferred.
+//! - Full x86_64 `rt_sigframe` build/restore (`build_sigframe` /
+//!   `restore_sigframe`) — the codec is implemented, not deferred.
 //!
 //! ## Phase 2 non-goals (deferred)
 //!
@@ -222,11 +222,13 @@ pub struct X8664BootSysregs {
     /// `carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE`.
     /// Source: AMD APM vol. 2 §3.1.7; OSDev "SYSCALL/SYSRET".
     pub lstar: u64,
-    /// STAR = 0x0013_0008_0000_0000: user-base[63:48]=0x13, kernel-base[47:32]=0x08.
+    /// STAR = 0x0013_0008_0000_0000: user-base bits 63:48 = 0x13,
+    /// kernel-base bits 47:32 = 0x08.
     ///
-    /// STAR[47:32]=0x0008: SYSCALL loads CS=0x08 (GDT[1] kCS64), SS=0x10 (GDT[2] kSS).
-    /// STAR[63:48]=0x0013: SYSRET loads SS=0x1B (0x13+8=0x18|RPL3, GDT[3] uSS)
-    /// and CS=0x23 (0x13+16=0x20|RPL3, GDT[4] uCS64).
+    /// STAR bits 47:32 = 0x0008: SYSCALL loads CS=0x08 (GDT entry 1 kCS64),
+    /// SS=0x10 (GDT entry 2 kSS).
+    /// STAR bits 63:48 = 0x0013: SYSRET loads SS=0x1B (0x13+8=0x18|RPL3,
+    /// GDT entry 3 uSS) and CS=0x23 (0x13+16=0x20|RPL3, GDT entry 4 uCS64).
     /// GDT order: null/kCS/kSS/uSS/uCS (see `gdt` field).
     /// Source: AMD APM vol. 2 §3.1.7; OSDev "SYSCALL/SYSRET".
     pub star: u64,

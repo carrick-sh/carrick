@@ -1888,7 +1888,7 @@ impl HostFsBackend {
     /// syscall), so the deep branch is compiled out there and the macOS
     /// behavior is unchanged.
     ///
-    /// For a deep path, [`HostFsBackend::deep_anchor`] descends in
+    /// For a deep path, `deep_anchor` descends in
     /// sub-`PATH_MAX` chunks: each chunk of intermediate directories is
     /// opened as its own cap-std `Dir` via `open_dir` (i.e. `openat2`
     /// `RESOLVE_BENEATH` the PREVIOUS handle — the sandbox containment

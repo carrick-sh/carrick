@@ -9,9 +9,11 @@ commands for different reasons:
   *build* with a named message. These cost nothing at runtime and need no HVF,
   no Docker, no signed binary.
 * **Runtime conformance** — observable behavior is pinned by differential tests
-  that run an identical workload under carrick and under a real Linux
-  `linux/arm64` container (the Docker oracle) and diff the output. These need the
-  signed release binary and a reachable Docker daemon.
+  that run an identical workload under carrick and under a real Linux container
+  (the Docker oracle) and diff the output. The default macOS/HVF lane uses
+  `linux/arm64`; local x86_64 backend lanes use `linux/amd64`. Guest-running
+  macOS lanes need a signed release binary and a reachable Docker daemon unless
+  the oracle verdict is cached.
 
 Compile-time checks pin *what the bytes are*; runtime probes pin *what the
 syscall does*. Both are gates: a green build plus a green probe suite is the
@@ -49,19 +51,45 @@ they run from a plain `cargo build` artifact and stay green on any machine.
 
 ---
 
-## Differential probe suite vs Docker
+## Unified conformance harness vs Docker
 
-The runtime ABI gate. It lives in `crates/carrick-cli/tests/conformance.rs` and
-runs deliberately:
+The primary runtime gate is `carrick-conformance`, driven through `just`:
+
+```sh
+just conformance                 # full tier, default local HVF lane
+just conformance smoke           # smoke tier
+just conformance full --bless    # refresh baseline/oracle outputs when intended
+just matrix                      # re-render docs/support-matrix.md from results
+```
+
+The harness reads `scripts/conformance/suites.toml`, runs carrick and Docker in
+separate phases, classifies verdicts against committed baselines, writes JSONL
+reports, and renders [support-matrix.md](support-matrix.md). It also has local
+backend lanes:
+
+```sh
+cargo run -p carrick-conformance -- --lane kvm-local --tier smoke
+cargo run -p carrick-conformance -- --lane bhyve-local --tier smoke
+cargo run -p carrick-conformance -- --lane nvmm-local --tier smoke
+```
+
+Those lanes expect a platform-native `carrick` binary built with the matching
+`platform-*` feature and generally inject `--platform linux/amd64`. Backend
+expected gaps belong in backend overlays, not in the main HVF baseline.
+
+## Legacy differential probe suite vs Docker
+
+The older line-exact ABI probe gate still lives in
+`crates/carrick-cli/tests/conformance.rs` and runs deliberately:
 
 ```sh
 just conformance                                              # builds+signs, then runs
 cargo test -p carrick-cli --test conformance -- --nocapture   # if already built+signed
 ```
 
-`just conformance` depends on `build`, so it always re-signs the release binary
-first ([`scripts/build-signed.sh`](../scripts/build-signed.sh)). `--nocapture`
-surfaces the per-case `PASS`/`FAIL`/`XFAIL` lines as they run.
+`just conformance-probes` depends on `build`, so it always re-signs the release
+binary first ([`scripts/build-signed.sh`](../scripts/build-signed.sh)).
+`--nocapture` surfaces the per-case `PASS`/`FAIL`/`XFAIL` lines as they run.
 
 ### What a case is
 
@@ -102,7 +130,7 @@ Every `#[test]` here **passes by skipping** when its prerequisites are absent, s
 
 A genuine ABI divergence is the only thing that turns a non-skipped case red.
 
-### Two-phase, parallel, never carrick‖docker
+### Two-phase, parallel, never carrick||docker
 
 > [!WARNING]
 > Carrick (an HVF guest) and the Docker oracle (a LinuxKit VM) **starve each
@@ -285,17 +313,17 @@ A duplicate or overlapping constant — invisible by inspection — becomes
 
 ### Syscall-table ordering
 
-`AARCH64_SYSCALLS` in `crates/carrick-hvf/src/syscall.rs` is looked up via
+`AARCH64_SYSCALLS` in `crates/carrick-vmm-hvf/src/syscall.rs` is looked up via
 `binary_search_by_key` on the syscall number, which is only correct if the table
 is strictly sorted. A `const _: () = { … }` guard at
-`crates/carrick-hvf/src/syscall.rs:536` walks the table at compile time and
+`crates/carrick-vmm-hvf/src/syscall.rs:536` walks the table at compile time and
 asserts each row's number is strictly greater than the previous — guaranteeing
 both binary-search validity and number uniqueness. Insert a row out of order and
 the build fails:
 
 ```
 error[E0080]: evaluation of constant value failed
-  --> crates/carrick-hvf/src/syscall.rs:539:9
+  --> crates/carrick-vmm-hvf/src/syscall.rs:539:9
    |
 539 | /         assert!(
 540 | |             AARCH64_SYSCALLS[i - 1].number < AARCH64_SYSCALLS[i].number,
@@ -345,8 +373,8 @@ failure loudly rather than degrading into a silent `HV_DENIED`.
 * [diagnostics-and-debugging.md](diagnostics-and-debugging.md) — `carrick trace`,
   the event ring, the carrick-lldb plugin, and the env vars (`CARRICK_RUN_ID`,
   `CARRICK_INSECURE_REGISTRIES`, …) used above.
-* [architecture-overview.md](architecture-overview.md) — the HVF trap boundary,
-  paging, and scheduling model the ABI structs and syscall table feed.
+* [architecture-overview.md](architecture-overview.md) — the mature HVF trap
+  boundary, paging, and scheduling model the ABI structs and syscall table feed.
 * [syscalls-emulation-map.md](syscalls-emulation-map.md) — the per-syscall
   support map behind `AARCH64_SYSCALLS`.
 * [../README.md](../README.md) — quickstart and the `just` recipe index.

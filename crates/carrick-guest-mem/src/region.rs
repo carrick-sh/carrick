@@ -9,7 +9,7 @@
 //!  1. the PROT_NONE check — a buffer overlapping a guest `mprotect(PROT_NONE)`
 //!     range must fault with `EFAULT` even though the host backing is physically
 //!     accessible (the host-side check; see
-//!     [`carrick_mem::protections::MemoryProtections`]); and
+//!     `carrick_mem::protections::MemoryProtections`); and
 //!  2. the region lookup + bounds — resolve the guest address to the single
 //!     host-backed region that wholly contains it, or fail out-of-bounds.
 //!
@@ -25,15 +25,15 @@
 //! which chunks per stage-1 page, strips pointer tags, walks the guest stage-1
 //! tables (`translate_va`) to disambiguate overlapping high-VA aliases, and
 //! prefers the NEWEST region — keeps that selection as its own glue and does
-//! NOT route through [`find_region_for_gpa`] (which would change which region a
-//! syscall buffer copy lands in). It may still reuse [`GuestAccessError`] and
+//! NOT route through [`crate::region::find_region_for_gpa`] (which would change which region a
+//! syscall buffer copy lands in). It may still reuse [`crate::region::GuestAccessError`] and
 //! the gate ORDERING for parity.
 //!
 //! DEPENDENCY NOTE: the PROT_NONE primitive
 //! (`carrick_mem::protections::MemoryProtections`) lives in `carrick-mem`, which
 //! already depends on THIS crate — so this crate cannot depend back on it
 //! without a cycle (and this crate is deliberately the dependency-light leaf;
-//! see the crate docs). [`safe_guest_access`] therefore takes the PROT_NONE
+//! see the crate docs). [`crate::region::safe_guest_access`] therefore takes the PROT_NONE
 //! check as a `no_access` predicate closure (`|gpa, len| -> bool`); the backend
 //! supplies `|g, l| self.protections.range_no_access(g, l)`. Zero-cost (it
 //! monomorphizes) and keeps the leaf crate clean.
@@ -62,7 +62,7 @@ pub struct GuestMemoryRegion {
 /// Why a guarded guest access was refused. Each backend maps these to its own
 /// [`MemoryError`] variant so the wire-visible errno is unchanged: today both
 /// backends return [`MemoryError::OutOfBounds`] for BOTH the PROT_NONE reject
-/// and the lookup miss, so [`map_to_memory_error`] does the same.
+/// and the lookup miss, so [`GuestAccessError::map_to_memory_error`] does the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestAccessError {
     /// `[gpa, gpa+len)` overlaps a PROT_NONE range — the buffer must `EFAULT`.

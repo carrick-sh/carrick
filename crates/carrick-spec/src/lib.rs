@@ -5,9 +5,10 @@
 //!
 //! # Why this crate exists
 //!
-//! carrick is a five-crate workspace whose dependency edges flow strictly
-//! downhill: `carrick-cli` → `carrick-engine` → {`carrick-image`,
-//! `carrick-runtime`} → `carrick-spec`. This crate sits at the very bottom.
+//! carrick is a multi-crate workspace whose product dependency edges flow
+//! strictly downhill: `carrick-cli` → `carrick-engine` → {`carrick-image`,
+//! `carrick-runtime`} → `carrick-spec`. Platform-selected VMM and host crates
+//! hang below the runtime. This crate sits at the very bottom.
 //! Every layer above it speaks in these types, so they are the *lingua franca*
 //! that crosses every layer boundary:
 //!

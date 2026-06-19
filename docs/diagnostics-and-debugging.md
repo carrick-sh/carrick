@@ -67,7 +67,7 @@ written as root: `cat`/`grep` it without sudo, `rm` may need sudo.
 ### USDT probe families
 
 The probes are static USDT, wired at the translation boundaries via the `usdt`
-crate (`crates/carrick-hvf/src/probes.rs`, `#[usdt::provider(provider =
+crate (`crates/carrick-vmm-hvf/src/probes.rs`, `#[usdt::provider(provider =
 "carrick")]`). Three families let you triangulate guest vs host:
 
 - **carrick USDT (`carrick*:::`)** — the guest's Linux syscalls and carrick
@@ -294,7 +294,7 @@ carrick run --json <image> -- <cmd>
 everything carrick could **not** fully service: unhandled syscalls (by number +
 name, with invocation counts), partially-implemented syscalls, unhandled
 `ioctl(2)` requests, unimplemented `/proc` and `/sys` read paths, unsupported
-signals, and unknown syscall-flag bits (`crates/carrick-hvf/src/compat.rs`,
+signals, and unknown syscall-flag bits (`crates/carrick-vmm-hvf/src/compat.rs`,
 `CompatReporter` → `CompatReport`). It is the **"what does this workload need
 that we don't handle yet"** tool — point it at a new binary and the report is
 your gap list, sorted by frequency.
@@ -316,8 +316,10 @@ aggregation, `carrick trace` is the live stream.
   probe suite and Docker differential tests; the compile-time no-panic gate.
 - [conformance-coverage.md](conformance-coverage.md) — the active probe gate
   mapping (which invariant each `conformance-probes/` probe owns).
-- [architecture-overview.md](architecture-overview.md) — HVF traps, stage-1
-  paging, and the BKL-free scheduling these tools observe.
+- [architecture-overview.md](architecture-overview.md) — mature HVF traps,
+  stage-1 paging, and the BKL-free scheduling these tools observe.
+- [hal.md](hal.md) — KVM, bhyve, NVMM, host-primitive crates, and the shared
+  x86_64 engine.
 - [syscalls-emulation-map.md](syscalls-emulation-map.md) — the per-syscall
   translation map a `compat-report` gap points back into.
 - [../README.md](../README.md) — quickstart, the `ld64`-vs-`lld` `__dof_carrick`

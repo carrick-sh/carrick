@@ -108,7 +108,7 @@ The minimum checks for this branch shape are:
 cargo metadata --no-deps --format-version=1
 cargo test -p carrick-cli --test perf_runner cases -- --nocapture
 cargo test -p carrick-runtime --test integration futex_wake_returns_count_and_advances_table -- --nocapture
-cargo test -p carrick-hvf futex -- --nocapture
+cargo test -p carrick-vmm-hvf futex -- --nocapture
 cargo test -p carrick-runtime --test integration writev -- --nocapture
 scripts/build-signed.sh --features syscall-shim
 scripts/build-probes.sh

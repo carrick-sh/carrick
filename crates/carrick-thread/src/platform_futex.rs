@@ -3,7 +3,7 @@
 //!
 //! Every backend's `PlatformFutex` impl (HVF, KVM, bhyve, NVMM) was the same
 //! shape: the PRIVATE (process-anonymous) path is verbatim delegation to the
-//! shared parking-lot [`FutexTable`], and only the SHARED (`MAP_SHARED`,
+//! shared parking-lot [`crate::thread::FutexTable`], and only the SHARED (`MAP_SHARED`,
 //! cross-process) path differs — by exactly one kernel call:
 //!
 //!   * macOS  → `os_sync_wait_on_address` / `os_sync_wake_by_address` (`__ulock`)
@@ -12,9 +12,9 @@
 //!   * NetBSD → `__futex`  (a future arm)
 //!   * illumos → `lwp_park` (a future arm)
 //!
-//! So the whole impl is hoisted here ONCE over [`FutexTableFutex<S>`], and each
+//! So the whole impl is hoisted here ONCE over [`crate::platform_futex::FutexTableFutex`], and each
 //! host plugs in only its best shared-page primitive behind the tiny
-//! [`SharedFutexSyscall`] shim — NOT a lowest-common-denominator. The shared
+//! [`crate::platform_futex::SharedFutexSyscall`] shim — NOT a lowest-common-denominator. The shared
 //! deadline/slice/interrupt loop is [`carrick_hal::shared_wait_sliced`]; the
 //! per-host residue is a ~15-line `SharedFutexSyscall` impl.
 //!

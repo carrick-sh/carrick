@@ -1,17 +1,15 @@
 //! Guest address-space construction — the memory image a Linux process runs in
-//! when carrick maps it onto a Hypervisor.framework vCPU.
+//! when carrick maps it onto a backend vCPU.
 //!
 //! # Theory of operation
 //!
-//! carrick runs an unmodified Linux ELF as a native macOS process under HVF,
-//! with NO guest Linux kernel. Something must still do the kernel's job of
-//! laying out a process's address space: load the ELF segments, place the
-//! stack/heap/mmap arenas, install the auxiliary vector, and — because we run on
-//! bare aarch64 EL0/EL1, not on top of a kernel — hand-build the things a kernel
-//! would already have set up: page tables, exception vectors, the entry path
-//! into EL0, and the vDSO. That is this crate. It produces an [`memory::AddressSpace`]
-//! (a list of [`memory::MemoryRegion`]s plus an entry point and the EL1 control
-//! registers to program); the trap engine in `carrick-vmm-hvf` `hv_vm_map`s those
+//! carrick runs an unmodified Linux ELF with NO guest Linux kernel. Something
+//! must still do the kernel's job of laying out a process's address space: load
+//! the ELF segments, place the stack/heap/mmap arenas, install the auxiliary
+//! vector, and hand-build the things a kernel would already have set up: page
+//! tables, exception vectors, entry paths, and the vDSO. That is this crate. It
+//! produces an [`memory::AddressSpace`] (a list of [`memory::MemoryRegion`]s
+//! plus an entry point and control state); the selected VMM backend maps those
 //! regions and starts the vCPU.
 //!
 //! ## The four problems this crate solves

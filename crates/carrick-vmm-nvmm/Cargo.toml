@@ -11,11 +11,10 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
-# The NetBSD/NVMM host backend (the fourth platform, after macOS/HVF,
-# Linux/KVM, and FreeBSD/bhyve). The whole crate is `#![cfg(target_os =
+# The NetBSD/NVMM VMM backend. The whole crate is `#![cfg(target_os =
 # "netbsd")]`; on any other host the lib compiles to an empty crate, so the
-# default macOS workspace build (and Linux CI) stay green without libnvmm on
-# the link line.
+# default macOS workspace build and other host builds stay green without libnvmm
+# on the link line.
 #
 # M1 builds the thin per-VMM `X86Vmm`/`X86Vcpu` trait pair over the SHARED
 # `carrick-x86` engine (the portability Stage-5 acceptance test): the trap loop,
