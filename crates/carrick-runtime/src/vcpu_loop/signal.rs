@@ -121,7 +121,7 @@ pub(crate) fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
 /// then `el0_fault_signal` (instruction/data abort → SIGSEGV/SIGBUS, carrying
 /// `FAR_EL1` as `si_addr`). Mapping only `el0_fault_signal` would regress
 /// BRK/single-step SIGTRAP delivery (ptrace, Go TestDebugCall).
-pub(crate) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
+pub(super) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32, u64)> {
     if let Some((signum, si_code)) = el0_debug_signal(esr) {
         Some((signum, si_code, elr))
     } else {
@@ -140,7 +140,7 @@ pub(crate) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32,
 /// [`lower_el0_fault`]; x86 backends emit `GuestFault` directly (CR2 →
 /// `fault_addr`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn deliver_fault_signal<E: ThreadedEngine>(
+pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     kernel: &Kernel,
     engine: &mut E,
     this_tid: ThreadId,
