@@ -720,6 +720,56 @@ const CANONICAL_READLINKAT: u64 = 78;
 const X86_NR_MKDIR: u64 = 83;
 /// Canonical (asm-generic / aarch64) `mkdirat` number.
 const CANONICAL_MKDIRAT: u64 = 34;
+/// x86-64 `open(2)` (syscalls(2)). asm-generic only exposes `openat`; canonical
+/// 2 is `io_submit`, so a table fallthrough would mis-dispatch. Desugars to
+/// `openat(AT_FDCWD, path, flags, mode)`.
+const X86_NR_OPEN: u64 = 2;
+/// x86-64 `creat(2)` (syscalls(2)). No asm-generic creat; lowers to
+/// `openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode)`. Canonical 85 is
+/// `timerfd_create`, so it MUST be handled pre-table.
+const X86_NR_CREAT: u64 = 85;
+/// Canonical (asm-generic / aarch64) `openat` number (shared by open + creat).
+const CANONICAL_OPENAT: u64 = 56;
+/// x86-64 `unlink(2)` (syscalls(2)). Desugars to `unlinkat(AT_FDCWD, path, 0)`.
+const X86_NR_UNLINK: u64 = 87;
+/// x86-64 `rmdir(2)` (syscalls(2)). Desugars to
+/// `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)` — same canonical as unlink.
+const X86_NR_RMDIR: u64 = 84;
+/// Canonical (asm-generic / aarch64) `unlinkat` number (shared by unlink+rmdir).
+const CANONICAL_UNLINKAT: u64 = 35;
+/// x86-64 `rename(2)` (syscalls(2)). Desugars to
+/// `renameat(AT_FDCWD, old, AT_FDCWD, new)` — TWO dirfds.
+const X86_NR_RENAME: u64 = 82;
+/// Canonical (asm-generic / aarch64) `renameat` number.
+const CANONICAL_RENAMEAT: u64 = 38;
+/// x86-64 `link(2)` (syscalls(2)). Desugars to
+/// `linkat(AT_FDCWD, old, AT_FDCWD, new, 0)` — TWO dirfds, flags=0.
+const X86_NR_LINK: u64 = 86;
+/// Canonical (asm-generic / aarch64) `linkat` number.
+const CANONICAL_LINKAT: u64 = 37;
+/// x86-64 `symlink(2)` (syscalls(2)). Desugars to
+/// `symlinkat(target, AT_FDCWD, linkpath)` — dirfd is the SECOND arg.
+const X86_NR_SYMLINK: u64 = 88;
+/// Canonical (asm-generic / aarch64) `symlinkat` number.
+const CANONICAL_SYMLINKAT: u64 = 36;
+/// x86-64 `mknod(2)` (syscalls(2)). Desugars to
+/// `mknodat(AT_FDCWD, path, mode, dev)` — NO flags arg.
+const X86_NR_MKNOD: u64 = 133;
+/// Canonical (asm-generic / aarch64) `mknodat` number.
+const CANONICAL_MKNODAT: u64 = 33;
+/// x86-64 `chmod(2)` (syscalls(2)). Desugars to
+/// `fchmodat(AT_FDCWD, path, mode, 0)` (chmod always follows symlinks).
+const X86_NR_CHMOD: u64 = 90;
+/// Canonical (asm-generic / aarch64) `fchmodat` number.
+const CANONICAL_FCHMODAT: u64 = 53;
+/// x86-64 `chown(2)` (syscalls(2)). Desugars to
+/// `fchownat(AT_FDCWD, path, owner, group, 0)`.
+const X86_NR_CHOWN: u64 = 92;
+/// x86-64 `lchown(2)` (syscalls(2)). Desugars to
+/// `fchownat(AT_FDCWD, path, owner, group, AT_SYMLINK_NOFOLLOW)`.
+const X86_NR_LCHOWN: u64 = 94;
+/// Canonical (asm-generic / aarch64) `fchownat` number (shared by chown+lchown).
+const CANONICAL_FCHOWNAT: u64 = 54;
 /// `SIGCHLD` exit-signal (signal(7)); the low byte of the clone flags word.
 const LINUX_SIGCHLD: u64 = 17;
 /// `CLONE_VM` (clone(2)).
@@ -823,6 +873,132 @@ impl X8664GuestArch {
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
         }
+        // ── Legacy x86_64-only fs syscalls → their asm-generic *at canonicals.
+        // These run BEFORE the table-remap fallthrough so their (different)
+        // x86_64 numbers never reach the table (where some collide with unrelated
+        // canonical syscalls: 2=io_submit, 85=timerfd_create, 87=timerfd_gettime).
+        // open/creat → openat(56)
+        if x86_number == X86_NR_OPEN {
+            // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode).
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_OPENAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
+            });
+        }
+        if x86_number == X86_NR_CREAT {
+            // creat(path, mode) == openat(AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC,
+            // mode). The flags word is SYNTHESIZED (creat has no flags arg); mode
+            // (args[1]) lands in the openat MODE slot (a3), not the flags slot.
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_OPENAT,
+                args: [
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[0],
+                    carrick_abi::LINUX_O_CREAT
+                        | carrick_abi::LINUX_O_WRONLY
+                        | carrick_abi::LINUX_O_TRUNC,
+                    args[1],
+                    0,
+                    0,
+                ],
+            });
+        }
+        // unlink/rmdir → unlinkat(35), distinguished only by the flags slot.
+        if x86_number == X86_NR_UNLINK {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_UNLINKAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_RMDIR {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_UNLINKAT,
+                args: [
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[0],
+                    carrick_abi::LINUX_AT_REMOVEDIR,
+                    0,
+                    0,
+                    0,
+                ],
+            });
+        }
+        // rename/link → two-dirfd *at variants (AT_FDCWD in BOTH dirfd slots).
+        if x86_number == X86_NR_RENAME {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_RENAMEAT,
+                args: [
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[0],
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[1],
+                    0,
+                    0,
+                ],
+            });
+        }
+        if x86_number == X86_NR_LINK {
+            // flags=0 mirrors link(2) (no AT_SYMLINK_FOLLOW).
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_LINKAT,
+                args: [
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[0],
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[1],
+                    0,
+                    0,
+                ],
+            });
+        }
+        // symlink → symlinkat(36): dirfd is the SECOND arg, NOT prepended.
+        if x86_number == X86_NR_SYMLINK {
+            // symlink(target, linkpath) → symlinkat(target, AT_FDCWD, linkpath).
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_SYMLINKAT,
+                args: [args[0], carrick_abi::LINUX_AT_FDCWD, args[1], 0, 0, 0],
+            });
+        }
+        // mknod → mknodat(33): NO flags arg (4 args).
+        if x86_number == X86_NR_MKNOD {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_MKNODAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
+            });
+        }
+        // chmod → fchmodat(53), flags=0 (chmod always follows symlinks).
+        if x86_number == X86_NR_CHMOD {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_FCHMODAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
+            });
+        }
+        // chown/lchown → fchownat(54), distinguished only by the flags slot.
+        if x86_number == X86_NR_CHOWN {
+            // flags=0: chown FOLLOWS symlinks. owner/group -1 sentinel passes through.
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_FCHOWNAT,
+                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
+            });
+        }
+        if x86_number == X86_NR_LCHOWN {
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_FCHOWNAT,
+                args: [
+                    carrick_abi::LINUX_AT_FDCWD,
+                    args[0],
+                    args[1],
+                    args[2],
+                    carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW,
+                    0,
+                ],
+            });
+        }
+        // NOTE: x86_64 utime(132)/utimes(235) also need normalization (to
+        // utimensat=88 with a utimbuf/timeval -> timespec[2] struct conversion via
+        // a private dispatcher handler). Deferred — they require a struct-
+        // converting CARRICK_PRIVATE handler, not a plain arg shuffle; the full
+        // verified spec is recorded (x86-legacy-syscall-shims workflow).
 
         let canonical = match X8664SyscallTable::remap(x86_number) {
             SyscallRemap::Direct(c) => c,
@@ -1010,6 +1186,161 @@ mod normalize_tests {
             }
             _ => panic!("mkdir must be Plain"),
         }
+    }
+
+    /// Assert that x86 `rax` with `a` normalizes to a Plain RawSyscall of
+    /// `num`/`args`. Covers the legacy-fs *at shims.
+    fn assert_plain(rax: u64, a: [u64; 6], num: u64, args: [u64; 6]) {
+        match X8664GuestArch::normalize_syscall(&frame(rax, a)) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, num, "syscall {rax} canonical number");
+                assert_eq!(rs.args, args, "syscall {rax} args");
+            }
+            _ => panic!("x86 {rax} must normalize to a Plain RawSyscall"),
+        }
+    }
+
+    #[test]
+    fn unlink_normalizes_to_unlinkat_at_fdcwd_no_flags() {
+        // unlink(87) → unlinkat(35, AT_FDCWD, path, flags=0).
+        assert_plain(
+            87,
+            [0x1000, 0, 0, 0, 0, 0],
+            35,
+            [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn rmdir_normalizes_to_unlinkat_with_removedir_flag() {
+        // rmdir(84) → unlinkat(35) — SAME canonical as unlink, distinguished
+        // ONLY by AT_REMOVEDIR in the flags slot (a2).
+        assert_plain(
+            84,
+            [0x1000, 0, 0, 0, 0, 0],
+            35,
+            [
+                carrick_abi::LINUX_AT_FDCWD,
+                0x1000,
+                carrick_abi::LINUX_AT_REMOVEDIR,
+                0,
+                0,
+                0,
+            ],
+        );
+    }
+
+    #[test]
+    fn rename_and_link_normalize_to_two_dirfd_at_variants() {
+        // rename(82) → renameat(38) with AT_FDCWD in BOTH dirfd slots (a0 AND a2).
+        assert_plain(
+            82,
+            [0x1000, 0x2000, 0, 0, 0, 0],
+            38,
+            [
+                carrick_abi::LINUX_AT_FDCWD,
+                0x1000,
+                carrick_abi::LINUX_AT_FDCWD,
+                0x2000,
+                0,
+                0,
+            ],
+        );
+        // link(86) → linkat(37), two dirfds, flags=0.
+        assert_plain(
+            86,
+            [0x1000, 0x2000, 0, 0, 0, 0],
+            37,
+            [
+                carrick_abi::LINUX_AT_FDCWD,
+                0x1000,
+                carrick_abi::LINUX_AT_FDCWD,
+                0x2000,
+                0,
+                0,
+            ],
+        );
+    }
+
+    #[test]
+    fn symlink_normalizes_with_dirfd_in_the_second_slot() {
+        // symlink(88) → symlinkat(36, target, AT_FDCWD, linkpath): the dirfd is
+        // the SECOND arg — target stays at a0, AT_FDCWD is INSERTED at a1, and
+        // linkpath SHIFTS to a2. The easy bug is prepending AT_FDCWD at a0.
+        assert_plain(
+            88,
+            [0x1000, 0x2000, 0, 0, 0, 0],
+            36,
+            [0x1000, carrick_abi::LINUX_AT_FDCWD, 0x2000, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn chmod_chown_lchown_normalize_to_fchmodat_fchownat() {
+        // chmod(90) → fchmodat(53, AT_FDCWD, path, mode, 0).
+        assert_plain(
+            90,
+            [0x1000, 0o600, 0, 0, 0, 0],
+            53,
+            [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0o600, 0, 0, 0],
+        );
+        // chown(92) → fchownat(54), flags=0 (follows symlinks).
+        assert_plain(
+            92,
+            [0x1000, 5, 6, 0, 0, 0],
+            54,
+            [carrick_abi::LINUX_AT_FDCWD, 0x1000, 5, 6, 0, 0],
+        );
+        // lchown(94) → fchownat(54) — SAME canonical as chown, distinguished ONLY
+        // by AT_SYMLINK_NOFOLLOW in the flags slot (a4).
+        assert_plain(
+            94,
+            [0x1000, 5, 6, 0, 0, 0],
+            54,
+            [
+                carrick_abi::LINUX_AT_FDCWD,
+                0x1000,
+                5,
+                6,
+                carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW,
+                0,
+            ],
+        );
+    }
+
+    #[test]
+    fn open_creat_mknod_normalize_correctly() {
+        // open(2) → openat(56, AT_FDCWD, path, flags, mode).
+        assert_plain(
+            2,
+            [0x1000, 0o2, 0o644, 0, 0, 0],
+            56,
+            [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0o2, 0o644, 0, 0],
+        );
+        // creat(85) → openat(56, AT_FDCWD, path, O_CREAT|O_WRONLY|O_TRUNC, mode):
+        // flags SYNTHESIZED at a2, mode (args[1]) lands in the MODE slot (a3).
+        assert_plain(
+            85,
+            [0x1000, 0o644, 0, 0, 0, 0],
+            56,
+            [
+                carrick_abi::LINUX_AT_FDCWD,
+                0x1000,
+                carrick_abi::LINUX_O_CREAT
+                    | carrick_abi::LINUX_O_WRONLY
+                    | carrick_abi::LINUX_O_TRUNC,
+                0o644,
+                0,
+                0,
+            ],
+        );
+        // mknod(133) → mknodat(33, AT_FDCWD, path, mode, dev) — NO flags arg.
+        assert_plain(
+            133,
+            [0x1000, 0o644, 0x42, 0, 0, 0],
+            33,
+            [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0o644, 0x42, 0, 0],
+        );
     }
 
     #[test]
