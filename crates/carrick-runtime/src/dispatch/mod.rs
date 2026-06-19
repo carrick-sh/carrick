@@ -145,8 +145,6 @@ use crate::linux_abi::{
     CARRICK_PRIVATE_X86_FSTAT,
     CARRICK_PRIVATE_X86_LSTAT,
     CARRICK_PRIVATE_X86_NEWFSTATAT,
-    CARRICK_PRIVATE_X86_POLL,
-    CARRICK_PRIVATE_X86_SELECT,
     CARRICK_PRIVATE_X86_STAT,
     KernelAbi,
     // ABI constants moved from dispatch.rs (Goal #3, private set)
@@ -604,6 +602,10 @@ macro_rules! define_syscall {
 macro_rules! syscall_table {
     ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
         $(#[$meta])*
+        // An empty (or about-to-be-emptied) table is a `match` whose only arm
+        // returns, making the `Some(..)` unreachable — that's expected for a
+        // not-yet-populated module table, so allow it.
+        #[allow(unreachable_code)]
         $vis fn $name<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
             Some(match number {
                 $( $num => SyscallDispatcher::$handler, )*
@@ -1646,19 +1648,9 @@ pub(crate) type SyscallHandler<M> =
 syscall_table! {
     pub(crate) fn dispatch_misc;
     17 => getcwd,
-    19 => eventfd2,
-    20 => epoll_create1,
-    21 => epoll_ctl,
-    22 => epoll_pwait,
     23 => dup,
     24 => dup3,
     CARRICK_PRIVATE_X86_DUP2 => dup2,
-        // x86_64 poll(2): shares the ppoll handler, which branches on the
-        // canonical number to read arg2 as an INT timeout_ms (not a *timespec).
-        CARRICK_PRIVATE_X86_POLL => ppoll,
-        // x86_64 select(2): shares the pselect6 handler, which branches on the
-        // canonical number to read the timeout as a *timeval (not *timespec).
-        CARRICK_PRIVATE_X86_SELECT => pselect6,
         CARRICK_PRIVATE_X86_STAT => x86_stat,
         CARRICK_PRIVATE_X86_FSTAT => x86_fstat,
         CARRICK_PRIVATE_X86_LSTAT => x86_lstat,
@@ -1702,8 +1694,6 @@ syscall_table! {
         69 => preadv,
         70 => pwritev,
         71 => sendfile,
-        72 => pselect6,
-        73 => ppoll,
         74 => signalfd4,
         76 => splice,
         78 => readlinkat,
@@ -1800,21 +1790,6 @@ syscall_table! {
         195 => shmctl,
         196 => shmat,
         197 => shmdt,
-        198 => socket,
-        199 => socketpair,
-        200 => bind,
-        201 => listen,
-        202 => accept,
-        203 => connect,
-        204 => getsockname,
-        205 => getpeername,
-        206 => sendto,
-        207 => recvfrom,
-        208 => setsockopt,
-        209 => getsockopt,
-        210 => shutdown,
-        211 => sendmsg,
-        212 => recvmsg,
         214 => brk,
         215 => munmap,
         216 => mremap,
@@ -1832,7 +1807,6 @@ syscall_table! {
         232 => mincore,
         233 => madvise,
         240 => rt_tgsigqueueinfo,
-        242 => accept4,
         260 => wait4,
         261 => prlimit64,
         266 => clock_adjtime,
@@ -1885,8 +1859,6 @@ syscall_table! {
         175 => sys_geteuid,
         176 => sys_getgid,
         177 => sys_getegid,
-        243 => sys_recvmmsg,
-        269 => sys_sendmmsg,
         435 => sys_clone3,
         283 => sys_membarrier,
         293 => sys_rseq,
@@ -1950,6 +1922,7 @@ impl SyscallDispatcher {
     /// membership oracle the `routing_tests` characterization test pins against,
     /// so the refactor that moves arms out of the central table and into each
     /// module's `dispatch_<area>` cannot silently drop or re-route a number.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resolves(&self, number: u64) -> bool {
         Self::dispatch_normalized_known(number)
     }
