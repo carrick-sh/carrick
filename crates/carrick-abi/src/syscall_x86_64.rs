@@ -180,7 +180,9 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=33 dup2: LEGACY (asm-generic has dup3=24). dup2(old,new) vs
     // dup3(old,new,flags) — and dup2(fd,fd) is a no-op-success where dup3 EINVALs
     // → LEFT OUT. (see deferred block)
-    // x86_64=34 pause: LEGACY x86_64-only, NO asm-generic equivalent → Unknown.
+    // x86_64=34 pause: LEGACY x86_64-only, NO asm-generic pause. Shimmed in
+    // x8664_arch::normalize_syscall to canonical ppoll(NULL,0,NULL) (block until
+    // a signal) — the form aarch64 libc emits for pause(). NOT a table entry.
     // x86_64=35 nanosleep → canonical nanosleep=101 (SAME name+shape)
     direct(35, "nanosleep", 101),
     // x86_64=36 getitimer → canonical getitimer=102 (SAME name+shape)
@@ -876,8 +878,9 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   7   poll        → ppoll(73):      timeout_ms→*timespec; (the Direct above is
     //                                     a bring-up convenience, NOT a faithful shim)
     //
+    // 34 pause is now shimmed → ppoll(NULL,0,NULL) in normalize_syscall (above).
     // Also LEFT OUT (no asm-generic equivalent AT ALL → honest -ENOSYS, NOT a
-    // shim candidate): 34 pause, 37 alarm, 111 getpgrp, 134 uselib, 136 ustat,
+    // shim candidate): 37 alarm, 111 getpgrp, 134 uselib, 136 ustat,
     // 139 sysfs, 154 modify_ldt, 156 _sysctl, 172 iopl, 173 ioperm,
     // 174 create_module, 177 get_kernel_syms, 178 query_module, 180 nfsservctl,
     // 181 getpmsg, 182 putpmsg, 183 afs_syscall, 184 tuxcall, 185 security,
