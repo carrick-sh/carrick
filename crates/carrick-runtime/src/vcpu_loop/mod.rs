@@ -317,7 +317,7 @@ pub(crate) use signal::{
 // but no non-test in-crate caller does, so gate them to avoid an unused-import
 // warning on the normal build.
 #[cfg(test)]
-pub(super) use signal::{el0_debug_signal, el0_fault_signal, is_default_ignore_signal};
+pub(super) use signal::{el0_debug_signal, is_default_ignore_signal};
 
 // ===================================================================
 // Cross-platform kernel-half state.
