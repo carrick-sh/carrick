@@ -15,7 +15,42 @@
 set -e
 cd "$(dirname "$0")/.."
 
-cargo build --release "$@"
+# Entitlements selection.
+#
+# Default: scripts/entitlements.plist — hypervisor only. Production HVF binary;
+# NOT debuggable (no get-task-allow), so hardened-runtime protections hold.
+#
+# Debug: scripts/entitlements-debug.plist — hypervisor + get-task-allow. Lets a
+# debugger attach (task_for_pid). REQUIRED for the carrick-lldb event-ring
+# workflow (`lldb -p <pid> -o "process save-core ..."`): on macOS with SIP
+# "Debugging Restrictions: enabled", attaching to a self-signed process WITHOUT
+# get-task-allow is denied — on macOS 27 / lldb-1703 that denial shows up as an
+# immediate SIGILL (exit 132) before any lldb command runs. Opt in with either:
+#     CARRICK_DEBUG_SIGN=1 ./scripts/build-signed.sh
+#     ./scripts/build-signed.sh --debug
+# The hypervisor entitlement is present in BOTH plists, so a --debug build still
+# runs guests; it is just additionally debuggable. Never use --debug for a
+# binary you ship or leave on an untrusted machine.
+entitlements="scripts/entitlements.plist"
+debug_sign="${CARRICK_DEBUG_SIGN:-0}"
+
+# Strip a leading --debug from the cargo passthrough args (it is OURS, not
+# cargo's). Everything else flows through to `cargo build` unchanged.
+cargo_args=""
+for arg in "$@"; do
+    case "$arg" in
+        --debug) debug_sign=1 ;;
+        *) cargo_args="$cargo_args $arg" ;;
+    esac
+done
+
+if [ "$debug_sign" != "0" ]; then
+    entitlements="scripts/entitlements-debug.plist"
+    echo "build-signed: DEBUG signing (hypervisor + get-task-allow) — debuggable; do not ship" >&2
+fi
+
+# shellcheck disable=SC2086
+cargo build --release $cargo_args
 
 built="${CARGO_TARGET_DIR:-target}/release/carrick"
 signed="target/release/carrick"
@@ -33,11 +68,11 @@ if [ "$built" != "$signed" ]; then
     tmp="$signed.tmp.$$"
     trap 'rm -f "$tmp"' EXIT
     cp -f "$built" "$tmp"
-    codesign --force --sign - --entitlements scripts/entitlements.plist "$tmp"
+    codesign --force --sign - --entitlements "$entitlements" "$tmp"
     mv -f "$tmp" "$signed"
 else
     # Unset CARGO_TARGET_DIR (common case): sign in place. codesign itself writes
     # via a temp + rename, so the in-place case is already atomic.
-    codesign --force --sign - --entitlements scripts/entitlements.plist "$signed"
+    codesign --force --sign - --entitlements "$entitlements" "$signed"
 fi
-echo "built + signed: $signed (from $built)"
+echo "built + signed: $signed (from $built, entitlements=$entitlements)"
