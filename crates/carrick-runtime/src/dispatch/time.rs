@@ -53,6 +53,30 @@ syscall_table! {
     /// the other modules' tables. Add a `time` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_time;
+    85 => timerfd_create,
+    86 => timerfd_settime,
+    87 => timerfd_gettime,
+    101 => nanosleep,
+    102 => getitimer,
+    103 => setitimer,
+    107 => timer_create,
+    108 => timer_gettime,
+    109 => timer_getoverrun,
+    110 => timer_settime,
+    111 => timer_delete,
+    112 => clock_settime,
+    113 => clock_gettime,
+    114 => clock_getres,
+    115 => clock_nanosleep,
+    153 => times,
+    163 => getrlimit,
+    165 => getrusage,
+    169 => gettimeofday,
+    170 => settimeofday,
+    171 => adjtimex,
+    179 => sysinfo,
+    261 => prlimit64,
+    266 => clock_adjtime,
 }
 
 /// Pack a `(value_ns, interval_ns)` pair into a `LinuxItimerspec` (the Linux
