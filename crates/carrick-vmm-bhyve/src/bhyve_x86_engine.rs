@@ -956,11 +956,13 @@ impl X86Vmm for BhyveVmm {
         // #PF path (`demand_commit`) backs one page on first touch, re-running
         // the faulting instruction. Only VAs already backed by a window (the
         // eager kernel/ELF/stack regions, or an already-committed page) take the
-        // real page-table edit below. `prot` is irrelevant for a reservation —
-        // the committed page is mapped RW and Linux faults on PROT_NONE access
-        // are not the workload here (Go reserves then commits before touching).
+        // real page-table edit below. The reservation REMEMBERS the requested
+        // PROT_WRITE: a read-only (PROT_READ) page commits a present-but-read-only
+        // leaf, so a guest store to it re-faults with PFEC.P=1 and the engine
+        // delivers SIGSEGV/SEGV_ACCERR — instead of the store silently succeeding.
         if self.host_ptr(address, 1).is_none() {
-            self.ram.reserve(address, len);
+            let writable = LinuxProtFlags::from_bits_truncate(prot).contains(LinuxProtFlags::WRITE);
+            self.ram.reserve(address, len, writable);
             return Ok(());
         }
         let host = self
@@ -1017,14 +1019,20 @@ impl X86Vmm for BhyveVmm {
         {
             CommitOutcome::AlreadyMapped => Ok(true),
             CommitOutcome::NotReserved => Ok(false),
-            CommitOutcome::Committed(gpa) => {
+            CommitOutcome::Committed { gpa, writable } => {
                 let host = self.vm.map_gpa(gpa, 4096).ok_or_else(|| {
                     MemoryError::HostMap(format!("bhyve demand_commit: map_gpa 0x{gpa:x} unmapped"))
                 })?;
                 // SAFETY: live sysmem of 4096 bytes — Linux anon zero-fill.
                 unsafe { std::ptr::write_bytes(host, 0, 4096) };
+                // Map the leaf with the reservation's protection. A read-only
+                // (PROT_READ) reservation commits a PRESENT but read-only leaf, so
+                // the guest WRITE that demand-faulted this page re-faults with
+                // PFEC.P=1 (not-present bit clear) — the shared engine then skips
+                // demand_commit and delivers SIGSEGV/SEGV_ACCERR. A writable
+                // reservation commits RW (the common anon-arena case).
                 self.with_live_pml4(|mgr| {
-                    mgr.map_aliased(page, gpa, 4096, true).map_err(|_| {
+                    mgr.map_aliased(page, gpa, 4096, writable).map_err(|_| {
                         MemoryError::OutOfBounds {
                             address: page,
                             length: 4096,
