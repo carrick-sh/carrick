@@ -2266,6 +2266,10 @@ impl SyscallDispatcher {
             // VALUE is read from guest memory below once `memory` is bound.
             let sigmask_addr = sigmask.0;
             let request_number = cx.number();
+            // x86_64 poll(2) reaches this handler via CARRICK_PRIVATE_X86_POLL:
+            // arg2 (`timeout`) is an INT timeout_ms (not a *timespec) and there is
+            // no sigmask. ppoll(73) keeps the *timespec + sigmask decode below.
+            let is_poll = request_number == carrick_abi::CARRICK_PRIVATE_X86_POLL;
             let request_args = cx.raw_args();
             let memory = &mut *cx.memory;
             let reporter = cx.reporter;
@@ -2273,7 +2277,12 @@ impl SyscallDispatcher {
             // Decode timeout. NULL pointer means block forever; non-NULL points
             // to a `struct timespec { i64 tv_sec; i64 tv_nsec; }`. We translate
             // to milliseconds for libc::poll (-1 = forever, 0 = immediate).
-            let timeout_ms: i32 = if timeout_address == 0 {
+            let timeout_ms: i32 = if is_poll {
+                // poll: arg2 IS the int timeout_ms (-1 = block forever, 0 = return
+                // now, N = N ms). The raw register value is sign-correct in its
+                // low 32 bits.
+                timeout_address as i32
+            } else if timeout_address == 0 {
                 -1
             } else {
                 match read_kernel_struct::<LinuxTimespec>(memory, timeout_address) {
@@ -2298,7 +2307,10 @@ impl SyscallDispatcher {
             // wait (it stays pending, delivered after the syscall). Mirrors
             // epoll_pwait. Read before the pollfd loop (returns an owned Vec, so the
             // `memory` borrow is released).
-            let block_signals: u64 = if sigmask_addr != 0 {
+            let block_signals: u64 = if is_poll {
+                // poll(2) has no sigmask argument.
+                0
+            } else if sigmask_addr != 0 {
                 if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                     return Ok(LINUX_EINVAL.into());
                 }
