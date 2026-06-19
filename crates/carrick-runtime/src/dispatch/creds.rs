@@ -47,6 +47,29 @@ syscall_table! {
     /// the other modules' tables. Add a `creds` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_creds;
+    90 => capget,
+    91 => capset,
+    140 => setpriority,
+    141 => getpriority,
+    143 => setregid,
+    144 => setgid,
+    145 => setreuid,
+    146 => setuid,
+    147 => setresuid,
+    148 => getresuid,
+    149 => setresgid,
+    150 => getresgid,
+    158 => getgroups,
+    166 => umask,
+    151 => sys_setfsuid,
+    152 => sys_setfsgid,
+    159 => sys_setgroups,
+    172 => sys_getpid,
+    173 => sys_getppid,
+    174 => sys_getuid,
+    175 => sys_geteuid,
+    176 => sys_getgid,
+    177 => sys_getegid,
 }
 
 /// Per-process nice value (the calling process's PRIO_PROCESS priority).
