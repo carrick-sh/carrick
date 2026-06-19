@@ -330,11 +330,15 @@ pub(super) fn host_sockaddr_family(bytes: &[u8]) -> u16 {
     if bytes.len() < 2 {
         return libc::AF_UNSPEC as u16;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
+        // BSD layout (macOS, FreeBSD, NetBSD): `sa_len(u8) sa_family(u8)` — the
+        // family is byte 1. FreeBSD/NetBSD are BSDs too, so they must take THIS
+        // branch, not the Linux one (a FreeBSD host reading the Linux u16 here
+        // would decode garbage and reject AF_INET/AF_UNIX binds — EAFNOSUPPORT).
         bytes[1] as u16
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         u16::from_ne_bytes([bytes[0], bytes[1]])
     }
@@ -346,12 +350,15 @@ pub(super) fn host_sockaddr_family(bytes: &[u8]) -> u16 {
 /// be sized to the full sockaddr (macOS `sa_len` is taken from `out.len()`).
 pub(super) fn set_host_sockaddr_header(out: &mut [u8], family: i32) {
     debug_assert!(out.len() >= 2);
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
+        // BSD layout (macOS, FreeBSD, NetBSD): `sa_len(u8) sa_family(u8)`. All
+        // non-Linux hosts here are BSDs — a FreeBSD host given the Linux u16
+        // family reads sa_family=0 (AF_UNSPEC) and rejects the bind/connect.
         out[0] = out.len().min(255) as u8;
         out[1] = family as u8;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         out[0..2].copy_from_slice(&(family as u16).to_ne_bytes());
     }
