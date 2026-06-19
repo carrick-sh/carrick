@@ -57,6 +57,23 @@ syscall_table! {
     /// the other modules' tables. Add a `mem` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_mem;
+    214 => brk,
+    215 => munmap,
+    216 => mremap,
+    222 => mmap,
+    223 => fadvise64,
+    226 => mprotect,
+    227 => msync,
+    228 => mlock,
+    229 => munlock,
+    230 => mlockall,
+    231 => munlockall,
+    232 => mincore,
+    233 => madvise,
+    425 => io_uring_setup,
+    426 => io_uring_enter,
+    427 => io_uring_register,
+    283 => sys_membarrier,
 }
 
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
