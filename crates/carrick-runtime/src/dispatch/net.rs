@@ -265,6 +265,23 @@ impl SyscallDispatcher {
                         ready |= LINUX_EPOLLERR;
                     }
                 }
+                // macOS `poll(2)` does NOT surface TCP urgent/out-of-band data
+                // through `POLLPRI` (it stays clear even with a pending urgent
+                // byte), so the recompute above can never assert EPOLLPRI on
+                // Darwin. The instance kqueue's `EVFILT_EXCEPT`/`NOTE_OOB` filter
+                // detects the OOB edge correctly, but this level-readiness probe
+                // (which the epoll_pwait re-poll trusts over the drained bits)
+                // must answer EPOLLPRI the Darwin-native way too — otherwise the
+                // edge is drained then dropped and EPOLLPRI is never delivered
+                // (probe `epollpri`). Check it via a one-shot kqueue OOB probe
+                // whenever the caller is interested in EPOLLPRI; `host_fd_has_oob`
+                // is a no-op on hosts whose native poll already handled POLLPRI.
+                if requested_events & LINUX_EPOLLPRI != 0
+                    && ready & LINUX_EPOLLPRI == 0
+                    && host_fd_has_oob(host_fd)
+                {
+                    ready |= LINUX_EPOLLPRI;
+                }
                 // macOS doesn't report a named-FIFO read-end ready when its last
                 // writer closed — the kernel-decided beacon does (dispatch::
                 // fifo_beacon). Check it REGARDLESS of the host poll result: a
