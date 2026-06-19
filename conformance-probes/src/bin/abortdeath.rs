@@ -29,10 +29,7 @@ extern "C" fn never_called(_: i32) {
 /// Fork a child that runs `body` and is reaped by the parent. Returns
 /// `(wifsignaled, wtermsig_matches_expected, wifexited, wexitstatus)` — the
 /// caller picks which booleans to report.
-unsafe fn fork_run_and_reap(
-    expected_sig: i32,
-    body: extern "C" fn(),
-) -> (bool, bool, bool, i32) {
+unsafe fn fork_run_and_reap(expected_sig: i32, body: extern "C" fn()) -> (bool, bool, bool, i32) {
     let pid = libc::fork();
     if pid == 0 {
         body();
@@ -44,7 +41,11 @@ unsafe fn fork_run_and_reap(
     let signaled = libc::WIFSIGNALED(status);
     let term_matches = signaled && libc::WTERMSIG(status) == expected_sig;
     let exited = libc::WIFEXITED(status);
-    let exit_status = if exited { libc::WEXITSTATUS(status) } else { -1 };
+    let exit_status = if exited {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    };
     (signaled, term_matches, exited, exit_status)
 }
 
@@ -105,15 +106,13 @@ fn main() {
             sigkill_wtermsig_matches = sigkill_matches,
         );
 
-        let (abort_signaled, abort_matches, _, _) =
-            fork_run_and_reap(libc::SIGABRT, body_abort);
+        let (abort_signaled, abort_matches, _, _) = fork_run_and_reap(libc::SIGABRT, body_abort);
         report!(
             abort_sigabrts_child = abort_signaled,
             abort_wtermsig_matches = abort_matches,
         );
 
-        let (clean_signaled, _, clean_exited, clean_status) =
-            fork_run_and_reap(0, body_clean_exit);
+        let (clean_signaled, _, clean_exited, clean_status) = fork_run_and_reap(0, body_clean_exit);
         report!(
             clean_exit_no_signal = !clean_signaled,
             clean_exit_wifexited = clean_exited,

@@ -54,8 +54,8 @@ fn main() {
         let mut buf = vec![0xAAu8; block * 4];
         let base = buf.as_mut_ptr() as usize;
         let aligned = (base + block) & !(block - 1); // a block-aligned addr inside buf
-        // SAFETY: `aligned` and `aligned+block` lie within `buf` (we allocated
-        // 4×block and skipped at most one block for alignment).
+                                                     // SAFETY: `aligned` and `aligned+block` lie within `buf` (we allocated
+                                                     // 4×block and skipped at most one block for alignment).
         unsafe {
             asm!("dc zva, {addr}", addr = in(reg) aligned, options(nostack));
         }

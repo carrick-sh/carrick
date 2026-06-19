@@ -85,7 +85,9 @@ impl Ring {
         fill(sqe);
         // array[tail & mask] = slot; advance SQ tail.
         ptr::write_unaligned(
-            self.ring.add(self.sq_array_off + ((self.seq & self.sq_mask) as usize) * 4) as *mut u32,
+            self.ring
+                .add(self.sq_array_off + ((self.seq & self.sq_mask) as usize) * 4)
+                as *mut u32,
             slot as u32,
         );
         ptr::write_unaligned(self.ring.add(self.sq_tail_off) as *mut u32, self.seq + 1);
@@ -200,7 +202,11 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
     // Host-file WRITE then READ round-trip. run-elf's rootfs is empty: mkdir /tmp.
     libc::mkdir(c"/tmp".as_ptr(), 0o755);
     let path = c"/tmp/iou_probe";
-    let file = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC, 0o644);
+    let file = libc::open(
+        path.as_ptr(),
+        libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+        0o644,
+    );
     if file < 0 {
         return false;
     }
@@ -232,10 +238,7 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
     // READV: scatter the read across two iovecs.
     let mut a = [0u8; 4];
     let mut b = [0u8; 5];
-    let iov = [
-        (a.as_mut_ptr() as u64, 4u64),
-        (b.as_mut_ptr() as u64, 5u64),
-    ];
+    let iov = [(a.as_mut_ptr() as u64, 4u64), (b.as_mut_ptr() as u64, 5u64)];
     if r.submit_reap(|sqe| {
         *sqe.add(0) = IORING_OP_READV;
         ptr::write_unaligned(sqe.add(4) as *mut i32, file);

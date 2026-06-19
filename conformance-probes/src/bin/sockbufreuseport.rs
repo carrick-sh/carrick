@@ -20,7 +20,13 @@ use conformance_probes::report;
 unsafe fn getsockopt_int(fd: i32, level: i32, opt: i32) -> i32 {
     let mut val: i32 = -1;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
-    libc::getsockopt(fd, level, opt, &mut val as *mut i32 as *mut libc::c_void, &mut len);
+    libc::getsockopt(
+        fd,
+        level,
+        opt,
+        &mut val as *mut i32 as *mut libc::c_void,
+        &mut len,
+    );
     val
 }
 
@@ -46,7 +52,9 @@ fn main() {
         report!(sndbuf_doubled = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF) >= 16384);
 
         // SO_REUSEADDR widening must not leak into SO_REUSEPORT read-back.
-        report!(reuseaddr_set_ok = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1) == 0);
+        report!(
+            reuseaddr_set_ok = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1) == 0
+        );
         report!(
             reuseport_still_zero = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT) == 0
         );

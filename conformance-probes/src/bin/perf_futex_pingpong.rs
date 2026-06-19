@@ -6,8 +6,8 @@
 //! Output is `key=value` lines (parsed by tests/perf_runner.rs), NOT diffed:
 //!   futex_pingpong_p50_us=<f> futex_pingpong_p95_us=<f>
 //!   futex_pingpong_min_us=<f> iters=<u> wake_zero_ok=<bool> nproc=<u>
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -109,10 +109,7 @@ fn main() {
 
     println!("futex_pingpong_p50_us={:.3}", pct(0.50));
     println!("futex_pingpong_p95_us={:.3}", pct(0.95));
-    println!(
-        "futex_pingpong_min_us={:.3}",
-        samples_ns[0] as f64 / 1000.0
-    );
+    println!("futex_pingpong_min_us={:.3}", samples_ns[0] as f64 / 1000.0);
     println!("iters={}", samples_ns.len());
     println!("nproc={}", nproc());
 }

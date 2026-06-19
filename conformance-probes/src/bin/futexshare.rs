@@ -16,7 +16,13 @@ const FUTEX_WAIT: libc::c_int = 0; // shared (no FUTEX_PRIVATE_FLAG)
 const FUTEX_WAKE: libc::c_int = 1;
 
 unsafe fn futex(uaddr: *mut u32, op: libc::c_int, val: u32) -> libc::c_long {
-    libc::syscall(SYS_FUTEX, uaddr, op, val, std::ptr::null::<libc::timespec>())
+    libc::syscall(
+        SYS_FUTEX,
+        uaddr,
+        op,
+        val,
+        std::ptr::null::<libc::timespec>(),
+    )
 }
 
 fn main() {

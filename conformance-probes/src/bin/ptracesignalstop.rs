@@ -326,8 +326,7 @@ fn main() {
             blocking_sigterm_reaped_stop = blocking_sigterm.reaped_stop,
             blocking_sigterm_stopped = blocking_sigterm.stopped,
             blocking_sigterm_stopsig = blocking_sigterm.stopsig,
-            blocking_sigterm_stopsig_is_sigterm =
-                blocking_sigterm.stopsig == libc::SIGTERM,
+            blocking_sigterm_stopsig_is_sigterm = blocking_sigterm.stopsig == libc::SIGTERM,
             blocking_sigterm_wait_errno = blocking_sigterm.wait_errno,
             blocking_sigterm_wait_eintr = blocking_sigterm.wait_errno == libc::EINTR,
             blocking_sigterm_cont_ok = blocking_sigterm.cont_ok,
@@ -352,13 +351,11 @@ fn main() {
             delayed_blocking_sighup_stopsig_is_sighup =
                 delayed_blocking_sighup.stopsig == libc::SIGHUP,
             delayed_blocking_sighup_wait_errno = delayed_blocking_sighup.wait_errno,
-            delayed_blocking_sighup_wait_eintr =
-                delayed_blocking_sighup.wait_errno == libc::EINTR,
+            delayed_blocking_sighup_wait_eintr = delayed_blocking_sighup.wait_errno == libc::EINTR,
             delayed_blocking_sighup_cont_ok = delayed_blocking_sighup.cont_ok,
             delayed_blocking_sighup_final_reaped = delayed_blocking_sighup.final_reaped,
             delayed_blocking_sighup_final_exited = delayed_blocking_sighup.final_exited,
-            delayed_blocking_sighup_final_exit_matches =
-                delayed_blocking_sighup.final_exit_matches,
+            delayed_blocking_sighup_final_exit_matches = delayed_blocking_sighup.final_exit_matches,
             sigstop_fork_ok = sigstop.fork_ok,
             sigstop_reaped_stop = sigstop.reaped_stop,
             sigstop_stopped = sigstop.stopped,

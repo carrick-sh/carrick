@@ -36,12 +36,18 @@ fn main() {
             "setlease_rdlck_ok={}",
             libc::fcntl(rfd, F_SETLEASE, F_RDLCK) == 0
         );
-        println!("getlease_is_rdlck={}", libc::fcntl(rfd, F_GETLEASE) == F_RDLCK);
+        println!(
+            "getlease_is_rdlck={}",
+            libc::fcntl(rfd, F_GETLEASE) == F_RDLCK
+        );
         println!(
             "setlease_unlck_ok={}",
             libc::fcntl(rfd, F_SETLEASE, F_UNLCK) == 0
         );
-        println!("getlease_is_unlck={}", libc::fcntl(rfd, F_GETLEASE) == F_UNLCK);
+        println!(
+            "getlease_is_unlck={}",
+            libc::fcntl(rfd, F_GETLEASE) == F_UNLCK
+        );
         let bad = libc::fcntl(rfd, F_SETLEASE, 99);
         println!(
             "setlease_bad_type_einval={}",

@@ -34,7 +34,10 @@ fn main() {
         // getpriority with an invalid `which` → EINVAL.
         *libc::__errno_location() = 0;
         let bad = libc::getpriority(99, 0);
-        println!("getpriority_bad_which_einval={}", bad == -1 && errno() == libc::EINVAL);
+        println!(
+            "getpriority_bad_which_einval={}",
+            bad == -1 && errno() == libc::EINVAL
+        );
 
         let _ = errno;
     }

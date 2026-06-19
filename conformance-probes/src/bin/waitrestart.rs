@@ -43,7 +43,10 @@ unsafe fn install(sig: i32, h: extern "C" fn(i32), flags: i32) {
 
 unsafe fn arm_alarm_ms(ms: i64) {
     let it = libc::itimerval {
-        it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 },
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
         it_value: libc::timeval {
             tv_sec: ms / 1000,
             tv_usec: (ms % 1000) * 1000,

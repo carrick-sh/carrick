@@ -2,7 +2,7 @@
 //! of the container init (the sh that `docker run`/`carrick run` launched), so
 //! its parent is ns-pid 1. It forks a child and reaps it, asserting wait4
 //! returns that child's own ns-pid and the child sees the probe as its parent.
-use conformance_probes::{report, reap};
+use conformance_probes::{reap, report};
 fn main() {
     unsafe {
         let ppid = libc::getppid();

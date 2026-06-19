@@ -38,7 +38,10 @@ fn main() {
         let via = b"/tmp/sm_link/f\0".as_ptr() as *const libc::c_char;
         let rc = libc::mknod(via, libc::S_IFIFO | 0o644, 0);
         println!("mknod_via_symlink_ok={}", rc == 0);
-        println!("mknod_via_symlink_enoent={}", rc == -1 && errno() == libc::ENOENT);
+        println!(
+            "mknod_via_symlink_enoent={}",
+            rc == -1 && errno() == libc::ENOENT
+        );
 
         let mut st: libc::stat = std::mem::zeroed();
         let at_target = libc::lstat(b"/tmp/sm_real/f\0".as_ptr() as *const libc::c_char, &mut st);

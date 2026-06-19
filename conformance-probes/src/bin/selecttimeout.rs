@@ -66,7 +66,10 @@ fn now_monotonic() -> libc::timespec {
 
 fn case_select_bare_timeout() {
     unsafe {
-        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 10_000 };
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 10_000,
+        };
         let start = now_monotonic();
         let rc = libc::select(
             0,
@@ -92,7 +95,10 @@ fn case_select_pipe_ready() {
         let mut set: libc::fd_set = MaybeUninit::zeroed().assume_init();
         libc::FD_ZERO(&mut set);
         libc::FD_SET(rd, &mut set);
-        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 10_000 };
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 10_000,
+        };
         let start = now_monotonic();
         let rc = libc::select(
             rd + 1,
@@ -121,7 +127,10 @@ fn case_select_pipe_not_ready() {
         let mut set: libc::fd_set = MaybeUninit::zeroed().assume_init();
         libc::FD_ZERO(&mut set);
         libc::FD_SET(rd, &mut set);
-        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 10_000 };
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 10_000,
+        };
         let start = now_monotonic();
         let rc = libc::select(
             rd + 1,
@@ -144,7 +153,10 @@ fn case_select_pipe_not_ready() {
 
 fn case_pselect_bare_timeout() {
     unsafe {
-        let ts = libc::timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
         let start = now_monotonic();
         let rc = libc::pselect(
             0,
@@ -184,7 +196,10 @@ fn case_pselect_blocked_signal_stays_pending() {
         // run during the wait" from user code — only the rc/timeout
         // shape and the post-return mask + delivered-or-pending state.
         arm_alarm_ms(5);
-        let ts = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 };
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 50_000_000,
+        };
         let start = now_monotonic();
         let rc = libc::pselect(
             0,
@@ -202,8 +217,7 @@ fn case_pselect_blocked_signal_stays_pending() {
         // handler-ran in a stable window.
         let mask_restored = !is_blocked(libc::SIGALRM);
         let _ = block_signal(libc::SIGALRM);
-        let delivered_after =
-            is_pending(libc::SIGALRM) || ALRM_HITS.load(Ordering::SeqCst) >= 1;
+        let delivered_after = is_pending(libc::SIGALRM) || ALRM_HITS.load(Ordering::SeqCst) >= 1;
         // Drain.
         let _ = unblock_signal(libc::SIGALRM);
         disarm_alarm();
@@ -226,7 +240,10 @@ fn case_pselect_unblocked_signal_interrupts() {
         arm_alarm_ms(5);
         // 500 ms upper bound — but with the alarm wired and unblocked the
         // wait should EINTR in ~5 ms; the 500 ms is just the safety bound.
-        let ts = libc::timespec { tv_sec: 0, tv_nsec: 500_000_000 };
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 500_000_000,
+        };
         let start = now_monotonic();
         let rc = libc::pselect(
             0,

@@ -80,7 +80,10 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("stage2") => stage2(),
         _ => {
-            let exe = args.first().map(String::as_str).unwrap_or("/tmp/execthreads");
+            let exe = args
+                .first()
+                .map(String::as_str)
+                .unwrap_or("/tmp/execthreads");
             stage1(exe);
         }
     }

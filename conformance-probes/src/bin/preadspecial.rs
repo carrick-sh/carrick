@@ -18,10 +18,7 @@ fn main() {
         let mut fds = [0i32; 2];
         if libc::pipe(fds.as_mut_ptr()) == 0 {
             let rc = libc::pread(fds[0], buf.as_mut_ptr() as *mut _, 16, 0);
-            println!(
-                "pread_pipe_espipe={}",
-                rc == -1 && errno() == libc::ESPIPE
-            );
+            println!("pread_pipe_espipe={}", rc == -1 && errno() == libc::ESPIPE);
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
@@ -43,7 +40,11 @@ fn main() {
 
         // pread on a regular file still works.
         let f = CString::new("/tmp/pread_probe").unwrap();
-        let wf = libc::open(f.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let wf = libc::open(
+            f.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if wf >= 0 {
             libc::write(wf, b"hello".as_ptr() as *const _, 5);
         }

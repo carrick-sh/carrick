@@ -62,9 +62,7 @@ fn main() {
         //     {11,11,13}; 42 is none of them.
         let rc3 = setresuid(42, -1, -1);
         let er3 = if rc3 < 0 { errno() } else { 0 };
-        report!(
-            unpriv_setresuid_foreign_eperm = rc3 == -1 && er3 == libc::EPERM,
-        );
+        report!(unpriv_setresuid_foreign_eperm = rc3 == -1 && er3 == libc::EPERM,);
 
         // (4) Unprivileged setuid to the saved id (13) → only euid changes.
         let rc4 = setuid(13);

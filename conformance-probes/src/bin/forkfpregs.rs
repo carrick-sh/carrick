@@ -71,11 +71,7 @@ fn main() {
         let mut buf = [0u8; 16];
         let mut got = 0usize;
         while got < 16 {
-            let n = libc::read(
-                r,
-                buf.as_mut_ptr().add(got) as *mut libc::c_void,
-                16 - got,
-            );
+            let n = libc::read(r, buf.as_mut_ptr().add(got) as *mut libc::c_void, 16 - got);
             if n <= 0 {
                 break;
             }

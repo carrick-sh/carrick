@@ -53,7 +53,7 @@ fn main() {
     }
     println!("thread_created=true");
     let _ = std::io::stdout().flush(); // emit before the fork can wedge
-    // Let the sibling actually enter nanosleep before we fork.
+                                       // Let the sibling actually enter nanosleep before we fork.
     let ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 200_000_000,

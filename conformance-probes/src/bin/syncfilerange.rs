@@ -27,15 +27,24 @@ fn main() {
 
         // negative offset → EINVAL
         let r3 = libc::syscall(libc::SYS_sync_file_range, fd as i64, -1i64, 1i64, 1i64);
-        println!("sfr_neg_offset_einval={}", r3 == -1 && errno() == libc::EINVAL);
+        println!(
+            "sfr_neg_offset_einval={}",
+            r3 == -1 && errno() == libc::EINVAL
+        );
 
         // negative nbytes → EINVAL
         let r4 = libc::syscall(libc::SYS_sync_file_range, fd as i64, 0i64, -1i64, 2i64);
-        println!("sfr_neg_nbytes_einval={}", r4 == -1 && errno() == libc::EINVAL);
+        println!(
+            "sfr_neg_nbytes_einval={}",
+            r4 == -1 && errno() == libc::EINVAL
+        );
 
         // unknown flag bit → EINVAL
         let r5 = libc::syscall(libc::SYS_sync_file_range, fd as i64, 0i64, 1i64, 8i64);
-        println!("sfr_bad_flags_einval={}", r5 == -1 && errno() == libc::EINVAL);
+        println!(
+            "sfr_bad_flags_einval={}",
+            r5 == -1 && errno() == libc::EINVAL
+        );
 
         // valid regular-file call → 0
         let r6 = libc::syscall(libc::SYS_sync_file_range, fd as i64, 0i64, 1i64, 2i64);

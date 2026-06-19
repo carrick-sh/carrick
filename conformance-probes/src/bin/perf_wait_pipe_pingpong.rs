@@ -127,8 +127,14 @@ fn main() {
     close_fd(data[1]);
 
     samples_ns.sort_unstable();
-    println!("wait_pipe_pingpong_p50_us={:.3}", percentile(&samples_ns, 0.50));
-    println!("wait_pipe_pingpong_p95_us={:.3}", percentile(&samples_ns, 0.95));
+    println!(
+        "wait_pipe_pingpong_p50_us={:.3}",
+        percentile(&samples_ns, 0.50)
+    );
+    println!(
+        "wait_pipe_pingpong_p95_us={:.3}",
+        percentile(&samples_ns, 0.95)
+    );
     println!(
         "wait_pipe_pingpong_min_us={:.3}",
         samples_ns[0] as f64 / 1000.0

@@ -31,7 +31,10 @@ fn main() {
             "write_broken_pipe_epipe={}",
             r == -1 && errno() == libc::EPIPE
         );
-        println!("sigpipe_delivered_once={}", HITS.load(Ordering::SeqCst) == 1);
+        println!(
+            "sigpipe_delivered_once={}",
+            HITS.load(Ordering::SeqCst) == 1
+        );
         libc::close(fds[1]);
 
         // --- ignored SIGPIPE: still EPIPE, but no handler runs ---
@@ -41,10 +44,7 @@ fn main() {
         libc::close(fds2[0]);
         HITS.store(0, Ordering::SeqCst);
         let r2 = libc::write(fds2[1], buf.as_ptr() as *const _, 4);
-        println!(
-            "ignored_still_epipe={}",
-            r2 == -1 && errno() == libc::EPIPE
-        );
+        println!("ignored_still_epipe={}", r2 == -1 && errno() == libc::EPIPE);
         println!("ignored_no_handler={}", HITS.load(Ordering::SeqCst) == 0);
         libc::close(fds2[1]);
 

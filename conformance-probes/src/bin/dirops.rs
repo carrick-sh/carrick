@@ -38,7 +38,10 @@ fn main() {
     // readdir reflects a newly created file.
     fs::write("/tmp/dd/zzz", b"z").ok();
     let names2 = sorted_names("/tmp/dd");
-    println!("readdir_dd_zzz listed={}", names2.iter().any(|n| n == "zzz"));
+    println!(
+        "readdir_dd_zzz listed={}",
+        names2.iter().any(|n| n == "zzz")
+    );
 
     // hardlink: create /tmp/h1 ("hl"), link to /tmp/h2, read back + nlink.
     fs::write("/tmp/h1", b"hl").ok();
@@ -59,11 +62,17 @@ fn main() {
     }
     match fs::metadata("/tmp/dlnk") {
         Ok(m) => println!("symlink_dlnk_stat_dir={}", m.is_dir()),
-        Err(e) => println!("symlink_dlnk_stat_dir=ERR:{}", e.raw_os_error().unwrap_or(-1)),
+        Err(e) => println!(
+            "symlink_dlnk_stat_dir=ERR:{}",
+            e.raw_os_error().unwrap_or(-1)
+        ),
     }
     match fs::symlink_metadata("/tmp/dlnk") {
         Ok(m) => println!("symlink_dlnk_lstat_symlink={}", m.file_type().is_symlink()),
-        Err(e) => println!("symlink_dlnk_lstat_symlink=ERR:{}", e.raw_os_error().unwrap_or(-1)),
+        Err(e) => println!(
+            "symlink_dlnk_lstat_symlink=ERR:{}",
+            e.raw_os_error().unwrap_or(-1)
+        ),
     }
 
     // rename a directory: /tmp/rd (with a file) -> /tmp/rd2.
@@ -88,10 +97,7 @@ fn main() {
         fs::write("/tmp/ne/f", b"x").ok();
         let dir = CString::new("/tmp/ne").unwrap();
         let r0 = unsafe { libc::rmdir(dir.as_ptr()) };
-        println!(
-            "rmdir_notempty_errno={}",
-            if r0 == 0 { 0 } else { errno() }
-        );
+        println!("rmdir_notempty_errno={}", if r0 == 0 { 0 } else { errno() });
         fs::remove_file("/tmp/ne/f").ok();
         let r1 = unsafe { libc::rmdir(dir.as_ptr()) };
         println!("rmdir_emptied_rc={}", r1);

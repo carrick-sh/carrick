@@ -91,7 +91,8 @@ fn main() {
             parent_did_not_get_child_sigint = PARENT_SIGINT_HITS.load(Ordering::SeqCst) == 0,
             child_reaped = child_reaped,
             child_exited = child_reaped && libc::WIFEXITED(status),
-            child_exit_zero = child_reaped && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            child_exit_zero =
+                child_reaped && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             child_not_signaled = child_reaped && !libc::WIFSIGNALED(status),
         );
     }

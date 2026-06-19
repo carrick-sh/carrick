@@ -75,7 +75,11 @@ fn main() {
         report!(setall_getall = sa == 0 && ga == 0 && got == [3, 7]);
 
         // semop: sem0 is 3 now (from SETALL); decrement by 2 → 1.
-        let mut dec = Sembuf { sem_num: 0, sem_op: -2, sem_flg: 0 };
+        let mut dec = Sembuf {
+            sem_num: 0,
+            sem_op: -2,
+            sem_flg: 0,
+        };
         let op = semop(id, &mut dec, 1);
         let after = semctl(id, 0, GETVAL, 0);
         report!(semop_decrement = op == 0 && after == 1);
@@ -83,7 +87,11 @@ fn main() {
         // Cross-process: child increments sem0 by 4; parent sees 5.
         let pid = libc::fork();
         if pid == 0 {
-            let mut inc = Sembuf { sem_num: 0, sem_op: 4, sem_flg: 0 };
+            let mut inc = Sembuf {
+                sem_num: 0,
+                sem_op: 4,
+                sem_flg: 0,
+            };
             let _ = semop(id, &mut inc, 1);
             libc::_exit(0);
         }

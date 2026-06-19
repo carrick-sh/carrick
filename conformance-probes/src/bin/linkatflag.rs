@@ -92,13 +92,9 @@ fn main() {
         let setup_target = make_regfile(&target);
         // /tmp/linkatflag_sym -> /tmp/linkatflag_target : a symlink TO it.
         libc::unlink(sym.ptr());
-        let setup_sym =
-            libc::symlinkat(target.ptr(), AT_FDCWD, sym.ptr()) == 0;
+        let setup_sym = libc::symlinkat(target.ptr(), AT_FDCWD, sym.ptr()) == 0;
 
-        report!(
-            setup_target_ok = setup_target,
-            setup_sym_ok = setup_sym,
-        );
+        report!(setup_target_ok = setup_target, setup_sym_ok = setup_sym,);
 
         // (1) AT_SYMLINK_FOLLOW on the symlink. Linux: legal flag -> rc 0.
         //     carrick (bug): 0x400 is an unknown bit -> EINVAL(-22).

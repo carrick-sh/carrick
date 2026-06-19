@@ -28,20 +28,47 @@ fn main() {
         let buf = vec![0xABu8; (pg * 4) as usize];
         libc::write(fd, buf.as_ptr() as *const _, buf.len());
 
-        let range = CachestatRange { off: 0, len: pg * 4 };
+        let range = CachestatRange {
+            off: 0,
+            len: pg * 4,
+        };
         let mut cs = [0u64; 5]; // nr_cache, nr_dirty, nr_writeback, nr_evicted, nr_recently_evicted
 
         // A valid cachestat on a regular file succeeds.
-        let rc = libc::syscall(451, fd as i64, &range as *const _ as i64, cs.as_mut_ptr() as i64, 0i64);
+        let rc = libc::syscall(
+            451,
+            fd as i64,
+            &range as *const _ as i64,
+            cs.as_mut_ptr() as i64,
+            0i64,
+        );
         println!("cachestat_ok={}", rc == 0);
 
         // unknown flags → EINVAL.
-        let r2 = libc::syscall(451, fd as i64, &range as *const _ as i64, cs.as_mut_ptr() as i64, 1i64);
-        println!("cachestat_bad_flags_einval={}", r2 == -1 && errno() == libc::EINVAL);
+        let r2 = libc::syscall(
+            451,
+            fd as i64,
+            &range as *const _ as i64,
+            cs.as_mut_ptr() as i64,
+            1i64,
+        );
+        println!(
+            "cachestat_bad_flags_einval={}",
+            r2 == -1 && errno() == libc::EINVAL
+        );
 
         // bad fd → EBADF.
-        let r3 = libc::syscall(451, -1i64, &range as *const _ as i64, cs.as_mut_ptr() as i64, 0i64);
-        println!("cachestat_badfd_ebadf={}", r3 == -1 && errno() == libc::EBADF);
+        let r3 = libc::syscall(
+            451,
+            -1i64,
+            &range as *const _ as i64,
+            cs.as_mut_ptr() as i64,
+            0i64,
+        );
+        println!(
+            "cachestat_badfd_ebadf={}",
+            r3 == -1 && errno() == libc::EBADF
+        );
 
         let _ = errno;
         libc::close(fd);

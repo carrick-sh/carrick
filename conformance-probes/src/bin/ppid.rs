@@ -38,9 +38,7 @@ fn main() {
 
     unsafe { libc::close(fds[1]) };
     let mut bytes = [0u8; 4];
-    let n = unsafe {
-        libc::read(fds[0], bytes.as_mut_ptr() as *mut libc::c_void, bytes.len())
-    };
+    let n = unsafe { libc::read(fds[0], bytes.as_mut_ptr() as *mut libc::c_void, bytes.len()) };
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
 

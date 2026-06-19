@@ -13,8 +13,8 @@
 use conformance_probes::report;
 
 const LEN: usize = 4 * 1024 * 1024; // 4 MiB — large enough to be its own arena
-// region and exercise the bump-then-reclaim
-// path rather than a small-object pool.
+                                    // region and exercise the bump-then-reclaim
+                                    // path rather than a small-object pool.
 
 /// Map LEN anon bytes, fill with 0xNN, then unmap. Returns the mapping address
 /// (so the caller can confirm reuse) or 0 on failure.

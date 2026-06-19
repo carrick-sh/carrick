@@ -54,8 +54,7 @@ fn main() {
         // end never has data, so a blocking recv on it would block until
         // SO_RCVTIMEO (or, if ignored, forever — caught by the watchdog).
         let mut sv = [0i32; 2];
-        let pair_ok =
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) == 0;
+        let pair_ok = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) == 0;
         if !pair_ok {
             report!(setup_socketpair_ok = false);
             return;

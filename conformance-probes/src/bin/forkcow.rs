@@ -57,7 +57,10 @@ fn main() {
     println!("bss_isolated={}", unsafe { BSS_GLOBAL } == 0x4444_4444);
     println!("heap_isolated={}", heap[0] == 0x3333_3333);
     if mmap_ok {
-        println!("mmap_isolated={}", unsafe { *(page as *const u64) } == 0x2222_2222);
+        println!(
+            "mmap_isolated={}",
+            unsafe { *(page as *const u64) } == 0x2222_2222
+        );
     } else {
         println!("mmap_isolated=skip");
     }

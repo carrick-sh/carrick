@@ -47,8 +47,7 @@ fn main() {
             handler_siginfo_nonnull = INFO_NONNULL.load(Ordering::SeqCst),
             handler_query_ok = QUERY_OK.load(Ordering::SeqCst),
             handler_query_retained_siginfo = QUERY_RETAINED_SIGINFO.load(Ordering::SeqCst),
-            disposition_reset_to_dfl =
-                after_query_ok && after.sa_sigaction == libc::SIG_DFL,
+            disposition_reset_to_dfl = after_query_ok && after.sa_sigaction == libc::SIG_DFL,
         );
     }
 }

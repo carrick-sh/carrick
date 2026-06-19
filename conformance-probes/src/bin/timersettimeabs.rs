@@ -81,24 +81,42 @@ fn main() {
 
         // (1a) it_value.tv_nsec >= 1e9 -> EINVAL, and the call must NOT succeed.
         let bad_nsec = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: 0, tv_nsec: 2_000_000_000 },
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 2_000_000_000,
+            },
         };
         let rc = libc::timer_settime(id, 0, &bad_nsec, std::ptr::null_mut());
         report!(nsec_too_big_einval = rc == -1 && errno() == libc::EINVAL);
 
         // (1b) negative tv_nsec -> EINVAL.
         let neg_nsec = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: 0, tv_nsec: -1 },
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: -1,
+            },
         };
         let rc = libc::timer_settime(id, 0, &neg_nsec, std::ptr::null_mut());
         report!(nsec_negative_einval = rc == -1 && errno() == libc::EINVAL);
 
         // (1c) negative tv_sec -> EINVAL.
         let neg_sec = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: -1, tv_nsec: 0 },
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            },
         };
         let rc = libc::timer_settime(id, 0, &neg_sec, std::ptr::null_mut());
         report!(sec_negative_einval = rc == -1 && errno() == libc::EINVAL);
@@ -108,8 +126,14 @@ fn main() {
         // abstime arm overwrites it, and the generation bump in posix_timer::arm
         // retires this 50ms thread, so it cannot leak a spurious SIGUSR1.
         let good = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 },
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 50_000_000,
+            },
         };
         report!(valid_arm_ok = libc::timer_settime(id, 0, &good, std::ptr::null_mut()) == 0);
 
@@ -121,8 +145,14 @@ fn main() {
         let mut now: libc::timespec = MaybeUninit::zeroed().assume_init();
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
         let past = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: now.tv_sec, tv_nsec: now.tv_nsec },
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: now.tv_sec,
+                tv_nsec: now.tv_nsec,
+            },
         };
         let _ = libc::timer_settime(id, TIMER_ABSTIME, &past, std::ptr::null_mut());
 
@@ -132,7 +162,10 @@ fn main() {
             if USR1_HITS.load(Ordering::SeqCst) >= 1 || Instant::now() >= deadline {
                 break;
             }
-            let ts = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000,
+            };
             libc::nanosleep(&ts, std::ptr::null_mut());
         }
         report!(abstime_past_delivered = USR1_HITS.load(Ordering::SeqCst) >= 1);

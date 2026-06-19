@@ -188,7 +188,10 @@ fn main() {
         let (moved, wake1, wake2) = run_round(FUTEX_CMP_REQUEUE, 0);
         println!("cmp_requeue_returned_n={}", moved == N as libc::c_long);
         println!("cmp_requeue_word1_drained={}", wake1 == 0);
-        println!("cmp_requeue_word2_has_rest={}", wake2 == (N - 1) as libc::c_long);
+        println!(
+            "cmp_requeue_word2_has_rest={}",
+            wake2 == (N - 1) as libc::c_long
+        );
         println!(
             "cmp_requeue_all_completed={}",
             RETURNED.load(Ordering::SeqCst) == N

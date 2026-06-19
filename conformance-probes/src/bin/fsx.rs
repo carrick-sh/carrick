@@ -52,18 +52,26 @@ fn main() {
     // assert mtime equals the fixed value (boolean).
     {
         const FIXED: i64 = 1_000_000_000;
-        let fd = open("/tmp/ut", libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/ut",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd >= 0 {
             unsafe { libc::close(fd) };
         }
         let path = CString::new("/tmp/ut").unwrap();
         let times = [
-            libc::timespec { tv_sec: FIXED as _, tv_nsec: 0 },
-            libc::timespec { tv_sec: FIXED as _, tv_nsec: 0 },
+            libc::timespec {
+                tv_sec: FIXED as _,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: FIXED as _,
+                tv_nsec: 0,
+            },
         ];
-        let rc = unsafe {
-            libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0)
-        };
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
         if rc != 0 {
             println!("utimensat=ERR:{}", errno());
         } else {
@@ -83,9 +91,7 @@ fn main() {
         if fd < 0 {
             println!("fadvise=ERR:{}", errno());
         } else {
-            let rc = unsafe {
-                libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL)
-            };
+            let rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
             // posix_fadvise returns the errno directly (0 on success).
             if rc != 0 {
                 println!("fadvise=ERR:{}", rc);
@@ -100,7 +106,11 @@ fn main() {
     // carrick may not support fallocate; print errno on failure so the diff
     // reveals it.
     {
-        let fd = open("/tmp/falloc", libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/falloc",
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd < 0 {
             println!("fallocate=ERR:{}", errno());
         } else {
@@ -145,7 +155,11 @@ fn main() {
 
     // fsync / fdatasync on an open (writable) file: rc (0 on success).
     {
-        let fd = open("/tmp/fsy", libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/fsy",
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd < 0 {
             println!("fsync=ERR:{}", errno());
         } else {
@@ -171,7 +185,11 @@ fn main() {
     // ENOTSUP/ENODATA; carrick likely ENOSYS/ENOTSUP. Print the errno so the
     // diff documents the gap. This is a known-unsupported area.
     {
-        let fd = open("/tmp/xattr", libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/xattr",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd >= 0 {
             unsafe { libc::close(fd) };
         }
@@ -201,9 +219,7 @@ fn main() {
         };
         println!("getxattr={}", rc_or_err(gr as i64));
 
-        let lr = unsafe {
-            libc::listxattr(path.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
-        };
+        let lr = unsafe { libc::listxattr(path.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
         println!("listxattr={}", rc_or_err(lr as i64));
 
         // removexattr round-trip: drop the attr just set, then a get must report
@@ -290,9 +306,7 @@ fn main() {
     // differ — print errno on failure.
     {
         let path = CString::new("/tmp/mknod_reg").unwrap();
-        let rc = unsafe {
-            libc::mknod(path.as_ptr(), libc::S_IFREG | 0o644, 0)
-        };
+        let rc = unsafe { libc::mknod(path.as_ptr(), libc::S_IFREG | 0o644, 0) };
         if rc != 0 {
             println!("mknod_reg=ERR:{}", errno());
         } else {
@@ -303,9 +317,8 @@ fn main() {
         println!("mknod_reg_exists={}", exists);
 
         let path2 = CString::new("/tmp/mknodat_reg").unwrap();
-        let rc2 = unsafe {
-            libc::mknodat(libc::AT_FDCWD, path2.as_ptr(), libc::S_IFREG | 0o644, 0)
-        };
+        let rc2 =
+            unsafe { libc::mknodat(libc::AT_FDCWD, path2.as_ptr(), libc::S_IFREG | 0o644, 0) };
         if rc2 != 0 {
             println!("mknodat_reg=ERR:{}", errno());
         } else {
