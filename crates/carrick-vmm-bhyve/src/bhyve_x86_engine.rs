@@ -926,6 +926,13 @@ impl X86Vmm for BhyveVmm {
         self.vm.map_gpa(target_gpa, len)
     }
 
+    fn is_guest_reserved(&self, va: u64) -> bool {
+        // A reserved (lazily anon-backed) VA the guest has not touched has no
+        // window yet; the engine's read path treats it as kernel zero-fill
+        // instead of EFAULT (see X86Vmm::is_guest_reserved).
+        self.ram.find_reservation(va)
+    }
+
     fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
         // A carrick-side WRITE into a lazily-reserved arena range — the
         // file-backed mmap content copy, stack/auxv staging — must materialize
