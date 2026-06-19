@@ -92,6 +92,36 @@ syscall_table! {
     /// the other modules' tables. Add a `net` syscall by adding an arm
     /// HERE — no shared routing table to edit.
     pub(crate) fn dispatch_net;
+    19 => eventfd2,
+    20 => epoll_create1,
+    21 => epoll_ctl,
+    22 => epoll_pwait,
+    // x86_64 poll(2): shares the ppoll handler, which branches on the
+    // canonical number to read arg2 as an INT timeout_ms (not a *timespec).
+    carrick_abi::CARRICK_PRIVATE_X86_POLL => ppoll,
+    // x86_64 select(2): shares the pselect6 handler, which branches on the
+    // canonical number to read the timeout as a *timeval (not *timespec).
+    carrick_abi::CARRICK_PRIVATE_X86_SELECT => pselect6,
+    72 => pselect6,
+    73 => ppoll,
+    198 => socket,
+    199 => socketpair,
+    200 => bind,
+    201 => listen,
+    202 => accept,
+    203 => connect,
+    204 => getsockname,
+    205 => getpeername,
+    206 => sendto,
+    207 => recvfrom,
+    208 => setsockopt,
+    209 => getsockopt,
+    210 => shutdown,
+    211 => sendmsg,
+    212 => recvmsg,
+    242 => accept4,
+    243 => sys_recvmmsg,
+    269 => sys_sendmmsg,
 }
 mod support;
 use support::*;
