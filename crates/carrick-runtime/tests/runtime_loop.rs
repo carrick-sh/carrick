@@ -25,10 +25,10 @@ const HELLO: &[u8] = b"hello from carrick\n";
 #[test]
 fn runtime_loop_dispatches_static_elf_write_and_exit() {
     build_linux_fixture();
-    let mut image = AddressSpace::load_elf(
-        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-vmm-kvm-aarch64-hello",
-    )
-    .unwrap();
+    let elf = repo_root().join(
+        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello",
+    );
+    let mut image = AddressSpace::load_elf(&elf).unwrap();
     let message = image.find_bytes(HELLO).unwrap();
     let mut trap = ScriptedTrap::new([
         Aarch64SyscallFrame {
@@ -298,8 +298,21 @@ impl SyscallTrap for ScriptedTrap {
     }
 }
 
+/// Repository root, derived from this crate's manifest dir
+/// (`<repo>/crates/carrick-runtime`). `cargo test` runs the test binary with
+/// CWD set to the crate manifest dir, not the repo root, so fixture and script
+/// paths must be anchored here rather than assumed relative to the repo root.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crate manifest dir has a <repo>/crates/<crate> shape")
+        .to_path_buf()
+}
+
 fn build_linux_fixture() {
-    let status = Command::new("scripts/build-linux-fixtures.sh")
+    let status = Command::new(repo_root().join("scripts/build-linux-fixtures.sh"))
+        .current_dir(repo_root())
         .status()
         .unwrap();
     assert!(status.success());
