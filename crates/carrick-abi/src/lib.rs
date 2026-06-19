@@ -2196,6 +2196,16 @@ pub const CARRICK_PRIVATE_X86_UTIME: u64 = u64::MAX - 0x26;
 /// `utimensat(AT_FDCWD, path, &times, flags=0)`. Out-of-range tv_usec
 /// (outside [0,999999]) -> -EINVAL; an unreadable guest pointer -> -EFAULT.
 pub const CARRICK_PRIVATE_X86_UTIMES: u64 = u64::MAX - 0x27;
+/// Carrick-internal normalized syscall number for x86_64 `poll(2)`.
+///
+/// x86_64 `poll(fds, nfds, timeout_ms)` carries an INT timeout (milliseconds:
+/// -1 blocks, 0 returns now). The asm-generic/aarch64 canonical has only
+/// `ppoll(fds, nfds, *timespec, ...)` whose 3rd arg is a POINTER (0 = NULL =
+/// block forever) — so folding `poll` into `ppoll` mis-reads a `poll(.,.,0)`
+/// non-blocking probe as an infinite wait (musl's startup `poll([0,1,2],3,0)`
+/// then wedges the guest). This private number routes `poll` to the ppoll
+/// handler's poll branch, which reads arg2 as `timeout_ms` and uses no sigmask.
+pub const CARRICK_PRIVATE_X86_POLL: u64 = u64::MAX - 0x28;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;

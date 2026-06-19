@@ -684,6 +684,11 @@ pub const CANONICAL_CLONE: u64 = 220;
 const X86_NR_FORK: u64 = 57;
 /// x86-64 `vfork(2)` (syscalls(2)). Desugars to clone(220)+CLONE_VM|CLONE_VFORK|SIGCHLD.
 const X86_NR_VFORK: u64 = 58;
+/// x86-64 `poll(2)` (syscalls(2)). Desugars to a private dispatcher shim because
+/// the canonical/asm-generic ABI has only `ppoll(2)`, whose 3rd arg is a
+/// `*timespec` POINTER — folding poll in would mis-read poll's INT `timeout_ms`
+/// (a `poll(.,.,0)` non-blocking probe would wedge as an infinite wait).
+const X86_NR_POLL: u64 = 7;
 /// x86-64 `dup2(2)` (syscalls(2)). Desugars to a private dispatcher shim because
 /// canonical/asm-generic has `dup3(2)` but no `dup2(2)`.
 const X86_NR_DUP2: u64 = 33;
@@ -817,6 +822,16 @@ impl X8664GuestArch {
                     0,
                     0,
                 ],
+            });
+        }
+        if x86_number == X86_NR_POLL {
+            // poll(fds, nfds, timeout_ms) — keep the args; the private handler
+            // reads arg2 as an INT timeout_ms (NOT a *timespec) and uses no
+            // sigmask. Folding into ppoll(73) mis-read timeout_ms=0 as a NULL
+            // timeout pointer → infinite wait (musl startup wedge).
+            return SyscallNorm::Plain(RawSyscall {
+                number: carrick_abi::CARRICK_PRIVATE_X86_POLL,
+                args: [args[0], args[1], args[2], 0, 0, 0],
             });
         }
         if x86_number == X86_NR_DUP2 {
@@ -1124,6 +1139,23 @@ mod normalize_tests {
                 assert_eq!(rs.args, [3, 1, 0, 0, 0, 0]);
             }
             _ => panic!("dup2 must be Plain"),
+        }
+    }
+
+    #[test]
+    fn poll_normalizes_to_private_number_not_ppoll() {
+        // x86 poll = 7. Folding it into canonical ppoll(73) mis-reads poll's INT
+        // timeout_ms (arg2) as ppoll's *timespec pointer — a poll(.,.,0)
+        // non-blocking probe would then block forever. poll must normalize to a
+        // PRIVATE number (distinct from ppoll) so the dispatcher reads arg2 as an
+        // int timeout. The args (fds, nfds, timeout_ms) pass through unchanged.
+        match X8664GuestArch::normalize_syscall(&frame(7, [0x1000, 3, 0, 0xBAD, 0xBAD, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_POLL);
+                assert_ne!(rs.number, 73); // NOT canonical ppoll
+                assert_eq!(rs.args, [0x1000, 3, 0, 0, 0, 0]);
+            }
+            _ => panic!("poll must be Plain"),
         }
     }
 

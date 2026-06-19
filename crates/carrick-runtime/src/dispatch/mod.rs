@@ -145,6 +145,7 @@ use crate::linux_abi::{
     CARRICK_PRIVATE_X86_FSTAT,
     CARRICK_PRIVATE_X86_LSTAT,
     CARRICK_PRIVATE_X86_NEWFSTATAT,
+    CARRICK_PRIVATE_X86_POLL,
     CARRICK_PRIVATE_X86_STAT,
     KernelAbi,
     // ABI constants moved from dispatch.rs (Goal #3, private set)
@@ -1644,6 +1645,9 @@ impl SyscallDispatcher {
         23 => dup,
         24 => dup3,
         CARRICK_PRIVATE_X86_DUP2 => dup2,
+        // x86_64 poll(2): shares the ppoll handler, which branches on the
+        // canonical number to read arg2 as an INT timeout_ms (not a *timespec).
+        CARRICK_PRIVATE_X86_POLL => ppoll,
         CARRICK_PRIVATE_X86_STAT => x86_stat,
         CARRICK_PRIVATE_X86_FSTAT => x86_fstat,
         CARRICK_PRIVATE_X86_LSTAT => x86_lstat,
