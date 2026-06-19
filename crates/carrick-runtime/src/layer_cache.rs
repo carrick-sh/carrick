@@ -348,10 +348,55 @@ fn reflink_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
         if rc == 0 {
             return Ok(());
         }
+        // FICLONE requires CAP_SYS_RAWIO — denied in unprivileged containers,
+        // where it returns EPERM — and is unsupported on some filesystems.
+        // copy_file_range(2) needs no capability and still performs a reflink/COW
+        // on btrfs/XFS/bcachefs and ZFS with block_cloning (an efficient in-kernel
+        // copy otherwise), so try it before falling back to a userspace byte copy.
+        if copy_file_range_whole(&s, &d).is_ok() {
+            return Ok(());
+        }
     }
     // Reflink unavailable on this volume — `std::fs::copy` overwrites the empty
     // file the failed clone left behind (it create/truncates the destination).
     std::fs::copy(src, dst)?; // nosemgrep
+    Ok(())
+}
+
+/// Copy the whole file `s` -> `d` via `copy_file_range(2)`: a reflink/COW where
+/// the filesystem supports it (incl. unprivileged ZFS block_cloning, where
+/// `FICLONE` is denied) and an efficient in-kernel copy otherwise. `d` was just
+/// create/truncated, so both fds sit at offset 0; NULL offsets let the kernel
+/// advance them. (The FreeBSD seed path, which has no `FICLONE`, will reuse this
+/// once its `replicate_tree`/extattr counterpart is wired.)
+#[cfg(target_os = "linux")]
+fn copy_file_range_whole(s: &std::fs::File, d: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let mut remaining = s.metadata()?.len();
+    while remaining > 0 {
+        // SAFETY: both fds are open/valid; NULL in/out offsets advance the file
+        // positions; len is clamped to what is left.
+        let n = unsafe {
+            libc::copy_file_range(
+                s.as_raw_fd(),
+                std::ptr::null_mut(),
+                d.as_raw_fd(),
+                std::ptr::null_mut(),
+                remaining as usize,
+                0,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            break; // short of EOF with no progress — let the caller byte-copy.
+        }
+        remaining -= n as u64;
+    }
+    if remaining != 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    }
     Ok(())
 }
 
