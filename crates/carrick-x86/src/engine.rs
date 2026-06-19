@@ -25,7 +25,7 @@ use carrick_hal::{
     ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SysReg, SyscallTrap, ThreadedEngine,
     TrapError,
 };
-use carrick_mem::memory::AddressSpace;
+use carrick_mem::memory::{AddressSpace, LINUX_NULL_GUARD_END};
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
 use crate::vmm::{X86Exit, X86FaultKind, X86Reg, X86Vcpu, X86Vmm};
@@ -315,6 +315,16 @@ fn host_run_len<V: X86Vmm>(vm: &V, addr: u64, max: usize) -> usize {
 
 impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        // A guest pointer in the NULL guard region [0, 0x10000) is unmapped on
+        // Linux; the aarch64 path faults it (safe_access_translated). The x86
+        // host_ptr path has no VA guard — the low identity window backs GPA 0 —
+        // so without this a syscall copy of a NULL/low pointer would silently
+        // read zeros instead of EFAULT (memfdcreate/iovecedge). Zero-length is
+        // exempt (read(fd, NULL, 0) == 0).
+        if length > 0 && address < LINUX_NULL_GUARD_END {
+            trace_x86_efault("read", address, length);
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         let mut out = vec![0u8; length];
         let mut off = 0usize;
         while off < length {
@@ -348,6 +358,13 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
+        // NULL-guard, mirroring read_bytes (and the aarch64 path): a write
+        // through a NULL/low guest pointer must EFAULT, not silently hit the
+        // GPA-0-backed low window.
+        if length > 0 && address < LINUX_NULL_GUARD_END {
+            trace_x86_efault("write", address, length);
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         let mut off = 0usize;
         while off < length {
             let addr = address + off as u64;
