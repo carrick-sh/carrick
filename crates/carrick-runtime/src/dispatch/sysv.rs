@@ -377,7 +377,7 @@ pub(super) fn shmid_ds_bytes(segment: &ShmSegment) -> [u8; 112] {
 }
 
 // ===================================================================
-// Syscall handlers (wired into normalized_dispatch! as 194/195/196/197).
+// Syscall handlers (wired into dispatch_sysv as 194/195/196/197).
 // ===================================================================
 
 impl SyscallDispatcher {

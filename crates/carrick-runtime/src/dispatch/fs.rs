@@ -1822,7 +1822,7 @@ impl SyscallDispatcher {
 
     // === Normalized shim-wrappers ===
     // Thin adapters giving each remaining legacy handler the uniform
-    // SyscallCtx<M> contract so it can live in the `normalized_dispatch!`
+    // SyscallCtx<M> contract so it can live in the `dispatch_fs`
     // table. The inner fns are unchanged (already tested); these forward
     // `ctx.request` (Copy) and `ctx.memory`. Once every syscall has a
     // wrapper the legacy match in `dispatch()` is deleted and the macro

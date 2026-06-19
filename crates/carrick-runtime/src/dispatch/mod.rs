@@ -13,20 +13,24 @@
 //! and the shared helpers the per-domain handler modules
 //! (`fs`, `proc`, `net`, `mem`, `signal`, …) build on.
 //!
-//! # The dispatch table: one normalized contract, macro-generated
+//! # The dispatch table: one normalized contract, per-module routing
 //!
-//! Every migrated handler has the *same* signature — a method on
-//! [`SyscallDispatcher`] taking `&mut SyscallCtx<M>` and returning
-//! `Result<DispatchOutcome, DispatchError>`. The `normalized_dispatch!` macro
-//! (below) expands a `number => handler` list into two functions:
-//! `dispatch_normalized` (the `match` that builds a [`SyscallCtx`] and calls the
-//! handler) and `dispatch_normalized_known` (a membership test the threaded path
-//! uses to decide whether a syscall is claimed at all). The macro table is the
-//! single authoritative syscall registry: any number it does not claim is
-//! genuinely unimplemented and returns `-ENOSYS`. There is no hand-written
-//! mega-`match` anymore — the legacy fall-through arm has shrunk to nothing, so
-//! an unclaimed number records a structured compat event and ENOSYSes rather
-//! than panicking. **The supervisor never panics on guest input.**
+//! Every handler has the *same* signature — a method on [`SyscallDispatcher`]
+//! taking `&mut SyscallCtx<M>` and returning `Result<DispatchOutcome,
+//! DispatchError>` — so a `number → handler` mapping is just a `match` returning
+//! one [`SyscallHandler`] fn pointer. Each per-domain module (`fs`, `net`,
+//! `mem`, `proc`, `signal`, `time`, `creds`, `sysv`) owns its OWN routing table
+//! via the `syscall_table!` macro, which emits a `dispatch_<area>(number) ->
+//! Option<SyscallHandler<M>>`. `resolve_handler` chains those eight tables;
+//! `dispatch_normalized` (builds a [`SyscallCtx`] and invokes the resolved
+//! handler) and `dispatch_normalized_known` (the membership test the threaded
+//! path uses) both go through it, so they cannot drift. There is NO central
+//! routing chokepoint: adding a syscall is a one-module edit, which lets many
+//! agents grow their own module's syscall set without contending on a shared
+//! file. The chained tables are the single authoritative syscall registry: any
+//! number no module claims is genuinely unimplemented and returns `-ENOSYS` —
+//! a structured compat event, never a panic. **The supervisor never panics on
+//! guest input.**
 //!
 //! [`SyscallCtx`] is a *transient narrow borrow*: it bundles the request, a
 //! scoped `&mut` of guest memory, the compat reporter, and (on the threaded
@@ -1618,14 +1622,6 @@ impl Default for SyscallDispatcher {
     }
 }
 
-/// Generate `dispatch_normalized`, the single match over syscalls migrated
-/// to the normalized `SyscallCtx` handler contract. Each entry maps a
-/// syscall number to a handler method `fn(&mut self, &mut SyscallCtx<M>)
-/// -> Result<DispatchOutcome, DispatchError>`. `dispatch()` tries this
-/// first and falls through to the legacy match for not-yet-migrated
-/// syscalls; the borrow of memory/reporter is scoped to the call so the
-/// legacy arm can still use them. As subsystems migrate this list grows
-/// and the legacy match shrinks. See [[plan-syscall-macro-split]].
 /// A normalized syscall handler resolved to a bare function pointer: the
 /// `define_syscall!`-generated `sys_*` methods all share this signature, so a
 /// `number → handler` table is just a `match` returning one of these. Each
