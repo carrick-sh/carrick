@@ -1636,39 +1636,13 @@ impl Default for SyscallDispatcher {
 pub(crate) type SyscallHandler<M> =
     fn(&SyscallDispatcher, &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError>;
 
-// Central routing table for syscall numbers not yet migrated to a per-module
-// `dispatch_<area>`. As each module's arms move into its own table (Task A1),
-// this shrinks; when empty it can be dropped entirely. `resolve_handler` chains
-// the per-module tables and falls back to this one.
-syscall_table! {
-    pub(crate) fn dispatch_misc;
-    30 => ioprio_set,
-    31 => ioprio_get,
-    58 => vhangup,
-    186 => msgget,
-    187 => msgctl,
-    188 => msgrcv,
-    189 => msgsnd,
-    190 => semget,
-    191 => semctl,
-    192 => semtimedop,
-    193 => semop,
-    194 => shmget,
-    195 => shmctl,
-    196 => shmat,
-    197 => shmdt,
-}
-
-// end syscall_table! dispatch_misc
-
 /// Resolve a syscall number to its handler by chaining every dispatch module's
-/// own routing table, then the central `dispatch_misc` fallback for arms not
-/// yet migrated to a module. This is the single source of truth for "is this
-/// number claimed, and by which handler"; both `dispatch_normalized` (which
-/// builds the ctx and invokes the handler) and `dispatch_normalized_known`
-/// (the membership test) go through it. Each module owns its own arms, so a
-/// future agent adds a syscall by editing ONE module's `dispatch_<area>` — never
-/// this function or a shared table.
+/// own routing table. This is the single source of truth for "is this number
+/// claimed, and by which handler"; both `dispatch_normalized` (which builds the
+/// ctx and invokes the handler) and `dispatch_normalized_known` (the membership
+/// test) go through it. Each module owns its own arms, so a future agent adds a
+/// syscall by editing ONE module's `dispatch_<area>` — never this function (the
+/// central `dispatch()` chokepoint is gone). See [[plan-concurrent-fanout-lanes]].
 fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
     fs::dispatch_fs(number)
         .or_else(|| net::dispatch_net(number))
@@ -1678,7 +1652,6 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
         .or_else(|| time::dispatch_time(number))
         .or_else(|| creds::dispatch_creds(number))
         .or_else(|| sysv::dispatch_sysv(number))
-        .or_else(|| dispatch_misc(number))
 }
 
 impl SyscallDispatcher {
