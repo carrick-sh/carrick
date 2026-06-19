@@ -21,12 +21,36 @@
 //! talking to `launchservicesd` over Mach, wedging the guest's vCPU. The
 //! argv/environ stack overwrite is fork-safe (the heap copy survives fork;
 //! the stack bytes are private per process after fork).
+//!
+//! ## Non-macOS hosts
+//!
+//! carrick also targets Linux/KVM, FreeBSD/bhyve and NetBSD/NVMM, where the
+//! same `carrick:<id>: <name>` title underpins the scoped-kill / run-id
+//! isolation (`pkill -f "carrick:<id>:"`, `scripts/sudo/kill.sh`) that lets
+//! concurrent runs / lanes / the conformance gate coexist:
+//!
+//!   * **BSD (FreeBSD/NetBSD/OpenBSD/DragonFly):** the kernel reserves a
+//!     dedicated `ps_strings` title slot, and libc exposes `setproctitle(3)` to
+//!     write it — no environ relocation needed. We call `setproctitle("-%s",
+//!     label)`; the leading `-` suppresses libc's default `progname: ` prefix so
+//!     the visible title is *exactly* the label.
+//!   * **Linux:** glibc/musl have no `setproctitle`, so we use the libuv trick —
+//!     overwrite the contiguous `argv`/`environ` byte run in place (that's what
+//!     `/proc/PID/cmdline` and `ps` read), widening the writable window by
+//!     relocating `environ` onto the heap exactly as the macOS path does (using
+//!     the `environ` global instead of `_NSGetEnviron`). We also set
+//!     `/proc/PID/comm` via `prctl(PR_SET_NAME)` for the 15-char short name. An
+//!     `.init_array` constructor captures `(argc, argv, envp)` before `main`,
+//!     since Linux has no `_NSGetArgv`/`_NSGetEnviron` accessors.
+//!
+//! All non-macOS paths preserve the macOS fork-safety constraints: `init()`
+//! runs before any fork/thread, and the widened buffer is private per process
+//! after fork.
 //
-// On non-macOS targets `init`/`set_host_process_name` are inert stubs, so the
-// label machinery (`RUN_ID`, `run_id`, `proc_label`) has no caller in the built
-// binary and clippy flags it as dead. It is exercised on macOS (and by the unit
-// tests on every platform), so allow dead_code module-wide rather than removing
-// or cfg-gating the still-tested helpers.
+// The label machinery (`RUN_ID`, `run_id`, `proc_label`) and a few helpers are
+// only reachable on some platforms; they are exercised on every platform by the
+// unit tests, so allow dead_code module-wide rather than cfg-gating the still-
+// tested helpers.
 #![allow(dead_code)]
 
 use std::sync::OnceLock;
@@ -68,20 +92,20 @@ pub(crate) fn proc_label(name: &str, run_id: Option<&str>) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct Buffer {
     start: *mut u8,
     len: usize,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 unsafe impl Send for Buffer {}
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 unsafe impl Sync for Buffer {}
 
 /// Discovered writable `argv`/`environ` byte range. `None` if discovery
 /// declined to relocate (non-contiguous layout, NULL pointers, etc).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static BUFFER: OnceLock<Option<Buffer>> = OnceLock::new();
 
 /// Initialize process-title relocation. Idempotent — subsequent calls are
@@ -97,7 +121,35 @@ pub fn init() {
     BUFFER.get_or_init(|| unsafe { discover_and_relocate() });
 }
 
-#[cfg(not(target_os = "macos"))]
+/// BSD `init()`: `setproctitle(3)` writes a kernel-reserved title slot, so
+/// there is nothing to relocate. No-op.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn init() {}
+
+/// Linux `init()`: relocate `environ` onto the heap (libuv trick) to widen the
+/// in-place writable argv/env window. See the macOS `init()` and
+/// `discover_and_relocate` for the contiguity/fork-safety contract; the only
+/// difference is the argv/environ source — captured by the `.init_array`
+/// constructor below instead of `_NSGetArgv`/`_NSGetEnviron`.
+#[cfg(target_os = "linux")]
+pub fn init() {
+    BUFFER.get_or_init(|| unsafe { discover_and_relocate() });
+}
+
+/// Fallback `init()` for any other non-macOS host (no title mechanism known).
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
 pub fn init() {}
 
 /// Set the host thread/process name to `carrick: <comm>` so external
@@ -133,10 +185,85 @@ pub fn set_host_process_name(comm: &[u8]) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// BSD `set_host_process_name`: build the same `proc_label` and hand it to
+/// `setproctitle(3)`. The `-` format prefix suppresses libc's default
+/// `progname: ` so `ps -o command` shows EXACTLY the label, e.g.
+/// `carrick:cr-test123: ls` — greppable per-run for the scoped reaper.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn set_host_process_name(comm: &[u8]) {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let name = String::from_utf8_lossy(&comm[..end]);
+    let label = proc_label(&name, run_id());
+
+    // A NUL in the label would truncate the C string; `proc_label` only ever
+    // contains the run-id + the guest task name, but guard anyway.
+    let Ok(clabel) = std::ffi::CString::new(label) else {
+        return;
+    };
+    // Leading "-" in the format suppresses setproctitle's default
+    // "progname: " prefix, so the title is the label verbatim.
+    const FMT: &[u8] = b"-%s\0";
+    unsafe {
+        libc::setproctitle(
+            FMT.as_ptr() as *const libc::c_char,
+            clabel.as_ptr() as *const libc::c_char,
+        );
+    }
+}
+
+/// Linux `set_host_process_name`: (a) overwrite the in-place argv/env byte
+/// window — what `/proc/PID/cmdline` and `ps` read — NUL-padding the remainder,
+/// and (b) `prctl(PR_SET_NAME)` to set `/proc/PID/comm` (15-char cap) for the
+/// short name. Mirrors the macOS argv-overwrite path; if `init()` declined to
+/// relocate we fall back to the `argv[0]`-only window.
+#[cfg(target_os = "linux")]
+pub fn set_host_process_name(comm: &[u8]) {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let name = String::from_utf8_lossy(&comm[..end]);
+    let label = proc_label(&name, run_id());
+
+    // (1) /proc/PID/comm via prctl(PR_SET_NAME) — the kernel caps this at 16
+    // bytes including the NUL (15 visible chars). Shows in `ps -o comm`, top,
+    // /proc/PID/comm, and as the thread name in gdb/perf. Use the run-id +
+    // name label truncated to fit; the full label lives in cmdline below.
+    if let Ok(cstr) = std::ffi::CString::new(label.chars().take(15).collect::<String>()) {
+        unsafe {
+            libc::prctl(libc::PR_SET_NAME, cstr.as_ptr() as libc::c_ulong, 0, 0, 0);
+        }
+    }
+
+    // (2) argv/env byte window in-place overwrite — what `/proc/PID/cmdline`
+    // and `ps -o command` read. If `init()` widened the window by relocating
+    // environ we get the full argv+envp byte span; otherwise fall back to
+    // `argv[0]`-only. NUL-pad the remainder so a shortened name doesn't leave
+    // stale trailing text (and so `/proc/PID/cmdline`'s NUL-separated parsing
+    // collapses to the single title arg).
+    unsafe {
+        if let Some((buf, len)) = wide_buffer() {
+            write_label_into(buf, len, label.as_bytes());
+        } else {
+            write_label_argv0_only(label.as_bytes());
+        }
+    }
+}
+
+/// Fallback for any other non-macOS host: no title mechanism. No-op.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
 pub fn set_host_process_name(_comm: &[u8]) {}
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wide_buffer() -> Option<(*mut u8, usize)> {
     BUFFER
         .get()
@@ -144,7 +271,7 @@ fn wide_buffer() -> Option<(*mut u8, usize)> {
         .map(|b| (b.start, b.len))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 unsafe fn write_label_into(buf: *mut u8, len: usize, bytes: &[u8]) {
     unsafe {
         let n = bytes.len().min(len);
@@ -286,6 +413,168 @@ unsafe fn discover_and_relocate() -> Option<Buffer> {
         // so its layout matches the `**char` libc wants.
         let leaked: &'static mut [*mut libc::c_char] = Box::leak(new_env.into_boxed_slice());
         *environ_pp = leaked.as_mut_ptr();
+
+        Some(Buffer { start, len })
+    }
+}
+
+// ---- Linux argv/environ capture + relocation ----
+//
+// Linux has no `_NSGetArgv`/`_NSGetEnviron`. The glibc/musl runtime instead
+// invokes every `.init_array` constructor with `(int argc, char **argv, char
+// **envp)` before `main`, so we register one to stash those pointers. `environ`
+// is a libc global; we relocate it (and read it back) the same way the macOS
+// path uses `*_NSGetEnviron`.
+#[cfg(target_os = "linux")]
+mod linux_capture {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    pub(super) static ARGC: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    pub(super) static ARGV: AtomicPtr<*mut libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// `.init_array` entry: glibc/musl call this with `(argc, argv, envp)`
+    /// before `main`. We only stash argc/argv here — `environ` is read from the
+    /// libc global at relocation time so we observe any pre-`init` setenv.
+    ///
+    /// # Safety
+    /// Invoked by the C runtime with the process's real argv. We only copy the
+    /// two scalar pointer/count values into atomics.
+    pub(super) extern "C" fn capture(argc: libc::c_int, argv: *mut *mut libc::c_char) {
+        ARGC.store(argc, Ordering::Relaxed);
+        ARGV.store(argv, Ordering::Relaxed);
+    }
+
+    // Register `capture` in `.init_array`. `#[used]` keeps the linker from
+    // dropping the otherwise-unreferenced pointer; the section name is the
+    // glibc/musl constructor table the dynamic loader walks with (argc,argv,
+    // envp). The signature `(c_int, **c_char)` matches what the loader passes
+    // (the third `envp` arg is ignored — extra args are harmless on the SysV
+    // ABI).
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static CAPTURE_CTOR: extern "C" fn(libc::c_int, *mut *mut libc::c_char) = capture;
+}
+
+// libc's `environ` global. glibc and musl both export it; the `libc` crate does
+// not bind it, so declare it here (matches PostgreSQL/libuv usage on Linux).
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    static mut environ: *mut *mut libc::c_char;
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn write_label_argv0_only(bytes: &[u8]) {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        let argv = linux_capture::ARGV.load(Ordering::Relaxed);
+        if argv.is_null() {
+            return;
+        }
+        let arg0 = *argv;
+        if arg0.is_null() {
+            return;
+        }
+        let orig_len = libc::strlen(arg0);
+        let n = bytes.len().min(orig_len);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), arg0 as *mut u8, n);
+        for i in n..orig_len {
+            *arg0.add(i) = 0;
+        }
+    }
+}
+
+/// Linux twin of the macOS `discover_and_relocate`: same contiguity walk and
+/// heap-relocation of `environ`, but argv/argc come from the `.init_array`
+/// capture and environ is the libc global rather than `_NSGetEnviron`. The
+/// kernel lays argv+envp out as one contiguous run at the top of the stack on
+/// Linux too, so the macOS contiguity invariants hold. See the macOS function
+/// for the full safety contract.
+#[cfg(target_os = "linux")]
+unsafe fn discover_and_relocate() -> Option<Buffer> {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        let argc = linux_capture::ARGC.load(Ordering::Relaxed);
+        let argv = linux_capture::ARGV.load(Ordering::Relaxed);
+        // The `.init_array` constructor must have run before `init()` (it runs
+        // before `main`). If argv is null we never captured it — decline.
+        if argv.is_null() || argc <= 0 {
+            return None;
+        }
+        let arg0 = *argv;
+        if arg0.is_null() {
+            return None;
+        }
+        let environ_ptr = std::ptr::addr_of_mut!(environ);
+        // Local snapshot of the environ array head. Named distinctly from the
+        // `environ` static (a `let environ` would shadow-error: E0530).
+        let env_arr = *environ_ptr;
+
+        // Walk argv strings, requiring each to abut the previous
+        // (prev_end + 1 == next_start) — the kernel's stack layout.
+        let mut cursor = arg0 as *const libc::c_char;
+        let mut end: *const libc::c_char = arg0 as *const libc::c_char;
+        for i in 0..argc {
+            let p = *argv.offset(i as isize);
+            if p.is_null() {
+                return None;
+            }
+            if !std::ptr::eq(p, cursor) {
+                return None;
+            }
+            let l = libc::strlen(p);
+            end = (p as *const u8).add(l) as *const libc::c_char;
+            cursor = end.add(1);
+        }
+
+        // Then environ — same contiguity rule, STOP-AT-FIRST-BREAK so a pre-init
+        // setenv (heap-allocated, won't abut the stack run) bounds the writable
+        // window but we still strdup every entry onto the heap.
+        let mut env_count: usize = 0;
+        let mut still_contiguous = true;
+        if !env_arr.is_null() {
+            let mut i: usize = 0;
+            loop {
+                let p = *env_arr.add(i);
+                if p.is_null() {
+                    break;
+                }
+                if still_contiguous {
+                    if std::ptr::eq(p, cursor) {
+                        let l = libc::strlen(p);
+                        end = (p as *const u8).add(l) as *const libc::c_char;
+                        cursor = end.add(1);
+                    } else {
+                        still_contiguous = false;
+                    }
+                }
+                i += 1;
+            }
+            env_count = i;
+        }
+
+        let start = arg0 as *mut u8;
+        let len = (end as usize) - (arg0 as usize) + 1; // include trailing NUL
+
+        // Strdup the env strings onto the heap and repoint `environ` at the
+        // duplicate. Box::leak so libc's getenv/setenv keep a live array.
+        let mut new_env: Vec<*mut libc::c_char> = Vec::with_capacity(env_count + 1);
+        if !env_arr.is_null() {
+            for i in 0..env_count {
+                let src = *env_arr.add(i);
+                let dup = libc::strdup(src);
+                if dup.is_null() {
+                    for &p in &new_env {
+                        libc::free(p as *mut libc::c_void);
+                    }
+                    return None;
+                }
+                new_env.push(dup);
+            }
+        }
+        new_env.push(std::ptr::null_mut());
+
+        let leaked: &'static mut [*mut libc::c_char] = Box::leak(new_env.into_boxed_slice());
+        *environ_ptr = leaked.as_mut_ptr();
 
         Some(Buffer { start, len })
     }
