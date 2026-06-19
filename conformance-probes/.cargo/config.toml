@@ -11,3 +11,10 @@
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "link-self-contained=yes"]
+
+# Same recipe for the aarch64 Linux target, so the SAME probes can be built
+# natively on an Apple-silicon mac and run on the aarch64/HVF backend — the
+# "macOS reference" — to classify a gap as x86-vs-macOS (a parity gap) vs shared.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
