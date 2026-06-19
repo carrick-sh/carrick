@@ -120,6 +120,23 @@ pub fn total_us() -> u64 {
     total_ns_including_active() / 1000
 }
 
+/// THIS vCPU thread's own accumulated guest CPU time in microseconds (including
+/// an in-flight run). For getrusage(RUSAGE_THREAD): the guest's getrusage traps
+/// out and runs the dispatch ON its own vCPU thread, so this thread's slot is the
+/// calling guest thread's CPU. Saturating.
+pub fn this_thread_us() -> u64 {
+    MY_SLOT.with(|&slot| {
+        let committed = EXEC_SLOTS[slot].load(Ordering::Relaxed);
+        let start = ACTIVE_START_NS[slot].load(Ordering::Acquire);
+        let ns = if start == 0 {
+            committed
+        } else {
+            committed.saturating_add(monotonic_ns().saturating_sub(start))
+        };
+        ns / 1000
+    })
+}
+
 /// Clear per-process state in a freshly `fork`ed child: its vCPU starts a new
 /// exec clock at zero and it has not waited any children of its own. (The
 /// shared child-exit table is process-shared and intentionally NOT cleared.)
