@@ -1304,6 +1304,19 @@ pub mod runtime {
             libc::setsid();
         }
 
+        // Name the host process `carrick:<run-id>: <basename>` up front (the
+        // macOS sibling does this in execute.rs before the run loop). This is
+        // what powers the scoped reaper — `pkill -f "carrick:<id>:"` /
+        // scripts/sudo/kill.sh — so concurrent runs / lanes / the conformance
+        // gate can coexist, and lets `ps`/`/proc/PID/comm` identify which guest
+        // a carrick host process is driving. `init()` (called from the CLI's
+        // `main` before any fork) already widened the writable window.
+        {
+            let exec_path = &spec.executable;
+            let base = exec_path.rsplit('/').next().unwrap_or(exec_path);
+            crate::dispatch::set_host_process_name(base.as_bytes());
+        }
+
         // 1. Extract the OCI layers onto a fresh cap-std scratch rootfs.
         let mut host = HostFsBackend::new()
             .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("scratch dir: {e}")))?;
