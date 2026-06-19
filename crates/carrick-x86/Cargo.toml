@@ -24,5 +24,10 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 # the run-elf service loop + fault delivery call host `read(2)`/`write(2)` and
 # reference `libc` signal/errno numbers.
 carrick-abi = { path = "../carrick-abi" }
+# guest_cpu accounting (begin_active/finish_active around the guest run) so
+# getrusage(RUSAGE_SELF)/times/`/proc` see the guest's CPU time. Done ONCE in this
+# shared run loop → every backend that uses it (bhyve, NVMM) accounts the guest
+# CPU; KVM and HVF have their own trap loops that already do the same.
+carrick-host = { path = "../carrick-host" }
 bitflags.workspace = true
 libc.workspace = true
