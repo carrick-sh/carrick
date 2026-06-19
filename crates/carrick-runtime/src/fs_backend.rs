@@ -2211,8 +2211,19 @@ fn with_entry_fd<R>(
     use cap_std::fs::OpenOptionsExt;
     use std::os::fd::AsRawFd;
     if is_dir {
-        let d = dir.open_dir(rel).ok()?;
-        Some(f(d.as_raw_fd()))
+        // cap-std's open_dir() uses O_PATH on Linux, and f*xattr on an O_PATH fd
+        // returns EBADF — so directory owner/mode xattrs (mkdir/chmod setgid,
+        // chmod that follows a symlink to a dir) silently failed there. Open the
+        // directory READ-ONLY instead (a plain fd that accepts f*xattr), via the
+        // same confined cap-std open the file branches use. Falls back to
+        // open_dir if a read open of the directory is refused.
+        match dir.open_with(rel, cap_std::fs::OpenOptions::new().read(true)) {
+            Ok(d) => Some(f(d.as_raw_fd())),
+            Err(_) => {
+                let d = dir.open_dir(rel).ok()?;
+                Some(f(d.as_raw_fd()))
+            }
+        }
     } else if writable {
         let file = dir
             .open_with(rel, cap_std::fs::OpenOptions::new().read(true).write(true))
