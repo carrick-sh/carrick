@@ -60,6 +60,16 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+
+syscall_table! {
+    /// Per-module syscall routing for the `proc` subsystem (Task A1).
+    ///
+    /// Owns the `number → handler` arms for every syscall this module
+    /// implements. `resolve_handler` in `dispatch/mod.rs` chains this with
+    /// the other modules' tables. Add a `proc` syscall by adding an arm
+    /// HERE — no shared routing table to edit.
+    pub(crate) fn dispatch_proc;
+}
 // ptrace(2) PEEK/POKE request numbers live in the shared ABI crate (the
 // dispatch ABI-constant gate forbids module-level LINUX_* declarations here).
 use crate::linux_abi::{

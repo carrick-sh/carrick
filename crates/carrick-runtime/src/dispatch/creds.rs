@@ -39,6 +39,16 @@
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
 
+syscall_table! {
+    /// Per-module syscall routing for the `creds` subsystem (Task A1).
+    ///
+    /// Owns the `number → handler` arms for every syscall this module
+    /// implements. `resolve_handler` in `dispatch/mod.rs` chains this with
+    /// the other modules' tables. Add a `creds` syscall by adding an arm
+    /// HERE — no shared routing table to edit.
+    pub(crate) fn dispatch_creds;
+}
+
 /// Per-process nice value (the calling process's PRIO_PROCESS priority).
 /// Default 0. setpriority(PRIO_PROCESS, self) stores it (clamped to [-20,19])
 /// and getpriority(PRIO_PROCESS, self) reports it as the kernel-ABI `20 - nice`
