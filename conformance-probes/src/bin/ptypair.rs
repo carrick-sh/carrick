@@ -30,11 +30,7 @@ fn main() {
         // any other pty call.
         let name_ptr2 = libc::ptsname(master);
         assert!(!name_ptr2.is_null(), "ptsname (2nd call) returned NULL");
-        let slave_fd = libc::open(
-            name_ptr2,
-            libc::O_RDWR | libc::O_NOCTTY,
-            0u32,
-        );
+        let slave_fd = libc::open(name_ptr2, libc::O_RDWR | libc::O_NOCTTY, 0u32);
         assert!(slave_fd >= 0, "open slave failed");
 
         println!("slave_isatty={}", libc::isatty(slave_fd));

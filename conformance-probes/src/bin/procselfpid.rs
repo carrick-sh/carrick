@@ -12,7 +12,10 @@ fn main() {
         let field = |key: &str| -> i64 {
             status
                 .lines()
-                .find_map(|l| l.strip_prefix(key).map(|v| v.trim().parse::<i64>().unwrap_or(-1)))
+                .find_map(|l| {
+                    l.strip_prefix(key)
+                        .map(|v| v.trim().parse::<i64>().unwrap_or(-1))
+                })
                 .unwrap_or(-2)
         };
         println!("gettid_eq_getpid={}", gettid == getpid);

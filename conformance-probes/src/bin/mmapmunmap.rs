@@ -95,7 +95,10 @@ fn main() {
 
         // munmap of an unaligned address → EINVAL (oracle-agreed edge kept intact)
         let u3 = libc::munmap((page + 1) as *mut libc::c_void, page);
-        println!("munmap_unaligned_einval={}", u3 == -1 && errno() == libc::EINVAL);
+        println!(
+            "munmap_unaligned_einval={}",
+            u3 == -1 && errno() == libc::EINVAL
+        );
 
         libc::close(fd);
         let _ = errno;

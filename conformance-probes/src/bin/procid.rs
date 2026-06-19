@@ -26,12 +26,18 @@ fn main() {
     // getgroups: count + whether group 0 is present.
     let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     if n < 0 {
-        println!("getgroups=ERR:{}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        println!(
+            "getgroups=ERR:{}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        );
     } else {
         let mut groups = vec![0 as libc::gid_t; n as usize];
         let got = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
         if got < 0 {
-            println!("getgroups=ERR:{}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+            println!(
+                "getgroups=ERR:{}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            );
         } else {
             groups.truncate(got as usize);
             println!("getgroups count={} has_root={}", got, groups.contains(&0));
@@ -50,15 +56,25 @@ fn main() {
         println!("uname_sysname={}", cstr_field(&uts.sysname));
         println!("uname_machine={}", cstr_field(&uts.machine));
     } else {
-        println!("uname=ERR:{}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        println!(
+            "uname=ERR:{}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        );
     }
 
     // sysinfo(): only booleans (values are non-deterministic).
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
     if unsafe { libc::sysinfo(&mut info) } == 0 {
-        println!("sysinfo totalram_pos={} procs_ge1={}", info.totalram > 0, info.procs >= 1);
+        println!(
+            "sysinfo totalram_pos={} procs_ge1={}",
+            info.totalram > 0,
+            info.procs >= 1
+        );
     } else {
-        println!("sysinfo=ERR:{}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        println!(
+            "sysinfo=ERR:{}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        );
     }
 
     // getpriority(PRIO_PROCESS, 0): the nice value. errno must be cleared
@@ -85,7 +101,10 @@ fn main() {
             rl.rlim_cur <= rl.rlim_max
         );
     } else {
-        println!("rlimit_nofile=ERR:{}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        println!(
+            "rlimit_nofile=ERR:{}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        );
     }
 
     // sched_getaffinity / sched_yield.
@@ -93,11 +112,15 @@ fn main() {
     println!("sched_yield={}", yield_ret);
 
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } == 0 {
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } == 0
+    {
         let count = unsafe { libc::CPU_COUNT(&set) };
         println!("sched_affinity nonempty={}", count > 0);
     } else {
-        println!("sched_affinity=ERR:{}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        println!(
+            "sched_affinity=ERR:{}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        );
     }
 }
 

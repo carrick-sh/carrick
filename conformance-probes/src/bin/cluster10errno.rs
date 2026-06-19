@@ -95,7 +95,10 @@ fn main() {
             libc::close(devnull);
         }
         let rc = libc::fdatasync(-1);
-        println!("fdatasync_badfd_ebadf={}", rc == -1 && errno() == libc::EBADF);
+        println!(
+            "fdatasync_badfd_ebadf={}",
+            rc == -1 && errno() == libc::EBADF
+        );
         let rfd = open(
             "/tmp/cl10_sync",
             libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,

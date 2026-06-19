@@ -48,7 +48,12 @@ struct Flock {
 }
 
 unsafe fn flock_op(fd: i32, cmd: i32, fl: &mut Flock) -> i64 {
-    libc::syscall(libc::SYS_fcntl, fd, cmd, fl as *mut Flock as *mut libc::c_void)
+    libc::syscall(
+        libc::SYS_fcntl,
+        fd,
+        cmd,
+        fl as *mut Flock as *mut libc::c_void,
+    )
 }
 
 fn mk(l_type: i16, start: i64, len: i64) -> Flock {

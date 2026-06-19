@@ -66,7 +66,8 @@ fn stage1(exe_arg: &str) {
         // execve self with stage2 arg.
         let path = CString::new(exe_arg).expect("argv[0]");
         let stage2_arg = CString::new("stage2").expect("stage2");
-        let argv: [*const libc::c_char; 3] = [path.as_ptr(), stage2_arg.as_ptr(), core::ptr::null()];
+        let argv: [*const libc::c_char; 3] =
+            [path.as_ptr(), stage2_arg.as_ptr(), core::ptr::null()];
         let env = CString::new("CARRICK_EXECVE_MARK=1").expect("env");
         let envp: [*const libc::c_char; 2] = [env.as_ptr(), core::ptr::null()];
         libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());

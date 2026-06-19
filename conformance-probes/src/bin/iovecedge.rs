@@ -43,13 +43,14 @@ fn main() {
         // (1) {buf, 8} then {NULL, 0} → writes 8, succeeds.
         let buf = b"abcdefgh";
         let iov = [
-            Iovec { base: buf.as_ptr() as u64, len: 8 },
+            Iovec {
+                base: buf.as_ptr() as u64,
+                len: 8,
+            },
             Iovec { base: 0, len: 0 },
         ];
         let rc = writev(fd, &iov);
-        report!(
-            zero_len_iovec_skipped_rc_is_8 = rc == 8,
-        );
+        report!(zero_len_iovec_skipped_rc_is_8 = rc == 8,);
 
         // (2) oversized iov_len (> SSIZE_MAX) → -1/EINVAL.
         let iov = [Iovec {
@@ -65,7 +66,10 @@ fn main() {
 
         // (3) genuinely bad pointer (non-zero base, non-zero len, unmapped) →
         //     -1/EFAULT. Negative control: the zero-skip must not swallow this.
-        let iov = [Iovec { base: 0x10, len: 64 }];
+        let iov = [Iovec {
+            base: 0x10,
+            len: 64,
+        }];
         let rc = writev(fd, &iov);
         let er = if rc < 0 { errno() } else { 0 };
         report!(

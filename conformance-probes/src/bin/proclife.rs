@@ -109,7 +109,10 @@ fn wnohang_reaping() {
     if pid == 0 {
         // ~150ms: long enough that the parent's first WNOHANG poll sees us
         // alive, short enough to keep the probe fast.
-        let ts = libc::timespec { tv_sec: 0, tv_nsec: 150_000_000 };
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 150_000_000,
+        };
         unsafe {
             libc::nanosleep(&ts, std::ptr::null_mut());
             libc::_exit(7);

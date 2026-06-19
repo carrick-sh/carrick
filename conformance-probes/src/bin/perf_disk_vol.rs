@@ -18,7 +18,9 @@ const SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 const CHUNK: usize = 1024 * 1024; // 1 MiB
 
 fn nproc() -> usize {
-    thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
 }
 
 fn main() {

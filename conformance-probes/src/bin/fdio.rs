@@ -49,10 +49,7 @@ fn main() {
 
             // dup3 with oldfd == newfd is EINVAL.
             let r3 = unsafe { libc::dup3(wr, wr, 0) };
-            println!(
-                "dup3_same_einval={}",
-                r3 == -1 && errno() == libc::EINVAL
-            );
+            println!("dup3_same_einval={}", r3 == -1 && errno() == libc::EINVAL);
 
             unsafe {
                 libc::close(dwr);
@@ -65,7 +62,11 @@ fn main() {
     // lseek: create /tmp/seek with "0123456789"; seek to 3, read 2 -> "34";
     // SEEK_END offset is 10.
     {
-        let fd = open("/tmp/seek", libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/seek",
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd < 0 {
             println!("lseek=ERR:{}", errno());
         } else {
@@ -125,7 +126,11 @@ fn main() {
     // O_APPEND: write "one\n", reopen with O_APPEND and write "two\n", read
     // whole file -> "one|two|".
     {
-        let fd = open("/tmp/ap", libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/ap",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd >= 0 {
             let one = b"one\n";
             unsafe { libc::write(fd, one.as_ptr() as *const _, one.len()) };
@@ -145,7 +150,11 @@ fn main() {
 
     // ftruncate: write "abcdef" to /tmp/tr, truncate to 3, read -> "abc".
     {
-        let fd = open("/tmp/tr", libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/tr",
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd < 0 {
             println!("ftruncate=ERR:{}", errno());
         } else {
@@ -162,7 +171,11 @@ fn main() {
 
     // readv/writev: writev two iovecs ("AB","CD") to /tmp/v, read 4 -> "ABCD".
     {
-        let fd = open("/tmp/v", libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        let fd = open(
+            "/tmp/v",
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
         if fd < 0 {
             println!("writev=ERR:{}", errno());
         } else {

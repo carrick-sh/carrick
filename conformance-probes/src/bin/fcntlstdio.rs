@@ -33,10 +33,7 @@ fn main() {
 
     // NEGATIVE control: an obviously-bogus fd must fail with EBADF.
     let bad = unsafe { libc::fcntl(999, libc::F_SETFL, libc::O_NONBLOCK) };
-    println!(
-        "setfl_badfd_ebadf={}",
-        bad == -1 && errno() == libc::EBADF
-    );
+    println!("setfl_badfd_ebadf={}", bad == -1 && errno() == libc::EBADF);
 }
 
 /// Current errno value.

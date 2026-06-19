@@ -46,8 +46,8 @@ fn main() {
             socket_ok = true,
             socket0_rdwr = (sock0_flags & libc::O_ACCMODE) == libc::O_RDWR,
             socket1_rdwr = (sock1_flags & libc::O_ACCMODE) == libc::O_RDWR,
-            sock_cloexec_not_nonblock = (sock0_flags & libc::O_NONBLOCK) == 0
-                && (sock1_flags & libc::O_NONBLOCK) == 0,
+            sock_cloexec_not_nonblock =
+                (sock0_flags & libc::O_NONBLOCK) == 0 && (sock1_flags & libc::O_NONBLOCK) == 0,
         );
     }
 }

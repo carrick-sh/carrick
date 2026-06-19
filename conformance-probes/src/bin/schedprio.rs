@@ -47,7 +47,10 @@ fn main() {
         );
         println!(
             "setscheduler_negpid_einval={}",
-            err_is(libc::syscall(SCHED_SETSCHEDULER, -1i64, 0i64, pp), libc::EINVAL)
+            err_is(
+                libc::syscall(SCHED_SETSCHEDULER, -1i64, 0i64, pp),
+                libc::EINVAL
+            )
         );
 
         // Bad param pointer (self, SCHED_OTHER) → EFAULT.
@@ -78,7 +81,10 @@ fn main() {
         );
         println!(
             "setpriority_pgrp_negwho_esrch={}",
-            err_is(libc::syscall(SETPRIORITY, PRIO_PGRP, -1i64, 0i64), libc::ESRCH)
+            err_is(
+                libc::syscall(SETPRIORITY, PRIO_PGRP, -1i64, 0i64),
+                libc::ESRCH
+            )
         );
     }
 }

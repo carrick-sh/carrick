@@ -16,5 +16,9 @@ fn main() {
     let dev = CString::new("/dev/null").unwrap();
     let fd3 = unsafe { libc::open(dev.as_ptr(), libc::O_RDONLY) };
     println!("nonempty_open_ok={}", fd3 >= 0);
-    if fd3 >= 0 { unsafe { libc::close(fd3); } }
+    if fd3 >= 0 {
+        unsafe {
+            libc::close(fd3);
+        }
+    }
 }

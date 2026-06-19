@@ -11,7 +11,13 @@ fn errno() -> i32 {
 
 fn open_sized(path: &str, len: usize) -> i32 {
     let c = CString::new(path).unwrap();
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644) };
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        )
+    };
     if fd >= 0 {
         unsafe { libc::ftruncate(fd, len as libc::off_t) };
     }
@@ -38,7 +44,14 @@ fn test(tag: &str, file_len: usize, prot: i32, readonly_fd: bool) {
         setup_fd
     };
     let m = unsafe {
-        libc::mmap(std::ptr::null_mut(), file_len, prot, libc::MAP_SHARED, fd, 0)
+        libc::mmap(
+            std::ptr::null_mut(),
+            file_len,
+            prot,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
     };
     if m == libc::MAP_FAILED {
         println!("{tag}_mmap=ERR:{}", errno());
@@ -69,7 +82,10 @@ fn main() {
     // a MAP_FIXED region at 512 GiB (0x80_0000_0000) and at 4 GiB
     // (0x1_0000_0000) — the loader's interpreter + ELF base. If these make the
     // subsequent MAP_SHARED alias fail, the trigger is a high identity region.
-    for (tag, addr) in [("hi512g", 0x80_0000_0000usize), ("hi4g", 0x1_0000_0000usize)] {
+    for (tag, addr) in [
+        ("hi512g", 0x80_0000_0000usize),
+        ("hi4g", 0x1_0000_0000usize),
+    ] {
         let m = unsafe {
             libc::mmap(
                 addr as *mut _,
@@ -86,9 +102,19 @@ fn main() {
     // 16 KiB (1 HVF page) RO and RW, then 32 KiB (2 pages) RO and RW — the head
     // failure was a 2-page (0x8000) RO mapping.
     test("ro16k", 16 * 1024, libc::PROT_READ, false);
-    test("rw16k", 16 * 1024, libc::PROT_READ | libc::PROT_WRITE, false);
+    test(
+        "rw16k",
+        16 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        false,
+    );
     test("ro32k", 32 * 1024, libc::PROT_READ, false);
-    test("rw32k", 32 * 1024, libc::PROT_READ | libc::PROT_WRITE, false);
+    test(
+        "rw32k",
+        32 * 1024,
+        libc::PROT_READ | libc::PROT_WRITE,
+        false,
+    );
     // The exact head shape: a ~27 KiB file mapped at its real length.
     test("ro27k", 0x6994, libc::PROT_READ, false);
     test("ro27k_rdonlyfd", 0x6994, libc::PROT_READ, true);

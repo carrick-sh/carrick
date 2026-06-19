@@ -49,11 +49,7 @@ fn main() {
                 libc::usleep(200_000);
                 let ppid = libc::getppid();
                 let bytes = ppid.to_ne_bytes();
-                libc::write(
-                    fds[1],
-                    bytes.as_ptr() as *const libc::c_void,
-                    bytes.len(),
-                );
+                libc::write(fds[1], bytes.as_ptr() as *const libc::c_void, bytes.len());
                 libc::close(fds[1]);
                 libc::_exit(0);
             }
@@ -96,7 +92,11 @@ fn main() {
         libc::close(fds[0]);
 
         let read_ok = got == 4;
-        let ppid = if read_ok { i32::from_ne_bytes(bytes) } else { 0 };
+        let ppid = if read_ok {
+            i32::from_ne_bytes(bytes)
+        } else {
+            0
+        };
         report!(
             reparent_pipe_ok = true,
             reparent_read_ok = read_ok,

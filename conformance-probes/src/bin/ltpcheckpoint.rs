@@ -66,10 +66,7 @@ fn main() {
         );
         let open_ok = fd >= 0;
         let open_errno = if fd < 0 { errno() } else { 0 };
-        report!(
-            shm_open_ok = open_ok,
-            shm_open_errno = open_errno,
-        );
+        report!(shm_open_ok = open_ok, shm_open_errno = open_errno,);
         if !open_ok {
             // Without an fd the rest of the test can't run; print stable
             // `false`s so the harness diff has the same line count.
@@ -140,7 +137,10 @@ fn main() {
             // Verify (8) — the child sees parent's last write (the 0).
             let saw_initial = core::ptr::read_volatile(word) == 0;
             // (9) FUTEX_WAIT on `word` expecting value 0; bounded 2 s.
-            let ts = libc::timespec { tv_sec: 2, tv_nsec: 0 };
+            let ts = libc::timespec {
+                tv_sec: 2,
+                tv_nsec: 0,
+            };
             let _ = futex_op(word, FUTEX_WAIT, 0, &ts);
             let saw_wake = core::ptr::read_volatile(word) == 0xC0DE;
             // Encode both observations in the child exit code:
@@ -195,14 +195,20 @@ fn main() {
                 if Instant::now().duration_since(start) > Duration::from_secs(2) {
                     libc::_exit(1);
                 }
-                let ts = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                };
                 libc::nanosleep(&ts, std::ptr::null_mut());
             }
         }
         if child < 0 {
             report!(shm_futex_child_wake_parent_wait = false);
         } else {
-            let ts = libc::timespec { tv_sec: 2, tv_nsec: 0 };
+            let ts = libc::timespec {
+                tv_sec: 2,
+                tv_nsec: 0,
+            };
             let _ = futex_op(word, FUTEX_WAIT, 0, &ts);
             let mut status = 0i32;
             let _ = libc::wait4(child, &mut status, 0, std::ptr::null_mut());

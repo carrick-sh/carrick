@@ -12,7 +12,8 @@ fn main() {
     unsafe {
         let tgt = b"cr_lco_t\0".as_ptr() as *const libc::c_char;
         let link = b"cr_lco_l\0".as_ptr() as *const libc::c_char;
-        libc::unlink(tgt); libc::unlink(link);
+        libc::unlink(tgt);
+        libc::unlink(link);
         libc::close(libc::open(tgt, libc::O_CREAT | libc::O_WRONLY, 0o644));
         libc::symlink(tgt, link);
         let rc = libc::lchown(link, 4242, 4243);
@@ -24,6 +25,7 @@ fn main() {
             link_owner_set = (rc == 0 && ls.st_uid == 4242 && ls.st_gid == 4243),
             target_untouched = (ts.st_uid == 0)
         );
-        libc::unlink(link); libc::unlink(tgt);
+        libc::unlink(link);
+        libc::unlink(tgt);
     }
 }

@@ -69,7 +69,14 @@ fn main() {
         let mut conn_fd = -1;
         while Instant::now() < deadline && conn_fd < 0 {
             epoll_wait_ready(epfd, deadline);
-            conn_fd = unsafe { libc::accept4(lfd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK) };
+            conn_fd = unsafe {
+                libc::accept4(
+                    lfd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_NONBLOCK,
+                )
+            };
         }
         if conn_fd < 0 {
             return false;
@@ -120,8 +127,7 @@ fn main() {
         while Instant::now() < deadline && got == 0 {
             epoll_wait_ready(epfd, deadline);
             loop {
-                let n =
-                    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n > 0 {
                     got += n;
                 } else {

@@ -17,7 +17,9 @@ const WARMUP_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB, untimed
 const WINDOW: Duration = Duration::from_secs(2);
 
 fn nproc() -> usize {
-    thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
 }
 
 fn main() {

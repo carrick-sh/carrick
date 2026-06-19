@@ -15,7 +15,10 @@ extern "C" fn handler(_sig: libc::c_int) {
 extern "C" fn thread_b(_arg: *mut libc::c_void) -> *mut libc::c_void {
     unsafe {
         libc::usleep(100_000); // let main reach pthread_join first
-        libc::pthread_kill(MAIN_TH.load(Ordering::SeqCst) as libc::pthread_t, libc::SIGUSR1);
+        libc::pthread_kill(
+            MAIN_TH.load(Ordering::SeqCst) as libc::pthread_t,
+            libc::SIGUSR1,
+        );
     }
     std::ptr::null_mut()
 }

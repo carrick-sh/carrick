@@ -59,8 +59,7 @@ fn main() {
         // musl's libc wrapper returns ENOSYS via the legacy POSIX-shape
         // (in some builds), so go straight through the syscall ABI — that's
         // also the layer carrick has to implement.
-        let sched =
-            libc::syscall(libc::SYS_sched_getscheduler, 0i32 as libc::c_long) as i32;
+        let sched = libc::syscall(libc::SYS_sched_getscheduler, 0i32 as libc::c_long) as i32;
         report!(
             sched_getscheduler_nonneg = sched >= 0,
             sched_getscheduler_is_other = sched == libc::SCHED_OTHER,

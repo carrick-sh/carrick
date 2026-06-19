@@ -29,11 +29,23 @@ const FUTEX_WAIT: libc::c_int = 0; // shared (no FUTEX_PRIVATE_FLAG)
 const FUTEX_WAKE: libc::c_int = 1;
 
 unsafe fn futex_wait(uaddr: *mut u32, val: u32) -> libc::c_long {
-    libc::syscall(SYS_FUTEX, uaddr, FUTEX_WAIT, val, std::ptr::null::<libc::timespec>())
+    libc::syscall(
+        SYS_FUTEX,
+        uaddr,
+        FUTEX_WAIT,
+        val,
+        std::ptr::null::<libc::timespec>(),
+    )
 }
 
 unsafe fn futex_wake(uaddr: *mut u32, val: u32) -> libc::c_long {
-    libc::syscall(SYS_FUTEX, uaddr, FUTEX_WAKE, val, std::ptr::null::<libc::timespec>())
+    libc::syscall(
+        SYS_FUTEX,
+        uaddr,
+        FUTEX_WAKE,
+        val,
+        std::ptr::null::<libc::timespec>(),
+    )
 }
 
 /// Run one round with `n` waiters; returns (rc_was_n, all_children_reaped_clean).
@@ -48,11 +60,8 @@ unsafe fn run_round(n: usize) -> (bool, bool) {
     // each probe in a fresh carrick guest so getpid() is unique per
     // probe invocation. The N suffix keeps the rounds inside one
     // invocation distinct.
-    let path: Vec<u8> = format!(
-        "/tmp/carrick_futexwakecount_pid{}_n{n}\0",
-        libc::getpid()
-    )
-    .into_bytes();
+    let path: Vec<u8> =
+        format!("/tmp/carrick_futexwakecount_pid{}_n{n}\0", libc::getpid()).into_bytes();
     let fd = libc::open(
         path.as_ptr() as *const libc::c_char,
         libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
@@ -94,8 +103,12 @@ unsafe fn run_round(n: usize) -> (bool, bool) {
             // a CAS loop on the raw pointer.
             loop {
                 let cur = std::ptr::read_volatile(counter);
-                let prev = std::sync::atomic::AtomicU32::from_ptr(counter)
-                    .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst);
+                let prev = std::sync::atomic::AtomicU32::from_ptr(counter).compare_exchange(
+                    cur,
+                    cur + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
                 if prev.is_ok() {
                     break;
                 }

@@ -102,7 +102,10 @@ fn epoll_wait_one(epfd: libc::c_int, data_read: libc::c_int) {
         if n < 0 && last_errno() == libc::EINTR {
             continue;
         }
-        eprintln!("epoll_wait failed_or_timed_out n={n} errno={}", last_errno());
+        eprintln!(
+            "epoll_wait failed_or_timed_out n={n} errno={}",
+            last_errno()
+        );
         std::process::exit(1);
     }
 }
@@ -170,8 +173,14 @@ fn main() {
     close_fd(data[1]);
 
     samples_ns.sort_unstable();
-    println!("epoll_pipe_loop_p50_us={:.3}", percentile(&samples_ns, 0.50));
-    println!("epoll_pipe_loop_p95_us={:.3}", percentile(&samples_ns, 0.95));
+    println!(
+        "epoll_pipe_loop_p50_us={:.3}",
+        percentile(&samples_ns, 0.50)
+    );
+    println!(
+        "epoll_pipe_loop_p95_us={:.3}",
+        percentile(&samples_ns, 0.95)
+    );
     println!(
         "epoll_pipe_loop_min_us={:.3}",
         samples_ns[0] as f64 / 1000.0

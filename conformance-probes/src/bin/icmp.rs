@@ -18,7 +18,7 @@ fn icmp_echo_packet(id: u16, seq: u16) -> [u8; 8] {
     let mut p = [0u8; 8];
     p[0] = ICMP_ECHO; // type
     p[1] = 0; // code
-    // checksum (p[2..4]) left zero for now
+              // checksum (p[2..4]) left zero for now
     p[4..6].copy_from_slice(&id.to_be_bytes());
     p[6..8].copy_from_slice(&seq.to_be_bytes());
     let ck = checksum(&p);

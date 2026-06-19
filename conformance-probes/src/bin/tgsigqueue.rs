@@ -19,7 +19,10 @@ extern "C" fn on_rt(_sig: i32, info: *mut libc::siginfo_t, _ctx: *mut libc::c_vo
             OBSERVED_SIGNO.store((*info).si_signo, Ordering::SeqCst);
             let base = info as *const u8;
             // si_value.sival_int sits at byte 0x18 in the aarch64 uapi layout.
-            OBSERVED_VALUE.store(core::ptr::read(base.add(0x18) as *const i32), Ordering::SeqCst);
+            OBSERVED_VALUE.store(
+                core::ptr::read(base.add(0x18) as *const i32),
+                Ordering::SeqCst,
+            );
         }
     }
 }

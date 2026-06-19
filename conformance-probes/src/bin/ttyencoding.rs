@@ -44,7 +44,11 @@ unsafe fn tcgets_ok(fd: i32) -> Option<bool> {
         Some(true)
     } else {
         let e = conformance_probes::errno();
-        if e == L_ENOTTY { Some(false) } else { None }
+        if e == L_ENOTTY {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 

@@ -2,8 +2,8 @@
 //! sibling threads too. This catches runtimes that return from the main vCPU
 //! loop while leaving host threads alive.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 

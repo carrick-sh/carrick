@@ -31,7 +31,7 @@
 //! macos_to_linux_errno — so it MATCHES today, but it guards against a
 //! regression in the central host->linux errno routing the fix introduces).
 
-use conformance_probes::{report, reap};
+use conformance_probes::{reap, report};
 
 // waitid raw constants (idtype values / option bits aren't all exposed
 // portably on aarch64-musl; waitidspec.rs uses the same literals).

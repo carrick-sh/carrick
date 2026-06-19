@@ -37,7 +37,11 @@ unsafe fn run() {
     addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
     let addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
-    if libc::bind(listener, &addr as *const _ as *const libc::sockaddr, addr_len) != 0
+    if libc::bind(
+        listener,
+        &addr as *const _ as *const libc::sockaddr,
+        addr_len,
+    ) != 0
         || libc::listen(listener, 1) != 0
     {
         report_results(setup_ok, add_ok, send_ok, wait_ready, revents_pri, recv_oob);
@@ -59,8 +63,7 @@ unsafe fn run() {
     }
 
     let client = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-    if client < 0
-        || libc::connect(client, &got as *const _ as *const libc::sockaddr, got_len) != 0
+    if client < 0 || libc::connect(client, &got as *const _ as *const libc::sockaddr, got_len) != 0
     {
         report_results(setup_ok, add_ok, send_ok, wait_ready, revents_pri, recv_oob);
         close_if_open(client);
@@ -94,9 +97,13 @@ unsafe fn run() {
         revents_pri = wait_ready && (out[0].events & EPOLLPRI) != 0;
 
         let mut byte = 0u8;
-        recv_oob =
-            libc::recv(client, &mut byte as *mut _ as *mut libc::c_void, 1, libc::MSG_OOB) == 1
-                && byte == b'!';
+        recv_oob = libc::recv(
+            client,
+            &mut byte as *mut _ as *mut libc::c_void,
+            1,
+            libc::MSG_OOB,
+        ) == 1
+            && byte == b'!';
     }
 
     report_results(setup_ok, add_ok, send_ok, wait_ready, revents_pri, recv_oob);

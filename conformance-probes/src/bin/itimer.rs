@@ -32,16 +32,28 @@ fn install_handler(sig: i32) {
 
 fn arm(which: i32, usec: i64) -> i32 {
     let it = libc::itimerval {
-        it_interval: libc::timeval { tv_sec: 0, tv_usec: usec },
-        it_value: libc::timeval { tv_sec: 0, tv_usec: usec },
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: usec,
+        },
+        it_value: libc::timeval {
+            tv_sec: 0,
+            tv_usec: usec,
+        },
     };
     unsafe { libc::setitimer(which, &it, std::ptr::null_mut()) }
 }
 
 fn disarm(which: i32) {
     let zero = libc::itimerval {
-        it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 },
-        it_value: libc::timeval { tv_sec: 0, tv_usec: 0 },
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
     };
     unsafe {
         libc::setitimer(which, &zero, std::ptr::null_mut());
@@ -80,8 +92,14 @@ fn main() {
     // back zero. (Booleans only — never the raw remaining time.)
     {
         let it = libc::itimerval {
-            it_interval: libc::timeval { tv_sec: 7, tv_usec: 0 },
-            it_value: libc::timeval { tv_sec: 7, tv_usec: 0 },
+            it_interval: libc::timeval {
+                tv_sec: 7,
+                tv_usec: 0,
+            },
+            it_value: libc::timeval {
+                tv_sec: 7,
+                tv_usec: 0,
+            },
         };
         unsafe { libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) };
         let mut got = MaybeUninit::<libc::itimerval>::uninit();

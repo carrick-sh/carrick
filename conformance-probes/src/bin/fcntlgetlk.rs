@@ -25,7 +25,10 @@ fn main() {
         println!("getlk_ok={}", rc == 0);
         println!("getlk_type_unlck={}", fl.l_type == libc::F_UNLCK as i16);
         println!("getlk_lpid_preserved={}", fl.l_pid == 0x7777);
-        println!("getlk_whence_preserved={}", fl.l_whence == libc::SEEK_SET as i16);
+        println!(
+            "getlk_whence_preserved={}",
+            fl.l_whence == libc::SEEK_SET as i16
+        );
 
         let _ = errno;
         libc::close(fd);

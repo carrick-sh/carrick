@@ -27,17 +27,13 @@ fn main() {
             libc::sigemptyset(&mut set);
             libc::sigaddset(&mut set, libc::SIGUSR1);
         }
-        let rc = unsafe {
-            libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
-        };
+        let rc = unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
         if rc != 0 {
             println!("sigprocmask_block=ERR:{}", errno());
         } else {
             // Read the current mask: pass NULL set, capture oldset.
             let mut cur: libc::sigset_t = unsafe { MaybeUninit::zeroed().assume_init() };
-            let rrc = unsafe {
-                libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut cur)
-            };
+            let rrc = unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut cur) };
             if rrc != 0 {
                 println!("sigprocmask_read=ERR:{}", errno());
             } else {
@@ -52,9 +48,7 @@ fn main() {
             libc::sigemptyset(&mut set2);
             libc::sigaddset(&mut set2, libc::SIGUSR1);
         }
-        let urc = unsafe {
-            libc::sigprocmask(libc::SIG_UNBLOCK, &set2, std::ptr::null_mut())
-        };
+        let urc = unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set2, std::ptr::null_mut()) };
         if urc != 0 {
             println!("sigprocmask_unblock=ERR:{}", errno());
         } else {
@@ -74,15 +68,16 @@ fn main() {
         act.sa_sigaction = handler as *const () as usize;
         unsafe { libc::sigemptyset(&mut act.sa_mask) };
         act.sa_flags = 0;
-        let rc = unsafe {
-            libc::sigaction(libc::SIGUSR1, &act, std::ptr::null_mut())
-        };
+        let rc = unsafe { libc::sigaction(libc::SIGUSR1, &act, std::ptr::null_mut()) };
         if rc != 0 {
             println!("sigaction_install=ERR:{}", errno());
         } else {
             HANDLER_RAN.store(false, Ordering::SeqCst);
             unsafe { libc::raise(libc::SIGUSR1) };
-            println!("sigaction_handler_ran={}", HANDLER_RAN.load(Ordering::SeqCst));
+            println!(
+                "sigaction_handler_ran={}",
+                HANDLER_RAN.load(Ordering::SeqCst)
+            );
         }
 
         // Restore default disposition.
@@ -90,9 +85,7 @@ fn main() {
         dfl.sa_sigaction = libc::SIG_DFL;
         unsafe { libc::sigemptyset(&mut dfl.sa_mask) };
         dfl.sa_flags = 0;
-        let drc = unsafe {
-            libc::sigaction(libc::SIGUSR1, &dfl, std::ptr::null_mut())
-        };
+        let drc = unsafe { libc::sigaction(libc::SIGUSR1, &dfl, std::ptr::null_mut()) };
         println!("sigaction_restore_rc={}", drc);
     }
 
@@ -103,9 +96,7 @@ fn main() {
         ign.sa_sigaction = libc::SIG_IGN;
         unsafe { libc::sigemptyset(&mut ign.sa_mask) };
         ign.sa_flags = 0;
-        let rc = unsafe {
-            libc::sigaction(libc::SIGUSR2, &ign, std::ptr::null_mut())
-        };
+        let rc = unsafe { libc::sigaction(libc::SIGUSR2, &ign, std::ptr::null_mut()) };
         if rc != 0 {
             println!("sigaction_ign_usr2=ERR:{}", errno());
         } else {
@@ -167,9 +158,7 @@ fn main() {
         unsafe { libc::sigemptyset(&mut dfl.sa_mask) };
         unsafe { libc::sigaction(libc::SIGUSR1, &dfl, std::ptr::null_mut()) };
 
-        let brc = unsafe {
-            libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
-        };
+        let brc = unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
         if brc != 0 {
             println!("sigpending=ERR:{}", errno());
         } else {
@@ -203,9 +192,7 @@ fn main() {
             libc::sigemptyset(&mut set);
             libc::sigaddset(&mut set, libc::SIGUSR1);
         }
-        let brc = unsafe {
-            libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
-        };
+        let brc = unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
         if brc != 0 {
             println!("sigtimedwait=ERR:{}", errno());
         } else {

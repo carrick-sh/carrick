@@ -94,14 +94,30 @@ fn main() {
                 let gc_sees_parent = get(map, 0) == A;
                 let gc_sees_child = get(map, 1) == B;
                 put(map, 2, C); // grandchild's write
-                put(map, 5, if gc_sees_parent && gc_sees_child { 1 } else { 9 });
+                put(
+                    map,
+                    5,
+                    if gc_sees_parent && gc_sees_child {
+                        1
+                    } else {
+                        9
+                    },
+                );
                 libc::_exit(0);
             }
             // child waits grandchild, then checks it saw the grandchild's write.
             let mut st = 0;
             while libc::wait4(grand, &mut st, 0, std::ptr::null_mut()) < 0 {}
             let child_sees_grand = get(map, 2) == C;
-            put(map, 3, if child_sees_parent && child_sees_grand { 1 } else { 9 });
+            put(
+                map,
+                3,
+                if child_sees_parent && child_sees_grand {
+                    1
+                } else {
+                    9
+                },
+            );
             libc::_exit(0);
         }
 

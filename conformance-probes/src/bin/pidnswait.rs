@@ -4,7 +4,7 @@
 //! pid is ESRCH. Asserts the fork-return == wait-return identity and the
 //! membership check, all as deterministic booleans (docs/namespaces-design.md
 //! §5.3).
-use conformance_probes::{report, reap};
+use conformance_probes::{reap, report};
 fn main() {
     unsafe {
         let a = libc::fork();

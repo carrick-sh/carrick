@@ -109,9 +109,7 @@ fn unix_bind_getsockname() {
     }
     let mut got: libc::sockaddr_un = unsafe { mem::zeroed() };
     let mut len = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-    let grc = unsafe {
-        libc::getsockname(fd, &mut got as *mut _ as *mut libc::sockaddr, &mut len)
-    };
+    let grc = unsafe { libc::getsockname(fd, &mut got as *mut _ as *mut libc::sockaddr, &mut len) };
     if grc != 0 {
         println!("unix_getsockname=ERR:{}", errno());
     } else {
@@ -135,9 +133,7 @@ fn unix_loopback() {
     }
     let addr = unix_addr(SOCK_PATH_LISTEN);
     let addr_len = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-    let brc = unsafe {
-        libc::bind(srv, &addr as *const _ as *const libc::sockaddr, addr_len)
-    };
+    let brc = unsafe { libc::bind(srv, &addr as *const _ as *const libc::sockaddr, addr_len) };
     if brc != 0 {
         println!("unix_loopback=ERR:{}", errno());
         unsafe { libc::close(srv) };
@@ -159,9 +155,7 @@ fn unix_loopback() {
         unlink(SOCK_PATH_LISTEN);
         return;
     }
-    let crc = unsafe {
-        libc::connect(cli, &addr as *const _ as *const libc::sockaddr, addr_len)
-    };
+    let crc = unsafe { libc::connect(cli, &addr as *const _ as *const libc::sockaddr, addr_len) };
     println!("unix_connect_ok={}", crc == 0);
 
     // accept() may need a couple of tries under nonblocking semantics.

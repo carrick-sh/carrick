@@ -25,8 +25,11 @@ fn preadv_once(fd: i32, iovecs: &[libc::iovec; SEGMENTS]) -> bool {
 
 fn main() {
     let dir = std::env::var("BENCH_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let path = CString::new(format!("{dir}/carrick_preadv_burst_{}.dat", std::process::id()))
-        .expect("path cstring");
+    let path = CString::new(format!(
+        "{dir}/carrick_preadv_burst_{}.dat",
+        std::process::id()
+    ))
+    .expect("path cstring");
     let fd = unsafe {
         libc::open(
             path.as_ptr(),

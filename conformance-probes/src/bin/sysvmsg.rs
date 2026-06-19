@@ -69,11 +69,17 @@ fn main() {
         let id = id as i32;
 
         // (2) send type 5, receive it.
-        let mut m = Msgbuf { mtype: 5, mtext: [0; 16] };
+        let mut m = Msgbuf {
+            mtype: 5,
+            mtext: [0; 16],
+        };
         m.mtext[..5].copy_from_slice(b"hello");
         let s = msgsnd(id, &m, 5, 0);
         let q1 = qnum(id);
-        let mut r = Msgbuf { mtype: 0, mtext: [0; 16] };
+        let mut r = Msgbuf {
+            mtype: 0,
+            mtext: [0; 16],
+        };
         let rc = msgrcv(id, &mut r, 16, 5, 0);
         let q0 = qnum(id);
         report!(
@@ -83,30 +89,48 @@ fn main() {
         );
 
         // (4) type-selective receive: queue type 5 then type 7; ask for 7.
-        let mut a = Msgbuf { mtype: 5, mtext: [0; 16] };
+        let mut a = Msgbuf {
+            mtype: 5,
+            mtext: [0; 16],
+        };
         a.mtext[..3].copy_from_slice(b"aaa");
-        let mut b = Msgbuf { mtype: 7, mtext: [0; 16] };
+        let mut b = Msgbuf {
+            mtype: 7,
+            mtext: [0; 16],
+        };
         b.mtext[..3].copy_from_slice(b"bbb");
         msgsnd(id, &a, 3, 0);
         msgsnd(id, &b, 3, 0);
-        let mut got = Msgbuf { mtype: 0, mtext: [0; 16] };
+        let mut got = Msgbuf {
+            mtype: 0,
+            mtext: [0; 16],
+        };
         let rc = msgrcv(id, &mut got, 16, 7, 0);
         report!(type_selective_recv = rc == 3 && got.mtype == 7 && &got.mtext[..3] == b"bbb");
         // drain the type-5 leftover.
-        let mut drain = Msgbuf { mtype: 0, mtext: [0; 16] };
+        let mut drain = Msgbuf {
+            mtype: 0,
+            mtext: [0; 16],
+        };
         msgrcv(id, &mut drain, 16, 5, 0);
 
         // (5) cross-process: child sends type 9, parent receives.
         let pid = libc::fork();
         if pid == 0 {
-            let mut c = Msgbuf { mtype: 9, mtext: [0; 16] };
+            let mut c = Msgbuf {
+                mtype: 9,
+                mtext: [0; 16],
+            };
             c.mtext[..4].copy_from_slice(b"xpro");
             msgsnd(id, &c, 4, 0);
             libc::_exit(0);
         }
         let mut st = 0i32;
         libc::waitpid(pid, &mut st, 0);
-        let mut cr = Msgbuf { mtype: 0, mtext: [0; 16] };
+        let mut cr = Msgbuf {
+            mtype: 0,
+            mtext: [0; 16],
+        };
         let rc = msgrcv(id, &mut cr, 16, 9, 0);
         report!(xprocess_send_recv = rc == 4 && &cr.mtext[..4] == b"xpro");
 

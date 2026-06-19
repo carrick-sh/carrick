@@ -95,10 +95,10 @@ fn main() {
                     let sym = symtab + s * 24; // sizeof(Elf64_Sym)
                     let st_name = rd_u32(sym) as u64; // st_name@0
                     let st_shndx = rd_u16(sym + 6); // st_shndx@6
-                    // Match by name + "defined" (st_shndx != 0) ONLY. Do NOT
-                    // filter on st_info type: real Linux marks
-                    // __kernel_rt_sigreturn as STT_NOTYPE, so a STT_FUNC filter
-                    // would falsely miss it on the oracle (a false DIFF).
+                                                    // Match by name + "defined" (st_shndx != 0) ONLY. Do NOT
+                                                    // filter on st_info type: real Linux marks
+                                                    // __kernel_rt_sigreturn as STT_NOTYPE, so a STT_FUNC filter
+                                                    // would falsely miss it on the oracle (a false DIFF).
                     if st_name == 0 || st_shndx == 0 {
                         continue;
                     }

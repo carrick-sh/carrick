@@ -103,9 +103,6 @@ fn main() {
         let bad = b"/tmp/cbad\0".as_ptr() as *const libc::c_char;
         libc::unlink(bad);
         let brc = libc::mknod(bad, libc::S_IFMT, 0);
-        println!(
-            "mknod_ifmt_einval={}",
-            brc == -1 && errno() == libc::EINVAL
-        );
+        println!("mknod_ifmt_einval={}", brc == -1 && errno() == libc::EINVAL);
     }
 }

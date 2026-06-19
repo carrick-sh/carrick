@@ -18,8 +18,8 @@
 //! the lookup, matching Go's goroutine scheduling. The first divergent `false`
 //! pinpoints which mapped access carrick serves incoherently.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const FILE_LEN: usize = 16 * 1024; // minFileLen
 const HDR_LEN: u32 = 32; // round(len(hdrPrefix)=28,4)=28, +4, rounded to 32

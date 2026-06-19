@@ -19,7 +19,9 @@ const ITERS: usize = 2000;
 const WARMUP: usize = 200;
 
 fn nproc() -> usize {
-    thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
 }
 
 fn main() {

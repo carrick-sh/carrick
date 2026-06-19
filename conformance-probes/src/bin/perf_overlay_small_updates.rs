@@ -58,7 +58,13 @@ fn update_once(paths: &[CString], iteration: usize) {
     if unsafe { libc::lseek(fd, offset, libc::SEEK_SET) } != offset {
         std::process::exit(1);
     }
-    let n = unsafe { libc::write(fd, WRITE_BYTES.as_ptr().cast::<libc::c_void>(), WRITE_BYTES.len()) };
+    let n = unsafe {
+        libc::write(
+            fd,
+            WRITE_BYTES.as_ptr().cast::<libc::c_void>(),
+            WRITE_BYTES.len(),
+        )
+    };
     if n != WRITE_BYTES.len() as isize {
         std::process::exit(1);
     }

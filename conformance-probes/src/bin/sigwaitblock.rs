@@ -105,8 +105,7 @@ fn main() {
 
         let mut status = 0i32;
         let wrc = libc::wait4(pid, &mut status, 0, std::ptr::null_mut());
-        let child_reaped =
-            wrc == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        let child_reaped = wrc == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
 
         println!("rt_sigtimedwait_null_returned_sig={}", rc == sig as i64);
         println!("rt_sigtimedwait_null_errno={}", wait_errno);

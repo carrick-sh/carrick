@@ -67,8 +67,14 @@ fn main() {
 
         // Arm a one-shot 50ms timer. it_interval=0 → no auto-rearm.
         let spec = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 },
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 50_000_000,
+            },
         };
         let settime_rc = libc::timer_settime(id, 0, &spec, std::ptr::null_mut());
         report!(timer_settime_rc_zero = settime_rc == 0);
@@ -76,8 +82,8 @@ fn main() {
         // Read the remaining time before it has fired. Should be positive.
         let mut cur: libc::itimerspec = MaybeUninit::zeroed().assume_init();
         let gettime_rc = libc::timer_gettime(id, &mut cur);
-        let remaining_positive = gettime_rc == 0
-            && (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0);
+        let remaining_positive =
+            gettime_rc == 0 && (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0);
         report!(timer_gettime_remaining_is_positive = remaining_positive);
 
         // Check overrun query on a live timer — boolean is-nonneg only.
@@ -96,7 +102,10 @@ fn main() {
             }
             // pause-friendly sleep; nanosleep would EINTR on delivery which is
             // exactly what we want.
-            let ts = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000,
+            };
             libc::nanosleep(&ts, std::ptr::null_mut());
         }
         report!(timer_signal_delivered = USR1_HITS.load(Ordering::SeqCst) >= 1);
@@ -109,8 +118,6 @@ fn main() {
         let post_rc = libc::timer_gettime(id, &mut after);
         let post_errno = errno();
         // Linux returns EINVAL for an unknown timer_t.
-        report!(
-            timer_gettime_after_delete_fails = post_rc == -1 && post_errno == libc::EINVAL,
-        );
+        report!(timer_gettime_after_delete_fails = post_rc == -1 && post_errno == libc::EINVAL,);
     }
 }
