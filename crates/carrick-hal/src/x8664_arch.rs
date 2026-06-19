@@ -689,6 +689,10 @@ const X86_NR_VFORK: u64 = 58;
 /// `*timespec` POINTER — folding poll in would mis-read poll's INT `timeout_ms`
 /// (a `poll(.,.,0)` non-blocking probe would wedge as an infinite wait).
 const X86_NR_POLL: u64 = 7;
+/// x86-64 `select(2)` (syscalls(2)). Desugars to a private dispatcher shim
+/// because canonical/asm-generic has only `pselect6(2)` (a *timespec timeout +
+/// sigmask) — select's *timeval timeout would be mis-read as a *timespec.
+const X86_NR_SELECT: u64 = 23;
 /// x86-64 `dup2(2)` (syscalls(2)). Desugars to a private dispatcher shim because
 /// canonical/asm-generic has `dup3(2)` but no `dup2(2)`.
 const X86_NR_DUP2: u64 = 33;
@@ -832,6 +836,15 @@ impl X8664GuestArch {
             return SyscallNorm::Plain(RawSyscall {
                 number: carrick_abi::CARRICK_PRIVATE_X86_POLL,
                 args: [args[0], args[1], args[2], 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_SELECT {
+            // select(nfds, r, w, e, *timeval) — keep the args; the private
+            // handler reads arg4 as a *timeval (tv_usec, not tv_nsec) and uses
+            // no sigmask. pselect6(72) keeps the *timespec + sigmask decode.
+            return SyscallNorm::Plain(RawSyscall {
+                number: carrick_abi::CARRICK_PRIVATE_X86_SELECT,
+                args: [args[0], args[1], args[2], args[3], args[4], 0],
             });
         }
         if x86_number == X86_NR_DUP2 {
@@ -1160,6 +1173,22 @@ mod normalize_tests {
     }
 
     #[test]
+    fn select_normalizes_to_private_number_not_pselect6() {
+        // x86 select = 23. pselect6's timeout is a *timespec; select's is a
+        // *timeval — folding them collides (tv_usec read as tv_nsec). select must
+        // get a PRIVATE number so the dispatcher reads the timeval. Args
+        // (nfds, r, w, e, *timeval) pass through; the sigmask slot is zeroed.
+        match X8664GuestArch::normalize_syscall(&frame(23, [3, 0x100, 0x200, 0, 0x300, 0xBAD])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_SELECT);
+                assert_ne!(rs.number, 72); // NOT canonical pselect6
+                assert_eq!(rs.args, [3, 0x100, 0x200, 0, 0x300, 0]);
+            }
+            _ => panic!("select must be Plain"),
+        }
+    }
+
+    #[test]
     fn pipe_normalizes_to_pipe2_with_zero_flags() {
         // x86 pipe = 22, but canonical 22 is epoll_pwait. Normalize through the
         // asm-generic successor and append flags=0.
@@ -1377,9 +1406,12 @@ mod normalize_tests {
 
     #[test]
     fn unknown_x86_syscall_normalizes_to_private_unsupported() {
-        // x86 select = 23, while canonical asm-generic 23 is dup. Unknown x86
-        // numbers must not fall through to the canonical dispatcher by number.
-        match X8664GuestArch::normalize_syscall(&frame(23, [0x1000, 3, 4, 5, 0, 0])) {
+        // x86_64 335 is unused (the gap between rseq=334 and
+        // pidfd_send_signal=424). An unknown x86 number must map to the private
+        // UNSUPPORTED number, not fall through to the canonical dispatcher BY
+        // NUMBER (canonical 335 is an unrelated syscall). (select=23 was the old
+        // example here until it got its own private shim.)
+        match X8664GuestArch::normalize_syscall(&frame(335, [0x1000, 3, 4, 5, 0, 0])) {
             SyscallNorm::Plain(rs) => {
                 assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED);
                 assert_eq!(rs.args, [0x1000, 3, 4, 5, 0, 0]);
