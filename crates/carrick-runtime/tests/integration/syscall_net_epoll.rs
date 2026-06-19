@@ -16,7 +16,8 @@ use carrick_runtime::dispatch::WaitFds;
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_EINTR, LINUX_EPOLLOUT, LINUX_SIOCGIFINDEX, LINUX_SIOCGIFNAME,
-    LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP,
+    LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP, LinuxGuestAbi,
+    LinuxX8664EpollEvent,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
@@ -2493,5 +2494,79 @@ fn close_of_added_fd_auto_removes_it_from_epoll_interest() {
         ),
         DispatchOutcome::Returned { value: 0 },
         "close() must auto-remove the fd from epoll interest (no spurious EEXIST on reuse)"
+    );
+}
+
+#[test]
+fn x86_64_epoll_uses_packed_event_layout() {
+    let mut memory = LinearMemory::new(0x4000, vec![0xee; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let ret = |dispatcher: &mut SyscallDispatcher,
+               memory: &mut LinearMemory,
+               request: SyscallRequest|
+     -> i64 {
+        match dispatcher.dispatch(request, memory, &reporter).unwrap() {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    };
+
+    let eventfd = ret(
+        &mut dispatcher,
+        &mut memory,
+        SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+    ) as u64;
+    let epfd = ret(
+        &mut dispatcher,
+        &mut memory,
+        SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+    ) as u64;
+
+    let wanted = LinuxX8664EpollEvent {
+        events: LINUX_EPOLLIN,
+        data: 0x1122_3344_5566_7788,
+    };
+    memory.write_bytes(0x4000, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([epfd, LINUX_EPOLL_CTL_ADD, eventfd, 0x4000, 0, 0]),
+            )
+            .with_guest_abi(LinuxGuestAbi::X86_64),
+        ),
+        0
+    );
+
+    write_u64(&mut memory, 0x4040, 1);
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            SyscallRequest::new(64, SyscallArgs::from([eventfd, 0x4040, 8, 0, 0, 0])),
+        ),
+        8
+    );
+
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            SyscallRequest::new(22, SyscallArgs::from([epfd, 0x4050, 4, 0, 0, 0]))
+                .with_guest_abi(LinuxGuestAbi::X86_64),
+        ),
+        1
+    );
+    let bytes = memory.read_bytes(0x4050, 20).unwrap();
+    assert_eq!(&bytes[0..4], &LINUX_EPOLLIN.to_le_bytes());
+    assert_eq!(&bytes[4..12], &0x1122_3344_5566_7788_u64.to_le_bytes());
+    assert_eq!(
+        &bytes[12..20],
+        &[0xee; 8],
+        "x86_64 epoll_event has 12-byte stride; 16-byte writes overflow"
     );
 }
