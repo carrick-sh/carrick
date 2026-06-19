@@ -265,6 +265,64 @@ pub(super) fn pollevent_to_epoll(ev: &carrick_hal::event::PollEvent) -> u32 {
     events
 }
 
+/// Is there TCP urgent / out-of-band data pending on `host_fd` right now?
+///
+/// This is the level-triggered "is EPOLLPRI asserted" probe the epoll(7)
+/// readiness recompute needs, and it CANNOT be answered with `libc::poll`'s
+/// `POLLPRI` on macOS: Darwin's `poll(2)` does not surface socket OOB through
+/// `POLLPRI` (it stays 0 even with a pending urgent byte), so the epoll_pwait
+/// re-poll dropped the OOB edge the instance kqueue had correctly drained, and
+/// EPOLLPRI was never delivered (probe `epollpri`). Darwin DOES expose OOB
+/// readiness through kqueue's `EVFILT_EXCEPT`/`NOTE_OOB`, so a one-shot,
+/// non-blocking kqueue check is the Darwin-native equivalent of `POLLPRI`.
+///
+/// A transient kqueue (created and dropped per call) keeps this stateless and
+/// fork-coherent — there is no registration to leak or to confuse with the
+/// instance multiplexer's long-lived `EVFILT_EXCEPT` filter. Best-effort: any
+/// host error means "not ready" (the caller still has the read/write/HUP path).
+///
+/// macOS/OpenBSD/DragonFly expose `EVFILT_EXCEPT`; on every other host (Linux,
+/// FreeBSD, NetBSD) OOB readiness is reported by the platform's native poll
+/// (`POLLPRI`) or has no kqueue equivalent, so this returns `false` and the
+/// caller falls back to its `libc::poll(POLLPRI)` path.
+#[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly"))]
+pub(super) fn host_fd_has_oob(host_fd: i32) -> bool {
+    use carrick_host_bsd::Kqueue;
+    use carrick_host_bsd::kqueue::{EVFILT_EXCEPT, Kevent, NOTE_OOB};
+
+    let Some(kq) = Kqueue::new_internal() else {
+        return false;
+    };
+    // EV_RECEIPT makes apply() report registration errors as a 0-data EV_ERROR
+    // kevent rather than a delivered event; we instead just register, then do a
+    // zero-timeout drain — an EVFILT_EXCEPT event with NOTE_OOB fflags means a
+    // pending urgent byte. EV_CLEAR keeps it from re-counting (irrelevant for a
+    // one-shot transient kq, but harmless).
+    let add = Kevent::oob(host_fd, libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR);
+    if kq.apply(&[add]).is_err() {
+        return false;
+    }
+    let mut out = [Kevent::empty(); 1];
+    let zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match kq.wait(&[], &mut out, Some(&zero)) {
+        Ok(n) if n >= 1 => {
+            let ev = out[0];
+            ev.filter() == EVFILT_EXCEPT && ev.fflags() & NOTE_OOB != 0
+        }
+        _ => false,
+    }
+}
+
+/// Non-Darwin hosts answer OOB readiness through their native `POLLPRI`
+/// (Linux) or have no `EVFILT_EXCEPT` (FreeBSD, NetBSD); see [`host_fd_has_oob`].
+#[cfg(not(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly")))]
+pub(super) fn host_fd_has_oob(_host_fd: i32) -> bool {
+    false
+}
+
 pub(super) fn read_pollfd(memory: &impl GuestMemory, address: u64) -> Result<LinuxPollFd, i32> {
     read_kernel_struct(memory, address)
 }
@@ -1834,6 +1892,72 @@ mod tests {
             guest_path,
             "must reverse-translate the host node to the guest sun_path via the xattr"
         );
+    }
+
+    #[test]
+    fn host_fd_has_oob_detects_pending_urgent_byte() {
+        // Darwin's poll(2) does not surface TCP urgent data through POLLPRI, so
+        // the epoll readiness recompute must use the kqueue EVFILT_EXCEPT probe.
+        // This test pins that contract: a connected TCP socketpair, one MSG_OOB
+        // byte sent, and host_fd_has_oob must report the urgent byte on the peer
+        // (and report `false` BEFORE the byte is sent). Linux native poll(POLLPRI)
+        // also satisfies the post-send assertion, so this runs on either host.
+        use std::mem::MaybeUninit;
+
+        unsafe {
+            let listener = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(listener >= 0);
+            let mut addr: libc::sockaddr_in = MaybeUninit::zeroed().assume_init();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let alen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(
+                libc::bind(listener, &addr as *const _ as *const libc::sockaddr, alen),
+                0
+            );
+            assert_eq!(libc::listen(listener, 1), 0);
+            let mut got: libc::sockaddr_in = MaybeUninit::zeroed().assume_init();
+            let mut glen = alen;
+            assert_eq!(
+                libc::getsockname(
+                    listener,
+                    &mut got as *mut _ as *mut libc::sockaddr,
+                    &mut glen
+                ),
+                0
+            );
+            let client = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(client >= 0);
+            assert_eq!(
+                libc::connect(client, &got as *const _ as *const libc::sockaddr, glen),
+                0
+            );
+            let server = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
+            assert!(server >= 0);
+
+            // Before any OOB byte: not ready.
+            assert!(
+                !host_fd_has_oob(client),
+                "no urgent data sent yet — must report not-ready"
+            );
+
+            // Send one urgent byte from the server end.
+            assert_eq!(
+                libc::send(server, b"!".as_ptr().cast(), 1, libc::MSG_OOB),
+                1
+            );
+            // Give the loopback stack a moment to deliver the urgent notification.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            assert!(
+                host_fd_has_oob(client),
+                "pending MSG_OOB urgent byte must make host_fd_has_oob report ready"
+            );
+
+            libc::close(server);
+            libc::close(client);
+            libc::close(listener);
+        }
     }
 
     #[test]
