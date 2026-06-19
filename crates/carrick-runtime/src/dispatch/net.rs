@@ -1235,13 +1235,33 @@ impl SyscallDispatcher {
         msgvec: GuestPtr,
         vlen: u64,
         flags: u64,
-        _timeout: GuestPtr,
+        timeout: GuestPtr,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
         let fd = fd.0;
         let msgvec = msgvec.0;
         let vlen = vlen as u32;
         let flags = flags as i32;
+        // Validate the optional timeout up front, exactly as pselect6/ppoll do: a
+        // malformed struct timespec (negative tv_sec, or tv_nsec outside
+        // [0, 1e9)) is rejected with EINVAL, a bad pointer with EFAULT, before any
+        // receive. The full per-datagram deadline semantics are not yet emulated
+        // (see the doc comment above); validating the argument is the
+        // Linux-faithful, side-effect-free part we can do precisely.
+        let timeout = timeout.0;
+        if timeout != 0 {
+            match read_kernel_struct::<LinuxTimespec>(&*memory, timeout) {
+                Ok(ts) => {
+                    // Copy out of the packed timespec before referencing (E0793).
+                    let sec = ts.tv_sec;
+                    let nsec = ts.tv_nsec;
+                    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                        return DispatchOutcome::errno(LINUX_EINVAL);
+                    }
+                }
+                Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
+            }
+        }
         const MMSGHDR_SIZE: u64 = <LinuxMmsghdr as KernelAbi>::ABI_SIZE as u64;
         const MSG_LEN_OFFSET: u64 = <LinuxMsghdr as KernelAbi>::ABI_SIZE as u64;
         let mut received: i32 = 0;
@@ -1290,6 +1310,58 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned {
             value: received as i64,
         }
+    }
+}
+
+#[cfg(test)]
+mod recvmmsg_tests {
+    use super::*;
+    use crate::dispatch::LinearMemory;
+
+    #[test]
+    fn recvmmsg_rejects_malformed_timeout_with_einval() {
+        // Linux validates the optional `timeout` struct timespec up front and
+        // rejects a tv_nsec outside [0, 1e9) (or a negative tv_sec) with EINVAL,
+        // just like nanosleep/ppoll/pselect6. carrick previously ignored the
+        // argument entirely, so a malformed timeout slipped through to a normal
+        // (EBADF/EFAULT) receive. The fd is irrelevant: validation must precede
+        // any fd/msgvec use.
+        let dispatcher = SyscallDispatcher::new();
+        let base = 0x1000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        // struct timespec { tv_sec: 0, tv_nsec: 2_000_000_000 } — tv_nsec >= 1e9.
+        let mut ts = [0u8; 16];
+        ts[8..16].copy_from_slice(&2_000_000_000i64.to_le_bytes());
+        memory.write_bytes(base, &ts).unwrap();
+
+        let out = dispatcher.recvmmsg(
+            Fd(-1),
+            GuestPtr(base + 0x100),
+            1,
+            0,
+            GuestPtr(base),
+            &mut memory,
+        );
+        assert!(
+            matches!(out, DispatchOutcome::Errno { errno } if errno == LINUX_EINVAL),
+            "malformed recvmmsg timeout must yield EINVAL, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn recvmmsg_null_timeout_is_not_validated() {
+        // A NULL timeout pointer is the common case and must NOT be treated as a
+        // malformed timespec — it simply means "no timeout".
+        let dispatcher = SyscallDispatcher::new();
+        let base = 0x1000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        let out = dispatcher.recvmmsg(Fd(-1), GuestPtr(base), 1, 0, GuestPtr(0), &mut memory);
+        // fd is invalid, so this is some receive error — the point is it is NOT
+        // the EINVAL we reserve for a malformed timeout.
+        assert!(
+            !matches!(out, DispatchOutcome::Errno { errno } if errno == LINUX_EINVAL),
+            "NULL timeout must not be rejected as malformed, got {out:?}"
+        );
     }
 }
 
@@ -2738,6 +2810,11 @@ impl SyscallDispatcher {
                     host_fd,
                     crate::event_ring::path_hash(&host_addr[2..end]),
                 );
+                // Stamp the guest sun_path onto the just-created host node so a
+                // DIFFERENT carrick process (whose per-process registry lacks
+                // this bind) can reverse-translate it in getsockname/getpeername
+                // instead of leaking the raw <hash>.sock host path.
+                persist_unix_path_xattr(&host_addr[2..end]);
             }
             // Bind succeeded. Materialise the guest-facing S_IFSOCK node at the
             // resolved guest path. Linux applies the umask to 0o777 for the
