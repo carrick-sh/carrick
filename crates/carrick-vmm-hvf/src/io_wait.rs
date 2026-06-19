@@ -667,6 +667,17 @@ impl ThreadWaiter {
         let cap = (changes.len() + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
 
+        // Cap every kevent slice at 50 ms so a pending guest signal (poked onto
+        // the self-pipe) is observed within one slice even when the kqueue wake
+        // edge is lost — a freshly forked child can race signal-pump/self-pipe
+        // reinitialisation and never see the wake (this is the exact bug d97a47a
+        // fixed for wait4; ppoll(0,0,NULL,...), which musl uses for pause() on
+        // aarch64, needs the same retry). The finite-timeout arm gets the SAME
+        // backstop: without it a `select([pipe],…,10s)` in a forked child sleeps
+        // the full 10 s instead of waking on a mid-wait SIGALRM. Total wait stays
+        // bounded by the real deadline — the `now >= dl` check below caps it; only
+        // the internal slicing changes, the timeout semantics are unchanged.
+        const SLICE_NS: i64 = 50_000_000;
         let result = loop {
             let ts = match deadline {
                 Some(dl) => {
@@ -674,18 +685,12 @@ impl ThreadWaiter {
                     if now >= dl {
                         break WaitResult::TimedOut;
                     }
-                    Some(duration_to_timespec(dl - now))
+                    let remaining = duration_to_timespec(dl - now);
+                    Some(clamp_timespec_to_slice(remaining, SLICE_NS))
                 }
-                // Bound the wait even when a signal pipe exists. The kqueue
-                // event is still the fast path, but a freshly forked child
-                // can race signal-pump/self-pipe reinitialisation and lose a
-                // wake edge forever (this is the exact bug d97a47a fixed for
-                // wait4; ppoll(0,0,NULL,...) — which musl uses for pause() on
-                // aarch64 — needs the same 50 ms retry to guarantee a pending
-                // guest signal is observed).
                 None => Some(libc::timespec {
                     tv_sec: 0,
-                    tv_nsec: 50_000_000,
+                    tv_nsec: SLICE_NS,
                 }),
             };
             let n = kq.wait(&changes, &mut events_out, ts.as_ref());
@@ -934,6 +939,27 @@ fn duration_to_timespec(d: Duration) -> libc::timespec {
     }
 }
 
+/// Cap a kevent timeout at `slice_ns` (sub-second) nanoseconds. A wait longer
+/// than the slice is shortened to the slice so the wait loop re-checks for a
+/// pending signal (and re-drains the self-pipe) at least every `slice_ns`; the
+/// caller's deadline check still bounds the TOTAL wait, so only the internal
+/// slicing changes, never the timeout semantics.
+#[cfg(target_os = "macos")]
+fn clamp_timespec_to_slice(ts: libc::timespec, slice_ns: i64) -> libc::timespec {
+    let slice_sec = (slice_ns / 1_000_000_000) as libc::time_t;
+    let slice_subsec = (slice_ns % 1_000_000_000) as libc::c_long;
+    let longer_than_slice =
+        ts.tv_sec > slice_sec || (ts.tv_sec == slice_sec && ts.tv_nsec > slice_subsec);
+    if longer_than_slice {
+        libc::timespec {
+            tv_sec: slice_sec,
+            tv_nsec: slice_subsec,
+        }
+    } else {
+        ts
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn remaining_timeout(deadline: Option<Instant>) -> Option<Duration> {
     deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -1035,6 +1061,50 @@ mod tests {
             !ready,
             "a stopped child is not exit-ready for a WEXITED-only waiter"
         );
+    }
+
+    /// The finite-timeout arm of `wait_kqueue` must cap each kevent slice at the
+    /// 50 ms backstop so a forked child's lost self-pipe wake is noticed within a
+    /// slice instead of sleeping the whole timeout. `clamp_timespec_to_slice`
+    /// shortens a long remaining timeout to one slice but leaves a short one
+    /// alone (the total wait stays bounded by the caller's deadline check).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clamp_timespec_caps_long_waits_at_slice() {
+        const SLICE_NS: i64 = 50_000_000;
+        // A 10 s remaining wait (the select(pipe, 10s) repro) is capped to 50 ms.
+        let ten_s = libc::timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        };
+        let capped = super::clamp_timespec_to_slice(ten_s, SLICE_NS);
+        assert_eq!(capped.tv_sec, 0);
+        assert_eq!(capped.tv_nsec as i64, SLICE_NS);
+
+        // Just over a slice → capped to a slice.
+        let over = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: SLICE_NS as libc::c_long + 1,
+        };
+        let capped = super::clamp_timespec_to_slice(over, SLICE_NS);
+        assert_eq!(capped.tv_nsec as i64, SLICE_NS);
+
+        // A remaining wait shorter than a slice is left untouched (last slice).
+        let short = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        };
+        let kept = super::clamp_timespec_to_slice(short, SLICE_NS);
+        assert_eq!(kept.tv_sec, 0);
+        assert_eq!(kept.tv_nsec, 10_000_000);
+
+        // Exactly one slice is the boundary — not "longer than", so kept as-is.
+        let exact = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: SLICE_NS as libc::c_long,
+        };
+        let kept = super::clamp_timespec_to_slice(exact, SLICE_NS);
+        assert_eq!(kept.tv_nsec as i64, SLICE_NS);
     }
 
     /// A wake pipe whose write end is closed (EOF) must not re-fire its
