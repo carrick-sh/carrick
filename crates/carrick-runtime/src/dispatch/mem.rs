@@ -49,6 +49,16 @@
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
 
+syscall_table! {
+    /// Per-module syscall routing for the `mem` subsystem (Task A1).
+    ///
+    /// Owns the `number → handler` arms for every syscall this module
+    /// implements. `resolve_handler` in `dispatch/mod.rs` chains this with
+    /// the other modules' tables. Add a `mem` syscall by adding an arm
+    /// HERE — no shared routing table to edit.
+    pub(crate) fn dispatch_mem;
+}
+
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
 pub(super) struct MemState {

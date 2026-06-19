@@ -594,6 +594,25 @@ macro_rules! define_syscall {
     };
 }
 
+/// Emit a `dispatch_<area>(number) -> Option<SyscallHandler<M>>` resolver from a
+/// `number => handler` list. Each dispatch module invokes this once with the
+/// arms it owns. The handler is returned as a fn pointer (the receiver and ctx
+/// are bound later by `dispatch_normalized`), which is what makes the per-module
+/// tables chainable without a shared `match` — adding a syscall is a one-module
+/// edit (Task A1). Defined before the `mod` declarations so the child dispatch
+/// modules can invoke it.
+macro_rules! syscall_table {
+    ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
+        $(#[$meta])*
+        $vis fn $name<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
+            Some(match number {
+                $( $num => SyscallDispatcher::$handler, )*
+                _ => return None,
+            })
+        }
+    };
+}
+
 mod abi_args;
 #[macro_use]
 mod creds;
@@ -1610,42 +1629,30 @@ impl Default for SyscallDispatcher {
 /// syscalls; the borrow of memory/reporter is scoped to the call so the
 /// legacy arm can still use them. As subsystems migrate this list grows
 /// and the legacy match shrinks. See [[plan-syscall-macro-split]].
-macro_rules! normalized_dispatch {
-    ( $( $num:pat => $handler:ident ),* $(,)? ) => {
-        fn dispatch_normalized(
-            &self,
-            request: SyscallRequest,
-            memory: &mut impl GuestMemory,
-            reporter: &CompatReporter,
-            thread: Option<ThreadCtx>,
-        ) -> Option<Result<DispatchOutcome, DispatchError>> {
-            match request.number {
-                $(
-                    $num => {
-                        let mut ctx = SyscallCtx { request, memory, reporter, thread };
-                        Some(self.$handler(&mut ctx))
-                    }
-                )*
-                _ => None,
-            }
-        }
+/// A normalized syscall handler resolved to a bare function pointer: the
+/// `define_syscall!`-generated `sys_*` methods all share this signature, so a
+/// `number → handler` table is just a `match` returning one of these. Each
+/// dispatch module owns a `dispatch_<area>(number) -> Option<SyscallHandler<M>>`
+/// over the numbers IT implements; `dispatch_normalized` chains them. Adding a
+/// syscall is then a one-module edit — no shared routing table to contend on
+/// (Task A1). See [[plan-concurrent-fanout-lanes]] Part A.
+pub(crate) type SyscallHandler<M> =
+    fn(&SyscallDispatcher, &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError>;
 
-        fn dispatch_normalized_known(number: u64) -> bool {
-            matches!(number, $( $num )|*)
-        }
-    };
-}
-
-impl SyscallDispatcher {
-    normalized_dispatch! {
-        17 => getcwd,
-        19 => eventfd2,
-        20 => epoll_create1,
-        21 => epoll_ctl,
-        22 => epoll_pwait,
-        23 => dup,
-        24 => dup3,
-        CARRICK_PRIVATE_X86_DUP2 => dup2,
+// Central routing table for syscall numbers not yet migrated to a per-module
+// `dispatch_<area>`. As each module's arms move into its own table (Task A1),
+// this shrinks; when empty it can be dropped entirely. `resolve_handler` chains
+// the per-module tables and falls back to this one.
+syscall_table! {
+    pub(crate) fn dispatch_misc;
+    17 => getcwd,
+    19 => eventfd2,
+    20 => epoll_create1,
+    21 => epoll_ctl,
+    22 => epoll_pwait,
+    23 => dup,
+    24 => dup3,
+    CARRICK_PRIVATE_X86_DUP2 => dup2,
         // x86_64 poll(2): shares the ppoll handler, which branches on the
         // canonical number to read arg2 as an INT timeout_ms (not a *timespec).
         CARRICK_PRIVATE_X86_POLL => ppoll,
@@ -1883,6 +1890,57 @@ impl SyscallDispatcher {
         435 => sys_clone3,
         283 => sys_membarrier,
         293 => sys_rseq,
+}
+
+// end syscall_table! dispatch_misc
+
+/// Resolve a syscall number to its handler by chaining every dispatch module's
+/// own routing table, then the central `dispatch_misc` fallback for arms not
+/// yet migrated to a module. This is the single source of truth for "is this
+/// number claimed, and by which handler"; both `dispatch_normalized` (which
+/// builds the ctx and invokes the handler) and `dispatch_normalized_known`
+/// (the membership test) go through it. Each module owns its own arms, so a
+/// future agent adds a syscall by editing ONE module's `dispatch_<area>` — never
+/// this function or a shared table.
+fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
+    fs::dispatch_fs(number)
+        .or_else(|| net::dispatch_net(number))
+        .or_else(|| mem::dispatch_mem(number))
+        .or_else(|| proc::dispatch_proc(number))
+        .or_else(|| signal::dispatch_signal(number))
+        .or_else(|| time::dispatch_time(number))
+        .or_else(|| creds::dispatch_creds(number))
+        .or_else(|| sysv::dispatch_sysv(number))
+        .or_else(|| dispatch_misc(number))
+}
+
+impl SyscallDispatcher {
+    /// Dispatch a syscall through the chained per-module routing. Returns `None`
+    /// for an unclaimed number (the caller ENOSYSes); otherwise builds the
+    /// transient `SyscallCtx` and invokes the resolved handler.
+    fn dispatch_normalized(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        let handler = resolve_handler(request.number)?;
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread,
+        };
+        Some(handler(self, &mut ctx))
+    }
+
+    /// Membership test: is `number` claimed by some dispatch module? Mirrors
+    /// `dispatch_normalized` exactly (both go through `resolve_handler`), so the
+    /// two can never drift. Uses `LinearMemory` as the concrete memory type —
+    /// the claimed set is independent of `M`.
+    fn dispatch_normalized_known(number: u64) -> bool {
+        resolve_handler::<LinearMemory>(number).is_some()
     }
 
     /// Characterization seam for the per-module routing refactor (Task A1).

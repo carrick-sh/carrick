@@ -45,6 +45,16 @@
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
 
+syscall_table! {
+    /// Per-module syscall routing for the `time` subsystem (Task A1).
+    ///
+    /// Owns the `number → handler` arms for every syscall this module
+    /// implements. `resolve_handler` in `dispatch/mod.rs` chains this with
+    /// the other modules' tables. Add a `time` syscall by adding an arm
+    /// HERE — no shared routing table to edit.
+    pub(crate) fn dispatch_time;
+}
+
 /// Pack a `(value_ns, interval_ns)` pair into a `LinuxItimerspec` (the Linux
 /// kernel ABI `struct __kernel_itimerspec`). Used by `timer_settime`'s
 /// `old_value` and `timer_gettime`'s `cur_value` writes.

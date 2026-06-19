@@ -83,6 +83,16 @@
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
+
+syscall_table! {
+    /// Per-module syscall routing for the `net` subsystem (Task A1).
+    ///
+    /// Owns the `number → handler` arms for every syscall this module
+    /// implements. `resolve_handler` in `dispatch/mod.rs` chains this with
+    /// the other modules' tables. Add a `net` syscall by adding an arm
+    /// HERE — no shared routing table to edit.
+    pub(crate) fn dispatch_net;
+}
 mod support;
 use support::*;
 pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
