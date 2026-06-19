@@ -693,6 +693,13 @@ const X86_NR_POLL: u64 = 7;
 /// because canonical/asm-generic has only `pselect6(2)` (a *timespec timeout +
 /// sigmask) — select's *timeval timeout would be mis-read as a *timespec.
 const X86_NR_SELECT: u64 = 23;
+/// x86-64 `pause(2)` (syscalls(2)). LEGACY x86_64-only — asm-generic has NO
+/// `pause` (aarch64 libc implements `pause()` as `ppoll(NULL, 0, NULL, sigmask)`
+/// = block forever until a signal). carrick desugars it to that canonical
+/// `ppoll` so the paused guest blocks at the cross-process-signal wait point and
+/// a fatal default-action signal (e.g. SIGTERM) actually terminates it — rather
+/// than ENOSYS-ing, which busy-loops the guest to the trap ceiling.
+const X86_NR_PAUSE: u64 = 34;
 /// x86-64 `dup2(2)` (syscalls(2)). Desugars to a private dispatcher shim because
 /// canonical/asm-generic has `dup3(2)` but no `dup2(2)`.
 const X86_NR_DUP2: u64 = 33;
@@ -729,6 +736,9 @@ const CANONICAL_READLINKAT: u64 = 78;
 const X86_NR_MKDIR: u64 = 83;
 /// Canonical (asm-generic / aarch64) `mkdirat` number.
 const CANONICAL_MKDIRAT: u64 = 34;
+/// Canonical (asm-generic / aarch64) `ppoll` number — the target for x86 `pause`
+/// (ppoll(NULL, 0, NULL) = block until a signal).
+const CANONICAL_PPOLL: u64 = 73;
 /// x86-64 `open(2)` (syscalls(2)). asm-generic only exposes `openat`; canonical
 /// 2 is `io_submit`, so a table fallthrough would mis-dispatch. Desugars to
 /// `openat(AT_FDCWD, path, flags, mode)`.
@@ -845,6 +855,20 @@ impl X8664GuestArch {
             return SyscallNorm::Plain(RawSyscall {
                 number: carrick_abi::CARRICK_PRIVATE_X86_SELECT,
                 args: [args[0], args[1], args[2], args[3], args[4], 0],
+            });
+        }
+        if x86_number == X86_NR_PAUSE {
+            // pause() = block forever until a signal. asm-generic has no pause;
+            // aarch64 libc emits ppoll(NULL, 0, NULL, sigmask), which carrick's
+            // ppoll handler treats as the infinite signal-wait. Route x86 pause
+            // there (NULL fds/nfds/timeout/sigmask) so the paused guest parks at
+            // the cross-process-signal wait point and a fatal default-action
+            // signal terminates it — instead of ENOSYS busy-looping. NOTE: must
+            // be canonical ppoll(73), NOT the poll shim (whose arg2=0 is an INT
+            // timeout_ms = return-now, which would re-introduce the spin).
+            return SyscallNorm::Plain(RawSyscall {
+                number: CANONICAL_PPOLL,
+                args: [0, 0, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_DUP2 {
@@ -1185,6 +1209,21 @@ mod normalize_tests {
                 assert_eq!(rs.args, [3, 0x100, 0x200, 0, 0x300, 0]);
             }
             _ => panic!("select must be Plain"),
+        }
+    }
+
+    #[test]
+    fn pause_normalizes_to_blocking_ppoll() {
+        // x86 pause = 34 (canonical 34 is mkdirat — must NOT fall through BY
+        // NUMBER). pause() blocks until a signal, so it maps to canonical
+        // ppoll(73) with NULL fds/nfds/timeout/sigmask (the infinite signal-wait
+        // aarch64 libc uses for pause). Its garbage register args are dropped.
+        match X8664GuestArch::normalize_syscall(&frame(34, [0xBAD, 0xBAD, 0xBAD, 7, 7, 7])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 73); // canonical ppoll, NOT mkdirat(34)
+                assert_eq!(rs.args, [0, 0, 0, 0, 0, 0]); // ppoll(NULL,0,NULL,NULL,0)
+            }
+            _ => panic!("pause must be Plain"),
         }
     }
 
