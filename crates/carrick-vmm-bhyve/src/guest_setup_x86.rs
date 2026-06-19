@@ -993,7 +993,13 @@ pub struct BhyveWindow {
 struct RamInner {
     windows: Vec<BhyveWindow>,
     cursor: u64,
-    reservations: Vec<(u64, u64)>,
+    // Each reservation is `(start, end, writable)`. `writable` carries the guest
+    // PROT_WRITE bit so a demand-committed page is mapped with the right leaf
+    // protection: a read-only (PROT_READ) reservation commits a PRESENT but
+    // read-only leaf, so a guest WRITE to it re-faults with PFEC.P=1 and the
+    // engine delivers SIGSEGV/SEGV_ACCERR (not silently allowing the store). A
+    // writable reservation commits an RW leaf (the common anon-arena case).
+    reservations: Vec<(u64, u64, bool)>,
 }
 
 /// A handle to the shared guest-RAM plan. `Clone` shares the `Arc`, NOT the
@@ -1010,7 +1016,9 @@ pub enum CommitOutcome {
     /// Not a known reservation — a genuine fault (deliver SIGSEGV).
     NotReserved,
     /// Freshly allocated this GPA + window; the caller maps the leaf + zero-fills.
-    Committed(u64),
+    /// `writable` is the reservation's protection: the caller maps the leaf RW
+    /// when true, read-only when false (so a write to a PROT_READ page faults).
+    Committed { gpa: u64, writable: bool },
 }
 
 /// Starting point for the bump allocator: 1 MiB (below the reserved 1 MiB
@@ -1021,19 +1029,26 @@ pub enum CommitOutcome {
 pub const X86_GPA_CURSOR_START: u64 = 0x40_0000; // 4 MiB — above init blob/GDT/LSTAR/PML4
 
 impl RamInner {
-    fn reserve(&mut self, va: u64, len: usize) {
+    fn reserve(&mut self, va: u64, len: usize, writable: bool) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
         if end <= start {
             return;
         }
-        self.reservations.push((start, end));
-        self.reservations.sort_by_key(|&(s, _)| s);
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.reservations.len());
-        for &(s, e) in &self.reservations {
+        // A re-reservation of an overlapping range (e.g. an mprotect changing the
+        // protection of an already-reserved-but-uncommitted range) must adopt the
+        // NEW writability, so punch out the overlap before inserting.
+        self.drop_reservation(start, (end - start) as usize);
+        self.reservations.push((start, end, writable));
+        self.reservations.sort_by_key(|&(s, _, _)| s);
+        // Coalesce only ADJACENT/overlapping ranges that AGREE on writability;
+        // ranges of differing protection must stay distinct so each commits its
+        // own leaf protection.
+        let mut merged: Vec<(u64, u64, bool)> = Vec::with_capacity(self.reservations.len());
+        for &(s, e, w) in &self.reservations {
             match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
+                Some(last) if s <= last.1 && last.2 == w => last.1 = last.1.max(e),
+                _ => merged.push((s, e, w)),
             }
         }
         self.reservations = merged;
@@ -1043,22 +1058,33 @@ impl RamInner {
         let page = va & !0xFFF;
         self.reservations
             .iter()
-            .any(|&(s, e)| page >= s && page < e)
+            .any(|&(s, e, _)| page >= s && page < e)
+    }
+
+    /// The writability of the reservation covering `va`, or `None` if `va` is
+    /// not in any reservation. Used by the demand-commit so the leaf protection
+    /// matches the guest's requested `prot`.
+    fn reservation_writable(&self, va: u64) -> Option<bool> {
+        let page = va & !0xFFF;
+        self.reservations
+            .iter()
+            .find(|&&(s, e, _)| page >= s && page < e)
+            .map(|&(_, _, w)| w)
     }
 
     fn drop_reservation(&mut self, va: u64, len: usize) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
-        let mut out: Vec<(u64, u64)> = Vec::with_capacity(self.reservations.len() + 1);
-        for &(s, e) in &self.reservations {
+        let mut out: Vec<(u64, u64, bool)> = Vec::with_capacity(self.reservations.len() + 1);
+        for &(s, e, w) in &self.reservations {
             if end <= s || start >= e {
-                out.push((s, e)); // disjoint — keep
+                out.push((s, e, w)); // disjoint — keep
             } else {
                 if s < start {
-                    out.push((s, start)); // left remainder
+                    out.push((s, start, w)); // left remainder (same protection)
                 }
                 if end < e {
-                    out.push((end, e)); // right remainder
+                    out.push((end, e, w)); // right remainder (same protection)
                 }
             }
         }
@@ -1135,10 +1161,12 @@ impl BhyveGuestRam {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record a lazily-reserved (guest PROT_NONE) VA range — backed on demand by
-    /// the `#PF` path, never eagerly GPA-mapped.
-    pub fn reserve(&self, va: u64, len: usize) {
-        self.lock().reserve(va, len);
+    /// Record a lazily-reserved VA range — backed on demand by the `#PF` path,
+    /// never eagerly GPA-mapped. `writable` is the guest's requested PROT_WRITE:
+    /// a read-only reservation commits a present-but-read-only leaf so a guest
+    /// store re-faults (SEGV_ACCERR) instead of silently succeeding.
+    pub fn reserve(&self, va: u64, len: usize, writable: bool) {
+        self.lock().reserve(va, len, writable);
     }
 
     /// True iff the page containing `va` lies in a reservation range.
@@ -1199,19 +1227,23 @@ impl BhyveGuestRam {
     /// ATOMIC demand-commit. Under ONE lock: `AlreadyMapped` if a window already
     /// covers `va` (a sibling won the race — re-run), `NotReserved` if it is not
     /// a reservation (genuine fault → SIGSEGV), else allocate one GPA span +
-    /// window, drop the reservation, and return `Committed(gpa)`. Keeps two
-    /// sibling vCPUs from committing the same page to divergent GPAs.
+    /// window, drop the reservation, and return `Committed { gpa, writable }`
+    /// (the leaf protection follows the reservation). Keeps two sibling vCPUs
+    /// from committing the same page to divergent GPAs.
     pub fn commit_if_absent(&self, va: u64, len: usize) -> Result<CommitOutcome, OsError> {
         let mut inner = self.lock();
         if inner.resolve(va, 1).is_some() {
             return Ok(CommitOutcome::AlreadyMapped);
         }
-        if !inner.find_reservation(va) {
+        let Some(writable) = inner.reservation_writable(va) else {
             return Ok(CommitOutcome::NotReserved);
-        }
-        let gpa = inner.add_bump(va & !0xFFF, len, true, true, false)?;
+        };
+        // The window's `write` flag mirrors the reservation's protection so a
+        // read-only page commits a read-only leaf (see `map_aliased` in
+        // `demand_commit`). Read this BEFORE drop_reservation clears it.
+        let gpa = inner.add_bump(va & !0xFFF, len, true, writable, false)?;
         inner.drop_reservation(va, len);
-        Ok(CommitOutcome::Committed(gpa))
+        Ok(CommitOutcome::Committed { gpa, writable })
     }
 }
 
@@ -2603,6 +2635,77 @@ mod tests {
             "4097 bytes rounds to 2 pages"
         );
         assert!(gpa2 < X86_MEM_SIZE as u64, "all GPAs within lowmem");
+    }
+
+    /// Commit a reserved page and return whether the committed window is
+    /// writable; panics if the VA was not a reservation.
+    fn commit_writable(ram: &BhyveGuestRam, va: u64) -> bool {
+        match ram.commit_if_absent(va, 4096).expect("commit") {
+            CommitOutcome::Committed { writable, .. } => writable,
+            CommitOutcome::AlreadyMapped => panic!("unexpected AlreadyMapped for {va:#x}"),
+            CommitOutcome::NotReserved => panic!("unexpected NotReserved for {va:#x}"),
+        }
+    }
+
+    /// A read-only reservation commits a read-only window; a writable reservation
+    /// commits a writable one. This is the unit-level guard for SEGV_ACCERR: a
+    /// PROT_READ anon page must NOT be demand-committed as RW (which would let a
+    /// guest store silently succeed instead of faulting). See the
+    /// `sigsegv_accerr_*` live fixture.
+    #[test]
+    fn reservation_writability_is_preserved_through_commit() {
+        let ram = BhyveGuestRam::new();
+
+        // Read-only reservation -> read-only commit.
+        ram.reserve(0x60_0000_0000, 4096, false);
+        assert!(
+            !commit_writable(&ram, 0x60_0000_0000),
+            "PROT_READ reservation must commit read-only"
+        );
+        let ro = ram
+            .windows_snapshot()
+            .into_iter()
+            .find(|w| w.va == 0x60_0000_0000)
+            .expect("ro window");
+        assert!(!ro.write, "committed read-only window must not be writable");
+
+        // Writable reservation -> writable commit.
+        ram.reserve(0x60_0001_0000, 4096, true);
+        assert!(
+            commit_writable(&ram, 0x60_0001_0000),
+            "PROT_WRITE reservation must commit writable"
+        );
+        let rw = ram
+            .windows_snapshot()
+            .into_iter()
+            .find(|w| w.va == 0x60_0001_0000)
+            .expect("rw window");
+        assert!(rw.write, "committed writable window must be writable");
+
+        // A non-reserved VA is a genuine fault (NotReserved -> SIGSEGV).
+        assert!(matches!(
+            ram.commit_if_absent(0x70_0000_0000, 4096)
+                .expect("commit unreserved"),
+            CommitOutcome::NotReserved
+        ));
+    }
+
+    /// Reservations of differing protection do NOT coalesce: adjacent
+    /// PROT_READ / PROT_WRITE mmaps each commit their own leaf protection.
+    #[test]
+    fn distinct_protection_reservations_do_not_merge() {
+        let ram = BhyveGuestRam::new();
+        // Two abutting pages, different writability.
+        ram.reserve(0x60_0000_0000, 4096, false); // ro
+        ram.reserve(0x60_0000_1000, 4096, true); // rw, abuts the ro page
+        assert!(
+            !commit_writable(&ram, 0x60_0000_0000),
+            "read-only page commits read-only even with a writable neighbor"
+        );
+        assert!(
+            commit_writable(&ram, 0x60_0000_1000),
+            "abutting writable page still commits writable"
+        );
     }
 
     /// BhyveGuestRam: overflow guard returns an error before exceeding the
