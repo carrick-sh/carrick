@@ -1218,9 +1218,17 @@ impl SyscallDispatcher {
     /// `recvmmsg(sockfd, msgvec, vlen, flags, timeout)` — Linux's
     /// batched recvmsg. Same shape as sendmmsg: loop over entries,
     /// call single recvmsg for each, fill msg_len on success.
-    /// The timeout argument is best-effort — we fall through to a
-    /// single libc::poll up front if it's non-NULL and at least one
-    /// message is wanted before blocking.
+    ///
+    /// LIMITATION: the `timeout` argument is currently NOT honored
+    /// (bound `_timeout`). The first message takes the socket's normal
+    /// blocking path (so the wait is bounded only by SO_RCVTIMEO, else
+    /// it blocks until a datagram arrives or a signal interrupts);
+    /// after the first datagram `received > 0` forces MSG_DONTWAIT so
+    /// the rest drain without waiting. A faithful implementation would
+    /// convert `timeout` to an absolute deadline once and check it
+    /// AFTER each received datagram (Linux only consults the timeout
+    /// between datagrams — it does NOT bound the wait for the first
+    /// one), NOT as an up-front poll.
     fn recvmmsg(
         &self,
         fd: Fd,
