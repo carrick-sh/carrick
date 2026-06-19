@@ -2180,6 +2180,22 @@ pub const CARRICK_PRIVATE_X86_NEWFSTATAT: u64 = u64::MAX - 0x24;
 /// unsupported x86 syscalls to this out-of-range number so they return ENOSYS
 /// instead of mis-dispatching with the wrong argument shape.
 pub const CARRICK_PRIVATE_X86_UNSUPPORTED: u64 = u64::MAX - 0x25;
+/// Carrick-internal normalized syscall number for x86_64 `utime(2)`.
+///
+/// `utime(path, *utimbuf)` differs from canonical `utimensat(dfd, path,
+/// *timespec[2], flags)` in BOTH arg0 (path vs dirfd) AND struct layout (16-byte
+/// `utimbuf{actime,modtime}` in whole seconds vs 32-byte `timespec[2]`). A plain
+/// `Direct(88)` would mis-dispatch the path pointer into the dirfd slot and feed
+/// the wrong struct, so it routes to a private handler that converts utimbuf ->
+/// timespec[2] (tv_nsec=0) then calls `utimensat(AT_FDCWD, path, &times, 0)`.
+pub const CARRICK_PRIVATE_X86_UTIME: u64 = u64::MAX - 0x26;
+/// Carrick-internal normalized syscall number for x86_64 `utimes(2)`.
+///
+/// `utimes(path, *timeval[2])` carries microsecond timevals; the private handler
+/// converts timeval[2] -> timespec[2] (tv_nsec = tv_usec*1000) then calls
+/// `utimensat(AT_FDCWD, path, &times, flags=0)`. Out-of-range tv_usec
+/// (outside [0,999999]) -> -EINVAL; an unreadable guest pointer -> -EFAULT.
+pub const CARRICK_PRIVATE_X86_UTIMES: u64 = u64::MAX - 0x27;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;

@@ -1,0 +1,13 @@
+# Native cross-compile of the conformance probes to x86_64 Linux, for the
+# KVM/bhyve x86_64 conformance lane (carrick's x86_64 backends). On macOS the
+# system `cc` cannot emit Linux ELF, so use the bundled `rust-lld` with the
+# self-contained musl runtime — no external cross-toolchain needed. Build with:
+#   cargo build --release --target x86_64-unknown-linux-musl [--bin <probe>]
+#
+# This section applies ONLY to the x86_64 target. The aarch64-musl probe set
+# (built in an arm64 rust:alpine container — see Cargo.toml) is unaffected, and
+# because conformance-probes is its own crate, this config never reaches the
+# parent carrick build.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
