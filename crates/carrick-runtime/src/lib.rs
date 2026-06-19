@@ -2081,6 +2081,26 @@ pub mod io_wait {
         // Re-arm with the REMAINING time across spurious host-EINTR so a signal
         // storm can't extend the wait past the deadline.
         let deadline = timeout.map(|d| Instant::now() + d);
+        // Backstop for an UNBOUNDED wait (`timeout == None`, e.g. a guest
+        // `pause()` = empty-fd ppoll with a NULL timeout). On the Linux/KVM lane
+        // such a wait blocks SOLELY on the kick signal (SIGRTMIN, sent by
+        // `kvm_signal_pump`'s `kick_all` after publishing a process-directed
+        // signal): there is no fd in the set to ready it and no self-pipe in the
+        // pollfds. If that single wake EDGE is LOST — the kick fired in the
+        // window between this thread publishing `WaitOnFds`/`WaitOnProcExit` and
+        // actually entering `ppoll`, or the pump's poke landed on a stale pipe
+        // mid fork-reinit — a NULL-timeout ppoll would wedge the thread FOREVER:
+        // PROC_PENDING already holds the signal, but the recheck below only runs
+        // on an EINTR that never arrives. A parent's `kill(child, SIG)` + the
+        // child's `pause()` deadlocked exactly here on KVM (the child stuck in
+        // `poll_schedule_timeout`, the parent's `wait4` park never firing —
+        // `signalexit`/`waitexitstorm` HANG). Cap an unbounded slice at a short
+        // backstop so a lost edge re-checks the pending state within bounded
+        // latency, then re-blocks — mirroring the bounded re-poll the sibling
+        // `wait_proc_exit`/`rt_sigsuspend` loops already use. A real wake (kick
+        // EINTR or an fd readying) still returns immediately; this only changes
+        // how long a LOST edge can hide.
+        const UNBOUNDED_BACKSTOP: Duration = Duration::from_millis(50);
         loop {
             let ts = match deadline {
                 Some(dl) => {
@@ -2088,13 +2108,18 @@ pub mod io_wait {
                     if now >= dl {
                         return WaitResult::TimedOut;
                     }
-                    let rem = dl - now;
+                    let rem = (dl - now).min(UNBOUNDED_BACKSTOP);
                     Some(libc::timespec {
                         tv_sec: rem.as_secs().min(i64::MAX as u64) as libc::time_t,
                         tv_nsec: rem.subsec_nanos() as libc::c_long,
                     })
                 }
-                None => None,
+                // Unbounded wait: block in a bounded backstop slice instead of a
+                // NULL timeout so a lost kick edge cannot wedge the thread.
+                None => Some(libc::timespec {
+                    tv_sec: UNBOUNDED_BACKSTOP.as_secs() as libc::time_t,
+                    tv_nsec: UNBOUNDED_BACKSTOP.subsec_nanos() as libc::c_long,
+                }),
             };
             let tsp = ts
                 .as_ref()
@@ -2113,7 +2138,31 @@ pub mod io_wait {
                 return WaitResult::Ready;
             }
             if n == 0 {
-                return WaitResult::TimedOut;
+                // ppoll slice elapsed. For a BOUNDED wait, only return TimedOut
+                // once the REAL deadline is reached — a slice truncated by the
+                // unbounded backstop cap above must re-block for the remainder
+                // (the loop top recomputes the remaining time and returns
+                // TimedOut when `now >= dl`). For an UNBOUNDED wait (`deadline
+                // == None`, a `pause()`), a slice elapsing is the backstop: it
+                // must NEVER surface as TimedOut (the guest asked to block
+                // forever); instead re-check whether a wake edge was LOST while
+                // we were blocked — a now-deliverable pending/ring signal that
+                // never EINTR'd us — and surface `Interrupted` so the caller's
+                // `deliver_pending_signal` runs, else re-block.
+                match deadline {
+                    Some(dl) if Instant::now() >= dl => return WaitResult::TimedOut,
+                    Some(_) => continue,
+                    None => {
+                        if crate::fork_quiesce::is_quiescing()
+                            || crate::fork_quiesce::exec_replacing_other_thread(tid)
+                            || crate::host_signal::has_unblocked_pending_for(tid, block_mask)
+                            || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
+                        {
+                            return WaitResult::Interrupted;
+                        }
+                        continue;
+                    }
+                }
             }
             let err = carrick_portable::errno();
             if err == libc::EINTR {
