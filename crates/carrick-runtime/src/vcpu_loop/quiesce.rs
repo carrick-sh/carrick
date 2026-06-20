@@ -506,6 +506,16 @@ where
                 pt_barrier().end();
                 crate::event_ring::reinit_after_fork();
                 crate::host_signal::reinit_after_fork();
+                // M:N scheduler: the child inherited the parent's pool but has only
+                // THIS thread, now the child's main (remapped to the child VM's vCPU
+                // 0). Drop the inherited (parent-slot) lease, reset to a fresh pool,
+                // and re-acquire slot 0 — otherwise the child's new threads block on
+                // slots held by parent threads that don't exist here.
+                carrick_hal::vcpu_sched::take_current_lease();
+                carrick_hal::vcpu_sched::global().reset_for_fork();
+                carrick_hal::vcpu_sched::set_current_lease(
+                    carrick_hal::vcpu_sched::global().acquire(self.this_tid as u64),
+                );
                 // PID namespace: block until the parent registered our ns-pid
                 // before any guest code runs. No-op when ns off.
                 crate::namespace::pid::await_self_registration();

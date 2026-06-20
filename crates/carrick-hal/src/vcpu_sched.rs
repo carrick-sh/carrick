@@ -50,12 +50,13 @@ pub trait VcpuScheduler: Send + Sync + 'static {
     fn release(&self, lease: SlotLease, why: Yield);
     /// N — the live vCPU budget.
     fn budget(&self) -> usize;
-    /// Reset the pool on a fork CHILD: free every slot EXCEPT `keep` (the forking
-    /// thread's, whose inherited lease must stay valid), since the child inherits
-    /// the parent's scheduler state but none of the parent's other threads. Without
-    /// this the child's new threads block forever on slots held by threads that do
-    /// not exist in the child. A no-op where there is no pool.
-    fn reset_for_fork(&self, keep: SlotId);
+    /// Reset to a FRESH full pool on a fork CHILD: the child inherits the parent's
+    /// scheduler state but none of the parent's threads, and (on bhyve) its forking
+    /// thread remaps to the child VM's vCPU 0 — so the child drops its inherited
+    /// lease, calls this, and re-acquires slot 0 as its new main. Without the reset
+    /// the child's threads block forever on slots held by threads that do not exist
+    /// in the child. A no-op where there is no pool.
+    fn reset_for_fork(&self);
 }
 
 struct PoolState {
@@ -125,19 +126,12 @@ impl VcpuScheduler for HostCondvarScheduler {
         self.budget
     }
 
-    fn reset_for_fork(&self, keep: SlotId) {
+    fn reset_for_fork(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // Free every id except the forking thread's; keep that id's generation so
-        // its inherited lease stays the live grant.
-        st.free = (0..self.budget as SlotId)
-            .filter(|&i| i != keep)
-            .rev()
-            .collect();
-        for (i, g) in st.generations.iter_mut().enumerate() {
-            if i as SlotId != keep {
-                *g = 0;
-            }
-        }
+        // Fresh full pool: every id free, every grant invalidated. The caller
+        // re-acquires the child's main slot (0) afterward.
+        st.free = (0..self.budget as SlotId).rev().collect();
+        st.generations.iter_mut().for_each(|g| *g = 0);
     }
 }
 
@@ -176,7 +170,7 @@ impl VcpuScheduler for NoopScheduler {
     fn budget(&self) -> usize {
         usize::MAX
     }
-    fn reset_for_fork(&self, _keep: SlotId) {}
+    fn reset_for_fork(&self) {}
 }
 
 std::thread_local! {
@@ -314,30 +308,21 @@ mod tests {
     }
 
     #[test]
-    fn reset_for_fork_frees_all_but_the_keeper() {
+    fn reset_for_fork_yields_a_fresh_full_pool() {
         let s = HostCondvarScheduler::new(4);
-        let a = s.acquire(1);
-        let b = s.acquire(2);
+        let _a = s.acquire(1);
+        let _b = s.acquire(2);
         let _c = s.acquire(3);
-        let keep = b.slot;
-        s.reset_for_fork(keep);
-        // The 3 non-keep ids are free again; 3 acquires succeed without blocking and
-        // none returns `keep` (it stays allocated to the forking thread).
-        let got: Vec<_> = (0..3).map(|_| s.acquire(9).slot).collect();
-        assert!(
-            !got.contains(&keep),
-            "the kept slot stays allocated across fork"
-        );
+        let _d = s.acquire(4); // pool now exhausted (4/4)
+        s.reset_for_fork(); // fork child: drop all phantom-parent allocations
+        // Every id is free again — N acquires succeed without blocking.
+        let got: Vec<_> = (0..4).map(|_| s.acquire(9).slot).collect();
         let mut all = got.clone();
-        all.push(keep);
         all.sort();
         assert_eq!(
             all,
             vec![0, 1, 2, 3],
-            "the pool is whole again, each id once"
+            "fork child gets a whole fresh N-slot pool"
         );
-        // The keeper's inherited lease is still the live grant.
-        s.release(b, Yield::Exited);
-        let _ = a; // a's slot was freed by reset (generation cleared); no release
     }
 }
