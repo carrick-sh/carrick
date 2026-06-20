@@ -68,6 +68,7 @@ syscall_table! {
     113 => clock_gettime,
     114 => clock_getres,
     115 => clock_nanosleep,
+    carrick_abi::CARRICK_PRIVATE_X86_ALARM => x86_alarm,
     153 => times,
     163 => getrlimit,
     165 => getrusage,
@@ -352,6 +353,46 @@ impl SyscallDispatcher {
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// x86_64 `alarm(seconds)`: legacy syscall with no asm-generic
+        /// canonical number. It is equivalent to arming/disarming
+        /// `ITIMER_REAL` with zero interval and returns the previous timer's
+        /// remaining seconds.
+        fn x86_alarm(this, cx, seconds: u64) {
+            let idx = LINUX_ITIMER_REAL as usize;
+            let previous = x86_alarm_remaining_seconds(this.proc.lock().itimers[idx]);
+            if seconds == 0 {
+                this.proc.lock().itimers[idx] = None;
+                match crate::timer_delivery::delivery() {
+                    Some(d) => d.disarm_itimer(idx),
+                    None => crate::itimer::disarm(idx),
+                }
+                return Ok(DispatchOutcome::Returned {
+                    value: previous.min(i64::MAX as u64) as i64,
+                });
+            }
+
+            let value = Duration::from_secs(seconds);
+            let interval = Duration::ZERO;
+            this.proc.lock().itimers[idx] = Some(crate::dispatch::proc::ItimerState {
+                set_at: std::time::Instant::now(),
+                value,
+                interval,
+            });
+
+            let value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
+            let generation = crate::itimer::arm(idx, value_ns, 0, false);
+            let signum = crate::itimer::signum_for(idx);
+            let owned = crate::timer_delivery::delivery()
+                .is_some_and(|d| d.arm_itimer(idx, value_ns, 0, false, signum));
+            if !owned {
+                crate::itimer::spawn_fallback_timer(idx, generation, value, interval);
+            }
+
+            Ok(DispatchOutcome::Returned {
+                value: previous.min(i64::MAX as u64) as i64,
+            })
         }
 
         /// `timer_create(clock_id, sevp, &id)`: allocate a per-process timer.
@@ -883,6 +924,18 @@ fn itimerval_from_state(
             }
         }
         None => crate::linux_abi::LinuxItimerval::zeroed(),
+    }
+}
+
+fn x86_alarm_remaining_seconds(state: Option<crate::dispatch::proc::ItimerState>) -> u64 {
+    let Some(timer) = state else {
+        return 0;
+    };
+    let remaining = timer.value.saturating_sub(timer.set_at.elapsed());
+    if remaining.is_zero() {
+        0
+    } else {
+        remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
     }
 }
 
