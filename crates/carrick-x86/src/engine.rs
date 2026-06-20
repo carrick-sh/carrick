@@ -355,6 +355,32 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         self.protections.set_no_access(address, len, no_access);
     }
 
+    /// x86-specific WRITE gate (the analog of HVF's `validate_guest_write_range`):
+    /// a syscall write faults if the buffer is PROT_NONE (any access) OR read-only
+    /// (`no_write`). Reads from a read-only mapping are fine (handled by the shared
+    /// default `read_bytes`, which gates only PROT_NONE). Carrick-internal writes
+    /// (`write_bytes_unchecked` -> `write_bytes_raw`) bypass both. `no_write` is
+    /// x86-only, so this lives here, not in the shared default.
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if !bytes.is_empty() {
+            if self.protections.range_no_access(address, bytes.len()) {
+                trace_x86_efault("write-na", address, bytes.len());
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+            if self.protections.range_no_write(address, bytes.len()) {
+                trace_x86_efault("write-ro", address, bytes.len());
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+        }
+        self.write_bytes_raw(address, bytes)
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         // A guest pointer in the NULL guard region [0, 0x10000) is unmapped on
         // Linux; the aarch64 path faults it (safe_access_translated). The x86
@@ -434,6 +460,14 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.vm.protect_range(address, len, prot)?;
+        // Syscall-path WRITE gate: a PROT_READ (no PROT_WRITE) mapping is read-only,
+        // so a kernel write into it must EFAULT (the x86 analog of HVF's
+        // validate_guest_write_range; reads from it are still fine). A writable prot
+        // clears it; PROT_NONE is covered by the no_access set. The dispatcher calls
+        // protect_range with the prot for BOTH mmap and mprotect, so this one hook
+        // covers a region read-only from creation AND a later mprotect(PROT_READ).
+        let read_only = prot != 0 && prot & carrick_abi::LINUX_PROT_WRITE == 0;
+        self.protections.set_no_write(address, len, read_only);
         self.flush_current_tlb()
     }
 
