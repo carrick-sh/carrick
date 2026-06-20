@@ -73,6 +73,10 @@ use thiserror::Error;
 /// forgetting the PROT_NONE gate (or vice versa). See the module docs.
 pub mod region;
 
+/// Process-wide PROT_NONE range bookkeeping — the single shared host-side EFAULT
+/// gate the [`GuestMemory`] default `read_bytes`/`write_bytes` run.
+pub mod protections;
+
 /// The Linux AArch64 syscall argument registers carrick reads at an `svc` trap
 /// (`x0`–`x5` args, `x8` syscall number).
 #[repr(C)]
