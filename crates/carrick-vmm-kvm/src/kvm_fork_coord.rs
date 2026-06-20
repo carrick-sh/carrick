@@ -105,9 +105,11 @@ impl HostForkCoordinator for KvmForkCoordinator {
         // 60s suspend timeout. (The module docs' old "KVM has no pump thread"
         // premise predates kvm_signal_pump and is no longer true.)
         let was_running = crate::kvm_signal_pump::stop_pump_for_fork();
-        PreparedHostFork {
-            had_signal_pump: was_running || SIGNAL_PUMP_INSTALLED.load(Ordering::SeqCst),
+        let had_signal_pump = was_running || SIGNAL_PUMP_INSTALLED.load(Ordering::SeqCst);
+        if had_signal_pump {
+            crate::kvm_signal_pump::block_pump_signals_for_fork();
         }
+        PreparedHostFork { had_signal_pump }
     }
 
     fn restart_after_parent_fork(
@@ -125,6 +127,7 @@ impl HostForkCoordinator for KvmForkCoordinator {
         if prepared.had_signal_pump || child_exit_needs_signal_pump {
             self.start_signal_pump(registry, futex);
         }
+        crate::kvm_signal_pump::restore_pump_signals_after_fork();
     }
 
     fn restart_after_child_fork(
@@ -147,6 +150,7 @@ impl HostForkCoordinator for KvmForkCoordinator {
         // closes the stale write fd, and spawns a fresh pipe + pump thread bound
         // to THIS child's registry/futex.
         crate::kvm_signal_pump::reinit_after_fork(registry, futex);
+        crate::kvm_signal_pump::restore_pump_signals_after_fork();
     }
 
     fn restart_after_fork_error(
@@ -161,6 +165,7 @@ impl HostForkCoordinator for KvmForkCoordinator {
         if prepared.had_signal_pump {
             self.ensure_handler_installed();
         }
+        crate::kvm_signal_pump::restore_pump_signals_after_fork();
     }
 }
 
