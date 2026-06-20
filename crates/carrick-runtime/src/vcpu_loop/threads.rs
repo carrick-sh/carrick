@@ -59,6 +59,17 @@ where
                 engine
                     .rebind_to_slot(new.slot, &st)
                     .map_err(RuntimeError::Trap)?;
+                let prev = old_slot.unwrap_or(new.slot);
+                crate::probes::mn_reclaim(
+                    self.this_tid as i32,
+                    prev,
+                    new.slot,
+                    if new.slot == prev { 1 } else { 2 },
+                );
+            } else if engine.reclaims() {
+                // A reclaiming backend that PARKED (uncontended — kept its vCPU).
+                let slot = carrick_hal::vcpu_sched::current_slot().unwrap_or(0);
+                crate::probes::mn_reclaim(self.this_tid as i32, slot, slot, 0);
             }
             let outcome = match raw {
                 FutexWaitOutcome::Woken => 0,
@@ -168,6 +179,13 @@ where
                 // process death frees it anyway.
                 let lease = carrick_hal::vcpu_sched::global().acquire(tid as u64);
                 carrick_hal::vcpu_sched::set_current_lease(lease);
+                crate::probes::mn_admit(
+                    tid as i32,
+                    lease.slot,
+                    carrick_hal::vcpu_sched::global()
+                        .budget()
+                        .min(u32::MAX as usize) as u32,
+                );
                 struct SlotGuard;
                 impl Drop for SlotGuard {
                     fn drop(&mut self) {
