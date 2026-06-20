@@ -61,6 +61,11 @@ pub(in crate::dispatch) struct IoState {
     /// to recover the binary path. Best-effort: populated on open, cleared on
     /// close (a stale entry for a recycled fd is overwritten by the next open).
     pub fd_open_paths: RwLock<HashMap<i32, String>>,
+    /// Bytes pulled from a host pipe by splice but not accepted by the
+    /// destination yet. Linux does not consume pipe bytes when splice returns
+    /// EAGAIN on the output side; host pipes have no peek API, so Carrick stages
+    /// the bytes here and retries them before reading more from the host pipe.
+    pub splice_pushback: Mutex<HashMap<i32, VecDeque<u8>>>,
     /// Live io_uring instances keyed by ring fd (WS-H4-B1). Side table rather
     /// than an `OpenDescription` variant so io_uring needs no new arm across the
     /// ~24 fd match sites; `mmap`/`io_uring_enter` look the ring up here.
@@ -103,6 +108,7 @@ impl IoState {
             stdio_cloexec: Mutex::new([false; 3]),
             closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
+            splice_pushback: Mutex::new(HashMap::new()),
             io_uring_instances: RwLock::new(HashMap::new()),
             nofile_soft: AtomicU64::new(DEFAULT_NOFILE_SOFT),
             epoll_fds: RwLock::new(std::collections::BTreeSet::new()),
