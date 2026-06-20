@@ -282,6 +282,57 @@ pub trait RegAccess {
     fn set_fpcr(&mut self, v: u64) -> Result<(), OsError>;
     fn get_fpsr(&self) -> Result<u64, OsError>;
     fn set_fpsr(&mut self, v: u64) -> Result<(), OsError>;
+
+    /// Save the FP/SIMD state for an x86 signal frame in one shot: MXCSR, the 16
+    /// XMM low halves (`[u32; 64]`, the FXSAVE `xmm_space` layout), and the 16
+    /// AVX `YMM_Hi` upper halves (256 bytes). The DEFAULT loops the per-register
+    /// getters (correct for any backend, e.g. aarch64); the x86 engine overrides
+    /// it with a SINGLE `KVM_GET_XSAVE` — the XSAVE area carries MXCSR + XMM in
+    /// its legacy FXSAVE region AND `YMM_Hi` in its AVX region. The per-register
+    /// path costs ~33 host ioctls per signal DELIVERY, a throughput cliff under a
+    /// signal flood (CPython `test_stress_delivery_simultaneous`).
+    fn save_fpsimd_frame(&mut self) -> Result<(u32, [u32; 64], [u8; 256]), OsError> {
+        let mxcsr = self.get_fpcr()? as u32;
+        let mut xmm = [0u32; 64];
+        let mut ymm_hi = [0u8; 256];
+        for n in 0..16u32 {
+            let v = self.get_vreg(n)?.to_le_bytes();
+            let b = (n * 4) as usize;
+            for j in 0..4 {
+                xmm[b + j] =
+                    u32::from_le_bytes([v[j * 4], v[j * 4 + 1], v[j * 4 + 2], v[j * 4 + 3]]);
+            }
+            let off = n as usize * 16;
+            ymm_hi[off..off + 16].copy_from_slice(&self.get_ymm_hi(n)?.to_le_bytes());
+        }
+        Ok((mxcsr, xmm, ymm_hi))
+    }
+
+    /// Restore the FP/SIMD state from an x86 signal frame (inverse of
+    /// [`RegAccess::save_fpsimd_frame`]). DEFAULT loops the per-register setters;
+    /// the x86 engine overrides with ONE `KVM_GET_XSAVE` + ONE `KVM_SET_XSAVE`,
+    /// replacing ~80 per-register ioctls per signal RETURN.
+    fn restore_fpsimd_frame(
+        &mut self,
+        mxcsr: u32,
+        xmm: &[u32; 64],
+        ymm_hi: &[u8; 256],
+    ) -> Result<(), OsError> {
+        self.set_fpcr(u64::from(mxcsr))?;
+        for n in 0..16u32 {
+            let b = (n * 4) as usize;
+            let mut raw = [0u8; 16];
+            for j in 0..4 {
+                raw[j * 4..j * 4 + 4].copy_from_slice(&xmm[b + j].to_le_bytes());
+            }
+            self.set_vreg(n, u128::from_le_bytes(raw))?;
+            let off = n as usize * 16;
+            let mut hi = [0u8; 16];
+            hi.copy_from_slice(&ymm_hi[off..off + 16]);
+            self.set_ymm_hi(n, u128::from_le_bytes(hi))?;
+        }
+        Ok(())
+    }
 }
 
 /// The bound the shared threaded loop is generic over. A backend is its own
