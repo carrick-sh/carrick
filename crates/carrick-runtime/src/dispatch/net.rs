@@ -197,6 +197,74 @@ impl SyscallDispatcher {
         }
     }
 
+    fn epoll_effective_interest(
+        events: u32,
+        last_ready: u32,
+        write_backpressured: bool,
+    ) -> carrick_hal::event::Interest {
+        let mut interest = epoll_interest_for(events);
+        if events & LINUX_EPOLLET == 0 {
+            return interest;
+        }
+        const READ_LATCH: u32 = LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
+        const WRITE_LATCH: u32 = LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR;
+        if last_ready & READ_LATCH != 0 {
+            interest.read = false;
+        }
+        if last_ready & WRITE_LATCH != 0 && !write_backpressured {
+            interest.write = false;
+        }
+        if last_ready & LINUX_EPOLLPRI != 0 {
+            interest.oob = false;
+        }
+        interest
+    }
+
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
+    fn rebind_epoll_host_registration(
+        &self,
+        kqueue: &Arc<EpollKqueue>,
+        interest: &HashMap<i32, EpollInterest>,
+        host_fd: i32,
+    ) {
+        let mut survivor: Option<(i32, u32)> = None;
+        let mut union_events = 0u32;
+        let mut union_interest = carrick_hal::event::Interest::default();
+        for (&other, slot) in interest.iter() {
+            if self.host_fd_for_poll(other) != Some(host_fd) {
+                continue;
+            }
+            survivor.get_or_insert((other, slot.reg_gen));
+            union_events |= slot.event.events;
+            let effective = Self::epoll_effective_interest(
+                slot.event.events,
+                slot.last_ready,
+                slot.write_backpressured,
+            );
+            union_interest.read |= effective.read;
+            union_interest.write |= effective.write;
+            union_interest.oob |= effective.oob;
+        }
+
+        kqueue.with_mux(|mux| match survivor {
+            Some((sfd, sgen)) => {
+                let _ = mux.register_io(
+                    host_fd,
+                    pack_epoll_udata(sfd, sgen),
+                    union_interest,
+                    epoll_trigger_mode(union_events),
+                );
+            }
+            None => {
+                let _ = mux.deregister(host_fd);
+            }
+        });
+    }
+
     fn epoll_ready_events(&self, fd: i32, requested_events: u32) -> u32 {
         let Some(open_file) = self.open_file(fd) else {
             return 0;
@@ -323,32 +391,54 @@ impl SyscallDispatcher {
     /// reports them regardless of the requested set, and a guest that just
     /// touched the fd must see a still-standing terminal condition again.
     #[cfg(any(
+        feature = "platform-macos",
         feature = "platform-linux",
         feature = "platform-freebsd",
         feature = "platform-netbsd"
     ))]
-    pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest) {
+    pub(crate) fn epoll_rearm_after_io(&self, request: &SyscallRequest, outcome: &DispatchOutcome) {
         const READ_CLEAR: u32 =
             LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI | LINUX_EPOLLHUP | LINUX_EPOLLERR;
         const WRITE_CLEAR: u32 = LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR;
+        let positive = matches!(outcome, DispatchOutcome::Returned { value } if *value > 0);
+        let zero = matches!(outcome, DispatchOutcome::Returned { value } if *value == 0);
+        let eagain = matches!(outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EAGAIN);
+        let read_consumed = positive || zero || eagain;
+        let write_consumed = positive;
         let a = |i: usize| request.arg(i) as i32;
+        let write_eagain_targets: [Option<i32>; 2] = if eagain {
+            match request.number {
+                64 | 66 | 68 | 70 | 287 | 206 | 211 | 269 => [Some(a(0)), None],
+                71 => [Some(a(0)), None],
+                76 | 285 => [Some(a(2)), None],
+                77 => [Some(a(1)), None],
+                _ => [None, None],
+            }
+        } else {
+            [None, None]
+        };
         // (fd, bits-to-clear) per direction the syscall consumed. aarch64 nrs.
         let targets: [Option<(i32, u32)>; 2] = match request.number {
             // read / readv / pread64 / preadv / preadv2, accept / accept4,
             // recvfrom / recvmsg / recvmmsg: consume the read side of arg0.
-            63 | 65 | 67 | 69 | 286 | 202 | 242 | 207 | 212 | 243 => {
+            63 | 65 | 67 | 69 | 286 | 202 | 242 | 207 | 212 | 243 if read_consumed => {
                 [Some((a(0), READ_CLEAR)), None]
             }
             // write / writev / pwrite64 / pwritev / pwritev2, sendto /
             // sendmsg / sendmmsg: consume the write side of arg0.
-            64 | 66 | 68 | 70 | 287 | 206 | 211 | 269 => [Some((a(0), WRITE_CLEAR)), None],
+            64 | 66 | 68 | 70 | 287 | 206 | 211 | 269 if write_consumed => {
+                [Some((a(0), WRITE_CLEAR)), None]
+            }
             // sendfile(out_fd, in_fd, ..): reads in_fd, writes out_fd.
-            71 => [Some((a(1), READ_CLEAR)), Some((a(0), WRITE_CLEAR))],
+            71 if positive => [Some((a(1), READ_CLEAR)), Some((a(0), WRITE_CLEAR))],
+            71 if zero || eagain => [Some((a(1), READ_CLEAR)), None],
             // splice(fd_in, off_in, fd_out, ..) / copy_file_range: reads
             // arg0, writes arg2. tee(fd_in, fd_out, ..): reads arg0, writes
             // arg1.
-            76 | 285 => [Some((a(0), READ_CLEAR)), Some((a(2), WRITE_CLEAR))],
-            77 => [Some((a(0), READ_CLEAR)), Some((a(1), WRITE_CLEAR))],
+            76 | 285 if positive => [Some((a(0), READ_CLEAR)), Some((a(2), WRITE_CLEAR))],
+            76 | 285 if zero || eagain => [Some((a(0), READ_CLEAR)), None],
+            77 if positive => [Some((a(0), READ_CLEAR)), Some((a(1), WRITE_CLEAR))],
+            77 if zero || eagain => [Some((a(0), READ_CLEAR)), None],
             _ => return,
         };
         // Snapshot the registered epoll fds and DROP the set lock before
@@ -365,10 +455,59 @@ impl SyscallDispatcher {
                     } = &mut *open
                     {
                         let mut cleared = false;
+                        #[cfg(any(
+                            feature = "platform-macos",
+                            feature = "platform-freebsd",
+                            feature = "platform-netbsd"
+                        ))]
+                        let mut host_rearms: Vec<i32> = Vec::new();
                         for (fd, clear) in targets.iter().flatten() {
                             if let Some(slot) = interest.get_mut(fd) {
-                                cleared |= slot.last_ready & clear != 0;
+                                let before = slot.last_ready;
                                 slot.last_ready &= !clear;
+                                if clear & WRITE_CLEAR != 0 {
+                                    slot.write_backpressured = false;
+                                }
+                                if before != slot.last_ready {
+                                    cleared = true;
+                                    #[cfg(any(
+                                        feature = "platform-macos",
+                                        feature = "platform-freebsd",
+                                        feature = "platform-netbsd"
+                                    ))]
+                                    if let Some(host_fd) = self.host_fd_for_poll(*fd) {
+                                        host_rearms.push(host_fd);
+                                    }
+                                }
+                            }
+                        }
+                        for fd in write_eagain_targets.iter().flatten() {
+                            if let Some(slot) = interest.get_mut(fd)
+                                && slot.event.events & LINUX_EPOLLET != 0
+                                && slot.event.events & LINUX_EPOLLOUT != 0
+                                && slot.last_ready & WRITE_CLEAR != 0
+                            {
+                                slot.write_backpressured = true;
+                                #[cfg(any(
+                                    feature = "platform-macos",
+                                    feature = "platform-freebsd",
+                                    feature = "platform-netbsd"
+                                ))]
+                                if let Some(host_fd) = self.host_fd_for_poll(*fd) {
+                                    host_rearms.push(host_fd);
+                                }
+                            }
+                        }
+                        #[cfg(any(
+                            feature = "platform-macos",
+                            feature = "platform-freebsd",
+                            feature = "platform-netbsd"
+                        ))]
+                        {
+                            host_rearms.sort_unstable();
+                            host_rearms.dedup();
+                            for host_fd in host_rearms {
+                                self.rebind_epoll_host_registration(kqueue, interest, host_fd);
                             }
                         }
                         // A waiter parked before this consumption holds a park
@@ -390,13 +529,6 @@ impl SyscallDispatcher {
             }
         }
     }
-
-    /// No-op twin: macOS epoll instances are kqueue-backed (`EV_CLEAR` gives
-    /// kernel-native edge re-arm), so consumption tracking is unnecessary —
-    /// and the HVF lane's in-memory-fd latch behavior is deliberately left
-    /// untouched.
-    #[cfg(feature = "platform-macos")]
-    pub(crate) fn epoll_rearm_after_io(&self, _request: &SyscallRequest) {}
 
     fn read_optional_fd_set(
         &self,
@@ -1544,7 +1676,7 @@ impl SyscallDispatcher {
                             let _ = mux.register_io(
                                 host_fd,
                                 pack_epoll_udata(fd, reg_gen),
-                                epoll_interest_for(ev_events),
+                                Self::epoll_effective_interest(ev_events, 0, false),
                                 epoll_trigger_mode(ev_events),
                             );
                         });
@@ -1560,6 +1692,7 @@ impl SyscallDispatcher {
                         EpollInterest {
                             event,
                             last_ready: 0,
+                            write_backpressured: false,
                             reg_gen,
                         },
                     );
@@ -1587,7 +1720,7 @@ impl SyscallDispatcher {
                             let _ = mux.register_io(
                                 host_fd,
                                 pack_epoll_udata(fd, reg_gen),
-                                epoll_interest_for(event.events),
+                                Self::epoll_effective_interest(event.events, 0, false),
                                 epoll_trigger_mode(event.events),
                             );
                         });
@@ -1596,6 +1729,7 @@ impl SyscallDispatcher {
                     *slot = EpollInterest {
                         event,
                         last_ready: 0,
+                        write_backpressured: false,
                         reg_gen,
                     };
                     // Re-arm visible to a parked waiter: rebuild its park set.
@@ -1623,32 +1757,45 @@ impl SyscallDispatcher {
                         // per-fd and auto-removes on close, but a *dup* keeps the host
                         // fd alive, so the host-fd-keyed registration must be rebound
                         // rather than dropped — identical to the kqueue case.
-                        let mut survivor: Option<(i32, u32)> = None;
-                        let mut union_events: u32 = 0;
-                        for (&other, slot) in interest.iter() {
-                            if this.host_fd_for_poll(other) == Some(host_fd) {
-                                survivor.get_or_insert((other, slot.reg_gen));
-                                union_events |= slot.event.events;
-                            }
-                        }
                         // With a survivor: re-arm the host registration to the
-                        // surviving fd carrying the UNION of all survivors' masks
+                        // UNION of all survivors' currently unlatched masks
                         // (register_io also clears interest classes no survivor still
-                        // wants), re-using THAT fd's generational handle. With none:
-                        // drop the host registration entirely.
-                        kqueue.with_mux(|mux| match survivor {
-                            Some((sfd, sgen)) => {
-                                let _ = mux.register_io(
-                                    host_fd,
-                                    pack_epoll_udata(sfd, sgen),
-                                    epoll_interest_for(union_events),
-                                    epoll_trigger_mode(union_events),
-                                );
+                        // wants), re-using one surviving fd's generational handle.
+                        // With none: drop the host registration entirely.
+                        #[cfg(any(
+                            feature = "platform-macos",
+                            feature = "platform-freebsd",
+                            feature = "platform-netbsd"
+                        ))]
+                        this.rebind_epoll_host_registration(kqueue, interest, host_fd);
+                        #[cfg(not(any(
+                            feature = "platform-macos",
+                            feature = "platform-freebsd",
+                            feature = "platform-netbsd"
+                        )))]
+                        {
+                            let mut survivor: Option<(i32, u32)> = None;
+                            let mut union_events: u32 = 0;
+                            for (&other, slot) in interest.iter() {
+                                if this.host_fd_for_poll(other) == Some(host_fd) {
+                                    survivor.get_or_insert((other, slot.reg_gen));
+                                    union_events |= slot.event.events;
+                                }
                             }
-                            None => {
-                                let _ = mux.deregister(host_fd);
-                            }
-                        });
+                            kqueue.with_mux(|mux| match survivor {
+                                Some((sfd, sgen)) => {
+                                    let _ = mux.register_io(
+                                        host_fd,
+                                        pack_epoll_udata(sfd, sgen),
+                                        epoll_interest_for(union_events),
+                                        epoll_trigger_mode(union_events),
+                                    );
+                                }
+                                None => {
+                                    let _ = mux.deregister(host_fd);
+                                }
+                            });
+                        }
                     }
                     clear_pending_epoll_ready(pending_ready, fd);
                     // A parked waiter still ppolls the removed fd's host fd;
@@ -1756,6 +1903,7 @@ impl SyscallDispatcher {
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
+            let mut ready_updates: Vec<(i32, u32, u32, bool)> = Vec::new();
 
             // (1) Drain the instance kqueue (non-blocking) for host-backed fds.
             // `kq_drained_all_filtered` tracks the corner case where the kqueue
@@ -1790,7 +1938,7 @@ impl SyscallDispatcher {
                     // toward `kq_drained_all_filtered`: it auto-resets, so polling
                     // kq_fd won't spin, whereas the all-filtered path parks on the
                     // signal pipe — the Node worker-teardown hang).
-                    let mut translatable_events = 0usize;
+                    let mut filtered_ready_events = 0usize;
                     if !poll_events.is_empty() {
                         // Build the per-wait routing tables from the LIVE interest map
                         // (NOT the pre-drain snapshot): an fd ADDed by another thread
@@ -1803,18 +1951,27 @@ impl SyscallDispatcher {
                         // here, then the epoll lock is dropped before the per-fd
                         // re-poll so a concurrent epoll_ctl isn't blocked on syscalls.
                         // gfd_info: guest fd -> (host_fd, requested events,
-                        // epoll_data, reg_gen). host_to_gfds: host fd -> guest fds
-                        // sharing it (dup fan-out). Types inferred from the inserts.
+                        // epoll_data, reg_gen, last_ready, write_backpressured). host_to_gfds: host fd
+                        // -> guest fds sharing it (dup fan-out). Types inferred
+                        // from the inserts.
                         let (gfd_info, host_to_gfds) = {
                             let open = open_file.description.read();
-                            let mut info: HashMap<i32, (i32, u32, u64, u32)> = HashMap::new();
+                            let mut info: HashMap<i32, (i32, u32, u64, u32, u32, bool)> =
+                                HashMap::new();
                             let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
                             if let OpenDescription::Epoll { interest, .. } = &*open {
                                 for (gfd, slot) in interest.iter() {
                                     if let Some(hfd) = this.host_fd_for_poll(*gfd) {
                                         info.insert(
                                             *gfd,
-                                            (hfd, slot.event.events, slot.event.data, slot.reg_gen),
+                                            (
+                                                hfd,
+                                                slot.event.events,
+                                                slot.event.data,
+                                                slot.reg_gen,
+                                                slot.last_ready,
+                                                slot.write_backpressured,
+                                            ),
                                         );
                                         rev.entry(hfd).or_default().push(*gfd);
                                     }
@@ -1839,8 +1996,7 @@ impl SyscallDispatcher {
                             }
                             let (guest_fd, generation) = unpack_epoll_udata(ev.token);
                             match gfd_info.get(&guest_fd) {
-                                Some(&(hfd, _, _, reg_gen)) if reg_gen == generation => {
-                                    translatable_events += 1;
+                                Some(&(hfd, _, _, reg_gen, _, _)) if reg_gen == generation => {
                                     if let Some(siblings) = host_to_gfds.get(&hfd) {
                                         deliver.extend(siblings.iter().copied());
                                     }
@@ -1862,10 +2018,47 @@ impl SyscallDispatcher {
                         // flagged owners (polling ALL registered fds was O(nfds) and
                         // too slow).
                         for gfd in deliver {
-                            if let Some(&(_, requested, data, _)) = gfd_info.get(&gfd) {
+                            if let Some(&(
+                                _,
+                                requested,
+                                data,
+                                reg_gen,
+                                last_ready,
+                                write_backpressured,
+                            )) =
+                                gfd_info.get(&gfd)
+                            {
                                 let raw = this.epoll_ready_events(gfd, requested);
-                                if raw != 0 {
-                                    acc.entry(gfd).or_insert((0, data)).0 |= raw;
+                                let clear_write_backpressure =
+                                    write_backpressured && raw & LINUX_EPOLLOUT != 0;
+                                ready_updates.push((gfd, reg_gen, raw, clear_write_backpressure));
+                                let mut ready_events = if requested & LINUX_EPOLLET != 0 {
+                                    raw & !last_ready
+                                } else {
+                                    raw
+                                };
+                                if clear_write_backpressure {
+                                    ready_events |= raw & LINUX_EPOLLOUT;
+                                }
+                                crate::probes::epoll_interest(
+                                    epfd,
+                                    gfd,
+                                    requested,
+                                    raw,
+                                    last_ready,
+                                    ready_events,
+                                );
+                                if ready_events != 0 {
+                                    acc.entry(gfd).or_insert((0, data)).0 |= ready_events;
+                                } else if requested & LINUX_EPOLLET != 0
+                                    && raw != 0
+                                    && raw & last_ready != 0
+                                {
+                                    // Software-latched level readiness: the
+                                    // host filter is narrowed below, so the
+                                    // kqueue fd is safe to park on again.
+                                } else if raw != 0 {
+                                    filtered_ready_events += 1;
                                 }
                             }
                         }
@@ -1878,14 +2071,13 @@ impl SyscallDispatcher {
                     // kq_fd won't spin and the kqueue-poll path stays reachable by the
                     // current owner's own later edge. A pure EVFILT_USER drain is
                     // likewise excluded — it auto-resets.
-                    kq_drained_all_filtered = translatable_events > 0 && acc.len() == acc_before;
+                    kq_drained_all_filtered =
+                        filtered_ready_events > 0 && acc.len() == acc_before;
                 }
             }
 
-            // (2) In-memory fds (no host fd): recompute readiness; keep the EPOLLET
-            // `last_ready` edge latch for these (the kqueue handles edge/level for
-            // host fds natively, so they need no latch).
-            let mut ready_updates: Vec<(i32, u32)> = Vec::new();
+            // (2) In-memory fds (no host fd): recompute readiness. Host-backed
+            // fds are latched in step (1) from level-triggered multiplexer wakes.
             for (fd, interest) in &interests {
                 // Host-fd fds are handled by the kqueue drain above — EXCEPT a
                 // named-FIFO read-end whose writer has closed: macOS kqueue won't
@@ -1898,7 +2090,7 @@ impl SyscallDispatcher {
                     }
                 let requested = interest.event.events;
                 let raw_ready = this.epoll_ready_events(*fd, requested);
-                ready_updates.push((*fd, raw_ready));
+                ready_updates.push((*fd, interest.reg_gen, raw_ready, false));
                 let ready_events = if requested & LINUX_EPOLLET != 0 {
                     raw_ready & !interest.last_ready
                 } else {
@@ -1934,10 +2126,49 @@ impl SyscallDispatcher {
 
             if !ready_updates.is_empty() || !oneshot_fds.is_empty() {
                 let mut open = open_file.description.write();
-                if let OpenDescription::Epoll { interest, .. } = &mut *open {
-                    for (fd, raw) in ready_updates {
+                if let OpenDescription::Epoll {
+                    interest, kqueue, ..
+                } = &mut *open
+                {
+                    #[cfg(any(
+                        feature = "platform-macos",
+                        feature = "platform-freebsd",
+                        feature = "platform-netbsd"
+                    ))]
+                    let mut host_rearms: Vec<i32> = Vec::new();
+                    for (fd, reg_gen, raw, clear_write_backpressure) in ready_updates {
                         if let Some(slot) = interest.get_mut(&fd) {
+                            if slot.reg_gen != reg_gen {
+                                continue;
+                            }
+                            let before = slot.last_ready;
                             slot.last_ready = raw;
+                            if clear_write_backpressure {
+                                slot.write_backpressured = false;
+                            }
+                            #[cfg(any(
+                                feature = "platform-macos",
+                                feature = "platform-freebsd",
+                                feature = "platform-netbsd"
+                            ))]
+                            if slot.event.events & LINUX_EPOLLET != 0
+                                && before != raw
+                                && let Some(host_fd) = this.host_fd_for_poll(fd)
+                            {
+                                host_rearms.push(host_fd);
+                            }
+                        }
+                    }
+                    #[cfg(any(
+                        feature = "platform-macos",
+                        feature = "platform-freebsd",
+                        feature = "platform-netbsd"
+                    ))]
+                    {
+                        host_rearms.sort_unstable();
+                        host_rearms.dedup();
+                        for host_fd in host_rearms {
+                            this.rebind_epoll_host_registration(kqueue, interest, host_fd);
                         }
                     }
                     for fd in &oneshot_fds {
