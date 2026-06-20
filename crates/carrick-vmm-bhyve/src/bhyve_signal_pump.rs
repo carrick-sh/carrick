@@ -62,6 +62,13 @@ static PUMP_STOP: AtomicBool = AtomicBool::new(false);
 /// handler.
 static PUMP_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
+/// Original signal mask for the thread currently crossing `libc::fork`.
+///
+/// `pthread_sigmask` is per-thread and the forking thread's mask is inherited by
+/// the child. Parent and child each restore their fork-copied value after their
+/// pump has been restarted.
+static FORK_OLD_SIGNAL_MASK: Mutex<Option<libc::sigset_t>> = Mutex::new(None);
+
 /// Async-signal-safe SIGCHLD handler. Unlike [`pump_handler`], it does NOT touch
 /// `PROC_PENDING`: SIGCHLD here is NOT a guest-published process signal but the
 /// host's native notification that a guest CHILD (a real host process — a guest
@@ -89,6 +96,48 @@ fn install_sigchld_handler() {
         libc::sigemptyset(&mut action.sa_mask);
         action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
         libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+    }
+}
+
+fn pump_signal_set() -> libc::sigset_t {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut set);
+        for &sig in &PUMP_SIGNALS {
+            libc::sigaddset(&mut set, sig);
+        }
+    }
+    set
+}
+
+/// Block host-pumped signals on the thread that is about to call `fork(2)`.
+///
+/// A parent can signal the child before the child has cleared inherited pending
+/// state and restarted its own pump. Blocking the pump-owned host signals across
+/// that window lets the kernel hold them pending until the child restores the
+/// mask after reinit, rather than letting `host_signal::reinit_after_fork` drop a
+/// genuinely new signal as stale inherited state.
+pub fn block_pump_signals_for_fork() {
+    let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let set = pump_signal_set();
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) };
+    if rc == 0 {
+        *FORK_OLD_SIGNAL_MASK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(old);
+    }
+}
+
+/// Restore the signal mask saved by [`block_pump_signals_for_fork`].
+pub fn restore_pump_signals_after_fork() {
+    let old = FORK_OLD_SIGNAL_MASK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(old) = old {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
     }
 }
 

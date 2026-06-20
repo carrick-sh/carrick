@@ -17,6 +17,7 @@ static SELF_PIPE_W: AtomicI32 = AtomicI32::new(-1);
 static SELF_PIPE_R: AtomicI32 = AtomicI32::new(-1);
 static PUMP_STOP: AtomicBool = AtomicBool::new(false);
 static PUMP_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+static FORK_OLD_SIGNAL_MASK: Mutex<Option<libc::sigset_t>> = Mutex::new(None);
 static SIGCHLD_INSTALLED: AtomicBool = AtomicBool::new(false);
 static PUMP_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -36,6 +37,42 @@ fn install_sigchld_handler() {
         libc::sigemptyset(&mut action.sa_mask);
         action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
         libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+    }
+}
+
+fn pump_signal_set() -> libc::sigset_t {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut set);
+        for &sig in &PUMP_SIGNALS {
+            libc::sigaddset(&mut set, sig);
+        }
+    }
+    set
+}
+
+/// Block host-pumped signals while a guest fork is in the child reinit window.
+pub fn block_pump_signals_for_fork() {
+    let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let set = pump_signal_set();
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) };
+    if rc == 0 {
+        *FORK_OLD_SIGNAL_MASK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(old);
+    }
+}
+
+/// Restore the mask saved by [`block_pump_signals_for_fork`].
+pub fn restore_pump_signals_after_fork() {
+    let old = FORK_OLD_SIGNAL_MASK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(old) = old {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
     }
 }
 

@@ -1,10 +1,13 @@
 //! NVMM impls of the shared threaded-loop coordinator traits.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use carrick_hal::{HostForkCoordinator, PlatformFutex, PreparedHostFork, VcpuRegistry};
 
 use crate::nvmm_kicker::install_nvmm_kick_handler;
+
+static SIGNAL_PUMP_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 pub struct NvmmForkCoordinator;
@@ -17,6 +20,7 @@ impl NvmmForkCoordinator {
     fn ensure_handler_installed(&self) {
         install_nvmm_kick_handler();
         crate::nvmm_xsig::init_xsig();
+        SIGNAL_PUMP_INSTALLED.store(true, Ordering::SeqCst);
     }
 }
 
@@ -27,9 +31,12 @@ impl HostForkCoordinator for NvmmForkCoordinator {
     }
 
     fn prepare_host_fork(&self) -> PreparedHostFork {
-        PreparedHostFork {
-            had_signal_pump: crate::nvmm_signal_pump::stop_pump_for_fork(),
+        let was_running = crate::nvmm_signal_pump::stop_pump_for_fork();
+        let had_signal_pump = was_running || SIGNAL_PUMP_INSTALLED.load(Ordering::SeqCst);
+        if had_signal_pump {
+            crate::nvmm_signal_pump::block_pump_signals_for_fork();
         }
+        PreparedHostFork { had_signal_pump }
     }
 
     fn restart_after_parent_fork(
@@ -42,6 +49,7 @@ impl HostForkCoordinator for NvmmForkCoordinator {
         if prepared.had_signal_pump || child_exit_needs_signal_pump {
             self.start_signal_pump(registry, futex);
         }
+        crate::nvmm_signal_pump::restore_pump_signals_after_fork();
     }
 
     fn restart_after_child_fork(
@@ -54,6 +62,7 @@ impl HostForkCoordinator for NvmmForkCoordinator {
             self.ensure_handler_installed();
         }
         crate::nvmm_signal_pump::reinit_after_fork(registry, futex);
+        crate::nvmm_signal_pump::restore_pump_signals_after_fork();
     }
 
     fn restart_after_fork_error(
@@ -65,6 +74,7 @@ impl HostForkCoordinator for NvmmForkCoordinator {
         if prepared.had_signal_pump {
             self.start_signal_pump(registry, futex);
         }
+        crate::nvmm_signal_pump::restore_pump_signals_after_fork();
     }
 }
 
