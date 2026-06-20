@@ -379,6 +379,26 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn vcpu_budget() -> usize {
         usize::MAX
     }
+    /// Whether this backend RECLAIMS a guest thread's vCPU slot when the thread
+    /// blocks (the M:N reclaim-on-block). `false` (default) keeps Phase-1
+    /// lifetime-binding — HVF/KVM until Phase 3. bhyve returns `true`.
+    fn reclaims(&self) -> bool {
+        false
+    }
+    /// Save THIS thread's full guest CPU state (GPRs + RSP/RFLAGS + FS/GS base +
+    /// FP/AVX) before releasing its vCPU slot at a block point. Only ever called by
+    /// the owning host thread, only when [`reclaims`](Self::reclaims). Opaque,
+    /// backend-serialized bytes round-tripped to [`rebind_to_slot`](Self::rebind_to_slot).
+    fn save_guest_state(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    /// Re-bind this engine to `slot`'s vCPU and restore `state` into it — called by
+    /// the owning thread when it re-acquires a (possibly different) slot after a
+    /// block. Only when [`reclaims`](Self::reclaims).
+    fn rebind_to_slot(&mut self, slot: crate::SlotId, state: &[u8]) -> Result<(), TrapError> {
+        let _ = (slot, state);
+        Ok(())
+    }
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError>;
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
     where
