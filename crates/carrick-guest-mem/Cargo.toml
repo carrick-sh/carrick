@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+parking_lot.workspace = true
