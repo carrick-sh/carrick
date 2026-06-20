@@ -41,4 +41,8 @@ impl HostSignalGlue for NvmmGlue {
     fn poke() {
         carrick_hal::signal_pump::poke();
     }
+
+    fn install_kick_handler() {
+        crate::nvmm_kicker::install_nvmm_kick_handler();
+    }
 }
