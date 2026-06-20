@@ -20,6 +20,10 @@ carrick-mem = { path = "../carrick-mem" }
 # trait so backends name one set of types. No cycle: timer-core depends only on
 # carrick-abi/portable/host (none of which depend on carrick-hal).
 carrick-timer-core = { path = "../carrick-timer-core" }
+# The shared async host-signal PUMP (`signal_pump`) needs the neutral pending
+# store + child-watch + the `HostSignalGlue` seam. No cycle: carrick-signal-core
+# depends only on libc (not carrick-hal).
+carrick-signal-core = { path = "../carrick-signal-core" }
 thiserror.workspace = true
 libc.workspace = true
 zerocopy.workspace = true

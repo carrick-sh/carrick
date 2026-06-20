@@ -365,6 +365,7 @@ dependencies = [
 name = "carrick-guest-mem"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serde",
  "thiserror",
 ]
@@ -376,6 +377,7 @@ dependencies = [
  "carrick-abi",
  "carrick-guest-mem",
  "carrick-mem",
+ "carrick-signal-core",
  "carrick-timer-core",
  "libc",
  "thiserror",
