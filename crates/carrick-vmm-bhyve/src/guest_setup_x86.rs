@@ -1091,6 +1091,66 @@ impl RamInner {
         self.reservations = out;
     }
 
+    /// Remove (or trim) any window overlapping `[va, va+len)`. Called from
+    /// `unmap_range` so a `munmap`'d VA stops resolving to its now-dead GPA.
+    ///
+    /// WHY this is REQUIRED (not just hygiene): windows are how `host_ptr`
+    /// resolves a guest VA → backing GPA for SYSCALL-path memory access, and
+    /// `resolve` returns the FIRST window covering a VA. If a freed window is
+    /// left behind, a later `mmap` that reuses the VA (the common musl
+    /// large-alloc / meta-area churn) keeps resolving the STALE first window —
+    /// while the guest's hardware (the live PML4 leaf) and `commit_range` use a
+    /// FRESH GPA. host_ptr (carrick's syscall copies) then reads/writes a
+    /// DIFFERENT physical page than the guest does, and `zero_backing` scrubs
+    /// the wrong (old) page. That divergence is the bhyve large-alloc heap
+    /// corruption (musl mallocng `a_crash()` / `get_meta` asserts). Pruning the
+    /// window forces a reused VA back through the clean `Committed`/`commit_range`
+    /// path: one fresh GPA, leaf + window + zero-fill all in agreement.
+    ///
+    /// The abandoned GPA span is NOT reclaimed into the bump cursor (a later
+    /// commit takes the next fresh GPA); only the VA→GPA *mapping* is dropped.
+    /// Partially-overlapping windows are trimmed to their non-overlapping
+    /// remainder(s), preserving each remainder's 1:1 va→gpa offset.
+    fn remove_windows(&mut self, va: u64, len: usize) {
+        let start = va & !0xFFF;
+        let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
+        if end <= start {
+            return;
+        }
+        let mut out: Vec<BhyveWindow> = Vec::with_capacity(self.windows.len());
+        for w in self.windows.drain(..) {
+            let w_start = w.va;
+            let w_end = w.va + w.len as u64;
+            if end <= w_start || start >= w_end {
+                out.push(w); // disjoint — keep
+                continue;
+            }
+            if w_start < start {
+                out.push(BhyveWindow {
+                    va: w_start,
+                    gpa: w.gpa,
+                    len: (start - w_start) as usize,
+                    user: w.user,
+                    write: w.write,
+                    exec: w.exec,
+                });
+            }
+            if end < w_end {
+                let delta = end - w_start;
+                out.push(BhyveWindow {
+                    va: end,
+                    gpa: w.gpa + delta,
+                    len: (w_end - end) as usize,
+                    user: w.user,
+                    write: w.write,
+                    exec: w.exec,
+                });
+            }
+            // The overlapping middle is dropped.
+        }
+        self.windows = out;
+    }
+
     fn plan_gpa(&mut self, len: usize) -> Result<u64, OsError> {
         // Round len up to the next 4 KiB boundary.
         let len_aligned = (len as u64 + 0xFFF) & !0xFFF;
@@ -1177,6 +1237,13 @@ impl BhyveGuestRam {
     /// Remove a (possibly partial) reservation range (munmap, or after a commit).
     pub fn drop_reservation(&self, va: u64, len: usize) {
         self.lock().drop_reservation(va, len);
+    }
+
+    /// Prune (or trim) any VA→GPA window overlapping `[va, va+len)` — used by
+    /// `unmap_range` so a freed VA does not keep resolving to a stale GPA. See
+    /// [`RamInner::remove_windows`] for why this is correctness-critical.
+    pub fn remove_windows(&self, va: u64, len: usize) {
+        self.lock().remove_windows(va, len);
     }
 
     /// Allocate a compact GPA for a window of `len` bytes (page-aligned).
@@ -2705,6 +2772,74 @@ mod tests {
         assert!(
             commit_writable(&ram, 0x60_0000_1000),
             "abutting writable page still commits writable"
+        );
+    }
+
+    /// REGRESSION (bhyve large-alloc heap corruption): `unmap_range` prunes the
+    /// VA→GPA window so a reused VA does NOT resolve to its dead GPA. Without
+    /// this, `resolve` keeps returning the stale FIRST window while the guest's
+    /// live PML4 leaf and `commit_range` move to a fresh GPA — `host_ptr`
+    /// (carrick's syscall copies) then diverges from the guest and
+    /// `zero_backing` scrubs the wrong page, surfacing as musl mallocng
+    /// `a_crash()` / `get_meta` asserts (`spliceunixpoll`, `go-net_http`).
+    #[test]
+    fn remove_windows_lets_reused_va_recommit_fresh() {
+        let ram = BhyveGuestRam::new();
+        let va = 0x60_0000_0000u64;
+
+        ram.reserve(va, 4096, true);
+        let g1 = match ram.commit_if_absent(va, 4096).expect("commit") {
+            CommitOutcome::Committed { gpa, .. } => gpa,
+            _ => panic!("expected Committed"),
+        };
+        assert_eq!(ram.resolve(va, 1), Some(g1), "committed VA resolves to G1");
+
+        // munmap-equivalent: prune the window.
+        ram.remove_windows(va, 4096);
+        assert_eq!(ram.resolve(va, 1), None, "pruned VA no longer resolves");
+
+        // Reuse: a fresh commit must take a NEW GPA (not the dead G1), and
+        // resolve must return ONLY the fresh window (no stale shadow).
+        ram.reserve(va, 4096, true);
+        let g2 = match ram.commit_if_absent(va, 4096).expect("recommit") {
+            CommitOutcome::Committed { gpa, .. } => gpa,
+            _ => panic!("expected Committed on reuse"),
+        };
+        assert_ne!(
+            g1, g2,
+            "reused VA must commit to a FRESH GPA, not the dead one"
+        );
+        assert_eq!(
+            ram.resolve(va, 1),
+            Some(g2),
+            "reused VA resolves to G2 only"
+        );
+        assert_eq!(
+            ram.windows_snapshot().iter().filter(|w| w.va == va).count(),
+            1,
+            "exactly one window for the reused VA (no stale shadow)"
+        );
+    }
+
+    /// `remove_windows` trims a partially-overlapping window to its
+    /// non-overlapping remainders, preserving each remainder's 1:1 va→gpa
+    /// offset.
+    #[test]
+    fn remove_windows_trims_partial_overlap() {
+        let ram = BhyveGuestRam::new();
+        let va = 0x60_0000_0000u64;
+        // One 4-page window.
+        let gpa = ram.add_bump(va, 4 * 4096, true, true, false).expect("bump");
+        // Punch the middle two pages.
+        ram.remove_windows(va + 4096, 2 * 4096);
+        // Head + tail survive at their original gpa offsets; the middle is gone.
+        assert_eq!(ram.resolve(va, 1), Some(gpa), "head page kept");
+        assert_eq!(ram.resolve(va + 4096, 1), None, "punched page 1 gone");
+        assert_eq!(ram.resolve(va + 2 * 4096, 1), None, "punched page 2 gone");
+        assert_eq!(
+            ram.resolve(va + 3 * 4096, 1),
+            Some(gpa + 3 * 4096),
+            "tail page kept at its original offset"
         );
     }
 
