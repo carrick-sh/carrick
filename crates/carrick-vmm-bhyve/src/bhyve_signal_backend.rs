@@ -45,4 +45,8 @@ impl HostSignalGlue for BhyveGlue {
     fn poke() {
         carrick_hal::signal_pump::poke();
     }
+
+    fn install_kick_handler() {
+        crate::install_bhyve_kick_handler();
+    }
 }

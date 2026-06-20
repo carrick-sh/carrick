@@ -30,6 +30,10 @@ pub use threaded::{
 pub mod sigframe;
 pub mod signal_arrival;
 pub use signal_arrival::{GenericSignalArrival, SignalArrival};
+/// The shared HostForkCoordinator for kick+futex backends (cfg-empty on macOS/HVF).
+pub mod fork_coord;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+pub use fork_coord::GenericForkCoordinator;
 /// The shared async host-signal pump (kick+futex backends; cfg-empty on macOS/HVF).
 pub mod signal_pump;
 pub mod timer_delivery;

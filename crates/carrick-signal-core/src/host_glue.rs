@@ -229,6 +229,7 @@ mod tests {
                 || s == L_RTMIN + 1
         }
         fn poke() {}
+        fn install_kick_handler() {}
     }
 
     /// BSD-like backend: a non-identity translation (host = linux + 100 for the
@@ -249,6 +250,7 @@ mod tests {
             matches!(s, 1 | 2 | 3 | 15) || s == 17 || s == 13
         }
         fn poke() {}
+        fn install_kick_handler() {}
     }
 
     #[test]
