@@ -141,6 +141,12 @@ pub trait GuestMemory {
     /// [`write_bytes_raw`](Self::write_bytes_raw). (The per-mapping WRITE
     /// permission gate is backend-local; HVF enforces it inside `write_bytes_raw`.)
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        // The SHARED default gates a write on the PROT_NONE set only. The READ-ONLY
+        // write gate (`range_no_write`, the analog of HVF's
+        // `validate_guest_write_range`) is backend-specific — HVF enforces it inside
+        // its own `write_bytes_raw`, and the x86 engine OVERRIDES this method to add
+        // the `no_write` check — so it deliberately does NOT live here (carrick's own
+        // content loads use the unchecked path to bypass it).
         if !bytes.is_empty()
             && self
                 .protections()

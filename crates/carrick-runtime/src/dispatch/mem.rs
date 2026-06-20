@@ -731,7 +731,13 @@ impl SyscallDispatcher {
                 }
 
                 memory.set_no_access(address, length_usize, false);
-                let _ = memory.write_bytes(address, &bytes);
+                // Stamp the file content via the UNCHECKED path: this is carrick
+                // loading the mapping, not a guest write. The final prot may be
+                // read-only, and the dynamic loader's `mmap(whole-lib, PROT_READ)`
+                // placeholder may have already marked this range `no_write` before
+                // it `MAP_FIXED`s each segment in — so the checked `write_bytes`
+                // (x86's read-only write gate) would wrongly EFAULT our own load.
+                let _ = memory.write_bytes_unchecked(address, &bytes);
                 if prot_none {
                     memory.set_no_access(address, length_usize, true);
                 }
