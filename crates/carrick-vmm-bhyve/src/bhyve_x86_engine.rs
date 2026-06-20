@@ -87,6 +87,32 @@ pub const BHYVE_X86_LAYOUT: BringupLayout = BringupLayout {
     pml4_base: X86_PML4_GPA,
 };
 
+/// The per-thread CPU registers captured/restored across an M:N reclaim re-bind:
+/// the 16 GPRs + RIP + RFLAGS. Process-wide control regs (CR0/3/4, EFER, CS) are
+/// NOT included — identical across the process's threads, they persist on the
+/// recycled vCPU (which `reopen_vcpu` does NOT reset). FS/GS base (TLS) is saved
+/// separately via the segment descriptor. (FP/AVX is a follow-up increment.)
+const SNAPSHOT_REGS: [c_int; 18] = [
+    VM_REG_GUEST_RAX,
+    VM_REG_GUEST_RBX,
+    VM_REG_GUEST_RCX,
+    VM_REG_GUEST_RDX,
+    VM_REG_GUEST_RSI,
+    VM_REG_GUEST_RDI,
+    VM_REG_GUEST_RBP,
+    VM_REG_GUEST_RSP,
+    VM_REG_GUEST_R8,
+    VM_REG_GUEST_R9,
+    VM_REG_GUEST_R10,
+    VM_REG_GUEST_R11,
+    VM_REG_GUEST_R12,
+    VM_REG_GUEST_R13,
+    VM_REG_GUEST_R14,
+    VM_REG_GUEST_R15,
+    VM_REG_GUEST_RIP,
+    VM_REG_GUEST_RFLAGS,
+];
+
 // ─── VcpuHandle: the shared, swappable per-vCPU runtime state ─────────────────
 
 /// The mutable runtime identity of a bhyve vCPU, shared (via `Arc`) between the
@@ -1298,6 +1324,80 @@ impl X86Vmm for BhyveVmm {
             )
         };
         if rc == 0 && val > 0 { val as usize } else { 8 }
+    }
+
+    fn reclaims(&self) -> bool {
+        // bhyve has the lowest vCPU cap; it reclaims so >N guest threads can run.
+        true
+    }
+
+    fn save_guest_state(&self) -> Vec<u8> {
+        // Captured at a ring-0 (LSTAR-stub) syscall block point — the per-thread
+        // GPRs/RSP/RIP/RFLAGS + FS/GS base. See SNAPSHOT_REGS.
+        let vc = self.h.as_bhyve();
+        let vals = vc.get_register_set(&SNAPSHOT_REGS).unwrap_or_default();
+        let (fb, fl, fa) = vc.get_desc(VM_REG_GUEST_FS).unwrap_or((0, 0, 0));
+        let (gb, gl, ga) = vc.get_desc(VM_REG_GUEST_GS).unwrap_or((0, 0, 0));
+        let mut buf = Vec::with_capacity(SNAPSHOT_REGS.len() * 8 + 32);
+        for v in &vals {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&fb.to_le_bytes());
+        buf.extend_from_slice(&gb.to_le_bytes());
+        for x in [fl, fa, gl, ga] {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        buf
+    }
+
+    fn rebind_to_slot(&mut self, slot: carrick_hal::SlotId, state: &[u8]) -> Result<(), TrapError> {
+        let id = slot as c_int;
+        let cur = self.h.slot().id;
+        // Re-open the recycled (already-activated, long-mode) vCPU and swap it in —
+        // only if the slot actually changed (re-binding to the SAME id is a no-op
+        // for the handle; the saved state is restored below regardless).
+        if id != cur {
+            let vm = self.h.slot().vm.clone();
+            let vcpu = vm
+                .reopen_vcpu(id)
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+            self.h.vcpu.store(vcpu.vcpu, Ordering::SeqCst);
+            let mut s = self.h.slot();
+            s.id = id;
+        }
+        // Restore the saved per-thread state into the freed vCPU.
+        let n = SNAPSHOT_REGS.len();
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&state[i * 8..i * 8 + 8]);
+            vals.push(u64::from_le_bytes(b));
+        }
+        let rd_u64 = |off: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&state[off..off + 8]);
+            u64::from_le_bytes(b)
+        };
+        let rd_u32 = |off: usize| {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&state[off..off + 4]);
+            u32::from_le_bytes(b)
+        };
+        let base = n * 8;
+        let fb = rd_u64(base);
+        let gb = rd_u64(base + 8);
+        let fl = rd_u32(base + 16);
+        let fa = rd_u32(base + 20);
+        let gl = rd_u32(base + 24);
+        let ga = rd_u32(base + 28);
+        let mut vc = self.h.as_bhyve();
+        vc.set_register_set(&SNAPSHOT_REGS, &vals)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        vc.set_desc(VM_REG_GUEST_FS, fb, fl, fa)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        vc.set_desc(VM_REG_GUEST_GS, gb, gl, ga)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        Ok(())
     }
 
     fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
