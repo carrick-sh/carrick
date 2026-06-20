@@ -1276,7 +1276,28 @@ impl X86Vmm for BhyveVmm {
     }
 
     fn wait_for_vcpu_slot() {
-        // No admission cap (bhyve activates vCPUs eagerly; no HVF-style limit).
+        // Admission is enforced by the carrick-hal VcpuScheduler (installed at
+        // startup with `vcpu_budget()`), which the shared thread-spawn path calls
+        // — so this backend hook stays a no-op.
+    }
+
+    fn vcpu_budget() -> usize {
+        // hw.vmm.maxcpu is the bhyve hard cap on concurrently-active vCPUs; a guest
+        // thread beyond it would EINVAL `vm_activate_cpu`. The scheduler bounds the
+        // live set to this N (recycling ids) so that never happens.
+        let mut val: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        let name = c"hw.vmm.maxcpu";
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && val > 0 { val as usize } else { 8 }
     }
 
     fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
