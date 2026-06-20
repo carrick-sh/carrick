@@ -238,6 +238,20 @@ pub fn interval_ns(which: usize) -> u64 {
         .map_or(0, |slot| slot.interval_ns.load(Ordering::SeqCst))
 }
 
+/// Mark a delivered expiry complete. One-shot timers are spent after that
+/// delivery, so retire their neutral armed slot. Periodic/two-phase timers stay
+/// armed for their next interval.
+///
+/// Returns `true` when this call retired a one-shot.
+pub fn complete_fire(which: usize) -> bool {
+    if interval_ns(which) == 0 {
+        disarm(which);
+        true
+    } else {
+        false
+    }
+}
+
 /// For CPU timers, decide whether enough guest CPU has elapsed for this timer
 /// to fire. If not, return a wall-clock recheck delay so the pump can replay a
 /// one-shot wake instead of consuming the timer while the guest is idle.
@@ -367,6 +381,7 @@ pub fn run_fallback(
         }
         on_fire();
         if interval_ns == 0 {
+            complete_fire(which);
             break;
         }
         std::thread::sleep(Duration::from_nanos(interval_ns));
@@ -390,6 +405,7 @@ fn run_fallback_cpu(which: usize, generation: u64, on_fire: &impl Fn()) {
             Some(CpuTimerDecision::Fire) => {
                 on_fire();
                 if interval_ns(which) == 0 {
+                    complete_fire(which);
                     break;
                 }
             }
@@ -451,6 +467,26 @@ mod tests {
             other => panic!("expected Fire, got {other:?}"),
         }
         disarm(1);
+    }
+
+    #[test]
+    fn one_shot_fire_retires_armed_slot() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        arm(0, 1_000_000, 0, false);
+
+        assert!(complete_fire(0));
+        assert!(!is_armed(0));
+    }
+
+    #[test]
+    fn periodic_fire_keeps_armed_slot() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        arm(0, 1_000_000, 1_000_000, false);
+
+        assert!(!complete_fire(0));
+        assert!(is_armed(0));
     }
 
     #[test]
