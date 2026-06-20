@@ -421,6 +421,22 @@ impl ThreadWaiter {
         result
     }
 
+    pub fn wait_with_dispatch_pending<F>(
+        &self,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: u64,
+        should_interrupt: F,
+    ) -> WaitResult
+    where
+        F: Fn() -> bool,
+    {
+        if should_interrupt() {
+            return WaitResult::Interrupted;
+        }
+        self.wait(fds, timeout, block_mask)
+    }
+
     /// Block using `poll(2)` instead of the per-thread kqueue. This is used for
     /// kqueue fds themselves: poll observes kqueue readability without draining
     /// the queued events.
@@ -480,6 +496,22 @@ impl ThreadWaiter {
         result
     }
 
+    pub fn wait_poll_with_dispatch_pending<F>(
+        &self,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: u64,
+        should_interrupt: F,
+    ) -> WaitResult
+    where
+        F: Fn() -> bool,
+    {
+        if should_interrupt() {
+            return WaitResult::Interrupted;
+        }
+        self.wait_poll(fds, timeout, block_mask)
+    }
+
     /// Block until process `pid` exits, a signal becomes pending, or a fork
     /// quiesce begins. Used by a blocking `waitid(P_PID)`: the child's exit is
     /// observed via the per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (macOS's
@@ -510,6 +542,22 @@ impl ThreadWaiter {
             }
         }
         self.wait_proc_exit_fallback(pid, block_mask)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn wait_proc_exit_with_dispatch_pending<F>(
+        &self,
+        pid: i32,
+        block_mask: u64,
+        should_interrupt: F,
+    ) -> WaitResult
+    where
+        F: Fn() -> bool,
+    {
+        if should_interrupt() {
+            return WaitResult::Interrupted;
+        }
+        self.wait_proc_exit(pid, block_mask)
     }
 
     /// Park in `kevent()` on the long-lived per-thread kqueue until `pid` exits,
@@ -643,6 +691,19 @@ impl ThreadWaiter {
     /// fall back to a bounded retry.
     #[cfg(not(target_os = "macos"))]
     pub fn wait_proc_exit(&self, _pid: i32, _block_mask: u64) -> WaitResult {
+        WaitResult::Interrupted
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn wait_proc_exit_with_dispatch_pending<F>(
+        &self,
+        _pid: i32,
+        _block_mask: u64,
+        _should_interrupt: F,
+    ) -> WaitResult
+    where
+        F: Fn() -> bool,
+    {
         WaitResult::Interrupted
     }
 
