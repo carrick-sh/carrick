@@ -1890,14 +1890,14 @@ mod tests {
     struct SigframeStub;
 
     impl carrick_guest_mem::GuestMemory for SigframeStub {
-        fn read_bytes(
+        fn read_bytes_raw(
             &self,
             _a: u64,
             _l: usize,
         ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
             Err(carrick_guest_mem::MemoryError::Unsupported)
         }
-        fn write_bytes(
+        fn write_bytes_raw(
             &mut self,
             _a: u64,
             _b: &[u8],
@@ -2007,12 +2007,20 @@ mod tests {
     }
 
     impl carrick_guest_mem::GuestMemory for SigframeRoundtrip {
-        fn read_bytes(&self, a: u64, l: usize) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        fn read_bytes_raw(
+            &self,
+            a: u64,
+            l: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
             Ok((0..l as u64)
                 .map(|i| *self.mem.get(&a.wrapping_add(i)).unwrap_or(&0))
                 .collect())
         }
-        fn write_bytes(&mut self, a: u64, b: &[u8]) -> Result<(), carrick_guest_mem::MemoryError> {
+        fn write_bytes_raw(
+            &mut self,
+            a: u64,
+            b: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
             for (i, &byte) in b.iter().enumerate() {
                 self.mem.insert(a.wrapping_add(i as u64), byte);
             }

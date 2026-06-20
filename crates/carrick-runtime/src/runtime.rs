@@ -1801,11 +1801,17 @@ struct SplitView<'a, M: GuestMemory, T: SyscallTrap> {
 }
 
 impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
-    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        self.mem.read_bytes(address, length)
+    // Inherit the gated default `read_bytes`/`write_bytes`; forward the gate's
+    // inputs (`protections()` + the raw copy) to the inner memory so the PROT_NONE
+    // EFAULT check is NOT lost through the wrapper.
+    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+        self.mem.protections()
     }
-    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.mem.write_bytes(address, bytes)
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.mem.read_bytes_raw(address, length)
+    }
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.mem.write_bytes_raw(address, bytes)
     }
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.zero_backing(address, len)

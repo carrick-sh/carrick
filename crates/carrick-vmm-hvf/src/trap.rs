@@ -2865,9 +2865,7 @@ impl HvfInner {
     /// mapping walk, and trace probes as the allocating form.
     fn read_guest_bytes_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
         let length = dst.len();
-        if self.range_no_access(address, length) {
-            return Err(MemoryError::OutOfBounds { address, length });
-        }
+        // PROT_NONE gated once in the default `GuestMemory::read_bytes`/`read_into`.
         let mut copied = 0usize;
         while copied < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
@@ -2947,9 +2945,7 @@ impl HvfInner {
 
     fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
-        if self.range_no_access(address, length) {
-            return Err(MemoryError::OutOfBounds { address, length });
-        }
+        // PROT_NONE gated once in the default `GuestMemory::write_bytes`.
         self.validate_guest_write_range(address, length, false)?;
         let mut copied = 0usize;
         while copied < length {
@@ -3064,9 +3060,7 @@ impl HvfInner {
     /// (audit M1; probe `rosharedbus`)
     fn write_guest_bytes_checked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
-        if self.range_no_access(address, length) {
-            return Err(MemoryError::OutOfBounds { address, length });
-        }
+        // PROT_NONE gated once in the default `GuestMemory::write_bytes`.
         self.validate_guest_write_range(address, length, true)?;
         let mut copied = 0usize;
         while copied < length {
@@ -4339,17 +4333,24 @@ impl HvfInner {
 }
 
 impl GuestMemory for HvfTrapEngine {
-    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+    /// The PROT_NONE set the shared default `read_bytes`/`write_bytes` gate on —
+    /// HVF's hand-rolled `range_no_access` syscall-path checks now fold into it.
+    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+        Some(&self.inner.protections)
+    }
+
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.inner.read_guest_bytes(address, length)
     }
 
-    fn read_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+    fn read_into_raw(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
         self.inner.read_guest_bytes_into(address, dst)
     }
 
-    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        // Syscall path: enforce the guest-visible mapping permission so a write
-        // into a read-only / carrick-owned mapping returns EFAULT (audit M1).
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        // The PROT_NONE gate ran in the default `write_bytes`; this still enforces
+        // the guest-visible mapping permission so a write into a read-only /
+        // carrick-owned mapping returns EFAULT (audit M1).
         self.inner.write_guest_bytes_checked(address, bytes)
     }
 

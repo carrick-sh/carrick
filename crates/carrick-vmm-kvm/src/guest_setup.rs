@@ -380,6 +380,11 @@ impl GuestRam {
         Arc::clone(&self.protections)
     }
 
+    /// Borrow the PROT_NONE set for the shared `GuestMemory::protections()` gate.
+    pub(crate) fn protections_ref(&self) -> &MemoryProtections {
+        &self.protections
+    }
+
     /// Whether [gpa, gpa+len) overlaps any PROT_NONE range (so a syscall buffer
     /// there must fault with EFAULT). Delegates to the SHARED, process-wide
     /// [`MemoryProtections`] so a sibling thread's `mprotect` is visible here.
@@ -637,6 +642,36 @@ impl GuestRam {
             return Err(carrick_guest_mem::region::GuestAccessError::OutOfBounds);
         }
         self.safe_access_projected(va, ipa, len)
+    }
+
+    /// Like [`safe_access_translated`] but WITHOUT the PROT_NONE gate — the shared
+    /// default `GuestMemory::read_bytes`/`write_bytes` already ran it on the guest
+    /// VA. Keeps the NULL-guard (a backing fact) + the IPA-translated single-region
+    /// lookup. This is the backing-only path the `*_raw` trait methods call.
+    pub(crate) fn safe_access_translated_raw(
+        &self,
+        va: u64,
+        ipa: u64,
+        len: usize,
+    ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
+        if len > 0 && va < LINUX_NULL_GUARD_END {
+            return Err(carrick_guest_mem::region::GuestAccessError::OutOfBounds);
+        }
+        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+        carrick_guest_mem::region::safe_guest_access_translated_in(
+            // PROT_NONE gated in the default GuestMemory::read_bytes/write_bytes.
+            |_g, _l| false,
+            windows
+                .iter()
+                .map(|w| carrick_guest_mem::region::GuestMemoryRegion {
+                    base: w.base,
+                    len: w.len,
+                    host_addr: w.host as *mut u8,
+                }),
+            va,
+            ipa,
+            len,
+        )
     }
 
     /// Copy `data` to guest-physical `gpa` (must lie wholly within one window).

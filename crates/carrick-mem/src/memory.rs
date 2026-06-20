@@ -2301,7 +2301,7 @@ fn linux_auxv_from_load_plan_with_vdso(
 }
 
 impl GuestMemory for AddressSpace {
-    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         let region = self
             .regions
             .iter()
@@ -2325,7 +2325,7 @@ impl GuestMemory for AddressSpace {
         Ok(out)
     }
 
-    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
         let region = self
             .regions
