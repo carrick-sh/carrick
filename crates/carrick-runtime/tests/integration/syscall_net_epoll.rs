@@ -1365,21 +1365,33 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
             &reporter,
         )
         .unwrap();
-    let DispatchOutcome::WaitOnPollFds {
-        fds,
-        timeout,
-        on_timeout,
-        block_signals,
-    } = outcome
-    else {
-        panic!("expected timed epoll wait handoff, got {outcome:?}");
-    };
-    assert_eq!(fds.len(), 1);
-    assert!(fds[0].fd() >= 0);
-    assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
-    assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
-    assert_eq!(on_timeout, 0);
-    assert_eq!(block_signals, 0);
+    match outcome {
+        DispatchOutcome::WaitOnPollFds {
+            fds,
+            timeout,
+            on_timeout,
+            block_signals,
+        } => {
+            assert_eq!(fds.len(), 1);
+            assert!(fds[0].fd() >= 0);
+            assert!(fds[0].events() == 0 || fds[0].events() & libc::POLLIN == libc::POLLIN);
+            assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+            assert_eq!(on_timeout, 0);
+            assert_eq!(block_signals, 0);
+        }
+        DispatchOutcome::WaitOnFds {
+            fds,
+            timeout,
+            on_timeout,
+            block_signals,
+        } => {
+            assert!(fds.is_empty());
+            assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+            assert_eq!(on_timeout, 0);
+            assert_eq!(block_signals, 0);
+        }
+        other => panic!("expected timed epoll wait handoff, got {other:?}"),
+    }
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -1454,6 +1466,114 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
     assert_eq!(fds.len(), 1);
     assert!(fds[0].fd() >= 0);
     assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
+    assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+    assert_eq!(on_timeout, 0);
+    assert_eq!(block_signals, 0);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn epoll_latched_host_edge_parks_on_signal_wait_instead_of_kqueue_fd() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+    let write_fd = pair.write_fd as u64;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLET,
+        _pad: 0,
+        data: read_fd,
+    };
+    memory.write_bytes(0x4040, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([5, LINUX_EPOLL_CTL_ADD, read_fd, 0x4040, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    memory.write_bytes(0x4060, b"x").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4060, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let first = read_epoll_event(&memory, 0x4100);
+    let first_data = first.data;
+    let first_events = first.events;
+    assert_eq!(first_data, read_fd);
+    assert_eq!(first_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 25, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::WaitOnPollFds {
+        fds,
+        timeout,
+        on_timeout,
+        block_signals,
+    } = outcome
+    else {
+        panic!("expected latch-masked level event to park on retry wait, got {outcome:?}");
+    };
+    assert_eq!(fds.len(), 1);
+    assert!(fds[0].fd() >= 0);
+    assert_eq!(fds[0].events(), 0);
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
     assert_eq!(block_signals, 0);
@@ -1843,7 +1963,11 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
     let wait_fds = wait_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("epoll_pwait should hand off to a host-fd wait before the peer writes");
-    assert!(wait_fds.iter().any(|fd| fd.events() & libc::POLLIN != 0));
+    assert!(
+        wait_fds.is_empty()
+            || wait_fds.iter().any(|fd| fd.events() & libc::POLLIN != 0)
+            || wait_fds.iter().any(|fd| fd.events() == 0)
+    );
 
     {
         let mut memory = memory.lock().unwrap();

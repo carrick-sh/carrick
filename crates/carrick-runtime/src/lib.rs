@@ -842,6 +842,7 @@ pub mod runtime {
     ) -> Result<DispatchOutcome, RuntimeError> {
         use crate::io_wait::{WaitFd, WaitResult};
         const EINTR: i32 = crate::linux_abi::LINUX_EINTR;
+        let mut poll_deadline: Option<std::time::Instant> = None;
         loop {
             // `dispatch` returns `DispatchError`, absorbed via `#[from]`.
             let outcome = dispatcher.dispatch(request, memory, reporter)?;
@@ -866,16 +867,33 @@ pub mod runtime {
                     timeout,
                     on_timeout,
                     block_signals,
-                } => match waiter.wait_poll(&fds, timeout, block_signals) {
-                    WaitResult::Ready => continue,
-                    WaitResult::TimedOut => {
-                        return Ok(DispatchOutcome::Returned { value: on_timeout });
+                } => {
+                    let timeout = match timeout {
+                        Some(duration) => {
+                            let deadline = *poll_deadline
+                                .get_or_insert_with(|| std::time::Instant::now() + duration);
+                            let now = std::time::Instant::now();
+                            if now >= deadline {
+                                return Ok(DispatchOutcome::Returned { value: on_timeout });
+                            }
+                            Some(deadline - now)
+                        }
+                        None => {
+                            poll_deadline = None;
+                            None
+                        }
+                    };
+                    match waiter.wait_poll(&fds, timeout, block_signals) {
+                        WaitResult::Ready => continue,
+                        WaitResult::TimedOut => {
+                            return Ok(DispatchOutcome::Returned { value: on_timeout });
+                        }
+                        WaitResult::Interrupted => {
+                            return Ok(DispatchOutcome::Errno { errno: EINTR });
+                        }
+                        WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                     }
-                    WaitResult::Interrupted => {
-                        return Ok(DispatchOutcome::Errno { errno: EINTR });
-                    }
-                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
-                },
+                }
                 DispatchOutcome::WaitOnFdsSelect {
                     fds,
                     timeout,
@@ -1890,7 +1908,7 @@ pub mod io_wait {
             timeout: Option<Duration>,
             block_mask: u64,
         ) -> WaitResult {
-            ppoll_wait(self.tid, fds, timeout, block_mask, || false)
+            ppoll_wait_poll(self.tid, fds, timeout, block_mask, || false)
         }
 
         pub fn wait_poll_with_dispatch_pending<F>(
@@ -1903,7 +1921,7 @@ pub mod io_wait {
         where
             F: Fn() -> bool,
         {
-            ppoll_wait(self.tid, fds, timeout, block_mask, should_interrupt)
+            ppoll_wait_poll(self.tid, fds, timeout, block_mask, should_interrupt)
         }
 
         /// Wait for a guest child process to become reapable (Phase 2 Task 7).
@@ -2126,7 +2144,25 @@ pub mod io_wait {
         block_mask: u64,
         should_interrupt: impl Fn() -> bool,
     ) -> WaitResult {
-        ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, false)
+        ppoll_wait_inner(
+            tid,
+            fds,
+            timeout,
+            block_mask,
+            should_interrupt,
+            false,
+            false,
+        )
+    }
+
+    fn ppoll_wait_poll(
+        tid: crate::thread::ThreadId,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: u64,
+        should_interrupt: impl Fn() -> bool,
+    ) -> WaitResult {
+        ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, false, true)
     }
 
     fn ppoll_wait_recheck_on_masked_interrupt(
@@ -2136,7 +2172,7 @@ pub mod io_wait {
         block_mask: u64,
         should_interrupt: impl Fn() -> bool,
     ) -> WaitResult {
-        ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, true)
+        ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, true, false)
     }
 
     fn ppoll_wait_inner(
@@ -2146,6 +2182,7 @@ pub mod io_wait {
         block_mask: u64,
         should_interrupt: impl Fn() -> bool,
         recheck_on_masked_interrupt: bool,
+        retry_poll_slice: bool,
     ) -> WaitResult {
         let mut pollfds: Vec<libc::pollfd> = fds
             .iter()
@@ -2231,6 +2268,7 @@ pub mod io_wait {
                 // `deliver_pending_signal` runs, else re-block.
                 match deadline {
                     Some(dl) if Instant::now() >= dl => return WaitResult::TimedOut,
+                    Some(_) if retry_poll_slice && !fds.is_empty() => return WaitResult::Ready,
                     Some(_) => continue,
                     None => {
                         if crate::fork_quiesce::is_quiescing()
@@ -2240,6 +2278,9 @@ pub mod io_wait {
                             || should_interrupt()
                         {
                             return WaitResult::Interrupted;
+                        }
+                        if retry_poll_slice && !fds.is_empty() {
+                            return WaitResult::Ready;
                         }
                         continue;
                     }
