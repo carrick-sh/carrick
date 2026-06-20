@@ -872,28 +872,57 @@ impl BhyveVmm {
     /// reservation. Used by `demand_commit` (one page, on a guest #PF) and
     /// `host_ptr_mut` (a whole range, when carrick itself must WRITE into a
     /// reserved region — file-backed mmap content, stack/auxv).
+    ///
+    /// CRITICAL: only ALREADY-UNCOMMITTED pages are (re)backed; pages a window
+    /// already covers are left untouched. Re-committing a live page would
+    /// allocate a FRESH zeroed GPA over it — destroying its contents. The biting
+    /// case: `host_ptr_mut` is driven by `write_bytes`, which probes the WHOLE
+    /// remaining length; a guest buffer that was demand-faulted page-by-page is
+    /// backed by 1-page windows that `resolve` cannot span, so `host_ptr` returns
+    /// `None` for the multi-page probe and we land here even though the pages ARE
+    /// committed. Blindly re-committing the span then zeroed the page holding the
+    /// musl mallocng group header (`base->meta`) that `free()`/`get_meta` reads —
+    /// the bhyve `read()`-into-a-touched-buffer heap corruption (`spliceunixpoll`,
+    /// `go-net_http`). Committing only the genuine holes keeps live data intact;
+    /// `write_bytes`' own per-run chunking then writes each page to its real GPA.
     fn commit_range(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
         let start = va & !0xFFF;
         let end = va.wrapping_add(len as u64).wrapping_add(0xFFF) & !0xFFF;
-        let span = (end - start) as usize;
-        let gpa = self
-            .ram
-            .add_bump(start, span, true, true, false)
-            .map_err(|e| MemoryError::HostMap(format!("bhyve commit_range: GPA alloc: {e}")))?;
-        let host = self.vm.map_gpa(gpa, span).ok_or_else(|| {
-            MemoryError::HostMap(format!("bhyve commit_range: map_gpa 0x{gpa:x} unmapped"))
-        })?;
-        // SAFETY: `host` is live sysmem of `span` bytes — zero the new anon pages.
-        unsafe { std::ptr::write_bytes(host, 0, span) };
-        self.with_live_pml4(|mgr| {
-            mgr.map_aliased(start, gpa, span as u64, true)
-                .map_err(|_| MemoryError::OutOfBounds {
-                    address: start,
-                    length: span,
+        let mut page = start;
+        while page < end {
+            // Preserve any page a window already backs (its live contents).
+            if self.ram.resolve(page, 1).is_some() {
+                page += 0x1000;
+                continue;
+            }
+            // Coalesce a contiguous run of uncommitted pages into ONE window +
+            // one PML4 edit (the original whole-span behaviour, scoped to holes).
+            let mut run_end = page + 0x1000;
+            while run_end < end && self.ram.resolve(run_end, 1).is_none() {
+                run_end += 0x1000;
+            }
+            let span = (run_end - page) as usize;
+            let gpa = self
+                .ram
+                .add_bump(page, span, true, true, false)
+                .map_err(|e| MemoryError::HostMap(format!("bhyve commit_range: GPA alloc: {e}")))?;
+            let host = self.vm.map_gpa(gpa, span).ok_or_else(|| {
+                MemoryError::HostMap(format!("bhyve commit_range: map_gpa 0x{gpa:x} unmapped"))
+            })?;
+            // SAFETY: `host` is live sysmem of `span` bytes — zero the new anon pages.
+            unsafe { std::ptr::write_bytes(host, 0, span) };
+            self.with_live_pml4(|mgr| {
+                mgr.map_aliased(page, gpa, span as u64, true).map_err(|_| {
+                    MemoryError::OutOfBounds {
+                        address: page,
+                        length: span,
+                    }
                 })?;
-            Ok(true)
-        })?;
-        self.ram.drop_reservation(start, span);
+                Ok(true)
+            })?;
+            self.ram.drop_reservation(page, span);
+            page = run_end;
+        }
         Ok(())
     }
 }
@@ -1050,11 +1079,20 @@ impl X86Vmm for BhyveVmm {
         // not resurrected by the default `protect_range(0)` → reserve path. A
         // committed page (a window covers it) still gets its present bits cleared.
         self.ram.drop_reservation(address, len);
-        if self.host_ptr(address, 1).is_some() {
+        let result = if self.host_ptr(address, 1).is_some() {
+            // Clear the live PML4 leaves WHILE the window still resolves the VA→GPA
+            // (protect_range needs host_ptr to find the committed page).
             self.protect_range(address, len, 0)
         } else {
             Ok(())
-        }
+        };
+        // THEN prune the window, so a later mmap that reuses this VA re-commits a
+        // FRESH GPA instead of resolving this now-dead one. Leaving the window
+        // behind diverges host_ptr (syscall copies) from the guest's live leaf and
+        // mis-targets zero_backing — the bhyve large-alloc heap corruption. Done
+        // after protect_range so the leaf-clear above can still resolve the VA.
+        self.ram.remove_windows(address, len);
+        result
     }
 
     fn map_host_alias(
