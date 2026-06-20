@@ -4934,9 +4934,9 @@ mod routing_tests {
     //! number here at every step, and a known-unrouted number must NOT resolve.
     use super::*;
     use crate::linux_abi::{
-        CARRICK_PRIVATE_X86_DUP2, CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_LSTAT,
-        CARRICK_PRIVATE_X86_NEWFSTATAT, CARRICK_PRIVATE_X86_POLL, CARRICK_PRIVATE_X86_SELECT,
-        CARRICK_PRIVATE_X86_STAT,
+        CARRICK_PRIVATE_X86_ALARM, CARRICK_PRIVATE_X86_DUP2, CARRICK_PRIVATE_X86_FSTAT,
+        CARRICK_PRIVATE_X86_LSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT, CARRICK_PRIVATE_X86_POLL,
+        CARRICK_PRIVATE_X86_SELECT, CARRICK_PRIVATE_X86_STAT,
     };
 
     /// Every syscall number routed by the dispatcher, enumerated from the full
@@ -5146,6 +5146,7 @@ mod routing_tests {
         113,
         114,
         115,
+        CARRICK_PRIVATE_X86_ALARM,
         153,
         163,
         165,
@@ -5210,7 +5211,7 @@ mod routing_tests {
         // expanded), which exceeds the original table's 235 arms.
         assert_eq!(
             ROUTED_NUMBERS.len(),
-            241,
+            242,
             "ROUTED_NUMBERS lost entries — the characterization set must stay complete"
         );
     }
