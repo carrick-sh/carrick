@@ -59,6 +59,34 @@ lldb19 -b \
   `0x200000` = `X86_PML4_GPA`); prints each level's entry + flags + the final GPA.
 - `bhyve-ctx` — show the captured vmctx.
 
+## Reading guest REGISTERS (`scripts/carrick_bhyve_regs_lldb.py`)
+
+lldb19's Rust expression evaluator **cannot call Rust methods** (`expr
+engine.vcpu.get_fs_base()` → "no member named get_fs_base"), so guest VMCS state
+is unreachable that way. But lldb CAN call **C functions** (same as `vm_map_gpa`),
+so this companion plugin adds `bhyve-regs [maxvcpu]`: for each vCPU id it calls
+`vm_vcpu_open` + `vm_get_register` (RIP/RSP/RBP/R12 + a full GPR dump when
+RIP==0) + `vm_get_desc` (FS base), and for a clone-thread that jumped to RIP=0 it
+page-walks RSP and dumps the stack top (the return address the bad `CALL` pushed).
+
+```
+lldb19 -b \
+  -o 'command script import /path/to/carrick/scripts/carrick_bhyve_regs_lldb.py' \
+  -o 'settings set target.process.follow-fork-mode child' \
+  -o 'breakpoint set --func-regex deliver_fault_signal' \  # stop at the fatal guest fault
+  -o run -o 'bhyve-regs 6' -o quit \
+  -- ./target/release/carrick run --platform linux/amd64 <img> /conformance/<x>.test ...
+```
+
+This cracked the bhyve **Go bring-up #PF at RIP=0**: the crashing clone-thread had
+`rdx=0 rcx=0 rax=0` and `[rsp]` = the return address inside libc's `clone3`
+wrapper child path (`call *%rdx`) — i.e. the sibling-entry `msr_init_blob`'s
+WRMSR/XSETBV clobbered the inherited RDX (glibc clone3's child fn ptr). Fix:
+`msr_init_blob` restores `entry_rdx`/`entry_rcx` before `iretq`. Reg ordinals
+(vmm.h): RBP=6 RSP=19 RIP=20 R12=11 FS=26; `vm_get_desc` for the FS *base*
+(`vm_get_register(FS_BASE=45)` EINVALs). Use func-regex for generic Rust fns —
+`--name carrick_runtime::…::deliver_fault_signal` is "pending" (monomorphized).
+
 Notes: inferior FFI calls work on FreeBSD lldb — but **cast the args** (`vm_map_gpa`
 wants `struct vmctx *`, not `void *`). Capture a typed value from the breakpoint
 frame (`expr struct vmctx *$ctx = ctx`) to avoid the cast. `follow-fork` works
