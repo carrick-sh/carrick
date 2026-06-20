@@ -1334,12 +1334,12 @@ mod tests {
     }
 
     impl GuestMemory for CountingMmapMemory {
-        fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
             let offset = self.range_offset(address, length)?;
             Ok(self.bytes[offset..offset + length].to_vec())
         }
 
-        fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
             let offset = self.range_offset(address, bytes.len())?;
             self.write_calls.set(self.write_calls.get() + 1);
             self.write_bytes_total

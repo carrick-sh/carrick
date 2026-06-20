@@ -1316,7 +1316,7 @@ impl LinearMemory {
 }
 
 impl GuestMemory for LinearMemory {
-    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         let offset = address
             .checked_sub(self.base)
             .ok_or(MemoryError::OutOfBounds { address, length })?;
@@ -1331,7 +1331,7 @@ impl GuestMemory for LinearMemory {
         Ok(self.bytes[offset..end].to_vec())
     }
 
-    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let offset = address
             .checked_sub(self.base)
             .ok_or(MemoryError::OutOfBounds {
@@ -6732,10 +6732,10 @@ mod overlay_dispatch_tests {
             word: u32,
         }
         impl GuestMemory for SharedOnly {
-            fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
                 Err(MemoryError::OutOfBounds { address, length })
             }
-            fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
                 Err(MemoryError::OutOfBounds {
                     address,
                     length: bytes.len(),
@@ -6776,7 +6776,7 @@ mod overlay_dispatch_tests {
     }
 
     impl GuestMemory for CountingMemory {
-        fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
             self.reads.set(self.reads.get() + 1);
             let offset = address
                 .checked_sub(self.base)
@@ -6792,7 +6792,7 @@ mod overlay_dispatch_tests {
             Ok(self.bytes[offset..end].to_vec())
         }
 
-        fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
             self.writes.set(self.writes.get() + 1);
             let offset = address
                 .checked_sub(self.base)
@@ -6886,10 +6886,10 @@ mod overlay_dispatch_tests {
             word: u32,
         }
         impl GuestMemory for SharedWord {
-            fn read_bytes(&self, _address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            fn read_bytes_raw(&self, _address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
                 Ok(self.word.to_le_bytes()[..length.min(4)].to_vec())
             }
-            fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
                 Err(MemoryError::OutOfBounds {
                     address,
                     length: bytes.len(),

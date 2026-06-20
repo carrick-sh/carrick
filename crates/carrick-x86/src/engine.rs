@@ -197,12 +197,38 @@ pub struct X86EngineCore<V: X86Vmm> {
     sysret_resume: Option<SysretResume>,
     /// `true` on the child side of a guest `fork(2)`.
     is_forked_child: bool,
+    /// Process-wide PROT_NONE set: the SHARED host-side EFAULT gate every x86
+    /// backend (KVM/bhyve/NVMM) inherits via `GuestMemory::read_bytes`/
+    /// `write_bytes`. Held as `Arc` so `clone(CLONE_THREAD)` siblings share ONE
+    /// set (a sibling's `mprotect` is seen by all); `fork(2)` gets an independent
+    /// COW copy; `execve` starts fresh. bhyve/NVMM need zero code for this — the
+    /// engine owns it.
+    protections: std::sync::Arc<carrick_guest_mem::protections::MemoryProtections>,
 }
 
 impl<V: X86Vmm> X86EngineCore<V> {
     /// Build an engine around an already-constructed VM + vCPU (the backend's
     /// bring-up produces these). `layout` is the GPA layout the bring-up used.
     pub fn from_parts(vm: V, vcpu: V::Vcpu, layout: BringupLayout) -> Self {
+        // A freshly brought-up (or execve'd, or fork-child) engine starts with no
+        // PROT_NONE ranges. Siblings instead SHARE the spawning thread's set via
+        // `from_parts_with_protections` (see `materialize_sibling`).
+        Self::from_parts_with_protections(
+            vm,
+            vcpu,
+            layout,
+            std::sync::Arc::new(carrick_guest_mem::protections::MemoryProtections::default()),
+        )
+    }
+
+    /// Like [`from_parts`](Self::from_parts) but adopts an existing PROT_NONE set
+    /// — used to make a `clone(CLONE_THREAD)` sibling SHARE its parent's gate.
+    pub fn from_parts_with_protections(
+        vm: V,
+        vcpu: V::Vcpu,
+        layout: BringupLayout,
+        protections: std::sync::Arc<carrick_guest_mem::protections::MemoryProtections>,
+    ) -> Self {
         // Calibrate the x86 vDSO clock page once, here in the shared construction
         // path, so EVERY backend gets the userspace clock fast path with no
         // per-backend bring-up code. Best-effort: a no-op until the vvar page is
@@ -216,6 +242,7 @@ impl<V: X86Vmm> X86EngineCore<V> {
             last_orig_rax: 0,
             sysret_resume: None,
             is_forked_child: false,
+            protections,
         }
     }
 
@@ -314,7 +341,21 @@ fn host_run_len<V: X86Vmm>(vm: &V, addr: u64, max: usize) -> usize {
 }
 
 impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
-    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+    /// The engine-owned PROT_NONE set, shared by every x86 backend (KVM, bhyve,
+    /// NVMM) — the default `read_bytes`/`write_bytes` run it before the raw copy
+    /// below, so bhyve/NVMM get the EFAULT gate with zero backend code.
+    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+        Some(&*self.protections)
+    }
+
+    /// Record/clear a guest PROT_NONE range (guest `mprotect(PROT_NONE)`/`munmap`).
+    /// Closes the x86 `set_no_access` no-op gap: without this the engine's
+    /// `protections()` set stays empty and the gate never fires.
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        self.protections.set_no_access(address, len, no_access);
+    }
+
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         // A guest pointer in the NULL guard region [0, 0x10000) is unmapped on
         // Linux; the aarch64 path faults it (safe_access_translated). The x86
         // host_ptr path has no VA guard — the low identity window backs GPA 0 —
@@ -356,7 +397,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         Ok(out)
     }
 
-    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
         // NULL-guard, mirroring read_bytes (and the aarch64 path): a write
         // through a NULL/low guest pointer must EFAULT, not silently hit the
@@ -809,6 +850,11 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         let _ = crate::vdso::populate_vdso_vvar(&self.vm, &self.vcpu);
         self.pending_resume_pc = None;
         self.sysret_resume = None;
+        // execve replaces the whole address space — the old image's PROT_NONE
+        // ranges are gone, so the gate must start fresh (else a new mapping at an
+        // old PROT_NONE VA would wrongly EFAULT).
+        self.protections =
+            std::sync::Arc::new(carrick_guest_mem::protections::MemoryProtections::default());
         Ok(())
     }
 
@@ -913,6 +959,11 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
 
     // CHILD.
     reset_x86_syscall_stats_for_fork_child();
+    // `engine.protections` needs NO re-snapshot: `libc::fork()` already COW-copied
+    // the Arc's `Vec` into the child's address space, so the child's PROT_NONE set
+    // is an independent copy of the parent's at fork time (the shared-Arc contract
+    // only matters for CLONE_THREAD siblings inside ONE process). Do NOT "fix" this
+    // by re-snapshotting — that would double-copy.
     engine
         .vm
         .rebuild_child_after_fork(&mut engine.vcpu, &frozen)?;
@@ -943,10 +994,14 @@ pub struct X86SiblingSpec<V: X86Vmm> {
     pub builder: V::SiblingBuilder,
     pub snapshot: X86VcpuSnapshot,
     pub layout: BringupLayout,
+    /// The spawning thread's PROT_NONE set — the sibling SHARES it (same VM /
+    /// address space), so an `mprotect` by any thread is seen by all.
+    pub protections: std::sync::Arc<carrick_guest_mem::protections::MemoryProtections>,
 }
 
 // SAFETY: the snapshot is POD and the layout is `Copy`; the builder is the
-// backend's own `Send` payload (bounded `Send` on the trait).
+// backend's own `Send` payload (bounded `Send` on the trait); the protections
+// `Arc<MemoryProtections>` is `Send + Sync`.
 unsafe impl<V: X86Vmm> Send for X86SiblingSpec<V> where V::SiblingBuilder: Send {}
 
 impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
@@ -974,13 +1029,20 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
             builder,
             snapshot,
             layout: self.layout,
+            protections: std::sync::Arc::clone(&self.protections),
         })
     }
 
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError> {
         let (vm, mut vcpu) = V::materialize_sibling(spec.builder)?;
         vm.restore_vcpu(&mut vcpu, spec.layout, &spec.snapshot)?;
-        Ok(Self::from_parts(vm, vcpu, spec.layout))
+        // SHARE the spawning thread's PROT_NONE set (same address space).
+        Ok(Self::from_parts_with_protections(
+            vm,
+            vcpu,
+            spec.layout,
+            spec.protections,
+        ))
     }
 
     fn program_counter(&self) -> Result<u64, TrapError> {

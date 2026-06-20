@@ -1017,7 +1017,7 @@ impl HostPtrPayloadMemory {
 
 #[cfg(target_os = "macos")]
 impl GuestMemory for HostPtrPayloadMemory {
-    fn read_bytes(
+    fn read_bytes_raw(
         &self,
         address: u64,
         length: usize,
@@ -1040,7 +1040,7 @@ impl GuestMemory for HostPtrPayloadMemory {
         Ok(self.bytes[offset..offset + length].to_vec())
     }
 
-    fn write_bytes(
+    fn write_bytes_raw(
         &mut self,
         address: u64,
         bytes: &[u8],
@@ -1466,7 +1466,7 @@ fn pwritev_host_file_reads_each_guest_iovec_once() {
     }
 
     impl GuestMemory for CountingPayloadMemory {
-        fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
             if self
                 .watched_ranges
                 .iter()
@@ -1477,7 +1477,7 @@ fn pwritev_host_file_reads_each_guest_iovec_once() {
             self.inner.read_bytes(address, length)
         }
 
-        fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
             self.inner.write_bytes(address, bytes)
         }
 
