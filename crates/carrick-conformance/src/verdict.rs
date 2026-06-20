@@ -125,10 +125,12 @@ pub fn classify(
     docker: &SuiteResult,
     baseline: &Baseline,
 ) -> Classification {
-    // An empty-pairs baseline entry means the suite was a crash/oracle-fail when
-    // blessed; treat it as "no baseline" so a later improvement reads as NEW, not
-    // a false REGRESSION against absent pairs.
-    let base = baseline.pairs_for(&suite.name).filter(|p| !p.is_empty());
+    // An empty-pairs baseline entry has no per-id comparisons, so later comparable
+    // output should read as NEW rather than REGRESSION. It is still a baseline
+    // entry for current crash/timeout classification, otherwise stale crash rows
+    // can be blessed again as first observations.
+    let baseline_entry = baseline.pairs_for(&suite.name);
+    let base = baseline_entry.filter(|p| !p.is_empty());
 
     // 1. Oracle short-circuit: a hung/broken oracle never counts against carrick.
     if docker.result == SuiteOutcome::None || docker.result == SuiteOutcome::Empty {
@@ -148,12 +150,14 @@ pub fn classify(
         } else {
             Verdict::CarrickCrash
         };
-        // Gating unless: no baseline (first obs), or the baseline already recorded
-        // this suite as a crash/timeout (unchanged). We approximate "baseline was a
-        // crash" as "baseline had no comparable pairs for this suite".
-        let baseline_was_bad = base.map(|p| p.is_empty()).unwrap_or(false);
-        let gating = base.is_some() && !baseline_was_bad;
-        let verdict = if base.is_none() { Verdict::New } else { v };
+        // Gating unless there is genuinely no baseline entry. Empty-pair entries
+        // are not comparable baselines, but they must not hide a current crash.
+        let gating = baseline_entry.is_some();
+        let verdict = if baseline_entry.is_none() {
+            Verdict::New
+        } else {
+            v
+        };
         return Classification {
             verdict,
             gating,
@@ -423,6 +427,26 @@ mod tests {
         assert_eq!(c.verdict, Verdict::CarrickCrash);
         assert!(c.gating);
         assert!(c.new_diffs.is_empty(), "no per-id diff storm");
+    }
+
+    #[test]
+    fn current_carrick_crash_against_empty_baseline_entry_gates() {
+        let mut crashed = res(&[]);
+        crashed.result = SuiteOutcome::None;
+        let baseline = {
+            let mut by = HashMap::new();
+            by.insert("s".to_string(), BTreeMap::new());
+            Baseline { by_suite: by }
+        };
+        let c = classify(
+            &suite(&[]),
+            &crashed,
+            false,
+            &res(&[("a", Outcome::Ok)]),
+            &baseline,
+        );
+        assert_eq!(c.verdict, Verdict::CarrickCrash);
+        assert!(c.gating);
     }
 
     #[test]
