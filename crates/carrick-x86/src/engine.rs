@@ -1313,6 +1313,48 @@ mod tests {
     }
 
     #[test]
+    fn x86_set_no_access_records_and_default_gate_efaults() {
+        // Regression for the x86 PROT_NONE gap (Review-P1): the engine OWNS the
+        // PROT_NONE set, `set_no_access` records into it (closing the old no-op),
+        // and the shared default `read_bytes`/`write_bytes` EFAULT a buffer in a
+        // protected range BEFORE touching backing — so KVM/bhyve/NVMM inherit the
+        // gate with no backend code. The end-to-end proof is the `protnonesyscall`
+        // reducer (OK on KVM+bhyve, was READ-NOT-GATED).
+        let layout = test_layout();
+        let mut engine = X86EngineCore::from_parts(TestVmm, TestVcpu::default(), layout);
+        let addr = 0x4000_0000u64;
+
+        // mprotect(PROT_NONE) -> set_no_access records the range.
+        engine.set_no_access(addr, 0x1000, true);
+        let prot = engine
+            .protections()
+            .expect("x86 engine surfaces its PROT_NONE set");
+        assert!(prot.range_no_access(addr, 0x10), "the range is recorded");
+        assert!(
+            !prot.range_no_access(addr + 0x2000, 0x10),
+            "outside the range stays clear"
+        );
+
+        // The default gate faults syscall buffers in the range (TestVmm's None
+        // host_ptr is never reached — the gate returns first).
+        assert!(matches!(
+            engine.read_bytes(addr, 8),
+            Err(MemoryError::OutOfBounds { .. })
+        ));
+        assert!(matches!(
+            engine.write_bytes(addr, &[0u8; 8]),
+            Err(MemoryError::OutOfBounds { .. })
+        ));
+
+        // Clearing (mprotect back to accessible) removes the gate.
+        engine.set_no_access(addr, 0x1000, false);
+        assert!(
+            !engine.protections().unwrap().range_no_access(addr, 0x10),
+            "set_no_access(false) clears the range"
+        );
+    }
+
+    #[test]
     fn current_pc_reports_user_rcx_after_kvm_trampoline_base_resume() {
         let layout = test_layout();
         let vcpu = TestVcpu {
