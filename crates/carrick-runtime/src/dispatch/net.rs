@@ -199,25 +199,10 @@ impl SyscallDispatcher {
 
     fn epoll_effective_interest(
         events: u32,
-        last_ready: u32,
-        write_backpressured: bool,
+        _last_ready: u32,
+        _write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
-        let mut interest = epoll_interest_for(events);
-        if events & LINUX_EPOLLET == 0 {
-            return interest;
-        }
-        const READ_LATCH: u32 = LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
-        const WRITE_LATCH: u32 = LINUX_EPOLLOUT | LINUX_EPOLLHUP | LINUX_EPOLLERR;
-        if last_ready & READ_LATCH != 0 {
-            interest.read = false;
-        }
-        if last_ready & WRITE_LATCH != 0 && !write_backpressured {
-            interest.write = false;
-        }
-        if last_ready & LINUX_EPOLLPRI != 0 {
-            interest.oob = false;
-        }
-        interest
+        epoll_interest_for(events)
     }
 
     #[cfg(any(
@@ -366,6 +351,19 @@ impl SyscallDispatcher {
         }
     }
 
+    fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
+        let Some(host_fd) = self.host_fd_for_poll(fd) else {
+            return 0;
+        };
+        let mut avail: libc::c_int = 0;
+        let rc = unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut avail) };
+        if rc == 0 && avail > 0 {
+            avail as u64
+        } else {
+            0
+        }
+    }
+
     /// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll
     /// emulation: after the guest performs a read-family syscall on fd X,
     /// clear the read-side bits of `last_ready` for X in every epoll interest
@@ -466,6 +464,9 @@ impl SyscallDispatcher {
                             if let Some(slot) = interest.get_mut(fd) {
                                 let before = slot.last_ready;
                                 slot.last_ready &= !clear;
+                                if clear & READ_CLEAR != 0 {
+                                    slot.last_read_avail = 0;
+                                }
                                 if clear & WRITE_CLEAR != 0 {
                                     slot.write_backpressured = false;
                                 }
@@ -1695,6 +1696,7 @@ impl SyscallDispatcher {
                         EpollInterest {
                             event,
                             last_ready: 0,
+                            last_read_avail: 0,
                             write_backpressured: false,
                             reg_gen,
                         },
@@ -1732,6 +1734,7 @@ impl SyscallDispatcher {
                     *slot = EpollInterest {
                         event,
                         last_ready: 0,
+                        last_read_avail: 0,
                         write_backpressured: false,
                         reg_gen,
                     };
@@ -1906,7 +1909,10 @@ impl SyscallDispatcher {
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
-            let mut ready_updates: Vec<(i32, u32, u32, bool)> = Vec::new();
+            let mut ready_updates: Vec<(i32, u32, u32, u64, bool)> = Vec::new();
+            let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
+            const READ_READY_BITS: u32 =
+                LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
 
             // (1) Drain the instance kqueue (non-blocking) for host-backed fds.
             // `kq_drained_all_filtered` tracks the corner case where the kqueue
@@ -1954,12 +1960,13 @@ impl SyscallDispatcher {
                         // here, then the epoll lock is dropped before the per-fd
                         // re-poll so a concurrent epoll_ctl isn't blocked on syscalls.
                         // gfd_info: guest fd -> (host_fd, requested events,
-                        // epoll_data, reg_gen, last_ready, write_backpressured). host_to_gfds: host fd
+                        // epoll_data, reg_gen, last_ready, last_read_avail,
+                        // write_backpressured). host_to_gfds: host fd
                         // -> guest fds sharing it (dup fan-out). Types inferred
                         // from the inserts.
                         let (gfd_info, host_to_gfds) = {
                             let open = open_file.description.read();
-                            let mut info: HashMap<i32, (i32, u32, u64, u32, u32, bool)> =
+                            let mut info: HashMap<i32, (i32, u32, u64, u32, u32, u64, bool)> =
                                 HashMap::new();
                             let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
                             if let OpenDescription::Epoll { interest, .. } = &*open {
@@ -1973,6 +1980,7 @@ impl SyscallDispatcher {
                                                 slot.event.data,
                                                 slot.reg_gen,
                                                 slot.last_ready,
+                                                slot.last_read_avail,
                                                 slot.write_backpressured,
                                             ),
                                         );
@@ -1991,17 +1999,19 @@ impl SyscallDispatcher {
                         // hit fans out to every guest fd currently sharing that host
                         // fd (dups). bits==0 is an EVFILT_USER(0) wake / untranslatable
                         // filter — in-memory readiness is recomputed in step (2).
-                        let mut deliver: std::collections::HashSet<i32> =
-                            std::collections::HashSet::new();
+                        let mut deliver: HashMap<i32, u32> = HashMap::new();
                         for ev in &poll_events {
-                            if pollevent_to_epoll(ev) == 0 {
+                            let edge_bits = pollevent_to_epoll(ev);
+                            if edge_bits == 0 {
                                 continue;
                             }
                             let (guest_fd, generation) = unpack_epoll_udata(ev.token);
                             match gfd_info.get(&guest_fd) {
-                                Some(&(hfd, _, _, reg_gen, _, _)) if reg_gen == generation => {
+                                Some(&(hfd, _, _, reg_gen, _, _, _)) if reg_gen == generation => {
                                     if let Some(siblings) = host_to_gfds.get(&hfd) {
-                                        deliver.extend(siblings.iter().copied());
+                                        for sibling in siblings {
+                                            *deliver.entry(*sibling).or_insert(0) |= edge_bits;
+                                        }
                                     }
                                 }
                                 _ => {
@@ -2020,23 +2030,45 @@ impl SyscallDispatcher {
                         // model: the edge only FLAGS the fd; we re-poll just the
                         // flagged owners (polling ALL registered fds was O(nfds) and
                         // too slow).
-                        for gfd in deliver {
+                        for (gfd, edge_bits) in deliver {
                             if let Some(&(
                                 _,
                                 requested,
                                 data,
                                 reg_gen,
                                 last_ready,
+                                last_read_avail,
                                 write_backpressured,
                             )) =
                                 gfd_info.get(&gfd)
                             {
+                                host_ready_sampled.insert(gfd);
                                 let raw = this.epoll_ready_events(gfd, requested);
+                                let read_avail = if raw & READ_READY_BITS != 0 {
+                                    this.host_read_avail_for_poll(gfd)
+                                } else {
+                                    0
+                                };
                                 let clear_write_backpressure =
                                     write_backpressured && raw & LINUX_EPOLLOUT != 0;
-                                ready_updates.push((gfd, reg_gen, raw, clear_write_backpressure));
+                                ready_updates.push((
+                                    gfd,
+                                    reg_gen,
+                                    raw,
+                                    read_avail,
+                                    clear_write_backpressure,
+                                ));
+                                let read_growth = if requested & LINUX_EPOLLET != 0
+                                    && edge_bits & READ_READY_BITS != 0
+                                    && raw & READ_READY_BITS != 0
+                                    && read_avail > last_read_avail
+                                {
+                                    raw & edge_bits & READ_READY_BITS
+                                } else {
+                                    0
+                                };
                                 let mut ready_events = if requested & LINUX_EPOLLET != 0 {
-                                    raw & !last_ready
+                                    (raw & !last_ready) | read_growth
                                 } else {
                                     raw
                                 };
@@ -2079,9 +2111,67 @@ impl SyscallDispatcher {
                 }
             }
 
-            // (2) In-memory fds (no host fd): recompute readiness. Host-backed
-            // fds are latched in step (1) from level-triggered multiplexer wakes.
+            // (2) Host-backed fds: the multiplexer edge says which owners are
+            // worth re-polling, but the live host level is still the authority.
+            // Re-sample any host-backed interest that was not already sampled
+            // from a drained mux event so a missed/stale edge cannot park an
+            // epoll waiter while the host fd is already readable/writable.
             for (fd, interest) in &interests {
+                if host_ready_sampled.contains(fd) || this.host_fd_for_poll(*fd).is_none() {
+                    continue;
+                }
+                host_ready_sampled.insert(*fd);
+                let requested = interest.event.events;
+                let raw_ready = this.epoll_ready_events(*fd, requested);
+                let read_avail = if raw_ready & READ_READY_BITS != 0 {
+                    this.host_read_avail_for_poll(*fd)
+                } else {
+                    0
+                };
+                let clear_write_backpressure =
+                    interest.write_backpressured && raw_ready & LINUX_EPOLLOUT != 0;
+                ready_updates.push((
+                    *fd,
+                    interest.reg_gen,
+                    raw_ready,
+                    read_avail,
+                    clear_write_backpressure,
+                ));
+                let read_growth = if requested & LINUX_EPOLLET != 0
+                    && raw_ready & READ_READY_BITS != 0
+                    && read_avail > interest.last_read_avail
+                {
+                    raw_ready & READ_READY_BITS
+                } else {
+                    0
+                };
+                let mut ready_events = if requested & LINUX_EPOLLET != 0 {
+                    (raw_ready & !interest.last_ready) | read_growth
+                } else {
+                    raw_ready
+                };
+                if clear_write_backpressure {
+                    ready_events |= raw_ready & LINUX_EPOLLOUT;
+                }
+                crate::probes::epoll_interest(
+                    epfd,
+                    *fd,
+                    requested,
+                    raw_ready,
+                    interest.last_ready,
+                    ready_events,
+                );
+                if ready_events != 0 {
+                    let entry = acc.entry(*fd).or_insert((0, interest.event.data));
+                    entry.0 |= ready_events;
+                }
+            }
+
+            // (3) In-memory fds (no host fd): recompute readiness.
+            for (fd, interest) in &interests {
+                if host_ready_sampled.contains(fd) {
+                    continue;
+                }
                 // Host-fd fds are handled by the kqueue drain above — EXCEPT a
                 // named-FIFO read-end whose writer has closed: macOS kqueue won't
                 // report that (dispatch::fifo_beacon decides it via a kernel
@@ -2093,7 +2183,7 @@ impl SyscallDispatcher {
                     }
                 let requested = interest.event.events;
                 let raw_ready = this.epoll_ready_events(*fd, requested);
-                ready_updates.push((*fd, interest.reg_gen, raw_ready, false));
+                ready_updates.push((*fd, interest.reg_gen, raw_ready, 0, false));
                 let ready_events = if requested & LINUX_EPOLLET != 0 {
                     raw_ready & !interest.last_ready
                 } else {
@@ -2139,13 +2229,14 @@ impl SyscallDispatcher {
                         feature = "platform-netbsd"
                     ))]
                     let mut host_rearms: Vec<i32> = Vec::new();
-                    for (fd, reg_gen, raw, clear_write_backpressure) in ready_updates {
+                    for (fd, reg_gen, raw, read_avail, clear_write_backpressure) in ready_updates {
                         if let Some(slot) = interest.get_mut(&fd) {
                             if slot.reg_gen != reg_gen {
                                 continue;
                             }
                             let before = slot.last_ready;
                             slot.last_ready = raw;
+                            slot.last_read_avail = read_avail;
                             if clear_write_backpressure {
                                 slot.write_backpressured = false;
                             }

@@ -60,6 +60,7 @@ use super::{EpollKqueue, Fd, GuestPtr, inode_for_path, linux_mode};
 pub(super) struct EpollInterest {
     pub(super) event: LinuxEpollEvent,
     pub(super) last_ready: u32,
+    pub(super) last_read_avail: u64,
     /// Edge-triggered write side was attempted and returned EAGAIN after an
     /// earlier EPOLLOUT delivery. Keep the host write filter armed while still
     /// suppressing immediate sampled OUT redelivery; the next host write event
