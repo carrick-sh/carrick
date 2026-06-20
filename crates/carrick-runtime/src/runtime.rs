@@ -1219,6 +1219,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     // split runtimes; the threaded runtime keeps its own fork-quiesce handling.
     let mut signal_wait_deadline = None;
     let mut sleep_deadline: Option<Instant> = None;
+    let mut poll_deadline: Option<Instant> = None;
     loop {
         let outcome =
             dispatch_with_panic_backstop(request.number, std::process::id() as ThreadId, || {
@@ -1322,6 +1323,21 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 block_signals,
             } => {
                 waiter.ensure_full();
+                let timeout = match timeout {
+                    Some(duration) => {
+                        let deadline =
+                            *poll_deadline.get_or_insert_with(|| Instant::now() + duration);
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(DispatchOutcome::Returned { value: on_timeout });
+                        }
+                        Some(deadline - now)
+                    }
+                    None => {
+                        poll_deadline = None;
+                        None
+                    }
+                };
                 match waiter.wait_poll(&fds, timeout, block_signals) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {

@@ -601,6 +601,10 @@ where
         // Monotonic deadline for a WaitOnSleep, established on first dispatch and
         // preserved across quiesce-park re-dispatch so the sleep isn't restarted.
         let mut sleep_deadline: Option<Instant> = None;
+        // Monotonic deadline for WaitOnPollFds, preserved across internal
+        // readiness re-sample retries so a finite guest epoll/pidfd wait is not
+        // restarted by the kqueue backstop.
+        let mut poll_deadline: Option<Instant> = None;
         loop {
             let request = SyscallRequest::from_raw(frame)
                 .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi());
@@ -745,6 +749,21 @@ where
                     block_signals,
                 } => {
                     self.waiter.ensure_full();
+                    let timeout = match timeout {
+                        Some(duration) => {
+                            let deadline =
+                                *poll_deadline.get_or_insert_with(|| Instant::now() + duration);
+                            let now = Instant::now();
+                            if now >= deadline {
+                                break Ok(DispatchOutcome::Returned { value: on_timeout });
+                            }
+                            Some(deadline - now)
+                        }
+                        None => {
+                            poll_deadline = None;
+                            None
+                        }
+                    };
                     match self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,

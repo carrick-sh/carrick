@@ -965,6 +965,21 @@ impl ThreadWaiter {
                 if self.should_interrupt(block_mask) {
                     return WaitResult::Interrupted;
                 }
+            } else if n == 0 {
+                if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                    return WaitResult::TimedOut;
+                }
+                if fds.is_empty() {
+                    continue;
+                }
+                // This is an internal retry point, not a guest-visible timeout:
+                // `WaitOnPollFds` is used for pollable readiness backends such as
+                // an epoll instance's kqueue fd. If the backend loses or spends a
+                // single wake edge while the watched fd remains ready, a long
+                // poll would otherwise sleep until the full guest deadline. Return
+                // Ready so the runtime re-dispatches the syscall and re-samples
+                // level readiness under the normal epoll latch.
+                return WaitResult::Ready;
             } else if n < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::EINTR) && self.should_interrupt(block_mask) {
@@ -1072,6 +1087,75 @@ mod tests {
         };
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
         assert_ne!(pollfd.revents & libc::POLLIN, 0);
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+    }
+
+    #[test]
+    fn unbounded_poll_wait_retries_after_backstop_slice() {
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let waiter = super::ThreadWaiter::new(7);
+            let result = waiter.wait_poll(&[super::WaitFd::raw(read_fd, libc::POLLIN)], None, 0);
+            let _ = tx.send(result);
+            unsafe {
+                libc::close(read_fd);
+            }
+        });
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("unbounded poll wait should return to let the dispatcher re-sample");
+        assert_eq!(result, super::WaitResult::Ready);
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+    }
+
+    #[test]
+    fn long_finite_poll_wait_retries_before_deadline() {
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let waiter = super::ThreadWaiter::new(7);
+            let result = waiter.wait_poll(
+                &[super::WaitFd::raw(read_fd, libc::POLLIN)],
+                Some(std::time::Duration::from_secs(60)),
+                0,
+            );
+            let _ = tx.send(result);
+            unsafe {
+                libc::close(read_fd);
+            }
+        });
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("long finite poll wait should retry before the guest deadline");
+        assert_eq!(result, super::WaitResult::Ready);
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+    }
+
+    #[test]
+    fn short_finite_poll_wait_observes_deadline() {
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let waiter = super::ThreadWaiter::new(7);
+
+        let result = waiter.wait_poll(
+            &[super::WaitFd::raw(fds[0], libc::POLLIN)],
+            Some(std::time::Duration::from_millis(10)),
+            0,
+        );
+
+        assert_eq!(result, super::WaitResult::TimedOut);
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
