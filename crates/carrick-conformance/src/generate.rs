@@ -41,11 +41,20 @@ const CPY_SMOKE: &[&str] = &[
 /// Go packages in the fast tier (proven MATCH).
 const GO_SMOKE: &[&str] = &["runtime", "sync", "context", "time"];
 
+/// CPython modules that make steady progress but exceed the default full-suite
+/// budget under the four-worker HVF matrix run.
+const CPYTHON_SLOW: &[&str] = &["test_tarfile"];
+
 /// Go packages whose test suites are CPU-bound-slow (not stuck) under nested
-/// KVM — toolchain subprocess churn (importers' compile/cgo) and bulk TLS
-/// handshakes — and need the larger budget (see the timeout comment at the
-/// suite construction site).
-const GO_SLOW: &[&str] = &["crypto/tls", "go/internal/srcimporter", "net/netip"];
+/// KVM or full-load HVF — toolchain subprocess churn (importers' compile/cgo),
+/// bulk TLS/HTTP handshakes, and large HTTP/2 test matrices — and need the
+/// larger budget (see the timeout comment at the suite construction site).
+const GO_SLOW: &[&str] = &[
+    "crypto/tls",
+    "go/internal/srcimporter",
+    "net/http",
+    "net/netip",
+];
 const GO_RUNTIME_SMOKE_RE: &str = "^(Test(FinalizerRegisterABI|UserArena.*|BitCursor|Callers.*|FPUnwindAfterRecovery|Chan|NonblockRecvRace|NonblockSelectRace2?|SelfSelect|SelectStress|SelectFairness|MultiConsumer|ShrinkStackDuringBlockedSend|NoShrinkStackWhileParking|SelectDuplicateChannel|SelectStackAdjust))$";
 /// LTP testcases in the fast tier (proven MATCH).
 const LTP_SMOKE: &[&str] = &[
@@ -60,6 +69,10 @@ const LTP_SMOKE: &[&str] = &[
     "gettimeofday01",
     "sched_getaffinity01",
 ];
+
+/// LTP binaries that are single manifests but multi-phase tests; the default
+/// 40 s syscall-family budget can kill them after valid progress.
+const LTP_SLOW: &[&str] = &["epoll-ltp"];
 
 /// LTP coverage is DENYLIST-based: every test binary in the image is a suite
 /// unless excluded here. (The original allowlist of syscall-family stems kept
@@ -110,6 +123,22 @@ fn ltp_stem(name: &str) -> &str {
         end -= 1;
     }
     &name[..end]
+}
+
+fn cpython_timeout_s(module: &str) -> u64 {
+    if CPYTHON_SLOW.contains(&module) {
+        600
+    } else {
+        300
+    }
+}
+
+fn go_timeout_s(pkg: &str) -> u64 {
+    if GO_SLOW.contains(&pkg) { 540 } else { 180 }
+}
+
+fn ltp_timeout_s(bin: &str) -> u64 {
+    if LTP_SLOW.contains(&bin) { 900 } else { 40 }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -280,7 +309,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             Regrtest,
             smoke(CPY_SMOKE.contains(&m.as_str())),
             Heavy,
-            300,
+            cpython_timeout_s(m),
             None,
             None,
         );
@@ -323,15 +352,11 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         } else {
             "Test"
         };
-        // CPU-bound toolchain/TLS suites proven slow-not-stuck under nested
-        // KVM: at the kvm lane's 2x scale, 540 gives the 1080 s ceiling the
-        // 6x-budget verification showed sufficient (560/560, 6/6, 268/268
-        // MATCH). docker and the hvf lane finish in seconds — upper bound only.
-        let timeout_s = if GO_SLOW.contains(&pkg.as_str()) {
-            540
-        } else {
-            180
-        };
+        // CPU-bound toolchain/TLS/HTTP suites proven slow-not-stuck under nested
+        // KVM or full-load HVF: at the kvm lane's 2x scale, 540 gives the
+        // 1080 s ceiling the 6x-budget verification showed sufficient. Docker
+        // and unloaded HVF usually finish much faster — upper bound only.
+        let timeout_s = go_timeout_s(pkg);
         suites.push(mk(
             format!("go-{binn}"),
             Go,
@@ -376,7 +401,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             VerdictKind::Ltp,
             smoke(LTP_SMOKE.contains(&b.as_str())),
             Light,
-            40,
+            ltp_timeout_s(b),
             None,
             None,
         );
@@ -407,4 +432,23 @@ pub fn generate_suites(out_path: &Path, check_only: bool) -> anyhow::Result<()> 
     std::fs::write(out_path, format!("{header}{body}"))?;
     eprintln!("wrote {} ({total} suites)", out_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_load_slow_suites_have_extended_budgets() {
+        assert_eq!(cpython_timeout_s("test_tarfile"), 600);
+        assert_eq!(go_timeout_s("net/http"), 540);
+        assert_eq!(ltp_timeout_s("epoll-ltp"), 900);
+    }
+
+    #[test]
+    fn ordinary_suites_keep_default_budgets() {
+        assert_eq!(cpython_timeout_s("test_json"), 300);
+        assert_eq!(go_timeout_s("net/url"), 180);
+        assert_eq!(ltp_timeout_s("gettid01"), 40);
+    }
 }
