@@ -1495,6 +1495,18 @@ pub mod host_signal {
         publish_pending_for, take_pending_for, take_pending_in_for,
     };
 
+    // The active backend's host-signal glue (Review-P1 #6 seam). One cfg-selected
+    // type alias replaces the per-function backend fanout below: every signal op
+    // is now ONE generic call through the shared `carrick_signal_core::host_glue`
+    // / `carrick_hal::signal_pump`, parameterized here. A new kick backend adds one
+    // line + a `HostSignalGlue` impl and inherits the whole shared driver.
+    #[cfg(feature = "platform-linux")]
+    pub(crate) type ActiveGlue = carrick_vmm_kvm::KvmGlue;
+    #[cfg(feature = "platform-freebsd")]
+    pub(crate) type ActiveGlue = carrick_vmm_bhyve::BhyveGlue;
+    #[cfg(feature = "platform-netbsd")]
+    pub(crate) type ActiveGlue = carrick_vmm_nvmm::NvmmGlue;
+
     // `has_pending_for` / `has_unblocked_pending_for` are NOT pure re-exports on
     // KVM: a cross-process guest signal may be sitting in the shared xsignal ring
     // (see `carrick_vmm_kvm::kvm_xsig`), so a waiter must also peek the ring. These
@@ -1576,46 +1588,19 @@ pub mod host_signal {
         // guards + stale self-pipe so the child's later `start_signal_pump`
         // re-arms a working pump (spawn-free — the spawn is the caller's
         // subsequent `start_signal_pump`). ----
-        #[cfg(feature = "platform-linux")]
-        carrick_vmm_kvm::kvm_signal_pump::reset_state_for_supervisor_fork();
-        #[cfg(feature = "platform-freebsd")]
-        carrick_vmm_bhyve::bhyve_signal_pump::reset_state_for_supervisor_fork();
-        #[cfg(feature = "platform-netbsd")]
-        carrick_vmm_nvmm::nvmm_signal_pump::reset_state_for_supervisor_fork();
+        carrick_hal::signal_pump::reset_state_for_supervisor_fork();
     }
     /// Translate a Linux (guest) signal number to the host kernel's number. On a
     /// Linux host this is identity (the numbers match); on a FreeBSD host the BSD
     /// numbering differs for several signals (SIGUSR1/2, SIGCHLD, SIGCONT/STOP/TSTP,
     /// SIGBUS, SIGURG, SIGIO, SIGSYS) so it routes through the bhyve table.
     pub fn linux_to_host_signum(sig: i32) -> i32 {
-        #[cfg(feature = "platform-linux")]
-        {
-            sig
-        }
-        #[cfg(feature = "platform-freebsd")]
-        {
-            carrick_vmm_bhyve::bhyve_signum::linux_to_host_signum(sig)
-        }
-        #[cfg(feature = "platform-netbsd")]
-        {
-            carrick_vmm_nvmm::nvmm_signum::linux_to_host_signum(sig)
-        }
+        carrick_signal_core::host_glue::glue_linux_to_host::<ActiveGlue>(sig)
     }
     /// Translate a host kernel signal number back to its Linux (guest) number.
     /// Identity on a Linux host; the inverse BSD table on FreeBSD.
     pub fn host_to_linux_signum(sig: i32) -> i32 {
-        #[cfg(feature = "platform-linux")]
-        {
-            sig
-        }
-        #[cfg(feature = "platform-freebsd")]
-        {
-            carrick_vmm_bhyve::bhyve_signum::host_to_linux_signum(sig)
-        }
-        #[cfg(feature = "platform-netbsd")]
-        {
-            carrick_vmm_nvmm::nvmm_signum::host_to_linux_signum(sig)
-        }
+        carrick_signal_core::host_glue::glue_host_to_linux::<ActiveGlue>(sig)
     }
     /// Resolve + REMOVE a child's `(parent_tid, exit_signal)` watch. Called by
     /// the dispatcher's synchronous terminal-reap path to CANCEL the async
@@ -1647,12 +1632,9 @@ pub mod host_signal {
     /// those signals after the emulated disposition was replaced. Delegates to the
     /// carrick-vmm-kvm glue (parallels HVF's reset).
     pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
-        #[cfg(feature = "platform-linux")]
-        carrick_vmm_kvm::kvm_disposition::reset_routed_handlers_after_execve(ignored_mask);
-        #[cfg(feature = "platform-freebsd")]
-        carrick_vmm_bhyve::bhyve_disposition::reset_routed_handlers_after_execve(ignored_mask);
-        #[cfg(feature = "platform-netbsd")]
-        carrick_vmm_nvmm::nvmm_disposition::reset_routed_handlers_after_execve(ignored_mask);
+        carrick_signal_core::host_glue::reset_routed_handlers_after_execve::<ActiveGlue>(
+            ignored_mask,
+        );
     }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
     /// neutral ring core (the nudge handler in `carrick_vmm_kvm::kvm_xsig` set the
@@ -1693,34 +1675,19 @@ pub mod host_signal {
     /// or KVM-claimed (pump/kick/nudge/SIGCHLD) signals. Delegates to the
     /// carrick-vmm-kvm glue, whose policy is the shared neutral host_disposition.
     pub fn ensure_host_handler(sig: i32) {
-        #[cfg(feature = "platform-linux")]
-        carrick_vmm_kvm::kvm_disposition::ensure_host_handler(sig);
-        #[cfg(feature = "platform-freebsd")]
-        carrick_vmm_bhyve::bhyve_disposition::ensure_host_handler(sig);
-        #[cfg(feature = "platform-netbsd")]
-        carrick_vmm_nvmm::nvmm_disposition::ensure_host_handler(sig);
+        carrick_signal_core::host_glue::ensure_host_handler::<ActiveGlue>(sig);
     }
     /// Mirror a guest `SIG_IGN` onto the HOST disposition so a sibling guest
     /// process's host `kill` is DROPPED (honoring the guest's ignore) instead of
     /// host-default-terminating us. No-op for non-routable / KVM-claimed signals.
     pub fn set_host_ignore(sig: i32) {
-        #[cfg(feature = "platform-linux")]
-        carrick_vmm_kvm::kvm_disposition::set_host_ignore(sig);
-        #[cfg(feature = "platform-freebsd")]
-        carrick_vmm_bhyve::bhyve_disposition::set_host_ignore(sig);
-        #[cfg(feature = "platform-netbsd")]
-        carrick_vmm_nvmm::nvmm_disposition::set_host_ignore(sig);
+        carrick_signal_core::host_glue::set_host_ignore::<ActiveGlue>(sig);
     }
     /// Reset a mirrored signal's HOST disposition to `SIG_DFL` (the guest reset it
     /// to default): clear any host SIG_IGN / routed handler mirrored earlier and
     /// possibly INHERITED across fork, so the host no longer swallows the signal.
     pub fn set_host_default(linux_signum: i32) {
-        #[cfg(feature = "platform-linux")]
-        carrick_vmm_kvm::kvm_disposition::set_host_default(linux_signum);
-        #[cfg(feature = "platform-freebsd")]
-        carrick_vmm_bhyve::bhyve_disposition::set_host_default(linux_signum);
-        #[cfg(feature = "platform-netbsd")]
-        carrick_vmm_nvmm::nvmm_disposition::set_host_default(linux_signum);
+        carrick_signal_core::host_glue::set_host_default::<ActiveGlue>(linux_signum);
     }
     /// Enqueue a cross-process guest signal into the shared `MAP_SHARED` xsignal
     /// ring (inherited across `fork`, so every carrick process shares ONE ring).
@@ -1738,12 +1705,7 @@ pub mod host_signal {
     /// — host `SIGRTMIN+1`, a pure wakeup whose handler marks the ring dirty +
     /// kicks the target's vCPUs out of `KVM_RUN` (see `carrick_vmm_kvm::kvm_xsig`).
     pub fn xsig_nudge(target_host: i32) {
-        #[cfg(feature = "platform-linux")]
-        carrick_vmm_kvm::kvm_xsig::xsig_nudge(target_host);
-        #[cfg(feature = "platform-freebsd")]
-        carrick_vmm_bhyve::bhyve_xsig::xsig_nudge(target_host);
-        #[cfg(feature = "platform-netbsd")]
-        carrick_vmm_nvmm::nvmm_xsig::xsig_nudge(target_host);
+        carrick_signal_core::host_glue::xsig_nudge::<ActiveGlue>(target_host);
     }
     /// No kqueue signal pump on Linux. Returning -1 makes the `setitimer`
     /// dispatch path (the only caller) skip the EVFILT_TIMER arming and use the
@@ -2029,20 +1991,9 @@ pub mod io_wait {
     /// artifact, never guest-visible state. Mirrored by an equality test in
     /// `carrick-vmm-kvm` (`kvm_disposition`'s claimed-signal tests).
     pub fn is_internal_kick_signal(signum: i32) -> bool {
-        #[cfg(feature = "platform-linux")]
-        {
-            signum == libc::SIGRTMIN() || signum == libc::SIGRTMIN() + 1
-        }
-        #[cfg(feature = "platform-freebsd")]
-        {
-            signum == carrick_vmm_bhyve::kick_signal()
-                || signum == carrick_vmm_bhyve::bhyve_xsig::nudge_signum()
-        }
-        #[cfg(feature = "platform-netbsd")]
-        {
-            signum == carrick_vmm_nvmm::nvmm_kicker::kick_signal()
-                || signum == carrick_vmm_nvmm::nvmm_xsig::nudge_signum()
-        }
+        use crate::host_signal::ActiveGlue;
+        use carrick_signal_core::HostSignalGlue;
+        signum == ActiveGlue::kick_signal() || signum == ActiveGlue::nudge_signum()
     }
 
     /// Peek (`WNOWAIT`) whether child `pid` sits in a ptrace signal-delivery
