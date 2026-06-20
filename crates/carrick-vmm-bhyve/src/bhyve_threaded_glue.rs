@@ -11,10 +11,13 @@
 //! initialising the cross-process xsignal ring + its nudge handler.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use carrick_hal::{HostForkCoordinator, PlatformFutex, PreparedHostFork, VcpuRegistry};
 
 use crate::bhyve_kicker::install_bhyve_kick_handler;
+
+static SIGNAL_PUMP_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
 pub struct BhyveForkCoordinator;
@@ -34,6 +37,7 @@ impl BhyveForkCoordinator {
     fn ensure_handler_installed(&self) {
         install_bhyve_kick_handler();
         crate::bhyve_xsig::init_xsig();
+        SIGNAL_PUMP_INSTALLED.store(true, Ordering::SeqCst);
     }
 }
 
@@ -53,9 +57,11 @@ impl HostForkCoordinator for BhyveForkCoordinator {
         // like the KVM/HVF coordinator (the pump takes process-global locks on every
         // wake; a fork that does not first join it can hand the child a held mutex).
         let was_running = crate::bhyve_signal_pump::stop_pump_for_fork();
-        PreparedHostFork {
-            had_signal_pump: was_running,
+        let had_signal_pump = was_running || SIGNAL_PUMP_INSTALLED.load(Ordering::SeqCst);
+        if had_signal_pump {
+            crate::bhyve_signal_pump::block_pump_signals_for_fork();
         }
+        PreparedHostFork { had_signal_pump }
     }
 
     fn restart_after_parent_fork(
@@ -71,6 +77,7 @@ impl HostForkCoordinator for BhyveForkCoordinator {
         if prepared.had_signal_pump || child_exit_needs_signal_pump {
             self.start_signal_pump(registry, futex);
         }
+        crate::bhyve_signal_pump::restore_pump_signals_after_fork();
     }
 
     fn restart_after_child_fork(
@@ -90,6 +97,7 @@ impl HostForkCoordinator for BhyveForkCoordinator {
         // `PUMP_STARTED == true` guard. `reinit_after_fork` resets the guard, closes
         // the stale write fd, and spawns a fresh pipe + pump thread for this child.
         crate::bhyve_signal_pump::reinit_after_fork(registry, futex);
+        crate::bhyve_signal_pump::restore_pump_signals_after_fork();
     }
 
     fn restart_after_fork_error(
@@ -102,6 +110,7 @@ impl HostForkCoordinator for BhyveForkCoordinator {
         if prepared.had_signal_pump {
             self.start_signal_pump(registry, futex);
         }
+        crate::bhyve_signal_pump::restore_pump_signals_after_fork();
     }
 }
 
