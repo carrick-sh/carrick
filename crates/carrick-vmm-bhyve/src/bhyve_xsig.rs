@@ -1,150 +1,36 @@
-//! bhyve glue for the cross-process explicit-signal ring ("xsignal ring") — the
-//! FreeBSD mirror of [`carrick_vmm_kvm::kvm_xsig`] (SP4.2).
-//!
-//! ## Why a ring, not a native cross-process queue
-//!
-//! A bhyve guest `fork` is a real `libc::fork()`: parent and child are SEPARATE
-//! host processes, each a hypervisor driving its own guest. A native host signal
-//! to a sibling host process does NOT carry the *guest* signal semantics — the
-//! host process is carrick, not the guest. So carrick uses the SAME shared-memory
-//! ring HVF and KVM use. The neutral ring core lives in
-//! [`carrick_signal_core::xsig`] (the `MAP_SHARED|MAP_ANON` ring inherited across
-//! `fork`, so every carrick process shares ONE ring). This module owns only the
-//! bhyve GLUE:
-//!   * the nudge SIGNAL number ([`nudge_signum`]),
-//!   * the `kill`-the-target nudge ([`xsig_nudge`]),
-//!   * the async-signal-safe nudge handler ([`xsig_nudge_handler`]) that marks the
-//!     ring dirty + wakes the signal pump, and
-//!   * the idempotent init/install ([`init_xsig`]).
-//!
-//! The sender writes a ring slot and `kill`s the target with the NUDGE signal — a
-//! pure wakeup that NEVER injects itself as a guest signal. The receiver's nudge
-//! handler sets the ring dirty flag and pokes the pump (so every vCPU is kicked
-//! out of `vm_run`); the runtime then drains the ring in dispatch context and
-//! re-injects each guest signal WITH the sender's siginfo (preserving `si_value`).
+//! bhyve glue for the cross-process xsignal ring — now a thin forwarder to the
+//! SHARED [`carrick_signal_core::host_glue`], parameterized by [`crate::BhyveGlue`].
+//! The ring core ([`carrick_signal_core::xsig`]) was always neutral; the nudge
+//! handler + install + `kill`-the-target are now shared too. (The runtime calls
+//! the shared `host_glue::xsig_nudge` directly after the #6 cfg-flip.)
 
-use std::os::raw::c_int;
-use std::sync::Once;
+use carrick_signal_core::HostSignalGlue;
+use carrick_signal_core::host_glue;
 
-use crate::bhyve_kicker::kick_signal;
+use crate::BhyveGlue;
 
-/// The host signal carrick uses to NUDGE a sibling process to drain its xsignal
-/// ring. Must differ from:
-///   * the vCPU kick ([`crate::bhyve_kicker::kick_signal`] = FreeBSD `SIGRTMIN`
-///     = 65): a nudge landing on the kick number would fire the kick no-op, which
-///     does NOT mark the ring dirty — so `xsig_has_pending()` stays false and the
-///     drain is skipped; and
-///   * the pump's host signals (`SIGHUP`/`SIGINT`/`SIGQUIT`/`SIGTERM`, see
-///     [`crate::bhyve_signal_pump`]): the pump handler would mark THAT number as a
-///     pending GUEST signal.
-///
-/// FreeBSD `SIGRTMIN` is the fixed `#define` 65 (see [`kick_signal`]); `+1` (66)
-/// satisfies both. It is fine if the guest ALSO uses guest-signal-`SIGRTMIN+1`:
-/// guest signals travel in the RING; the host nudge is ONLY ever a wakeup — its
-/// handler never injects itself as a guest signal.
-#[inline]
+/// The host signal carrick uses to NUDGE a sibling process (the kick signal + 1).
 pub fn nudge_signum() -> i32 {
-    kick_signal() + 1
+    BhyveGlue::nudge_signum()
 }
 
-/// Whether the host signal `host_signum` is the xsignal nudge. Parity with KVM/HVF.
+/// Whether `host_signum` is the xsignal nudge.
 #[allow(dead_code)]
 pub fn is_xsig_nudge(host_signum: i32) -> bool {
-    host_signum == nudge_signum()
+    host_signum == BhyveGlue::nudge_signum()
 }
 
-/// Nudge `target_host_pid` to drain its xsignal entries (host `SIGRTMIN+1`).
+/// Nudge `target_host_pid` to drain its xsignal entries.
 pub fn xsig_nudge(target_host_pid: i32) {
-    // SAFETY: kill(2) with a pid and a valid signal. A nudge to a dead pid returns
-    // ESRCH, which we ignore (the slot the sender wrote is simply never drained —
-    // the same outcome as the receiver having already exited).
-    unsafe {
-        libc::kill(target_host_pid, nudge_signum());
-    }
+    host_glue::xsig_nudge::<BhyveGlue>(target_host_pid);
 }
 
-/// The xsignal nudge handler: a sibling carrick process queued a guest signal for
-/// us in the shared ring. ASYNC-SIGNAL-SAFE ONLY — it does exactly two things,
-/// both safe from a signal handler:
-///   1. `mark_xsig_dirty()` — a single atomic store (sets the ring dirty flag), so
-///      `xsig_has_pending()` becomes true and the dispatcher drains the ring.
-///   2. `bhyve_signal_pump::poke()` — one `write(2)` to the pump's self-pipe, so
-///      the pump's `kick_all` fans every vCPU out of `vm_run` and each re-checks
-///      pending at its safe point (`deliver_pending_signal`).
-///
-/// NOTHING else (no locks, allocation, or `println!`).
-extern "C" fn xsig_nudge_handler(_sig: c_int) {
-    carrick_signal_core::xsig::mark_xsig_dirty();
-    crate::bhyve_signal_pump::poke();
-}
-
-/// Guards the one-time install of the nudge `sigaction`.
-static NUDGE_HANDLER_INSTALLED: Once = Once::new();
-
-/// Install the [`nudge_signum`] handler ONCE (idempotent). Installed with
-/// `sa_flags = 0` — crucially WITHOUT `SA_RESTART`, like the kick — so a nudge
-/// that lands DIRECTLY on a vCPU thread also EINTRs its in-progress `vm_run` (the
-/// pump poke covers the common case; the direct-EINTR is a belt-and-braces fast
-/// path). The mask is empty.
+/// Install the nudge handler (idempotent via the shared `Once`).
 pub fn install_xsig_nudge_handler() {
-    NUDGE_HANDLER_INSTALLED.call_once(|| {
-        // SAFETY: a zeroed `sigaction` is the documented "no flags, empty mask"
-        // form; we set the handler fn, an empty mask, and sa_flags = 0 (NO
-        // SA_RESTART). `xsig_nudge_handler` is a valid `extern "C"` handler.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = xsig_nudge_handler as *const () as libc::sighandler_t;
-            libc::sigemptyset(&mut action.sa_mask);
-            action.sa_flags = 0; // NO SA_RESTART — a direct nudge must EINTR vm_run.
-            libc::sigaction(nudge_signum(), &action, std::ptr::null_mut());
-        }
-    });
+    host_glue::install_xsig_nudge_handler::<BhyveGlue>();
 }
 
-/// Initialise the xsignal ring + install the nudge handler. Idempotent. MUST run
-/// pre-fork so the `MAP_SHARED` ring is created before `libc::fork` and inherited
-/// by every child. `xsig_init` no-ops on an already-mapped (e.g. inherited) ring,
-/// and the handler install is `Once`-guarded, so the post-fork re-assert is free.
+/// Initialise the xsignal ring + install the nudge handler. MUST run pre-fork.
 pub fn init_xsig() {
-    carrick_signal_core::xsig::xsig_init();
-    install_xsig_nudge_handler();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The nudge signal must be DISTINCT from the vCPU kick (FreeBSD `SIGRTMIN`
-    /// = 65): a nudge landing on the kick number would fire the no-op kick handler,
-    /// which never marks the ring dirty, so the drain would be skipped.
-    #[test]
-    fn nudge_distinct_from_kick() {
-        assert_ne!(
-            nudge_signum(),
-            kick_signal(),
-            "the xsig nudge must not collide with the vCPU kick signal"
-        );
-        assert_eq!(nudge_signum(), 66, "FreeBSD SIGRTMIN(65)+1");
-    }
-
-    /// The nudge signal must be DISTINCT from every pumped host signal
-    /// (SIGHUP/INT/QUIT/TERM): those numbers are marked as PENDING GUEST signals
-    /// by the pump handler, which is wrong for a pure wakeup.
-    #[test]
-    fn nudge_distinct_from_pump_signals() {
-        for &s in &[libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
-            assert_ne!(
-                nudge_signum(),
-                s,
-                "the xsig nudge must not collide with a pumped host signal"
-            );
-        }
-    }
-
-    /// `is_xsig_nudge` recognises the nudge number and rejects the kick number.
-    #[test]
-    fn is_xsig_nudge_matches_only_the_nudge() {
-        assert!(is_xsig_nudge(nudge_signum()));
-        assert!(!is_xsig_nudge(kick_signal()));
-    }
+    host_glue::init_xsig::<BhyveGlue>();
 }

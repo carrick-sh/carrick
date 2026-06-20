@@ -25,6 +25,8 @@ pub mod nvmm;
 pub mod nvmm_disposition;
 mod nvmm_futex;
 pub mod nvmm_kicker;
+pub mod nvmm_signal_backend;
+pub use nvmm_signal_backend::NvmmGlue;
 pub mod nvmm_signal_pump;
 pub mod nvmm_signum;
 pub mod nvmm_threaded_glue;
