@@ -78,6 +78,9 @@ impl VerdictParser for LtpParser {
         //       Enter/Exit-block trail, mmap10's iteration log). A real crash
         //       exits non-zero (or 124/137, handled above) and stays Empty.
         if !tier1 && passed + failed + broken + conf == 0 {
+            if text.contains("tst_exit: not found") {
+                broken = 1;
+            }
             for line in text.lines() {
                 if line.contains("FAILED") {
                     failed += 1;
@@ -180,6 +183,15 @@ mod tests {
     fn empty_is_empty() {
         let r = LtpParser.parse(&raw("nothing here\n"));
         assert_eq!(r.result, SuiteOutcome::Empty);
+    }
+
+    #[test]
+    fn missing_ltp_shell_helper_is_broken() {
+        let mut out = raw("/opt/ltp/testcases/bin/test_ioctl: 59: tst_exit: not found\n");
+        out.exit_code = 127;
+        let r = LtpParser.parse(&out);
+        assert_eq!(r.result, SuiteOutcome::Failure);
+        assert_eq!(r.ids.get("summary"), Some(&Outcome::Broken));
     }
 
     #[test]
