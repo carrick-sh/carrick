@@ -373,21 +373,24 @@ fn mem_debug(op: &str, ram: &GuestRam, address: u64, length: usize) {
 }
 
 impl GuestMemory for KvmTrapEngine {
-    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        // The PROT_NONE gate (a syscall buffer overlapping a PROT_NONE range
-        // faults EFAULT even though the host backing is accessible — C2 host-side
-        // check) AND the single-region whole-range lookup are the SHARED neutral
-        // gate (`safe_access_translated`). The PROT_NONE check stays keyed on the
-        // guest VA (`address`), while the backing lookup uses the stage-1
-        // translation (`ipa`) so a `repoint_private` overlay / high-VA alias
-        // resolves to the page the guest's OWN EL0 accesses hit — NOT the stale
-        // shared-aperture backing the VA still covers. Identity VAs: ipa==address,
-        // so this is byte-identical (and skips the walk). Both failure modes map
-        // to OutOfBounds (→ EFAULT), unchanged; the copy stays glue.
+    /// The PROT_NONE set the shared default `read_bytes`/`write_bytes` gate on
+    /// (keyed on the guest VA). KVM's old hand-rolled gate inside
+    /// `safe_access_translated` folds into it; `*_raw` does the IPA-translated
+    /// backing lookup only.
+    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+        Some(self.ram.protections_ref())
+    }
+
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        // PROT_NONE was gated on the guest VA in the default `read_bytes`; here we
+        // do the IPA-translated single-region lookup so a `repoint_private`
+        // overlay / high-VA alias resolves to the page the guest's OWN EL0 accesses
+        // hit — NOT the stale shared-aperture backing the VA still covers. Identity
+        // VAs: ipa==address (skips the walk). The copy stays glue.
         let ipa = self.syscall_buffer_ipa(address, length);
         let host = self
             .ram
-            .safe_access_translated(address, ipa, length)
+            .safe_access_translated_raw(address, ipa, length)
             .map_err(|e| {
                 mem_debug("read", &self.ram, ipa, length);
                 e.map_to_memory_error(address, length)
@@ -401,15 +404,16 @@ impl GuestMemory for KvmTrapEngine {
         Ok(out)
     }
 
-    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
-        // PROT_NONE on the guest VA; backing lookup on the translated IPA (see
-        // `read_bytes`). For a `repoint_private` overlay the syscall write lands
-        // in the PRIVATE overlay backing the guest reads, not the shared aperture.
+        // PROT_NONE gated on the guest VA in the default `write_bytes`; backing
+        // lookup on the translated IPA (see `read_bytes_raw`). For a
+        // `repoint_private` overlay the syscall write lands in the PRIVATE overlay
+        // backing the guest reads, not the shared aperture.
         let ipa = self.syscall_buffer_ipa(address, length);
         let host = self
             .ram
-            .safe_access_translated(address, ipa, length)
+            .safe_access_translated_raw(address, ipa, length)
             .map_err(|e| {
                 mem_debug("write", &self.ram, ipa, length);
                 e.map_to_memory_error(address, length)

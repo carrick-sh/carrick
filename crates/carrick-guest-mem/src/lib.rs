@@ -111,16 +111,84 @@ pub struct X8664SyscallFrame {
 /// backend may be the real HVF-backed address space or the in-memory
 /// `LinearMemory` used by unit tests.
 pub trait GuestMemory {
-    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError>;
-    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError>;
+    /// The process-wide PROT_NONE set this backend enforces on the syscall path,
+    /// or `None` for a modelless backend (the in-memory test models). When
+    /// `Some`, the default [`read_bytes`](Self::read_bytes) /
+    /// [`write_bytes`](Self::write_bytes) fault any buffer overlapping a recorded
+    /// range with `EFAULT` BEFORE touching backing — the single shared host-side
+    /// gate every real backend (HVF, KVM, and every x86 VMM) inherits for free.
+    /// A new backend gets the gate just by surfacing its protections here.
+    fn protections(&self) -> Option<&protections::MemoryProtections> {
+        None
+    }
 
-    /// Read exactly `dst.len()` bytes at `address` into `dst`, without
-    /// allocating. Default: delegate to `read_bytes` + copy (the in-memory test
+    /// PERMISSION-CHECKED guest read. DEFAULT: run the PROT_NONE gate
+    /// (`protections()`), then delegate to [`read_bytes_raw`](Self::read_bytes_raw).
+    /// Backends must NOT override this — implement `read_bytes_raw` instead so the
+    /// one shared gate always runs.
+    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        if length > 0
+            && self
+                .protections()
+                .is_some_and(|p| p.range_no_access(address, length))
+        {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
+        self.read_bytes_raw(address, length)
+    }
+
+    /// PERMISSION-CHECKED guest write. DEFAULT: PROT_NONE gate then
+    /// [`write_bytes_raw`](Self::write_bytes_raw). (The per-mapping WRITE
+    /// permission gate is backend-local; HVF enforces it inside `write_bytes_raw`.)
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if !bytes.is_empty()
+            && self
+                .protections()
+                .is_some_and(|p| p.range_no_access(address, bytes.len()))
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
+        self.write_bytes_raw(address, bytes)
+    }
+
+    /// Backing-only read: copy `length` bytes at `address` from the physical
+    /// backing, WITHOUT the PROT_NONE gate (the default `read_bytes` already ran
+    /// it). Real backends implement the host-pointer copy here; the test models
+    /// copy out of their flat buffer. May still fault OUT-OF-BOUNDS / NULL-guard /
+    /// reserved-page semantics — those are backing facts, not PROT_NONE.
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError>;
+
+    /// Backing-only write, no PROT_NONE gate. HVF additionally enforces the
+    /// guest-visible WRITE permission here (a read-only mapping → EFAULT).
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError>;
+
+    /// Read exactly `dst.len()` bytes at `address` into `dst`. DEFAULT: run the
+    /// PROT_NONE gate once, then delegate to [`read_into_raw`](Self::read_into_raw).
+    /// Do not override — override `read_into_raw` for a no-alloc fast path.
+    fn read_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        if !dst.is_empty()
+            && self
+                .protections()
+                .is_some_and(|p| p.range_no_access(address, dst.len()))
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: dst.len(),
+            });
+        }
+        self.read_into_raw(address, dst)
+    }
+
+    /// Backing-only fixed-size read into `dst`, no PROT_NONE gate (the default
+    /// `read_into` ran it). Default: `read_bytes_raw` + copy (the in-memory test
     /// backend has nothing to gain). The HVF backend overrides this to
     /// `volatile`-copy straight into `dst`, removing the per-call `Vec` on the
     /// hot fixed-size-read path (`read_u32`/`read_u64`/struct-header reads).
-    fn read_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
-        let bytes = self.read_bytes(address, dst.len())?;
+    fn read_into_raw(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        let bytes = self.read_bytes_raw(address, dst.len())?;
         dst.copy_from_slice(&bytes);
         Ok(())
     }
@@ -133,7 +201,7 @@ pub trait GuestMemory {
     /// in-memory backend and the KVM backend model no such distinction). The HVF
     /// backend overrides this to its unchecked writer.
     fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.write_bytes(address, bytes)
+        self.write_bytes_raw(address, bytes)
     }
 
     /// Zero `[address, address+len)` in the PHYSICAL backing, bypassing the
@@ -146,7 +214,9 @@ pub trait GuestMemory {
     /// `write_bytes` (the in-memory backend models no protection, so it always
     /// writes); the HVF backend overrides this to write the host backing raw.
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.write_bytes(address, &vec![0u8; len])
+        // Raw write: scrubbing a reused PROT_NONE / unmapped region must bypass
+        // the gate (the checked path would EFAULT and leave stale bytes).
+        self.write_bytes_raw(address, &vec![0u8; len])
     }
 
     /// Whether every byte of `[address, address+length)` is currently guest-WRITABLE
