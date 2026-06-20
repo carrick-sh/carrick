@@ -132,6 +132,24 @@ where
                 // otherwise hit HV_NO_RESOURCES here. Done OUTSIDE the topology
                 // lock so a fork in flight isn't stalled behind a full gate.
                 E::wait_for_vcpu_slot();
+                // M:N admission: borrow a vCPU slot from the scheduler (blocks if
+                // the backend's N-slot pool is full; a Noop no-op on HVF/KVM). The
+                // lease names the vCPU id the backend reads via `current_slot()`; an
+                // RAII guard frees it on EVERY exit path (including the early
+                // `!is_live` return below) except a full-process `_exit`, where
+                // process death frees it anyway.
+                let lease = carrick_hal::vcpu_sched::global().acquire(tid as u64);
+                carrick_hal::vcpu_sched::set_current_lease(lease);
+                struct SlotGuard;
+                impl Drop for SlotGuard {
+                    fn drop(&mut self) {
+                        if let Some(l) = carrick_hal::vcpu_sched::take_current_lease() {
+                            carrick_hal::vcpu_sched::global()
+                                .release(l, carrick_hal::vcpu_sched::Yield::Exited);
+                        }
+                    }
+                }
+                let _slot_guard = SlotGuard;
                 // Build the vCPU + register it in the kicker UNDER the topology
                 // lock, so this is atomic w.r.t. a fork's VM teardown.
                 let topo = crate::fork_quiesce::topology_lock()
