@@ -24,9 +24,13 @@
 //! `THREAD_PENDING` is touched only from normal dispatch context (a host handler
 //! can't name a guest tid), so a plain `Mutex` is safe there.
 
+pub mod backend;
 pub mod child_watch;
 pub mod host_disposition;
+pub mod host_glue;
 pub mod xsig;
+
+pub use backend::HostSignalGlue;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
