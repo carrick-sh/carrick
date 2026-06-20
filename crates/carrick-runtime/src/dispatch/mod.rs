@@ -5741,6 +5741,140 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn epoll_et_repolls_host_level_when_mux_misses_wake() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+        let pair_addr = h.reserve(8);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let reader = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let writer = i32::from_le_bytes(pair[4..8].try_into().unwrap());
+
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(reader as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, ev_addr, 0, 0],
+            )),
+            0
+        );
+
+        let byte_addr = h.put_bytes(b"x");
+        assert_eq!(
+            returned(h.call(64, [writer as u64, byte_addr, 1, 0, 0, 0])),
+            1
+        );
+
+        let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+        {
+            let open = epoll_open.description.read();
+            let OpenDescription::Epoll { kqueue, .. } = &*open else {
+                panic!("epfd should be an epoll description");
+            };
+            let host_fd = h
+                .dispatcher
+                .host_fd_for_poll(reader)
+                .expect("reader should be host-backed");
+            kqueue.with_mux(|mux| {
+                mux.deregister(host_fd)
+                    .expect("test setup should remove host wake filter");
+            });
+        }
+
+        let out_addr = h.reserve(16);
+        let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+        assert_eq!(
+            n, 1,
+            "epoll_pwait must resample host fd levels when the host wake edge is stale"
+        );
+        let out = h.memory.read_bytes(out_addr, 16).unwrap();
+        let events = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        assert_ne!(events & LINUX_EPOLLIN, 0);
+        assert_eq!(data, reader as u64);
+    }
+
+    #[test]
+    fn epoll_et_delivers_new_host_edge_while_level_still_ready() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+        let pair_addr = h.reserve(8);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let reader = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let writer = i32::from_le_bytes(pair[4..8].try_into().unwrap());
+
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(reader as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, reader as u64, ev_addr, 0, 0],
+            )),
+            0
+        );
+
+        let first_addr = h.put_bytes(b"a");
+        assert_eq!(
+            returned(h.call(64, [writer as u64, first_addr, 1, 0, 0, 0])),
+            1
+        );
+        let out_addr = h.reserve(16);
+        assert_eq!(returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])), 1);
+
+        let second_addr = h.put_bytes(b"b");
+        assert_eq!(
+            returned(h.call(64, [writer as u64, second_addr, 1, 0, 0, 0])),
+            1
+        );
+        let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+        assert_eq!(
+            n, 1,
+            "a new host ET edge must be delivered even while the fd remains level-readable"
+        );
+        let out = h.memory.read_bytes(out_addr, 16).unwrap();
+        let events = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        assert_ne!(events & LINUX_EPOLLIN, 0);
+        assert_eq!(data, reader as u64);
+    }
+
+    #[test]
     fn epoll_et_write_eagain_after_partial_write_keeps_write_filter_armed() {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
