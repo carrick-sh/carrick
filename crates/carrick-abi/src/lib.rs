@@ -2215,6 +2215,12 @@ pub const CARRICK_PRIVATE_X86_POLL: u64 = u64::MAX - 0x28;
 /// number routes select to the pselect6 handler's select branch, which reads
 /// the timeout as a timeval and uses no sigmask.
 pub const CARRICK_PRIVATE_X86_SELECT: u64 = u64::MAX - 0x29;
+/// Carrick-internal normalized syscall number for x86_64 `alarm(2)`.
+///
+/// x86_64 exposes legacy `alarm(seconds)` as syscall 37, while asm-generic has
+/// no canonical `alarm` entry. Route it privately so glibc/CPython can use the
+/// same interval-timer state and SIGALRM delivery path as `setitimer`.
+pub const CARRICK_PRIVATE_X86_ALARM: u64 = u64::MAX - 0x2a;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
