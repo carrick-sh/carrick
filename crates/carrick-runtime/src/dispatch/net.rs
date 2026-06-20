@@ -241,7 +241,7 @@ impl SyscallDispatcher {
                     host_fd,
                     pack_epoll_udata(sfd, sgen),
                     union_interest,
-                    epoll_trigger_mode(union_events),
+                    epoll_host_trigger_mode(union_events),
                 );
             }
             None => {
@@ -1280,6 +1280,7 @@ impl SyscallDispatcher {
         // Keep the host socket non-blocking; Linux-visible blocking intent is
         // carried by status_flags and serviced by WaitOnFds.
         set_host_nonblocking(new_host);
+        widen_unix_stream_buffers(new_host, family, type_);
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::with_host_fd(
@@ -1681,7 +1682,7 @@ impl SyscallDispatcher {
                                 host_fd,
                                 pack_epoll_udata(fd, reg_gen),
                                 Self::epoll_effective_interest(ev_events, 0, false),
-                                epoll_trigger_mode(ev_events),
+                                epoll_host_trigger_mode(ev_events),
                             );
                         });
                         crate::event_ring::rec(
@@ -1726,7 +1727,7 @@ impl SyscallDispatcher {
                                 host_fd,
                                 pack_epoll_udata(fd, reg_gen),
                                 Self::epoll_effective_interest(event.events, 0, false),
-                                epoll_trigger_mode(event.events),
+                                epoll_host_trigger_mode(event.events),
                             );
                         });
                     }
@@ -1794,7 +1795,7 @@ impl SyscallDispatcher {
                                         host_fd,
                                         pack_epoll_udata(sfd, sgen),
                                         epoll_interest_for(union_events),
-                                        epoll_trigger_mode(union_events),
+                                        epoll_host_trigger_mode(union_events),
                                     );
                                 }
                                 None => {
@@ -1909,7 +1910,7 @@ impl SyscallDispatcher {
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
-            let mut ready_updates: Vec<(i32, u32, u32, u64, bool)> = Vec::new();
+            let mut ready_updates: Vec<(i32, u32, u32, Option<u64>, bool)> = Vec::new();
             let mut host_ready_sampled = std::collections::HashSet::<i32>::new();
             const READ_READY_BITS: u32 =
                 LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLHUP | LINUX_EPOLLERR;
@@ -2063,19 +2064,11 @@ impl SyscallDispatcher {
                                 };
                                 let clear_write_backpressure =
                                     write_backpressured && raw & LINUX_EPOLLOUT != 0;
-                                ready_updates.push((
-                                    gfd,
-                                    reg_gen,
-                                    raw,
-                                    observed_read_avail,
-                                    clear_write_backpressure,
-                                ));
                                 let read_growth = if requested & LINUX_EPOLLET != 0
-                                    && edge_bits & READ_READY_BITS != 0
                                     && raw & READ_READY_BITS != 0
                                     && observed_read_avail > last_read_avail
                                 {
-                                    raw & edge_bits & READ_READY_BITS
+                                    raw & READ_READY_BITS
                                 } else {
                                     0
                                 };
@@ -2087,6 +2080,20 @@ impl SyscallDispatcher {
                                 if clear_write_backpressure {
                                     ready_events |= raw & LINUX_EPOLLOUT;
                                 }
+                                let read_avail_update = if raw & READ_READY_BITS == 0 {
+                                    Some(0)
+                                } else if ready_events & READ_READY_BITS != 0 {
+                                    Some(observed_read_avail)
+                                } else {
+                                    None
+                                };
+                                ready_updates.push((
+                                    gfd,
+                                    reg_gen,
+                                    raw,
+                                    read_avail_update,
+                                    clear_write_backpressure,
+                                ));
                                 crate::probes::epoll_interest(
                                     epfd,
                                     gfd,
@@ -2101,9 +2108,33 @@ impl SyscallDispatcher {
                                     && raw != 0
                                     && raw & last_ready != 0
                                 {
-                                    // Software-latched level readiness: the
-                                    // host filter is narrowed below, so the
-                                    // kqueue fd is safe to park on again.
+                                    #[cfg(any(
+                                        feature = "platform-macos",
+                                        feature = "platform-freebsd",
+                                        feature = "platform-netbsd"
+                                    ))]
+                                    {
+                                        // BSD host-fd registrations are kept
+                                        // level-triggered and the guest ET
+                                        // contract is enforced by last_ready.
+                                        // A level event that is fully masked by
+                                        // the software latch would make the
+                                        // instance kqueue fd immediately
+                                        // readable again, so park on the
+                                        // signal/backstop path instead.
+                                        filtered_ready_events += 1;
+                                    }
+                                    #[cfg(not(any(
+                                        feature = "platform-macos",
+                                        feature = "platform-freebsd",
+                                        feature = "platform-netbsd"
+                                    )))]
+                                    {
+                                        // Native epoll ET on Linux has no
+                                        // persistent level event to spin on
+                                        // here; a later edge will re-wake the
+                                        // instance.
+                                    }
                                 } else if raw != 0 {
                                     filtered_ready_events += 1;
                                 }
@@ -2142,13 +2173,6 @@ impl SyscallDispatcher {
                 };
                 let clear_write_backpressure =
                     interest.write_backpressured && raw_ready & LINUX_EPOLLOUT != 0;
-                ready_updates.push((
-                    *fd,
-                    interest.reg_gen,
-                    raw_ready,
-                    read_avail,
-                    clear_write_backpressure,
-                ));
                 let read_growth = if requested & LINUX_EPOLLET != 0
                     && raw_ready & READ_READY_BITS != 0
                     && read_avail > interest.last_read_avail
@@ -2165,6 +2189,20 @@ impl SyscallDispatcher {
                 if clear_write_backpressure {
                     ready_events |= raw_ready & LINUX_EPOLLOUT;
                 }
+                let read_avail_update = if raw_ready & READ_READY_BITS == 0 {
+                    Some(0)
+                } else if ready_events & READ_READY_BITS != 0 {
+                    Some(read_avail)
+                } else {
+                    None
+                };
+                ready_updates.push((
+                    *fd,
+                    interest.reg_gen,
+                    raw_ready,
+                    read_avail_update,
+                    clear_write_backpressure,
+                ));
                 crate::probes::epoll_interest(
                     epfd,
                     *fd,
@@ -2195,12 +2233,12 @@ impl SyscallDispatcher {
                     }
                 let requested = interest.event.events;
                 let raw_ready = this.epoll_ready_events(*fd, requested);
-                ready_updates.push((*fd, interest.reg_gen, raw_ready, 0, false));
                 let ready_events = if requested & LINUX_EPOLLET != 0 {
                     raw_ready & !interest.last_ready
                 } else {
                     raw_ready
                 };
+                ready_updates.push((*fd, interest.reg_gen, raw_ready, Some(0), false));
                 crate::probes::epoll_interest(
                     epfd,
                     *fd,
@@ -2248,7 +2286,9 @@ impl SyscallDispatcher {
                             }
                             let before = slot.last_ready;
                             slot.last_ready = raw;
-                            slot.last_read_avail = read_avail;
+                            if let Some(read_avail) = read_avail {
+                                slot.last_read_avail = read_avail;
+                            }
                             if clear_write_backpressure {
                                 slot.write_backpressured = false;
                             }
@@ -2337,15 +2377,25 @@ impl SyscallDispatcher {
                 } else {
                     Some(Duration::from_millis(timeout_ms as u64))
                 };
-                if kq_drained_all_filtered || !has_interests {
-                    // Either the kqueue is already readable for events we
-                    // DON'T care about (filtered to zero by the interest mask),
-                    // or no interests are registered at all (epoll_pwait with
-                    // an empty interest set must still honour the timeout +
-                    // signal interrupt path, not return 0 immediately).
-                    // Either way: polling kq_fd would spin or be pointless.
-                    // Sleep the timeout on the signal pipe — interruptible by
-                    // a real signal.
+                if kq_drained_all_filtered {
+                    // The instance kqueue is readable, but every drained event
+                    // was masked by the guest interest or by the software ET
+                    // latch. Polling kq_fd for POLLIN would wake immediately
+                    // and spin; polling the same valid fd with an empty event
+                    // mask uses the WaitOnPollFds backstop as an interruptible
+                    // retry sleep while preserving the guest deadline.
+                    crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
+                    return Ok(DispatchOutcome::WaitOnPollFds {
+                        fds: WaitFds::raw_one(kq_fd, 0),
+                        timeout,
+                        on_timeout: 0,
+                        block_signals,
+                    });
+                }
+                if !has_interests {
+                    // epoll_pwait with an empty interest set must still honour
+                    // timeout + signal interruption, not return 0 immediately.
+                    // There is no instance-fd readiness to wait for.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     return Ok(DispatchOutcome::WaitOnFds {
                         fds: WaitFds::empty(),

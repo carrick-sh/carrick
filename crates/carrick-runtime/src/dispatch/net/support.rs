@@ -116,12 +116,45 @@ pub(super) fn epoll_interest_for(events: u32) -> carrick_hal::event::Interest {
 }
 
 /// Edge (`EPOLLET`) vs level trigger mode for a multiplexer registration.
+#[cfg_attr(
+    any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
+    allow(dead_code)
+)]
 pub(super) fn epoll_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode {
     if events & LINUX_EPOLLET != 0 {
         carrick_hal::event::TriggerMode::Edge
     } else {
         carrick_hal::event::TriggerMode::Level
     }
+}
+
+/// Trigger mode used for host-fd registrations that back a guest epoll set.
+///
+/// BSD kqueue `EV_CLEAR` can spend the only host edge while the guest-side
+/// `EPOLLET` latch still suppresses delivery. Keep the host registration
+/// level-triggered there and enforce the guest edge contract in software with
+/// `EpollInterest::last_ready`. Linux's backend is native epoll, so it keeps
+/// the real `EPOLLET` registration.
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+pub(super) fn epoll_host_trigger_mode(_events: u32) -> carrick_hal::event::TriggerMode {
+    carrick_hal::event::TriggerMode::Level
+}
+
+#[cfg(not(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+)))]
+pub(super) fn epoll_host_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode {
+    epoll_trigger_mode(events)
 }
 
 /// Monotonic source of epoll-registration generations (the high half of a
@@ -433,24 +466,24 @@ pub(super) fn host_socktype_backing(family: i32, base_type: i32) -> i32 {
     linux_to_host_socktype(base_type)
 }
 
-/// Widen a host AF_UNIX stream/seqpacket socket's send (and recv) buffer to the
-/// Linux default (212992). macOS gives AF_UNIX stream sockets only an 8 KiB
-/// buffer; Linux gives 212992. A guest that writes up to its socket buffer
+/// Widen a host AF_UNIX stream/seqpacket socket's send (and recv) buffer beyond
+/// macOS' tiny default. Linux-visible `getsockopt(SO_SNDBUF/SO_RCVBUF)` reports
+/// the guest-intended/default Linux value from `OpenDescriptionBase`, so this is
+/// host-only backing capacity. A guest that writes up to its socket buffer
 /// expecting the write to complete WITHOUT a draining reader then blocks forever
 /// on a POLLOUT that never comes — e.g. Go's splice/sendfile "Limited" copy, where
-/// a writer goroutine pushes the full payload while the reader consumes only a
-/// capped prefix; the unconsumed tail (up to size-limit) can exceed 8 KiB and
-/// strand the writer (Go os TestSpliceFile/Limited/Half-Unix HANG). SO_SNDBUF is
-/// the load-bearing option (it governs the writer); SO_RCVBUF is set for symmetry.
-/// Best-effort: errors are ignored. No-op for AF_INET (macOS already gives it a
-/// large buffer) and for DGRAM (datagram boundary semantics differ — never widen).
+/// a writer goroutine pushes a large payload while the reader consumes in large
+/// netpoll waits. SO_SNDBUF is the load-bearing option (it governs the writer);
+/// SO_RCVBUF is set for symmetry. Best-effort: errors are ignored. No-op for
+/// AF_INET (macOS already gives it a large buffer) and for DGRAM (datagram
+/// boundary semantics differ — never widen).
 pub(super) fn widen_unix_stream_buffers(host_fd: i32, family: i32, base_type: i32) {
     if family != LINUX_AF_UNIX
         || (base_type != LINUX_SOCK_STREAM && base_type != LINUX_SOCK_SEQPACKET)
     {
         return;
     }
-    const LINUX_DEFAULT_UNIX_BUF: libc::c_int = 212992;
+    const HOST_UNIX_STREAM_BUF: libc::c_int = 4 * 1024 * 1024;
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
         // SAFETY: host_fd is a live socket fd; the optval is a valid &c_int.
         unsafe {
@@ -458,7 +491,7 @@ pub(super) fn widen_unix_stream_buffers(host_fd: i32, family: i32, base_type: i3
                 host_fd,
                 libc::SOL_SOCKET,
                 opt,
-                &LINUX_DEFAULT_UNIX_BUF as *const libc::c_int as *const libc::c_void,
+                &HOST_UNIX_STREAM_BUF as *const libc::c_int as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
