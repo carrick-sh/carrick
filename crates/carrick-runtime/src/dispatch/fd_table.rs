@@ -60,6 +60,11 @@ use super::{EpollKqueue, Fd, GuestPtr, inode_for_path, linux_mode};
 pub(super) struct EpollInterest {
     pub(super) event: LinuxEpollEvent,
     pub(super) last_ready: u32,
+    /// Edge-triggered write side was attempted and returned EAGAIN after an
+    /// earlier EPOLLOUT delivery. Keep the host write filter armed while still
+    /// suppressing immediate sampled OUT redelivery; the next host write event
+    /// is a fresh transition and should be delivered once.
+    pub(super) write_backpressured: bool,
     /// Per-registration generation, the high half of this fd's multiplexer
     /// `udata` handle (`pack_epoll_udata`). Guest fd numbers AND host fd numbers
     /// are recycled rapidly under churn, so a drained kqueue/epoll event keyed by

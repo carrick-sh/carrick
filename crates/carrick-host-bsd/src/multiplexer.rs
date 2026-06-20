@@ -4,7 +4,7 @@
 use crate::kqueue::NOTE_EXITSTATUS;
 #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly"))]
 use crate::kqueue::{EVFILT_EXCEPT, NOTE_OOB};
-use crate::kqueue::{Kevent, KeventFlags, Kqueue};
+use crate::kqueue::{Kevent, Kqueue};
 use carrick_hal::error::OsError;
 use carrick_hal::event::{
     EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents,
@@ -48,11 +48,13 @@ impl EventMultiplexer for KqueueMultiplexer {
         interest: Interest,
         mode: TriggerMode,
     ) -> Result<(), OsError> {
-        let edge: KeventFlags = match mode {
-            TriggerMode::Edge => libc::EV_CLEAR,
-            TriggerMode::Level => 0,
-        };
-        let base = libc::EV_ADD | libc::EV_ENABLE | edge;
+        // Keep IO filters level-triggered even when the guest asked for
+        // EPOLLET. The runtime applies the edge contract with its software
+        // last-ready latch; the host kqueue must remain level-triggered so a
+        // parked waiter wakes while buffered data / EOF is still true even if an
+        // earlier drain consumed the single EV_CLEAR edge.
+        let _ = mode;
+        let base = libc::EV_ADD | libc::EV_ENABLE;
 
         let mut changes = Vec::with_capacity(3);
         if interest.read {

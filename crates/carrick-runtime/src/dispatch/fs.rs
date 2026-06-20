@@ -2004,6 +2004,61 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: n as i64 }
     }
 
+    fn take_splice_pipe_bytes(
+        &self,
+        guest_fd: i32,
+        host_fd: i32,
+        count: usize,
+    ) -> Result<Vec<u8>, DispatchError> {
+        let mut buf = Vec::new();
+        {
+            let mut staged = self.io.splice_pushback.lock();
+            let mut empty = false;
+            if let Some(queue) = staged.get_mut(&guest_fd) {
+                while buf.len() < count {
+                    let Some(byte) = queue.pop_front() else {
+                        break;
+                    };
+                    buf.push(byte);
+                }
+                empty = queue.is_empty();
+            }
+            if empty {
+                staged.remove(&guest_fd);
+            }
+        }
+        if buf.len() >= count {
+            return Ok(buf);
+        }
+
+        let offset = buf.len();
+        buf.resize(count, 0);
+        // BLOCKING-IO-OK: splice/sendfile source read. The in fd is a regular
+        // file or an already-readable pipe end; converting this niche path to
+        // the lockless wait is a tracked follow-up, not a server hot path.
+        let n = unsafe {
+            libc::read(
+                host_fd,
+                buf[offset..].as_mut_ptr().cast::<libc::c_void>(),
+                count - offset,
+            )
+        };
+        let n = n.host_syscall_errno()?;
+        buf.truncate(offset + n as usize);
+        Ok(buf)
+    }
+
+    fn restore_splice_pipe_bytes(&self, guest_fd: i32, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut staged = self.io.splice_pushback.lock();
+        let queue = staged.entry(guest_fd).or_default();
+        for byte in bytes.iter().rev() {
+            queue.push_front(*byte);
+        }
+    }
+
     fn write_output_fd(
         &self,
         fd: i32,
@@ -4348,6 +4403,7 @@ impl SyscallDispatcher {
             if fd.0 >= 0 && fd.0 < 3 {
                 this.io.closed_stdio.lock()[fd.0 as usize] = true;
             }
+            this.io.splice_pushback.lock().remove(&fd.0);
             // Auto-remove this fd from every epoll interest set BEFORE freeing
             // the fd number from open_files. ORDER IS LOAD-BEARING: the instant
             // the fd leaves open_files another thread's open/pipe/dup can recycle
@@ -4420,6 +4476,7 @@ impl SyscallDispatcher {
                 // separate per fd, so the fd is still in the table — hence not
                 // reallocatable — across its own detach.
                 for fd in fds {
+                    this.io.splice_pushback.lock().remove(&fd);
                     this.detach_fd_from_epolls(fd);
                     if let Some(open_file) = this.io.open_files.write().remove(&fd) {
                         // Centralised close so pty masters freed via close_range
@@ -5607,16 +5664,26 @@ impl SyscallDispatcher {
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(errno.into());
                 }
-                let mut buf = vec![0u8; count];
-                // BLOCKING-IO-OK: splice/sendfile source read. The in fd is a
-                // regular file or an already-readable pipe end; converting this
-                // niche path to the lockless wait is a tracked follow-up, not a
-                // server hot path.
-                let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, count) };
-                let n = n.host_syscall_errno()?;
-                buf.truncate(n as usize);
+                let buf = this.take_splice_pipe_bytes(in_fd.0, host_fd, count)?;
+                if buf.is_empty() {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid);
-                return Ok(outcome);
+                let DispatchOutcome::Returned { value } = outcome else {
+                    this.restore_splice_pipe_bytes(in_fd.0, &buf);
+                    return Ok(outcome);
+                };
+                let written = if value <= 0 {
+                    0
+                } else {
+                    usize::try_from(value).unwrap_or(buf.len()).min(buf.len())
+                };
+                if written < buf.len() {
+                    this.restore_splice_pipe_bytes(in_fd.0, &buf[written..]);
+                }
+                return Ok(DispatchOutcome::Returned {
+                    value: written as i64,
+                });
             }
 
             // Splice OUT of a host socket (socket -> pipe, and socket -> socket).

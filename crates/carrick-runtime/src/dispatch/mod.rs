@@ -1980,6 +1980,7 @@ impl SyscallDispatcher {
         };
 
         for (fd, open_file) in removed {
+            self.io.splice_pushback.lock().remove(&fd);
             self.close_open_file_and_free_pty(&open_file);
             // Linux auto-removes a closed fd from every epoll interest set.
             self.detach_fd_from_epolls(fd);
@@ -2246,11 +2247,6 @@ impl SyscallDispatcher {
         });
 
         let result = self.dispatch_normalized(request, memory, reporter, thread);
-        // Consumption-based EPOLLET re-arm: a read/write-family syscall on a
-        // watched fd services the latched edge; clear it so the next sampled
-        // assertion is delivered (the Linux-lane lost-edge wedge — see
-        // `epoll_rearm_after_io`). After the handler, idempotent on re-entry.
-        self.epoll_rearm_after_io(&request);
         let outcome = match result {
             Some(r) => match lower_handler_result(r) {
                 Ok(outcome) => outcome,
@@ -2260,7 +2256,12 @@ impl SyscallDispatcher {
                 errno: LINUX_ENOSYS,
             },
         };
-
+        // Consumption-based EPOLLET re-arm: a read/write-family syscall on a
+        // watched fd services the latched edge; clear it so the next sampled
+        // assertion is delivered (the Linux-lane lost-edge wedge — see
+        // `epoll_rearm_after_io`). Outcome matters: an EAGAIN write did not
+        // consume writable capacity and must not synthesize another OUT edge.
+        self.epoll_rearm_after_io(&request, &outcome);
         let (retval, errno) = outcome.retval_errno();
         reporter.record(CompatEvent::SyscallReturn {
             number: request.number,
@@ -2436,9 +2437,9 @@ impl SyscallDispatcher {
         // dispatched here first; the borrow of memory/reporter is scoped to
         // the call, so the legacy match below can still use them for the rest.
         if let Some(result) = self.dispatch_normalized(request, memory, reporter, thread) {
-            // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
-            self.epoll_rearm_after_io(&request);
             let outcome = lower_handler_result(result)?;
+            // Consumption-based EPOLLET re-arm (see `epoll_rearm_after_io`).
+            self.epoll_rearm_after_io(&request, &outcome);
             let (retval, errno) = outcome.retval_errno();
             reporter.record(CompatEvent::SyscallReturn {
                 number: request.number,
@@ -4754,6 +4755,19 @@ fn write_host_pipe_payload(
             // Route through the readiness wait rather than leaking it to the guest
             // (see read_host_pipe).
             if e == LINUX_EAGAIN || e == LINUX_EINTR {
+                if e == LINUX_EAGAIN
+                    && nonblocking
+                    && offset == 0
+                    && write_kind != HostWriteKind::RegularFile
+                    && let Some(result) = try_small_nonblocking_write(host_fd, payload.as_slice())
+                {
+                    return match result {
+                        Ok(written) => DispatchOutcome::Returned {
+                            value: written as i64,
+                        },
+                        Err(errno) => DispatchOutcome::Errno { errno },
+                    };
+                }
                 if block_until_complete && offset > 0 {
                     if crate::host_signal::has_unblocked_pending_for(tid, 0) {
                         return DispatchOutcome::Returned {
@@ -4817,6 +4831,27 @@ fn write_host_pipe_payload(
         }
         return DispatchOutcome::Returned { value: n as i64 };
     }
+}
+
+fn try_small_nonblocking_write(host_fd: i32, bytes: &[u8]) -> Option<Result<usize, i32>> {
+    if bytes.len() <= 1 {
+        return None;
+    }
+    const RETRIES: [usize; 6] = [16 * 1024, 4 * 1024, 1024, 256, 64, 1];
+    for cap in RETRIES {
+        let len = bytes.len().min(cap);
+        if len == 0 || len == bytes.len() {
+            continue;
+        }
+        let n = unsafe { libc::write(host_fd, bytes.as_ptr().cast(), len) };
+        match n.host_syscall_errno() {
+            Ok(value) if value > 0 => return Some(Ok(value as usize)),
+            Ok(_) => continue,
+            Err(errno) if errno == LINUX_EAGAIN || errno == LINUX_EINTR => continue,
+            Err(errno) => return Some(Err(errno)),
+        }
+    }
+    None
 }
 
 /// A host op returned EAGAIN: a non-blocking guest fd gets EAGAIN; a blocking
@@ -5325,6 +5360,111 @@ mod overlay_dispatch_tests {
             write.offset()
         );
         assert!(write.sigpipe_on_epipe());
+    }
+
+    #[test]
+    fn large_nonblocking_host_pipe_write_uses_small_ready_window() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        crate::dispatch::net::set_host_nonblocking(fds[1]);
+
+        let chunk = [0xA5; 4096];
+        loop {
+            let n = unsafe { libc::write(fds[1], chunk.as_ptr().cast(), chunk.len()) };
+            if n > 0 {
+                continue;
+            }
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert!(matches!(
+                errno,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
+            ));
+            break;
+        }
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(fds[0], byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+
+        let bytes = vec![0x5A; 64 * 1024];
+        let outcome = write_host_pipe(
+            &bytes,
+            fds[1],
+            None,
+            true,
+            HostWriteKind::PipeLike,
+            0x7FFE_0103,
+            false,
+        );
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("large nonblocking write should make partial progress, got {outcome:?}");
+        };
+        assert!(
+            value > 0 && (value as usize) < bytes.len(),
+            "expected a positive partial write, got {value}"
+        );
+    }
+
+    #[test]
+    fn large_nonblocking_host_socket_write_uses_small_ready_window() {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        crate::dispatch::net::set_host_nonblocking(fds[0]);
+
+        let chunk = [0xA5; 4096];
+        loop {
+            let n = unsafe { libc::write(fds[0], chunk.as_ptr().cast(), chunk.len()) };
+            if n > 0 {
+                continue;
+            }
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert!(matches!(
+                errno,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
+            ));
+            break;
+        }
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(fds[1], byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+
+        let bytes = vec![0x5A; 64 * 1024];
+        let outcome = write_host_pipe(
+            &bytes,
+            fds[0],
+            None,
+            true,
+            HostWriteKind::SocketLike,
+            0x7FFE_0104,
+            false,
+        );
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        let DispatchOutcome::Returned { value } = outcome else {
+            panic!("large nonblocking socket write should make partial progress, got {outcome:?}");
+        };
+        assert!(
+            value > 0 && (value as usize) < bytes.len(),
+            "expected a positive partial socket write, got {value}"
+        );
     }
 
     #[test]
