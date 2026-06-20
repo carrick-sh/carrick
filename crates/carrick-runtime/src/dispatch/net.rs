@@ -439,6 +439,7 @@ impl SyscallDispatcher {
             76 | 285 if zero || eagain => [Some((a(0), READ_CLEAR)), None],
             77 if positive => [Some((a(0), READ_CLEAR)), Some((a(1), WRITE_CLEAR))],
             77 if zero || eagain => [Some((a(0), READ_CLEAR)), None],
+            _ if write_eagain_targets.iter().any(Option::is_some) => [None, None],
             _ => return,
         };
         // Snapshot the registered epoll fds and DROP the set lock before
@@ -454,7 +455,7 @@ impl SyscallDispatcher {
                         interest, kqueue, ..
                     } = &mut *open
                     {
-                        let mut cleared = false;
+                        let mut snapshot_changed = false;
                         #[cfg(any(
                             feature = "platform-macos",
                             feature = "platform-freebsd",
@@ -469,7 +470,7 @@ impl SyscallDispatcher {
                                     slot.write_backpressured = false;
                                 }
                                 if before != slot.last_ready {
-                                    cleared = true;
+                                    snapshot_changed = true;
                                     #[cfg(any(
                                         feature = "platform-macos",
                                         feature = "platform-freebsd",
@@ -485,9 +486,11 @@ impl SyscallDispatcher {
                             if let Some(slot) = interest.get_mut(fd)
                                 && slot.event.events & LINUX_EPOLLET != 0
                                 && slot.event.events & LINUX_EPOLLOUT != 0
-                                && slot.last_ready & WRITE_CLEAR != 0
                             {
-                                slot.write_backpressured = true;
+                                if !slot.write_backpressured {
+                                    snapshot_changed = true;
+                                    slot.write_backpressured = true;
+                                }
                                 #[cfg(any(
                                     feature = "platform-macos",
                                     feature = "platform-freebsd",
@@ -514,7 +517,7 @@ impl SyscallDispatcher {
                         // set whose ET exclusion was computed from the now-
                         // serviced edge (the fd may be parked with events==0 —
                         // deaf). Pop it so it re-samples and re-parks armed.
-                        if cleared {
+                        if snapshot_changed {
                             kqueue.wake_parked();
                         }
                         false
