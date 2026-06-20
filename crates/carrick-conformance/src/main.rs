@@ -1078,7 +1078,7 @@ fn preflight_kvm_local(bin: &Path) -> anyhow::Result<()> {
 
 /// Local FreeBSD/bhyve preflight: the binary is built for platform-freebsd and
 /// runs on this host, so macOS codesign is irrelevant. Validate only the local
-/// executable and bhyve device directory before the suite fan-out starts.
+/// executable and bhyve device before the suite fan-out starts.
 fn preflight_bhyve_local(bin: &Path) -> anyhow::Result<()> {
     let meta = match std::fs::metadata(bin) {
         Ok(m) => m,
@@ -1097,8 +1097,8 @@ fn preflight_bhyve_local(bin: &Path) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(
-        std::path::Path::new("/dev/vmm").exists(),
-        "/dev/vmm is missing — `--lane bhyve-local` must run on a FreeBSD host with bhyve"
+        bhyve_device_available(Path::new("/dev/vmm"), Path::new("/dev/vmmctl")),
+        "/dev/vmm or /dev/vmmctl is missing — `--lane bhyve-local` must run on a FreeBSD host with bhyve"
     );
     if let (Ok(bin_t), Some(src_t)) = (meta.modified(), newest_runtime_src_mtime())
         && bin_t < src_t
@@ -1110,6 +1110,10 @@ fn preflight_bhyve_local(bin: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn bhyve_device_available(vmm_dir: &Path, vmmctl: &Path) -> bool {
+    vmm_dir.exists() || vmmctl.exists()
 }
 
 /// Local NetBSD/NVMM preflight: the binary is built for platform-netbsd and runs
@@ -1352,6 +1356,27 @@ mod tests {
         assert_eq!(cpython_worker_count(None, 2), 2);
         assert_eq!(cpython_worker_count(None, 8), 4);
         assert_eq!(cpython_worker_count(Some(9), 4), 4);
+    }
+
+    #[test]
+    fn bhyve_preflight_accepts_control_node_or_vm_directory() {
+        let root =
+            std::env::temp_dir().join(format!("carrick-bhyve-device-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let vmm_dir = root.join("vmm");
+        let vmmctl = root.join("vmmctl");
+
+        assert!(!bhyve_device_available(&vmm_dir, &vmmctl));
+
+        std::fs::write(&vmmctl, b"").expect("create vmmctl stand-in");
+        assert!(bhyve_device_available(&vmm_dir, &vmmctl));
+
+        std::fs::remove_file(&vmmctl).expect("remove vmmctl stand-in");
+        std::fs::create_dir(&vmm_dir).expect("create vmm dir stand-in");
+        assert!(bhyve_device_available(&vmm_dir, &vmmctl));
+
+        std::fs::remove_dir_all(&root).expect("cleanup temp root");
     }
 
     #[test]
