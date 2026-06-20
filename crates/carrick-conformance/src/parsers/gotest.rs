@@ -31,8 +31,11 @@ impl VerdictParser for GotestParser {
         // TestSpliceFile/TCP-To-TTY → exit 2, truncating at 104/727). Treat that
         // as a crash so a partial run becomes ORACLE_FAIL (oracle side) /
         // CARRICK_CRASH (carrick side) instead of gating against half a suite.
+        let recovered_expected_panic_failure = raw.exit_code == 2
+            && text.contains("panic: did not panic [recovered]")
+            && text.contains("--- FAIL:");
         let crashed = CRASH_SIGNATURES.iter().any(|sig| text.contains(sig))
-            || !matches!(raw.exit_code, 0 | 1);
+            || (!matches!(raw.exit_code, 0 | 1) && !recovered_expected_panic_failure);
 
         let Ok(re) = Regex::new(LINE) else {
             return SuiteResult::empty();
@@ -70,6 +73,8 @@ impl VerdictParser for GotestParser {
 
         let result = if crashed {
             SuiteOutcome::None
+        } else if ids.is_empty() && text.contains("testing: warning: no tests to run") {
+            SuiteOutcome::Success
         } else if ids.is_empty() {
             SuiteOutcome::Empty
         } else if t.failed > 0 {
@@ -221,5 +226,27 @@ PASS";
         let mut failed = raw("--- FAIL: TestA (0.0s)\nFAIL");
         failed.exit_code = 1;
         assert_eq!(GotestParser.parse(&failed).result, SuiteOutcome::Failure);
+    }
+
+    #[test]
+    fn no_tests_to_run_is_success() {
+        let r = GotestParser.parse(&raw("testing: warning: no tests to run\nPASS\n"));
+        assert_eq!(r.result, SuiteOutcome::Success);
+        assert_eq!(r.totals.n, 0);
+        assert!(r.ids.is_empty());
+    }
+
+    #[test]
+    fn recovered_expected_panic_is_failure_not_crash() {
+        let mut out = raw("\
+=== RUN   TestTypeFieldReadOnly
+--- FAIL: TestTypeFieldReadOnly (0.00s)
+panic: did not panic [recovered]
+\tpanic: did not panic
+");
+        out.exit_code = 2;
+        let r = GotestParser.parse(&out);
+        assert_eq!(r.result, SuiteOutcome::Failure);
+        assert_eq!(r.ids.get("TestTypeFieldReadOnly"), Some(&Outcome::Fail));
     }
 }
