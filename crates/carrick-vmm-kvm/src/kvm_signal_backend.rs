@@ -55,6 +55,10 @@ impl HostSignalGlue for KvmGlue {
     fn poke() {
         carrick_hal::signal_pump::poke();
     }
+
+    fn install_kick_handler() {
+        crate::kvm_kicker::install_kvm_kick_handler();
+    }
 }
 
 #[cfg(test)]
