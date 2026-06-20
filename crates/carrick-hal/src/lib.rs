@@ -36,6 +36,9 @@ pub mod fork_coord;
 pub use fork_coord::GenericForkCoordinator;
 /// The shared async host-signal pump (kick+futex backends; cfg-empty on macOS/HVF).
 pub mod signal_pump;
+/// The pluggable M:N admission scheduler bounding guest threads onto N vCPU slots.
+pub mod vcpu_sched;
+pub use vcpu_sched::{SlotId, SlotLease, VcpuScheduler, Yield};
 pub mod timer_delivery;
 pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery};
 pub mod guest_arch;
