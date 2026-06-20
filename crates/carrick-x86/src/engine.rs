@@ -1055,6 +1055,18 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         V::vcpu_budget()
     }
 
+    fn reclaims(&self) -> bool {
+        self.vm.reclaims()
+    }
+
+    fn save_guest_state(&self) -> Vec<u8> {
+        self.vm.save_guest_state()
+    }
+
+    fn rebind_to_slot(&mut self, slot: carrick_hal::SlotId, state: &[u8]) -> Result<(), TrapError> {
+        self.vm.rebind_to_slot(slot, state)
+    }
+
     fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
         crate::engine::fork_x86(self)
     }

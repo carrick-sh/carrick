@@ -412,6 +412,24 @@ pub trait X86Vmm: Sized {
         usize::MAX
     }
 
+    /// Whether this backend RECLAIMS a thread's vCPU slot on block (M:N reclaim).
+    /// `false` (default) = Phase-1 lifetime-binding (KVM); bhyve returns `true`.
+    fn reclaims(&self) -> bool {
+        false
+    }
+
+    /// Save THIS thread's full guest CPU state (GPRs + RSP/RFLAGS + FS/GS base +
+    /// FP/AVX) before releasing its vCPU slot at a block point.
+    fn save_guest_state(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Re-bind to `slot`'s vCPU and restore `state` into it after a block.
+    fn rebind_to_slot(&mut self, slot: carrick_hal::SlotId, state: &[u8]) -> Result<(), TrapError> {
+        let _ = (slot, state);
+        Ok(())
+    }
+
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling thread needs to
     /// add its own vCPU on the SAME VM (shared VM handle + window descriptors +
     /// a reserved live-vcpu slot, etc.).
