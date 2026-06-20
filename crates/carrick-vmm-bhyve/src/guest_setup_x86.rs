@@ -1394,6 +1394,7 @@ pub fn carrick_boot_gdt_bytes() -> Vec<u8> {
 ///   see `rax = 0`; zeroing RAX after the pushes (but before iretq) delivers
 ///   that. The boot ELF `_start` ignores the inbound RAX, so the boot call site
 ///   passes `false`.
+#[allow(clippy::too_many_arguments)]
 pub fn msr_init_blob(
     lstar: u64,
     star: u64,
@@ -1402,6 +1403,8 @@ pub fn msr_init_blob(
     user_rsp: u64,
     user_rflags: u64,
     clear_rax: bool,
+    entry_rdx: u64,
+    entry_rcx: u64,
 ) -> Vec<u8> {
     let mut b = Vec::with_capacity(128);
 
@@ -1492,6 +1495,25 @@ pub fn msr_init_blob(
         b.push(0x31);
         b.push(0xC0);
     }
+
+    // Restore the entry RDX and RCX LAST — the WRMSRs (mov edx,hi / mov ecx,msr)
+    // and the XSETBV (xor edx,edx / xor ecx,ecx) above CLOBBER them to 0. A real
+    // Linux `clone`/`clone3` child inherits the parent's full register file
+    // (except RAX=0 and RSP), and the glibc `clone3` wrapper's child path calls
+    // its thread fn via `call *%rdx` with the arg in a preserved register — so a
+    // clobbered RDX makes the child `call *0` and #PF at RIP=0 (the bhyve Go
+    // bring-up crash). musl's `clone` passes the fn on the child STACK, so it
+    // never noticed. RCX is the post-`syscall` return RIP the child should also
+    // inherit. `iretq` does NOT reload RDX/RCX, so values set here persist into
+    // ring 3. (Boot/main-vCPU callers pass 0/0, matching the prior XSETBV-zeroed
+    // state — no behaviour change there.)
+    //   mov rdx, imm64 (REX.W BA) ; mov rcx, imm64 (REX.W B9)
+    b.push(0x48);
+    b.push(0xBA);
+    b.extend_from_slice(&entry_rdx.to_le_bytes());
+    b.push(0x48);
+    b.push(0xB9);
+    b.extend_from_slice(&entry_rcx.to_le_bytes());
 
     // iretq  (REX.W CF)
     b.push(0x48);
@@ -1688,6 +1710,8 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
         LINUX_STACK_TOP, // ring-3 RSP after iretq (guest VA, not GPA)
         regs.rflags,     // RFLAGS (0x2)
         false,           // M1 trampoline path ignores the inbound RAX
+        0,               // entry RDX (process entry: 0 for static, matches prior)
+        0,               // entry RCX
     );
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
 
@@ -1880,6 +1904,8 @@ pub fn bring_up_x86_m1() -> Result<BroughtUpX86, OsError> {
         LINUX_STACK_TOP, // ring-3 RSP (guest VA)
         regs.rflags,
         false, // M1 user code ignores the inbound RAX
+        0,     // entry RDX (boot)
+        0,     // entry RCX (boot)
     );
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
     write_gpa(&vm, X86_GDT_GPA, &carrick_boot_gdt_bytes())?;
@@ -2141,6 +2167,8 @@ pub fn bring_up_x86_elf(
         initial_rsp, // ring-3 RSP: initial stack from with_linux_initial_stack
         regs.rflags,
         false, // the ELF `_start` ignores the inbound RAX
+        0,     // entry RDX (process entry: 0 for a static binary)
+        0,     // entry RCX
     );
     write_gpa(&vm, X86_INIT_BLOB_GPA, &blob)?;
 
@@ -2250,6 +2278,10 @@ pub const GPR_IDX_RBX: usize = 1;
 /// Index of RCX within [`X8664BhyveSnapshot::gpr`]. After a `syscall`, hardware
 /// sets RCX = the post-syscall return RIP — the child's ring-3 resume PC.
 pub const GPR_IDX_RCX: usize = 2;
+/// Index of RDX within [`X8664BhyveSnapshot::gpr`]. A clone/clone3 child inherits
+/// it; glibc's `clone3` child path calls its thread fn via `call *%rdx`, so the
+/// sibling entry blob must restore it (the WRMSR/XSETBV setup clobbers it).
+pub const GPR_IDX_RDX: usize = 3;
 
 /// The 15 GPR `vm_reg_name` ordinals captured by [`snapshot_x86_bhyve`], in the
 /// order they occupy [`X8664BhyveSnapshot::gpr`].
@@ -2473,6 +2505,12 @@ pub fn program_x86_vcpu_longmode_entry(
         child_rsp,
         regs.rflags,
         true,
+        // The clone/clone3 child inherits the parent's RDX (glibc clone3's child
+        // fn ptr → `call *%rdx`) and RCX (post-syscall return RIP). The blob's
+        // WRMSR/XSETBV setup zeroes both; restore them so the child does not
+        // `call *0` and #PF at RIP=0 (the bhyve Go bring-up crash).
+        snap.gpr[GPR_IDX_RDX],
+        snap.gpr[GPR_IDX_RCX],
     );
     write_gpa(vm, blob_gpa, &blob)?;
 
@@ -2889,11 +2927,16 @@ mod tests {
             0x2000,
             0x2,
             false,
+            0,
+            0,
         );
         assert!(!blob.is_empty(), "blob must be non-empty");
+        // Fits well under the per-sibling 256-byte slot: the ring-0 scratch RSP
+        // is the slot top and its <=5 pushes (~40B) reach +216, so the code must
+        // stay below that. The RDX/RCX restore added ~20B over the original ~115.
         assert!(
-            blob.len() <= 128,
-            "blob fits in 128 bytes (got {})",
+            blob.len() <= 160,
+            "blob fits the slot below the ring-0 scratch (got {})",
             blob.len()
         );
         // First instruction: mov ecx, MSR_LSTAR → B9 82 00 00 C0
@@ -2914,7 +2957,7 @@ mod tests {
     /// positions in the push sequence (after the three WRMSRs).
     #[test]
     fn msr_init_blob_encodes_ring3_selectors() {
-        let blob = msr_init_blob(0, 0, 0, 0, 0, 0x2, false);
+        let blob = msr_init_blob(0, 0, 0, 0, 0, 0x2, false, 0, 0);
         // The iretq frame's first push is the SS selector: `push imm32` (0x68)
         // followed by USER_SS_SEL (LE). Search for it rather than asserting a
         // fixed offset — the pre-frame setup (3 WRMSRs, then the MXCSR mask and
@@ -2933,19 +2976,53 @@ mod tests {
     /// child must see `rax = 0` after the iretq.
     #[test]
     fn msr_init_blob_clear_rax_emits_xor_before_iretq() {
-        let with = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true);
-        let without = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false);
+        let with = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, 0, 0);
+        let without = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, false, 0, 0);
         assert_eq!(
             with.len(),
             without.len() + 2,
             "clear_rax adds exactly the 2-byte xor eax,eax"
         );
         let n = with.len();
-        // ... 31 C0 48 CF  (xor eax,eax ; iretq)
+        // Tail (entry_rdx=entry_rcx=0): xor eax,eax ; mov rdx,0 ; mov rcx,0 ; iretq
+        //   31 C0 | 48 BA 00*8 | 48 B9 00*8 | 48 CF
+        assert_eq!(&with[n - 2..], &[0x48, 0xCF], "blob ends with iretq");
         assert_eq!(
-            &with[n - 4..],
-            &[0x31, 0xC0, 0x48, 0xCF],
-            "clear_rax tail = xor eax,eax + iretq"
+            &with[n - 22..n - 2],
+            &[
+                0x48, 0xBA, 0, 0, 0, 0, 0, 0, 0, 0, // mov rdx, 0
+                0x48, 0xB9, 0, 0, 0, 0, 0, 0, 0, 0, // mov rcx, 0
+            ],
+            "RDX/RCX restore precedes iretq"
+        );
+        assert_eq!(
+            &with[n - 24..n - 22],
+            &[0x31, 0xC0],
+            "clear_rax emits xor eax,eax just before the RDX/RCX restore"
+        );
+    }
+
+    /// REGRESSION (bhyve Go bring-up #PF at RIP=0): the sibling-entry blob must
+    /// restore the inherited RDX (glibc `clone3`'s child fn ptr, called via
+    /// `call *%rdx`) and RCX (post-`syscall` return RIP) right before `iretq` —
+    /// the WRMSR/XSETBV setup clobbers both to 0. A non-zero pair must appear as
+    /// `mov rdx,imm64 ; mov rcx,imm64` immediately before the iretq.
+    #[test]
+    fn msr_init_blob_restores_entry_rdx_rcx_before_iretq() {
+        let rdx = 0x1122_3344_5566_7788u64;
+        let rcx = 0xCAFE_F00D_DEAD_BEEFu64;
+        let blob = msr_init_blob(0, 0, 0, 0x1000, 0x2000, 0x2, true, rdx, rcx);
+        let n = blob.len();
+        assert_eq!(&blob[n - 2..], &[0x48, 0xCF], "ends with iretq");
+        let mut expect = vec![0x48, 0xBA]; // mov rdx, imm64
+        expect.extend_from_slice(&rdx.to_le_bytes());
+        expect.push(0x48);
+        expect.push(0xB9); // mov rcx, imm64
+        expect.extend_from_slice(&rcx.to_le_bytes());
+        assert_eq!(
+            &blob[n - 22..n - 2],
+            &expect[..],
+            "inherited RDX then RCX restored immediately before iretq"
         );
     }
 
