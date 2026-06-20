@@ -637,7 +637,11 @@ fn fan_out_scheduled<T: Send>(
                                 if state.claimed[slot] {
                                     continue;
                                 }
-                                let Some(permit) = lanes.try_acquire(&suites[suite_index]) else {
+                                let suite = &suites[suite_index];
+                                let Some(permit) = lanes.try_acquire(suite) else {
+                                    if suite_requires_exclusive_lane(suite) {
+                                        break;
+                                    }
                                     continue;
                                 };
                                 state.claimed[slot] = true;
@@ -726,73 +730,113 @@ fn cpython_worker_count(configured: Option<usize>, workers: usize) -> usize {
 }
 
 struct SchedulerLanes {
-    generic_heavy: Semaphore,
-    cpython_heavy: Semaphore,
+    state: Mutex<SchedulerLaneState>,
+    cpython_heavy_limit: usize,
+    generic_heavy_limit: usize,
+}
+
+#[derive(Default)]
+struct SchedulerLaneState {
+    active_total: usize,
+    active_cpython_heavy: usize,
+    active_generic_heavy: usize,
+    exclusive_active: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SchedulerLaneKind {
+    Light,
+    CpythonHeavy,
+    GenericHeavy,
+    Exclusive,
 }
 
 impl SchedulerLanes {
     fn new(cpython_workers: usize) -> Self {
         Self {
-            generic_heavy: Semaphore::new(1),
-            cpython_heavy: Semaphore::new(cpython_workers.max(1)),
+            state: Mutex::new(SchedulerLaneState::default()),
+            cpython_heavy_limit: cpython_workers.max(1),
+            generic_heavy_limit: 1,
         }
     }
 
     fn try_acquire(&self, suite: &Suite) -> Option<Option<SchedulerPermit<'_>>> {
-        if suite.weight != Weight::Heavy {
-            return Some(None);
-        }
-        let semaphore = if suite.ecosystem == Ecosystem::Cpython {
-            &self.cpython_heavy
+        let kind = if suite_requires_exclusive_lane(suite) {
+            SchedulerLaneKind::Exclusive
+        } else if suite.weight != Weight::Heavy {
+            SchedulerLaneKind::Light
+        } else if suite.ecosystem == Ecosystem::Cpython {
+            SchedulerLaneKind::CpythonHeavy
         } else {
-            &self.generic_heavy
+            SchedulerLaneKind::GenericHeavy
         };
-        semaphore
-            .try_acquire()
-            .map(|permit| Some(SchedulerPermit { _permit: permit }))
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.exclusive_active {
+            return None;
+        }
+        match kind {
+            SchedulerLaneKind::Exclusive => {
+                if state.active_total > 0 {
+                    return None;
+                }
+                state.exclusive_active = true;
+                state.active_total += 1;
+            }
+            SchedulerLaneKind::Light => {
+                state.active_total += 1;
+            }
+            SchedulerLaneKind::CpythonHeavy => {
+                if state.active_cpython_heavy >= self.cpython_heavy_limit {
+                    return None;
+                }
+                state.active_cpython_heavy += 1;
+                state.active_total += 1;
+            }
+            SchedulerLaneKind::GenericHeavy => {
+                if state.active_generic_heavy >= self.generic_heavy_limit {
+                    return None;
+                }
+                state.active_generic_heavy += 1;
+                state.active_total += 1;
+            }
+        }
+        Some(Some(SchedulerPermit { lanes: self, kind }))
+    }
+
+    fn release(&self, kind: SchedulerLaneKind) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active_total = state.active_total.saturating_sub(1);
+        match kind {
+            SchedulerLaneKind::Exclusive => {
+                state.exclusive_active = false;
+            }
+            SchedulerLaneKind::Light => {}
+            SchedulerLaneKind::CpythonHeavy => {
+                state.active_cpython_heavy = state.active_cpython_heavy.saturating_sub(1);
+            }
+            SchedulerLaneKind::GenericHeavy => {
+                state.active_generic_heavy = state.active_generic_heavy.saturating_sub(1);
+            }
+        }
     }
 }
 
 struct SchedulerPermit<'a> {
-    _permit: SemaphorePermit<'a>,
+    lanes: &'a SchedulerLanes,
+    kind: SchedulerLaneKind,
 }
 
-struct Semaphore {
-    max: usize,
-    active: Mutex<usize>,
-}
-
-impl Semaphore {
-    fn new(max: usize) -> Self {
-        Self {
-            max: max.max(1),
-            active: Mutex::new(0),
-        }
-    }
-
-    fn try_acquire(&self) -> Option<SemaphorePermit<'_>> {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        if *active >= self.max {
-            return None;
-        }
-        *active += 1;
-        Some(SemaphorePermit { semaphore: self })
-    }
-
-    fn release(&self) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        *active = active.saturating_sub(1);
-    }
-}
-
-struct SemaphorePermit<'a> {
-    semaphore: &'a Semaphore,
-}
-
-impl Drop for SemaphorePermit<'_> {
+impl Drop for SchedulerPermit<'_> {
     fn drop(&mut self) {
-        self.semaphore.release();
+        self.lanes.release(self.kind);
     }
+}
+
+fn suite_requires_exclusive_lane(suite: &Suite) -> bool {
+    // The root net/http Go package is reliable when run alone but can make
+    // little progress when co-scheduled with CPython-heavy suites under HVF.
+    matches!(suite.name.as_str(), "go-net_http")
 }
 
 fn select(suites: &[Suite], tier: Tier, ecos: &[String], names: &[String]) -> Vec<Suite> {
@@ -1359,6 +1403,44 @@ mod tests {
         assert!(
             cpython_started_before_generic_finished.load(Ordering::SeqCst),
             "blocked generic-heavy suites should not stop eligible CPython-heavy suites from starting"
+        );
+    }
+
+    #[test]
+    fn load_sensitive_suites_run_without_overlap() {
+        let lanes = SchedulerLanes::new(2);
+        let suites = vec![
+            suite("go-net_http", Ecosystem::Go, Weight::Heavy),
+            suite("cpython-tarfile", Ecosystem::Cpython, Weight::Heavy),
+            suite("ltp-gettid01", Ecosystem::Ltp, Weight::Light),
+        ];
+
+        let active = AtomicUsize::new(0);
+        let exclusive_active = AtomicBool::new(false);
+        let overlapped = AtomicBool::new(false);
+        let indices: Vec<usize> = (0..suites.len()).collect();
+        let _ = fan_out_scheduled(&indices, &suites, 3, &lanes, |i| {
+            let is_exclusive = suites[i].name == "go-net_http";
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            if is_exclusive {
+                exclusive_active.store(true, Ordering::SeqCst);
+                if now != 1 {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                exclusive_active.store(false, Ordering::SeqCst);
+            } else {
+                if exclusive_active.load(Ordering::SeqCst) {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "go-net_http must not overlap with other suites"
         );
     }
 
