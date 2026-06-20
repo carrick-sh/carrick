@@ -486,19 +486,13 @@ impl GuestArch for X8664GuestArch {
         let mut fp = X8664Fpstate::empty();
         let mut ymm_hi = [0u8; 256];
         if p.fpsimd_enabled {
-            fp.mxcsr = engine.get_fpcr()? as u32;
-            let mut xmm = [0u32; 64];
-            for n in 0..16u32 {
-                let v = engine.get_vreg(n)?.to_le_bytes();
-                let b = (n * 4) as usize;
-                for j in 0..4 {
-                    xmm[b + j] =
-                        u32::from_le_bytes([v[j * 4], v[j * 4 + 1], v[j * 4 + 2], v[j * 4 + 3]]);
-                }
-                let hi = engine.get_ymm_hi(n)?.to_le_bytes();
-                ymm_hi[n as usize * 16..n as usize * 16 + 16].copy_from_slice(&hi);
-            }
+            // ONE KVM_GET_XSAVE (x86 override of save_fpsimd_frame) carries MXCSR
+            // + XMM0–15 + the AVX YMM_Hi — replacing 1 + 16 + 16 per-register
+            // ioctls (the signal-storm throughput cliff).
+            let (mxcsr, xmm, hi) = engine.save_fpsimd_frame()?;
+            fp.mxcsr = mxcsr;
             fp.xmm_space = xmm;
+            ymm_hi = hi;
         }
 
         // ── siginfo: queued > fault > SI_USER; re-stamp si_signo. ──
@@ -631,28 +625,15 @@ impl GuestArch for X8664GuestArch {
         let ef = (mc.eflags | 0x2) & !(1u64 << 8);
         engine.set_reg(Reg::Rflags, ef)?;
 
-        // Restore MXCSR + XMM0–15 from the frame's FXSAVE area.
+        // Restore MXCSR + XMM0–15 + AVX YMM_Hi from the frame's FXSAVE area.
         if fpsimd_enabled {
-            engine.set_fpcr(u64::from({ fp }.mxcsr))?;
+            // Copy the values out of the (packed) frame structs first, then hand
+            // them to the engine's batched restore — ONE KVM_GET_XSAVE + ONE
+            // KVM_SET_XSAVE (x86 override) instead of ~80 per-register ioctls.
+            let mxcsr = { fp }.mxcsr;
             let xmm = fp.xmm_space;
-            for n in 0..16u32 {
-                let b = (n * 4) as usize;
-                let mut raw = [0u8; 16];
-                for j in 0..4 {
-                    raw[j * 4..j * 4 + 4].copy_from_slice(&xmm[b + j].to_le_bytes());
-                }
-                engine.set_vreg(n, u128::from_le_bytes(raw))?;
-            }
-            // Restore the AVX YMM_Hi (carrick-internal trailing area) AFTER the
-            // XMM writes above: set_ymm_hi read-modify-writes the XSAVE, so the
-            // just-restored low halves are preserved alongside the upper halves.
             let ymm_hi = frame.ymm_hi;
-            for n in 0..16u32 {
-                let off = n as usize * 16;
-                let mut raw = [0u8; 16];
-                raw.copy_from_slice(&ymm_hi[off..off + 16]);
-                engine.set_ymm_hi(n, u128::from_le_bytes(raw))?;
-            }
+            engine.restore_fpsimd_frame(mxcsr, &xmm, &ymm_hi)?;
         }
 
         Ok(crate::sigframe::SigframeRestore {

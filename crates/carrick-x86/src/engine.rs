@@ -551,6 +551,62 @@ impl<V: X86Vmm> carrick_hal::RegAccess for X86EngineCore<V> {
             .map_err(|_| OsError::from_raw(libc::EIO))
     }
 
+    /// Batched signal-frame FP save: ONE `KVM_GET_XSAVE` yields MXCSR + XMM0–15
+    /// (legacy FXSAVE region) AND the AVX `YMM_Hi` (extended region) — replacing
+    /// the per-register default's ~33 ioctls per signal delivery (the
+    /// `test_stress_delivery_simultaneous` throughput cliff).
+    fn save_fpsimd_frame(&mut self) -> Result<(u32, [u32; 64], [u8; 256]), OsError> {
+        let xs = self
+            .vcpu
+            .get_xsave()
+            .map_err(|_| OsError::from_raw(libc::EIO))?
+            .ok_or_else(|| OsError::from_raw(libc::EIO))?;
+        let mxcsr = u32::from_le_bytes(
+            xs[FXSAVE_MXCSR_OFF..FXSAVE_MXCSR_OFF + 4]
+                .try_into()
+                .unwrap_or([0u8; 4]),
+        );
+        let mut xmm = [0u32; 64];
+        for (i, word) in xmm.iter_mut().enumerate() {
+            let o = FXSAVE_XMM0_OFF + i * 4;
+            *word = u32::from_le_bytes(xs[o..o + 4].try_into().unwrap_or([0u8; 4]));
+        }
+        let mut ymm_hi = [0u8; 256];
+        let avx = crate::vmm::XSAVE_AVX_OFFSET;
+        ymm_hi.copy_from_slice(&xs[avx..avx + 256]);
+        Ok((mxcsr, xmm, ymm_hi))
+    }
+
+    /// Batched signal-frame FP restore: ONE `KVM_GET_XSAVE` + ONE `KVM_SET_XSAVE`
+    /// for MXCSR + all 16 XMM + all 16 YMM_Hi — replacing the per-register
+    /// default's ~80 ioctls per signal return.
+    fn restore_fpsimd_frame(
+        &mut self,
+        mxcsr: u32,
+        xmm: &[u32; 64],
+        ymm_hi: &[u8; 256],
+    ) -> Result<(), OsError> {
+        let mut xs = self
+            .vcpu
+            .get_xsave()
+            .map_err(|_| OsError::from_raw(libc::EIO))?
+            .ok_or_else(|| OsError::from_raw(libc::EIO))?;
+        xs[FXSAVE_MXCSR_OFF..FXSAVE_MXCSR_OFF + 4].copy_from_slice(&mxcsr.to_le_bytes());
+        for (i, word) in xmm.iter().enumerate() {
+            let o = FXSAVE_XMM0_OFF + i * 4;
+            xs[o..o + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let avx = crate::vmm::XSAVE_AVX_OFFSET;
+        xs[avx..avx + 256].copy_from_slice(ymm_hi);
+        // Advertise SSE (bit 1, for MXCSR+XMM) and AVX (bit 2, for YMM_Hi) so the
+        // setter restores those components instead of treating them as init zeros.
+        xs[512] |= 0x06;
+        self.vcpu
+            .set_xsave(&xs)
+            .map(|_| ())
+            .map_err(|_| OsError::from_raw(libc::EIO))
+    }
+
     fn get_fpcr(&self) -> Result<u64, OsError> {
         // x86 has no FPCR; MXCSR is the nearest control word.
         let fx = self
