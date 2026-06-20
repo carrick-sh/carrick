@@ -5740,6 +5740,86 @@ mod overlay_dispatch_tests {
         }
     }
 
+    #[test]
+    fn epoll_et_write_eagain_after_partial_write_keeps_write_filter_armed() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+        let pair_addr = h.reserve(8);
+        assert_eq!(
+            returned(h.call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                    0,
+                    pair_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+        let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+        let writer = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLOUT | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(writer as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, writer as u64, ev_addr, 0, 0,],
+            )),
+            0
+        );
+
+        let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+        {
+            let mut open = epoll_open.description.write();
+            let OpenDescription::Epoll { interest, .. } = &mut *open else {
+                panic!("epfd should be an epoll description");
+            };
+            let slot = interest.get_mut(&writer).expect("writer interest");
+            slot.last_ready = LINUX_EPOLLOUT;
+            slot.write_backpressured = false;
+        }
+
+        let write_request =
+            SyscallRequest::new(64, SyscallArgs::from([writer as u64, MEM_BASE, 1, 0, 0, 0]));
+        h.dispatcher
+            .epoll_rearm_after_io(&write_request, &DispatchOutcome::Returned { value: 1 });
+        {
+            let open = epoll_open.description.read();
+            let OpenDescription::Epoll { interest, .. } = &*open else {
+                panic!("epfd should be an epoll description");
+            };
+            let slot = interest.get(&writer).expect("writer interest");
+            assert_eq!(slot.last_ready & LINUX_EPOLLOUT, 0);
+            assert!(!slot.write_backpressured);
+        }
+
+        h.dispatcher.epoll_rearm_after_io(
+            &write_request,
+            &DispatchOutcome::Errno {
+                errno: LINUX_EAGAIN,
+            },
+        );
+        {
+            let open = epoll_open.description.read();
+            let OpenDescription::Epoll { interest, .. } = &*open else {
+                panic!("epfd should be an epoll description");
+            };
+            let slot = interest.get(&writer).expect("writer interest");
+            assert!(
+                slot.write_backpressured,
+                "write EAGAIN after a partial nonblocking write must keep EPOLLET/EPOLLOUT armed"
+            );
+        }
+    }
+
     /// GROUNDED REGRESSION GATE (Rust, in-tree, cross-platform: macOS kqueue +
     /// Linux epoll-emulation) for the epoll EPOLLET edge-loss hang. It drives the
     /// REAL `epoll_pwait`/`epoll_ctl`/`pipe2` handlers through the threaded
