@@ -669,7 +669,17 @@ where
                     block_signals,
                 } => {
                     self.waiter.ensure_full();
-                    match self.waiter.wait(&fds, timeout, block_signals) {
+                    match self.waiter.wait_with_dispatch_pending(
+                        &fds,
+                        timeout,
+                        block_signals,
+                        || {
+                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                self.this_tid,
+                                block_signals,
+                            )
+                        },
+                    ) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             break Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -695,7 +705,17 @@ where
                     clear_on_timeout,
                 } => {
                     self.waiter.ensure_full();
-                    match self.waiter.wait(&fds, timeout, block_signals) {
+                    match self.waiter.wait_with_dispatch_pending(
+                        &fds,
+                        timeout,
+                        block_signals,
+                        || {
+                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                self.this_tid,
+                                block_signals,
+                            )
+                        },
+                    ) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             for (addr, len) in &clear_on_timeout {
@@ -725,7 +745,17 @@ where
                     block_signals,
                 } => {
                     self.waiter.ensure_full();
-                    match self.waiter.wait_poll(&fds, timeout, block_signals) {
+                    match self.waiter.wait_poll_with_dispatch_pending(
+                        &fds,
+                        timeout,
+                        block_signals,
+                        || {
+                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                self.this_tid,
+                                block_signals,
+                            )
+                        },
+                    ) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             break Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -746,7 +776,16 @@ where
                 }
                 DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
                     self.waiter.ensure_full();
-                    match self.waiter.wait_proc_exit(pid, block_signals) {
+                    match self.waiter.wait_proc_exit_with_dispatch_pending(
+                        pid,
+                        block_signals,
+                        || {
+                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                self.this_tid,
+                                block_signals,
+                            )
+                        },
+                    ) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::Interrupted
                         | crate::io_wait::WaitResult::TimedOut => {

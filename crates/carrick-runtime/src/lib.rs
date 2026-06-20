@@ -1866,7 +1866,20 @@ pub mod io_wait {
             timeout: Option<Duration>,
             block_mask: u64,
         ) -> WaitResult {
-            ppoll_wait(self.tid, fds, timeout, block_mask)
+            ppoll_wait(self.tid, fds, timeout, block_mask, || false)
+        }
+
+        pub fn wait_with_dispatch_pending<F>(
+            &self,
+            fds: &[WaitFd],
+            timeout: Option<Duration>,
+            block_mask: u64,
+            should_interrupt: F,
+        ) -> WaitResult
+        where
+            F: Fn() -> bool,
+        {
+            ppoll_wait(self.tid, fds, timeout, block_mask, should_interrupt)
         }
 
         /// `poll(2)`-flavoured wait. On Linux this is the same `ppoll` as
@@ -1877,7 +1890,20 @@ pub mod io_wait {
             timeout: Option<Duration>,
             block_mask: u64,
         ) -> WaitResult {
-            ppoll_wait(self.tid, fds, timeout, block_mask)
+            ppoll_wait(self.tid, fds, timeout, block_mask, || false)
+        }
+
+        pub fn wait_poll_with_dispatch_pending<F>(
+            &self,
+            fds: &[WaitFd],
+            timeout: Option<Duration>,
+            block_mask: u64,
+            should_interrupt: F,
+        ) -> WaitResult
+        where
+            F: Fn() -> bool,
+        {
+            ppoll_wait(self.tid, fds, timeout, block_mask, should_interrupt)
         }
 
         /// Wait for a guest child process to become reapable (Phase 2 Task 7).
@@ -1894,6 +1920,18 @@ pub mod io_wait {
         /// specific child; `pid <= 0` watches ANY child (`P_ALL`), matching the
         /// guest `wait4(-1, …)` / `wait4(0, …)` "any child" forms.
         pub fn wait_proc_exit(&self, pid: i32, block_mask: u64) -> WaitResult {
+            self.wait_proc_exit_with_dispatch_pending(pid, block_mask, || false)
+        }
+
+        pub fn wait_proc_exit_with_dispatch_pending<F>(
+            &self,
+            pid: i32,
+            block_mask: u64,
+            should_interrupt: F,
+        ) -> WaitResult
+        where
+            F: Fn() -> bool,
+        {
             loop {
                 if child_status_ready(pid) {
                     return WaitResult::Ready;
@@ -1938,9 +1976,13 @@ pub mod io_wait {
                 // child exited during the park; aarch64 reaps before parking so
                 // it never bit). `ppoll_wait` retries on a masked interrupt and
                 // re-polls the child, so the wait restarts transparently.
-                if let WaitResult::Interrupted =
-                    ppoll_wait(self.tid, &[], Some(Duration::from_millis(50)), block_mask)
-                {
+                if let WaitResult::Interrupted = ppoll_wait_recheck_on_masked_interrupt(
+                    self.tid,
+                    &[],
+                    Some(Duration::from_millis(50)),
+                    block_mask,
+                    &should_interrupt,
+                ) {
                     return WaitResult::Interrupted;
                 }
             }
@@ -2082,6 +2124,28 @@ pub mod io_wait {
         fds: &[WaitFd],
         timeout: Option<Duration>,
         block_mask: u64,
+        should_interrupt: impl Fn() -> bool,
+    ) -> WaitResult {
+        ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, false)
+    }
+
+    fn ppoll_wait_recheck_on_masked_interrupt(
+        tid: crate::thread::ThreadId,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: u64,
+        should_interrupt: impl Fn() -> bool,
+    ) -> WaitResult {
+        ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, true)
+    }
+
+    fn ppoll_wait_inner(
+        tid: crate::thread::ThreadId,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: u64,
+        should_interrupt: impl Fn() -> bool,
+        recheck_on_masked_interrupt: bool,
     ) -> WaitResult {
         let mut pollfds: Vec<libc::pollfd> = fds
             .iter()
@@ -2115,6 +2179,9 @@ pub mod io_wait {
         // how long a LOST edge can hide.
         const UNBOUNDED_BACKSTOP: Duration = Duration::from_millis(50);
         loop {
+            if should_interrupt() {
+                return WaitResult::Interrupted;
+            }
             let ts = match deadline {
                 Some(dl) => {
                     let now = Instant::now();
@@ -2170,6 +2237,7 @@ pub mod io_wait {
                             || crate::fork_quiesce::exec_replacing_other_thread(tid)
                             || crate::host_signal::has_unblocked_pending_for(tid, block_mask)
                             || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
+                            || should_interrupt()
                         {
                             return WaitResult::Interrupted;
                         }
@@ -2227,8 +2295,16 @@ pub mod io_wait {
                 }
                 if crate::host_signal::has_unblocked_pending_for(tid, block_mask)
                     || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
+                    || should_interrupt()
                 {
                     return WaitResult::Interrupted;
+                }
+                // Spurious or masked host signal. Normal fd waits retry the
+                // remaining deadline. A proc-exit wait instead returns to its
+                // outer child-status probe so a SIGCHLD/kick cannot burn the
+                // full 50 ms backstop while a zombie is already reapable.
+                if recheck_on_masked_interrupt {
+                    return WaitResult::TimedOut;
                 }
                 // Spurious host signal; no guest signal delivery yet — retry.
                 continue;
@@ -2256,6 +2332,26 @@ pub mod io_wait {
             for s in 1..=31 {
                 assert!(!super::is_internal_kick_signal(s), "signal {s}");
             }
+        }
+    }
+
+    #[cfg(all(test, feature = "platform-linux", target_os = "linux"))]
+    mod ppoll_backstop_tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[test]
+        fn unbounded_wait_checks_dispatch_pending_after_backstop_slice() {
+            let checks = AtomicUsize::new(0);
+
+            let result = super::ppoll_wait(7, &[], None, 0, || {
+                checks.fetch_add(1, Ordering::SeqCst) > 0
+            });
+
+            assert_eq!(result, super::WaitResult::Interrupted);
+            assert!(
+                checks.load(Ordering::SeqCst) >= 2,
+                "predicate must be checked before and after the backstop slice"
+            );
         }
     }
 }

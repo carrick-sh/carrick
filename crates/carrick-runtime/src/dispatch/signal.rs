@@ -719,6 +719,23 @@ impl SyscallDispatcher {
         self.take_pending_in(tid, !mask)
     }
 
+    /// True iff dispatcher-owned signal state has a pending signal deliverable
+    /// to `tid` under the temporary wait mask. This complements
+    /// `host_signal::has_unblocked_pending_for`: host_signal sees backend/pump
+    /// pending state, while this sees the dispatcher's per-thread and shared
+    /// process pending sets.
+    pub(crate) fn has_deliverable_dispatch_pending_for_wait(
+        &self,
+        tid: crate::thread::ThreadId,
+        block_mask: u64,
+    ) -> bool {
+        let always_deliverable =
+            sigmask_bit(LINUX_SIGKILL).unwrap_or(0) | sigmask_bit(LINUX_SIGSTOP).unwrap_or(0);
+        let signal = self.signal.lock();
+        let pending = signal.pendings.get(&tid).copied().unwrap_or(0) | signal.process_pending;
+        pending & (!block_mask | always_deliverable) != 0
+    }
+
     /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
     /// from that thread's pending set OR the shared process pending set. Used by
     /// `rt_sigtimedwait`/sigwait and `take_deliverable_pending`. The union lets
@@ -1984,6 +2001,19 @@ mod tests {
         assert_eq!(d.take_deliverable_pending(waiter), Some(34));
         assert_eq!(d.take_deliverable_pending(sender), Some(34));
         assert_eq!(d.take_deliverable_pending(waiter), None);
+    }
+
+    #[test]
+    fn wait_predicate_sees_shared_process_pending() {
+        let d = SyscallDispatcher::new();
+        let tid: crate::thread::ThreadId = 42;
+        let usr1 = 10;
+        let blocked = sigmask_bit(usr1).unwrap();
+
+        d.mark_process_signal_pending(usr1);
+
+        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, 0));
+        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, blocked));
     }
 
     #[test]
