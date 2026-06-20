@@ -195,6 +195,21 @@ mod real {
         /// carrick-host pid; correlate with `execve__loaded` (same pid) to
         /// see which binary exited with which code.
         fn guest__exit(_: u32, _: i32) {}
+        /// M:N scheduler — a guest thread was ADMITTED to a vCPU slot (a new
+        /// `clone` sibling, or the main reservation). `tid` guest thread, `slot`
+        /// the granted vCPU id, `budget` the pool size N (`usize::MAX`-clamped to
+        /// u32 on unbounded HVF/KVM). Pair with `mn__reclaim` to trace the M:N
+        /// lifecycle of a guest thread over the bounded vCPU pool.
+        fn mn__admit(_: i32, _: u32, _: u32) {}
+        /// M:N scheduler — a BLOCKING guest thread's reclaim decision (the heart of
+        /// the M:N: how a thread time-shares the bounded vCPU pool). `tid` guest
+        /// thread, `old_slot` the slot it held entering the block, `new_slot` the
+        /// slot it holds on wake, `kind`: 0=PARKED (uncontended — kept its vCPU, no
+        /// reclaim, the fast path), 1=RECLAIMED and got its OWN slot back (no
+        /// re-bind), 2=RECLAIMED onto a DIFFERENT slot (full state re-bind — another
+        /// thread ran on its vCPU while it blocked). A trace can compute the
+        /// reclaim/park ratio and spot re-bind storms.
+        fn mn__reclaim(_: i32, _: u32, _: u32, _: i32) {}
         /// Fires on execve with the joined argv (space-separated), so
         /// dtrace operators can see exactly how the guest invokes a
         /// child (e.g. apt's sqv method calling /usr/bin/sqv).
@@ -380,6 +395,14 @@ mod real {
 
     pub fn guest_exit(code: i32) {
         carrick_usdt::guest__exit!(|| (std::process::id(), code));
+    }
+
+    pub fn mn_admit(tid: i32, slot: u32, budget: u32) {
+        carrick_usdt::mn__admit!(|| (tid, slot, budget));
+    }
+
+    pub fn mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32) {
+        carrick_usdt::mn__reclaim!(|| (tid, old_slot, new_slot, kind));
     }
 
     /// Per-run lifecycle phase markers (see the `lifecycle` provider doc). Fire one
@@ -973,6 +996,8 @@ mod stub {
     stub!(ulock_wait(host_addr: u64, value: u32, timeout_us: u32, phase: i32, rc: i64));
     stub!(ulock_wake(host_addr: u64, iter: i32, rc: i64));
     stub!(guest_exit(code: i32));
+    stub!(mn_admit(tid: i32, slot: u32, budget: u32));
+    stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(lifecycle(phase: u32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(fs_op(op: &str, path: &str, errno: i32));
