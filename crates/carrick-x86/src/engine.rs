@@ -1051,6 +1051,10 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         V::wait_for_vcpu_slot();
     }
 
+    fn vcpu_budget() -> usize {
+        V::vcpu_budget()
+    }
+
     fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
         crate::engine::fork_x86(self)
     }

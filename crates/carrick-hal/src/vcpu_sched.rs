@@ -120,11 +120,58 @@ impl VcpuScheduler for HostCondvarScheduler {
     }
 }
 
+/// A no-op scheduler for backends with no carrick-side cap (budget =
+/// `usize::MAX`): `acquire` never blocks and returns a throwaway lease, `release`
+/// is a no-op. Used by HVF (whose own `vcpu_gate` stays in Phase 1) and KVM, so
+/// the shared thread-spawn path can call the scheduler unconditionally without
+/// changing their behaviour. A bounded `HostCondvarScheduler(usize::MAX)` would
+/// try to materialize a 4-billion-entry free-list — hence this separate type.
+pub struct NoopScheduler {
+    next: AtomicU64,
+}
+
+impl NoopScheduler {
+    pub fn new() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+        }
+    }
+}
+
+impl Default for NoopScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VcpuScheduler for NoopScheduler {
+    fn acquire(&self, _tid: u64) -> SlotLease {
+        SlotLease {
+            slot: 0,
+            generation: self.next.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+    fn release(&self, _lease: SlotLease, _why: Yield) {}
+    fn budget(&self) -> usize {
+        usize::MAX
+    }
+}
+
 static GLOBAL: OnceLock<Box<dyn VcpuScheduler>> = OnceLock::new();
 
 /// Install the process scheduler once at startup (idempotent; first wins).
 pub fn install_global(sched: Box<dyn VcpuScheduler>) {
     let _ = GLOBAL.set(sched);
+}
+
+/// Install the right scheduler for a backend's `vcpu_budget()`: a bounded
+/// [`HostCondvarScheduler`], or a [`NoopScheduler`] when unbounded (`usize::MAX`).
+pub fn install_for_budget(budget: usize) {
+    if budget == usize::MAX {
+        install_global(Box::new(NoopScheduler::new()));
+    } else {
+        install_global(Box::new(HostCondvarScheduler::new(budget)));
+    }
 }
 
 /// The process scheduler. Panics if not installed — startup MUST install it before
@@ -207,5 +254,16 @@ mod tests {
         );
         s.release(b, Yield::Exited);
         s.release(c, Yield::Exited);
+    }
+
+    #[test]
+    fn noop_scheduler_never_blocks_and_budget_is_max() {
+        let s = NoopScheduler::new();
+        let a = s.acquire(1);
+        let b = s.acquire(2);
+        assert_eq!(s.budget(), usize::MAX);
+        assert_ne!(a.generation(), b.generation(), "leases are distinguishable");
+        s.release(a, Yield::Exited);
+        s.release(b, Yield::Exited); // no-op, no panic, no double-free concern
     }
 }

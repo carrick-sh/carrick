@@ -406,6 +406,12 @@ pub trait X86Vmm: Sized {
     /// vCPU cap; a no-op on KVM/bhyve).
     fn wait_for_vcpu_slot() {}
 
+    /// Live concurrent-vCPU budget N for the M:N admission scheduler. `usize::MAX`
+    /// = no carrick-side cap (KVM); bhyve returns `hw.vmm.maxcpu`.
+    fn vcpu_budget() -> usize {
+        usize::MAX
+    }
+
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling thread needs to
     /// add its own vCPU on the SAME VM (shared VM handle + window descriptors +
     /// a reserved live-vcpu slot, etc.).
