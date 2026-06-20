@@ -31,51 +31,48 @@
 //!
 //! [`GuestMemory`]: crate::GuestMemory
 
-/// Sorted, merged, non-overlapping `[start, end)` guest-address ranges that are
-/// currently `PROT_NONE`. See the module docs for the sharing contract.
+/// Sorted, merged, non-overlapping `[start, end)` guest-address ranges with an
+/// O(log n) overlap query. The shared building block for both protection sets in
+/// [`MemoryProtections`]: the PROT_NONE set and the read-only (no-write) set.
 #[derive(Default)]
-pub struct MemoryProtections {
-    no_access: parking_lot::RwLock<Vec<(u64, u64)>>,
+struct RangeSet {
+    ranges: parking_lot::RwLock<Vec<(u64, u64)>>,
 }
 
-impl MemoryProtections {
-    /// Seed from an existing range list (e.g. a `fork(2)` child taking an
-    /// independent copy of the parent's [`snapshot`](Self::snapshot)).
-    pub fn from_ranges(ranges: Vec<(u64, u64)>) -> Self {
+impl RangeSet {
+    fn from_ranges(ranges: Vec<(u64, u64)>) -> Self {
         Self {
-            no_access: parking_lot::RwLock::new(ranges),
+            ranges: parking_lot::RwLock::new(ranges),
         }
     }
 
-    /// A point-in-time copy of the protected ranges (for an independent fork).
-    pub fn snapshot(&self) -> Vec<(u64, u64)> {
-        self.no_access.read().clone()
+    fn snapshot(&self) -> Vec<(u64, u64)> {
+        self.ranges.read().clone()
     }
 
-    /// True if `[address, address+length)` overlaps any PROT_NONE range — i.e. a
-    /// syscall buffer there must fault `EFAULT`.
-    pub fn range_no_access(&self, address: u64, length: usize) -> bool {
+    /// True if `[address, address+length)` overlaps any range in the set.
+    fn contains(&self, address: u64, length: usize) -> bool {
         let end = address.saturating_add(length as u64);
         if end <= address {
             return false;
         }
-        let ranges = self.no_access.read();
+        let ranges = self.ranges.read();
         let idx = ranges.partition_point(|&(_, e)| e <= address);
         ranges
             .get(idx)
             .is_some_and(|&(s, e)| address < e && s < end)
     }
 
-    /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range, keeping
-    /// the set sorted and merged. Setting merges adjacent/overlapping ranges;
-    /// clearing splits a partially-cleared range into the still-protected ends.
-    pub fn set_no_access(&self, address: u64, len: usize, no_access: bool) {
+    /// Add (`present=true`, merging adjacent/overlapping) or remove
+    /// (`present=false`, splitting a partially-cleared range into the surviving
+    /// ends) the range `[address, address+len)`, keeping the set sorted + merged.
+    fn set(&self, address: u64, len: usize, present: bool) {
         let end = address.saturating_add(len as u64);
         if end <= address {
             return;
         }
-        let mut ranges = self.no_access.write();
-        if no_access {
+        let mut ranges = self.ranges.write();
+        if present {
             ranges.push((address, end));
             ranges.sort_by_key(|&(start, _)| start);
             let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
@@ -112,6 +109,61 @@ impl MemoryProtections {
     }
 }
 
+/// The process-wide host-side protection sets a backend enforces on the syscall
+/// path: the PROT_NONE set (any access faults `EFAULT`) and the read-only set (a
+/// WRITE faults `EFAULT`). See the module docs for the sharing contract.
+#[derive(Default)]
+pub struct MemoryProtections {
+    /// Guest ranges that are `PROT_NONE` — any syscall access faults `EFAULT`.
+    no_access: RangeSet,
+    /// Guest ranges that are READ-ONLY (`PROT_READ` without `PROT_WRITE`) — a
+    /// syscall WRITE faults `EFAULT`, but a READ is fine. The x86 analog of HVF's
+    /// `validate_guest_write_range`; backends with their own per-mapping write
+    /// model (HVF) leave this empty.
+    no_write: RangeSet,
+}
+
+impl MemoryProtections {
+    /// Seed the PROT_NONE set from an existing range list (e.g. a `fork(2)` child
+    /// taking an independent copy of the parent's [`snapshot`](Self::snapshot)).
+    /// The no-write set starts empty (the common case; a forked engine re-derives
+    /// it, or — for x86 — the whole `Arc` is COW-copied so this path is unused).
+    pub fn from_ranges(ranges: Vec<(u64, u64)>) -> Self {
+        Self {
+            no_access: RangeSet::from_ranges(ranges),
+            no_write: RangeSet::default(),
+        }
+    }
+
+    /// A point-in-time copy of the PROT_NONE ranges.
+    pub fn snapshot(&self) -> Vec<(u64, u64)> {
+        self.no_access.snapshot()
+    }
+
+    /// True if `[address, address+length)` overlaps any PROT_NONE range — a syscall
+    /// buffer there must fault `EFAULT` (read OR write).
+    pub fn range_no_access(&self, address: u64, length: usize) -> bool {
+        self.no_access.contains(address, length)
+    }
+
+    /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range.
+    pub fn set_no_access(&self, address: u64, len: usize, no_access: bool) {
+        self.no_access.set(address, len, no_access);
+    }
+
+    /// True if `[address, address+length)` overlaps any READ-ONLY range — a syscall
+    /// WRITE there must fault `EFAULT` (a READ is allowed).
+    pub fn range_no_write(&self, address: u64, length: usize) -> bool {
+        self.no_write.contains(address, length)
+    }
+
+    /// Record (`no_write=true`, a `PROT_READ`-only range) or clear (`false`, the
+    /// range became writable / unmapped) a read-only range.
+    pub fn set_no_write(&self, address: u64, len: usize, no_write: bool) {
+        self.no_write.set(address, len, no_write);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +193,30 @@ mod tests {
         assert_eq!(p.snapshot(), vec![(0x1000, 0x2000)]);
         assert!(!p.range_no_access(0x4000, 0)); // zero length never faults
         assert!(!p.range_no_access(u64::MAX, 16)); // saturating end: no overlap
+    }
+
+    /// The no_write (read-only) set is INDEPENDENT of no_access and shares the same
+    /// merge/split RangeSet logic. A PROT_READ range is no_write but NOT no_access
+    /// (reads are fine, writes EFAULT); clearing (became writable) removes it.
+    #[test]
+    fn no_write_set_is_independent_of_no_access() {
+        let p = MemoryProtections::default();
+        p.set_no_write(0x5000, 0x1000, true);
+        assert!(p.range_no_write(0x5500, 0x10), "read-only range recorded");
+        assert!(
+            !p.range_no_access(0x5500, 0x10),
+            "no_write != no_access (reads ok)"
+        );
+        // Independent sets: marking no_access elsewhere doesn't touch no_write.
+        p.set_no_access(0x8000, 0x1000, true);
+        assert!(p.range_no_write(0x5500, 0x10));
+        assert!(p.range_no_access(0x8000, 0x10));
+        assert!(!p.range_no_write(0x8000, 0x10));
+        // Became writable: cleared.
+        p.set_no_write(0x5000, 0x1000, false);
+        assert!(
+            !p.range_no_write(0x5500, 0x10),
+            "writable again clears no_write"
+        );
     }
 }
