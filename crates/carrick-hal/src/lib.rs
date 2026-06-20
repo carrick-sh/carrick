@@ -30,6 +30,8 @@ pub use threaded::{
 pub mod sigframe;
 pub mod signal_arrival;
 pub use signal_arrival::{GenericSignalArrival, SignalArrival};
+/// The shared async host-signal pump (kick+futex backends; cfg-empty on macOS/HVF).
+pub mod signal_pump;
 pub mod timer_delivery;
 pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery};
 pub mod guest_arch;
