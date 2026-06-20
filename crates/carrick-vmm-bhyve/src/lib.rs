@@ -46,6 +46,10 @@ pub use bhyve_kicker::{BhyveKickHandle, BhyveKicker, install_bhyve_kick_handler,
 #[cfg(target_arch = "x86_64")]
 pub mod bhyve_disposition;
 #[cfg(target_arch = "x86_64")]
+pub mod bhyve_signal_backend;
+#[cfg(target_arch = "x86_64")]
+pub use bhyve_signal_backend::BhyveGlue;
+#[cfg(target_arch = "x86_64")]
 pub mod bhyve_signal_pump;
 #[cfg(target_arch = "x86_64")]
 pub mod bhyve_signum;
