@@ -5875,6 +5875,110 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn epoll_et_delivers_listener_edge_without_read_byte_growth() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+        let listener = returned(h.call(
+            198,
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        )) as i32;
+
+        let bind_addr = h.reserve(16);
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        sockaddr[2..4].copy_from_slice(&0u16.to_be_bytes());
+        sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        h.memory.write_bytes(bind_addr, &sockaddr).unwrap();
+        assert_eq!(
+            returned(h.call(200, [listener as u64, bind_addr, 16, 0, 0, 0])),
+            0
+        );
+        assert_eq!(returned(h.call(201, [listener as u64, 8, 0, 0, 0, 0])), 0);
+
+        let name_addr = h.reserve(16);
+        let name_len_addr = h.reserve(4);
+        h.memory
+            .write_bytes(name_len_addr, &(16u32).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            returned(h.call(204, [listener as u64, name_addr, name_len_addr, 0, 0, 0],)),
+            0
+        );
+        let bound = h.memory.read_bytes(name_addr, 16).unwrap();
+        let port = u16::from_be_bytes([bound[2], bound[3]]);
+        assert_ne!(port, 0);
+
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(listener as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, listener as u64, ev_addr, 0, 0],
+            )),
+            0
+        );
+
+        let mut host_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            host_addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        }
+        host_addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        host_addr.sin_port = port.to_be();
+        host_addr.sin_addr = libc::in_addr {
+            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        };
+        let connect_client = || {
+            let client = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert!(client >= 0, "host client socket");
+            let rc = unsafe {
+                libc::connect(
+                    client,
+                    &host_addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "host client connect");
+            client
+        };
+
+        let out_addr = h.reserve(16);
+        let client1 = connect_client();
+        assert_eq!(returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])), 1);
+        assert_eq!(
+            returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])),
+            0,
+            "EPOLLET must not blindly redeliver a still-unaccepted listener level"
+        );
+
+        let client2 = connect_client();
+        let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+        unsafe {
+            libc::close(client1);
+            libc::close(client2);
+        }
+        assert_eq!(
+            n, 1,
+            "a later listener EPOLLET edge must be delivered even though FIONREAD stays zero"
+        );
+        let out = h.memory.read_bytes(out_addr, 16).unwrap();
+        let events = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        assert_ne!(events & LINUX_EPOLLIN, 0);
+        assert_eq!(data, listener as u64);
+    }
+
+    #[test]
     fn epoll_et_write_eagain_after_partial_write_keeps_write_filter_armed() {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;

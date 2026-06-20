@@ -1999,18 +1999,25 @@ impl SyscallDispatcher {
                         // hit fans out to every guest fd currently sharing that host
                         // fd (dups). bits==0 is an EVFILT_USER(0) wake / untranslatable
                         // filter — in-memory readiness is recomputed in step (2).
-                        let mut deliver: HashMap<i32, u32> = HashMap::new();
+                        let mut deliver: HashMap<i32, (u32, u64)> = HashMap::new();
                         for ev in &poll_events {
                             let edge_bits = pollevent_to_epoll(ev);
                             if edge_bits == 0 {
                                 continue;
                             }
+                            let edge_readiness_count = if ev.readiness_count > 0 {
+                                ev.readiness_count as u64
+                            } else {
+                                0
+                            };
                             let (guest_fd, generation) = unpack_epoll_udata(ev.token);
                             match gfd_info.get(&guest_fd) {
                                 Some(&(hfd, _, _, reg_gen, _, _, _)) if reg_gen == generation => {
                                     if let Some(siblings) = host_to_gfds.get(&hfd) {
                                         for sibling in siblings {
-                                            *deliver.entry(*sibling).or_insert(0) |= edge_bits;
+                                            let entry = deliver.entry(*sibling).or_insert((0, 0));
+                                            entry.0 |= edge_bits;
+                                            entry.1 = entry.1.max(edge_readiness_count);
                                         }
                                     }
                                 }
@@ -2030,7 +2037,7 @@ impl SyscallDispatcher {
                         // model: the edge only FLAGS the fd; we re-poll just the
                         // flagged owners (polling ALL registered fds was O(nfds) and
                         // too slow).
-                        for (gfd, edge_bits) in deliver {
+                        for (gfd, (edge_bits, edge_readiness_count)) in deliver {
                             if let Some(&(
                                 _,
                                 requested,
@@ -2049,19 +2056,24 @@ impl SyscallDispatcher {
                                 } else {
                                     0
                                 };
+                                let observed_read_avail = if edge_readiness_count > 0 {
+                                    edge_readiness_count
+                                } else {
+                                    read_avail
+                                };
                                 let clear_write_backpressure =
                                     write_backpressured && raw & LINUX_EPOLLOUT != 0;
                                 ready_updates.push((
                                     gfd,
                                     reg_gen,
                                     raw,
-                                    read_avail,
+                                    observed_read_avail,
                                     clear_write_backpressure,
                                 ));
                                 let read_growth = if requested & LINUX_EPOLLET != 0
                                     && edge_bits & READ_READY_BITS != 0
                                     && raw & READ_READY_BITS != 0
-                                    && read_avail > last_read_avail
+                                    && observed_read_avail > last_read_avail
                                 {
                                     raw & edge_bits & READ_READY_BITS
                                 } else {
