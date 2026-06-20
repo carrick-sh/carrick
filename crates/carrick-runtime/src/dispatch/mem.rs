@@ -916,6 +916,21 @@ impl SyscallDispatcher {
                 if memory.read_bytes(address.0, 1).is_err() {
                     return Ok(LINUX_ENOMEM.into());
                 }
+                // Linux returns ENOMEM unless the WHOLE [address, address+length)
+                // range is mapped. Require the END page to be mapped too (not just
+                // the first): an overflowing or unmapped end is ENOMEM. This also
+                // BOUNDS the residency vec below — without it a guest-controlled
+                // `length` (up to u64::MAX) forces a petabyte `vec![1u8; pages]`
+                // that aborts the carrick process (alloc failure is not a
+                // catchable panic). A mapped end caps the range to the guest's
+                // actual mappings (≤ guest RAM), so `pages` stays small.
+                let last_page = match address.0.checked_add(length - 1) {
+                    Some(end) => end & !(LINUX_PAGE_SIZE - 1),
+                    None => return Ok(LINUX_ENOMEM.into()),
+                };
+                if memory.read_bytes(last_page, 1).is_err() {
+                    return Ok(LINUX_ENOMEM.into());
+                }
                 let pages = length.div_ceil(LINUX_PAGE_SIZE);
                 let bytes = vec![1u8; pages as usize];
                 memory.write_bytes(vec.0, &bytes)?;
