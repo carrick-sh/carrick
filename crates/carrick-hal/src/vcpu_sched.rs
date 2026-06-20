@@ -157,6 +157,30 @@ impl VcpuScheduler for NoopScheduler {
     }
 }
 
+std::thread_local! {
+    /// The slot lease the CURRENT host thread holds. Set by the runtime right
+    /// after `acquire` (on the guest thread's own host thread), read by the
+    /// backend when it creates that thread's vCPU, and taken by the runtime at
+    /// thread exit to `release`. Per-host-thread by nature — a thread-local is the
+    /// natural representation, and the runtime owns the set/clear lifecycle.
+    static CURRENT_LEASE: std::cell::Cell<Option<SlotLease>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record the lease the current host thread just acquired (runtime, post-acquire).
+pub fn set_current_lease(lease: SlotLease) {
+    CURRENT_LEASE.with(|c| c.set(Some(lease)));
+}
+
+/// Take the current thread's lease (runtime, at thread exit, to release it).
+pub fn take_current_lease() -> Option<SlotLease> {
+    CURRENT_LEASE.with(|c| c.take())
+}
+
+/// The slot id the current host thread holds, if any — the backend's vCPU id.
+pub fn current_slot() -> Option<SlotId> {
+    CURRENT_LEASE.with(|c| c.get().map(|l| l.slot))
+}
+
 static GLOBAL: OnceLock<Box<dyn VcpuScheduler>> = OnceLock::new();
 
 /// Install the process scheduler once at startup (idempotent; first wins).
