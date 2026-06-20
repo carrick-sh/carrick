@@ -1333,12 +1333,22 @@ impl X86Vmm for BhyveVmm {
 
     fn save_guest_state(&self) -> Vec<u8> {
         // Captured at a ring-0 (LSTAR-stub) syscall block point — the per-thread
-        // GPRs/RSP/RIP/RFLAGS + FS/GS base. See SNAPSHOT_REGS.
+        // GPRs/RSP/RIP/RFLAGS + FS/GS base + FP/AVX. See SNAPSHOT_REGS.
         let vc = self.h.as_bhyve();
         let vals = vc.get_register_set(&SNAPSHOT_REGS).unwrap_or_default();
         let (fb, fl, fa) = vc.get_desc(VM_REG_GUEST_FS).unwrap_or((0, 0, 0));
         let (gb, gl, ga) = vc.get_desc(VM_REG_GUEST_GS).unwrap_or((0, 0, 0));
-        let mut buf = Vec::with_capacity(SNAPSHOT_REGS.len() * 8 + 32);
+        // FP/AVX: drive the FXSAVE/XSAVE stub (valid at the ring-0 syscall boundary,
+        // `started`+CPL-0) so a reclaimed thread keeps its SSE/AVX state — Go &c. use
+        // SSE, so without this a reclaim corrupts FP. `None` when the vCPU has not
+        // reached a real syscall yet (a brand-new thread has nothing to preserve).
+        let xsave = BhyveX86Vcpu {
+            h: Arc::clone(&self.h),
+        }
+        .get_xsave()
+        .ok()
+        .flatten();
+        let mut buf = Vec::with_capacity(SNAPSHOT_REGS.len() * 8 + 33 + carrick_x86::XSAVE_LEN);
         for v in &vals {
             buf.extend_from_slice(&v.to_le_bytes());
         }
@@ -1346,6 +1356,13 @@ impl X86Vmm for BhyveVmm {
         buf.extend_from_slice(&gb.to_le_bytes());
         for x in [fl, fa, gl, ga] {
             buf.extend_from_slice(&x.to_le_bytes());
+        }
+        match xsave {
+            Some(xs) => {
+                buf.push(1);
+                buf.extend_from_slice(&xs);
+            }
+            None => buf.push(0),
         }
         buf
     }
@@ -1397,6 +1414,16 @@ impl X86Vmm for BhyveVmm {
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         vc.set_desc(VM_REG_GUEST_GS, gb, gl, ga)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Restore FP/AVX if it was captured (the flag byte follows the descriptors).
+        let fp_off = base + 32;
+        if state.get(fp_off) == Some(&1) && state.len() >= fp_off + 1 + carrick_x86::XSAVE_LEN {
+            let mut xs = [0u8; carrick_x86::XSAVE_LEN];
+            xs.copy_from_slice(&state[fp_off + 1..fp_off + 1 + carrick_x86::XSAVE_LEN]);
+            let _ = BhyveX86Vcpu {
+                h: Arc::clone(&self.h),
+            }
+            .set_xsave(&xs);
+        }
         Ok(())
     }
 
