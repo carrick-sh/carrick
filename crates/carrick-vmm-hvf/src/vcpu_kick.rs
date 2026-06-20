@@ -373,6 +373,8 @@ pub fn spawn_signal_pump(
                                         i64::try_from(delay_ns).unwrap_or(i64::MAX),
                                     )
                                     .with_udata_u64(crate::itimer::generation(which))]);
+                                } else {
+                                    crate::itimer::complete_fire(which);
                                 }
                                 continue;
                             }
@@ -392,6 +394,8 @@ pub fn spawn_signal_pump(
                                     )
                                     .with_udata_u64(crate::itimer::generation(which))]);
                                 }
+                            } else {
+                                crate::itimer::complete_fire(which);
                             }
                         }
                         continue;
