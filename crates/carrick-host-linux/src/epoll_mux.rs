@@ -436,6 +436,7 @@ impl EventMultiplexer for EpollMultiplexer {
                 out.push(PollEvent {
                     token: ident,
                     readiness: Readiness::empty(),
+                    readiness_count: 0,
                     error: None,
                     eof: false,
                     exit_status: None,
@@ -462,6 +463,7 @@ impl EventMultiplexer for EpollMultiplexer {
                 out.push(PollEvent {
                     token: raw_token,
                     readiness: Readiness::READ,
+                    readiness_count: 0,
                     error: None,
                     eof: false,
                     exit_status: None,
@@ -477,6 +479,7 @@ impl EventMultiplexer for EpollMultiplexer {
                 out.push(PollEvent {
                     token: raw_token,
                     readiness: Readiness::READ,
+                    readiness_count: 0,
                     error: None,
                     eof: true,
                     exit_status,
@@ -507,6 +510,7 @@ impl EventMultiplexer for EpollMultiplexer {
             out.push(PollEvent {
                 token: raw_token,
                 readiness,
+                readiness_count: 0,
                 error,
                 eof,
                 exit_status: None,
@@ -578,6 +582,7 @@ impl EpollMultiplexer {
                     out.push(PollEvent {
                         token,
                         readiness: Readiness::READ,
+                        readiness_count: 0,
                         error: None,
                         eof: ev.mask & (libc::IN_IGNORED | libc::IN_DELETE_SELF) != 0,
                         exit_status: None,

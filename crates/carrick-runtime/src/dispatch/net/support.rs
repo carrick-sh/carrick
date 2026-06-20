@@ -2263,6 +2263,7 @@ mod tests {
         let ev = |readiness: Readiness, eof: bool, error: Option<i32>| PollEvent {
             token: 7,
             readiness,
+            readiness_count: 0,
             error,
             eof,
             exit_status: None,
