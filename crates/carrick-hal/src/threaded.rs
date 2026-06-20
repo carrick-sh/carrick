@@ -373,6 +373,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
 
     fn kick_handle(&self) -> Self::KickHandle;
     fn wait_for_vcpu_slot();
+    /// Live concurrent-vCPU budget N for the admission scheduler (the M:N pool).
+    /// `usize::MAX` (the default) means "no carrick-side cap" — HVF (its own
+    /// `vcpu_gate` stays in Phase 1) and KVM; bhyve returns `hw.vmm.maxcpu`.
+    fn vcpu_budget() -> usize {
+        usize::MAX
+    }
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError>;
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
     where

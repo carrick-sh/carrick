@@ -532,6 +532,11 @@ pub mod runtime {
         // descendant inherits the same MAP_SHARED region.
         crate::guest_cpu::init_child_table();
 
+        // Install the M:N admission scheduler for this backend's concurrent-vCPU
+        // budget (a bounded HostCondvarScheduler for bhyve's hw.vmm.maxcpu; a Noop
+        // for unbounded HVF/KVM). Once, before any guest thread can spawn.
+        carrick_hal::vcpu_sched::install_for_budget(E::vcpu_budget());
+
         // The CONCRETE process-private futex table, threaded UNCHANGED through the
         // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
         // protocol stays byte-identical). The host's object-safe `PlatformFutex`
