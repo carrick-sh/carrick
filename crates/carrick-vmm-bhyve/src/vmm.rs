@@ -625,6 +625,20 @@ impl BhyveSharedVm {
         let _ = unsafe { vcpu_reset(vcpu) };
         Ok((BhyveVcpu { vcpu }, id))
     }
+
+    /// Re-open an ALREADY-activated vCPU id for the M:N reclaim re-bind: just the
+    /// handle — NO `vm_activate_cpu` (the id persists for the VM's life) and NO
+    /// `vcpu_reset` (a recycled vCPU keeps its long-mode control regs; the caller
+    /// restores only the per-thread GPRs/RSP/RFLAGS/FS-GS-base it saved).
+    pub fn reopen_vcpu(&self, id: c_int) -> Result<BhyveVcpu, OsError> {
+        let vcpu = unsafe { vm_vcpu_open(self.0.ctx, id) };
+        if vcpu.is_null() {
+            return Err(OsError::new(format!(
+                "bhyve: reopen vm_vcpu_open({id}) NULL"
+            )));
+        }
+        Ok(BhyveVcpu { vcpu })
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

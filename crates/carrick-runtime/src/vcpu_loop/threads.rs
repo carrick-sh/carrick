@@ -25,22 +25,50 @@ where
         use crate::thread::FutexWaitOutcome;
 
         let retval: i64 = loop {
-            let outcome =
-                match self
-                    .futex
-                    .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
-                        crate::host_signal::has_pending_for(self.this_tid)
-                            || crate::fork_quiesce::is_quiescing()
-                            || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
-                    }) {
-                    FutexWaitOutcome::Woken => 0,
-                    FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
-                    FutexWaitOutcome::Interrupted if crate::fork_quiesce::is_quiescing() => {
-                        self.release_and_park_vcpu_for_fork(engine)?;
-                        continue;
-                    }
-                    FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
+            // M:N reclaim-on-block: free this thread's vCPU slot for the duration of
+            // the blocking wait so another guest thread can run on it, restoring this
+            // thread's state into a (possibly different) slot on wake. Only when the
+            // backend reclaims (bhyve); a no-op on HVF/KVM (Phase 1 lifetime-bind).
+            let snapshot = if engine.reclaims() && carrick_hal::vcpu_sched::global().has_waiters() {
+                let st = engine.save_guest_state();
+                let old_slot = carrick_hal::vcpu_sched::current_slot();
+                if let Some(l) = carrick_hal::vcpu_sched::take_current_lease() {
+                    carrick_hal::vcpu_sched::global()
+                        .release(l, carrick_hal::vcpu_sched::Yield::Blocked);
+                }
+                Some((st, old_slot))
+            } else {
+                None
+            };
+            let raw = self
+                .futex
+                .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
+                    crate::host_signal::has_pending_for(self.this_tid)
+                        || crate::fork_quiesce::is_quiescing()
+                        || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
+                });
+            if let Some((st, old_slot)) = snapshot {
+                // Prefer the thread's OWN just-released slot (reuse its clean vCPU,
+                // no re-bind) over reclaiming another thread's — esp. an exited one.
+                let new = match old_slot {
+                    Some(p) => carrick_hal::vcpu_sched::global()
+                        .acquire_preferring(self.this_tid as u64, p),
+                    None => carrick_hal::vcpu_sched::global().acquire(self.this_tid as u64),
                 };
+                carrick_hal::vcpu_sched::set_current_lease(new);
+                engine
+                    .rebind_to_slot(new.slot, &st)
+                    .map_err(RuntimeError::Trap)?;
+            }
+            let outcome = match raw {
+                FutexWaitOutcome::Woken => 0,
+                FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
+                FutexWaitOutcome::Interrupted if crate::fork_quiesce::is_quiescing() => {
+                    self.release_and_park_vcpu_for_fork(engine)?;
+                    continue;
+                }
+                FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
+            };
             break outcome;
         };
         self.complete_returned(engine, retval)

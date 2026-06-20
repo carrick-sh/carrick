@@ -5,7 +5,7 @@
 //!
 //! See `docs/superpowers/specs/2026-06-20-mn-vcpu-scheduler-design.md`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -45,6 +45,21 @@ impl SlotLease {
 pub trait VcpuScheduler: Send + Sync + 'static {
     /// Block (parking the host thread) until a slot id is granted.
     fn acquire(&self, tid: u64) -> SlotLease;
+    /// Reclaim re-acquire: grant `preferred` (the slot the thread just released to
+    /// block) if it is still free, so the thread tends to reuse its OWN clean vCPU
+    /// with no re-bind — avoiding reclaiming a just-EXITED thread's dirty vCPU.
+    /// Falls back to a normal acquire. Default: ignore the hint.
+    fn acquire_preferring(&self, tid: u64, preferred: SlotId) -> SlotLease {
+        let _ = preferred;
+        self.acquire(tid)
+    }
+    /// True if any thread is currently blocked waiting for a slot (contention).
+    /// The runtime only reclaims-on-block when this holds — with spare slots a
+    /// blocking thread KEEPS its vCPU (no save/release/rebind), the fast path that
+    /// also avoids the spawn-vs-reclaim slot race. Default: never (no reclaim).
+    fn has_waiters(&self) -> bool {
+        false
+    }
     /// Return a slot. `Exited` frees it for reuse; `Blocked` is treated as
     /// `Exited` in Phase 1 (no reclaim yet) but distinguished for Phase 2.
     fn release(&self, lease: SlotLease, why: Yield);
@@ -72,6 +87,8 @@ pub struct HostCondvarScheduler {
     state: Mutex<PoolState>,
     cv: Condvar,
     grant_gen: AtomicU64,
+    /// Count of host threads currently blocked in `acquire` waiting for a slot.
+    blocked: AtomicUsize,
 }
 
 impl HostCondvarScheduler {
@@ -86,6 +103,7 @@ impl HostCondvarScheduler {
             }),
             cv: Condvar::new(),
             grant_gen: AtomicU64::new(1),
+            blocked: AtomicUsize::new(0),
         }
     }
 }
@@ -100,10 +118,44 @@ impl VcpuScheduler for HostCondvarScheduler {
                 return SlotLease { slot, generation };
             }
             // 50ms backstop like HVF's gate — never miss a release wakeup.
+            self.blocked.fetch_add(1, Ordering::SeqCst);
             let (g, _) = self
                 .cv
                 .wait_timeout(st, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner());
+            self.blocked.fetch_sub(1, Ordering::SeqCst);
+            st = g;
+        }
+    }
+
+    fn has_waiters(&self) -> bool {
+        self.blocked.load(Ordering::SeqCst) > 0
+    }
+
+    fn acquire_preferring(&self, _tid: u64, preferred: SlotId) -> SlotLease {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            // Reuse the thread's OWN just-released slot if it is still free.
+            if let Some(pos) = st.free.iter().position(|&s| s == preferred) {
+                st.free.remove(pos);
+                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
+                st.generations[preferred as usize] = generation;
+                return SlotLease {
+                    slot: preferred,
+                    generation,
+                };
+            }
+            if let Some(slot) = st.free.pop() {
+                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
+                st.generations[slot as usize] = generation;
+                return SlotLease { slot, generation };
+            }
+            self.blocked.fetch_add(1, Ordering::SeqCst);
+            let (g, _) = self
+                .cv
+                .wait_timeout(st, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            self.blocked.fetch_sub(1, Ordering::SeqCst);
             st = g;
         }
     }
