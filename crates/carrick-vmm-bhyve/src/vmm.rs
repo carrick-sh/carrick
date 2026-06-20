@@ -20,7 +20,7 @@
 //! compile-verified only (bhyve runs same-arch guests; the box is amd64).
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use carrick_hal::OsError;
 #[cfg(target_arch = "aarch64")]
@@ -271,6 +271,13 @@ fn sysreg_id(r: SysReg) -> Result<c_int, OsError> {
 struct BhyveVmInner {
     ctx: *mut Vmctx,
     next_vcpu: AtomicI32,
+    /// Bitset of activated vCPU ids (bit i = id i has been `vm_activate_cpu`d).
+    /// Init `1` (bit 0 set) because the MAIN vCPU is id 0. A sibling vCPU id granted
+    /// by the M:N scheduler is activated at most once for the VM's life; a recycled
+    /// id (a prior thread exited) is re-opened + re-seeded, never re-activated
+    /// (safe: `BhyveVcpu` has no `Drop`, so the kernel vCPU persists). Ids ≥ 64 fall
+    /// back to always-activate (N = hw.vmm.maxcpu is ≤ that on supported hosts).
+    activated: AtomicU64,
     /// `true` for an OWNING inner (`create`'s fresh VM, an execve's fresh VM, a
     /// fork child's fresh VM): its `Drop`/`destroy_in_place` run `vm_destroy`.
     /// `false` for a BORROWED inner (a vfork child's non-owning view of the
@@ -400,6 +407,7 @@ impl BhyveVm {
             inner: Arc::new(BhyveVmInner {
                 ctx,
                 next_vcpu: AtomicI32::new(0),
+                activated: AtomicU64::new(1), // bit 0 = the main vCPU (id 0)
                 // A freshly-created VM is OWNED: its `Drop`/`destroy_in_place`
                 // run `vm_destroy`.
                 owns: true,
@@ -479,6 +487,10 @@ impl BhyveVm {
             inner: Arc::new(BhyveVmInner {
                 ctx: shared.0.ctx,
                 next_vcpu: AtomicI32::new(1),
+                // Borrowed view of the parent's SHARED VM: its vCPUs are already
+                // activated, so treat every id as activated → always re-open + re-
+                // seed, never re-activate.
+                activated: AtomicU64::new(u64::MAX),
                 owns: false,
             }),
         }
@@ -585,16 +597,30 @@ impl BhyveSharedVm {
     /// blob + scratch-stack slot from the post-boot-free init-blob page by id, so
     /// the caller needs the id (sibling ids start at 1; id 0 is the main vCPU).
     pub fn add_sibling_vcpu(&self) -> Result<(BhyveVcpu, c_int), OsError> {
-        let id = self.0.next_vcpu.fetch_add(1, Ordering::SeqCst);
+        // Use the M:N scheduler's granted slot id (0..N, RECYCLED across guest
+        // threads) instead of a monotonic counter that would exhaust hw.vmm.maxcpu
+        // (the #10 vm_activate_cpu EINVAL bug). Fall back to the counter only if no
+        // lease is set (e.g. a Noop-scheduler backend that never reaches here).
+        let id = carrick_hal::vcpu_sched::current_slot()
+            .map(|s| s as c_int)
+            .unwrap_or_else(|| self.0.next_vcpu.fetch_add(1, Ordering::SeqCst));
         // SAFETY: `self.0.ctx` is a live vmctx for the VM's lifetime.
         let vcpu = unsafe { vm_vcpu_open(self.0.ctx, id) };
         if vcpu.is_null() {
             return Err(OsError::new(format!("bhyve: vm_vcpu_open({id}) NULL")));
         }
-        // SAFETY: `vcpu` is the just-opened vcpu handle.
-        let rc = unsafe { vm_activate_cpu(vcpu) };
-        if rc != 0 {
-            return Err(os_err("vm_activate_cpu", rc));
+        // Activate each id at most once for the VM's life (a recycled id is
+        // re-opened + re-seeded, never re-activated — BhyveVcpu has no Drop, so the
+        // kernel vCPU persists). Ids >= 64 fall back to always-activate.
+        let bit = if id < 64 { 1u64 << id } else { 0 };
+        let already = bit != 0 && (self.0.activated.fetch_or(bit, Ordering::SeqCst) & bit) != 0;
+        if !already {
+            // SAFETY: `vcpu` is the just-opened vcpu handle.
+            let rc = unsafe { vm_activate_cpu(vcpu) };
+            if rc != 0 {
+                self.0.activated.fetch_and(!bit, Ordering::SeqCst);
+                return Err(os_err("vm_activate_cpu", rc));
+            }
         }
         let _ = unsafe { vcpu_reset(vcpu) };
         Ok((BhyveVcpu { vcpu }, id))

@@ -536,6 +536,12 @@ pub mod runtime {
         // budget (a bounded HostCondvarScheduler for bhyve's hw.vmm.maxcpu; a Noop
         // for unbounded HVF/KVM). Once, before any guest thread can spawn.
         carrick_hal::vcpu_sched::install_for_budget(E::vcpu_budget());
+        // Reserve slot 0 for the MAIN thread (its vCPU is id 0), so siblings draw
+        // 1..N-1 and never collide with the main vCPU. Held for the process's life
+        // (released implicitly by `_exit`).
+        carrick_hal::vcpu_sched::set_current_lease(
+            carrick_hal::vcpu_sched::global().acquire(main_tid as u64),
+        );
 
         // The CONCRETE process-private futex table, threaded UNCHANGED through the
         // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
