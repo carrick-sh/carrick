@@ -161,6 +161,11 @@ impl Readiness {
 pub struct PollEvent {
     pub token: u64,
     pub readiness: Readiness,
+    /// Backend-supplied readiness quantity, when available. BSD kqueue reports
+    /// `kevent.data` here: for a listening socket this is the pending accept
+    /// count, and for readable streams it is the byte count. Backends that do
+    /// not expose a quantity set this to zero.
+    pub readiness_count: i64,
     /// `EV_EOF`/fflags → `EPOLLERR`.
     pub error: Option<i32>,
     /// → `EPOLLHUP`.

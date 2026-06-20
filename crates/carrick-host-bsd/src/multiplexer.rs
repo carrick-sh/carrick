@@ -224,6 +224,7 @@ impl EventMultiplexer for KqueueMultiplexer {
             out.push(PollEvent {
                 token,
                 readiness,
+                readiness_count: ev.data(),
                 error,
                 eof: is_eof,
                 exit_status,
