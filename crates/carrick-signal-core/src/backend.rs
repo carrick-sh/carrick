@@ -44,8 +44,8 @@ pub trait HostSignalGlue: 'static {
     fn host_to_linux(host_signum: i32) -> i32;
 
     /// Translate a LINUX (guest) signum to the HOST signum, for installing the
-    /// `sigaction` on the right host number. Inverse of [`host_to_linux`]; KVM
-    /// identity, BSD table. Pure (signal-safe).
+    /// `sigaction` on the right host number. Inverse of [`Self::host_to_linux`];
+    /// KVM identity, BSD table. Pure (signal-safe).
     fn linux_to_host(linux_signum: i32) -> i32;
 
     /// Whether `linux_signum` is already CLAIMED by this backend for one of its own
