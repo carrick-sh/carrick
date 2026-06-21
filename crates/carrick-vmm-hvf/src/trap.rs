@@ -634,8 +634,9 @@ mod vcpu_gate {
     static GATE_CV: Condvar = Condvar::new();
 
     /// HVF concurrent-vCPU budget for SIBLING threads (cap − reserve). Queried
-    /// once; if the query fails we fall back to a conservative 60.
-    fn budget() -> i64 {
+    /// once; if the query fails we fall back to a conservative 60. Now also the
+    /// `ThreadedEngine::vcpu_budget()` the bounded scheduler installs.
+    pub(crate) fn budget() -> i64 {
         *BUDGET.get_or_init(|| {
             let mut max: u32 = 0;
             let rc = unsafe { applevisor_sys::hv_vm_get_max_vcpu_count(&mut max) };
@@ -831,6 +832,11 @@ struct HvfInner {
     _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     vcpu: applevisor::vcpu::Vcpu,
     mappings: Vec<HvfMappedRegion>,
+    /// Per-thread snapshot stashed by the M:N reclaim between `save_guest_state`
+    /// (snapshot + destroy this vCPU at a block point) and `rebind_to_slot`
+    /// (recreate + restore on wake). The SAME host thread saves then restores, so
+    /// a plain field is safe and avoids serializing `VcpuSnapshot` through bytes.
+    reclaim_snapshot: Option<VcpuSnapshot>,
     /// The exception class of the most recent vCPU exit. We need to remember
     /// whether the trap came in via EL0 `svc` (`EC = 0x15`) or the EL1 vector
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
@@ -997,6 +1003,14 @@ struct VcpuSnapshot {
     /// and either writes to unmapped memory or loops indefinitely
     /// because the thread's tid never lands at the expected slot.
     tpidr_el0: u64,
+    /// TPIDRRO_EL0 (read-only EL0 thread ptr). `hv_vcpu_create` zeroes it and the
+    /// guest can only READ it (EL1 writes it), so a fork/clone or a destroy/recreate
+    /// reclaim must restore it — some runtimes (vDSO cpu-id, rseq) read it.
+    tpidrro_el0: u64,
+    /// TPIDR_EL1 — carrick stamps the guest tid here for the fast `gettid` path
+    /// (`run_until_syscall`). `hv_vcpu_create` zeroes it; a destroy/recreate reclaim
+    /// that doesn't restore it makes `gettid()` return 0/stale.
+    tpidr_el1: u64,
     last_exit_class: u64,
     /// V0-V31 + FPSR/FPCR, captured/restored across fork(2)/clone. A forked
     /// child (and the parent — both rebuild a fresh vCPU) would otherwise resume
@@ -1584,6 +1598,7 @@ impl HvfTrapEngine {
                 _vm: vm,
                 vcpu,
                 mappings: Vec::new(),
+                reclaim_snapshot: None,
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -3470,6 +3485,14 @@ impl HvfInner {
                 .vcpu
                 .get_sys_reg(SysReg::TPIDR_EL0)
                 .map_err(hvf_error)?,
+            tpidrro_el0: self
+                .vcpu
+                .get_sys_reg(SysReg::TPIDRRO_EL0)
+                .map_err(hvf_error)?,
+            tpidr_el1: self
+                .vcpu
+                .get_sys_reg(SysReg::TPIDR_EL1)
+                .map_err(hvf_error)?,
             last_exit_class: self.last_exit_class,
             vregs,
             fpsr,
@@ -3522,6 +3545,15 @@ impl HvfInner {
         self.vcpu
             .set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
             .map_err(hvf_error)?;
+        // TPIDRRO_EL0 (guest-readable thread ptr) + TPIDR_EL1 (carrick's fast-gettid
+        // tid stamp) are zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or
+        // a destroy/recreate reclaim) must restore both.
+        self.vcpu
+            .set_sys_reg(SysReg::TPIDRRO_EL0, snap.tpidrro_el0)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TPIDR_EL1, snap.tpidr_el1)
+            .map_err(hvf_error)?;
         // Apply SCTLR last so the MMU enable lands with the new tables.
         self.vcpu
             .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
@@ -3546,6 +3578,48 @@ impl HvfInner {
                 .map_err(hvf_error)?;
         }
         self.last_exit_class = snap.last_exit_class;
+        Ok(())
+    }
+
+    /// M:N reclaim — BLOCK side. Snapshot this vCPU and DESTROY it (freeing one
+    /// HVF concurrent-vCPU slot) so another guest thread can run while this one
+    /// parks in the futex wait. The SAME thread recreates it via
+    /// [`reclaim_resume_vcpu`](Self::reclaim_resume_vcpu) on wake. Unlike the fork
+    /// path this does NOT publish mappings or rebuild the VM — the VM is unchanged;
+    /// only the per-thread vCPU is recycled. (No `FORK_VCPU_SNAPSHOT` / no
+    /// `rebuilt_vm_cell`: the snapshot is stashed in `self.reclaim_snapshot`, and
+    /// recreate uses the existing `self._vm`.)
+    fn reclaim_park_vcpu(&mut self) -> Result<(), TrapError> {
+        let snap = self.snapshot_vcpu()?;
+        self.reclaim_snapshot = Some(snap);
+        // Raw destroy — only the owning thread may, and applevisor's Drop would
+        // panic on the post-destroy handle.
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu.id()) };
+        vcpu_destroyed();
+        if rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "reclaim_park_vcpu: hv_vcpu_destroy rc={rc:#x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// M:N reclaim — WAKE side. Recreate this thread's vCPU in the EXISTING VM (no
+    /// fork rebuild) and restore the parked register state (incl. TPIDR_EL0/
+    /// TPIDRRO_EL0/TPIDR_EL1 and the V-regs). The CALLER must hold
+    /// `fork_quiesce::topology_lock` so `vcpu_create` cannot race a concurrent
+    /// fork's `hv_vm_destroy`/`create`.
+    fn reclaim_resume_vcpu(&mut self) -> Result<(), TrapError> {
+        let snap = self.reclaim_snapshot.take().ok_or_else(|| {
+            TrapError::Hypervisor("reclaim_resume_vcpu: no parked snapshot".into())
+        })?;
+        let new_vcpu = self._vm.vcpu_create().map_err(hvf_error)?;
+        vcpu_created();
+        enable_el0_counter_access(new_vcpu.id());
+        // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
+        // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
+        std::mem::forget(std::mem::replace(&mut self.vcpu, new_vcpu));
+        self.restore_vcpu(&snap)?;
         Ok(())
     }
 
@@ -3772,6 +3846,7 @@ impl HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,
             mappings: Vec::with_capacity(mapping_descs.len()),
+            reclaim_snapshot: None,
             last_exit_class: snapshot.last_exit_class,
             last_fault_esr: 0,
             is_forked_child: pid == 0,
@@ -3973,6 +4048,7 @@ impl HvfInner {
             _vm: vm,
             vcpu,
             mappings: Vec::with_capacity(mappings.len()),
+            reclaim_snapshot: None,
             last_exit_class: snapshot.last_exit_class,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -4123,6 +4199,7 @@ impl HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,
             mappings: Vec::new(),
+            reclaim_snapshot: None,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: was_forked_child,
@@ -4804,6 +4881,8 @@ mod thread_sibling_tests {
             spsr_el1: 0x3c0,
             elr_el1: 0x5678, // post-syscall resume point (instruction after svc)
             tpidr_el0: 0xBEEF_0000,
+            tpidrro_el0: 0xBEEF_1000,
+            tpidr_el1: 0xBEEF_2000,
             last_exit_class: AARCH64_HVC_EXCEPTION_CLASS,
             vregs: [0u128; 32],
             fpsr: 0,
@@ -5605,9 +5684,50 @@ impl carrick_hal::ThreadedEngine for HvfTrapEngine {
     }
 
     fn wait_for_vcpu_slot() {
-        // Forward to the existing static slot gate (the 64-vCPU cap admission
-        // gate in the private `vcpu_gate` module).
-        HvfTrapEngine::wait_for_vcpu_slot();
+        // RETIRED: the bounded carrick-hal scheduler (installed for vcpu_budget())
+        // now performs admission in the shared spawn path. Keeping the old
+        // vcpu_gate here too would DOUBLE-GATE and defeat reclaim — the gate slot
+        // would stay held while the thread blocks, so freeing the scheduler slot
+        // wouldn't actually let a waiter run. No-op.
+    }
+
+    fn vcpu_budget() -> usize {
+        // The HVF concurrent-vCPU cap minus the fork-rebuild reserve — the same
+        // value the retired vcpu_gate enforced. The bounded scheduler enforces it,
+        // and reclaim recycles vCPUs so >cap guest threads run instead of hanging.
+        vcpu_gate::budget().max(1) as usize
+    }
+
+    fn reclaims(&self) -> bool {
+        true
+    }
+
+    fn reclaim_refreshes_kicker(&self) -> bool {
+        // HVF reclaim DESTROYS the vCPU, so the runtime must unregister this
+        // thread's (now-dead-id) kick handle before the no-vCPU wait and
+        // re-register the recreated vCPU's handle on wake.
+        true
+    }
+
+    fn save_guest_state(&mut self) -> Vec<u8> {
+        // Snapshot + DESTROY this vCPU (frees the slot). The snapshot is stashed in
+        // `self.inner.reclaim_snapshot` (read by `rebind_to_slot` on the SAME
+        // thread), so the returned bytes are unused. A park failure is fatal.
+        self.inner
+            .reclaim_park_vcpu()
+            .expect("HVF reclaim: snapshot + destroy failed");
+        Vec::new()
+    }
+
+    fn rebind_to_slot(
+        &mut self,
+        _slot: carrick_hal::SlotId,
+        _state: &[u8],
+    ) -> Result<(), TrapError> {
+        // Recreate this thread's vCPU in the EXISTING VM + restore the parked
+        // state. Slot id ignored (HVF recreates its OWN vCPU; no pool to swap).
+        // The caller (complete_futex_wait) holds topology_lock around this.
+        self.inner.reclaim_resume_vcpu()
     }
 
     /// Build a [`ThreadSpec`] for a thread-creating clone.

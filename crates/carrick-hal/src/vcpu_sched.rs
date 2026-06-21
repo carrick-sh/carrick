@@ -60,6 +60,16 @@ pub trait VcpuScheduler: Send + Sync + 'static {
     fn has_waiters(&self) -> bool {
         false
     }
+    /// True if at least one slot is currently FREE. The reclaim-on-block fast path
+    /// PARKS (keeps the vCPU) only when this holds: a parked thread can't then
+    /// starve a *future* waiter, because a free slot already exists for that waiter
+    /// to grab. When NO slot is free, a blocking thread must RECLAIM (release its
+    /// slot) even if no one is waiting yet — otherwise a waiter that arrives while
+    /// it is parked at, say, a barrier it can only leave once that waiter runs would
+    /// deadlock. Default: always spare (unbounded backends never park-starve).
+    fn has_spare_capacity(&self) -> bool {
+        true
+    }
     /// Return a slot. `Exited` frees it for reuse; `Blocked` is treated as
     /// `Exited` in Phase 1 (no reclaim yet) but distinguished for Phase 2.
     fn release(&self, lease: SlotLease, why: Yield);
@@ -130,6 +140,15 @@ impl VcpuScheduler for HostCondvarScheduler {
 
     fn has_waiters(&self) -> bool {
         self.blocked.load(Ordering::SeqCst) > 0
+    }
+
+    fn has_spare_capacity(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free
+            .is_empty()
     }
 
     fn acquire_preferring(&self, _tid: u64, preferred: SlotId) -> SlotLease {

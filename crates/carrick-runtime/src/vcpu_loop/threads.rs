@@ -29,12 +29,28 @@ where
             // the blocking wait so another guest thread can run on it, restoring this
             // thread's state into a (possibly different) slot on wake. Only when the
             // backend reclaims (bhyve); a no-op on HVF/KVM (Phase 1 lifetime-bind).
-            let snapshot = if engine.reclaims() && carrick_hal::vcpu_sched::global().has_waiters() {
+            // Reclaim (free this vCPU) when the backend reclaims AND either someone
+            // is already waiting OR there is no spare slot — parking with a full pool
+            // would let a future waiter starve (the parked thread is stuck at, e.g.,
+            // a barrier it can only leave once that waiter runs). With spare capacity
+            // and no waiter, PARK (keep the vCPU) — the fast path.
+            let reclaim_now = engine.reclaims()
+                && (carrick_hal::vcpu_sched::global().has_waiters()
+                    || !carrick_hal::vcpu_sched::global().has_spare_capacity());
+            let snapshot = if reclaim_now {
                 let st = engine.save_guest_state();
                 let old_slot = carrick_hal::vcpu_sched::current_slot();
                 if let Some(l) = carrick_hal::vcpu_sched::take_current_lease() {
                     carrick_hal::vcpu_sched::global()
                         .release(l, carrick_hal::vcpu_sched::Yield::Blocked);
+                }
+                // A backend whose reclaim DESTROYS the vCPU (HVF) leaves a dead-id
+                // kick handle (raw hv_vcpu_destroy doesn't drop applevisor's
+                // liveness Weak, so is_valid() lies). Unregister it before the
+                // no-vCPU wait — a parked thread is woken by the futex predicate,
+                // not the kicker — and re-register the recreated vCPU after rebind.
+                if engine.reclaim_refreshes_kicker() {
+                    self.kicker.unregister(self.this_tid);
                 }
                 Some((st, old_slot))
             } else {
@@ -56,9 +72,23 @@ where
                     None => carrick_hal::vcpu_sched::global().acquire(self.this_tid as u64),
                 };
                 carrick_hal::vcpu_sched::set_current_lease(new);
-                engine
-                    .rebind_to_slot(new.slot, &st)
-                    .map_err(RuntimeError::Trap)?;
+                if engine.reclaim_refreshes_kicker() {
+                    // HVF recreates the vCPU: do it under the topology lock so
+                    // vcpu_create can't race a concurrent fork's hv_vm_destroy/
+                    // create, then re-register the fresh vCPU's kick handle.
+                    let _topo = crate::fork_quiesce::topology_lock()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    engine
+                        .rebind_to_slot(new.slot, &st)
+                        .map_err(RuntimeError::Trap)?;
+                    let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
+                    self.kicker.register(self.this_tid, handle);
+                } else {
+                    engine
+                        .rebind_to_slot(new.slot, &st)
+                        .map_err(RuntimeError::Trap)?;
+                }
                 let prev = old_slot.unwrap_or(new.slot);
                 crate::probes::mn_reclaim(
                     self.this_tid as i32,
