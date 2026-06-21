@@ -579,6 +579,12 @@ crates — which is also why this pass is scoped to compile-checking; HVF/KVM/bh
 - **F6 (fp-stub half) — bhyve's byte-identical `fp_stub_bytes` re-points at
   `carrick_x86::fp_stub_bytes`** (behavior-neutral; drops the hand-copy and its
   parity test). *(freebsd)*
+- **P2.9 (dead VcpuKick surface) — removed `VcpuKick::target_in_guest` /
+  `raw_vcpu_id`** (both had zero callers — confirmed) and the always-`None`
+  per-kicker `in_guest: Option<Arc<AtomicBool>>` fields across hvf/kvm/bhyve/nvmm
+  + carrick-x86. Pure subtraction; the LIVE in-guest handshake
+  (`VcpuRegistry::register_in_guest`/`set_in_guest`/`any_other_in_guest`, used by
+  the run-loop Dekker handshake) is untouched. *(all 5)*
 - **Compile-time:** dropped `clap` from `carrick-observability` (one `ValueEnum`
   derive → hand-written `FromStr`/`Display`), removing the heavy clap proc-macro
   from every backend's compile closure (they pulled it only via observability).
@@ -627,7 +633,8 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
 - **P3.13 / P3.15 — `PageTableCodec` edit contract; one name-keyed syscall-number
   registry.** Both large; P3.13 carries memory-model risk (the arm stage-2
   incoherence extras must stay per-ISA).
-- **Dead-forwarder deletion (part of P2.9).** The `*_signal_pump.rs` / `*_xsig.rs`
+- **Dead-forwarder *files* (part of P2.9).** The `*_signal_pump.rs` / `*_xsig.rs`
   files are thin per-backend instantiations of the shared generics, not pure dead
   code — deleting them needs call-site migration, so it is a refactor, not the
-  "pure subtraction" the heading implies.
+  "pure subtraction" the heading implies. (The dead VcpuKick *methods/fields*,
+  which genuinely had no callers, are already removed — see above.)

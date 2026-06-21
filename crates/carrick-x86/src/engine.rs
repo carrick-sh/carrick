@@ -1136,10 +1136,6 @@ mod tests {
 
     impl VcpuKick for TestKick {
         fn kick(&self) {}
-
-        fn target_in_guest(&self) -> bool {
-            false
-        }
     }
 
     #[derive(Default)]

@@ -19,9 +19,7 @@
 //! the Dekker handshake with the fork / page-table coordinators is SeqCst on
 //! both sides.
 
-use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The signal carrick uses to force a vCPU out of `KVM_RUN`.
 ///
@@ -73,10 +71,6 @@ pub fn install_kvm_kick_handler() {
 pub struct KvmKickHandle {
     /// The owning vCPU thread's pthread id (the kick target).
     tid: libc::pthread_t,
-    /// The owning vCPU thread's `in_guest` flag, if known at handle-build time.
-    /// `target_in_guest` reads it; `None` (the common path) reports `false`,
-    /// matching the HVF handle whose in-guest state lives in the registry.
-    in_guest: Option<Arc<AtomicBool>>,
 }
 
 impl KvmKickHandle {
@@ -91,10 +85,7 @@ impl KvmKickHandle {
         install_kvm_kick_handler();
         // SAFETY: `pthread_self` is always safe and returns this thread's id.
         let tid = unsafe { libc::pthread_self() };
-        Self {
-            tid,
-            in_guest: None,
-        }
+        Self { tid }
     }
 }
 
@@ -107,18 +98,6 @@ impl carrick_hal::VcpuKick for KvmKickHandle {
             libc::pthread_kill(self.tid, kick_signal());
         }
     }
-
-    fn target_in_guest(&self) -> bool {
-        // Dekker rule: SeqCst load. `None` (the registry tracks in-guest state
-        // via VcpuRegistry::set_in_guest / any_other_in_guest, as on HVF) -> false.
-        self.in_guest
-            .as_ref()
-            .map(|f| f.load(Ordering::SeqCst))
-            .unwrap_or(false)
-    }
-
-    // raw_vcpu_id keeps its trait default (None): KVM has no bulk-kick primitive
-    // (no `hv_vcpus_exit`), so the bulk paths fan out per-handle `pthread_kill`.
 }
 
 /// The KVM vCPU-kick registry. The bookkeeping (the two maps + the SeqCst Dekker
@@ -131,6 +110,8 @@ pub type KvmKicker = carrick_hal::GenericVcpuRegistry;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use carrick_hal::{VcpuKick, VcpuRegistry};
 
@@ -142,9 +123,6 @@ mod tests {
     struct InertHandle;
     impl VcpuKick for InertHandle {
         fn kick(&self) {}
-        fn target_in_guest(&self) -> bool {
-            false
-        }
     }
 
     fn boxed() -> Box<dyn carrick_hal::VcpuKickDyn> {

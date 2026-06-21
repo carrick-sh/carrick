@@ -72,12 +72,6 @@ impl carrick_hal::VcpuKick for NvmmKickHandle {
             libc::pthread_kill(self.tid, kick_signal());
         }
     }
-
-    fn target_in_guest(&self) -> bool {
-        // The registry tracks in-guest state (set_in_guest / any_other_in_guest),
-        // mirroring the KVM handle whose in-guest state lives in the registry.
-        false
-    }
 }
 
 /// The NVMM vCPU-kick registry — the platform-neutral
