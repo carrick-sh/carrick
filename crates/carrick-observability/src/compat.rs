@@ -554,10 +554,36 @@ impl CompatReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+/// Output shape for `compat-report`. Parsed/rendered via `FromStr`/`Display`
+/// (not a `clap::ValueEnum` derive) so this foundational crate — linked by every
+/// backend — does not pull the heavy `clap` proc-macro into its compile closure.
+/// The CLI drives the arg through these impls (`#[arg(long, default_value_t)]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatReportFormat {
     Json,
     Text,
+}
+
+impl std::str::FromStr for CompatReportFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "json" => Ok(Self::Json),
+            "text" => Ok(Self::Text),
+            other => Err(format!(
+                "invalid format `{other}` (expected `json` or `text`)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for CompatReportFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Json => "json",
+            Self::Text => "text",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

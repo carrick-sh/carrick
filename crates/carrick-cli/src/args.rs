@@ -505,7 +505,10 @@ pub(crate) enum Commands {
     /// `compat-report` renders the HVF syscall-coverage report; macOS-only.
     #[cfg(feature = "platform-macos")]
     CompatReport {
-        #[arg(long, value_enum, default_value_t = CompatReportFormat::Json)]
+        // `CompatReportFormat` parses via `FromStr`/`Display` (not a clap
+        // `ValueEnum` derive) so its home crate carrick-observability does not
+        // pull `clap` into every backend's compile closure.
+        #[arg(long, default_value_t = CompatReportFormat::Json)]
         format: CompatReportFormat,
         #[arg(last = true)]
         command: Vec<String>,
