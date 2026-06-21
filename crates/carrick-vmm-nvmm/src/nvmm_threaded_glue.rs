@@ -45,27 +45,20 @@ impl carrick_hal::TimerDelivery for NvmmTimerDelivery {
             let generation = armed.generation;
             let slot = armed.slot.clone();
             let kicker = Arc::clone(&self.kicker);
+            let on_fire = move || {
+                carrick_signal_core::publish_process_signal(signum);
+                kicker.kick_all();
+            };
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-ptimer-{id}"))
                 .spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_nanos(value_ns));
-                    if !carrick_timer_core::posix::generation_matches(&slot, generation) {
-                        return;
-                    }
-                    carrick_signal_core::publish_process_signal(signum);
-                    kicker.kick_all();
-                    if interval_ns == 0 {
-                        return;
-                    }
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_nanos(interval_ns));
-                        if !carrick_timer_core::posix::generation_matches(&slot, generation) {
-                            return;
-                        }
-                        carrick_timer_core::posix::record_overrun(&slot);
-                        carrick_signal_core::publish_process_signal(signum);
-                        kicker.kick_all();
-                    }
+                    carrick_timer_core::posix::run_fallback(
+                        slot,
+                        generation,
+                        value_ns,
+                        interval_ns,
+                        on_fire,
+                    );
                 });
         }
         Some(armed.old)
