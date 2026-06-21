@@ -2378,12 +2378,7 @@ impl HvfInner {
         // genuinely-unmappable backing still terminates instead of spinning.
         let mut alias_remap_limiter = AliasRemapLimiter::default();
         let exit = loop {
-            let run_start = std::time::Instant::now();
-            crate::guest_cpu::begin_active();
-            let run_result = self.vcpu.run();
-            let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            crate::guest_cpu::finish_active(run_ns);
-            run_result.map_err(hvf_error)?;
+            crate::guest_cpu::timed_run(|| self.vcpu.run()).map_err(hvf_error)?;
             let exit = self.vcpu.get_exit_info();
             if exit.reason == ExitReason::CANCELED {
                 // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this

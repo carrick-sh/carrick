@@ -728,11 +728,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
             // add to the host thread's rusage. Mirrors the KVM (KvmTrapEngine) and
             // HVF trap loops, but lives HERE so every backend on this shared engine
             // gets it for free.
-            let run_start = std::time::Instant::now();
-            carrick_host::guest_cpu::begin_active();
-            let run_result = self.vcpu.run();
-            let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            carrick_host::guest_cpu::finish_active(run_ns);
+            let run_result = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
             match run_result? {
                 X86Exit::Syscall { frame, resume_pc } => {
                     self.sysret_resume = None;
