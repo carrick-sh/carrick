@@ -620,17 +620,17 @@ impl SyscallTrap for KvmTrapEngine {
                             .map_err(|e| TrapError::Hypervisor(e.to_string()))
                     };
                     self.last_fault_esr = syndrome;
-                    return Err(TrapError::EL0Fault {
+                    return Err(TrapError::el0_fault(
                         syndrome,
-                        elr: g(Reg::ElrEl1)?,
+                        g(Reg::ElrEl1)?,
                         far,
-                        x16: g(Reg::X(16))?,
-                        x17: g(Reg::X(17))?,
-                        x29: g(Reg::X(29))?,
-                        x30: g(Reg::X(30))?,
-                        sp: g(Reg::Sp)?,
-                        from_el0_direct: false,
-                    });
+                        g(Reg::X(16))?,
+                        g(Reg::X(17))?,
+                        g(Reg::X(29))?,
+                        g(Reg::X(30))?,
+                        g(Reg::Sp)?,
+                        false,
+                    ));
                 }
                 VcpuExit::MmioWrite { gpa, data, len } => {
                     let pc = self.vcpu.reg(Reg::Pc).unwrap_or(0);
