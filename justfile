@@ -42,8 +42,10 @@ install-hooks:
     @echo "Installed hooks: pre-commit (fmt-check), pre-push (clippy). Bypass with --no-verify."
 
 # No-panic lint gate (unwrap/expect/panic/todo denied) — matches CI.
+# `--keep-going` reports clippy errors across ALL crates in one pass instead of
+# stopping at the first failing crate (so a push surfaces the whole list at once).
 clippy *ARGS:
-    cargo clippy --workspace --all-targets {{ARGS}} -- -D warnings
+    cargo clippy --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
 
 # Formatting check (matches CI).
 fmt-check:
