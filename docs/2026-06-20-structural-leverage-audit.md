@@ -613,11 +613,19 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
 > (order `F8 → F4 → F5 → F7 → F3`; F3 last because it consumes the F4/F5/F8
 > seams). First slice landed: F7's `guest_cpu::timed_run` (below).
 
-- **F3 — `make_signal_arrival()` on `HostBackend` + delete `run_threaded_hvf_loop`.**
-  The seam is additive and safe, but migrating HVF onto the shared loop changes
-  the macOS signal-arrival path (kqueue pump), which only manifests at runtime and
-  cannot be exercised here. The shared-loop body is also `cfg(platform-linux/
-  freebsd/netbsd)`-only in `carrick-runtime` (ring-blocked from cross-check).
+- **F3 — fold `run_threaded_hvf_loop` onto the shared `run_threaded_loop`. DONE
+  (2026-06-21, rig-verified).** Extracted `HostBackend` + `run_threaded_loop` into
+  the new neutral `crate::threaded_loop` module; HVF's loop is now a thin wrapper
+  over `run_threaded_loop(.., HvfHostBackend, ..)` (the macOS twin of
+  `run_threaded_kvm_loop`). The 5 divergences became 4 `HostBackend` methods with
+  macOS-safe defaults (`make_signal_arrival` / `pre_loop_setup` /
+  `start_pump_eagerly` / `register_process_timer_kicker`) + an inlined PID-ns
+  fallback. All four backends drive ONE loop. Verified: macOS build signed +
+  clippy + HVF probe gate; **carrick-runtime + carrick-cli compile natively on
+  FreeBSD 15.1** (the BSD lane the `ring` C build had blocked from a macOS
+  cross-check — which also surfaced + fixed a pre-existing non-macOS build break:
+  the maskfork `mask_replaces` field was never destructured in the synchronous
+  dispatch loop).
 - **F5 — `HvfFutex` → `FutexTableFutex<HvfShared>`. DONE (2026-06-21, rig-verified).**
   A `SharedFutexSyscall::pre_wait` default-no-op hook lets HVF fold its
   forwarding shim onto the shared `FutexTableFutex` (KVM/bhyve/NVMM use it),
