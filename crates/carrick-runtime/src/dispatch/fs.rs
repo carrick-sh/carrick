@@ -5442,6 +5442,7 @@ impl SyscallDispatcher {
                                 timeout: None,
                                 on_timeout: -(LINUX_EAGAIN as i64),
                                 block_signals: 0,
+                                mask_replaces: false,
                             }
                         });
                     }

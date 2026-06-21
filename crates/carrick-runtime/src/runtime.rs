@@ -1268,6 +1268,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 timeout,
                 on_timeout,
                 block_signals,
+                mask_replaces: _,
             } => {
                 waiter.ensure_full();
                 match waiter.wait(&fds, timeout, block_signals) {
@@ -1289,6 +1290,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 fds,
                 timeout,
                 block_signals,
+                mask_replaces: _,
                 clear_on_timeout,
             } => {
                 waiter.ensure_full();
@@ -1321,6 +1323,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 timeout,
                 on_timeout,
                 block_signals,
+                mask_replaces: _,
             } => {
                 waiter.ensure_full();
                 let timeout = match timeout {

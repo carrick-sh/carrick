@@ -448,6 +448,7 @@ impl SyscallDispatcher {
                             timeout: None,
                             on_timeout: 0,
                             block_signals: 0,
+                            mask_replaces: false,
                         };
                     }
                 },
