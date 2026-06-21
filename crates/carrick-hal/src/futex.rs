@@ -7,11 +7,6 @@ use std::time::{Duration, Instant};
 
 use carrick_abi::{LINUX_EINTR, LINUX_ETIMEDOUT};
 
-pub trait CrossProcessFutex: Send + Sync {
-    fn wait(&self, host_addr: usize, expected: u32, timeout_us: u32) -> i64;
-    fn wake(&self, host_addr: usize, all: bool) -> i64;
-}
-
 /// Cap on a single cross-process (`MAP_SHARED`) futex wait slice: the per-vCPU
 /// kick cannot interrupt a thread blocked in the host wait primitive, so we wake
 /// every ≤20 ms to re-check `interrupted()` and the deadline.
