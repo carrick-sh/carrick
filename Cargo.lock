@@ -623,6 +623,7 @@ dependencies = [
 name = "carrick-vmm-kvm"
 version = "0.1.0"
 dependencies = [
+ "carrick-aarch64",
  "carrick-abi",
  "carrick-guest-mem",
  "carrick-hal",

@@ -1336,7 +1336,7 @@ impl KvmVm {
     /// Unregister a previously-mapped memory slot by re-issuing
     /// `KVM_SET_USER_MEMORY_REGION` with `memory_size = 0` — KVM's idiom for
     /// deleting a slot. Used by
-    /// [`crate::trap_engine::KvmTrapEngine::execve_into`] to tear down the old
+    /// `Aarch64EngineCore::execve_into` to tear down the old
     /// image's slots on the LIVE VM before re-registering the new image's
     /// windows (in-place remap, no VM teardown).
     ///

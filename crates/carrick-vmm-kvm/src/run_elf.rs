@@ -16,7 +16,7 @@ use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory};
 use carrick_hal::{ForkOutcome, SyscallTrap};
 use carrick_mem::memory::AddressSpace;
 
-use crate::trap_engine::KvmTrapEngine;
+use crate::trap_engine::{KvmTrapEngine, new_kvm_trap_engine};
 
 // asm-generic / aarch64 Linux syscall numbers (the only ABI carrick supports).
 const SYS_CLOSE: u64 = 57;
@@ -41,7 +41,7 @@ const CLONE_VM: u64 = 0x0000_0100;
 /// Returns the guest's exit code.
 pub fn run_elf_kvm(path: impl AsRef<Path>) -> Result<i32, String> {
     let image = AddressSpace::load_elf(path).map_err(|e| format!("load_elf: {e}"))?;
-    let mut engine = KvmTrapEngine::new(&image).map_err(|e| format!("kvm bring-up: {e}"))?;
+    let mut engine = new_kvm_trap_engine(&image).map_err(|e| format!("kvm bring-up: {e}"))?;
     let trace = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
 
     loop {

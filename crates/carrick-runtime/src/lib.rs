@@ -865,7 +865,11 @@ pub mod runtime {
                     b"TERM=dumb".as_slice(),
                 ],
             )?;
-        let mut engine = carrick_vmm_kvm::KvmTrapEngine::new(&image)?;
+        // `KvmTrapEngine` is now a type alias to the shared
+        // `Aarch64EngineCore<KvmAarch64Vmm>` (Stage 2), constructed via the
+        // backend's `bring_up` free function — mirroring the x86 lane's
+        // `kvm_x86_engine::bring_up`.
+        let mut engine = carrick_vmm_kvm::kvm_aarch64_engine::bring_up(&image)?;
         // Phase 2 Task 7: drive the generic MULTI-THREADED loop by default so
         // fork/execve/threads/futex guests run (handle_fork, sibling vCPUs, the
         // private/shared futex paths). The single-threaded thin loop
@@ -1076,7 +1080,9 @@ pub mod runtime {
     pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
         run_oci_with_engine(
             spec,
-            |image| carrick_vmm_kvm::KvmTrapEngine::new(image).map_err(RuntimeError::from),
+            |image| {
+                carrick_vmm_kvm::kvm_aarch64_engine::bring_up(image).map_err(RuntimeError::from)
+            },
             |engine, dispatcher, max_traps| run_threaded_kvm_loop(engine, dispatcher, max_traps),
         )
     }
