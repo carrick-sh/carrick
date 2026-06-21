@@ -573,6 +573,12 @@ crates — which is also why this pass is scoped to compile-checking; HVF/KVM/bh
 - **Pre-existing fix (fix-forward):** arch-split `kvm::append_vcpu_state` — it
   called x86-only `VcpuFd::get_regs/get_sregs` unconditionally, so the aarch64
   KVM lane did not compile.
+- **F9 (image-prep half) — `carrick_x86::load_x86_elf_image`.** The
+  `load_elf_for + with_vdso_bytes + with_linux_initial_stack` idiom (copied 4×,
+  twice in one NVMM file) is now one helper, called from KVM/bhyve/NVMM. *(all 5)*
+- **F6 (fp-stub half) — bhyve's byte-identical `fp_stub_bytes` re-points at
+  `carrick_x86::fp_stub_bytes`** (behavior-neutral; drops the hand-copy and its
+  parity test). *(freebsd)*
 - **Compile-time:** dropped `clap` from `carrick-observability` (one `ValueEnum`
   derive → hand-written `FromStr`/`Display`), removing the heavy clap proc-macro
   from every backend's compile closure (they pulled it only via observability).
@@ -600,10 +606,14 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
   wrapper 3→1, add a shared `TrapError::el0_fault` constructor) are safe and
   verifiable and are the recommended first step.
 - **F6 — migrate bhyve `guest_setup_x86` onto carrick-x86 bringup/fault helpers.**
-  Verifiable (freebsd) and high value (the byte-identical `fp_stub_bytes` kept in
-  sync only by a unit test); the SYSCALL-enable blob and FP/XSAVE stub MUST stay
-  bit-compatible for fork/clone, with no compiler enforcement — wants the bhyve
-  fork/clone runtime gate to confirm, not just a typecheck.
+  *Partly landed:* the byte-identical `fp_stub_bytes` (previously kept in sync by
+  a unit test) now re-points at the single `carrick_x86::fp_stub_bytes` — a
+  behavior-neutral dedup, verified on freebsd. *Deferred:* the `msr_init_blob`
+  re-point (the audit notes it has diverged by two args, so re-pointing CHANGES
+  behavior) and the `fault_idt`/`fault_stub`/`write_fault_tables` migration — the
+  SYSCALL-enable blob and the fault stubs MUST stay bit-compatible for fork/clone
+  with no compiler enforcement, so those want the bhyve fork/clone runtime gate to
+  confirm, not just a typecheck.
 - **F9 / F10 — `run_elf_with_engine` generic + drop `run_threaded_X_loop`
   wrappers + retire per-VMM mains.** The cheap slice (hoist `load_x86_elf_image`
   into carrick-x86) is verifiable and worth doing next.
