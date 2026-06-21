@@ -1482,11 +1482,13 @@ fn run_threaded_hvf_loop(
     // shared clone path (`spawn_clone_thread`) calls `vcpu_sched::global()`, which
     // PANICS ("scheduler not installed") if this is skipped — so every multi-
     // threaded HVF guest needs it, exactly like the x86 `run_threaded_loop`. HVF
-    // still enforces its concurrent-vCPU cap through its OWN `vcpu_gate`, so the
-    // scheduler installed here is the unbounded Noop (the shared slot acquire is a
-    // no-op; the gate does the real admission). When HVF gains reclaim-on-block
-    // this becomes the bounded HVF cap and the vcpu_gate is retired.
-    carrick_hal::vcpu_sched::install_for_budget(usize::MAX);
+    // now reclaims-on-block (destroy/recreate the vCPU), so this is the BOUNDED
+    // scheduler at the HVF cap (the retired `vcpu_gate`'s budget); >cap guest
+    // threads time-share the pool instead of hanging. Reserve slot 0 for the main
+    // thread (its vCPU is id 0) so siblings draw 1..N-1.
+    carrick_hal::vcpu_sched::install_for_budget(
+        <HvfTrapEngine as carrick_hal::ThreadedEngine>::vcpu_budget(),
+    );
     carrick_hal::vcpu_sched::set_current_lease(
         carrick_hal::vcpu_sched::global().acquire(main_tid as u64),
     );

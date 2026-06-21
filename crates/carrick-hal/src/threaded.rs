@@ -385,11 +385,21 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn reclaims(&self) -> bool {
         false
     }
+    /// Whether this backend's reclaim DESTROYS the vCPU (so its kick handle goes
+    /// dead and the runtime must unregister it from the VcpuRegistry before the
+    /// block and re-register on wake). `true` for HVF (destroy/recreate; raw
+    /// hv_vcpu_destroy does not drop applevisor's liveness Weak, so a stale handle
+    /// would lie `is_valid`); `false` for bhyve (pool-swap keeps the vCPU alive).
+    fn reclaim_refreshes_kicker(&self) -> bool {
+        false
+    }
     /// Save THIS thread's full guest CPU state (GPRs + RSP/RFLAGS + FS/GS base +
     /// FP/AVX) before releasing its vCPU slot at a block point. Only ever called by
     /// the owning host thread, only when [`reclaims`](Self::reclaims). Opaque,
     /// backend-serialized bytes round-tripped to [`rebind_to_slot`](Self::rebind_to_slot).
-    fn save_guest_state(&self) -> Vec<u8> {
+    /// `&mut self`: HVF DESTROYS its vCPU inside this call (snapshot then
+    /// hv_vcpu_destroy); bhyve/KVM read registers and ignore the extra mutability.
+    fn save_guest_state(&mut self) -> Vec<u8> {
         Vec::new()
     }
     /// Re-bind this engine to `slot`'s vCPU and restore `state` into it — called by
