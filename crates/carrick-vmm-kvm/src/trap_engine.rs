@@ -1105,20 +1105,9 @@ impl SyscallTrap for KvmTrapEngine {
 
 impl KvmTrapEngine {
     fn read_frame(&self) -> Result<Aarch64SyscallFrame, TrapError> {
-        let g = |n: u32| {
-            self.vcpu
-                .reg(Reg::X(n))
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))
-        };
-        Ok(Aarch64SyscallFrame {
-            x0: g(0)?,
-            x1: g(1)?,
-            x2: g(2)?,
-            x3: g(3)?,
-            x4: g(4)?,
-            x5: g(5)?,
-            x8: g(8)?,
-        })
+        // The syscall-frame register set (x0..x5 + x8) is single-sourced (F7).
+        carrick_hal::read_aarch64_syscall_frame(|r| self.vcpu.reg(r))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 }
 

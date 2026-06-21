@@ -311,6 +311,29 @@ pub trait RegAccess {
     }
 }
 
+/// Read the aarch64 Linux syscall-argument frame — `x0..x5` (the 6 args) + `x8`
+/// (the syscall number) — from a vCPU via a register getter.
+///
+/// Both aarch64 backends (HVF, KVM) extract the IDENTICAL frame on every `svc`
+/// trap; this single-sources the register set so it lives in ONE place, a step
+/// toward the `Aarch64EngineCore` symmetry with `carrick_x86` (F7). Takes a
+/// `get` closure rather than `&impl RegAccess` because HVF reads inside its inner
+/// engine (which is not itself the `RegAccess` impl). Each backend maps the
+/// [`OsError`] to its own `TrapError` at the call site.
+pub fn read_aarch64_syscall_frame(
+    mut get: impl FnMut(Reg) -> Result<u64, OsError>,
+) -> Result<carrick_guest_mem::Aarch64SyscallFrame, OsError> {
+    Ok(carrick_guest_mem::Aarch64SyscallFrame {
+        x0: get(Reg::X(0))?,
+        x1: get(Reg::X(1))?,
+        x2: get(Reg::X(2))?,
+        x3: get(Reg::X(3))?,
+        x4: get(Reg::X(4))?,
+        x5: get(Reg::X(5))?,
+        x8: get(Reg::X(8))?,
+    })
+}
+
 /// The bound the shared threaded loop is generic over. A backend is its own
 /// trap vehicle + register access + guest memory + per-thread/fork lifecycle.
 /// `GuestMemory` is a supertrait so the shared loop can `write_bytes` to the

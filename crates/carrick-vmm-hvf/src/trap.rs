@@ -2711,15 +2711,10 @@ impl HvfInner {
             let _ = (spsr, x2, x3, x4, x5);
         }
 
-        let frame = Aarch64SyscallFrame {
-            x0: self.vcpu.get_reg(Reg::X0).map_err(hvf_error)?,
-            x1: self.vcpu.get_reg(Reg::X1).map_err(hvf_error)?,
-            x2: self.vcpu.get_reg(Reg::X2).map_err(hvf_error)?,
-            x3: self.vcpu.get_reg(Reg::X3).map_err(hvf_error)?,
-            x4: self.vcpu.get_reg(Reg::X4).map_err(hvf_error)?,
-            x5: self.vcpu.get_reg(Reg::X5).map_err(hvf_error)?,
-            x8: self.vcpu.get_reg(Reg::X8).map_err(hvf_error)?,
-        };
+        // The syscall-frame register set (x0..x5 + x8) is single-sourced (F7); the
+        // getter reads the same applevisor registers this inline build did.
+        let frame = carrick_hal::read_aarch64_syscall_frame(|r| hvf_get_reg(&self.vcpu, r))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         // Snapshot the syscall number + original arg0 before the dispatcher
         // overwrites x0 with the retval, so an SA_RESTART handler that
         // interrupts this syscall can restart it (rewind PC to the `svc`,
