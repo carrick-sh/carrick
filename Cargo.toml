@@ -23,11 +23,19 @@ unimplemented = "deny"
 # macOS defaults to bundling debuginfo into a .dSYM via dsymutil on every link;
 # `unpacked` skips that packaging step (lldb/`carrick trace` still resolve line
 # info from the .o), cutting the link-dominated test-binary rebuild waves.
+# Incremental compilation is OFF workspace-wide (dev/test; dev-fast inherits dev,
+# release already defaults off). Incremental can mark the binary "fresh" without
+# re-running the post-build codesign step, leaving a stale/unsigned binary that
+# fails with HV_DENIED on the HVF rig — and it adds a class of stale-rlib
+# nondeterminism (a dependent crate compiled against an out-of-date rlib).
+# Determinism + reliable re-signing matter more here than the rebuild speedup.
 [profile.dev]
 split-debuginfo = "unpacked"
+incremental = false
 
 [profile.test]
 split-debuginfo = "unpacked"
+incremental = false
 
 # Everyday fast inner-loop profile: drop heavy type/variable DWARF, keep line
 # tables (backtraces + `carrick trace`/lldb line numbers still work). Use
