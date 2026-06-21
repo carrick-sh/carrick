@@ -21,7 +21,7 @@ pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
 pub mod futex;
-pub use futex::{CrossProcessFutex, SHARED_FUTEX_MAX_SLICE_NS, SharedWaitStep, shared_wait_sliced};
+pub use futex::{SHARED_FUTEX_MAX_SLICE_NS, SharedWaitStep, shared_wait_sliced};
 pub mod threaded;
 pub use threaded::{
     FutexOutcome, GenericVcpuRegistry, GuestEntryRegs, HostForkCoordinator, PlatformFutex,
