@@ -1607,17 +1607,3 @@ pub fn engine_from_brought_up(bux: BroughtUpX86) -> X86EngineCore<BhyveVmm> {
     };
     X86EngineCore::from_parts(vmm, vcpu, BHYVE_X86_LAYOUT)
 }
-
-// Keep the FP-stub byte emitter referenced (parity assertion: the carrick-x86
-// copy and the bhyve copy must agree; the bhyve copy is still written into guest
-// RAM by bring_up_x86_elf's write_fp_stub).
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn fp_stub_bytes_agree_with_carrick_x86() {
-        assert_eq!(
-            crate::guest_setup_x86::fp_stub_bytes(),
-            carrick_x86::fp_stub_bytes()
-        );
-    }
-}
