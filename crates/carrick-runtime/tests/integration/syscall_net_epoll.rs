@@ -1371,6 +1371,7 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
             timeout,
             on_timeout,
             block_signals,
+            mask_replaces: _,
         } => {
             assert_eq!(fds.len(), 1);
             assert!(fds[0].fd() >= 0);
@@ -1384,6 +1385,7 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
             timeout,
             on_timeout,
             block_signals,
+            mask_replaces: _,
         } => {
             assert!(fds.is_empty());
             assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
@@ -1459,6 +1461,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
         timeout,
         on_timeout,
         block_signals,
+        mask_replaces: _,
     } = outcome
     else {
         panic!("expected epoll wait handoff, got {outcome:?}");
@@ -1567,6 +1570,7 @@ fn epoll_latched_host_edge_parks_on_signal_wait_instead_of_kqueue_fd() {
         timeout,
         on_timeout,
         block_signals,
+        mask_replaces: _,
     } = outcome
     else {
         panic!("expected latch-masked level event to park on retry wait, got {outcome:?}");
@@ -2072,6 +2076,7 @@ fn dispatch_with_wait(
                 timeout,
                 on_timeout,
                 block_signals,
+                mask_replaces: _,
             } => {
                 let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
                 match waiter.wait(&fds, timeout, block_signals) {
@@ -2090,6 +2095,7 @@ fn dispatch_with_wait(
                 timeout,
                 on_timeout,
                 block_signals,
+                mask_replaces: _,
             } => {
                 let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
                 match waiter.wait_poll(&fds, timeout, block_signals) {
@@ -2239,6 +2245,7 @@ fn dispatch_threaded_with_wait_notify(
                 timeout,
                 on_timeout,
                 block_signals,
+                mask_replaces: _,
             } => {
                 if let Some(sender) = wait_notify.take() {
                     sender.send(fds.clone()).unwrap();
@@ -2260,6 +2267,7 @@ fn dispatch_threaded_with_wait_notify(
                 timeout,
                 on_timeout,
                 block_signals,
+                mask_replaces: _,
             } => {
                 if let Some(sender) = wait_notify.take() {
                     sender.send(fds.clone()).unwrap();

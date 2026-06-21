@@ -671,6 +671,7 @@ where
                     timeout,
                     on_timeout,
                     block_signals,
+                    mask_replaces,
                 } => {
                     self.waiter.ensure_full();
                     match self.waiter.wait_with_dispatch_pending(
@@ -681,6 +682,7 @@ where
                             kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
                                 self.this_tid,
                                 block_signals,
+                                mask_replaces,
                             )
                         },
                     ) {
@@ -706,6 +708,7 @@ where
                     fds,
                     timeout,
                     block_signals,
+                    mask_replaces,
                     clear_on_timeout,
                 } => {
                     self.waiter.ensure_full();
@@ -717,6 +720,7 @@ where
                             kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
                                 self.this_tid,
                                 block_signals,
+                                mask_replaces,
                             )
                         },
                     ) {
@@ -747,6 +751,7 @@ where
                     timeout,
                     on_timeout,
                     block_signals,
+                    mask_replaces,
                 } => {
                     self.waiter.ensure_full();
                     let timeout = match timeout {
@@ -772,6 +777,7 @@ where
                             kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
                                 self.this_tid,
                                 block_signals,
+                                mask_replaces,
                             )
                         },
                     ) {
@@ -799,9 +805,13 @@ where
                         pid,
                         block_signals,
                         || {
+                            // waitpid is additive: block_signals is
+                            // `non_interrupting_signal_mask` (a persistent-mask
+                            // superset), so the persistent-mask union is a no-op.
                             kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
                                 self.this_tid,
                                 block_signals,
+                                false,
                             )
                         },
                     ) {

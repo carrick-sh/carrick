@@ -720,20 +720,35 @@ impl SyscallDispatcher {
     }
 
     /// True iff dispatcher-owned signal state has a pending signal deliverable
-    /// to `tid` under the temporary wait mask. This complements
+    /// to `tid` for a blocking wait. This complements
     /// `host_signal::has_unblocked_pending_for`: host_signal sees backend/pump
     /// pending state, while this sees the dispatcher's per-thread and shared
     /// process pending sets.
+    ///
+    /// `mask_replaces` selects the wait's effective block mask. For
+    /// `ppoll`/`pselect6`/`epoll_pwait`, `block_mask` is a POSIX sigmask that
+    /// REPLACES the thread mask for the wait, so it is used ALONE — a signal the
+    /// temp mask unblocks must interrupt even if persistently blocked (probe
+    /// `ppollunblock`). For a plain `read`/`recv`/`connect` (additive; `block_mask`
+    /// is `0`), the thread's PERSISTENT mask gates the wait — a blocked-and-pending
+    /// signal must NOT interrupt it (probe `maskfork`). Unioning the two would
+    /// over-block the ppoll-unblock case, so the choice is explicit per call site.
     pub(crate) fn has_deliverable_dispatch_pending_for_wait(
         &self,
         tid: crate::thread::ThreadId,
         block_mask: u64,
+        mask_replaces: bool,
     ) -> bool {
         let always_deliverable =
             sigmask_bit(LINUX_SIGKILL).unwrap_or(0) | sigmask_bit(LINUX_SIGSTOP).unwrap_or(0);
         let signal = self.signal.lock();
+        let effective_block_mask = if mask_replaces {
+            block_mask
+        } else {
+            signal.mask_for(tid) | block_mask
+        };
         let pending = signal.pendings.get(&tid).copied().unwrap_or(0) | signal.process_pending;
-        pending & (!block_mask | always_deliverable) != 0
+        pending & (!effective_block_mask | always_deliverable) != 0
     }
 
     /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
@@ -2012,8 +2027,21 @@ mod tests {
 
         d.mark_process_signal_pending(usr1);
 
-        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, 0));
-        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, blocked));
+        // Additive (read/recv, block_mask=0, mask_replaces=false): an UNBLOCKED
+        // pending signal is deliverable and interrupts the wait.
+        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, 0, false));
+        // Replace (ppoll/pselect/epoll_pwait): a signal the temp mask BLOCKS does
+        // not interrupt.
+        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, blocked, true));
+        d.restore_signal_mask(tid, blocked);
+        // Additive: a signal blocked by the thread's PERSISTENT mask must NOT
+        // interrupt a plain read — this is the `maskfork` invariant.
+        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, 0, false));
+        // Replace: an EMPTY temp mask UNBLOCKS that persistently-blocked pending
+        // signal, so it MUST be deliverable — POSIX ppoll/pselect replace
+        // semantics. Unioning the persistent mask would wrongly suppress it; this
+        // guards the `ppollunblock` regression.
+        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, 0, true));
     }
 
     #[test]
