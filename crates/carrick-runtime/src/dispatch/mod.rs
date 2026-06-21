@@ -962,7 +962,6 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
                 write.bytes.len() - write.offset,
             )
         };
-        #[cfg(target_os = "macos")]
         crate::probes::host_pipe_io(write.host_fd(), 1, n as i64);
         if let Err(errno) = n.host_syscall_errno() {
             if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
@@ -4554,7 +4553,6 @@ fn read_host_pipe_into(
     // BLOCKING-IO-OK: host-backed descriptions are made O_NONBLOCK at creation
     // or adoption sites; EAGAIN becomes WaitOnFds for blocking guest fds.
     let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-    #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if let Err(e) = n.host_syscall_errno() {
         // EINTR: interrupted by a HOST signal. Don't surface it to the guest —
@@ -4753,7 +4751,6 @@ fn write_host_pipe_payload(
                 eprintln!("[TTYDBG-POST] host_fd={host_fd} wrote={n} outq_after={outq}");
             }
         }
-        #[cfg(target_os = "macos")]
         crate::probes::host_pipe_io(host_fd, 1, n as i64);
         if let Err(e) = n.host_syscall_errno() {
             // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
