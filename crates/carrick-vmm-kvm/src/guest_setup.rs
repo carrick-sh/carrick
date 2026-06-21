@@ -218,8 +218,8 @@ const ENC_ISB: u32 = 0xd503_3fdf; // isb
 /// MMIO-exit completion vehicle the syscall/fault vectors use.
 ///
 /// Register discipline: the trampoline clobbers x8 and x9 (the store value and
-/// the sentinel-address scratch). The caller ([`crate::trap_engine::
-/// KvmTrapEngine::run_el1_maintenance`]) SAVES and RESTORES x8 and x9 around the
+/// the sentinel-address scratch). The caller
+/// (`Aarch64EngineCore::run_el1_maintenance`) SAVES and RESTORES x8 and x9 around the
 /// run, exactly as it saves/restores PC/PSTATE/ELR_EL1/SPSR_EL1 — so the
 /// in-flight (parked) syscall frame resumes unperturbed. The store value (x8) is
 /// irrelevant to the host (only the gpa matters), so it is left as the
@@ -308,7 +308,7 @@ pub struct GuestRam {
     /// is the HOST-SIDE syscall-read check (cheap, no page tables). Making the
     /// GUEST itself fault mid-EL0 is the COMPLEMENTARY stage-1 path:
     /// `protect_range`/`unmap_range`/`unmap_alias_range` edit the live stage-1
-    /// descriptors (via [`crate::trap_engine::KvmTrapEngine::pt_edit_and_flush`],
+    /// descriptors (via `Aarch64EngineCore::pt_edit_and_flush`,
     /// which also runs the EL1-maintenance TLBI so a RE-protect of an already-
     /// walked page takes effect) and the Phase-4 EL0-fault→SIGSEGV path delivers
     /// the resulting abort — so these are LIVE overrides, not no-ops.
@@ -337,7 +337,7 @@ pub struct GuestRam {
 ///
 /// For the long-lived initial / forked-child RAM this never fires in practice
 /// (the engine lives for the process). It matters for
-/// [`crate::trap_engine::KvmTrapEngine::execve_into`], which REPLACES `self.ram`
+/// `Aarch64EngineCore::execve_into`, which REPLACES `self.ram`
 /// with a fresh `GuestRam` for the new image: the OLD `GuestRam` drops here and
 /// must release its host mmaps, or repeated execve would leak the prior image's
 /// windows (heap/mmap-arena/stack near 1 TiB are huge VA reservations).
@@ -693,7 +693,7 @@ impl GuestRam {
     }
 
     /// Rebuild a fresh `KvmVm` + `KvmVcpu` over THIS `GuestRam`'s existing host
-    /// mmaps — the child side of [`crate::trap_engine::KvmTrapEngine::fork`].
+    /// mmaps — the child side of `Aarch64EngineCore::fork`.
     ///
     /// After `libc::fork`, the child's inherited KVM fds point at the PARENT's
     /// kernel VM and are useless, so the child opens `/dev/kvm` afresh
@@ -843,7 +843,7 @@ impl GuestRam {
     /// (EL0 trampoline / stage-1 identity tables / EL1 sentinel vectors) into
     /// them. This is the shared "lay out the guest physical RAM for an image"
     /// step used by BOTH the initial [`bring_up`] and
-    /// [`crate::trap_engine::KvmTrapEngine::execve_into`] — execve replaces the
+    /// `Aarch64EngineCore::execve_into` — execve replaces the
     /// guest image in place by building a new `GuestRam` here and re-registering
     /// its windows on the LIVE VM (the slots having first been unmapped).
     ///
@@ -935,15 +935,6 @@ impl GuestRam {
             .iter()
             .map(|w| (w.slot_gpa.unwrap_or(w.base), w.host as *mut u8, w.len))
             .collect()
-    }
-
-    /// Number of windows in THIS view. Test-only: execve now unregisters by the
-    /// shared per-VM slot counter (`KvmVm::slot_count`), not the window count —
-    /// a sibling-registered alias slot lives in the VM but only in the SIBLING's
-    /// GuestRam view, so this undercounts the VM's live slots.
-    #[cfg(test)]
-    pub(crate) fn window_count(&self) -> usize {
-        self.windows.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Shared, `Send`-safe descriptors of this RAM's host-backed windows.
@@ -1138,7 +1129,7 @@ pub(crate) fn populate_vdso_vvar(vcpu: &KvmVcpu, ram: &mut GuestRam) -> Result<(
 /// controls PSTATE, so PAN stays clear so the EL1 sentinel store reaches MMIO).
 ///
 /// Shared by both [`bring_up`] (initial image) and
-/// [`crate::trap_engine::KvmTrapEngine::execve_into`] (in-place image
+/// `Aarch64EngineCore::execve_into` (in-place image
 /// replacement). `execve_into` additionally zeroes x0..x30 before calling this
 /// (Linux execve clears the GPRs); this routine sets only SP/PC/PSTATE among the
 /// core registers, leaving x0..x30 to the caller's zeroing — and resets

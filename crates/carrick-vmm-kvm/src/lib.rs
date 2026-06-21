@@ -32,6 +32,11 @@ pub mod timer_delivery;
 // on x86_64.  The x86_64 analogues live in the cfg(x86_64) stubs below.
 #[cfg(target_arch = "aarch64")]
 pub mod fork;
+// The KVM aarch64 lane on the shared `carrick-aarch64` scaffold (Stage 2-KVM):
+// `KvmAarch64Vmm`/`impl Aarch64Vcpu for KvmVcpu` + `bring_up` →
+// `Aarch64EngineCore<KvmAarch64Vmm>`. Replaces the hand-rolled `KvmTrapEngine`.
+#[cfg(target_arch = "aarch64")]
+pub mod kvm_aarch64_engine;
 #[cfg(target_arch = "aarch64")]
 pub mod run_elf;
 #[cfg(target_arch = "aarch64")]
@@ -43,6 +48,8 @@ pub use kvm_futex::{KvmFutex, make_kvm_futex};
 pub use kvm_kicker::{KvmKickHandle, KvmKicker, install_kvm_kick_handler};
 pub use timer_delivery::KvmTimerDelivery;
 
+#[cfg(target_arch = "aarch64")]
+pub use kvm_aarch64_engine::{KvmAarch64Engine, KvmAarch64Vmm, bring_up as aarch64_bring_up};
 #[cfg(target_arch = "aarch64")]
 pub use run_elf::run_elf_kvm;
 #[cfg(target_arch = "aarch64")]

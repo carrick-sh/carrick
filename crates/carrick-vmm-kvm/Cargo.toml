@@ -26,6 +26,10 @@ carrick-abi = { path = "../carrick-abi" }
 # The shared x86 engine scaffold (Stage 4-KVM): the KVM x86 lane is migrated onto
 # `X86EngineCore<KvmVmm>` instead of the hand-rolled `KvmX86TrapEngine`.
 carrick-x86 = { path = "../carrick-x86" }
+# The shared aarch64 engine scaffold (Stage 2-KVM): the KVM aarch64 lane is
+# migrated onto `Aarch64EngineCore<KvmAarch64Vmm>` instead of the hand-rolled
+# `KvmTrapEngine`. Only the thin `Aarch64Vcpu`/`Aarch64Vmm` impls live in this crate.
+carrick-aarch64 = { path = "../carrick-aarch64" }
 # Neutral timer slot/registry bookkeeping. `KvmTimerDelivery` delegates slot
 # mutation here and (for POSIX) spawns the wall-clock firing thread; interval
 # timers use the caller-spawned `run_fallback` (arm_itimer → false).

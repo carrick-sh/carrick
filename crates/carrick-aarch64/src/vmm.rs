@@ -18,7 +18,8 @@
 
 use std::sync::Arc;
 
-use carrick_guest_mem::Aarch64SyscallFrame;
+use carrick_guest_mem::protections::MemoryProtections;
+use carrick_guest_mem::{Aarch64SyscallFrame, MemoryError};
 use carrick_hal::{
     GuestEntryRegs, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick, VcpuRegistry,
 };
@@ -182,6 +183,19 @@ pub trait Aarch64Vcpu {
     fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError>;
     fn restore(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError>;
 
+    /// The guest's real x9 at the trapped `svc`. The EL1 sentinel vector clobbers
+    /// x9 (the sentinel-store scratch) after stashing the guest's live x9 in a
+    /// scratch sysreg (KVM: `TPIDR_EL1`, free at EL0). The shared `complete_syscall`
+    /// restores it on every syscall return, and `fork` carries it onto the child
+    /// (the snapshot captured the CLOBBERED x9). The Linux aarch64 syscall ABI
+    /// preserves x1..x30, and musl holds a live x9 across `brk(2)`
+    /// (`__expand_heap` → `str x10,[x9,#920]`), so without this the guest faults on
+    /// the sentinel GPA. DEFAULT `Ok(0)`: a backend whose trap vehicle never
+    /// clobbers x9 has nothing to restore.
+    fn get_saved_x9(&self) -> Result<u64, TrapError> {
+        Ok(0)
+    }
+
     /// Run until the next exit, decoding the backend's native trap surface into
     /// [`Aarch64Exit`]. HVF: `hv_vcpu_run` + `get_exit_info()` => EXCEPTION+ESR.EC
     /// decode (svc / abort / sys64 MRS / maint-hvc) + CANCELED => `Kicked`. KVM:
@@ -262,6 +276,70 @@ pub trait Aarch64Vmm: Sized {
         Ok(false)
     }
 
+    // ── guest-memory access (the GuestMemory backing seam) ──
+    //
+    // The PROT_NONE EFAULT gate is keyed on the guest VA and lives in the engine's
+    // default `read_bytes`/`write_bytes` (via [`Self::protections`]); the backend
+    // hooks below do the BACKING access only, on the stage-1-TRANSLATED IPA, so a
+    // `repoint_private` overlay / high-VA alias resolves to the page the guest's
+    // OWN EL0 accesses hit rather than the stale shared aperture the VA still
+    // covers. For an identity VA `ipa == va`. (HVF: discrete per-region windows;
+    // KVM: `GuestRam::safe_access_translated_raw`.)
+
+    /// Read live guest memory at guest-PHYSICAL `gpa` (no VA translation, no
+    /// PROT_NONE gate). The shared run-elf / page-table seed paths read raw GPAs
+    /// (e.g. the live stage-1 page-table region, an `execve` path string).
+    fn read_gpa(&self, gpa: u64, len: usize) -> Result<Vec<u8>, TrapError>;
+
+    /// The PROT_NONE set the engine's default `read_bytes`/`write_bytes` gate on
+    /// (keyed on the guest VA). `Some(..)` so the gate fires; the backend owns the
+    /// set (KVM in `GuestRam`, shared across siblings) so a sibling thread's
+    /// `mprotect(PROT_NONE)` is observed here.
+    fn protections(&self) -> Option<&MemoryProtections>;
+
+    /// Backing READ of `[va, va+len)` whose stage-1 translation is `ipa`. The
+    /// engine already ran the PROT_NONE gate (on `va`); this does the IPA-translated
+    /// single-region backing copy. NULL-guard + single-window bounds live in the
+    /// backend.
+    fn translated_read(&self, va: u64, ipa: u64, len: usize) -> Result<Vec<u8>, MemoryError>;
+
+    /// Backing WRITE of `bytes` to `[va, va+len)` whose stage-1 translation is
+    /// `ipa`. Symmetric to [`Self::translated_read`].
+    fn translated_write(&mut self, va: u64, ipa: u64, bytes: &[u8]) -> Result<(), MemoryError>;
+
+    /// Record/clear a PROT_NONE range (the HOST-SIDE EFAULT bookkeeping). The
+    /// COMPLEMENTARY guest-side enforcement (so the guest's OWN EL0 access faults)
+    /// is the engine's stage-1 `protect_range`/`unmap_range` (page-table edit +
+    /// TLBI). Keyed on the guest VA.
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool);
+
+    /// Scrub the physical backing of `[address, address+len)`, BYPASSING the
+    /// PROT_NONE check — clears a reused/`munmap`'d region whose stale bytes must
+    /// never resurface after a later `mprotect` makes it readable.
+    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError>;
+
+    /// Host VA of a guest futex word IFF it lives in the `MAP_SHARED` aperture —
+    /// lets the dispatcher route a guest cross-process (`MAP_SHARED`) futex through
+    /// the shared host-`SYS_futex` path on the same physical page (inherited across
+    /// `fork(2)`). `None` for a private/COW word (those stay in-process via the
+    /// parking-lot `FutexTable`).
+    fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+        None
+    }
+
+    /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): mmap the host
+    /// file/anon backing and register a fresh stage-2 alias slot, returning the
+    /// `(gpa, writable)` the engine then threads into the SHARED stage-1
+    /// `map_aliased` edit. KVM derives the alias GPA from the VA inside its <1 TiB
+    /// arena; HVF maps at a low alias IPA. The STAGE-1 path stays in the engine.
+    fn add_alias(
+        &mut self,
+        va: u64,
+        len: u64,
+        payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    ) -> Result<(u64, bool), TrapError>;
+
     // ── vCPU lifecycle ──
 
     /// Create a fresh vCPU bound to this VM.
@@ -274,15 +352,29 @@ pub trait Aarch64Vmm: Sized {
     /// the x86 `ForkRamStrategy{Cow,EagerCopy}`.
     fn fork_ram_strategy(&self) -> ForkRamStrategy;
 
+    /// Freeze the guest RAM segment on the PARENT before `libc::fork`, so an
+    /// `EagerCopy` backend's child can rebuild from a coherent image. Only invoked
+    /// by the shared `fork()` when [`Self::fork_ram_strategy`] is `EagerCopy`
+    /// (HVF, whose windows are `MAP_SHARED`); the `Cow` default (KVM) is a no-op.
+    /// Mirrors the x86 `freeze_ram`.
+    fn freeze_ram_for_fork(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// Child-side rebuild after `libc::fork()`: KVM rebuilds a fresh `KvmVm` over
     /// the COW host mmaps; HVF rebuilds a fresh `applevisor` VM and re-`hv_vm_map`s
-    /// each region. The shared `fork()` calls this then restores the snapshot +
-    /// sets x0=0 + advances the child past the sentinel/HVC. (The x86
-    /// `rebuild_child_after_fork` analogue.)
+    /// each region. This hook owns the whole child-side register re-seat (restore
+    /// `snapshot`, set x0=0, restore the real x9 = `saved_x9`, advance the child PC
+    /// past the EL1-vector sentinel store / HVC, re-calibrate the vDSO clock), since
+    /// the PC-advance distance and the post-MMIO replay are per-trap-vehicle. The
+    /// shared `fork()` then sets the engine's `is_forked_child` flag, clears the
+    /// pending/tracking state, and clones the page-table editor. (The x86
+    /// `rebuild_child_after_fork` analogue, plus the aarch64 x9/sentinel carry.)
     fn rebuild_child_after_fork(
         &mut self,
         vcpu: &mut Self::Vcpu,
         snapshot: &Aarch64VcpuSnapshot,
+        saved_x9: u64,
     ) -> Result<(), TrapError>;
 
     /// `execve(2)` image replacement. KVM remaps slots in place on the live VM;
