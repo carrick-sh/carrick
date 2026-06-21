@@ -26,6 +26,15 @@ use crate::error::OsError;
 pub struct RawSyscall {
     pub number: u64,
     pub args: [u64; 6],
+    /// The guest Linux UAPI struct-layout family for this syscall, stamped by
+    /// the concrete backend's `GuestArch` at decode time. Carried as DATA (not
+    /// inferred at the loop boundary) because `SyscallTrap::next_syscall` is
+    /// type-erased over the ISA — a runtime loop generic over `R: SyscallTrap`
+    /// (the no-threads / combined Linux loops) has no `Arch` to consult, so the
+    /// abi must travel with the decoded syscall. `SyscallRequest::from_raw`
+    /// reads it, so a call site cannot forget the guest ABI and mis-marshal
+    /// epoll/stat/sigset layouts on the x86 path.
+    pub guest_abi: carrick_abi::LinuxGuestAbi,
 }
 
 /// A register/V-reg access through [`crate::RegAccess`] failed mid-sigframe

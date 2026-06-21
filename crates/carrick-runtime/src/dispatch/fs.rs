@@ -1595,6 +1595,7 @@ impl SyscallDispatcher {
         let exec_path = proc.executable_path.clone();
         let argv = proc.argv.clone();
         let env = proc.env.clone();
+        let guest_arch = proc.reported_arch();
         drop(proc);
         let open_fds = self.open_fd_numbers();
         let mem = self.mem_snapshot();
@@ -1604,6 +1605,7 @@ impl SyscallDispatcher {
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
+            guest_arch,
             environ: Some(env.as_slice()),
             open_fds: Some(open_fds.as_slice()),
             auxv: Some(mem.linux_auxv_image.as_slice()),

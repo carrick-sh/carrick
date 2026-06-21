@@ -138,7 +138,19 @@ fn net_interfaces() -> Vec<NetIface> {
 
 #[cfg(not(target_os = "macos"))]
 fn net_interfaces() -> Vec<NetIface> {
-    Vec::new()
+    // Off-macOS the AF_LINK/getifaddrs walk above is not wired up (Linux uses
+    // AF_PACKET/sockaddr_ll, not BSD's sockaddr_dl), so synthesize at least the
+    // loopback interface — every Linux box has `lo`, and a wholly empty
+    // /sys/class/net diverges from Docker for anything that enumerates
+    // interfaces. Full host enumeration on these backends is a follow-up.
+    vec![NetIface {
+        name: "lo".to_owned(),
+        index: 1,
+        mac: [0u8; 6],
+        mac_len: 6,
+        flags: (libc::IFF_LOOPBACK | libc::IFF_UP | libc::IFF_RUNNING) as u32,
+        is_loopback: true,
+    }]
 }
 
 /// Render `/sys/class/net/<if>/<attr>` for a live interface, or `None` if the

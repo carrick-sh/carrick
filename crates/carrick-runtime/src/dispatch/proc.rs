@@ -516,6 +516,20 @@ impl ProcState {
             ptrace_traceme: false,
         }
     }
+
+    /// The ISA this guest reports about *itself*. A native x86_64 guest
+    /// (`native_x86_64`, the bhyve/KVM-x86/NVMM backends) and a binfmt-translated
+    /// x86_64 guest (`binfmt_interpreted`, Apple Rosetta) both report x86_64;
+    /// otherwise native aarch64. SINGLE source for every arch-dependent synthetic
+    /// surface — `uname(2)`, `/proc/cpuinfo`, and future arch-keyed files — so
+    /// they can never contradict each other.
+    pub(super) fn reported_arch(&self) -> crate::vfs::GuestReportedArch {
+        if self.binfmt_interpreted || self.native_x86_64 {
+            crate::vfs::GuestReportedArch::X86_64
+        } else {
+            crate::vfs::GuestReportedArch::Aarch64
+        }
+    }
 }
 
 impl SyscallDispatcher {
@@ -1549,14 +1563,14 @@ impl SyscallDispatcher {
             // identity (executable_path stays the target, as on real Linux). Both
             // carry the resolved nodename.
             let nodename = crate::execute::guest_hostname();
-            let x86_64 = {
-                let p = this.proc.lock();
-                p.binfmt_interpreted || p.native_x86_64
-            };
-            let uts = if x86_64 {
-                LinuxUtsname::carrick_x86_64_with_nodename(nodename)
-            } else {
-                LinuxUtsname::carrick_aarch64_with_nodename(nodename)
+            let arch = this.proc.lock().reported_arch();
+            let uts = match arch {
+                crate::vfs::GuestReportedArch::X86_64 => {
+                    LinuxUtsname::carrick_x86_64_with_nodename(nodename)
+                }
+                crate::vfs::GuestReportedArch::Aarch64 => {
+                    LinuxUtsname::carrick_aarch64_with_nodename(nodename)
+                }
             };
             memory.write_bytes(address.0, uts.abi_bytes())?;
             Ok(DispatchOutcome::Returned { value: 0 })
