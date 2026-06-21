@@ -623,13 +623,18 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
   forwarding shim onto the shared `FutexTableFutex` (KVM/bhyve/NVMM use it),
   keeping its carrick-trace probes; ~100 LOC → a ~25-line `HvfShared`. Futex
   probe spine + 17/17 unit tests pass; KVM/bhyve/NVMM unchanged.
-- **F4 / F8 — fold HVF onto `host_glue` / `PumpForkCoordinator<P>`.** Both change
-  the hardest-to-test macOS backend's signal-disposition / fork-pump handshake —
-  the exact class of change (lost-wake, interruptibility) that a compile check
-  cannot catch. F8 in particular needs a parameterized **pump-lifecycle policy**
-  (HVF lazy/tty-gated vs the generic always-on) + self-pipe-reinit ownership, not
-  a blind copy — see the [refactor plan](2026-06-21-hvf-holdout-refactor-plan.md).
-  F4's spec bug-claims are muddled and need ABI verification first.
+- **F4 — fold HVF signal disposition onto `host_glue`. DONE (2026-06-21,
+  rig-verified).** Additive per-function skip gates + `is_synchronous_self_fault`
+  (defaults keep KVM/bhyve/NVMM byte-identical) + a ~30-line `HvfGlue`; HVF's four
+  disposition fns + `handle_routed` collapse to delegations. Every disposition
+  probe identical pre/post; 29/29 unit tests. (Both spec bug-claims were falsified
+  — F4 was pure dedup.)
+- **F8 — fold HVF onto `PumpForkCoordinator<P>`.** Changes the macOS backend's
+  fork-pump handshake — the lost-wake/interruptibility class a compile check can't
+  catch. Needs a parameterized **pump-lifecycle policy** (HVF lazy/tty-gated vs
+  the generic always-on) + self-pipe-reinit ownership + real meaning for the
+  kick-signal stubs F4 left — not a blind copy. See the
+  [refactor plan](2026-06-21-hvf-holdout-refactor-plan.md).
 - **F7 — `Aarch64EngineCore<V>` + `Aarch64Exit`.** Touches both aarch64 trap-loop
   shells (HVF + KVM). *Slice landed (2026-06-21, commit d8791cc8):* the
   `guest_cpu` run-timing wrapper is hoisted 3→1 into

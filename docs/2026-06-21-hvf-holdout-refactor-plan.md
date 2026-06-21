@@ -78,10 +78,23 @@ before F3 so the trap shell is centralized when F3 wires it in.
   the generic `PumpForkCoordinator`), `just conformance-probes` (fork*/clone*/
   kill*/maskfork/ppollunblock), nested-fork shell stress under `-t`.
 
-### F4 — HVF signal disposition → `carrick-signal-core` host_glue
-- **Current:** HVF re-implements the disposition control flow
-  (`carrick-vmm-hvf/src/host_signal.rs:945-1083`) vs shared
-  `carrick-signal-core/src/host_glue.rs:30-148`.
+### F4 — HVF signal disposition → `carrick-signal-core` host_glue — **DONE (rig-verified)**
+- **Landed:** additive `HostSignalGlue` methods (`skip_install_routing` /
+  `skip_ignore_mirror` / `skip_execve_reset`, defaults = the prior
+  `!is_routable`/`is_claimed` so KVM/bhyve/NVMM are byte-unchanged) +
+  `is_synchronous_self_fault` wired into `shared_routed_handler`; a ~30-line
+  `HvfGlue` overriding them. HVF's four disposition fns + `handle_routed` collapse
+  to one-line delegations; coherent because HVF already writes carrick-signal-core's
+  `proc_pending` (`HvfGlue::poke = notify_pending`).
+- **Verified:** every disposition probe identical pre/post (execvereset reset,
+  killfault si_code guard `ignored=6/6 correct=1`, killgroup\*, faultaddr, execsig,
+  forksigwalk); 29/29 unit tests; clippy clean. The 2 pre-existing unrelated
+  failures (execvereset altstack, cloneexitsig chld) reproduce on the pre-F4 binary.
+- **Note for F8:** F4 STUBBED HvfGlue's `kick_signal`/`install_kick_handler` (HVF
+  kicks via `hv_vcpus_exit`); the disposition path never consults them. F8 must
+  give those real meaning OR keep the trait relaxed — the coupling below stands.
+- *(historical)* **Was:** HVF re-implemented the disposition control flow
+  (`host_signal.rs:945-1083`) vs shared `host_glue.rs:30-148`.
 - **CORRECTION (verify before fixing):** the spec's two claimed bugs are
   **muddled** — (a) the SIGINT skip-set claim cites `matches!(9|13|17|19)` which
   does NOT contain SIGINT(2); (b) the `reset_routed_handlers_after_execve`
