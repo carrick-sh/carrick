@@ -446,7 +446,6 @@ name = "carrick-observability"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
- "clap",
  "libc",
  "parking_lot",
  "serde",
