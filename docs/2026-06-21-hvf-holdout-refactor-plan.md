@@ -172,7 +172,21 @@ before F3 so the trap shell is centralized when F3 wires it in.
   trap shells share one engine (like carrick_x86). Large.
 - **Verify:** the full probe gate (the engine drives all syscall dispatch).
 
-### F3 — fold `run_threaded_hvf_loop` onto the shared `run_threaded_loop` — NEXT (fully scoped; F4/F5/F8 done)
+### F3 — fold `run_threaded_hvf_loop` onto the shared `run_threaded_loop` — **DONE (rig-verified)**
+- **Landed:** extracted `HostBackend` + `run_threaded_loop` into the new neutral
+  `crate::threaded_loop` module; HVF's loop is a thin wrapper over
+  `run_threaded_loop(trap, dispatcher, HvfHostBackend, max_traps)`. The 5
+  divergences became 4 `HostBackend` methods with macOS-safe defaults
+  (`make_signal_arrival`, `pre_loop_setup`, `start_pump_eagerly`,
+  `register_process_timer_kicker` — cfg'd) + the PID-ns fallback inlined (guarded
+  by `requested()`). All four backends now drive ONE loop.
+- **Verified:** build signed clean; carrick-runtime (macOS) compiles; HVF rig
+  smoke + maskfork/killgroup/forksleepfork/itimer/itimerprofidle/posixtimers; full
+  gate. *Linux/freebsd/netbsd inline-runtime compile relies on CI* — `ring`'s C
+  build script blocks the carrick-runtime cross-compile from macOS (the change
+  there is a single `use` + the moved trait; the new methods are defaults, so the
+  existing KVM/bhyve/NVMM `HostBackend` impls are untouched).
+- *(historical scope notes below)*
 The KVM/bhyve/NVMM loops are already thin wrappers — e.g. `run_threaded_kvm_loop`
 is just `run_threaded_loop(engine, dispatcher, KvmHostBackend, max_traps)`
 (lib.rs:761). F3 makes HVF the same. With F4/F5/F8 done, the seams it consumes
