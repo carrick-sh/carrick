@@ -618,11 +618,18 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
   the macOS signal-arrival path (kqueue pump), which only manifests at runtime and
   cannot be exercised here. The shared-loop body is also `cfg(platform-linux/
   freebsd/netbsd)`-only in `carrick-runtime` (ring-blocked from cross-check).
-- **F4 / F5 / F8 — fold HVF onto `host_glue` / `FutexTableFutex<HvfSharedFutex>` /
-  `PumpForkCoordinator<P>`.** All three change the hardest-to-test macOS backend's
-  signal-disposition / futex / fork-pump handshake — the exact class of change
-  (lost-wake, interruptibility) that a compile check cannot catch and that
-  Linux/FreeBSD CI would miss.
+- **F5 — `HvfFutex` → `FutexTableFutex<HvfShared>`. DONE (2026-06-21, rig-verified).**
+  A `SharedFutexSyscall::pre_wait` default-no-op hook lets HVF fold its
+  forwarding shim onto the shared `FutexTableFutex` (KVM/bhyve/NVMM use it),
+  keeping its carrick-trace probes; ~100 LOC → a ~25-line `HvfShared`. Futex
+  probe spine + 17/17 unit tests pass; KVM/bhyve/NVMM unchanged.
+- **F4 / F8 — fold HVF onto `host_glue` / `PumpForkCoordinator<P>`.** Both change
+  the hardest-to-test macOS backend's signal-disposition / fork-pump handshake —
+  the exact class of change (lost-wake, interruptibility) that a compile check
+  cannot catch. F8 in particular needs a parameterized **pump-lifecycle policy**
+  (HVF lazy/tty-gated vs the generic always-on) + self-pipe-reinit ownership, not
+  a blind copy — see the [refactor plan](2026-06-21-hvf-holdout-refactor-plan.md).
+  F4's spec bug-claims are muddled and need ABI verification first.
 - **F7 — `Aarch64EngineCore<V>` + `Aarch64Exit`.** Touches both aarch64 trap-loop
   shells (HVF + KVM). *Slice landed (2026-06-21, commit d8791cc8):* the
   `guest_cpu` run-timing wrapper is hoisted 3→1 into
