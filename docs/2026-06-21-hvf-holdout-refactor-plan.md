@@ -172,16 +172,46 @@ before F3 so the trap shell is centralized when F3 wires it in.
   trap shells share one engine (like carrick_x86). Large.
 - **Verify:** the full probe gate (the engine drives all syscall dispatch).
 
-### F3 — `make_signal_arrival` on `HostBackend` + delete `run_threaded_hvf_loop`
-- **Current:** generic shared loop (`carrick-runtime/src/lib.rs:507-632`) vs the
-  HVF clone (`carrick-runtime/src/runtime.rs:1455-1584`); the ONE load-bearing
-  difference is the `SignalArrival` type (generic kick+futex vs HVF kqueue pump).
-- **ADDED SCOPE the spec understates:** `HostBackend`/`run_threaded_loop` are
-  `#[cfg(any(platform-linux,freebsd,netbsd))]` (lib.rs:463-467, 502-506) — NOT
-  compiled on macOS. F3 must un-gate them for platform-macos, add an
-  `HvfHostBackend`, and relocate the HVF-exclusive pre-loop setup
-  (`install_default_handlers` runtime.rs:1460, `TermiosRestoreGuard` 1461,
-  conditional pump-start 1547-1549). LAST, after F4/F5/F8 land + rig-verify.
+### F3 — fold `run_threaded_hvf_loop` onto the shared `run_threaded_loop` — NEXT (fully scoped; F4/F5/F8 done)
+The KVM/bhyve/NVMM loops are already thin wrappers — e.g. `run_threaded_kvm_loop`
+is just `run_threaded_loop(engine, dispatcher, KvmHostBackend, max_traps)`
+(lib.rs:761). F3 makes HVF the same. With F4/F5/F8 done, the seams it consumes
+(HvfGlue, hvf_futex, the fork coordinator) all exist.
+
+**STRUCTURAL PREREQUISITE (discovered 2026-06-21 — the real work):** the shared
+`run_threaded_loop` + `HostBackend` live INSIDE `#[cfg(not macos)] pub mod runtime
+{ … }` (an INLINE module in lib.rs, the Linux/KVM path), while
+`run_threaded_hvf_loop` is the SEPARATE `#[cfg(macos)] runtime.rs` file — two
+mutually-exclusive same-named `crate::runtime` modules. So "un-gate for macOS" is
+really: **extract `run_threaded_loop` + `HostBackend` (+ the `*HostBackend` impls'
+shared scaffold) into a NEW platform-neutral module** (e.g. `threaded_loop.rs`,
+no cfg) that BOTH the Linux inline module and `runtime.rs` call. Only then can HVF
+fold. This is a real run-loop module restructure, highest-stakes (the loop drives
+the ENTIRE runtime), so verify on the FULL gate + interactive `-t` + a container.
+
+**The 5 per-backend differences (each → a `HostBackend` method, defaults preserve
+KVM/bhyve/NVMM byte-for-byte):**
+1. `signal_arrival` (lib.rs:574 hardcodes `GenericSignalArrival`) → `fn
+   make_signal_arrival(&self, kicker, futex) -> Arc<dyn SignalArrival>`; default
+   `GenericSignalArrival{kicker,futex}`, HVF `HvfSignalArrival`.
+2. Pre-loop setup (runtime.rs:1460-1461 `install_default_handlers` +
+   `TermiosRestoreGuard`) → `fn pre_loop_setup(&self) -> Box<dyn Any>`; default
+   `Box::new(())`, HVF installs handlers + returns the termios guard (held for the
+   loop).
+3. Pump-start policy (shared loop line 591 starts UNCONDITIONALLY; HVF gates on
+   `host_isatty` runtime.rs:1547) → `fn start_pump_eagerly(&self) -> bool`;
+   default `true`, HVF `isatty(0)||isatty(1)`.
+4. Timer wiring: shared calls `timer_delivery::register(kicker,main_tid)` +
+   `register_delivery(make_timer_delivery())`; HVF skips the first. HVF can GAIN
+   it (harmless — only registers the kicker for the fallback thread, spawned only
+   in a pump-less context); `make_timer_delivery` → `HvfTimerDelivery`.
+5. PID-namespace fallback (runtime.rs:1481-1483) → add to the shared loop guarded
+   by `namespace::pid::requested()` (no-op when not requested → KVM/bhyve/NVMM
+   unchanged).
+**Then:** `HvfHostBackend` (make_futex=`hvf_futex`, make_fork_coordinator=
+`ForkCoordinator`, make_kicker=`VcpuKicker`, the 5 above); repoint runtime.rs:745
+to `run_threaded_loop(trap, dispatcher, HvfHostBackend, max_traps)`; delete
+`run_threaded_hvf_loop`. `HvfTrapEngine: ThreadedEngine` already (trap.rs:5676).
 
 ## Load-bearing splits to PRESERVE (audit §3 — do NOT fold)
 - Wake primitive: HVF kqueue/`EVFILT_USER` + self-pipe vs generic self-pipe +
