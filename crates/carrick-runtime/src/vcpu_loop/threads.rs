@@ -91,7 +91,7 @@ where
                 }
                 let prev = old_slot.unwrap_or(new.slot);
                 crate::probes::mn_reclaim(
-                    self.this_tid as i32,
+                    self.this_tid,
                     prev,
                     new.slot,
                     if new.slot == prev { 1 } else { 2 },
@@ -99,7 +99,7 @@ where
             } else if engine.reclaims() {
                 // A reclaiming backend that PARKED (uncontended — kept its vCPU).
                 let slot = carrick_hal::vcpu_sched::current_slot().unwrap_or(0);
-                crate::probes::mn_reclaim(self.this_tid as i32, slot, slot, 0);
+                crate::probes::mn_reclaim(self.this_tid, slot, slot, 0);
             }
             let outcome = match raw {
                 FutexWaitOutcome::Woken => 0,
@@ -210,7 +210,7 @@ where
                 let lease = carrick_hal::vcpu_sched::global().acquire(tid as u64);
                 carrick_hal::vcpu_sched::set_current_lease(lease);
                 crate::probes::mn_admit(
-                    tid as i32,
+                    tid,
                     lease.slot,
                     carrick_hal::vcpu_sched::global()
                         .budget()
