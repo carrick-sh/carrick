@@ -1456,12 +1456,12 @@ impl HvfTrapEngine {
             None
         };
         // PSTATE source: kick path (EL0) → live CPSR; eret path (EL1) → SPSR_EL1,
-        // where the `svc`/sigreturn-svc latched the EL0 PSTATE.
-        let pstate_source = if interrupted_pc.is_some() {
-            live_cpsr
-        } else {
-            self.get_reg(carrick_hal::Reg::SpsrEl1)?
-        };
+        // where the `svc`/sigreturn-svc latched the EL0 PSTATE. Single-sourced
+        // (F7); HVF reuses its already-read `live_cpsr` for the kick path.
+        let pstate_source =
+            carrick_hal::aarch64_signal_pstate_source(interrupted_pc, Some(live_cpsr), |r| {
+                self.get_reg(r)
+            })?;
         let params = carrick_hal::sigframe::InjectParams {
             signum,
             handler,

@@ -334,6 +334,31 @@ pub fn read_aarch64_syscall_frame(
     })
 }
 
+/// Select the PSTATE to save into an aarch64 signal frame.
+///
+/// The two aarch64 backends agree on the rule: the KICK path (a host signal
+/// interrupted the guest mid-EL0, so `interrupted_pc` is set) saves the LIVE EL0
+/// PSTATE; the SYSCALL/eret path (`interrupted_pc == None`) saves `SPSR_EL1`,
+/// where the `svc` latched the EL0 PSTATE. Single-sourced here (F7).
+///
+/// `live_pstate` lets a caller that ALREADY read the live PSTATE (HVF reads it
+/// for its EL-discrimination) reuse it instead of re-reading; `None` reads it
+/// fresh (KVM).
+pub fn aarch64_signal_pstate_source(
+    interrupted_pc: Option<u64>,
+    live_pstate: Option<u64>,
+    get: impl Fn(Reg) -> Result<u64, OsError>,
+) -> Result<u64, OsError> {
+    if interrupted_pc.is_some() {
+        match live_pstate {
+            Some(p) => Ok(p),
+            None => get(Reg::Pstate),
+        }
+    } else {
+        get(Reg::SpsrEl1)
+    }
+}
+
 /// The bound the shared threaded loop is generic over. A backend is its own
 /// trap vehicle + register access + guest memory + per-thread/fork lifecycle.
 /// `GuestMemory` is a supertrait so the shared loop can `write_bytes` to the
