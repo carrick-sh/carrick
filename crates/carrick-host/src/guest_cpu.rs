@@ -82,6 +82,21 @@ pub fn finish_active(delta_ns: u64) {
     });
 }
 
+/// Time one vCPU run: mark this thread active, invoke `run`, and commit the
+/// elapsed guest-CPU nanoseconds. The per-backend run-loop CPU-accounting wrapper
+/// single-sourced — every aarch64/x86 trap loop (`hv_vcpu_run`, `KVM_RUN`, the
+/// shared x86 engine) wraps its run the same way, so a new backend gets correct
+/// `getrusage`/`times`/`/proc` guest CPU time by calling this instead of copying
+/// the `Instant::now()` / `begin_active` / `finish_active` dance. Returns `run`'s
+/// value unchanged.
+pub fn timed_run<T>(run: impl FnOnce() -> T) -> T {
+    let start = std::time::Instant::now();
+    begin_active();
+    let result = run();
+    finish_active(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+    result
+}
+
 /// Process-wide guest CPU time (nanoseconds): the sum across all vCPU slots.
 pub fn total_ns() -> u64 {
     EXEC_SLOTS.iter().map(|s| s.load(Ordering::Relaxed)).sum()
