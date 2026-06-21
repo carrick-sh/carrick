@@ -685,6 +685,7 @@ impl SyscallDispatcher {
                         timeout,
                         on_timeout: -(LINUX_EAGAIN as i64),
                         block_signals: 0,
+                        mask_replaces: false,
                     }
                 }
             }
@@ -1344,6 +1345,7 @@ impl SyscallDispatcher {
                 timeout: None,
                 on_timeout: -(LINUX_EINPROGRESS as i64),
                 block_signals: 0,
+                mask_replaces: false,
             };
         }
         e.into()
@@ -2390,6 +2392,7 @@ impl SyscallDispatcher {
                         timeout,
                         on_timeout: 0,
                         block_signals,
+                        mask_replaces: sigmask_ptr != 0,
                     });
                 }
                 if !has_interests {
@@ -2402,6 +2405,7 @@ impl SyscallDispatcher {
                         timeout,
                         on_timeout: 0,
                         block_signals,
+                        mask_replaces: sigmask_ptr != 0,
                     });
                 }
                 crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
@@ -2415,6 +2419,7 @@ impl SyscallDispatcher {
                     timeout,
                     on_timeout: 0,
                     block_signals,
+                    mask_replaces: sigmask_ptr != 0,
                 });
             }
 
@@ -2618,6 +2623,7 @@ impl SyscallDispatcher {
                     timeout,
                     on_timeout: 0,
                     block_signals,
+                    mask_replaces: sigmask_addr != 0,
                 });
             } else if let Some(host_fds) = all_host {
                 let mut pollfds: Vec<libc::pollfd> = host_fds
@@ -2674,6 +2680,7 @@ impl SyscallDispatcher {
                         fds: WaitFds::raw(wait_fds),
                         timeout,
                         block_signals,
+                        mask_replaces: sigmask_addr != 0,
                         clear_on_timeout,
                     });
                 }
@@ -2969,6 +2976,7 @@ impl SyscallDispatcher {
                     timeout,
                     on_timeout: 0,
                     block_signals,
+                    mask_replaces: !is_poll && sigmask_addr != 0,
                 });
             }
 
@@ -3402,6 +3410,7 @@ impl SyscallDispatcher {
                     timeout: None,
                     on_timeout: -(LINUX_EINPROGRESS as i64),
                     block_signals: 0,
+                    mask_replaces: false,
                 });
             }
             if is_unspec_disconnect && (e == LINUX_EAFNOSUPPORT || e == LINUX_EINVAL) {
