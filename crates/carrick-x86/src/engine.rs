@@ -1059,7 +1059,7 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         self.vm.reclaims()
     }
 
-    fn save_guest_state(&self) -> Vec<u8> {
+    fn save_guest_state(&mut self) -> Vec<u8> {
         self.vm.save_guest_state()
     }
 
