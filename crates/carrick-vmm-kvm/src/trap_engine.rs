@@ -1010,12 +1010,11 @@ impl SyscallTrap for KvmTrapEngine {
         //     (frozen at the last eret-into-EL0). The LIVE EL0 PSTATE is in
         //     `user_pt_regs.pstate` (`Reg::Pstate`) — the same place the loop
         //     read the live PC for `interrupted_pc`. Mirrors HVF (trap.rs:1319).
-        let pstate_source = if interrupted_pc.is_some() {
-            self.get_reg(Reg::Pstate)
-        } else {
-            self.get_reg(Reg::SpsrEl1)
-        }
-        .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // PSTATE source (syscall vs kick path) single-sourced (F7); KVM is always
+        // EL0, so it reads fresh (no pre-read live PSTATE).
+        let pstate_source =
+            carrick_hal::aarch64_signal_pstate_source(interrupted_pc, None, |r| self.get_reg(r))
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         let params = carrick_hal::sigframe::InjectParams {
             signum,
             handler,
