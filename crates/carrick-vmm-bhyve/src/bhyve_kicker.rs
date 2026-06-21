@@ -44,7 +44,6 @@ pub fn install_bhyve_kick_handler() {
 #[derive(Clone)]
 pub struct BhyveKickHandle {
     tid: libc::pthread_t,
-    in_guest: Option<Arc<AtomicBool>>,
     /// Set by `kick()` BEFORE the `pthread_kill`. A pthread_kill makes the
     /// in-flight `vm_run` exit with `VM_EXITCODE_BOGUS` (a pending thread AST →
     /// `vm_exit_astpending`), NOT `EINTR`. This flag lets `next_syscall` tell
@@ -61,11 +60,7 @@ impl BhyveKickHandle {
         install_bhyve_kick_handler();
         // SAFETY: pthread_self is always safe.
         let tid = unsafe { libc::pthread_self() };
-        Self {
-            tid,
-            in_guest: None,
-            kick_pending,
-        }
+        Self { tid, kick_pending }
     }
 }
 
@@ -79,13 +74,6 @@ impl carrick_hal::VcpuKick for BhyveKickHandle {
         unsafe {
             libc::pthread_kill(self.tid, kick_signal());
         }
-    }
-
-    fn target_in_guest(&self) -> bool {
-        self.in_guest
-            .as_ref()
-            .map(|f| f.load(Ordering::SeqCst))
-            .unwrap_or(false)
     }
 }
 
