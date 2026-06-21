@@ -30,6 +30,11 @@ pub use threaded::{
 pub mod sigframe;
 pub mod signal_arrival;
 pub use signal_arrival::{GenericSignalArrival, SignalArrival};
+/// The platform-NEUTRAL fork-coordinator state machine, generic over the
+/// backend's [`pump_fork_coord::HostSignalPump`] (self-pipe or kqueue). Every
+/// backend's coordinator is a `PumpForkCoordinator<P>`.
+pub mod pump_fork_coord;
+pub use pump_fork_coord::{HostSignalPump, PumpForkCoordinator};
 /// The shared HostForkCoordinator for kick+futex backends (cfg-empty on macOS/HVF).
 pub mod fork_coord;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
