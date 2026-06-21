@@ -24,9 +24,9 @@ pub mod vmm;
 
 pub use bringup::{fp_stub_bytes, msr_init_blob, run_fp_stub};
 pub use bringup_fns::{
-    BringupLayout, LongModeSegmentState, X86VcpuSnapshot, build_pml4, long_mode_segment_state,
-    plan_windows, program_longmode_entry, program_user_segments, restore, run_elf_service_loop,
-    seed_entry, snapshot, write_bringup_images,
+    BringupLayout, LongModeSegmentState, X86VcpuSnapshot, build_pml4, load_x86_elf_image,
+    long_mode_segment_state, plan_windows, program_longmode_entry, program_user_segments, restore,
+    run_elf_service_loop, seed_entry, snapshot, write_bringup_images,
 };
 pub use engine::X86EngineCore;
 pub use fault::{

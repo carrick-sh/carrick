@@ -524,6 +524,26 @@ const NEG_ENOMEM: i64 = -12;
 const M2_HEAP_CAP: u64 = 8 * 1024 * 1024; // 8 MiB
 const M2_MMAP_CAP: u64 = 64 * 1024 * 1024; // 64 MiB
 
+/// Load a static x86_64 ELF and prepare its guest image — the image-prep idiom
+/// every x86 run-elf path (KVM/bhyve/NVMM) repeated verbatim (NVMM did it twice
+/// in one file): map the ELF, materialize the shared x86_64 vDSO/vvar, and build
+/// the Linux initial stack (argc/argv/envp/auxv) with `argv = [path]` and an
+/// empty environment. Returns a diagnostic string on failure.
+pub fn load_x86_elf_image(
+    path: &std::path::Path,
+) -> Result<carrick_mem::memory::AddressSpace, String> {
+    use carrick_hal::x8664_arch::X8664GuestArch;
+    carrick_mem::memory::AddressSpace::load_elf_for(path, X8664GuestArch::elf_machine())
+        .map_err(|e| format!("load_elf_x86: {e}"))?
+        .with_vdso_bytes(X8664GuestArch::vdso_bytes())
+        .map_err(|e| format!("with_vdso_bytes: {e}"))?
+        .with_linux_initial_stack(
+            [path.as_os_str().as_encoded_bytes()],
+            std::iter::empty::<&[u8]>(),
+        )
+        .map_err(|e| format!("with_linux_initial_stack: {e}"))
+}
+
 /// The shared M2 run-elf service loop (design §2.2). Drives `engine` through the
 /// startup syscall set a static-musl `hello` exercises, returning the guest's
 /// exit code. Backend-agnostic: it needs only `SyscallTrap` (next/complete) and

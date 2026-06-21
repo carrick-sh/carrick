@@ -13,10 +13,6 @@
 
 use std::path::Path;
 
-use carrick_hal::guest_arch::GuestArch as _;
-use carrick_hal::x8664_arch::X8664GuestArch;
-use carrick_mem::memory::AddressSpace;
-
 /// Boot the static x86_64 ELF at `path` under KVM and run it to exit.
 ///
 /// Returns the guest's exit code on success, or a diagnostic string on failure.
@@ -24,19 +20,9 @@ pub fn run_elf_kvm_x86(path: impl AsRef<Path>) -> Result<i32, String> {
     let path = path.as_ref();
 
     // ── Load the ELF ─────────────────────────────────────────────────────────
-    //
-    // `with_vdso_bytes`: materializes the x86_64 vDSO/vvar so clock-heavy
-    // runtimes resolve `__vdso_clock_gettime` instead of trapping per read.
-    // `with_linux_initial_stack`: builds argc/argv/envp/auxv on the guest stack.
-    let image = AddressSpace::load_elf_for(path, X8664GuestArch::elf_machine())
-        .map_err(|e| format!("load_elf_x86: {e}"))?
-        .with_vdso_bytes(X8664GuestArch::vdso_bytes())
-        .map_err(|e| format!("with_vdso_bytes: {e}"))?
-        .with_linux_initial_stack(
-            [path.as_os_str().as_encoded_bytes()], // argv[0] = ELF path
-            std::iter::empty::<&[u8]>(),           // no env vars
-        )
-        .map_err(|e| format!("with_linux_initial_stack: {e}"))?;
+    // map + vDSO/vvar + Linux initial-stack; the idiom is shared across every
+    // x86 run-elf path (KVM/bhyve/NVMM).
+    let image = carrick_x86::load_x86_elf_image(path)?;
 
     // ── Bring up the generic engine over the KVM backend pair ────────────────
     let mut engine =
