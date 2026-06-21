@@ -606,6 +606,13 @@ ring-blocked from cross-compile) or carries **mechanism risk** the audit itself
 flags — so landing them blind, compile-check-only, would be the wrong trade. They
 are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs):
 
+> **Update (2026-06-21, on the HVF rig):** these are now runtime-verifiable. A
+> dependency-ordered, correctness-first execution plan with code-verified
+> corrections to the per-seam approach is in
+> [`2026-06-21-hvf-holdout-refactor-plan.md`](2026-06-21-hvf-holdout-refactor-plan.md)
+> (order `F8 → F4 → F5 → F7 → F3`; F3 last because it consumes the F4/F5/F8
+> seams). First slice landed: F7's `guest_cpu::timed_run` (below).
+
 - **F3 — `make_signal_arrival()` on `HostBackend` + delete `run_threaded_hvf_loop`.**
   The seam is additive and safe, but migrating HVF onto the shared loop changes
   the macOS signal-arrival path (kqueue pump), which only manifests at runtime and
@@ -617,9 +624,13 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
   (lost-wake, interruptibility) that a compile check cannot catch and that
   Linux/FreeBSD CI would miss.
 - **F7 — `Aarch64EngineCore<V>` + `Aarch64Exit`.** Touches both aarch64 trap-loop
-  shells (HVF + KVM). The zero-risk slices (hoist the `guest_cpu` run-timing
-  wrapper 3→1, add a shared `TrapError::el0_fault` constructor) are safe and
-  verifiable and are the recommended first step.
+  shells (HVF + KVM). *Slice landed (2026-06-21, commit d8791cc8):* the
+  `guest_cpu` run-timing wrapper is hoisted 3→1 into
+  `carrick_host::guest_cpu::timed_run` (HVF/KVM/x86 run loops, behaviour-identical,
+  rig-verified). *Deferred:* the `TrapError::el0_fault` constructor (low value —
+  the HVF and KVM sites read different register types, so a clean shared
+  constructor is awkward standalone; fold it into the full `Aarch64EngineCore<V>`
+  extraction instead).
 - **F6 — migrate bhyve `guest_setup_x86` onto carrick-x86 bringup/fault helpers.**
   *Partly landed:* the byte-identical `fp_stub_bytes` (previously kept in sync by
   a unit test) now re-points at the single `carrick_x86::fp_stub_bytes` — a
