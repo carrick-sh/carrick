@@ -680,6 +680,10 @@ pub mod runtime {
                     timeout,
                     on_timeout,
                     block_signals,
+                    // The synchronous waiter blocks `block_signals` directly; the
+                    // additive-vs-replace metadata is for the threaded dispatcher
+                    // pending-signal predicate only.
+                    mask_replaces: _,
                 } => match waiter.wait(&fds, timeout, block_signals) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
@@ -695,6 +699,7 @@ pub mod runtime {
                     timeout,
                     on_timeout,
                     block_signals,
+                    mask_replaces: _,
                 } => {
                     let timeout = match timeout {
                         Some(duration) => {
@@ -727,6 +732,7 @@ pub mod runtime {
                     timeout,
                     block_signals,
                     clear_on_timeout,
+                    mask_replaces: _,
                 } => match waiter.wait(&fds, timeout, block_signals) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
