@@ -90,11 +90,34 @@ before F3 so the trap shell is centralized when F3 wires it in.
   dispatcher `ignored_mask` ABI (is it indexed by `signum` or `signum-1`?) and
   the real per-backend skip sets. Do NOT "fix" an off-by-one without proving the
   ABI direction with a probe.
-- **Genuine leverage:** the synchronous-fault `si_code` guard (host_signal.rs
-  ~899-918) is HVF-only; making it a `HostSignalGlue::is_synchronous_self_fault`
-  trait method puts it where any backend can opt in (audit §2.1 F4).
-- **Verify:** kill02 / sigaction02 / job-control LTP, a new `sigint_routable`
-  probe run on HVF + KVM to prove skip-set symmetry.
+- **CORRECTION (both bug-claims FALSIFIED by code):** (a) no SIGINT drift —
+  `ensure_host_handler` line 946 skips only `{9,13,17,19}`, so HVF DOES route
+  SIGINT; (b) no off-by-one — both HVF (host_signal.rs:1070) and the shared
+  (host_glue.rs:141) use `1u64 << linux_signum` for `ignored_mask` (correct per
+  the dispatcher ABI, documented at host_signal.rs:1067-1069) and `<< (signum-1)`
+  for the install mask. **F4 is pure dedup, no correctness bug.**
+- **REAL intricacy (why it's not a clean fold):** HVF has THREE different
+  per-function skip-sets — install `{9,13,17,19}`, ignore/default
+  `{2,4,5,6,7,8,9,11,13,17,19}`, reset `{2,9,13,17,19}` — because HVF ROUTES the
+  fault set (a sibling `kill -SEGV` must reach the guest) with the synchronous
+  si_code guard, but must NOT host-`SIG_IGN` a fault (it would re-execute
+  forever). The shared `host_glue` has ONE `is_routable` gate, which can't express
+  this. The fold needs additive `HostSignalGlue` methods — `skip_install`,
+  `skip_ignore`, `skip_execve_reset` (defaults = the current `!is_routable` /
+  `is_claimed`, so KVM/bhyve/NVMM are byte-unchanged) + `is_synchronous_self_fault`
+  wired into `shared_routed_handler` — then a full `HvfGlue` overriding them.
+- **THE COUPLING (F4 ⇄ F8 ⇄ F3):** a `HostSignalGlue` impl requires
+  `kick_signal()` + `install_kick_handler()`, but **HVF has no signal-based kick**
+  — it kicks vCPUs via `hv_vcpus_exit` (a direct syscall) and pokes its pump via a
+  self-pipe, not an RT-signal. So `HvfGlue` can't be created without ALSO
+  reconciling HVF's signal-less kick + kqueue pump with the shared trait surface
+  (F8's territory). **This structural mismatch — HVF's signal-less kick + kqueue
+  pump vs the shared signal-based model — is the deep reason HVF is "the factoring
+  holdout," and why F4/F8/F3 are one coupled refactor, not three independent
+  folds.** Either relax the trait (kick becomes an associated mechanism, not
+  necessarily a signal) or give HVF a no-op kick-signal shim; decide that FIRST.
+- **Verify:** kill02 / sigaction02 / job-control LTP + the kill*/sig* probe spine
+  on the HVF rig (only HVF exercises the routed-fault + si_code-guard path).
 
 ### F5 — `HvfFutex` → `FutexTableFutex<HvfShared>` — **DONE (commit after d8791cc8)**
 - **Done out of plan-order** (it's behaviour-preserving + independent of F4/F8, so
