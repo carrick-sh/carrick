@@ -30,8 +30,12 @@ pub fn glue_linux_to_host<G: HostSignalGlue>(linux_signum: i32) -> i32 {
 // ─── disposition mirror (was kvm/bhyve/nvmm_disposition.rs) ────────────────────
 
 /// Whether `linux_signum` is eligible for a mirrored host disposition on backend
-/// `G`: the SHARED neutral base policy ANDed with `!G::is_claimed`. The single
-/// gate every disposition fn below consults.
+/// `G`: the SHARED neutral base policy ANDed with `!G::is_claimed`. This is the
+/// complement of the DEFAULT `HostSignalGlue::skip_install_routing`; the
+/// disposition fns now consult the per-function `G::skip_*` gates (so a backend
+/// like HVF that routes the fault set can differ per function), and this remains
+/// as the test oracle for the default routability.
+#[cfg(test)]
 fn is_routable<G: HostSignalGlue>(linux_signum: i32) -> bool {
     host_disposition::is_host_routable(linux_signum) && !G::is_claimed(linux_signum)
 }
@@ -49,6 +53,25 @@ extern "C" fn shared_routed_handler<G: HostSignalGlue>(
 ) {
     let linux_signum = G::host_to_linux(host_signum);
     if !info.is_null() {
+        // si_code > 0 ⇒ hardware/kernel-generated (a real fault at the faulting
+        // PC), i.e. carrick's OWN bug: restore the default disposition and return
+        // so the process crashes visibly with the true signal. si_code <= 0 ⇒
+        // SI_USER/SI_QUEUE/SI_TKILL, sent by another process ⇒ route to the guest.
+        // `is_synchronous_self_fault` is `false` for every backend whose guest
+        // faults are vmexits (KVM/bhyve/NVMM), so this is a no-op there; HVF
+        // overrides it for the fault set it routes.
+        let si_code = unsafe { (*info).si_code };
+        if G::is_synchronous_self_fault(linux_signum, si_code) {
+            // SAFETY: zeroed sigaction with SIG_DFL is the documented default
+            // disposition form; signal-safe.
+            unsafe {
+                let mut dfl: libc::sigaction = std::mem::zeroed();
+                dfl.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut dfl.sa_mask);
+                libc::sigaction(host_signum, &dfl, std::ptr::null_mut());
+            }
+            return;
+        }
         // SAFETY: the kernel hands a valid siginfo_t to an SA_SIGINFO handler;
         // `si_pid()` reads the POSIX union member. `record_sender` is one atomic
         // store — async-signal-safe.
@@ -88,7 +111,7 @@ fn install_sigaction<G: HostSignalGlue>(linux_signum: i32, handler: libc::sighan
 /// process's host `kill` runs THIS guest's handler instead of host-default
 /// terminating us. Idempotent; no-op for non-routable / `G`-claimed signals.
 pub fn ensure_host_handler<G: HostSignalGlue>(linux_signum: i32) {
-    if !is_routable::<G>(linux_signum) {
+    if G::skip_install_routing(linux_signum) {
         return;
     }
     if host_disposition::mark_installed(linux_signum) {
@@ -105,7 +128,7 @@ pub fn ensure_host_handler<G: HostSignalGlue>(linux_signum: i32) {
 /// later `SIG_IGN -> handler` transition re-installs the route. No-op for
 /// non-routable / `G`-claimed signals.
 pub fn set_host_ignore<G: HostSignalGlue>(linux_signum: i32) {
-    if !is_routable::<G>(linux_signum) {
+    if G::skip_ignore_mirror(linux_signum) {
         return;
     }
     install_sigaction::<G>(linux_signum, libc::SIG_IGN);
@@ -116,7 +139,7 @@ pub fn set_host_ignore<G: HostSignalGlue>(linux_signum: i32) {
 /// to default), clearing any inherited host ignore/route. No-op for non-routable /
 /// `G`-claimed signals.
 pub fn set_host_default<G: HostSignalGlue>(linux_signum: i32) {
-    if !is_routable::<G>(linux_signum) {
+    if G::skip_ignore_mirror(linux_signum) {
         return;
     }
     install_sigaction::<G>(linux_signum, libc::SIG_DFL);
@@ -135,7 +158,7 @@ pub fn reset_routed_handlers_after_execve<G: HostSignalGlue>(ignored_mask: u64) 
         if installed & install_bit == 0 {
             continue;
         }
-        if G::is_claimed(linux_signum) {
+        if G::skip_execve_reset(linux_signum) {
             continue;
         }
         let ignored_bit = 1u64 << linux_signum;
