@@ -443,6 +443,7 @@ mod tests {
     ///     (mirrors the unbounded drain at vcpu_loop.rs:1528-1565), holds
     ///     `lock_paused_across_fork` across a no-op "fork", then
     ///     `end_quiesce`/`end_fork`.
+    ///
     /// A lost `end_quiesce` wake (the flag is lowered OUTSIDE the `paused` lock)
     /// would leave a parker in `cv.wait` forever; a watchdog deadline turns that
     /// eternal hang into a test failure. RED if the coordination loses a wake;

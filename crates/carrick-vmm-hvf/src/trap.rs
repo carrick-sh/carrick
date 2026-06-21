@@ -5717,7 +5717,11 @@ impl carrick_hal::ThreadedEngine for HvfTrapEngine {
     fn save_guest_state(&mut self) -> Vec<u8> {
         // Snapshot + DESTROY this vCPU (frees the slot). The snapshot is stashed in
         // `self.inner.reclaim_snapshot` (read by `rebind_to_slot` on the SAME
-        // thread), so the returned bytes are unused. A park failure is fatal.
+        // thread), so the returned bytes are unused. A park failure is fatal: the
+        // vCPU could not be snapshotted/destroyed, so there is no safe way to
+        // continue the M:N reclaim — hence the intentional `expect` (the workspace
+        // otherwise denies `expect_used`).
+        #[allow(clippy::expect_used)]
         self.inner
             .reclaim_park_vcpu()
             .expect("HVF reclaim: snapshot + destroy failed");

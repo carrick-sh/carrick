@@ -287,6 +287,13 @@ pub fn install_for_budget(budget: usize) {
 
 /// The process scheduler. Panics if not installed — startup MUST install it before
 /// any guest thread spawns.
+///
+/// `expect` is an intentional startup-invariant guard (the workspace otherwise
+/// denies `expect_used`): `install_for_budget` runs during backend init before
+/// any guest thread can spawn, so reaching here with no scheduler is a
+/// startup-ordering bug, not a runtime condition. Fail loudly rather than
+/// silently fall back to an un-gated scheduler.
+#[allow(clippy::expect_used)]
 pub fn global() -> &'static dyn VcpuScheduler {
     GLOBAL.get().expect("vcpu scheduler not installed").as_ref()
 }
