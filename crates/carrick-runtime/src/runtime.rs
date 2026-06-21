@@ -1443,9 +1443,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
 // HVF kicker / futex table / `ForkCoordinator` and threading them in.
 // ===================================================================
 
-use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
-use crate::vcpu_loop::{KernelState, PlatformFutexFactory, VcpuLoopOutcome, run_vcpu_until_exit};
-use parking_lot::Mutex;
+use crate::thread::{FutexTable, ThreadId};
 use std::sync::Arc;
 
 /// Top-level multi-threaded HVF entry. Builds the shared dispatcher lock + the
