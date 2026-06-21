@@ -22,7 +22,6 @@
 #![cfg(target_os = "netbsd")]
 
 pub mod nvmm;
-pub mod nvmm_disposition;
 mod nvmm_futex;
 pub mod nvmm_kicker;
 pub mod nvmm_signal_backend;

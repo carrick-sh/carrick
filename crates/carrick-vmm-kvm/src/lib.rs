@@ -14,7 +14,6 @@
 
 pub mod guest_setup;
 pub mod kvm;
-pub mod kvm_disposition;
 pub mod kvm_fork_coord;
 pub mod kvm_futex;
 pub mod kvm_kicker;
