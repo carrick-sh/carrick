@@ -56,8 +56,8 @@ use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::Pml4Manager;
 use carrick_x86::{
-    BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86FaultKind,
-    X86Reg, X86Seg, X86Vcpu, X86Vmm,
+    BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86Reg, X86Seg,
+    X86Vcpu, X86Vmm,
 };
 
 use crate::bhyve_kicker::{BhyveKickHandle, BhyveKicker};
@@ -727,37 +727,32 @@ impl X86Vcpu for BhyveX86Vcpu {
                     let context = fault_user_context_from_bytes(record.vector(), &frame)
                         .map_err(Self::reg_err)?;
                     let cr2 = self.get_raw(VM_REG_GUEST_CR2)?;
-                    self.set_raw(VM_REG_GUEST_RAX, context.saved_rax)?;
-                    self.set_raw(VM_REG_GUEST_RIP, context.rip)?;
-                    self.set_raw(VM_REG_GUEST_RSP, context.rsp)?;
-                    self.set_raw(VM_REG_GUEST_RFLAGS, context.rflags)?;
-                    let kind = match record.vector() {
-                        0 => X86FaultKind::DivideError,
-                        6 => X86FaultKind::InvalidOpcode,
-                        13 => X86FaultKind::GeneralProtection,
-                        14 => X86FaultKind::PageFault,
-                        17 => X86FaultKind::AlignmentCheck,
-                        v => {
-                            return Err(TrapError::Hypervisor(format!(
-                                "bhyve: unhandled guest fault vector {v} \
-                                 (err=0x{:x} rip=0x{:x} cr2=0x{:x})",
-                                context.error_code, context.rip, cr2
-                            )));
-                        }
-                    };
-                    let fault_addr = match kind {
-                        X86FaultKind::PageFault => cr2,
-                        X86FaultKind::GeneralProtection => 0,
-                        X86FaultKind::DivideError
-                        | X86FaultKind::InvalidOpcode
-                        | X86FaultKind::AlignmentCheck
-                        | X86FaultKind::Other => context.rip,
-                    };
-                    return Ok(X86Exit::Fault {
-                        kind,
-                        fault_addr,
+                    // Hand the assembled fault frame to the SHARED classifier
+                    // (exactly like KVM/NVMM). It enforces the ring-0 fault guard —
+                    // a fault whose saved CS is ring-0 (inside the LSTAR stub /
+                    // kernel window) is a hard engine error, never a deliverable
+                    // guest signal with a bogus user RIP/RSP — and single-sources
+                    // the vector→kind and fault-address tables. Reading the live
+                    // ring-0 fault frame off the stack (`read_va`, above) is the
+                    // ONLY genuinely bhyve-specific step; everything past "I have
+                    // vector + error + rip + rsp + cr2" is identical across
+                    // backends, so it must not fork here.
+                    let doorbell = carrick_x86::FaultDoorbellRecord {
+                        vector: u8::try_from(record.vector()).map_err(|_| {
+                            TrapError::Hypervisor(format!(
+                                "bhyve: fault vector does not fit in u8: {}",
+                                record.vector()
+                            ))
+                        })?,
                         error_code: context.error_code,
-                    });
+                        rip: context.rip,
+                        cs: context.cs,
+                        rsp: context.rsp,
+                        rflags: context.rflags,
+                        saved_rax: context.saved_rax,
+                        cr2,
+                    };
+                    return carrick_x86::fault_exit_from_record(self, doorbell, "bhyve-x86");
                 }
                 // A requested kick surfaces as BOGUS (astpending), not EINTR. If WE
                 // raised the kick, surface Kicked so the loop re-checks pending;
