@@ -194,7 +194,7 @@ pub struct VmExit {
 /// (spec §8: a libc `rdmsr` surprise must be a 5-minute triage, never a
 /// silent resume).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum X86Exit {
+pub enum BhyveVmExit {
     /// `VM_EXITCODE_INOUT` on the syscall-doorbell `OUT`. The vCPU is parked
     /// ON the instruction; the resume discipline (RIP advance vs auto) is
     /// resolved empirically at M0 (plan T3) and owned by the caller.
@@ -228,7 +228,7 @@ pub enum X86Exit {
 impl BhyveVcpu {
     /// Run the vCPU and decode the amd64 exit (the x86 sibling of the aarch64
     /// `HvVcpu::run`).
-    pub fn run_x86(&mut self) -> Result<X86Exit, OsError> {
+    pub fn run_x86(&mut self) -> Result<BhyveVmExit, OsError> {
         // SAFETY: VmExit is repr(C) plain-old-data (ints + a POD union);
         // the all-zero bit pattern is a valid value for every field.
         let mut exit: VmExit = unsafe { std::mem::zeroed() };
@@ -249,7 +249,7 @@ impl BhyveVcpu {
             // so EINTR is read from last_os_error.
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
-                return Ok(X86Exit::Kicked);
+                return Ok(BhyveVmExit::Kicked);
             }
             return Err(os_err("vm_run", rc));
         }
@@ -258,7 +258,7 @@ impl BhyveVcpu {
                 // SAFETY: the INOUT exitcode selects the `inout` union arm
                 // (machine/vmm.h:582).
                 let io = unsafe { exit.u.inout };
-                X86Exit::Inout {
+                BhyveVmExit::Inout {
                     port: io.port,
                     bytes: io.width(),
                     is_in: io.is_in(),
@@ -266,13 +266,13 @@ impl BhyveVcpu {
                     rip: exit.rip,
                 }
             }
-            VM_EXITCODE_HLT => X86Exit::Hlt,
-            VM_EXITCODE_BOGUS | VM_EXITCODE_REQIDLE => X86Exit::Bogus,
+            VM_EXITCODE_HLT => BhyveVmExit::Hlt,
+            VM_EXITCODE_BOGUS | VM_EXITCODE_REQIDLE => BhyveVmExit::Bogus,
             VM_EXITCODE_PAGING => {
                 // SAFETY: the PAGING exitcode selects the `paging` union arm
                 // (machine/vmm.h:584-587).
                 let pg = unsafe { exit.u.paging };
-                X86Exit::Paging {
+                BhyveVmExit::Paging {
                     gpa: pg.gpa,
                     fault_type: pg.fault_type,
                     rip: exit.rip,
@@ -282,9 +282,9 @@ impl BhyveVcpu {
                 // SAFETY: the SUSPENDED exitcode selects the `suspended` union
                 // arm (machine/vmm.h:647-649).
                 let s = unsafe { exit.u.suspended };
-                X86Exit::Suspended { how: s.how }
+                BhyveVmExit::Suspended { how: s.how }
             }
-            other => X86Exit::Other {
+            other => BhyveVmExit::Other {
                 code: other,
                 rip: exit.rip,
             },
