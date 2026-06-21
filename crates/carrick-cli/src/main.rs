@@ -87,6 +87,35 @@
 //! [`runtime_util`] (the fork-safe async bridge + docker-format helpers), and
 //! [`debug`] (ESR / lldb tooling).
 
+// ── Exactly-one-platform invariant (enforced, not assumed) ──────────────────
+// `carrick-cli` links exactly one VMM + host backend via a single `platform-*`
+// feature (see Cargo.toml). Selecting none — or more than one — otherwise fails
+// late with opaque duplicate-symbol / missing-dependency errors; these guards
+// turn that into a clear diagnostic at the front door. The matching
+// `platform-* ⇔ target_os` invariant is asserted in `build.rs`.
+#[cfg(not(any(
+    feature = "platform-macos",
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd",
+)))]
+compile_error!(
+    "no platform selected: enable exactly one of \
+     platform-macos / platform-linux / platform-freebsd / platform-netbsd"
+);
+#[cfg(any(
+    all(feature = "platform-macos", feature = "platform-linux"),
+    all(feature = "platform-macos", feature = "platform-freebsd"),
+    all(feature = "platform-macos", feature = "platform-netbsd"),
+    all(feature = "platform-linux", feature = "platform-freebsd"),
+    all(feature = "platform-linux", feature = "platform-netbsd"),
+    all(feature = "platform-freebsd", feature = "platform-netbsd"),
+))]
+compile_error!(
+    "multiple platforms selected: enable exactly one platform-* feature \
+     (each pulls a mutually-exclusive host VMM backend)"
+);
+
 mod args;
 mod commands;
 // `debug` (guest address-space snapshot for the lldb plugin) reads the macOS-only
