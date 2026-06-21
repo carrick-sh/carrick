@@ -1478,6 +1478,18 @@ fn run_threaded_hvf_loop(
     if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
         let _ = crate::namespace::pid::init(std::process::id());
     }
+    // Install the M:N admission scheduler BEFORE any guest thread can spawn. The
+    // shared clone path (`spawn_clone_thread`) calls `vcpu_sched::global()`, which
+    // PANICS ("scheduler not installed") if this is skipped — so every multi-
+    // threaded HVF guest needs it, exactly like the x86 `run_threaded_loop`. HVF
+    // still enforces its concurrent-vCPU cap through its OWN `vcpu_gate`, so the
+    // scheduler installed here is the unbounded Noop (the shared slot acquire is a
+    // no-op; the gate does the real admission). When HVF gains reclaim-on-block
+    // this becomes the bounded HVF cap and the vcpu_gate is retired.
+    carrick_hal::vcpu_sched::install_for_budget(usize::MAX);
+    carrick_hal::vcpu_sched::set_current_lease(
+        carrick_hal::vcpu_sched::global().acquire(main_tid as u64),
+    );
     // The CONCRETE process-private futex table threaded UNCHANGED into the
     // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
     // protocol stays byte-identical). The object-safe `PlatformFutex` wraps the
