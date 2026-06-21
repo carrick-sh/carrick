@@ -1230,19 +1230,38 @@ impl X86Vmm for BhyveVmm {
     }
 
     fn freeze_ram(&self) -> Result<Vec<u8>, TrapError> {
-        // Snapshot the parent's ENTIRE [0, X86_MEM_SIZE) sysmem into a private
-        // heap buffer BEFORE libc::fork, while the parent vCPU is suspended at the
-        // trap (atomic). The child copies from THIS buffer, not the parent's now-
-        // concurrently-live kernel RAM (the minherit-COW route was proven not to
-        // work for bhyve's in-kernel vCPU writes — see the old fork's negative
-        // result). bhyve maps the whole sysmem contiguously at GPA 0.
-        let src = self.vm.map_gpa(0, X86_MEM_SIZE).ok_or_else(|| {
-            TrapError::Hypervisor("bhyve-x86: freeze_ram map_gpa(0, X86_MEM_SIZE) NULL".into())
+        // Snapshot the parent's LIVE high-water [0, total_size()) — NOT the full
+        // 512 MiB pool — into a private heap buffer BEFORE libc::fork, while the
+        // parent vCPU is suspended at the trap (atomic). The child copies from THIS
+        // buffer, not the parent's now-concurrently-live kernel RAM.
+        //
+        // Why a copy (not COW): FreeBSD cannot COW bhyve guest sysmem. The memseg
+        // is a plain OBJT_SWAP object with no shadow infrastructure (sys/dev/vmm/
+        // vmm_mem.c), and it is dual-mapped into the host AND the hypervisor's
+        // separate guest vmspace; marking it COW makes the two views diverge to
+        // different physical pages -> virtio crash / guest FS corruption (Elena
+        // Mihailescu, freebsd-amd64@, 2018-07-30, bhyve live-migration). illumos
+        // bhyve confirms independently (wired VMM-reservoir, no shadow). So bhyve
+        // MUST copy where KVM (mmap MAP_PRIVATE COW) and HVF (clonefile/mach COW)
+        // get laziness free from the OS — but only the LIVE range.
+        //
+        // Why total_size() is the correct bound: it is the monotonic bump cursor
+        // (guest_setup_x86.rs). Every committed GPA — bring-up artifacts, demand_
+        // commit #PF pages, commit_range host writes — is allocated below it, and
+        // abandoned munmap spans are never reclaimed, so it is a true high-water.
+        // [total_size(), X86_MEM_SIZE) is reserved-but-never-touched (demand-zero)
+        // and is byte-identical to the child's freshly kernel-zeroed segment.
+        // Copying the whole pool forced ~512 MiB resident PER FORK regardless of
+        // the guest's working set; this bounds it to the live footprint.
+        let live = self.ram.total_size().min(X86_MEM_SIZE);
+        debug_assert!(live <= X86_MEM_SIZE);
+        let src = self.vm.map_gpa(0, live.max(1)).ok_or_else(|| {
+            TrapError::Hypervisor("bhyve-x86: freeze_ram map_gpa(0, live) NULL".into())
         })?;
-        let mut buf = vec![0u8; X86_MEM_SIZE];
-        // SAFETY: src spans the full X86_MEM_SIZE parent sysmem; the parent vCPU
-        // is suspended (no concurrent guest write); buf is fresh + disjoint.
-        unsafe { std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), X86_MEM_SIZE) };
+        let mut buf = vec![0u8; live];
+        // SAFETY: src spans `live` parent sysmem bytes; the parent vCPU is
+        // suspended (no concurrent guest write); buf is fresh + disjoint.
+        unsafe { std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), live) };
         Ok(buf)
     }
 
@@ -1261,13 +1280,20 @@ impl X86Vmm for BhyveVmm {
             .mmap_memseg(0, VM_SEGID_SYSMEM, X86_MEM_SIZE, PROT_RWX)
             .map_err(map_err)?;
 
-        // Eager full-RAM copy from the frozen buffer (kernel-owned, non-COW RAM).
-        let dst = child_vm.map_gpa(0, X86_MEM_SIZE).ok_or_else(|| {
-            TrapError::Hypervisor("bhyve-x86: child map_gpa(0, X86_MEM_SIZE) NULL".into())
+        // Copy ONLY the live high-water captured in `frozen` (frozen.len() =
+        // the parent's [0, total_size())). The child segment is the FULL 512 MiB
+        // (reserved-lazy + kernel-zeroed by setup_memory above), so the untouched
+        // tail [live, X86_MEM_SIZE) stays demand-zero — byte-identical to the
+        // parent's never-touched tail — and the GPA plan can still place pages up
+        // to the cap. This bounds per-fork resident RAM from ~512 MiB to the live
+        // working set (the kernel-owned sysmem is non-COW; see freeze_ram).
+        let live = frozen.len();
+        let dst = child_vm.map_gpa(0, live.max(1)).ok_or_else(|| {
+            TrapError::Hypervisor("bhyve-x86: child map_gpa(0, live) NULL".into())
         })?;
-        // SAFETY: frozen is X86_MEM_SIZE bytes; dst is the full child sysmem; the
-        // regions are disjoint (private buffer vs the child VM mapping).
-        unsafe { std::ptr::copy_nonoverlapping(frozen.as_ptr(), dst, X86_MEM_SIZE) };
+        // SAFETY: frozen is `live` bytes; dst is the first `live` bytes of the
+        // child sysmem; disjoint (private buffer vs the child VM mapping).
+        unsafe { std::ptr::copy_nonoverlapping(frozen.as_ptr(), dst, live) };
 
         // Create vCPU 0 on the child VM.
         let child_vcpu = child_vm.add_vcpu().map_err(map_err)?;
