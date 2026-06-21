@@ -1504,10 +1504,10 @@ fn run_threaded_hvf_loop(
     // generic loop ever naming `HvfFutex`.
     let futex = Arc::new(FutexTable::new());
     let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
-        Arc::new(crate::threaded_impl::HvfFutex(Arc::clone(&futex)));
+        Arc::new(crate::threaded_impl::hvf_futex(Arc::clone(&futex)));
     let platform_futex_factory: PlatformFutexFactory = Arc::new(
         |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
-            Arc::new(crate::threaded_impl::HvfFutex(table))
+            Arc::new(crate::threaded_impl::hvf_futex(table))
         },
     );
     // The HVF host-fork coordinator, boxed object-safe so the cross-platform
