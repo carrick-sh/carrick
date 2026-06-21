@@ -55,6 +55,25 @@ before F3 so the trap shell is centralized when F3 wires it in.
   leverage**, NOT a reproducible-bug fix. The race window it closes is real but
   not currently observable, so verify by "no regression on fork probes" + the
   state-machine unit test, not a red→green repro.
+- **CORRECTION 4 (the BIG one — pump-LIFECYCLE policy diverges, not just the wake
+  primitive):** the two coordinators' restart paths are genuinely different, so a
+  single state machine CHANGES one backend's behavior:
+  - The generic's `restart_after_child_fork` calls `reinit_after_fork::<G>`
+    **UNCONDITIONALLY** (signal_pump.rs:361 — it tears down the stale self-pipe
+    AND respawns the pump every time): the generic pump is **always-on**.
+  - HVF's child path respawns **only `if had_signal_pump`** (fork_coord.rs:98),
+    and the HVF pump is **lazy** — `start_signal_pump` is gated on tty/interactive
+    (runtime.rs:1547-1549), so a non-interactive guest never has a pump.
+  - HVF's self-pipe reinit is owned by the **runtime** (quiesce.rs:508,
+    `host_signal::reinit_after_fork`), run BEFORE the coordinator's restart
+    (quiesce.rs:531) — whereas the generic coordinator owns its own self-pipe
+    rebuild inside `reinit_after_fork::<G>`.
+  So `PumpForkCoordinator<P>` must parameterize the **pump policy** (always-on vs
+  lazy) and the **self-pipe-reinit ownership** (pump-owned vs runtime-owned), not
+  just the wake primitive + block/restore. This is a careful design pass — fold
+  HVF onto the GENERIC (more-robust) policy only if the rig confirms HVF's lazy
+  pump can become always-on without regressing the non-interactive/tty paths
+  (pty/job-control probes), OR keep the policy as a trait knob. Do NOT blind-copy.
 - **Verify:** `cargo test --lib` (the coordinator state-machine tests, lifted to
   the generic `PumpForkCoordinator`), `just conformance-probes` (fork*/clone*/
   kill*/maskfork/ppollunblock), nested-fork shell stress under `-t`.
@@ -77,14 +96,17 @@ before F3 so the trap shell is centralized when F3 wires it in.
 - **Verify:** kill02 / sigaction02 / job-control LTP, a new `sigint_routable`
   probe run on HVF + KVM to prove skip-set symmetry.
 
-### F5 — `HvfFutex` → `FutexTableFutex<HvfSharedFutex>`
-- **Current:** HVF hand-rolls the deadline/slice/interrupt loop
-  (`carrick-vmm-hvf/src/threaded_impl.rs`) vs the shared `shared_wait_sliced`.
-- **Care:** this is the exact site lost-wake bugs hide; sequence AFTER F4 so the
-  signal/EINTR-interruptibility fixes are banked first (futex wait and signal
-  interruptibility interact). Preserve the carrick-trace probes the module
-  deliberately keeps (move them into `HvfSharedFutex::wait_one_slice`).
-- **Verify:** futex*/perf_futex_pingpong probes, LTP futex suite.
+### F5 — `HvfFutex` → `FutexTableFutex<HvfShared>` — **DONE (commit after d8791cc8)**
+- **Done out of plan-order** (it's behaviour-preserving + independent of F4/F8, so
+  the "after F4" sequencing wasn't load-bearing for it). `HvfFutex` was already a
+  forwarding shim; its private path + `shared_wait_sliced` loop + wake were
+  byte-identical to `FutexTableFutex<S>`. The only thing keeping it separate was
+  the carrick-trace probes: a default-no-op `SharedFutexSyscall::pre_wait` hook
+  (once-before-wait peek) + moving the per-slice probe into `wait_one_slice` let
+  it fold to `FutexTableFutex<HvfShared>` (~100 LOC → a ~25-line `HvfShared`).
+- **Verified on the rig:** futexshare/requeue/deadline/pilock/extra/wakecount all
+  pass; 17/17 carrick-thread futex unit tests; the `pre_wait` default keeps
+  KVM/bhyve/NVMM unchanged (cross-compile clean).
 
 ### F7 — `Aarch64EngineCore<V: Aarch64Vmm>` (engine symmetric to carrick_x86)
 - **DONE (slice):** `guest_cpu::timed_run` hoist — the 3 run-loop CPU-timing
