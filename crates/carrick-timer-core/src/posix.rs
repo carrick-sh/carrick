@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// One POSIX timer's arm spec (`timer_settime` value/interval + the signum to
 /// deliver). `si_value` carries the `sigev_value` payload for the `SI_TIMER`
@@ -170,6 +170,89 @@ pub fn generation_matches(slot: &PosixTimerSlot, generation: u64) -> bool {
 /// observed).
 pub fn record_overrun(slot: &PosixTimerSlot) {
     slot.overruns.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Linux CPU-time clocks whose POSIX timers must fire off AGGREGATE GUEST CPU
+/// time, not wall-clock: `CLOCK_PROCESS_CPUTIME_ID` (2) / `CLOCK_THREAD_CPUTIME_ID`
+/// (3).
+fn is_cpu_clock(clock_id: i32) -> bool {
+    clock_id == 2 || clock_id == 3
+}
+
+/// Drive a POSIX per-process timer's expiries on a backend firing thread. SHARED
+/// by every backend (KVM/bhyve/NVMM kick+futex, the HVF wall-clock fallback, and
+/// the runtime's inline arm) — the THREAD SPAWN and the per-fire action
+/// (`on_fire`: publish the process signal + kick) are backend-specific; only this
+/// timing loop is shared. Was copied ~4× and NONE of the copies handled
+/// CPU-time clocks (they all fired off wall-clock). Branches on the timer's
+/// clock: a CPU-time clock drives off the aggregate guest CPU total (so the timer
+/// only advances while the guest actually burns CPU); every other clock is
+/// wall-clock. `value_ns` is the first expiry, `interval_ns == 0` is one-shot.
+/// Retires on a generation bump (disarm/re-arm).
+pub fn run_fallback(
+    slot: std::sync::Arc<PosixTimerSlot>,
+    generation: u64,
+    value_ns: u64,
+    interval_ns: u64,
+    on_fire: impl Fn(),
+) {
+    if is_cpu_clock(slot.clock_id) {
+        run_fallback_cpu(&slot, generation, value_ns, interval_ns, &on_fire);
+        return;
+    }
+    std::thread::sleep(Duration::from_nanos(value_ns));
+    if !generation_matches(&slot, generation) {
+        return;
+    }
+    on_fire();
+    if interval_ns == 0 {
+        return;
+    }
+    loop {
+        std::thread::sleep(Duration::from_nanos(interval_ns));
+        if !generation_matches(&slot, generation) {
+            return;
+        }
+        record_overrun(&slot);
+        on_fire();
+    }
+}
+
+/// CPU-time POSIX timer fallback: poll the aggregate guest CPU total (mirroring
+/// `itimer::run_fallback_cpu`) instead of sleeping wall-clock, so a
+/// `CLOCK_PROCESS_CPUTIME_ID` timer fires off real guest CPU and not while the
+/// process is idle. The previous per-backend copies fired CPU-clock timers off
+/// wall-clock — too early on an idle process.
+fn run_fallback_cpu(
+    slot: &PosixTimerSlot,
+    generation: u64,
+    value_ns: u64,
+    interval_ns: u64,
+    on_fire: &impl Fn(),
+) {
+    let start = carrick_host::guest_cpu::total_ns_including_active();
+    let mut due = start.saturating_add(value_ns);
+    let mut fired = false;
+    loop {
+        if !generation_matches(slot, generation) {
+            return;
+        }
+        let now = carrick_host::guest_cpu::total_ns_including_active();
+        if now < due {
+            let delay = crate::itimer::cpu_timer_recheck_delay_ns(due - now);
+            std::thread::sleep(Duration::from_nanos(delay));
+            continue;
+        }
+        if fired {
+            record_overrun(slot);
+        }
+        on_fire();
+        fired = true;
+        if interval_ns == 0 {
+            return;
+        }
+        due = now.saturating_add(interval_ns);
+    }
 }
 
 /// Compute the remaining value/interval for a timer. Returns `None` for an

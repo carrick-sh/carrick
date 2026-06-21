@@ -24,6 +24,8 @@ pub struct BhyveTimerDelivery {
 }
 
 impl carrick_hal::TimerDelivery for BhyveTimerDelivery {
+    /// bhyve has no kqueue pump, so the dispatch arm spawns
+    /// `itimer::run_fallback` (return `false`) — identical to KVM/NVMM.
     fn arm_itimer(
         &self,
         _which: usize,
@@ -35,20 +37,52 @@ impl carrick_hal::TimerDelivery for BhyveTimerDelivery {
         false
     }
 
-    fn disarm_itimer(&self, _which: usize) {}
+    fn disarm_itimer(&self, which: usize) {
+        // Bump the slot generation so the running fallback thread retires; the
+        // previous no-op leaked `armed = true` and let a disarmed itimer keep
+        // firing.
+        carrick_timer_core::itimer::disarm(which);
+    }
 
     fn arm_posix(
         &self,
-        _id: i32,
-        _value_ns: u64,
-        _interval_ns: u64,
+        id: i32,
+        value_ns: u64,
+        interval_ns: u64,
     ) -> Option<carrick_hal::timer_delivery::PosixTimerSpec> {
-        None
+        // Was a silent no-op: POSIX per-process timers did nothing on FreeBSD.
+        // Spawn the shared firing thread (publish the PROCESS signal + kick every
+        // vCPU), exactly like KVM/NVMM.
+        let armed = carrick_timer_core::posix::arm(id, value_ns, interval_ns)?;
+        if value_ns > 0 {
+            let signum = armed.signum;
+            let generation = armed.generation;
+            let slot = armed.slot.clone();
+            let kicker = Arc::clone(&self.kicker);
+            let on_fire = move || {
+                carrick_signal_core::publish_process_signal(signum);
+                kicker.kick_all();
+            };
+            let _ = std::thread::Builder::new()
+                .name(format!("carrick-ptimer-{id}"))
+                .spawn(move || {
+                    carrick_timer_core::posix::run_fallback(
+                        slot,
+                        generation,
+                        value_ns,
+                        interval_ns,
+                        on_fire,
+                    );
+                });
+        }
+        Some(armed.old)
     }
 
-    fn disarm_posix(&self, _id: i32) {}
+    fn disarm_posix(&self, id: i32) {
+        let _ = carrick_timer_core::posix::arm(id, 0, 0);
+    }
 
-    fn current_arm(&self, _which: usize) -> Option<carrick_hal::timer_delivery::TimerArm> {
-        None
+    fn current_arm(&self, which: usize) -> Option<carrick_hal::timer_delivery::TimerArm> {
+        carrick_timer_core::itimer::current_arm(which)
     }
 }

@@ -7,7 +7,6 @@
 //! publishes the signal into the per-thread pending store and KICKS the target
 //! vCPU — the SAME publish+kick the runtime's `timer_delivery::deliver` performs.
 use std::sync::Arc;
-use std::time::Duration;
 
 use carrick_hal::{PosixTimerSpec, ThreadId, TimerArm, TimerDelivery, VcpuRegistry};
 
@@ -48,33 +47,24 @@ impl TimerDelivery for KvmTimerDelivery {
             let generation = armed.generation;
             let slot = armed.slot.clone();
             let kicker = Arc::clone(&self.kicker);
-            let deliver = move |sig: i32| {
-                // POSIX per-process timer signals are PROCESS-directed: publish
-                // into the shared PROC_PENDING mask and kick EVERY vCPU so any
-                // unblocked thread delivers it (a blocked main thread must not
-                // drop the timer). Mirrors `timer_delivery::deliver` for itimers.
-                carrick_signal_core::publish_process_signal(sig);
+            // POSIX per-process timer signals are PROCESS-directed: publish into
+            // the shared PROC_PENDING mask and kick EVERY vCPU so any unblocked
+            // thread delivers it (a blocked main thread must not drop the timer).
+            // The wall-clock-vs-CPU-clock timing loop is shared in timer-core.
+            let on_fire = move || {
+                carrick_signal_core::publish_process_signal(signum);
                 kicker.kick_all();
             };
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-ptimer-{id}"))
                 .spawn(move || {
-                    std::thread::sleep(Duration::from_nanos(value_ns));
-                    if !carrick_timer_core::posix::generation_matches(&slot, generation) {
-                        return;
-                    }
-                    deliver(signum);
-                    if interval_ns == 0 {
-                        return;
-                    }
-                    loop {
-                        std::thread::sleep(Duration::from_nanos(interval_ns));
-                        if !carrick_timer_core::posix::generation_matches(&slot, generation) {
-                            return;
-                        }
-                        carrick_timer_core::posix::record_overrun(&slot);
-                        deliver(signum);
-                    }
+                    carrick_timer_core::posix::run_fallback(
+                        slot,
+                        generation,
+                        value_ns,
+                        interval_ns,
+                        on_fire,
+                    );
                 });
         }
         Some(armed.old)
