@@ -26,11 +26,9 @@ mod nvmm_futex;
 pub mod nvmm_kicker;
 pub mod nvmm_signal_backend;
 pub use nvmm_signal_backend::NvmmGlue;
-pub mod nvmm_signal_pump;
 pub mod nvmm_signum;
 pub mod nvmm_threaded_glue;
 pub mod nvmm_x86_engine;
-pub mod nvmm_xsig;
 pub mod run_elf;
 
 pub use nvmm::{
