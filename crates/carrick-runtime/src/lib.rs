@@ -533,8 +533,11 @@ pub mod runtime {
         crate::guest_cpu::init_child_table();
 
         // Install the M:N admission scheduler for this backend's concurrent-vCPU
-        // budget (a bounded HostCondvarScheduler for bhyve's hw.vmm.maxcpu; a Noop
-        // for unbounded HVF/KVM). Once, before any guest thread can spawn.
+        // budget: a bounded HostCondvarScheduler for the finite-cap reclaiming
+        // backends (bhyve's hw.vmm.maxcpu, KVM's KVM_CAP_MAX_VCPUS) so >budget
+        // guest threads time-share the vCPU pool instead of failing vCPU creation;
+        // a Noop for an unbounded backend (vcpu_budget == usize::MAX). Once, before
+        // any guest thread can spawn.
         carrick_hal::vcpu_sched::install_for_budget(E::vcpu_budget());
         // Reserve slot 0 for the MAIN thread (its vCPU is id 0), so siblings draw
         // 1..N-1 and never collide with the main vCPU. Held for the process's life

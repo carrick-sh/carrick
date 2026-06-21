@@ -39,7 +39,7 @@ use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
 use carrick_x86::{
     BringupLayout, FAULT_DOORBELL_PORT, FaultDoorbellRecord, ForkRamStrategy, MsrInstall,
     WindowPlan, X86_FAULT_RECORD_U32_WORDS, X86EngineCore, X86Exit, X86Reg, X86Seg, X86Vcpu,
-    X86VcpuSnapshot, X86Vmm, fault_exit_from_record,
+    X86VcpuSnapshot, X86Vmm, fault_exit_from_record, snapshot as x86_snapshot,
 };
 use kvm_bindings::{Msrs, kvm_dtable, kvm_msr_entry, kvm_segment};
 
@@ -66,9 +66,26 @@ pub struct KvmVmm {
     vm: KvmVm,
     ram: GuestRam,
     page_tables: Arc<Mutex<Pml4Manager>>,
+    /// The `vm`-side half of the x86 M:N block-recycle reclaim — a clone of the
+    /// engine's live-vCPU shared slot + the shared recycle pool. Bound to a
+    /// specific [`KvmVcpu`] via [`Self::bind_reclaim`] at every point the engine
+    /// pairs this `KvmVmm` with a vCPU (bring-up, sibling, fork-child, execve), so
+    /// `save_guest_state`/`rebind_to_slot` — which only receive `&mut self.vm` —
+    /// can reach and swap the live vCPU underneath the engine's separate `vcpu`
+    /// field. `None` only in the transient window before the first bind.
+    reclaim: Option<crate::kvm::KvmReclaimHandle>,
 }
 
 impl KvmVmm {
+    /// Bind this `KvmVmm`'s reclaim handle to `vcpu` — the engine's live vCPU on
+    /// this thread. Called at every point the engine (re)pairs the vmm with a
+    /// vCPU (initial bring-up, clone sibling, fork-child rebuild, execve). The
+    /// handle shares `vcpu`'s [`Arc<KvmVcpuSlot>`], so a later block-recycle swaps
+    /// the same live vCPU the engine runs.
+    fn bind_reclaim(&mut self, vcpu: &KvmVcpu) {
+        self.reclaim = Some(vcpu.reclaim_handle(self.vm.vm_handle()));
+    }
+
     /// Build a sibling `KvmVmm` over the shared VM handle + window descriptors (a
     /// `clone(CLONE_THREAD)` sibling shares every slot — no re-registration).
     fn from_sibling(
@@ -83,6 +100,7 @@ impl KvmVmm {
             vm,
             ram,
             page_tables,
+            reclaim: None,
         }
     }
 
@@ -258,6 +276,9 @@ impl X86Vmm for KvmVmm {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         self.page_tables = Arc::new(Mutex::new(page_tables));
+        // Re-bind reclaim to the child's fresh VM + vCPU (new shared slot + a new
+        // vcpu pool on the rebuilt VM).
+        self.bind_reclaim(vcpu);
         Ok(())
     }
 
@@ -296,6 +317,8 @@ impl X86Vmm for KvmVmm {
         self.vm = new_vm;
         self.ram = new_ram;
         self.page_tables = new_page_tables;
+        // Re-bind reclaim to the replacement image's fresh VM + vCPU.
+        self.bind_reclaim(vcpu);
         Ok(())
     }
 
@@ -304,7 +327,95 @@ impl X86Vmm for KvmVmm {
     }
 
     fn wait_for_vcpu_slot() {
-        // KVM has no Apple-HVF concurrent-vCPU admission cap.
+        // Admission is enforced by the carrick-hal VcpuScheduler installed for
+        // `vcpu_budget()` (a bounded HostCondvarScheduler since the budget is
+        // finite); this backend hook stays a no-op.
+    }
+
+    fn vcpu_budget() -> usize {
+        // KVM_CAP_MAX_VCPUS is the hard per-VM cap; a guest thread beyond it would
+        // EINVAL KVM_CREATE_VCPU. Bound the live admitted set to (cap - reserve)
+        // so total created vcpu ids stay ≤ cap (the exit+block recycle reuses ids
+        // within that bound). The reserve mirrors bhyve/HVF: headroom for the
+        // boot vCPU + a fork-rebuild in flight. A query failure falls back to a
+        // safe constant well under the typical ~512 cap.
+        //
+        // CARRICK_KVM_BUDGET overrides it (testing): the real cap is ~512, far
+        // above any practical thread count, so force a low budget to exercise the
+        // block-recycle reclaim with a small barrier.
+        if let Some(n) = std::env::var("CARRICK_KVM_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+        {
+            return n;
+        }
+        kvm_max_vcpus().saturating_sub(VCPU_BUDGET_RESERVE).max(1)
+    }
+
+    fn reclaims(&self) -> bool {
+        // KVM reclaims so a guest with MORE concurrent threads than the budget can
+        // run: a blocking thread parks its vCPU into the recycle pool and another
+        // thread pops it (pool-swap / block-recycle).
+        true
+    }
+
+    fn save_guest_state(&self) -> Vec<u8> {
+        // Snapshot the blocking thread's full guest CPU state (16 GPRs + RIP/RSP/
+        // RFLAGS + CR0/3/4 + EFER + FS/GS base + the full XSAVE incl AVX YMM) via
+        // the shared X86 snapshot, SERIALIZE it into the returned bytes (round-
+        // tripped to `rebind_to_slot` on the SAME thread), then PARK this thread's
+        // vCPU into the recycle pool so another admitted thread can pop+reuse its
+        // finite vcpu id. Serializing keeps this `&self` (no interior-mutable stash
+        // needed). On any failure return empty — `rebind_to_slot` then errors out
+        // (a reclaim failure is fatal to the thread, never silent corruption).
+        let Some(reclaim) = self.reclaim.as_ref() else {
+            return Vec::new();
+        };
+        // Capture the snapshot through a transient view over the live shared slot
+        // (the vCPU is parked at the ring-0 LSTAR-stub syscall boundary — CPL 0 —
+        // so the native KVM_GET_XSAVE captures clean FP/AVX state).
+        let bytes = match reclaim.with_vcpu(|vcpu| x86_snapshot(vcpu)) {
+            Ok(s) => serialize_x86_snapshot(&s),
+            Err(_) => return Vec::new(),
+        };
+        // Park the vCPU AFTER the snapshot read (which needs the live fd): move the
+        // fd into the recycle pool and leave the shared slot empty for the no-vCPU
+        // host wait.
+        reclaim.park_current();
+        bytes
+    }
+
+    fn rebind_to_slot(
+        &mut self,
+        _slot: carrick_hal::SlotId,
+        state: &[u8],
+    ) -> Result<(), TrapError> {
+        // Re-acquire a vCPU for the woken thread and restore its saved state. The
+        // scheduler `slot` is admission bookkeeping; KVM maps it to whatever
+        // pooled/fresh vcpu id `install_recycled` returns (like HVF/bhyve, the
+        // slot value itself is not the KVM vcpu id).
+        let Some(snap) = deserialize_x86_snapshot(state) else {
+            return Err(TrapError::Hypervisor(
+                "kvm reclaim rebind: missing/short snapshot".into(),
+            ));
+        };
+        // Pop a recycled (or fresh) vCPU and INSTALL it into the engine's shared
+        // slot, so the engine's separate `vcpu` field now drives it. `reclaim` is a
+        // `&self.reclaim` borrow; `install_recycled` is `&self`, and the later
+        // `restore_vcpu` is also `&self` — overlapping SHARED borrows, both legal.
+        let reclaim = self
+            .reclaim
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("kvm reclaim rebind: unbound".into()))?;
+        reclaim
+            .install_recycled()
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Restore the saved register file onto the freshly-installed vCPU through a
+        // transient view over the now-live shared slot, reusing the production KVM
+        // restore (full sregs/regs/xsave/MSRs + the page-table walks that feed the
+        // resume-state record). `with_vcpu` returns the closure's result.
+        reclaim.with_vcpu(|vcpu| self.restore_vcpu(vcpu, KVM_X86_LAYOUT, &snap))
     }
 
     fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
@@ -320,7 +431,7 @@ impl X86Vmm for KvmVmm {
     }
 
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError> {
-        let vmm = Self::from_sibling(
+        let mut vmm = Self::from_sibling(
             builder.vm,
             builder.windows,
             builder.protections,
@@ -330,6 +441,8 @@ impl X86Vmm for KvmVmm {
             .vm
             .add_sibling_vcpu()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // Bind reclaim to this sibling's fresh vCPU (its own shared slot).
+        vmm.bind_reclaim(&vcpu);
         // Transfer the reserved VCPU_LIVE slot to the vcpu before the (fallible)
         // restore the engine runs next.
         builder.ticket.consume();
@@ -640,7 +753,7 @@ impl X86Vcpu for KvmVcpu {
         // Read sregs from the mmap'd kvm_run.s.regs (the kernel synced it out on
         // the doorbell exit; kvm_valid_regs requests SREGS too) instead of a
         // KVM_GET_SREGS ioctl. Read-only mirror — kernel sregs stay authoritative.
-        let mut sregs = if crate::kvm::sync_regs_supported() {
+        let mut sregs = if self.sync_regs_usable() {
             self.fd().sync_regs().sregs
         } else {
             crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
@@ -733,7 +846,7 @@ impl X86Vcpu for KvmVcpu {
         // kvm_dirty_regs), so the kernel registers stay authoritative and every
         // other accessor (get_gpr/set_gpr) is unaffected. RAX/RIP are independent
         // of RCX/R11, so reading first preserves their values.
-        let mut regs = if crate::kvm::sync_regs_supported() {
+        let mut regs = if self.sync_regs_usable() {
             self.fd().sync_regs().regs
         } else {
             crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
@@ -745,7 +858,27 @@ impl X86Vcpu for KvmVcpu {
         let user_rflags = regs.r11 | 0x2;
         self.prepare_sysret_resume(layout)?;
         regs.rax = return_value as u64;
-        regs.rip = resume_pc;
+        // RIP fix-up for the M:N reclaim resume:
+        //
+        // The syscall trampoline is `out %al,$0xC5 ; sysretq`; `resume_pc` is the
+        // OUT address (trampoline_base). On the NORMAL path the vCPU is still
+        // parked at that KVM_EXIT_IO with a pending PIO completion, so the NEXT
+        // KVM_RUN advances RIP past the 2-byte OUT (to the sysretq) before
+        // executing — landing the guest on the SYSRET. The reclaim path swaps in a
+        // freshly-installed vCPU whose pending PIO was FLUSHED at acquisition
+        // (`create_vcpu_on_shared_vm`), so KVM has NOTHING to auto-advance: setting
+        // RIP=resume_pc would re-execute the OUT, re-trap the doorbell with RAX
+        // clobbered to the syscall's return value, and the guest would re-issue the
+        // SAME syscall with a bogus number (read/EBADF) — glibc's "futex facility
+        // returned an unexpected error code". `sync_regs_usable()` is false exactly
+        // for that un-run installed vCPU, so step the RIP past the OUT ourselves.
+        let stale_reclaim = !self.sync_regs_usable();
+        regs.rip = if stale_reclaim && resume_pc == layout.trampoline_base {
+            const SYSCALL_DOORBELL_OUT_LEN: u64 = 2; // `E6 C5` = out %al,$0xC5
+            resume_pc + SYSCALL_DOORBELL_OUT_LEN
+        } else {
+            resume_pc
+        };
         crate::kvm::record_kvm_stat(crate::kvm::KvmStat::SetRegs);
         self.fd()
             .set_regs(&regs)
@@ -958,7 +1091,7 @@ impl X86Vcpu for KvmVcpu {
                 // With KVM_CAP_SYNC_REGS the kernel already mirrored the GPRs into
                 // kvm_run.s.regs on this exit (kvm_valid_regs was set before the
                 // run), so read the frame from the mmap page — no KVM_GET_REGS.
-                let regs = if crate::kvm::sync_regs_supported() {
+                let regs = if self.sync_regs_usable() {
                     self.fd().sync_regs().regs
                 } else {
                     crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetRegs);
@@ -1003,6 +1136,101 @@ impl X86Vcpu for KvmVcpu {
         // KVM exits on HLT by default (KVM_EXIT_HLT); no capability to enable.
         Ok(())
     }
+}
+
+// ─── M:N reclaim helpers (budget query + snapshot (de)serialization) ─────────
+
+/// Headroom subtracted from KVM_CAP_MAX_VCPUS for the admission budget: the boot
+/// vCPU plus a fork-rebuild's fresh vcpu that can momentarily coexist with the
+/// recycled set (mirrors the bhyve/HVF reserve idea). Keeps total created vcpu
+/// ids safely under the hard cap.
+const VCPU_BUDGET_RESERVE: usize = 16;
+
+/// Fallback budget when KVM_CAP_MAX_VCPUS can't be queried — comfortably under
+/// the typical ~512 cap and large enough not to over-serialize realistic guests.
+const VCPU_BUDGET_FALLBACK: usize = 240;
+
+/// Query KVM_CAP_MAX_VCPUS (the per-VM hard cap). Opens a throwaway `/dev/kvm`
+/// handle (the cap is global, not per-VM, so any handle reports it) and reads the
+/// integer extension; on any failure returns [`VCPU_BUDGET_FALLBACK`].
+fn kvm_max_vcpus() -> usize {
+    match kvm_ioctls::Kvm::new() {
+        Ok(kvm) => {
+            let n = kvm.check_extension_int(kvm_ioctls::Cap::MaxVcpus);
+            if n > 0 {
+                n as usize
+            } else {
+                VCPU_BUDGET_FALLBACK
+            }
+        }
+        Err(_) => VCPU_BUDGET_FALLBACK,
+    }
+}
+
+/// Wire format of an [`X86VcpuSnapshot`] for the reclaim save→rebind round-trip
+/// (same host thread, so endianness/layout are trivially consistent): the 16
+/// GPRs + RIP/RSP/RFLAGS + CR0/3/4 + EFER + FS/GS base as little-endian u64s,
+/// then a 1-byte XSAVE-present flag, then (if present) the XSAVE_LEN bytes.
+const SNAP_SCALARS: usize = 16 + 3 + 4 + 2; // gprs + rip/rsp/rflags + cr0/3/4/efer + fs/gs
+const SNAP_HEADER_LEN: usize = SNAP_SCALARS * 8 + 1;
+
+fn serialize_x86_snapshot(s: &X86VcpuSnapshot) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(SNAP_HEADER_LEN + carrick_x86::XSAVE_LEN);
+    for g in &s.gprs {
+        buf.extend_from_slice(&g.to_le_bytes());
+    }
+    for v in [
+        s.rip, s.rsp, s.rflags, s.cr0, s.cr3, s.cr4, s.efer, s.fs_base, s.gs_base,
+    ] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    match &s.xsave {
+        Some(xs) => {
+            buf.push(1);
+            buf.extend_from_slice(xs);
+        }
+        None => buf.push(0),
+    }
+    buf
+}
+
+fn deserialize_x86_snapshot(state: &[u8]) -> Option<X86VcpuSnapshot> {
+    if state.len() < SNAP_HEADER_LEN {
+        return None;
+    }
+    let rd = |i: usize| -> u64 {
+        let off = i * 8;
+        u64::from_le_bytes(state[off..off + 8].try_into().unwrap_or([0u8; 8]))
+    };
+    let mut gprs = [0u64; 16];
+    for (i, g) in gprs.iter_mut().enumerate() {
+        *g = rd(i);
+    }
+    let xsave = if state[SNAP_SCALARS * 8] == 1 {
+        let start = SNAP_HEADER_LEN;
+        let end = start + carrick_x86::XSAVE_LEN;
+        if state.len() < end {
+            return None;
+        }
+        let mut xs = [0u8; carrick_x86::XSAVE_LEN];
+        xs.copy_from_slice(&state[start..end]);
+        Some(xs)
+    } else {
+        None
+    };
+    Some(X86VcpuSnapshot {
+        gprs,
+        rip: rd(16),
+        rsp: rd(17),
+        rflags: rd(18),
+        cr0: rd(19),
+        cr3: rd(20),
+        cr4: rd(21),
+        efer: rd(22),
+        fs_base: rd(23),
+        gs_base: rd(24),
+        xsave,
+    })
 }
 
 /// Serialize a `kvm_fpu` into the 512-byte legacy fxsave layout (Intel SDM
@@ -1063,11 +1291,15 @@ fn fxsave_into_kvm_fpu(fx: &[u8; 512], fpu: &mut kvm_bindings::kvm_fpu) {
 /// mode via the shared [`carrick_x86::program_longmode_entry`].
 pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<KvmVmm>, TrapError> {
     let (vm, ram, page_tables, vcpu) = build_kvm_x86_guest(image)?;
-    let vmm = KvmVmm {
+    let mut vmm = KvmVmm {
         vm,
         ram,
         page_tables,
+        reclaim: None,
     };
+    // Bind the reclaim handle to the boot vCPU so a later block-recycle can swap
+    // the live vCPU underneath the engine's separate `vcpu` field.
+    vmm.bind_reclaim(&vcpu);
     Ok(X86EngineCore::from_parts(vmm, vcpu, KVM_X86_LAYOUT))
 }
 
