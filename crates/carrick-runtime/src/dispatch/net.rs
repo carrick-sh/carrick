@@ -1969,8 +1969,11 @@ impl SyscallDispatcher {
                         // from the inserts.
                         let (gfd_info, host_to_gfds) = {
                             let open = open_file.description.read();
-                            let mut info: HashMap<i32, (i32, u32, u64, u32, u32, u64, bool)> =
-                                HashMap::new();
+                            // Per-guest-fd epoll interest snapshot: (host_fd,
+                            // events, epoll data, reg_gen, last_ready,
+                            // last_read_avail, write_backpressured).
+                            type GfdInterest = (i32, u32, u64, u32, u32, u64, bool);
+                            let mut info: HashMap<i32, GfdInterest> = HashMap::new();
                             let mut rev: HashMap<i32, Vec<i32>> = HashMap::new();
                             if let OpenDescription::Epoll { interest, .. } = &*open {
                                 for (gfd, slot) in interest.iter() {

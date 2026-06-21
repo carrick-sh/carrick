@@ -9,6 +9,9 @@
 //! agree, and nothing else enforces that. (The exactly-one-platform invariant is
 //! enforced separately by `compile_error!` in `main.rs`.)
 
+// A build script reports a configuration error by panicking — cargo turns that
+// into a build failure with the message. The workspace otherwise denies `panic`.
+#[allow(clippy::panic)]
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
