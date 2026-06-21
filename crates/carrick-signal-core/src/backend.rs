@@ -65,6 +65,45 @@ pub trait HostSignalGlue: 'static {
     /// invokes it from normal context, never from a signal handler), so it may
     /// install a `sigaction`. The kick handler is the no-op whose only job is to
     /// EINTR the backend's run-loop ioctl (KVM_RUN / vm_run / nvmm_vcpu_run) — see
-    /// each backend's `*_kicker::install_*_kick_handler`.
+    /// each backend's `*_kicker::install_*_kick_handler`. A backend whose kick is
+    /// NOT a signal (HVF: `hv_vcpus_exit`) makes this a no-op.
     fn install_kick_handler();
+
+    /// Whether to SKIP installing a routed host handler for `linux_signum` — the
+    /// gate `host_glue::ensure_host_handler` consults. Default = the neutral
+    /// `!is_host_routable` (faults + uncatchable) OR `is_claimed`, i.e. exactly the
+    /// pre-existing `!is_routable`. HVF overrides: it ROUTES the fault set (a
+    /// sibling `kill -SEGV` must reach the guest, distinguished by
+    /// [`is_synchronous_self_fault`](Self::is_synchronous_self_fault)), so it skips
+    /// a SMALLER set. Pure (signal-safe).
+    fn skip_install_routing(linux_signum: i32) -> bool {
+        // Exactly the pre-existing `!is_routable`: !is_host_routable || is_claimed.
+        !crate::host_disposition::is_host_routable(linux_signum) || Self::is_claimed(linux_signum)
+    }
+
+    /// Whether to SKIP mirroring a guest `SIG_IGN`/`SIG_DFL` onto the host — the
+    /// gate `set_host_ignore`/`set_host_default` consult. Default =
+    /// [`skip_install_routing`](Self::skip_install_routing). HVF overrides to ALSO
+    /// skip the fault set + SIGINT: host-`SIG_IGN`ing a synchronous fault would let
+    /// a real fault re-execute forever. Pure (signal-safe).
+    fn skip_ignore_mirror(linux_signum: i32) -> bool {
+        Self::skip_install_routing(linux_signum)
+    }
+
+    /// Whether to SKIP `linux_signum` in the execve disposition reset — the gate
+    /// `reset_routed_handlers_after_execve` consults. Default = `is_claimed`.
+    /// Pure (signal-safe).
+    fn skip_execve_reset(linux_signum: i32) -> bool {
+        Self::is_claimed(linux_signum)
+    }
+
+    /// Whether a host signal carrying `si_code` for guest `linux_signum` is a
+    /// SYNCHRONOUS self-fault — a real CPU fault at the faulting PC, i.e. carrick's
+    /// OWN bug, which must crash visibly — rather than an async cross-process
+    /// `kill` (route to the guest). Default `false`: KVM/bhyve/NVMM guest faults
+    /// are vmexits, never host signals. HVF overrides: a fault signum with
+    /// `si_code > 0`. Consulted by `shared_routed_handler`. Pure (signal-safe).
+    fn is_synchronous_self_fault(_linux_signum: i32, _si_code: i32) -> bool {
+        false
+    }
 }
