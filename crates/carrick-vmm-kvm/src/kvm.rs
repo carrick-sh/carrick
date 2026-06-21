@@ -7,6 +7,7 @@
 // Tasks 2–4 wire the x86 paths.  Suppress dead_code warnings on non-aarch64
 // targets to keep `cargo clippy -- -D warnings` clean on container-104.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
@@ -555,21 +556,69 @@ pub(crate) struct SharedVmHandle {
     #[cfg(target_arch = "x86_64")]
     cpuid: Arc<CpuId>,
 }
-pub struct KvmVcpu {
-    /// `Some` until drop. On drop the fd is PARKED into `recycle` instead of
-    /// closed: KVM vcpu ids are a FINITE per-VM resource (KVM_CAP_MAX_VCPUS,
-    /// ~512) and a created vcpu persists until VM teardown — there is no
-    /// KVM_DESTROY_VCPU, and closing the fd does not free the id. A
-    /// thread-churny guest (cpython's test_threading spawns thousands of
-    /// short-lived threads, each a sibling vCPU) exhausts the id space and
-    /// later KVM_CREATE_VCPUs fail with EINVAL unless exited siblings' vcpus
-    /// are REUSED. `create_vcpu_on_shared_vm` pops a parked vcpu and
-    /// re-initializes it (KVM_ARM_VCPU_INIT is a full architectural reset)
-    /// before handing it out — same UNPROGRAMMED contract as a fresh vcpu.
-    fd: Option<VcpuFd>,
-    recycle: Option<Arc<Mutex<Vec<ParkedVcpu>>>>,
+/// The swappable live-vCPU identity, shared (via `Arc`) between the engine's
+/// `vcpu: KvmVcpu` field and — on the x86 M:N reclaim path — its `vm: KvmVmm`
+/// field, so a block-recycle (`KvmVmm::save_guest_state` / `rebind_to_slot`) can
+/// swap the live vCPU underneath BOTH at once. This mirrors bhyve's `VcpuHandle`
+/// (an `AtomicPtr<Vcpu>` shared between its engine fields); KVM's analogue holds
+/// the owned RAII `VcpuFd` in an `UnsafeCell` instead of a raw pointer.
+///
+/// SAFETY contract (the same single-owner invariant bhyve relies on, and that
+/// the pre-existing `&self` fd accessors — e.g. [`KvmVcpu::set_reg_shared`] —
+/// already assume): the engine + its vCPU are owned by exactly one host thread
+/// at a time, and the `vm`-side swap (`save_guest_state`/`rebind_to_slot`) runs
+/// ONLY on that same thread while it is parked in a host futex wait — i.e. when
+/// the vCPU is NOT inside `KVM_RUN`. So the `&VcpuFd`/`&mut VcpuFd` the accessors
+/// hand out never alias a concurrent swap.
+struct KvmVcpuSlot {
+    /// `Some` until drop / reclaim-park. The `Option` lets `Drop` (and the
+    /// block-recycle save path) MOVE the fd into the recycle pool. The None arm
+    /// of [`KvmVcpu::fd`]/[`KvmVcpu::fd_mut`] is unreachable in normal operation.
+    fd: UnsafeCell<Option<VcpuFd>>,
+    /// This vCPU's x86 fault-table slot (its `KVM_CREATE_VCPU` id at creation;
+    /// recycled vcpus carry the parked slot). Swapped alongside `fd` on reclaim.
     #[cfg(target_arch = "x86_64")]
-    fault_slot: u64,
+    fault_slot: UnsafeCell<u64>,
+    /// `true` when the mmap'd `kvm_run.s.regs` sync-out mirror is STALE w.r.t.
+    /// the authoritative kernel registers — set by the M:N reclaim
+    /// (`install_recycled` swaps in a vCPU programmed via `KVM_SET_REGS` that has
+    /// NEVER exited `KVM_RUN`, so its `s.regs` page still holds the previous
+    /// occupant's last-exit frame / zeros), cleared after the next `KVM_RUN`
+    /// repopulates it. While set, every `sync_regs()` reader on the syscall-resume
+    /// path must fall back to a `KVM_GET_REGS`/`KVM_GET_SREGS` ioctl, or it
+    /// resumes the guest on garbage RCX/R11/RIP and faults. Swapped alongside `fd`
+    /// on reclaim (it tracks the live vCPU identity).
+    #[cfg(target_arch = "x86_64")]
+    sync_regs_stale: UnsafeCell<bool>,
+}
+
+// SAFETY: the slot is single-thread-owned at any instant (see the type doc); the
+// `UnsafeCell`s are only ever read/written by that one owning thread.
+unsafe impl Send for KvmVcpuSlot {}
+unsafe impl Sync for KvmVcpuSlot {}
+
+pub struct KvmVcpu {
+    /// The shared, swappable live-vCPU identity (fd + fault slot). On the x86
+    /// reclaim path the engine's `vm: KvmVmm` holds a clone of this same `Arc`,
+    /// so a block-recycle swaps the live vCPU underneath the engine's separate
+    /// `vcpu` field. On every other path it is a private one-strong-ref `Arc`.
+    ///
+    /// KVM vcpu ids are a FINITE per-VM resource (KVM_CAP_MAX_VCPUS, ~512) and a
+    /// created vcpu persists until VM teardown — there is no KVM_DESTROY_VCPU,
+    /// and closing the fd does not free the id. A thread-churny guest (cpython's
+    /// test_threading spawns thousands of short-lived threads, each a sibling
+    /// vCPU) exhausts the id space and later KVM_CREATE_VCPUs fail with EINVAL
+    /// unless exited siblings' vcpus are REUSED. So both thread EXIT (`Drop`) and
+    /// block (`KvmVmm::save_guest_state`) PARK the fd into `recycle`, and
+    /// `create_vcpu_on_shared_vm` pops a parked vcpu (full architectural reset)
+    /// before handing it out — same UNPROGRAMMED contract as a fresh vcpu.
+    slot: Arc<KvmVcpuSlot>,
+    recycle: Option<Arc<Mutex<Vec<ParkedVcpu>>>>,
+    /// `true` for a TRANSIENT view built by the x86 M:N reclaim path over an
+    /// already-live shared slot (see [`KvmReclaimHandle::with_vcpu`]): its `Drop`
+    /// must NOT take/park the fd (the real `KvmVcpu` still owns it) nor decrement
+    /// [`VCPU_LIVE`] (it never incremented). A normal vCPU leaves this `false`.
+    borrowed: bool,
     #[cfg(target_arch = "x86_64")]
     last_x86_restore: Option<KvmX86RestoreState>,
 }
@@ -613,7 +662,12 @@ impl KvmVcpu {
     /// can call `kvm_ioctls::VcpuFd::get_regs`/`set_regs`/`get_sregs`/`set_sregs`
     /// without going through the aarch64 `HvVcpu::reg`/`set_reg` path.
     pub(crate) fn fd(&self) -> &VcpuFd {
-        self.fd.as_ref().unwrap_or_else(|| {
+        // SAFETY: single-thread-owned (see `KvmVcpuSlot` doc) — no concurrent
+        // swap aliases this borrow. The None arm is unreachable in normal
+        // operation (set transiently only between save-park and rebind, on the
+        // SAME thread, which makes no fd call in that window).
+        let opt = unsafe { &*self.slot.fd.get() };
+        opt.as_ref().unwrap_or_else(|| {
             eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
             std::process::abort()
         })
@@ -621,7 +675,10 @@ impl KvmVcpu {
 
     /// Mutable access for the one fd method that needs it (`VcpuFd::run`).
     pub(crate) fn fd_mut(&mut self) -> &mut VcpuFd {
-        self.fd.as_mut().unwrap_or_else(|| {
+        // SAFETY: see `fd()` — single-thread-owned; the `&mut self` receiver plus
+        // the single-owner invariant guarantees no other access aliases this.
+        let opt = unsafe { &mut *self.slot.fd.get() };
+        opt.as_mut().unwrap_or_else(|| {
             eprintln!("carrick: KvmVcpu fd accessed after drop-park (unreachable)");
             std::process::abort()
         })
@@ -644,7 +701,33 @@ impl KvmVcpu {
 
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn x86_fault_slot(&self) -> u64 {
-        self.fault_slot
+        // SAFETY: single-thread-owned scalar read (see `KvmVcpuSlot` doc).
+        unsafe { *self.slot.fault_slot.get() }
+    }
+
+    /// Whether the mmap'd `kvm_run.s.regs` sync-out mirror can be trusted for a
+    /// register read. It is `true` only when KVM_CAP_SYNC_REGS is available AND
+    /// the vCPU has exited `KVM_RUN` at least once since its registers were last
+    /// programmed via `KVM_SET_REGS` (see `KvmVcpuSlot::sync_regs_stale`). After a
+    /// reclaim swap the freshly-installed vCPU is programmed but un-run, so this
+    /// returns `false` and the caller must use a `KVM_GET_REGS` ioctl instead of
+    /// the stale mirror.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sync_regs_usable(&self) -> bool {
+        // SAFETY: single-thread-owned scalar read (see `KvmVcpuSlot` doc).
+        sync_regs_supported() && unsafe { !*self.slot.sync_regs_stale.get() }
+    }
+
+    /// The shared swappable-vCPU handle, for the engine's `vm: KvmVmm` to clone
+    /// so a block-recycle (x86 M:N reclaim) can swap the live vCPU underneath the
+    /// engine's separate `vcpu` field. Mirrors bhyve's `Arc<VcpuHandle>` sharing.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn reclaim_handle(&self, vm: SharedVmHandle) -> KvmReclaimHandle {
+        KvmReclaimHandle {
+            slot: Arc::clone(&self.slot),
+            recycle: self.recycle.clone(),
+            vm,
+        }
     }
 
     pub(crate) fn append_debug_state(&self, msg: &mut String) {
@@ -792,15 +875,124 @@ mod x86_tests {
     }
 }
 
+/// The `vm`-side half of the x86 M:N block-recycle (pool-swap) reclaim. Holds a
+/// clone of the engine's live-vCPU [`Arc<KvmVcpuSlot>`] (so swapping the fd here
+/// is visible through the engine's separate `vcpu: KvmVcpu` field) plus the
+/// shared VM handle + recycle pool (so it can park the blocking thread's vCPU and
+/// pop a recycled one — the same finite-id pool the EXIT recycle uses).
+///
+/// KVM allows cross-thread `KVM_RUN`, and the bounded admission scheduler caps
+/// concurrent threads at `vcpu_budget()` ≤ KVM_CAP_MAX_VCPUS, so the total number
+/// of created vcpu ids never exceeds the cap and `KVM_CREATE_VCPU` never EINVALs.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct KvmReclaimHandle {
+    slot: Arc<KvmVcpuSlot>,
+    recycle: Option<Arc<Mutex<Vec<ParkedVcpu>>>>,
+    vm: SharedVmHandle,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl KvmReclaimHandle {
+    /// Run `f` against a TRANSIENT [`KvmVcpu`] view over the live shared slot, for
+    /// the snapshot (save) / restore (rebind) which are written against the
+    /// `X86Vcpu` / `restore_kvm_vcpu` surface. The view's `borrowed` flag makes
+    /// its `Drop` a no-op (the real `KvmVcpu` still owns the fd + the VCPU_LIVE
+    /// count). The closure is the ONLY accessor for its duration (single-thread
+    /// owned), so the shared-slot borrow is sound.
+    pub(crate) fn with_vcpu<R>(&self, f: impl FnOnce(&mut KvmVcpu) -> R) -> R {
+        let mut view = KvmVcpu {
+            slot: Arc::clone(&self.slot),
+            recycle: None,
+            borrowed: true,
+            last_x86_restore: None,
+        };
+        f(&mut view)
+    }
+
+    /// PARK the blocking thread's live vCPU into the recycle pool and leave the
+    /// shared slot empty (`fd = None`) for the no-vCPU host wait. Another admitted
+    /// thread can then pop+reuse this fd via `create_vcpu_on_shared_vm`, so the
+    /// live vcpu-id count stays ≤ budget. Idempotent-safe: a missing fd or pool
+    /// just drops the vcpu (closing the fd) — correctness over reuse.
+    pub(crate) fn park_current(&self) {
+        // SAFETY: single-thread-owned (see `KvmVcpuSlot` doc); the owning thread
+        // is between save and the futex wait, not inside KVM_RUN.
+        let fd = unsafe { (*self.slot.fd.get()).take() };
+        let fault_slot = unsafe { *self.slot.fault_slot.get() };
+        if let (Some(fd), Some(pool)) = (fd, self.recycle.as_deref())
+            && let Ok(mut parked) = pool.lock()
+        {
+            parked.push(ParkedVcpu { fd, fault_slot });
+        }
+        // No pool / poisoned lock: the fd just closes here (the `take` above
+        // dropped it) — forgoing reuse, never unsound.
+    }
+
+    /// Re-acquire a vCPU for the woken thread: pop a recycled vCPU (or create a
+    /// fresh id if the pool is empty) via the SAME path the exit-recycle uses,
+    /// then INSTALL its fd + fault slot into the shared slot so the engine's live
+    /// `vcpu` field drives it. Returns the installed fault slot for diagnostics.
+    pub(crate) fn install_recycled(&self) -> Result<u64, OsError> {
+        // `create_vcpu_on_shared_vm` pops a parked vcpu (flushing any stale MMIO
+        // completion + re-applying XCR0) or creates a fresh id — a fully-reset,
+        // UNPROGRAMMED vCPU, exactly what `restore` expects.
+        let vm = KvmVm::from_shared_vm(self.vm.clone());
+        let fresh = vm.create_vcpu_on_shared_vm()?;
+        // Move the fresh fd + fault slot out of `fresh` (its `recycle` is the same
+        // pool; neutralize its Drop so it does not re-park the fd we are adopting).
+        // SAFETY: single-thread-owned; `fresh` is a local we are dismantling.
+        let fd = unsafe { (*fresh.slot.fd.get()).take() };
+        let fault_slot = unsafe { *fresh.slot.fault_slot.get() };
+        // Prevent `fresh`'s Drop from parking the (now-None) fd or decrementing
+        // VCPU_LIVE — it never represented an independent live vCPU; we transplant
+        // its fd into the engine's existing slot, whose own Drop owns the count.
+        let mut fresh = fresh;
+        fresh.borrowed = true;
+        drop(fresh);
+        let fd = fd.ok_or_else(|| os_err("kvm reclaim install", "recycled vcpu had no fd"))?;
+        // SAFETY: single-thread-owned; the slot is empty (park_current took it).
+        unsafe {
+            *self.slot.fd.get() = Some(fd);
+            *self.slot.fault_slot.get() = fault_slot;
+            // The installed fd belongs to a vCPU that has never exited KVM_RUN in
+            // this slot's identity; its kvm_run.s.regs mirror is the previous
+            // occupant's last-exit frame (or zeros for a fresh id). The reclaim
+            // restore programs the real registers via KVM_SET_REGS, but the mirror
+            // stays stale until the next KVM_RUN — flag it so the syscall-resume
+            // readers (complete_sysret / prepare_sysret_resume) use KVM_GET_REGS
+            // instead of the garbage mirror. Without this the resumed guest
+            // sysrets to a bogus RCX/RIP and SIGSEGVs.
+            *self.slot.sync_regs_stale.get() = true;
+        }
+        Ok(fault_slot)
+    }
+}
+
 impl Drop for KvmVcpu {
     fn drop(&mut self) {
-        if let (Some(fd), Some(pool)) = (self.fd.take(), self.recycle.as_deref())
+        // A transient reclaim view owns nothing — leave the shared slot + the
+        // VCPU_LIVE count to the real `KvmVcpu`.
+        if self.borrowed {
+            return;
+        }
+        // Take the fd out of the SHARED slot (single-thread-owned, so the
+        // UnsafeCell access is sound even while `vm: KvmVmm` holds a clone of the
+        // Arc on the reclaim path). It is already `None` if a block-recycle
+        // (`KvmVmm::save_guest_state`) parked it before this drop — then there is
+        // nothing left to park here, which is correct.
+        // SAFETY: see `KvmVcpuSlot` doc — the owning thread is the only accessor.
+        let taken = unsafe { (*self.slot.fd.get()).take() };
+        #[cfg(target_arch = "x86_64")]
+        let fault_slot = unsafe { *self.slot.fault_slot.get() };
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = ();
+        if let (Some(fd), Some(pool)) = (taken, self.recycle.as_deref())
             && let Ok(mut parked) = pool.lock()
         {
             parked.push(ParkedVcpu {
                 fd,
                 #[cfg(target_arch = "x86_64")]
-                fault_slot: self.fault_slot,
+                fault_slot,
             });
         }
         // No pool (or a poisoned lock): the fd just closes — correct for VM
@@ -1114,10 +1306,17 @@ impl KvmVm {
             }
         }
         Ok(KvmVcpu {
-            fd: Some(fd),
+            slot: Arc::new(KvmVcpuSlot {
+                fd: UnsafeCell::new(Some(fd)),
+                #[cfg(target_arch = "x86_64")]
+                fault_slot: UnsafeCell::new(fault_slot),
+                // A just-created (or recycled) vCPU has never exited KVM_RUN, so
+                // the s.regs sync-out mirror is stale until the first run.
+                #[cfg(target_arch = "x86_64")]
+                sync_regs_stale: UnsafeCell::new(true),
+            }),
             recycle: Some(Arc::clone(&self.vcpu_pool)),
-            #[cfg(target_arch = "x86_64")]
-            fault_slot,
+            borrowed: false,
             #[cfg(target_arch = "x86_64")]
             last_x86_restore: None,
         })
@@ -1268,9 +1467,18 @@ impl HvVcpu for KvmVcpu {
             self.fd_mut().set_sync_valid_reg(SyncReg::Register);
             self.fd_mut().set_sync_valid_reg(SyncReg::SystemRegister);
         }
+        // Capture the stale-flag cell pointer BEFORE the run borrow: a successful
+        // exit borrows `self` (the kvm_run slice in `KvmExit::IoOut`/`MmioWrite`)
+        // through the `match exit` below, so we cannot touch `self.slot` there.
+        // SAFETY: single-thread-owned (see `KvmVcpuSlot` doc); the pointer stays
+        // valid for the whole call (the slot is an Arc field of `self`).
+        #[cfg(target_arch = "x86_64")]
+        let sync_stale_cell: *mut bool = self.slot.sync_regs_stale.get();
         let exit = match self.fd_mut().run() {
             Ok(e) => e,
             Err(e) if e.errno() == libc::EINTR => {
+                // KVM_RUN was interrupted (kick) BEFORE entering the guest — the
+                // kernel did NOT repopulate s.regs, so leave any staleness intact.
                 record_kvm_stat(KvmStat::RunEintr);
                 return Ok(VcpuExit::Kicked);
             }
@@ -1280,6 +1488,14 @@ impl HvVcpu for KvmVcpu {
                 return Err(os_err(&msg, e));
             }
         };
+        // A genuine guest exit repopulated kvm_run.s.regs from the live registers
+        // — the sync-out mirror is fresh again (clears any reclaim staleness).
+        // SAFETY: single-thread-owned scalar write through the pre-captured cell
+        // pointer (avoids re-borrowing `self`, which `exit` holds via the slice).
+        #[cfg(target_arch = "x86_64")]
+        if sync_regs_supported() {
+            unsafe { *sync_stale_cell = false }
+        }
         match exit {
             KvmExit::MmioWrite(gpa, data) => {
                 record_kvm_stat(KvmStat::ExitMmio);
