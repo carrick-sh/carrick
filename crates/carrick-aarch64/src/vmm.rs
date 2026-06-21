@@ -1,0 +1,360 @@
+//! The thin per-VMM backend trait pair (`Aarch64Vmm` + `Aarch64Vcpu`) and the
+//! small value types they trade in (`Aarch64Exit`, `Aarch64VcpuSnapshot`,
+//! `ForkRamStrategy`).
+//!
+//! This is the Axis-1 (aarch64 host/VMM) seam, mirroring `carrick-x86`'s
+//! [`crate`]-level `X86Vmm`/`X86Vcpu` pair. Everything that is *genuinely*
+//! per-VMM on aarch64 (HVF's `applevisor` trap surface vs KVM's MMIO-sentinel
+//! trap surface) is named here, and `carrick-aarch64`'s engine scaffold is
+//! written ONCE over this pair (Stage 2+). The trait surface is reverse-
+//! engineered from the HVF ∩ KVM intersection: the genuinely-irreducible body is
+//! [`Aarch64Vcpu::run`] (each backend decodes its native trap surface into
+//! [`Aarch64Exit`]); the genuinely-per-VMM divergence is on [`Aarch64Vmm`]
+//! (fork VM rebuild, execve remap, sibling spawn, stage-2 mapping, the HVF-only
+//! lazy-alias re-map as the [`Aarch64Vmm::handle_memory_exit`] hook).
+//!
+//! Stage 1 defines this surface only — NOTHING implements it yet (no backend is
+//! migrated). It must compile standalone.
+
+use std::sync::Arc;
+
+use carrick_guest_mem::Aarch64SyscallFrame;
+use carrick_hal::{
+    GuestEntryRegs, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick, VcpuRegistry,
+};
+use carrick_mem::memory::AddressSpace;
+
+/// COW-inherit vs eager full-RAM copy at `fork(2)`. POLICY only, mirroring the
+/// x86 `ForkRamStrategy`: the shared fork path reads this to decide *whether* to
+/// freeze; the per-backend copy MECHANISM stays in the backend, behind
+/// [`Aarch64Vmm::rebuild_child_after_fork`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkRamStrategy {
+    /// KVM `MAP_PRIVATE` + Linux COW: the child inherits RAM for free, nothing is
+    /// copied.
+    Cow,
+    /// HVF's windows are `MAP_SHARED`, so a forked child must copy private pages
+    /// (the parent freezes / the child rebuilds a fresh `applevisor` VM).
+    EagerCopy,
+}
+
+/// The shared exit shape. Lifted from HVF's `applevisor` `ExitReason`+`ESR.EC`
+/// decode ∪ KVM's `VcpuExit::MmioWrite{gpa}`/`Kicked`/`Halt`. Backends decode
+/// their native exit into THIS.
+///
+/// `resume_pc` rides [`Aarch64Exit::Syscall`] so the ENGINE owns the
+/// pending-syscall state (the §2.1 contract). On aarch64 it is the post-`svc`
+/// `ELR_EL1` the EL1 vector's `eret` consumes — so `complete_syscall` sets X0
+/// only and never re-advances PC.
+#[derive(Debug, Clone)]
+pub enum Aarch64Exit {
+    /// A guest EL0 `svc #0`. `frame` carries x0..x5 + x8 (already read via the
+    /// shared `read_aarch64_syscall_frame`); `resume_pc` is `ELR_EL1` (= svc+4).
+    /// HVF: surfaced when the EL1-vector vehicle is an EXCEPTION with
+    /// EC==SVC/HVC-syscall. KVM: `MmioWrite{gpa == SENTINEL_GPA}`.
+    Syscall {
+        frame: Aarch64SyscallFrame,
+        resume_pc: u64,
+    },
+
+    /// An EL0 SYNCHRONOUS fault (data/instruction abort, alignment, undef, debug)
+    /// the engine lowers to `TrapError::EL0Fault` then to `GuestFault`. Carries
+    /// the raw architectural state both backends already build `el0_fault()`
+    /// from. `from_el0_direct` is the ONE trap-surface bit: HVF gets a DIRECT
+    /// EXCEPTION exit (authoritative PC=ELR, VA=FAR) => `true`; KVM steers the
+    /// abort to the guest VBAR and catches it at the fault sentinel, latching
+    /// `ELR_EL1`/`FAR_EL1` => `false`. (Matches
+    /// `carrick_hal::TrapError::EL0Fault::from_el0_direct`.)
+    EL0Fault {
+        /// `ESR_EL1`.
+        syndrome: u64,
+        /// `ELR_EL1` (or authoritative exit PC).
+        elr: u64,
+        /// `FAR_EL1` (or authoritative exit VA).
+        far: u64,
+        x16: u64,
+        x17: u64,
+        x29: u64,
+        x30: u64,
+        sp: u64,
+        from_el0_direct: bool,
+    },
+
+    /// An EL0 `MRS` of an emulated ID/timer/cache register that trapped (Rosetta
+    /// x86-on-arm + HVF). The engine's shared `emulate_el0_sys64_read` services
+    /// it and re-enters; backends whose config never traps `MRS` never surface
+    /// this (cf. x86's `FpDoorbell` / `Memory` defaults).
+    Sys64Read {
+        /// `ESR_EL1` (op0/op1/CRn/CRm/op2 decode).
+        esr: u64,
+    },
+
+    /// The EL1 stage-1 TLBI maintenance trampoline finished
+    /// (`run_el1_maintenance`). HVF: `hvc #1`. KVM:
+    /// `MmioWrite{gpa == MAINT_SENTINEL_GPA}`. The shared maintenance loop
+    /// matches on THIS instead of each backend matching its native vehicle.
+    MaintenanceDone,
+
+    /// WFI/halt with no syscall pending: the engine returns `Ok(None)`, the loop
+    /// runs signal delivery and resumes.
+    Halt,
+
+    /// Cross-thread kick (HVF `hv_vcpus_exit` -> `ExitReason::CANCELED`; KVM
+    /// signal -> `KVM_RUN` EINTR). The shared loop checks: if PC is in the
+    /// carrick EL1 vector, swallow + re-enter; else report `Ok(None)`.
+    Kicked,
+
+    /// A backend memory exit a sparse/alias backend can resolve and retry. HVF
+    /// uses this for the lazy high-VA alias re-map on a forked child's missing
+    /// stage-2 entry; KVM never surfaces it (siblings share one VM). Mirrors
+    /// `X86Exit::Memory{gpa}` + [`Aarch64Vmm::handle_memory_exit`] (default
+    /// `Ok(false)`).
+    Memory { gpa: u64, va: u64 },
+}
+
+/// Snapshot of a vCPU's full architectural register file (GPRs + stage-1 MMU
+/// sysregs + V-regs + FP control), taken on the parent before `fork(2)`/`clone`/
+/// `execve` and restored onto the child's rebuilt vCPU.
+///
+/// Promoted from `carrick-vmm-kvm/src/fork.rs::VcpuSnapshot` so HVF and KVM share
+/// ONE snapshot format; the only per-VMM marshalling is
+/// [`Aarch64Vcpu::snapshot`]/[`Aarch64Vcpu::restore`]. This is the FP-carrying
+/// shape — `vregs`/`fpsr`/`fpcr` are real fields (a zero-stubbed FP form silently
+/// corrupts a guest's NEON/FP state across fork/clone/execve and signal
+/// save/restore). `.fpsr` holds FPSR and `.fpcr` holds FPCR (do NOT swap).
+#[derive(Debug, Clone)]
+pub struct Aarch64VcpuSnapshot {
+    /// X0..X30 (the general-purpose register file).
+    pub gprs: [u64; 31],
+    pub pc: u64,
+    pub pstate: u64,
+    /// `user_pt_regs.sp` == SP_EL0 (the EL0/user stack pointer).
+    pub sp_el0: u64,
+    pub sp_el1: u64,
+    pub elr_el1: u64,
+    pub spsr_el1: u64,
+    pub ttbr0: u64,
+    pub ttbr1: u64,
+    pub tcr: u64,
+    pub sctlr: u64,
+    pub mair: u64,
+    pub vbar: u64,
+    pub cpacr: u64,
+    /// TPIDR_EL0 — the EL0 thread pointer (libc TLS base).
+    pub tpidr_el0: u64,
+    /// V0..V31 (the full 128-bit NEON/FP register file).
+    pub vregs: [u128; 32],
+    /// FPSR.
+    pub fpsr: u32,
+    /// FPCR.
+    pub fpcr: u32,
+}
+
+/// Per-vCPU register/run surface. The ONLY thing genuinely per-VMM on the vCPU
+/// side. HVF wraps `applevisor::Vcpu`; KVM wraps its `KvmVcpu` (which already
+/// provides every method body). Supersedes the bare
+/// [`carrick_hal::HvVcpu`] — it adds snapshot/restore, V-regs, FP control, and
+/// fault-register reads. The genuinely-per-VMM marshalling lives here and
+/// NOWHERE in the shared engine.
+pub trait Aarch64Vcpu {
+    // ── GPR / sysreg access ──
+    fn get_reg(&self, r: Reg) -> Result<u64, TrapError>;
+    fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError>;
+    fn get_sys_reg(&self, r: SysReg) -> Result<u64, TrapError>;
+    fn set_sys_reg(&mut self, r: SysReg, v: u64) -> Result<(), TrapError>;
+
+    // ── V-regs + FP control (aarch64 V0..V31 are full 128b) ──
+    fn get_vreg(&self, n: u32) -> Result<u128, TrapError>;
+    fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), TrapError>;
+    fn get_fpcr(&self) -> Result<u64, TrapError>;
+    fn set_fpcr(&mut self, v: u64) -> Result<(), TrapError>;
+    fn get_fpsr(&self) -> Result<u64, TrapError>;
+    fn set_fpsr(&mut self, v: u64) -> Result<(), TrapError>;
+    // NOTE: the applevisor `set_simd_fp_reg_v` C-shim (the u128-by-value ABI-bug
+    // workaround) lives in the HVF impl of `set_vreg` ONLY; KVM calls its native
+    // setter. This is exactly x86's "the backend provides the fix (if any)".
+
+    // ── fault-register reads (for Aarch64Exit::EL0Fault capture) ──
+    fn get_esr_el1(&self) -> Result<u64, TrapError>;
+    fn get_far_el1(&self) -> Result<u64, TrapError>;
+
+    // ── snapshot / restore (the VALUE is ISA-neutral; the I/O is per-VMM) ──
+    fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError>;
+    fn restore(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError>;
+
+    /// Run until the next exit, decoding the backend's native trap surface into
+    /// [`Aarch64Exit`]. HVF: `hv_vcpu_run` + `get_exit_info()` => EXCEPTION+ESR.EC
+    /// decode (svc / abort / sys64 MRS / maint-hvc) + CANCELED => `Kicked`. KVM:
+    /// `KVM_RUN` => `MmioWrite{SENTINEL => Syscall, FAULT_SENTINEL => EL0Fault,
+    /// MAINT_SENTINEL => MaintenanceDone}` + EINTR => `Kicked`. `resume_pc` filled
+    /// at decode time; the ENGINE owns the pending-syscall state (§2.1).
+    fn run(&mut self) -> Result<Aarch64Exit, TrapError>;
+
+    /// Force this vCPU out of `run()` from another thread (HVF `hv_vcpus_exit`;
+    /// KVM `pthread_kill(SIGRTMIN)`).
+    fn kick(&self) -> Result<(), TrapError>;
+
+    /// Set the hardware TSO (total-store-order) memory model. HVF sets
+    /// `ACTLR_EL1.EnTSO` for Rosetta; KVM keeps the no-op default. Carried
+    /// separately from [`Self::set_memory_model`] so a backend that needs both a
+    /// guest-prctl entrypoint and a direct bring-up entrypoint has each.
+    fn set_hardware_tso(&mut self, _tso: bool) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// `prctl(PR_SET_MEM_MODEL, TSO)`: HVF sets `ACTLR_EL1.EnTSO` for Rosetta; KVM
+    /// keeps the no-op default (matches `SyscallTrap::set_memory_model`).
+    fn set_memory_model(&mut self, _tso: bool) -> Result<(), TrapError> {
+        Ok(())
+    }
+}
+
+/// VM-level memory + lifecycle. One per guest process. This is where the
+/// GENUINELY-backend-specific divergence lives: fork VM rebuild, execve remap,
+/// sibling spawn, host memory windows + stage-2 mapping, and the HVF-only
+/// lazy-alias re-map (as the optional [`Self::handle_memory_exit`] hook). Mirrors
+/// `carrick-x86`'s `X86Vmm`.
+pub trait Aarch64Vmm: Sized {
+    type Vcpu: Aarch64Vcpu;
+
+    /// The per-backend vCPU-kick handle (`KvmKickHandle` / `HvfKickHandle`).
+    type KickHandle: VcpuKick + 'static;
+
+    /// The `Send` payload `build_sibling_builder` hands a freshly spawned host
+    /// thread; `materialize_sibling` turns it into a fresh `(Self, Self::Vcpu)`
+    /// pair on the SAME VM (`clone(CLONE_THREAD)`) without re-registering memory.
+    type SiblingBuilder: Send;
+
+    // ── memory windows + stage-2 (the hv_vm_map / KVM-slot seam) ──
+
+    /// The host pointer backing `[gpa, gpa + len)`, or `None` if unmapped. The
+    /// engine's `GuestMemory` impl copies through this (KVM `ram.host_ptr`; HVF
+    /// mapping `host_addr` lookup).
+    fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8>;
+
+    /// Mutable variant of [`Self::host_ptr`]. Backends with sparse/lazy backing
+    /// may materialize the requested range before returning the host pointer.
+    fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
+        self.host_ptr(gpa, len)
+    }
+
+    /// Copy `bytes` into guest physical memory at `gpa`.
+    fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), TrapError>;
+
+    /// Map host memory at a stage-2 IPA. The STAGE-1 path (page-table edit) is
+    /// the shared engine's job; this is only the backend stage-2 op: HVF
+    /// `hv_vm_map`; KVM `KVM_SET_USER_MEMORY_REGION`. Used by the shared
+    /// `map_host_alias`.
+    fn map_stage2(
+        &mut self,
+        ipa: u64,
+        host: *mut u8,
+        len: u64,
+        perms: MemPerms,
+    ) -> Result<(), TrapError>;
+
+    /// Resolve a backend memory exit. HVF overrides for the lazy high-VA alias
+    /// re-map (lookup_shared_alias + `hv_vm_map` on a forked child's missing
+    /// stage-2 entry — the one HVF-only cluster). KVM keeps the default
+    /// `Ok(false)`: siblings share one VM, fork relies on Linux COW, no analogue.
+    /// Mirrors `X86Vmm::handle_memory_exit`.
+    fn handle_memory_exit(&mut self, _gpa: u64, _va: u64) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    // ── vCPU lifecycle ──
+
+    /// Create a fresh vCPU bound to this VM.
+    fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError>;
+
+    // ── fork (skeleton shared; this is the per-VMM rebuild mechanism) ──
+
+    /// COW-inherit vs eager copy. KVM is `MAP_PRIVATE` + Linux COW; HVF's windows
+    /// are `MAP_SHARED` so its child must copy private pages. Modeled exactly on
+    /// the x86 `ForkRamStrategy{Cow,EagerCopy}`.
+    fn fork_ram_strategy(&self) -> ForkRamStrategy;
+
+    /// Child-side rebuild after `libc::fork()`: KVM rebuilds a fresh `KvmVm` over
+    /// the COW host mmaps; HVF rebuilds a fresh `applevisor` VM and re-`hv_vm_map`s
+    /// each region. The shared `fork()` calls this then restores the snapshot +
+    /// sets x0=0 + advances the child past the sentinel/HVC. (The x86
+    /// `rebuild_child_after_fork` analogue.)
+    fn rebuild_child_after_fork(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        snapshot: &Aarch64VcpuSnapshot,
+    ) -> Result<(), TrapError>;
+
+    /// `execve(2)` image replacement. KVM remaps slots in place on the live VM;
+    /// HVF rebuilds the VM. The shared `execve_into` calls this then reprograms
+    /// sysregs (shared `program_sysregs`) + clears pending state.
+    fn execve_rebuild(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError>;
+
+    /// Forked-child `_exit` cleanup (skips Drop). KVM/HVF default no-op (fd-bound
+    /// / swapped VM); matches `SyscallTrap::process_exit_cleanup`. A future
+    /// bhyve-on-arm backend would override. (Identical to the x86 hook.)
+    fn process_exit_cleanup(&mut self) {}
+
+    // ── threaded sibling lifecycle (the generic ThreadedEngine drives these) ──
+
+    /// A kick handle for the current vCPU thread (the engine's `kick_handle`).
+    fn kick_handle(&self) -> Self::KickHandle;
+
+    /// Backend admission gate before a new vCPU thread runs (HVF's concurrent-
+    /// vCPU cap ~64; a no-op on KVM).
+    fn wait_for_vcpu_slot() {}
+
+    /// Live concurrent-vCPU budget N for the M:N admission scheduler.
+    /// `usize::MAX` = no carrick-side cap (KVM); HVF returns its concurrent cap.
+    fn vcpu_budget() -> usize {
+        usize::MAX
+    }
+
+    /// Whether this backend RECLAIMS a thread's vCPU slot on block (M:N reclaim).
+    /// `false` (default) = Phase-1 lifetime-binding (KVM); HVF returns `true`.
+    fn reclaims(&self) -> bool {
+        false
+    }
+
+    /// Save THIS thread's full guest CPU state before releasing its vCPU slot at
+    /// a block point (M:N reclaim). Returns the snapshot the engine stashes in
+    /// `reclaim_snapshot`; `rebind_to_slot` restores it on wake.
+    fn save_guest_state(&self) -> Result<Aarch64VcpuSnapshot, TrapError>;
+
+    /// Re-bind to `slot`'s vCPU and restore `snapshot` into it after a block.
+    fn rebind_to_slot(
+        &mut self,
+        slot: SlotId,
+        snapshot: &Aarch64VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        let _ = (slot, snapshot);
+        Ok(())
+    }
+
+    /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling needs to add its
+    /// own vCPU on the SAME VM (shared VM handle + window descriptors + a
+    /// live-vcpu ticket). KVM `build_sibling_spec`; HVF publishes its VM + clones
+    /// the mapping list. `entry` carries the new thread's `clone` deltas (return
+    /// value / child stack / TLS).
+    fn build_sibling_builder(
+        &self,
+        entry: GuestEntryRegs,
+    ) -> Result<Self::SiblingBuilder, TrapError>;
+
+    /// On the sibling thread, turn the builder into a fresh `(VM, vCPU)` on the
+    /// SAME VM. KVM `materialize_sibling`; the engine restores the seeded snapshot
+    /// + SHARES the protections/page_tables Arc.
+    fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError>;
+
+    /// Set SP_EL0 on a vfork child given an explicit `child_stack`, through
+    /// `&self` (the shared loop holds only `&engine`).
+    fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError>;
+
+    /// A FRESH kick registry for the CHILD of a guest `fork(2)` (only the calling
+    /// thread survived `libc::fork`). KVM `fresh_fork_kicker`.
+    fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry>;
+}

@@ -288,6 +288,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-aarch64"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-host",
+ "carrick-mem",
+ "libc",
+]
+
+[[package]]
 name = "carrick-abi"
 version = "0.1.0"
 dependencies = [
