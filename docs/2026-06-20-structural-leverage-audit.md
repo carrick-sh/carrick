@@ -553,6 +553,15 @@ crates — which is also why this pass is scoped to compile-checking; HVF/KVM/bh
 - **§2.5 / P0.2 — guest-arch accessor.** `ProcState::reported_arch()` feeds both
   `uname(2)` and `/proc/cpuinfo`; x86 guests get a real x86_64 cpuinfo block.
   `/sys/class/net` gets a synthetic loopback off-macOS. *(macos + all)*
+  *HVF-rig runtime check (2026-06-21):* aarch64 guests show carrick's ARM block,
+  agreeing with `uname=aarch64`. The audit's claim that **Rosetta-on-macOS** x86
+  guests showed an ARM `/proc/cpuinfo` is imprecise — Apple's RosettaLinux
+  interpreter intercepts `/proc/cpuinfo` itself and presents an x86 CPU
+  (`vendor_id: VirtualApple`), while non-CPU `/proc` files (`/proc/version`) fall
+  through to carrick's synthetic. So carrick's synthetic x86 block is reached only
+  on the NATIVE x86 backends (KVM/bhyve/NVMM), where the fix is correct
+  (unit-tested); the Rosetta path was never buggy and the change does not regress
+  it.
 - **P0.3 — `RawSyscall` carries `LinuxGuestAbi`.** Stamped by each backend's
   `GuestArch` at decode time; `SyscallRequest::from_raw` reads it, so the
   type-erased no-threads / combined-Linux loops can no longer mis-marshal the x86
