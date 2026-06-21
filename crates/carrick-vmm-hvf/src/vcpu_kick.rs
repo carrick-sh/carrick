@@ -449,7 +449,7 @@ mod tests {
         let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
             std::sync::Arc::new(VcpuKicker::new());
         let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
-            crate::threaded_impl::HvfFutex(std::sync::Arc::new(crate::thread::FutexTable::new())),
+            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
         );
         let pump = spawn_signal_pump(registry, futex);
         pump.stop();
@@ -470,7 +470,7 @@ mod tests {
         let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
             std::sync::Arc::new(VcpuKicker::new());
         let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
-            crate::threaded_impl::HvfFutex(std::sync::Arc::new(crate::thread::FutexTable::new())),
+            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
         );
         let pump = spawn_signal_pump(registry, futex);
         // Let the pump finish setting up and park in kevent().

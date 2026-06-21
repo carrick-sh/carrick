@@ -116,12 +116,12 @@ impl HostForkCoordinator for ForkCoordinator {
 mod tests {
     use super::*;
     use crate::thread::FutexTable;
-    use crate::threaded_impl::HvfFutex;
+    use crate::threaded_impl::hvf_futex;
     use crate::vcpu_kick::VcpuKicker;
 
     fn dyn_context() -> (Arc<dyn VcpuRegistry>, Arc<dyn PlatformFutex>) {
         let registry: Arc<dyn VcpuRegistry> = Arc::new(VcpuKicker::new());
-        let futex: Arc<dyn PlatformFutex> = Arc::new(HvfFutex(Arc::new(FutexTable::new())));
+        let futex: Arc<dyn PlatformFutex> = Arc::new(hvf_futex(Arc::new(FutexTable::new())));
         (registry, futex)
     }
 

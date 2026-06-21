@@ -1,117 +1,69 @@
-//! `PlatformFutex` implementation for HVF.
+//! `PlatformFutex` for HVF: [`FutexTableFutex<HvfShared>`].
 //!
-//! `HvfFutex` wraps the process-private `carrick_thread::thread::FutexTable`
-//! (parking-lot-backed) for private-anonymous futex operations, and delegates
-//! the `MAP_SHARED` / cross-process futex operations to the Darwin
-//! `os_sync_wait_on_address` / `os_sync_wake_by_address` API via
-//! `carrick_host::ulock`.
+//! The PRIVATE (process-anonymous) futex path is verbatim delegation to the
+//! shared parking-lot [`carrick_thread::thread::FutexTable`]; only the SHARED
+//! (`MAP_SHARED`, cross-process) path is host-specific — one Darwin
+//! `os_sync_wait_on_address` / `os_sync_wake_by_address` (`__ulock`) slice + wake.
+//! That is exactly the [`carrick_thread::platform_futex::FutexTableFutex<S>`]
+//! shape KVM/bhyve/NVMM already use, so HVF folds onto it: it supplies only the
+//! ~25-line [`HvfShared`] `SharedFutexSyscall` impl.
 //!
-//! This is a forwarding shim only.  All semantics are owned by the existing
-//! `FutexTable` / ulock implementations; this file just names the
-//! `carrick_hal::PlatformFutex` surface and routes each method to the
-//! correct existing call.
+//! HVF previously kept a hand-rolled `HvfFutex` SOLELY to layer carrick-trace
+//! probes into the wait path (`futex_route` once before the wait; `ulock_wait`
+//! per slice). With the `SharedFutexSyscall::pre_wait` hook (the once-before
+//! peek) and the per-slice probes inside `wait_one_slice`, those live in
+//! `HvfShared` and the whole duplicate impl + slice/deadline loop is gone.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use carrick_hal::{FutexOutcome, PlatformFutex, ThreadId};
-use carrick_thread::thread::{FutexTable, FutexWaitOutcome};
+use carrick_hal::SharedWaitStep;
+use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexSyscall};
+use carrick_thread::thread::FutexTable;
 
-// ---------------------------------------------------------------------------
-// The shared-futex (MAP_SHARED, cross-process) slice constant.
-//
-// The existing `shared_futex_wait` loop in runtime.rs slices each __ulock
-// wait to ≤20 ms so a pending guest signal is observed promptly (the kick
-// cannot interrupt __ulock).  We apply the same cap here.
-// ---------------------------------------------------------------------------
+// The shared-futex (MAP_SHARED, cross-process) slice cap: each `__ulock` wait is
+// sliced to ≤20 ms so a pending guest signal is observed promptly (the kick
+// cannot interrupt `__ulock`). The deadline/slice/interrupt loop around this is
+// shared (`carrick_hal::shared_wait_sliced`, driven by `FutexTableFutex`).
 const SHARED_FUTEX_MAX_SLICE_US: u32 = 20_000;
 
-/// The HVF `PlatformFutex` implementation.
-///
-/// Wraps the per-process `FutexTable` for private futex ops and delegates
-/// MAP_SHARED / cross-process futex ops to the Darwin ulock API.
-pub struct HvfFutex(pub Arc<FutexTable>);
+/// HVF's `MAP_SHARED` (cross-process) futex primitive: Darwin `os_sync` /
+/// `__ulock`, carrying the carrick-trace probes the module deliberately keeps.
+pub struct HvfShared;
 
-impl PlatformFutex for HvfFutex {
-    /// Park the calling thread on a private (anonymous) futex.
-    ///
-    /// The value-equality check was already performed by the dispatcher BEFORE
-    /// it returned `DispatchOutcome::FutexWait`, so we do NOT re-check here —
-    /// we call `prepare_wait` (which captures the generation) and then
-    /// `wait_prepared_for_thread` directly, so that a thread-directed signal
-    /// (tgkill) can wake this specific parked thread via its `ParkToken(tid)`.
-    fn private_wait(
-        &self,
-        addr: u64,
-        _val: u32,
-        tid: ThreadId,
-        timeout: Option<Duration>,
-        interrupted: &dyn Fn() -> bool,
-    ) -> FutexOutcome {
-        let wait = self.0.prepare_wait(addr);
-        match self
-            .0
-            .wait_prepared_for_thread(wait, timeout, tid, interrupted)
-        {
-            FutexWaitOutcome::Woken => FutexOutcome::Woken,
-            FutexWaitOutcome::TimedOut => FutexOutcome::TimedOut,
-            FutexWaitOutcome::Interrupted => FutexOutcome::Interrupted,
-        }
-    }
-
-    fn private_wake(&self, addr: u64, n: u32) -> u32 {
-        self.0.wake(addr, n)
-    }
-
-    /// Wait on a MAP_SHARED (cross-process) futex via `os_sync_wait_on_address`.
-    ///
-    /// Mirrors the `shared_futex_wait` loop in runtime.rs: slices each kernel
-    /// wait to ≤20 ms, re-checks `interrupted()` between slices, and returns
-    /// the raw `i64` (-errno on error, ≥0 on woken/value-mismatch) that the
-    /// run loop translates to Linux errno.
-    fn shared_wait(
-        &self,
-        host_addr: usize,
-        value: u32,
-        timeout: Option<Duration>,
-        interrupted: &dyn Fn() -> bool,
-    ) -> i64 {
-        // Pre-wait peek probe: mirror the single-threaded shared_futex_wait in
-        // runtime.rs. Reads the current value at host_addr so carrick-trace can
-        // see the word before any wait commences. (Once, before the loop.)
+impl SharedFutexSyscall for HvfShared {
+    /// Pre-wait peek: read the current shared word so carrick-trace can see it
+    /// before any wait commences (once, at the top of `shared_wait`).
+    fn pre_wait(&self, host_addr: usize, val: u32) {
         let host_value = unsafe { (host_addr as *const u32).read() };
-        crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
-        // The deadline/slice/interrupt loop is shared (carrick_hal); only the
-        // single `os_sync` wait + its macOS-errno classification is HVF-specific.
-        carrick_hal::shared_wait_sliced(timeout, interrupted, &|slice_ns| {
-            let slice_us =
-                u32::try_from((slice_ns / 1_000).min(i64::from(SHARED_FUTEX_MAX_SLICE_US)))
-                    .unwrap_or(SHARED_FUTEX_MAX_SLICE_US);
-            crate::probes::ulock_wait(host_addr as u64, value, slice_us, 0, 0);
-            let r = carrick_host::ulock::wait(host_addr, value, slice_us);
-            crate::probes::ulock_wait(host_addr as u64, value, slice_us, 1, r);
-            if r >= 0 {
-                // Woken or value already differed — caller re-checks. Linux
-                // FUTEX_WAIT returns 0.
-                return carrick_hal::SharedWaitStep::Woken;
-            }
-            let host_errno = (-r) as i32;
-            if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
-                // Slice expired or signal nudge — re-check at the loop top.
-                return carrick_hal::SharedWaitStep::Retry;
-            }
-            // Any other error (e.g. EFAULT) is returned directly; errno values
-            // happen to agree between macOS and Linux for EFAULT (14).
-            carrick_hal::SharedWaitStep::Error(r)
-        })
+        crate::probes::futex_route(host_addr as u64, 99, val as i32, host_value as u64);
     }
 
-    fn shared_wake(&self, host_addr: usize, n: u32) -> i64 {
-        // Mirror the existing shared-futex wake sites (dispatch/proc.rs:1366,
-        // dispatch/mod.rs): wake ONE waiter at a time with a sched_yield between
-        // iterations. macOS's os_sync_wake_by_address_any reports spurious
-        // successes when called back-to-back on a SHARED address; the
-        // sched_yield between iterations is the cure. Returns the count woken.
+    /// One ≤20 ms `os_sync_wait_on_address` slice + its macOS-errno
+    /// classification. `Woken` for a wake / at-entry value mismatch (the guest
+    /// re-checks; Linux `FUTEX_WAIT` returns 0), `Retry` for a slice timeout or
+    /// signal nudge (the shared loop re-checks the deadline + interrupt), `Error`
+    /// for any other terminal `-errno` (EFAULT agrees macOS↔Linux at 14).
+    fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
+        let slice_us = u32::try_from((slice_ns / 1_000).min(i64::from(SHARED_FUTEX_MAX_SLICE_US)))
+            .unwrap_or(SHARED_FUTEX_MAX_SLICE_US);
+        crate::probes::ulock_wait(host_addr as u64, val, slice_us, 0, 0);
+        let r = carrick_host::ulock::wait(host_addr, val, slice_us);
+        crate::probes::ulock_wait(host_addr as u64, val, slice_us, 1, r);
+        if r >= 0 {
+            return SharedWaitStep::Woken;
+        }
+        let host_errno = (-r) as i32;
+        if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
+            return SharedWaitStep::Retry;
+        }
+        SharedWaitStep::Error(r)
+    }
+
+    /// Wake up to `n` waiters on the shared-page word. macOS's
+    /// `os_sync_wake_by_address_any` reports spurious successes when called
+    /// back-to-back on a SHARED address, so wake ONE at a time with a
+    /// `sched_yield` between iterations. Returns the count woken.
+    fn wake(&self, host_addr: usize, n: u32) -> i64 {
         let mut woke = 0i64;
         for _ in 0..n {
             let rc = carrick_host::ulock::wake(host_addr, false);
@@ -125,18 +77,14 @@ impl PlatformFutex for HvfFutex {
         }
         woke
     }
+}
 
-    fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
-        self.0.requeue(from, to, wake, requeue)
-    }
+/// HVF's `PlatformFutex`: the shared `FutexTableFutex` over the `HvfShared`
+/// cross-process primitive. (Was a hand-rolled `HvfFutex` struct + impl.)
+pub type HvfFutex = FutexTableFutex<HvfShared>;
 
-    #[inline]
-    fn notify_signal_pending(&self) {
-        self.0.notify_signal_pending();
-    }
-
-    #[inline]
-    fn notify_signal_pending_for(&self, tid: ThreadId) {
-        self.0.notify_signal_pending_for(tid);
-    }
+/// Construct HVF's futex over a process-private `FutexTable` (the
+/// `HvfFutex(table)` tuple-construction replacement).
+pub fn hvf_futex(table: Arc<FutexTable>) -> HvfFutex {
+    FutexTableFutex::new(table, HvfShared)
 }

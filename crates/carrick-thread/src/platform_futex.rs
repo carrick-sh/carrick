@@ -46,6 +46,13 @@ pub trait SharedFutexSyscall: Send + Sync {
     /// Wake up to `n` waiters on the shared-page word at `host_addr`. Returns the
     /// count woken (≥0) or `-errno`.
     fn wake(&self, host_addr: usize, n: u32) -> i64;
+
+    /// Optional once-before-wait hook (default no-op), run once at the top of
+    /// [`FutexTableFutex::shared_wait`] before the slice loop. A host can use it
+    /// for a pre-wait observability peek at the shared word (HVF emits a
+    /// carrick-trace `futex_route` probe here, which is why it previously kept its
+    /// own `PlatformFutex` copy — this hook lets it fold onto the shared one).
+    fn pre_wait(&self, _host_addr: usize, _val: u32) {}
 }
 
 /// The one `PlatformFutex` impl: a process-private [`FutexTable`] (the private
@@ -103,6 +110,7 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64 {
+        self.shared.pre_wait(host_addr, value);
         shared_wait_sliced(timeout, interrupted, &|slice_ns| {
             self.shared.wait_one_slice(host_addr, value, slice_ns)
         })
