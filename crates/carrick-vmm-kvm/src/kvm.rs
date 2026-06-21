@@ -32,6 +32,12 @@ fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
 }
 
+// `VcpuFd::get_regs`/`get_sregs` are x86-only in kvm-ioctls (gated
+// `cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))`), so the
+// debug-state dump is split per ISA: the x86 lane reads the full GPR/SREG set;
+// the aarch64 lane has no equivalent whole-frame ioctl (it uses per-register
+// `get_one_reg`), so it emits a placeholder rather than failing to compile.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn append_vcpu_state(fd: &VcpuFd, msg: &mut String) {
     match fd.get_regs() {
         Ok(r) => msg.push_str(&format!(
@@ -47,6 +53,11 @@ pub(crate) fn append_vcpu_state(fd: &VcpuFd, msg: &mut String) {
         )),
         Err(e) => msg.push_str(&format!(" sregs=<KVM_GET_SREGS failed: {e}>")),
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn append_vcpu_state(_fd: &VcpuFd, msg: &mut String) {
+    msg.push_str(" regs=<aarch64: per-register get_one_reg, no whole-frame dump>");
 }
 
 /// Process-global count of live KVM vCPUs (created-or-in-flight minus
