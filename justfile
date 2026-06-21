@@ -1,18 +1,32 @@
 # Carrick task runner.
 #
-# Carrick needs the `com.apple.security.hypervisor` entitlement to run a guest,
-# and `cargo build` strips the codesignature on macOS — so a bare cargo build
-# produces a binary that fails every run with HV_DENIED (0xfae94007). These
-# recipes always go through scripts/build-signed.sh so the binary is never
-# left unsigned. Run `just` (or `just --list`) to see all recipes.
+# The build/run recipes are CROSS-PLATFORM (macOS/HVF, Linux/KVM, FreeBSD/bhyve,
+# NetBSD/NVMM): `_platform_features` selects the right backend feature set per host,
+# and on macOS the build is codesigned (a bare `cargo build` strips the
+# `com.apple.security.hypervisor` entitlement → every run fails HV_DENIED
+# 0xfae94007; scripts/build-signed.sh re-signs it). Run `just --list` for all recipes.
+
+# Per-host backend feature flags for `cargo build`/`cargo test` of carrick-cli.
+# macOS uses the default features (+ codesign via build-signed.sh), so it is empty.
+_platform_features := if os() == "macos" { "" \
+} else if os() == "linux" { "--no-default-features --features syscall-shim,platform-linux" \
+} else if os() == "freebsd" { "--no-default-features --features platform-freebsd" \
+} else if os() == "netbsd" { "--no-default-features --features platform-netbsd" \
+} else { "UNSUPPORTED-HOST" }
 
 # Show the recipe list (default).
 default:
     @just --list
 
-# Build + codesign the release binary (the only runnable build; args go to cargo).
+# Build the runnable release binary for the host (args go to cargo). macOS codesigns
+# the HVF entitlement; Linux/FreeBSD/NetBSD do a plain build with the backend features.
 build *ARGS:
-    ./scripts/build-signed.sh {{ARGS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
+        exec ./scripts/build-signed.sh {{ARGS}}
+    fi
+    exec cargo build --release -p carrick-cli {{_platform_features}} {{ARGS}}
 
 # Build + sign, then run the signed binary (e.g. `just run run ubuntu:24.04 /bin/echo hi`).
 run *ARGS: build
@@ -20,7 +34,7 @@ run *ARGS: build
 
 # Fast unsigned debug build (cannot run a guest — for compile-checking only).
 check *ARGS:
-    cargo build {{ARGS}}
+    cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
 
 # Install git hooks (.githooks/): fmt-check at commit, clippy gate at push.
 install-hooks:
@@ -87,7 +101,7 @@ matrix:
 
 # Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
 conformance-probes: build
-    cargo test -p carrick-cli --test conformance -- --nocapture
+    cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
 
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
