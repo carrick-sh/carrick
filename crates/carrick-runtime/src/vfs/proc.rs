@@ -79,11 +79,26 @@ pub struct ProcMapsEntry {
     pub path: String,
 }
 
+/// The ISA a guest reports about *itself* through arch-dependent synthetic
+/// surfaces — `uname(2)`, `/proc/cpuinfo`, and any future arch-keyed file. A
+/// single source (`ProcState::reported_arch`, mirroring `guest_hostname()`)
+/// feeds all of them so they can never contradict each other: the bug this
+/// closes was an x86_64 guest seeing `uname=x86_64` but `/proc/cpuinfo=ARM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuestReportedArch {
+    #[default]
+    Aarch64,
+    X86_64,
+}
+
 /// Minimal live state needed by synthetic `/proc` renderers.
 #[derive(Debug, Clone, Default)]
 pub struct SyntheticProcContext {
     pub executable_path: String,
     pub argv: Vec<String>,
+    /// The ISA this guest reports about itself, so `/proc/cpuinfo` agrees with
+    /// `uname(2)` for x86_64 guests (native x86 backends + Rosetta-translated).
+    pub guest_arch: GuestReportedArch,
     /// Guest environment (`KEY=VALUE`) as opaque bytes, surfaced via
     /// `/proc/self/environ` (env values need not be UTF-8).
     pub environ: Vec<Vec<u8>>,
@@ -418,7 +433,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/config.gz" => Some(synthetic_proc_config_gz()),
-        "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo()),
+        "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo(ctx.guest_arch)),
         "/proc/devices" => Some(synthetic_proc_devices().to_vec()),
         "/proc/diskstats" => Some(synthetic_proc_diskstats().to_vec()),
         "/proc/filesystems" => Some(synthetic_proc_filesystems().to_vec()),
@@ -1470,6 +1485,7 @@ impl Vfs for ProcVfs {
         let synth_ctx = SyntheticProcContext {
             executable_path: ctx.executable_path.unwrap_or("").to_owned(),
             argv: ctx.argv.unwrap_or(&[]).to_vec(),
+            guest_arch: ctx.guest_arch,
             environ: ctx.environ.unwrap_or(&[]).to_vec(),
             open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
             auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
@@ -1601,17 +1617,23 @@ fn label_for_region(region: &ProcMapsEntry, executable_path: &str) -> (u64, u64,
     (start, end, label)
 }
 
-fn synthetic_proc_cpuinfo() -> Vec<u8> {
+fn synthetic_proc_cpuinfo(arch: GuestReportedArch) -> Vec<u8> {
     // One "processor" block per Linux-visible logical CPU so the count agrees with
     // sched_getaffinity, /proc/stat and /sys/.../cpu/online. Go/nproc count
-    // CPUs via sched_getaffinity, but lscpu and some runtimes parse this.
+    // CPUs via sched_getaffinity, but lscpu and some runtimes parse this. The
+    // block shape is per-ISA: an x86_64 guest (native x86 backends or a
+    // Rosetta-translated guest) must NOT read an ARM block — that contradicts
+    // `uname(2)` and breaks lscpu / language runtimes that parse cpuinfo.
     let ncpu = crate::host_facts::logical_cpu_count();
     let mut out = String::new();
-    for cpu in 0..ncpu {
-        // NOTE: the kernel emits `CPU architecture: 8` with NO tab before the
-        // colon (unlike the other rows); some strict parsers split on `: `.
-        out.push_str(&format!(
-            "processor\t: {cpu}\n\
+    match arch {
+        GuestReportedArch::Aarch64 => {
+            for cpu in 0..ncpu {
+                // NOTE: the kernel emits `CPU architecture: 8` with NO tab before
+                // the colon (unlike the other rows); some strict parsers split on
+                // `: `.
+                out.push_str(&format!(
+                    "processor\t: {cpu}\n\
 BogoMIPS\t: 48.00\n\
 Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n\
 CPU implementer\t: 0x61\n\
@@ -1620,7 +1642,47 @@ CPU variant\t: 0x0\n\
 CPU part\t: 0x000\n\
 CPU revision\t: 0\n\
 \n"
-        ));
+                ));
+            }
+        }
+        GuestReportedArch::X86_64 => {
+            for cpu in 0..ncpu {
+                // x86_64 blocks are colon-tab separated throughout. The `flags`
+                // line advertises the baseline x86-64 feature set carrick's x86
+                // backends present (SSE/SSE2, syscall, nx, long mode), enough for
+                // lscpu / glibc HWCAP probing without claiming features the guest
+                // ISA does not expose.
+                out.push_str(&format!(
+                    "processor\t: {cpu}\n\
+vendor_id\t: GenuineIntel\n\
+cpu family\t: 6\n\
+model\t\t: 85\n\
+model name\t: carrick virtual x86_64\n\
+stepping\t: 4\n\
+microcode\t: 0x1\n\
+cpu MHz\t\t: 2500.000\n\
+cache size\t: 16384 KB\n\
+physical id\t: 0\n\
+siblings\t: {ncpu}\n\
+core id\t\t: {cpu}\n\
+cpu cores\t: {ncpu}\n\
+apicid\t\t: {cpu}\n\
+initial apicid\t: {cpu}\n\
+fpu\t\t: yes\n\
+fpu_exception\t: yes\n\
+cpuid level\t: 22\n\
+wp\t\t: yes\n\
+flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch fsgsbase bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves\n\
+bugs\t\t:\n\
+bogomips\t: 5000.00\n\
+clflush size\t: 64\n\
+cache_alignment\t: 64\n\
+address sizes\t: 46 bits physical, 48 bits virtual\n\
+power management:\n\
+\n"
+                ));
+            }
+        }
     }
     out.into_bytes()
 }
@@ -3212,6 +3274,45 @@ mod tests {
             sig_shdpnd: 0,
             ..SyntheticProcContext::default()
         }
+    }
+
+    #[test]
+    fn cpuinfo_block_matches_guest_arch() {
+        // aarch64 guest: ARM block, never the x86 vendor line.
+        let arm = String::from_utf8(synthetic_proc_cpuinfo(GuestReportedArch::Aarch64)).unwrap();
+        assert!(arm.contains("CPU architecture: 8"), "arm cpuinfo: {arm}");
+        assert!(
+            !arm.contains("GenuineIntel"),
+            "arm cpuinfo leaked x86: {arm}"
+        );
+
+        // x86_64 guest: x86 block, never the ARM markers — the bug this closes
+        // was an x86_64 guest (uname=x86_64) reading an ARM /proc/cpuinfo.
+        let x86 = String::from_utf8(synthetic_proc_cpuinfo(GuestReportedArch::X86_64)).unwrap();
+        assert!(x86.contains("GenuineIntel"), "x86 cpuinfo: {x86}");
+        assert!(
+            x86.contains("flags\t\t:"),
+            "x86 cpuinfo missing flags: {x86}"
+        );
+        assert!(
+            x86.contains(" lm "),
+            "x86 cpuinfo missing long-mode flag: {x86}"
+        );
+        assert!(
+            !x86.contains("CPU architecture: 8") && !x86.contains("CPU implementer"),
+            "x86 cpuinfo leaked ARM: {x86}"
+        );
+    }
+
+    #[test]
+    fn synthetic_file_cpuinfo_keys_off_context_arch() {
+        let mut ctx = demo_ctx();
+        ctx.guest_arch = GuestReportedArch::X86_64;
+        let out = String::from_utf8(synthetic_file("/proc/cpuinfo", &ctx).unwrap()).unwrap();
+        assert!(
+            out.contains("GenuineIntel"),
+            "ctx-routed x86 cpuinfo: {out}"
+        );
     }
 
     #[test]

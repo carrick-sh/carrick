@@ -5320,7 +5320,12 @@ impl SyscallTrap for HvfTrapEngine {
         Ok(self.run_until_syscall()?.map(|frame| {
             let (number, args) =
                 <Self as carrick_hal::ThreadedEngine>::Arch::decode_syscall(&frame);
-            carrick_hal::RawSyscall { number, args }
+            let guest_abi = <Self as carrick_hal::ThreadedEngine>::Arch::linux_guest_abi();
+            carrick_hal::RawSyscall {
+                number,
+                args,
+                guest_abi,
+            }
         }))
     }
 

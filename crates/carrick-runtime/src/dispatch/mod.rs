@@ -837,7 +837,11 @@ impl SyscallRequest {
         Self {
             number: raw.number,
             args: SyscallArgs::from(raw.args),
-            guest_abi: LinuxGuestAbi::Aarch64,
+            // The backend's `GuestArch` stamped the guest ABI onto the decoded
+            // syscall (it cannot be inferred here — the no-threads / combined
+            // Linux loops are type-erased over the ISA). Reading it off `raw`
+            // means no call site can forget it and mis-marshal the x86 path.
+            guest_abi: raw.guest_abi,
         }
     }
 }
@@ -3604,6 +3608,7 @@ impl SyscallDispatcher {
         crate::vfs::SyntheticProcContext {
             executable_path: proc.executable_path.clone(),
             argv: proc.argv.clone(),
+            guest_arch: proc.reported_arch(),
             environ: proc.env.clone(),
             open_fds: self.open_fd_numbers(),
             auxv: mem.linux_auxv_image,

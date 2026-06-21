@@ -96,7 +96,7 @@ pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
-pub use proc::{ProcMapsEntry, ProcVfs, SyntheticProcContext};
+pub use proc::{GuestReportedArch, ProcMapsEntry, ProcVfs, SyntheticProcContext};
 pub use resolvconf::ResolvConfVfs;
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
@@ -273,6 +273,9 @@ pub enum VfsHandle {
 pub struct OpenContext<'a> {
     pub executable_path: Option<&'a str>,
     pub argv: Option<&'a [String]>,
+    /// The ISA this guest reports about itself, so `/proc/cpuinfo` agrees with
+    /// `uname(2)` for x86_64 guests. See [`GuestReportedArch`].
+    pub guest_arch: GuestReportedArch,
     /// Guest environment (`KEY=VALUE`, opaque bytes) for `/proc/self/environ`.
     pub environ: Option<&'a [Vec<u8>]>,
     /// The guest's currently-open fd numbers, for the `/proc/self/fd` directory
