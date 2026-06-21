@@ -81,6 +81,7 @@ fn syscall_request_can_be_built_from_a_raw_syscall() {
     let raw = carrick_hal::RawSyscall {
         number: 64,
         args: [1, 0x4000, 17, 0, 0, 0],
+        guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
     };
 
     assert_eq!(

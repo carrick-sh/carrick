@@ -589,7 +589,12 @@ impl SyscallTrap for KvmTrapEngine {
                     // the raw frame above (their x8/x0 meaning is aarch64-fixed).
                     let (number, args) =
                         <Self as carrick_hal::ThreadedEngine>::Arch::decode_syscall(&frame);
-                    return Ok(Some(carrick_hal::RawSyscall { number, args }));
+                    let guest_abi = <Self as carrick_hal::ThreadedEngine>::Arch::linux_guest_abi();
+                    return Ok(Some(carrick_hal::RawSyscall {
+                        number,
+                        args,
+                        guest_abi,
+                    }));
                 }
                 VcpuExit::MmioWrite { gpa, .. } if gpa == FAULT_SENTINEL_GPA => {
                     // An EL0 SYNCHRONOUS FAULT (data/instruction abort, alignment)
