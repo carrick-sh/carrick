@@ -2338,17 +2338,7 @@ impl HvfInner {
         let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
         crate::probes::vcpu_fault(syndrome, elr, far, x30, sp, unsafe { libc::getpid() });
         self.last_fault_esr = syndrome;
-        TrapError::EL0Fault {
-            syndrome,
-            elr,
-            far,
-            x16,
-            x17,
-            x29,
-            x30,
-            sp,
-            from_el0_direct,
-        }
+        TrapError::el0_fault(syndrome, elr, far, x16, x17, x29, x30, sp, from_el0_direct)
     }
 
     fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {

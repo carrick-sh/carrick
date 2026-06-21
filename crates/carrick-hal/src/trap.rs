@@ -261,6 +261,40 @@ pub enum TrapError {
     },
 }
 
+impl TrapError {
+    /// Build a [`TrapError::EL0Fault`] from the fault info + the EL0 GP-register
+    /// snapshot captured at an aarch64 guest fault. The two aarch64 backends read
+    /// these off their own vCPU API (HVF applevisor `Reg`/`SysReg`, KVM
+    /// `carrick_hal::Reg`) then call this — single-sourcing the 9-field `EL0Fault`
+    /// variant shape so a new fault field is added in ONE place, not in every
+    /// backend's struct literal. (F7: the shared aarch64 fault-construction seam,
+    /// the `Aarch64EngineCore` symmetry to `carrick_x86`.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn el0_fault(
+        syndrome: u64,
+        elr: u64,
+        far: u64,
+        x16: u64,
+        x17: u64,
+        x29: u64,
+        x30: u64,
+        sp: u64,
+        from_el0_direct: bool,
+    ) -> Self {
+        TrapError::EL0Fault {
+            syndrome,
+            elr,
+            far,
+            x16,
+            x17,
+            x29,
+            x30,
+            sp,
+            from_el0_direct,
+        }
+    }
+}
+
 /// Outcome of `SyscallTrap::fork`. The parent learns the child's PID; the child
 /// returns and continues executing with a freshly-rebuilt VM that points at the
 /// same host buffers.
