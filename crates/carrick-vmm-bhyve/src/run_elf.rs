@@ -9,8 +9,6 @@
 
 use std::path::Path;
 
-use carrick_hal::guest_arch::GuestArch as _;
-use carrick_hal::x8664_arch::X8664GuestArch;
 use carrick_mem::memory::AddressSpace;
 
 use crate::guest_setup_x86::bring_up_x86_elf;
@@ -35,15 +33,9 @@ pub fn build_x86_engine_from_image(image: &AddressSpace) -> Result<BhyveX86Engin
 /// scaffold (`X86EngineCore<BhyveVmm>`).
 pub fn build_x86_engine_shared(path: impl AsRef<Path>) -> Result<BhyveX86Engine, String> {
     let path = path.as_ref();
-    let image = AddressSpace::load_elf_for(path, X8664GuestArch::elf_machine())
-        .map_err(|e| format!("load_elf_for: {e}"))?
-        .with_vdso_bytes(X8664GuestArch::vdso_bytes())
-        .map_err(|e| format!("with_vdso_bytes: {e}"))?
-        .with_linux_initial_stack(
-            [path.as_os_str().as_encoded_bytes()],
-            std::iter::empty::<&[u8]>(),
-        )
-        .map_err(|e| format!("with_linux_initial_stack: {e}"))?;
+    // The map + vDSO/vvar + Linux initial-stack idiom is shared across every x86
+    // run-elf path (KVM/bhyve/NVMM).
+    let image = carrick_x86::load_x86_elf_image(path)?;
 
     build_x86_engine_from_image(&image)
 }
