@@ -629,12 +629,16 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
   disposition fns + `handle_routed` collapse to delegations. Every disposition
   probe identical pre/post; 29/29 unit tests. (Both spec bug-claims were falsified
   — F4 was pure dedup.)
-- **F8 — fold HVF onto `PumpForkCoordinator<P>`.** Changes the macOS backend's
-  fork-pump handshake — the lost-wake/interruptibility class a compile check can't
-  catch. Needs a parameterized **pump-lifecycle policy** (HVF lazy/tty-gated vs
-  the generic always-on) + self-pipe-reinit ownership + real meaning for the
-  kick-signal stubs F4 left — not a blind copy. See the
-  [refactor plan](2026-06-21-hvf-holdout-refactor-plan.md).
+- **F8 — fold HVF onto `PumpForkCoordinator<P>`. DONE (2026-06-21, rig-verified).**
+  New `carrick_hal::pump_fork_coord` (platform-neutral `PumpForkCoordinator<P>` +
+  `HostSignalPump`); kick+futex backends → `PumpForkCoordinator<SelfPipePump<G>>`,
+  HVF → `PumpForkCoordinator<KqueuePump>`. The parameterized pump-lifecycle policy
+  (always-on vs lazy via `installed_independent_of_stop`; self-pipe-reinit
+  ownership via `reinit_child(had)`; no-op `ensure_handler` for HVF's signal-less
+  kick) reproduces BOTH backends exactly. Coordinator unit tests + fork/clone probe
+  spine + fork-storm/nested-fork demos (no lost-wake); KVM/bhyve cross-compile.
+  *Robustness follow-up:* HVF's real `pthread_sigmask` block/restore (today no-op,
+  = pre-fold) — self-contained now the seam exists.
 - **F7 — `Aarch64EngineCore<V>` + `Aarch64Exit`.** Touches both aarch64 trap-loop
   shells (HVF + KVM). *Slice landed (2026-06-21, commit d8791cc8):* the
   `guest_cpu` run-timing wrapper is hoisted 3→1 into

@@ -30,8 +30,25 @@ before F3 so the trap shell is centralized when F3 wires it in.
 
 ## Per-fold specs, with code-verified corrections
 
-### F8 — fork coordinator → `PumpForkCoordinator<P: HostSignalPump>`
-- **Current:** generic `GenericForkCoordinator<G>` (`carrick-hal/src/fork_coord.rs:80`,
+### F8 — fork coordinator → `PumpForkCoordinator<P: HostSignalPump>` — **DONE (rig-verified)**
+- **Landed:** `carrick_hal::pump_fork_coord` — the platform-neutral
+  `PumpForkCoordinator<P>` state machine + `HostSignalPump` trait. Kick+futex
+  backends → `PumpForkCoordinator<SelfPipePump<G>>` (`GenericForkCoordinator<G>` is
+  that alias); HVF → `PumpForkCoordinator<KqueuePump>`. The state machine
+  reproduces BOTH backends exactly (CORRECTION 4's policy divergence is handled by
+  `installed_independent_of_stop` (always-on vs lazy) + `reinit_child(had)`
+  (coordinator- vs runtime-owned self-pipe reinit) + no-op `ensure_handler` for
+  HVF's signal-less kick).
+- **Verified:** coordinator unit tests (lazy + always-on, HVF 3/3); fork/clone
+  probe spine on the rig (clonebasic/clone3args/forkshared/forksigwalk/
+  forksleepfork/forkcow/forkaltstack/forkfpregs/forkhighva/maskfork/killgroup);
+  fork-storm + nested-fork demos (no lost-wake); KVM/bhyve cross-compile; clippy.
+- **Robustness follow-up (clearly scoped):** HVF's `block/restore_signals_for_fork`
+  are still no-op (= pre-fold behavior). The real fix = `pthread_sigmask` HVF's
+  routed-handler signal set across the fork window (CORRECTION 2). Self-contained
+  now that the seam exists.
+- *(historical design notes below)*
+- **Was:** generic `GenericForkCoordinator<G>` (`carrick-hal/src/fork_coord.rs:80`,
   cfg linux/freebsd/netbsd, process-global self-pipe pump) vs HVF `ForkCoordinator`
   (`carrick-vmm-hvf/src/fork_coord.rs:59`, instance `Mutex<Option<SignalPump>>`,
   kqueue pump).
