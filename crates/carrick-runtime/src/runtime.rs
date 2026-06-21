@@ -1452,135 +1452,68 @@ use std::sync::Arc;
 /// thread registry + futex table, then runs the MAIN guest thread's vCPU
 /// through `run_vcpu_until_exit`. Thread-creating clones spawn sibling host
 /// threads that run the same function on their own vCPU.
+/// HVF's [`crate::threaded_loop::HostBackend`]: `hvf_futex`, the kqueue
+/// `ForkCoordinator`, `VcpuKicker`, `HvfTimerDelivery`, the `HvfSignalArrival`
+/// kqueue-pump wake, and HVF's pre-loop setup (default cross-process signal
+/// handlers + a termios-restore guard) with a tty-gated LAZY pump.
+struct HvfHostBackend;
+
+impl crate::threaded_loop::HostBackend for HvfHostBackend {
+    fn make_futex(&self, table: Arc<FutexTable>) -> Arc<dyn carrick_hal::PlatformFutex> {
+        Arc::new(crate::threaded_impl::hvf_futex(table))
+    }
+
+    fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator> {
+        Box::new(crate::fork_coord::ForkCoordinator::new())
+    }
+
+    fn make_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
+        Arc::new(crate::vcpu_kick::VcpuKicker::new())
+    }
+
+    fn make_timer_delivery(
+        &self,
+        _kicker: Arc<dyn carrick_hal::VcpuRegistry>,
+        _main_tid: ThreadId,
+    ) -> Arc<dyn carrick_hal::TimerDelivery> {
+        // HVF arms an EVFILT_TIMER on the pump kqueue and owns delivery; only a
+        // pump-less fork child falls back to the shared wall-clock thread.
+        Arc::new(crate::timer_delivery_impl::HvfTimerDelivery)
+    }
+
+    fn make_signal_arrival(
+        &self,
+        _kicker: &Arc<dyn carrick_hal::VcpuRegistry>,
+        _platform_futex: &Arc<dyn carrick_hal::PlatformFutex>,
+    ) -> Arc<dyn carrick_hal::SignalArrival> {
+        // HVF's kqueue-pump wake (per-thread waiter wakes, xsig ring, child-exit
+        // watches) — NOT the generic kick+futex arrival.
+        Arc::new(crate::signal_arrival::HvfSignalArrival)
+    }
+
+    fn pre_loop_setup(&self) -> Box<dyn std::any::Any> {
+        crate::host_signal::install_default_handlers();
+        Box::new(crate::host_tty::TermiosRestoreGuard::new())
+    }
+
+    fn start_pump_eagerly(&self) -> bool {
+        // Non-interactive runners start pump-free and request a pump lazily;
+        // interactive terminals keep prompt Ctrl-C delivery for busy guests.
+        crate::host_tty::host_isatty(0) || crate::host_tty::host_isatty(1)
+    }
+}
+
+/// Thin wrapper over the shared [`crate::threaded_loop::run_threaded_loop`] with
+/// [`HvfHostBackend`] — the macOS twin of `run_threaded_kvm_loop` (F3). The shared
+/// loop owns the scaffold (thread registry, root-pid + child-CPU table, PID-ns
+/// fallback, M:N scheduler, `KernelState`, `run_vcpu_until_exit`, result
+/// assembly); only HVF's host trait-objects differ, and those are `HvfHostBackend`.
 fn run_threaded_hvf_loop(
     trap: HvfTrapEngine,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
-    crate::host_signal::install_default_handlers();
-    let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
-
-    let main_tid: ThreadId = std::process::id() as ThreadId;
-    let registry = Arc::new(ThreadRegistry::new(main_tid));
-    // Publish for the /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
-    crate::thread::set_current_registry(Arc::clone(&registry));
-    // Record the root guest pid (before any fork) so /proc/<pid>/ can tell a
-    // guest process (any descendant of the root) from a host process.
-    crate::host_proc::set_root_guest_pid(std::process::id());
-    // Create the shared reaped-child CPU table before any fork so every guest
-    // descendant inherits the same MAP_SHARED region (child CPU → parent
-    // cutime/cstime + RUSAGE_CHILDREN).
-    crate::guest_cpu::init_child_table();
-    // PID-namespace launch placement (container runs only — `run-elf` never
-    // requests it). The MAP_SHARED ns table is allocated and the init slot
-    // filled in `maybe_fork_ns_supervisor` (the guest-init child branch), which
-    // runs BEFORE this on the container path. As a fallback for any path that
-    // reaches here with placement requested but no region yet (e.g. the
-    // supervisor fork was skipped on setup failure), initialize identity-style
-    // here so getpid()==1 still holds (docs/namespaces-design.md §5.2).
-    if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
-        let _ = crate::namespace::pid::init(std::process::id());
-    }
-    // Install the M:N admission scheduler BEFORE any guest thread can spawn. The
-    // shared clone path (`spawn_clone_thread`) calls `vcpu_sched::global()`, which
-    // PANICS ("scheduler not installed") if this is skipped — so every multi-
-    // threaded HVF guest needs it, exactly like the x86 `run_threaded_loop`. HVF
-    // now reclaims-on-block (destroy/recreate the vCPU), so this is the BOUNDED
-    // scheduler at the HVF cap (the retired `vcpu_gate`'s budget); >cap guest
-    // threads time-share the pool instead of hanging. Reserve slot 0 for the main
-    // thread (its vCPU is id 0) so siblings draw 1..N-1.
-    carrick_hal::vcpu_sched::install_for_budget(
-        <HvfTrapEngine as carrick_hal::ThreadedEngine>::vcpu_budget(),
-    );
-    carrick_hal::vcpu_sched::set_current_lease(
-        carrick_hal::vcpu_sched::global().acquire(main_tid as u64),
-    );
-    // The CONCRETE process-private futex table threaded UNCHANGED into the
-    // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
-    // protocol stays byte-identical). The object-safe `PlatformFutex` wraps the
-    // SAME table for the SHARED-futex / notify-signal-pending ops, so the two
-    // stay consistent. The factory rebuilds that pairing over a fresh table on
-    // the CHILD side of a guest fork (`vcpu_loop::handle_fork`), without the
-    // generic loop ever naming `HvfFutex`.
-    let futex = Arc::new(FutexTable::new());
-    let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
-        Arc::new(crate::threaded_impl::hvf_futex(Arc::clone(&futex)));
-    let platform_futex_factory: PlatformFutexFactory = Arc::new(
-        |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
-            Arc::new(crate::threaded_impl::hvf_futex(table))
-        },
-    );
-    // The HVF host-fork coordinator, boxed object-safe so the cross-platform
-    // `KernelState` never names the concrete `ForkCoordinator`.
-    let fork_coordinator: Box<dyn carrick_hal::HostForkCoordinator> =
-        Box::new(crate::fork_coord::ForkCoordinator::new());
-    // Registry of live vCPUs so a signalling thread (tgkill) or the
-    // process-directed signal pump can force a target out of `hv_vcpu_run`.
-    // Held object-safe as the `VcpuRegistry` the generic loop drives. Built
-    // before the kernel so `HvfSignalArrival` can wake a target vCPU via it.
-    let kicker: Arc<dyn carrick_hal::VcpuRegistry> = Arc::new(crate::vcpu_kick::VcpuKicker::new());
-    // The HVF signal ARRIVAL/wake mechanism (kqueue pump self-pipe, per-thread
-    // waiter wakes, xsig MAP_SHARED ring, child-exit watches). Delegates to the
-    // existing `crate::host_signal` glue; held object-safe in `KernelState`.
-    let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
-        Arc::new(crate::signal_arrival::HvfSignalArrival);
-    // Install the backend `TimerDelivery` the dispatch arm reaches through the
-    // process-global (`dispatch/time.rs` has no KernelState ref). HVF arms an
-    // EVFILT_TIMER on the pump kqueue and returns true (it owns delivery); only
-    // a pump-less fork child falls back to the shared wall-clock thread.
-    crate::timer_delivery::register_delivery(Arc::new(
-        crate::timer_delivery_impl::HvfTimerDelivery,
-    ));
-    let kernel = Arc::new(KernelState::new(
-        dispatcher,
-        fork_coordinator,
-        signal_arrival,
-    ));
-    // Track spawned sibling threads so the process doesn't tear down while a
-    // worker is mid-flight. We join them after the main thread finishes.
-    let threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-    // Daemon that kicks in-guest vCPUs when process-directed async signals are
-    // observable. Non-interactive command runners start pump-free and request it
-    // lazily when a guest installs a real signal handler or forks a child whose
-    // exit signal is caught/blocked; interactive terminals keep prompt Ctrl-C
-    // delivery for busy guests that have not made another syscall.
-    if crate::host_tty::host_isatty(0) || crate::host_tty::host_isatty(1) {
-        kernel.fork.start_signal_pump(&kicker, &platform_futex);
-    }
-
-    let outcome = run_vcpu_until_exit(
-        Arc::clone(&kernel),
-        trap,
-        Arc::clone(&registry),
-        Arc::clone(&futex),
-        Arc::clone(&platform_futex),
-        Arc::clone(&platform_futex_factory),
-        main_tid,
-        Arc::clone(&threads),
-        Arc::clone(&kicker),
-        max_traps,
-    )?;
-
-    let result = match outcome {
-        VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
-        VcpuLoopOutcome::ThreadDone => {
-            // The main thread ran exit(2) while siblings were alive. Assemble
-            // a result from the shared kernel buffers; siblings keep running
-            // until the process exits, but for the run-to-completion CLI we
-            // collect output now.
-            let report = kernel.reporter.snapshot();
-            RunResult {
-                exit_code: 0,
-                stdout: kernel.dispatcher.stdout(),
-                stderr: kernel.dispatcher.stderr(),
-                traps: 0,
-                report,
-                trap_limit_hit: false,
-            }
-        }
-    };
-
-    Ok(result)
+    crate::threaded_loop::run_threaded_loop(trap, dispatcher, HvfHostBackend, max_traps)
 }
 
 // `run_vcpu_until_exit`, `assemble_run_result`, `PendingSignalAction`,
