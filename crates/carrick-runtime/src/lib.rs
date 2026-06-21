@@ -2528,37 +2528,30 @@ pub mod posix_timer {
         remaining,
     };
 
-    use std::time::Duration;
-
     /// (Re-)arm timer `id`. Returns the PREVIOUS spec (for `timer_settime`'s
-    /// old_value). A `value_ns == 0` disarms. A non-zero value spawns a
-    /// wall-clock firing thread that delivers `signum` after `value` then every
-    /// `interval`, until the timer is re-armed or deleted (generation bump).
+    /// old_value). A `value_ns == 0` disarms. A non-zero value spawns a firing
+    /// thread (the shared timer-core loop) that delivers `signum` after `value`
+    /// then every `interval`, until the timer is re-armed or deleted (generation
+    /// bump).
     pub fn arm(id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixTimerSpec> {
         let armed = carrick_timer_core::posix::arm(id, value_ns, interval_ns)?;
         if value_ns > 0 {
             let signum = armed.signum;
             let generation = armed.generation;
             let slot = armed.slot.clone();
+            let on_fire = move || {
+                crate::timer_delivery::deliver(signum);
+            };
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-ptimer-{id}"))
                 .spawn(move || {
-                    std::thread::sleep(Duration::from_nanos(value_ns));
-                    if !carrick_timer_core::posix::generation_matches(&slot, generation) {
-                        return;
-                    }
-                    crate::timer_delivery::deliver(signum);
-                    if interval_ns == 0 {
-                        return;
-                    }
-                    loop {
-                        std::thread::sleep(Duration::from_nanos(interval_ns));
-                        if !carrick_timer_core::posix::generation_matches(&slot, generation) {
-                            return;
-                        }
-                        carrick_timer_core::posix::record_overrun(&slot);
-                        crate::timer_delivery::deliver(signum);
-                    }
+                    carrick_timer_core::posix::run_fallback(
+                        slot,
+                        generation,
+                        value_ns,
+                        interval_ns,
+                        on_fire,
+                    );
                 });
         }
         Some(armed.old)
