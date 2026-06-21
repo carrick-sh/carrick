@@ -16,34 +16,16 @@ pub type ThreadId = i32;
 /// HVF: `hv_vcpus_exit`. KVM: `pthread_kill(tid, KICK_SIGNAL)` -> `KVM_RUN` EINTR.
 pub trait VcpuKick: Send + Sync + Clone {
     fn kick(&self);
-    /// Whether the target vCPU is currently inside guest execution (the
-    /// `in_guest` SeqCst flag the run loop maintains around `next_syscall`).
-    fn target_in_guest(&self) -> bool;
-    /// The backend's raw vCPU id if the vCPU is still live, for bulk-kick paths
-    /// that force several vCPUs out at once (HVF `hv_vcpus_exit(ids, count)`).
-    /// `None` once the vCPU is destroyed (a stale id is then skipped). Backends
-    /// with no bulk-kick primitive return `None` and rely on per-handle `kick`.
-    fn raw_vcpu_id(&self) -> Option<u64> {
-        None
-    }
 }
 
 /// Object-safe `VcpuKick` for storage in the registry (the `Clone` bound on
 /// `VcpuKick` is not object-safe, so the registry stores boxed handles).
 pub trait VcpuKickDyn: Send + Sync {
     fn kick(&self);
-    fn target_in_guest(&self) -> bool;
-    fn raw_vcpu_id(&self) -> Option<u64>;
 }
 impl<T: VcpuKick> VcpuKickDyn for T {
     fn kick(&self) {
         VcpuKick::kick(self)
-    }
-    fn target_in_guest(&self) -> bool {
-        VcpuKick::target_in_guest(self)
-    }
-    fn raw_vcpu_id(&self) -> Option<u64> {
-        VcpuKick::raw_vcpu_id(self)
     }
 }
 
@@ -171,12 +153,6 @@ mod generic_registry_tests {
     impl VcpuKickDyn for CountingHandle {
         fn kick(&self) {
             self.0.fetch_add(1, Ordering::SeqCst);
-        }
-        fn target_in_guest(&self) -> bool {
-            false
-        }
-        fn raw_vcpu_id(&self) -> Option<u64> {
-            None
         }
     }
 

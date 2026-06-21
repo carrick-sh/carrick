@@ -39,22 +39,6 @@ impl carrick_hal::VcpuKick for VcpuKickHandle {
         let ids: Vec<u64> = std::iter::once(self).filter_map(valid_id).collect();
         kick_ids(&ids);
     }
-
-    #[inline]
-    fn target_in_guest(&self) -> bool {
-        // VcpuKickHandle does not own the in-guest flag itself; the flag lives
-        // in VcpuKicker::in_guest (an Arc<AtomicBool> keyed by tid).  The shared
-        // loop tracks in-guest state via VcpuRegistry::set_in_guest /
-        // any_other_in_guest on the kicker, not per-handle, so this stays false.
-        false
-    }
-
-    #[inline]
-    fn raw_vcpu_id(&self) -> Option<u64> {
-        // The live vCPU id for the bulk hv_vcpus_exit path, or None once the
-        // vCPU is gone (valid_id is the existing liveness-checked extractor).
-        valid_id(self)
-    }
 }
 
 /// A `Send`/`Sync` handle to a guest thread's vCPU, usable from any thread to
