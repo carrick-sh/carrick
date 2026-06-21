@@ -655,15 +655,22 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
   the HVF and KVM sites read different register types, so a clean shared
   constructor is awkward standalone; fold it into the full `Aarch64EngineCore<V>`
   extraction instead).
-- **F6 — migrate bhyve `guest_setup_x86` onto carrick-x86 bringup/fault helpers.**
-  *Partly landed:* the byte-identical `fp_stub_bytes` (previously kept in sync by
-  a unit test) now re-points at the single `carrick_x86::fp_stub_bytes` — a
-  behavior-neutral dedup, verified on freebsd. *Deferred:* the `msr_init_blob`
-  re-point (the audit notes it has diverged by two args, so re-pointing CHANGES
-  behavior) and the `fault_idt`/`fault_stub`/`write_fault_tables` migration — the
-  SYSCALL-enable blob and the fault stubs MUST stay bit-compatible for fork/clone
-  with no compiler enforcement, so those want the bhyve fork/clone runtime gate to
-  confirm, not just a typecheck.
+- **F6 — migrate bhyve `guest_setup_x86` onto carrick-x86. SUBSTANTIALLY DONE
+  (re-assessed 2026-06-21).** The "~3100 lines to migrate" conflated load-bearing
+  bhyve-specific code with shareable duplication. The SHAREABLE surface is already
+  on carrick-x86, NVMM-shaped: `BhyveVmm: X86Vmm`, the run loop is
+  `X86EngineCore<BhyveVmm>` + `fault_exit_from_record`, run-elf is
+  `load_x86_elf_image` + `run_elf_service_loop`, plus `plan_windows`, the
+  `MsrInstall::NeedsRing0Blob` seam, and `fp_stub_bytes`. What REMAINS in
+  `guest_setup_x86.rs` is the **load-bearing bhyve residue the audit's own
+  "do NOT collapse" set names**: the FreeBSD `BhyveGuestRam` memory model
+  (`vm_setup_memory`/`vm_map_gpa`), the ring-0 MSR-via-blob workaround (libvmmapi
+  has no MSR ioctl), the doorbell fault-decode, and the M0 substrate-proof
+  scaffolding (test-only, `tests/live_vcpu.rs`). The leftover `msr_init_blob`
+  re-point + `fault_*` migration are bit-compatible-with-fork/clone code with no
+  compiler enforcement → they need the bhyve fork/clone RUNTIME gate to confirm,
+  not a typecheck, so they correctly stay backend-specific. There is no clean
+  remaining migration here — the right shape is reached.
 - **F9 / F10 — `run_elf_with_engine` generic + drop `run_threaded_X_loop`
   wrappers + retire per-VMM mains.** The cheap slice (hoist `load_x86_elf_image`
   into carrick-x86) is verifiable and worth doing next.
