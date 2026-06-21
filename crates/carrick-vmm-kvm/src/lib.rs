@@ -18,7 +18,6 @@ pub mod kvm_fork_coord;
 pub mod kvm_futex;
 pub mod kvm_kicker;
 pub mod kvm_signal_backend;
-pub mod kvm_signal_pump;
 pub mod kvm_xsig;
 
 pub use kvm_signal_backend::KvmGlue;
