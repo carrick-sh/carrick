@@ -743,6 +743,29 @@ const CANONICAL_MKDIRAT: u64 = 34;
 /// Canonical (asm-generic / aarch64) `ppoll` number — the target for x86 `pause`
 /// (ppoll(NULL, 0, NULL) = block until a signal).
 const CANONICAL_PPOLL: u64 = 73;
+/// x86-64 `epoll_wait(2)` (syscalls(2)). LEGACY x86_64-only — asm-generic has NO
+/// `epoll_wait`, only `epoll_pwait(2)` (which appends a `*sigmask` + `sigsetsize`
+/// pair). glibc emits the raw `epoll_wait` syscall for `epoll_wait()`, whereas
+/// musl routes it through `epoll_pwait(…, NULL, 0)`; without this shim every
+/// glibc `epoll_wait()` ENOSYS'd (probes epoll*hup/fifoepolleof/netpoll/pollevent/
+/// expectcontinue/epollexclusive/epollpri). Desugars to `epoll_pwait` with a NULL
+/// sigmask (sigsetsize 0); the `epoll_pwait` handler treats a 0 mask pointer as
+/// "no sigmask", which is exactly `epoll_wait`'s semantics.
+const X86_NR_EPOLL_WAIT: u64 = 232;
+/// Canonical (asm-generic / aarch64) `epoll_pwait` number — the target for x86
+/// `epoll_wait` (epoll_pwait(epfd, events, maxevents, timeout, NULL, 0)).
+const CANONICAL_EPOLL_PWAIT: u64 = 22;
+/// x86-64 `getpgrp(2)` (syscalls(2)). LEGACY x86_64-only — asm-generic has NO
+/// `getpgrp`, only `getpgid(2)` (POSIX defines `getpgrp()` == `getpgid(0)`).
+/// glibc emits the raw `getpgrp` syscall, whereas musl implements `getpgrp()` as
+/// `getpgid(0)`; without this shim every glibc `getpgrp()` ENOSYS'd and returned
+/// -1, so the guest read a bogus process-group id (probes proclife/killtarget/
+/// setpgidparentgroup: `getpgrp()<=0` → setpgid/kill(-pgid) then failed).
+/// Desugars to `getpgid(0)`.
+const X86_NR_GETPGRP: u64 = 111;
+/// Canonical (asm-generic / aarch64) `getpgid` number — the target for x86
+/// `getpgrp` (getpgid(0)).
+const CANONICAL_GETPGID: u64 = 155;
 /// x86-64 `open(2)` (syscalls(2)). asm-generic only exposes `openat`; canonical
 /// 2 is `io_submit`, so a table fallthrough would mis-dispatch. Desugars to
 /// `openat(AT_FDCWD, path, flags, mode)`.
@@ -917,6 +940,29 @@ impl X8664GuestArch {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
                 number: CANONICAL_PPOLL,
+                args: [0, 0, 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_EPOLL_WAIT {
+            // epoll_wait(epfd, events, maxevents, timeout_ms) → canonical
+            // epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask=NULL,
+            // sigsetsize=0). The epoll_pwait handler reads a 0 sigmask pointer as
+            // "no mask" — exactly epoll_wait's semantics. Args 0..=3 pass through
+            // unchanged (same shape); only the two trailing sigmask args are
+            // synthesised as NULL/0.
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                number: CANONICAL_EPOLL_PWAIT,
+                args: [args[0], args[1], args[2], args[3], 0, 0],
+            });
+        }
+        if x86_number == X86_NR_GETPGRP {
+            // getpgrp() == getpgid(0) (POSIX). asm-generic has no getpgrp; route
+            // it to canonical getpgid with pid=0 so the guest reads its own
+            // process-group id instead of ENOSYS (-1).
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                number: CANONICAL_GETPGID,
                 args: [0, 0, 0, 0, 0, 0],
             });
         }
@@ -1425,6 +1471,34 @@ mod normalize_tests {
                 assert_eq!(rs.args, [carrick_abi::LINUX_AT_FDCWD, 0x1000, 4, 0, 0, 0]);
             }
             _ => panic!("access must be Plain"),
+        }
+    }
+
+    #[test]
+    fn epoll_wait_normalizes_to_epoll_pwait_null_sigmask() {
+        // x86 epoll_wait = 232, but canonical asm-generic only exposes
+        // epoll_pwait(22). Normalize epoll_wait(epfd, events, max, timeout)
+        // through epoll_pwait(epfd, events, max, timeout, NULL, 0): the four
+        // shared args pass through and the trailing sigmask pair is NULL/0.
+        match X8664GuestArch::normalize_syscall(&frame(232, [3, 0x1000, 16, 1000, 0xBAD, 0xBAD])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 22);
+                assert_eq!(rs.args, [3, 0x1000, 16, 1000, 0, 0]);
+            }
+            _ => panic!("epoll_wait must be Plain"),
+        }
+    }
+
+    #[test]
+    fn getpgrp_normalizes_to_getpgid_zero() {
+        // x86 getpgrp = 111, but canonical asm-generic only exposes getpgid(155).
+        // POSIX getpgrp() == getpgid(0); normalize to getpgid(0).
+        match X8664GuestArch::normalize_syscall(&frame(111, [0xBAD, 0xBAD, 0, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 155);
+                assert_eq!(rs.args, [0, 0, 0, 0, 0, 0]);
+            }
+            _ => panic!("getpgrp must be Plain"),
         }
     }
 
