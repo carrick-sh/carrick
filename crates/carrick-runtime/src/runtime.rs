@@ -27,10 +27,10 @@
 //!   registry. Used by `run-elf` of a static binary, the in-process test
 //!   harnesses, and LTP fixtures. A guest `fork(2)` here is a plain `libc::fork`;
 //!   the child keeps running the same loop.
-//! - **Multi-threaded** ([`run_threaded_hvf_loop`] → [`run_vcpu_until_exit`]):
+//! - **Multi-threaded** ([`run_threaded_hvf_loop`] → [`run_vcpu_until_exit`](crate::vcpu_loop::run_vcpu_until_exit)):
 //!   **one host thread plus one HVF vCPU per guest thread**, all sharing one
 //!   process VM (stage-2 mappings are visible to every vCPU). Shared kernel
-//!   state lives behind [`KernelState`] (an `Arc`, each subsystem internally
+//!   state lives behind [`KernelState`](crate::vcpu_loop::KernelState) (an `Arc`, each subsystem internally
 //!   synchronised — there is no longer a single big lock). This is the path real
 //!   workloads (Go, CPython, Node, apt/dpkg) take.
 //!
@@ -46,7 +46,7 @@
 //! - **`clone(2)` that creates a thread** (`CLONE_VM`): no `libc::fork` at all.
 //!   [`ThreadRuntimeState::spawn_clone_thread`](crate::vcpu_loop::ThreadRuntimeState)
 //!   spawns a host thread that builds
-//!   its own vCPU in the *same* VM and runs [`run_vcpu_until_exit`]. HVF caps
+//!   its own vCPU in the *same* VM and runs [`run_vcpu_until_exit`](crate::vcpu_loop::run_vcpu_until_exit). HVF caps
 //!   concurrent vCPUs (64 on this host); a guest with more live threads than the
 //!   cap blocks in `wait_for_vcpu_slot` until one frees, since `clone(2)` already
 //!   reported success and the guest may `join` the thread.
