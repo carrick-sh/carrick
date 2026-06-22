@@ -318,6 +318,64 @@ pub trait X86Vmm: Sized {
         Ok(false)
     }
 
+    /// Translate a guest VA to its GPA by walking the live page tables, or
+    /// `None` if no leaf maps it. Used by the engine's `GuestMemory` raw
+    /// read/write path to resolve a `repoint_private` overlay VA (whose stage-1
+    /// leaf points at the per-process overlay GPA, NOT the stale shared-aperture
+    /// GPA the identity lookup would use) — see
+    /// [`carrick_mem::memory::needs_stage1_translation`]. The default returns
+    /// `None`, which makes the engine fall back to its identity fast path (the
+    /// correct behaviour for any backend without an overlay).
+    fn translate_va(&self, _va: u64) -> Option<u64> {
+        None
+    }
+
+    /// Repoint guest VA `[va, va+len)` at the per-process PRIVATE overlay
+    /// aperture GPA `overlay_gpa` (identity GPA==VA, boot-mapped), seeding the
+    /// overlay backing with `content` FIRST (while `va` still translates to the
+    /// stale shared-aperture GPA, so no torn read during the flip). Backs a guest
+    /// `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` over a shared-aperture VA: carrick's
+    /// shared aperture is host-`MAP_SHARED`, so a write through `va` would leak a
+    /// guest's "private" stores to every other mapper and across fork — the
+    /// overlay is `MAP_SHARED`-free (fork-snapshotted), so the repointed VA's
+    /// stores stay private. The backend seeds `host_ptr(overlay_gpa)`, then edits
+    /// the live PML4 leaf to point `va` at `overlay_gpa` (a 4 KiB-precise
+    /// `map_aliased`); the engine flushes the TLB afterwards. The default returns
+    /// a clear error (NOT a silent no-op) so a backend without the overlay wired
+    /// up surfaces the gap instead of leaking.
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        _overlay_gpa: u64,
+        _len: usize,
+        _content: &[u8],
+    ) -> Result<(), MemoryError> {
+        Err(MemoryError::HostMap(format!(
+            "carrick-x86: repoint_private not implemented for this backend (va=0x{va:x})"
+        )))
+    }
+
+    /// Back and map a guest `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` at an
+    /// arbitrary VA that has NO existing page-table leaf or memory slot (a
+    /// MAP_FIXED outside the eager mmap arena / image regions — e.g. a loader
+    /// placing its interpreter at a high identity VA). The backend allocates a
+    /// fresh identity GPA slot (GPA==VA) backed by zeroed anonymous host memory
+    /// and installs the VA→GPA leaf so the guest's own EL0 access has real
+    /// backing instead of faulting. `writable` controls the leaf R/W bit. The
+    /// engine flushes the TLB afterwards. The default returns a clear error so a
+    /// backend without this path surfaces the gap (the guest write would
+    /// otherwise SIGSEGV on an unbacked VA).
+    fn back_fixed_anon(
+        &mut self,
+        va: u64,
+        _len: usize,
+        _writable: bool,
+    ) -> Result<(), MemoryError> {
+        Err(MemoryError::HostMap(format!(
+            "carrick-x86: back_fixed_anon not implemented for this backend (va=0x{va:x})"
+        )))
+    }
+
     /// Create a fresh vCPU bound to this VM.
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError>;
 

@@ -275,6 +275,24 @@ impl<V: X86Vmm> X86EngineCore<V> {
         self.vcpu.get_gpr(X86Reg::Rflags)
     }
 
+    /// The GPA a syscall buffer at guest VA `address` resolves to. Identity
+    /// (`address`) for every ordinary pointer — NO page-table walk on the hot
+    /// path. Only a `repoint_private` overlay over a shared-aperture VA
+    /// ([`carrick_mem::memory::needs_stage1_translation`]) walks the live page
+    /// tables to find the per-process overlay GPA whose backing the guest's OWN
+    /// accesses hit (the identity GPA still resolves to the STALE shared
+    /// aperture). High VAs (the alias arena) are EXCLUDED by
+    /// `needs_stage1_translation`: their window is keyed at the VA, so identity
+    /// is correct there. A walk miss falls back to `address` (identity),
+    /// preserving prior behaviour for an unmapped VA. Mirrors the aarch64
+    /// engine's `syscall_buffer_ipa`.
+    fn syscall_buffer_gpa(&self, address: u64, len: usize) -> u64 {
+        if !carrick_mem::memory::needs_stage1_translation(address, len as u64) {
+            return address;
+        }
+        self.vm.translate_va(address).unwrap_or(address)
+    }
+
     fn flush_current_tlb(&mut self) -> Result<(), MemoryError> {
         let cr3 = self
             .vcpu
@@ -399,10 +417,16 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             trace_x86_efault("read", address, length);
             return Err(MemoryError::OutOfBounds { address, length });
         }
+        // Resolve the GPA the guest's OWN access hits: identity for ordinary
+        // pointers, the per-process overlay GPA for a `repoint_private` VA over
+        // the shared aperture (the identity GPA still backs the STALE shared
+        // page). The overlay slot is contiguous, so translating the base and
+        // adding the offset addresses the whole buffer.
+        let gpa_base = self.syscall_buffer_gpa(address, length);
         let mut out = vec![0u8; length];
         let mut off = 0usize;
         while off < length {
-            let addr = address + off as u64;
+            let addr = gpa_base + off as u64;
             let run = host_run_len(&self.vm, addr, length - off);
             if run == 0 {
                 // A reserved-but-uncommitted page (a lazily-zeroed anonymous
@@ -439,9 +463,13 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             trace_x86_efault("write", address, length);
             return Err(MemoryError::OutOfBounds { address, length });
         }
+        // Resolve the GPA the guest's OWN access hits (see `read_bytes_raw`): for
+        // a `repoint_private` overlay VA this lands the syscall write in the
+        // PRIVATE overlay backing the guest reads, not the stale shared aperture.
+        let gpa_base = self.syscall_buffer_gpa(address, length);
         let mut off = 0usize;
         while off < length {
-            let addr = address + off as u64;
+            let addr = gpa_base + off as u64;
             // Let a lazy/sparse backend materialize the range before we probe
             // run lengths: `host_run_len` uses the immutable `host_ptr`, which
             // reads 0 for a not-yet-backed reservation, so a host-side write into
@@ -466,7 +494,28 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        self.vm.protect_range(address, len, prot)?;
+        // A non-PROT_NONE MAP_FIXED|MAP_PRIVATE|MAP_ANON landing OUTSIDE the eager
+        // mmap arena / image regions (a guest placing a mapping at a high identity
+        // VA) needs a host backing slot before the guest can touch it. The aarch64
+        // backend has a broad 0..1 TiB identity stage-1 + backing, so such a VA is
+        // already live; the x86 PML4 only maps the arena/aperture/stack windows.
+        // Back it on demand: allocate a fresh identity-GPA slot + install the leaf,
+        // so the guest's own access hits real backing instead of a SIGSEGV. The
+        // slot can be absent two ways, BOTH caught by `host_ptr(address,1).is_none()`:
+        //   (1) no page-table leaf at all (`vm.protect_range` errors — a VA the PML4
+        //       never mapped); or
+        //   (2) a leaf exists but points at a GPA with no memory slot.
+        // An in-arena / aperture VA always resolves (its MAP_NORESERVE slot exists
+        // even before the pages are resident), so this only fires for a genuinely
+        // unbacked MAP_FIXED. PROT_NONE (prot==0) needs no backing — an unmapped VA
+        // must keep faulting, exactly as Linux wants.
+        let protect_err = self.vm.protect_range(address, len, prot).err();
+        if prot != 0 && self.vm.host_ptr(address, 1).is_none() {
+            let writable = prot & carrick_abi::LINUX_PROT_WRITE != 0;
+            self.vm.back_fixed_anon(address, len, writable)?;
+        } else if let Some(e) = protect_err {
+            return Err(e);
+        }
         // Syscall-path WRITE gate: a PROT_READ (no PROT_WRITE) mapping is read-only,
         // so a kernel write into it must EFAULT (the x86 analog of HVF's
         // validate_guest_write_range; reads from it are still fine). A writable prot
@@ -475,6 +524,22 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         // covers a region read-only from creation AND a later mprotect(PROT_READ).
         let read_only = prot != 0 && prot & carrick_abi::LINUX_PROT_WRITE == 0;
         self.protections.set_no_write(address, len, read_only);
+        self.flush_current_tlb()
+    }
+
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_gpa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), MemoryError> {
+        // Seed the overlay backing + repoint the leaf on the backend (it seeds
+        // `host_ptr(overlay_gpa)` FIRST, while `va` still maps to the stale shared
+        // aperture, then edits the live PML4 leaf), then flush the current vCPU's
+        // TLB so an already-touched overlay VA picks up the new mapping. Mirrors
+        // the aarch64 engine's `repoint_private` (pt edit + EL1-maintenance TLBI).
+        self.vm.repoint_private(va, overlay_gpa, len, content)?;
         self.flush_current_tlb()
     }
 
