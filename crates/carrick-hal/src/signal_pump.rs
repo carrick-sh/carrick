@@ -356,8 +356,8 @@ pub fn start_pump<G: HostSignalGlue>(
 }
 
 /// Re-arm the pump in a freshly forked CHILD: the child inherited `PUMP_STARTED`
-/// + the parent's pipe fds but NOT the parent's pump thread. Reset the guards +
-/// the stale fds + the inherited child-watches, then `start_pump` again.
+/// and the parent's pipe fds but NOT the parent's pump thread. Reset the guards,
+/// the stale fds, and the inherited child-watches, then `start_pump` again.
 pub fn reinit_after_fork<G: HostSignalGlue>(
     registry: &Arc<dyn VcpuRegistry>,
     futex: &Arc<dyn PlatformFutex>,
