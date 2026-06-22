@@ -597,6 +597,7 @@ version = "0.1.0"
 dependencies = [
  "applevisor",
  "applevisor-sys",
+ "carrick-aarch64",
  "carrick-abi",
  "carrick-guest-mem",
  "carrick-hal",

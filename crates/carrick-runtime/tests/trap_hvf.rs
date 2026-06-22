@@ -5,10 +5,15 @@
 
 use carrick_runtime::elf::SegmentPerms;
 use carrick_runtime::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE};
+// `program_counter()` and `set_guest_thread_id()` are methods on the
+// `ThreadedEngine` trait (the shared `Aarch64EngineCore` implements it); bring the
+// trait into scope so they resolve on the engine value.
+use carrick_hal::ThreadedEngine;
 use carrick_runtime::trap::{
     AARCH64_HVC_EXCEPTION_CLASS, AARCH64_SVC_EXCEPTION_CLASS, GuestMappingPlan, HVF_PAGE_SIZE,
     HvfTrapEngine, TrapBackend, aarch64_exception_class, hvf_capabilities,
     is_aarch64_hvc_exception, is_aarch64_svc_exception, is_aarch64_syscall_exception,
+    new_hvf_trap_engine,
 };
 
 #[test]
@@ -141,22 +146,58 @@ fn with_el1_vectors_installs_hvc_then_eret_at_lower_el_sync_slot() {
         &bytes[0x400..0x408],
         &[0x42, 0x00, 0x00, 0xd4, 0xe0, 0x03, 0x9f, 0xd6],
     );
-    // Slot 0x000 ("Current EL with SP0, sync") is a bare eret — first
-    // four bytes are the eret opcode.
-    assert_eq!(&bytes[0x000..0x004], &[0xe0, 0x03, 0x9f, 0xd6]);
+    // Slot 0x000 ("Current EL with SP0, sync") now issues `hvc #3` (0xd4000062),
+    // NOT a bare `eret`. carrick's guest only runs at EL0, so a synchronous
+    // exception taken WHILE AT EL1 (i.e. in the EL1 vector trampoline) is always
+    // carrick state corruption; the slot fail-louds with `hvc #3` so the host sees
+    // ESR/ELR/FAR instead of the old bare `eret` that silently re-faulted at 100%
+    // CPU forever. (Verified non-test layout — see carrick-mem `memory.rs`
+    // `AARCH64_HVC_FAULT_OPCODE` / the current-EL sync vector slots.)
+    assert_eq!(&bytes[0x000..0x004], &[0x62, 0x00, 0x00, 0xd4]);
 }
 
 #[test]
 fn hvf_engine_constructor_is_real_or_platform_gated() {
-    match HvfTrapEngine::new() {
-        Ok(engine) => {
-            assert_eq!(engine.backend(), TrapBackend::HypervisorFramework);
+    // The shared engine has no standalone `new()`; `new_hvf_trap_engine` builds
+    // the VM+vCPU AND maps the image AND parks at the EL0 trampoline in one call,
+    // so it needs *some* image to construct. Use a minimal one-page executable
+    // segment (the same shape as `hvf_engine_maps_address_space_*`).
+    let image = AddressSpace::from_segments(
+        0x4000,
+        [(
+            0x4000,
+            SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            0xd4200000_u32.to_le_bytes().to_vec(),
+            4,
+        )],
+    )
+    .unwrap();
+
+    match new_hvf_trap_engine(&image) {
+        Ok(_engine) => {
+            // Backend identity is no longer observable off the engine itself
+            // (post-consolidation onto `Aarch64EngineCore`); assert it via the
+            // free `hvf_capabilities()` reporter instead of the old
+            // `engine.backend()`.
+            assert_eq!(hvf_capabilities().backend, TrapBackend::HypervisorFramework);
         }
         Err(err) => {
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                // On macOS/aarch64 the only legitimate failure is at the
+                // hypervisor layer — most commonly `HV_DENIED` (0xfae94007) when
+                // the test binary is UNSIGNED (lacks the hypervisor entitlement),
+                // i.e. the self-skip case. The shared bring-up surfaces every such
+                // failure as `TrapError::Hypervisor(_)`, which Displays as
+                // "hypervisor operation failed: …" (the old standalone
+                // `HvfTrapEngine::new()` message that mentioned "Hypervisor.framework"
+                // is gone with the consolidation).
                 let message = err.to_string();
                 assert!(
-                    message.contains("Hypervisor.framework"),
+                    message.contains("hypervisor operation failed"),
                     "unexpected HVF error: {message}"
                 );
             } else {
@@ -183,12 +224,17 @@ fn hvf_engine_maps_address_space_when_backend_is_available() {
     )
     .unwrap();
 
-    let mut engine = match HvfTrapEngine::new() {
+    // `new_hvf_trap_engine` now builds the VM+vCPU, maps the image, and parks the
+    // vCPU at its entry in one call (there is no separate `map_address_space`).
+    let engine = match new_hvf_trap_engine(&image) {
         Ok(engine) => engine,
         Err(err) => {
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                // Unsigned test binary (no hypervisor entitlement) -> HV_DENIED,
+                // surfaced as `TrapError::Hypervisor` ("hypervisor operation
+                // failed: …"); this is the self-skip case.
                 assert!(
-                    err.to_string().contains("Hypervisor.framework"),
+                    err.to_string().contains("hypervisor operation failed"),
                     "unexpected HVF error: {err}"
                 );
             } else {
@@ -198,10 +244,14 @@ fn hvf_engine_maps_address_space_when_backend_is_available() {
         }
     };
 
-    let plan = engine.map_address_space(&image).unwrap();
-
-    assert_eq!(plan.entry, 0x4000);
-    assert_eq!(engine.mapped_region_count(), 1);
+    // This bare image installs no EL0 trampoline, so the vCPU is parked directly
+    // at `plan.entry` (== 0x4000); `program_counter()` reflects that.
+    //
+    // The old `engine.mapped_region_count()` assertion is dropped: region count is
+    // no longer observable off the engine after the consolidation onto the shared
+    // `Aarch64EngineCore` (the engine exposes no mapping-count accessor). The
+    // GuestMappingPlan region-count itself is already covered by the
+    // `guest_mapping_plan_*` tests above.
     assert_eq!(engine.program_counter().unwrap(), 0x4000);
 }
 
@@ -224,8 +274,13 @@ fn shim_probe_code_bytes() -> Vec<u8> {
         .collect()
 }
 
-fn shim_probe_engine_or_skip() -> Option<HvfTrapEngine> {
-    match HvfTrapEngine::new() {
+// Build the engine FROM a fully-prepared image: `new_hvf_trap_engine` creates the
+// VM+vCPU, maps the address space, and parks at the EL0 trampoline in one call
+// (the old `HvfTrapEngine::new()` + `engine.map_address_space(&image)` two-step is
+// gone). Returns `None` (a SKIP) when HVF is unavailable — same self-skip contract
+// as the other engine tests.
+fn shim_engine_or_skip(image: &AddressSpace) -> Option<HvfTrapEngine> {
+    match new_hvf_trap_engine(image) {
         Ok(engine) => {
             eprintln!("[hvf-shim-test] RUN: engine created, executing guest");
             Some(engine)
@@ -270,10 +325,9 @@ fn el1_shim_services_getpid_at_el1_without_a_host_trap() {
     .and_then(|a| a.with_linux_initial_stack(vec!["t"], Vec::<&str>::new()))
     .unwrap();
 
-    let Some(mut engine) = shim_probe_engine_or_skip() else {
+    let Some(mut engine) = shim_engine_or_skip(&image) else {
         return;
     };
-    engine.map_address_space(&image).unwrap();
     // Boot-stamp the identity page exactly like the runtime does.
     const SENTINEL_PID: u32 = 0xABCD;
     engine
@@ -323,10 +377,9 @@ fn el1_legacy_vectors_trap_getpid_to_the_host() {
     .and_then(|a| a.with_linux_initial_stack(vec!["t"], Vec::<&str>::new()))
     .unwrap();
 
-    let Some(mut engine) = shim_probe_engine_or_skip() else {
+    let Some(mut engine) = shim_engine_or_skip(&image) else {
         return;
     };
-    engine.map_address_space(&image).unwrap();
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
         frame.number, 172,
@@ -372,25 +425,37 @@ fn gettid_probe_image(shim: bool) -> AddressSpace {
 }
 
 #[test]
-fn el1_shim_services_gettid_from_tpidr_el1() {
+fn el1_shim_set_guest_thread_id_is_a_noop_so_gettid_traps_to_the_host() {
     use carrick_runtime::trap::SyscallTrap;
 
-    let Some(mut engine) = shim_probe_engine_or_skip() else {
+    // The EL1 shim's gettid handler still exists (it reads TPIDR_EL1), but on the
+    // consolidated `Aarch64EngineCore` the only writer of that per-vCPU tid —
+    // `ThreadedEngine::set_guest_thread_id` — is now a DOCUMENTED NO-OP (see
+    // carrick-aarch64 `engine.rs`: "aarch64 backends have no in-guest gettid fast
+    // path … neither HVF nor KVM run [its tid stamping]"). The neutral
+    // `Aarch64Vcpu`/`SysReg` surface exposes no TPIDR_EL1 setter either, so there
+    // is no public path to stamp it. Consequently the cbz guard sees TPIDR_EL1==0
+    // and gettid (178) traps straight to the host instead of being serviced at
+    // EL1.
+    //
+    // (The old assertion — "gettid serviced at EL1, first host trap is exit_group
+    // (94) carrying the stamped tid in x0" — verified a fast path the engine
+    // consolidation deliberately removed; the per-process getpid identity fast
+    // path above is unaffected and still proves the EL1-shim path is live.)
+    let image = gettid_probe_image(true);
+    let Some(mut engine) = shim_engine_or_skip(&image) else {
         return;
     };
-    engine.map_address_space(&gettid_probe_image(true)).unwrap();
-    // Stamp the per-vCPU tid exactly like the runtime does at thread setup.
+    // `set_guest_thread_id` is the call the runtime makes at thread setup; here it
+    // is a no-op (does NOT stamp TPIDR_EL1). Exercise it to prove that.
     const SENTINEL_TID: u64 = 0x4321;
     engine.set_guest_thread_id(SENTINEL_TID).unwrap();
 
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
-        frame.number, 94,
-        "gettid (178) must be serviced at EL1; first host trap is exit_group"
-    );
-    assert_eq!(
-        frame.args[0], SENTINEL_TID,
-        "fast-path gettid must return the per-vCPU TPIDR_EL1 tid"
+        frame.number, 178,
+        "set_guest_thread_id is a no-op on the shared engine, so the unstamped \
+         TPIDR_EL1 cbz guard must trap gettid to the host"
     );
 }
 
@@ -398,12 +463,12 @@ fn el1_shim_services_gettid_from_tpidr_el1() {
 fn el1_shim_gettid_guard_traps_when_tpidr_el1_unstamped() {
     use carrick_runtime::trap::SyscallTrap;
 
-    let Some(mut engine) = shim_probe_engine_or_skip() else {
-        return;
-    };
     // Do NOT stamp TPIDR_EL1 (left 0). The cbz guard must fall through to the
     // host trap rather than return a wrong gettid==0.
-    engine.map_address_space(&gettid_probe_image(true)).unwrap();
+    let image = gettid_probe_image(true);
+    let Some(mut engine) = shim_engine_or_skip(&image) else {
+        return;
+    };
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
         frame.number, 178,

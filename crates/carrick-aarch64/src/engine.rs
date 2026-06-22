@@ -537,13 +537,45 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.vm.translated_read(address, ipa, length)
     }
 
+    fn read_into_raw(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        // No-alloc fixed-size read (`read_u32`/`read_u64`/struct headers). The
+        // backend may `volatile`-copy straight into `dst` (HVF); the default copies
+        // through a `Vec`. PROT_NONE was already gated in `read_into`.
+        let ipa = self.syscall_buffer_ipa(address, dst.len());
+        self.vm.translated_read_into(address, ipa, dst)
+    }
+
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         // PROT_NONE gated on the guest VA in the default `write_bytes`; backing
         // lookup on the translated IPA (see `read_bytes_raw`). For a
         // `repoint_private` overlay the syscall write lands in the PRIVATE overlay
-        // backing the guest reads, not the shared aperture.
+        // backing the guest reads, not the shared aperture. The backend's
+        // `translated_write` ALSO enforces the guest-visible WRITE permission (HVF
+        // returns EFAULT on a read-only mapping — audit M1); KVM models none.
         let ipa = self.syscall_buffer_ipa(address, bytes.len());
         self.vm.translated_write(address, ipa, bytes)
+    }
+
+    fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        // carrick-INTERNAL frame the guest must receive even into a guest-read-only
+        // mapping (vdso vvar, sigframe, bootstrap): bypass the per-mapping WRITE
+        // permission (the host page is writable). PROT_NONE is NOT re-gated (the
+        // default `write_bytes_unchecked` doesn't gate either). The translated IPA
+        // resolves a `repoint_private` overlay to the private backing.
+        let ipa = self.syscall_buffer_ipa(address, bytes.len());
+        self.vm.translated_write_unchecked(address, ipa, bytes)
+    }
+
+    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+        self.vm.guest_range_is_writable(address, length)
+    }
+
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        self.vm.host_ptr_for_read(address, len)
+    }
+
+    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        self.vm.host_ptr_for_write(address, len)
     }
 
     /// Record/clear a PROT_NONE range so syscall buffers there fault (EFAULT). This
@@ -597,6 +629,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// the guest's own access faults (vs the host-side `no_access` check). The
     /// unmapped range is typically ALREADY-TOUCHED, so flush the stale TLB entry.
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        // Drop any process-shared alias index entry for this VA range BEFORE the
+        // stage-1 invalidate (no-op for the common low-VA arena; HVF's
+        // `alias_registry` for a high-VA alias routed here). KVM no-op.
+        self.vm.on_unmap(address, len);
         self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
     }
 
@@ -604,6 +640,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// sub-table(s) (vs `unmap_range`, which keeps the table for the low-VA arena's
     /// in-place reuse). Flush the stale TLB entry. Mirrors HVF.
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        // The alias backing is freed here; drop the process-shared index entry first
+        // so a cross-thread fallback never resolves a now-munmap'd `host_addr` (HVF).
+        self.vm.on_unmap(address, len);
         self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
     }
 
@@ -825,17 +864,21 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // vector's `eret`. We must NOT advance it again, or the instruction after
         // the `svc` would be skipped.
         self.vcpu.set_reg(Reg::X(0), return_value as u64)?;
-        // Restore the guest's x9. The Linux aarch64 syscall ABI preserves x1..x30
-        // across an `svc`, and musl relies on it (`__expand_heap` holds its
-        // malloc-context pointer in x9 across `brk(2)` and then `str x10, [x9,
-        // #920]`). The EL1 sentinel vector clobbers x9 as the sentinel-store
-        // scratch, so it first stashes the guest's x9 in a scratch sysreg (KVM:
-        // TPIDR_EL1, free at EL0); restore it here, on every syscall return.
-        // Without this the guest resumes with x9 = SENTINEL_GPA and faults on that
-        // store. (glibc never held a live x9 across an svc, which masked this until
-        // alpine/musl.)
-        let saved_x9 = self.vcpu.get_saved_x9()?;
-        self.vcpu.set_reg(Reg::X(9), saved_x9)
+        // Restore the guest's x9 IFF this backend's trap vehicle clobbered it. The
+        // Linux aarch64 syscall ABI preserves x1..x30 across an `svc`, and musl
+        // relies on it (`__expand_heap` holds its malloc-context pointer in x9 across
+        // `brk(2)` and then `str x10, [x9, #920]`). KVM's EL1 sentinel vector clobbers
+        // x9 as the sentinel-store scratch, so it stashes the guest's x9 in a scratch
+        // sysreg (TPIDR_EL1, free at EL0) and returns it as `Some` here. HVF's `hvc #2`
+        // vehicle clobbers NO GPR (x9 stays live in the register file), so it returns
+        // `None` and we must NOT write x9 — a blanket `set_reg(X9, 0)` would DESTROY
+        // the guest's live malloc-context pointer and fault it at `[0 + 920]`
+        // (=0x398), the alpine/musl dynamic-binary crash. (glibc never held a live x9
+        // across an svc, which masked even the KVM case until alpine/musl.)
+        if let Some(saved_x9) = self.vcpu.get_saved_x9()? {
+            self.vcpu.set_reg(Reg::X(9), saved_x9)?;
+        }
+        Ok(())
     }
 
     fn is_forked_child(&self) -> bool {
@@ -847,11 +890,13 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         //    resume inside the same trapped syscall site. (Taken while the vCPU is
         //    suspended at the syscall trap — atomic, race-free.)
         let snap = self.vcpu.snapshot()?;
-        // The EL1 vector stashed the guest's live x9 in a scratch sysreg (the
-        // sentinel store clobbers x9). The snapshot captured the CLOBBERED x9, so
-        // capture the real x9 here to restore on the child (the child resumes
-        // straight at the eret and never runs `complete_syscall`).
-        let saved_x9 = self.vcpu.get_saved_x9().unwrap_or(0);
+        // The guest's real x9 to carry onto the child (the child resumes straight at
+        // the eret and never runs `complete_syscall`). KVM's snapshot captured the
+        // CLOBBERED x9 (the sentinel store), so it returns `Some(real_x9)` to repair.
+        // HVF's vehicle clobbers no GPR, so its snapshot already holds the live x9 and
+        // it returns `None` (and ignores this param in `rebuild_*_after_fork`); 0 is a
+        // harmless placeholder there.
+        let saved_x9 = self.vcpu.get_saved_x9().ok().flatten().unwrap_or(0);
 
         // For EagerCopy backends (HVF), freeze RAM pre-fork so the child can rebuild
         // from a coherent image; Cow backends (KVM) lean on Linux COW.
@@ -889,8 +934,14 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             ));
         }
         if pid > 0 {
-            // PARENT: the live VM is untouched. Return the child pid so the runtime
-            // writes it into the guest's x0.
+            // PARENT: KVM's live VM is untouched (`rebuild_parent_after_fork` is a
+            // no-op). HVF tore its VM down pre-fork (in `freeze_ram_for_fork`), so
+            // it MUST rebuild here too — a fresh VM, re-`hv_vm_map` of its own (and
+            // the quiesced siblings') buffers, and a register restore from the
+            // pre-fork snapshot. Return the child pid so the runtime writes it into
+            // the guest's x0.
+            self.vm
+                .rebuild_parent_after_fork(&mut self.vcpu, &snap, saved_x9)?;
             return Ok(ForkOutcome::Parent {
                 child_pid: pid as i32,
             });
@@ -940,7 +991,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     fn map_host_alias(
         &mut self,
         va: u64,
-        _ipa: u64,
+        ipa: u64,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
@@ -948,11 +999,14 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // Back a dynamic alias mapping: the backend mmaps the host file/anon backing
         // and registers a fresh stage-2 alias slot, returning the (gpa, writable);
         // the engine then builds the VA→gpa stage-1 path via the SHARED
-        // `map_aliased`. (KVM ignores the dispatcher's HVF-shaped `_ipa` and derives
-        // the gpa from the VA inside its <1 TiB arena.) No TLBI: the alias VA is
-        // brand-new (no stale TLB entry), so the guest's first access walks the
+        // `map_aliased`. The dispatcher ALREADY allocated `ipa` from the global alias
+        // IPA arena (`crate::memory::alloc_alias_ipa`) and tracks it for the matching
+        // `munmap`; HVF MUST map at that exact IPA (re-allocating would double-consume
+        // the arena and desync the dispatcher's VA→IPA bookkeeping). KVM IGNORES `ipa`
+        // and derives the gpa from the VA inside its <1 TiB arena. No TLBI: the alias
+        // VA is brand-new (no stale TLB entry), so the guest's first access walks the
         // just-written tables — the same fresh-page argument as `protect_range`.
-        let (gpa, writable) = self.vm.add_alias(va, len, payload, file)?;
+        let (gpa, writable) = self.vm.add_alias(va, ipa, len, payload, file)?;
         self.pt_edit(|mgr| mgr.map_aliased(va, gpa, len, writable))
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
@@ -972,17 +1026,36 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
         use carrick_hal::RegAccess as _;
-        // The interrupted PSTATE to save into the sigframe. Which register holds it
-        // depends on HOW we left EL0:
-        //   * SYSCALL path (`interrupted_pc.is_none()`): the `svc` exception latched
-        //     the EL0 PSTATE into SPSR_EL1, so read `Reg::SpsrEl1`.
-        //   * KICK path (`interrupted_pc.is_some()`): a host signal EINTR'd the
-        //     guest run mid-EL0 with NO exception taken, so SPSR_EL1 is stale; the
-        //     LIVE EL0 PSTATE is in `Reg::Pstate`. Single-sourced via
-        //     `aarch64_signal_pstate_source` (F7).
+        // Choose the resume mechanism by the LIVE exception level, NOT by whether the
+        // caller supplied an interrupted_pc. When the vCPU is at EL1 (inside the EL1
+        // trampoline — a syscall boundary OR a just-serviced rt_sigreturn), the
+        // interrupted USER context is latched in ELR_EL1/SPSR_EL1 and the handler
+        // must enter via the pending `eret` (which drops to EL0t). A caller-supplied
+        // interrupted_pc is the x86 rt_sigreturn resume-RIP workaround (vcpu_loop
+        // sets signal_interrupted_pc after SigReturn); on aarch64 it is an EL1
+        // trampoline PC, and taking the "kick" path for it (overwrite the live PC,
+        // keep the EL1 PSTATE) would run the handler AT EL1 → its first PXN
+        // instruction fetch aborts. Normalising interrupted_pc to None when at EL1
+        // routes saved_pc/PSTATE/handler-entry through the eret path so the handler
+        // runs at EL0t. Genuine EL0 kicks (the run loop's CANCELED handler guarantees
+        // is_guest) keep the live-CPSR kick path. (KVM never sets interrupted_pc on
+        // aarch64, so this is inert there.)
+        let live_pstate = self.get_reg(Reg::Pstate)?;
+        let interrupted_pc = if carrick_hal::aarch64::ExecLevel::from_pstate(live_pstate).is_guest()
+        {
+            interrupted_pc
+        } else {
+            None
+        };
+        // The interrupted PSTATE to save into the sigframe: KICK path (interrupted_pc
+        // set, EL0) → the live CPSR we just read; SYSCALL/eret path → SPSR_EL1 where
+        // the `svc`/sigreturn-svc latched the EL0 PSTATE. Single-sourced (F7); reuse
+        // the already-read `live_pstate` for the kick path.
         let pstate_source =
-            carrick_hal::aarch64_signal_pstate_source(interrupted_pc, None, |r| self.get_reg(r))
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+            carrick_hal::aarch64_signal_pstate_source(interrupted_pc, Some(live_pstate), |r| {
+                self.get_reg(r)
+            })
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
         let params = carrick_hal::sigframe::InjectParams {
             signum,
             handler,
@@ -997,7 +1070,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             pstate_source,
             orig_x0: self.last_syscall_orig_x0,
             fault_esr: self.last_fault_esr,
-            fpsimd_enabled: true,
+            // HVF gates FP/SIMD save on `CARRICK_NO_FPSIMD` (differential measurement);
+            // KVM keeps the default `true`.
+            fpsimd_enabled: self.vm.fpsimd_enabled(),
             sigreturn_trampoline_base: carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE,
         };
         <Self as ThreadedEngine>::Arch::build_sigframe(self, params)?;
@@ -1008,9 +1083,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        // fpsimd_enabled MUST match inject_signal (true). Returns the SAVED SIGMASK
-        // — not saved_pc — mirroring the per-backend impls.
-        let r = <Self as ThreadedEngine>::Arch::restore_sigframe(self, true)?;
+        // fpsimd_enabled MUST match inject_signal. Returns the SAVED SIGMASK — not
+        // saved_pc — mirroring the per-backend impls.
+        let fpsimd = self.vm.fpsimd_enabled();
+        let r = <Self as ThreadedEngine>::Arch::restore_sigframe(self, fpsimd)?;
         Ok(r.sigmask)
     }
 }
@@ -1088,25 +1164,31 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.reclaims()
     }
 
+    fn reclaim_refreshes_kicker(&self) -> bool {
+        self.vm.reclaim_refreshes_kicker()
+    }
+
     fn save_guest_state(&mut self) -> Vec<u8> {
-        // M:N reclaim-on-block. KVM aarch64 does not reclaim (`reclaims()` is
-        // false), so this is never called on that path; serialize the backend
-        // snapshot for backends that do (HVF, later). On any failure return empty —
+        // M:N reclaim-on-block. KVM aarch64 does not reclaim (`reclaims()` is false),
+        // so this is never called on that path; HVF DESTROYS its vCPU in place here
+        // (passing `&mut self.vcpu`) and stashes the snapshot internally, so the
+        // returned bytes are unused (empty). On any failure return empty —
         // `rebind_to_slot` then errors (a reclaim failure is fatal to the thread,
         // never silent corruption).
-        match self.vm.save_guest_state() {
+        match self.vm.save_guest_state(&mut self.vcpu) {
             Ok(snap) => serialize_snapshot(&snap),
             Err(_) => Vec::new(),
         }
     }
 
     fn rebind_to_slot(&mut self, slot: SlotId, state: &[u8]) -> Result<(), TrapError> {
-        let Some(snap) = deserialize_snapshot(state) else {
-            return Err(TrapError::Hypervisor(
-                "aarch64 reclaim rebind: missing/short snapshot".into(),
-            ));
-        };
-        self.vm.rebind_to_slot(slot, &snap)
+        // HVF stashes the snapshot internally (it destroyed the vCPU in place), so
+        // the serialized `state` is empty for it; reconstruct a snapshot only if
+        // present (a future serialize-based backend), else hand a zeroed placeholder
+        // the HVF rebind ignores (it `take`s its own stashed snapshot). The backend
+        // recreates the vCPU and writes it back through `&mut self.vcpu`.
+        let snap = deserialize_snapshot(state).unwrap_or_else(zeroed_snapshot);
+        self.vm.rebind_to_slot(slot, &snap, &mut self.vcpu)
     }
 
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {
@@ -1115,7 +1197,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // (x0=0, sp_el0=stack, tpidr_el0=tls, pc=parent.elr_el1 = post-svc).
         let parent = self.vcpu.snapshot()?;
         let snapshot = seed_sibling_snapshot(&parent, entry);
-        let builder = self.vm.build_sibling_builder(entry)?;
+        // HVF needs the parent vCPU to clone its VM handle + capture its mapping
+        // descriptors into the builder; KVM ignores it. The seeded SNAPSHOT (above)
+        // is what the new vCPU is restored from — both backends share that.
+        let builder = self.vm.build_sibling_builder(&self.vcpu, entry)?;
         Ok(Aarch64SiblingSpec {
             builder,
             snapshot,
@@ -1130,10 +1215,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError> {
         let (vm, mut vcpu) = V::materialize_sibling(spec.builder)?;
-        // Restore the seeded register file onto the new vCPU. Unlike the fork child,
-        // the PC is already the post-svc address (seed_sibling_snapshot set
-        // pc = parent.elr_el1), so there is NO sentinel-store replay to skip.
-        vcpu.restore(&spec.snapshot)?;
+        // Restore the seeded register file onto the FRESHLY-CREATED sibling vCPU via
+        // `restore_thread_start`: KVM does a plain restore (the PC is already the
+        // post-svc address — no sentinel-store replay to skip); HVF routes through
+        // its EL0-trampoline thread-start so a brand-new vCPU eret's into EL0 at the
+        // post-clone instruction.
+        vcpu.restore_thread_start(&spec.snapshot)?;
         // SHARE the spawning thread's page-table editor + PROT_NONE set.
         Ok(Self::from_parts_with_shared(
             vm,
@@ -1161,6 +1248,70 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
         self.vm.fresh_fork_kicker()
     }
+
+    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
+        // vfork (`CLONE_VM`): the child SHARES the parent's guest RAM. Flag it on the
+        // backend (HVF maps the SAME buffers instead of snapshotting private regions;
+        // KVM ignores the flag — its fork is plain COW), run the normal fork, then
+        // clear the flag so a later plain fork snapshots again.
+        self.vm.set_vfork_share(true);
+        let r = self.fork();
+        self.vm.set_vfork_share(false);
+        r
+    }
+
+    fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
+        // Multithreaded-fork sibling: snapshot + destroy THIS vCPU and publish its
+        // regions so the forker re-maps them into the rebuilt VM (HVF). KVM no-op.
+        self.vm.release_vcpu_for_fork(&mut self.vcpu)
+    }
+
+    fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
+        // Multithreaded-fork sibling, step 2: recreate this vCPU in the forker's
+        // republished VM and restore the pre-fork register state (HVF). KVM no-op.
+        self.vm.rebuild_vcpu_after_fork(&mut self.vcpu)
+    }
+
+    fn publish_vm_for_siblings(&mut self) -> Result<(), TrapError> {
+        // Forker, after rebuilding its VM: publish a clone for the quiesced siblings
+        // to recreate their vCPUs in (HVF). KVM no-op.
+        self.vm.publish_vm_for_siblings()
+    }
+
+    fn destroy_vcpu_on_thread_exit(&mut self) {
+        // A guest thread exiting frees an HVF concurrent-vCPU slot (HVF). KVM no-op.
+        self.vm.destroy_vcpu_on_thread_exit(&mut self.vcpu);
+    }
+}
+
+/// An all-zero [`Aarch64VcpuSnapshot`]. Used as the placeholder the engine hands to
+/// a destroy-in-place reclaim backend (HVF), which ignores it and `take`s its own
+/// internally-stashed snapshot. A serialize-based backend never hits this path
+/// (its `state` deserializes).
+fn zeroed_snapshot() -> Aarch64VcpuSnapshot {
+    Aarch64VcpuSnapshot {
+        gprs: [0; 31],
+        pc: 0,
+        pstate: 0,
+        sp_el0: 0,
+        sp_el1: 0,
+        elr_el1: 0,
+        spsr_el1: 0,
+        ttbr0: 0,
+        ttbr1: 0,
+        tcr: 0,
+        sctlr: 0,
+        mair: 0,
+        vbar: 0,
+        cpacr: 0,
+        tpidr_el0: 0,
+        tpidrro_el0: 0,
+        tpidr_el1: 0,
+        actlr_el1: 0,
+        vregs: [0; 32],
+        fpsr: 0,
+        fpcr: 0,
+    }
 }
 
 /// Serialize an [`Aarch64VcpuSnapshot`] for the reclaim save→rebind round-trip
@@ -1168,7 +1319,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 /// never reclaims, so this is exercised only by a later HVF migration; kept here
 /// so the engine is self-contained.
 fn serialize_snapshot(s: &Aarch64VcpuSnapshot) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(31 * 8 + 14 * 8 + 32 * 16 + 8);
+    let mut buf = Vec::with_capacity(31 * 8 + 17 * 8 + 32 * 16 + 8);
     for g in &s.gprs {
         buf.extend_from_slice(&g.to_le_bytes());
     }
@@ -1187,6 +1338,9 @@ fn serialize_snapshot(s: &Aarch64VcpuSnapshot) -> Vec<u8> {
         s.vbar,
         s.cpacr,
         s.tpidr_el0,
+        s.tpidrro_el0,
+        s.tpidr_el1,
+        s.actlr_el1,
     ] {
         buf.extend_from_slice(&v.to_le_bytes());
     }
@@ -1200,7 +1354,7 @@ fn serialize_snapshot(s: &Aarch64VcpuSnapshot) -> Vec<u8> {
 
 fn deserialize_snapshot(state: &[u8]) -> Option<Aarch64VcpuSnapshot> {
     const GPR_BYTES: usize = 31 * 8;
-    const SPECIAL_BYTES: usize = 14 * 8;
+    const SPECIAL_BYTES: usize = 17 * 8;
     const VREG_BYTES: usize = 32 * 16;
     const TOTAL: usize = GPR_BYTES + SPECIAL_BYTES + VREG_BYTES + 8;
     if state.len() < TOTAL {
@@ -1233,6 +1387,9 @@ fn deserialize_snapshot(state: &[u8]) -> Option<Aarch64VcpuSnapshot> {
     let vbar = next();
     let cpacr = next();
     let tpidr_el0 = next();
+    let tpidrro_el0 = next();
+    let tpidr_el1 = next();
+    let actlr_el1 = next();
     let mut vregs = [0u128; 32];
     for (i, v) in vregs.iter_mut().enumerate() {
         let base = GPR_BYTES + SPECIAL_BYTES + i * 16;
@@ -1261,6 +1418,9 @@ fn deserialize_snapshot(state: &[u8]) -> Option<Aarch64VcpuSnapshot> {
         vbar,
         cpacr,
         tpidr_el0,
+        tpidrro_el0,
+        tpidr_el1,
+        actlr_el1,
         vregs,
         fpsr,
         fpcr,
@@ -1296,6 +1456,9 @@ mod tests {
             vbar: 0x400,
             cpacr: 0x3 << 20,
             tpidr_el0: 0x1234,
+            tpidrro_el0: 0x5678,
+            tpidr_el1: 0x9abc,
+            actlr_el1: 0x2,
             vregs: [0x9; 32],
             fpsr: 0x11,
             fpcr: 0x22,

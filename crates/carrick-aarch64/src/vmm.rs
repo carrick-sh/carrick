@@ -143,6 +143,19 @@ pub struct Aarch64VcpuSnapshot {
     pub cpacr: u64,
     /// TPIDR_EL0 — the EL0 thread pointer (libc TLS base).
     pub tpidr_el0: u64,
+    /// TPIDRRO_EL0 — the read-only EL0 thread pointer. `hv_vcpu_create` zeroes it
+    /// and the guest can only READ it (EL1 writes it), so a fork/clone/reclaim must
+    /// restore it — vDSO cpu-id / rseq read it. KVM does not use it (left 0).
+    pub tpidrro_el0: u64,
+    /// TPIDR_EL1 — carrick's per-vCPU scratch. HVF stamps the guest tid here for
+    /// the fast `gettid` path; `hv_vcpu_create` zeroes it, so a rebuild must restore
+    /// it. (On KVM TPIDR_EL1 backs the syscall-frame `saved_x9` stash; the snapshot
+    /// carries it so a reclaim/fork round-trips that too.)
+    pub tpidr_el1: u64,
+    /// ACTLR_EL1 — incl. EnTSO (Rosetta `prctl(PR_SET_MEM_MODEL, TSO)`). Restored
+    /// across fork/clone/reclaim so a rebuilt vCPU keeps hardware x86 TSO. KVM has
+    /// no such bit (left 0).
+    pub actlr_el1: u64,
     /// V0..V31 (the full 128-bit NEON/FP register file).
     pub vregs: [u128; 32],
     /// FPSR.
@@ -183,17 +196,32 @@ pub trait Aarch64Vcpu {
     fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError>;
     fn restore(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError>;
 
-    /// The guest's real x9 at the trapped `svc`. The EL1 sentinel vector clobbers
-    /// x9 (the sentinel-store scratch) after stashing the guest's live x9 in a
-    /// scratch sysreg (KVM: `TPIDR_EL1`, free at EL0). The shared `complete_syscall`
-    /// restores it on every syscall return, and `fork` carries it onto the child
-    /// (the snapshot captured the CLOBBERED x9). The Linux aarch64 syscall ABI
-    /// preserves x1..x30, and musl holds a live x9 across `brk(2)`
-    /// (`__expand_heap` → `str x10,[x9,#920]`), so without this the guest faults on
-    /// the sentinel GPA. DEFAULT `Ok(0)`: a backend whose trap vehicle never
-    /// clobbers x9 has nothing to restore.
-    fn get_saved_x9(&self) -> Result<u64, TrapError> {
-        Ok(0)
+    /// Restore `snap` onto a FRESHLY-CREATED sibling vCPU (a `clone(CLONE_THREAD)`
+    /// thread). DEFAULT: a plain [`Self::restore`] (KVM — its restore sets PC/PSTATE
+    /// directly and a fresh KVM vCPU enters EL0 via its own MMIO vehicle). HVF
+    /// OVERRIDES: a brand-new HVF vCPU has never transitioned to EL0, so it must
+    /// start at the EL0 trampoline (in EL1h) with `SPSR_EL1=EL0t` and
+    /// `ELR_EL1=snap.pc`, so the trampoline's single `eret` drops it into EL0 at the
+    /// post-clone instruction — distinct from a `restore` that just resumes.
+    fn restore_thread_start(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
+        self.restore(snap)
+    }
+
+    /// The guest's real x9 at the trapped `svc`, IFF this backend's trap vehicle
+    /// clobbered it. The EL1 sentinel vector clobbers x9 (the sentinel-store
+    /// scratch) after stashing the guest's live x9 in a scratch sysreg (KVM:
+    /// `TPIDR_EL1`, free at EL0). The shared `complete_syscall` restores it on every
+    /// syscall return. The Linux aarch64 syscall ABI preserves x1..x30, and musl
+    /// holds a live x9 across `brk(2)` (`__expand_heap` → `str x10,[x9,#920]`), so
+    /// without this the guest faults on the sentinel GPA.
+    ///
+    /// `Some(x9)` ⟹ the vehicle clobbered x9; `complete_syscall` writes it back.
+    /// DEFAULT `Ok(None)` ⟹ the vehicle leaves x9 live in the register file
+    /// (HVF's `hvc #2` clobbers NO GPR), so `complete_syscall` must NOT touch it —
+    /// a blanket `set_reg(X9, 0)` here would DESTROY the guest's live x9 (musl's
+    /// malloc-context pointer) and fault it on the next `str x10,[x9,#920]`.
+    fn get_saved_x9(&self) -> Result<Option<u64>, TrapError> {
+        Ok(None)
     }
 
     /// Run until the next exit, decoding the backend's native trap surface into
@@ -335,10 +363,69 @@ pub trait Aarch64Vmm: Sized {
     fn add_alias(
         &mut self,
         va: u64,
+        ipa: u64,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(u64, bool), TrapError>;
+
+    /// Called by the engine's `unmap_range`/`unmap_alias_range` BEFORE the stage-1
+    /// invalidate, so a backend with a process-shared alias index (HVF's
+    /// `alias_registry`) can drop the entry for a high-VA alias whose backing is
+    /// about to be freed — a stale `host_addr` must never resolve after the
+    /// `OwnedHostMapping` unmaps it. KVM has no such index; default no-op.
+    fn on_unmap(&mut self, _va: u64, _len: usize) {}
+
+    /// Whether the engine saves/restores guest FP/SIMD across signal delivery (the
+    /// `InjectParams::fpsimd_enabled` flag for inject + restore). HVF gates this on
+    /// `CARRICK_NO_FPSIMD` (differential measurement); KVM keeps the default `true`.
+    fn fpsimd_enabled(&self) -> bool {
+        true
+    }
+
+    /// Backing-only fixed-size READ into `dst` whose stage-1 translation is `ipa`,
+    /// the no-alloc hot path (`read_u32`/`read_u64`/struct headers). Default:
+    /// allocate via [`Self::translated_read`] + copy. HVF overrides to
+    /// `volatile`-copy straight into `dst`.
+    fn translated_read_into(&self, va: u64, ipa: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        let bytes = self.translated_read(va, ipa, dst.len())?;
+        dst.copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    /// Backing WRITE that bypasses the guest-visible WRITE permission (a
+    /// carrick-INTERNAL frame the guest must receive even into a guest-read-only
+    /// mapping: vdso vvar, the signal frame, bootstrap). The host page is writable;
+    /// only the guest-visible permission is bypassed. Default: the permission-checked
+    /// [`Self::translated_write`] (KVM models no per-mapping write-permission split).
+    /// HVF overrides to its unchecked writer.
+    fn translated_write_unchecked(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.translated_write(va, ipa, bytes)
+    }
+
+    /// Whether every byte of `[va, va+len)` is currently guest-WRITABLE (signal
+    /// delivery uses this to detect an unwritable SA_ONSTACK alt-stack → Linux
+    /// `force_sigsegv`). Default `true` (KVM models no per-mapping write-permission
+    /// flag); HVF checks its per-region `guest_writable` + PROT_NONE set.
+    fn guest_range_is_writable(&self, _va: u64, _len: usize) -> bool {
+        true
+    }
+
+    /// Host pointer for a CONTIGUOUS guest range usable for zero-copy host I/O,
+    /// valid IFF the whole `[va, va+len)` is one mapped region (and, for writes,
+    /// guest-writable). `None` ⇒ the caller falls back to `read_bytes`/`write_bytes`.
+    /// Default `None` (KVM uses the identity copy path); HVF resolves its region.
+    fn host_ptr_for_read(&self, _va: u64, _len: usize) -> Option<*const u8> {
+        None
+    }
+    fn host_ptr_for_write(&mut self, _va: u64, _len: usize) -> Option<*mut u8> {
+        None
+    }
 
     // ── vCPU lifecycle ──
 
@@ -377,6 +464,28 @@ pub trait Aarch64Vmm: Sized {
         saved_x9: u64,
     ) -> Result<(), TrapError>;
 
+    /// Parent-side rebuild after `libc::fork()`. KVM keeps its live VM untouched —
+    /// default no-op. HVF MUST tear its VM down BEFORE `libc::fork` (a live VM at
+    /// fork time makes the child's `hv_vm_create` fail), so BOTH sides rebuild a
+    /// fresh `applevisor` VM and re-`hv_vm_map` their buffers; this is the PARENT's
+    /// half (the child's is [`Self::rebuild_child_after_fork`]). The shared `fork()`
+    /// calls this on the parent branch with the same pre-fork `snapshot`/`saved_x9`.
+    /// `share_vm` is the vfork flag (`CLONE_VM`): the child shares the parent's RAM.
+    fn rebuild_parent_after_fork(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+        _snapshot: &Aarch64VcpuSnapshot,
+        _saved_x9: u64,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Set the vfork (`CLONE_VM`) flag for the NEXT fork: the child shares the
+    /// parent's guest RAM instead of snapshotting private regions. The shared
+    /// `fork_vfork` sets this, runs the normal `fork()`, and the backend's
+    /// `freeze_ram_for_fork`/rebuild hooks read it. KVM ignores it (default no-op).
+    fn set_vfork_share(&mut self, _share_vm: bool) {}
+
     /// `execve(2)` image replacement. KVM remaps slots in place on the live VM;
     /// HVF rebuilds the VM. The shared `execve_into` calls this then reprograms
     /// sysregs (shared `program_sysregs`) + clears pending state.
@@ -412,28 +521,43 @@ pub trait Aarch64Vmm: Sized {
         false
     }
 
-    /// Save THIS thread's full guest CPU state before releasing its vCPU slot at
-    /// a block point (M:N reclaim). Returns the snapshot the engine stashes in
-    /// `reclaim_snapshot`; `rebind_to_slot` restores it on wake.
-    fn save_guest_state(&self) -> Result<Aarch64VcpuSnapshot, TrapError>;
+    /// Save THIS thread's full guest CPU state before releasing its vCPU slot at a
+    /// block point (M:N reclaim), passing the engine-owned `vcpu`. KVM aarch64 does
+    /// not reclaim (default no-op error). HVF DESTROYS the vCPU here (snapshot then
+    /// raw `hv_vcpu_destroy`) and stashes the snapshot internally; the returned
+    /// snapshot is unused for HVF (it round-trips through its own field). The engine
+    /// passes `&mut self.vcpu` so a destroy-in-place backend can recycle it.
+    fn save_guest_state(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not reclaim (save_guest_state)".into(),
+        ))
+    }
 
-    /// Re-bind to `slot`'s vCPU and restore `snapshot` into it after a block.
+    /// Re-bind to `slot`'s vCPU after a block (M:N reclaim wake), passing the
+    /// engine-owned `vcpu`. HVF RECREATES the vCPU in its existing VM and restores
+    /// the parked state, writing the new vCPU back through `vcpu`. KVM no-op.
     fn rebind_to_slot(
         &mut self,
         slot: SlotId,
         snapshot: &Aarch64VcpuSnapshot,
+        vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        let _ = (slot, snapshot);
+        let _ = (slot, snapshot, vcpu);
         Ok(())
     }
 
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling needs to add its
     /// own vCPU on the SAME VM (shared VM handle + window descriptors + a
-    /// live-vcpu ticket). KVM `build_sibling_spec`; HVF publishes its VM + clones
-    /// the mapping list. `entry` carries the new thread's `clone` deltas (return
-    /// value / child stack / TLS).
+    /// live-vcpu ticket). KVM `build_sibling_spec` (ignores `vcpu`); HVF publishes
+    /// its VM + clones the mapping list and needs `vcpu` to snapshot the parent.
+    /// `entry` carries the new thread's `clone` deltas (return value / child stack /
+    /// TLS).
     fn build_sibling_builder(
         &self,
+        vcpu: &Self::Vcpu,
         entry: GuestEntryRegs,
     ) -> Result<Self::SiblingBuilder, TrapError>;
 
@@ -449,4 +573,42 @@ pub trait Aarch64Vmm: Sized {
     /// A FRESH kick registry for the CHILD of a guest `fork(2)` (only the calling
     /// thread survived `libc::fork`). KVM `fresh_fork_kicker`.
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry>;
+
+    // ── multithreaded-fork sibling lifecycle (HVF-only; KVM defaults no-op) ──
+    //
+    // A MULTITHREADED guest fork on HVF must quiesce sibling vCPUs, destroy them
+    // so the forker can `hv_vm_destroy` before `libc::fork`, then republish the
+    // rebuilt VM for them to recreate vCPUs in. KVM siblings share ONE VM and rely
+    // on Linux COW, so none of this is needed (defaults).
+
+    /// Whether this backend's M:N reclaim DESTROYS the vCPU (so its kick handle goes
+    /// dead and the runtime must unregister it from the registry before the block
+    /// and re-register on wake). `true` for HVF (raw `hv_vcpu_destroy` does not drop
+    /// applevisor's liveness Weak); `false` (default) for pool-swap backends.
+    fn reclaim_refreshes_kicker(&self) -> bool {
+        false
+    }
+
+    /// Multithreaded fork — sibling side, step 1: snapshot + destroy THIS vCPU
+    /// (raw destroy; only the owning thread may) and publish this thread's regions
+    /// so the forker can re-map them into the rebuilt parent VM. KVM no-op.
+    fn release_vcpu_for_fork(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Multithreaded fork — forker, after rebuilding its VM: publish a clone of the
+    /// new process VM so quiesced siblings recreate their vCPUs in it. KVM no-op.
+    fn publish_vm_for_siblings(&self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// Multithreaded fork — sibling side, step 2: recreate this vCPU in the
+    /// forker's republished VM and restore the pre-fork register state. KVM no-op.
+    fn rebuild_vcpu_after_fork(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// A guest thread is exiting: destroy its vCPU (freeing an HVF concurrent-vCPU
+    /// slot). KVM no-op (vCPU drops with the engine).
+    fn destroy_vcpu_on_thread_exit(&mut self, _vcpu: &mut Self::Vcpu) {}
 }

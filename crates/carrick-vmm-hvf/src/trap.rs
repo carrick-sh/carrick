@@ -170,7 +170,7 @@
 // dispatcher — the last edge blocking a future carrick-vmm-hvf crate (A3).
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
-use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
+use carrick_guest_mem::MemoryError;
 use serde::Serialize;
 
 mod sysreg;
@@ -332,24 +332,28 @@ impl GuestMappingPlan {
     }
 }
 
-pub struct HvfTrapEngine {
-    inner: std::mem::ManuallyDrop<HvfInner>,
-}
+// The public HVF trap engine IS `Aarch64EngineCore<HvfAarch64Vmm>`: the shared
+// `carrick-aarch64` scaffold parameterized over the thin HVF backend trait pair
+// (`crate::hvf_aarch64_engine`). Every existing `crate::trap::HvfTrapEngine`
+// reference (carrick-runtime's run loop, the integration tests) resolves through
+// this alias unchanged. The trap loop / register walk / guest-memory gate /
+// fork/execve/sibling sequencing / threaded lifecycle now live ONCE in
+// carrick-aarch64; the HVF-specific atoms below feed it through the trait pair.
+//
+// The leak-until-exit Drop discipline (NEVER run applevisor's Vcpu /
+// VirtualMachine destructors after a `fork(2)`, or they panic with "no VM or
+// vCPU available") now lives per-half: `HvfAarch64Vcpu`'s `Drop` skips
+// `ManuallyDrop::drop`, and `HvfVmState` holds the VM in a no-op `ManuallyDrop`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub type HvfTrapEngine =
+    carrick_aarch64::Aarch64EngineCore<crate::hvf_aarch64_engine::HvfAarch64Vmm>;
 
-// On Drop we deliberately do NOT run applevisor's Vcpu / VirtualMachine
-// destructors. Once carrick has executed a single `fork(2)` inside the
-// trap loop, applevisor's internal state is no longer consistent with
-// HVF in either the parent or the child — Drop unwraps
-// `hv_vcpu_destroy` and panics with "no VM or vCPU available". Since
-// the carrick host process is exiting either way, we let the kernel
-// reclaim the HVF VM / vCPU at process exit and skip the Rust-side
-// teardown.
-impl Drop for HvfTrapEngine {
-    fn drop(&mut self) {
-        // `ManuallyDrop::drop` is the only thing that would invoke
-        // `HvfInner::Drop` (which in turn drops `applevisor::Vcpu` and
-        // `VirtualMachineInstance`). Skipping it is the whole point.
-    }
+/// Bring up the HVF trap engine from a loaded image: create the VM + vCPU, map
+/// the guest address space, and park the vCPU at the EL0-entry trampoline. The
+/// runtime calls this instead of the old `HvfTrapEngine::new()` + `map_plan`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn new_hvf_trap_engine(image: &AddressSpace) -> Result<HvfTrapEngine, TrapError> {
+    crate::hvf_aarch64_engine::bring_up(image)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -490,7 +494,7 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
 /// exit LEAKS the backing (HvfTrapEngine::Drop is a no-op), so no unregister is
 /// needed there. Keyed on the VA `start` because `munmap` supplies a VA.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn unregister_alias(va: u64, len: usize) {
+pub(crate) fn unregister_alias(va: u64, len: usize) {
     let end = va.saturating_add(len as u64);
     alias_registry()
         .lock()
@@ -621,8 +625,7 @@ fn vcpu_created() {
 /// be a self-deadlock — those paths call `vcpu_create` directly.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_gate {
-    use std::sync::atomic::Ordering;
-    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::sync::{Condvar, OnceLock};
 
     /// Slots we keep in reserve below the raw HVF cap so a multithreaded fork can
     /// always rebuild its quiesced siblings' vCPUs (each sibling releases then
@@ -630,12 +633,17 @@ mod vcpu_gate {
     const RESERVE: i64 = 4;
 
     static BUDGET: OnceLock<i64> = OnceLock::new();
-    static GATE_LOCK: Mutex<()> = Mutex::new(());
     static GATE_CV: Condvar = Condvar::new();
 
     /// HVF concurrent-vCPU budget for SIBLING threads (cap − reserve). Queried
-    /// once; if the query fails we fall back to a conservative 60. Now also the
-    /// `ThreadedEngine::vcpu_budget()` the bounded scheduler installs.
+    /// once; if the query fails we fall back to a conservative 60. The
+    /// `Aarch64Vmm::vcpu_budget()` the bounded scheduler installs.
+    ///
+    /// NOTE: the old blocking `acquire()` admission gate is RETIRED — the bounded
+    /// carrick-hal scheduler (installed for `vcpu_budget()`) does admission in the
+    /// shared spawn path, and HVF's `wait_for_vcpu_slot` is now a no-op. `notify`
+    /// is still poked on every vCPU destroy in case a future waiter parks on the
+    /// condvar.
     pub(crate) fn budget() -> i64 {
         *BUDGET.get_or_init(|| {
             let mut max: u32 = 0;
@@ -645,27 +653,7 @@ mod vcpu_gate {
         })
     }
 
-    /// Block until the live vCPU count is below budget, so the caller can create
-    /// one more without tripping HV_NO_RESOURCES. Returns immediately if there is
-    /// headroom. Uses a 50ms timed wait as a backstop (the condvar is also poked
-    /// on every vCPU destroy) so we can't miss a wakeup and wedge forever.
-    pub fn acquire() {
-        let b = budget();
-        loop {
-            if super::VCPU_LIVE.load(Ordering::SeqCst) < b {
-                return;
-            }
-            let guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // Re-check under the lock to avoid sleeping past a destroy that raced
-            // between the load above and taking the lock.
-            if super::VCPU_LIVE.load(Ordering::SeqCst) < b {
-                return;
-            }
-            let _ = GATE_CV.wait_timeout(guard, std::time::Duration::from_millis(50));
-        }
-    }
-
-    /// A vCPU was destroyed; wake any sibling thread waiting for a slot.
+    /// A vCPU was destroyed; wake any thread parked on the gate condvar.
     pub fn notify() {
         GATE_CV.notify_all();
     }
@@ -725,7 +713,7 @@ pub fn clear_rebuilt_vm_for_fork() {
 /// the GPRs so a handler that uses SIMD (aarch64 `memcpy`/`memset`, the guest's
 /// own handler body) cannot corrupt the interrupted thread's vector state.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const SIMD_FP_TABLE: [applevisor::vcpu::SimdFpReg; 32] = {
+pub(crate) const SIMD_FP_TABLE: [applevisor::vcpu::SimdFpReg; 32] = {
     use applevisor_sys::hv_simd_fp_reg_t::*;
     [
         Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q17, Q18, Q19,
@@ -758,7 +746,11 @@ const SIMD_FP_TABLE: [applevisor::vcpu::SimdFpReg; 32] = {
 /// `hv_simd_fp_uchar16_t` for the kernel call — C gets the vector ABI right on
 /// stable. Returns the raw `hv_return_t` (0 = `HV_SUCCESS`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn set_simd_fp_reg_v(vcpu_id: u64, reg: applevisor_sys::hv_simd_fp_reg_t, value: u128) -> i32 {
+pub(crate) fn set_simd_fp_reg_v(
+    vcpu_id: u64,
+    reg: applevisor_sys::hv_simd_fp_reg_t,
+    value: u128,
+) -> i32 {
     unsafe extern "C" {
         fn carrick_set_simd_fp_reg(vcpu: u64, reg: u32, bytes: *const u8) -> i32;
     }
@@ -827,20 +819,33 @@ pub fn dump_kick_stats() {
     );
 }
 
+/// The HVF VM half: the live `applevisor` VM + the per-thread mapping list +
+/// the process-shared PROT_NONE / page-table state, plus the fork/reclaim
+/// bookkeeping. The `vcpu` lives separately in `HvfAarch64Vcpu` (the shared
+/// engine owns it), so the trap loop, register walk, fork/execve/sibling
+/// SEQUENCING and threaded lifecycle live ONCE in `carrick-aarch64`; the
+/// methods here take the vCPU as a parameter when they touch it.
+///
+/// The VM is held in a no-op `ManuallyDrop` — exactly the old
+/// `ManuallyDrop<HvfInner>` discipline, now per-half: once a single `fork(2)`
+/// has run inside the trap loop, applevisor's `VirtualMachine` destructor no
+/// longer matches HVF and panics ("no VM or vCPU available"). The process is
+/// exiting either way; the kernel reclaims the VM.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct HvfInner {
-    _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
-    vcpu: applevisor::vcpu::Vcpu,
+pub(crate) struct HvfVmState {
+    _vm:
+        std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
     mappings: Vec<HvfMappedRegion>,
-    /// Per-thread snapshot stashed by the M:N reclaim between `save_guest_state`
-    /// (snapshot + destroy this vCPU at a block point) and `rebind_to_slot`
+    /// Per-thread snapshot stashed by the M:N reclaim between `reclaim_park`
+    /// (snapshot + destroy this vCPU at a block point) and `reclaim_resume`
     /// (recreate + restore on wake). The SAME host thread saves then restores, so
     /// a plain field is safe and avoids serializing `VcpuSnapshot` through bytes.
     reclaim_snapshot: Option<VcpuSnapshot>,
     /// The exception class of the most recent vCPU exit. We need to remember
     /// whether the trap came in via EL0 `svc` (`EC = 0x15`) or the EL1 vector
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
-    /// advance PC past the HVC before resuming.
+    /// advance PC past the HVC before resuming. Carried in the `VcpuSnapshot` so
+    /// fork/clone/reclaim round-trip it.
     last_exit_class: u64,
     /// ESR_EL1 of the most recent EL0 synchronous fault. The arm64 kernel puts
     /// it in the signal frame's `esr_context`; Apple Rosetta's signal handler
@@ -881,21 +886,58 @@ struct HvfInner {
     /// handler-injection path rewinds PC to the `svc` and restores this x0.
     last_syscall_nr: Option<u64>,
     last_syscall_orig_x0: u64,
+    /// The id of THIS thread's live vCPU, tracked because the shared engine's
+    /// `freeze_ram_for_fork` hook (`fork_prepare_and_teardown`) does NOT receive
+    /// the vCPU — yet the parent must `hv_vcpu_destroy` its vCPU BEFORE
+    /// `hv_vm_destroy` (and before `libc::fork`, or the child can't
+    /// `hv_vm_create`). Updated on every vCPU (re)create (boot/clone/fork/exec/
+    /// reclaim). NOT the applevisor wrapper — that lives in `HvfAarch64Vcpu`; this
+    /// is only the raw id for the pre-fork teardown.
+    vcpu_id: applevisor_sys::hv_vcpu_t,
+    /// A `Send`/`Sync`-able kick handle for THIS thread's live vCPU (a `Weak` to
+    /// the vCPU's liveness guard, so a kick after destroy is a safe no-op). The
+    /// engine's `ThreadedEngine::kick_handle` routes through `self.vm` (NOT the
+    /// vCPU), so HVF — whose kick mechanism is the vCPU's `hv_vcpus_exit` handle —
+    /// stashes the handle here, refreshed on every vCPU (re)create.
+    vcpu_handle: applevisor::vcpu::VcpuHandle,
+    /// The vfork (`CLONE_VM`) flag for the NEXT fork: the child SHARES the
+    /// parent's guest RAM instead of snapshotting private regions. Set by the
+    /// engine's `set_vfork_share`, read by `fork_prepare_and_teardown`.
+    vfork_share: bool,
+    /// Fork descriptor stash, captured by `fork_prepare_and_teardown` (the
+    /// pre-`libc::fork` half) and consumed by `fork_rebuild` (the post-fork
+    /// half). The parent re-maps `mapping_descs` (its own buffers); the child
+    /// re-maps `child_descs` (the private snapshots / shared originals). Only
+    /// populated between the two halves of a single fork.
+    fork_mapping_descs: Vec<ForkMappingDesc>,
+    fork_child_descs: Vec<ForkMappingDesc>,
 }
 
+/// Owns ONLY the three vCPU-touching associated functions the shared engine
+/// reaches through the `Aarch64Vcpu` trait — the native-exit decode
+/// (`run_to_exit`) and the snapshot/restore I/O — so they are free of
+/// `HvfVmState` (they take the bare `applevisor` vCPU). The name is kept so the
+/// new module's `HvfInner::snapshot_vcpu_from` / `restore_vcpu_into` /
+/// `run_to_exit` paths resolve unchanged.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn replace_destroyed_hvf_inner(slot: &mut HvfInner, new_inner: HvfInner) {
-    // The caller has already destroyed the raw HVF vCPU/VM handles behind
-    // `slot`. Assigning normally would run applevisor destructors for those
-    // stale wrappers; `ptr::write` is the single no-drop replacement point.
-    unsafe {
-        std::ptr::write(slot as *mut HvfInner, new_inner);
-    }
+pub(crate) struct HvfInner;
+
+/// Overwrite `slot`'s VM in place WITHOUT running applevisor's `VirtualMachine`
+/// Drop on the old (already raw-destroyed) handle — the single no-drop VM
+/// replacement point (the fork/execve rebuilds). `mem::forget` the old (it was
+/// `hv_vm_destroy`'d via the raw API; running its wrapper Drop now would panic).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replace_destroyed_vm(
+    slot: &mut HvfVmState,
+    new_vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+) {
+    let old = std::mem::replace(&mut slot._vm, std::mem::ManuallyDrop::new(new_vm));
+    std::mem::forget(std::mem::ManuallyDrop::into_inner(old));
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
-struct HvfMappedRegion {
+pub(crate) struct HvfMappedRegion {
     /// Guest VIRTUAL start (the syscall-path lookup key). Differs from `ipa`
     /// only for the Rosetta high-VA alias.
     start: u64,
@@ -974,56 +1016,57 @@ struct MappingView {
 /// exactly where the parent left off (post-clone syscall).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone)]
-struct VcpuSnapshot {
-    gprs: [u64; 31], // X0..X30
-    pc: u64,
-    cpsr: u64,
-    sp_el0: u64,
-    sctlr_el1: u64,
-    tcr_el1: u64,
-    ttbr0_el1: u64,
+pub(crate) struct VcpuSnapshot {
+    pub(crate) gprs: [u64; 31], // X0..X30
+    pub(crate) pc: u64,
+    pub(crate) cpsr: u64,
+    pub(crate) sp_el0: u64,
+    pub(crate) sctlr_el1: u64,
+    pub(crate) tcr_el1: u64,
+    pub(crate) ttbr0_el1: u64,
     /// TTBR1_EL1 (upper-half root). The captured `tcr_el1` enables TTBR1
     /// (EPD1=0) for the x86-64 high-half under Rosetta, so a fork/clone that
     /// rebuilds the vCPU MUST also restore TTBR1_EL1 — otherwise it walks from
     /// base 0 and every high-VA access (incl. the signal frame on a post-fork
     /// rt_sigreturn) faults/reads garbage.
-    ttbr1_el1: u64,
+    pub(crate) ttbr1_el1: u64,
     /// ACTLR_EL1 (incl. EnTSO, set by Rosetta's prctl(PR_SET_MEM_MODEL,TSO)).
     /// Restored across fork/clone so the rebuilt vCPU keeps hardware x86 TSO.
-    actlr_el1: u64,
-    mair_el1: u64,
-    vbar_el1: u64,
-    cpacr_el1: u64,
-    spsr_el1: u64,
-    elr_el1: u64,
+    pub(crate) actlr_el1: u64,
+    pub(crate) mair_el1: u64,
+    pub(crate) vbar_el1: u64,
+    pub(crate) cpacr_el1: u64,
+    pub(crate) spsr_el1: u64,
+    pub(crate) elr_el1: u64,
     /// EL0 thread pointer. Set by musl during thread init via the asm
     /// `msr tpidr_el0, x?` and read back via `mrs x?, TPIDR_EL0`. If
     /// we don't restore it post-fork, the child's musl post-clone
     /// path computes thread-struct offsets relative to bogus zero
     /// and either writes to unmapped memory or loops indefinitely
     /// because the thread's tid never lands at the expected slot.
-    tpidr_el0: u64,
+    pub(crate) tpidr_el0: u64,
     /// TPIDRRO_EL0 (read-only EL0 thread ptr). `hv_vcpu_create` zeroes it and the
     /// guest can only READ it (EL1 writes it), so a fork/clone or a destroy/recreate
     /// reclaim must restore it — some runtimes (vDSO cpu-id, rseq) read it.
-    tpidrro_el0: u64,
+    pub(crate) tpidrro_el0: u64,
     /// TPIDR_EL1 — carrick stamps the guest tid here for the fast `gettid` path
     /// (`run_until_syscall`). `hv_vcpu_create` zeroes it; a destroy/recreate reclaim
     /// that doesn't restore it makes `gettid()` return 0/stale.
-    tpidr_el1: u64,
-    last_exit_class: u64,
+    pub(crate) tpidr_el1: u64,
+    pub(crate) last_exit_class: u64,
     /// V0-V31 + FPSR/FPCR, captured/restored across fork(2)/clone. A forked
     /// child (and the parent — both rebuild a fresh vCPU) would otherwise resume
     /// with the vector file zeroed by hv_vcpu_create, corrupting any runtime
     /// that keeps live caller-saved V-state across a raw clone svc (Go, inline
     /// NEON). Restored via the set_simd_fp_reg_v shim. (audit M2; probe forkfpregs)
-    vregs: [u128; 32],
-    fpsr: u32,
-    fpcr: u32,
+    pub(crate) vregs: [u128; 32],
+    pub(crate) fpsr: u32,
+    pub(crate) fpcr: u32,
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-struct HvfInner;
+// Off macOS/aarch64 the HVF backend is cfg'd out entirely (no `applevisor`, no
+// `HvfTrapEngine` alias, no register-access helpers), so there is no non-macOS
+// `HvfInner` marker to carry — `HvfInner` exists ONLY on the macOS/HVF lane.
 
 /// One mapping descriptor for a thread sibling: the guest-physical range,
 /// the host VA backing it, its size, and the stage-2 perms. The sibling vCPU
@@ -1046,6 +1089,9 @@ struct ThreadMappingDesc {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ThreadMappingDesc {
+    /// Project a live region into a `Send`-safe descriptor for a `ThreadSpec` (the
+    /// sibling thread mirrors it as an UNOWNED `HvfMappedRegion`). Called by
+    /// `HvfVmState::build_thread_spec` (the per-VMM `build_sibling_builder`).
     fn from_region(region: &HvfMappedRegion) -> Self {
         Self {
             start: region.start,
@@ -1127,14 +1173,14 @@ pub struct ThreadSpec {
     /// Shared stage-1 page-table editor (one VM ⇒ one set of tables; siblings
     /// share this so concurrent edits serialize through its mutex).
     page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
-    snapshot: VcpuSnapshot,
 }
 
 // SAFETY: `ThreadSpec` carries raw `*mut u8` host pointers (inside the
 // mapping descriptors). Those pointers name buffers that are valid for the
 // entire host process address space — they outlive every guest thread and
-// are never reallocated for the life of the VM. The `VcpuSnapshot` is plain
-// register data. The applevisor VM handle is itself `Send` (Arc-backed).
+// are never reallocated for the life of the VM. The seeded register snapshot
+// rides the engine's `Aarch64SiblingSpec`, NOT here (the engine restores it
+// onto the sibling vCPU). The applevisor VM handle is itself `Send` (Arc-backed).
 // Moving the spec to another thread to materialise a vCPU there is exactly
 // the supported HVF pattern (create the vCPU on its owning thread), so the
 // raw pointers crossing the thread boundary is sound.
@@ -1144,446 +1190,16 @@ unsafe impl Send for ThreadSpec {}
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub struct ThreadSpec;
 
-impl HvfTrapEngine {
-    pub fn new() -> Result<Self, TrapError> {
-        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            return Err(TrapError::UnsupportedPlatform);
-        }
-        Self::new_platform()
-    }
-
-    pub fn backend(&self) -> TrapBackend {
-        TrapBackend::HypervisorFramework
-    }
-
-    pub fn mapped_region_count(&self) -> usize {
-        self.inner.mapped_region_count()
-    }
-
-    pub fn program_counter(&self) -> Result<u64, TrapError> {
-        self.inner.program_counter()
-    }
-
-    /// A `Send`/`Sync` handle other threads can use to force this vCPU out of
-    /// `hv_vcpu_run` (see [`crate::vcpu_kick`]). Published into the shared
-    /// `VcpuKicker` when this thread starts running.
-    pub fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
-        self.inner.vcpu_kick_handle()
-    }
-
-    pub fn map_address_space(
-        &mut self,
-        address_space: &AddressSpace,
-    ) -> Result<GuestMappingPlan, TrapError> {
-        let plan = GuestMappingPlan::from_address_space(address_space)?;
-        self.map_plan(&plan)?;
-        Ok(plan)
-    }
-
-    pub fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
-        self.inner.run_until_syscall()
-    }
-
-    pub fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
-        self.inner.complete_syscall(return_value)
-    }
-
-    pub fn last_syscall_nr(&self) -> Option<u64> {
-        self.inner.last_syscall_nr()
-    }
-
-    /// Toggle hardware x86_64 Total Store Ordering on this vCPU by setting or
-    /// clearing `ACTLR_EL1.EnTSO` (bit index 1). Apple Rosetta-translated
-    /// guests request this via `prctl(PR_SET_MEM_MODEL, PR_SET_MEM_MODEL_TSO)`
-    /// so x86 atomics/ordering are honoured in hardware instead of needing
-    /// expensive barrier emulation. `applevisor` only permits this single bit
-    /// to be set via `ACTLR_EL1`. Per-vCPU: must run on the active vCPU thread.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn set_hardware_tso(&self, tso: bool) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        const EN_TSO: u64 = 1 << 1;
-        let actlr = self
-            .inner
-            .vcpu
-            .get_sys_reg(SysReg::ACTLR_EL1)
-            .map_err(hvf_error)?;
-        let next = if tso { actlr | EN_TSO } else { actlr & !EN_TSO };
-        self.inner
-            .vcpu
-            .set_sys_reg(SysReg::ACTLR_EL1, next)
-            .map_err(hvf_error)?;
-        Ok(())
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn set_hardware_tso(&self, _tso: bool) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Set the guest's user stack pointer (`SP_EL0`). Used for a vfork clone that
-    /// supplies an explicit `child_stack`: an ordinary `fork(2)` keeps the
-    /// parent's SP (correct for `child_stack == NULL`, which Go `os/exec` uses),
-    /// but a `clone` with a real child stack (e.g. glibc/musl's `clone()` wrapper
-    /// with a child function) requires the child to run on that stack. The caller
-    /// (`handle_fork`) sets it on the child AFTER the fork, before resuming.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        self.inner
-            .vcpu
-            .set_sys_reg(SysReg::SP_EL0, sp)
-            .map_err(hvf_error)
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn set_guest_sp_el0(&self, _sp: u64) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Stamp this vCPU's `TPIDR_EL1` with the running guest thread's
-    /// guest-visible tid, which the EL1 syscall-shim dispatcher returns for
-    /// `gettid` without a VM exit. `TPIDR_EL1` is EL1-only and otherwise unused
-    /// by carrick (the guest uses `TPIDR_EL0` for TLS), so it is free to carry
-    /// the per-thread id. Re-stamped whenever the vCPU is (re)created
-    /// (boot/clone/fork/exec). See `docs/syscall-shim-design.md`.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        self.inner
-            .vcpu
-            .set_sys_reg(SysReg::TPIDR_EL1, tid)
-            .map_err(hvf_error)
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn set_guest_thread_id(&self, _tid: u64) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Back a dynamic high-VA `mmap` (see `DispatchOutcome::MapHostAlias`).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn map_host_alias(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-    ) -> Result<(), TrapError> {
-        self.inner.map_host_alias(va, ipa, len, payload, file)
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn map_host_alias(
-        &mut self,
-        _va: u64,
-        _ipa: u64,
-        _len: u64,
-        _payload: &[u8],
-        _file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-    ) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Real macOS fork(2). The parent continues running its existing HVF
-    /// context unchanged; the child returns with a freshly-rebuilt VM
-    /// pointing at the same host buffers (COW via Mach VM), all sysregs
-    /// and GPRs restored from a pre-fork snapshot, and `complete_syscall`
-    /// not yet called for the clone — so the caller writes 0 (child) or
-    /// the child's pid (parent) into x0 to satisfy the guest's
-    /// expectations.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        self.inner.fork(false)
-    }
-
-    /// vfork-style fork (`CLONE_VM|CLONE_VFORK`): the child SHARES the parent's
-    /// guest RAM instead of getting a CoW snapshot. MUST be paired with
-    /// parent-suspend — the caller (`handle_fork`) blocks the parent vCPU until
-    /// the child `execve`s or `_exit`s, because sharing RAM with a running parent
-    /// would let them race on the same physical pages.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
-        self.inner.fork(true)
-    }
-
-    /// Build a [`ThreadSpec`] for a thread-creating clone. Snapshots the
-    /// parent vCPU, seeds the child registers (PC=post-svc, X0=0, SP_EL0=
-    /// stack, TPIDR_EL0=tls), clones the shared VM handle, and copies the
-    /// mapping descriptors so the new thread's vCPU sees the same guest
-    /// memory. Does NOT touch the parent's HVF state otherwise — the parent
-    /// keeps running its own vCPU.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn build_thread_spec(&self, stack: u64, tls: u64) -> Result<ThreadSpec, TrapError> {
-        self.inner.build_thread_spec(stack, tls)
-    }
-
-    /// Materialise a thread sibling on the CURRENT host thread from a
-    /// [`ThreadSpec`]: create a new vCPU in the shared VM, mirror the
-    /// inherited mapping metadata (UNOWNED), and seed the child registers. The
-    /// returned engine resumes the cloned guest thread on its next
-    /// `next_syscall`. MUST be called on the host thread that will own the
-    /// vCPU (HVF requires vCPU create+run+destroy on one thread).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn from_thread_spec(spec: ThreadSpec) -> Result<Self, TrapError> {
-        HvfInner::from_thread_spec(spec).map(|inner| Self {
-            inner: std::mem::ManuallyDrop::new(inner),
-        })
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn build_thread_spec(&self, _stack: u64, _tls: u64) -> Result<ThreadSpec, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn from_thread_spec(_spec: ThreadSpec) -> Result<Self, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Block until there is room under the HVF concurrent-vCPU cap to create one
-    /// more sibling vCPU (see the private `vcpu_gate` module). MUST be called by
-    /// the new sibling's own host thread BEFORE it takes the fork topology lock —
-    /// blocking while holding that lock would stall forks and serialise sibling
-    /// starts.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn wait_for_vcpu_slot() {
-        vcpu_gate::acquire();
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn wait_for_vcpu_slot() {}
-
-    /// True iff this engine was produced by a successful `fork(2)`
-    /// returning into the child. The runtime uses this to short-circuit
-    /// host-side teardown when the guest exits (Rust drops on the
-    /// rebuilt HVF state would otherwise panic in applevisor's Vcpu
-    /// Drop). Always false on non-macOS/non-aarch64 builds.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn is_forked_child(&self) -> bool {
-        self.inner.is_forked_child
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn is_forked_child(&self) -> bool {
-        false
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Linux `execve(2)`: tear down the current HVF VM, build a fresh
-    /// one, install the new address space, and reset the vCPU as if
-    /// this engine had just been created with `map_address_space(new)`.
-    ///
-    /// On success there is no return value to write into x0 — execve
-    /// does not return to the caller; the next `run_until_syscall`
-    /// resumes at the new image's entry point.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn execve_into(&mut self, address_space: &AddressSpace) -> Result<(), TrapError> {
-        self.inner.execve_into(address_space)
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn execve_into(&mut self, _: &AddressSpace) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Push a Carrick signal frame onto SP_EL0 and redirect the next
-    /// vCPU resume to `handler(signum)`. Returns the address of the
-    /// frame so a future debugger can correlate. See
-    /// `SyscallTrap::inject_signal` for the semantics.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        fault_siginfo: Option<(i32, u64)>,
-        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-        restart_syscall: bool,
-    ) -> Result<(), TrapError> {
-        use carrick_hal::GuestArch as _;
-        use carrick_hal::RegAccess;
-
-        // HVF-only kick-path tripwire. Invariant: a kick-path resume PC is
-        // genuine guest EL0 code, never carrick's EL1 trampoline —
-        // `run_until_syscall` resumes EL1-window kicks rather than reporting
-        // them. If this fires, that guard regressed and we're about to corrupt
-        // an in-flight syscall. Tripwire (release) + assert (debug).
-        if let Some(pc) = interrupted_pc {
-            KICK_PATH_INJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if crate::memory::is_carrick_el1_vector_va(pc) {
-                INJECT_AT_EL1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                debug_assert!(
-                    false,
-                    "signal injection at EL1 trampoline PC 0x{pc:x} (carrick space, not guest)"
-                );
-            }
-        }
-
-        // Choose the resume mechanism by the LIVE exception level, NOT by whether
-        // the caller supplied an interrupted_pc. When the vCPU is at EL1 (inside
-        // the EL1 trampoline — a syscall boundary OR a just-serviced
-        // rt_sigreturn), the interrupted USER context is latched in
-        // ELR_EL1/SPSR_EL1 and the handler must enter via the pending `eret`
-        // (which drops to EL0t). A caller-supplied interrupted_pc is the x86
-        // rt_sigreturn resume-RIP workaround (vcpu_loop sets signal_interrupted_pc
-        // after SigReturn); on aarch64 it is an EL1 trampoline PC, and taking the
-        // "kick" path for it (overwrite Reg::PC, keep the EL1 PSTATE) ran the
-        // handler AT EL1 → its first PXN instruction fetch aborted → the
-        // current-EL fail-loud trap (a SIGURG/SIGCHLD stacked on a sigreturn,
-        // hit under concurrent os/exec). Normalising interrupted_pc to None when
-        // at EL1 routes saved_pc/PSTATE/handler-entry through the eret path so the
-        // handler runs at EL0t. Genuine EL0 kicks (CANCELED handler guarantees
-        // is_guest) keep the live-CPSR kick path unchanged.
-        let live_cpsr = self.get_reg(carrick_hal::Reg::Pstate)?;
-        let interrupted_pc = if ExecLevel::from_pstate(live_cpsr).is_guest() {
-            interrupted_pc
-        } else {
-            None
-        };
-        // PSTATE source: kick path (EL0) → live CPSR; eret path (EL1) → SPSR_EL1,
-        // where the `svc`/sigreturn-svc latched the EL0 PSTATE. Single-sourced
-        // (F7); HVF reuses its already-read `live_cpsr` for the kick path.
-        let pstate_source =
-            carrick_hal::aarch64_signal_pstate_source(interrupted_pc, Some(live_cpsr), |r| {
-                self.get_reg(r)
-            })?;
-        let params = carrick_hal::sigframe::InjectParams {
-            signum,
-            handler,
-            sa_restorer,
-            pending_syscall_retval,
-            interrupted_pc,
-            altstack,
-            saved_sigmask,
-            fault_siginfo,
-            queued_siginfo,
-            restart_syscall,
-            pstate_source,
-            orig_x0: self.inner.last_syscall_orig_x0,
-            fault_esr: self.inner.last_fault_esr,
-            fpsimd_enabled: fpsimd_save_enabled(),
-            sigreturn_trampoline_base: crate::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE,
-        };
-        let info = <Self as carrick_hal::ThreadedEngine>::Arch::build_sigframe(self, params)?;
-        crate::probes::signal_inject(signum, info.saved_pc, info.new_sp, handler);
-
-        // Signal-injection trap: x8 sentinel marks "not a syscall",
-        // x0 carries the signum. PC is the handler entry; FP/SP aren't
-        // meaningful mid-injection so leave them 0.
-        crate::probes::vcpu_trap(&crate::compat::GuestRegs {
-            pc: handler,
-            sp: 0,
-            fp: 0,
-            lr: 0,
-            x8: 0xffff_ffff_ffff_ffff,
-            x0: signum as u64,
-            stack_guest_base: 0,
-            stack_host_base: 0,
-            stack_guest_end: 0,
-        });
-        Ok(())
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn inject_signal(
-        &mut self,
-        _signum: i32,
-        _handler: u64,
-        _sa_restorer: u64,
-        _pending_syscall_retval: Option<i64>,
-        _interrupted_pc: Option<u64>,
-        _altstack: Option<(u64, u64)>,
-        _saved_sigmask: u64,
-        _fault_siginfo: Option<(i32, u64)>,
-        _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-        _restart_syscall: bool,
-    ) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Pop the Carrick signal frame at SP_EL0 and restore the pre-
-    /// signal register state. Used by `rt_sigreturn(2)`.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        use carrick_hal::GuestArch as _;
-        let r = <Self as carrick_hal::ThreadedEngine>::Arch::restore_sigframe(
-            self,
-            fpsimd_save_enabled(),
-        )?;
-        crate::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
-        Ok(r.sigmask)
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// Multithreaded-fork sibling: snapshot + destroy this vCPU (storing the
-    /// snapshot in a thread-local) so the forking thread can `hv_vm_destroy`.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
-        self.inner.release_vcpu_for_fork()
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    /// A sibling guest thread is exiting: destroy ITS OWN vCPU (only the owning
-    /// thread may) so the slot is freed in the process-global VM. Without this,
-    /// the no-op `Drop` leaks the vCPU live forever, and a later fork's
-    /// `hv_vm_destroy` trips over the accumulated dead-thread vCPUs (HV_BUSY).
-    /// Raw `hv_vcpu_destroy`, not applevisor's panicky wrapper.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn destroy_vcpu_on_thread_exit(&mut self) {
-        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(self.inner.vcpu.id()) };
-        vcpu_destroyed();
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn destroy_vcpu_on_thread_exit(&mut self) {}
-
-    /// Multithreaded-fork parent: publish the rebuilt VM for quiesced siblings.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn publish_vm_for_siblings(&self) {
-        self.inner.publish_vm_for_siblings();
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn publish_vm_for_siblings(&self) {}
-
-    /// Multithreaded-fork sibling: recreate this vCPU in the parent's rebuilt VM
-    /// and restore the thread-local snapshot from `release_vcpu_for_fork`.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
-        self.inner.rebuild_vcpu_after_fork()
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn new_platform() -> Result<Self, TrapError> {
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfVmState {
+    /// Create the VM + the (one) vCPU, map the guest address space, program the
+    /// initial vCPU sysregs/trampoline, and return the `(state_without_vcpu,
+    /// vcpu)` pair the shared engine owns separately. Consolidates the old
+    /// `HvfTrapEngine::new_platform` + `map_plan` + the initial-PC/SPSR/SCTLR/
+    /// TTBR/CPACR/CNTKCTL/VBAR/SP/vdso setup into one constructor.
+    pub(crate) fn new_with_plan(
+        plan: &GuestMappingPlan,
+    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu), TrapError> {
         use applevisor::prelude::*;
 
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
@@ -1593,32 +1209,25 @@ impl HvfTrapEngine {
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(vcpu.id());
-        Ok(Self {
-            inner: std::mem::ManuallyDrop::new(HvfInner {
-                _vm: vm,
-                vcpu,
-                mappings: Vec::new(),
-                reclaim_snapshot: None,
-                last_exit_class: 0,
-                last_fault_esr: 0,
-                is_forked_child: false,
-                forked_no_exec: false,
-                protections: std::sync::Arc::new(MemoryProtections::default()),
-                page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
-                last_syscall_nr: None,
-                last_syscall_orig_x0: 0,
-            }),
-        })
-    }
 
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    fn new_platform() -> Result<Self, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn map_plan(&mut self, plan: &GuestMappingPlan) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
+        let mut state = HvfVmState {
+            _vm: std::mem::ManuallyDrop::new(vm),
+            mappings: Vec::new(),
+            reclaim_snapshot: None,
+            last_exit_class: 0,
+            last_fault_esr: 0,
+            is_forked_child: false,
+            forked_no_exec: false,
+            protections: std::sync::Arc::new(MemoryProtections::default()),
+            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            vcpu_id: vcpu.id(),
+            vcpu_handle: vcpu.get_handle(),
+            vfork_share: false,
+            fork_mapping_descs: Vec::new(),
+            fork_child_descs: Vec::new(),
+        };
 
         for mapping in &plan.mappings {
             #[cfg(feature = "trace-hvf")]
@@ -1632,7 +1241,7 @@ impl HvfTrapEngine {
                 if mapping.perms.execute { '+' } else { '-' },
             );
             let region = map_region_raw(mapping)?;
-            self.inner.mappings.push(region);
+            state.mappings.push(region);
         }
 
         // Start PC: if an EL0 entry trampoline is installed, the vCPU begins
@@ -1641,19 +1250,14 @@ impl HvfTrapEngine {
         // starts directly at the user entry (used by the existing EL1-only
         // unit tests).
         let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
-        self.inner
-            .vcpu
-            .set_reg(Reg::PC, initial_pc)
-            .map_err(hvf_error)?;
+        vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
         // M[3:0]=0b0101 = EL1h (AArch64 EL1 using SP_EL1) + DAIF masked.
         // HVF reset CPSR is also EL1h; we set it explicitly so a re-entry
         // after a syscall trap doesn't depend on whatever HVF left in place.
         // The vCPU stays at EL1h until the trampoline `eret` swaps PSTATE
         // for the SPSR_EL1 value programmed below.
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-        self.inner
-            .vcpu
-            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+        vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
             .map_err(hvf_error)?;
         // When using the trampoline, stage SPSR_EL1 with "AArch64 EL0t, DAIF
         // masked" (M[3:0]=0b0000) and ELR_EL1 with the user-mode entry. The
@@ -1663,13 +1267,9 @@ impl HvfTrapEngine {
         // exception that HVF surfaces to the host.
         if let Some(_trampoline) = plan.el0_trampoline_entry {
             const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+            vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
                 .map_err(hvf_error)?;
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::ELR_EL1, plan.entry)
+            vcpu.set_sys_reg(SysReg::ELR_EL1, plan.entry)
                 .map_err(hvf_error)?;
         }
         // Disable stage-1 MMU translation for the EL0/EL1 guest. Without this,
@@ -1709,7 +1309,7 @@ impl HvfTrapEngine {
         // forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue, NOT part of the
         // shared value.
         use carrick_hal::GuestArch as _;
-        let boot = <Self as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
+        let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
         let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
         // Stage-1 MMU is on by default. The identity tables use AP=00 for
         // kernel pages (trampoline/vectors/PT) and AP=01+PXN=1 for user
@@ -1721,9 +1321,7 @@ impl HvfTrapEngine {
             // MAIR_EL1 slot 0 = Normal memory, Inner & Outer Write-Back
             // Cacheable, RW-allocate (0xFF). Slot 1..7 stay 0 (Device-
             // nGnRnE), unused for now.
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
+            vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
                 .map_err(hvf_error)?;
             // TCR_EL1: TTBR0 (lower half) and TTBR1 (upper half) BOTH active.
             //   T0SZ = T1SZ = 16 (48-bit VA each half) — wide enough for
@@ -1745,25 +1343,17 @@ impl HvfTrapEngine {
             //              software tag strip in mapping_for_range / mmap).
             // boot.tcr_el1 is the shared bootstrap value via GuestArch
             // (canonical rationale in carrick_mem::arch_sysregs).
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
+            vcpu.set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
                 .map_err(hvf_error)?;
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+            vcpu.set_sys_reg(SysReg::TTBR0_EL1, pt_base)
                 .map_err(hvf_error)?;
             // TTBR1 shares the same root (see the TCR comment above).
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::TTBR1_EL1, pt_base)
+            vcpu.set_sys_reg(SysReg::TTBR1_EL1, pt_base)
                 .map_err(hvf_error)?;
             // Enable stage-1 MMU (M=1) on top of the C=1, I=1 flags above.
             sctlr_el1 |= 1;
         }
-        self.inner
-            .vcpu
-            .set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
             .map_err(hvf_error)?;
         // Enable FP/SIMD for the guest. Without this, CPACR_EL1.FPEN defaults
         // to "trap at EL0", and musl's `memset` (which uses NEON `dup`/`stp`
@@ -1773,9 +1363,7 @@ impl HvfTrapEngine {
         // turns the trap off; the bottom two bits of each TRC* field are kept
         // at zero (trace unsupported, no SME).
         // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
-        self.inner
-            .vcpu
-            .set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
             .map_err(hvf_error)?;
         // Allow EL0 to read the virtual (EL0VCTEN, bit 1) and physical
         // (EL0PCTEN, bit 0) counters directly without trapping to EL1. This is
@@ -1784,41 +1372,28 @@ impl HvfTrapEngine {
         // emulate_el0_sys64_read path stays as a fallback for any guest whose
         // read still traps. Harmless for guests that don't read the counter.
         const CNTKCTL_EL1_EL0_COUNTER_ACCESS: u64 = (1 << 1) | (1 << 0);
-        self.inner
-            .vcpu
-            .set_sys_reg(SysReg::CNTKCTL_EL1, CNTKCTL_EL1_EL0_COUNTER_ACCESS)
+        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, CNTKCTL_EL1_EL0_COUNTER_ACCESS)
             .map_err(hvf_error)?;
         // Route lower-EL synchronous exceptions (EL0 `svc #0`) through our
         // vector page. Without this, VBAR_EL1 defaults to 0 (or whatever
         // HVF leaves it at) and the SVC fetch faults on an unmapped page.
         if let Some(vectors_base) = plan.el1_vectors_base {
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::VBAR_EL1, vectors_base)
+            vcpu.set_sys_reg(SysReg::VBAR_EL1, vectors_base)
                 .map_err(hvf_error)?;
         }
         if let Some(stack_pointer) = plan.initial_stack_pointer {
             // Running at EL1h, so seed both SP_EL1 (current SP) and SP_EL0
             // (in case anything ever drops back to EL0).
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::SP_EL1, stack_pointer)
+            vcpu.set_sys_reg(SysReg::SP_EL1, stack_pointer)
                 .map_err(hvf_error)?;
-            self.inner
-                .vcpu
-                .set_sys_reg(SysReg::SP_EL0, stack_pointer)
+            vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
                 .map_err(hvf_error)?;
         }
         // Fill the vDSO vvar page so __kernel_clock_gettime can derive time from
         // CNTVCT_EL0 in userspace. Best-effort: if the page isn't mapped (a load
         // path without with_vdso) just skip — the guest falls back to syscalls.
-        self.inner.populate_vdso_data_page();
-        Ok(())
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    fn map_plan(&mut self, _: &GuestMappingPlan) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
+        state.populate_vdso_data_page();
+        Ok((state, vcpu))
     }
 }
 
@@ -1967,232 +1542,158 @@ fn strip_pointer_tag(address: u64) -> u64 {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl HvfInner {
-    fn mapped_region_count(&self) -> usize {
-        self.mappings.len()
+impl HvfVmState {
+    /// The process-wide PROT_NONE bookkeeping (the engine's EFAULT gate).
+    pub(crate) fn protections_ref(&self) -> &MemoryProtections {
+        &self.protections
     }
 
-    fn program_counter(&self) -> Result<u64, TrapError> {
-        use applevisor::prelude::*;
-
-        self.vcpu.get_reg(Reg::PC).map_err(hvf_error)
+    /// A `Send`/`Sync` kick handle for THIS thread's live vCPU. The engine's
+    /// `ThreadedEngine::kick_handle` routes through the Vmm, which does not hold
+    /// the vCPU, so HVF stashes the handle on every vCPU create (see the
+    /// `vcpu_handle` field) and hands it out here.
+    pub(crate) fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
+        crate::vcpu_kick::VcpuKickHandle::new(self.vcpu_handle.clone())
     }
 
-    fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
-        crate::vcpu_kick::VcpuKickHandle::new(self.vcpu.get_handle())
+    /// Set the vfork (`CLONE_VM`) flag for the NEXT fork.
+    pub(crate) fn set_vfork_share(&mut self, share_vm: bool) {
+        self.vfork_share = share_vm;
     }
 
-    /// Run the EL1 stage-1 maintenance trampoline on THIS vCPU to flush the
-    /// stale stage-1 TLB after the host edited page descriptors (the only way
-    /// to make a descriptor change guest-observable; arm64 public HVF has no
-    /// stage-2 TLBI). The caller must have quiesced sibling vCPUs. The
-    /// trampoline touches no GPRs/SP and its closing `hvc #1` traps EL1→EL2, so
-    /// EL1 register state is intact; we still save/restore the interrupted
-    /// EL1-vector PC/CPSR/ELR_EL1/SPSR_EL1 defensively so the in-flight syscall
-    /// resumes exactly as before.
-    fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        // M[3:0]=0b0101 EL1h (SP_EL1) + DAIF masked; same value boot uses to
-        // run the EL0-entry trampoline at EL1.
-        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-
-        let saved_pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
-        let saved_cpsr = self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
-        let saved_elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
-        let saved_spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
-
-        self.vcpu
-            .set_reg(Reg::PC, crate::memory::LINUX_EL1_MAINT_BASE)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
-            .map_err(hvf_error)?;
-
-        let result = loop {
-            self.vcpu.run().map_err(hvf_error)?;
-            let exit = self.vcpu.get_exit_info();
-            match exit.reason {
-                // A cross-thread kick landed mid-flush; the trampoline is tiny
-                // and idempotent, so just resume it to completion.
-                ExitReason::CANCELED => continue,
-                ExitReason::EXCEPTION => {
-                    if is_aarch64_hvc_maintenance(exit.exception.syndrome) {
-                        break Ok(());
-                    }
-                    // Per spec: an ambiguous exit here means we cannot trust
-                    // guest memory visibility — surface it rather than resume.
-                    break Err(TrapError::UnexpectedException {
-                        syndrome: exit.exception.syndrome,
-                        virtual_address: exit.exception.virtual_address,
-                        physical_address: exit.exception.physical_address,
-                    });
-                }
-                _ => {
-                    break Err(TrapError::UnexpectedExit {
-                        reason: format!("{:?} during EL1 maintenance", exit.reason),
-                    });
-                }
-            }
-        };
-
-        // Restore the interrupted EL1-vector state regardless of outcome.
-        self.vcpu.set_reg(Reg::PC, saved_pc).map_err(hvf_error)?;
-        self.vcpu
-            .set_reg(Reg::CPSR, saved_cpsr)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::ELR_EL1, saved_elr)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::SPSR_EL1, saved_spsr)
-            .map_err(hvf_error)?;
-        result
+    /// Create a fresh vCPU bound to this VM (the boot/clone/fork/reclaim
+    /// vcpu_create; admission is the bounded scheduler's job, NOT this path).
+    pub(crate) fn add_vcpu(&mut self) -> Result<applevisor::vcpu::Vcpu, TrapError> {
+        let vcpu = self._vm.vcpu_create().map_err(hvf_error)?;
+        vcpu_created();
+        enable_el0_counter_access(vcpu.id());
+        self.vcpu_id = vcpu.id();
+        self.vcpu_handle = vcpu.get_handle();
+        Ok(vcpu)
     }
 
-    /// Host VA of the page-table region's backing (offset 0 == base).
-    fn pt_host_ptr(&self) -> Option<*mut u8> {
-        self.mapping_for_range(crate::memory::LINUX_PAGE_TABLES_BASE, 8)
-            .map(|m| m.host_addr)
+    /// Host pointer backing `[gpa, gpa+len)`, or `None` if unmapped. The
+    /// engine's `GuestMemory` copies through this; HVF resolves it via the same
+    /// per-thread mapping walk (with the stage-1-IPA disambiguation) the
+    /// syscall path uses.
+    pub(crate) fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
+        let mapping = self.mapping_for_range(gpa, len.max(1))?;
+        let offset = (gpa.wrapping_sub(mapping.start)) as usize;
+        Some(unsafe { mapping.host_addr.add(offset) })
     }
 
-    /// Edit stage-1 descriptors under the shared manager lock, atomically sync
-    /// the changed descriptors to the host backing (ordered so a concurrent
-    /// sibling walk stays safe), then flush the stage-1 TLB via the EL1
-    /// maintenance trampoline so this vCPU (and, inner-shareable, its siblings)
-    /// observe the change.
-    fn pt_edit_and_flush(
-        &mut self,
-        edit: impl FnOnce(
-            &mut crate::page_table::PageTableManager,
-        ) -> Result<bool, crate::page_table::PageTableError>,
-    ) -> Result<(), MemoryError> {
-        use crate::page_table::PageTableError;
-        let host = self
-            .pt_host_ptr()
-            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
-        let pt = std::sync::Arc::clone(&self.page_tables);
-        let changed = {
-            let mut guard = pt.lock();
-            // Build from the live host backing on first edit (matches the boot
-            // image; nothing else writes the tables before this). `get_or_insert_with`
-            // returns the live manager whether it already existed or was just built,
-            // so there is no Option to unwrap.
-            let mgr = guard.get_or_insert_with(|| {
-                let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
-                let mut bytes = vec![0u8; size];
-                unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), size) };
-                // Build through this engine's `GuestArch` MMU codec (`Self`
-                // here is the inner state, not the engine, so name the engine).
-                use carrick_hal::PageTableCodec as _;
-                <<HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::new_manager(
-                    bytes,
-                    crate::memory::LINUX_PAGE_TABLES_BASE,
-                )
+    /// Copy `bytes` into guest physical memory at `gpa` (raw GPA, no PROT_NONE
+    /// gate, no permission check — the engine's run-elf / page-table seed path).
+    pub(crate) fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let Some(mapping) = self.mapping_for_range(gpa, bytes.len().max(1)) else {
+            return Err(MemoryError::OutOfBounds {
+                address: gpa,
+                length: bytes.len(),
             });
-            // Coalescing reclaims spare sub-tables into the 58-page pool; without
-            // it, sustained discontiguous mmap/munmap churn leaks them until
-            // OutOfTables → ENOMEM (PROVEN: the pt-pool watermark climbed to
-            // 55/58, free=0, then Go OOM'd in TestPageAllocAlloc). Coalesce is a
-            // break-before-make table↔block flip plus a page free — unsafe only
-            // if a sibling holds a stale walk-cache reference to the freed page.
-            // PMR removes exactly that hazard: every multi-vCPU table edit pauses
-            // ALL siblings out of guest and `tlbi vmalle1is`-broadcasts before
-            // resuming them, so none holds a stale walk across the free OR a
-            // later reuse. So coalesce is safe iff the edit is EXCLUSIVE —
-            // single-vCPU, or PMR-protected (the pt pause is held right now). The
-            // flag is historically named `multi_vcpu` but really means "unsafe to
-            // coalesce". (The earlier note blaming coalesce for an alloc_table
-            // use-after-free was a misattribution: that was the fork-manager
-            // reset bug, present coalesce on AND off, since fixed.)
-            let live_multi = VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst) > 1;
-            let unsafe_to_coalesce =
-                live_multi && !crate::fork_quiesce::pt_barrier().is_quiescing();
-            mgr.set_multi_vcpu(unsafe_to_coalesce);
-            let changed = edit(mgr).map_err(|e| match e {
-                PageTableError::OutOfTables => {
-                    MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
-                }
-                PageTableError::BadAddress => MemoryError::OutOfBounds {
-                    address: 0,
-                    length: 0,
-                },
-            })?;
-            // Pool occupancy after the edit — a rising `in_use` toward capacity
-            // is the leak; flat proves coalescing keeps it bounded.
-            let (in_use, free_list, capacity) = mgr.pool_stats();
-            crate::probes::pt_pool(in_use, free_list, capacity, i32::from(changed));
-            if changed {
-                // SAFETY: `host` backs the live page-table region for the whole
-                // process lifetime; the manager only writes 8-byte-aligned
-                // descriptor slots within it.
-                unsafe { mgr.sync_to_host(host) };
-            }
-            changed
         };
-        // Nothing changed (range already at the target protection): no host
-        // write, no TLBI.
-        if !changed {
-            return Ok(());
+        let offset = (gpa.wrapping_sub(mapping.start)) as usize;
+        unsafe {
+            volatile_copy_to_guest(bytes.as_ptr(), mapping.host_addr.add(offset), bytes.len());
         }
-        self.run_el1_maintenance()
-            .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))?;
         Ok(())
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        use crate::linux_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
-        // PROT_EXEC clears UXN (executable); its absence sets UXN so a data page
-        // is non-executable (W^X / NX), matching Linux. (Boot regions — the
-        // image's own code, trampolines, vDSO — are mapped executable at boot
-        // and are not edited here; only guest mmap/mprotect ranges pass through.)
-        let exec = prot & LINUX_PROT_EXEC != 0;
-        self.pt_edit_and_flush(|mgr| {
-            if prot & LINUX_PROT_WRITE != 0 {
-                mgr.set_rw(address, len, exec)
-            } else if prot & LINUX_PROT_READ != 0 {
-                mgr.set_readonly(address, len, exec)
-            } else {
-                mgr.set_prot_none(address, len)
-            }
-        })
+    /// Read `len` bytes of live guest memory at guest-physical `gpa` (no VA
+    /// translation, no PROT_NONE gate).
+    pub(crate) fn read_gpa(&self, gpa: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
+        let Some(mapping) = self.mapping_for_range(gpa, len.max(1)) else {
+            return Err(MemoryError::OutOfBounds {
+                address: gpa,
+                length: len,
+            });
+        };
+        let offset = (gpa.wrapping_sub(mapping.start)) as usize;
+        let mut out = vec![0u8; len];
+        unsafe {
+            volatile_copy_from_guest(mapping.host_addr.add(offset), out.as_mut_ptr(), len);
+        }
+        Ok(out)
     }
 
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        // Drop any process-shared alias index entry for this VA range BEFORE the
-        // stage-1 invalidate (no-op for the common low-VA arena case — aliases are
-        // high-VA — but munmap can route a high-VA alias here too).
-        unregister_alias(address, len);
-        self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
+    /// Map host memory at a stage-2 IPA (`hv_vm_map`). The STAGE-1 path stays in
+    /// the engine; this is the backend stage-2 op only.
+    pub(crate) fn map_stage2(
+        &mut self,
+        ipa: u64,
+        host: *mut u8,
+        len: u64,
+        perms: carrick_hal::MemPerms,
+    ) -> Result<(), TrapError> {
+        let perms_raw: u64 = u64::from(hvf_mem_perms(perms));
+        let r = unsafe {
+            applevisor_sys::hv_vm_map(host as *mut std::ffi::c_void, ipa, len as usize, perms_raw)
+        };
+        if r != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "hv_vm_map(ipa=0x{ipa:x}, size={len}) failed: 0x{r:x}"
+            )));
+        }
+        Ok(())
     }
 
-    /// `munmap` of a high-VA alias: invalidate AND reclaim the now-empty alias
-    /// sub-table(s) back to the spare pool (vs `unmap_range`, which keeps the
-    /// table for the low-VA arena's in-place reuse). See `unmap_aliased`.
-    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        // The backing is freed here; drop the process-shared index entry first so
-        // a cross-thread fallback never resolves a now-munmap'd host_addr.
-        unregister_alias(address, len);
-        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
+    /// The HVF-only lazy high-VA alias re-map: a forked child rebuilt its VM
+    /// from only the forking thread's mappings, dropping a `guest_shared` alias a
+    /// sibling thread mapped; re-`hv_vm_map` the registered host backing into
+    /// THIS VM so the faulting instruction re-executes cleanly. Returns true iff
+    /// it remapped. (The engine's `next_syscall` already runs the bounded in-loop
+    /// remap; this is the `handle_memory_exit` hook surface — kept for the trait,
+    /// driven on the rare path the in-loop remap doesn't cover.)
+    pub(crate) fn try_lazy_alias_remap(&mut self, gpa: u64, va: u64) -> bool {
+        let fault_ipa = if gpa != 0 {
+            gpa
+        } else {
+            va.wrapping_sub(crate::memory::LINUX_HIGH_VA_THRESHOLD)
+                .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE)
+        };
+        let Some(b) = lookup_shared_alias(fault_ipa) else {
+            return false;
+        };
+        // SAFETY: `host_addr` is a live MAP_SHARED mmap registered by
+        // `add_alias`; re-mapping the same host range to the same IPA in this VM
+        // is idempotent (a nonzero rc — already mapped by a racing sibling — is
+        // fine).
+        let _ = unsafe {
+            applevisor_sys::hv_vm_map(b.host_addr as *mut std::ffi::c_void, b.ipa, b.size, b.perms)
+        };
+        crate::probes::hv_vm_map_alias(va, b.ipa, b.size as u64, 0, self.forked_no_exec as i32);
+        true
     }
 
-    /// Back a dynamic high-VA `mmap`: `hv_vm_map` host-anon memory at the
-    /// reserved low IPA, build the VA→IPA stage-1 path, and register the region
-    /// for syscall-path access (keyed by the VA). RWX so a JIT (Rosetta) can
-    /// both write and execute it; the guest may `mprotect` afterwards.
-    fn map_host_alias(
+    /// Back a dynamic high-VA `mmap` (`DispatchOutcome::MapHostAlias`): allocate
+    /// the low alias IPA, `hv_vm_map` the host file/anon backing there, register
+    /// the alias process-globally, and add the per-thread region — returning the
+    /// `(gpa = ipa, writable)` the engine then threads into the SHARED stage-1
+    /// `map_aliased`. RWX so a JIT (Rosetta) can write+execute it; the guest may
+    /// `mprotect` afterwards.
+    ///
+    /// Mirrors the old `map_host_alias`, with the IPA derived HERE (the dispatcher
+    /// no longer supplies it through the shared `map_host_alias` seam): the same
+    /// `crate::memory::alloc_alias_ipa` the dispatcher used.
+    pub(crate) fn add_alias(
         &mut self,
         va: u64,
         ipa: u64,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<(u64, bool), TrapError> {
+        // Use the IPA the DISPATCHER already allocated from the global alias arena
+        // (`crate::memory::alloc_alias_ipa`) and passed through `MapHostAlias` — do
+        // NOT re-allocate here (that double-consumed the arena and desynced the
+        // dispatcher's VA→IPA bookkeeping, the dynamic-loader fault). The returned
+        // gpa IS this ipa (HVF's stage-2 maps the host at the IPA, identity gpa==ipa).
         // hv_vm_map requires a 16 KiB-granular size; round the HOST mapping up
-        // to the HVF granule. The stage-1 `map_aliased` below still maps only the
-        // exact `len` (the guest's page-aligned request), so a sub-16 KiB mmap
-        // never maps extra 4 KiB guest pages into a neighbouring region's
-        // page-table entries (which would redirect that region's fetches/reads
-        // to the wrong IPA — the amd64 Rosetta JIT undefined-instruction bug).
+        // to the HVF granule. The stage-1 `map_aliased` (the engine, on the exact
+        // `len`) below still maps only the guest's page-aligned request, so a
+        // sub-16 KiB mmap never maps extra 4 KiB guest pages into a neighbouring
+        // region's page-table entries (which would redirect that region's
+        // fetches/reads to the wrong IPA — the amd64 Rosetta JIT undefined-
+        // instruction bug).
         let hvf_len = align_up(len, HVF_PAGE_SIZE)?;
         let size = usize::try_from(hvf_len).map_err(|_| TrapError::MappingTooLarge(len))?;
         // The host page is mapped at the guest's actual prot (map_shared_file),
@@ -2209,15 +1710,13 @@ impl HvfInner {
             // survive fork. The dispatcher handed us a dup'd fd it owns; mmap
             // takes its own reference, so close the dup once mapped.
             Some((fd, offset, prot)) => {
-                let m = crate::host_mapping::OwnedHostMapping::map_shared_file(
-                    fd, offset, size, prot,
-                )
-                .map_err(|e| {
-                    unsafe { libc::close(fd) };
-                    TrapError::Hypervisor(format!(
-                        "alias MAP_SHARED file (fd={fd} off={offset} size={size} prot={prot}) failed: {e}"
-                    ))
-                })?;
+                let m = crate::host_mapping::OwnedHostMapping::map_shared_file(fd, offset, size, prot)
+                    .map_err(|e| {
+                        unsafe { libc::close(fd) };
+                        TrapError::Hypervisor(format!(
+                            "alias MAP_SHARED file (fd={fd} off={offset} size={size} prot={prot}) failed: {e}"
+                        ))
+                    })?;
                 unsafe { libc::close(fd) };
                 m
             }
@@ -2249,36 +1748,16 @@ impl HvfInner {
                 "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={size} failed: 0x{r:x}"
             )));
         }
-        // Build VA→IPA descriptors + TLBI so the guest's own accesses translate.
-        // Thread guest writability through: a SHM_RDONLY (PROT_READ) alias is
-        // built AP=RO so a direct guest store faults SIGSEGV (stage-1 first),
-        // matching Linux do_shmat — preserving the IPA output address.
-        let pt_res =
-            self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, ipa, len, alias_guest_writable));
-        {
-            // Trace the manager's view of the alias path (carrick trace:
-            // pt-alias-walk) — fires for parent (ok) and forked child (fail) so
-            // a trace can diff them. bit0=forked child, bit1=build failed.
-            let descs = self
-                .page_tables
-                .lock()
-                .as_ref()
-                .map(|m| m.debug_walk(va))
-                .unwrap_or([0u64; 4]);
-            let flag = (self.forked_no_exec as i32) | ((pt_res.is_err() as i32) << 1);
-            crate::probes::pt_alias_walk(va, descs, flag);
-        }
-        pt_res.map_err(|e| TrapError::Hypervisor(format!("alias page-table build failed: {e}")))?;
         let guest_shared = host_mapping.guest_shared();
         // Register EVERY alias (MAP_SHARED file AND private anon — Go's high-VA
         // heap arenas) process-globally in `alias_registry`. Two consumers: the
         // stage-2 lazy on-fault re-map (a forked VM that lost the alias), and the
         // SYSCALL-PATH cross-thread fallback in `mapping_for_range` (a sibling
         // thread whose per-thread `mappings` never saw this alias — the
-        // "read/wait: bad address" EFAULT). Was guest_shared-only; widening it to
-        // anon is safe because the index is non-owning (raw host_addr) and removed
-        // on munmap. guest_writable is carried so a PROT_READ file alias still
-        // EFAULTs a syscall write via the fallback instead of SIGBUS-ing the host.
+        // "read/wait: bad address" EFAULT). The index is non-owning (raw
+        // host_addr) and removed on munmap. guest_writable is carried so a
+        // PROT_READ file alias still EFAULTs a syscall write via the fallback
+        // instead of SIGBUS-ing the host.
         register_shared_alias(AliasBacking {
             start: va,
             ipa,
@@ -2300,482 +1779,13 @@ impl HvfInner {
             guest_shared,
             guest_writable: alias_guest_writable,
         });
-        Ok(())
+        Ok((ipa, alias_guest_writable))
     }
 
-    /// Snapshot the EL0 fault registers, fire the `vcpu_fault` trace probe,
-    /// stash the ESR for the signal frame's `esr_context`, and build the
-    /// [`TrapError::EL0Fault`]. `from_el0_direct` distinguishes the direct
-    /// EL0-abort exit (`true` — runtime redirects PC) from the HVC-trampoline
-    /// underlying fault (`false` — runtime redirects ELR_EL1).
-    ///
-    /// `direct_fault` carries the AUTHORITATIVE fault info for the direct path:
-    /// `(true_pc, fault_va)` from HVF's exit (`Reg::PC` + `exception
-    /// .virtual_address`). On that path the guest's EL1 vector never runs, so
-    /// `ELR_EL1`/`FAR_EL1` are STALE (left over from the last `svc` — e.g.
-    /// elr=post-svc, far=0), which would otherwise be baked into the guest's
-    /// SIGSEGV frame as a bogus resume-PC + `si_addr`. The HVC-trampoline path
-    /// passes `None`: there the EL1 vector latched both sysregs, so they are
-    /// authoritative and the runtime relies on `ELR_EL1` for the re-run.
-    fn capture_el0_fault(
-        &mut self,
-        syndrome: u64,
-        from_el0_direct: bool,
-        direct_fault: Option<(u64, u64)>,
-    ) -> TrapError {
-        use applevisor::prelude::*;
-        let (elr, far) = match direct_fault {
-            Some((true_pc, fault_va)) => (true_pc, fault_va),
-            None => (
-                self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0),
-                self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0),
-            ),
-        };
-        let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
-        let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
-        let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
-        let x30 = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
-        let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-        crate::probes::vcpu_fault(syndrome, elr, far, x30, sp, unsafe { libc::getpid() });
-        self.last_fault_esr = syndrome;
-        TrapError::el0_fault(syndrome, elr, far, x16, x17, x29, x30, sp, from_el0_direct)
-    }
-
-    fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
-        use applevisor::prelude::*;
-
-        // Lifecycle marker: the first entry here is the moment the guest first
-        // runs — i.e. INITIAL boot/setup is done. Fired once per process; since
-        // carrick forks via no-exec `libc::fork`, a forked child inherits the
-        // parent's already-completed Once and does NOT re-fire this — so it
-        // cleanly means "first boot", distinct from a fork (which rebuilds the
-        // child's HVF context + restores a snapshot WITHOUT reloading the image,
-        // bracketed by the separate fork__pre/fork__post probes). A trace splits
-        // a fresh run into boot (start→here) / guest (here→guest-exit) /
-        // teardown (guest-exit→process-exit); fork cost is fork__pre→fork__post.
-        static FIRST_RUN: std::sync::Once = std::sync::Once::new();
-        FIRST_RUN.call_once(|| crate::probes::lifecycle(crate::probes::phase::FIRST_VCPU_RUN));
-
-        // Time the vCPU's guest execution: the wall time spent inside
-        // hv_vcpu_run is the time this vCPU thread was on-CPU running guest
-        // code (blocking guest syscalls trap OUT and wait in carrick host code,
-        // so this is execution time, not idle). HVF guest cycles don't accrue
-        // to the host thread's rusage, so getrusage/times/`/proc` source the
-        // guest's user CPU time from this. (hv_vcpu_get_exec_time was measured
-        // to under-report ~40× here, so it isn't used.) Accumulated lock-free
-        // into this vCPU thread's slot; summed process-wide by `guest_cpu`.
-        // Bounds lazy re-mapping of dropped guest_shared aliases (below) so a
-        // genuinely-unmappable backing still terminates instead of spinning.
-        let mut alias_remap_limiter = AliasRemapLimiter::default();
-        let exit = loop {
-            crate::guest_cpu::timed_run(|| self.vcpu.run()).map_err(hvf_error)?;
-            let exit = self.vcpu.get_exit_info();
-            if exit.reason == ExitReason::CANCELED {
-                // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this
-                // vCPU out of the guest so a pending signal can be delivered.
-                //
-                // But the kick can land while the vCPU is still inside carrick's
-                // EL1 trap trampoline — a guest EL0 `svc`/fault is mid-flight,
-                // between the vector entry (VBAR_EL1 = vectors_base, e.g. the
-                // sync-from-EL0 entry at +0x400) and the HVC that traps out to
-                // the host. PC there is an EL1 trampoline address, NOT a guest
-                // userspace PC. Injecting a signal frame at it (the run loop
-                // treats `None` as "deliver at current PC") overwrites the
-                // in-flight exception and wedges the thread — reproduced as a
-                // SIGURG storm corrupting a futex waiter (pc=vectors_base+0x404).
-                //
-                // Resume until the guest is back at EL0 so the trampoline
-                // completes its HVC and the real syscall is serviced; the
-                // pending signal is then delivered at that clean EL0 boundary.
-                let cpsr = self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
-                if !ExecLevel::from_pstate(cpsr).is_guest() {
-                    EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::probes::kick_in_kernel(
-                        self.vcpu.get_reg(Reg::PC).unwrap_or(0),
-                        ((cpsr >> 2) & 0b11) as u32,
-                    );
-                    continue;
-                }
-                return Ok(None);
-            }
-            // A direct EL0 abort on a high-VA alias address that THIS vCPU's
-            // shared VM is missing: a `fork()` rebuilt the shared VM from only the
-            // forking thread's mappings, dropping a `guest_shared` alias mapped by
-            // a sibling thread (the go-build telemetry counter). arm64 HVF has no
-            // stage-2 TLB shootdown, so re-running alone never fixes it — but the
-            // host backing is a MAP_SHARED mmap still live at the registered host
-            // address, so re-`hv_vm_map`'ing it into THIS (shared) VM restores the
-            // stage-2 entry for every thread, and the instruction re-executes
-            // cleanly. Only registered aliases are touched, so a genuine bad
-            // access to unregistered memory still faults. Bounded as a backstop.
-            if exit.reason == ExitReason::EXCEPTION
-                && is_aarch64_el0_abort_exception(exit.exception.syndrome)
-                && crate::memory::is_high_va(exit.exception.virtual_address)
-            {
-                let fault_ipa = if exit.exception.physical_address != 0 {
-                    exit.exception.physical_address
-                } else {
-                    // Aliases are placed at va = HIGH_VA_THRESHOLD + (ipa - BASE).
-                    exit.exception
-                        .virtual_address
-                        .wrapping_sub(crate::memory::LINUX_HIGH_VA_THRESHOLD)
-                        .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE)
-                };
-                if let Some(b) = lookup_shared_alias(fault_ipa)
-                    && alias_remap_limiter.allow(b.ipa)
-                {
-                    // SAFETY: `host_addr` is a live MAP_SHARED mmap (the alias
-                    // backing) registered by map_host_alias; re-mapping the same
-                    // host range to the same IPA in this VM is idempotent. A
-                    // nonzero rc (e.g. already mapped by a racing sibling) is fine
-                    // — re-run and re-walk regardless.
-                    let _ = unsafe {
-                        applevisor_sys::hv_vm_map(
-                            b.host_addr as *mut std::ffi::c_void,
-                            b.ipa,
-                            b.size,
-                            b.perms,
-                        )
-                    };
-                    crate::probes::hv_vm_map_alias(
-                        exit.exception.virtual_address,
-                        b.ipa,
-                        b.size as u64,
-                        0,
-                        self.forked_no_exec as i32,
-                    );
-                    // Diagnostic-only alias-remap counter+dump, gated behind
-                    // `debug-stats` (no other consumer reads the counter).
-                    #[cfg(feature = "debug-stats")]
-                    {
-                        let n =
-                            ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n.is_multiple_of(256) {
-                            eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.ipa);
-                        }
-                    }
-                    continue;
-                }
-            }
-            break exit;
-        };
-        if exit.reason != ExitReason::EXCEPTION {
-            return Err(TrapError::UnexpectedExit {
-                reason: format!("{:?}", exit.reason),
-            });
-        }
-
-        let exception = exit.exception;
-        // A guest EL0 memory abort HVF couldn't satisfy (e.g. a stack overflow
-        // that ran SP off the mapped stack) surfaces DIRECTLY as an EXCEPTION
-        // exit with EC=0x20/0x24, NOT through our EL1 vector's HVC. Deliver it to
-        // the guest as the right Linux signal (SIGSEGV) so its handler runs —
-        // CPython faulthandler._stack_overflow expects exactly this — instead of
-        // fataling with "unexpected exception".
-        if is_aarch64_el0_abort_exception(exception.syndrome) {
-            // CARRICK_TRACE_FAULT: dump the AUTHORITATIVE fault info from the HVF
-            // exit (exception.virtual_address + guest Reg::PC) next to the EL1
-            // sysregs (ELR_EL1/FAR_EL1), which are STALE on this direct exit (the
-            // guest's EL1 vector never ran), plus the full GPR set so the register
-            // holding the bad pointer is visible. Diagnostic only; off by
-            // default (compile-gated behind `trace-hvf`).
-            #[cfg(feature = "trace-hvf")]
-            {
-                let pc = self.vcpu.get_reg(Reg::PC).unwrap_or(0);
-                let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-                let far_reg = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
-                let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-                let mut gprs = [0u64; 31];
-                for (i, slot) in gprs.iter_mut().enumerate() {
-                    if let Some(r) = GPR_TABLE.get(i) {
-                        *slot = self.vcpu.get_reg(*r).unwrap_or(0);
-                    }
-                }
-                // Does THIS process/vCPU have the faulting alias in its OWN
-                // re-map list (so its hv_vm has the stage-2 mapping)? A fork
-                // child rebuilds a fresh hv_vm and replays only the mappings it
-                // inherited; an alias mapped by a sibling thread / after this
-                // process forked is absent here -> its hv_vm faults on it.
-                let va = exception.virtual_address;
-                let mapped_here = self.mappings.iter().any(|m| m.start <= va && va < m.end);
-                eprintln!(
-                    "FAULTDUMP pid={} esr=0x{:x} exit_va=0x{:x} exit_pa=0x{:x} pc=0x{:x} elr_stale=0x{:x} far_stale=0x{:x} sp=0x{:x} forked_child={} forked_no_exec={} nmappings={} mapped_here={}",
-                    unsafe { libc::getpid() },
-                    exception.syndrome,
-                    exception.virtual_address,
-                    exception.physical_address,
-                    pc,
-                    elr,
-                    far_reg,
-                    sp,
-                    self.is_forked_child,
-                    self.forked_no_exec,
-                    self.mappings.len(),
-                    mapped_here,
-                );
-                eprintln!(
-                    "FAULTGPR pid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x} x6=0x{:x} x7=0x{:x} x8=0x{:x} x9=0x{:x} x10=0x{:x} x11=0x{:x} x12=0x{:x} x13=0x{:x} x14=0x{:x} x15=0x{:x}",
-                    unsafe { libc::getpid() },
-                    gprs[0],
-                    gprs[1],
-                    gprs[2],
-                    gprs[3],
-                    gprs[4],
-                    gprs[5],
-                    gprs[6],
-                    gprs[7],
-                    gprs[8],
-                    gprs[9],
-                    gprs[10],
-                    gprs[11],
-                    gprs[12],
-                    gprs[13],
-                    gprs[14],
-                    gprs[15],
-                );
-                eprintln!(
-                    "FAULTGPR2 pid={} x16=0x{:x} x17=0x{:x} x18=0x{:x} x19=0x{:x} x20=0x{:x} x21=0x{:x} x22=0x{:x} x23=0x{:x} x24=0x{:x} x25=0x{:x} x26=0x{:x} x27=0x{:x} x28=0x{:x} x29=0x{:x} x30=0x{:x}",
-                    unsafe { libc::getpid() },
-                    gprs[16],
-                    gprs[17],
-                    gprs[18],
-                    gprs[19],
-                    gprs[20],
-                    gprs[21],
-                    gprs[22],
-                    gprs[23],
-                    gprs[24],
-                    gprs[25],
-                    gprs[26],
-                    gprs[27],
-                    gprs[28],
-                    gprs[29],
-                    gprs[30],
-                );
-                // Read the faulting instruction word at the TRUE pc (Reg::PC).
-                if let Ok(b) = self.read_guest_bytes(pc, 4) {
-                    let insn = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    eprintln!(
-                        "FAULTINSN pid={} pc=0x{:x} insn=0x{:08x}",
-                        unsafe { libc::getpid() },
-                        pc,
-                        insn
-                    );
-                }
-            }
-            // Direct EL0-abort exit (post-rewrite); the HVC-underlying path below
-            // also routes through capture_el0_fault (which stashes the ESR for
-            // the signal frame's esr_context — Rosetta's handler requires it).
-            // ELR_EL1/FAR_EL1 are STALE here (the guest EL1 vector never ran), so
-            // pass HVF's authoritative faulting PC (Reg::PC) + VA
-            // (exception.virtual_address) for the signal frame's resume-PC + si_addr.
-            let true_pc = self.vcpu.get_reg(Reg::PC).unwrap_or(0);
-            return Err(self.capture_el0_fault(
-                exception.syndrome,
-                true,
-                Some((true_pc, exception.virtual_address)),
-            ));
-        }
-        // Fail loud on the EL1 vector's `hvc #3` (current-EL synchronous slot):
-        // carrick's guest took a synchronous exception WHILE AT EL1, which only
-        // happens when a guest resume left PSTATE at EL1 (e.g. a signal handler
-        // entered with SPSR_EL1=EL1h, whose PXN instruction fetch aborts). The
-        // bare-`eret` vectors used to spin on this forever at 100 % CPU with no
-        // host exit; the `hvc #3` trap surfaces it here. ESR_EL1/ELR_EL1/FAR_EL1
-        // still hold the ORIGINAL EL1 fault (the `hvc` left them untouched), so
-        // report them verbatim. This is a carrick bug, not a guest fault — do not
-        // deliver it to the guest as a signal; terminate loudly with the cause.
-        if is_aarch64_hvc_fault(exception.syndrome) {
-            let esr_el1 = self.vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
-            let elr_el1 = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-            let far_el1 = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
-            let spsr_el1 = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
-            let ec = (esr_el1 >> 26) & 0x3f;
-            eprintln!(
-                "FAIL-LOUD pid={pid}: guest executed at EL1 and faulted \
-                 (current-EL sync vector) — carrick state corruption (a guest \
-                 resume left PSTATE at EL1, commonly a signal handler entered \
-                 with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the \
-                 hvc #3 vector trap. esr_el1={esr_el1:#x} ec={ec:#x} \
-                 elr_el1={elr_el1:#x} far_el1={far_el1:#x} spsr_el1={spsr_el1:#x}",
-                pid = unsafe { libc::getpid() },
-            );
-            return Err(TrapError::GuestAtEl1 {
-                esr_el1,
-                elr_el1,
-                far_el1,
-                spsr_el1,
-            });
-        }
-        if !is_aarch64_syscall_exception(exception.syndrome) {
-            return Err(TrapError::UnexpectedException {
-                syndrome: exception.syndrome,
-                virtual_address: exception.virtual_address,
-                physical_address: exception.physical_address,
-            });
-        }
-        // EC=0x16 (HVC) only means our EL1 vector trampoline fired — it
-        // catches ALL lower-EL synchronous exceptions, not just SVCs.
-        // Look at ESR_EL1 to see what actually trapped to EL1; if it's
-        // not an SVC, surface it as an unexpected-EL0-fault so the
-        // runtime can deliver the right Linux signal instead of pretending
-        // x8 is a syscall number.
-        if is_aarch64_hvc_exception(exception.syndrome) {
-            let underlying = self.vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
-            if !is_aarch64_svc_exception(underlying) {
-                if self.emulate_el0_sys64_read(underlying)? {
-                    return self.run_until_syscall();
-                }
-                let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-                let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
-                // Decoded fault diagnostics for `carrick trace` (vcpu-fault-regs)
-                // as SCALARS — the faulting instruction word + the base register
-                // a load/store dereferenced and its value. So a script sees e.g.
-                // `ldr x0,[x0,#8]` with x0=17 -> far=0x19, without an eprintln
-                // rebuild. Scalars survive a fault that kills the process before
-                // DTrace's action runs (a copyin-pointer probe would not). Built
-                // only at the fault (never on the happy path); the host-side read
-                // of the instruction word can't be done in D (guest VA != host).
-                {
-                    let insn = self
-                        .read_guest_bytes(elr, 4)
-                        .ok()
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
-                        .unwrap_or(0);
-                    let rn = ((insn >> 5) & 0x1f) as u32;
-                    // rn==31 encodes SP/XZR; GPR_TABLE is [Reg; 31] (X0..X30), so
-                    // a direct index panics (host abort) on any SP-relative
-                    // faulting load. Use the checked accessor. Fixture: sp_fault.
-                    let xrn = GPR_TABLE
-                        .get(rn as usize)
-                        .and_then(|r| self.vcpu.get_reg(*r).ok())
-                        .unwrap_or(0);
-                    crate::probes::vcpu_fault_regs(underlying, elr, far, insn, rn, xrn);
-                }
-                // Walk the LIVE host page-table backing at the faulting VA so a
-                // trace can tell whether the leaf PTE is invalid in memory (a
-                // logic bug — a missing/lost validate) vs valid-but-stale-TLB (a
-                // coherence bug). Reads exactly what the guest HW walker sees.
-                if let Some(host) = self.pt_host_ptr() {
-                    let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
-                    // SAFETY: `host` backs the page-table region for the whole
-                    // process; we read `size` bytes from it, no writes.
-                    let bytes = unsafe { std::slice::from_raw_parts(host, size) };
-                    // Walk through this engine's `GuestArch` MMU codec (`Self`
-                    // here is the inner state, not the engine, so name the
-                    // engine).
-                    use carrick_hal::PageTableCodec as _;
-                    let d = <<HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch as carrick_hal::GuestArch>::Mmu::walk_descriptors(
-                        bytes,
-                        crate::memory::LINUX_PAGE_TABLES_BASE,
-                        far,
-                    );
-                    crate::probes::pt_fault_walk(far, d[0], d[1], d[2], d[3]);
-                }
-                // HVC-trampoline path: the guest EL1 vector latched ELR_EL1/FAR_EL1,
-                // so they are authoritative — pass None to read them.
-                return Err(self.capture_el0_fault(underlying, false, None));
-            }
-        }
-        self.last_exit_class = aarch64_exception_class(exception.syndrome);
-
-        #[cfg(feature = "trace-hvf")]
-        {
-            let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
-            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
-            let spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
-            let sp_el0 = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
-            let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).map_err(hvf_error)?;
-            let x0 = self.vcpu.get_reg(Reg::X0).map_err(hvf_error)?;
-            let x1 = self.vcpu.get_reg(Reg::X1).map_err(hvf_error)?;
-            let x2 = self.vcpu.get_reg(Reg::X2).map_err(hvf_error)?;
-            let x3 = self.vcpu.get_reg(Reg::X3).map_err(hvf_error)?;
-            let x4 = self.vcpu.get_reg(Reg::X4).map_err(hvf_error)?;
-            let x5 = self.vcpu.get_reg(Reg::X5).map_err(hvf_error)?;
-            let x8 = self.vcpu.get_reg(Reg::X8).map_err(hvf_error)?;
-            let esr = self.vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
-            eprintln!(
-                "TRAP exit_va=0x{:x} exit_pa=0x{:x} esr_el1=0x{:x} (ec=0x{:02x}) pc=0x{:x} elr=0x{:x} sp=0x{:x} far=0x{:x} x8={} x0=0x{:x} x1=0x{:x}",
-                exception.virtual_address,
-                exception.physical_address,
-                esr,
-                (esr >> 26) & 0x3f,
-                pc,
-                elr,
-                sp_el0,
-                far,
-                x8,
-                x0,
-                x1
-            );
-            let _ = (spsr, x2, x3, x4, x5);
-        }
-
-        // The syscall-frame register set (x0..x5 + x8) is single-sourced (F7); the
-        // getter reads the same applevisor registers this inline build did.
-        let frame = carrick_hal::read_aarch64_syscall_frame(|r| hvf_get_reg(&self.vcpu, r))
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        // Snapshot the syscall number + original arg0 before the dispatcher
-        // overwrites x0 with the retval, so an SA_RESTART handler that
-        // interrupts this syscall can restart it (rewind PC to the `svc`,
-        // restore this x0) instead of surfacing EINTR.
-        self.last_syscall_nr = Some(frame.x8);
-        self.last_syscall_orig_x0 = frame.x0;
-        // Guest EL0 PC at the trap. HVF sets ELR_EL1 to the
-        // instruction-after-svc when it dispatches the synchronous
-        // exception, so this is the address the guest will resume at
-        // after `complete_syscall`.
-        let guest_pc = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
-        let lr = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
-        // FP (x29) + SP let guest_stack.d walk the guest call chain.
-        let fp = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
-        let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-        // Guest+host bases of the region containing `sp`, so a DTrace
-        // consumer can translate stack VAs and copyin frames (the two
-        // bases individually fit in i64; a single offset would wrap).
-        let (stack_guest_base, stack_host_base, stack_guest_end) = self
-            .mappings
-            .iter()
-            .find(|m| sp >= m.start && sp < m.end)
-            .map(|m| (m.start, m.host_addr as u64, m.end))
-            .unwrap_or((0, 0, 0));
-        crate::probes::vcpu_trap(&crate::compat::GuestRegs {
-            pc: guest_pc,
-            sp,
-            fp,
-            lr,
-            x8: frame.x8,
-            x0: frame.x0,
-            stack_guest_base,
-            stack_host_base,
-            stack_guest_end,
-        });
-        Ok(Some(frame))
-    }
-
-    fn last_syscall_nr(&self) -> Option<u64> {
-        self.last_syscall_nr
-    }
-
-    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-
-        self.vcpu
-            .set_reg(Reg::X0, return_value as u64)
-            .map_err(hvf_error)?;
-        #[cfg(feature = "trace-hvf")]
-        {
-            let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
-            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
-            eprintln!(
-                "COMPLETE return=0x{:x} pc=0x{:x} elr_el1=0x{:x}",
-                return_value, pc, elr
-            );
-        }
-        Ok(())
-    }
-
-    fn emulate_el0_sys64_read(&mut self, esr: u64) -> Result<bool, TrapError> {
+    fn emulate_el0_sys64_read_inner(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        esr: u64,
+    ) -> Result<bool, TrapError> {
         use applevisor::prelude::*;
 
         // EL0 read of a feature-ID register (the CRn==0, Op0==3, Op1==0 space).
@@ -2808,15 +1818,14 @@ impl HvfInner {
                 _ => None,
             };
             let value = match id_reg {
-                Some(reg) => self.vcpu.get_sys_reg(reg).map_err(hvf_error)?,
+                Some(reg) => vcpu.get_sys_reg(reg).map_err(hvf_error)?,
                 None => 0,
             };
             if let Some(target) = GPR_TABLE.get(rt_id) {
-                self.vcpu.set_reg(*target, value).map_err(hvf_error)?;
+                vcpu.set_reg(*target, value).map_err(hvf_error)?;
             }
-            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
-            self.vcpu
-                .set_sys_reg(SysReg::ELR_EL1, elr.wrapping_add(4))
+            let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+            vcpu.set_sys_reg(SysReg::ELR_EL1, elr.wrapping_add(4))
                 .map_err(hvf_error)?;
             return Ok(true);
         }
@@ -2834,11 +1843,10 @@ impl HvfInner {
             El0SysRegRead::DczidEl0 => host_ctr_dczid().1,
         };
         if let Some(target) = GPR_TABLE.get(rt as usize) {
-            self.vcpu.set_reg(*target, value).map_err(hvf_error)?;
+            vcpu.set_reg(*target, value).map_err(hvf_error)?;
         }
-        let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::ELR_EL1, elr.wrapping_add(4))
+        let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::ELR_EL1, elr.wrapping_add(4))
             .map_err(hvf_error)?;
         Ok(true)
     }
@@ -2849,7 +1857,11 @@ impl HvfInner {
         self.protections.range_no_access(address, length)
     }
 
-    fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+    pub(crate) fn read_guest_bytes(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
         let mut bytes = vec![0u8; length];
         self.read_guest_bytes_into(address, &mut bytes)?;
         Ok(bytes)
@@ -2858,7 +1870,11 @@ impl HvfInner {
     /// No-alloc core of [`Self::read_guest_bytes`]: `volatile`-copy `dst.len()` bytes
     /// of guest memory at `address` straight into `dst`. Same checks, chunked
     /// mapping walk, and trace probes as the allocating form.
-    fn read_guest_bytes_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+    pub(crate) fn read_guest_bytes_into(
+        &self,
+        address: u64,
+        dst: &mut [u8],
+    ) -> Result<(), MemoryError> {
         let length = dst.len();
         // PROT_NONE gated once in the default `GuestMemory::read_bytes`/`read_into`.
         let mut copied = 0usize;
@@ -2907,7 +1923,7 @@ impl HvfInner {
     /// (the boot-mapped shared aperture; shared across carrick processes via
     /// the inherited MAP_SHARED backing). Used to back a cross-process futex
     /// with the public `os_sync_wait_on_address` API (see `crate::ulock`).
-    fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
+    pub(crate) fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
         // Fast path: the region is in THIS thread's mapping list.
         if let Some(mapping) = self.mapping_for_range(address, 4) {
             if !mapping.guest_shared {
@@ -2938,7 +1954,11 @@ impl HvfInner {
         None
     }
 
-    fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+    pub(crate) fn write_guest_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
         let length = bytes.len();
         // PROT_NONE gated once in the default `GuestMemory::write_bytes`.
         self.validate_guest_write_range(address, length, false)?;
@@ -2987,7 +2007,7 @@ impl HvfInner {
     /// `read_guest_bytes`'s address handling (raw no-access guard, tag strip)
     /// but returns the backing pointer instead of copying. See
     /// `GuestMemory::host_ptr_for_read`.
-    fn host_ptr_for_read(&self, address: u64, length: usize) -> Option<*const u8> {
+    pub(crate) fn host_ptr_for_read(&self, address: u64, length: usize) -> Option<*const u8> {
         if length == 0 || self.range_no_access(address, length) {
             return None;
         }
@@ -3006,7 +2026,7 @@ impl HvfInner {
     /// guest read-only mapping must EFAULT via the checked copy path, not be
     /// written by the kernel through a raw host pointer. See
     /// `GuestMemory::host_ptr_for_write`.
-    fn host_ptr_for_write(&self, address: u64, length: usize) -> Option<*mut u8> {
+    pub(crate) fn host_ptr_for_write(&mut self, address: u64, length: usize) -> Option<*mut u8> {
         if length == 0 || self.range_no_access(address, length) {
             return None;
         }
@@ -3034,7 +2054,11 @@ impl HvfInner {
     /// fault and cannot scrub it. The arena backing is always mapped (munmap only
     /// stage-1-invalidates; arm64 HVF has no stage-2 flush), so the lookup
     /// succeeds for the reclaimed region.
-    fn zero_guest_backing(&mut self, address: u64, length: usize) -> Result<(), MemoryError> {
+    pub(crate) fn zero_guest_backing(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Result<(), MemoryError> {
         let Some(mapping) = self.mapping_for_range_mut(address, length) else {
             return Err(MemoryError::OutOfBounds { address, length });
         };
@@ -3053,7 +2077,11 @@ impl HvfInner {
     /// registered `write:false`). Carrick-internal writes (vdso vvar, sigframe,
     /// bootstrap) deliberately use the unchecked `write_guest_bytes`.
     /// (audit M1; probe `rosharedbus`)
-    fn write_guest_bytes_checked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+    pub(crate) fn write_guest_bytes_checked(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
         let length = bytes.len();
         // PROT_NONE gated once in the default `GuestMemory::write_bytes`.
         self.validate_guest_write_range(address, length, true)?;
@@ -3119,7 +2147,7 @@ impl HvfInner {
         Ok(())
     }
 
-    fn guest_copy_chunk(
+    pub(crate) fn guest_copy_chunk(
         address: u64,
         offset: usize,
         total_length: usize,
@@ -3199,7 +2227,7 @@ impl HvfInner {
     /// skips if the vvar page isn't mapped.
     /// Stamp this process's host PID into the vvar RNG generation (P2). It is
     /// unique per process; re-stamped for a forked child in
-    /// `rebuild_vcpu_after_fork` so the child's generation never matches the
+    /// `fork_rebuild` so the child's generation never matches the
     /// snapshot it COW-inherited from its parent — forcing the userspace
     /// getrandom blob to reseed instead of reusing the parent's keystream.
     fn stamp_rng_generation(&mut self) {
@@ -3261,52 +2289,10 @@ impl HvfInner {
         // seq stays 0 (even = stable); these aren't updated after boot.
     }
 
-    /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE
-    /// overlay aperture, seeding the slot with `content`. Backs a
-    /// `MAP_FIXED|MAP_PRIVATE` over a shared-aperture VA: afterwards the guest's
-    /// stores to `va` translate (stage-1) to `overlay_ipa` and hit the
-    /// per-process overlay page, NOT the shared backing — so a "private" write
-    /// no longer leaks to peers or across fork. Stage-1 ONLY (the overlay window
-    /// was `hv_vm_map`'d at boot); arm64 has no stage-2 TLB shootdown, which is
-    /// exactly why we never re-map stage-2 here.
-    fn repoint_private(
-        &mut self,
-        va: u64,
-        overlay_ipa: u64,
-        len: usize,
-        content: &[u8],
-    ) -> Result<(), MemoryError> {
-        // Seed the overlay slot FIRST, while `va` still translates to the OLD
-        // (shared) IPA, so no concurrent reader sees a torn page through `va`.
-        // `overlay_ipa` is identity (== overlay VA); it lives in the overlay
-        // region, which is the only mapping that contains it.
-        let dst = {
-            let mapping = self.mapping_for_range(overlay_ipa, len.max(1)).ok_or(
-                MemoryError::OutOfBounds {
-                    address: overlay_ipa,
-                    length: len,
-                },
-            )?;
-            let offset = (overlay_ipa - mapping.start) as usize;
-            unsafe { mapping.host_addr.add(offset) }
-        };
-        if !content.is_empty() {
-            let n = content.len().min(len);
-            unsafe {
-                std::ptr::copy_nonoverlapping(content.as_ptr(), dst, n);
-            }
-        }
-        // Stage-1 repoint + TLB flush. `map_aliased` splits the covering boot
-        // block (1 GiB/2 MiB) down to a page leaf via `descend_creating` when
-        // `va`/`len` aren't block-aligned, so a single page within the shared
-        // aperture is repointed without disturbing its neighbours.
-        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, overlay_ipa, len as u64, true))
-    }
-
     /// Mark `[address, address+len)` PROT_NONE (`no_access=true`) or clear it.
     /// Clearing performs interval subtraction so an mprotect/mmap that re-enables
     /// part of a PROT_NONE region leaves only the still-protected remainder.
-    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+    pub(crate) fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.protections.set_no_access(address, len, no_access);
     }
 
@@ -3369,7 +2355,7 @@ impl HvfInner {
         ipa >= region.ipa && ipa < region.ipa + region.size as u64
     }
 
-    fn mapping_index_for_range(
+    pub(crate) fn mapping_index_for_range(
         mappings: &[HvfMappedRegion],
         address: u64,
         length: usize,
@@ -3408,177 +2394,40 @@ impl HvfInner {
         self.page_tables.lock().as_ref()?.translate(va)
     }
 
-    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+    pub(crate) fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
         self.mapping_for_range(address, length).is_some() && !self.range_no_access(address, length)
-    }
-
-    /// Snapshot every register the trap engine ever writes. We restore
-    /// from this in the forked child after the new vCPU is created.
-    fn snapshot_vcpu(&self) -> Result<VcpuSnapshot, TrapError> {
-        use applevisor::prelude::*;
-        let mut gprs = [0u64; 31];
-        for (i, reg) in GPR_TABLE.iter().enumerate() {
-            gprs[i] = self.vcpu.get_reg(*reg).map_err(hvf_error)?;
-        }
-        // V0-V31 + FPSR/FPCR (audit M2): preserved across fork/clone so the
-        // vector file survives the vCPU rebuild. Gated like the signal path.
-        let mut vregs = [0u128; 32];
-        let (mut fpsr, mut fpcr) = (0u32, 0u32);
-        if fpsimd_save_enabled() {
-            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
-                vregs[i] = self.vcpu.get_simd_fp_reg(*reg).map_err(hvf_error)?;
-            }
-            fpsr = self.vcpu.get_reg(Reg::FPSR).map_err(hvf_error)? as u32;
-            fpcr = self.vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
-        }
-        Ok(VcpuSnapshot {
-            gprs,
-            pc: self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
-            cpsr: self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
-            sp_el0: self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?,
-            sctlr_el1: self
-                .vcpu
-                .get_sys_reg(SysReg::SCTLR_EL1)
-                .map_err(hvf_error)?,
-            tcr_el1: self.vcpu.get_sys_reg(SysReg::TCR_EL1).map_err(hvf_error)?,
-            ttbr0_el1: self
-                .vcpu
-                .get_sys_reg(SysReg::TTBR0_EL1)
-                .map_err(hvf_error)?,
-            ttbr1_el1: self
-                .vcpu
-                .get_sys_reg(SysReg::TTBR1_EL1)
-                .map_err(hvf_error)?,
-            actlr_el1: self
-                .vcpu
-                .get_sys_reg(SysReg::ACTLR_EL1)
-                .map_err(hvf_error)?,
-            mair_el1: self.vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
-            vbar_el1: self.vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
-            cpacr_el1: self
-                .vcpu
-                .get_sys_reg(SysReg::CPACR_EL1)
-                .map_err(hvf_error)?,
-            spsr_el1: self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
-            elr_el1: self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
-            tpidr_el0: self
-                .vcpu
-                .get_sys_reg(SysReg::TPIDR_EL0)
-                .map_err(hvf_error)?,
-            tpidrro_el0: self
-                .vcpu
-                .get_sys_reg(SysReg::TPIDRRO_EL0)
-                .map_err(hvf_error)?,
-            tpidr_el1: self
-                .vcpu
-                .get_sys_reg(SysReg::TPIDR_EL1)
-                .map_err(hvf_error)?,
-            last_exit_class: self.last_exit_class,
-            vregs,
-            fpsr,
-            fpcr,
-        })
-    }
-
-    fn restore_vcpu(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
-            self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
-        }
-        self.vcpu.set_reg(Reg::PC, snap.pc).map_err(hvf_error)?;
-        self.vcpu.set_reg(Reg::CPSR, snap.cpsr).map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
-            .map_err(hvf_error)?;
-        // Order matters: program TCR/MAIR/TTBR0 before flipping SCTLR.M.
-        self.vcpu
-            .set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
-            .map_err(hvf_error)?;
-        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO)
-        // are part of the guest's live state; the captured TCR enables TTBR1, so
-        // restoring TTBR0 alone would leave TTBR1 walking from base 0 and lose
-        // hardware TSO — both required for the post-fork/clone guest to run.
-        self.vcpu
-            .set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::SPSR_EL1, snap.spsr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::ELR_EL1, snap.elr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
-            .map_err(hvf_error)?;
-        // TPIDRRO_EL0 (guest-readable thread ptr) + TPIDR_EL1 (carrick's fast-gettid
-        // tid stamp) are zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or
-        // a destroy/recreate reclaim) must restore both.
-        self.vcpu
-            .set_sys_reg(SysReg::TPIDRRO_EL0, snap.tpidrro_el0)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::TPIDR_EL1, snap.tpidr_el1)
-            .map_err(hvf_error)?;
-        // Apply SCTLR last so the MMU enable lands with the new tables.
-        self.vcpu
-            .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
-            .map_err(hvf_error)?;
-        // Restore V0-V31 + FPSR/FPCR via the C shim (NOT applevisor's
-        // set_simd_fp_reg, which zeroes via the wrong register class). (audit M2)
-        if fpsimd_save_enabled() {
-            let vcpu_id = self.vcpu.id();
-            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
-                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.vregs[i]);
-                if rc != 0 {
-                    return Err(TrapError::Hypervisor(format!(
-                        "fork restore set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
-                    )));
-                }
-            }
-            self.vcpu
-                .set_reg(Reg::FPSR, u64::from(snap.fpsr))
-                .map_err(hvf_error)?;
-            self.vcpu
-                .set_reg(Reg::FPCR, u64::from(snap.fpcr))
-                .map_err(hvf_error)?;
-        }
-        self.last_exit_class = snap.last_exit_class;
-        Ok(())
     }
 
     /// M:N reclaim — BLOCK side. Snapshot this vCPU and DESTROY it (freeing one
     /// HVF concurrent-vCPU slot) so another guest thread can run while this one
     /// parks in the futex wait. The SAME thread recreates it via
-    /// [`reclaim_resume_vcpu`](Self::reclaim_resume_vcpu) on wake. Unlike the fork
+    /// [`reclaim_resume`](Self::reclaim_resume) on wake. Unlike the fork
     /// path this does NOT publish mappings or rebuild the VM — the VM is unchanged;
     /// only the per-thread vCPU is recycled. (No `FORK_VCPU_SNAPSHOT` / no
     /// `rebuilt_vm_cell`: the snapshot is stashed in `self.reclaim_snapshot`, and
     /// recreate uses the existing `self._vm`.)
-    fn reclaim_park_vcpu(&mut self) -> Result<(), TrapError> {
-        let snap = self.snapshot_vcpu()?;
+    ///
+    /// NOT YET WIRED: the shared engine's `ThreadedEngine::save_guest_state` /
+    /// `rebind_to_slot` route through the `&self` / `&mut self.vm` `Aarch64Vmm`
+    /// reclaim hooks, which CANNOT reach the engine's separately-owned vCPU — so
+    /// they surface an error for HVF (see the `save_guest_state` impl in
+    /// `hvf_aarch64_engine.rs`). The DESTROY-IN-PLACE reclaim these methods
+    /// implement needs `&mut vcpu`, so they wait on a future engine override that
+    /// passes the vCPU through. Kept here as the ready reclaim surface.
+    #[allow(dead_code)]
+    pub(crate) fn reclaim_park(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+    ) -> Result<(), TrapError> {
+        let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
         self.reclaim_snapshot = Some(snap);
         // Raw destroy — only the owning thread may, and applevisor's Drop would
         // panic on the post-destroy handle.
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu.id()) };
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu.id()) };
         vcpu_destroyed();
         if rc != 0 {
             return Err(TrapError::Hypervisor(format!(
-                "reclaim_park_vcpu: hv_vcpu_destroy rc={rc:#x}"
+                "reclaim_park: hv_vcpu_destroy rc={rc:#x}"
             )));
         }
         Ok(())
@@ -3588,18 +2437,32 @@ impl HvfInner {
     /// fork rebuild) and restore the parked register state (incl. TPIDR_EL0/
     /// TPIDRRO_EL0/TPIDR_EL1 and the V-regs). The CALLER must hold
     /// `fork_quiesce::topology_lock` so `vcpu_create` cannot race a concurrent
-    /// fork's `hv_vm_destroy`/`create`.
-    fn reclaim_resume_vcpu(&mut self) -> Result<(), TrapError> {
-        let snap = self.reclaim_snapshot.take().ok_or_else(|| {
-            TrapError::Hypervisor("reclaim_resume_vcpu: no parked snapshot".into())
-        })?;
+    /// fork's `hv_vm_destroy`/`create`. Writes the recreated vCPU back through
+    /// `vcpu` via `std::mem::replace` + `forget` of the old (already-destroyed)
+    /// handle (no applevisor Drop).
+    ///
+    /// NOT YET WIRED — see [`reclaim_park`](Self::reclaim_park): the engine's
+    /// reclaim hooks can't reach the vCPU, so this destroy/recreate-in-place
+    /// reclaim waits on a future engine override.
+    #[allow(dead_code)]
+    pub(crate) fn reclaim_resume(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+    ) -> Result<(), TrapError> {
+        let snap = self
+            .reclaim_snapshot
+            .take()
+            .ok_or_else(|| TrapError::Hypervisor("reclaim_resume: no parked snapshot".into()))?;
         let new_vcpu = self._vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(new_vcpu.id());
+        self.vcpu_id = new_vcpu.id();
+        self.vcpu_handle = new_vcpu.get_handle();
         // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
-        std::mem::forget(std::mem::replace(&mut self.vcpu, new_vcpu));
-        self.restore_vcpu(&snap)?;
+        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+        HvfInner::restore_vcpu_into(vcpu, &snap)?;
+        self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
 
@@ -3607,37 +2470,41 @@ impl HvfInner {
     /// it (raw `hv_vcpu_destroy`; only the owning thread may) so the forking
     /// thread can `hv_vm_destroy` before `libc::fork` (which fails HV_BUSY while
     /// any vCPU is alive). The wrapper is left stale until `rebuild_vcpu_after_fork`.
-    fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
+    pub(crate) fn release_vcpu_for_fork(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+    ) -> Result<(), TrapError> {
         // Publish this sibling's regions so the forking thread re-maps them into
         // the rebuilt parent VM (the rebuild otherwise replays only the forker's
         // own mappings, dropping this thread's per-thread aliases). We then park
         // (caller: release_and_park_vcpu_for_fork) holding our OwnedHostMappings
         // alive, so the forker re-maps live backings.
         publish_sibling_fork_mappings(&self.mappings);
-        let snap = self.snapshot_vcpu()?;
+        let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
         FORK_VCPU_SNAPSHOT.with(|s| *s.borrow_mut() = Some(snap));
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu.id()) };
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu.id()) };
         vcpu_destroyed();
         // phase 3: a nonzero rc means this sibling FAILED to destroy its own
         // vCPU, so it stays live and the forker's hv_vm_destroy hits HV_BUSY.
-        crate::probes::fork_quiesce(3, rc as i64, self.vcpu.id() as i64, unsafe {
-            libc::getpid()
-        });
+        crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });
         Ok(())
     }
 
     /// Multithreaded fork — forking thread (parent), after rebuilding its VM.
     /// Publish a clone of the new process VM so quiesced siblings can recreate
     /// their vCPUs in it.
-    fn publish_vm_for_siblings(&self) {
-        *rebuilt_vm_cell().lock() = Some(self._vm.clone());
+    pub(crate) fn publish_vm_for_siblings(&self) {
+        *rebuilt_vm_cell().lock() = Some((*self._vm).clone());
     }
 
     /// Multithreaded fork — sibling side, step 2 (after the parent published the
     /// rebuilt VM and released the quiesce). Recreate this vCPU in the new VM
     /// and restore the pre-fork register state. Mappings are VM-global (the
     /// parent remapped them into the shared VM), so nothing to re-map here.
-    fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
+    pub(crate) fn rebuild_vcpu_after_fork(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+    ) -> Result<(), TrapError> {
         let snap = FORK_VCPU_SNAPSHOT
             .with(|s| s.borrow_mut().take())
             .ok_or_else(|| TrapError::Hypervisor("no fork vCPU snapshot for rebuild".into()))?;
@@ -3647,25 +2514,48 @@ impl HvfInner {
         let new_vm = rebuilt_vm_cell()
             .lock()
             .clone()
-            .unwrap_or_else(|| self._vm.clone());
+            .unwrap_or_else(|| (*self._vm).clone());
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(new_vcpu.id());
+        self.vcpu_id = new_vcpu.id();
+        self.vcpu_handle = new_vcpu.get_handle();
         // Replace _vm and vcpu WITHOUT running applevisor's panicky Drop on the
         // old (already-destroyed) handles — mirror the fork/thread-sibling
         // leak-until-exit discipline.
-        std::mem::forget(std::mem::replace(&mut self.vcpu, new_vcpu));
-        std::mem::forget(std::mem::replace(&mut self._vm, new_vm));
-        self.restore_vcpu(&snap)?;
+        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+        replace_destroyed_vm(self, new_vm);
+        HvfInner::restore_vcpu_into(vcpu, &snap)?;
+        self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
 
-    fn fork(&mut self, share_vm: bool) -> Result<ForkOutcome, TrapError> {
-        use applevisor::prelude::*;
+    /// A guest thread is exiting: destroy ITS OWN vCPU (only the owning thread
+    /// may) so the slot is freed in the process-global VM. Without this, the
+    /// no-op `Drop` leaks the vCPU live forever, and a later fork's
+    /// `hv_vm_destroy` trips over the accumulated dead-thread vCPUs (HV_BUSY).
+    /// Raw `hv_vcpu_destroy`, not applevisor's panicky wrapper.
+    pub(crate) fn destroy_vcpu_on_thread_exit(&mut self, vcpu: &mut applevisor::vcpu::Vcpu) {
+        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu.id()) };
+        vcpu_destroyed();
+    }
 
-        // Pre-fork: snapshot vCPU state and capture mapping descriptors.
-        let snapshot = self.snapshot_vcpu()?;
-        crate::probes::fork_pre(snapshot.pc, snapshot.elr_el1, snapshot.cpsr);
+    /// Multithreaded fork — PRE-`libc::fork` half (the forking thread, single
+    /// process). Snapshot every PRIVATE region into a child-private copy (guest
+    /// RAM is host-MAP_SHARED, so fork doesn't isolate it), capture the mapping
+    /// descriptors, and tear down the HVF VM via the raw API (a live VM at fork
+    /// time makes the child's `hv_vm_create` fail). Both sides then rebuild from
+    /// the stashed descriptors in `fork_rebuild`. Does NOT call `libc::fork` (the
+    /// shared engine does that) and does NOT snapshot the vCPU registers (the
+    /// engine snapshots separately and passes them into `fork_rebuild`).
+    pub(crate) fn fork_prepare_and_teardown(&mut self) -> Result<(), TrapError> {
+        // Probe parity with the old monolithic fork: the engine snapshots the
+        // vCPU (PC/ELR/CPSR) just before this; report the pre-fork marker. The
+        // vCPU registers are no longer read here (the engine owns the snapshot),
+        // so fire the marker with zeros — the engine's snapshot carries the
+        // authoritative values the old `fork_pre` reported.
+        crate::probes::fork_pre(0, 0, 0);
+
         let mapping_descs: Vec<ForkMappingDesc> = self
             .mappings
             .iter()
@@ -3688,8 +2578,9 @@ impl HvfInner {
         // guest MAP_SHARED file mappings (`guest_shared`) are NOT snapshotted —
         // they must stay shared across fork (POSIX), so both sides keep mapping
         // the same host buffer. Built unconditionally because we don't yet know
-        // which side we are; the parent drops its unused owned snapshots after
-        // choosing `mapping_descs` below.
+        // which side we are; the parent drops its unused owned snapshots when it
+        // chooses `mapping_descs` in `fork_rebuild`.
+        let share_vm = self.vfork_share;
         let mut child_descs: Vec<ForkMappingDesc> = Vec::with_capacity(mapping_descs.len());
         for desc in &mapping_descs {
             // vfork (CLONE_VM): the child SHARES the parent's address space, so map
@@ -3698,7 +2589,7 @@ impl HvfInner {
             // so the child's writes land in the parent's RAM (true CLONE_VM). This
             // is only sound because the parent vCPU is SUSPENDED for the whole vfork
             // window (caller: handle_fork), and the child detaches into its own
-            // private VM on execve (execve_into rebuilds fresh buffers).
+            // private VM on execve (execve_rebuild rebuilds fresh buffers).
             //
             // EXCEPTION: the stage-1 page-table BACKING stays PRIVATE even for a
             // vfork child. The child keeps its own (cloned) PageTableManager whose
@@ -3732,15 +2623,28 @@ impl HvfInner {
             });
         }
 
-        // Tear down the parent's HVF context BEFORE forking. macOS's
-        // HVF kernel state is not fork-safe: if a VM exists in the
-        // parent at fork(2) time, the child inherits a "resource is
-        // busy" state that prevents `hv_vm_create` from succeeding.
-        // Both processes then rebuild a fresh VM from the snapshot.
-        let inherited_vcpu_id = self.vcpu.id();
-        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
+        // Tear down the parent's HVF context BEFORE the engine forks. macOS's
+        // HVF kernel state is not fork-safe: if a VM exists in the parent at
+        // fork(2) time, the child inherits a "resource is busy" state that
+        // prevents `hv_vm_create` from succeeding. Both processes then rebuild a
+        // fresh VM from the stashed descriptors in `fork_rebuild`. The engine's
+        // `freeze_ram_for_fork` hook does NOT pass the vCPU, so we destroy by the
+        // tracked `vcpu_id` (the stale `HvfAarch64Vcpu` wrapper is replaced in
+        // `fork_rebuild`, which DOES hold `&mut vcpu`).
+        let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu_id) };
         vcpu_destroyed();
         let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
+            eprintln!(
+                "[FORKDBG pid={}] teardown vcpu_id={:#x} vcpu_destroy_rc={:#x} vm_destroy_rc={:#x} live={} share_vm={}",
+                unsafe { libc::getpid() },
+                self.vcpu_id,
+                vcpu_destroy_rc,
+                vm_destroy_rc,
+                VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst),
+                share_vm,
+            );
+        }
         // phase 2: a nonzero rc means a vCPU was still live at teardown — the
         // HV_BUSY root cause (the rebuilt VM is then corrupt and sibling
         // vcpu_create fails). Traceable via `carrick trace` fork__quiesce.
@@ -3751,58 +2655,78 @@ impl HvfInner {
             unsafe { libc::getpid() },
         );
 
-        // Real fork. Caller is expected to have flushed any host-side
-        // stdio buffers; for our JSON-at-end report flow this is fine.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(TrapError::ForkFailed(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
-        if pid == 0 {
-            // The child has a new pid, but its inherited USDT DOF is
-            // registered with the kernel under the PARENT's pid. Re-register
-            // so DTrace's `carrick*` provider matches this child too —
-            // otherwise forked guest processes (apt's http method, dpkg-deb's
-            // tar subprocess) are invisible to `carrick trace`, which made
-            // tracing forked failures unreliable.
-            let _ = crate::probes::register_dtrace_probes();
-        }
-        // Both parent and child fall through to the rebuild path below.
-        // The discriminator at the end of the function returns the
-        // appropriate `ForkOutcome` based on `pid`.
+        self.fork_mapping_descs = mapping_descs;
+        self.fork_child_descs = child_descs;
+        Ok(())
+    }
 
-        // ----- Symmetric rebuild path (parent AND child reach here) -----
-        //
-        // Build a fresh VM + vCPU. Both processes have just had their
-        // HVF state torn down (parent did it pre-fork; child inherited
-        // the now-empty state via fork). Each side independently
-        // re-registers the inherited host buffers via raw `hv_vm_map`.
+    /// Multithreaded fork — POST-`libc::fork` half. Build a fresh VM + vCPU,
+    /// re-`hv_vm_map` the right buffers (the CHILD uses the private snapshots; the
+    /// PARENT re-maps its own + the union of every quiesced sibling's regions),
+    /// restore the engine-supplied register `snap` onto the NEW vCPU, and
+    /// re-stamp the vvar RNG generation (child). `is_child` keys the parent-vs-
+    /// child inheritance EXACTLY as the old monolithic `fork`.
+    pub(crate) fn fork_rebuild(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        snap: &VcpuSnapshot,
+        is_child: bool,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+
+        // Take the descriptors stashed in `fork_prepare_and_teardown`. The parent
+        // re-maps its own buffers (`mapping_descs`); the child re-maps the private
+        // snapshots / shared originals (`child_descs`). The unused set drops here.
+        let mapping_descs = std::mem::take(&mut self.fork_mapping_descs);
+        let child_descs = std::mem::take(&mut self.fork_child_descs);
+
+        // Build a fresh VM + vCPU. Both processes have just had their HVF state
+        // torn down (parent did it pre-fork; child inherited the now-empty state
+        // via fork). Each side independently re-registers the inherited host
+        // buffers via raw `hv_vm_map`.
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
+        if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
+            eprintln!(
+                "[FORKDBG pid={}] fork_rebuild is_child={} max_ipa={:#x} (pre-create)",
+                unsafe { libc::getpid() },
+                is_child,
+                max_ipa,
+            );
+        }
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
         let new_vm = virtual_machine_with_private_signals_blocked(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(new_vcpu.id());
+        if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
+            eprintln!(
+                "[FORKDBG pid={}] fork_rebuild is_child={} new_vcpu_id={:#x} n_descs={}",
+                unsafe { libc::getpid() },
+                is_child,
+                new_vcpu.id(),
+                if is_child {
+                    child_descs.len()
+                } else {
+                    mapping_descs.len()
+                },
+            );
+        }
+        self.vcpu_id = new_vcpu.id();
+        self.vcpu_handle = new_vcpu.get_handle();
 
-        // Overwrite *self with the new HvfInner WITHOUT running Drop on
-        // the old contents. The old struct holds applevisor wrappers
-        // around HVF handles that we already destroyed via the raw API
-        // pre-fork; running their Drop now would unwrap NO_RESOURCES
-        // and panic.
-        //
-        // `is_forked_child` is true only in the child process; the
-        // parent kept its pre-fork host process identity, so its post-
-        // fork cleanup still uses the normal path (which now also goes
-        // through ManuallyDrop, so neither side runs the panicky
-        // destructors).
-        // In the parent, keep the exact shared protection table siblings
-        // already use; otherwise post-fork mmap/mprotect changes split across
-        // two Arcs and one thread can see a valid Go heap futex as PROT_NONE.
-        // The child is single-threaded after fork, so it gets a private copy of
-        // the parent's ranges at the fork point.
-        let inherited_protections = if pid == 0 {
+        // Swap the new VM + vCPU into place WITHOUT running applevisor's Drop on
+        // the old (raw-destroyed) handles. `is_forked_child` is true only in the
+        // child process; the parent kept its pre-fork host process identity.
+        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+        replace_destroyed_vm(self, new_vm);
+
+        // In the parent, keep the exact shared protection table siblings already
+        // use; otherwise post-fork mmap/mprotect changes split across two Arcs and
+        // one thread can see a valid Go heap futex as PROT_NONE. The child is
+        // single-threaded after fork, so it gets a private copy of the parent's
+        // ranges at the fork point.
+        self.protections = if is_child {
             std::sync::Arc::new(MemoryProtections::from_ranges(self.protections.snapshot()))
         } else {
             std::sync::Arc::clone(&self.protections)
@@ -3816,35 +2740,40 @@ impl HvfInner {
         // an L2 slot holding `USER_PAGE_FLAGS | <arena PA>`). The CHILD gets a
         // private backing copy, so it needs its OWN manager — but a CLONE of the
         // parent's state, not a reset, so its bump cursor matches that backing.
-        let inherited_page_tables = if pid == 0 {
+        self.page_tables = if is_child {
             let cloned = self.page_tables.lock().clone();
             std::sync::Arc::new(parking_lot::Mutex::new(cloned))
         } else {
             std::sync::Arc::clone(&self.page_tables)
         };
-        let new_inner = HvfInner {
-            _vm: new_vm,
-            vcpu: new_vcpu,
-            mappings: Vec::with_capacity(mapping_descs.len()),
-            reclaim_snapshot: None,
-            last_exit_class: snapshot.last_exit_class,
-            last_fault_esr: 0,
-            is_forked_child: pid == 0,
-            forked_no_exec: pid == 0,
-            protections: inherited_protections,
-            page_tables: inherited_page_tables,
-            last_syscall_nr: None,
-            last_syscall_orig_x0: 0,
-        };
-        replace_destroyed_hvf_inner(self, new_inner);
+        // CRITICAL: LEAK the old mapping Vec (do NOT drop it). Each old
+        // `HvfMappedRegion` owns an `OwnedHostMapping` whose Drop `munmap`s the host
+        // backing — and the `mapping_descs` we re-`hv_vm_map` below carry BORROWED
+        // raw pointers INTO those exact buffers. Dropping the old Vec here would
+        // munmap them out from under the re-map, so `hv_vm_map` faults (HV_ERROR).
+        // This matches the original monolithic `fork`, which swapped the whole
+        // `HvfInner` via `ptr::write` + `mem::forget` and so never ran Drop on the
+        // old mappings (the leak-until-exit / ManuallyDrop discipline; the kernel
+        // reclaims the pages at process exit). The CHILD remaps its own private
+        // snapshots (`child_descs`), which are MOVED into the rebuilt mappings below,
+        // so the parent's borrowed originals it inherited via COW are likewise kept
+        // alive by this leak.
+        std::mem::forget(std::mem::replace(
+            &mut self.mappings,
+            Vec::with_capacity(mapping_descs.len()),
+        ));
+        self.reclaim_snapshot = None;
+        self.last_exit_class = snap.last_exit_class;
+        self.last_fault_esr = 0;
+        self.is_forked_child = is_child;
+        self.forked_no_exec = is_child;
+        self.last_syscall_nr = None;
+        self.last_syscall_orig_x0 = 0;
 
-        // Re-map each region using raw hv_vm_map. The PARENT re-maps its
-        // original buffers; the CHILD maps the pre-fork private snapshots for
-        // PRIVATE regions and the shared originals for guest-MAP_SHARED ones.
-        // The unused set (the child's snapshot copies in the parent) drops here
-        // when the parent chooses `mapping_descs`; the child moves its owned
-        // snapshots into the rebuilt engine.
-        let descs = if pid == 0 { child_descs } else { mapping_descs };
+        // Re-map each region using raw hv_vm_map. The PARENT re-maps its original
+        // buffers; the CHILD maps the pre-fork private snapshots for PRIVATE
+        // regions and the shared originals for guest-MAP_SHARED ones.
+        let descs = if is_child { child_descs } else { mapping_descs };
         for desc in descs {
             let host_addr = desc.host.ptr();
             let perms_raw: u64 = u64::from(desc.perms);
@@ -3916,8 +2845,8 @@ impl HvfInner {
         // we end the quiesce, holding its OwnedHostMapping. The region is UNOWNED
         // here (memory/host_mapping = None) so the parent never frees a buffer the
         // sibling owns. The CHILD is single-threaded post-fork (uses child_descs),
-        // so it must NOT inherit sibling aliases — hence pid != 0 only.
-        if pid != 0 {
+        // so it must NOT inherit sibling aliases — hence parent only.
+        if !is_child {
             let mut mapped_ipas: std::collections::HashSet<u64> =
                 self.mappings.iter().map(|m| m.ipa).collect();
             let siblings = sibling_fork_mappings().lock().clone();
@@ -3956,13 +2885,25 @@ impl HvfInner {
             }
         }
 
-        // Restore vCPU register state from the pre-fork snapshot. Both
-        // parent and child resume inside the same `clone` syscall site;
-        // the dispatcher will then write the appropriate retval into
-        // X0 (child pid for parent, 0 for child).
-        self.restore_vcpu(&snapshot)?;
-        crate::probes::fork_post(pid, snapshot.pc, snapshot.elr_el1);
-        if pid == 0 {
+        // Restore vCPU register state from the engine's pre-fork snapshot. Both
+        // parent and child resume inside the same `clone` syscall site; the
+        // dispatcher then writes the appropriate retval into X0 (child pid for
+        // parent, 0 for child).
+        HvfInner::restore_vcpu_into(vcpu, snap)?;
+        self.last_exit_class = snap.last_exit_class;
+        let post_pid = if is_child {
+            0
+        } else {
+            unsafe { libc::getpid() }
+        };
+        crate::probes::fork_post(post_pid, snap.pc, snap.elr_el1);
+        if is_child {
+            // The child has a new pid, but its inherited USDT DOF is registered
+            // with the kernel under the PARENT's pid. Re-register so DTrace's
+            // `carrick*` provider matches this child too — otherwise forked guest
+            // processes (apt's http method, dpkg-deb's tar subprocess) are
+            // invisible to `carrick trace`.
+            let _ = crate::probes::register_dtrace_probes();
             // P2 getrandom fork-safety: re-stamp the vvar RNG generation with the
             // child's new PID. `self` is now the child's rebuilt engine — its vvar
             // mapping points at the child's freshly re-mapped snapshot buffer, and
@@ -3971,45 +2912,44 @@ impl HvfInner {
             // forces the userspace getrandom blob to reseed instead of reusing the
             // parent's keystream (gated by conformance-probes/getrandomvdsofork).
             self.stamp_rng_generation();
-            Ok(ForkOutcome::Child)
-        } else {
-            Ok(ForkOutcome::Parent { child_pid: pid })
         }
+        Ok(())
     }
 
-    /// Snapshot the parent + capture mapping descriptors for a thread
-    /// sibling. The shared VM handle is cloned (Arc-refcounted) so the
-    /// spawned thread can create its vCPU against it.
-    fn build_thread_spec(&self, stack: u64, tls: u64) -> Result<ThreadSpec, TrapError> {
-        let parent = self.snapshot_vcpu()?;
-        let snapshot = seed_child_snapshot(&parent, stack, tls);
+    /// Build a [`ThreadSpec`] for a thread-creating `clone(CLONE_THREAD)`: clone the
+    /// SHARED VM handle (Arc-refcounted, so the new thread can `vcpu_create` against
+    /// it) + the SHARED protections/page-table Arcs + a COPY of the mapping
+    /// descriptors (the new thread's vCPU sees the same guest memory; the stage-2
+    /// entries are VM-global). Does NOT snapshot the vCPU — the engine carries the
+    /// seeded register snapshot in its own `Aarch64SiblingSpec` and restores it onto
+    /// the sibling vCPU via `restore_thread_start` after `from_thread_spec`.
+    pub(crate) fn build_thread_spec(&self) -> Result<ThreadSpec, TrapError> {
         let mappings: Vec<ThreadMappingDesc> = self
             .mappings
             .iter()
             .map(ThreadMappingDesc::from_region)
             .collect();
         Ok(ThreadSpec {
-            vm: self._vm.clone(),
+            vm: (*self._vm).clone(),
             mappings,
             protections: std::sync::Arc::clone(&self.protections),
             page_tables: std::sync::Arc::clone(&self.page_tables),
-            snapshot,
         })
     }
 
-    /// Stand up the sibling vCPU on the current thread. Mirrors fork()'s
-    /// rebuild path but KEEPS the shared VM (the spec's `vm` clone) instead
-    /// of creating a new one, and marks every re-mapped region UNOWNED
-    /// (`memory: None`) so this engine never unmaps the buffers the main
-    /// engine owns. Thread siblings are not forked child processes: the
-    /// runtime must keep normal process-wide signal/exit semantics for them.
-    fn from_thread_spec(spec: ThreadSpec) -> Result<Self, TrapError> {
+    /// Stand up a thread sibling on the current host thread from a [`ThreadSpec`]:
+    /// create a new vCPU in the shared VM and mirror the inherited (UNOWNED)
+    /// mapping metadata. Returns the `(state, vcpu)` pair; the engine restores the
+    /// seeded register snapshot. MUST be called on the host thread that will own
+    /// the vCPU (HVF requires vCPU create+run+destroy on one thread).
+    pub(crate) fn from_thread_spec(
+        spec: ThreadSpec,
+    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu), TrapError> {
         let ThreadSpec {
             vm,
             mappings,
             protections,
             page_tables,
-            snapshot,
         } = spec;
 
         // The spec captured `vm` at clone time. If a fork rebuilt the VM since
@@ -4024,12 +2964,11 @@ impl HvfInner {
         vcpu_created();
         enable_el0_counter_access(vcpu.id());
 
-        let mut inner = HvfInner {
-            _vm: vm,
-            vcpu,
+        let mut state = HvfVmState {
+            _vm: std::mem::ManuallyDrop::new(vm),
             mappings: Vec::with_capacity(mappings.len()),
             reclaim_snapshot: None,
-            last_exit_class: snapshot.last_exit_class,
+            last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
             forked_no_exec: false,
@@ -4037,6 +2976,11 @@ impl HvfInner {
             page_tables,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
+            vcpu_id: vcpu.id(),
+            vcpu_handle: vcpu.get_handle(),
+            vfork_share: false,
+            fork_mapping_descs: Vec::new(),
+            fork_child_descs: Vec::new(),
         };
 
         for mapping in mappings {
@@ -4046,102 +2990,21 @@ impl HvfInner {
             // an already-mapped no-op and at worst map-table churn while other
             // vCPUs are running. Keep only local metadata used by syscall-path
             // guest-memory accessors.
-            inner.mappings.push(mapping.into_unowned_region());
+            state.mappings.push(mapping.into_unowned_region());
         }
 
-        inner.restore_vcpu_thread_start(&snapshot)?;
-        Ok(inner)
+        Ok((state, vcpu))
     }
 
-    /// Seed a BRAND-NEW sibling vCPU so it enters EL0 at the child's resume
-    /// PC. Unlike `restore_vcpu` (used by fork, whose vCPU had already done
-    /// the boot trampoline `eret` into EL0 and merely resumes), a freshly
-    /// created vCPU has never transitioned to EL0. We therefore start it at
-    /// the EL0 trampoline page (in EL1h) with SPSR_EL1=EL0t and
-    /// ELR_EL1=the child's EL0 PC, so the trampoline's single `eret` drops
-    /// the vCPU into EL0 at exactly the post-clone instruction — mirroring
-    /// `map_plan`'s initial-boot sequence but with thread-private PC/SP/TLS.
-    fn restore_vcpu_thread_start(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
+    /// `execve(2)` image replacement: tear down + rebuild the VM around the new
+    /// image, reset the vCPU to "initial process startup" (zeroed GPRs, EL0
+    /// trampoline). Clears the alias registry. Preserves `is_forked_child`.
+    pub(crate) fn execve_rebuild(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        plan: &GuestMappingPlan,
+    ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
-        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
-            self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
-        }
-        // Start at the EL0 trampoline page in EL1h; the trampoline `eret`s
-        // into EL0t at ELR_EL1 with SPSR_EL1's PSTATE.
-        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-        const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
-        self.vcpu
-            .set_reg(Reg::PC, crate::memory::LINUX_EL0_TRAMPOLINE_BASE)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
-            .map_err(hvf_error)?;
-        // The child's EL0 resume PC (snap.pc == parent ELR_EL1 == post-svc).
-        self.vcpu
-            .set_sys_reg(SysReg::ELR_EL1, snap.pc)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
-            .map_err(hvf_error)?;
-        // Same translation regime as the parent (shared address space).
-        self.vcpu
-            .set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
-            .map_err(hvf_error)?;
-        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO)
-        // are part of the guest's live state; the captured TCR enables TTBR1, so
-        // restoring TTBR0 alone would leave TTBR1 walking from base 0 and lose
-        // hardware TSO — both required for the post-fork/clone guest to run.
-        self.vcpu
-            .set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
-            .map_err(hvf_error)?;
-        self.vcpu
-            .set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
-            .map_err(hvf_error)?;
-        // SP_EL1 for the brief EL1h trampoline window. The trampoline only
-        // executes one `eret` and touches no stack, but give it a sane value
-        // (the child's EL0 stack works; the trampoline never pushes).
-        self.vcpu
-            .set_sys_reg(SysReg::SP_EL1, snap.sp_el0)
-            .map_err(hvf_error)?;
-        // Enable the MMU last, identically to the parent.
-        self.vcpu
-            .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
-            .map_err(hvf_error)?;
-        self.last_exit_class = snap.last_exit_class;
-        Ok(())
-    }
-
-    /// Replace the engine's HVF state with a fresh VM that runs
-    /// `address_space` from its entry point. Used for `execve(2)`.
-    ///
-    /// Sequence mirrors `fork()`'s rebuild path but takes a brand-new
-    /// AddressSpace rather than a snapshot, and resets the vCPU to
-    /// "initial process startup" (trampoline + new entry) rather than
-    /// "resume mid-syscall".
-    fn execve_into(&mut self, address_space: &AddressSpace) -> Result<(), TrapError> {
-        use applevisor::prelude::*;
-
-        // Build the mapping plan up front so any image errors surface
-        // before we destroy the current HVF state.
-        let plan = GuestMappingPlan::from_address_space(address_space)?;
 
         // execve replaces the WHOLE address space: drop every process-shared alias
         // index entry so a stale pre-exec high-VA `host_addr` can never be resolved
@@ -4149,10 +3012,9 @@ impl HvfInner {
         // no other thread is mid-lookup against these entries.)
         alias_registry().lock().clear();
 
-        // Tear down the current HVF VM. Same dance as fork(): destroy
-        // vCPU then VM via raw API (applevisor's Drop is bypassed by
-        // the `ManuallyDrop` wrapper around `HvfInner`).
-        let inherited_vcpu_id = self.vcpu.id();
+        // Tear down the current HVF VM. Same dance as fork(): destroy vCPU then VM
+        // via raw API (applevisor's Drop is bypassed).
+        let inherited_vcpu_id = vcpu.id();
         let _ = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
         vcpu_destroyed();
         let _ = unsafe { applevisor_sys::hv_vm_destroy() };
@@ -4165,65 +3027,62 @@ impl HvfInner {
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
         enable_el0_counter_access(new_vcpu.id());
+        self.vcpu_id = new_vcpu.id();
+        self.vcpu_handle = new_vcpu.get_handle();
 
-        // Preserve `is_forked_child` across execve. A process that
-        // descended from the original `carrick run` invocation should
-        // keep using the `_exit`-without-JSON shutdown path even after
-        // it execve's into a different image; otherwise every forked +
-        // execve'd descendant prints its own JSON report to stdout
-        // (interleaved with the parent's), making the user-visible
-        // output unreadable.
+        // Preserve `is_forked_child` across execve. A process that descended from
+        // the original `carrick run` invocation should keep using the
+        // `_exit`-without-JSON shutdown path even after it execve's into a
+        // different image; otherwise every forked + execve'd descendant prints its
+        // own JSON report to stdout (interleaved with the parent's), making the
+        // user-visible output unreadable.
         let was_forked_child = self.is_forked_child;
-        // Replace inner in place WITHOUT Drop on the old.
-        let new_inner = HvfInner {
-            _vm: new_vm,
-            vcpu: new_vcpu,
-            mappings: Vec::new(),
-            reclaim_snapshot: None,
-            last_exit_class: 0,
-            last_fault_esr: 0,
-            is_forked_child: was_forked_child,
-            forked_no_exec: false, // execve gives a fresh VM: no longer a live forked-no-exec child
-            // execve replaces the address space; any prior PROT_NONE ranges are
-            // gone. The new image starts with none until it mmaps them.
-            protections: std::sync::Arc::new(MemoryProtections::default()),
-            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
-            last_syscall_nr: None,
-            last_syscall_orig_x0: 0,
-        };
-        replace_destroyed_hvf_inner(self, new_inner);
+        // Swap the new VM + vCPU into place WITHOUT running Drop on the old.
+        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+        replace_destroyed_vm(self, new_vm);
+        // LEAK the old image's mappings (do NOT drop): the old VM was just
+        // raw-`hv_vm_destroy`'d, and the original monolithic `execve_into` swapped
+        // the whole `HvfInner` via `ptr::write`/`mem::forget` and so never ran Drop
+        // on the old mappings (the leak-until-exit discipline; the kernel reclaims
+        // at process exit). Dropping here would `munmap` the old `OwnedHostMapping`s
+        // — harmless for the now-unmapped image, but we keep the exact discipline so
+        // no stale alias-registry/sibling reference can dangle.
+        std::mem::forget(std::mem::take(&mut self.mappings));
+        self.reclaim_snapshot = None;
+        self.last_exit_class = 0;
+        self.last_fault_esr = 0;
+        self.is_forked_child = was_forked_child;
+        self.forked_no_exec = false; // execve gives a fresh VM: no longer a live forked-no-exec child
+        // execve replaces the address space; any prior PROT_NONE ranges are gone.
+        self.protections = std::sync::Arc::new(MemoryProtections::default());
+        self.page_tables = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        self.last_syscall_nr = None;
+        self.last_syscall_orig_x0 = 0;
 
-        // Apply the new mapping plan via the shared raw-mmap helper (same
-        // backing as map_plan — see `map_region_raw` for why we avoid
-        // applevisor `Memory`/`alloc_zeroed`).
+        // Apply the new mapping plan via the shared raw-mmap helper.
         for mapping in &plan.mappings {
             self.mappings.push(map_region_raw(mapping)?);
         }
 
-        // Initial vCPU state — same sequence as `map_address_space`.
-        // Zero the GPRs first: Linux's execve contract says the new
-        // program starts with all registers clear (x29/x30 are part
-        // of the ABI calling convention but the kernel zeros them too)
-        // except for SP and PC. Without this, musl's _start in the new
-        // image inherits the previous process's x8 which can decode
-        // as a bogus syscall number on the first svc.
+        // Initial vCPU state — same sequence as `new_with_plan`. Zero the GPRs
+        // first: Linux's execve contract says the new program starts with all
+        // registers clear except for SP and PC. Without this, musl's _start in the
+        // new image inherits the previous process's x8 which can decode as a bogus
+        // syscall number on the first svc.
         for reg in GPR_TABLE {
-            self.vcpu.set_reg(reg, 0).map_err(hvf_error)?;
+            vcpu.set_reg(reg, 0).map_err(hvf_error)?;
         }
 
         let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
-        self.vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
+        vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-        self.vcpu
-            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+        vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
             .map_err(hvf_error)?;
         if let Some(_trampoline) = plan.el0_trampoline_entry {
             const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
-            self.vcpu
-                .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+            vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
                 .map_err(hvf_error)?;
-            self.vcpu
-                .set_sys_reg(SysReg::ELR_EL1, plan.entry)
+            vcpu.set_sys_reg(SysReg::ELR_EL1, plan.entry)
                 .map_err(hvf_error)?;
         }
         // C=1, I=1, UCI=1 (bit 26), UCT=1 (bit 15), DZE=1 (bit 14) — EL0 cache-
@@ -4236,65 +3095,516 @@ impl HvfInner {
         // M cleared and OR M back in there. HVF leaves SPAN(23) CLEAR and
         // forces PSTATE.PAN=1 (FEAT_PAN3) — SPAN is KVM glue, NOT part of the
         // shared value.
-        // (`Self` here is the inner state, not the engine, so name the engine.)
         use carrick_hal::GuestArch as _;
         let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
         let mut sctlr_el1: u64 = boot.sctlr_el1 & !1;
         if let Some(pt_base) = plan.stage1_page_tables_base {
-            self.vcpu
-                .set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
+            vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
                 .map_err(hvf_error)?;
             // 48-bit VA, TTBR0 + TTBR1 both active sharing one root. MUST stay
-            // identical to the canonical TCR comment/value in map_address_space.
+            // identical to the canonical TCR comment/value in new_with_plan.
             // boot.tcr_el1 is the shared bootstrap value via GuestArch
             // (canonical rationale in carrick_mem::arch_sysregs).
-            self.vcpu
-                .set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
+            vcpu.set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
                 .map_err(hvf_error)?;
-            self.vcpu
-                .set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+            vcpu.set_sys_reg(SysReg::TTBR0_EL1, pt_base)
                 .map_err(hvf_error)?;
             // TTBR1 shares the same root (see the TCR comment above).
-            self.vcpu
-                .set_sys_reg(SysReg::TTBR1_EL1, pt_base)
+            vcpu.set_sys_reg(SysReg::TTBR1_EL1, pt_base)
                 .map_err(hvf_error)?;
             sctlr_el1 |= 1;
         }
-        self.vcpu
-            .set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
             .map_err(hvf_error)?;
         // boot.cpacr_el1 (FPEN=0b11, no FP/SIMD trap at EL0) is shared.
-        self.vcpu
-            .set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
             .map_err(hvf_error)?;
         if let Some(vectors_base) = plan.el1_vectors_base {
-            self.vcpu
-                .set_sys_reg(SysReg::VBAR_EL1, vectors_base)
+            vcpu.set_sys_reg(SysReg::VBAR_EL1, vectors_base)
                 .map_err(hvf_error)?;
         }
         if let Some(stack_pointer) = plan.initial_stack_pointer {
-            self.vcpu
-                .set_sys_reg(SysReg::SP_EL1, stack_pointer)
+            vcpu.set_sys_reg(SysReg::SP_EL1, stack_pointer)
                 .map_err(hvf_error)?;
-            self.vcpu
-                .set_sys_reg(SysReg::SP_EL0, stack_pointer)
+            vcpu.set_sys_reg(SysReg::SP_EL0, stack_pointer)
                 .map_err(hvf_error)?;
         }
-        // execve resets TPIDR_EL0 — the new image's musl init will
-        // call set_thread_area to initialise it.
-        self.vcpu
-            .set_sys_reg(SysReg::TPIDR_EL0, 0)
-            .map_err(hvf_error)?;
+        // execve resets TPIDR_EL0 — the new image's musl init will call
+        // set_thread_area to initialise it.
+        vcpu.set_sys_reg(SysReg::TPIDR_EL0, 0).map_err(hvf_error)?;
 
-        // Verify post-execve sysreg state through dtrace. If stage-1
-        // isn't on or TTBR0 doesn't point at the new tables, the new
-        // process will fault on the first LDAXR.
-        let actual_sctlr = self.vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0);
-        let actual_ttbr0 = self.vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
-        let actual_mair = self.vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
+        // Verify post-execve sysreg state through dtrace. If stage-1 isn't on or
+        // TTBR0 doesn't point at the new tables, the new process will fault on the
+        // first LDAXR.
+        let actual_sctlr = vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0);
+        let actual_ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
+        let actual_mair = vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
         crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
         self.populate_vdso_data_page();
         Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfInner {
+    /// Snapshot every register the trap engine ever writes, reading from the
+    /// passed `vcpu`. Gated like the signal path on `fpsimd_save_enabled()`. The
+    /// shared engine's `Aarch64Vcpu::snapshot` calls this; `last_exit_class` is
+    /// owned by the engine, so the snapshot carries 0 for it.
+    pub(crate) fn snapshot_vcpu_from(
+        vcpu: &applevisor::vcpu::Vcpu,
+    ) -> Result<VcpuSnapshot, TrapError> {
+        use applevisor::prelude::*;
+        let mut gprs = [0u64; 31];
+        for (i, reg) in GPR_TABLE.iter().enumerate() {
+            gprs[i] = vcpu.get_reg(*reg).map_err(hvf_error)?;
+        }
+        // V0-V31 + FPSR/FPCR (audit M2): preserved across fork/clone so the
+        // vector file survives the vCPU rebuild. Gated like the signal path.
+        let mut vregs = [0u128; 32];
+        let (mut fpsr, mut fpcr) = (0u32, 0u32);
+        if fpsimd_save_enabled() {
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                vregs[i] = vcpu.get_simd_fp_reg(*reg).map_err(hvf_error)?;
+            }
+            fpsr = vcpu.get_reg(Reg::FPSR).map_err(hvf_error)? as u32;
+            fpcr = vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
+        }
+        Ok(VcpuSnapshot {
+            gprs,
+            pc: vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
+            cpsr: vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
+            sp_el0: vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?,
+            sctlr_el1: vcpu.get_sys_reg(SysReg::SCTLR_EL1).map_err(hvf_error)?,
+            tcr_el1: vcpu.get_sys_reg(SysReg::TCR_EL1).map_err(hvf_error)?,
+            ttbr0_el1: vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?,
+            ttbr1_el1: vcpu.get_sys_reg(SysReg::TTBR1_EL1).map_err(hvf_error)?,
+            actlr_el1: vcpu.get_sys_reg(SysReg::ACTLR_EL1).map_err(hvf_error)?,
+            mair_el1: vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
+            vbar_el1: vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
+            cpacr_el1: vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
+            spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
+            elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
+            tpidr_el0: vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
+            tpidrro_el0: vcpu.get_sys_reg(SysReg::TPIDRRO_EL0).map_err(hvf_error)?,
+            tpidr_el1: vcpu.get_sys_reg(SysReg::TPIDR_EL1).map_err(hvf_error)?,
+            // The engine owns last_exit_class; the snapshot carries 0 for it.
+            last_exit_class: 0,
+            vregs,
+            fpsr,
+            fpcr,
+        })
+    }
+
+    /// Restore `snap` onto the passed `vcpu` (the fork/clone/reclaim rebuild +
+    /// the engine's `Aarch64Vcpu::restore`). The old `restore_vcpu` body.
+    pub(crate) fn restore_vcpu_into(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        snap: &VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
+            vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        vcpu.set_reg(Reg::PC, snap.pc).map_err(hvf_error)?;
+        vcpu.set_reg(Reg::CPSR, snap.cpsr).map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Order matters: program TCR/MAIR/TTBR0 before flipping SCTLR.M.
+        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+            .map_err(hvf_error)?;
+        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO)
+        // are part of the guest's live state; the captured TCR enables TTBR1, so
+        // restoring TTBR0 alone would leave TTBR1 walking from base 0 and lose
+        // hardware TSO — both required for the post-fork/clone guest to run.
+        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SPSR_EL1, snap.spsr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.elr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
+            .map_err(hvf_error)?;
+        // TPIDRRO_EL0 (guest-readable thread ptr) + TPIDR_EL1 (carrick's fast-gettid
+        // tid stamp) are zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or
+        // a destroy/recreate reclaim) must restore both.
+        vcpu.set_sys_reg(SysReg::TPIDRRO_EL0, snap.tpidrro_el0)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TPIDR_EL1, snap.tpidr_el1)
+            .map_err(hvf_error)?;
+        // Apply SCTLR last so the MMU enable lands with the new tables.
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
+            .map_err(hvf_error)?;
+        // Restore V0-V31 + FPSR/FPCR via the C shim (NOT applevisor's
+        // set_simd_fp_reg, which zeroes via the wrong register class). (audit M2)
+        if fpsimd_save_enabled() {
+            let vcpu_id = vcpu.id();
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.vregs[i]);
+                if rc != 0 {
+                    return Err(TrapError::Hypervisor(format!(
+                        "fork restore set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
+                    )));
+                }
+            }
+            vcpu.set_reg(Reg::FPSR, u64::from(snap.fpsr))
+                .map_err(hvf_error)?;
+            vcpu.set_reg(Reg::FPCR, u64::from(snap.fpcr))
+                .map_err(hvf_error)?;
+        }
+        Ok(())
+    }
+
+    /// Seed a BRAND-NEW sibling vCPU (a `clone(CLONE_THREAD)` thread) so it enters
+    /// EL0 at the child's resume PC. Unlike [`restore_vcpu_into`] (used by fork,
+    /// whose vCPU had already done the boot trampoline `eret` into EL0 and merely
+    /// resumes), a freshly created vCPU has never transitioned to EL0. We therefore
+    /// start it at the EL0 trampoline page (in EL1h) with `SPSR_EL1=EL0t` and
+    /// `ELR_EL1=snap.pc`, so the trampoline's single `eret` drops the vCPU into EL0
+    /// at exactly the post-clone instruction — mirroring `map_plan`'s initial-boot
+    /// sequence but with thread-private PC/SP/TLS. (The engine's `restore_thread_start`
+    /// routes here for HVF; `last_exit_class` is engine-owned and not restored here.)
+    pub(crate) fn restore_vcpu_thread_start_into(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        snap: &VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
+            vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        // Start at the EL0 trampoline page in EL1h; the trampoline `eret`s into EL0t
+        // at ELR_EL1 with SPSR_EL1's PSTATE.
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
+        vcpu.set_reg(Reg::PC, crate::memory::LINUX_EL0_TRAMPOLINE_BASE)
+            .map_err(hvf_error)?;
+        vcpu.set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        // The child's EL0 resume PC (snap.pc == parent ELR_EL1 == post-svc).
+        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.pc)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Same translation regime as the parent (shared address space).
+        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+            .map_err(hvf_error)?;
+        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO) are
+        // part of the guest's live state; the captured TCR enables TTBR1, so restoring
+        // TTBR0 alone would leave TTBR1 walking from base 0 and lose hardware TSO —
+        // both required for the post-clone guest to run.
+        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
+            .map_err(hvf_error)?;
+        // SP_EL1 for the brief EL1h trampoline window. The trampoline only executes
+        // one `eret` and touches no stack, but give it a sane value (the child's EL0
+        // stack works; the trampoline never pushes).
+        vcpu.set_sys_reg(SysReg::SP_EL1, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Enable the MMU last, identically to the parent.
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
+            .map_err(hvf_error)?;
+        Ok(())
+    }
+
+    /// Run the passed `vcpu` to its next exit, decoding HVF's native trap surface
+    /// into the neutral [`carrick_aarch64::Aarch64Exit`]. The old
+    /// `run_until_syscall` exit decode, returning `Aarch64Exit` instead of an
+    /// `Option<Aarch64SyscallFrame>` — the shared engine owns the
+    /// pending-syscall/SA_RESTART state, the guest-CPU accounting and the
+    /// EL1-maintenance loop, so this surfaces
+    /// `Syscall`/`EL0Fault`/`MaintenanceDone`/`Kicked`, keeps the internal
+    /// kick-swallow + the bounded in-loop lazy alias re-map, and services the
+    /// sys64 MRS read inline (a loop `continue`).
+    pub(crate) fn run_to_exit(
+        vcpu: &mut applevisor::vcpu::Vcpu,
+    ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
+        use applevisor::prelude::*;
+        use carrick_aarch64::Aarch64Exit;
+
+        // Lifecycle marker: the first entry here is the moment the guest first
+        // runs — i.e. INITIAL boot/setup is done. Fired once per process; since
+        // carrick forks via no-exec `libc::fork`, a forked child inherits the
+        // parent's already-completed Once and does NOT re-fire this.
+        static FIRST_RUN: std::sync::Once = std::sync::Once::new();
+        FIRST_RUN.call_once(|| crate::probes::lifecycle(crate::probes::phase::FIRST_VCPU_RUN));
+
+        // Bounds lazy re-mapping of dropped guest_shared aliases so a
+        // genuinely-unmappable backing still terminates instead of spinning.
+        let mut alias_remap_limiter = AliasRemapLimiter::default();
+        loop {
+            // The engine accounts the guest CPU time via `guest_cpu::timed_run`
+            // around its `vcpu.run()` call, so do NOT double-account here.
+            vcpu.run().map_err(hvf_error)?;
+            let exit = vcpu.get_exit_info();
+            if exit.reason == ExitReason::CANCELED {
+                // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this
+                // vCPU out of the guest so a pending signal can be delivered.
+                //
+                // But the kick can land while the vCPU is still inside carrick's
+                // EL1 trap trampoline — a guest EL0 `svc`/fault is mid-flight,
+                // between the vector entry (VBAR_EL1 = vectors_base, e.g. the
+                // sync-from-EL0 entry at +0x400) and the HVC that traps out to
+                // the host. PC there is an EL1 trampoline address, NOT a guest
+                // userspace PC. Reporting that as a deliverable kick overwrites
+                // the in-flight exception and wedges the thread — reproduced as a
+                // SIGURG storm corrupting a futex waiter (pc=vectors_base+0x404).
+                //
+                // Resume until the guest is back at EL0 so the trampoline
+                // completes its HVC and the real syscall is serviced; the
+                // pending signal is then delivered at that clean EL0 boundary.
+                let cpsr = vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
+                if !ExecLevel::from_pstate(cpsr).is_guest() {
+                    EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::probes::kick_in_kernel(
+                        vcpu.get_reg(Reg::PC).unwrap_or(0),
+                        ((cpsr >> 2) & 0b11) as u32,
+                    );
+                    continue;
+                }
+                return Ok(Aarch64Exit::Kicked);
+            }
+            // A direct EL0 abort on a high-VA alias address that THIS vCPU's
+            // shared VM is missing: a `fork()` rebuilt the shared VM from only the
+            // forking thread's mappings, dropping a `guest_shared` alias mapped by
+            // a sibling thread (the go-build telemetry counter). arm64 HVF has no
+            // stage-2 TLB shootdown, so re-running alone never fixes it — but the
+            // host backing is a MAP_SHARED mmap still live at the registered host
+            // address, so re-`hv_vm_map`'ing it into THIS (shared) VM restores the
+            // stage-2 entry for every thread, and the instruction re-executes
+            // cleanly. Only registered aliases are touched, so a genuine bad
+            // access to unregistered memory still faults. Bounded as a backstop.
+            // (Kept INSIDE run_to_exit, NOT surfaced as Aarch64Exit::Memory — the
+            // in-loop remap is the safe, behavior-identical choice.)
+            if exit.reason == ExitReason::EXCEPTION
+                && is_aarch64_el0_abort_exception(exit.exception.syndrome)
+                && crate::memory::is_high_va(exit.exception.virtual_address)
+            {
+                let fault_ipa = if exit.exception.physical_address != 0 {
+                    exit.exception.physical_address
+                } else {
+                    // Aliases are placed at va = HIGH_VA_THRESHOLD + (ipa - BASE).
+                    exit.exception
+                        .virtual_address
+                        .wrapping_sub(crate::memory::LINUX_HIGH_VA_THRESHOLD)
+                        .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE)
+                };
+                if let Some(b) = lookup_shared_alias(fault_ipa)
+                    && alias_remap_limiter.allow(b.ipa)
+                {
+                    // SAFETY: `host_addr` is a live MAP_SHARED mmap (the alias
+                    // backing) registered by add_alias; re-mapping the same host
+                    // range to the same IPA in this VM is idempotent. A nonzero rc
+                    // (e.g. already mapped by a racing sibling) is fine — re-run
+                    // and re-walk regardless.
+                    let _ = unsafe {
+                        applevisor_sys::hv_vm_map(
+                            b.host_addr as *mut std::ffi::c_void,
+                            b.ipa,
+                            b.size,
+                            b.perms,
+                        )
+                    };
+                    crate::probes::hv_vm_map_alias(
+                        exit.exception.virtual_address,
+                        b.ipa,
+                        b.size as u64,
+                        0,
+                        0,
+                    );
+                    // Diagnostic-only alias-remap counter+dump, gated behind
+                    // `debug-stats` (no other consumer reads the counter).
+                    #[cfg(feature = "debug-stats")]
+                    {
+                        let n =
+                            ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n.is_multiple_of(256) {
+                            eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.ipa);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if exit.reason != ExitReason::EXCEPTION {
+                // WFI/halt or any non-EXCEPTION non-CANCELED exit that today
+                // errored: keep erroring.
+                return Err(TrapError::UnexpectedExit {
+                    reason: format!("{:?}", exit.reason),
+                });
+            }
+
+            let exception = exit.exception;
+            // A guest EL0 memory abort HVF couldn't satisfy (e.g. a stack overflow
+            // that ran SP off the mapped stack) surfaces DIRECTLY as an EXCEPTION
+            // exit with EC=0x20/0x24, NOT through our EL1 vector's HVC. Surface it
+            // as a DIRECT EL0Fault so the runtime delivers the right Linux signal
+            // (SIGSEGV) instead of fataling. ELR_EL1/FAR_EL1 are STALE here (the
+            // guest's EL1 vector never ran), so build the fault from HVF's
+            // authoritative PC (Reg::PC) + VA (exception.virtual_address).
+            if is_aarch64_el0_abort_exception(exception.syndrome) {
+                let true_pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
+                let far = exception.virtual_address;
+                let x16 = vcpu.get_reg(Reg::X16).unwrap_or(0);
+                let x17 = vcpu.get_reg(Reg::X17).unwrap_or(0);
+                let x29 = vcpu.get_reg(Reg::X29).unwrap_or(0);
+                let x30 = vcpu.get_reg(Reg::LR).unwrap_or(0);
+                let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                crate::probes::vcpu_fault(exception.syndrome, true_pc, far, x30, sp, unsafe {
+                    libc::getpid()
+                });
+                return Ok(Aarch64Exit::EL0Fault {
+                    syndrome: exception.syndrome,
+                    elr: true_pc,
+                    far,
+                    x16,
+                    x17,
+                    x29,
+                    x30,
+                    sp,
+                    from_el0_direct: true,
+                });
+            }
+            // Fail loud on the EL1 vector's `hvc #3` (current-EL synchronous slot):
+            // carrick's guest took a synchronous exception WHILE AT EL1, which only
+            // happens when a guest resume left PSTATE at EL1 (e.g. a signal handler
+            // entered with SPSR_EL1=EL1h, whose PXN instruction fetch aborts). The
+            // bare-`eret` vectors used to spin on this forever at 100 % CPU with no
+            // host exit; the `hvc #3` trap surfaces it here. ESR_EL1/ELR_EL1/FAR_EL1
+            // still hold the ORIGINAL EL1 fault (the `hvc` left them untouched), so
+            // report them verbatim. This is a carrick bug, not a guest fault — do
+            // not deliver it to the guest as a signal; terminate loudly.
+            if is_aarch64_hvc_fault(exception.syndrome) {
+                let esr_el1 = vcpu.get_sys_reg(SysReg::ESR_EL1).unwrap_or(0);
+                let elr_el1 = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                let far_el1 = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+                let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
+                let ec = (esr_el1 >> 26) & 0x3f;
+                eprintln!(
+                    "FAIL-LOUD pid={pid}: guest executed at EL1 and faulted \
+                     (current-EL sync vector) — carrick state corruption (a guest \
+                     resume left PSTATE at EL1, commonly a signal handler entered \
+                     with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the \
+                     hvc #3 vector trap. esr_el1={esr_el1:#x} ec={ec:#x} \
+                     elr_el1={elr_el1:#x} far_el1={far_el1:#x} spsr_el1={spsr_el1:#x}",
+                    pid = unsafe { libc::getpid() },
+                );
+                return Err(TrapError::GuestAtEl1 {
+                    esr_el1,
+                    elr_el1,
+                    far_el1,
+                    spsr_el1,
+                });
+            }
+            if !is_aarch64_syscall_exception(exception.syndrome) {
+                return Err(TrapError::UnexpectedException {
+                    syndrome: exception.syndrome,
+                    virtual_address: exception.virtual_address,
+                    physical_address: exception.physical_address,
+                });
+            }
+            // EC=0x16 (HVC) only means our EL1 vector trampoline fired — it catches
+            // ALL lower-EL synchronous exceptions, not just SVCs. Look at ESR_EL1
+            // to see what actually trapped to EL1; if it's not an SVC, either
+            // emulate it (sys64 MRS read → re-run) or surface it as an EL0Fault.
+            if is_aarch64_hvc_exception(exception.syndrome) {
+                // The maintenance HVC (`hvc #1`) is consumed by the engine's
+                // EL1-maintenance loop; if it ever reaches here, report it so the
+                // engine's loop can match on it.
+                if is_aarch64_hvc_maintenance(exception.syndrome) {
+                    return Ok(Aarch64Exit::MaintenanceDone);
+                }
+                let underlying = vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
+                if !is_aarch64_svc_exception(underlying) {
+                    if HvfVmState::emulate_el0_sys64_read_inner(vcpu, underlying)? {
+                        // Serviced (ELR_EL1 advanced, target GPR written) — re-run.
+                        continue;
+                    }
+                    let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                    let far = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+                    // Decoded fault diagnostics for `carrick trace`
+                    // (vcpu-fault-regs) as SCALARS — the faulting instruction word
+                    // + the base register a load/store dereferenced and its value.
+                    {
+                        let insn = 0u64;
+                        let rn = ((insn >> 5) & 0x1f) as u32;
+                        let xrn = GPR_TABLE
+                            .get(rn as usize)
+                            .and_then(|r| vcpu.get_reg(*r).ok())
+                            .unwrap_or(0);
+                        crate::probes::vcpu_fault_regs(underlying, elr, far, insn, rn, xrn);
+                    }
+                    let x16 = vcpu.get_reg(Reg::X16).unwrap_or(0);
+                    let x17 = vcpu.get_reg(Reg::X17).unwrap_or(0);
+                    let x29 = vcpu.get_reg(Reg::X29).unwrap_or(0);
+                    let x30 = vcpu.get_reg(Reg::LR).unwrap_or(0);
+                    let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                    crate::probes::vcpu_fault(underlying, elr, far, x30, sp, unsafe {
+                        libc::getpid()
+                    });
+                    // HVC-trampoline path: the guest EL1 vector latched
+                    // ELR_EL1/FAR_EL1, so they are authoritative.
+                    return Ok(Aarch64Exit::EL0Fault {
+                        syndrome: underlying,
+                        elr,
+                        far,
+                        x16,
+                        x17,
+                        x29,
+                        x30,
+                        sp,
+                        from_el0_direct: false,
+                    });
+                }
+            }
+            // A genuine guest EL0 `svc`. Read the syscall frame; the engine owns
+            // the pending-syscall/SA_RESTART state (it sets last_syscall_nr/orig_x0
+            // from the frame). resume_pc = ELR_EL1 (= svc+4), which the EL1
+            // vector's `eret` consumes.
+            let resume_pc = vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+            let frame = carrick_hal::read_aarch64_syscall_frame(|r| hvf_get_reg(vcpu, r))
+                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+            // vcpu_trap probe parity: guest PC at the trap (= ELR_EL1) + the live
+            // FP/SP/LR so a DTrace consumer can walk the guest call chain. The
+            // stack-region bases require the per-thread mapping list (on
+            // HvfVmState, not reachable here), so report zero bases.
+            let lr = vcpu.get_reg(Reg::LR).unwrap_or(0);
+            let fp = vcpu.get_reg(Reg::X29).unwrap_or(0);
+            let sp = vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+            crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+                pc: resume_pc,
+                sp,
+                fp,
+                lr,
+                x8: frame.x8,
+                x0: frame.x0,
+                stack_guest_base: 0,
+                stack_host_base: 0,
+                stack_guest_end: 0,
+            });
+            return Ok(Aarch64Exit::Syscall { frame, resume_pc });
+        }
     }
 }
 
@@ -4348,119 +3658,6 @@ impl MappingView {
             // shared_futex_host_addr (an anon arena alias must NOT be).
             guest_shared: b.guest_shared,
         }
-    }
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-impl HvfInner {
-    fn mapped_region_count(&self) -> usize {
-        0
-    }
-
-    fn program_counter(&self) -> Result<u64, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
-        crate::vcpu_kick::VcpuKickHandle::placeholder()
-    }
-
-    fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    fn complete_syscall(&mut self, _: i64) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
-    }
-
-    fn last_syscall_nr(&self) -> Option<u64> {
-        None
-    }
-
-    fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        Err(MemoryError::OutOfBounds { address, length })
-    }
-
-    fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        Err(MemoryError::OutOfBounds {
-            address,
-            length: bytes.len(),
-        })
-    }
-}
-
-impl GuestMemory for HvfTrapEngine {
-    /// The PROT_NONE set the shared default `read_bytes`/`write_bytes` gate on —
-    /// HVF's hand-rolled `range_no_access` syscall-path checks now fold into it.
-    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
-        Some(&self.inner.protections)
-    }
-
-    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        self.inner.read_guest_bytes(address, length)
-    }
-
-    fn read_into_raw(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
-        self.inner.read_guest_bytes_into(address, dst)
-    }
-
-    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        // The PROT_NONE gate ran in the default `write_bytes`; this still enforces
-        // the guest-visible mapping permission so a write into a read-only /
-        // carrick-owned mapping returns EFAULT (audit M1).
-        self.inner.write_guest_bytes_checked(address, bytes)
-    }
-
-    fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.inner.write_guest_bytes(address, bytes)
-    }
-
-    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
-        self.inner.host_ptr_for_read(address, len)
-    }
-
-    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
-        self.inner.host_ptr_for_write(address, len)
-    }
-
-    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        // Scrub the host backing raw — the reused region may be no-access /
-        // PROT_NONE, which the permission-checked writes refuse (see the trait).
-        self.inner.zero_guest_backing(address, len)
-    }
-
-    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
-        self.inner.set_no_access(address, len, no_access);
-    }
-
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        self.inner.protect_range(address, len, prot)
-    }
-
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.inner.unmap_range(address, len)
-    }
-
-    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.inner.unmap_alias_range(address, len)
-    }
-
-    fn repoint_private(
-        &mut self,
-        va: u64,
-        overlay_ipa: u64,
-        len: usize,
-        content: &[u8],
-    ) -> Result<(), MemoryError> {
-        self.inner.repoint_private(va, overlay_ipa, len, content)
-    }
-
-    fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
-        self.inner.shared_futex_host_addr(address)
-    }
-
-    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        self.inner.guest_range_is_writable(address, length)
     }
 }
 
@@ -4711,27 +3908,41 @@ fn hvf_error(error: applevisor::error::HypervisorError) -> TrapError {
     TrapError::Hypervisor(error.to_string())
 }
 
-/// Derive the register snapshot for a thread-creating clone's child vCPU
-/// from the parent's snapshot taken at the clone svc. The child shares the
-/// SAME guest address space (same TTBR0/SCTLR/MMU state) so all sysregs are
-/// copied verbatim; only the thread-private state differs:
-///   - PC / ELR_EL1 = parent's ELR_EL1 (the instruction after the clone svc).
-///     `complete_syscall` doesn't re-advance PC because HVF already set
-///     ELR_EL1 to post-svc when it took the trap, so the child resumes there.
-///   - X0 = 0: clone(2) returns 0 in the new thread.
-///   - SP_EL0 = `stack`: the child's stack pointer (clone's stack arg).
-///   - TPIDR_EL0 = `tls` if non-zero (CLONE_SETTLS), else the parent's value.
+/// Convert a neutral [`carrick_hal::MemPerms`] to the applevisor stage-2
+/// `MemPerms` for [`HvfVmState::map_stage2`]. A DIRECT mapping (no RWX
+/// escalation): that escalation is the `hvf_perms(SegmentPerms)` boot/alias path;
+/// the engine's `map_stage2` callers pass the perms they want verbatim.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn seed_child_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> VcpuSnapshot {
-    let mut child = parent.clone();
-    child.pc = parent.elr_el1;
-    child.gprs[0] = 0;
-    child.sp_el0 = stack;
-    if tls != 0 {
-        child.tpidr_el0 = tls;
+fn hvf_mem_perms(perms: carrick_hal::MemPerms) -> applevisor::memory::MemPerms {
+    use applevisor::memory::MemPerms;
+    match (perms.read, perms.write, perms.exec) {
+        (false, false, false) => MemPerms::None,
+        (true, false, false) => MemPerms::Read,
+        (false, true, false) => MemPerms::Write,
+        (false, false, true) => MemPerms::Exec,
+        (true, true, false) => MemPerms::ReadWrite,
+        (true, false, true) => MemPerms::ReadExec,
+        (false, true, true) => MemPerms::WriteExec,
+        (true, true, true) => MemPerms::ReadWriteExec,
     }
-    child
 }
+
+/// The HVF concurrent-vCPU budget (cap − fork-rebuild reserve) for the bounded
+/// M:N scheduler the engine installs via `Aarch64Vmm::vcpu_budget`. Same value
+/// the retired `vcpu_gate` enforced; reclaim recycles vCPUs so >cap guest threads
+/// run instead of hanging. macOS/HVF-only: `vcpu_gate` (and the whole HVF backend)
+/// is cfg'd out off the HVF lane, and the only caller (the new module's
+/// `Aarch64Vmm::vcpu_budget`) is macOS-only too.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hvf_vcpu_budget() -> usize {
+    vcpu_gate::budget().max(1) as usize
+}
+
+// NOTE: the thread-sibling register seeding (`seed_child_snapshot`) now lives
+// ONCE in the shared engine (`carrick_aarch64::seed_sibling_snapshot`), which the
+// engine's `build_sibling_spec` applies before `materialize_sibling`. HVF's
+// `from_thread_spec` only stands up the vCPU + mirrors the mapping metadata; the
+// engine restores the seeded snapshot onto it.
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
@@ -4839,63 +4050,13 @@ mod memory_protection_tests {
 mod thread_sibling_tests {
     use super::*;
 
-    fn parent_snapshot() -> VcpuSnapshot {
-        let mut gprs = [0u64; 31];
-        // Distinct values so we can prove the rest of the GPRs are copied.
-        for (i, slot) in gprs.iter_mut().enumerate() {
-            *slot = 0xA000 + i as u64;
-        }
-        VcpuSnapshot {
-            gprs,
-            pc: 0x1234, // the SVC PC; NOT where the child should resume
-            cpsr: 0x3c0,
-            sp_el0: 0xF000_0000,
-            sctlr_el1: 0x1005,
-            tcr_el1: 0x2,
-            ttbr0_el1: 0x40000,
-            ttbr1_el1: 0x40000,
-            actlr_el1: 0,
-            mair_el1: 0xff,
-            vbar_el1: 0x80000,
-            cpacr_el1: 0x300000,
-            spsr_el1: 0x3c0,
-            elr_el1: 0x5678, // post-syscall resume point (instruction after svc)
-            tpidr_el0: 0xBEEF_0000,
-            tpidrro_el0: 0xBEEF_1000,
-            tpidr_el1: 0xBEEF_2000,
-            last_exit_class: AARCH64_HVC_EXCEPTION_CLASS,
-            vregs: [0u128; 32],
-            fpsr: 0,
-            fpcr: 0,
-        }
-    }
-
-    #[test]
-    fn child_resumes_at_post_syscall_pc_with_x0_zero() {
-        let parent = parent_snapshot();
-        let child = seed_child_snapshot(&parent, /*stack=*/ 0x7_0000, /*tls=*/ 0x9_0000);
-        // The child must resume at the instruction *after* the clone svc,
-        // i.e. the parent's ELR_EL1 — mirroring complete_syscall, which
-        // does not re-advance PC (HVF already set ELR to post-svc).
-        assert_eq!(child.pc, parent.elr_el1);
-        // pthread_create expects clone to return 0 in the new thread.
-        assert_eq!(child.gprs[0], 0);
-    }
-
-    #[test]
-    fn child_uses_clone_stack_and_tls() {
-        let parent = parent_snapshot();
-        let child = seed_child_snapshot(&parent, 0x7_0000, 0x9_0000);
-        assert_eq!(child.sp_el0, 0x7_0000);
-        assert_eq!(child.tpidr_el0, 0x9_0000);
-    }
-
-    #[test]
-    fn child_keeps_parent_tls_when_clone_tls_is_zero() {
-        let parent = parent_snapshot();
-        let child = seed_child_snapshot(&parent, 0x7_0000, /*tls=*/ 0);
-        assert_eq!(child.tpidr_el0, parent.tpidr_el0);
-    }
+    // NOTE: the thread-sibling register SEEDING tests (child_resumes_at_post_
+    // syscall_pc_with_x0_zero / child_uses_clone_stack_and_tls /
+    // child_keeps_parent_tls_when_clone_tls_is_zero / child_copies_all_other_
+    // gprs_and_sysregs) moved with `seed_child_snapshot` into the shared engine:
+    // they live ONCE in `carrick_aarch64`'s `seed_applies_thread_entry_deltas`
+    // (over the neutral `Aarch64VcpuSnapshot`). HVF no longer owns the seeding, so
+    // it no longer owns those assertions.
 
     #[test]
     fn decodes_el0_counter_register_traps() {
@@ -4932,50 +4093,29 @@ mod thread_sibling_tests {
     }
 
     #[test]
-    fn child_copies_all_other_gprs_and_sysregs() {
-        let parent = parent_snapshot();
-        let child = seed_child_snapshot(&parent, 0x7_0000, 0x9_0000);
-        // X1..X30 carried verbatim.
-        for i in 1..31 {
-            assert_eq!(child.gprs[i], parent.gprs[i], "gpr {i}");
-        }
-        assert_eq!(child.sctlr_el1, parent.sctlr_el1);
-        assert_eq!(child.ttbr0_el1, parent.ttbr0_el1);
-        assert_eq!(child.ttbr1_el1, parent.ttbr1_el1);
-        assert_eq!(child.actlr_el1, parent.actlr_el1);
-        assert_eq!(child.tcr_el1, parent.tcr_el1);
-        assert_eq!(child.mair_el1, parent.mair_el1);
-        assert_eq!(child.vbar_el1, parent.vbar_el1);
-        assert_eq!(child.cpacr_el1, parent.cpacr_el1);
-        assert_eq!(child.spsr_el1, parent.spsr_el1);
-        // ELR_EL1 must point at the post-syscall PC so the very first eret
-        // out of EL1 (after we seed the vCPU) lands the child in EL0.
-        assert_eq!(child.elr_el1, parent.elr_el1);
-        assert_eq!(child.last_exit_class, parent.last_exit_class);
-    }
-
-    #[test]
     fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
-        let region = HvfMappedRegion {
+        // `into_unowned_region` (the surviving half of the old `ThreadMappingDesc`
+        // round-trip; `from_region` moved to the engine's sibling-builder seam)
+        // must re-materialise the syscall-path metadata UNOWNED (memory/host_mapping
+        // = None) so a sibling never frees the main engine's buffers.
+        let desc = ThreadMappingDesc {
             start: 0x1000,
             ipa: 0x1000,
             end: 0x5000,
             host_addr: 0x7000usize as *mut u8,
             size: 0x4000,
             perms: applevisor::memory::MemPerms::ReadWrite,
-            memory: None,
-            host_mapping: None,
             guest_shared: true,
             guest_writable: true,
         };
 
-        let copied = ThreadMappingDesc::from_region(&region).into_unowned_region();
+        let copied = desc.into_unowned_region();
 
-        assert_eq!(copied.start, region.start);
-        assert_eq!(copied.end, region.end);
-        assert_eq!(copied.host_addr, region.host_addr);
-        assert_eq!(copied.size, region.size);
-        assert_eq!(copied.perms, region.perms);
+        assert_eq!(copied.start, 0x1000);
+        assert_eq!(copied.end, 0x5000);
+        assert_eq!(copied.host_addr, 0x7000usize as *mut u8);
+        assert_eq!(copied.size, 0x4000);
+        assert_eq!(copied.perms, applevisor::memory::MemPerms::ReadWrite);
         assert!(copied.memory.is_none());
         assert!(copied.host_mapping.is_none());
         assert!(copied.guest_shared);
@@ -5094,11 +4234,11 @@ mod thread_sibling_tests {
             let mut plan = Vec::new();
             while copied < length {
                 let (chunk_address, chunk_len) =
-                    HvfInner::guest_copy_chunk(address, copied, length)?;
+                    HvfVmState::guest_copy_chunk(address, copied, length)?;
                 let stage1_ipa = crate::memory::is_high_va(chunk_address)
                     .then(|| self.translate(chunk_address))
                     .flatten();
-                let mapping_idx = HvfInner::mapping_index_for_range(
+                let mapping_idx = HvfVmState::mapping_index_for_range(
                     &self.mappings,
                     chunk_address,
                     chunk_len,
@@ -5139,8 +4279,12 @@ mod thread_sibling_tests {
             ),
         ];
 
-        let idx =
-            HvfInner::mapping_index_for_range(&mappings, b_start + 0x1000, 8, Some(b_ipa + 0x1000));
+        let idx = HvfVmState::mapping_index_for_range(
+            &mappings,
+            b_start + 0x1000,
+            8,
+            Some(b_ipa + 0x1000),
+        );
 
         assert_eq!(idx, Some(0));
     }
@@ -5162,7 +4306,7 @@ mod thread_sibling_tests {
         // start and use it for bytes after new_start, even though stage-1 has
         // already repointed that tail to the newer alias.
         assert_eq!(
-            HvfInner::mapping_index_for_range(
+            HvfVmState::mapping_index_for_range(
                 &mappings,
                 address,
                 length,
@@ -5175,13 +4319,13 @@ mod thread_sibling_tests {
         let mut owners = Vec::new();
         while offset < length {
             let (chunk_address, chunk_len) =
-                HvfInner::guest_copy_chunk(address, offset, length).unwrap();
+                HvfVmState::guest_copy_chunk(address, offset, length).unwrap();
             let stage1_ipa = if chunk_address < new_start {
                 old_ipa + (chunk_address - old_start)
             } else {
                 new_ipa + (chunk_address - new_start)
             };
-            let idx = HvfInner::mapping_index_for_range(
+            let idx = HvfVmState::mapping_index_for_range(
                 &mappings,
                 chunk_address,
                 chunk_len,
@@ -5273,100 +4417,9 @@ mod thread_sibling_tests {
         );
         let mappings = vec![old, new];
 
-        let idx = HvfInner::mapping_index_for_range(&mappings, start + 0x1000, 8, None);
+        let idx = HvfVmState::mapping_index_for_range(&mappings, start + 0x1000, 8, None);
 
         assert_eq!(idx, Some(1));
-    }
-}
-
-impl SyscallTrap for HvfTrapEngine {
-    fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        self.fork()
-    }
-
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
-        self.execve_into(new_image)
-    }
-
-    fn is_forked_child(&self) -> bool {
-        HvfTrapEngine::is_forked_child(self)
-    }
-
-    fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
-        // Read the raw per-ISA register frame exactly as before, then decode it
-        // through this engine's `GuestArch` so the runtime loop is ISA-neutral
-        // (Phase 1, Task 3). The aarch64 decode is x8 → number, x0..x5 → args.
-        use carrick_hal::GuestArch as _;
-        Ok(self.run_until_syscall()?.map(|frame| {
-            let (number, args) =
-                <Self as carrick_hal::ThreadedEngine>::Arch::decode_syscall(&frame);
-            let guest_abi = <Self as carrick_hal::ThreadedEngine>::Arch::linux_guest_abi();
-            carrick_hal::RawSyscall {
-                number,
-                args,
-                guest_abi,
-            }
-        }))
-    }
-
-    fn current_pc(&self) -> Result<u64, TrapError> {
-        self.program_counter()
-    }
-
-    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
-        self.complete_syscall(return_value)
-    }
-
-    fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
-        self.set_hardware_tso(tso)
-    }
-
-    fn map_host_alias(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
-    ) -> Result<(), TrapError> {
-        HvfTrapEngine::map_host_alias(self, va, ipa, len, payload, file)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        fault_siginfo: Option<(i32, u64)>,
-        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-        restart_syscall: bool,
-    ) -> Result<(), TrapError> {
-        HvfTrapEngine::inject_signal(
-            self,
-            signum,
-            handler,
-            sa_restorer,
-            pending_syscall_retval,
-            interrupted_pc,
-            altstack,
-            saved_sigmask,
-            fault_siginfo,
-            queued_siginfo,
-            restart_syscall,
-        )
-    }
-
-    fn last_syscall_nr(&self) -> Option<u64> {
-        self.last_syscall_nr()
-    }
-
-    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        HvfTrapEngine::restore_from_sigframe(self)
     }
 }
 
@@ -5386,14 +4439,14 @@ impl SyscallTrap for HvfTrapEngine {
 /// Convert an applevisor error to a HAL OsError, using EIO as the errno.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[inline]
-fn hvf_os_error(_e: applevisor::error::HypervisorError) -> carrick_hal::OsError {
+pub(crate) fn hvf_os_error(_e: applevisor::error::HypervisorError) -> carrick_hal::OsError {
     carrick_hal::OsError::from_raw(libc::EIO)
 }
 
 /// Map a HAL [`carrick_hal::Reg`] to the corresponding applevisor value and
 /// read it from `vcpu`.  On non-HVF targets returns ENOSYS (never called).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn hvf_get_reg(
+pub(crate) fn hvf_get_reg(
     vcpu: &applevisor::vcpu::Vcpu,
     r: carrick_hal::Reg,
 ) -> Result<u64, carrick_hal::OsError> {
@@ -5415,13 +4468,8 @@ fn hvf_get_reg(
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn hvf_get_reg(_vcpu: &HvfInner, _r: carrick_hal::Reg) -> Result<u64, carrick_hal::OsError> {
-    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn hvf_set_reg(
+pub(crate) fn hvf_set_reg(
     vcpu: &applevisor::vcpu::Vcpu,
     r: carrick_hal::Reg,
     v: u64,
@@ -5442,17 +4490,8 @@ fn hvf_set_reg(
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn hvf_set_reg(
-    _vcpu: &HvfInner,
-    _r: carrick_hal::Reg,
-    _v: u64,
-) -> Result<(), carrick_hal::OsError> {
-    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn hvf_get_sys_reg(
+pub(crate) fn hvf_get_sys_reg(
     vcpu: &applevisor::vcpu::Vcpu,
     r: carrick_hal::SysReg,
 ) -> Result<u64, carrick_hal::OsError> {
@@ -5472,13 +4511,8 @@ fn hvf_get_sys_reg(
     vcpu.get_sys_reg(hvf_reg).map_err(hvf_os_error)
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn hvf_get_sys_reg(_vcpu: &HvfInner, _r: carrick_hal::SysReg) -> Result<u64, carrick_hal::OsError> {
-    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn hvf_set_sys_reg(
+pub(crate) fn hvf_set_sys_reg(
     vcpu: &applevisor::vcpu::Vcpu,
     r: carrick_hal::SysReg,
     v: u64,
@@ -5497,293 +4531,6 @@ fn hvf_set_sys_reg(
         _ => return Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
     };
     vcpu.set_sys_reg(hvf_reg, v).map_err(hvf_os_error)
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn hvf_set_sys_reg(
-    _vcpu: &HvfInner,
-    _r: carrick_hal::SysReg,
-    _v: u64,
-) -> Result<(), carrick_hal::OsError> {
-    Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-}
-
-impl carrick_hal::RegAccess for HvfTrapEngine {
-    fn get_reg(&self, r: carrick_hal::Reg) -> Result<u64, carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            hvf_get_reg(&self.inner.vcpu, r)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = r;
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-
-    fn set_reg(&mut self, r: carrick_hal::Reg, v: u64) -> Result<(), carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            hvf_set_reg(&self.inner.vcpu, r, v)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (r, v);
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-
-    fn get_sys_reg(&self, r: carrick_hal::SysReg) -> Result<u64, carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            hvf_get_sys_reg(&self.inner.vcpu, r)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = r;
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-
-    fn set_sys_reg(&mut self, r: carrick_hal::SysReg, v: u64) -> Result<(), carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            hvf_set_sys_reg(&self.inner.vcpu, r, v)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (r, v);
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-
-    fn get_vreg(&self, n: u32) -> Result<u128, carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            let idx = n as usize;
-            if idx >= SIMD_FP_TABLE.len() {
-                return Err(carrick_hal::OsError::from_raw(libc::EINVAL));
-            }
-            self.inner
-                .vcpu
-                .get_simd_fp_reg(SIMD_FP_TABLE[idx])
-                .map_err(hvf_os_error)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = n;
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-
-    fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            let idx = n as usize;
-            if idx >= SIMD_FP_TABLE.len() {
-                return Err(carrick_hal::OsError::from_raw(libc::EINVAL));
-            }
-            let vcpu_id = self.inner.vcpu.id();
-            let rc = set_simd_fp_reg_v(vcpu_id, SIMD_FP_TABLE[idx], v);
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(carrick_hal::OsError::from_raw(libc::EIO))
-            }
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = (n, v);
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-
-    fn get_fpcr(&self) -> Result<u64, carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            use applevisor::prelude::*;
-            self.inner.vcpu.get_reg(Reg::FPCR).map_err(hvf_os_error)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-    }
-
-    fn set_fpcr(&mut self, v: u64) -> Result<(), carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            use applevisor::prelude::*;
-            self.inner.vcpu.set_reg(Reg::FPCR, v).map_err(hvf_os_error)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = v;
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-
-    fn get_fpsr(&self) -> Result<u64, carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            use applevisor::prelude::*;
-            self.inner.vcpu.get_reg(Reg::FPSR).map_err(hvf_os_error)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-    }
-
-    fn set_fpsr(&mut self, v: u64) -> Result<(), carrick_hal::OsError> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            use applevisor::prelude::*;
-            self.inner.vcpu.set_reg(Reg::FPSR, v).map_err(hvf_os_error)
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = v;
-            Err(carrick_hal::OsError::from_raw(libc::ENOSYS))
-        }
-    }
-}
-
-// SAFETY: HvfTrapEngine wraps a ManuallyDrop<HvfInner> containing
-// applevisor::Vcpu (non-Send due to raw pointers). The `Send` impl is
-// required because the `carrick_hal::ThreadedEngine` trait declares a `Send`
-// supertrait bound that the generic shared run-loop relies on. Soundness
-// holds because each Vcpu is owned by exactly one HvfTrapEngine confined to a
-// single thread: a thread-creating clone moves a `ThreadSpec` (itself
-// `unsafe impl Send`, see above) across the boundary and the destination
-// thread builds its own engine via `from_thread_spec` — the engine is never
-// shared or concurrently mutated across threads. It is the spec that crosses
-// the thread boundary, not the engine.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe impl Send for HvfTrapEngine {}
-
-impl carrick_hal::ThreadedEngine for HvfTrapEngine {
-    type Arch = carrick_hal::Aarch64GuestArch;
-    type KickHandle = crate::vcpu_kick::VcpuKickHandle;
-    type SiblingSpec = ThreadSpec;
-
-    fn kick_handle(&self) -> Self::KickHandle {
-        // Forward to the existing `vcpu_kick_handle()` method.
-        self.vcpu_kick_handle()
-    }
-
-    fn wait_for_vcpu_slot() {
-        // RETIRED: the bounded carrick-hal scheduler (installed for vcpu_budget())
-        // now performs admission in the shared spawn path. Keeping the old
-        // vcpu_gate here too would DOUBLE-GATE and defeat reclaim — the gate slot
-        // would stay held while the thread blocks, so freeing the scheduler slot
-        // wouldn't actually let a waiter run. No-op.
-    }
-
-    fn vcpu_budget() -> usize {
-        // The HVF concurrent-vCPU cap minus the fork-rebuild reserve — the same
-        // value the retired vcpu_gate enforced. The bounded scheduler enforces it,
-        // and reclaim recycles vCPUs so >cap guest threads run instead of hanging.
-        vcpu_gate::budget().max(1) as usize
-    }
-
-    fn reclaims(&self) -> bool {
-        true
-    }
-
-    fn reclaim_refreshes_kicker(&self) -> bool {
-        // HVF reclaim DESTROYS the vCPU, so the runtime must unregister this
-        // thread's (now-dead-id) kick handle before the no-vCPU wait and
-        // re-register the recreated vCPU's handle on wake.
-        true
-    }
-
-    fn save_guest_state(&mut self) -> Vec<u8> {
-        // Snapshot + DESTROY this vCPU (frees the slot). The snapshot is stashed in
-        // `self.inner.reclaim_snapshot` (read by `rebind_to_slot` on the SAME
-        // thread), so the returned bytes are unused. A park failure is fatal: the
-        // vCPU could not be snapshotted/destroyed, so there is no safe way to
-        // continue the M:N reclaim — hence the intentional `expect` (the workspace
-        // otherwise denies `expect_used`).
-        #[allow(clippy::expect_used)]
-        self.inner
-            .reclaim_park_vcpu()
-            .expect("HVF reclaim: snapshot + destroy failed");
-        Vec::new()
-    }
-
-    fn rebind_to_slot(
-        &mut self,
-        _slot: carrick_hal::SlotId,
-        _state: &[u8],
-    ) -> Result<(), TrapError> {
-        // Recreate this thread's vCPU in the EXISTING VM + restore the parked
-        // state. Slot id ignored (HVF recreates its OWN vCPU; no pool to swap).
-        // The caller (complete_futex_wait) holds topology_lock around this.
-        self.inner.reclaim_resume_vcpu()
-    }
-
-    /// Build a [`ThreadSpec`] for a thread-creating clone.
-    ///
-    /// The trait signature matches the existing `build_thread_spec(stack, tls)`
-    /// method exactly — no adaptation needed.
-    fn build_sibling_spec(
-        &self,
-        entry: carrick_hal::GuestEntryRegs,
-    ) -> Result<Self::SiblingSpec, TrapError> {
-        // Map the ISA-neutral entry deltas onto HVF's existing (stack, tls) API.
-        // A clone(CLONE_THREAD) sibling always supplies both; `None` (a fork
-        // child, which does not route through build_sibling_spec) defaults to 0.
-        self.build_thread_spec(entry.stack.unwrap_or(0), entry.tls.unwrap_or(0))
-    }
-
-    /// Materialise a thread sibling on the current host thread from a
-    /// [`ThreadSpec`].  Forwards to the existing `from_thread_spec` static
-    /// constructor.
-    fn materialize_sibling(spec: Self::SiblingSpec) -> Result<Self, TrapError>
-    where
-        Self: Sized,
-    {
-        HvfTrapEngine::from_thread_spec(spec)
-    }
-
-    fn program_counter(&self) -> Result<u64, TrapError> {
-        HvfTrapEngine::program_counter(self)
-    }
-
-    fn set_guest_sp_el0(&self, sp: u64) -> Result<(), TrapError> {
-        HvfTrapEngine::set_guest_sp_el0(self, sp)
-    }
-
-    fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
-        HvfTrapEngine::set_guest_thread_id(self, tid)
-    }
-
-    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
-        HvfTrapEngine::fork_vfork(self)
-    }
-
-    fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
-        HvfTrapEngine::release_vcpu_for_fork(self)
-    }
-
-    fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
-        HvfTrapEngine::rebuild_vcpu_after_fork(self)
-    }
-
-    fn publish_vm_for_siblings(&mut self) -> Result<(), TrapError> {
-        HvfTrapEngine::publish_vm_for_siblings(self);
-        Ok(())
-    }
-
-    fn destroy_vcpu_on_thread_exit(&mut self) {
-        HvfTrapEngine::destroy_vcpu_on_thread_exit(self);
-    }
-
-    fn fresh_fork_kicker(&self) -> std::sync::Arc<dyn carrick_hal::VcpuRegistry> {
-        // The CHILD side of a guest fork: libc::fork replicated only the calling
-        // thread, so drop the parent's kicker and start over with an empty one
-        // (no phantom siblings). The child rebuilds its private-futex backend
-        // via the PlatformFutexFactory over a fresh FutexTable in the run loop,
-        // so we only mint the kicker here.
-        std::sync::Arc::new(crate::vcpu_kick::VcpuKicker::new())
-    }
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
