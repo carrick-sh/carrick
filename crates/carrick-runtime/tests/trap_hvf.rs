@@ -425,37 +425,34 @@ fn gettid_probe_image(shim: bool) -> AddressSpace {
 }
 
 #[test]
-fn el1_shim_set_guest_thread_id_is_a_noop_so_gettid_traps_to_the_host() {
+fn el1_shim_services_gettid_from_tpidr_el1() {
     use carrick_runtime::trap::SyscallTrap;
 
-    // The EL1 shim's gettid handler still exists (it reads TPIDR_EL1), but on the
-    // consolidated `Aarch64EngineCore` the only writer of that per-vCPU tid —
-    // `ThreadedEngine::set_guest_thread_id` — is now a DOCUMENTED NO-OP (see
-    // carrick-aarch64 `engine.rs`: "aarch64 backends have no in-guest gettid fast
-    // path … neither HVF nor KVM run [its tid stamping]"). The neutral
-    // `Aarch64Vcpu`/`SysReg` surface exposes no TPIDR_EL1 setter either, so there
-    // is no public path to stamp it. Consequently the cbz guard sees TPIDR_EL1==0
-    // and gettid (178) traps straight to the host instead of being serviced at
-    // EL1.
-    //
-    // (The old assertion — "gettid serviced at EL1, first host trap is exit_group
-    // (94) carrying the stamped tid in x0" — verified a fast path the engine
-    // consolidation deliberately removed; the per-process getpid identity fast
-    // path above is unaffected and still proves the EL1-shim path is live.)
+    // gettid (178) is serviced at EL1 from the per-vCPU TPIDR_EL1 tid. On the
+    // consolidated `Aarch64EngineCore`, `ThreadedEngine::set_guest_thread_id`
+    // stamps that tid via the `Aarch64Vcpu::stamp_guest_thread_id` seam — HVF
+    // writes TPIDR_EL1 (its `hvc` vehicle leaves it free), KVM no-ops it (its
+    // sentinel vehicle uses TPIDR_EL1 as the live-x9 stash, so KVM traps gettid to
+    // the host). This proves the HVF fast path: the FIRST host-visible trap must be
+    // exit_group (94), NOT gettid — and x0 must carry the stamped tid, proving the
+    // EL1 handler read TPIDR_EL1 and returned it as the syscall result.
     let image = gettid_probe_image(true);
     let Some(mut engine) = shim_engine_or_skip(&image) else {
         return;
     };
-    // `set_guest_thread_id` is the call the runtime makes at thread setup; here it
-    // is a no-op (does NOT stamp TPIDR_EL1). Exercise it to prove that.
+    // Stamp the per-vCPU tid exactly like the runtime does at thread setup.
     const SENTINEL_TID: u64 = 0x4321;
     engine.set_guest_thread_id(SENTINEL_TID).unwrap();
 
     let frame = engine.next_syscall().unwrap().expect("guest must trap");
     assert_eq!(
-        frame.number, 178,
-        "set_guest_thread_id is a no-op on the shared engine, so the unstamped \
-         TPIDR_EL1 cbz guard must trap gettid to the host"
+        frame.number, 94,
+        "gettid (178) must be serviced at EL1; first host trap is exit_group"
+    );
+    assert_eq!(
+        frame.args[0], SENTINEL_TID,
+        "fast-path gettid must return the per-vCPU TPIDR_EL1 tid stamped via \
+         the stamp_guest_thread_id seam"
     );
 }
 

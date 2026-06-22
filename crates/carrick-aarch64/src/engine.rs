@@ -1238,11 +1238,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.set_guest_sp(&self.vcpu, sp)
     }
 
-    fn set_guest_thread_id(&self, _tid: u64) -> Result<(), TrapError> {
-        // No-op: aarch64 backends have no in-guest gettid fast path (that needs the
-        // syscall shim, which neither HVF nor KVM run). The guest reads its tid via
-        // the trapped `gettid` syscall, serviced by the dispatcher.
-        Ok(())
+    fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
+        // Stamp the per-thread scratch sysreg the EL1-vector `gettid` fast path
+        // reads, so `gettid(2)` is serviced at EL1 without a host trap. Genuinely
+        // per-VMM (see `Aarch64Vcpu::stamp_guest_thread_id`): HVF stamps TPIDR_EL1;
+        // KVM no-ops (TPIDR_EL1 is its live-x9 stash) and traps `gettid` to the host.
+        self.vcpu.stamp_guest_thread_id(tid)
     }
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
