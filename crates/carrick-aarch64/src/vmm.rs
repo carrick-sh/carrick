@@ -224,6 +224,19 @@ pub trait Aarch64Vcpu {
         Ok(None)
     }
 
+    /// Stamp the guest-visible thread id into the per-thread scratch sysreg the
+    /// EL1-vector `gettid` fast path reads, so `gettid(2)` is serviced at EL1
+    /// without a host trap. DEFAULT `Ok(())` (no-op) ⟹ this backend has no
+    /// in-guest `gettid` fast path and the dispatcher services `gettid` on the
+    /// host trap. Genuinely per-VMM: HVF stamps `TPIDR_EL1` (its `hvc` vehicle
+    /// leaves that sysreg free); KVM CANNOT — its sentinel vehicle already uses
+    /// `TPIDR_EL1` as the live-x9 stash (see [`Self::get_saved_x9`]), so it keeps
+    /// the no-op and traps `gettid` to the host.
+    fn stamp_guest_thread_id(&self, tid: u64) -> Result<(), TrapError> {
+        let _ = tid;
+        Ok(())
+    }
+
     /// Run until the next exit, decoding the backend's native trap surface into
     /// [`Aarch64Exit`]. HVF: `hv_vcpu_run` + `get_exit_info()` => EXCEPTION+ESR.EC
     /// decode (svc / abort / sys64 MRS / maint-hvc) + CANCELED => `Kicked`. KVM:
