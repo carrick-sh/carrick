@@ -4,8 +4,9 @@
 //! Every backend stops + joins its host signal pump before `libc::fork` (the pump
 //! holds process-global locks a fork would strand in the child) and recreates it
 //! on the three post-fork paths. That state machine was written twice — the
-//! kick+futex backends' [`crate::fork_coord::GenericForkCoordinator`] (self-pipe
-//! pump, always-on) and HVF's `ForkCoordinator` (kqueue pump, lazy). They differ
+//! kick+futex backends' `GenericForkCoordinator` (self-pipe
+//! pump, always-on; `crate::fork_coord`, cfg-empty on macOS) and HVF's
+//! `ForkCoordinator` (kqueue pump, lazy). They differ
 //! ONLY in the pump PRIMITIVE and two policies (always-on vs lazy; whether the
 //! child's pump reinit is owned by the coordinator or by the runtime), all of
 //! which are exactly the [`HostSignalPump`] methods. This is the one shared

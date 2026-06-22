@@ -1035,7 +1035,7 @@ impl NvmmX86Vcpu {
 /// The shared `carrick_x86::seg_ar` emits the **VMX** access-rights layout
 /// (Intel SDM vol.3 §24.4.1): type[0:3], s[4], dpl[5:6], p[7], avl[12], l[13],
 /// db[14], g[15]. NVMM's `attrib` is a **contiguous bitfield** (confirmed on-box
-/// + grounding doc): type[0:3], s[4], dpl[5:6], p[7], avl[8], l[9], def[10],
+/// and grounding doc): type[0:3], s[4], dpl[5:6], p[7], avl[8], l[9], def[10],
 /// g[11]. The low byte (type/s/dpl/p) is identical; the high flags move, so we
 /// repack avl/l/db(def)/g into NVMM's positions. (Getting this wrong leaves CS
 /// without its 64-bit `l` bit → the guest never runs long-mode ring-3 → spin.)

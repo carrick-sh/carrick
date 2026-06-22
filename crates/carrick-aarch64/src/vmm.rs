@@ -576,7 +576,7 @@ pub trait Aarch64Vmm: Sized {
 
     /// On the sibling thread, turn the builder into a fresh `(VM, vCPU)` on the
     /// SAME VM. KVM `materialize_sibling`; the engine restores the seeded snapshot
-    /// + SHARES the protections/page_tables Arc.
+    /// and SHARES the protections/page_tables Arc.
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError>;
 
     /// Set SP_EL0 on a vfork child given an explicit `child_stack`, through

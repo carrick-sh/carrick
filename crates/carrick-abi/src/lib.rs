@@ -455,7 +455,7 @@ impl LinuxWinsize {
 
 /// Size of the Linux kernel-ABI `struct termios` for TCGETS/TCSETS on
 /// aarch64. It's `c_iflag/c_oflag/c_cflag/c_lflag` (4 u32s = 16 bytes)
-/// + `c_line` (1 byte) + `c_cc[19]` (19 bytes) = **36 bytes**.
+/// plus `c_line` (1 byte) and `c_cc[19]` (19 bytes) = **36 bytes**.
 ///
 /// The `c_ispeed`/`c_ospeed` fields belong to `struct termios2` (TCGETS2),
 /// a separate ioctl. Writing 44 bytes for TCGETS overflows the
@@ -1319,8 +1319,8 @@ pub const LINUX_FPSIMD_MAGIC: u32 = 0x4650_8001;
 
 /// AArch64 `struct fpsimd_context`: the FP/SIMD register record stored at the
 /// start of `sigcontext.__reserved`. `vregs` holds V0–V31 as 128-bit values.
-/// `#[repr(C, packed)]` matches the kernel's contiguous layout (head 8 + fpsr 4
-/// + fpcr 4 + vregs 512 = 528 bytes; `vregs` at offset 16).
+/// `#[repr(C, packed)]` matches the kernel's contiguous layout (head 8, fpsr 4,
+/// fpcr 4, vregs 512 = 528 bytes; `vregs` at offset 16).
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
