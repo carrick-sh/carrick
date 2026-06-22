@@ -3379,19 +3379,44 @@ fn host_clock_duration(clock_id: libc::clockid_t) -> Option<Duration> {
 }
 
 fn monotonic_duration() -> Duration {
+    // On a Linux host the guest's CLOCK_MONOTONIC IS the host's — read the host
+    // CLOCK_MONOTONIC (NOT CLOCK_MONOTONIC_RAW). RAW is the un-virtualized
+    // hardware clock; inside a time-namespace (LXC/containers) it is NOT offset
+    // by the namespace's boottime delta while CLOCK_MONOTONIC and CLOCK_BOOTTIME
+    // ARE, so a RAW monotonic can exceed the virtualized BOOTTIME and break the
+    // BOOTTIME >= MONOTONIC invariant. Keeping both on the virtualized family
+    // makes the invariant hold; it also matches what the guest asked for.
+    #[cfg(target_os = "linux")]
+    {
+        return host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or(Duration::ZERO);
+    }
     // Linux CLOCK_MONOTONIC does NOT advance while the system is suspended.
     // On macOS that is CLOCK_UPTIME_RAW (mach_absolute_time) — NOT macOS
     // CLOCK_MONOTONIC, which (unlike Linux) keeps counting through sleep and
     // therefore corresponds to Linux CLOCK_BOOTTIME (see `boottime_duration`).
-    host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW).unwrap_or(Duration::ZERO)
+    #[cfg(not(target_os = "linux"))]
+    {
+        host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW).unwrap_or(Duration::ZERO)
+    }
 }
 
 fn boottime_duration() -> Duration {
+    // On a Linux host the guest's CLOCK_BOOTTIME IS the host's — read it natively
+    // so it shares the same (time-namespace-virtualized) epoch family as
+    // monotonic_duration above; BOOTTIME = MONOTONIC + suspend, so the
+    // BOOTTIME >= MONOTONIC invariant holds.
+    #[cfg(target_os = "linux")]
+    {
+        return host_clock_duration(libc::CLOCK_BOOTTIME).unwrap_or_else(monotonic_duration);
+    }
     // Linux CLOCK_BOOTTIME = CLOCK_MONOTONIC + time spent suspended. macOS
     // CLOCK_MONOTONIC (backed by mach_continuous_time) is exactly that: it
     // continues to advance while the system sleeps, so it is >= the
     // suspend-excluding `monotonic_duration` above.
-    host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or_else(monotonic_duration)
+    #[cfg(not(target_os = "linux"))]
+    {
+        host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or_else(monotonic_duration)
+    }
 }
 
 fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec {

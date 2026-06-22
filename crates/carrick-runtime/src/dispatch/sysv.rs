@@ -74,15 +74,34 @@ unsafe extern "C" {
 }
 
 /// macOS `struct msqid_ds` field offsets (measured via offsetof). Used to
-/// translate IPC_STAT into the Linux aarch64 `msqid64_ds` layout.
+/// translate IPC_STAT into the Linux aarch64 `msqid64_ds` layout. Each host
+/// reads its msqid_ds the FAITHFUL way: Linux and FreeBSD read a NATIVE
+/// `libc::msqid_ds` by field name (the two field-naming conventions differ —
+/// `__key`/`__seq`/`__msg_cbytes` on Linux vs `key`/`seq`/`msg_cbytes` on
+/// FreeBSD — so each has its own arm below). macOS reads these raw offsets
+/// (libc lacks the type on macOS). NetBSD also lands on the macOS-offset path:
+/// libc 0.2 does NOT define `msqid_ds` for NetBSD, so a native read can't be
+/// expressed there — the macOS-offset path is the best-effort fallback (no NetBSD
+/// SysV-msg conformance box exists to bless a native layout). These constants are
+/// gated to the hosts that actually use them (macOS + NetBSD = "no native
+/// msqid_ds we read by name").
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MACOS_MSQID_DS_SIZE: usize = 116;
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_CBYTES: usize = 32; // u64
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_QNUM: usize = 40; // u64
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_QBYTES: usize = 48; // u64
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_LSPID: usize = 56; // i32
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_LRPID: usize = 60; // i32
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_STIME: usize = 64; // time_t (read low 8)
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_RTIME: usize = 76; // time_t
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 const MAC_MSG_CTIME: usize = 88; // time_t
 
 // Linux aarch64 `struct msqid64_ds` field offsets (asm-generic/msgbuf.h):
@@ -649,10 +668,125 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_IPC_SET => Ok(DispatchOutcome::Returned { value: 0 }),
+                #[cfg(target_os = "linux")]
                 LINUX_IPC_STAT => {
-                    // Stat into a raw macOS msqid_ds buffer (libc lacks the
-                    // type on macOS); extract msg_qnum/msg_qbytes from the
-                    // measured offsets.
+                    // On a Linux host the kernel returns a NATIVE msqid_ds
+                    // (libc has the type), so read its fields by NAME rather than
+                    // re-deriving them from the macOS offsets — double-translating
+                    // the macOS layout against a Linux struct corrupts every field.
+                    // Only owner/creator come from the guest creds (carrick's host
+                    // process is not the guest uid); key/mode/times/counters are the
+                    // host kernel's truth.
+                    let mut ds: libc::msqid_ds = unsafe { core::mem::zeroed() };
+                    let rc = unsafe {
+                        libc::msgctl(
+                            msqid as i32,
+                            libc::IPC_STAT,
+                            &mut ds as *mut libc::msqid_ds,
+                        )
+                    };
+                    if let Err(errno) = rc.host_syscall_errno() {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    if buf != 0 {
+                        let mut out = [0u8; LINUX_MSQID_DS_SIZE];
+                        let put8 = |out: &mut [u8], o: usize, v: u64| {
+                            out[o..o + 8].copy_from_slice(&v.to_le_bytes())
+                        };
+                        let put4 = |out: &mut [u8], o: usize, v: i32| {
+                            out[o..o + 4].copy_from_slice(&v.to_le_bytes())
+                        };
+                        put8(&mut out, LIN_MSG_STIME, ds.msg_stime as u64);
+                        put8(&mut out, LIN_MSG_RTIME, ds.msg_rtime as u64);
+                        put8(&mut out, LIN_MSG_CTIME, ds.msg_ctime as u64);
+                        put8(&mut out, LIN_MSG_CBYTES, ds.__msg_cbytes);
+                        put8(&mut out, LIN_MSG_QNUM, ds.msg_qnum);
+                        put8(&mut out, LIN_MSG_QBYTES, ds.msg_qbytes);
+                        put4(&mut out, LIN_MSG_LSPID, ds.msg_lspid);
+                        put4(&mut out, LIN_MSG_LRPID, ds.msg_lrpid);
+                        // Linux ipc64_perm — key@0,uid@4,gid@8,cuid@12,cgid@16,
+                        // mode@20(u32),seq@24(u16). owner/creator come from the GUEST
+                        // creds; key/mode/seq are the host kernel's.
+                        let creds = this.cred_snapshot();
+                        put4(&mut out, 0, ds.msg_perm.__key);
+                        put4(&mut out, 4, creds.euid as i32);
+                        put4(&mut out, 8, creds.egid as i32);
+                        put4(&mut out, 12, creds.euid as i32);
+                        put4(&mut out, 16, creds.egid as i32);
+                        out[20..24].copy_from_slice(&(ds.msg_perm.mode as u32).to_le_bytes());
+                        out[24..26].copy_from_slice(&ds.msg_perm.__seq.to_le_bytes());
+                        let memory = &mut *cx.memory;
+                        if memory.write_bytes(buf, &out).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+                #[cfg(target_os = "freebsd")]
+                LINUX_IPC_STAT => {
+                    // On a FreeBSD host the kernel returns a NATIVE msqid_ds
+                    // (libc has the type), so read its fields by NAME — the
+                    // faithful equivalent of the Linux arm. FreeBSD's field
+                    // naming differs from Linux's (no leading underscores on the
+                    // ipc_perm `key`/`seq` and the queue uses `msg_cbytes`, not
+                    // `__msg_cbytes`), so this is a separate arm rather than a
+                    // widened `cfg`. Only owner/creator come from the GUEST creds
+                    // (carrick's host process is not the guest uid); key/mode/
+                    // times/counters are the host kernel's truth.
+                    let mut ds: libc::msqid_ds = unsafe { core::mem::zeroed() };
+                    let rc = unsafe {
+                        libc::msgctl(msqid as i32, libc::IPC_STAT, &mut ds as *mut libc::msqid_ds)
+                    };
+                    if let Err(errno) = rc.host_syscall_errno() {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    if buf != 0 {
+                        let mut out = [0u8; LINUX_MSQID_DS_SIZE];
+                        let put8 = |out: &mut [u8], o: usize, v: u64| {
+                            out[o..o + 8].copy_from_slice(&v.to_le_bytes())
+                        };
+                        let put4 = |out: &mut [u8], o: usize, v: i32| {
+                            out[o..o + 4].copy_from_slice(&v.to_le_bytes())
+                        };
+                        put8(&mut out, LIN_MSG_STIME, ds.msg_stime as u64);
+                        put8(&mut out, LIN_MSG_RTIME, ds.msg_rtime as u64);
+                        put8(&mut out, LIN_MSG_CTIME, ds.msg_ctime as u64);
+                        put8(&mut out, LIN_MSG_CBYTES, ds.msg_cbytes as u64);
+                        put8(&mut out, LIN_MSG_QNUM, ds.msg_qnum as u64);
+                        put8(&mut out, LIN_MSG_QBYTES, ds.msg_qbytes as u64);
+                        put4(&mut out, LIN_MSG_LSPID, ds.msg_lspid);
+                        put4(&mut out, LIN_MSG_LRPID, ds.msg_lrpid);
+                        // Linux ipc64_perm — key@0,uid@4,gid@8,cuid@12,cgid@16,
+                        // mode@20(u32),seq@24(u16). owner/creator come from the GUEST
+                        // creds; key/mode/seq are the host kernel's. FreeBSD's
+                        // ipc_perm exposes the same fields under unprefixed names.
+                        let creds = this.cred_snapshot();
+                        // FreeBSD `key_t` is i64 (Linux's is i32); the Linux IPC
+                        // perm `key` field is 4 bytes, so narrow to i32.
+                        put4(&mut out, 0, ds.msg_perm.key as i32);
+                        put4(&mut out, 4, creds.euid as i32);
+                        put4(&mut out, 8, creds.egid as i32);
+                        put4(&mut out, 12, creds.euid as i32);
+                        put4(&mut out, 16, creds.egid as i32);
+                        out[20..24].copy_from_slice(&(ds.msg_perm.mode as u32).to_le_bytes());
+                        out[24..26].copy_from_slice(&ds.msg_perm.seq.to_le_bytes());
+                        let memory = &mut *cx.memory;
+                        if memory.write_bytes(buf, &out).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                LINUX_IPC_STAT => {
+                    // macOS + NetBSD: libc has no `msqid_ds` we can read by name
+                    // (NetBSD doesn't define it in libc 0.2; macOS never did), so
+                    // stat into a raw buffer and extract the fields from the
+                    // MEASURED macOS offsets. macOS uses these offsets correctly;
+                    // NetBSD's native msqid_ds layout differs, so this path is
+                    // best-effort there (no NetBSD SysV-msg conformance box exists
+                    // to bless a native layout). The Linux and FreeBSD arms above
+                    // do the faithful by-name read for their hosts.
                     let mut ds = [0u8; MACOS_MSQID_DS_SIZE];
                     let rc = unsafe {
                         msgctl(msqid as i32, libc::IPC_STAT, ds.as_mut_ptr() as *mut libc::c_void)

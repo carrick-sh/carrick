@@ -572,7 +572,56 @@ mod imp {
         0
     }
     pub fn self_resource_usage() -> Option<ResourceUsage> {
-        None
+        #[cfg(target_os = "linux")]
+        {
+            let mut usage = ResourceUsage::default();
+
+            // CPU + peak RSS from getrusage(RUSAGE_SELF). ru_maxrss is KiB on Linux.
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: getrusage(RUSAGE_SELF) fills `ru` for this process; a zeroed
+            // rusage is a valid out-buffer.
+            let ru_ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0;
+            if ru_ok {
+                let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+                usage.user_us = to_us(ru.ru_utime);
+                usage.system_us = to_us(ru.ru_stime);
+                usage.maxrss_bytes = (ru.ru_maxrss.max(0) as u64).saturating_mul(1024);
+                usage.majflt = ru.ru_majflt.max(0) as u64;
+            }
+
+            // RUSAGE_CHILDREN for reaped children (tms_cutime / RUSAGE_CHILDREN).
+            let mut ruc: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: same contract as above for RUSAGE_CHILDREN.
+            if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ruc) } == 0 {
+                let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+                usage.child_user_us = to_us(ruc.ru_utime);
+                usage.child_system_us = to_us(ruc.ru_stime);
+            }
+
+            // Current VSZ / RSS from /proc/self/statm (pages: size, resident, ...).
+            let mut statm_ok = false;
+            if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+                let mut fields = statm.split_whitespace();
+                // SAFETY: sysconf(_SC_PAGESIZE) has no side effects; >0 on Linux.
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64;
+                if let (Some(size), Some(resident)) = (fields.next(), fields.next())
+                    && let (Ok(size), Ok(resident)) = (size.parse::<u64>(), resident.parse::<u64>())
+                {
+                    usage.virtual_bytes = size.saturating_mul(page);
+                    usage.resident_bytes = resident.saturating_mul(page);
+                    statm_ok = true;
+                }
+            }
+
+            if !ru_ok && !statm_ok {
+                return None;
+            }
+            Some(usage)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// (user_us, system_us) CPU time for the CURRENT thread, from the host

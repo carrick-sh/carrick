@@ -36,11 +36,15 @@ fn vvar_offsets(freq_hz: u64, guest_tsc: u64, realtime_ns: u64, monotonic_ns: u6
 }
 
 /// Host monotonic reference for the vvar offset. The guest reads `CLOCK_MONOTONIC`
-/// from the fast path; we calibrate against the closest non-NTP-adjusted host
-/// clock available per host OS (raw monotonic on Linux/macOS, plain monotonic on
-/// the BSDs where `_RAW` is absent).
+/// from the fast path; calibrate against the host's `CLOCK_MONOTONIC` so the vDSO
+/// fast path shares the SAME (time-namespace-virtualized) epoch family as the
+/// syscall-path MONOTONIC/BOOTTIME. Calibrating against `CLOCK_MONOTONIC_RAW`
+/// instead diverges inside a time-namespace (RAW is un-virtualized → larger than
+/// the virtualized BOOTTIME), breaking the guest's BOOTTIME >= MONOTONIC
+/// invariant. On macOS, raw uptime (mach_absolute_time) is the Linux-MONOTONIC
+/// analogue; the BSDs lack `_RAW` and use plain monotonic.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const MONOTONIC_REF: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
+const MONOTONIC_REF: libc::clockid_t = libc::CLOCK_MONOTONIC;
 #[cfg(target_os = "macos")]
 const MONOTONIC_REF: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
