@@ -294,6 +294,13 @@ fn is_signed_with_hypervisor(bin: &PathBuf) -> bool {
 /// it never disturbs another worktree's binary.
 #[allow(clippy::panic)]
 fn ensure_signed(bin: &PathBuf) {
+    // codesign + the hypervisor entitlement are macOS/HVF-only. Off-macOS the
+    // binary runs directly (KVM/bhyve/NVMM carry no entitlement) and `codesign`
+    // does not exist, so signing is both meaningless and impossible — skip it so
+    // the conformance/probe gate runs on the Linux/FreeBSD fleet too.
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
     if is_signed_with_hypervisor(bin) {
         return;
     }
