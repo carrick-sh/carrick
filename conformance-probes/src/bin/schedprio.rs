@@ -13,12 +13,19 @@
 
 use conformance_probes::errno;
 
-const SCHED_SETPARAM: libc::c_long = 118;
-const SCHED_SETSCHEDULER: libc::c_long = 119;
-const SCHED_GETSCHEDULER: libc::c_long = 120;
-const SCHED_GETPARAM: libc::c_long = 121;
-const SETPRIORITY: libc::c_long = 140;
-const GETPRIORITY: libc::c_long = 141;
+// Syscall numbers are ARCH-SPECIFIC. The earlier hardcoded 118-121/140-141 were
+// the asm-generic/aarch64 numbers, which name DIFFERENT syscalls on x86_64
+// (e.g. raw 119 is setresgid there, not sched_setscheduler) — so the probe
+// diverged from Linux on the x86_64 lane. Resolve them through libc's
+// arch-correct `SYS_*` constants so the SAME source exercises the right syscall
+// on every target (aarch64 still resolves to 118-121/140-141; x86_64 to
+// 142/144/145/143/141/140).
+const SCHED_SETPARAM: libc::c_long = libc::SYS_sched_setparam;
+const SCHED_SETSCHEDULER: libc::c_long = libc::SYS_sched_setscheduler;
+const SCHED_GETSCHEDULER: libc::c_long = libc::SYS_sched_getscheduler;
+const SCHED_GETPARAM: libc::c_long = libc::SYS_sched_getparam;
+const SETPRIORITY: libc::c_long = libc::SYS_setpriority;
+const GETPRIORITY: libc::c_long = libc::SYS_getpriority;
 const PRIO_PROCESS: libc::c_long = 0;
 const PRIO_PGRP: libc::c_long = 1;
 const PRIO_USER: libc::c_long = 2;
