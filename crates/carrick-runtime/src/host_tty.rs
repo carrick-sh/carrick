@@ -33,77 +33,138 @@ use parking_lot::Mutex;
 
 use crate::linux_abi::{LinuxTermios, LinuxWinsize};
 
+// The Linux↔Darwin termios bit/index translation tables and helpers below are
+// macOS-only (Darwin's bit positions and `c_cc` order differ from Linux's). Every
+// non-macOS host translates field-by-field against its OWN `libc::` termios bits
+// (see the `cfg(not(target_os = "macos"))` impls of
+// `host_to_linux_termios`/`linux_to_host_termios`): on Linux those `libc::` values
+// EQUAL the guest-Linux values, so the translation is identity-equivalent (the
+// Linux box is unchanged); on FreeBSD/NetBSD they are that host's native bits, so
+// the translation is faithful by construction. Every Darwin-only item is gated
+// under macOS so the non-macOS build stays dead-code-free (clippy denies warns).
+
 /// POSIX `c_iflag` bits that share VALUES between Linux and Darwin:
 /// IGNBRK 0x01..ICRNL 0x100 (=0x1FF), IXANY 0x800, IUTF8 0x4000.
 /// IXON/IXOFF do NOT share values (Linux 0x400/0x1000 vs Darwin
 /// 0x200/0x400) and are translated explicitly below. (audit M4; probe termiosbits)
+#[cfg(target_os = "macos")]
 const COMMON_IFLAG_MASK: u32 = 0x0000_49FF;
+#[cfg(target_os = "macos")]
 const LINUX_IXON: u32 = 0x0400;
+#[cfg(target_os = "macos")]
 const LINUX_IXOFF: u32 = 0x1000;
+#[cfg(target_os = "macos")]
 const DARWIN_IXON: carrick_portable::TcFlag = 0x0200;
+#[cfg(target_os = "macos")]
 const DARWIN_IXOFF: carrick_portable::TcFlag = 0x0400;
 
 /// POSIX `c_oflag` bits with matching values: OPOST 0x0001,
 /// ONLCR 0x0004 (Linux) — Darwin uses 0x0002 for ONLCR. To keep
 /// the round-trip honest we mask only OPOST here; ONLCR is
 /// translated explicitly below.
+#[cfg(target_os = "macos")]
 const COMMON_OFLAG_MASK: u32 = 0x0000_0001;
+#[cfg(target_os = "macos")]
 const LINUX_ONLCR: u32 = 0x0004;
+#[cfg(target_os = "macos")]
 const DARWIN_ONLCR: carrick_portable::TcFlag = 0x0002;
+#[cfg(target_os = "macos")]
 const LINUX_OCRNL: u32 = 0x0008;
+#[cfg(target_os = "macos")]
 const DARWIN_OCRNL: carrick_portable::TcFlag = 0x0010;
 
 /// c_cflag field values. Linux and Darwin use DIFFERENT bit positions for the
 /// CSIZE/CSTOPB/parity group, so each is translated per-field (not masked 1:1).
 /// The CBAUD baud nibble is NOT copied (baud rides in c_ispeed/c_ospeed).
 /// (audit M4; probe termiosbits)
+#[cfg(target_os = "macos")]
 const LINUX_CSIZE: u32 = 0x0030;
+#[cfg(target_os = "macos")]
 const LINUX_CS6: u32 = 0x0010;
+#[cfg(target_os = "macos")]
 const LINUX_CS7: u32 = 0x0020;
+#[cfg(target_os = "macos")]
 const LINUX_CS8: u32 = 0x0030;
+#[cfg(target_os = "macos")]
 const LINUX_CSTOPB: u32 = 0x0040;
+#[cfg(target_os = "macos")]
 const LINUX_CREAD: u32 = 0x0080;
+#[cfg(target_os = "macos")]
 const LINUX_PARENB: u32 = 0x0100;
+#[cfg(target_os = "macos")]
 const LINUX_PARODD: u32 = 0x0200;
+#[cfg(target_os = "macos")]
 const LINUX_HUPCL: u32 = 0x0400;
+#[cfg(target_os = "macos")]
 const LINUX_CLOCAL: u32 = 0x0800;
+#[cfg(target_os = "macos")]
 const DARWIN_CSIZE: carrick_portable::TcFlag = 0x0300;
+#[cfg(target_os = "macos")]
 const DARWIN_CS6: carrick_portable::TcFlag = 0x0100;
+#[cfg(target_os = "macos")]
 const DARWIN_CS7: carrick_portable::TcFlag = 0x0200;
+#[cfg(target_os = "macos")]
 const DARWIN_CS8: carrick_portable::TcFlag = 0x0300;
+#[cfg(target_os = "macos")]
 const DARWIN_CSTOPB: carrick_portable::TcFlag = 0x0400;
+#[cfg(target_os = "macos")]
 const DARWIN_CREAD: carrick_portable::TcFlag = 0x0800;
+#[cfg(target_os = "macos")]
 const DARWIN_PARENB: carrick_portable::TcFlag = 0x1000;
+#[cfg(target_os = "macos")]
 const DARWIN_PARODD: carrick_portable::TcFlag = 0x2000;
+#[cfg(target_os = "macos")]
 const DARWIN_HUPCL: carrick_portable::TcFlag = 0x4000;
+#[cfg(target_os = "macos")]
 const DARWIN_CLOCAL: carrick_portable::TcFlag = 0x8000;
 
 /// POSIX `c_lflag` bits ISIG 0x01, ICANON 0x02, ECHO 0x08, ECHOE
 /// 0x10, ECHOK 0x20, ECHONL 0x40, NOFLSH 0x80, TOSTOP 0x100,
 /// IEXTEN 0x8000 — all match Linux. Darwin uses different values
 /// for some of these so we translate them explicitly.
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_ISIG: u32 = 0x0000_0001;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_ICANON: u32 = 0x0000_0002;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_ECHO: u32 = 0x0000_0008;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_ECHOE: u32 = 0x0000_0010;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_ECHOK: u32 = 0x0000_0020;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_ECHONL: u32 = 0x0000_0040;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_NOFLSH: u32 = 0x0000_0080;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_TOSTOP: u32 = 0x0000_0100;
+#[cfg(target_os = "macos")]
 const LINUX_LFLAG_IEXTEN: u32 = 0x0000_8000;
 
 // Darwin values from <sys/termios.h>.
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ECHOKE: carrick_portable::TcFlag = 0x0000_0001; // unused on linux side; ignore inbound
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ECHOE: carrick_portable::TcFlag = 0x0000_0002;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ECHOK: carrick_portable::TcFlag = 0x0000_0004;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ECHO: carrick_portable::TcFlag = 0x0000_0008;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ECHONL: carrick_portable::TcFlag = 0x0000_0010;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ECHOPRT: carrick_portable::TcFlag = 0x0000_0020;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ECHOCTL: carrick_portable::TcFlag = 0x0000_0040;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ISIG: carrick_portable::TcFlag = 0x0000_0080;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_ICANON: carrick_portable::TcFlag = 0x0000_0100;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_IEXTEN: carrick_portable::TcFlag = 0x0000_0400;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_NOFLSH: carrick_portable::TcFlag = 0x8000_0000;
+#[cfg(target_os = "macos")]
 const DARWIN_LFLAG_TOSTOP: carrick_portable::TcFlag = 0x0040_0000;
 
 // VINTR/VQUIT/VERASE/etc indices differ between Linux and Darwin.
@@ -120,6 +181,7 @@ const DARWIN_LFLAG_TOSTOP: carrick_portable::TcFlag = 0x0040_0000;
 /// Map "Linux VINTR-style index" -> "Darwin index". `None` means the
 /// slot has no direct equivalent on Darwin (e.g. VSWTC) and we leave
 /// the byte at 0.
+#[cfg(target_os = "macos")]
 const LINUX_TO_DARWIN_CC: [Option<usize>; 17] = [
     Some(8),  // 0 VINTR
     Some(9),  // 1 VQUIT
@@ -157,11 +219,85 @@ pub fn get_host_termios(fd: i32) -> Option<LinuxTermios> {
     // SAFETY: zero-initialised termios is the documented "uninitialised
     // input, kernel fills it" form for tcgetattr.
     unsafe {
-        let mut darwin: libc::termios = core::mem::zeroed();
-        if libc::tcgetattr(fd, &mut darwin) != 0 {
+        let mut host: libc::termios = core::mem::zeroed();
+        if libc::tcgetattr(fd, &mut host) != 0 {
             return None;
         }
-        Some(darwin_to_linux_termios(&darwin))
+        Some(host_to_linux_termios(&host))
+    }
+}
+
+/// Translate a host `libc::termios` into the guest Linux `LinuxTermios`.
+/// On macOS the field VALUES/positions differ from Linux, so each flag group
+/// is remapped by `darwin_to_linux_termios`.
+#[cfg(target_os = "macos")]
+fn host_to_linux_termios(d: &libc::termios) -> LinuxTermios {
+    darwin_to_linux_termios(d)
+}
+
+/// Translate a host `libc::termios` into the guest Linux `LinuxTermios` for any
+/// NON-macOS host (Linux + the BSDs). Each guest-Linux bit/`c_cc` index is filled
+/// from the HOST's NATIVE `libc::` flag, so the value lands at the position the
+/// guest expects regardless of where the host keeps it. On Linux every `libc::`
+/// flag EQUALS the guest-Linux value, so this is identity-equivalent (the Linux
+/// box is byte-for-byte unchanged); on FreeBSD/NetBSD `libc::ICRNL`, `libc::IXON`,
+/// `libc::CS8`, `libc::ICANON`, the `libc::V*` indices, … are that host's native
+/// positions, so the translation is faithful by construction. Anything outside
+/// the well-known POSIX set is dropped (matching the documented policy).
+#[cfg(not(target_os = "macos"))]
+fn host_to_linux_termios(d: &libc::termios) -> LinuxTermios {
+    use guest_linux_termios as g;
+    let h = d;
+
+    let mut c_iflag = 0u32;
+    for (host_bit, linux_bit) in iflag_pairs(h) {
+        if (h.c_iflag & host_bit) != 0 {
+            c_iflag |= linux_bit;
+        }
+    }
+    let mut c_oflag = 0u32;
+    for (host_bit, linux_bit) in oflag_pairs(h) {
+        if (h.c_oflag & host_bit) != 0 {
+            c_oflag |= linux_bit;
+        }
+    }
+    let mut c_cflag = host_csize_to_linux(h.c_cflag);
+    for (host_bit, linux_bit) in cflag_pairs(h) {
+        if (h.c_cflag & host_bit) != 0 {
+            c_cflag |= linux_bit;
+        }
+    }
+    let mut c_lflag = 0u32;
+    for (host_bit, linux_bit) in lflag_pairs(h) {
+        if (h.c_lflag & host_bit) != 0 {
+            c_lflag |= linux_bit;
+        }
+    }
+
+    // c_cc: copy each control char from its HOST `libc::V*` slot into the
+    // guest-Linux slot. On Linux the indices coincide; on the BSDs they differ
+    // (e.g. Darwin/BSD VEOF=0, Linux VEOF=4), so go index-by-index.
+    let mut c_cc = [0u8; 19];
+    for (linux_idx, host_idx) in g::CC_INDEX_PAIRS {
+        if linux_idx < c_cc.len() && host_idx < h.c_cc.len() {
+            c_cc[linux_idx] = h.c_cc[host_idx] as u8;
+        }
+    }
+
+    // Baud rides in c_ispeed/c_ospeed; read via the POSIX accessors (the raw
+    // fields differ in width/type across hosts).
+    // SAFETY: `h` is a fully-initialised termios; cfget*speed only read it.
+    let ispeed = unsafe { libc::cfgetispeed(h) } as u32;
+    let ospeed = unsafe { libc::cfgetospeed(h) } as u32;
+    LinuxTermios {
+        c_iflag,
+        c_oflag,
+        c_cflag,
+        c_lflag,
+        c_line: 0,
+        c_cc,
+        c_ispeed: ispeed,
+        c_ospeed: ospeed,
     }
 }
 
@@ -174,22 +310,314 @@ pub fn set_host_termios(fd: i32, linux: &LinuxTermios) -> bool {
     // SAFETY: zero-initialised termios then overwritten field-by-field
     // before being passed to tcsetattr.
     unsafe {
-        let mut darwin: libc::termios = core::mem::zeroed();
+        let mut host: libc::termios = core::mem::zeroed();
         // Preserve any bits we don't translate by reading the current
-        // state first; that way we don't blow away platform-specific
-        // bits like Darwin's ECHOKE.
-        let _ = libc::tcgetattr(fd, &mut darwin);
-        linux_to_darwin_termios(linux, &mut darwin);
+        // state first; that way we don't blow away platform-specific bits.
+        let _ = libc::tcgetattr(fd, &mut host);
+        linux_to_host_termios(linux, &mut host);
         #[cfg(feature = "trace-io")]
         {
             let (li, lo, ll) = (linux.c_iflag, linux.c_oflag, linux.c_lflag);
-            let (di, do_, dl) = (darwin.c_iflag, darwin.c_oflag, darwin.c_lflag);
+            let (di, do_, dl) = (host.c_iflag, host.c_oflag, host.c_lflag);
             eprintln!(
-                "[TERMDBG] fd={fd} linux iflag={li:#06x} oflag={lo:#06x} lflag={ll:#06x} -> darwin iflag={di:#06x} oflag={do_:#06x} lflag={dl:#06x}"
+                "[TERMDBG] fd={fd} linux iflag={li:#06x} oflag={lo:#06x} lflag={ll:#06x} -> host iflag={di:#06x} oflag={do_:#06x} lflag={dl:#06x}"
             );
         }
-        libc::tcsetattr(fd, libc::TCSANOW, &darwin) == 0
+        libc::tcsetattr(fd, libc::TCSANOW, &host) == 0
     }
+}
+
+/// Translate a guest Linux `LinuxTermios` into the host `libc::termios` in
+/// place. On macOS the flag groups are remapped to Darwin positions by
+/// `linux_to_darwin_termios`.
+#[cfg(target_os = "macos")]
+fn linux_to_host_termios(l: &LinuxTermios, d: &mut libc::termios) {
+    linux_to_darwin_termios(l, d);
+}
+
+/// Translate a guest Linux `LinuxTermios` into the host `libc::termios` for any
+/// NON-macOS host (Linux + the BSDs). The inverse of the non-macOS
+/// `host_to_linux_termios`: each guest-Linux bit/`c_cc` index is written to the
+/// HOST's NATIVE `libc::` position. On Linux the positions coincide so this is
+/// identity-equivalent (the Linux box is unchanged); on FreeBSD/NetBSD it lands
+/// each bit at that host's native position, so a guest CS8/IXON/ICANON/VINTR
+/// takes effect correctly. Host-specific bits the guest never sets are preserved
+/// by clearing only the well-known POSIX mask before OR-ing the translated bits.
+#[cfg(not(target_os = "macos"))]
+fn linux_to_host_termios(l: &LinuxTermios, d: &mut libc::termios) {
+    // Clear the well-known POSIX bits we translate, preserve everything else.
+    let (i_mask, o_mask, c_mask, l_mask) = host_posix_masks(d);
+    let mut iflag = d.c_iflag & !i_mask;
+    for (host_bit, linux_bit) in iflag_pairs(d) {
+        if (l.c_iflag & linux_bit) != 0 {
+            iflag |= host_bit;
+        }
+    }
+    let mut oflag = d.c_oflag & !o_mask;
+    for (host_bit, linux_bit) in oflag_pairs(d) {
+        if (l.c_oflag & linux_bit) != 0 {
+            oflag |= host_bit;
+        }
+    }
+    let mut cflag = d.c_cflag & !c_mask;
+    cflag |= linux_csize_to_host(l.c_cflag);
+    for (host_bit, linux_bit) in cflag_pairs(d) {
+        if (l.c_cflag & linux_bit) != 0 {
+            cflag |= host_bit;
+        }
+    }
+    let mut lflag = d.c_lflag & !l_mask;
+    for (host_bit, linux_bit) in lflag_pairs(d) {
+        if (l.c_lflag & linux_bit) != 0 {
+            lflag |= host_bit;
+        }
+    }
+
+    d.c_iflag = iflag;
+    d.c_oflag = oflag;
+    d.c_cflag = cflag;
+    d.c_lflag = lflag;
+
+    for (linux_idx, host_idx) in guest_linux_termios::CC_INDEX_PAIRS {
+        if host_idx < d.c_cc.len() && linux_idx < l.c_cc.len() {
+            d.c_cc[host_idx] = l.c_cc[linux_idx] as libc::cc_t;
+        }
+    }
+
+    carrick_portable::set_termios_speeds(d, l.c_ispeed, l.c_ospeed);
+}
+
+/// Guest-Linux termios ABI constants (asm-generic/termbits.h) — the canonical
+/// values the guest uses, independent of the host. Used by the non-macOS
+/// translation to pair each host `libc::` bit with the guest-Linux bit it maps
+/// to. (On a Linux host these equal the corresponding `libc::` value, so the
+/// translation collapses to identity; on the BSDs the host `libc::` side differs
+/// and these stay fixed at the guest values.)
+#[cfg(not(target_os = "macos"))]
+mod guest_linux_termios {
+    // c_iflag
+    pub const IGNBRK: u32 = 0x0001;
+    pub const BRKINT: u32 = 0x0002;
+    pub const IGNPAR: u32 = 0x0004;
+    pub const PARMRK: u32 = 0x0008;
+    pub const INPCK: u32 = 0x0010;
+    pub const ISTRIP: u32 = 0x0020;
+    pub const INLCR: u32 = 0x0040;
+    pub const IGNCR: u32 = 0x0080;
+    pub const ICRNL: u32 = 0x0100;
+    pub const IXON: u32 = 0x0400;
+    pub const IXANY: u32 = 0x0800;
+    pub const IXOFF: u32 = 0x1000;
+    pub const IMAXBEL: u32 = 0x2000;
+    /// `IUTF8` is Linux-only on the host side (`libc::IUTF8` exists only there),
+    /// so the guest-Linux constant is referenced only on Linux. Gate it to avoid
+    /// a dead-code warning on the BSD builds (clippy denies warnings).
+    #[cfg(target_os = "linux")]
+    pub const IUTF8: u32 = 0x4000;
+    // c_oflag
+    pub const OPOST: u32 = 0x0001;
+    pub const ONLCR: u32 = 0x0004;
+    pub const OCRNL: u32 = 0x0008;
+    pub const ONOCR: u32 = 0x0010;
+    pub const ONLRET: u32 = 0x0020;
+    // c_cflag (CSIZE field handled separately)
+    pub const CSTOPB: u32 = 0x0040;
+    pub const CREAD: u32 = 0x0080;
+    pub const PARENB: u32 = 0x0100;
+    pub const PARODD: u32 = 0x0200;
+    pub const HUPCL: u32 = 0x0400;
+    pub const CLOCAL: u32 = 0x0800;
+    pub const CSIZE: u32 = 0x0030;
+    pub const CS6: u32 = 0x0010;
+    pub const CS7: u32 = 0x0020;
+    pub const CS8: u32 = 0x0030;
+    // c_lflag
+    pub const ISIG: u32 = 0x0001;
+    pub const ICANON: u32 = 0x0002;
+    pub const ECHO: u32 = 0x0008;
+    pub const ECHOE: u32 = 0x0010;
+    pub const ECHOK: u32 = 0x0020;
+    pub const ECHONL: u32 = 0x0040;
+    pub const NOFLSH: u32 = 0x0080;
+    pub const TOSTOP: u32 = 0x0100;
+    pub const ECHOCTL: u32 = 0x0200;
+    pub const ECHOPRT: u32 = 0x0400;
+    pub const ECHOKE: u32 = 0x0800;
+    pub const IEXTEN: u32 = 0x8000;
+
+    /// `(linux_cc_index, host_libc_cc_index)` pairs. On Linux the two are equal;
+    /// on the BSDs the host index comes from `libc::V*`. The host indices are the
+    /// `libc::V*` constants resolved at the call site; this table is just the
+    /// guest-Linux ordering (asm-generic/termbits.h). The host side is filled in
+    /// by `CC_INDEX_PAIRS` below using the host `libc::V*` values.
+    pub const LINUX_VINTR: usize = 0;
+    pub const LINUX_VQUIT: usize = 1;
+    pub const LINUX_VERASE: usize = 2;
+    pub const LINUX_VKILL: usize = 3;
+    pub const LINUX_VEOF: usize = 4;
+    pub const LINUX_VTIME: usize = 5;
+    pub const LINUX_VMIN: usize = 6;
+    pub const LINUX_VSTART: usize = 8;
+    pub const LINUX_VSTOP: usize = 9;
+    pub const LINUX_VSUSP: usize = 10;
+    pub const LINUX_VEOL: usize = 11;
+    pub const LINUX_VREPRINT: usize = 12;
+    pub const LINUX_VDISCARD: usize = 13;
+    pub const LINUX_VWERASE: usize = 14;
+    pub const LINUX_VLNEXT: usize = 15;
+    pub const LINUX_VEOL2: usize = 16;
+
+    /// `(linux_index, host_index)` pairs, host index from the host `libc::V*`.
+    /// On Linux `libc::VINTR == 0 == LINUX_VINTR`, etc., so every pair is the
+    /// identity `(n, n)`; on the BSDs the host side differs.
+    pub const CC_INDEX_PAIRS: [(usize, usize); 16] = [
+        (LINUX_VINTR, libc::VINTR),
+        (LINUX_VQUIT, libc::VQUIT),
+        (LINUX_VERASE, libc::VERASE),
+        (LINUX_VKILL, libc::VKILL),
+        (LINUX_VEOF, libc::VEOF),
+        (LINUX_VTIME, libc::VTIME),
+        (LINUX_VMIN, libc::VMIN),
+        (LINUX_VSTART, libc::VSTART),
+        (LINUX_VSTOP, libc::VSTOP),
+        (LINUX_VSUSP, libc::VSUSP),
+        (LINUX_VEOL, libc::VEOL),
+        (LINUX_VREPRINT, libc::VREPRINT),
+        (LINUX_VDISCARD, libc::VDISCARD),
+        (LINUX_VWERASE, libc::VWERASE),
+        (LINUX_VLNEXT, libc::VLNEXT),
+        (LINUX_VEOL2, libc::VEOL2),
+    ];
+}
+
+/// `(host_libc_bit, guest_linux_bit)` pairs for c_iflag. The `_d` arg pins the
+/// `libc::tcflag_t` width to the host's. Both sides are simple boolean bits
+/// (CSIZE is handled separately), so the translation is a per-bit copy.
+///
+/// `IUTF8` exists in `libc` only on Linux (the BSDs have no such input-processing
+/// bit), so it is included only there — a guest `IUTF8` bit simply has no host
+/// equivalent on the BSDs and is dropped, matching the documented
+/// "zero anything the host doesn't understand" policy.
+#[cfg(not(target_os = "macos"))]
+fn iflag_pairs(_d: &libc::termios) -> Vec<(libc::tcflag_t, u32)> {
+    use guest_linux_termios as g;
+    // `IUTF8` only exists in `libc` on Linux; on the BSDs there is no host bit to
+    // pair, so the optional tail is empty there (a guest IUTF8 bit is dropped,
+    // per the "zero anything the host doesn't understand" policy).
+    #[cfg(target_os = "linux")]
+    let optional: &[(libc::tcflag_t, u32)] = &[(libc::IUTF8, g::IUTF8)];
+    #[cfg(not(target_os = "linux"))]
+    let optional: &[(libc::tcflag_t, u32)] = &[];
+    let mut pairs = vec![
+        (libc::IGNBRK, g::IGNBRK),
+        (libc::BRKINT, g::BRKINT),
+        (libc::IGNPAR, g::IGNPAR),
+        (libc::PARMRK, g::PARMRK),
+        (libc::INPCK, g::INPCK),
+        (libc::ISTRIP, g::ISTRIP),
+        (libc::INLCR, g::INLCR),
+        (libc::IGNCR, g::IGNCR),
+        (libc::ICRNL, g::ICRNL),
+        (libc::IXON, g::IXON),
+        (libc::IXANY, g::IXANY),
+        (libc::IXOFF, g::IXOFF),
+        (libc::IMAXBEL, g::IMAXBEL),
+    ];
+    pairs.extend_from_slice(optional);
+    pairs
+}
+
+/// `(host_libc_bit, guest_linux_bit)` pairs for c_oflag. ONLCR/OCRNL/ONOCR/ONLRET
+/// are the post-processing bits the guest cares about; OPOST gates them.
+#[cfg(not(target_os = "macos"))]
+fn oflag_pairs(_d: &libc::termios) -> [(libc::tcflag_t, u32); 5] {
+    use guest_linux_termios as g;
+    [
+        (libc::OPOST, g::OPOST),
+        (libc::ONLCR, g::ONLCR),
+        (libc::OCRNL, g::OCRNL),
+        (libc::ONOCR, g::ONOCR),
+        (libc::ONLRET, g::ONLRET),
+    ]
+}
+
+/// `(host_libc_bit, guest_linux_bit)` pairs for c_cflag, EXCLUDING the CSIZE
+/// field (translated by `host_csize_to_linux`/`linux_csize_to_host`).
+#[cfg(not(target_os = "macos"))]
+fn cflag_pairs(_d: &libc::termios) -> [(libc::tcflag_t, u32); 6] {
+    use guest_linux_termios as g;
+    [
+        (libc::CSTOPB, g::CSTOPB),
+        (libc::CREAD, g::CREAD),
+        (libc::PARENB, g::PARENB),
+        (libc::PARODD, g::PARODD),
+        (libc::HUPCL, g::HUPCL),
+        (libc::CLOCAL, g::CLOCAL),
+    ]
+}
+
+/// `(host_libc_bit, guest_linux_bit)` pairs for c_lflag.
+#[cfg(not(target_os = "macos"))]
+fn lflag_pairs(_d: &libc::termios) -> [(libc::tcflag_t, u32); 12] {
+    use guest_linux_termios as g;
+    [
+        (libc::ISIG, g::ISIG),
+        (libc::ICANON, g::ICANON),
+        (libc::ECHO, g::ECHO),
+        (libc::ECHOE, g::ECHOE),
+        (libc::ECHOK, g::ECHOK),
+        (libc::ECHONL, g::ECHONL),
+        (libc::NOFLSH, g::NOFLSH),
+        (libc::TOSTOP, g::TOSTOP),
+        (libc::ECHOCTL, g::ECHOCTL),
+        (libc::ECHOPRT, g::ECHOPRT),
+        (libc::ECHOKE, g::ECHOKE),
+        (libc::IEXTEN, g::IEXTEN),
+    ]
+}
+
+/// Translate the host's CSIZE field (a 2-bit field whose VALUE differs between
+/// hosts) to the guest-Linux CSIZE field. CS5 is 0 on every host.
+#[cfg(not(target_os = "macos"))]
+fn host_csize_to_linux(host_cflag: libc::tcflag_t) -> u32 {
+    use guest_linux_termios as g;
+    match host_cflag & libc::CSIZE {
+        x if x == libc::CS8 => g::CS8,
+        x if x == libc::CS7 => g::CS7,
+        x if x == libc::CS6 => g::CS6,
+        _ => 0, // CS5
+    }
+}
+
+/// Inverse of `host_csize_to_linux`: guest-Linux CSIZE field -> host CSIZE field.
+#[cfg(not(target_os = "macos"))]
+fn linux_csize_to_host(linux_cflag: u32) -> libc::tcflag_t {
+    use guest_linux_termios as g;
+    match linux_cflag & g::CSIZE {
+        x if x == g::CS8 => libc::CS8,
+        x if x == g::CS7 => libc::CS7,
+        x if x == g::CS6 => libc::CS6,
+        _ => 0, // CS5
+    }
+}
+
+/// The host's well-known POSIX bit masks per flag word — the union of every bit
+/// the translation owns, so `linux_to_host_termios` can clear exactly those and
+/// preserve any host-specific bits the guest never names.
+#[cfg(not(target_os = "macos"))]
+fn host_posix_masks(
+    d: &libc::termios,
+) -> (
+    libc::tcflag_t,
+    libc::tcflag_t,
+    libc::tcflag_t,
+    libc::tcflag_t,
+) {
+    let i = iflag_pairs(d).iter().fold(0, |m, (b, _)| m | *b);
+    let o = oflag_pairs(d).iter().fold(0, |m, (b, _)| m | *b);
+    let c = cflag_pairs(d).iter().fold(libc::CSIZE, |m, (b, _)| m | *b);
+    let l = lflag_pairs(d).iter().fold(0, |m, (b, _)| m | *b);
+    (i, o, c, l)
 }
 
 /// Read the host fd's window size. Returns `None` if the fd isn't a
@@ -214,6 +642,7 @@ pub fn get_host_winsize(fd: i32) -> Option<LinuxWinsize> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
     let mut iflag = (d.c_iflag as u32) & COMMON_IFLAG_MASK;
     if d.c_iflag & DARWIN_IXON != 0 {
@@ -314,6 +743,7 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
     // Preserve any host-specific bits outside the masks we translate.
     let preserved_iflag =
@@ -743,6 +1173,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn cc_index_table_is_within_darwin_bounds() {
         // libc::NCCS on Darwin is 20.
@@ -751,6 +1182,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn round_trip_lflag_canonical_bits() {
         // Synthesize a Darwin termios with ICANON+ECHO+ISIG set,
@@ -772,6 +1204,7 @@ mod tests {
         assert!(d2.c_lflag as carrick_portable::TcFlag & DARWIN_LFLAG_ISIG != 0);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn cc_table_round_trip_vintr() {
         // Plant VINTR (Linux idx 0) -> Darwin idx 8 -> Linux idx 0.
@@ -789,6 +1222,7 @@ mod tests {
 
     // ---- helpers for make_raw tests ----
 
+    #[cfg(target_os = "macos")]
     fn open_test_pty_for_raw() -> (i32, i32) {
         let m = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         assert!(m >= 0, "posix_openpt failed");
@@ -802,6 +1236,7 @@ mod tests {
         (m, s)
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn make_raw_clears_icanon_and_echo() {
         let _guard = TTY_TEST_LOCK.lock();
@@ -833,6 +1268,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn make_raw_snapshot_survives_restore() {
         let _guard = TTY_TEST_LOCK.lock();

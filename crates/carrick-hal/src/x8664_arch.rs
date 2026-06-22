@@ -724,6 +724,10 @@ const X86_NR_NEWFSTATAT: u64 = 262;
 /// x86-64 `pipe(2)` (syscalls(2)). Desugars to canonical `pipe2(2)` with
 /// flags=0 because asm-generic only exposes `pipe2`.
 const X86_NR_PIPE: u64 = 22;
+/// x86-64 `pipe2(2)` (syscalls(2)). SAME name+shape as canonical pipe2, but the
+/// `flags` word carries O_DIRECT at the x86 bit (0x4000) — translate it like
+/// open's flags, else the handler's allowed-flag mask EINVALs the request.
+const X86_NR_PIPE2: u64 = 293;
 /// Canonical (asm-generic / aarch64) `pipe2` number.
 const CANONICAL_PIPE2: u64 = 59;
 /// x86-64 `readlink(2)` (syscalls(2)). Desugars to canonical `readlinkat(2)`
@@ -970,6 +974,24 @@ impl X8664GuestArch {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
                 number: CANONICAL_PIPE2,
                 args: [args[0], 0, 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_PIPE2 {
+            // pipe2(fildes, flags): O_CLOEXEC/O_NONBLOCK are identical across the
+            // two ABIs and pass through; only O_DIRECT moves (x86 0x4000 →
+            // canonical 0x10000). Reusing translate_x86_open_flags would also swap
+            // O_DIRECTORY/O_LARGEFILE/O_NOFOLLOW, which are not pipe2 flags, so do
+            // the single-bit move directly.
+            const X86_O_DIRECT: u64 = 0x4000;
+            const CANON_O_DIRECT: u64 = 0x10000;
+            let mut flags = args[1] & !X86_O_DIRECT;
+            if args[1] & X86_O_DIRECT != 0 {
+                flags |= CANON_O_DIRECT;
+            }
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                number: CANONICAL_PIPE2,
+                args: [args[0], flags, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_READLINK {

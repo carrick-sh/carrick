@@ -1068,12 +1068,41 @@ pub mod runtime {
             "/etc/nsswitch.conf",
             b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec(),
         );
+        // /etc/hosts + /etc/hostname are RUNTIME-managed under the --net=host
+        // contract: regenerate them on EVERY start (NOT an if-missing fill) so the
+        // guest always resolves `localhost` and its own hostname, and so a stale
+        // image-baked hostname can't shadow uname(2). Mirrors the macOS seeder
+        // (execute.rs seed_guest_baseline). Most OCI images ship an EMPTY
+        // /etc/hosts and rely on the runtime to populate it, so an existence guard
+        // would (wrongly) leave the guest unable to resolve itself.
         let host = crate::execute::guest_hostname();
-        let hosts = format!(
-            "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t{host}\n"
+        let mut hosts_content = String::from(
+            "127.0.0.1\tlocalhost\n\
+             ::1\tlocalhost ip6-localhost ip6-loopback\n\
+             ff02::1\tip6-allnodes\n\
+             ff02::2\tip6-allrouters\n",
         );
-        fill("/etc/hosts", hosts.into_bytes());
-        fill("/etc/hostname", format!("{host}\n").into_bytes());
+        hosts_content.push_str(&format!("127.0.1.1\t{host}\n"));
+        // Preserve any NON-loopback entries the image baked into /etc/hosts;
+        // carrick owns the loopback + self lines above, so skip those.
+        let existing = backend.file_contents("/etc/hosts").unwrap_or_default();
+        for line in String::from_utf8_lossy(&existing).lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let first = trimmed.split_whitespace().next().unwrap_or("");
+            let carrick_managed = matches!(
+                first,
+                "127.0.0.1" | "127.0.1.1" | "::1" | "ff02::1" | "ff02::2"
+            );
+            if !carrick_managed {
+                hosts_content.push_str(trimmed);
+                hosts_content.push('\n');
+            }
+        }
+        let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
+        let _ = backend.set_file_contents("/etc/hostname", format!("{host}\n").into_bytes());
     }
 
     #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]

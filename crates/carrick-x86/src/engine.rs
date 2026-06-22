@@ -917,7 +917,19 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        self.vm.map_host_alias(va, ipa, len, payload, file)
+        // The third element of `file` is the HOST libc::PROT_* mask the dispatcher
+        // computed for this file-backed alias. A PROT_READ-only alias is backed by
+        // a host mmap WITHOUT PROT_WRITE, so a syscall-path write into it would take
+        // a fatal host SIGBUS (the guest-reachable crash the `rosharedbus` probe
+        // catches). Register the range in the syscall WRITE gate so such a write
+        // surfaces as a clean EFAULT instead — mirroring HVF's
+        // validate_guest_write_range. Reads stay allowed; a writable alias clears it.
+        let read_only = file.is_some_and(|(_, _, prot)| prot & libc::PROT_WRITE == 0);
+        self.vm.map_host_alias(va, ipa, len, payload, file)?;
+        if let Ok(len_usize) = usize::try_from(len) {
+            self.protections.set_no_write(va, len_usize, read_only);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
