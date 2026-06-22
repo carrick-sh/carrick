@@ -84,6 +84,14 @@ fn to_neutral(s: VcpuSnapshot) -> Aarch64VcpuSnapshot {
         vbar: s.vbar,
         cpacr: s.cpacr,
         tpidr_el0: s.tpidr_el0,
+        // KVM's `VcpuSnapshot` does not carry these HVF-shaped sysregs (TPIDRRO_EL0,
+        // TPIDR_EL1 scratch, ACTLR_EL1/EnTSO): the KVM aarch64 lane has no Rosetta
+        // TSO bit and uses TPIDR_EL1 only for the live syscall x9 stash (carried
+        // separately via `get_saved_x9`). Zero-fill so the neutral round-trip is
+        // total; `from_neutral` drops them again.
+        tpidrro_el0: 0,
+        tpidr_el1: 0,
+        actlr_el1: 0,
         vregs: s.vregs,
         fpsr: s.fpsr,
         fpcr: s.fpcr,
@@ -180,13 +188,14 @@ impl Aarch64Vcpu for KvmVcpu {
         KvmVcpu::restore(self, &from_neutral(snap)).map_err(os_to_trap)
     }
 
-    fn get_saved_x9(&self) -> Result<u64, TrapError> {
+    fn get_saved_x9(&self) -> Result<Option<u64>, TrapError> {
         // The EL1 sentinel vector stashed the guest's live x9 in TPIDR_EL1 (the
         // sentinel store clobbers x9). The shared `complete_syscall` reads it back
         // from here to restore x9 on every syscall return (the Linux aarch64 ABI
         // preserves x1..x30; musl's `__expand_heap` holds its malloc-context
-        // pointer in x9 across `brk(2)`). On KVM TPIDR_EL1 is free for this.
-        KvmVcpu::get_tpidr_el1(self).map_err(os_to_trap)
+        // pointer in x9 across `brk(2)`). On KVM TPIDR_EL1 is free for this. `Some`
+        // ⟹ the vehicle clobbered x9, so `complete_syscall` writes it back.
+        KvmVcpu::get_tpidr_el1(self).map(Some).map_err(os_to_trap)
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
@@ -402,6 +411,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
     fn add_alias(
         &mut self,
         va: u64,
+        ipa: u64,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
@@ -410,6 +420,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         // KVM IGNORES the dispatcher's `ipa` (HVF-shaped: a low IPA at 96 GiB that
         // sits INSIDE KVM's single low-window slot, so it can't be a fresh slot).
+        let _ = ipa;
         // Derive the alias GPA deterministically from the guest VA, inside the free
         // <1 TiB arena (the 40-bit nested-KVM IPA limit). The dispatcher's alias
         // VAs span [1 TiB, 1 TiB + 64 GiB), so the offset always lands in-arena; a
@@ -609,7 +620,10 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         // sibling never has to wait for a slot before KVM_CREATE_VCPU.
     }
 
-    fn save_guest_state(&self) -> Result<Aarch64VcpuSnapshot, TrapError> {
+    fn save_guest_state(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
         // KVM aarch64 does NOT reclaim (`reclaims()` is the default `false`), so
         // the M:N save/rebind round-trip is never exercised on this path. Surface a
         // clear error rather than silently corrupting state if it ever is.
@@ -620,10 +634,10 @@ impl Aarch64Vmm for KvmAarch64Vmm {
 
     fn build_sibling_builder(
         &self,
-        // The engine seeds the snapshot from these `clone` deltas (return value /
-        // child stack / TLS) and carries it in its own `Aarch64SiblingSpec`; the
-        // KVM builder only needs the shared VM + window descriptors, so it ignores
-        // them.
+        // KVM's sibling shares the parent VM (Arc handle) + window descriptors, so it
+        // needs neither the parent vCPU (it does not snapshot here — the engine seeds
+        // the neutral snapshot) nor the `clone` deltas. Both ignored.
+        _vcpu: &Self::Vcpu,
         _entry: GuestEntryRegs,
     ) -> Result<Self::SiblingBuilder, TrapError> {
         // Snapshot the parent vCPU is the engine's job (it owns the vcpu); here we

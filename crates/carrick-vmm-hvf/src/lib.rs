@@ -61,3 +61,8 @@ pub mod threaded_impl;
 pub mod timer_delivery;
 pub mod trap;
 pub mod vcpu_kick;
+// The HVF aarch64 backend on the shared `carrick-aarch64` scaffold (F7 step 4/5):
+// the thin `Aarch64Vmm`/`Aarch64Vcpu` trait pair the generic `Aarch64EngineCore`
+// is parameterized over. `crate::trap::HvfTrapEngine` aliases the specialization.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod hvf_aarch64_engine;
