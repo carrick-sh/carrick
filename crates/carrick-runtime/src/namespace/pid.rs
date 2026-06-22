@@ -513,6 +513,21 @@ pub fn init_handles(signum: i32) -> bool {
     }
 }
 
+/// Whether `signum` is a signal pid-1 is protected from when UNHANDLED, i.e. a
+/// default-lethal signal that is NOT the always-unblockable SIGKILL/SIGSTOP
+/// (those always act on pid 1). Used by the kill path to apply pid-1 semantics
+/// even on the non-namespaced OCI path where `region()` is absent but the guest
+/// still presents itself AS the container init (bootstrap pid 1): a default-
+/// lethal, unhandled signal pid-1 sends to ITSELF is dropped, matching Linux
+/// (init never gets the default action for an unhandled signal). The caller
+/// supplies the "is there a handler" check (the dispatcher's own handler table).
+pub fn is_init_protected_default_signal(signum: i32) -> bool {
+    if signum == 9 || signum == 19 {
+        return false;
+    }
+    is_default_lethal(signum)
+}
+
 /// The signals whose default action terminates the process and which pid-1 is
 /// protected from when unhandled (`pid_namespaces(7)`: pid 1 only gets signals
 /// it has a handler for, plus the always-unblockable SIGKILL/SIGSTOP which are

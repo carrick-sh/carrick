@@ -108,6 +108,82 @@ fn open_watch_fd(host: &Path) -> Result<i32, VfsError> {
     Ok(host_fd)
 }
 
+/// Prefix for the per-symlink owner SIDECAR file. Linux forbids `user.*` (and
+/// even `trusted.*`) xattrs on symlinks at the VFS layer, on every filesystem,
+/// so a symlink's carrick-owned uid/gid cannot be stored in an xattr the way a
+/// regular file's or directory's is. We instead persist it in a tiny on-disk
+/// sidecar placed ADJACENT to the symlink (`<dir>/.carrick-lnkown.<name>`),
+/// which is fork-coherent (real host file, inherited across `libc::fork` like
+/// the rootfs itself — NOT an in-process map) and needs no root-path threading.
+/// macOS allows xattrs on symlinks (XATTR_NOFOLLOW), so the sidecar is only used
+/// where the xattr write/read could not carry the owner — see `symlink_owner_*`.
+/// The whole sidecar mechanism is therefore `cfg(not(target_os = "macos"))`:
+/// macOS keeps the XATTR_NOFOLLOW path unchanged.
+#[cfg(not(target_os = "macos"))]
+const LINK_OWNER_SIDECAR_PREFIX: &str = ".carrick-lnkown.";
+
+/// True iff `name` is a per-symlink owner sidecar (filtered from `readdir`).
+#[cfg(not(target_os = "macos"))]
+fn is_link_owner_sidecar_name(name: &str) -> bool {
+    name.starts_with(LINK_OWNER_SIDECAR_PREFIX)
+}
+
+/// The sidecar path for the symlink at host path `link`: same directory, name
+/// prefixed with [`LINK_OWNER_SIDECAR_PREFIX`]. `None` if `link` has no file
+/// name (e.g. is the root) — a symlink always has one, so this is defensive.
+#[cfg(not(target_os = "macos"))]
+fn link_owner_sidecar_path(link: &Path) -> Option<PathBuf> {
+    let name = link.file_name()?.to_str()?;
+    let dir = link.parent()?;
+    Some(dir.join(format!("{LINK_OWNER_SIDECAR_PREFIX}{name}")))
+}
+
+/// Persist a symlink's owner (uid/gid, each `Some`/`None`) to its sidecar,
+/// merging with any already-stored values so a uid-only then gid-only chown both
+/// stick. Returns `Ok(())` on success (or when there is nothing to write).
+#[cfg(not(target_os = "macos"))]
+fn write_symlink_owner_sidecar(
+    link: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), VfsError> {
+    let Some(sidecar) = link_owner_sidecar_path(link) else {
+        return Ok(());
+    };
+    // Merge with any existing owner so a partial chown preserves the other half
+    // (Linux lchown(uid, -1) leaves gid untouched; -1 arrives here as `None`).
+    let (mut cur_uid, mut cur_gid) = read_symlink_owner_sidecar(link);
+    if let Some(u) = uid {
+        cur_uid = Some(u);
+    }
+    if let Some(g) = gid {
+        cur_gid = Some(g);
+    }
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&cur_uid.unwrap_or(u32::MAX).to_le_bytes());
+    buf[4..8].copy_from_slice(&cur_gid.unwrap_or(u32::MAX).to_le_bytes());
+    std::fs::write(&sidecar, buf).map_err(map_io_error)
+}
+
+/// Read a symlink's sidecar-stored owner, `(uid, gid)` each `Some` when present.
+/// A `u32::MAX` field means "unset" (lchown never sets uid/gid to -1/`u32::MAX`).
+#[cfg(not(target_os = "macos"))]
+fn read_symlink_owner_sidecar(link: &Path) -> (Option<u32>, Option<u32>) {
+    let Some(sidecar) = link_owner_sidecar_path(link) else {
+        return (None, None);
+    };
+    let Ok(buf) = std::fs::read(&sidecar) else {
+        return (None, None);
+    };
+    if buf.len() != 8 {
+        return (None, None);
+    }
+    let uid = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let gid = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let unset = |v: u32| (v != u32::MAX).then_some(v);
+    (unset(uid), unset(gid))
+}
+
 fn read_u32_xattr(host: &Path, name: &str, nofollow: bool) -> Option<u32> {
     let cpath = CString::new(host.as_os_str().as_bytes()).ok()?;
     let cname = CString::new(name).ok()?;
@@ -166,10 +242,23 @@ fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Resul
 }
 
 fn owner_from_host_xattrs(host: &Path, nofollow: bool) -> (Option<u32>, Option<u32>) {
-    (
-        read_u32_xattr(host, crate::fs_backend::CARRICK_UID_XATTR_NAME, nofollow),
-        read_u32_xattr(host, crate::fs_backend::CARRICK_GID_XATTR_NAME, nofollow),
-    )
+    #[allow(unused_mut)]
+    let mut uid = read_u32_xattr(host, crate::fs_backend::CARRICK_UID_XATTR_NAME, nofollow);
+    #[allow(unused_mut)]
+    let mut gid = read_u32_xattr(host, crate::fs_backend::CARRICK_GID_XATTR_NAME, nofollow);
+    // A symlink's owner can't live in an xattr on Linux (the kernel rejects
+    // `user.*`/`trusted.*` xattrs on symlinks), so a NOFOLLOW lookup that found
+    // no xattr falls back to the adjacent owner sidecar. The sidecar only exists
+    // for symlinks `lchown`ed under carrick, so this is a no-op for everything
+    // else (the `read` simply misses). macOS carries the owner in the xattr
+    // (XATTR_NOFOLLOW), so the sidecar is never written/read there.
+    #[cfg(not(target_os = "macos"))]
+    if nofollow && (uid.is_none() || gid.is_none()) {
+        let (s_uid, s_gid) = read_symlink_owner_sidecar(host);
+        uid = uid.or(s_uid);
+        gid = gid.or(s_gid);
+    }
+    (uid, gid)
 }
 
 fn is_socket_marker(host: &Path, nofollow: bool) -> bool {
@@ -294,6 +383,13 @@ impl Vfs for BindVfs {
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&host).map_err(map_io_error)? {
             let entry = entry.map_err(map_io_error)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Hide carrick's per-symlink owner sidecars (non-macOS owner store):
+            // they are an internal metadata store, not guest-visible entries.
+            #[cfg(not(target_os = "macos"))]
+            if is_link_owner_sidecar_name(&name) {
+                continue;
+            }
             let file_type = entry.file_type().map_err(map_io_error)?;
             let kind = if file_type.is_dir() {
                 EntryKind::Directory
@@ -304,10 +400,7 @@ impl Vfs for BindVfs {
             } else {
                 EntryKind::File
             };
-            entries.push(DirEnt {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                kind,
-            });
+            entries.push(DirEnt { name, kind });
         }
         Ok(entries)
     }
@@ -457,6 +550,15 @@ impl Vfs for BindVfs {
             return Ok(());
         }
         let host = self.to_host(path)?;
+        // If this entry is a symlink it may have an owner sidecar (keyed by name,
+        // adjacent on disk); remove it too so a later symlink that reuses the
+        // name does not inherit a stale owner. Best-effort: a missing sidecar (the
+        // common case — only `lchown`ed symlinks have one) is ignored. macOS keeps
+        // the owner in the symlink's xattr, so there is no sidecar to clean up.
+        #[cfg(not(target_os = "macos"))]
+        if let Some(sidecar) = link_owner_sidecar_path(&host) {
+            let _ = std::fs::remove_file(&sidecar);
+        }
         std::fs::remove_file(&host).map_err(map_io_error)
     }
 
@@ -487,7 +589,23 @@ impl Vfs for BindVfs {
         }
         let host_from = self.to_host(from)?;
         let host_to = self.to_host(to)?;
-        std::fs::rename(&host_from, &host_to).map_err(map_io_error)
+        std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;
+        // Carry a symlink's owner sidecar across the rename (keyed by name, so it
+        // must move with the link). Best-effort: only `lchown`ed symlinks have
+        // one; a stale sidecar at the destination name is overwritten/removed.
+        // macOS keeps the owner in the symlink's own xattr (no sidecar).
+        #[cfg(not(target_os = "macos"))]
+        if let (Some(src), Some(dst)) = (
+            link_owner_sidecar_path(&host_from),
+            link_owner_sidecar_path(&host_to),
+        ) {
+            if src.exists() {
+                let _ = std::fs::rename(&src, &dst);
+            } else {
+                let _ = std::fs::remove_file(&dst);
+            }
+        }
+        Ok(())
     }
 
     fn symlink(&self, target: &str, link: &str) -> Result<(), VfsError> {
@@ -550,14 +668,28 @@ impl Vfs for BindVfs {
             return Err(LINUX_EROFS);
         }
         let host = self.to_host(path)?;
-        let exists = if nofollow {
+        let meta = if nofollow {
             std::fs::symlink_metadata(&host)
         } else {
             std::fs::metadata(&host)
         };
-        if let Err(err) = exists {
-            return Err(map_io_error(err));
+        let meta = match meta {
+            Ok(m) => m,
+            Err(err) => return Err(map_io_error(err)),
+        };
+        // A symlink's owner cannot be stored in an xattr on a non-macOS host:
+        // Linux (and the BSDs) reject `user.*`/`trusted.*` xattrs on symlinks at
+        // the VFS layer, on every filesystem. There an `lchown` of a symlink
+        // persists the owner in an adjacent on-disk sidecar instead —
+        // fork-coherent, read back by `owner_from_host_xattrs`'s NOFOLLOW
+        // fallback. macOS allows `setxattr(..., XATTR_NOFOLLOW)` on a symlink, so
+        // it keeps the xattr path unchanged (no behavior change on the reference
+        // lane). Regular files/dirs always use the xattr path.
+        #[cfg(not(target_os = "macos"))]
+        if nofollow && meta.file_type().is_symlink() {
+            return write_symlink_owner_sidecar(&host, uid, gid);
         }
+        let _ = &meta;
         write_owner_xattrs(&host, uid, gid, nofollow)
     }
 
