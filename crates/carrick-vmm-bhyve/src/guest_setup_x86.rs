@@ -185,22 +185,22 @@ const MSR_SF_MASK: u32 = 0xC000_0084;
 // [11:8] system-descriptor fields (unused for code/data), [13] L (64-bit
 // code), [14] D/B, [15] G. Plus bit 16 = "unusable" (no valid selector).
 /// Ring-0 64-bit code segment: P=1 S=1 type=0xA (exec/read) DPL=0 L=1.
-/// Mirrors GDT[1] = 0x0020_9A00_0000_0000 (L=bit53, P=bit47, S=bit44,
+/// Mirrors `GDT[1]` = 0x0020_9A00_0000_0000 (L=bit53, P=bit47, S=bit44,
 /// type=bits43:40 = 0xA); translated to VMX access format.
 pub const ACCESS_RING0_CS64: u32 = 0x209B; // P|S|exec/read|DPL0|L
 /// Ring-0 data segment: P=1 S=1 type=0x2 (data/RW) DPL=0.
-/// Mirrors GDT[2] = 0x0000_9200_0000_0000.
+/// Mirrors `GDT[2]` = 0x0000_9200_0000_0000.
 pub const ACCESS_RING0_SS: u32 = 0x0093; // P|S|data/RW|DPL0
 /// Ring-3 data segment: P=1 S=1 type=0x2 (data/RW) DPL=3.
-/// Mirrors GDT[3] = 0x0000_F200_0000_0000.
+/// Mirrors `GDT[3]` = 0x0000_F200_0000_0000.
 /// Ring-3 data segment access rights (the user SS/DS/ES/FS/GS value the iretq
-/// latches from GDT[3]). The iretq loads these from the GDT on the privilege
+/// latches from `GDT[3]`). The iretq loads these from the GDT on the privilege
 /// change, so they are not pre-programmed; kept for the GDT-encoding unit tests
 /// and the (blocked) ring-3 entry work — see the M1 iretq blocker note.
 #[allow(dead_code)]
 const ACCESS_RING3_SS: u32 = 0x00F3; // P|S|data/RW|DPL3
 /// Ring-3 64-bit code segment: P=1 S=1 type=0xA (exec/read) DPL=3 L=1.
-/// Mirrors GDT[4] = 0x0020_FA00_0000_0000 (latched by the iretq from the GDT).
+/// Mirrors `GDT[4]` = 0x0020_FA00_0000_0000 (latched by the iretq from the GDT).
 #[allow(dead_code)]
 const ACCESS_RING3_CS64: u32 = 0x20FB; // P|S|exec/read|DPL3|L
 /// "Unusable" segment: bit 16 set — the selector is not loaded.
@@ -221,13 +221,13 @@ const ACCESS_RING3_DATA: u32 = 0x00F3; // = ACCESS_RING3_SS
 
 // Ring-3 selector values (SS/CS fields; RPL is encoded in the low 2 bits).
 // These match the SYSRET arithmetic in x8664_arch.rs::star_selector_arithmetic.
-/// User CS64 selector: GDT[4]=0x20 | RPL3=3 → 0x23.
+/// User CS64 selector: `GDT[4]`=0x20 | RPL3=3 → 0x23.
 const USER_CS64_SEL: u64 = 0x23;
-/// User SS selector: GDT[3]=0x18 | RPL3=3 → 0x1B.
+/// User SS selector: `GDT[3]`=0x18 | RPL3=3 → 0x1B.
 const USER_SS_SEL: u64 = 0x1B;
-/// Kernel CS64 selector: GDT[1]=0x08.
+/// Kernel CS64 selector: `GDT[1]`=0x08.
 pub const KERN_CS64_SEL: u64 = 0x08;
-/// Kernel SS selector: GDT[2]=0x10.
+/// Kernel SS selector: `GDT[2]`=0x10.
 pub const KERN_SS_SEL: u64 = 0x10;
 
 /// The syscall doorbell port: the `SENTINEL_GPA` analogue. The LSTAR stub's
@@ -540,7 +540,7 @@ pub const M1_BLOB_VA: u64 = 0x40_0000;
 /// M1 ring-3 blob: `write(1, "hello\n", 6)` then `exit_group(0)` via real
 /// SYSCALL instructions.  Uses **x86_64 syscall numbers** (write=1,
 /// exit_group=231); the host remaps them to canonical (64, 94) via
-/// [`X8664SyscallTable::remap`].
+/// `X8664SyscallTable::remap`.
 ///
 /// Byte encoding (AMD64 APM vol. 3 / OSDev ISA reference; offsets from
 /// [`M1_BLOB_VA`]). The code is exactly 0x21 (33) bytes — counting
@@ -1226,7 +1226,7 @@ impl BhyveGuestRam {
 
     /// Prune (or trim) any VA→GPA window overlapping `[va, va+len)` — used by
     /// `unmap_range` so a freed VA does not keep resolving to a stale GPA. See
-    /// [`RamInner::remove_windows`] for why this is correctness-critical.
+    /// `RamInner::remove_windows` for why this is correctness-critical.
     pub fn remove_windows(&self, va: u64, len: usize) {
         self.lock().remove_windows(va, len);
     }
@@ -1310,14 +1310,14 @@ impl Default for BhyveGuestRam {
 /// carrick's 5-entry boot GDT image (null/kCS64/kSS/uSS/uCS64), serialized
 /// to 40 bytes.
 ///
-/// This is the GDT the 5-entry [`X8664BootSysregs::gdt`] encodes; the values
+/// This is the GDT the 5-entry [`X8664BootSysregs::gdt`](carrick_hal::x8664_arch::X8664BootSysregs::gdt) encodes; the values
 /// here must match exactly (they ARE the same constants, laid out for
 /// `write_gpa`). The 5-entry layout is required by the SYSRET selector
 /// arithmetic (AMD APM vol. 2 §3.1.7): the user-base field of STAR (0x13)
-/// maps uSS to GDT[3]=0x18 and uCS64 to GDT[4]=0x20 post-RPL-OR.
+/// maps uSS to `GDT[3]`=0x18 and uCS64 to `GDT[4]`=0x20 post-RPL-OR.
 ///
 /// Bytes are little-endian GDT descriptor words, matching the Intel SDM
-/// vol. 3 §3.4.5 encoding in [`X8664BootSysregs`].
+/// vol. 3 §3.4.5 encoding in [`X8664BootSysregs`](carrick_hal::x8664_arch::X8664BootSysregs).
 pub fn carrick_boot_gdt_bytes() -> Vec<u8> {
     let regs = X8664GuestArch::bootstrap_sysregs();
     let mut out = Vec::with_capacity(8 * GDT_LEN);
@@ -1976,7 +1976,7 @@ pub const M2_MMAP_CAP: usize = 16 * 1024 * 1024; // 16 MiB
 /// each capped to one page.  These are not reachable in M2's run-to-exit path.
 pub const M2_MISC_CAP: usize = 4096; // 1 page
 
-/// Bring up a carrick x86_64/bhyve vCPU from a fully loaded [`AddressSpace`].
+/// Bring up a carrick x86_64/bhyve vCPU from a fully loaded [`AddressSpace`](carrick_mem::memory::AddressSpace).
 ///
 /// Mirrors [`bring_up_x86_m1`] but maps ALL regions from `image.regions()` as
 /// bhyve windows instead of a hard-coded user blob, then sets the vCPU's ring-3
@@ -2301,7 +2301,7 @@ const SNAPSHOT_GPR_IDS: [c_int; 15] = [
 /// FP/SIMD is intentionally absent (D4 — see the module note above).
 #[derive(Clone, Debug)]
 pub struct X8664BhyveSnapshot {
-    /// The 15 GPRs RAX..R15, indexed by [`SNAPSHOT_GPR_IDS`] (RAX = index 0).
+    /// The 15 GPRs RAX..R15, indexed by `SNAPSHOT_GPR_IDS` (RAX = index 0).
     /// RSP is the separate `rsp` field — ordinal 19 is outside the 0..14 block.
     pub gpr: [u64; 15],
     /// RSP (ordinal 19).
@@ -2416,7 +2416,7 @@ pub fn restore_x86_bhyve(
 
 /// Program a fresh vCPU (a sibling vCPU `id` on the shared VM, or vCPU 0 of a
 /// forked child's fresh VM) for long-mode ring-3 entry at the snapshot's
-/// post-trap context (RIP = snap.gpr[RCX], RSP = snap.rsp, rax=0 via the blob's
+/// post-trap context (RIP = `snap.gpr[RCX]`, RSP = snap.rsp, rax=0 via the blob's
 /// clear_rax).
 ///
 /// # Why a per-sibling ring-0 blob

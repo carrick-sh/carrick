@@ -292,7 +292,7 @@ unsafe impl Send for BhyveVmInner {}
 unsafe impl Sync for BhyveVmInner {}
 
 impl Drop for BhyveVmInner {
-    /// Tear down /dev/vmm/<name>. This runs exactly once, when the last `Arc`
+    /// Tear down `/dev/vmm/<name>`. This runs exactly once, when the last `Arc`
     /// holder drops (refcount hit 0) — i.e. after the main engine AND every
     /// sibling engine that cloned the handle have all been dropped. With the
     /// per-create unique name (see `BhyveVm::create`) each VM owns a distinct
@@ -477,7 +477,7 @@ impl BhyveVm {
     /// across `libc::fork` would only give the child a private post-fork copy, so
     /// a fresh base-1 atomic is both simpler and equivalent.
     ///
-    /// Distinct from [`from_shared`] (sibling-in-one-process, which clones the
+    /// Distinct from [`from_shared`](Self::from_shared) (sibling-in-one-process, which clones the
     /// owning inner and relies on the per-process `Arc` refcount): across
     /// `libc::fork` the `Arc` refcount is per-process and wrong for ownership, so
     /// a forked child that shares the parent's VM uses this fresh non-owning
@@ -502,7 +502,7 @@ impl BhyveVm {
         self.inner.owns
     }
 
-    /// Tear down the VM (and /dev/vmm/<name>). With `Arc`-based ownership this
+    /// Tear down the VM (and `/dev/vmm/<name>`). With `Arc`-based ownership this
     /// is just dropping `self`: the `Arc` refcount decrements, and when it hits
     /// zero (this was the LAST holder — the main engine plus every sibling that
     /// cloned a handle have all dropped) `BhyveVmInner::drop` runs `vm_destroy`

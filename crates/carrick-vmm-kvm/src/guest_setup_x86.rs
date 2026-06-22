@@ -4,7 +4,7 @@
 //! bring-up). It reuses [`GuestRam`] verbatim (host mmap + KVM_SET_USER_MEMORY_REGION
 //! slots are ISA-neutral) and programs the vCPU via the x86-specific ioctls.
 //!
-//! **Key simplification vs bhyve:** [`KVM_SET_MSRS`] exposes LSTAR/STAR/SFMASK
+//! **Key simplification vs bhyve:** `KVM_SET_MSRS` exposes LSTAR/STAR/SFMASK
 //! directly. No ring-0 WRMSR init blob is needed. The vCPU enters ring 3 from
 //! the first `KVM_RUN`. (Source: KVM API docs §4.81 "KVM_SET_MSRS".)
 //!

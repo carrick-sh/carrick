@@ -3,7 +3,7 @@
 //! generic over. Unlike KVM, bhyve runs on FreeBSD, whose host signal numbers
 //! differ from Linux for several signals, so the translation methods consult the
 //! `bhyve_signum` table (the SAME shared code then services both the identity and
-//! translated paths). The irreducible vCPU KICK lives in [`crate::bhyve_kicker`]
+//! translated paths). The irreducible vCPU KICK lives in `crate::bhyve_kicker`
 //! (FreeBSD `SIGRTMIN` = 65, with the `kick_pending`/`VM_EXITCODE_BOGUS`
 //! disambiguation); only its signal NUMBER is named here.
 

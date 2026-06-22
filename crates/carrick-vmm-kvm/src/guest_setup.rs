@@ -644,7 +644,7 @@ impl GuestRam {
         self.safe_access_projected(va, ipa, len)
     }
 
-    /// Like [`safe_access_translated`] but WITHOUT the PROT_NONE gate — the shared
+    /// Like [`safe_access_translated`](Self::safe_access_translated) but WITHOUT the PROT_NONE gate — the shared
     /// default `GuestMemory::read_bytes`/`write_bytes` already ran it on the guest
     /// VA. Keeps the NULL-guard (a backing fact) + the IPA-translated single-region
     /// lookup. This is the backing-only path the `*_raw` trait methods call.
@@ -675,7 +675,7 @@ impl GuestRam {
     }
 
     /// Copy `data` to guest-physical `gpa` (must lie wholly within one window).
-    /// `pub(crate)` so the `GuestMemory` impl on [`crate::trap_engine::KvmTrapEngine`]
+    /// `pub(crate)` so the `GuestMemory` impl on `crate::trap_engine::KvmTrapEngine`
     /// can service guest `write_bytes` through the same bounds-checked path
     /// bring-up uses; the guest VA is identity-mapped to this GPA.
     pub(crate) fn write_gpa(&mut self, gpa: u64, data: &[u8]) -> Result<(), OsError> {
@@ -703,7 +703,7 @@ impl GuestRam {
     /// via [`KvmVm::add_vcpu`]). PRIVATE windows are the Linux-COW copies; the
     /// `MAP_SHARED` aperture re-registers the SAME (inherited) host pages, so its
     /// writes stay coherent across the fork. The vCPU is returned UNPROGRAMMED;
-    /// the caller restores the parent's [`VcpuSnapshot`] onto it.
+    /// the caller restores the parent's `VcpuSnapshot` onto it.
     pub(crate) fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
         let mut vm = KvmVm::create_empty()?;
         let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
@@ -802,11 +802,11 @@ impl GuestRam {
     }
 
     /// Host virtual address of the `len`-byte word at guest-physical `gpa`, but
-    /// ONLY when it lies wholly within a [`WindowKind::Shared`] window (the
+    /// ONLY when it lies wholly within a `WindowKind::Shared` window (the
     /// boot-mapped `MAP_SHARED|MAP_ANONYMOUS` aperture). That backing is the SAME
     /// physical page in parent and child across `fork(2)`, so it is a valid
     /// target for a bare host `SYS_futex` cross-process rendezvous (see
-    /// [`crate::kvm_futex::KvmFutex::shared_wait`]). Returns `None` for a word in
+    /// `crate::kvm_futex::KvmFutex::shared_wait`). Returns `None` for a word in
     /// a `Private` (COW) window — those futexes stay in-process via the parking-
     /// lot [`carrick_thread::thread::FutexTable`]. The guest is identity-mapped
     /// (VA == GPA), so the dispatcher passes the guest futex VA straight in.

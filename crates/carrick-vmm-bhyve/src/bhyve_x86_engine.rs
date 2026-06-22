@@ -35,7 +35,7 @@
 //! the shared `fork_x86` re-seeds the EXISTING `engine.vcpu` via `restore` after
 //! the child rebuilds its VM. But bhyve's EagerCopy fork needs a DIFFERENT vCPU
 //! object on a DIFFERENT `/dev/vmm` node. So `BhyveX86Vcpu` and `BhyveVmm` share
-//! one [`VcpuHandle`] (an `Arc`): the raw `*mut Vcpu` lives in an `AtomicPtr`
+//! one `VcpuHandle` (an `Arc`): the raw `*mut Vcpu` lives in an `AtomicPtr`
 //! there, and `rebuild_child_vm` (which runs in the forked child with `&mut
 //! self.vm`) swaps the pointer + the child's `BhyveSharedVm`/`id` INSIDE the
 //! shared handle. Because `engine.vcpu` shares the same `Arc<VcpuHandle>`, its
@@ -196,7 +196,7 @@ unsafe impl Sync for VcpuHandle {}
 // ─── BhyveX86Vcpu (the X86Vmm::Vcpu) ─────────────────────────────────────────
 
 /// The per-vCPU register/run surface the generic engine drives. A thin `Arc`
-/// over [`VcpuHandle`] (so the engine's `vm` and `vcpu` fields can share, and
+/// over `VcpuHandle` (so the engine's `vm` and `vcpu` fields can share, and
 /// swap, one live vCPU on fork).
 ///
 /// `Clone` clones the `Arc` only — all clones drive the SAME underlying vCPU.
@@ -277,7 +277,13 @@ impl BhyveX86Vcpu {
         const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
         let rd = |table_gpa: u64, idx: usize| -> Result<u64, TrapError> {
             let b = self.read_gpa(table_gpa + (idx as u64) * 8, 8)?;
-            Ok(u64::from_le_bytes(b.try_into().unwrap()))
+            let octet: [u8; 8] = b.try_into().map_err(|_| {
+                TrapError::Hypervisor(format!(
+                    "translate_va: short read for PTE at gpa 0x{:x}",
+                    table_gpa + (idx as u64) * 8
+                ))
+            })?;
+            Ok(u64::from_le_bytes(octet))
         };
         let e4 = rd(X86_PML4_GPA, ((va >> 39) & 0x1FF) as usize)?;
         let nx = |lvl: &str| TrapError::Hypervisor(format!("translate_va 0x{va:x}: {lvl} absent"));

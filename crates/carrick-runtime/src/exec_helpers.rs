@@ -180,6 +180,9 @@ pub(crate) fn build_run_image_for(
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+// One cohesive set of ELF-image inputs (the `execfn`-carrying variant of
+// `build_run_image_for`); the extra `execfn` arg just edges past the 7-arg limit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_run_image_for_execfn(
     bytes: &[u8],
     argv: Vec<Vec<u8>>,

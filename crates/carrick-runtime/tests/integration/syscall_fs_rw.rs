@@ -12,7 +12,11 @@ mod support;
 
 #[cfg(target_os = "macos")]
 use carrick_runtime::fs_backend::HostFsBackend;
-use carrick_runtime::linux_abi::{LINUX_AT_FDCWD, LINUX_EFAULT, LINUX_O_CREAT, LINUX_O_RDWR};
+use carrick_runtime::linux_abi::LINUX_AT_FDCWD;
+// `LINUX_EFAULT`/`LINUX_O_CREAT`/`LINUX_O_RDWR` are only referenced by the
+// macOS-only (`--fs host`) tests below, so gate their import to match.
+#[cfg(target_os = "macos")]
+use carrick_runtime::linux_abi::{LINUX_EFAULT, LINUX_O_CREAT, LINUX_O_RDWR};
 use support::*;
 
 #[test]
@@ -345,6 +349,10 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
 /// copies a file with exactly this loop, spun forever re-printing the first
 /// chunk. The in-memory `File` variant (covered above) was unaffected; this
 /// pins the `HostFile` arm specifically.
+///
+/// `HostFsBackend` (the `--fs host` cap-std backend) is macOS-only, so this
+/// host-backed regression test is gated to macOS to match its import.
+#[cfg(target_os = "macos")]
 #[test]
 fn sendfile_null_offset_advances_host_backed_file_across_calls() {
     let scratch = tempfile::TempDir::new().unwrap();

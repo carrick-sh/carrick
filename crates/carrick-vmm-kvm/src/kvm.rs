@@ -74,7 +74,7 @@ pub(crate) fn append_vcpu_state(_fd: &VcpuFd, msg: &mut String) {
 /// sibling `KVM_RUN: Bad address` after the slot teardown.
 ///
 /// Incremented at OWNED vcpu construction (`add_vcpu`: boot + the fork-child
-/// rebuild) or at sibling-spec creation ([`VcpuLiveTicket`] — see its doc for
+/// rebuild) or at sibling-spec creation (`VcpuLiveTicket` — see its doc for
 /// the in-flight window), decremented in [`KvmVcpu::drop`] — which runs at
 /// the end of a sibling's `run_vcpu_until_exit`, AFTER its last guest-RAM
 /// access. A fork CHILD inherits the parent's value (plain static, copied by
@@ -575,7 +575,7 @@ pub(crate) struct SharedVmHandle {
 /// the owned RAII `VcpuFd` in an `UnsafeCell` instead of a raw pointer.
 ///
 /// SAFETY contract (the same single-owner invariant bhyve relies on, and that
-/// the pre-existing `&self` fd accessors — e.g. [`KvmVcpu::set_reg_shared`] —
+/// the pre-existing `&self` fd accessors — e.g. `KvmVcpu::set_reg_shared` —
 /// already assume): the engine + its vCPU are owned by exactly one host thread
 /// at a time, and the `vm`-side swap (`save_guest_state`/`rebind_to_slot`) runs
 /// ONLY on that same thread while it is parked in a host futex wait — i.e. when
@@ -1174,7 +1174,7 @@ impl KvmVm {
     /// a `clone(CLONE_THREAD)` sibling adds a vCPU to the SAME VM the parent
     /// runs on. Delegates to [`HvVm::add_vcpu`] (`KVM_CREATE_VCPU` + preferred-
     /// target init); the vCPU is returned UNPROGRAMMED for the caller to restore
-    /// the seeded [`VcpuSnapshot`] onto.
+    /// the seeded `VcpuSnapshot` onto.
     pub(crate) fn add_sibling_vcpu(&self) -> Result<KvmVcpu, OsError> {
         // Deliberately NOT counted into VCPU_LIVE here: the sibling's +1 was
         // taken at `build_sibling_spec` time ([`VcpuLiveTicket`]) to cover the
