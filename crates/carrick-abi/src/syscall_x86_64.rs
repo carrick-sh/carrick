@@ -348,7 +348,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=110 getppid → canonical getppid=173 (SAME name+shape)
     direct(110, "getppid", 173),
     // x86_64=111 getpgrp: LEGACY x86_64-only, NO asm-generic equivalent
-    // (asm-generic uses getpgid(0)) → Unknown.
+    // (asm-generic uses getpgid(0)). SHIMMED in x8664_arch::normalize_syscall →
+    // getpgid(0); glibc emits the raw getpgrp syscall, so it can't be LEFT OUT.
     // x86_64=112 setsid → canonical setsid=157 (SAME name+shape)
     direct(112, "setsid", 157),
     // x86_64=113 setreuid → canonical setreuid=145 (SAME name+shape)
@@ -573,7 +574,9 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(231, "exit_group", 94),
     // x86_64=232 epoll_wait: LEGACY (asm-generic has epoll_pwait=22).
     // epoll_wait(epfd,events,max,timeout) vs epoll_pwait(...,*sigmask,size) →
-    // DIFFERENT arg shape → LEFT OUT. (see deferred block)
+    // DIFFERENT arg shape. SHIMMED in x8664_arch::normalize_syscall →
+    // epoll_pwait(epfd,events,max,timeout, NULL, 0); glibc emits the raw
+    // epoll_wait syscall, so it can't be LEFT OUT (see deferred block).
     // x86_64=233 epoll_ctl → canonical epoll_ctl=21 (SAME name+shape)
     direct(233, "epoll_ctl", 21),
     // x86_64=234 tgkill → canonical tgkill=131 (SAME name+shape)
@@ -869,7 +872,6 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   133 mknod       → mknodat(33):    prepend AT_FDCWD
     //   201 time        → (no successor):  asm-generic libc uses clock_gettime/gettimeofday
     //   213 epoll_create→ epoll_create1(20): size arg dropped; flags=0
-    //   232 epoll_wait  → epoll_pwait(22): append sigmask=NULL, sigsetsize=0
     //   235 utimes      → utimensat(88):  timeval[2]→timespec[2]; prepend AT_FDCWD
     //   253 inotify_init→ inotify_init1(26): append flags=0
     //   261 futimesat   → utimensat(88):  timeval[2]→timespec[2]
@@ -878,9 +880,11 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   7   poll        → ppoll(73):      timeout_ms→*timespec; (the Direct above is
     //                                     a bring-up convenience, NOT a faithful shim)
     //
-    // 34 pause is now shimmed → ppoll(NULL,0,NULL) in normalize_syscall (above).
+    // Now shimmed in normalize_syscall (above): 34 pause → ppoll(NULL,0,NULL);
+    // 37 alarm → private alarm shim; 111 getpgrp → getpgid(0); 232 epoll_wait →
+    // epoll_pwait(…, NULL, 0).
     // Also LEFT OUT (no asm-generic equivalent AT ALL → honest -ENOSYS, NOT a
-    // shim candidate): 37 alarm, 111 getpgrp, 134 uselib, 136 ustat,
+    // shim candidate): 134 uselib, 136 ustat,
     // 139 sysfs, 154 modify_ldt, 156 _sysctl, 172 iopl, 173 ioperm,
     // 174 create_module, 177 get_kernel_syms, 178 query_module, 180 nfsservctl,
     // 181 getpmsg, 182 putpmsg, 183 afs_syscall, 184 tuxcall, 185 security,
