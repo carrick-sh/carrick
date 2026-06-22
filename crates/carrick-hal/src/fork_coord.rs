@@ -1,5 +1,5 @@
 //! The kick+futex backends' [`crate::HostSignalPump`]: a SELF-PIPE pump (KVM,
-//! bhyve, NVMM), generic over the backend's [`HostSignalGlue`]. Paired with the
+//! bhyve, NVMM), generic over the backend's [`HostSignalGlue`](carrick_signal_core::HostSignalGlue). Paired with the
 //! shared [`crate::PumpForkCoordinator`] state machine it reproduces the three
 //! ~identical per-backend fork coordinators — they differed ONLY in which
 //! `install_*_kick_handler` / `*_xsig::init_xsig` / `*_signal_pump::*` they called,
@@ -36,7 +36,7 @@ static SIGNAL_PUMP_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// The self-pipe async host-signal pump for a kick+futex backend `G`. Owns no
 /// per-instance state — the pump thread + self-pipe + install flag are all
-/// process-global (`crate::signal_pump` + [`SIGNAL_PUMP_INSTALLED`]); `G` is used
+/// process-global (`crate::signal_pump` + `SIGNAL_PUMP_INSTALLED`); `G` is used
 /// only through associated fns.
 pub struct SelfPipePump<G: HostSignalGlue>(PhantomData<fn() -> G>);
 

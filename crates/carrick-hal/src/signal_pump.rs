@@ -3,8 +3,8 @@
 //! `SIGQUIT`/`SIGTERM` — the ones a supervisor or tty sends, which carrick never
 //! injects itself) and turn them into a guest-deliverable pending signal, plus
 //! run the child-exit reaper. This is the byte-identical `kvm/bhyve/nvmm_signal_pump`
-//! collapsed into ONE module, generic over the backend's [`HostSignalGlue`] for the
-//! single delta: [`pump_handler`] translates the host signum to the guest's Linux
+//! collapsed into ONE module, generic over the backend's [`HostSignalGlue`](carrick_signal_core::HostSignalGlue) for the
+//! single delta: `pump_handler` translates the host signum to the guest's Linux
 //! signum (KVM identity; the BSD backends use their table). HVF has a different
 //! (kqueue) pump and does NOT use this.
 //!
