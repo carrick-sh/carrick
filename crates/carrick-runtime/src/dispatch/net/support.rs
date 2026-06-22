@@ -1023,10 +1023,12 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
             Some((libc::SOL_SOCKET, host_opt))
         }
         // IPPROTO_IP options: Linux and macOS use DIFFERENT numbers, so translate
-        // explicitly (macOS values from <netinet/in.h>; the libc crate is missing
-        // several, hence literals). Unknown options pass through (best-effort).
-        // Constants are fully-qualified so a missing import can't silently become
-        // a catch-all binding that mis-maps everything.
+        // explicitly on macOS (macOS values from <netinet/in.h>; the libc crate is
+        // missing several, hence literals). The macOS-literal arm is preserved
+        // verbatim (the macOS probe gate is validated against it).
+        // Unknown options pass through (best-effort). Constants are fully-qualified
+        // so a missing import can't silently become a catch-all binding.
+        #[cfg(target_os = "macos")]
         LINUX_SOL_IP => {
             use crate::linux_abi as a;
             let host_opt = match optname {
@@ -1046,6 +1048,36 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
             };
             Some((libc::IPPROTO_IP, host_opt))
         }
+        // Every non-macOS host (Linux + the BSDs) translates the guest-Linux
+        // IP_* option to the HOST's NATIVE `libc::IP_*` number. On Linux those
+        // `libc::IP_*` values EQUAL the guest-Linux values, so this resolves to
+        // an identity map (the Linux box stays byte-for-byte unchanged); on
+        // FreeBSD/NetBSD they resolve to that host's native numbers, so the
+        // translation is faithful by construction. `IP_OPTIONS`/`IP_PKTINFO`
+        // are absent from `libc` on FreeBSD, so they fall through to the
+        // best-effort pass-through (the same default an unmodelled option takes).
+        #[cfg(not(target_os = "macos"))]
+        LINUX_SOL_IP => {
+            use crate::linux_abi as a;
+            let host_opt = match optname {
+                a::LINUX_IP_HDRINCL => libc::IP_HDRINCL,
+                a::LINUX_IP_TOS => libc::IP_TOS,
+                a::LINUX_IP_TTL => libc::IP_TTL,
+                a::LINUX_IP_MULTICAST_IF => libc::IP_MULTICAST_IF,
+                a::LINUX_IP_MULTICAST_TTL => libc::IP_MULTICAST_TTL,
+                a::LINUX_IP_MULTICAST_LOOP => libc::IP_MULTICAST_LOOP,
+                a::LINUX_IP_ADD_MEMBERSHIP => libc::IP_ADD_MEMBERSHIP,
+                a::LINUX_IP_DROP_MEMBERSHIP => libc::IP_DROP_MEMBERSHIP,
+                a::LINUX_IP_RECVTTL => libc::IP_RECVTTL,
+                a::LINUX_IP_RECVTOS => libc::IP_RECVTOS,
+                #[cfg(not(target_os = "freebsd"))]
+                a::LINUX_IP_OPTIONS => libc::IP_OPTIONS,
+                #[cfg(not(target_os = "freebsd"))]
+                a::LINUX_IP_PKTINFO => libc::IP_PKTINFO,
+                other => other,
+            };
+            Some((libc::IPPROTO_IP, host_opt))
+        }
         LINUX_SOL_TCP => {
             let host_opt = match optname {
                 LINUX_TCP_NODELAY => libc::TCP_NODELAY,
@@ -1059,7 +1091,11 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
             Some((libc::IPPROTO_TCP, host_opt))
         }
         LINUX_SOL_UDP => Some((libc::IPPROTO_UDP, optname)),
-        // IPPROTO_IPV6 options: same story (macOS <netinet6/in6.h>).
+        // IPPROTO_IPV6 options: same story (macOS <netinet6/in6.h>). The
+        // macOS-literal arm is preserved verbatim (validated by the macOS probe
+        // gate); macOS gates the RFC 3542 values behind __APPLE_USE_RFC_3542 and
+        // the libc crate omits several, hence literals.
+        #[cfg(target_os = "macos")]
         LINUX_SOL_IPV6 => {
             use crate::linux_abi as a;
             let host_opt = match optname {
@@ -1076,6 +1112,43 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
                 a::LINUX_IPV6_PKTINFO => 46,
                 a::LINUX_IPV6_HOPLIMIT => 47,
                 a::LINUX_IPV6_RECVPKTINFO => 61,
+                other => other,
+            };
+            Some((libc::IPPROTO_IPV6, host_opt))
+        }
+        // Every non-macOS host (Linux + the BSDs) maps the guest-Linux IPV6_*
+        // option to the HOST's NATIVE `libc::IPV6_*` number. On Linux those equal
+        // the guest-Linux values, so this is an identity map (the Linux box is
+        // unchanged); on FreeBSD/NetBSD they resolve to that host's native numbers
+        // (e.g. FreeBSD IPV6_HOPLIMIT=47, IPV6_TCLASS=61), so the translation is
+        // faithful by construction. Covers the options the probes use
+        // (RECVHOPLIMIT/HOPLIMIT/TCLASS/PKTINFO).
+        #[cfg(not(target_os = "macos"))]
+        LINUX_SOL_IPV6 => {
+            use crate::linux_abi as a;
+            // The multicast JOIN/LEAVE option is spelled differently in `libc`
+            // per host: glibc Linux exposes it as `IPV6_ADD_MEMBERSHIP`/
+            // `IPV6_DROP_MEMBERSHIP` (=20/21), the BSDs as `IPV6_JOIN_GROUP`/
+            // `IPV6_LEAVE_GROUP` (=12/13). Both name the same option on their
+            // host, so select the spelling that exists on the build target.
+            #[cfg(target_os = "linux")]
+            let (join_group, leave_group) = (libc::IPV6_ADD_MEMBERSHIP, libc::IPV6_DROP_MEMBERSHIP);
+            #[cfg(not(target_os = "linux"))]
+            let (join_group, leave_group) = (libc::IPV6_JOIN_GROUP, libc::IPV6_LEAVE_GROUP);
+            let host_opt = match optname {
+                a::LINUX_IPV6_UNICAST_HOPS => libc::IPV6_UNICAST_HOPS,
+                a::LINUX_IPV6_MULTICAST_IF => libc::IPV6_MULTICAST_IF,
+                a::LINUX_IPV6_MULTICAST_HOPS => libc::IPV6_MULTICAST_HOPS,
+                a::LINUX_IPV6_MULTICAST_LOOP => libc::IPV6_MULTICAST_LOOP,
+                a::LINUX_IPV6_JOIN_GROUP => join_group,
+                a::LINUX_IPV6_LEAVE_GROUP => leave_group,
+                a::LINUX_IPV6_V6ONLY => libc::IPV6_V6ONLY,
+                a::LINUX_IPV6_RECVTCLASS => libc::IPV6_RECVTCLASS,
+                a::LINUX_IPV6_TCLASS => libc::IPV6_TCLASS,
+                a::LINUX_IPV6_RECVHOPLIMIT => libc::IPV6_RECVHOPLIMIT,
+                a::LINUX_IPV6_PKTINFO => libc::IPV6_PKTINFO,
+                a::LINUX_IPV6_HOPLIMIT => libc::IPV6_HOPLIMIT,
+                a::LINUX_IPV6_RECVPKTINFO => libc::IPV6_RECVPKTINFO,
                 other => other,
             };
             Some((libc::IPPROTO_IPV6, host_opt))
@@ -1665,16 +1738,30 @@ pub(in crate::dispatch) fn build_linux_scm_creds(
 /// TYPE numbers below differ between the two).
 pub(in crate::dispatch) const LINUX_IPPROTO_IPV6: i32 = 41;
 
-/// IPv6 RFC 3542 ancillary cmsg-type number translation, macOS→Linux. macOS and
+/// IPv6 RFC 3542 ancillary cmsg-type number translation, host→Linux. macOS and
 /// Linux assign DIFFERENT values to the same IPV6_* cmsg types (macOS gates them
 /// behind `__APPLE_USE_RFC_3542`). The `setsockopt` optname direction is already
 /// translated by `linux_to_host_sockopt`; this covers the returned `recvmsg`
 /// cmsg_type, which carrick must translate back so the guest (Linux) sees the
-/// expected type. `(linux, macos)`:
+/// expected type. `(linux, host)`. The macOS literal map is preserved verbatim
+/// (validated by the macOS probe gate).
+#[cfg(target_os = "macos")]
 const IPV6_CMSG_MAP: &[(i32, i32)] = &[
-    (52, 47), // IPV6_HOPLIMIT
-    (67, 36), // IPV6_TCLASS
-    (50, 46), // IPV6_PKTINFO
+    (52, 47), // IPV6_HOPLIMIT  (Linux 52 -> macOS 47)
+    (67, 36), // IPV6_TCLASS    (Linux 67 -> macOS 36)
+    (50, 46), // IPV6_PKTINFO   (Linux 50 -> macOS 46)
+];
+/// Every non-macOS host (Linux + the BSDs) maps the guest-Linux cmsg type to the
+/// HOST's NATIVE `libc::IPV6_*` cmsg-type number. On Linux those equal the
+/// guest-Linux values (the map is identity, so the Linux box is unchanged); on
+/// FreeBSD/NetBSD they resolve to that host's native numbers — faithful by
+/// construction. The Linux-side keys come from `carrick-abi`'s guest-Linux
+/// constants so the wire value the guest sees is exact.
+#[cfg(not(target_os = "macos"))]
+const IPV6_CMSG_MAP: &[(i32, i32)] = &[
+    (crate::linux_abi::LINUX_IPV6_HOPLIMIT, libc::IPV6_HOPLIMIT),
+    (crate::linux_abi::LINUX_IPV6_TCLASS, libc::IPV6_TCLASS),
+    (crate::linux_abi::LINUX_IPV6_PKTINFO, libc::IPV6_PKTINFO),
 ];
 
 /// Translate a macOS IPPROTO_IPV6 cmsg-type back to the guest (Linux) value.

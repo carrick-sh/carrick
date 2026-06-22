@@ -1210,16 +1210,15 @@ impl SyscallDispatcher {
                     return Ok(LINUX_ENOMEM.into());
                 }
                 if advice == LINUX_MADV_DONTNEED {
-                    const ZERO_CHUNK: [u8; 4096] = [0; 4096];
-                    let mut remaining = length;
-                    let mut cursor = address.0;
-                    while remaining > 0 {
-                        let chunk = remaining.min(ZERO_CHUNK.len());
-                        if memory.write_bytes(cursor, &ZERO_CHUNK[..chunk]).is_err() {
-                            return Ok(LINUX_ENOMEM.into());
-                        }
-                        remaining -= chunk;
-                        cursor += chunk as u64;
+                    // MADV_DONTNEED zeroes the PHYSICAL backing — this is a
+                    // carrick-internal scrub, not a guest store, so it must bypass
+                    // the guest-visible write-protection gate. The permission-checked
+                    // write_bytes path is range-gated on x86 (engine.rs range_no_write)
+                    // and faults on a PROT_READ / no-access region, leaving stale
+                    // bytes; zero_backing writes the host backing directly (same call
+                    // the MAP_FIXED/munmap-reuse scrub uses above).
+                    if memory.zero_backing(address.0, length).is_err() {
+                        return Ok(LINUX_ENOMEM.into());
                     }
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })

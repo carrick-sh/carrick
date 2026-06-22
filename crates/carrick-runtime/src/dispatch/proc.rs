@@ -2331,10 +2331,32 @@ fn translate_wait_status(status: i32) -> i32 {
     // (LTP ptrace05 signums 18/19/34..64).
     #[cfg(target_os = "linux")]
     {
-        status
+        // The host IS Linux: signal numbers + the wstatus encoding already match
+        // the guest ABI, so no remap. But the host runs with RLIMIT_CORE=0 (so it
+        // never sets the 0x80 core-dumped bit), while carrick models the GUEST's
+        // setrlimit/PR_SET_DUMPABLE — the Linux contract is that WCOREDUMP() is
+        // true whenever the process died by a core-dumping signal. Synthesize the
+        // bit for those signals (signal numbers are already Linux-native here).
+        let low = status & 0x7f;
+        if low != 0 && low != 0x7f {
+            (status & !0x80) | core_dump_bit_for(low)
+        } else {
+            status
+        }
     }
     #[cfg(not(target_os = "linux"))]
     translate_wait_status_darwin(status)
+}
+
+/// The wstatus core-dumped bit (0x80) iff `linux_sig` is a core-dumping signal
+/// per signal(7): SIGQUIT(3), SIGILL(4), SIGTRAP(5), SIGABRT(6), SIGBUS(7),
+/// SIGFPE(8), SIGSEGV(11), SIGXCPU(24), SIGXFSZ(25), SIGSYS(31).
+fn core_dump_bit_for(linux_sig: i32) -> i32 {
+    if matches!(linux_sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
+        0x80
+    } else {
+        0
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2365,15 +2387,7 @@ fn translate_wait_status_darwin(status: i32) -> i32 {
         // Mirror Linux by OR-ing the bit on for those signals; preserve the
         // host's bit if it set it.
         let host_core = status & 0x80;
-        // Linux core-dumping signals per signal(7): SIGQUIT(3), SIGILL(4),
-        // SIGTRAP(5), SIGABRT(6), SIGBUS(7), SIGFPE(8), SIGSEGV(11),
-        // SIGXCPU(24), SIGXFSZ(25), SIGSYS(31).
-        let synthetic_core = if matches!(linux_sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
-            0x80
-        } else {
-            0
-        };
-        (linux_sig & 0x7f) | host_core | synthetic_core
+        (linux_sig & 0x7f) | host_core | core_dump_bit_for(linux_sig)
     } else {
         // Exited normally: high byte is the exit code, left untouched.
         status
