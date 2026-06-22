@@ -1136,7 +1136,7 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
-            if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
+            if let Some(routed) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
             }
             if signal_is_self_target(tid) {
@@ -1157,7 +1157,7 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
-            if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
+            if let Some(routed) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
             }
             // raise()/pthread_kill name the caller as tgkill(getpid(), gettid()).
@@ -1565,16 +1565,27 @@ impl SyscallDispatcher {
         ctx: &SyscallCtx<M>,
         tid: i64,
         signum: u64,
+        record_synthetic: bool,
     ) -> Option<DispatchOutcome> {
         let t = ctx.thread.as_ref()?;
         let target = tid as crate::thread::ThreadId;
         if i64::from(t.tid) == tid {
-            self.record_tkill_siginfo(t.tid, signum as i32);
+            // tkill/tgkill carry no payload, so they synthesize an SI_TKILL
+            // siginfo here. rt_sigqueueinfo/rt_tgsigqueueinfo pass `false`: they
+            // record the caller's REAL payload siginfo themselves, and recording
+            // BOTH would queue the zero-payload synthetic AHEAD of the real one
+            // for an RT signal (record_pending_siginfo appends for RT) — take()
+            // pops the front, so the queued si_value would be lost.
+            if record_synthetic {
+                self.record_tkill_siginfo(t.tid, signum as i32);
+            }
             return Some(self.raise_thread_directed_self(t.tid, signum));
         }
         if t.registry.is_live(target) {
             let signum_i32 = signum as i32;
-            self.record_tkill_siginfo(target, signum_i32);
+            if record_synthetic {
+                self.record_tkill_siginfo(target, signum_i32);
+            }
             if self.signal_blocked(target, signum_i32) {
                 self.mark_signal_pending(target, signum_i32);
                 return Some(DispatchOutcome::Returned { value: 0 });
@@ -1621,7 +1632,7 @@ impl SyscallDispatcher {
 
         // Sibling-thread route: deliver directly so the SA_SIGINFO frame carries
         // the original si_value (LTP rt_sigqueueinfo01 / rt_tgsigqueueinfo01).
-        if let Some(routed) = self.route_thread_signal(ctx, route_target, signum) {
+        if let Some(routed) = self.route_thread_signal(ctx, route_target, signum, false) {
             let target_tid = route_target as crate::thread::ThreadId;
             if let Some(info) = user_info {
                 self.record_pending_siginfo(target_tid, s, info);

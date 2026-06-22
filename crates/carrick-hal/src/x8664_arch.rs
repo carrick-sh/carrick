@@ -473,8 +473,22 @@ impl GuestArch for X8664GuestArch {
         //    function entry; the handler is entered as-if-CALLed). ──
         let frame_size = core::mem::size_of::<X8664Rtsigframe>() as u64;
         let base = match p.altstack {
-            Some((ss_sp, ss_size)) => ss_sp.wrapping_add(ss_size),
-            None => saved_rsp.wrapping_sub(128),
+            // SA_ONSTACK: switch to the alt-stack TOP — but ONLY when we are not
+            // already executing on it. A nested SA_NODEFER|SA_ONSTACK handler is
+            // already on the alt stack; resetting to the top would rebuild the
+            // depth-2 frame ON TOP of the live depth-1 frame → no clean unwind →
+            // the `sigreenter` trap-loop runaway (spins to the 1M-trap ceiling).
+            // When already on the sigstack, continue DOWNWARD past the red zone
+            // exactly like the main-stack path. (Matches Linux `get_sigframe`,
+            // which uses the alt-stack top only when `!on_sig_stack(sp)`.)
+            Some((ss_sp, ss_size))
+                if !(ss_sp..ss_sp.wrapping_add(ss_size)).contains(&saved_rsp) =>
+            {
+                ss_sp.wrapping_add(ss_size)
+            }
+            // No SA_ONSTACK, OR already on the alt stack: reserve below the live
+            // RSP, skipping the 128-byte red zone.
+            _ => saved_rsp.wrapping_sub(128),
         };
         let new_sp = (base.wrapping_sub(frame_size) & !0xf).wrapping_sub(8);
         // fpstate pointer = the FXSAVE area's address within the frame.
