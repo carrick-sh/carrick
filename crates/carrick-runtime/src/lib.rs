@@ -1083,7 +1083,7 @@ pub mod runtime {
             |image| {
                 carrick_vmm_kvm::kvm_aarch64_engine::bring_up(image).map_err(RuntimeError::from)
             },
-            |engine, dispatcher, max_traps| run_threaded_kvm_loop(engine, dispatcher, max_traps),
+            run_threaded_kvm_loop,
         )
     }
 
@@ -1092,7 +1092,7 @@ pub mod runtime {
         run_oci_with_engine(
             spec,
             |image| carrick_vmm_kvm::kvm_x86_engine::bring_up(image).map_err(RuntimeError::from),
-            |engine, dispatcher, max_traps| run_threaded_kvm_loop(engine, dispatcher, max_traps),
+            run_threaded_kvm_loop,
         )
     }
 
@@ -1104,7 +1104,7 @@ pub mod runtime {
                 carrick_vmm_bhyve::run_elf::build_x86_engine_from_image(image)
                     .map_err(|e| RuntimeError::Unsupported(format!("build bhyve engine: {e}")))
             },
-            |engine, dispatcher, max_traps| run_threaded_bhyve_loop(engine, dispatcher, max_traps),
+            run_threaded_bhyve_loop,
         )
     }
 
@@ -1116,7 +1116,7 @@ pub mod runtime {
                 carrick_vmm_nvmm::run_elf::build_x86_engine_from_image(image)
                     .map_err(|e| RuntimeError::Unsupported(format!("build nvmm engine: {e}")))
             },
-            |engine, dispatcher, max_traps| run_threaded_nvmm_loop(engine, dispatcher, max_traps),
+            run_threaded_nvmm_loop,
         )
     }
 

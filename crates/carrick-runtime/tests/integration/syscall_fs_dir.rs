@@ -1307,6 +1307,9 @@ fn bind_mount_directory_inotify_reports_created_child_name() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+// `HostFsBackend` (the `--fs host` cap-std backend) is macOS-only; gate the
+// host-overlay inotify test to match its import so the fleet compiles.
+#[cfg(target_os = "macos")]
 #[test]
 fn host_overlay_directory_inotify_reports_created_child_name() {
     const IN_NONBLOCK: u64 = 0o4000;

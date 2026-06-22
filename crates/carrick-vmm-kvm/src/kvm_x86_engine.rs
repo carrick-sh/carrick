@@ -1303,9 +1303,12 @@ pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<KvmVmm>, TrapError
     Ok(X86EngineCore::from_parts(vmm, vcpu, KVM_X86_LAYOUT))
 }
 
-fn build_kvm_x86_guest(
-    image: &AddressSpace,
-) -> Result<(KvmVm, GuestRam, Arc<Mutex<Pml4Manager>>, KvmVcpu), TrapError> {
+/// The freshly-built KVM x86 guest parts: the VM, its `GuestRam` window table,
+/// the shared PML4 manager, and the boot vCPU. `bring_up` destructures these
+/// into a `KvmVmm` + engine.
+type BuiltKvmX86Guest = (KvmVm, GuestRam, Arc<Mutex<Pml4Manager>>, KvmVcpu);
+
+fn build_kvm_x86_guest(image: &AddressSpace) -> Result<BuiltKvmX86Guest, TrapError> {
     use carrick_hal::HvVm as _;
 
     // 1. Lay out guest RAM (identity GPA = VA; N capped MAP_NORESERVE windows).

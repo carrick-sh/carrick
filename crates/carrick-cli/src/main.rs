@@ -48,7 +48,7 @@
 //! - **Diagnostic surface** (carrick-specific, no docker analogue): `trace`
 //!   (in-process DTrace, auto-sudo — see [`trace_cli`] and [`commands`]),
 //!   `debug` (ESR decode, lldb-plugin path, debug-state inspect — see
-//!   [`debug`]), `syscalls` / `trap-capabilities` / `compat-report`
+//!   the `debug` module), `syscalls` / `trap-capabilities` / `compat-report`
 //!   (introspection of the emulation tables), `inspect-elf` / `plan-elf-load` /
 //!   `load-elf` / `run-elf` / `dispatch-syscall` (ELF + syscall fixtures), and
 //!   `volume` (the APFS scratch subvolume — see [`args`]).
@@ -85,7 +85,7 @@
 //! management), [`fs_setup`] (`--fs host|memory` backend selection + guest
 //! baseline seeding), [`trace_cli`] (privilege handoff for DTrace),
 //! [`runtime_util`] (the fork-safe async bridge + docker-format helpers), and
-//! [`debug`] (ESR / lldb tooling).
+//! the `debug` module (ESR / lldb tooling).
 
 // ── Exactly-one-platform invariant (enforced, not assumed) ──────────────────
 // `carrick-cli` links exactly one VMM + host backend via a single `platform-*`

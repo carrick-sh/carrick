@@ -6,7 +6,7 @@
 //! primitive. HVF has Apple's `hv_vcpus_exit(ids, count)`; KVM has no such
 //! direct call, so we use the kernel's documented mechanism: a signal delivered
 //! to the vCPU thread makes the in-progress `KVM_RUN` ioctl return `-EINTR`
-//! (which [`crate::kvm::KvmVcpu::run`] maps to [`carrick_hal::VcpuExit::Kicked`]).
+//! (which `crate::kvm::KvmVcpu::run` maps to [`carrick_hal::VcpuExit::Kicked`]).
 //! The signal is [`kick_signal`] (`SIGRTMIN`), and its handler does nothing —
 //! its ONLY job is to interrupt `KVM_RUN`, so it must be installed WITHOUT
 //! `SA_RESTART` (or the kernel would silently restart the ioctl and the kick
@@ -15,7 +15,7 @@
 //! Each guest thread publishes a [`KvmKickHandle`] (carrying its `pthread_t`)
 //! into the shared [`KvmKicker`] when it starts running and removes it on exit.
 //! A signalling thread looks the target up and `pthread_kill`s it. The in-guest
-//! flag bookkeeping mirrors the HVF [`crate::trap_engine`]-driven path exactly:
+//! flag bookkeeping mirrors the HVF `crate::trap_engine`-driven path exactly:
 //! the Dekker handshake with the fork / page-table coordinators is SeqCst on
 //! both sides.
 
