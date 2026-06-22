@@ -16,14 +16,21 @@
 //! booleans: did open succeed, did write report the full length, did the
 //! readback equal what we wrote). Diffed line-exact carrick-vs-Linux.
 //!
-//! O_TMPFILE on aarch64 Linux is `__O_TMPFILE (0o20000000) | O_DIRECTORY
-//! (0o40000)`; defined locally because the libc crate doesn't expose it on
-//! every target.
+//! O_TMPFILE is `__O_TMPFILE (0o20000000) | O_DIRECTORY`; the libc crate doesn't
+//! expose O_TMPFILE on every target so it's assembled here. `O_DIRECTORY` is
+//! ARCH-SPECIFIC (0o40000 on aarch64 but 0o200000 on x86_64, where 0o40000 is
+//! instead O_DIRECT) — so it MUST come from `libc::O_DIRECTORY`, not a hardcoded
+//! 0o40000. Hardcoding it produced `__O_TMPFILE | O_DIRECT` on x86_64, a
+//! malformed flag combo that real Linux rejects at open(2) while carrick
+//! tolerated it — the x86_64-lane DIFF this resolves.
 
 use std::sync::mpsc;
 use std::thread;
 
-const O_TMPFILE: i32 = 0o20_000_000 | 0o40_000; // __O_TMPFILE | O_DIRECTORY
+// The kernel's __O_TMPFILE bit (same on every arch); O_DIRECTORY is arch-specific.
+const O_TMPFILE_BIT: i32 = 0o20_000_000;
+// __O_TMPFILE | O_DIRECTORY, arch-correct via libc::O_DIRECTORY.
+const O_TMPFILE: i32 = O_TMPFILE_BIT | libc::O_DIRECTORY;
 
 fn main() {
     // Become multithreaded before the syscall under test: this is what routes
