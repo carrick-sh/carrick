@@ -248,6 +248,24 @@ pub trait X86Vmm: Sized {
         self.host_ptr(gpa, len)
     }
 
+    /// Host virtual address of the `len`-byte futex word at guest-physical `gpa`,
+    /// but ONLY when that word lies in a `MAP_SHARED` window whose backing is the
+    /// SAME physical page in parent and child across `fork(2)` — the boot-mapped
+    /// shared aperture OR a runtime file-backed `MAP_SHARED` alias. Such a word is
+    /// a valid cross-process rendezvous target for a bare host `SYS_futex`, so the
+    /// engine routes it through `PlatformFutex::shared_wait/shared_wake` instead of
+    /// the per-process parking lot. `None` for a private/anon (COW) word — those
+    /// stay in-process. Default `None`: a bring-up backend with no shared windows
+    /// keeps every futex private. The KVM backend overrides it (`GuestRam` tracks
+    /// `WindowKind::Shared`); bhyve/NVMM can adopt it when they grow shared
+    /// windows. Without this, every cross-process futex on x86 fell to the
+    /// per-process parking lot and a forked child's `FUTEX_WAKE` never reached a
+    /// parent parked in `FUTEX_WAIT` on the same `/dev/shm` page (`ltpcheckpoint`'s
+    /// reverse direction, gating ~10 LTP signal tests via `tst_checkpoint`).
+    fn shared_futex_host_addr(&self, _gpa: u64, _len: usize) -> Option<usize> {
+        None
+    }
+
     /// Whether `va` lies in a guest memory RESERVATION that is not yet committed
     /// (a lazily-backed `mmap`/`brk` page the guest has never touched). On a
     /// demand-paged backend (bhyve), such a page has no `host_ptr` until first

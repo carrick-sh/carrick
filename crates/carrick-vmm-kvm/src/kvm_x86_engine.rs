@@ -176,6 +176,16 @@ impl X86Vmm for KvmVmm {
         self.ram.host_ptr(gpa, len)
     }
 
+    /// Resolve a futex word's GPA to the host address of its `MAP_SHARED`
+    /// backing, but only when it lies in a fork-coherent shared window (the boot
+    /// aperture or a runtime file-backed alias — both `WindowKind::Shared`). The
+    /// `GuestRam` already tracks this for the aarch64 lane; expose it on the x86
+    /// `X86Vmm` seam so the shared engine routes the cross-process futex through
+    /// the bare-`SYS_futex` shared path (`ltpcheckpoint` reverse direction).
+    fn shared_futex_host_addr(&self, gpa: u64, len: usize) -> Option<usize> {
+        self.ram.shared_futex_host_addr(gpa, len)
+    }
+
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         let prot = LinuxProtFlags::from_bits_truncate(prot);
         let exec = prot.contains(LinuxProtFlags::EXEC);
