@@ -117,10 +117,11 @@ Already well-expressed (do **not** re-abstract): `HostSignalGlue` +
 `EventMultiplexer`, `GuestArch`.
 
 **The unexpressed-polymorphism gaps:**
-1. **No `Aarch64EngineCore`** (highest durability leverage). KVM-aarch64
-   `trap_engine.rs:562` (1.8k LOC) and HVF `trap.rs` (5.8k LOC) hand-roll the
-   aarch64 trap-loop shell twice. The x86 side already proved the
-   `X86EngineCore<V>`-over-`(X86Vmm,X86Vcpu)` pattern erases exactly this.
+1. ~~**No `Aarch64EngineCore`** (highest durability leverage). KVM-aarch64 and
+   HVF hand-roll the aarch64 trap-loop shell twice.~~ **RESOLVED 2026-06-21 (F7,
+   see §6):** `carrick-aarch64::Aarch64EngineCore<V: Aarch64Vmm>` now drives BOTH
+   backends over the existing `HvVm`/`HvVcpu` seam (gap #2), exactly the x86
+   pattern — KVM `trap_engine.rs` 1797→499, HVF `trap.rs` 5810→4557.
 2. **Double VM/vCPU abstraction**: `HvVm`/`HvVcpu` (`hypervisor.rs`) and
    `X86Vmm`/`X86Vcpu` both abstract "a vCPU/VM"; `X86Vcpu::run` delegates to
    `HvVcpu::run`. Resolve by making `HvVm`/`HvVcpu` the aarch64 pair (feeding
@@ -647,14 +648,23 @@ are sequenced for a follow-up with the right test rig (HVF host + KVM/bhyve VMs)
   spine + fork-storm/nested-fork demos (no lost-wake); KVM/bhyve cross-compile.
   *Robustness follow-up:* HVF's real `pthread_sigmask` block/restore (today no-op,
   = pre-fold) — self-contained now the seam exists.
-- **F7 — `Aarch64EngineCore<V>` + `Aarch64Exit`.** Touches both aarch64 trap-loop
-  shells (HVF + KVM). *Slice landed (2026-06-21, commit d8791cc8):* the
-  `guest_cpu` run-timing wrapper is hoisted 3→1 into
-  `carrick_host::guest_cpu::timed_run` (HVF/KVM/x86 run loops, behaviour-identical,
-  rig-verified). *Deferred:* the `TrapError::el0_fault` constructor (low value —
-  the HVF and KVM sites read different register types, so a clean shared
-  constructor is awkward standalone; fold it into the full `Aarch64EngineCore<V>`
-  extraction instead).
+- **F7 — `Aarch64EngineCore<V>` + `Aarch64Exit`. DONE (2026-06-21).** The new
+  `carrick-aarch64` crate holds `Aarch64EngineCore<V: Aarch64Vmm>` (~1535 lines:
+  the shared trap loop, `complete_syscall`, `inject_signal`, `restore_from_sigframe`,
+  `fork`/`execve` sequencing, `run_el1_maintenance`, `pt_edit*`, `repoint_private`,
+  `map_host_alias`, EL0Fault construction, FPSIMD, `GuestMemory`, the sibling glue)
+  + `Aarch64Exit` + the thin `Aarch64Vmm`/`Aarch64Vcpu` seam, mirroring the proven
+  `X86EngineCore`. BOTH aarch64 backends are now this one engine: KVM
+  (`trap_engine.rs` 1797→499 + `kvm_aarch64_engine.rs`) and HVF (`trap.rs`
+  5810→4557 + `hvf_aarch64_engine.rs`); a syscall/fault/page-table/fork fix lands
+  ONCE for both. Verified KVM via lima (43/43) and HVF via the probe spine
+  (286/286 musl) + live alpine/glibc runs. The trap-surfacing difference (HVF
+  HVC-trampoline vs KVM sentinel-MMIO) is isolated behind `Vcpu::run()->Aarch64Exit`.
+  A diff-review workflow confirmed the engine is the true UNION of KVM+HVF (one
+  migration regression — an x9-clobber on HVF's vehicle — found, fixed, verified;
+  the `get_saved_x9` and `stamp_guest_thread_id` Option/seam designs let each
+  backend express its genuine TPIDR_EL1 use — x9-stash on KVM, gettid-tid on HVF).
+  Commits: 0c0faee6 (scaffold), 70f072ae (KVM), 0b1faa07 (HVF), 1f60c388 (gettid).
 - **F6 — migrate bhyve `guest_setup_x86` onto carrick-x86. SUBSTANTIALLY DONE
   (re-assessed 2026-06-21).** The "~3100 lines to migrate" conflated load-bearing
   bhyve-specific code with shareable duplication. The SHAREABLE surface is already
