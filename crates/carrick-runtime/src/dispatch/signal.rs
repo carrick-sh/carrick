@@ -1009,6 +1009,33 @@ impl SyscallDispatcher {
             } else {
                 i64::from(pid.0)
             };
+            // pid-1 protection on the NON-namespaced OCI path (§5.4,
+            // pid_namespaces(7)). The guest's init presents itself as bootstrap
+            // pid 1; carrick does NOT fork a real NsSupervisor here (unlike the
+            // macOS/HVF path), so a `kill(1, SIG)` would otherwise fall into the
+            // `signal_is_self_target(1)` fast path and self-raise — terminating
+            // the SENDER (a forked descendant) instead of being dropped as Linux
+            // drops a default-lethal, UNHANDLED signal aimed at pid 1. Intercept
+            // BEFORE the self-target fast path: a default-lethal signal to the
+            // guest init (bootstrap pid 1) that the init has no handler for is
+            // dropped (the call still returns success — Linux delivers nothing
+            // but does not error). SIGKILL/SIGSTOP always act and are excluded by
+            // `is_init_protected_default_signal`. When THIS process is the init we
+            // can consult its own handler table; a forked descendant cannot see
+            // the init's table on this path, so a default-lethal unhandled-by-the-
+            // sender signal to pid 1 is dropped (the common, Linux-correct case).
+            // On the namespaced (macOS/HVF) path the real NsSupervisor is pid 1,
+            // `should_drop_signal_to_init` (below) handles it, and `pid` here is
+            // the init's translated HOST pid (not bootstrap 1), so this guard is
+            // a no-op there.
+            if signum != 0
+                && pid == LINUX_BOOTSTRAP_PID as i64
+                && crate::namespace::pid::is_init_protected_default_signal(signum as i32)
+                && this.registered_signal_handler(signum as i32).is_none()
+                && !this.signal_is_ignored(signum as i32)
+            {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             if signal_is_self_target(pid) {
                 let tid = Self::ctx_tid(cx);
                 if this.proc.lock().ptrace_traceme && signum != 0 {

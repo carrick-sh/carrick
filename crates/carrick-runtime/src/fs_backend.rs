@@ -2383,12 +2383,81 @@ fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u
     }
 }
 
+/// Prefix for a per-symlink xattr SIDECAR file (non-macOS). Linux (and every
+/// Linux filesystem) forbids `user.*`/`trusted.*` xattrs ON A SYMLINK at the VFS
+/// layer, so a symlink's carrick-owned uid/gid (`lchown`) cannot be stored in an
+/// xattr the way a regular file's is. We persist it instead in a tiny sidecar
+/// file placed ADJACENT to the link (`<dir>/.carrick-lnkxattr.<name>.<key>`),
+/// which is fork-coherent (a real on-disk file under the rootfs, inherited
+/// across `libc::fork`, NOT an in-process map) and resolved through the SAME
+/// cap-std `Dir` as the link itself. macOS keeps the XATTR_NOFOLLOW path above.
 #[cfg(not(target_os = "macos"))]
-fn symlink_get_u32_xattr(_d: &cap_std::fs::Dir, _r: &Path, _n: &[u8]) -> Option<u32> {
-    None
+const LINK_XATTR_SIDECAR_PREFIX: &str = ".carrick-lnkxattr.";
+
+/// Map a carrick xattr name (`b"user.carrick.uid\0"`) to its short sidecar key
+/// (`uid`). Returns `None` for an unrecognised name (defensive; only the three
+/// carrick `user.carrick.*` owner/socket names are ever passed here).
+#[cfg(not(target_os = "macos"))]
+fn link_xattr_sidecar_key(name: &[u8]) -> Option<&'static str> {
+    let trimmed = name.strip_suffix(b"\0").unwrap_or(name);
+    match trimmed {
+        b"user.carrick.uid" => Some("uid"),
+        b"user.carrick.gid" => Some("gid"),
+        b"user.carrick.socket" => Some("socket"),
+        _ => None,
+    }
 }
+
+/// The sidecar relative path for the symlink `rel`, attr `key`: same parent dir,
+/// name `.carrick-lnkxattr.<linkname>.<key>`. `None` if `rel` has no file name.
 #[cfg(not(target_os = "macos"))]
-fn symlink_set_u32_xattr(_d: &cap_std::fs::Dir, _r: &Path, _n: &[u8], _v: u32) {}
+fn link_xattr_sidecar_rel(rel: &Path, key: &str) -> Option<std::path::PathBuf> {
+    let name = rel.file_name()?.to_str()?;
+    let file = format!("{LINK_XATTR_SIDECAR_PREFIX}{name}.{key}");
+    Some(match rel.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(file),
+        _ => std::path::PathBuf::from(file),
+    })
+}
+
+/// True iff `name` is a per-symlink xattr sidecar (hidden from `readdir`).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn is_link_xattr_sidecar_name(name: &str) -> bool {
+    name.starts_with(LINK_XATTR_SIDECAR_PREFIX)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn symlink_get_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8]) -> Option<u32> {
+    let key = link_xattr_sidecar_key(name)?;
+    let sidecar = link_xattr_sidecar_rel(rel, key)?;
+    let bytes = dir.read(&sidecar).ok()?;
+    (bytes.len() == 4).then(|| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32) {
+    let Some(key) = link_xattr_sidecar_key(name) else {
+        return;
+    };
+    let Some(sidecar) = link_xattr_sidecar_rel(rel, key) else {
+        return;
+    };
+    // Best-effort, matching the macOS `lsetxattr` path (which also ignores
+    // failure): a write error leaves the owner unset and `lstat` falls back to
+    // the host uid, exactly as before this sidecar existed.
+    let _ = dir.write(&sidecar, val.to_le_bytes());
+}
+
+/// Remove any xattr sidecars belonging to the symlink `rel` (called from the
+/// backend's unlink so a reused name does not inherit a stale owner). Best-effort.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn remove_link_xattr_sidecars(dir: &cap_std::fs::Dir, rel: &Path) {
+    for key in ["uid", "gid", "socket"] {
+        if let Some(sidecar) = link_xattr_sidecar_rel(rel, key) {
+            let _ = dir.remove_file(&sidecar);
+        }
+    }
+}
 
 fn read_owner_xattr(
     dir: &cap_std::fs::Dir,
@@ -2926,7 +2995,14 @@ impl FsBackend for HostFsBackend {
         let Ok((dir, at_rel)) = self.at(rel) else {
             return false;
         };
-        dir.remove_file(&at_rel).is_ok() || dir.remove_dir(&at_rel).is_ok()
+        let removed = dir.remove_file(&at_rel).is_ok() || dir.remove_dir(&at_rel).is_ok();
+        // Clean up any per-symlink xattr sidecars (non-macOS owner store) so a
+        // later entry that reuses the name does not inherit a stale owner.
+        #[cfg(not(target_os = "macos"))]
+        if removed {
+            remove_link_xattr_sidecars(&dir, &at_rel);
+        }
+        removed
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
@@ -2968,6 +3044,12 @@ impl FsBackend for HostFsBackend {
             // or plain-UTF-8) form; carry it through unchanged. The guest-facing
             // getdents decodes the escape back to the raw opaque bytes.
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Hide carrick's per-symlink xattr sidecars (non-macOS owner store):
+            // an internal metadata file, not a guest-visible directory entry.
+            #[cfg(not(target_os = "macos"))]
+            if is_link_xattr_sidecar_name(&name) {
+                continue;
+            }
             let kind = match entry.file_type() {
                 Ok(ft) if ft.is_dir() => RootFsEntryKind::Directory,
                 Ok(ft) if ft.is_symlink() => RootFsEntryKind::Symlink,
@@ -3032,6 +3114,23 @@ impl FsBackend for HostFsBackend {
         src_dir
             .rename(&src_at, &dst_dir, &dst_at)
             .map_err(|_| BackendError::Io)?;
+        // Carry a symlink's xattr sidecars (non-macOS owner store) across the
+        // rename — they are keyed by name, so they must move with the link.
+        // Best-effort: only `lchown`ed symlinks have any; a missing one is a
+        // no-op, and a stale sidecar at the destination name is removed first.
+        #[cfg(not(target_os = "macos"))]
+        {
+            remove_link_xattr_sidecars(&dst_dir, &dst_at);
+            for key in ["uid", "gid", "socket"] {
+                if let (Some(s), Some(d)) = (
+                    link_xattr_sidecar_rel(&src_at, key),
+                    link_xattr_sidecar_rel(&dst_at, key),
+                ) && src_dir.symlink_metadata(&s).is_ok()
+                {
+                    let _ = src_dir.rename(&s, &dst_dir, &d);
+                }
+            }
+        }
         // A rename can move a directory that the stat cache holds as a parent
         // anchor; a cached fd silently follows the inode to its new location, so
         // a later stat by the OLD path would wrongly resolve under the new one

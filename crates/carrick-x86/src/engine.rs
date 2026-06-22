@@ -380,6 +380,23 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         self.protections.set_no_access(address, len, no_access);
     }
 
+    /// Resolve a guest futex VA to the host address of its `MAP_SHARED` backing
+    /// (the boot aperture OR a runtime file-backed alias), so a cross-process
+    /// futex routes through the bare-`SYS_futex` shared path instead of the
+    /// per-process parking lot. Translate the VA to the GPA the guest's own
+    /// access hits (identity for ordinary pointers, the stage-1 mapping for an
+    /// aliased VA at/above the 40-bit IPA cap), then ask the VMM whether that GPA
+    /// lies in a fork-coherent shared window. `None` (private/anon word) keeps the
+    /// futex in-process. Without this override the engine inherited the default
+    /// `None`, so EVERY x86 cross-process futex fell to the per-process parking
+    /// lot — a forked child's `FUTEX_WAKE` never reached a parent parked in
+    /// `FUTEX_WAIT` on the same `/dev/shm` page (`ltpcheckpoint` reverse direction).
+    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
+        // A futex word is a 4-byte u32.
+        let gpa = self.syscall_buffer_gpa(guest_addr, 4);
+        self.vm.shared_futex_host_addr(gpa, 4)
+    }
+
     /// x86-specific WRITE gate (the analog of HVF's `validate_guest_write_range`):
     /// a syscall write faults if the buffer is PROT_NONE (any access) OR read-only
     /// (`no_write`). Reads from a read-only mapping are fine (handled by the shared
