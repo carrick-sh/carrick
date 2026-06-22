@@ -181,7 +181,17 @@ matrix:
     cargo run -p carrick-conformance -- --render-matrix
 
 # Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
+# On the x86_64 fleet the AMD64 probe sets are built NATIVELY here (cheap: host
+# rustc, no Docker/QEMU) so the gate has binaries to run; on macOS the aarch64 +
+# Rosetta-amd64 sets are built out-of-band via scripts/build-probes.sh (Docker
+# cross-build) — the harness only runs probes whose binaries exist, so an absent
+# set just SKIPs that lane.
 conformance-probes: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -m)" in
+        x86_64|amd64) ./scripts/build-probes.sh ;;
+    esac
     cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
 
 # Re-sign an already-built release binary (rarely needed on its own).

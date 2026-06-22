@@ -154,12 +154,37 @@ const ARM64: Lane = Lane {
 };
 
 const AMD64: Lane = Lane {
-    label: "amd64-rosetta",
+    // Host-neutral label: this lane now serves BOTH the macOS-Rosetta x86_64
+    // guest path AND the native x86_64 fleet (Linux/KVM, FreeBSD/bhyve,
+    // NetBSD/NVMM), where carrick executes the guest directly via carrick-x86.
+    // `lane_runnable_here` decides whether the current host can run it (native
+    // x86_64 OR Rosetta-on-macOS); the probe sets below are the same portable
+    // sources cross-compiled for x86_64, mirroring the ARM64 lane.
+    label: "amd64",
     platform: "linux/amd64",
     image: "docker.io/library/ubuntu:24.04",
-    // Apple's Linux Rosetta path does not run the standalone probe binaries yet;
-    // the amd64 shell lane is glibc-dynamic and exercises supported scope.
-    probe_sets: &[],
+    probe_sets: &[
+        ProbeSet {
+            libc: "musl",
+            // REPORT-ONLY for now (like the gnu set started): on the native
+            // x86_64 fleet this lane surfaces ~34 genuine carrick-x86 ABI gaps
+            // (SEGVs on aliassize/mapfixed private-overlay, SysV msg, CLOCK_BOOTTIME,
+            // si_value propagation, …) — real carrick-x86 BRING-UP work, since
+            // x86_64 is an active lane behind the mature HVF/aarch64 reference
+            // (the same probes PASS on ARM64). The run prints a SUMMARY of every
+            // DIFF each pass so the gaps stay visible and shrink-tracked; flip
+            // this to `gating: true` once carrick-x86 reaches probe parity. On
+            // macOS this lane only runs via Rosetta and is report-only regardless
+            // (Rosetta, not carrick, does the translation — see `set_gates_here`).
+            target: "x86_64-unknown-linux-musl",
+            gating: false,
+        },
+        ProbeSet {
+            libc: "gnu",
+            target: "x86_64-unknown-linux-gnu",
+            gating: false,
+        },
+    ],
 };
 
 const LANES: &[Lane] = &[ARM64, AMD64];
@@ -266,8 +291,56 @@ fn rosetta_available() -> bool {
     std::path::Path::new("/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta").exists()
 }
 
-fn lane_available(lane: Lane) -> bool {
-    lane.platform != "linux/amd64" || rosetta_available()
+/// Whether the CURRENT host can actually execute a lane's GUEST architecture
+/// under carrick — used to SKIP (not fail) a lane whose guest arch this host
+/// can't run. carrick is not an emulator: it runs the guest's native ISA on a
+/// hardware vCPU, so the runnable matrix is keyed on host arch, not just on
+/// "is the VMM present".
+///
+///   * aarch64 guests (`linux/arm64`) — runnable on an **aarch64 host**
+///     (macOS/HVF, or a Linux/KVM aarch64 box) natively. On an x86_64 host the
+///     shared carrick-x86 engine CANNOT execute aarch64 code (it would fail with
+///     `unsupported ELF machine: 183`), so the lane is SKIPPED there.
+///   * x86_64 guests (`linux/amd64`) — runnable **natively on an x86_64 host**
+///     (the Linux/KVM + FreeBSD/bhyve + NetBSD/NVMM fleet, `carrick-x86`), OR via
+///     Apple's in-guest Linux Rosetta on a macOS/arm64 host. On macOS/arm64
+///     `cfg!(target_arch = "x86_64")` is false, so the Rosetta predicate is the
+///     only thing that keeps this lane alive there — exactly as before.
+///
+/// Net effect: macOS keeps gating ARM64 and runs amd64 via Rosetta (report-only
+/// — see `set_gates_here`); the x86_64 fleet gates AMD64 and SKIPs ARM64 instead
+/// of erroring on it.
+fn lane_runnable_here(lane: &Lane) -> bool {
+    match lane.platform {
+        // aarch64 guests need an aarch64 host (no cross-ISA execution).
+        "linux/arm64" => cfg!(target_arch = "aarch64"),
+        // x86_64 guests run natively on an x86_64 host, or via Rosetta on macOS.
+        "linux/amd64" => cfg!(target_arch = "x86_64") || rosetta_available(),
+        // Unknown platform: be conservative and skip rather than error.
+        _ => false,
+    }
+}
+
+/// Whether a probe set's DIFFs should fail the gate ON THIS HOST. A probe set is
+/// only the system-under-test where carrick ITSELF executes the guest ISA — i.e.
+/// the host arch matches the guest arch. The macOS amd64 lane runs through
+/// Apple's in-guest Linux Rosetta (a translation layer that is NOT carrick's ABI
+/// path), so a DIFF there reflects Rosetta-vs-Docker, not a carrick x86_64 gap:
+/// keep that lane REPORT-ONLY on macOS even for an intent-gating (musl) set.
+/// On the native x86_64 fleet carrick-x86 IS the implementation under test, so
+/// the amd64 musl set gates there. The aarch64 lane only runs on an aarch64 host
+/// (lane_runnable_here), where it is always native — so its intent-gating is
+/// honoured unchanged.
+fn set_gates_here(lane: &Lane, set: &ProbeSet) -> bool {
+    if !set.gating {
+        return false;
+    }
+    match lane.platform {
+        // Gates only when carrick runs the guest natively (host arch == guest).
+        "linux/amd64" => cfg!(target_arch = "x86_64"),
+        "linux/arm64" => cfg!(target_arch = "aarch64"),
+        _ => false,
+    }
 }
 
 /// True if `bin` already carries the hypervisor entitlement.
@@ -523,10 +596,13 @@ fn conformance() {
         };
         let mut failures = Vec::new();
         for lane in LANES {
-            if !lane_available(*lane) {
+            if !lane_runnable_here(lane) {
                 eprintln!(
-                    "SKIP conformance[{}]: Rosetta for Linux not installed",
-                    lane.label
+                    "SKIP conformance[{}]: host ({}) cannot run {} guests \
+                     (no cross-ISA execution; Rosetta absent for amd64-on-macOS)",
+                    lane.label,
+                    std::env::consts::ARCH,
+                    lane.platform
                 );
                 continue;
             }
@@ -741,6 +817,15 @@ fn conformance_default_run_contract() {
         eprintln!("SKIP conformance_default_run_contract: target/release/carrick not built");
         return;
     };
+    // This contract runs the ARM64 (aarch64) image on the default path; an
+    // x86_64 host can't execute aarch64 guests, so skip there rather than error.
+    if !lane_runnable_here(&ARM64) {
+        eprintln!(
+            "SKIP conformance_default_run_contract: host ({}) cannot run aarch64 guests",
+            std::env::consts::ARCH
+        );
+        return;
+    }
     ensure_signed(&bin);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -829,11 +914,14 @@ fn conformance_default_run_contract() {
 }
 
 // ---------------------------------------------------------------------------
-// Probe binaries: compiled static aarch64-linux-musl ELFs (built by
-// scripts/build-probes.sh) run UNDER carrick and UNDER Docker, byte-identical.
-// Each probe prints deterministic, one-line-per-observation output. We ship
-// the binary into the guest by base64-encoding it and feeding the encoded
-// bytes to `base64 -d` on the child's STDIN (it's ~600KB — too big for argv).
+// Probe binaries: compiled Linux ELFs (built by scripts/build-probes.sh) run
+// UNDER carrick and UNDER Docker, byte-identical. The target triple is per
+// ProbeSet — aarch64-linux-{musl,gnu} for the ARM64 lane, x86_64-linux-{musl,
+// gnu} for the AMD64 lane — so the SAME portable probe sources gate both the
+// macOS/aarch64 reference path and the x86_64 fleet (Linux/KVM, FreeBSD/bhyve).
+// Each probe prints deterministic, one-line-per-observation output. We ship the
+// binary into the guest by base64-encoding it and feeding the encoded bytes to
+// `base64 -d` on the child's STDIN (it's ~600KB — too big for argv).
 // ---------------------------------------------------------------------------
 
 /// `base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p` — the binary arrives on
@@ -1234,17 +1322,23 @@ fn conformance_probes() {
 
     let mut nongating_diffs: Vec<String> = Vec::new();
     for lane in LANES {
-        if !lane_available(*lane) {
+        if !lane_runnable_here(lane) {
             eprintln!(
-                "SKIP conformance_probes[{}]: Rosetta for Linux not installed",
-                lane.label
+                "SKIP conformance_probes[{}]: host ({}) cannot run {} guests \
+                 (no cross-ISA execution; Rosetta absent for amd64-on-macOS)",
+                lane.label,
+                std::env::consts::ARCH,
+                lane.platform
             );
             continue;
         }
         // Each lane runs its probe suite once per libc flavour (musl, gnu): the
         // matrix. The gnu set is report-only (non-gating) until its glibc-path
-        // gaps are triaged; the musl set gates as before.
+        // gaps are triaged; the musl set gates — but only where carrick runs the
+        // guest natively (set_gates_here): the macOS amd64-via-Rosetta lane is
+        // report-only because Rosetta, not carrick, is translating it.
         for set in lane.probe_sets {
+            let gates = set_gates_here(lane, set);
             let dir = probes_dir(set.target);
             if !dir.exists() {
                 eprintln!(
@@ -1363,41 +1457,42 @@ fn conformance_probes() {
                     ProbeOutcome::Pass => eprintln!("PASS {qualified}"),
                     ProbeOutcome::UnexpectedPass => {
                         // A known-gap probe started passing → the gap is fixed.
-                        // Only the GATING (musl) set asserts: remove it from
-                        // KNOWN_PROBE_GAPS. (gnu is report-only.)
+                        // Only a GATING set asserts: remove it from
+                        // KNOWN_PROBE_GAPS. (report-only sets don't.)
                         eprintln!("UNEXPECTED PASS {qualified} (remove from KNOWN_PROBE_GAPS)");
-                        if set.gating {
+                        if gates {
                             fixed_gaps.push(qualified);
                         }
                     }
                     ProbeOutcome::Fail(diff) => {
-                        if set.gating {
+                        if gates {
                             eprintln!("FAIL {qualified}\n{diff}");
                             failures.push(qualified);
                         } else {
-                            // Non-gating (gnu) DIFF: surface it as a glibc-path
-                            // gap to triage, but do NOT fail the gate yet.
+                            // Report-only DIFF (gnu set, or amd64-via-Rosetta on
+                            // macOS): surface it as a gap to triage, but do NOT
+                            // fail the gate yet.
                             set_diffs += 1;
                             eprintln!(
-                                "DIFF {qualified} (gnu report-only — glibc gap to triage)\n{diff}"
+                                "DIFF {qualified} (report-only — ABI/Rosetta gap to triage)\n{diff}"
                             );
                             nongating_diffs.push(qualified);
                         }
                     }
                     ProbeOutcome::Xfail(diff) => eprintln!("XFAIL {qualified} (known gap)\n{diff}"),
                     ProbeOutcome::Error(e) => {
-                        if set.gating {
+                        if gates {
                             eprintln!("FAIL {qualified} ({e})");
                             failures.push(qualified);
                         } else {
                             set_diffs += 1;
-                            eprintln!("DIFF {qualified} (gnu report-only — error: {e})");
+                            eprintln!("DIFF {qualified} (report-only — error: {e})");
                             nongating_diffs.push(qualified);
                         }
                     }
                 }
             }
-            if !set.gating {
+            if !gates {
                 eprintln!(
                     "SUMMARY {}:{} (report-only): {}/{} probes DIFF from Linux",
                     lane.label,
@@ -1430,6 +1525,16 @@ fn conformance_go_fixture() {
         eprintln!("SKIP conformance_go_fixture: target/release/carrick not built");
         return;
     };
+    // The fixture is an aarch64 Go binary run under the ARM64 lane; on an
+    // x86_64 host carrick can't execute aarch64 guests (no cross-ISA), so skip
+    // rather than error on the unsupported ELF machine.
+    if !lane_runnable_here(&ARM64) {
+        eprintln!(
+            "SKIP conformance_go_fixture: host ({}) cannot run aarch64 guests",
+            std::env::consts::ARCH
+        );
+        return;
+    }
 
     let docker_ok = Command::new("docker")
         .arg("version")
