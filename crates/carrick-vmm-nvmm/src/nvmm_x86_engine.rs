@@ -773,6 +773,15 @@ impl X86Vmm for NvmmVmm {
         Ok(())
     }
 
+    /// Walk the live PML4 for the engine's overlay-VA translation. (NVMM does
+    /// not yet implement `repoint_private` — its compact GPA map does not back
+    /// the 608 GiB overlay aperture identity-GPA — so the engine never asks this
+    /// for an overlay VA today; wired for correctness so a future overlay impl is
+    /// resolved here rather than against the stale shared aperture.)
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        lock_page_tables(&self.page_tables).as_ref()?.translate(va)
+    }
+
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         let vcpu = self.mach.create_vcpu(0).map_err(map_err)?;
         let regions = read_regions(&self.regions);

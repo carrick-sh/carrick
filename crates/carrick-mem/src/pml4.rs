@@ -228,9 +228,20 @@ fn descend_creating(
 ) -> Result<usize, Pml4Error> {
     let idx = indices(va);
     let mut table_off = 0usize; // root PML4 at byte offset 0
-    for &slot in idx.iter().take(3) {
+    for (level, &slot) in idx.iter().take(3).enumerate() {
         let off = table_off + slot * 8;
         let desc = read_desc(bytes, off);
+        // A 2 MiB PS leaf at the PD level (level 2) covers `va` as a single block.
+        // To install a 4 KiB leaf inside it we must SPLIT the block into a PT
+        // first (the boot builder maps bulk regions — heap/arena/shared aperture —
+        // as 2 MiB PS leaves, so a `repoint_private`/sub-block alias landing on
+        // such a VA hits this). Without the split, the PS frame GPA is mistaken
+        // for a table pointer below → BadAddress. Mirrors aarch64
+        // `descend_creating`'s `split_block`.
+        if level == 2 && desc & PML4_P != 0 && desc & PML4_PS != 0 {
+            table_off = split_2m_leaf_in(bytes, next_free, base, off)?;
+            continue;
+        }
         if desc & PML4_P != 0 {
             if user && desc & PML4_US == 0 {
                 // Upgrade: a user walk now passes through this intermediate.
@@ -257,6 +268,46 @@ fn descend_creating(
         table_off = new_off;
     }
     Ok(table_off)
+}
+
+/// Split the 2 MiB PS leaf at PD descriptor byte offset `pd_leaf_off` into a
+/// fresh PT of 512 contiguous 4 KiB leaves (preserving the block's GPA frame +
+/// permission bits), rewrite the PD descriptor to point at the new PT, and
+/// return the new PT's byte offset. The free-function form of
+/// [`Pml4Manager::split_2m_leaf`], usable from [`descend_creating`] which holds
+/// `bytes`/`next_free` directly rather than `&mut Pml4Manager`.
+fn split_2m_leaf_in(
+    bytes: &mut [u8],
+    next_free: &mut usize,
+    base: u64,
+    pd_leaf_off: usize,
+) -> Result<usize, Pml4Error> {
+    let desc = read_desc(bytes, pd_leaf_off);
+    if desc & PML4_PS == 0 {
+        return Err(Pml4Error::BadAddress);
+    }
+    let new_pt_off = *next_free;
+    if new_pt_off + PT_PAGE > bytes.len() {
+        return Err(Pml4Error::OutOfTables);
+    }
+    *next_free += PT_PAGE;
+    let base_gpa = desc & PML4_ADDR_MASK & !LARGE_2M_MASK;
+    let leaf_flags = desc & (PML4_P | PML4_RW | PML4_US | PML4_NX);
+    for index in 0..512usize {
+        let gpa = base_gpa + (index as u64) * PT_PAGE as u64;
+        write_desc(
+            bytes,
+            new_pt_off + index * 8,
+            (gpa & PML4_ADDR_MASK) | leaf_flags,
+        );
+    }
+    let table_flags = PML4_P | PML4_RW | if desc & PML4_US != 0 { PML4_US } else { 0 };
+    write_desc(
+        bytes,
+        pd_leaf_off,
+        ((base + new_pt_off as u64) & PML4_ADDR_MASK) | table_flags,
+    );
+    Ok(new_pt_off)
 }
 
 /// Diagnostic: walk a raw PML4 table image for `va`, returning the descriptor
@@ -339,39 +390,8 @@ impl Pml4Manager {
         read_desc(&self.bytes, off)
     }
 
-    fn alloc_table_page(&mut self) -> Result<usize, Pml4Error> {
-        let new_off = self.next_free;
-        if new_off + PT_PAGE > self.bytes.len() {
-            return Err(Pml4Error::OutOfTables);
-        }
-        self.next_free += PT_PAGE;
-        self.bytes[new_off..new_off + PT_PAGE].fill(0);
-        Ok(new_off)
-    }
-
     fn split_2m_leaf(&mut self, pd_leaf_off: usize) -> Result<usize, Pml4Error> {
-        let desc = self.read_desc(pd_leaf_off);
-        if desc & PML4_PS == 0 {
-            return Err(Pml4Error::BadAddress);
-        }
-        let new_pt_off = self.alloc_table_page()?;
-        let base_gpa = desc & PML4_ADDR_MASK & !LARGE_2M_MASK;
-        let leaf_flags = desc & (PML4_P | PML4_RW | PML4_US | PML4_NX);
-        for index in 0..512usize {
-            let gpa = base_gpa + (index as u64) * PT_PAGE as u64;
-            write_desc(
-                &mut self.bytes,
-                new_pt_off + index * 8,
-                (gpa & PML4_ADDR_MASK) | leaf_flags,
-            );
-        }
-        let table_flags = PML4_P | PML4_RW | if desc & PML4_US != 0 { PML4_US } else { 0 };
-        write_desc(
-            &mut self.bytes,
-            pd_leaf_off,
-            ((self.base + new_pt_off as u64) & PML4_ADDR_MASK) | table_flags,
-        );
-        Ok(new_pt_off)
+        split_2m_leaf_in(&mut self.bytes, &mut self.next_free, self.base, pd_leaf_off)
     }
 
     /// Byte offset of the PT (level-3) table for `va`, creating missing
@@ -871,6 +891,42 @@ mod tests {
         assert_ne!(walk[3] & PML4_RW, 0, "writable alias leaf");
         assert_eq!(walk[3] & PML4_NX, 0, "alias leaf is executable");
         assert_eq!(walk[3] & PML4_ADDR_MASK, alias_gpa);
+    }
+
+    #[test]
+    fn map_aliased_repoints_a_page_inside_a_2m_block_leaf() {
+        // The `repoint_private` overlay case: a region (here the shared aperture
+        // shape) is boot-mapped as 2 MiB PD PS block leaves, and a single 4 KiB
+        // page at a 2 MiB-aligned VA inside it is re-pointed to a DIFFERENT GPA
+        // (the per-process overlay aperture). map_aliased must SPLIT the covering
+        // 2 MiB block to a PT and overwrite just that leaf — without the split,
+        // descend_creating mistook the 2 MiB frame GPA for a table pointer and
+        // returned BadAddress (the x86 mapfixed/mapfixedfork SEGV/leak).
+        let va = 0x90_0000_0000u64; // 2 MiB-aligned, mapped as a 2 MiB PS block
+        let overlay_gpa = 0x98_0000_0000u64; // distinct overlay GPA
+        let bytes = build(&[user_rw_nx(va, va, LARGE_2M)]);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        // Precondition: the covering PD entry is a 2 MiB PS leaf.
+        let pre = walk_descriptors(mgr.bytes(), BASE, va);
+        assert_ne!(pre[2] & PML4_PS, 0, "region starts as a 2 MiB PS block");
+
+        mgr.map_aliased(va, overlay_gpa, 0x1000, true)
+            .expect("repoint one page inside the 2 MiB block");
+
+        // The repointed page now resolves to the overlay GPA; its neighbour in the
+        // same 2 MiB block still resolves to the original identity GPA (split
+        // preserved the block's other leaves).
+        assert_eq!(mgr.translate(va), Some(overlay_gpa));
+        assert_eq!(mgr.translate(va + 0x1000), Some(va + 0x1000));
+        let walk = walk_descriptors(mgr.bytes(), BASE, va);
+        assert_eq!(walk[2] & PML4_PS, 0, "2 MiB block was split to a PT");
+        assert_eq!(
+            walk[3] & PML4_ADDR_MASK,
+            overlay_gpa,
+            "leaf points at overlay"
+        );
+        assert_ne!(walk[3] & PML4_RW, 0, "repointed leaf is writable");
+        assert_ne!(walk[3] & PML4_US, 0, "repointed leaf is user-accessible");
     }
 
     #[test]

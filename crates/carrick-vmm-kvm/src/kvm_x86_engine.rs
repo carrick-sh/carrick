@@ -246,6 +246,80 @@ impl X86Vmm for KvmVmm {
         Ok(())
     }
 
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        self.page_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .translate(va)
+    }
+
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_gpa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), MemoryError> {
+        // The overlay aperture (608 GiB) is identity GPA==VA and boot-mapped as a
+        // normal KVM slot, so `host_ptr(overlay_gpa)` resolves its private (NOT
+        // MAP_SHARED) backing. Seed `content` into that backing FIRST — while `va`
+        // still maps to the stale shared-aperture GPA, so no torn read through
+        // `va` during the flip.
+        let dst = self
+            .ram
+            .host_ptr(overlay_gpa, len.max(1))
+            .ok_or(MemoryError::OutOfBounds {
+                address: overlay_gpa,
+                length: len,
+            })?;
+        if !content.is_empty() {
+            let n = content.len().min(len);
+            // SAFETY: `host_ptr` proved `[overlay_gpa, overlay_gpa+len)` lies wholly
+            // within the overlay slot's backing, so `dst[..n]` (n <= len) is valid
+            // and writable; `content[..n]` is a distinct, valid source slice.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), dst, n) };
+        }
+        // Repoint the live PML4 leaf for `va` at the overlay GPA (`map_aliased`
+        // splits any covering 2 MiB block to a 4 KiB leaf so a single page is
+        // repointed without disturbing neighbours), then copy the table image back
+        // over the live PML4 backing. The engine reloads CR3 afterwards.
+        let len_u64 = u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
+            address: va,
+            length: len,
+        })?;
+        self.edit_page_tables(va, len, |mgr| {
+            mgr.map_aliased(va, overlay_gpa, len_u64, true)
+                .map(|()| true)
+        })
+    }
+
+    fn back_fixed_anon(&mut self, va: u64, len: usize, writable: bool) -> Result<(), MemoryError> {
+        use crate::guest_setup::AliasBacking;
+
+        // Back a MAP_FIXED|MAP_PRIVATE|MAP_ANON at an arbitrary VA that the PML4
+        // does not yet map (outside the eager arena/image). Allocate a fresh
+        // identity-GPA slot (GPA==VA) backed by zeroed anon host memory, then
+        // install the VA→GPA leaf so the guest's own access has real backing.
+        let len_u64 = u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
+            address: va,
+            length: len,
+        })?;
+        self.ram
+            .add_alias(
+                &mut self.vm,
+                va,
+                va,
+                len_u64,
+                AliasBacking::Anon { payload: &[] },
+            )
+            .map_err(|e| {
+                MemoryError::HostMap(format!("kvm-x86: back_fixed_anon add_alias: {e}"))
+            })?;
+        self.edit_page_tables(va, len, |mgr| {
+            mgr.map_aliased(va, va, len_u64, writable).map(|()| true)
+        })
+    }
+
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         use carrick_hal::HvVm as _;
         self.vm
