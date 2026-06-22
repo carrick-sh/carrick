@@ -192,6 +192,12 @@ pub struct X86EngineCore<V: X86Vmm> {
     /// overwrites RAX with the retval. SA_RESTART restores it so a restarted
     /// syscall re-executes with its number intact.
     last_orig_rax: u64,
+    /// CANONICAL syscall number of the most recent trapped `syscall`, tracked so
+    /// `SyscallTrap::last_syscall_nr` can feed the run loop's SA_RESTART decision
+    /// (`is_restartable_syscall` matches CANONICAL numbers like waitid=95/wait4=260,
+    /// NOT the raw x86 rax — wait4=61/waitid=247). Without this override the engine
+    /// inherited the `None` default and SA_RESTART was dead on the whole x86 lane.
+    last_syscall_canonical: Option<u64>,
     /// User-mode state saved by SYSCALL while the live RIP is parked on the
     /// trampoline SYSRET.
     sysret_resume: Option<SysretResume>,
@@ -240,6 +246,7 @@ impl<V: X86Vmm> X86EngineCore<V> {
             layout,
             pending_resume_pc: None,
             last_orig_rax: 0,
+            last_syscall_canonical: None,
             sysret_resume: None,
             is_forked_child: false,
             protections,
@@ -743,7 +750,12 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                             self.complete_syscall(ret)?;
                             continue;
                         }
-                        SyscallNorm::Plain(raw) => return Ok(Some(raw)),
+                        SyscallNorm::Plain(raw) => {
+                            // Track the CANONICAL number for SA_RESTART (see
+                            // `last_syscall_canonical` / `last_syscall_nr`).
+                            self.last_syscall_canonical = Some(raw.number);
+                            return Ok(Some(raw));
+                        }
                     }
                 }
                 X86Exit::Halt => {
@@ -826,6 +838,14 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
             .map_or(live_rip, |resume| resume.user_pc))
     }
 
+    /// The CANONICAL number of the most recent trapped syscall, tracked in
+    /// `next_syscall`. Without this override X86EngineCore inherited the `None`
+    /// default, so the run loop's `last_syscall_nr().is_some_and(is_restartable…)`
+    /// gate was always false and SA_RESTART never fired on the x86 lane.
+    fn last_syscall_nr(&self) -> Option<u64> {
+        self.last_syscall_canonical
+    }
+
     fn process_exit_cleanup(&mut self) {
         // Delegate to the backend (§2.5c): a HOOK, not Drop — the forked child
         // `_exit`s skipping Drops. Default is a no-op (KVM/NVMM RAM is released by
@@ -879,6 +899,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         // (shared, so no backend re-implements it).
         let _ = crate::vdso::populate_vdso_vvar(&self.vm, &self.vcpu);
         self.pending_resume_pc = None;
+        self.last_syscall_canonical = None;
         self.sysret_resume = None;
         // execve replaces the whole address space — the old image's PROT_NONE
         // ranges are gone, so the gate must start fresh (else a new mapping at an
@@ -1010,6 +1031,7 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     // already been restored at the syscall-return point, so completion must only
     // write RAX=0 and must not reuse the parent's pending resume PC.
     engine.pending_resume_pc = None;
+    engine.last_syscall_canonical = None;
     engine.sysret_resume = None;
     engine.is_forked_child = true;
     Ok(ForkOutcome::Child)
