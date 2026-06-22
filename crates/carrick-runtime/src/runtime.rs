@@ -732,8 +732,9 @@ fn run_address_space_with_hvf_and_dispatcher(
     // Run the guest. In the forked guest-init, errors must NOT unwind (see below),
     // so capture the fallible tail in a closure and branch on the role.
     let run = (move || -> Result<RunResult, RuntimeError> {
-        let mut trap = HvfTrapEngine::new()?;
-        trap.map_address_space(&image)?;
+        // Build the engine (create VM + vCPU, map the address space, park at the EL0
+        // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
+        let mut trap = crate::trap::new_hvf_trap_engine(&image)?;
         // Hand the dispatcher the real region list + auxv so /proc/self/maps
         // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
         // ELF instead of the legacy summary. Language runtimes, malloc
