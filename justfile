@@ -18,6 +18,18 @@ _platform_features := if os() == "macos" { "" \
 default:
     @just --list
 
+# (off-macOS only) Emit the `-p <crate> …` set of THIS host's own workspace crates —
+# carrick-cli plus its whole platform dep-closure (carrick-runtime, the shared
+# carrick-x86/carrick-aarch64 engines, and the host's VMM backend: bhyve/kvm/nvmm),
+# but NOT carrick-vmm-hvf (macOS-only; its build script needs cc/applevisor). The
+# gate recipes below feed this list to `cargo {test,doc}` off-macOS so the
+# platform's OWN crates are exercised without `--workspace` dragging in HVF or the
+# macos-default features (a virtual workspace also rejects a root `--features`).
+# Derived from `cargo tree` so it self-updates as crates are added/removed.
+[private]
+_platform_crates:
+    @cargo tree -p carrick-cli {{_platform_features}} --prefix none 2>/dev/null | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' '
+
 # Build the runnable release binary for the host (args go to cargo). macOS codesigns
 # the HVF entitlement; Linux/FreeBSD/NetBSD do a plain build with the backend features.
 build *ARGS:
@@ -45,7 +57,18 @@ install-hooks:
 # `--keep-going` reports clippy errors across ALL crates in one pass instead of
 # stopping at the first failing crate (so a push surfaces the whole list at once).
 clippy *ARGS:
-    cargo clippy --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
+        # macOS lints the whole workspace (HVF backend included) with default features.
+        exec cargo clippy --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
+    fi
+    # Off-macOS: lint carrick-cli + its platform dep-closure (carrick-runtime, the
+    # shared x86/aarch64 engines, this host's VMM backend) under the backend feature
+    # set, so the kvm/bhyve/nvmm code the macOS gate never sees is linted too. Scoping
+    # to -p carrick-cli {{_platform_features}} keeps HVF/macos-defaults out (a root
+    # --workspace --features is rejected on a virtual workspace).
+    exec cargo clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
 
 # Formatting check (matches CI).
 fmt-check:
@@ -57,21 +80,77 @@ fmt:
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test *ARGS:
-    cargo test --workspace --lib {{ARGS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
+        # macOS runs every workspace crate's lib tests (HVF backend included).
+        exec cargo test --workspace --lib {{ARGS}}
+    fi
+    # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
+    # _platform_crates) under the backend feature set — `--workspace --lib` would
+    # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
+    pkgs="$(just --justfile {{justfile()}} _platform_crates)"
+    exec cargo test $pkgs {{_platform_features}} --lib {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items {{ARGS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
+        # macOS documents every workspace crate (HVF backend included).
+        exec env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items {{ARGS}}
+    fi
+    # Off-macOS: document THIS host's own crates explicitly (-p list from
+    # _platform_crates) under the backend feature set. The explicit -p list is
+    # load-bearing: with only `-p carrick-cli … --no-deps`, rustdoc checks but does
+    # NOT run on the backend crates, so broken intra-doc links in carrick-vmm-kvm/
+    # bhyve/nvmm (cfg'd-empty on macOS, so the macOS gate never sees them) slip
+    # through. --no-deps still keeps -D warnings off EXTERNAL crates.
+    pkgs="$(just --justfile {{justfile()}} _platform_crates)"
+    exec env RUSTDOCFLAGS="-D warnings" cargo doc $pkgs {{_platform_features}} --no-deps --document-private-items {{ARGS}}
 
 # Host integration suites (no HVF/Docker); syscall_process is its own binary (matches CI).
+# carrick-runtime and carrick-engine default to platform-macos (→ HVF), so off-macOS
+# they need {{_platform_features}}; carrick-image has no platform features (left bare).
 test-integration:
-    cargo test -p carrick-runtime --test integration
-    cargo test -p carrick-runtime --test syscall_process
-    cargo test -p carrick-engine
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
+        cargo test -p carrick-runtime --test integration
+        cargo test -p carrick-runtime --test syscall_process
+        cargo test -p carrick-engine
+        cargo test -p carrick-image
+        exit 0
+    fi
+    # Off-macOS: same suites, but with the backend feature set on the crates that
+    # default to platform-macos. (The `integration` suite has some macOS-only test
+    # bodies that aren't cfg-gated and a couple of cases that need a prebuilt
+    # fixtures/linux-aarch64-hello image — those fail/skip ENVIRONMENTALLY off-macOS,
+    # not because of feature wiring.)
+    cargo test -p carrick-runtime {{_platform_features}} --test integration
+    cargo test -p carrick-runtime {{_platform_features}} --test syscall_process
+    cargo test -p carrick-engine {{_platform_features}}
     cargo test -p carrick-image
 
 # Run the full host CI gate locally (fmt · clippy · build · docs · tests) — the source of truth CI calls.
-ci: fmt-check clippy (check "--workspace") doc test test-integration
+# Composes the now-OS-aware leaf recipes. The only OS difference is the `check` arg:
+# on macOS `check --workspace` compiles every crate (HVF included); off-macOS a bare
+# `check` (= `cargo build -p carrick-cli {{_platform_features}}`) is the right scope —
+# `--workspace` there would drag in carrick-vmm-hvf (cc/applevisor) and fail.
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    j() { just --justfile {{justfile()}} "$@"; }
+    j fmt-check
+    j clippy
+    if [ "{{os()}}" = "macos" ]; then
+        j check --workspace
+    else
+        j check
+    fi
+    j doc
+    j test
+    j test-integration
 
 # Unified language/LTP conformance harness vs Docker (needs Docker + signed binary).
 # `just conformance` = full tier; `just conformance smoke` = fast gate; extra args pass
