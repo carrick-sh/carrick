@@ -1222,6 +1222,16 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     "timeextra",
     "clockgetres",
     "netpoll",
+    // splicenetpoll pushes 1 MiB through socket->pipe->socket splices against a
+    // 12s deadline with a throttled drainer + 32 KiB socket buffers + edge-
+    // triggered epoll. carrick is faithful (real SO_SNDBUF passthrough, EPOLLOUT
+    // readiness via a real host poll(), correct EPOLLET re-arm) but ~10% lower
+    // per-syscall overhead, so it moves the MiB in ~10.5s while throttled-loopback
+    // Docker lands near the 12s line — the DOCKER oracle ITSELF flips (measured
+    // 4 false / 2 true across 6 native-amd64 runs), so the verdict is a coin-flip
+    // on the deadline, not a correctness signal. (The earlier exit-125 abort was
+    // the /dev/shm absence, fixed separately; the splice/poll path is correct.)
+    "splicenetpoll",
     // mmaprecl churns 800 x 64 MiB anonymous map/unmap cycles. It validates
     // arena reuse and zero-on-reuse, but under the full parallel gate the host
     // can spend enough time in unrelated guests/Docker that the probe exceeds
