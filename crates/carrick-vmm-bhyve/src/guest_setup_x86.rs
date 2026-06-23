@@ -1001,13 +1001,16 @@ struct ShmAlias {
 struct RamInner {
     windows: Vec<BhyveWindow>,
     cursor: u64,
-    // Each reservation is `(start, end, writable)`. `writable` carries the guest
-    // PROT_WRITE bit so a demand-committed page is mapped with the right leaf
-    // protection: a read-only (PROT_READ) reservation commits a PRESENT but
-    // read-only leaf, so a guest WRITE to it re-faults with PFEC.P=1 and the
-    // engine delivers SIGSEGV/SEGV_ACCERR (not silently allowing the store). A
-    // writable reservation commits an RW leaf (the common anon-arena case).
-    reservations: Vec<(u64, u64, bool)>,
+    // Each reservation is `(start, end, writable, exec)`. `writable`/`exec` carry
+    // the guest PROT_WRITE/PROT_EXEC bits so a demand-committed page is mapped
+    // with the right leaf protection: a read-only (PROT_READ) reservation commits
+    // a PRESENT but read-only leaf, so a guest WRITE to it re-faults with
+    // PFEC.P=1 and the engine delivers SIGSEGV/SEGV_ACCERR (not silently allowing
+    // the store). A writable reservation commits an RW leaf (the common anon-arena
+    // case). `exec` gates the leaf NX bit: a non-exec (no PROT_EXEC) reservation
+    // commits an NX leaf, so a guest instruction FETCH from it #PFs (W^X), exactly
+    // as on Linux/KVM — instead of silently executing a data page.
+    reservations: Vec<(u64, u64, bool, bool)>,
     // File-backed shm aliases to flush to their backing files at the fork
     // barrier (SysV-shm cross-process coherence — see `ShmAlias`).
     shm_aliases: Vec<ShmAlias>,
@@ -1027,9 +1030,15 @@ pub enum CommitOutcome {
     /// Not a known reservation — a genuine fault (deliver SIGSEGV).
     NotReserved,
     /// Freshly allocated this GPA + window; the caller maps the leaf + zero-fills.
-    /// `writable` is the reservation's protection: the caller maps the leaf RW
-    /// when true, read-only when false (so a write to a PROT_READ page faults).
-    Committed { gpa: u64, writable: bool },
+    /// `writable`/`exec` are the reservation's protection: the caller maps the
+    /// leaf RW when `writable` (else read-only, so a write to a PROT_READ page
+    /// faults) and executable when `exec` (else NX, so a fetch from a no-PROT_EXEC
+    /// page faults).
+    Committed {
+        gpa: u64,
+        writable: bool,
+        exec: bool,
+    },
 }
 
 /// Starting point for the bump allocator: 1 MiB (below the reserved 1 MiB
@@ -1040,7 +1049,7 @@ pub enum CommitOutcome {
 pub const X86_GPA_CURSOR_START: u64 = 0x40_0000; // 4 MiB — above init blob/GDT/LSTAR/PML4
 
 impl RamInner {
-    fn reserve(&mut self, va: u64, len: usize, writable: bool) {
+    fn reserve(&mut self, va: u64, len: usize, writable: bool, exec: bool) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
         if end <= start {
@@ -1048,18 +1057,18 @@ impl RamInner {
         }
         // A re-reservation of an overlapping range (e.g. an mprotect changing the
         // protection of an already-reserved-but-uncommitted range) must adopt the
-        // NEW writability, so punch out the overlap before inserting.
+        // NEW protection, so punch out the overlap before inserting.
         self.drop_reservation(start, (end - start) as usize);
-        self.reservations.push((start, end, writable));
-        self.reservations.sort_by_key(|&(s, _, _)| s);
-        // Coalesce only ADJACENT/overlapping ranges that AGREE on writability;
-        // ranges of differing protection must stay distinct so each commits its
-        // own leaf protection.
-        let mut merged: Vec<(u64, u64, bool)> = Vec::with_capacity(self.reservations.len());
-        for &(s, e, w) in &self.reservations {
+        self.reservations.push((start, end, writable, exec));
+        self.reservations.sort_by_key(|&(s, ..)| s);
+        // Coalesce only ADJACENT/overlapping ranges that AGREE on BOTH writability
+        // and exec; ranges of differing protection must stay distinct so each
+        // commits its own leaf protection.
+        let mut merged: Vec<(u64, u64, bool, bool)> = Vec::with_capacity(self.reservations.len());
+        for &(s, e, w, x) in &self.reservations {
             match merged.last_mut() {
-                Some(last) if s <= last.1 && last.2 == w => last.1 = last.1.max(e),
-                _ => merged.push((s, e, w)),
+                Some(last) if s <= last.1 && last.2 == w && last.3 == x => last.1 = last.1.max(e),
+                _ => merged.push((s, e, w, x)),
             }
         }
         self.reservations = merged;
@@ -1069,33 +1078,33 @@ impl RamInner {
         let page = va & !0xFFF;
         self.reservations
             .iter()
-            .any(|&(s, e, _)| page >= s && page < e)
+            .any(|&(s, e, ..)| page >= s && page < e)
     }
 
-    /// The writability of the reservation covering `va`, or `None` if `va` is
-    /// not in any reservation. Used by the demand-commit so the leaf protection
-    /// matches the guest's requested `prot`.
-    fn reservation_writable(&self, va: u64) -> Option<bool> {
+    /// The `(writable, exec)` protection of the reservation covering `va`, or
+    /// `None` if `va` is not in any reservation. Used by the demand-commit so the
+    /// leaf protection (R/W and NX) matches the guest's requested `prot`.
+    fn reservation_prot(&self, va: u64) -> Option<(bool, bool)> {
         let page = va & !0xFFF;
         self.reservations
             .iter()
-            .find(|&&(s, e, _)| page >= s && page < e)
-            .map(|&(_, _, w)| w)
+            .find(|&&(s, e, ..)| page >= s && page < e)
+            .map(|&(_, _, w, x)| (w, x))
     }
 
     fn drop_reservation(&mut self, va: u64, len: usize) {
         let start = va & !0xFFF;
         let end = (va.wrapping_add(len as u64).wrapping_add(0xFFF)) & !0xFFF;
-        let mut out: Vec<(u64, u64, bool)> = Vec::with_capacity(self.reservations.len() + 1);
-        for &(s, e, w) in &self.reservations {
+        let mut out: Vec<(u64, u64, bool, bool)> = Vec::with_capacity(self.reservations.len() + 1);
+        for &(s, e, w, x) in &self.reservations {
             if end <= s || start >= e {
-                out.push((s, e, w)); // disjoint — keep
+                out.push((s, e, w, x)); // disjoint — keep
             } else {
                 if s < start {
-                    out.push((s, start, w)); // left remainder (same protection)
+                    out.push((s, start, w, x)); // left remainder (same protection)
                 }
                 if end < e {
-                    out.push((end, e, w)); // right remainder (same protection)
+                    out.push((end, e, w, x)); // right remainder (same protection)
                 }
             }
         }
@@ -1234,11 +1243,13 @@ impl BhyveGuestRam {
     }
 
     /// Record a lazily-reserved VA range — backed on demand by the `#PF` path,
-    /// never eagerly GPA-mapped. `writable` is the guest's requested PROT_WRITE:
-    /// a read-only reservation commits a present-but-read-only leaf so a guest
-    /// store re-faults (SEGV_ACCERR) instead of silently succeeding.
-    pub fn reserve(&self, va: u64, len: usize, writable: bool) {
-        self.lock().reserve(va, len, writable);
+    /// never eagerly GPA-mapped. `writable`/`exec` are the guest's requested
+    /// PROT_WRITE/PROT_EXEC: a read-only reservation commits a present-but-
+    /// read-only leaf so a guest store re-faults (SEGV_ACCERR), and a non-exec
+    /// reservation commits an NX leaf so a guest instruction fetch re-faults
+    /// (SEGV_ACCERR) — instead of silently succeeding.
+    pub fn reserve(&self, va: u64, len: usize, writable: bool, exec: bool) {
+        self.lock().reserve(va, len, writable, exec);
     }
 
     /// True iff the page containing `va` lies in a reservation range.
@@ -1314,15 +1325,20 @@ impl BhyveGuestRam {
         if inner.resolve(va, 1).is_some() {
             return Ok(CommitOutcome::AlreadyMapped);
         }
-        let Some(writable) = inner.reservation_writable(va) else {
+        let Some((writable, exec)) = inner.reservation_prot(va) else {
             return Ok(CommitOutcome::NotReserved);
         };
-        // The window's `write` flag mirrors the reservation's protection so a
-        // read-only page commits a read-only leaf (see `map_aliased` in
-        // `demand_commit`). Read this BEFORE drop_reservation clears it.
-        let gpa = inner.add_bump(va & !0xFFF, len, true, writable, false)?;
+        // The window's `write`/`exec` flags mirror the reservation's protection so
+        // a read-only page commits a read-only leaf and a non-exec page commits an
+        // NX leaf (see `map_aliased` in `demand_commit`). Read this BEFORE
+        // drop_reservation clears it.
+        let gpa = inner.add_bump(va & !0xFFF, len, true, writable, exec)?;
         inner.drop_reservation(va, len);
-        Ok(CommitOutcome::Committed { gpa, writable })
+        Ok(CommitOutcome::Committed {
+            gpa,
+            writable,
+            exec,
+        })
     }
 
     /// Record a host-file-backed shm alias whose sysmem must be flushed back to
@@ -2834,7 +2850,7 @@ mod tests {
         let ram = BhyveGuestRam::new();
 
         // Read-only reservation -> read-only commit.
-        ram.reserve(0x60_0000_0000, 4096, false);
+        ram.reserve(0x60_0000_0000, 4096, false, false);
         assert!(
             !commit_writable(&ram, 0x60_0000_0000),
             "PROT_READ reservation must commit read-only"
@@ -2847,7 +2863,7 @@ mod tests {
         assert!(!ro.write, "committed read-only window must not be writable");
 
         // Writable reservation -> writable commit.
-        ram.reserve(0x60_0001_0000, 4096, true);
+        ram.reserve(0x60_0001_0000, 4096, true, true);
         assert!(
             commit_writable(&ram, 0x60_0001_0000),
             "PROT_WRITE reservation must commit writable"
@@ -2873,8 +2889,8 @@ mod tests {
     fn distinct_protection_reservations_do_not_merge() {
         let ram = BhyveGuestRam::new();
         // Two abutting pages, different writability.
-        ram.reserve(0x60_0000_0000, 4096, false); // ro
-        ram.reserve(0x60_0000_1000, 4096, true); // rw, abuts the ro page
+        ram.reserve(0x60_0000_0000, 4096, false, false); // ro
+        ram.reserve(0x60_0000_1000, 4096, true, true); // rw, abuts the ro page
         assert!(
             !commit_writable(&ram, 0x60_0000_0000),
             "read-only page commits read-only even with a writable neighbor"
@@ -2897,7 +2913,7 @@ mod tests {
         let ram = BhyveGuestRam::new();
         let va = 0x60_0000_0000u64;
 
-        ram.reserve(va, 4096, true);
+        ram.reserve(va, 4096, true, true);
         let g1 = match ram.commit_if_absent(va, 4096).expect("commit") {
             CommitOutcome::Committed { gpa, .. } => gpa,
             _ => panic!("expected Committed"),
@@ -2910,7 +2926,7 @@ mod tests {
 
         // Reuse: a fresh commit must take a NEW GPA (not the dead G1), and
         // resolve must return ONLY the fresh window (no stale shadow).
-        ram.reserve(va, 4096, true);
+        ram.reserve(va, 4096, true, true);
         let g2 = match ram.commit_if_absent(va, 4096).expect("recommit") {
             CommitOutcome::Committed { gpa, .. } => gpa,
             _ => panic!("expected Committed on reuse"),

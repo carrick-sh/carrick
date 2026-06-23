@@ -589,6 +589,7 @@ impl Pml4Manager {
         gpa: u64,
         len: u64,
         writable: bool,
+        exec: bool,
     ) -> Result<(), Pml4Error> {
         if va & PAGE_MASK != 0 || gpa & PAGE_MASK != 0 {
             return Err(Pml4Error::Misaligned);
@@ -605,7 +606,15 @@ impl Pml4Manager {
             return Err(Pml4Error::Misaligned);
         }
 
-        let leaf_bits = PML4_P | PML4_US | if writable { PML4_RW } else { 0 };
+        // NX (bit 63) on the leaf when the mapping is non-executable. Effective
+        // only with EFER.NXE=1 (set at bring-up). A demand-committed anon page
+        // mapped from a `mmap(PROT_READ|PROT_WRITE)` (no PROT_EXEC) reservation is
+        // NON-exec, so a guest instruction fetch from it must #PF (W^X) exactly as
+        // on Linux/KVM. File/anon SHARED aliases pass `exec=true` (the historical
+        // executable-alias behaviour). The intermediate table entries stay
+        // permissive (no NX) — only the leaf gates execution.
+        let leaf_bits =
+            PML4_P | PML4_US | if writable { PML4_RW } else { 0 } | if exec { 0 } else { PML4_NX };
         let base = self.base;
         // 2 MiB-aligned aliases (every large file/anon alias: the IPA is
         // 2 MiB-block-aligned and the alias VA is derived 2 MiB-aligned) map the
@@ -877,7 +886,7 @@ mod tests {
         let high_va = 0x0100_0000_0000 + 0x20_0000;
         let alias_gpa = 0xA0_0000_0000;
 
-        mgr.map_aliased(high_va, alias_gpa, 0x2000, true)
+        mgr.map_aliased(high_va, alias_gpa, 0x2000, true, true)
             .expect("map high alias");
 
         assert_eq!(mgr.translate(high_va), Some(alias_gpa));
@@ -891,6 +900,40 @@ mod tests {
         assert_ne!(walk[3] & PML4_RW, 0, "writable alias leaf");
         assert_eq!(walk[3] & PML4_NX, 0, "alias leaf is executable");
         assert_eq!(walk[3] & PML4_ADDR_MASK, alias_gpa);
+    }
+
+    /// W^X for a demand-committed anon leaf: `map_aliased(..., exec=false)` must
+    /// set the leaf NX bit (and keep it clear for `exec=true`), so a guest fetch
+    /// from a non-PROT_EXEC mmap page #PFs on the bhyve demand-paging backend
+    /// exactly as on Linux/KVM. The intermediate table entries stay exec
+    /// (NX clear) — only the leaf gates the fetch.
+    #[test]
+    fn map_aliased_exec_flag_gates_leaf_nx() {
+        let low_va = 0x40_0000;
+        let nx_va = 0x0100_0000_0000 + 0x20_0000;
+        let nx_gpa = 0xA0_0000_0000;
+        let x_va = nx_va + 0x1000;
+        let x_gpa = nx_gpa + 0x1000;
+
+        let bytes = build(&[user_rw_nx(low_va, low_va, 0x1000)]);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+
+        // Non-exec demand leaf -> NX set.
+        mgr.map_aliased(nx_va, nx_gpa, 0x1000, true, false)
+            .expect("map non-exec demand leaf");
+        let walk = walk_descriptors(mgr.bytes(), BASE, nx_va);
+        assert_ne!(walk[3] & PML4_NX, 0, "exec=false leaf is NX (W^X)");
+        assert_ne!(walk[3] & PML4_RW, 0, "writable leaf");
+        // The intermediate levels must NOT be NX (they cover exec siblings too).
+        for (level, desc) in walk.iter().take(3).enumerate() {
+            assert_eq!(desc & PML4_NX, 0, "intermediate level {level} stays exec");
+        }
+
+        // Exec demand leaf -> NX clear.
+        mgr.map_aliased(x_va, x_gpa, 0x1000, true, true)
+            .expect("map exec demand leaf");
+        let walk = walk_descriptors(mgr.bytes(), BASE, x_va);
+        assert_eq!(walk[3] & PML4_NX, 0, "exec=true leaf is executable");
     }
 
     #[test]
@@ -910,7 +953,7 @@ mod tests {
         let pre = walk_descriptors(mgr.bytes(), BASE, va);
         assert_ne!(pre[2] & PML4_PS, 0, "region starts as a 2 MiB PS block");
 
-        mgr.map_aliased(va, overlay_gpa, 0x1000, true)
+        mgr.map_aliased(va, overlay_gpa, 0x1000, true, true)
             .expect("repoint one page inside the 2 MiB block");
 
         // The repointed page now resolves to the overlay GPA; its neighbour in the
@@ -945,7 +988,7 @@ mod tests {
         let two_gib = 2 * 1024 * 1024 * 1024u64;
         let len = two_gib + 0x4000; // 2 GiB + a 16 KiB sub-2-MiB tail
 
-        mgr.map_aliased(va, gpa, len, true)
+        mgr.map_aliased(va, gpa, len, true, true)
             .expect("2 GiB+tail 2 MiB-aligned alias must fit via PD block leaves");
 
         assert_eq!(mgr.translate(va), Some(gpa));
