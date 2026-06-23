@@ -766,7 +766,9 @@ impl X86Vmm for NvmmVmm {
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("nvmm-x86: page tables not initialized".into()))?;
         page_tables
-            .map_aliased(va, mapped_ipa, len, writable)
+            // exec=true preserves NVMM's prior executable-leaf behaviour (its NX,
+            // like KVM's, is applied by the backend protect_range/set_rw path).
+            .map_aliased(va, mapped_ipa, len, writable, true)
             .map_err(|e| TrapError::Hypervisor(format!("nvmm-x86: PML4 map_aliased: {e:?}")))?;
         let bytes = page_tables.bytes();
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pt_host, bytes.len()) };
