@@ -112,7 +112,8 @@ pub(crate) enum Commands {
     Pull {
         image: String,
         /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
-        /// OCI manifest entry for a multi-arch image. Defaults to arm64.
+        /// OCI manifest entry for a multi-arch image. Defaults to the host-native
+        /// architecture.
         #[arg(long, value_name = "OS/ARCH")]
         platform: Option<String>,
     },
@@ -228,9 +229,11 @@ pub(crate) enum Commands {
     Run {
         image: String,
         /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
-        /// OCI manifest entry for multi-arch images and, for amd64, enables
-        /// Rosetta 2 translation of the x86_64 guest. Defaults to the host
-        /// architecture (arm64 on Apple Silicon).
+        /// OCI manifest entry for multi-arch images. Defaults to the host-native
+        /// architecture, so it is not needed for a native run (arm64 on Apple
+        /// Silicon, amd64 on the x86_64 lanes). On Apple Silicon, `linux/amd64`
+        /// runs the x86_64 guest through Apple Rosetta 2 and requires it to be
+        /// installed.
         #[arg(long, value_name = "OS/ARCH")]
         platform: Option<String>,
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]

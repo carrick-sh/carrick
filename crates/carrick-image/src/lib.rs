@@ -151,10 +151,12 @@ impl ImageStore {
         path
     }
 
-    /// Per-platform image directory. The host-native default (linux/arm64)
-    /// keeps the legacy un-suffixed path so existing stores still resolve;
-    /// any other platform (e.g. linux/amd64 for Rosetta) is cached in a
-    /// sibling subdirectory so the two architectures never collide.
+    /// Per-platform image directory. The host-native default (see
+    /// [`PlatformTarget::default_target`] — linux/arm64 on Apple Silicon,
+    /// linux/amd64 on the x86_64 lanes) keeps the legacy un-suffixed path so
+    /// existing stores still resolve; any other platform (e.g. linux/amd64 under
+    /// Rosetta on an aarch64 host) is cached in a sibling subdirectory so the two
+    /// architectures never collide.
     pub fn image_dir_for(&self, image: &ImageReference, target: &PlatformTarget) -> PathBuf {
         let base = self.image_dir(image);
         if *target == PlatformTarget::default_target() {
@@ -237,10 +239,19 @@ pub struct PlatformTarget {
 }
 
 impl PlatformTarget {
+    /// The platform pulled/cached when `--platform` is omitted: the host-native
+    /// architecture (see [`carrick_spec::Platform::host_native`]) — arm64 on
+    /// Apple Silicon, amd64 on the x86_64 lanes. This is also the sentinel
+    /// [`ImageStore::image_dir_for`] uses to key the legacy un-suffixed store dir,
+    /// so the host-native image keeps the clean path while a translated
+    /// (e.g. amd64-under-Rosetta) image lands in a suffixed sibling. Keeping this
+    /// host-native (rather than a fixed arm64) matches the engine's run-time
+    /// default ([`carrick_spec::Platform::default`]), so the no-`--platform` pull
+    /// and the no-`--platform` run never select different architectures.
     pub fn default_target() -> Self {
         Self {
             os: "linux".to_string(),
-            arch: "arm64".to_string(),
+            arch: carrick_spec::Platform::host_native().oci_arch().to_string(),
             variant: None,
         }
     }
@@ -1078,7 +1089,7 @@ mod tests {
             entry("linux", "arm64", None, "sha256:arm64"),
             entry("linux", "arm", Some("v7"), "sha256:armv7"),
         ];
-        let target = PlatformTarget::default_target();
+        let target = PlatformTarget::parse("linux/arm64").expect("parse");
         assert_eq!(
             select_manifest_digest(&entries, &target),
             Some("sha256:arm64".to_string())
@@ -1101,14 +1112,14 @@ mod tests {
             entry("windows", "amd64", None, "sha256:win-amd64"),
             entry("windows", "arm64", None, "sha256:win-arm64"),
         ];
-        let target = PlatformTarget::default_target();
+        let target = PlatformTarget::parse("linux/arm64").expect("parse");
         assert_eq!(select_manifest_digest(&entries, &target), None);
     }
 
     #[test]
     fn accepts_arm64_v8_variant() {
         let entries = vec![entry("linux", "arm64", Some("v8"), "sha256:arm64v8")];
-        let target = PlatformTarget::default_target();
+        let target = PlatformTarget::parse("linux/arm64").expect("parse");
         assert_eq!(
             select_manifest_digest(&entries, &target),
             Some("sha256:arm64v8".to_string())
@@ -1118,7 +1129,7 @@ mod tests {
     #[test]
     fn rejects_arm64_v7_variant() {
         let entries = vec![entry("linux", "arm64", Some("v7"), "sha256:arm64v7")];
-        let target = PlatformTarget::default_target();
+        let target = PlatformTarget::parse("linux/arm64").expect("parse");
         assert_eq!(select_manifest_digest(&entries, &target), None);
     }
 
@@ -1147,6 +1158,24 @@ mod tests {
     }
 
     #[test]
+    fn default_target_is_host_native() {
+        // The no-`--platform` pull target must follow the host architecture so it
+        // agrees with the engine's run-time default (Platform::default), or
+        // create/run -d would warm a different arch than `start` runs.
+        let target = PlatformTarget::default_target();
+        assert_eq!(target.os, "linux");
+        assert_eq!(target.variant, None);
+        assert_eq!(
+            target.arch,
+            carrick_spec::Platform::host_native().oci_arch()
+        );
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(target.arch, "arm64");
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(target.arch, "amd64");
+    }
+
+    #[test]
     fn override_arm64_v8_matches_unspecified_entry() {
         let entries = vec![entry("linux", "arm64", None, "sha256:arm64")];
         let target = PlatformTarget::parse("linux/arm64/v8").expect("parse");
@@ -1162,7 +1191,7 @@ mod tests {
         bad.platform = None;
         let good = entry("linux", "arm64", None, "sha256:arm64");
         let entries = vec![bad, good];
-        let target = PlatformTarget::default_target();
+        let target = PlatformTarget::parse("linux/arm64").expect("parse");
         assert_eq!(
             select_manifest_digest(&entries, &target),
             Some("sha256:arm64".to_string())
