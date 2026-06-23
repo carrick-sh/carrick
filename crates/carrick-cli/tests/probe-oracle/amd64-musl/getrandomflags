@@ -1,0 +1,6 @@
+ab06bd0ea0df1518
+valid_no_flags_ok=true
+valid_nonblock_ok=true
+valid_random_ok=true
+invalid_flag_einval=true
+all_bits_einval=true

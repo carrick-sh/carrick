@@ -1,0 +1,9 @@
+73f46da5404d1d97
+fdstat_size_match=true
+fdstat_mtime_match=true
+fdstat_mode_match=true
+fdstat_ino_match=true
+fdstat_mtime_is_set=true
+statx_emptypath_mtime_match=ERR:22
+statx_emptypath_size_match=ERR
+statx_emptypath_ino_match=ERR

@@ -1,0 +1,5 @@
+3fe59ee778368a9d
+kill_init_term_ok=true
+kill_init_term_errno=0
+survived_after_signalling_init=true
+self_handler_fired=true

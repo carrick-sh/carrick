@@ -1,0 +1,6 @@
+9fb0d54afd122e85
+sigqueue_ok=true
+sigtimedwait_returns_sigusr1=true
+si_signo_is_sigusr1=true
+si_code_is_si_queue=true
+si_pid_is_self=true

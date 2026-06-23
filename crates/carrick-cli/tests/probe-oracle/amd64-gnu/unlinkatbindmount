@@ -1,0 +1,10 @@
+a717e4de2ad0f0d4
+shm_dir_exists=true
+unlinkat_open_ok=true
+unlinkat_pre_exists=true
+unlinkat_returned_zero=true
+unlinkat_post_exists=false
+unlinkat_post_errno_enoent=true
+unlink_open_ok=true
+unlink_returned_zero=true
+unlink_post_errno_enoent=true

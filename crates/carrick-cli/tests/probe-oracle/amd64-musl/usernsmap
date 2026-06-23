@@ -1,0 +1,8 @@
+29ec520d588a56fc
+uid_map_identity=true
+gid_map_identity=true
+setgroups_allow=true
+capeff=00000000a80425fb
+capeff_nonzero=true
+capbnd_eq_capeff=true
+capprm_eq_capeff=true

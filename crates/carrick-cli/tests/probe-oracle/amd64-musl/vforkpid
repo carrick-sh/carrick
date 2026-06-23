@@ -1,0 +1,7 @@
+988fba86724569df
+vfork_child_created=true
+vfork_child_reaped=true
+getpid_stable_after_vfork=true
+kill_getpid_after_vfork_rc_zero=true
+kill_getpid_after_vfork_not_esrch=true
+kill_getpid_after_vfork_handler_ran=true

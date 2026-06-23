@@ -1,0 +1,7 @@
+0ce234649a881327
+sigterm_wifsignaled=true
+sigterm_wtermsig_matches=true
+sigkill_wifsignaled=true
+sigkill_wtermsig_matches=true
+clean_exit_not_signalled=true
+clean_exit_status_zero=true

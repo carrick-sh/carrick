@@ -1,0 +1,12 @@
+8085c900b3a708e5
+setup_ok=true
+slave_isatty=true
+set1_ok=true
+get1_ok=true
+set2_ok=true
+get2_ok=true
+cs8_csize_is_cs8=true
+cstopb_set=true
+parodd_set=true
+ixon_set=true
+ixoff_set=true

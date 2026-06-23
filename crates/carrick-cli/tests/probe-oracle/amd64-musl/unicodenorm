@@ -1,0 +1,9 @@
+2f3233883b6ca8b1
+setup_dir=true
+setup_nfc_file=true
+nfc_stat_ok=true
+nfd_stat_enoent=true
+nfd_open_enoent=true
+nfd_lstat_enoent=true
+readdir_has_nfc=true
+readdir_has_nfd=false

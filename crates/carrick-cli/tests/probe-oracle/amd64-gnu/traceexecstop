@@ -1,0 +1,13 @@
+48bb2ede486e76c4
+fork_ok=true
+exec_stop_reaped=true
+exec_stopped=true
+exec_stopsig=5
+exec_stopsig_is_sigtrap=true
+exec_exited_instead=false
+exec_early_exit_status=0
+ptrace_cont_ok=true
+ptrace_cont_errno=0
+final_reaped=true
+final_exited=true
+final_exit_status_is_77=true

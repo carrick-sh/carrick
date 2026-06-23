@@ -1,0 +1,6 @@
+6fa63828fc3dbb55
+setup_ok=true
+rdonly_attach_ok=true
+rdonly_read_coherent=true
+rdonly_store_faults=true
+rw_attach_store_ok=true

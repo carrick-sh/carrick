@@ -1,0 +1,5 @@
+ed1de87e1d368fd5
+woke_on_first_write=true
+woke_on_writer_close=true
+reported_in_or_hup=true
+read_returns_eof=true

@@ -1,0 +1,5 @@
+63213ac743fa0a49
+nonexec_mmap_faults=true
+exec_mmap_fetch_allowed=true
+mprotect_drop_exec_faults=true
+mprotect_add_exec_fetch_allowed=true

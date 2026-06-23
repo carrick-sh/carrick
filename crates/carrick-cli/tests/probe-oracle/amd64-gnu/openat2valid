@@ -1,0 +1,8 @@
+49d84ddfc28bdbb7
+openat2_create_ok=true
+openat2_mode_no_create_einval=true
+openat2_bad_mode_einval=true
+openat2_bad_resolve_einval=true
+openat2_size_zero_einval=true
+openat2_nonzero_pad_e2big=true
+openat2_bad_dfd_ebadf=false

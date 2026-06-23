@@ -1,0 +1,7 @@
+35d5f8b4ab261dda
+set_robust_list_badlen_einval=true
+set_robust_list_ok=true
+get_robust_list_null_len_efault=true
+get_robust_list_null_head_efault=true
+get_robust_list_unused_esrch=true
+get_robust_list_self_ok=true

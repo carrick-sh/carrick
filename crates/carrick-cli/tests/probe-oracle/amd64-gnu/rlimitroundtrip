@@ -1,0 +1,8 @@
+abad102110a16dd1
+core_set_ok=true
+core_cur_roundtrips=true
+core_max_roundtrips=true
+stack_set_ok=true
+stack_soft_roundtrips=true
+core_unchanged_by_stack=true
+core_cur_gt_max_einval=true

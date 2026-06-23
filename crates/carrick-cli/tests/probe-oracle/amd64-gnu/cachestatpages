@@ -1,0 +1,4 @@
+83a10d6cded3f4dd
+cachestat_ok=false
+cachestat_bad_flags_einval=false
+cachestat_badfd_ebadf=false

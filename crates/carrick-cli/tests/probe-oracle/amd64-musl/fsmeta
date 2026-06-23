@@ -1,0 +1,14 @@
+b841075803794fed
+getcwd=/tmp/probe/a/b
+stat_passwd size=888 mode=644 file=true
+lstat_symlink is_symlink=true is_file=false
+stat_symlink_follows_is_file=true
+readlink_target_ok=true
+access_passwd_r=0
+access_passwd_w=0
+access_sh_x=0
+access_missing=-1
+newfile size=5 mode=644
+chmod640 mode=640
+readlink=tgt
+rename src_exists=false dst_exists=true

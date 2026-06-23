@@ -1,0 +1,7 @@
+070c81568e465333
+vdso_present=true
+has_clock_gettime=false
+has_gettimeofday=false
+has_clock_getres=false
+has_rt_sigreturn=false
+all_four_present=false

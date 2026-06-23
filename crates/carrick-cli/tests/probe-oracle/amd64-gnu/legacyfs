@@ -1,0 +1,16 @@
+964966743a7b0530
+mkdir=true
+creat=true
+chmod=true
+chmod_verified=true
+chown=true
+link=true
+link_verified=true
+unlink=true
+unlink_verified=true
+symlink=true
+readlink=true
+rename=true
+rename_verified=true
+mknod=true
+mknod_verified=true

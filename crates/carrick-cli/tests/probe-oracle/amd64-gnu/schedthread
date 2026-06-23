@@ -1,0 +1,7 @@
+ea1621cb6999de9e
+child_tid_positive=false
+sched_getscheduler_live_thread_is_other=false
+sched_getscheduler_live_thread_errno_zero=false
+sched_getparam_live_thread_rc_zero=false
+sched_getparam_live_thread_errno_zero=false
+sched_getparam_live_thread_priority_zero=true

@@ -1,0 +1,5 @@
+a976e4b6f1842596
+msgget_ok=true
+msgctl_stat_ok=true
+msg_perm_key_matches=true
+msg_perm_mode_0660=true

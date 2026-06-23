@@ -1,0 +1,11 @@
+b278013e1f4cc50b
+rt_sigtimedwait_null_returned_sig=true
+rt_sigtimedwait_null_errno=0
+rt_sigtimedwait_null_info_sig=true
+rt_sigtimedwait_consumed_not_handled=true
+rt_sigtimedwait_child_reaped=true
+pthread_sigtimedwait_kill_ok=true
+pthread_sigtimedwait_returned_sig=true
+pthread_sigtimedwait_errno=0
+pthread_sigtimedwait_info_sig=true
+pthread_sigtimedwait_join_ok=true

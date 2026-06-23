@@ -1,0 +1,5 @@
+a3d972b2f374fa65
+data_isolated=true
+bss_isolated=true
+heap_isolated=true
+mmap_isolated=true

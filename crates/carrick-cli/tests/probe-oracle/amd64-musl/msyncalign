@@ -1,0 +1,4 @@
+cb57f57a07f6b002
+aligned_msync_ok=true
+unaligned_msync_fails=true
+unaligned_errno_is_einval=true

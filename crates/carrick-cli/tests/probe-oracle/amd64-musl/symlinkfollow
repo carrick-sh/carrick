@@ -1,0 +1,11 @@
+1c19922d3daaaf13
+dangling_setup=true
+dangling_lstat_islnk=true
+dangling_stat_enoent=true
+symlink_follow_target_mode=true
+create_trailing_slash_eisdir=true
+create_no_slash_ok=true
+fifo_setup=true
+fifo_fstat_isfifo=true
+fifo_samestat=true
+fifo_mode_match=true

@@ -1,0 +1,8 @@
+a342710c2731870f
+setown_ok=true
+getown_roundtrip=true
+setsig_ok=true
+getsig_roundtrip=true
+setown_ex_ok=true
+getown_ex_roundtrip=true
+getsig_default_zero=true

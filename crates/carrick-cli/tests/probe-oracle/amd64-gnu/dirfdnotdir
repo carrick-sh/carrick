@@ -1,0 +1,3 @@
+23457926e9b794a7
+fstatat_nondir_dirfd_enotdir=true
+fstatat_badfd_ebadf=true

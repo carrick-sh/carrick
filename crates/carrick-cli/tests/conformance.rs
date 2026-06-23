@@ -425,6 +425,80 @@ fn case_run_id() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Probe-oracle cache. The Docker oracle's output for a probe is DETERMINISTIC
+// (fixed by the probe source + libc + lane image), so it is captured ONCE
+// ("blessed") on a Docker host, committed, and reused: routine gates then run
+// carrick only and diff against the cached oracle — no Docker. This makes the
+// probe gate runnable where there is NO local Docker (notably FreeBSD/bhyve)
+// and stops the gate re-running the entire Docker oracle every time. Same
+// philosophy as the suite oracle cache (scripts/conformance/oracle-cache.jsonl).
+//
+// Layout — one file per probe:
+//   crates/carrick-cli/tests/probe-oracle/<lane>-<libc>/<probe>
+// First line = the probe SOURCE hash (a source edit invalidates the entry → it
+// must be re-blessed); the remainder is the EXACT `run_docker_probe` output
+// (normalized stdout+stderr). (Re-)bless from a Docker host with:
+//   cargo test -p carrick-cli --test conformance <platform features> -- \
+//       --ignored bless_probe_oracle --nocapture
+// then commit the updated probe-oracle/ tree. Timing-sensitive probes
+// (is_timing_sensitive) and perf_* are NOT cached — their output is
+// non-deterministic, so they always need a live oracle and are skipped where
+// Docker is absent.
+
+fn probe_oracle_dir(lane_label: &str, libc: &str) -> PathBuf {
+    repo_path(&format!(
+        "crates/carrick-cli/tests/probe-oracle/{lane_label}-{libc}"
+    ))
+}
+
+/// Stable content fingerprint of a probe's source, so a source edit invalidates
+/// its cached oracle. Not cryptographic — it only needs to detect change.
+fn probe_src_hash(name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    match std::fs::read(repo_path(&format!("conformance-probes/src/bin/{name}.rs"))) {
+        Ok(bytes) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            format!("{:016x}", h.finish())
+        }
+        Err(_) => "nosrc".to_string(),
+    }
+}
+
+/// Cached Docker-oracle output for a probe, iff present AND its source hash
+/// still matches (a stale entry — source changed since bless — reads as a miss).
+fn cached_probe_oracle(lane_label: &str, libc: &str, name: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(probe_oracle_dir(lane_label, libc).join(name)).ok()?;
+    let (hash_line, body) = raw.split_once('\n')?;
+    (hash_line == probe_src_hash(name)).then(|| body.to_string())
+}
+
+/// Persist a freshly-captured Docker-oracle output for a probe (the bless step).
+fn write_probe_oracle(
+    lane_label: &str,
+    libc: &str,
+    name: &str,
+    output: &str,
+) -> std::io::Result<()> {
+    let dir = probe_oracle_dir(lane_label, libc);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join(name),
+        format!("{}\n{output}", probe_src_hash(name)),
+    )
+}
+
+/// Where a probe's Docker oracle comes from for this gate run.
+enum OracleSource {
+    /// Read from the committed cache — no Docker touched.
+    Cached(String),
+    /// Run live against Docker (cache miss / stale, Docker available).
+    Live(std::io::Result<String>),
+    /// Cache miss AND no Docker — cannot gate this probe; loudly skipped.
+    Unblessed,
+}
+
 /// Reap only run `run_id`'s wedged guests (kill.sh's scoped mode) — the belt to
 /// the per-pgid `kill(-pid)` suspenders, catching a guest that escaped its
 /// process group via setpgid/setsid. Best-effort (needs NOPASSWD sudo).
@@ -581,7 +655,7 @@ fn conformance() {
         .build()
         .expect("tokio runtime");
     rt.block_on(async {
-        let docker = match Docker::connect_with_local_defaults() {
+        let docker = match Docker::connect_with_defaults() {
             Ok(d) => match d.ping().await {
                 Ok(_) => d,
                 Err(e) => {
@@ -832,7 +906,7 @@ fn conformance_default_run_contract() {
         .build()
         .expect("tokio runtime");
     rt.block_on(async {
-        let docker = match Docker::connect_with_local_defaults() {
+        let docker = match Docker::connect_with_defaults() {
             Ok(d) => match d.ping().await {
                 Ok(_) => d,
                 Err(e) => {
@@ -1302,23 +1376,30 @@ fn conformance_probes() {
         return;
     };
     // Docker reachability check (std::process side, so no bollard ping here):
-    // a trivial `docker version` must succeed.
-    let docker_ok = Command::new("docker")
+    // a trivial `docker version` must succeed. Unlike before, the gate does NOT
+    // bail when Docker is absent: it falls back to the committed probe-oracle
+    // cache (a deterministic probe diffs against its blessed Docker output), so
+    // the gate still runs carrick-only on a Docker-less host (e.g. FreeBSD/bhyve).
+    let docker_available = Command::new("docker")
         .arg("version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !docker_ok {
-        eprintln!("SKIP conformance_probes: Docker not reachable");
-        return;
+    if !docker_available {
+        eprintln!(
+            "NOTE conformance_probes: Docker not reachable — diffing against the \
+             committed probe-oracle cache (carrick-only). Probes with no cached \
+             oracle are skipped; bless them on a Docker host."
+        );
     }
 
     ensure_signed(&bin);
 
     let mut failures = Vec::new();
     let mut fixed_gaps = Vec::new();
+    let mut unblessed: Vec<String> = Vec::new();
 
     let mut nongating_diffs: Vec<String> = Vec::new();
     for lane in LANES {
@@ -1417,36 +1498,68 @@ fn conformance_probes() {
                     .ok()
                     .map(|enc| run_carrick_probe(&bin, *lane, enc))
             });
-            // Phase 2 — Docker oracle only, strictly after phase 1.
-            let docker_outs: Vec<Option<std::io::Result<String>>> =
+            // Phase 2 — oracle, strictly after phase 1 (carrick and Docker never
+            // overlap). Prefer the committed cache (no Docker); else live Docker on a
+            // miss/stale entry; else Unblessed (no Docker + no cache → can't gate it).
+            let oracle_outs: Vec<Option<OracleSource>> =
                 fan_out_indexed(jobs.len(), n_workers, |i| {
-                    jobs[i]
-                        .1
-                        .as_ref()
-                        .ok()
-                        .map(|enc| run_docker_probe(*lane, enc))
+                    jobs[i].1.as_ref().ok().map(|enc| {
+                        let name = &jobs[i].0;
+                        if let Some(cached) = cached_probe_oracle(lane.label, set.libc, name) {
+                            OracleSource::Cached(cached)
+                        } else if docker_available {
+                            OracleSource::Live(run_docker_probe(*lane, enc))
+                        } else {
+                            OracleSource::Unblessed
+                        }
+                    })
                 });
             // Phase 3 — classify (runs nothing).
             let mut results: Vec<(String, ProbeOutcome)> = Vec::new();
-            for ((name, enc), (carrick_out, docker_out)) in jobs
+            for ((name, enc), (carrick_out, oracle)) in jobs
                 .into_iter()
-                .zip(carrick_outs.into_iter().zip(docker_outs))
+                .zip(carrick_outs.into_iter().zip(oracle_outs))
             {
-                let outcome = match enc {
-                    Err(e) => (name, ProbeOutcome::Error(format!("read probe: {e}"))),
-                    Ok(_) => classify_probe(
-                        name,
-                        &carrick_out.unwrap_or_default(),
-                        docker_out.unwrap_or_else(|| Ok(String::new())),
-                    ),
+                let outcome = match (enc, oracle) {
+                    (Err(e), _) => (name, ProbeOutcome::Error(format!("read probe: {e}"))),
+                    (Ok(_), Some(OracleSource::Unblessed)) | (Ok(_), None) => {
+                        eprintln!(
+                            "SKIP {}:{}:{name} (no cached oracle + no Docker — bless on a Docker host)",
+                            lane.label, set.libc
+                        );
+                        unblessed.push(format!("{}:{}:{name}", lane.label, set.libc));
+                        continue;
+                    }
+                    (Ok(_), Some(src)) => {
+                        let docker_out = match src {
+                            OracleSource::Cached(c) => Ok(c),
+                            OracleSource::Live(r) => r,
+                            OracleSource::Unblessed => Ok(String::new()),
+                        };
+                        classify_probe(name, &carrick_out.unwrap_or_default(), docker_out)
+                    }
                 };
                 results.push(outcome);
             }
 
             // Quarantined (timing-sensitive) probes: serial, after the fan-out — each
-            // is carrick THEN docker, one at a time, so already non-overlapping.
+            // is carrick THEN docker, one at a time, so already non-overlapping. Their
+            // output is non-deterministic → NOT cached, so where Docker is absent they
+            // can't be gated and are loudly skipped.
             for probe in &quarantine {
-                results.push(run_one_probe(&bin, *lane, probe));
+                if docker_available {
+                    results.push(run_one_probe(&bin, *lane, probe));
+                } else {
+                    let name = probe
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<unknown>");
+                    eprintln!(
+                        "SKIP {}:{}:{name} (timing-sensitive; needs a live Docker oracle)",
+                        lane.label, set.libc
+                    );
+                    unblessed.push(format!("{}:{}:{name}", lane.label, set.libc));
+                }
             }
             results.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic report order
 
@@ -1509,11 +1622,101 @@ fn conformance_probes() {
             nongating_diffs.len()
         );
     }
+    if !unblessed.is_empty() {
+        eprintln!(
+            "NOTE {} probe(s) had no cached oracle and no Docker — not gated this run; \
+             bless them on a Docker host (`-- --ignored bless_probe_oracle`): {unblessed:?}",
+            unblessed.len()
+        );
+    }
     assert!(
         fixed_gaps.is_empty(),
         "known-gap probes now PASS — remove from KNOWN_PROBE_GAPS: {fixed_gaps:?}"
     );
     assert!(failures.is_empty(), "probe conformance gaps: {failures:?}");
+}
+
+/// Bless the probe-oracle cache: capture each DETERMINISTIC probe's Docker
+/// output once and commit it under `probe-oracle/`, so routine gates run
+/// carrick-only and Docker-less hosts (FreeBSD/bhyve) can gate at all. Runs NO
+/// carrick (Docker only), so it is safe to bless on any Docker host without the
+/// HVF guest churn of a full gate. `#[ignore]` — run deliberately:
+///   cargo test -p carrick-cli --test conformance <platform features> -- \
+///       --ignored bless_probe_oracle --nocapture
+/// then `git add crates/carrick-cli/tests/probe-oracle && git commit`.
+#[test]
+#[ignore = "bless step: writes the committed probe-oracle cache from live Docker"]
+fn bless_probe_oracle() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    let docker_available = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        docker_available,
+        "bless_probe_oracle needs a reachable Docker daemon (DOCKER_HOST honoured)"
+    );
+
+    let mut blessed = 0usize;
+    for lane in LANES {
+        for set in lane.probe_sets {
+            if !probes_dir(set.target).exists() {
+                continue;
+            }
+            for probe in probe_binaries(set.target) {
+                let Some(name) = probe
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                // Non-deterministic probes can't be cached.
+                if GATE_SKIP_PROBES.contains(&name.as_str())
+                    || name.starts_with("perf_")
+                    || is_timing_sensitive(&probe)
+                {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read(&probe) else {
+                    continue;
+                };
+                let encoded = engine.encode(&raw).into_bytes();
+                match run_docker_probe(*lane, &encoded) {
+                    Ok(out) => {
+                        write_probe_oracle(lane.label, set.libc, &name, &out)
+                            .expect("write probe oracle");
+                        blessed += 1;
+                        eprintln!("BLESSED {}:{}:{name}", lane.label, set.libc);
+                    }
+                    Err(e) => eprintln!(
+                        "SKIP-BLESS {}:{}:{name} (docker error: {e})",
+                        lane.label, set.libc
+                    ),
+                }
+            }
+        }
+    }
+    eprintln!("bless_probe_oracle: wrote {blessed} probe oracle(s)");
+}
+
+#[test]
+fn probe_oracle_entry_roundtrip() {
+    // The on-disk entry is `<src_hash>\n<output>`; reading splits at the FIRST
+    // newline, so an output that itself contains newlines round-trips exactly.
+    let output = "first\nsecond  \n\nfourth";
+    let entry = format!("{}\n{output}", "deadbeefcafe0000");
+    let (hash_line, body) = entry.split_once('\n').expect("entry has a hash line");
+    assert_eq!(hash_line, "deadbeefcafe0000");
+    assert_eq!(body, output);
+    // A probe with no source file gets the stable sentinel hash.
+    assert_eq!(probe_src_hash("__definitely_not_a_real_probe__"), "nosrc");
 }
 
 #[test]

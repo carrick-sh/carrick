@@ -1,0 +1,6 @@
+43384538b3b695a4
+both_children_alive=true
+foreign_pid_esrch=true
+wait_a_eq_fork_a=true
+wait_b_eq_fork_b=true
+children_distinct=true
