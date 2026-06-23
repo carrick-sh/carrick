@@ -56,6 +56,10 @@ where
             } else {
                 None
             };
+            // Genuine guest block (FUTEX_WAIT): publish Blocked so a sibling's
+            // /proc/<pid>/stat reads `S`. `Running` is re-published when the vCPU
+            // resumes guest code after the wake (run_vcpu_until_exit top).
+            crate::run_state::publish(crate::run_state::RunState::Blocked);
             let raw = self
                 .futex
                 .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
@@ -128,6 +132,8 @@ where
                 || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
         };
         let retval = loop {
+            // Genuine guest block (cross-process MAP_SHARED FUTEX_WAIT).
+            crate::run_state::publish(crate::run_state::RunState::Blocked);
             let retval = self
                 .platform_futex
                 .shared_wait(host_addr, value, timeout, &interrupted);
