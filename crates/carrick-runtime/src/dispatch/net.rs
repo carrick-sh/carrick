@@ -198,11 +198,25 @@ impl SyscallDispatcher {
     }
 
     fn epoll_effective_interest(
+        &self,
+        fd: i32,
         events: u32,
         _last_ready: u32,
         _write_backpressured: bool,
     ) -> carrick_hal::event::Interest {
-        epoll_interest_for(events)
+        let mut interest = epoll_interest_for(events);
+        // A one-way pipe/FIFO read end is never writable under Linux, so it must
+        // never carry a write filter. FreeBSD's kqueue arms `EVFILT_WRITE` on a
+        // pipe read end and fires it immediately (the read end is reported
+        // "writable"); that spurious edge wakes a blocked edge-triggered
+        // `epoll_wait` and pollutes the readiness latch with `EPOLLOUT`, masking
+        // the real `EPOLLIN|EPOLLHUP` EOF. Suppressing write interest here keeps
+        // the host registration faithful to Linux semantics on every host.
+        if interest.write && self.host_fd_is_oneway_pipe_read_end(fd) {
+            interest.write = false;
+            interest.read = true;
+        }
+        interest
     }
 
     #[cfg(any(
@@ -225,7 +239,8 @@ impl SyscallDispatcher {
             }
             survivor.get_or_insert((other, slot.reg_gen));
             union_events |= slot.event.events;
-            let effective = Self::epoll_effective_interest(
+            let effective = self.epoll_effective_interest(
+                other,
                 slot.event.events,
                 slot.last_ready,
                 slot.write_backpressured,
@@ -280,6 +295,18 @@ impl SyscallDispatcher {
                 // in the real kernel object. Mirror what poll()/ppoll() do —
                 // map the guest fd to its host fd and do a non-blocking
                 // libc::poll(timeout 0), then translate revents → epoll events.
+                // A one-way pipe/FIFO read end is never writable under Linux;
+                // FreeBSD's poll(2) wrongly reports POLLOUT on it (see
+                // host_fd_is_oneway_pipe_read_end), so drop EPOLLOUT for it.
+                let suppress_pollout = matches!(
+                    &*open,
+                    OpenDescription::HostPipe {
+                        is_read_end: true,
+                        bidirectional: false,
+                        pty: None,
+                        ..
+                    }
+                );
                 drop(open);
                 let Some(host_fd) = self.host_fd_for_poll(fd) else {
                     return 0;
@@ -288,7 +315,7 @@ impl SyscallDispatcher {
                 if requested_events & LINUX_EPOLLIN != 0 {
                     interest |= libc::POLLIN;
                 }
-                if requested_events & LINUX_EPOLLOUT != 0 {
+                if requested_events & LINUX_EPOLLOUT != 0 && !suppress_pollout {
                     interest |= libc::POLLOUT;
                 }
                 if requested_events & LINUX_EPOLLPRI != 0 {
@@ -305,7 +332,10 @@ impl SyscallDispatcher {
                     if pfd.revents & libc::POLLIN != 0 {
                         ready |= LINUX_EPOLLIN;
                     }
-                    if pfd.revents & libc::POLLOUT != 0 {
+                    // FreeBSD's poll(2) sets POLLOUT on a pipe read end even when
+                    // it was not requested; a one-way read end is never writable
+                    // on Linux, so never surface EPOLLOUT for it.
+                    if pfd.revents & libc::POLLOUT != 0 && !suppress_pollout {
                         ready |= LINUX_EPOLLOUT;
                     }
                     if pfd.revents & libc::POLLPRI != 0 {
@@ -590,6 +620,42 @@ impl SyscallDispatcher {
         None
     }
 
+    /// Is `fd` a one-way (non-bidirectional, non-pty) pipe/FIFO READ end?
+    ///
+    /// Such an fd is NEVER writable under Linux `poll(2)`/`epoll(7)`: a read end
+    /// has no write side, so `POLLOUT`/`EPOLLOUT` is impossible there. Most hosts
+    /// agree — macOS and Linux `poll()` leave `POLLOUT` clear on a pipe read end.
+    /// **FreeBSD does not:** `poll(POLLIN|POLLOUT)` on a pipe read end returns
+    /// `POLLOUT` (the kernel reports the read end "writable"), and kqueue's
+    /// `EVFILT_WRITE` arms and fires on a read end with `data == buffer space`.
+    /// That spurious writability both wakes a blocked edge-triggered `epoll_wait`
+    /// early and latches `EPOLLOUT` into the readiness latch, masking the real
+    /// EOF (`EPOLLIN|EPOLLHUP`) that arrives when the writer later closes — the
+    /// `epolletblockedhup`/`epolletchildhup` failures on bhyve.
+    ///
+    /// Suppressing `POLLOUT`/`EPOLLOUT` for a one-way read end is correct on
+    /// EVERY host (Linux/macOS already never assert it there), so this needs no
+    /// `cfg`-split — it is a no-op everywhere except FreeBSD/NetBSD, where it
+    /// removes the divergence.
+    pub(super) fn host_fd_is_oneway_pipe_read_end(&self, fd: i32) -> bool {
+        if fd < 0 {
+            return false;
+        }
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        let open = open_file.description.read();
+        matches!(
+            &*open,
+            OpenDescription::HostPipe {
+                is_read_end: true,
+                bidirectional: false,
+                pty: None,
+                ..
+            }
+        )
+    }
+
     /// Remove `fd` from every epoll instance's interest set (and purge any
     /// readiness already queued for it). Linux auto-removes a closed fd from all
     /// epoll interest lists; carrick keys interest by guest fd NUMBER, so a
@@ -838,13 +904,24 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLOUT;
                 }
             }
-            OpenDescription::HostPipe { host_fd, .. } => {
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end,
+                bidirectional,
+                pty,
+                ..
+            } => {
                 // Poll the real host pipe fd so the guest's poll loop reflects
                 // actual kernel readiness: a read end with buffered data is
                 // POLLIN-ready, a write end with buffer space is POLLOUT-ready,
                 // and a hung-up peer surfaces POLLHUP/POLLERR. Reporting
                 // nothing here made poll/ppoll/pselect6 undercount ready fds
                 // for pipe ends.
+                // A one-way pipe/FIFO read end is never writable under Linux, but
+                // FreeBSD's poll(2) reports POLLOUT on it — drop that spurious
+                // writability so poll/ppoll/select agree with Linux (and with the
+                // epoll path's host_fd_is_oneway_pipe_read_end suppression).
+                let suppress_pollout = *is_read_end && !*bidirectional && pty.is_none();
                 let mut pfd = libc::pollfd {
                     fd: *host_fd,
                     events: 0,
@@ -853,7 +930,7 @@ impl SyscallDispatcher {
                 if requested_events & LINUX_POLLIN != 0 {
                     pfd.events |= libc::POLLIN;
                 }
-                if requested_events & LINUX_POLLOUT != 0 {
+                if requested_events & LINUX_POLLOUT != 0 && !suppress_pollout {
                     pfd.events |= libc::POLLOUT;
                 }
                 let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
@@ -861,7 +938,7 @@ impl SyscallDispatcher {
                     if pfd.revents & libc::POLLIN != 0 {
                         ready |= LINUX_POLLIN;
                     }
-                    if pfd.revents & libc::POLLOUT != 0 {
+                    if pfd.revents & libc::POLLOUT != 0 && !suppress_pollout {
                         ready |= LINUX_POLLOUT;
                     }
                     if pfd.revents & libc::POLLERR != 0 {
@@ -1679,11 +1756,12 @@ impl SyscallDispatcher {
                     let reg_gen = next_epoll_reg_gen();
                     if let Some(host_fd) = host_fd {
                         let ev_events = event.events;
+                        let effective = this.epoll_effective_interest(fd, ev_events, 0, false);
                         kqueue.with_mux(|mux| {
                             let _ = mux.register_io(
                                 host_fd,
                                 pack_epoll_udata(fd, reg_gen),
-                                Self::epoll_effective_interest(ev_events, 0, false),
+                                effective,
                                 epoll_host_trigger_mode(ev_events),
                             );
                         });
@@ -1724,11 +1802,12 @@ impl SyscallDispatcher {
                     // handle is unchanged — see EPOLL_CTL_ADD).
                     let reg_gen = slot.reg_gen;
                     if let Some(host_fd) = host_fd {
+                        let effective = this.epoll_effective_interest(fd, event.events, 0, false);
                         kqueue.with_mux(|mux| {
                             let _ = mux.register_io(
                                 host_fd,
                                 pack_epoll_udata(fd, reg_gen),
-                                Self::epoll_effective_interest(event.events, 0, false),
+                                effective,
                                 epoll_host_trigger_mode(event.events),
                             );
                         });
