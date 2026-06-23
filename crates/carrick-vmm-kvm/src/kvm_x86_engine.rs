@@ -74,6 +74,16 @@ pub struct KvmVmm {
     /// can reach and swap the live vCPU underneath the engine's separate `vcpu`
     /// field. `None` only in the transient window before the first bind.
     reclaim: Option<crate::kvm::KvmReclaimHandle>,
+    /// `vfork(2)` (`CLONE_VM|CLONE_VFORK`) shared shadows, armed by
+    /// `prepare_vfork_share` PRE-`libc::fork` and consumed once: the CHILD reads
+    /// them in `rebuild_child_after_fork_vfork` (registers its slots over them);
+    /// the PARENT reconciles + frees them in `finish_vfork_parent` on resume.
+    /// `Some` only inside one vfork window; `None` otherwise.
+    vfork_shadows: Option<crate::guest_setup::VforkShadows>,
+    /// The guest mmap-arena high-water published by the runtime just before a
+    /// `vfork(2)` (`set_vfork_arena_high_water`). Bounds `prepare_vfork_shadows`'
+    /// residency scan to the used arena prefix. `u64::MAX` ⇒ no bound (full scan).
+    vfork_arena_high_water: u64,
 }
 
 impl KvmVmm {
@@ -84,6 +94,25 @@ impl KvmVmm {
     /// the same live vCPU the engine runs.
     fn bind_reclaim(&mut self, vcpu: &KvmVcpu) {
         self.reclaim = Some(vcpu.reclaim_handle(self.vm.vm_handle()));
+    }
+
+    /// Adopt a freshly-rebuilt child VM/vCPU (ordinary fork or vfork-share): swap
+    /// in the new VM, repoint the engine's vCPU, mark this process's single vCPU
+    /// live, give the child its own page-table manager (the parent's is now a
+    /// separate process), and re-bind the reclaim handle to the new VM + vCPU.
+    fn adopt_child_vm(&mut self, vcpu: &mut KvmVcpu, new_vm: KvmVm, new_vcpu: KvmVcpu) {
+        self.vm = new_vm;
+        *vcpu = new_vcpu;
+        crate::kvm::VCPU_LIVE.store(1, std::sync::atomic::Ordering::SeqCst);
+        let page_tables = self
+            .page_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.page_tables = Arc::new(Mutex::new(page_tables));
+        // Re-bind reclaim to the child's fresh VM + vCPU (new shared slot + a new
+        // vcpu pool on the rebuilt VM).
+        self.bind_reclaim(vcpu);
     }
 
     /// Build a sibling `KvmVmm` over the shared VM handle + window descriptors (a
@@ -101,6 +130,8 @@ impl KvmVmm {
             ram,
             page_tables,
             reclaim: None,
+            vfork_shadows: None,
+            vfork_arena_high_water: u64::MAX,
         }
     }
 
@@ -351,19 +382,61 @@ impl X86Vmm for KvmVmm {
             .ram
             .rebuild_vm_for_child()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        self.vm = new_vm;
-        *vcpu = new_vcpu;
-        crate::kvm::VCPU_LIVE.store(1, std::sync::atomic::Ordering::SeqCst);
-        let page_tables = self
-            .page_tables
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        self.page_tables = Arc::new(Mutex::new(page_tables));
-        // Re-bind reclaim to the child's fresh VM + vCPU (new shared slot + a new
-        // vcpu pool on the rebuilt VM).
-        self.bind_reclaim(vcpu);
+        self.adopt_child_vm(vcpu, new_vm, new_vcpu);
         Ok(())
+    }
+
+    fn set_vfork_arena_high_water(&mut self, high_water: u64) {
+        self.vfork_arena_high_water = high_water;
+    }
+
+    fn prepare_vfork_share(&mut self) -> Result<bool, TrapError> {
+        // vfork (CLONE_VM): allocate shared shadows of every MAP_PRIVATE window so
+        // the child can share the parent's address space across libc::fork (which
+        // would otherwise COW them private). Stash them for the post-fork halves.
+        let shadows = self
+            .ram
+            .prepare_vfork_shadows(self.vfork_arena_high_water)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // No shadows (e.g. an all-shared layout) → nothing to share; degrade to a
+        // plain fork so the runtime doesn't wrongly run the parent-reconcile path.
+        if shadows.is_empty() {
+            return Ok(false);
+        }
+        self.vfork_shadows = Some(shadows);
+        Ok(true)
+    }
+
+    fn rebuild_child_after_fork_vfork(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        _frozen: &[u8],
+    ) -> Result<(), TrapError> {
+        // Register the child's slots over the parent's shared shadows so the
+        // child's guest writes are visible to the suspended parent (CLONE_VM).
+        let shadows = self.vfork_shadows.take().ok_or_else(|| {
+            TrapError::Hypervisor("kvm-x86: vfork child rebuild without armed shadows".into())
+        })?;
+        let (new_vm, new_vcpu) = self
+            .ram
+            .rebuild_vm_for_child_vfork(&shadows)
+            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
+        // The CHILD must NOT free the shadows — they belong to the parent's
+        // mapping and the parent munmaps them on resume. `VforkShadows` has NO
+        // `Drop`, so simply dropping this handle here releases nothing (the child
+        // detaches on execve → a fresh VM, or on `_exit` → process death).
+        drop(shadows);
+        self.adopt_child_vm(vcpu, new_vm, new_vcpu);
+        Ok(())
+    }
+
+    fn finish_vfork_parent(&mut self) {
+        // The child has execve'd/_exited, so the shared window is quiescent. Copy
+        // the child's shared writes back into the parent's private windows and
+        // release the shadows. No-op if nothing was armed (degrade path).
+        if let Some(shadows) = self.vfork_shadows.take() {
+            self.ram.finish_vfork_parent(shadows);
+        }
     }
 
     fn process_exit_cleanup(&mut self) {
@@ -1380,6 +1453,8 @@ pub fn bring_up(image: &AddressSpace) -> Result<X86EngineCore<KvmVmm>, TrapError
         ram,
         page_tables,
         reclaim: None,
+        vfork_shadows: None,
+        vfork_arena_high_water: u64::MAX,
     };
     // Bind the reclaim handle to the boot vCPU so a later block-recycle can swap
     // the live vCPU underneath the engine's separate `vcpu` field.
