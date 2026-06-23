@@ -1249,7 +1249,25 @@ where
                     state.handle_execve(&kernel, &mut engine, path, argv, env)?;
                 }
                 DispatchOutcome::SigReturn => {
-                    let restored_sigmask = engine.restore_from_sigframe()?;
+                    let restored_sigmask = match engine.restore_from_sigframe() {
+                        Ok(mask) => mask,
+                        // A guest-reachable bad rt_sigreturn frame (bad SP, or a
+                        // corrupt/forged frame) is force_sigsegv on Linux: kill
+                        // THIS process by SIGSEGV (exit 139), never abort the whole
+                        // carrick runtime. Mirrors the unclassified-EL0-fault path.
+                        Err(TrapError::SignalDeliveryFault) => {
+                            if engine.is_forked_child()
+                                || kernel.dispatcher.is_forked_guest_process()
+                            {
+                                let out = kernel.dispatcher.stdout();
+                                let err = kernel.dispatcher.stderr();
+                                forked_child_die_by_signal(11, &out, &err);
+                            }
+                            let result = assemble_run_result(&kernel, 128 + 11, traps, false);
+                            return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     kernel
                         .dispatcher
                         .restore_signal_mask(state.this_tid, restored_sigmask);
