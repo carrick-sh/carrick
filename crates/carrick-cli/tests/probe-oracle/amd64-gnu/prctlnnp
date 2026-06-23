@@ -1,0 +1,17 @@
+276141b0225a696a
+nnp_initial_zero=true
+nnp_set_ok=true
+nnp_now_one=true
+nnp_bad_arg_einval=true
+keepcaps_initial_zero=true
+keepcaps_set_ok=true
+keepcaps_now_one=true
+keepcaps_two_einval=true
+subreaper_set_ok=true
+subreaper_get_ok=true
+subreaper_value_one=true
+timerslack_default_50000=true
+timerslack_set_ok=true
+timerslack_now_120000=true
+timerslack_reset_ok=true
+timerslack_back_to_default=true

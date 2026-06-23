@@ -1,0 +1,7 @@
+2bec3517270568b1
+epollpri_setup_ok=true
+epollpri_add_ok=true
+epollpri_send_oob_ok=true
+epollpri_wait_ready=true
+epollpri_revents_pri=true
+epollpri_recv_oob_ok=true

@@ -1,0 +1,12 @@
+5b15a2375853a85b
+affinity_ge_1=true
+online_gt_1=true
+topology_surfaces_agree=true
+affinity_subset_of_online=true
+sysconf_conf_ge_onln_ge_1=true
+sysconf_onln_in_affinity_online_range=true
+getcpu_ok=true
+getcpu_in_range=true
+setaffinity_full_ok=true
+setaffinity_full_roundtrip=true
+setaffinity_empty_einval=true

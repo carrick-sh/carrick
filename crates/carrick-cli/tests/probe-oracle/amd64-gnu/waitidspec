@@ -1,0 +1,14 @@
+db6a7181a752844e
+waitid_exit7_rc_zero=true
+waitid_exit7_si_signo_is_sigchld=true
+waitid_exit7_si_code_is_cld_exited=true
+waitid_exit7_si_status_is_7=true
+waitid_kill_rc_zero=true
+waitid_kill_si_code_is_cld_killed=true
+waitid_kill_si_status_is_sigkill=true
+waitid_wnowait_peek_ok=true
+waitid_wnowait_peek_status_is_11=true
+waitid_wnowait_reap_ok=true
+waitid_wnowait_reap_status_is_11=true
+waitid_no_children_rc_is_neg_one=true
+waitid_no_children_errno_is_echild=true

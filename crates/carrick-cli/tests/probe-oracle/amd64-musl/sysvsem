@@ -1,0 +1,7 @@
+7c1b2cb5653d3058
+semget_ok=true
+setval_getval=true
+setall_getall=true
+semop_decrement=true
+xprocess_shared=true
+ipc_rmid_ok=true

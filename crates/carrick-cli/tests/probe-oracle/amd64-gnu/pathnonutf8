@@ -1,0 +1,9 @@
+604d8f2f696306db
+open_create_ok=true
+write_ok=true
+fstat_ok=true
+reopen_ok=true
+read_roundtrip=true
+pathstat_ok=true
+listdir_has_name=true
+unlink_then_gone=true

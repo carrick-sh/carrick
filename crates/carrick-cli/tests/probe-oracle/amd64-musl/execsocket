@@ -1,0 +1,7 @@
+18c5bcec4058a8c2
+socketpair_ok=true
+child_exited_zero=true
+child_exit_code=0
+parent_read_child_ok=true
+parent_read_eof=true
+parent_read_errno=0

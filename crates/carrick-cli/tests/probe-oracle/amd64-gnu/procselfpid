@@ -1,0 +1,4 @@
+9bd96b556554efc0
+gettid_eq_getpid=true
+proc_pid_eq_getpid=true
+proc_tgid_eq_getpid=true

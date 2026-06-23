@@ -1,0 +1,10 @@
+f6ea67634bff2c1d
+socketpair_ok=true
+open_payload_ok=true
+write_marker_ok=true
+sendmsg_ok=true
+recvmsg_ok=true
+one_scm_cmsg=true
+received_fd_valid=true
+received_fd_fresh=true
+readback_matches=true

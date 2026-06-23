@@ -1,0 +1,8 @@
+f7da6eaec816314d
+setup_real_dir=true
+setup_abs_symlink=true
+mknod_via_symlink_ok=true
+mknod_via_symlink_enoent=false
+fifo_at_target_in_rootfs=true
+fifo_via_symlink_path=true
+contained_consistent=true

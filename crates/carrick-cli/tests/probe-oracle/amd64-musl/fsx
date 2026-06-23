@@ -1,0 +1,25 @@
+528c45898516dd6e
+statfs_root bsize_pos=true blocks_pos=true
+fstatfs_root bsize_pos=true blocks_pos=true
+utimensat_mtime_ok=true
+fadvise rc=0
+fallocate rc=0
+fallocate_size=4096
+sync rc=0
+syncfs rc=0
+fsync rc=0
+fdatasync rc=0
+setxattr=rc=0
+getxattr=rc=1
+listxattr=rc=13
+removexattr=rc=0
+getxattr_after_remove=ERR:61
+removexattr_absent=ERR:61
+removexattr_nopath=ERR:2
+faccessat2_passwd_r rc=0
+readlinkat_exe_nonempty=true
+getcwd=/tmp
+mknod_reg rc=0
+mknod_reg_exists=true
+mknodat_reg rc=0
+mknodat_reg_exists=true

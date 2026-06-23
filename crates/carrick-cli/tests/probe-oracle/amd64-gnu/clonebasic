@@ -1,0 +1,5 @@
+35361c40028991eb
+clone_basic_rc_positive=true
+clone_basic_child_reaped=true
+clone_thread_alone_rc_neg_one=true
+clone_thread_alone_errno_einval=true

@@ -1,0 +1,8 @@
+47ba7964bea6e298
+setup_open_ok=true
+setfl_rc_zero=true
+accmode_before_wronly=true
+accmode_after_still_wronly=true
+creat_bit_stored=false
+trunc_bit_stored=false
+nonblock_set=true

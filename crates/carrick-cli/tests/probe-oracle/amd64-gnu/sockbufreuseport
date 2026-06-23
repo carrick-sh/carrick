@@ -1,0 +1,10 @@
+4b0917dccc228e6a
+socket_ok=true
+rcvbuf_set_ok=true
+rcvbuf_doubled=true
+sndbuf_set_ok=true
+sndbuf_doubled=true
+reuseaddr_set_ok=true
+reuseport_still_zero=true
+reuseport_set_ok=true
+reuseport_now_one=true

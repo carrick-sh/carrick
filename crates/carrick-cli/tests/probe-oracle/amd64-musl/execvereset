@@ -1,0 +1,9 @@
+c0a0a901866f8829
+sigchld_reset_to_dfl=true
+sigusr2_reset_to_dfl=true
+sigpipe_still_ign=true
+altstack_size_is_zero=false
+altstack_sp_is_null=false
+altstack_flag_disabled=false
+sigusr1_mask_preserved=true
+sigusr1_pending_preserved=true

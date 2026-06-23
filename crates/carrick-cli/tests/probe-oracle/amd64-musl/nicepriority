@@ -1,0 +1,6 @@
+d2ef1a4b6f28e3d8
+set_nice_2_ok=true
+get_nice_is_2=true
+set_nice_50_ok=true
+get_nice_clamped_19=true
+getpriority_bad_which_einval=true

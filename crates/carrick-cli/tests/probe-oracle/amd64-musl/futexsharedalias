@@ -1,0 +1,8 @@
+236d8adba5b89825
+futex_shared_alias_setup=true
+futex_shared_alias_b_ready=true
+futex_shared_alias_a_ready=true
+futex_shared_alias_wake_a_rc_one=false
+futex_shared_alias_a_exited_after_single_wake=true
+futex_shared_alias_b_still_blocked_after_single_wake=true
+futex_shared_alias_cleanup_ok=true

@@ -1,0 +1,7 @@
+faaf0805e9a83d66
+setup_ok=true
+fixed_ok=true
+child_inherited_private=true
+parent_isolated_from_child=true
+child_isolated_from_parent=true
+parent_keeps_own_write=true

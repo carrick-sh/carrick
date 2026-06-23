@@ -1,0 +1,6 @@
+2306b0bf367c7f4b
+reg_lsetxattr_ok=true
+reg_lgetxattr_roundtrip=true
+reg_llistxattr_has=true
+reg_lremovexattr_ok=true
+reg_lgetxattr_after_remove_enodata=true

@@ -1,0 +1,11 @@
+8b478bb2f349f42b
+sigprocmask_usr1_blocked=true
+sigprocmask_usr1_absent=true
+sigaction_handler_ran=true
+sigaction_restore_rc=0
+sigign_usr2_survived=true
+sigaltstack_size_match=true
+sigaltstack_rc=0
+sigpending_usr1=true
+kill_self_sig0_rc=0
+sigtimedwait_signo=10

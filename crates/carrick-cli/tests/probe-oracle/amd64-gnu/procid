@@ -1,0 +1,17 @@
+4d122487235174e9
+pid_positive=true
+ppid_differs=true
+getuid=0
+geteuid=0
+getgid=0
+getegid=0
+getgroups count=1 has_root=true
+umask_prev=22
+uname_sysname=Linux
+uname_machine=x86_64
+sysinfo totalram_pos=true procs_ge1=true
+getpriority_nice=0
+prctl_dumpable=1
+rlimit_nofile cur_pos=true cur_le_max=true
+sched_yield=0
+sched_affinity nonempty=true

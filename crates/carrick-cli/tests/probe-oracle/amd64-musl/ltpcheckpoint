@@ -1,0 +1,12 @@
+d411e0c43d891790
+devshm_access_ok=true
+shm_open_ok=true
+shm_open_errno=0
+shm_chmod_ok=true
+shm_ftruncate_ok=true
+shm_mmap_ok=true
+shm_close_ok=true
+shm_post_close_writable=true
+shm_fork_child_sees_parent_write=true
+shm_futex_xprocess_wake_wakes_wait=true
+shm_futex_child_wake_parent_wait=true

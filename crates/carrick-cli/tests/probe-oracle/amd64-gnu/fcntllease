@@ -1,0 +1,7 @@
+7f116a9e03112189
+setlease_rdlck_ok=true
+getlease_is_rdlck=true
+setlease_unlck_ok=true
+getlease_is_unlck=true
+setlease_bad_type_einval=true
+setlease_rdlck_on_rdwr_eagain=true

@@ -1,0 +1,6 @@
+8ffd4bb8de144c19
+getsockname_null_addr_efault=true
+getsockname_null_len_efault=true
+getsockname_neg_len_einval=true
+getsockname_ok=true
+getpeername_neg_len_einval=true

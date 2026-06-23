@@ -1,0 +1,11 @@
+217a65a5fd00c20d
+getscheduler_negpid_einval=true
+getparam_negpid_einval=true
+setparam_negpid_einval=true
+setscheduler_negpid_einval=true
+setscheduler_badptr_efault=true
+getpriority_badwhich_einval=true
+getpriority_process_negwho_esrch=true
+getpriority_pgrp_negwho_esrch=true
+getpriority_user_negwho_esrch=true
+setpriority_pgrp_negwho_esrch=true

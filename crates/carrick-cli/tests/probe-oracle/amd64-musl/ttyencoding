@@ -1,0 +1,10 @@
+9c869f04a35f5711
+setup_ok=true
+pipe_isatty=false
+pipe_tcgets_enotty=true
+pipe_isatty_matches_tcgets=true
+pty_isatty=true
+pty_tcgets_ok=true
+pty_isatty_matches_tcgets=true
+stdin_isatty=false
+stdin_isatty_matches_tcgets=true

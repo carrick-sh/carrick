@@ -1,0 +1,6 @@
+888d9fccdcfb5948
+zero_len_iovec_skipped_rc_is_8=true
+oversized_iovlen_rc_neg_one=true
+oversized_iovlen_errno_einval=true
+bad_ptr_rc_neg_one=true
+bad_ptr_errno_efault=true

@@ -1,0 +1,22 @@
+98f16ef501f2cae3
+mkdir_d1 exists=true
+rmdir_d1 exists=false
+mkdirp_d2 exists=true
+mkdirp_d2 dir=true
+mkdirp_d2_a dir=true
+mkdirp_d2_a_b dir=true
+readdir_dd names=a,b,c
+readdir_dd count=3
+readdir_dd_zzz listed=true
+hardlink_h2_content_ok=true
+hardlink_h1_nlink=2
+symlink_dlnk_target=/tmp/dd
+symlink_dlnk_stat_dir=true
+symlink_dlnk_lstat_symlink=true
+rename_dir rd_exists=false
+rename_dir rd2_file_exists=true
+unlink_u1 exists=false
+rmdir_notempty_errno=39
+rmdir_emptied_rc=0
+rmdir_emptied_gone=true
+getdents_dot count=4
