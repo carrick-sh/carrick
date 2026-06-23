@@ -527,7 +527,20 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         // unbacked MAP_FIXED. PROT_NONE (prot==0) needs no backing — an unmapped VA
         // must keep faulting, exactly as Linux wants.
         let protect_err = self.vm.protect_range(address, len, prot).err();
-        if prot != 0 && self.vm.host_ptr(address, 1).is_none() {
+        // A demand-paged backend (bhyve) chooses NOT to eagerly back the anon mmap
+        // arena: its `protect_range` records a RESERVATION for any unbacked VA and
+        // returns Ok, then `demand_commit` backs one page per #PF on first touch.
+        // For such a VA `host_ptr(address,1)` is legitimately `None` even though the
+        // mapping is fully serviced — so `back_fixed_anon` (whose default errors)
+        // must NOT fire, or every arena mmap on bhyve fails with ENOMEM. Only a
+        // genuinely-unbacked, NON-reserved MAP_FIXED needs the eager fallback slot.
+        // `is_guest_reserved` is `false` by default (KVM/NVMM never reserve — they
+        // host-map the arena lazily and `host_ptr` resolves it), so this is a no-op
+        // for the eager backends.
+        if prot != 0
+            && self.vm.host_ptr(address, 1).is_none()
+            && !self.vm.is_guest_reserved(address)
+        {
             let writable = prot & carrick_abi::LINUX_PROT_WRITE != 0;
             self.vm.back_fixed_anon(address, len, writable)?;
         } else if let Some(e) = protect_err {
