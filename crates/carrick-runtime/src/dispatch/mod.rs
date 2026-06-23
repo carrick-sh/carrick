@@ -4887,6 +4887,10 @@ fn try_small_nonblocking_write(host_fd: i32, bytes: &[u8]) -> Option<Result<usiz
         if len == 0 || len == bytes.len() {
             continue;
         }
+        // BLOCKING-IO-OK: this path is reached only after a prior write to the
+        // same fd returned EAGAIN (see the caller's `e == LINUX_EAGAIN &&
+        // nonblocking` guard), so host_fd is non-blocking and libc::write cannot
+        // block — the loop treats EAGAIN as "retry a smaller chunk".
         let n = unsafe { libc::write(host_fd, bytes.as_ptr().cast(), len) };
         match n.host_syscall_errno() {
             Ok(value) if value > 0 => return Some(Ok(value as usize)),

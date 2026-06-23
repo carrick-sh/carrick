@@ -52,6 +52,41 @@ const SAFE_TOKENS: &[&str] = &[
 /// lines before the actual call (e.g. the two-branch recvfrom in recvfrom).
 const WINDOW: usize = 24;
 
+/// Line indices that fall inside a `#[cfg(test)]` block. The guard targets the
+/// production kernel-lock path; inline test modules legitimately open localhost
+/// sockets / blocking pipes and are NOT that path, so they are excluded. Brace
+/// balance is naive (it ignores braces inside strings/chars), which is fine for
+/// these dispatch files where `#[cfg(test)]` only guards `mod`/`fn` items.
+fn cfg_test_line_set(lines: &[&str]) -> std::collections::HashSet<usize> {
+    let mut in_test = std::collections::HashSet::new();
+    let mut depth: i32 = 0;
+    let mut pending = false; // saw #[cfg(test)], awaiting the item's opening brace
+    let mut test_depth: Option<i32> = None; // brace depth at which the test block opened
+    for (i, line) in lines.iter().enumerate() {
+        if test_depth.is_some() {
+            in_test.insert(i);
+        }
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            pending = true;
+        }
+        if pending && test_depth.is_none() {
+            if line.contains('{') {
+                test_depth = Some(depth);
+                pending = false;
+            } else if line.contains(';') {
+                pending = false; // a non-block #[cfg(test)] item (use/const)
+            }
+        }
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if let Some(td) = test_depth
+            && depth <= td
+        {
+            test_depth = None;
+        }
+    }
+    in_test
+}
+
 #[test]
 fn no_unguarded_blocking_host_io_in_dispatch() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -62,8 +97,13 @@ fn no_unguarded_blocking_host_io_in_dispatch() {
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let lines: Vec<&str> = src.lines().collect();
+        let test_lines = cfg_test_line_set(&lines);
 
         for (i, line) in lines.iter().enumerate() {
+            // Test code (inline #[cfg(test)] modules) is not the kernel-lock path.
+            if test_lines.contains(&i) {
+                continue;
+            }
             // Skip comments and doc text — we only care about real call sites.
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") || trimmed.starts_with("///") {
