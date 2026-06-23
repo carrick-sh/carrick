@@ -951,6 +951,16 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+        // A `wait4`/`waitid` that reaped a child is a process-exit happens-before
+        // barrier: the child's stores to a shared `MAP_SHARED` mapping are now
+        // final. Backends that can't share guest physical RAM across the fork
+        // (bhyve) use the backing file as the cross-process medium and must
+        // re-read it into the parent's sysmem here so the parent SEES those
+        // stores. No-op on KVM/HVF (their alias IS a fork-coherent host
+        // `MAP_SHARED` of the file). Canonical wait4=260, waitid=95.
+        if matches!(self.last_syscall_canonical, Some(260) | Some(95)) && return_value >= 0 {
+            self.vm.refresh_shared_after_wait();
+        }
         // Write RAX = return value and resume inside the stashed syscall
         // trampoline. KVM reports the native current RIP (observed as the OUT
         // address); bhyve reports `rip + inst_length` (the SYSRETQ). Either way

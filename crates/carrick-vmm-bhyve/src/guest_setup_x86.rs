@@ -1392,6 +1392,17 @@ impl BhyveGuestRam {
             })
             .collect()
     }
+
+    /// Snapshot the registered shm aliases as `(gpa, fd, offset, read_len)` for a
+    /// REFRESH — re-read the backing file INTO sysmem (the inverse of
+    /// `shm_aliases_for_flush`). Used after the parent reaps a child (`wait4`/
+    /// `waitid`): the child flushed its stores to the file on exit, so the parent
+    /// must re-read the file to see them (the child wrote a different process's
+    /// private sysmem; bhyve's only cross-process medium is the shared inode).
+    /// `read_len` is bounded by the file size so it never reads past the content.
+    pub fn shm_aliases_for_refresh(&self) -> Vec<(u64, libc::c_int, libc::off_t, usize)> {
+        self.shm_aliases_for_flush()
+    }
 }
 
 impl Drop for ShmAlias {
