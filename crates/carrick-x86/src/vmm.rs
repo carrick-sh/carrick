@@ -435,6 +435,40 @@ pub trait X86Vmm: Sized {
         self.rebuild_child_vm(frozen)
     }
 
+    /// Publish the guest mmap-arena high-water just before a `vfork(2)` so
+    /// [`Self::prepare_vfork_share`] can bound its per-window residency scan to the
+    /// used arena prefix (the arena window is otherwise tens of GiB). Default
+    /// no-op; KVM stores it.
+    fn set_vfork_arena_high_water(&mut self, _high_water: u64) {}
+
+    /// `vfork(2)` (`CLONE_VM|CLONE_VFORK`) PARENT, PRE-`libc::fork`: arrange for the
+    /// child to SHARE this address space. A backend whose guest RAM is already
+    /// fork-shared (or which has no shared-VM path) leaves this a no-op and falls
+    /// back to a plain fork. KVM (host-`MAP_PRIVATE` RAM) allocates shared shadows
+    /// of its private windows here and stashes them on the VM. Returns `true` iff
+    /// sharing was actually armed (so the caller knows the child must rebuild the
+    /// shared way and the parent must reconcile on resume).
+    fn prepare_vfork_share(&mut self) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    /// `vfork(2)` CHILD, POST-`libc::fork`: rebuild the VM/vCPU SHARING the parent's
+    /// address space (over the shadows armed in [`Self::prepare_vfork_share`]).
+    /// Only called when `prepare_vfork_share` returned `true`. The default mirrors
+    /// the ordinary child rebuild (no distinct shared path).
+    fn rebuild_child_after_fork_vfork(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        frozen: &[u8],
+    ) -> Result<(), TrapError> {
+        self.rebuild_child_after_fork(vcpu, frozen)
+    }
+
+    /// `vfork(2)` PARENT, on RESUME (the child has execve'd/`_exit`ed): reconcile
+    /// the child's shared writes back into this VM and release the share. Only
+    /// called when [`Self::prepare_vfork_share`] returned `true`. Default no-op.
+    fn finish_vfork_parent(&mut self) {}
+
     /// Restore a generic x86 vCPU snapshot onto a backend vCPU. The default
     /// uses the shared trait-level register writers; backends with stricter
     /// ioctl grouping requirements can override while keeping the x86 snapshot

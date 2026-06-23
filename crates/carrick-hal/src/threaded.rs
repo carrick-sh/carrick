@@ -452,6 +452,19 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
         self.fork()
     }
+    /// Publish the guest mmap-arena high-water (the dispatcher's
+    /// `mmap_arena_high_water`) just before a `vfork(2)` so a shared-VM backend can
+    /// bound the per-window residency scan to the used arena prefix instead of the
+    /// full (e.g. 32 GiB) arena. Default no-op; the KVM backend stores it for
+    /// `prepare_vfork_share`. Harmless to call on a non-vfork fork.
+    fn set_vfork_arena_high_water(&mut self, _high_water: u64) {}
+    /// `vfork(2)` PARENT, on RESUME (the suspended parent's pipe wait returned —
+    /// the child has execve'd/`_exit`ed). Reconcile any shared-VM writes the child
+    /// made back into the parent's address space and release the share. Backends
+    /// that share the parent's RAM directly (HVF) or have no shared-VM path need
+    /// nothing here; the KVM backend, which shares via a shadow that the suspended
+    /// parent must copy back, overrides it. Default no-op.
+    fn finish_vfork_parent(&mut self) {}
     fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
         Ok(())
     }
