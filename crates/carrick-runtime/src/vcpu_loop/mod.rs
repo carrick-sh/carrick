@@ -621,6 +621,7 @@ where
             match outcome {
                 DispatchOutcome::BlockingHostWrite(mut write) => {
                     self.waiter.ensure_full();
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
                     loop {
                         if crate::fork_quiesce::is_quiescing() {
                             self.release_and_park_vcpu_for_fork(engine)?;
@@ -674,6 +675,7 @@ where
                     mask_replaces,
                 } => {
                     self.waiter.ensure_full();
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -712,6 +714,7 @@ where
                     clear_on_timeout,
                 } => {
                     self.waiter.ensure_full();
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -769,6 +772,7 @@ where
                             None
                         }
                     };
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -801,6 +805,7 @@ where
                 }
                 DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
                     self.waiter.ensure_full();
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait_proc_exit_with_dispatch_pending(
                         pid,
                         block_signals,
@@ -841,6 +846,7 @@ where
                         }
                     };
                     self.waiter.ensure_full();
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait(&[], Some(slice), !wait_set) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
@@ -878,6 +884,7 @@ where
                         break Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     self.waiter.ensure_full();
+                    crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait(&[], Some(deadline - now), 0) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
@@ -1004,6 +1011,12 @@ where
                 continue;
             }
             // ---- vCPU run: NO dispatcher lock held ----
+            // Publish that this guest is RUNNING (executing guest code). This is
+            // the single point that means "guest code is live now": it clears the
+            // post-fork `Booting` state and any prior `Blocked`, so a sibling's
+            // /proc/<pid>/stat reads `R`. A genuine guest-blocking wait re-publishes
+            // `Blocked` below for the duration of the park (see `block_guard`).
+            crate::run_state::publish(crate::run_state::RunState::Running);
             let next = engine.next_syscall();
             // Out of guest now (in host): a coordinator may proceed past us.
             state

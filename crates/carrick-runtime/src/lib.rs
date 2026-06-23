@@ -265,6 +265,7 @@ pub mod trap {
 }
 pub mod overlay;
 pub mod pathcodec;
+pub mod run_state;
 
 // Cross-platform run-loop result/error + kernel-half state. Single home for
 // `RunResult` / `RuntimeError` / `KernelState` / `Kernel` / `VcpuLoopOutcome`,

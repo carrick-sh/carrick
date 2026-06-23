@@ -149,6 +149,13 @@ where
     // Shared reaped-child CPU table, allocated before any fork so every guest
     // descendant inherits the same MAP_SHARED region.
     crate::guest_cpu::init_child_table();
+    // Shared published-run-state table (same MAP_SHARED-before-fork pattern), so
+    // a sibling's /proc/<pid>/stat reads the guest's TRUE run-state instead of
+    // the host vCPU-thread scheduler state (a booting child parked in the host's
+    // internal boot ppoll is `R`, not `S`). Publish this (root) process as
+    // Booting until its vCPU first resumes guest code.
+    crate::run_state::init_table();
+    crate::run_state::publish(crate::run_state::RunState::Booting);
 
     // Install the M:N admission scheduler for this backend's concurrent-vCPU
     // budget: a bounded HostCondvarScheduler for the finite-cap reclaiming

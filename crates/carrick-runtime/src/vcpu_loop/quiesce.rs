@@ -373,6 +373,12 @@ where
                 }
                 crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
                 crate::guest_cpu::register_child(child_pid as u32);
+                // Seed the child's published run-state as Booting NOW, from the
+                // parent, before this fork returns — so a parent that polls
+                // /proc/<child>/stat immediately (pauseinterrupt2) sees `R`, not
+                // the child's host boot-ppoll `S`. The table is shared, so this is
+                // the same slot the child later updates to Running/Blocked.
+                crate::run_state::publish_child_booting(child_pid as u32);
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its fd
                 // to the guest pidfd-out pointer.
                 if let Some(addr) = pidfd_out {
@@ -519,6 +525,13 @@ where
                 pt_barrier().end();
                 crate::event_ring::reinit_after_fork();
                 crate::host_signal::reinit_after_fork();
+                // Publish THIS child (new host pid) as Booting in the SHARED
+                // run-state table, before any post-fork boot work that parks the
+                // vCPU in the host's internal boot ppoll — so a parent reading
+                // /proc/<child>/stat sees `R` during boot (as real Linux does),
+                // not the `S` of that boot park. Republished `Running` when the
+                // child's vCPU first resumes guest code (run_vcpu_until_exit top).
+                crate::run_state::reinit_booting_after_fork();
                 // M:N scheduler: the child inherited the parent's pool but has only
                 // THIS thread, now the child's main (remapped to the child VM's vCPU
                 // 0). Drop the inherited (parent-slot) lease, reset to a fresh pool,
