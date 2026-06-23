@@ -62,8 +62,9 @@ use carrick_x86::{
 
 use crate::bhyve_kicker::{BhyveKickHandle, BhyveKicker};
 use crate::guest_setup_x86::{
-    BhyveGuestRam, BroughtUpX86, CommitOutcome, FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT,
-    FaultScratchRecord, PROT_RWX, SYSCALL_DOORBELL_PORT, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA,
+    ACCESS_RING3_CS64, ACCESS_RING3_SS, BhyveGuestRam, BroughtUpX86, CommitOutcome,
+    FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultScratchRecord, PROT_RWX,
+    SYSCALL_DOORBELL_PORT, USER_CS64_SEL, USER_SS_SEL, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA,
     X86_FP_STUB_GPA, X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_CAPACITY, X86_PML4_GPA, bring_up_x86_elf,
     fault_scratch_gpa, fault_scratch_record_from_bytes, fault_stack_frame_len,
     fault_user_context_from_bytes, program_x86_vcpu_longmode_entry, snapshot_x86_bhyve,
@@ -71,11 +72,12 @@ use crate::guest_setup_x86::{
 use crate::vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm, Vcpu};
 use crate::vmm_x86::{
     BhyveVmExit as NativeExit, VM_CAP_HALT_EXIT, VM_REG_GUEST_CR0, VM_REG_GUEST_CR2,
-    VM_REG_GUEST_CR3, VM_REG_GUEST_CR4, VM_REG_GUEST_CS, VM_REG_GUEST_EFER, VM_REG_GUEST_FS,
-    VM_REG_GUEST_GS, VM_REG_GUEST_R8, VM_REG_GUEST_R9, VM_REG_GUEST_R10, VM_REG_GUEST_R11,
-    VM_REG_GUEST_R12, VM_REG_GUEST_R13, VM_REG_GUEST_R14, VM_REG_GUEST_R15, VM_REG_GUEST_RAX,
-    VM_REG_GUEST_RBP, VM_REG_GUEST_RBX, VM_REG_GUEST_RCX, VM_REG_GUEST_RDI, VM_REG_GUEST_RDX,
-    VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI, VM_REG_GUEST_RSP,
+    VM_REG_GUEST_CR3, VM_REG_GUEST_CR4, VM_REG_GUEST_CS, VM_REG_GUEST_DS, VM_REG_GUEST_EFER,
+    VM_REG_GUEST_ES, VM_REG_GUEST_FS, VM_REG_GUEST_GS, VM_REG_GUEST_R8, VM_REG_GUEST_R9,
+    VM_REG_GUEST_R10, VM_REG_GUEST_R11, VM_REG_GUEST_R12, VM_REG_GUEST_R13, VM_REG_GUEST_R14,
+    VM_REG_GUEST_R15, VM_REG_GUEST_RAX, VM_REG_GUEST_RBP, VM_REG_GUEST_RBX, VM_REG_GUEST_RCX,
+    VM_REG_GUEST_RDI, VM_REG_GUEST_RDX, VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI,
+    VM_REG_GUEST_RSP, VM_REG_GUEST_SS,
 };
 
 /// The bhyve x86 kernel-window GPA layout (the §2.5a/`BringupLayout` per-backend
@@ -236,6 +238,28 @@ impl BhyveX86Vcpu {
 
     fn get_desc(&self, reg: c_int) -> Result<(u64, u32, u32), TrapError> {
         self.h.as_bhyve().get_desc(reg).map_err(Self::reg_err)
+    }
+
+    /// Reload the ring-3 user segment selectors + hidden descriptors on the live
+    /// vCPU, reproducing the state a `sysretq`/`iretq` to user space would latch
+    /// (CS=0x23/DPL3/L, SS/DS/ES=0x1B/DPL3, base=0, 4 GiB flat). Called from the
+    /// fault-doorbell path: taking a guest #PF through the IDT gate latched the
+    /// ring-0 kernel CS into the live VMCS, so a fault that resumes in ring-3
+    /// (demand-commit re-run or a delivered signal) must restore the user segments
+    /// first. The shared `restore_user_after_fault`→`program_user_segments` does
+    /// this for KVM/NVMM, but bhyve's `X86Vcpu::set_segment` is an intentional
+    /// no-op (the fork/clone iretq-blocker), so the fault path restores them here
+    /// — base/limit/AR via `set_desc`, the selector via `set_reg_raw`. FS/GS are
+    /// NOT touched (their TLS base is independent guest state). This is the same
+    /// descriptor encoding `program_x86_vcpu_longmode_entry`'s iretq frame produces.
+    fn restore_ring3_segments(&self) -> Result<(), TrapError> {
+        self.set_desc(VM_REG_GUEST_CS, 0, 0xFFFF_FFFF, ACCESS_RING3_CS64)?;
+        self.set_raw(VM_REG_GUEST_CS, USER_CS64_SEL)?;
+        for reg in [VM_REG_GUEST_SS, VM_REG_GUEST_DS, VM_REG_GUEST_ES] {
+            self.set_desc(reg, 0, 0xFFFF_FFFF, ACCESS_RING3_SS)?;
+            self.set_raw(reg, USER_SS_SEL)?;
+        }
+        Ok(())
     }
 
     fn set_cap(&self, cap: c_int, val: c_int) -> Result<(), TrapError> {
@@ -733,6 +757,26 @@ impl X86Vcpu for BhyveX86Vcpu {
                     let context = fault_user_context_from_bytes(record.vector(), &frame)
                         .map_err(Self::reg_err)?;
                     let cr2 = self.get_raw(VM_REG_GUEST_CR2)?;
+                    // Restore the ring-3 user segments on the live vCPU. Taking the
+                    // #PF through the guest IDT gate latched CS=KERN_CS64_SEL (ring-0)
+                    // into the live VMCS; whether this fault is DEMAND-COMMITTED (the
+                    // engine re-runs the faulting instruction) or DELIVERED as a
+                    // signal, the vCPU must resume in ring-3 at `context.rip`. The
+                    // shared `restore_user_after_fault` calls `program_user_segments`
+                    // for exactly this — but bhyve's `set_segment` is an intentional
+                    // no-op (the fork/clone iretq-blocker), so the live ring-3 CS/SS
+                    // would otherwise stay at the ring-0 selector the IDT gate left.
+                    // Without this, the FIRST demand fault re-runs the guest in ring-0;
+                    // it only "recovers" because the NEXT SYSCALL's `sysretq` reloads
+                    // ring-3 — so two back-to-back demand faults with no intervening
+                    // syscall (glibc ld.so's relocation loop touching consecutive
+                    // fresh arena pages) leave the second running supervisor, and the
+                    // shared ring-0 fault guard then kills the guest (vector=14 cs=0x8).
+                    // Only restore when the FAULTING context was ring-3 — a genuine
+                    // ring-0 fault must keep its CS so the guard still fires.
+                    if context.cs & 3 == 3 {
+                        self.restore_ring3_segments()?;
+                    }
                     // Hand the assembled fault frame to the SHARED classifier
                     // (exactly like KVM/NVMM). It enforces the ring-0 fault guard —
                     // a fault whose saved CS is ring-0 (inside the LSTAR stub /

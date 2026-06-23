@@ -197,12 +197,10 @@ pub const ACCESS_RING0_SS: u32 = 0x0093; // P|S|data/RW|DPL0
 /// latches from `GDT[3]`). The iretq loads these from the GDT on the privilege
 /// change, so they are not pre-programmed; kept for the GDT-encoding unit tests
 /// and the (blocked) ring-3 entry work — see the M1 iretq blocker note.
-#[allow(dead_code)]
-const ACCESS_RING3_SS: u32 = 0x00F3; // P|S|data/RW|DPL3
+pub(crate) const ACCESS_RING3_SS: u32 = 0x00F3; // P|S|data/RW|DPL3
 /// Ring-3 64-bit code segment: P=1 S=1 type=0xA (exec/read) DPL=3 L=1.
 /// Mirrors `GDT[4]` = 0x0020_FA00_0000_0000 (latched by the iretq from the GDT).
-#[allow(dead_code)]
-const ACCESS_RING3_CS64: u32 = 0x20FB; // P|S|exec/read|DPL3|L
+pub(crate) const ACCESS_RING3_CS64: u32 = 0x20FB; // P|S|exec/read|DPL3|L
 /// "Unusable" segment: bit 16 set — the selector is not loaded.
 /// Applied to DS/ES/FS/GS at ring-0 entry (the data segments are only needed
 /// at ring-3; the init blob loads them via iretq + iret ABI after SYSRET).
@@ -222,9 +220,9 @@ const ACCESS_RING3_DATA: u32 = 0x00F3; // = ACCESS_RING3_SS
 // Ring-3 selector values (SS/CS fields; RPL is encoded in the low 2 bits).
 // These match the SYSRET arithmetic in x8664_arch.rs::star_selector_arithmetic.
 /// User CS64 selector: `GDT[4]`=0x20 | RPL3=3 → 0x23.
-const USER_CS64_SEL: u64 = 0x23;
+pub(crate) const USER_CS64_SEL: u64 = 0x23;
 /// User SS selector: `GDT[3]`=0x18 | RPL3=3 → 0x1B.
-const USER_SS_SEL: u64 = 0x1B;
+pub(crate) const USER_SS_SEL: u64 = 0x1B;
 /// Kernel CS64 selector: `GDT[1]`=0x08.
 pub const KERN_CS64_SEL: u64 = 0x08;
 /// Kernel SS selector: `GDT[2]`=0x10.
