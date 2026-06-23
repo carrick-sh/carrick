@@ -24,7 +24,7 @@ use support::gzip_tar_with_modes;
 #[test]
 fn loads_static_linux_fixture_into_guest_address_space() {
     build_fixture();
-    let artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-vmm-kvm-aarch64-hello";
+    let artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello";
     let image = AddressSpace::load_elf(artifact).unwrap();
 
     assert!(image.entry() >= image.regions()[0].start);
@@ -98,7 +98,7 @@ fn builds_linux_initial_stack_with_argv_envp_and_auxv() {
 #[test]
 fn loaded_elf_initial_stack_includes_linux_auxv() {
     build_fixture();
-    let artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-vmm-kvm-aarch64-hello";
+    let artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello";
     let image = AddressSpace::load_elf(artifact)
         .unwrap()
         .with_linux_initial_stack([artifact.to_owned()], std::iter::empty::<String>())
