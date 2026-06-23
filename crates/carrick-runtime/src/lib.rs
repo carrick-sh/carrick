@@ -295,6 +295,61 @@ pub mod vfs;
 #[cfg(feature = "platform-macos")]
 pub use execute::Runtime;
 
+/// Absolute host path to Apple's Rosetta 2 Linux interpreter that carrick probes
+/// (and, on macOS, redirects x86_64 ELF loads to). Resolution order, so the same
+/// probe is correct on every Apple-Silicon host regardless of OS:
+///   1. `CARRICK_ROSETTA_PATH` — explicit override for non-standard layouts.
+///   2. The `interpreter` recorded in the kernel's binfmt_misc `rosetta`
+///      registration (`/proc/sys/fs/binfmt_misc/rosetta`). This is how an
+///      Apple-Silicon Linux guest under Virtualization.framework (e.g. a lima VM
+///      with `rosetta.enabled: true`) exposes Apple's Rosetta-for-Linux, and it
+///      names wherever the guest mounted it. The read simply fails (and is
+///      skipped) on macOS and on hosts without Rosetta.
+///   3. Apple's fixed macOS location.
+pub fn rosetta_interpreter_path() -> String {
+    const APPLE_DEFAULT: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
+    if let Some(p) = std::env::var_os("CARRICK_ROSETTA_PATH") {
+        return p.to_string_lossy().into_owned();
+    }
+    if let Ok(reg) = std::fs::read_to_string("/proc/sys/fs/binfmt_misc/rosetta") {
+        if let Some(path) = parse_binfmt_interpreter(&reg) {
+            return path.to_string();
+        }
+    }
+    APPLE_DEFAULT.to_string()
+}
+
+/// Extract the `interpreter <path>` value from a binfmt_misc registration dump
+/// (the body of `/proc/sys/fs/binfmt_misc/rosetta`). Pure, so the lima-discovery
+/// path is unit-testable without a real `/proc`.
+fn parse_binfmt_interpreter(reg: &str) -> Option<&str> {
+    reg.lines()
+        .find_map(|l| l.strip_prefix("interpreter "))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+}
+
+/// Whether Apple Rosetta 2 for Linux is accessible on this host — the gate for
+/// running x86_64 (`linux/amd64`) guests on an aarch64 host. Probes the
+/// interpreter file (see [`rosetta_interpreter_path`]) for read access: a cheap
+/// `access(2)` check, not a full read, and host-agnostic so it is correct on
+/// macOS AND on an Apple-Silicon Linux guest (e.g. lima) that mounts
+/// Rosetta-for-Linux. On an x86_64 host, amd64 is the native ISA and this is
+/// never consulted.
+///
+/// NOTE: this reports interpreter *presence*, which is what the engine's
+/// [pre-run gate](../carrick_engine/fn.check_platform_runnable.html) needs. The
+/// x86→Rosetta ELF-load *redirect* is currently wired only on the macOS/HVF load
+/// path (`runtime::maybe_redirect_to_rosetta`); the Linux/KVM load path does not
+/// yet redirect, so on a lima guest a `true` here gates the request in but the
+/// execute-side bring-up is still in progress.
+pub fn rosetta_available() -> bool {
+    match std::ffi::CString::new(rosetta_interpreter_path()) {
+        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::R_OK) == 0 },
+        Err(_) => false,
+    }
+}
+
 #[cfg(any(
     feature = "platform-linux",
     feature = "platform-freebsd",
@@ -2410,5 +2465,28 @@ pub mod posix_timer {
                 });
         }
         Some(armed.old)
+    }
+}
+
+#[cfg(test)]
+mod rosetta_detection_tests {
+    use super::parse_binfmt_interpreter;
+
+    #[test]
+    fn parses_rosetta_binfmt_interpreter_path() {
+        // Shape of a real /proc/sys/fs/binfmt_misc/rosetta dump on a lima guest.
+        let reg = "enabled\ninterpreter /mnt/lima-rosetta/rosetta\nflags: POCF\noffset 0\nmagic 7f454c46\n";
+        assert_eq!(
+            parse_binfmt_interpreter(reg),
+            Some("/mnt/lima-rosetta/rosetta")
+        );
+    }
+
+    #[test]
+    fn binfmt_without_interpreter_line_is_none() {
+        assert_eq!(parse_binfmt_interpreter("enabled\noffset 0\n"), None);
+        // A bare `interpreter ` with no path is rejected (not an empty path).
+        assert_eq!(parse_binfmt_interpreter("interpreter   \n"), None);
+        assert_eq!(parse_binfmt_interpreter(""), None);
     }
 }

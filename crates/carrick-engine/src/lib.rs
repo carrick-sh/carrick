@@ -55,8 +55,8 @@
 //!
 //! ## Platform and the image read-through
 //!
-//! [`request_platform`] canonicalises `--platform` (or the host default,
-//! arm64) into a [`Platform`]. [`Engine::resolve`] maps that to a
+//! [`request_platform`] canonicalises `--platform` (or, when omitted, the
+//! host-native architecture) into a [`Platform`]. [`Engine::resolve`] maps that to a
 //! [`carrick_image::PlatformTarget`] and calls `resolve_with_platform`, so an
 //! amd64 (Rosetta) run pulls and caches the amd64 manifest without disturbing
 //! the native arm64 cache (see the `carrick-image` BTS), then returns the merged
@@ -87,7 +87,8 @@ pub use carrick_spec::{FsBackendKind, ImageConfig, Mount, PidMode, Platform, Run
 pub struct CliRunRequest {
     pub image_ref: String,
     /// Raw OCI platform string from the CLI (`--platform linux/amd64`), or
-    /// `None` to default to the host architecture (arm64).
+    /// `None` to default to the host-native architecture (see
+    /// [`Platform::host_native`]).
     pub platform: Option<String>,
     pub args: Vec<String>,
     pub env_overrides: Vec<String>,
@@ -115,12 +116,51 @@ pub struct CliRunRequest {
 }
 
 /// Parse the request's `--platform` into the canonical [`Platform`], falling
-/// back to the host default (arm64) when absent or unrecognised.
+/// back to the host-native architecture (see [`Platform::host_native`]) when
+/// absent or unrecognised — so `carrick run <image>` with no `--platform`
+/// targets the ISA this host runs without translation (arm64 on Apple Silicon,
+/// amd64 on the x86_64 lanes).
 pub fn request_platform(req: &CliRunRequest) -> Platform {
     req.platform
         .as_deref()
         .and_then(Platform::from_oci_str)
         .unwrap_or_default()
+}
+
+/// Verify the requested guest [`Platform`] can actually run on this host, BEFORE
+/// pulling its (possibly large) image. A guest whose ISA matches the host runs
+/// natively. The one cross-ISA path carrick supports is an x86_64 guest on an
+/// aarch64 host via Apple Rosetta 2 — on macOS directly, or inside an
+/// Apple-Silicon Linux VM (e.g. lima) that exposes Rosetta-for-Linux — so that
+/// combination is allowed only when the Rosetta interpreter is accessible
+/// (probed by [`carrick_runtime::rosetta_available`]); an arm64 guest on an
+/// x86_64 host has no translation path and is rejected outright. The error
+/// strings are user-facing (surfaced by `carrick run`/`create`), so they name
+/// the actionable fix. This is a no-op on a native run, the common case.
+pub fn check_platform_runnable(platform: Platform) -> Result<(), String> {
+    match platform.host_execution() {
+        carrick_spec::HostExecution::Native => Ok(()),
+        carrick_spec::HostExecution::RosettaTranslated => {
+            if carrick_runtime::rosetta_available() {
+                Ok(())
+            } else {
+                Err(
+                    "running an x86_64 (linux/amd64) container on an aarch64 host \
+                     requires Apple Rosetta 2 for Linux, which was not found. On macOS \
+                     install it with `softwareupdate --install-rosetta`; in an \
+                     Apple-Silicon Linux VM (e.g. lima) enable Rosetta for the guest \
+                     (lima: `rosetta.enabled: true`) or point `CARRICK_ROSETTA_PATH` at \
+                     the mounted interpreter. Or omit `--platform` to run the native \
+                     arm64 image."
+                        .to_string(),
+                )
+            }
+        }
+        carrick_spec::HostExecution::Unsupported => Err("running an arm64 (linux/arm64) \
+             container on an x86_64 host is not supported: carrick has no \
+             arm64-on-x86_64 translation. Omit `--platform` to run the native amd64 image."
+            .to_string()),
+    }
 }
 
 pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunSpec, String> {
@@ -308,6 +348,11 @@ impl Engine {
         // images are cached separately from the host-native arm64 so the two
         // never collide in the store, and pulling honours the platform hint.
         let platform = request_platform(&req);
+        // Reject an unrunnable target (e.g. `--platform linux/amd64` on an Apple
+        // Silicon host without Rosetta) BEFORE pulling its image, with an
+        // actionable message. This is the authoritative gate every run path
+        // funnels through (foreground `run`, `start`, the detached child).
+        check_platform_runnable(platform).map_err(anyhow::Error::msg)?;
         let target = carrick_image::PlatformTarget {
             os: "linux".to_string(),
             arch: platform.oci_arch().to_string(),
@@ -640,5 +685,44 @@ mod tests {
         assert_eq!(mk(None, Some("os")), "/os");
         // absolute --workdir still wins verbatim
         assert_eq!(mk(Some("/image/app"), Some("/user/app")), "/user/app");
+    }
+
+    #[test]
+    fn request_platform_defaults_to_host_native() {
+        // No `--platform` → the host-native ISA (so a native run never needs the
+        // flag), and an explicit value still parses.
+        let mut req = base_req(None);
+        req.platform = None;
+        assert_eq!(request_platform(&req), Platform::host_native());
+        req.platform = Some("linux/amd64".to_string());
+        assert_eq!(request_platform(&req), Platform::Amd64);
+        req.platform = Some("linux/arm64".to_string());
+        assert_eq!(request_platform(&req), Platform::Aarch64);
+    }
+
+    #[test]
+    fn native_platform_is_always_runnable() {
+        // The host's own ISA always runs without any translation layer.
+        assert!(check_platform_runnable(Platform::host_native()).is_ok());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn amd64_guest_on_arm_host_tracks_rosetta_presence() {
+        // On Apple Silicon, an amd64 guest is runnable iff Rosetta is installed —
+        // the gate must agree exactly with the runtime's own Rosetta probe.
+        assert_eq!(
+            check_platform_runnable(Platform::Amd64).is_ok(),
+            carrick_runtime::rosetta_available()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn arm64_guest_on_x86_host_is_rejected() {
+        // No reverse (arm64-on-x86_64) translation exists.
+        let err = check_platform_runnable(Platform::Aarch64)
+            .expect_err("arm64 guest on x86_64 host must be rejected");
+        assert!(err.contains("not supported"), "unexpected message: {err}");
     }
 }
