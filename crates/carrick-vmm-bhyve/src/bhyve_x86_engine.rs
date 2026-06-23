@@ -1371,6 +1371,101 @@ impl X86Vmm for BhyveVmm {
         Ok(())
     }
 
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_va: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), MemoryError> {
+        // Guest `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` over a shared-aperture VA.
+        // The dispatcher already carved an overlay slot (`overlay_va`, in the
+        // per-process private overlay aperture) and asks the backend to make `va`
+        // resolve there so the guest's "private" stores stay private. On bhyve the
+        // overlay aperture is demand-paged (capped to 1 page at bring-up — see
+        // guest_setup_x86.rs `M2_MISC_CAP`), so there is no pre-allocated overlay
+        // GPA the KVM path's identity `host_ptr(overlay_gpa)` relies on. Instead
+        // allocate a FRESH private bhyve GPA, seed it with `content`, and repoint
+        // `va`'s live PML4 leaf at that GPA. The new GPA is keyed in the window
+        // table at `overlay_va` so a later access through the overlay VA (and the
+        // re-MAP_FIXED free path) resolves consistently; the leaf for `va` is what
+        // the guest's own EL0 access and carrick's syscall-buffer translation
+        // (`needs_stage1_translation`) both target.
+        let span = (len + 0xFFF) & !0xFFF;
+        if span == 0 {
+            return Ok(());
+        }
+        // Reuse an existing overlay-VA window if a prior repoint already backed it
+        // (the dispatcher frees the old overlay slot on re-MAP_FIXED, but the bhyve
+        // GPA window persists; resolve it so we seed/repoint in place rather than
+        // leaking a fresh GPA each time).
+        let gpa = match self.ram.resolve(overlay_va, span) {
+            Some(gpa) => gpa,
+            None => self
+                .ram
+                .add_bump(overlay_va, span, true, true, false)
+                .map_err(|e| {
+                    MemoryError::HostMap(format!("bhyve repoint_private: GPA alloc: {e}"))
+                })?,
+        };
+        let host = self.vm.map_gpa(gpa, span).ok_or_else(|| {
+            MemoryError::HostMap(format!("bhyve repoint_private: map_gpa 0x{gpa:x} unmapped"))
+        })?;
+        // Seed: zero the whole slot (Linux anon zero-fill), then copy `content`
+        // (the dispatcher passes zeros for an anon MAP_FIXED, but honour any seed).
+        // SAFETY: `host` is live sysmem of `span` bytes (>= len).
+        unsafe { std::ptr::write_bytes(host, 0, span) };
+        if !content.is_empty() {
+            let n = content.len().min(span);
+            // SAFETY: `host` spans `span` >= n bytes; `content[..n]` is a distinct
+            // valid source slice.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), host, n) };
+        }
+        // Repoint the live PML4 leaf for `va` at the fresh private GPA (4 KiB
+        // precise; the engine reloads CR3 after this returns).
+        self.with_live_pml4(|mgr| {
+            mgr.map_aliased(va & !0xFFF, gpa, span as u64, true, true)
+                .map_err(|_| MemoryError::OutOfBounds {
+                    address: va,
+                    length: span,
+                })?;
+            Ok(true)
+        })
+    }
+
+    fn back_fixed_anon(&mut self, va: u64, len: usize, writable: bool) -> Result<(), MemoryError> {
+        // Back a `MAP_FIXED|MAP_PRIVATE|MAP_ANON` at a VA the PML4 does not yet map
+        // (outside the eager arena/image). bhyve demand-pages the anon mmap arena,
+        // so a fresh in-arena MAP_FIXED is already serviced by a reservation (see
+        // `protect_range`); this only fires for a genuinely-unbacked, NON-reserved
+        // VA. Allocate an identity-keyed private GPA, zero it, and install the leaf
+        // so the guest's own access hits real backing instead of faulting.
+        let span = (len + 0xFFF) & !0xFFF;
+        if span == 0 {
+            return Ok(());
+        }
+        let base = va & !0xFFF;
+        let gpa = self
+            .ram
+            .add_bump(base, span, true, writable, false)
+            .map_err(|e| MemoryError::HostMap(format!("bhyve back_fixed_anon: GPA alloc: {e}")))?;
+        let host = self.vm.map_gpa(gpa, span).ok_or_else(|| {
+            MemoryError::HostMap(format!("bhyve back_fixed_anon: map_gpa 0x{gpa:x} unmapped"))
+        })?;
+        // SAFETY: `host` is live sysmem of `span` bytes — Linux anon zero-fill.
+        unsafe { std::ptr::write_bytes(host, 0, span) };
+        self.with_live_pml4(|mgr| {
+            // exec=true: the caller's `protect_range`/`set_rw` re-applies the prot
+            // (incl. NX); the leaf itself stays executable here.
+            mgr.map_aliased(base, gpa, span as u64, writable, true)
+                .map_err(|_| MemoryError::OutOfBounds {
+                    address: base,
+                    length: span,
+                })?;
+            Ok(true)
+        })
+    }
+
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         // The engine only calls add_vcpu on a freshly-constructed VMM; bhyve's
         // `bring_up` already created vCPU 0 and stored it in the shared handle, so
@@ -1685,6 +1780,17 @@ impl X86Vmm for BhyveVmm {
     }
 
     fn process_exit_cleanup(&mut self) {
+        // Push this process's writable file-backed `MAP_SHARED` alias stores back
+        // to their backing files BEFORE the VM node is torn down. bhyve can't share
+        // guest physical RAM across the fork, so the shared inode is the only
+        // cross-process medium: a forked child's stores live in its private sysmem
+        // and must reach the file here so the parent — which re-reads the file when
+        // it reaps this child (`refresh_shared_after_wait`) — sees them. Cheap and
+        // safe: the process is exiting (no concurrent guest write to these pages),
+        // the write is bounded by file size, and a read-only alias is skipped (no
+        // dirty data). Done for a borrowed (vfork-shared) VM too — the writes are
+        // owed regardless of who destroys the node.
+        self.flush_shm_aliases();
         // Tear down the bhyve VM node on a forked-child `_exit` (which skips
         // Drop). A vfork-shared (borrowed) VM must NOT be destroyed — the parent
         // owns the node and resumes on it (§2.5c). Carried verbatim from the old
@@ -1693,6 +1799,32 @@ impl X86Vmm for BhyveVmm {
             return;
         }
         self.vm.destroy_in_place();
+    }
+
+    fn refresh_shared_after_wait(&mut self) {
+        // The parent just reaped a child (`wait4`/`waitid`). The child flushed its
+        // writable file-backed `MAP_SHARED` aliases to their files on exit
+        // (`process_exit_cleanup`); re-read those files INTO this (parent's) sysmem
+        // so a subsequent guest load of a shared page sees the child's stores.
+        // bhyve copies file→private sysmem (it can't back a guest segment with a
+        // host fd), so without this re-read the parent reads its own stale private
+        // copy. A `waitpid` return is a process-exit happens-before barrier, so the
+        // file read is a consistent snapshot. KVM/HVF need nothing (their alias IS
+        // a host `MAP_SHARED` of the file). Best-effort: a transient map_gpa/pread
+        // failure leaves that one alias as stale as before — never fatal.
+        for (gpa, fd, offset, read_len) in self.ram.shm_aliases_for_refresh() {
+            if read_len == 0 {
+                continue;
+            }
+            let Some(host) = self.vm.map_gpa(gpa, read_len) else {
+                continue;
+            };
+            // SAFETY: map_gpa proved `[gpa, gpa+read_len)` is live sysmem; we read
+            // the file into it via pread. The reaped child has exited, so the file
+            // holds its final stores.
+            let n = unsafe { libc::pread(fd, host as *mut libc::c_void, read_len, offset) };
+            let _ = n;
+        }
     }
 
     fn execve_rebuild(

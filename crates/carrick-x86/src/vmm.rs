@@ -469,6 +469,18 @@ pub trait X86Vmm: Sized {
     /// called when [`Self::prepare_vfork_share`] returned `true`. Default no-op.
     fn finish_vfork_parent(&mut self) {}
 
+    /// Called by the engine right after a `wait4`/`waitid` completes (the parent
+    /// has reaped a child). A backend whose guest `MAP_SHARED` file mappings are
+    /// genuinely fork-coherent (KVM/HVF: the alias IS a host `MAP_SHARED` of the
+    /// file) needs nothing here — the default is a no-op. bhyve CANNOT share guest
+    /// physical RAM across the parent/child VM split (kernel-owned, non-COW
+    /// sysmem), so it copies file→private sysmem and uses the shared inode as the
+    /// cross-process medium: the child flushes its stores to the file on exit, and
+    /// the parent must re-read the file into its own sysmem HERE (a `waitpid`
+    /// return is a process-exit happens-before barrier, so the read is a
+    /// consistent snapshot of the reaped child's writes).
+    fn refresh_shared_after_wait(&mut self) {}
+
     /// Restore a generic x86 vCPU snapshot onto a backend vCPU. The default
     /// uses the shared trait-level register writers; backends with stricter
     /// ioctl grouping requirements can override while keeping the x86 snapshot
