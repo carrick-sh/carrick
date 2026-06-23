@@ -266,8 +266,13 @@ where
         }
 
         // Publish the arena high-water so the child snapshot's mincore scan is
-        // bounded to the guest's used prefix, not all 32 GiB.
-        crate::trap::set_guest_arena_high_water(kernel.dispatcher.mmap_arena_high_water());
+        // bounded to the guest's used prefix, not all 32 GiB. The HVF child
+        // snapshot reads the process-global (trap::set_guest_arena_high_water); a
+        // shared-VM backend (KVM vfork) reads it off the engine via the hook (a
+        // no-op elsewhere) so its per-window residency scan is bounded too.
+        let arena_high_water = kernel.dispatcher.mmap_arena_high_water();
+        crate::trap::set_guest_arena_high_water(arena_high_water);
+        engine.set_vfork_arena_high_water(arena_high_water);
         // vfork: an inherited pipe to SUSPEND the parent until the child
         // execve/_exit. Created BEFORE the fork so BOTH processes inherit BOTH
         // ends; these are host fds (NOT in the guest fd table). On a pipe() failure
@@ -428,6 +433,14 @@ where
                         // EINTR → re-poll on the remaining budget.
                     }
                     unsafe { libc::close(vf_read) };
+                    // The child has now execve'd or exited, so the shared window is
+                    // quiescent. Reconcile the child's shared-VM writes back into
+                    // the parent's address space and release the share (KVM's shadow
+                    // copy-back; a no-op for backends that shared the RAM directly).
+                    // Safe to do unconditionally: a non-vfork-shared backend's hook
+                    // is a no-op, and on the pipe-failure degrade path nothing was
+                    // armed.
+                    engine.finish_vfork_parent();
                     // The vfork child shared the parent's guest RAM until it
                     // execve'd or exited. Its child-side identity stamp therefore
                     // overwrote the shared EL1 shim identity page; restore the

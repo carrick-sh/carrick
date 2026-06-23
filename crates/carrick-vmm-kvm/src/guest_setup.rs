@@ -94,6 +94,50 @@ fn align_up_slot(addr: u64) -> Result<u64, OsError> {
         .ok_or_else(|| OsError::new(format!("kvm: region end 0x{addr:x} overflows on align")))
 }
 
+/// Copy ONLY the RESIDENT pages of `[src, src+scan)` into `dst` (which must back
+/// `total` >= `scan` bytes). Used by the `vfork(2)` shadow seed + copy-back so a
+/// multi-GB window doesn't fault in every untouched page (the OOM-`SIGKILL` a
+/// naive `memcpy` causes). `mincore` reports which of `src`'s pages are resident
+/// WITHOUT committing them; non-resident pages are left untouched in `dst` (lazily
+/// zero under `MAP_NORESERVE` — correct, since the parent never touched them
+/// either). On `mincore` failure, fall back to copying the bounded `scan` prefix
+/// in full (correct, just less sparse). Mirrors HVF's `clone_region_for_child`.
+fn copy_resident_pages(src: *const u8, dst: *mut u8, scan: usize, total: usize) {
+    if scan == 0 {
+        return;
+    }
+    let page = {
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if p <= 0 { 4096usize } else { p as usize }
+    };
+    let n_pages = scan.div_ceil(page);
+    let mut resident = vec![0u8; n_pages];
+    // Linux `mincore` vec arg is `*mut c_uchar` (u8); resident[] is u8.
+    let rc = unsafe {
+        libc::mincore(
+            src as *mut libc::c_void,
+            scan,
+            resident.as_mut_ptr() as *mut libc::c_uchar,
+        )
+    };
+    if rc != 0 {
+        // mincore failed — copy the bounded prefix in full (still bounded by
+        // `scan`, so the arena's used-prefix bound keeps this from OOMing).
+        // SAFETY: `src`/`dst` each back at least `total` >= `scan` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, scan.min(total)) };
+        return;
+    }
+    for (i, &flag) in resident.iter().enumerate() {
+        if flag & 1 != 0 {
+            let off = i * page;
+            let len = page.min(total - off);
+            // SAFETY: `off + len <= total`; both pointers back `total` bytes and
+            // the mappings are distinct (non-overlapping).
+            unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst.add(off), len) };
+        }
+    }
+}
+
 // The aarch64 vector table layout (matches carrick-mem's el1_vectors_bytes):
 // 16 slots * 0x80 bytes; the lower-EL synchronous slot is at offset 0x400.
 const AARCH64_VECTOR_SLOT_SIZE: u64 = 0x80;
@@ -727,6 +771,162 @@ impl GuestRam {
         Ok((vm, vcpu))
     }
 
+    /// `vfork(2)` (`CLONE_VM|CLONE_VFORK`) PARENT, PRE-`libc::fork` half.
+    ///
+    /// A `Private` (COW) window is NOT shared across `fork(2)` — the child's guest
+    /// writes land in its own copy, invisible to the suspended parent, so the
+    /// CLONE_VM "writes visible to the parent" contract breaks (the `vforkvmshare`
+    /// gap). HVF gets sharing for free because its guest RAM is host-`MAP_SHARED`;
+    /// KVM's is host-`MAP_PRIVATE` (deliberate, so an ordinary fork COWs for free).
+    ///
+    /// Bridge the two WITHOUT making the parent's long-lived RAM shared (which
+    /// would break the parent's NEXT ordinary fork): for every `Private` window
+    /// allocate a `MAP_SHARED|MAP_ANONYMOUS` SHADOW of the same length, seed it
+    /// with the window's current contents, and return the shadow list. The CHILD
+    /// re-registers its KVM slots over the shadows ([`Self::rebuild_vm_for_child_vfork`]),
+    /// so the child's guest writes hit the shared shadow; the parent — SUSPENDED
+    /// for the whole vfork window — copies the shadow back into its private window
+    /// on resume ([`Self::finish_vfork_parent`]), making the child's writes visible.
+    ///
+    /// `Shared` windows (the futex aperture, file aliases) already survive fork
+    /// coherently, so they carry NO shadow (the child maps the inherited host page
+    /// as-is, exactly like an ordinary fork).
+    ///
+    /// NOTE on page tables: HVF keeps the stage-1 page-table BACKING private even
+    /// for a vfork child (defense-in-depth against a pre-execve child PT edit
+    /// corrupting the suspended parent). On the x86 KVM layout the PML4/CR3 backing
+    /// is FUSED into the low identity window (trampoline + GDT + PML4 + low image),
+    /// so it cannot be excluded without splitting that window. This is sound for a
+    /// LEGAL vfork-for-exec child — the only thing it may do is `execve`/`_exit`,
+    /// neither of which edits page tables (execve rebuilds a fresh VM + tables),
+    /// and the parent is SUSPENDED for the whole window — exactly the Go `os/exec`
+    /// / glibc `posix_spawn` shape this targets.
+    ///
+    /// `arena_high_water` is the guest's mmap-arena high-water (the runtime
+    /// publishes it pre-fork). The seed copy is **mincore-gated**: only RESIDENT
+    /// pages are copied into the shadow (the rest stay lazily zero under
+    /// `MAP_NORESERVE`), and the residency scan over the 32 GiB arena window is
+    /// bounded to `[LINUX_MMAP_BASE, arena_high_water)`. A naive full-window memcpy
+    /// would FAULT IN every byte of every window — committing the whole multi-GB
+    /// arena → OOM-`SIGKILL` (the exact failure this gates against). This mirrors
+    /// the HVF child-snapshot `clone_region_for_child`.
+    pub(crate) fn prepare_vfork_shadows(
+        &self,
+        arena_high_water: u64,
+    ) -> Result<VforkShadows, OsError> {
+        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+        let mut shadows = Vec::new();
+        for w in windows.iter() {
+            if w.kind != WindowKind::Private {
+                continue;
+            }
+            // SAFETY: anonymous MAP_SHARED mapping we own for the vfork window; the
+            // child maps over it and the parent munmaps it in finish_vfork_parent.
+            let shadow = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    w.len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if shadow == libc::MAP_FAILED {
+                // Roll back the shadows already mapped, then signal failure so the
+                // caller degrades to a plain (non-suspending) fork rather than
+                // sharing nothing.
+                for s in &shadows {
+                    let s: &VforkShadow = s;
+                    unsafe { libc::munmap(s.shadow as *mut libc::c_void, s.len) };
+                }
+                return Err(OsError::new(format!(
+                    "kvm: vfork shadow mmap failed for window 0x{:x}+{}",
+                    w.base, w.len
+                )));
+            }
+            // Seed the shadow with the window's RESIDENT contents (only) so the
+            // child sees the parent's pre-fork state without committing untouched
+            // arena/heap/stack pages. The arena window's scan is bounded to the
+            // used prefix; other windows scan in full (they are small).
+            let scan = if w.base == carrick_mem::memory::LINUX_MMAP_BASE {
+                arena_high_water
+                    .saturating_sub(w.base)
+                    .min(w.len as u64)
+                    .try_into()
+                    .unwrap_or(w.len)
+            } else {
+                w.len
+            };
+            copy_resident_pages(w.host as *const u8, shadow as *mut u8, scan, w.len);
+            shadows.push(VforkShadow {
+                base: w.base,
+                slot_gpa: w.slot_gpa,
+                private_host: w.host,
+                shadow: shadow as usize,
+                len: w.len,
+            });
+        }
+        Ok(VforkShadows { shadows })
+    }
+
+    /// `vfork(2)` CHILD, POST-`libc::fork` half: rebuild a fresh `KvmVm` + `KvmVcpu`
+    /// like [`Self::rebuild_vm_for_child`], but register every `Private` window's
+    /// KVM slot over its SHARED SHADOW (so the child's guest writes are visible to
+    /// the parent), and re-point the window's `host` at the shadow so the child's
+    /// syscall-buffer `read`/`write`/`host_ptr` see the same shared bytes. `Shared`
+    /// windows keep their inherited host page (already fork-coherent). The shadows
+    /// are owned by the parent's `VforkShadows`; the child must NOT munmap them —
+    /// it detaches on execve (a fresh VM) or `_exit` (process death).
+    pub(crate) fn rebuild_vm_for_child_vfork(
+        &self,
+        shadows: &VforkShadows,
+    ) -> Result<(KvmVm, KvmVcpu), OsError> {
+        let mut vm = KvmVm::create_empty()?;
+        let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
+        for w in windows.iter_mut() {
+            // A Private window registers over its shadow (shared with the parent);
+            // a Shared window keeps the inherited host page (already coherent).
+            let host = shadows
+                .shadow_for(w.base, w.slot_gpa)
+                .inspect(|&s| w.host = s)
+                .unwrap_or(w.host);
+            vm.map_memory(
+                w.slot_gpa.unwrap_or(w.base),
+                host as *mut u8,
+                w.len,
+                MemPerms::ReadWriteExec,
+            )?;
+        }
+        drop(windows);
+        let vcpu = vm.add_vcpu()?;
+        Ok((vm, vcpu))
+    }
+
+    /// `vfork(2)` PARENT, on RESUME (the child has execve'd or `_exit`ed, so the
+    /// shared window is quiescent — the parent was suspended for the whole window).
+    /// Copy each shadow's RESIDENT pages back into the parent's private window, so
+    /// the child's shared writes become visible to the parent (CLONE_VM), then
+    /// release the shadows. The copy-back is mincore-gated for the same reason the
+    /// seed is: only pages the child actually touched (made resident in the shared
+    /// shadow) are copied — a full copy-back would fault in every untouched arena
+    /// page in the PARENT, re-introducing the OOM. Idempotent against an empty
+    /// `VforkShadows` (pipe-failure degrade path).
+    pub(crate) fn finish_vfork_parent(&self, shadows: VforkShadows) {
+        for s in &shadows.shadows {
+            // Copy back only the shadow's resident pages (what the child wrote).
+            copy_resident_pages(
+                s.shadow as *const u8,
+                s.private_host as *mut u8,
+                s.len,
+                s.len,
+            );
+            // SAFETY: `shadow` is the mapping we created in prepare_vfork_shadows;
+            // it is unmapped exactly once here (the child never owned/freed it).
+            unsafe { libc::munmap(s.shadow as *mut libc::c_void, s.len) };
+        }
+    }
+
     /// Read `len` bytes of LIVE guest memory at guest-physical `gpa` (so guest
     /// writes are visible). `gpa` must lie wholly within one backed window — e.g.
     /// a `write(2)` buffer the guest passed in `x1`.
@@ -1008,6 +1208,41 @@ pub(crate) struct WindowDesc {
     /// Alias windows: the KVM-slot GPA (differs from `base`). `None` for ordinary
     /// identity windows.
     pub slot_gpa: Option<u64>,
+}
+
+/// One `Private` window's `vfork(2)` SHARED SHADOW (see
+/// [`GuestRam::prepare_vfork_shadows`]). `private_host` is the parent's
+/// (COW-private) window backing; `shadow` is the `MAP_SHARED` mapping the child
+/// registers its KVM slot over. The window is identified by `(base, slot_gpa)`
+/// (the same key the rebuild registration uses).
+pub(crate) struct VforkShadow {
+    base: u64,
+    slot_gpa: Option<u64>,
+    private_host: usize,
+    shadow: usize,
+    len: usize,
+}
+
+/// The set of `vfork(2)` shadows a vfork parent prepared pre-`libc::fork`. Carried
+/// across the fork (the child consults it in `rebuild_vm_for_child_vfork`; the
+/// parent reconciles + releases it in `finish_vfork_parent`).
+pub(crate) struct VforkShadows {
+    shadows: Vec<VforkShadow>,
+}
+
+impl VforkShadows {
+    /// Whether any window has a shadow (false on the pipe-failure degrade path).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.shadows.is_empty()
+    }
+
+    /// The shadow host pointer for the window keyed by `(base, slot_gpa)`, if any.
+    fn shadow_for(&self, base: u64, slot_gpa: Option<u64>) -> Option<usize> {
+        self.shadows
+            .iter()
+            .find(|s| s.base == base && s.slot_gpa == slot_gpa)
+            .map(|s| s.shadow)
+    }
 }
 
 /// How [`GuestRam::add_alias`] backs a dynamic alias mapping's host memory.

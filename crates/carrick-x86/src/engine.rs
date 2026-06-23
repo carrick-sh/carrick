@@ -967,7 +967,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
     }
 
     fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        crate::engine::fork_x86(self)
+        crate::engine::fork_x86(self, false)
     }
 
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
@@ -1076,7 +1076,10 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
 ///     valid in the fork child (KVM), then the generic engine re-seeds the vCPU.
 ///   - `EagerCopy` (bhyve): freeze the segment, rebuild a fresh named child VM
 ///     from it (`freeze_ram` / `rebuild_child_vm`), then re-seed.
-fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, TrapError> {
+fn fork_x86<V: X86Vmm>(
+    engine: &mut X86EngineCore<V>,
+    vfork: bool,
+) -> Result<ForkOutcome, TrapError> {
     use crate::vmm::ForkRamStrategy;
 
     // Snapshot the parent vCPU BEFORE forking (suspended at the trap — atomic).
@@ -1088,6 +1091,17 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     let frozen = match strategy {
         ForkRamStrategy::EagerCopy => engine.vm.freeze_ram()?,
         ForkRamStrategy::Cow => Vec::new(),
+    };
+
+    // vfork (CLONE_VM|CLONE_VFORK): arm the shared-VM path PRE-fork so the child
+    // shares the parent's address space. A backend without a shared-VM path (or
+    // one whose RAM is already fork-shared) leaves this `false` and the vfork
+    // degrades to a plain CoW fork (still correct — the runtime keeps the parent
+    // suspended; only the share is absent). On KVM this allocates shared shadows.
+    let shared = if vfork {
+        engine.vm.prepare_vfork_share()?
+    } else {
+        false
     };
 
     // Real host fork. The run loop quiesces other threads around a guest fork;
@@ -1109,9 +1123,16 @@ fn fork_x86<V: X86Vmm>(engine: &mut X86EngineCore<V>) -> Result<ForkOutcome, Tra
     // is an independent copy of the parent's at fork time (the shared-Arc contract
     // only matters for CLONE_THREAD siblings inside ONE process). Do NOT "fix" this
     // by re-snapshotting — that would double-copy.
-    engine
-        .vm
-        .rebuild_child_after_fork(&mut engine.vcpu, &frozen)?;
+    if shared {
+        // vfork shared: register the child's slots over the parent's shared shadows.
+        engine
+            .vm
+            .rebuild_child_after_fork_vfork(&mut engine.vcpu, &frozen)?;
+    } else {
+        engine
+            .vm
+            .rebuild_child_after_fork(&mut engine.vcpu, &frozen)?;
+    }
     let layout = engine.layout;
     let child_snap = bringup_fns::seed_entry(&snap, GuestEntryRegs::default());
     engine
@@ -1180,7 +1201,15 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
     }
 
     fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
-        crate::engine::fork_x86(self)
+        crate::engine::fork_x86(self, true)
+    }
+
+    fn set_vfork_arena_high_water(&mut self, high_water: u64) {
+        self.vm.set_vfork_arena_high_water(high_water);
+    }
+
+    fn finish_vfork_parent(&mut self) {
+        self.vm.finish_vfork_parent();
     }
 
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {
