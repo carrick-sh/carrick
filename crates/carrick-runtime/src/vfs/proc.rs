@@ -2104,6 +2104,20 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
     } else {
         info.comm.clone()
     };
+    // Prefer the guest's TRUE published run-state over the host vCPU-thread's
+    // scheduler state. The host park is `S`/`D` (`do_sys_poll`) for BOTH a guest
+    // genuinely blocked in pause()/futex AND a freshly-forked child still in its
+    // post-fork runtime boot (before any guest code) — host-indistinguishable —
+    // so trusting the host state reports a booting child as Sleeping/uninterruptible,
+    // ~45 ms too early (the pauseinterrupt2 bug; the KVM boot ppoll shows host `D`).
+    // The publisher knows whether the guest is genuinely blocked, so its state wins
+    // for any LIVE host state (`R`/`S`/`D`). Only the terminal/job-control states
+    // the publisher never reports — zombie (`Z`) and stopped (`T`) — stay with the
+    // host kernel (a dead/stopped process has no fresh publish to trust).
+    let state = match info.state {
+        'Z' | 'T' => info.state,
+        _ => crate::run_state::published_stat_char(host_pid).unwrap_or(info.state),
+    };
     // Display pids are ns-local: the requested ns-pid for self, and the
     // ns-translation of the host ppid/pgid (0 / reparent handled by the
     // translation). When ns is off these are the raw host values.
@@ -2121,9 +2135,9 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         // Another guest process: we don't track its thread registry, so report
         // a single thread (num_threads=1). The multi-threaded-fork warning only
         // reads the caller's OWN /proc/self/stat, which uses the live count.
-        "stat" => Some(
-            proc_stat_line(pid, &comm, info.state, disp_ppid, disp_pgid, disp_pgid, 1).into_bytes(),
-        ),
+        "stat" => {
+            Some(proc_stat_line(pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1).into_bytes())
+        }
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
             let mut b = comm.clone().into_bytes();
@@ -2141,8 +2155,8 @@ TracerPid:\t0\n\
 Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
 Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
 Threads:\t1\n",
-                state = info.state,
-                state_long = proc_state_long(info.state),
+                state = state,
+                state_long = proc_state_long(state),
                 ppid = disp_ppid,
                 // Report the modeled container credentials, NOT the macOS host
                 // uid/gid (501/20) `host_proc` reads — a sibling guest process
