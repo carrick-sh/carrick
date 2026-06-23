@@ -1,0 +1,11 @@
+726785bfb5e0faf2
+prctl_initial_dumpable_is_one=true
+prctl_set_zero_ok=true
+prctl_get_after_zero_is_zero=true
+prctl_set_one_ok=true
+prctl_get_after_one_is_one=true
+prctl_set_two_rc=-1
+prctl_set_two_errno=22
+prctl_get_after_two=1
+prctl_set_invalid_rc_is_neg_one=true
+prctl_set_invalid_errno_is_einval=true

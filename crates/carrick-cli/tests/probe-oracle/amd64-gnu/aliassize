@@ -1,0 +1,11 @@
+0cd07dd01ec26e90
+hi512g_fixed_ok=true
+hi4g_fixed_ok=true
+ro16k_mmap_ok=true
+rw16k_mmap_ok=true
+rw16k_writeback_ok=true
+ro32k_mmap_ok=true
+rw32k_mmap_ok=true
+rw32k_writeback_ok=true
+ro27k_mmap_ok=true
+ro27k_rdonlyfd_mmap_ok=true

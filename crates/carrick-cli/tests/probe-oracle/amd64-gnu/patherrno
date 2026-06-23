@@ -1,0 +1,8 @@
+a90262acad6fe7be
+toolong_rc_neg_one=true
+toolong_errno_enametoolong=true
+notdir_rc_neg_one=true
+notdir_errno_enotdir=true
+mkdir_toolong_rc_neg_one=true
+mkdir_toolong_errno=true
+valid_stat_ok=true

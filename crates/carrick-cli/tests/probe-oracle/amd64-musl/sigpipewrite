@@ -1,0 +1,5 @@
+452c4a69ca15a8e7
+write_broken_pipe_epipe=true
+sigpipe_delivered_once=true
+ignored_still_epipe=true
+ignored_no_handler=true

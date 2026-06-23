@@ -1,0 +1,11 @@
+a4f4cd7522c86846
+close0_ok=true
+fstat0_ebadf=true
+getfl0_ebadf=true
+getfd0_ebadf=true
+isatty0_false=true
+dup0_ebadf=true
+lseek0_ebadf=true
+read0_ebadf=true
+devnull_reuses_fd0=true
+devnull_is_chardev=true

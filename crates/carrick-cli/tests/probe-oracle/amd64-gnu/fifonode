@@ -1,0 +1,14 @@
+d31fcc63f8b56b7a
+mknod_fifo_ok=true
+stat_ok=true
+stat_is_fifo=true
+stat_mode_0644=true
+open_rdwr_ok=true
+writable_when_empty=true
+readable_when_empty=false
+write_ok=true
+readable_after_write=true
+select_rdwr_returns_2=true
+read_ok=true
+open_rdonly_nonblock_ok=true
+mknod_ifmt_einval=true

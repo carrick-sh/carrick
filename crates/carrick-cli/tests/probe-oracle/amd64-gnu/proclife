@@ -1,0 +1,8 @@
+ef07e3c23289b167
+exit_normal reaped_match=true ifexited=true exitstatus=42 ifsignaled=false
+exit_signalled reaped_match=true ifsignaled=true termsig=15 ifexited=false
+execve_true ifexited=true exitstatus_match=true
+execve_false ifexited=true exitstatus_match=true
+wnohang first_zero=true final_match=true exitstatus=7
+pgroup pgrp_pos=true leads_own_group=true
+session sid_pos=true setsid_failed_eperm=true

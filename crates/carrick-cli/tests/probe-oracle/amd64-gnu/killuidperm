@@ -1,0 +1,5 @@
+67b749a01d35cbf2
+root_to_other_uid_allowed=true
+cross_uid_nonroot_kill_rc_neg_one=true
+cross_uid_nonroot_kill_errno_eperm=true
+same_uid_nonroot_kill_allowed=true

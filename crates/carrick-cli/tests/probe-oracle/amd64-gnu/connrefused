@@ -1,0 +1,6 @@
+f7b133a29b12c641
+connect_einprogress=true
+select_write_ready=true
+poll_hup_or_err=true
+getsockopt_ok=true
+so_error_is_econnrefused=true

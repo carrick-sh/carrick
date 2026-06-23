@@ -1,0 +1,8 @@
+84121df12277c438
+msgget_ok=true
+send_recv_roundtrip=true
+qnum_after_send_is_1=true
+qnum_after_recv_is_0=true
+type_selective_recv=true
+xprocess_send_recv=true
+ipc_rmid_ok=true

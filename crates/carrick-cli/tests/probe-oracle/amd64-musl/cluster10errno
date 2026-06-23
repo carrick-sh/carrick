@@ -1,0 +1,10 @@
+32fe90dedb7358f2
+pidfd_open_ok=true
+pidfd_cloexec=true
+fadvise_bad_advice_einval=true
+fadvise_pipe_espipe=false
+ftruncate_ro_einval=true
+ftruncate_ro_not_ebadf=true
+fdatasync_devnull_einval=true
+fdatasync_badfd_ebadf=true
+fdatasync_regular_ok=true

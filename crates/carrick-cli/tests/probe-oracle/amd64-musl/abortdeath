@@ -1,0 +1,10 @@
+b4b759f1dd562d6b
+sigterm_kills_child=true
+sigterm_wtermsig_matches=true
+sigkill_kills_child=true
+sigkill_wtermsig_matches=true
+abort_sigabrts_child=true
+abort_wtermsig_matches=true
+clean_exit_no_signal=true
+clean_exit_wifexited=true
+clean_exit_status_zero=true

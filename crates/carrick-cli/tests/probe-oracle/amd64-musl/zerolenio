@@ -1,0 +1,6 @@
+9df185cd0e9ccb47
+open_ok=true
+pwrite_null_zero_returns_0=true
+write_null_zero_returns_0=true
+pwritev_with_null_seg_returns_4=true
+readback_ok=true

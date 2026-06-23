@@ -1,0 +1,15 @@
+37afe7bb7ef93d03
+pipe2_read=ping
+pipe2_eof=true
+dup_roundtrip=true
+dup3_same_einval=true
+lseek_read=34
+lseek_end=10
+pread=XY
+pread_offset_unchanged=true
+fcntl_accmode=1
+fcntl_cloexec_initial=false
+fcntl_cloexec_set=true
+o_append=one|two|
+ftruncate=abc
+readv=ABCD

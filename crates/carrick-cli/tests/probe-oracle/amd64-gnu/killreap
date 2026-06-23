@@ -1,0 +1,5 @@
+cb6eb0c1a89a5b85
+sigterm_reaped=true
+sigterm_wifsignaled=true
+sigkill_reaped=true
+sigkill_wifsignaled=true

@@ -1,0 +1,9 @@
+30105f0b66228905
+setlk_bad_whence_einval=true
+setlk_bad_ptr_efault=true
+parent_write_lock_ok=true
+child_conflict_blocked=true
+child_getlk_sees_conflict=true
+child_getlk_free_unlck=true
+parent_unlock_ok=true
+child_relock_after_unlock_ok=true

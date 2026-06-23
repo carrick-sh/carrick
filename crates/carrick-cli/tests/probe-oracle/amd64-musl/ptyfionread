@@ -1,0 +1,7 @@
+912351d02e605a0a
+setup_ok=true
+slave_isatty=true
+poll_readable=true
+fionread_rc_zero=true
+fionread_positive=true
+drain_matches=true

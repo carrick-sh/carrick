@@ -1,0 +1,10 @@
+80867a853f0d3c40
+parent_handler_ok=true
+fork_ok=true
+child_sleeping=true
+send_sigint_ok=true
+parent_did_not_get_child_sigint=true
+child_reaped=true
+child_exited=true
+child_exit_zero=true
+child_not_signaled=true

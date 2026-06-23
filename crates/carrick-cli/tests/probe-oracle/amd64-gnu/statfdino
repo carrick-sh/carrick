@@ -1,0 +1,7 @@
+6402d06b08b21fbd
+dir_samestat=true
+dir_isdir_both=true
+file_samestat=true
+symlink_lstat_islnk=true
+symlink_stat_isreg=true
+symlink_distinct_from_target=true

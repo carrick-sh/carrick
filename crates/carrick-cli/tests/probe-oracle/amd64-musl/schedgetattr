@@ -1,0 +1,8 @@
+9e62b3bcf17a0ce6
+getattr_self_ok=true
+getattr_size_48=true
+getattr_policy_sched_other=true
+getattr_null_einval=true
+getattr_small_size_einval=true
+getattr_bad_flags_einval=true
+getattr_bad_pid_esrch=true

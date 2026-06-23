@@ -1,0 +1,7 @@
+a9330b8b27c8b85d
+shmget_ok=true
+shmat_ok=true
+rw_roundtrip_ok=true
+xproc_coherence_ok=true
+shmdt_ok=true
+shmctl_rmid_ok=true

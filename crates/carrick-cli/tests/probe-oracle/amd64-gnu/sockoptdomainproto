@@ -1,0 +1,6 @@
+9e0b303160401ceb
+unix_getsockopt_ok=true
+unix_domain_af_unix=true
+unix_protocol_zero=true
+inet_getsockopt_ok=true
+inet_domain_af_inet=true

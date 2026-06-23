@@ -1,0 +1,7 @@
+ba456b66b3887fbc
+setup_target_ok=true
+setup_sym_ok=true
+follow_rc_zero=true
+bogus_einval=false
+default_link_rc_zero=true
+nofollow_einval=false

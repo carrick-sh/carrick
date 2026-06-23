@@ -1,0 +1,4 @@
+d4a93caaf8370d73
+epoll_woke_on_writer_close=true
+reported_in_or_hup=true
+read_returns_eof=true

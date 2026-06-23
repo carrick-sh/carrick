@@ -1,0 +1,14 @@
+b6c2fdf25da57bd0
+fork_ok=true
+traceme_stop_reaped=true
+traceme_stopped=true
+traceme_stopsig=19
+traceme_stopsig_is_sigstop=true
+traceme_exited_before_stop=false
+traceme_early_exit_status=0
+ptrace_cont_ok=true
+ptrace_cont_errno=0
+ptrace_cont_errno_zero=true
+final_reaped=true
+final_exited=true
+final_exit_status_is_42=true

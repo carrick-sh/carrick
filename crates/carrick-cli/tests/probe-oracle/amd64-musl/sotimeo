@@ -1,0 +1,10 @@
+71be5de9cb94baa7
+setup_socketpair_ok=true
+dontwait_rc_minus_one=true
+dontwait_errno_eagain=true
+rcvtimeo_set_ok=true
+rcvtimeo_recv_rc_minus_one=true
+rcvtimeo_recv_errno_eagain=true
+rcvtimeo_watchdog_quiet=true
+ready_recv_n_two=true
+ready_recv_bytes_ok=true
