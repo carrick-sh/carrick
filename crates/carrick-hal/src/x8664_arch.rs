@@ -595,7 +595,10 @@ impl GuestArch for X8664GuestArch {
         let size = core::mem::size_of::<X8664Rtsigframe>();
         let bytes = engine
             .read_bytes(frame_sp, size)
-            .map_err(|e| TrapError::Hypervisor(format!("x86 sigframe read failed: {e}")))?;
+            // A bad guest RSP at rt_sigreturn makes this frame read fault — it is
+            // guest-reachable, so deliver a guest SIGSEGV (Linux force_sigsegv),
+            // never a fatal runtime abort. Mirrors inject_sigframe's write arm.
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
         let frame = X8664Rtsigframe::read_from_bytes(&bytes)
             .map_err(|_| TrapError::Hypervisor("x86 sigframe decode failed".into()))?;
 
@@ -612,9 +615,9 @@ impl GuestArch for X8664GuestArch {
         let rip = mc.rip;
         let top = rip >> 47;
         if top != 0 && top != 0x1_ffff {
-            return Err(TrapError::Hypervisor(format!(
-                "x86 rt_sigreturn: non-canonical resume RIP 0x{rip:x} (frame at 0x{frame_sp:x})"
-            )));
+            // Guest-controlled frame contents: a corrupt/forged rt_sigreturn
+            // frame is a guest fault (force_sigsegv), not a runtime abort.
+            return Err(TrapError::SignalDeliveryFault);
         }
 
         // Restore GPRs + RIP + RSP.

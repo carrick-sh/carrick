@@ -364,7 +364,10 @@ pub fn restore_sigframe<E: RegAccess + GuestMemory>(
     // we no longer require the private magic, which cannot survive Rosetta.
     let bytes = engine
         .read_bytes(sp, frame_size)
-        .map_err(|e| TrapError::Hypervisor(format!("sigframe read failed: {e}")))?;
+        // A bad guest SP at rt_sigreturn makes this frame read fault — it is
+        // guest-reachable, so deliver a guest SIGSEGV (force_sigsegv), not a
+        // fatal runtime abort. Mirrors build_sigframe's write arm.
+        .map_err(|_| TrapError::SignalDeliveryFault)?;
     let frame = carrick_abi::CarrickSigframe::read_from_bytes(&bytes)
         .map_err(|_| TrapError::Hypervisor("sigframe decode failed".to_string()))?;
     let magic = frame.magic;
@@ -383,9 +386,10 @@ pub fn restore_sigframe<E: RegAccess + GuestMemory>(
     // frame legitimately lacks.
     let resume_pstate = mcontext.pstate;
     if resume_pstate & 0b1111 != 0 {
-        return Err(TrapError::Hypervisor(format!(
-            "rt_sigreturn: frame at SP_EL0=0x{sp:x} has non-EL0 PSTATE 0x{resume_pstate:x} (magic 0x{magic:x})"
-        )));
+        // Guest-controlled frame: a corrupt/forged resume PSTATE (rt_sigreturn
+        // outside a handler, or a bad SP) is a guest fault (force_sigsegv), not
+        // a runtime abort.
+        return Err(TrapError::SignalDeliveryFault);
     }
     let saved_x = mcontext.regs;
     for (i, value) in saved_x.iter().enumerate() {
