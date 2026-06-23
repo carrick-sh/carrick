@@ -473,6 +473,21 @@ impl X86Vcpu for BhyveX86Vcpu {
         Ok(())
     }
 
+    /// Restore ring-3 user segments on the LIVE vCPU (fault/signal RESUME paths).
+    /// The shared default goes through `set_segment`, which is the no-op above, so
+    /// bhyve OVERRIDES it to program the selectors + hidden descriptors directly
+    /// (`vm_set_register`/`vm_set_desc`). This is the legitimate counterpart to the
+    /// fork/clone `set_segment` no-op: the fork/clone iretq bring-up must NOT touch
+    /// the live segments, but a synchronous-fault/`rt_sigreturn` resume MUST, or
+    /// the resumed user code runs supervisor (and the next fault, saved CS=ring-0,
+    /// trips the ring-0 fault guard → fatal). Without this, a Rust binary whose std
+    /// SIGSEGV handler returns into a still-faulting instruction (mmap NX violation,
+    /// unmapped mremap tail) re-runs that instruction in ring-0 instead of taking
+    /// the clean default-disposition SIGSEGV.
+    fn restore_user_segments(&mut self) -> Result<(), TrapError> {
+        self.restore_ring3_segments()
+    }
+
     fn get_fs_base(&self) -> Result<u64, TrapError> {
         // FS.base is VT-x hidden descriptor state: read via vm_get_desc (the
         // base field), NOT vm_get_register (which returns EINVAL on the base).
@@ -982,13 +997,17 @@ impl BhyveVmm {
             })?;
             // SAFETY: `host` is live sysmem of `span` bytes — zero the new anon pages.
             unsafe { std::ptr::write_bytes(host, 0, span) };
+            // exec=true: this is the SYSCALL-access backing path (carrick reading/
+            // writing guest mem), coalescing runs that may span reservations of
+            // mixed prot — it maps RWX so carrick can always touch the page. The
+            // GUEST's own execution permission (W^X / NX) is set independently by
+            // the `#PF` `demand_commit` path, which honours the reservation's exec.
             self.with_live_pml4(|mgr| {
-                mgr.map_aliased(page, gpa, span as u64, true).map_err(|_| {
-                    MemoryError::OutOfBounds {
+                mgr.map_aliased(page, gpa, span as u64, true, true)
+                    .map_err(|_| MemoryError::OutOfBounds {
                         address: page,
                         length: span,
-                    }
-                })?;
+                    })?;
                 Ok(true)
             })?;
             self.ram.drop_reservation(page, span);
@@ -1081,52 +1100,61 @@ impl X86Vmm for BhyveVmm {
         // #PF path (`demand_commit`) backs one page on first touch, re-running
         // the faulting instruction. Only VAs already backed by a window (the
         // eager kernel/ELF/stack regions, or an already-committed page) take the
-        // real page-table edit below. The reservation REMEMBERS the requested
-        // PROT_WRITE: a read-only (PROT_READ) page commits a present-but-read-only
-        // leaf, so a guest store to it re-faults with PFEC.P=1 and the engine
-        // delivers SIGSEGV/SEGV_ACCERR — instead of the store silently succeeding.
-        if self.host_ptr(address, 1).is_none() {
-            let writable = LinuxProtFlags::from_bits_truncate(prot).contains(LinuxProtFlags::WRITE);
-            self.ram.reserve(address, len, writable);
-            return Ok(());
-        }
-        let host = self
-            .vm
-            .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
-            .ok_or_else(|| {
-                MemoryError::HostMap(format!(
-                    "bhyve-x86: PML4 map_gpa 0x{X86_PML4_GPA:x} unmapped"
-                ))
-            })?;
-        let mut tables = vec![0u8; X86_PML4_CAPACITY];
-        // SAFETY: map_gpa proved the live PML4 table window is mapped.
-        unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
+        // real page-table edit. The reservation REMEMBERS the requested protection
+        // (PROT_WRITE → an RW leaf, !PROT_WRITE → a present-but-read-only leaf so a
+        // store re-faults SEGV_ACCERR; !PROT_EXEC → an NX leaf so a fetch faults).
+        //
+        // A range can be PARTIALLY backed: e.g. mremap-MOVE copies `old_size` bytes
+        // to a fresh destination (which commits only those pages via `write_bytes`/
+        // `commit_range`), then `protect_range`s the FULL `new_size`. The leading
+        // copied pages are backed (need a PML4 edit) while the grown tail is not
+        // (needs a reservation). The old all-or-nothing decision keyed on page 0
+        // alone took the edit branch and `set_rw` failed on the first uncommitted
+        // tail page → spurious ENOMEM (the bhyve mremap-grow gap). So split the
+        // range into maximal backed / unbacked runs and handle each correctly.
+        let flags = LinuxProtFlags::from_bits_truncate(prot);
+        let writable = flags.contains(LinuxProtFlags::WRITE);
+        let exec = flags.contains(LinuxProtFlags::EXEC);
 
-        let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
-        let prot = LinuxProtFlags::from_bits_truncate(prot);
-        let exec = prot.contains(LinuxProtFlags::EXEC);
-        let changed = if prot.is_empty() {
-            mgr.set_prot_none(address, len)
-        } else if prot.contains(LinuxProtFlags::WRITE) {
-            mgr.set_rw(address, len, exec)
-        } else {
-            mgr.set_readonly(address, len, exec)
-        }
-        .map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: len,
-        })?;
-        if !changed {
+        let start = address & !0xFFF;
+        let end = address.wrapping_add(len as u64).wrapping_add(0xFFF) & !0xFFF;
+        if end <= start {
             return Ok(());
         }
 
-        // SAFETY: the live table window and edited table image are both
-        // X86_PML4_CAPACITY bytes.
-        unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
-        self.h
-            .as_bhyve()
-            .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
-            .map_err(|e| MemoryError::HostMap(format!("bhyve-x86: reload CR3: {e}")))?;
+        let mut page = start;
+        while page < end {
+            let backed = self.host_ptr(page, 1).is_some();
+            // Extend a maximal run of pages with the SAME backing state.
+            let mut run_end = page + 0x1000;
+            while run_end < end && (self.host_ptr(run_end, 1).is_some() == backed) {
+                run_end += 0x1000;
+            }
+            let run_len = (run_end - page) as usize;
+            if backed {
+                // Edit the live PML4 leaves for the already-committed run (the
+                // shared locked copy-edit-copy + CR3 reload).
+                self.with_live_pml4(|mgr| {
+                    let changed = if flags.is_empty() {
+                        mgr.set_prot_none(page, run_len)
+                    } else if flags.contains(LinuxProtFlags::WRITE) {
+                        mgr.set_rw(page, run_len, exec)
+                    } else {
+                        mgr.set_readonly(page, run_len, exec)
+                    }
+                    .map_err(|_| MemoryError::OutOfBounds {
+                        address: page,
+                        length: run_len,
+                    })?;
+                    Ok(changed)
+                })?;
+            } else {
+                // Defer to the demand-commit path: record the reservation so the
+                // first touch commits the leaf with this protection.
+                self.ram.reserve(page, run_len, writable, exec);
+            }
+            page = run_end;
+        }
         Ok(())
     }
 
@@ -1144,7 +1172,11 @@ impl X86Vmm for BhyveVmm {
         {
             CommitOutcome::AlreadyMapped => Ok(true),
             CommitOutcome::NotReserved => Ok(false),
-            CommitOutcome::Committed { gpa, writable } => {
+            CommitOutcome::Committed {
+                gpa,
+                writable,
+                exec,
+            } => {
                 let host = self.vm.map_gpa(gpa, 4096).ok_or_else(|| {
                     MemoryError::HostMap(format!("bhyve demand_commit: map_gpa 0x{gpa:x} unmapped"))
                 })?;
@@ -1154,15 +1186,17 @@ impl X86Vmm for BhyveVmm {
                 // (PROT_READ) reservation commits a PRESENT but read-only leaf, so
                 // the guest WRITE that demand-faulted this page re-faults with
                 // PFEC.P=1 (not-present bit clear) — the shared engine then skips
-                // demand_commit and delivers SIGSEGV/SEGV_ACCERR. A writable
-                // reservation commits RW (the common anon-arena case).
+                // demand_commit and delivers SIGSEGV/SEGV_ACCERR. A non-exec
+                // (no PROT_EXEC) reservation commits an NX leaf, so a guest
+                // instruction FETCH re-faults (PFEC.P=1, I/D set) → SEGV_ACCERR
+                // (W^X). A writable+exec reservation commits RWX (the common
+                // anon-arena case).
                 self.with_live_pml4(|mgr| {
-                    mgr.map_aliased(page, gpa, 4096, writable).map_err(|_| {
-                        MemoryError::OutOfBounds {
+                    mgr.map_aliased(page, gpa, 4096, writable, exec)
+                        .map_err(|_| MemoryError::OutOfBounds {
                             address: page,
                             length: 4096,
-                        }
-                    })?;
+                        })?;
                     Ok(true)
                 })?;
                 Ok(true)
@@ -1321,7 +1355,9 @@ impl X86Vmm for BhyveVmm {
         // SAFETY: map_gpa proved the live PML4 window is mapped.
         unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
         let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
-        mgr.map_aliased(va, gpa, len, writable).map_err(|_| {
+        // exec=true: a MAP_SHARED file/anon host alias maps executable (the
+        // historical alias behaviour; shared-object text needs to execute).
+        mgr.map_aliased(va, gpa, len, writable, true).map_err(|_| {
             TrapError::Hypervisor(format!(
                 "bhyve map_host_alias: map_aliased va=0x{va:x} gpa=0x{gpa:x} len=0x{len:x}"
             ))

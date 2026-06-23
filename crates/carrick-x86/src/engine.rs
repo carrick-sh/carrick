@@ -1069,14 +1069,27 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         };
         <Self as ThreadedEngine>::Arch::build_sigframe(self, params)?;
         self.sysret_resume = None;
-        bringup_fns::program_user_segments(&mut self.vcpu)?;
+        // Re-enter ring-3 for the handler: a SYNCHRONOUS-fault signal arrives with
+        // the live CS possibly latched to ring-0 (the fault came through the guest
+        // IDT gate, or the Rust handler's own syscalls left the trampoline's kernel
+        // CS live). The backend hook restores DPL-3 CS/SS/DS/ES — a no-op-eliding
+        // `set_segment` (bhyve) overrides it to write the descriptors directly, so
+        // the handler does not run supervisor.
+        self.vcpu.restore_user_segments()?;
         Ok(())
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         let restored = <Self as ThreadedEngine>::Arch::restore_sigframe(self, true)?;
         self.sysret_resume = None;
-        bringup_fns::program_user_segments(&mut self.vcpu)?;
+        // `rt_sigreturn` resumes the INTERRUPTED user instruction; the handler that
+        // is returning ran its own syscalls, which (on bhyve) leave the live CS at
+        // the ring-0 syscall-trampoline selector. Restore ring-3 segments so the
+        // resumed instruction runs at DPL 3 — otherwise re-running a still-faulting
+        // instruction (a Rust handler returning to a genuine SIGSEGV site) faults
+        // with saved CS=ring-0 and trips the ring-0 fault guard → fatal engine error
+        // instead of the SIGSEGV the default disposition would deliver.
+        self.vcpu.restore_user_segments()?;
         Ok(restored.sigmask)
     }
 }

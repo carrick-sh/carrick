@@ -673,6 +673,30 @@ pub trait X86Vcpu {
     fn set_segment(&mut self, seg: X86Seg, base: u64, limit: u32, ar: u32)
     -> Result<(), TrapError>;
 
+    /// Reload the ring-3 user segment selectors + hidden descriptors on the LIVE
+    /// vCPU so a resume returns to user space (CS=DPL3/L, SS/DS/ES=DPL3, base=0,
+    /// 4 GiB flat) — exactly what an `iretq`/`sysretq` to user space would latch.
+    ///
+    /// Called on the synchronous-fault/signal RESUME paths ([`crate::fault`]
+    /// fault doorbell, `inject_signal`, `restore_from_sigframe`) where a guest #PF
+    /// taken through the IDT gate latched the ring-0 kernel CS into the live VMCS:
+    /// before the engine re-runs the faulting instruction (demand-commit), enters
+    /// a signal handler, or `rt_sigreturn`s back to the interrupted instruction,
+    /// the vCPU must be back in ring-3 or the resumed user code runs supervisor
+    /// (and the next fault, with saved CS=ring-0, trips the ring-0 fault guard →
+    /// fatal). The DEFAULT restores via [`crate::program_user_segments`]
+    /// (`set_segment`) — correct for KVM/NVMM, whose `set_segment` programs the
+    /// live hidden descriptors. bhyve's `set_segment` is an intentional no-op (the
+    /// fork/clone iretq-blocker), so it OVERRIDES this to write the selectors +
+    /// descriptors directly via `vm_set_register`/`vm_set_desc`.
+    fn restore_user_segments(&mut self) -> Result<(), TrapError> {
+        let segs = crate::long_mode_segment_state();
+        self.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
+        self.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
+        self.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
+        self.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)
+    }
+
     /// The `SegmentBaseRegs` mechanism (arch_prctl FS/GS base): KVM/NVMM via the
     /// segment struct, bhyve via `vm_get/set_desc(FS/GS.base)`.
     fn get_fs_base(&self) -> Result<u64, TrapError>;
