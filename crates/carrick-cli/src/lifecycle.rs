@@ -208,6 +208,13 @@ fn resolve_request_image(
     req: &carrick_engine::CliRunRequest,
     store: &carrick_image::ImageStore,
 ) -> anyhow::Result<carrick_image::ResolvedImage> {
+    // Reject an unrunnable `--platform` (e.g. amd64 on an Apple Silicon host with
+    // no Rosetta, or arm64 on x86_64) here in the foreground, so `create` / `run
+    // -d` fail to the user's terminal rather than in the detached log — and
+    // before pulling the image. `Engine::resolve` re-checks as the authoritative
+    // gate when the container is actually started.
+    carrick_engine::check_platform_runnable(carrick_engine::request_platform(req))
+        .map_err(anyhow::Error::msg)?;
     let image_ref = carrick_image::ImageReference::parse(&req.image_ref)?;
     let target = req
         .platform
@@ -391,6 +398,12 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
     state.persist()?;
 
     let req = rebuild_request_from_state(&state);
+    // Surface an unrunnable platform (e.g. an amd64 container on a host that
+    // lost Rosetta) here in the foreground, before forking the supervisor —
+    // `Engine::resolve`'s re-check otherwise fires inside the detached child,
+    // where its actionable message is swallowed to the container log.
+    carrick_engine::check_platform_runnable(carrick_engine::request_platform(&req))
+        .map_err(anyhow::Error::msg)?;
     let log = container::log_path(&id)?;
     // SAFETY: fork(2); single-threaded (no live tokio runtime).
     let pid = unsafe { libc::fork() };

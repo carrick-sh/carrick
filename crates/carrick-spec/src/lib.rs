@@ -248,17 +248,68 @@ pub enum PidMode {
 }
 
 /// The instruction-set architecture of the Linux container to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
-    /// AArch64 / arm64 — native on Apple Silicon. Default.
-    #[default]
+    /// AArch64 / arm64 — native on Apple Silicon and arm64 Linux hosts.
     Aarch64,
-    /// x86_64 / amd64 — translated via Apple Rosetta 2.
+    /// x86_64 / amd64 — native on x86_64 hosts (the KVM/bhyve/NVMM lanes); on
+    /// an aarch64 host it runs through Apple Rosetta 2 translation.
     Amd64,
 }
 
+/// How a guest [`Platform`] is executed on the host carrick was built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostExecution {
+    /// Guest ISA == host ISA — runs directly, no translation.
+    Native,
+    /// An x86_64 guest on an aarch64 host — runs via Apple Rosetta 2 (the only
+    /// cross-ISA path carrick supports), and only when Rosetta is installed.
+    RosettaTranslated,
+    /// No execution path exists on this host. The concrete case is an arm64
+    /// guest on an x86_64 host: carrick has no arm64-on-x86_64 translation.
+    Unsupported,
+}
+
 impl Platform {
+    /// The host's native guest ISA — what `carrick run` targets when
+    /// `--platform` is omitted. carrick always runs as a host-native binary
+    /// (never itself under emulation), so the compiled-in `target_arch` *is* the
+    /// host CPU architecture: aarch64 on Apple Silicon (and arm64 Linux),
+    /// x86_64 on the amd64 Linux/FreeBSD/NetBSD lanes. This is the value behind
+    /// [`Default`], used both for the CLI `--platform` fallback and the
+    /// [`RunSpec::platform`] serde default.
+    pub const fn host_native() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::Aarch64
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self::Amd64
+        }
+        // carrick only builds for aarch64/x86_64; fall back to aarch64 so the
+        // type still has a sensible default on any other host arch.
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            Self::Aarch64
+        }
+    }
+
+    /// Classify how running this guest platform would behave on the host carrick
+    /// was built for. `Native` when it matches the host ISA; `RosettaTranslated`
+    /// for an x86_64 guest on an aarch64 host (needs Rosetta 2); `Unsupported`
+    /// for an arm64 guest on an x86_64 host (no reverse translation). This is the
+    /// pure, host-arch-only half of the runnability decision — the caller layers
+    /// the Rosetta-installed check on top (see `carrick_engine::check_platform_runnable`).
+    pub const fn host_execution(self) -> HostExecution {
+        match (Self::host_native(), self) {
+            (Self::Aarch64, Self::Aarch64) | (Self::Amd64, Self::Amd64) => HostExecution::Native,
+            (Self::Aarch64, Self::Amd64) => HostExecution::RosettaTranslated,
+            (Self::Amd64, Self::Aarch64) => HostExecution::Unsupported,
+        }
+    }
+
     /// Parse from OCI platform strings ("linux/amd64", "linux/arm64", …) or
     /// bare arch tokens ("amd64", "arm64"). Returns `None` for anything we
     /// can't run, so the caller can fall back to the default.
@@ -279,6 +330,19 @@ impl Platform {
             Self::Aarch64 => "arm64",
             Self::Amd64 => "amd64",
         }
+    }
+}
+
+/// Defaults to the host-native ISA (see [`Platform::host_native`]) so a
+/// `carrick run` with no `--platform` targets the architecture carrick can run
+/// without translation, and a `RunSpec` deserialized without an explicit
+/// `platform` field inherits that same host-native default. (Historically this
+/// was hard-wired to `Aarch64`; pre-`platform` specs were only ever produced on
+/// aarch64 macOS, where host-native is still `Aarch64`, so the default is
+/// back-compatible there.)
+impl Default for Platform {
+    fn default() -> Self {
+        Self::host_native()
     }
 }
 
@@ -321,9 +385,11 @@ pub struct RunSpec {
     pub interactive: bool,
     pub max_traps: usize,
     pub debug_state_path: Option<Utf8PathBuf>,
-    /// Target ISA of the container. `Amd64` enables Rosetta 2 translation:
-    /// the runtime redirects x86_64 ELF loads through Rosetta and bind-mounts
-    /// the host Rosetta runtime into the guest VFS. Defaults to `Aarch64`.
+    /// Target ISA of the container. On an aarch64 host, `Amd64` enables Rosetta 2
+    /// translation: the runtime redirects x86_64 ELF loads through Rosetta and
+    /// bind-mounts the host Rosetta runtime into the guest VFS; on an x86_64 host
+    /// `Amd64` is the native ISA. Defaults to the host-native architecture (see
+    /// [`Platform::host_native`]).
     #[serde(default)]
     pub platform: Platform,
     /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
@@ -376,8 +442,41 @@ mod tests {
             Some(Platform::Aarch64)
         );
         assert_eq!(Platform::from_oci_str("linux/riscv64"), None);
-        assert_eq!(Platform::default(), Platform::Aarch64);
+        assert_eq!(Platform::default(), Platform::host_native());
         assert_eq!(Platform::Amd64.oci_arch(), "amd64");
+    }
+
+    #[test]
+    fn test_host_native_and_execution() {
+        // `Default` follows the host architecture, and the native guest always
+        // runs without translation.
+        assert_eq!(Platform::default(), Platform::host_native());
+        assert_eq!(
+            Platform::host_native().host_execution(),
+            HostExecution::Native
+        );
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(Platform::default(), Platform::Aarch64);
+            assert_eq!(Platform::Aarch64.host_execution(), HostExecution::Native);
+            // x86_64 guest on Apple Silicon → Rosetta path.
+            assert_eq!(
+                Platform::Amd64.host_execution(),
+                HostExecution::RosettaTranslated
+            );
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(Platform::default(), Platform::Amd64);
+            assert_eq!(Platform::Amd64.host_execution(), HostExecution::Native);
+            // arm64 guest on an x86_64 host → no reverse translation.
+            assert_eq!(
+                Platform::Aarch64.host_execution(),
+                HostExecution::Unsupported
+            );
+        }
     }
 
     #[test]
