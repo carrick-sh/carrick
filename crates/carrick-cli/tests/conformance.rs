@@ -1319,13 +1319,38 @@ fn run_one_probe(bin: &PathBuf, lane: Lane, probe: &std::path::Path) -> (String,
     };
     let carrick_out = run_carrick_probe_with_deadline(bin, lane, &encoded, deadline);
     let docker_out = run_docker_probe(lane, &encoded);
-    classify_probe(name, &carrick_out, docker_out)
+    classify_probe(name, lane.label, &carrick_out, docker_out)
 }
 
 /// Classify a probe from its (already-collected) carrick + docker outputs — pure,
 /// runs no carrick/docker, so it is the safe "phase 3" after the two-phase split.
+/// Probes that diverge ONLY on a specific lane because that lane's ORACLE — not
+/// carrick — is the limited side. carrick is correct; the divergence is the
+/// amd64 oracle box (Debian 12 / kernel 6.1, overlayfs, host net-ns) failing to
+/// match. Lane-scoped (NOT global `KNOWN_PROBE_GAPS`) so the aarch64 lane, whose
+/// LinuxKit oracle differs, is unaffected. Like `KNOWN_PROBE_GAPS`, an
+/// UNEXPECTED pass here fails the suite (the oracle improved → un-excuse it).
+const KNOWN_LANE_GAPS: &[(&str, &str)] = &[
+    // The amd64 oracle box runs Debian 12 / kernel 6.1, predating these syscalls;
+    // carrick implements them, so the probe sees carrick-success vs oracle-ENOSYS.
+    // A 6.5+/6.6+ oracle kernel makes these simply PASS (carrick is already right).
+    ("amd64", "cachestatpages"), // cachestat(451) — Linux 6.5
+    ("amd64", "chmodsetgid"),    // fchmodat2(452) — Linux 6.6
+    // carrick's `--fs host` backend is a real ext4 → O_TMPFILE works; Docker's
+    // overlayfs returns EOPNOTSUPP. carrick is MORE capable — a filesystem-backend
+    // difference, not a syscall gap, and kernel-independent.
+    ("amd64", "otmpfileforkexec"),
+    ("amd64", "tmpfilewrite"),
+    // Unprivileged ICMP ping sockets are gated by net.ipv4.ping_group_range, which
+    // Docker opens per-container in its OWN net-ns; carrick has no net-ns
+    // (--net=host) so it inherits the host's default-closed range ("1 0"). Closing
+    // this needs network-namespace support (the net-ns roadmap).
+    ("amd64", "icmp"),
+];
+
 fn classify_probe(
     name: String,
+    lane_label: &str,
     carrick_out: &str,
     docker_out: std::io::Result<String>,
 ) -> (String, ProbeOutcome) {
@@ -1333,7 +1358,8 @@ fn classify_probe(
         Ok(o) => o,
         Err(e) => return (name, ProbeOutcome::Error(format!("docker error: {e}"))),
     };
-    let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str());
+    let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str())
+        || KNOWN_LANE_GAPS.contains(&(lane_label, name.as_str()));
     let outcome = match (diff_lines(carrick_out, &docker_out), known_gap) {
         (None, false) => ProbeOutcome::Pass,
         (None, true) => ProbeOutcome::UnexpectedPass,
@@ -1546,7 +1572,12 @@ fn conformance_probes() {
                             OracleSource::Live(r) => r,
                             OracleSource::Unblessed => Ok(String::new()),
                         };
-                        classify_probe(name, &carrick_out.unwrap_or_default(), docker_out)
+                        classify_probe(
+                            name,
+                            lane.label,
+                            &carrick_out.unwrap_or_default(),
+                            docker_out,
+                        )
                     }
                 };
                 results.push(outcome);
@@ -1582,7 +1613,9 @@ fn conformance_probes() {
                         // A known-gap probe started passing → the gap is fixed.
                         // Only a GATING set asserts: remove it from
                         // KNOWN_PROBE_GAPS. (report-only sets don't.)
-                        eprintln!("UNEXPECTED PASS {qualified} (remove from KNOWN_PROBE_GAPS)");
+                        eprintln!(
+                            "UNEXPECTED PASS {qualified} (remove from KNOWN_PROBE_GAPS / KNOWN_LANE_GAPS)"
+                        );
                         if gates {
                             fixed_gaps.push(qualified);
                         }
@@ -1641,7 +1674,7 @@ fn conformance_probes() {
     }
     assert!(
         fixed_gaps.is_empty(),
-        "known-gap probes now PASS — remove from KNOWN_PROBE_GAPS: {fixed_gaps:?}"
+        "known-gap probes now PASS — remove from KNOWN_PROBE_GAPS / KNOWN_LANE_GAPS: {fixed_gaps:?}"
     );
     assert!(failures.is_empty(), "probe conformance gaps: {failures:?}");
 }
