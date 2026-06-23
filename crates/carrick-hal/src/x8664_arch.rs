@@ -2122,18 +2122,14 @@ mod tests {
         // Symmetric to build: the codec reads the frame from the guest stack and
         // fails only at the stub's Unsupported `read_bytes`.
         let result = X8664GuestArch::restore_sigframe(&mut SigframeStub, false);
-        assert!(
-            result.is_err(),
-            "restore_sigframe must fail against the Unsupported memory stub"
-        );
+        // The real codec reads the frame from the guest stack; the stub's
+        // Unsupported `read_bytes` makes that a `SignalDeliveryFault` (Linux
+        // force_sigsegv on a bad sigreturn frame) — NOT a "not implemented" stub
+        // error. Reaching the read at all proves the codec runs. Symmetric to
+        // `build_sigframe_runs_codec_and_faults_only_at_guest_memory` above.
         match result {
-            Err(TrapError::Hypervisor(msg)) => {
-                assert!(
-                    !msg.contains("not implemented"),
-                    "codec is implemented; error must not claim otherwise: {msg}"
-                );
-            }
-            Err(other) => panic!("expected TrapError::Hypervisor, got {other:?}"),
+            Err(TrapError::SignalDeliveryFault) => {}
+            Err(other) => panic!("expected SignalDeliveryFault from the codec, got {other:?}"),
             Ok(_) => panic!("codec must fail against the Unsupported memory stub"),
         }
     }
