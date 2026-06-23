@@ -2688,30 +2688,32 @@ pub(super) fn rosetta_handshake_ioctl(
 /// returns ETIMEDOUT immediately.
 fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) -> Duration {
     let abs_ns = (tv_sec as i128) * 1_000_000_000 + tv_nsec as i128;
-    // The guest built `abs_ns` on ITS clock. For a non-FUTEX_CLOCK_REALTIME
-    // futex that clock is Linux CLOCK_MONOTONIC, which carrick reports to the
-    // guest as macOS CLOCK_UPTIME_RAW (see monotonic_duration: neither counts
-    // suspend). "now" here MUST read the SAME base — macOS CLOCK_MONOTONIC is
-    // mach_continuous_time (uptime + suspend), so using it makes abs_ns - now
-    // off by the accumulated suspend time (hours on a laptop) → every absolute
-    // deadline computes as already-past → instant spurious ETIMEDOUT (broke
-    // CPython lock.acquire(timeout) / sem_timedwait / condvar timeouts; the
-    // futexextra→deadline probe pins it).
+    // The guest built `abs_ns` on ITS clock, so "now" here MUST read the SAME
+    // base or `abs_ns - now` is skewed and the deadline is mis-computed.
     //
-    // The FUTEX_CLOCK_REALTIME case reads the host wall clock here, which is
-    // correct ONLY because the guest's vDSO CLOCK_REALTIME is calibrated to the
-    // same wall clock (see HvfInner::populate_vdso_data_page, which derives the
-    // vvar realtime offset from CLOCK_UPTIME_RAW — the guest's CNTVCT base — not
-    // the suspend-counting raw cntvct MRS). Probe: futexrealtime.
-    let clock = if realtime {
-        libc::CLOCK_REALTIME
+    // Non-FUTEX_CLOCK_REALTIME → the guest clock is Linux CLOCK_MONOTONIC, which
+    // carrick services via `monotonic_duration()` (Linux host: the *virtualized*
+    // libc::CLOCK_MONOTONIC; macOS host: CLOCK_UPTIME_RAW — neither counts
+    // suspend). Read "now" from that SAME function, not a raw clock id: reading
+    // `carrick_portable::CLOCK_UPTIME_RAW` (== Linux CLOCK_MONOTONIC_RAW) skewed
+    // `now` from the guest base by the MONOTONIC vs MONOTONIC_RAW delta — tens of
+    // seconds inside an LXC/time-namespace (measured +57s on the KVM box) — so
+    // every absolute deadline computed as already-past → instant spurious
+    // ETIMEDOUT (broke timed lock/sem/condvar; probe: futexdeadline). On macOS
+    // this is identical to the previous CLOCK_UPTIME_RAW read, so the HVF lane is
+    // unchanged.
+    //
+    // The FUTEX_CLOCK_REALTIME case reads the host wall clock, correct because
+    // the guest's vDSO CLOCK_REALTIME is calibrated to the same wall clock.
+    // Probe: futexrealtime.
+    let now_ns: i128 = if realtime {
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: clock_gettime writes a timespec for a valid clock id.
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
+        (now.tv_sec as i128) * 1_000_000_000 + now.tv_nsec as i128
     } else {
-        carrick_portable::CLOCK_UPTIME_RAW
+        monotonic_duration().as_nanos() as i128
     };
-    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
-    // SAFETY: clock_gettime writes a timespec for a valid clock id.
-    unsafe { libc::clock_gettime(clock, &mut now) };
-    let now_ns = (now.tv_sec as i128) * 1_000_000_000 + now.tv_nsec as i128;
     let rel_ns = (abs_ns - now_ns).max(0);
     Duration::from_nanos(rel_ns.min(u64::MAX as i128) as u64)
 }
