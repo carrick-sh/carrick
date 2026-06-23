@@ -973,6 +973,31 @@ pub struct BhyveWindow {
 /// per-vCPU copy would let two threads commit the same page to divergent GPAs
 /// (the shared one-CR3 PML4 leaf then stops matching each vCPU's host_ptr → heap
 /// corruption, observed as Go's "bad sweepgen").
+/// A SysV-shm (or other host-file-backed) alias whose backing file is the
+/// CROSS-PROCESS shared medium. bhyve cannot back a guest segment with a host fd
+/// (the memseg model copies file→sysmem), so a guest store lands in PRIVATE
+/// sysmem and is invisible to a forked child that re-attaches the same segment —
+/// breaking SysV-shm coherence (which KVM/HVF get free from their MAP_SHARED file
+/// alias). To restore it, bhyve retains the segment's fd and, at the fork
+/// barrier (parent suspended in `freeze_ram`), flushes the alias's live sysmem
+/// back to the file; the child's `shmat`→`map_host_alias` then re-reads the
+/// up-to-date file. `fd` is OWNED (closed when the alias is dropped).
+struct ShmAlias {
+    /// Guest VA the alias is mapped at (the `host_ptr`/GPA lookup key).
+    va: u64,
+    /// Backing GPA in sysmem (the bytes to flush back to the file).
+    gpa: u64,
+    /// Page-aligned alias length (>= file_size).
+    len: usize,
+    /// Owned host fd of the backing file (write side; closed on drop).
+    fd: libc::c_int,
+    /// File offset the alias starts at.
+    offset: libc::off_t,
+    /// The file's size in bytes — bounds the write-back so it never grows the
+    /// file or reads/writes past the segment's real content.
+    file_size: usize,
+}
+
 struct RamInner {
     windows: Vec<BhyveWindow>,
     cursor: u64,
@@ -983,6 +1008,9 @@ struct RamInner {
     // engine delivers SIGSEGV/SEGV_ACCERR (not silently allowing the store). A
     // writable reservation commits an RW leaf (the common anon-arena case).
     reservations: Vec<(u64, u64, bool)>,
+    // File-backed shm aliases to flush to their backing files at the fork
+    // barrier (SysV-shm cross-process coherence — see `ShmAlias`).
+    shm_aliases: Vec<ShmAlias>,
 }
 
 /// A handle to the shared guest-RAM plan. `Clone` shares the `Arc`, NOT the
@@ -1196,6 +1224,7 @@ impl BhyveGuestRam {
                 windows: Vec::new(),
                 cursor: X86_GPA_CURSOR_START,
                 reservations: Vec::new(),
+                shm_aliases: Vec::new(),
             })),
         }
     }
@@ -1294,6 +1323,66 @@ impl BhyveGuestRam {
         let gpa = inner.add_bump(va & !0xFFF, len, true, writable, false)?;
         inner.drop_reservation(va, len);
         Ok(CommitOutcome::Committed { gpa, writable })
+    }
+
+    /// Record a host-file-backed shm alias whose sysmem must be flushed back to
+    /// its file at the fork barrier (SysV-shm cross-process coherence). Takes
+    /// OWNERSHIP of `fd` (closed when the alias is later dropped). If `va` is
+    /// already registered (a re-attach at the same VA), the prior alias's fd is
+    /// closed and replaced so the table never grows unbounded or leaks fds.
+    pub fn register_shm_alias(
+        &self,
+        va: u64,
+        gpa: u64,
+        len: usize,
+        fd: libc::c_int,
+        offset: libc::off_t,
+        file_size: usize,
+    ) {
+        let mut inner = self.lock();
+        if let Some(old) = inner.shm_aliases.iter_mut().find(|a| a.va == va) {
+            // SAFETY: we own the prior fd; replace it with the fresh one.
+            unsafe { libc::close(old.fd) };
+            old.gpa = gpa;
+            old.len = len;
+            old.fd = fd;
+            old.offset = offset;
+            old.file_size = file_size;
+            return;
+        }
+        inner.shm_aliases.push(ShmAlias {
+            va,
+            gpa,
+            len,
+            fd,
+            offset,
+            file_size,
+        });
+    }
+
+    /// Snapshot the registered shm aliases as `(gpa, fd, offset, write_len)` for
+    /// a fork-barrier flush. `write_len` is bounded by the file's real size so a
+    /// write-back never grows the file or writes past the segment's content.
+    pub fn shm_aliases_for_flush(&self) -> Vec<(u64, libc::c_int, libc::off_t, usize)> {
+        self.lock()
+            .shm_aliases
+            .iter()
+            .map(|a| {
+                let write_len = a
+                    .file_size
+                    .saturating_sub(a.offset.max(0) as usize)
+                    .min(a.len);
+                (a.gpa, a.fd, a.offset, write_len)
+            })
+            .collect()
+    }
+}
+
+impl Drop for ShmAlias {
+    fn drop(&mut self) {
+        // SAFETY: `fd` is the owned host fd of the backing file (a dispatcher fd
+        // map_host_alias took ownership of, or a re-attach replacement).
+        unsafe { libc::close(self.fd) };
     }
 }
 

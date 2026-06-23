@@ -996,6 +996,31 @@ impl BhyveVmm {
         }
         Ok(())
     }
+
+    /// Flush every registered writable file-backed shm alias's live sysmem back
+    /// to its backing FILE. Called at the fork barrier (`freeze_ram`, parent vCPU
+    /// suspended) so a forked child that re-`shmat`s the same segment reads the
+    /// parent's stores via map_host_alias's file→sysmem copy. Best-effort: a
+    /// transient `map_gpa`/`pwrite` failure is skipped (the worst case is the
+    /// pre-fix stale-file behaviour for that one alias, never a crash). The write
+    /// is bounded by the file's real size, so it never grows the file.
+    fn flush_shm_aliases(&self) {
+        for (gpa, fd, offset, write_len) in self.ram.shm_aliases_for_flush() {
+            if write_len == 0 {
+                continue;
+            }
+            let Some(host) = self.vm.map_gpa(gpa, write_len) else {
+                continue;
+            };
+            // SAFETY: map_gpa proved `[gpa, gpa+write_len)` is live sysmem; we read
+            // it into the kernel via pwrite. The parent vCPU is suspended, so the
+            // bytes are a consistent snapshot.
+            let n = unsafe { libc::pwrite(fd, host as *const libc::c_void, write_len, offset) };
+            // A short/failed write only leaves the file as stale as before the fix
+            // for this alias — never fatal; nothing to recover.
+            let _ = n;
+        }
+    }
 }
 
 impl X86Vmm for BhyveVmm {
@@ -1198,29 +1223,82 @@ impl X86Vmm for BhyveVmm {
         })?;
         match file {
             Some((fd, offset, _prot)) => {
-                // mmap the file's current content read-only in the host, copy it
-                // into the backing RAM, then drop the transient host view.
-                let src = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
+                // The dispatcher's alias `len` is page-aligned to the alias-IPA
+                // arena granularity (`HVF_PAGE_SIZE` = 16 KiB), but the backing
+                // file (e.g. a SysV-shm segment ftruncated to its requested size)
+                // is only its own length — which on x86 (4 KiB host pages) can be
+                // SMALLER than `len`. mmap'ing `len` over a short file is fine, but
+                // HOST-READING past the file's last page faults SIGBUS (the
+                // "object-specific hardware error" — what crashed the `sysvshm` /
+                // `shmrdonly` probes). So bound the copy to the bytes the file
+                // actually backs; the sysmem tail `[copy_len, len)` is the fresh
+                // bump GPA's kernel-zeroed RAM, matching Linux's zero-fill of a
+                // segment's partial last page. (KVM never hits this: it registers
+                // the mmap as a guest memslot WITHOUT host-reading it, so an
+                // out-of-bounds touch would fault inside the guest, not the host.)
+                let file_size = {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                        return Err(TrapError::Hypervisor(format!(
+                            "bhyve map_host_alias: fstat fd={fd}: {}",
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    st.st_size.max(0) as u64
+                };
+                let copy_len = file_size.saturating_sub(offset.max(0) as u64).min(len) as usize;
+                // mmap the file's current content read-only in the host, copy the
+                // file-backed prefix into the backing RAM, then drop the transient
+                // host view. Map only the backed pages so the mapping itself never
+                // straddles EOF.
+                if copy_len > 0 {
+                    let src = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            copy_len,
+                            libc::PROT_READ,
+                            libc::MAP_SHARED,
+                            fd,
+                            offset,
+                        )
+                    };
+                    if src == libc::MAP_FAILED {
+                        return Err(TrapError::Hypervisor(format!(
+                            "bhyve map_host_alias: mmap file fd={fd} off={offset} \
+                             copy_len=0x{copy_len:x}: {}",
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    // SAFETY: `src` is a `copy_len`-byte PROT_READ mapping wholly
+                    // within the file; `host` is live sysmem of `len` >= copy_len;
+                    // the regions don't overlap.
+                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, host, copy_len) };
+                    // SAFETY: drop the transient host view of the file.
+                    unsafe { libc::munmap(src, copy_len) };
+                }
+                // SysV-shm cross-process coherence: bhyve cannot back the guest
+                // segment with the host fd, so a guest store lands in private
+                // sysmem, invisible to a forked child that re-attaches the same
+                // file. For a WRITABLE alias, retain the fd and register the alias
+                // so `freeze_ram` flushes this GPA back to the file at the fork
+                // barrier — the child's re-`shmat` then reads the parent's stores
+                // (matching KVM/HVF, whose MAP_SHARED file alias is coherent for
+                // free). A READ-ONLY alias has no dirty data to push back, so just
+                // close its fd. (The dispatcher transferred fd ownership to us;
+                // KVM closes it after mmap — bhyve previously LEAKED it here.)
+                if writable {
+                    self.ram.register_shm_alias(
+                        va,
+                        gpa,
                         len as usize,
-                        libc::PROT_READ,
-                        libc::MAP_SHARED,
                         fd,
                         offset,
-                    )
-                };
-                if src == libc::MAP_FAILED {
-                    return Err(TrapError::Hypervisor(format!(
-                        "bhyve map_host_alias: mmap file fd={fd} off={offset} len=0x{len:x}: {}",
-                        std::io::Error::last_os_error()
-                    )));
+                        file_size as usize,
+                    );
+                } else {
+                    // SAFETY: we own `fd`; nothing to flush for a read-only alias.
+                    unsafe { libc::close(fd) };
                 }
-                // SAFETY: `src` is a len-byte PROT_READ mapping; `host` is live
-                // sysmem of `len`; the regions don't overlap.
-                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, host, len as usize) };
-                // SAFETY: drop the transient host view of the file.
-                unsafe { libc::munmap(src, len as usize) };
             }
             None => {
                 let n = payload.len().min(len as usize);
@@ -1298,6 +1376,15 @@ impl X86Vmm for BhyveVmm {
         // and is byte-identical to the child's freshly kernel-zeroed segment.
         // Copying the whole pool forced ~512 MiB resident PER FORK regardless of
         // the guest's working set; this bounds it to the live footprint.
+        // SysV-shm cross-process coherence: flush each writable file-backed alias's
+        // live sysmem back to its backing FILE before the child forks, so the
+        // child's re-`shmat` (which re-reads the file in map_host_alias) sees the
+        // parent's stores. This is the fork barrier — the parent vCPU is suspended,
+        // so the sysmem read is a consistent snapshot. KVM/HVF don't need this (their
+        // alias IS a MAP_SHARED file mapping, coherent for free); bhyve copies
+        // file→sysmem, so the file is stale until we push the dirty bytes back here.
+        self.flush_shm_aliases();
+
         let live = self.ram.total_size().min(X86_MEM_SIZE);
         debug_assert!(live <= X86_MEM_SIZE);
         let src = self.vm.map_gpa(0, live.max(1)).ok_or_else(|| {
