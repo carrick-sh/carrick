@@ -12,7 +12,7 @@ use carrick_hal::event::EventMultiplexer;
 use std::os::fd::RawFd;
 
 /// Fire the user-wake channel on an epoll instance's cached wake fd — the
-/// host-specific half of [`crate::dispatch::epoll_shim::notify_inmem_epoll`].
+/// host-specific half of `notify_inmem_epoll` (the dispatch-layer broadcast).
 /// The fd is the value `EpollKqueue::wake_fd` caches: the kqueue fd on the
 /// BSD/macOS lanes (whose `EVFILT_USER(0)` is pulsed by `kqueue::trigger_user`)
 /// or the user-wake `eventfd` on Linux (whose 8-byte counter is written by

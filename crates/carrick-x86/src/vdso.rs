@@ -5,7 +5,7 @@
 //! `__vdso_clock_gettime` reads `tsc/freq` nanoseconds plus a stamped offset
 //! from the shared vvar page; this module computes and writes that page.
 //!
-//! Backend-neutral by construction: it writes through [`X86Vmm::write_gpa`] and
+//! Backend-neutral by construction: it writes through [`carrick_hal::GuestVmBackend::write_gpa`] and
 //! reads the guest TSC through the optional [`X86Vcpu::read_msr`] hook. Without
 //! that hook the host TSC is used, which is correct whenever the backend runs
 //! the guest with a zero TSC offset; a backend whose guest TSC is offset

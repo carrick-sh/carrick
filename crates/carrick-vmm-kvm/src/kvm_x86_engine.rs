@@ -1518,7 +1518,7 @@ fn build_kvm_x86_guest(image: &AddressSpace) -> Result<BuiltKvmX86Guest, TrapErr
 
 /// Write the trampoline/GDT/PML4 byte images into `ram` directly (the bring-up
 /// holds `&mut GuestRam`, so it uses `GuestRam::write_gpa` rather than the
-/// `&self` `X86Vmm::write_gpa` hook).
+/// `&self` `GuestVmBackend::write_gpa` hook).
 fn write_bringup_images_via_ram(ram: &mut GuestRam, pml4_bytes: &[u8]) -> Result<(), TrapError> {
     use carrick_hal::guest_arch::GuestArch as _;
     use carrick_hal::x8664_arch::X8664GuestArch;
