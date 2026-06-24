@@ -34,7 +34,6 @@ use carrick_hal::{
 };
 use carrick_mem::memory::AddressSpace;
 
-use crate::fork::VcpuSnapshot;
 use crate::guest_setup::{
     BroughtUp, FAULT_SENTINEL_GPA, GuestRam, MAINT_SENTINEL_GPA, SENTINEL_GPA, WindowDesc,
     bring_up as ram_bring_up, populate_vdso_vvar, program_sysregs,
@@ -59,67 +58,6 @@ pub fn bring_up(image: &AddressSpace) -> Result<KvmAarch64Engine, TrapError> {
     } = ram_bring_up(image).map_err(|e| TrapError::Hypervisor(e.to_string()))?;
     let vmm = KvmAarch64Vmm { vm, ram };
     Ok(Aarch64EngineCore::from_parts(vmm, vcpu))
-}
-
-// ─── Aarch64VcpuSnapshot ⟷ fork::VcpuSnapshot ────────────────────────────────
-//
-// The two snapshot shapes are field-identical (both promoted from the same
-// `fork::VcpuSnapshot`); convert at the trait seam so `KvmVcpu` keeps its native
-// `snapshot()`/`restore()` (which the fork/sibling helpers also use) while the
-// shared engine trades in the neutral `Aarch64VcpuSnapshot`.
-
-fn to_neutral(s: VcpuSnapshot) -> Aarch64VcpuSnapshot {
-    Aarch64VcpuSnapshot {
-        gprs: s.gprs,
-        pc: s.pc,
-        pstate: s.pstate,
-        sp_el0: s.sp_el0,
-        sp_el1: s.sp_el1,
-        elr_el1: s.elr_el1,
-        spsr_el1: s.spsr_el1,
-        ttbr0: s.ttbr0,
-        ttbr1: s.ttbr1,
-        tcr: s.tcr,
-        sctlr: s.sctlr,
-        mair: s.mair,
-        vbar: s.vbar,
-        cpacr: s.cpacr,
-        tpidr_el0: s.tpidr_el0,
-        // KVM's `VcpuSnapshot` does not carry these HVF-shaped sysregs (TPIDRRO_EL0,
-        // TPIDR_EL1 scratch, ACTLR_EL1/EnTSO): the KVM aarch64 lane has no Rosetta
-        // TSO bit and uses TPIDR_EL1 only for the live syscall x9 stash (carried
-        // separately via `get_saved_x9`). Zero-fill so the neutral round-trip is
-        // total; `from_neutral` drops them again.
-        tpidrro_el0: 0,
-        tpidr_el1: 0,
-        actlr_el1: 0,
-        vregs: s.vregs,
-        fpsr: s.fpsr,
-        fpcr: s.fpcr,
-    }
-}
-
-fn from_neutral(s: &Aarch64VcpuSnapshot) -> VcpuSnapshot {
-    VcpuSnapshot {
-        gprs: s.gprs,
-        pc: s.pc,
-        pstate: s.pstate,
-        sp_el0: s.sp_el0,
-        sp_el1: s.sp_el1,
-        elr_el1: s.elr_el1,
-        spsr_el1: s.spsr_el1,
-        ttbr0: s.ttbr0,
-        ttbr1: s.ttbr1,
-        tcr: s.tcr,
-        sctlr: s.sctlr,
-        mair: s.mair,
-        vbar: s.vbar,
-        cpacr: s.cpacr,
-        tpidr_el0: s.tpidr_el0,
-        vregs: s.vregs,
-        fpsr: s.fpsr,
-        fpcr: s.fpcr,
-    }
 }
 
 // ─── impl Aarch64Vcpu for KvmVcpu ────────────────────────────────────────────
@@ -183,10 +121,10 @@ impl Aarch64Vcpu for KvmVcpu {
     }
 
     fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        KvmVcpu::snapshot(self).map(to_neutral).map_err(os_to_trap)
+        KvmVcpu::snapshot(self).map_err(os_to_trap)
     }
     fn restore(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
-        KvmVcpu::restore(self, &from_neutral(snap)).map_err(os_to_trap)
+        KvmVcpu::restore(self, snap).map_err(os_to_trap)
     }
 
     fn get_saved_x9(&self) -> Result<Option<u64>, TrapError> {
@@ -480,13 +418,12 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         // (except the MAP_SHARED aperture), Linux COW gives correct POSIX fork
         // divergence for free — no `mincore` snapshot and no per-region clone
         // (unlike HVF, whose RAM is MAP_SHARED).
-        let snap = from_neutral(snapshot);
         let (new_vm, mut new_vcpu) = self.ram.rebuild_vm_for_child().map_err(os_to_trap)?;
 
         // Restore the parent's register file onto the child's fresh vCPU, then set
         // x0 = 0 (the child's fork(2) return value). The child resumes inside the
         // same trapped clone/fork syscall, just like the parent.
-        KvmVcpu::restore(&mut new_vcpu, &snap).map_err(os_to_trap)?;
+        KvmVcpu::restore(&mut new_vcpu, snapshot).map_err(os_to_trap)?;
         // Disambiguate `set_reg`: `KvmVcpu` now has both `HvVcpu::set_reg` and the
         // new `Aarch64Vcpu::set_reg` in scope. Use the native `HvVcpu` path (these
         // are KVM-internal register writes during the child rebuild).
@@ -504,12 +441,12 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         // CRITICAL: advance the child PC past the EL1 vector's sentinel store.
         //
         // At the trap, the vCPU is suspended ON the `str x8,[x9]` sentinel store
-        // (snap.pc points AT it). On the PARENT's ORIGINAL vCPU, KVM remembers the
+        // (snapshot.pc points AT it). On the PARENT's ORIGINAL vCPU, KVM remembers the
         // MMIO is being completed and auto-advances PC by 4 on the next KVM_RUN, so
         // it resumes at the vector's `eret`. The CHILD's vCPU is BRAND-NEW with no
         // pending-MMIO state, so a plain restore would RE-EXECUTE the sentinel store
         // → another MMIO exit → re-trap the SAME (clone) frame → fork bomb. We
-        // replicate KVM's post-MMIO advance ourselves: PC = snap.pc + 4 lands on
+        // replicate KVM's post-MMIO advance ourselves: PC = snapshot.pc + 4 lands on
         // the vector's `eret`, which loads PC←ELR_EL1 (= the guest svc+4) and
         // PSTATE←SPSR_EL1 (= EL0t), dropping the child back into EL0 just past its
         // clone — exactly where the parent resumes.
@@ -517,7 +454,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         HvVcpu::set_reg(
             &mut new_vcpu,
             Reg::Pc,
-            snap.pc.wrapping_add(SENTINEL_STR_WIDTH),
+            snapshot.pc.wrapping_add(SENTINEL_STR_WIDTH),
         )
         .map_err(os_to_trap)?;
 
