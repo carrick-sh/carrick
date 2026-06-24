@@ -9,6 +9,33 @@
 
 use carrick_hal::error::OsError;
 use carrick_hal::event::EventMultiplexer;
+use std::os::fd::RawFd;
+
+/// Fire the user-wake channel on an epoll instance's cached wake fd — the
+/// host-specific half of [`crate::dispatch::epoll_shim::notify_inmem_epoll`].
+/// The fd is the value `EpollKqueue::wake_fd` caches: the kqueue fd on the
+/// BSD/macOS lanes (whose `EVFILT_USER(0)` is pulsed by `kqueue::trigger_user`)
+/// or the user-wake `eventfd` on Linux (whose 8-byte counter is written by
+/// `trigger_user_eventfd`, making the epoll `poll_fd` readable). Co-located with
+/// [`make_event_multiplexer`] so the host event-backend choice lives in exactly
+/// one place; the dispatch-layer caller stays host-agnostic.
+pub fn trigger_user_wake_fd(wake_fd: RawFd) {
+    #[cfg(any(
+        feature = "platform-macos",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ))]
+    let _ = carrick_host_bsd::kqueue::trigger_user(wake_fd, 0);
+    #[cfg(feature = "platform-linux")]
+    carrick_host_linux::epoll_mux::trigger_user_eventfd(wake_fd);
+    #[cfg(not(any(
+        feature = "platform-macos",
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    )))]
+    let _ = wake_fd;
+}
 
 /// Construct the platform readiness multiplexer.
 pub fn make_event_multiplexer() -> Result<Box<dyn EventMultiplexer>, OsError> {
