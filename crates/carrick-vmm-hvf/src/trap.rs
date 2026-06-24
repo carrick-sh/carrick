@@ -488,6 +488,35 @@ fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
         .copied()
 }
 
+/// Find the registered alias whose guest-VA window FULLY contains `[va, va+len)`.
+/// The cross-thread fallback's IPA key (`translate_va`) reads this thread's
+/// software stage-1 model, which can lack a freshly-`MAP_FIXED`-committed high-VA
+/// arena page that a sibling vCPU installed — even though `add_alias` already
+/// registered the backing here, keyed by guest VA. The VA key resolves it.
+///
+/// Two safety rules make this never resolve to the WRONG backing (the failure the
+/// `mapping_index_for_range` doc warns about):
+/// - **Whole range in ONE entry**: a buffer straddling two aliases returns `None`
+///   (→ EFAULT), never a partial backing.
+/// - **Newest-first** (`.rev()`): a Go arena page is covered by BOTH the PROT_NONE
+///   reservation entry AND the later `MAP_FIXED` commit; the commit is registered
+///   last, and `add_alias`/`map_aliased` register the IPA they install into stage-1
+///   in the same order — so the newest entry is exactly the backing the guest's own
+///   page tables use.
+///
+/// The caller gates on `!range_no_access` so a still-PROT_NONE reservation page
+/// (uncommitted) EFAULTs even though the reservation entry would contain its VA.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lookup_shared_alias_by_va(va: u64, len: usize) -> Option<AliasBacking> {
+    let end = va.saturating_add(len as u64);
+    alias_registry()
+        .lock()
+        .iter()
+        .rev()
+        .find(|e| va >= e.start && end <= e.start.saturating_add(e.size as u64))
+        .copied()
+}
+
 /// Drop the index entry for any alias whose guest-VA window overlaps
 /// `[va, va+len)` — called on a guest `munmap` of a high-VA alias (the only point
 /// the backing is actually freed), BEFORE the stage-1 invalidate, so a stale
@@ -2300,8 +2329,27 @@ impl HvfVmState {
         // boot-mapped into every thread's list). Key on the guest's OWN stage-1
         // IPA so an overlapping MAP_FIXED alias resolves to the backing the guest
         // actually sees.
-        let ipa = stage1_ipa?;
-        lookup_shared_alias(ipa).map(|b| MappingView::from_alias(&b))
+        if let Some(ipa) = stage1_ipa {
+            if let Some(b) = lookup_shared_alias(ipa) {
+                return Some(MappingView::from_alias(&b));
+            }
+        }
+        // VA-keyed fallback for when the IPA key is unavailable. `translate_va`
+        // reads THIS thread's software stage-1 model, which can lack a high-VA
+        // arena page a sibling vCPU freshly MAP_FIXED-committed (Go reserves its
+        // heap arena PROT_NONE, then MAP_FIXEDs RW sub-regions; a goroutine on
+        // another vCPU then reads/writes a buffer there). `add_alias` already
+        // registered that backing keyed by guest VA, so resolve it by VA. Gate on
+        // `!range_no_access` so a still-PROT_NONE reservation page EFAULTs as it
+        // must; `lookup_shared_alias_by_va` requires the whole range in one entry
+        // and picks newest-first, so it never resolves a partial or stale backing.
+        // This closes the intermittent Go "read/write: bad address" EFAULT.
+        if !self.range_no_access(address, length) {
+            if let Some(b) = lookup_shared_alias_by_va(address, length) {
+                return Some(MappingView::from_alias(&b));
+            }
+        }
+        None
     }
 
     fn mapping_for_range_mut(&mut self, address: u64, length: usize) -> Option<MappingView> {
