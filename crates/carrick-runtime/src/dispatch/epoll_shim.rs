@@ -38,20 +38,6 @@ pub(crate) fn unregister_epoll_kqueue(fd: i32) {
 /// handle through the registry).
 pub(crate) fn notify_inmem_epoll() {
     for &fd in EPOLL_INMEM_KQUEUES.lock().iter() {
-        #[cfg(any(
-            feature = "platform-macos",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
-        let _ = carrick_host_bsd::kqueue::trigger_user(fd, 0);
-        #[cfg(feature = "platform-linux")]
-        carrick_host_linux::epoll_mux::trigger_user_eventfd(fd);
-        #[cfg(not(any(
-            feature = "platform-macos",
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        )))]
-        let _ = fd;
+        crate::event_mux::trigger_user_wake_fd(fd);
     }
 }
