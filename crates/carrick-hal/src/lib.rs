@@ -16,6 +16,8 @@ pub mod error;
 pub use error::{MemPerms, OsError, Reg, SysReg};
 pub mod trap;
 pub use trap::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
+pub mod vm_backend;
+pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
 pub mod hypervisor;
 pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod event;

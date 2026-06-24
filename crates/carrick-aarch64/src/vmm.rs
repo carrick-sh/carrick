@@ -21,23 +21,15 @@ use std::sync::Arc;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Aarch64SyscallFrame, MemoryError};
 use carrick_hal::{
-    GuestEntryRegs, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick, VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick,
+    VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 
-/// COW-inherit vs eager full-RAM copy at `fork(2)`. POLICY only, mirroring the
-/// x86 `ForkRamStrategy`: the shared fork path reads this to decide *whether* to
-/// freeze; the per-backend copy MECHANISM stays in the backend, behind
-/// [`Aarch64Vmm::rebuild_child_after_fork`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForkRamStrategy {
-    /// KVM `MAP_PRIVATE` + Linux COW: the child inherits RAM for free, nothing is
-    /// copied.
-    Cow,
-    /// HVF's windows are `MAP_SHARED`, so a forked child must copy private pages
-    /// (the parent freezes / the child rebuilds a fresh `applevisor` VM).
-    EagerCopy,
-}
+/// COW-inherit vs eager full-RAM copy at `fork(2)`. Re-exported from
+/// [`carrick_hal`] (the single canonical definition, shared with the x86 lane) so
+/// existing `crate::vmm::ForkRamStrategy` references keep resolving.
+pub use carrick_hal::ForkRamStrategy;
 
 /// The shared exit shape. Lifted from HVF's `applevisor` `ExitReason`+`ESR.EC`
 /// decode ∪ KVM's `VcpuExit::MmioWrite{gpa}`/`Kicked`/`Halt`. Backends decode
@@ -269,7 +261,7 @@ pub trait Aarch64Vcpu {
 /// sibling spawn, host memory windows + stage-2 mapping, and the HVF-only
 /// lazy-alias re-map (as the optional [`Self::handle_memory_exit`] hook). Mirrors
 /// `carrick-x86`'s `X86Vmm`.
-pub trait Aarch64Vmm: Sized {
+pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type Vcpu: Aarch64Vcpu;
 
     /// The per-backend vCPU-kick handle (`KvmKickHandle` / `HvfKickHandle`).
@@ -281,20 +273,9 @@ pub trait Aarch64Vmm: Sized {
     type SiblingBuilder: Send;
 
     // ── memory windows + stage-2 (the hv_vm_map / KVM-slot seam) ──
-
-    /// The host pointer backing `[gpa, gpa + len)`, or `None` if unmapped. The
-    /// engine's `GuestMemory` impl copies through this (KVM `ram.host_ptr`; HVF
-    /// mapping `host_addr` lookup).
-    fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8>;
-
-    /// Mutable variant of [`Self::host_ptr`]. Backends with sparse/lazy backing
-    /// may materialize the requested range before returning the host pointer.
-    fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
-        self.host_ptr(gpa, len)
-    }
-
-    /// Copy `bytes` into guest physical memory at `gpa`.
-    fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), TrapError>;
+    //
+    // NOTE: `host_ptr` / `host_ptr_mut` / `write_gpa` are inherited from the shared
+    // [`GuestVmBackend`] supertrait (ISA-neutral, signature-identical with x86).
 
     /// Map host memory at a stage-2 IPA. The STAGE-1 path (page-table edit) is
     /// the shared engine's job; this is only the backend stage-2 op: HVF
@@ -446,11 +427,9 @@ pub trait Aarch64Vmm: Sized {
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError>;
 
     // ── fork (skeleton shared; this is the per-VMM rebuild mechanism) ──
-
-    /// COW-inherit vs eager copy. KVM is `MAP_PRIVATE` + Linux COW; HVF's windows
-    /// are `MAP_SHARED` so its child must copy private pages. Modeled exactly on
-    /// the x86 `ForkRamStrategy{Cow,EagerCopy}`.
-    fn fork_ram_strategy(&self) -> ForkRamStrategy;
+    //
+    // NOTE: `fork_ram_strategy` is inherited from the shared [`GuestVmBackend`]
+    // supertrait (ISA-neutral POLICY, signature-identical with x86).
 
     /// Freeze the guest RAM segment on the PARENT before `libc::fork`, so an
     /// `EagerCopy` backend's child can rebuild from a coherent image. Only invoked
@@ -508,31 +487,17 @@ pub trait Aarch64Vmm: Sized {
         new_image: &AddressSpace,
     ) -> Result<(), TrapError>;
 
-    /// Forked-child `_exit` cleanup (skips Drop). KVM/HVF default no-op (fd-bound
-    /// / swapped VM); matches `SyscallTrap::process_exit_cleanup`. A future
-    /// bhyve-on-arm backend would override. (Identical to the x86 hook.)
-    fn process_exit_cleanup(&mut self) {}
+    // NOTE: `process_exit_cleanup` is inherited from the shared [`GuestVmBackend`]
+    // supertrait (ISA-neutral hook, signature-identical with x86).
 
     // ── threaded sibling lifecycle (the generic ThreadedEngine drives these) ──
 
     /// A kick handle for the current vCPU thread (the engine's `kick_handle`).
     fn kick_handle(&self) -> Self::KickHandle;
 
-    /// Backend admission gate before a new vCPU thread runs (HVF's concurrent-
-    /// vCPU cap ~64; a no-op on KVM).
-    fn wait_for_vcpu_slot() {}
-
-    /// Live concurrent-vCPU budget N for the M:N admission scheduler.
-    /// `usize::MAX` = no carrick-side cap (KVM); HVF returns its concurrent cap.
-    fn vcpu_budget() -> usize {
-        usize::MAX
-    }
-
-    /// Whether this backend RECLAIMS a thread's vCPU slot on block (M:N reclaim).
-    /// `false` (default) = Phase-1 lifetime-binding (KVM); HVF returns `true`.
-    fn reclaims(&self) -> bool {
-        false
-    }
+    // NOTE: `wait_for_vcpu_slot` / `vcpu_budget` / `reclaims` are inherited from the
+    // shared [`GuestVmBackend`] supertrait (ISA-neutral, signature-identical with
+    // x86).
 
     /// Save THIS thread's full guest CPU state before releasing its vCPU slot at a
     /// block point (M:N reclaim), passing the engine-owned `vcpu`. KVM aarch64 does

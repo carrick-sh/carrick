@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::MemoryError;
+use carrick_hal::GuestVmBackend;
 use carrick_hal::OsError;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
@@ -1042,18 +1043,7 @@ impl BhyveVmm {
     }
 }
 
-impl X86Vmm for BhyveVmm {
-    type Vcpu = BhyveX86Vcpu;
-    type KickHandle = BhyveKickHandle;
-    type SiblingBuilder = BhyveSiblingBuilder;
-
-    fn setup_memory(&mut self, _plan: &WindowPlan) -> Result<(), TrapError> {
-        // bhyve realizes the plan as ONE contiguous lowmem segment (§2.5a). The
-        // segment + the window table are built by `bring_up`; this hook is a
-        // no-op (the BhyveVmm `bring_up` produces returns is already mapped).
-        Ok(())
-    }
-
+impl GuestVmBackend for BhyveVmm {
     fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), TrapError> {
         let host = self.vm.map_gpa(gpa, bytes.len()).ok_or_else(|| {
             TrapError::Hypervisor(format!("bhyve-x86: write_gpa 0x{gpa:x} unmapped"))
@@ -1070,13 +1060,6 @@ impl X86Vmm for BhyveVmm {
         self.vm.map_gpa(target_gpa, len)
     }
 
-    fn is_guest_reserved(&self, va: u64) -> bool {
-        // A reserved (lazily anon-backed) VA the guest has not touched has no
-        // window yet; the engine's read path treats it as kernel zero-fill
-        // instead of EFAULT (see X86Vmm::is_guest_reserved).
-        self.ram.find_reservation(va)
-    }
-
     fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
         // A carrick-side WRITE into a lazily-reserved arena range — the
         // file-backed mmap content copy, stack/auxv staging — must materialize
@@ -1091,6 +1074,85 @@ impl X86Vmm for BhyveVmm {
             let _ = self.commit_range(gpa, len);
         }
         self.host_ptr(gpa, len)
+    }
+
+    fn fork_ram_strategy(&self) -> ForkRamStrategy {
+        // bhyve guest RAM is kernel-owned and NOT copy-on-write across libc::fork
+        // (the inherited vmctx aliases the parent's live kernel pages). The whole
+        // segment must be eagerly copied into a fresh child VM (§2.5b).
+        ForkRamStrategy::EagerCopy
+    }
+
+    fn wait_for_vcpu_slot() {
+        // Admission is enforced by the carrick-hal VcpuScheduler (installed at
+        // startup with `vcpu_budget()`), which the shared thread-spawn path calls
+        // — so this backend hook stays a no-op.
+    }
+
+    fn vcpu_budget() -> usize {
+        // hw.vmm.maxcpu is the bhyve hard cap on concurrently-active vCPUs; a guest
+        // thread beyond it would EINVAL `vm_activate_cpu`. The scheduler bounds the
+        // live set to this N (recycling ids) so that never happens.
+        let mut val: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        let name = c"hw.vmm.maxcpu";
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && val > 0 { val as usize } else { 8 }
+    }
+
+    fn reclaims(&self) -> bool {
+        // bhyve has the lowest vCPU cap; it reclaims so >N guest threads can run.
+        true
+    }
+
+    fn process_exit_cleanup(&mut self) {
+        // Push this process's writable file-backed `MAP_SHARED` alias stores back
+        // to their backing files BEFORE the VM node is torn down. bhyve can't share
+        // guest physical RAM across the fork, so the shared inode is the only
+        // cross-process medium: a forked child's stores live in its private sysmem
+        // and must reach the file here so the parent — which re-reads the file when
+        // it reaps this child (`refresh_shared_after_wait`) — sees them. Cheap and
+        // safe: the process is exiting (no concurrent guest write to these pages),
+        // the write is bounded by file size, and a read-only alias is skipped (no
+        // dirty data). Done for a borrowed (vfork-shared) VM too — the writes are
+        // owed regardless of who destroys the node.
+        self.flush_shm_aliases();
+        // Tear down the bhyve VM node on a forked-child `_exit` (which skips
+        // Drop). A vfork-shared (borrowed) VM must NOT be destroyed — the parent
+        // owns the node and resumes on it (§2.5c). Carried verbatim from the old
+        // engine. The generic engine's `process_exit_cleanup` delegates here.
+        if self.vm_borrowed {
+            return;
+        }
+        self.vm.destroy_in_place();
+    }
+}
+
+impl X86Vmm for BhyveVmm {
+    type Vcpu = BhyveX86Vcpu;
+    type KickHandle = BhyveKickHandle;
+    type SiblingBuilder = BhyveSiblingBuilder;
+
+    fn setup_memory(&mut self, _plan: &WindowPlan) -> Result<(), TrapError> {
+        // bhyve realizes the plan as ONE contiguous lowmem segment (§2.5a). The
+        // segment + the window table are built by `bring_up`; this hook is a
+        // no-op (the BhyveVmm `bring_up` produces returns is already mapped).
+        Ok(())
+    }
+
+    fn is_guest_reserved(&self, va: u64) -> bool {
+        // A reserved (lazily anon-backed) VA the guest has not touched has no
+        // window yet; the engine's read path treats it as kernel zero-fill
+        // instead of EFAULT (see X86Vmm::is_guest_reserved).
+        self.ram.find_reservation(va)
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
@@ -1476,13 +1538,6 @@ impl X86Vmm for BhyveVmm {
         })
     }
 
-    fn fork_ram_strategy(&self) -> ForkRamStrategy {
-        // bhyve guest RAM is kernel-owned and NOT copy-on-write across libc::fork
-        // (the inherited vmctx aliases the parent's live kernel pages). The whole
-        // segment must be eagerly copied into a fresh child VM (§2.5b).
-        ForkRamStrategy::EagerCopy
-    }
-
     fn freeze_ram(&self) -> Result<Vec<u8>, TrapError> {
         // Snapshot the parent's LIVE high-water [0, total_size()) — NOT the full
         // 512 MiB pool — into a private heap buffer BEFORE libc::fork, while the
@@ -1588,36 +1643,6 @@ impl X86Vmm for BhyveVmm {
 
     fn kick_handle(&self) -> Self::KickHandle {
         BhyveKickHandle::for_current_thread(Arc::clone(&self.h.kick_pending))
-    }
-
-    fn wait_for_vcpu_slot() {
-        // Admission is enforced by the carrick-hal VcpuScheduler (installed at
-        // startup with `vcpu_budget()`), which the shared thread-spawn path calls
-        // — so this backend hook stays a no-op.
-    }
-
-    fn vcpu_budget() -> usize {
-        // hw.vmm.maxcpu is the bhyve hard cap on concurrently-active vCPUs; a guest
-        // thread beyond it would EINVAL `vm_activate_cpu`. The scheduler bounds the
-        // live set to this N (recycling ids) so that never happens.
-        let mut val: i32 = 0;
-        let mut len = std::mem::size_of::<i32>();
-        let name = c"hw.vmm.maxcpu";
-        let rc = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                &mut val as *mut _ as *mut libc::c_void,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc == 0 && val > 0 { val as usize } else { 8 }
-    }
-
-    fn reclaims(&self) -> bool {
-        // bhyve has the lowest vCPU cap; it reclaims so >N guest threads can run.
-        true
     }
 
     fn save_guest_state(&self) -> Vec<u8> {
@@ -1777,28 +1802,6 @@ impl X86Vmm for BhyveVmm {
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
         Arc::new(BhyveKicker::new())
-    }
-
-    fn process_exit_cleanup(&mut self) {
-        // Push this process's writable file-backed `MAP_SHARED` alias stores back
-        // to their backing files BEFORE the VM node is torn down. bhyve can't share
-        // guest physical RAM across the fork, so the shared inode is the only
-        // cross-process medium: a forked child's stores live in its private sysmem
-        // and must reach the file here so the parent — which re-reads the file when
-        // it reaps this child (`refresh_shared_after_wait`) — sees them. Cheap and
-        // safe: the process is exiting (no concurrent guest write to these pages),
-        // the write is bounded by file size, and a read-only alias is skipped (no
-        // dirty data). Done for a borrowed (vfork-shared) VM too — the writes are
-        // owed regardless of who destroys the node.
-        self.flush_shm_aliases();
-        // Tear down the bhyve VM node on a forked-child `_exit` (which skips
-        // Drop). A vfork-shared (borrowed) VM must NOT be destroyed — the parent
-        // owns the node and resumes on it (§2.5c). Carried verbatim from the old
-        // engine. The generic engine's `process_exit_cleanup` delegates here.
-        if self.vm_borrowed {
-            return;
-        }
-        self.vm.destroy_in_place();
     }
 
     fn refresh_shared_after_wait(&mut self) {

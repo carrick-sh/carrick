@@ -21,7 +21,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use carrick_hal::TrapError;
+use carrick_hal::{GuestVmBackend, TrapError};
 use carrick_mem::memory::AddressSpace;
 use carrick_x86::{
     BringupLayout, FAULT_DOORBELL_PORT, ForkRamStrategy, MsrInstall, WindowPlan, WindowRegion,
@@ -561,24 +561,7 @@ fn copy_file_mapping_payload(
     Ok(())
 }
 
-impl X86Vmm for NvmmVmm {
-    type Vcpu = NvmmX86Vcpu;
-    type KickHandle = NvmmKickHandle;
-    type SiblingBuilder = NvmmSiblingBuilder;
-
-    /// Realize the plan as N compact-GPA regions. The plan's `gpa` is the
-    /// (already compact) GPA the PML4 maps `va` to; `hva_map`+`gpa_map` backs it
-    /// and we record `va → hva` for the engine's by-VA accesses.
-    fn setup_memory(&mut self, plan: &WindowPlan) -> Result<(), TrapError> {
-        self.windows = plan.regions.clone();
-        for r in &plan.regions {
-            if let Some(chunk) = sparse_chunk_for_gpa(&[*r], r.gpa) {
-                self.map_window_chunk(chunk)?;
-            }
-        }
-        Ok(())
-    }
-
+impl GuestVmBackend for NvmmVmm {
     fn write_gpa(&self, va: u64, bytes: &[u8]) -> Result<(), TrapError> {
         // Called with a guest VA (image region start) or an identity-mapped
         // kernel-window GPA (== its VA). Resolve uniformly by VA.
@@ -611,6 +594,37 @@ impl X86Vmm for NvmmVmm {
             cursor = chunk_end.min(end);
         }
         self.resolve(va, usize::try_from(len).ok()?)
+    }
+
+    fn fork_ram_strategy(&self) -> ForkRamStrategy {
+        // NVMM vCPU writes land through the hypervisor's registered HVA view,
+        // not ordinary host stores that participate cleanly in process COW. The
+        // parent can run ahead after host fork and mutate pages before the child
+        // rematerializes its machine, so freeze private windows before fork.
+        ForkRamStrategy::EagerCopy
+    }
+
+    fn process_exit_cleanup(&mut self) {
+        self.mach.destroy_in_place();
+    }
+}
+
+impl X86Vmm for NvmmVmm {
+    type Vcpu = NvmmX86Vcpu;
+    type KickHandle = NvmmKickHandle;
+    type SiblingBuilder = NvmmSiblingBuilder;
+
+    /// Realize the plan as N compact-GPA regions. The plan's `gpa` is the
+    /// (already compact) GPA the PML4 maps `va` to; `hva_map`+`gpa_map` backs it
+    /// and we record `va → hva` for the engine's by-VA accesses.
+    fn setup_memory(&mut self, plan: &WindowPlan) -> Result<(), TrapError> {
+        self.windows = plan.regions.clone();
+        for r in &plan.regions {
+            if let Some(chunk) = sparse_chunk_for_gpa(&[*r], r.gpa) {
+                self.map_window_chunk(chunk)?;
+            }
+        }
+        Ok(())
     }
 
     fn handle_memory_exit(&mut self, gpa: u64) -> Result<bool, TrapError> {
@@ -791,14 +805,6 @@ impl X86Vmm for NvmmVmm {
         NvmmX86Vcpu::new(vcpu, fault_record_hva)
     }
 
-    fn fork_ram_strategy(&self) -> ForkRamStrategy {
-        // NVMM vCPU writes land through the hypervisor's registered HVA view,
-        // not ordinary host stores that participate cleanly in process COW. The
-        // parent can run ahead after host fork and mutate pages before the child
-        // rematerializes its machine, so freeze private windows before fork.
-        ForkRamStrategy::EagerCopy
-    }
-
     fn freeze_ram(&self) -> Result<Vec<u8>, TrapError> {
         let regions = read_regions(&self.regions);
         let total = regions
@@ -955,10 +961,6 @@ impl X86Vmm for NvmmVmm {
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
         Arc::new(NvmmKicker::new())
-    }
-
-    fn process_exit_cleanup(&mut self) {
-        self.mach.destroy_in_place();
     }
 
     fn execve_rebuild(

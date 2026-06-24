@@ -1304,6 +1304,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use carrick_hal::GuestVmBackend;
     use carrick_hal::threaded::{GenericVcpuRegistry, VcpuKick, VcpuRegistry};
 
     use crate::vmm::{ForkRamStrategy, MsrInstall, WindowPlan, X86Seg};
@@ -1329,6 +1330,20 @@ mod tests {
         set_gprs_calls: u32,
     }
 
+    impl GuestVmBackend for TestVmm {
+        fn write_gpa(&self, _gpa: u64, _bytes: &[u8]) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn host_ptr(&self, _gpa: u64, _len: usize) -> Option<*mut u8> {
+            None
+        }
+
+        fn fork_ram_strategy(&self) -> ForkRamStrategy {
+            ForkRamStrategy::Cow
+        }
+    }
+
     impl X86Vmm for TestVmm {
         type KickHandle = TestKick;
         type SiblingBuilder = ();
@@ -1338,20 +1353,8 @@ mod tests {
             Ok(())
         }
 
-        fn write_gpa(&self, _gpa: u64, _bytes: &[u8]) -> Result<(), TrapError> {
-            Ok(())
-        }
-
-        fn host_ptr(&self, _gpa: u64, _len: usize) -> Option<*mut u8> {
-            None
-        }
-
         fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
             Ok(TestVcpu::default())
-        }
-
-        fn fork_ram_strategy(&self) -> ForkRamStrategy {
-            ForkRamStrategy::Cow
         }
 
         fn kick_handle(&self) -> Self::KickHandle {

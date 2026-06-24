@@ -34,7 +34,7 @@ use carrick_aarch64::{
 };
 use carrick_guest_mem::MemoryError;
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_hal::{GuestEntryRegs, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
+use carrick_hal::{GuestEntryRegs, GuestVmBackend, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
 use carrick_mem::memory::AddressSpace;
 
 use crate::trap::{
@@ -273,13 +273,7 @@ pub struct HvfAarch64Vmm {
     pub(crate) state: HvfVmState,
 }
 
-impl Aarch64Vmm for HvfAarch64Vmm {
-    type Vcpu = HvfAarch64Vcpu;
-    type KickHandle = crate::vcpu_kick::VcpuKickHandle;
-    type SiblingBuilder = ThreadSpec;
-
-    // ── memory windows + stage-2 ──
-
+impl GuestVmBackend for HvfAarch64Vmm {
     fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
         self.state.host_ptr(gpa, len)
     }
@@ -289,6 +283,41 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .write_gpa(gpa, bytes)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
+
+    fn fork_ram_strategy(&self) -> ForkRamStrategy {
+        // HVF guest RAM is host-`MAP_SHARED` (HVF coherence), so fork(2) does NOT
+        // COW-isolate it; the child copies private pages. The shared `fork()` calls
+        // `freeze_ram_for_fork` (HVF: capture descriptors + private child snapshots +
+        // tear the VM down) before `libc::fork`.
+        ForkRamStrategy::EagerCopy
+    }
+
+    fn process_exit_cleanup(&mut self) {
+        // HVF's VM is swapped/leaked-until-exit (ManuallyDrop discipline); nothing to
+        // release on a forked-child `_exit`. Matches the historical no-op.
+    }
+
+    fn wait_for_vcpu_slot() {
+        // RETIRED: the bounded carrick-hal scheduler (installed for `vcpu_budget()`)
+        // does admission in the shared spawn path. Double-gating here would defeat
+        // reclaim (the gate slot would stay held while the thread blocks). No-op.
+    }
+
+    fn vcpu_budget() -> usize {
+        crate::trap::hvf_vcpu_budget()
+    }
+
+    fn reclaims(&self) -> bool {
+        true
+    }
+}
+
+impl Aarch64Vmm for HvfAarch64Vmm {
+    type Vcpu = HvfAarch64Vcpu;
+    type KickHandle = crate::vcpu_kick::VcpuKickHandle;
+    type SiblingBuilder = ThreadSpec;
+
+    // ── memory windows + stage-2 ──
 
     fn map_stage2(
         &mut self,
@@ -404,14 +433,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.add_vcpu().map(HvfAarch64Vcpu::new)
     }
 
-    fn fork_ram_strategy(&self) -> ForkRamStrategy {
-        // HVF guest RAM is host-`MAP_SHARED` (HVF coherence), so fork(2) does NOT
-        // COW-isolate it; the child copies private pages. The shared `fork()` calls
-        // `freeze_ram_for_fork` (HVF: capture descriptors + private child snapshots +
-        // tear the VM down) before `libc::fork`.
-        ForkRamStrategy::EagerCopy
-    }
-
     fn freeze_ram_for_fork(&mut self) -> Result<(), TrapError> {
         // Pre-fork (parent, single process): snapshot every PRIVATE region into a
         // child-private copy (guest RAM is MAP_SHARED, so fork doesn't isolate it),
@@ -466,11 +487,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.execve_rebuild(&mut vcpu.0, &plan)
     }
 
-    fn process_exit_cleanup(&mut self) {
-        // HVF's VM is swapped/leaked-until-exit (ManuallyDrop discipline); nothing to
-        // release on a forked-child `_exit`. Matches the historical no-op.
-    }
-
     // ── threaded sibling lifecycle ──
 
     fn kick_handle(&self) -> Self::KickHandle {
@@ -480,20 +496,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // live vCPU's `VcpuHandle` on every (re)create (the `vcpu_handle` field)
         // and hands it out here.
         self.state.vcpu_kick_handle()
-    }
-
-    fn wait_for_vcpu_slot() {
-        // RETIRED: the bounded carrick-hal scheduler (installed for `vcpu_budget()`)
-        // does admission in the shared spawn path. Double-gating here would defeat
-        // reclaim (the gate slot would stay held while the thread blocks). No-op.
-    }
-
-    fn vcpu_budget() -> usize {
-        crate::trap::hvf_vcpu_budget()
-    }
-
-    fn reclaims(&self) -> bool {
-        true
     }
 
     fn reclaim_refreshes_kicker(&self) -> bool {
