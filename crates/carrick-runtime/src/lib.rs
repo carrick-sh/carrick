@@ -884,6 +884,37 @@ pub mod runtime {
         }
     }
 
+    /// The shared dispatch tail of every Linux/KVM `run_elf_real_dispatch` arm:
+    /// build the engine from the (already arch-specifically constructed) `image`,
+    /// then drive it through the canonical multi-threaded KVM loop — or, under
+    /// `CARRICK_NO_THREADS`, the single-threaded combined loop (the A/B fallback
+    /// that surfaces `Unsupported` on any fork/clone/futex outcome). The
+    /// arch-specific image build (ELF machine, per-ISA vDSO, initial-stack env)
+    /// stays in each cfg arm; only this loop-dispatch policy is shared, so the
+    /// default loop and the `CARRICK_NO_THREADS` switch live in exactly one place.
+    #[cfg(feature = "platform-linux")]
+    fn run_elf_kvm_dispatch<E>(
+        image: &crate::memory::AddressSpace,
+        build_engine: impl FnOnce(&crate::memory::AddressSpace) -> Result<E, RuntimeError>,
+    ) -> Result<RunResult, RuntimeError>
+    where
+        E: carrick_hal::ThreadedEngine<KickHandle = carrick_vmm_kvm::KvmKickHandle>
+            + GuestMemory
+            + SyscallTrap
+            + 'static,
+        E::SiblingSpec: 'static,
+    {
+        let mut engine = build_engine(image)?;
+        if std::env::var_os("CARRICK_NO_THREADS").is_some() {
+            return run_combined_syscall_loop_linux(
+                &mut engine,
+                make_linux_dispatcher(),
+                DEFAULT_MAX_TRAPS,
+            );
+        }
+        run_threaded_kvm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+    }
+
     /// Phase B entry: boot a freestanding/static aarch64 ELF under KVM and run
     /// it through the REAL dispatcher — the `cfg(platform-linux)` sibling of the
     /// macOS `HvfTrapEngine` run path. `KvmTrapEngine` satisfies the loop's
@@ -925,22 +956,12 @@ pub mod runtime {
         // `Aarch64EngineCore<KvmAarch64Vmm>` (Stage 2), constructed via the
         // backend's `bring_up` free function — mirroring the x86 lane's
         // `kvm_x86_engine::bring_up`.
-        let mut engine = carrick_vmm_kvm::kvm_aarch64_engine::bring_up(&image)?;
-        // Phase 2 Task 7: drive the generic MULTI-THREADED loop by default so
-        // fork/execve/threads/futex guests run (handle_fork, sibling vCPUs, the
-        // private/shared futex paths). The single-threaded thin loop
-        // (`run_combined_syscall_loop_linux`) stays reachable as a `--no-threads`
-        // fallback via `CARRICK_NO_THREADS` for A/B debugging — it surfaces
-        // `Unsupported` on any fork/clone/futex outcome, so it is only useful for
-        // the simple write+exit cases the MVP validated.
-        if std::env::var_os("CARRICK_NO_THREADS").is_some() {
-            return run_combined_syscall_loop_linux(
-                &mut engine,
-                make_linux_dispatcher(),
-                DEFAULT_MAX_TRAPS,
-            );
-        }
-        run_threaded_kvm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+        // `KvmTrapEngine` is `Aarch64EngineCore<KvmAarch64Vmm>` (Stage 2), built
+        // via the backend's `bring_up`; the shared dispatch tail drives the
+        // default multi-threaded loop (or the `CARRICK_NO_THREADS` fallback).
+        run_elf_kvm_dispatch(&image, |image| {
+            carrick_vmm_kvm::kvm_aarch64_engine::bring_up(image).map_err(RuntimeError::from)
+        })
     }
 
     /// x86_64 KVM run through the FULL `SyscallDispatcher` (audit #1, M1).
@@ -970,19 +991,13 @@ pub mod runtime {
         // replaced the hand-rolled `KvmX86TrapEngine`. It satisfies the same
         // `GuestMemory + SyscallTrap` (single-threaded) and `ThreadedEngine`
         // (multi-threaded) bounds, so the loop wiring below is unchanged.
-        let mut engine = carrick_vmm_kvm::kvm_x86_engine::bring_up(&image)?;
-        // Default: the canonical multi-threaded loop, now SHARED with aarch64-KVM
-        // and HVF (M3). `CARRICK_NO_THREADS` keeps the M1 single-threaded combined
-        // loop reachable as an A/B fallback (mirrors the aarch64 arm). fork/clone/
-        // futex/signal outcomes still surface Unsupported until M3c/M3d.
-        if std::env::var_os("CARRICK_NO_THREADS").is_some() {
-            return run_combined_syscall_loop_linux(
-                &mut engine,
-                make_linux_dispatcher(),
-                DEFAULT_MAX_TRAPS,
-            );
-        }
-        run_threaded_kvm_loop(engine, make_linux_dispatcher(), DEFAULT_MAX_TRAPS)
+        // Stage-4 KVM migration: the x86 engine is the shared
+        // `X86EngineCore<KvmVmm>` (built by `kvm_x86_engine::bring_up`); the shared
+        // dispatch tail drives it through the same default/NO_THREADS loop policy
+        // as the aarch64 arm.
+        run_elf_kvm_dispatch(&image, |image| {
+            carrick_vmm_kvm::kvm_x86_engine::bring_up(image).map_err(RuntimeError::from)
+        })
     }
 
     #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
