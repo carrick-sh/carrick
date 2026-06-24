@@ -26,7 +26,7 @@ use kvm_ioctls::{Kvm, VcpuExit as KvmExit, VcpuFd, VmFd};
 use libc;
 
 #[cfg(target_arch = "aarch64")]
-use crate::fork::VcpuSnapshot;
+use carrick_aarch64::Aarch64VcpuSnapshot;
 
 fn os_err(context: &str, e: impl std::fmt::Display) -> OsError {
     OsError::new(format!("kvm: {context}: {e}"))
@@ -1174,7 +1174,7 @@ impl KvmVm {
     /// a `clone(CLONE_THREAD)` sibling adds a vCPU to the SAME VM the parent
     /// runs on. Delegates to [`HvVm::add_vcpu`] (`KVM_CREATE_VCPU` + preferred-
     /// target init); the vCPU is returned UNPROGRAMMED for the caller to restore
-    /// the seeded `VcpuSnapshot` onto.
+    /// the seeded `Aarch64VcpuSnapshot` onto.
     pub(crate) fn add_sibling_vcpu(&self) -> Result<KvmVcpu, OsError> {
         // Deliberately NOT counted into VCPU_LIVE here: the sibling's +1 was
         // taken at `build_sibling_spec` time ([`VcpuLiveTicket`]) to cover the
@@ -1767,12 +1767,12 @@ impl KvmVcpu {
     /// Captures all GPRs, special EL1 registers, system registers, and the full
     /// FP/SIMD state (`vregs`/`fpsr`/`fpcr`) so fork-children and execve inherit
     /// correct floating-point context (Phase 4).
-    pub fn snapshot(&self) -> Result<VcpuSnapshot, OsError> {
+    pub fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, OsError> {
         let mut gprs = [0u64; 31];
         for (n, g) in gprs.iter_mut().enumerate() {
             *g = self.reg(Reg::X(n as u32))?;
         }
-        Ok(VcpuSnapshot {
+        Ok(Aarch64VcpuSnapshot {
             gprs,
             pc: self.reg(Reg::Pc)?,
             pstate: self.reg(Reg::Pstate)?,
@@ -1788,6 +1788,14 @@ impl KvmVcpu {
             vbar: self.get_sys_reg(SysReg::Vbar)?,
             cpacr: self.get_sys_reg(SysReg::Cpacr)?,
             tpidr_el0: self.get_sys_reg(SysReg::TpidrEl0)?,
+            // HVF-shaped sysregs the KVM aarch64 lane does not use: no Rosetta TSO
+            // bit (ACTLR_EL1/EnTSO), TPIDRRO_EL0 unused, and TPIDR_EL1 holds only
+            // the live syscall x9 stash — round-tripped separately via
+            // `get_saved_x9`, NOT this snapshot. Zero them so the neutral shape is
+            // total (the shared engine already received these as zero pre-collapse).
+            tpidrro_el0: 0,
+            tpidr_el1: 0,
+            actlr_el1: 0,
             // Real FP/SIMD capture via the inherent accessors (Phase 4).
             vregs: {
                 let mut v = [0u128; 32];
@@ -1801,11 +1809,13 @@ impl KvmVcpu {
         })
     }
 
-    /// Restore a [`VcpuSnapshot`] onto this (freshly created) vCPU. The mirror of
-    /// [`Self::snapshot`]; restores GPRs, EL1/system registers, and the full
-    /// FP/SIMD state (`vregs`/`fpsr`/`fpcr`) so fork-children and execve inherit
-    /// correct floating-point context (Phase 4).
-    pub fn restore(&mut self, snap: &VcpuSnapshot) -> Result<(), OsError> {
+    /// Restore an [`Aarch64VcpuSnapshot`] onto this (freshly created) vCPU. The
+    /// mirror of [`Self::snapshot`]; restores GPRs, EL1/system registers, and the
+    /// full FP/SIMD state (`vregs`/`fpsr`/`fpcr`) so fork-children and execve
+    /// inherit correct floating-point context (Phase 4). The three HVF-shaped
+    /// sysregs the neutral snapshot also carries (TPIDRRO_EL0, TPIDR_EL1,
+    /// ACTLR_EL1) are intentionally NOT written on KVM — see [`Self::snapshot`].
+    pub fn restore(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), OsError> {
         for (n, g) in snap.gprs.iter().enumerate() {
             self.set_reg(Reg::X(n as u32), *g)?;
         }
