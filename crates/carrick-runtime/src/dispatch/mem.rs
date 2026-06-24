@@ -1089,8 +1089,7 @@ impl SyscallDispatcher {
                 // range reclaimed from a prior munmap (which marked it no-access).
                 memory.set_no_access(new_addr, new_len, false);
                 if reused {
-                    let zeros = vec![0u8; new_len];
-                    let _ = memory.write_bytes(new_addr, &zeros);
+                    let _ = memory.zero_guest_range(new_addr, new_len);
                 }
                 let copy_len = match usize::try_from(old_size) {
                     Ok(len) => len,

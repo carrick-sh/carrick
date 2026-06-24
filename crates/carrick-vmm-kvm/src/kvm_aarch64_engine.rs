@@ -28,6 +28,7 @@ use carrick_aarch64::{
 };
 use carrick_guest_mem::MemoryError;
 use carrick_guest_mem::protections::MemoryProtections;
+use carrick_guest_mem::zero_range_chunked;
 use carrick_hal::{
     GuestEntryRegs, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, TrapError, VcpuExit, VcpuRegistry,
 };
@@ -395,13 +396,16 @@ impl Aarch64Vmm for KvmAarch64Vmm {
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        let zeros = vec![0u8; len];
-        self.ram
-            .write_gpa(address, &zeros)
-            .map_err(|_| MemoryError::OutOfBounds {
-                address,
-                length: len,
-            })
+        // Streamed in fixed chunks (no `len`-sized temp); `write_gpa` bypasses the
+        // writability gate, which scrubbing a reused PROT_NONE / unmapped region needs.
+        zero_range_chunked(address, len, |addr, bytes| {
+            self.ram
+                .write_gpa(addr, bytes)
+                .map_err(|_| MemoryError::OutOfBounds {
+                    address: addr,
+                    length: bytes.len(),
+                })
+        })
     }
 
     fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {

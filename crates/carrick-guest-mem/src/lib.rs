@@ -107,6 +107,33 @@ pub struct X8664SyscallFrame {
     pub r9: u64,
 }
 
+/// One page of zeros, streamed by the chunked guest-zeroing helpers. Zeroing a
+/// guest range must never allocate a `len`-sized temporary — a guest can ask
+/// `select`/`munmap`/`mremap` to clear a large range — so the helpers write
+/// slices of this single static block instead of `vec![0u8; len]`.
+const ZERO_CHUNK: [u8; 4096] = [0u8; 4096];
+
+/// Zero `[address, address+len)` by streaming `ZERO_CHUNK` through `write`,
+/// never allocating a `len`-sized buffer. `write` is the caller's backing
+/// writer: the permission-CHECKED [`GuestMemory::write_bytes`] for a guest-owned
+/// buffer, or an unchecked raw / `write_gpa` writer for a backing scrub. Stops
+/// and returns the error on the first chunk `write` rejects, so a single
+/// faulting chunk behaves like the one `write_bytes` it replaces (guest ranges
+/// never reach the top of the address space, so the chunk-stride add cannot wrap
+/// in practice; `saturating_add` keeps it panic-free under release overflow checks).
+pub fn zero_range_chunked<F>(address: u64, len: usize, mut write: F) -> Result<(), MemoryError>
+where
+    F: FnMut(u64, &[u8]) -> Result<(), MemoryError>,
+{
+    let mut off = 0usize;
+    while off < len {
+        let chunk = (len - off).min(ZERO_CHUNK.len());
+        write(address.saturating_add(off as u64), &ZERO_CHUNK[..chunk])?;
+        off += chunk;
+    }
+    Ok(())
+}
+
 /// The guest physical/virtual memory a syscall handler reads and writes. The
 /// backend may be the real HVF-backed address space or the in-memory
 /// `LinearMemory` used by unit tests.
@@ -222,7 +249,23 @@ pub trait GuestMemory {
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         // Raw write: scrubbing a reused PROT_NONE / unmapped region must bypass
         // the gate (the checked path would EFAULT and leave stale bytes).
-        self.write_bytes_raw(address, &vec![0u8; len])
+        // Streamed in fixed chunks so a large scrub allocates nothing.
+        zero_range_chunked(address, len, |addr, bytes| {
+            self.write_bytes_raw(addr, bytes)
+        })
+    }
+
+    /// PERMISSION-CHECKED zeroing of a guest range, the counterpart to
+    /// [`zero_backing`](Self::zero_backing): use this when the guest legitimately
+    /// OWNS the bytes and a PROT_NONE / read-only overlap must EFAULT — e.g.
+    /// `select`/`pselect` zeroing its fd-sets on timeout, an `mremap` clearing a
+    /// reused destination, or io_uring ring init. Streams `ZERO_CHUNK` through
+    /// the gated [`write_bytes`](Self::write_bytes) so a large clear allocates
+    /// nothing; on the first faulting chunk it returns the error and stops,
+    /// exactly as the single `write_bytes` it replaces. Do NOT override — override
+    /// `write_bytes_raw` for a faster backing path.
+    fn zero_guest_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        zero_range_chunked(address, len, |addr, bytes| self.write_bytes(addr, bytes))
     }
 
     /// Whether every byte of `[address, address+length)` is currently guest-WRITABLE
@@ -334,4 +377,157 @@ pub enum MemoryError {
     /// A host-side mapping operation (mmap/hv_vm_map/...) failed.
     #[error("host mapping operation failed: {0}")]
     HostMap(String),
+}
+
+#[cfg(test)]
+mod zero_tests {
+    use super::*;
+    use crate::protections::MemoryProtections;
+
+    /// Minimal Vec-backed [`GuestMemory`] for exercising the zero helpers without
+    /// a hypervisor: `write_bytes_raw`/`read_bytes_raw` hit a flat buffer, and the
+    /// `protections()` gate is honoured by the trait's default `write_bytes`.
+    struct MockMem {
+        buf: Vec<u8>,
+        prot: MemoryProtections,
+    }
+
+    impl MockMem {
+        fn new(len: usize, fill: u8) -> Self {
+            Self {
+                buf: vec![fill; len],
+                prot: MemoryProtections::default(),
+            }
+        }
+    }
+
+    impl GuestMemory for MockMem {
+        fn protections(&self) -> Option<&MemoryProtections> {
+            Some(&self.prot)
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let a = address as usize;
+            self.buf
+                .get(a..a + length)
+                .map(<[u8]>::to_vec)
+                .ok_or(MemoryError::OutOfBounds { address, length })
+        }
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            let a = address as usize;
+            match self.buf.get_mut(a..a + bytes.len()) {
+                Some(slot) => {
+                    slot.copy_from_slice(bytes);
+                    Ok(())
+                }
+                None => Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn zero_range_chunked_streams_contiguous_chunks_without_full_alloc() {
+        // 2 full chunks + a partial: proves the helper never hands the writer a
+        // slice larger than ZERO_CHUNK (no len-sized temp), the slices are all
+        // zero, and together they cover [base, base+len) exactly once, contiguously.
+        let len = ZERO_CHUNK.len() * 2 + 1234;
+        let base = 0x4000u64;
+        let mut chunks: Vec<(u64, usize)> = Vec::new();
+        let mut all_zero = true;
+        zero_range_chunked(base, len, |addr, bytes| {
+            all_zero &= bytes.iter().all(|&b| b == 0);
+            assert!(bytes.len() <= ZERO_CHUNK.len(), "chunk exceeds ZERO_CHUNK");
+            chunks.push((addr, bytes.len()));
+            Ok(())
+        })
+        .expect("chunked zero succeeds");
+        assert!(all_zero, "every chunk is zero bytes");
+        assert_eq!(chunks.len(), 3, "two full chunks + remainder");
+        let mut cursor = base;
+        let mut total = 0usize;
+        for (addr, n) in &chunks {
+            assert_eq!(*addr, cursor, "chunks are contiguous, no gaps/overlap");
+            cursor += *n as u64;
+            total += *n;
+        }
+        assert_eq!(total, len, "covers the whole range");
+    }
+
+    #[test]
+    fn zero_range_chunked_zero_len_never_calls_writer() {
+        let mut calls = 0u32;
+        zero_range_chunked(0x1000, 0, |_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .expect("zero-length is a no-op Ok");
+        assert_eq!(calls, 0, "no writer call for an empty range");
+    }
+
+    #[test]
+    fn zero_range_chunked_propagates_writer_error() {
+        let err = zero_range_chunked(0x1000, 10, |_, _| {
+            Err(MemoryError::OutOfBounds {
+                address: 0x1000,
+                length: 10,
+            })
+        })
+        .unwrap_err();
+        assert!(matches!(err, MemoryError::OutOfBounds { .. }));
+    }
+
+    #[test]
+    fn zero_guest_range_zeros_a_writable_range_across_chunks() {
+        let len = ZERO_CHUNK.len() + 7;
+        let mut mem = MockMem::new(0x2000 + len, 0xAB);
+        mem.zero_guest_range(0x2000, len)
+            .expect("zero a writable range");
+        assert!(
+            mem.buf[0x2000..0x2000 + len].iter().all(|&b| b == 0),
+            "target range zeroed"
+        );
+        assert!(
+            mem.buf[..0x2000].iter().all(|&b| b == 0xAB),
+            "bytes before the range are untouched"
+        );
+    }
+
+    #[test]
+    fn zero_guest_range_faults_on_prot_none_and_scrubs_nothing() {
+        // The permission-checked path: a range overlapping a PROT_NONE window must
+        // EFAULT and write nothing — identical to the single `write_bytes` it replaces.
+        let mut mem = MockMem::new(0x100, 0xAB);
+        mem.prot.set_no_access(0x40, 0x20, true);
+        let err = mem.zero_guest_range(0x30, 0x40).unwrap_err();
+        assert!(matches!(err, MemoryError::OutOfBounds { .. }));
+        assert!(
+            mem.buf[0x30..0x70].iter().all(|&b| b == 0xAB),
+            "no bytes scrubbed when the gate faults"
+        );
+    }
+
+    #[test]
+    fn zero_backing_bypasses_the_prot_none_gate() {
+        // zero_backing is the deliberate BYPASS — scrubbing a reused PROT_NONE /
+        // unmapped region is its entire purpose, so it must succeed where
+        // zero_guest_range faults.
+        let mut mem = MockMem::new(0x100, 0xAB);
+        mem.prot.set_no_access(0x40, 0x20, true);
+        mem.zero_backing(0x30, 0x40)
+            .expect("backing scrub ignores the gate");
+        assert!(
+            mem.buf[0x30..0x70].iter().all(|&b| b == 0),
+            "the protected range is scrubbed"
+        );
+    }
+
+    #[test]
+    fn zero_backing_scrubs_across_multiple_chunks() {
+        let len = ZERO_CHUNK.len() * 2 + 1;
+        let mut mem = MockMem::new(len, 0xCD);
+        mem.zero_backing(0, len).expect("multi-chunk scrub");
+        assert!(mem.buf.iter().all(|&b| b == 0), "whole region scrubbed");
+    }
 }

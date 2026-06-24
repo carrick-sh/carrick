@@ -795,7 +795,7 @@ pub mod runtime {
                         // select returns 0 with the fd-sets zeroed; the handler
                         // left them intact, so zero them here.
                         for (addr, len) in &clear_on_timeout {
-                            let _ = memory.write_bytes(*addr, &vec![0u8; *len]);
+                            let _ = memory.zero_guest_range(*addr, *len);
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
