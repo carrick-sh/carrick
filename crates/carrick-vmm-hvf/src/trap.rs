@@ -170,6 +170,7 @@
 // dispatcher — the last edge blocking a future carrick-vmm-hvf crate (A3).
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
+use carrick_aarch64::Aarch64VcpuSnapshot;
 use carrick_guest_mem::MemoryError;
 use serde::Serialize;
 
@@ -1011,57 +1012,33 @@ struct MappingView {
     guest_shared: bool,
 }
 
-/// Snapshot of vCPU register state captured before fork(2). The child
-/// restores from this after rebuilding the HVF context so it resumes
-/// exactly where the parent left off (post-clone syscall).
+/// Snapshot of vCPU register state captured before fork(2). The child restores
+/// from this after rebuilding the HVF context so it resumes exactly where the
+/// parent left off (post-clone syscall).
+///
+/// The architectural register file lives in the ISA-neutral
+/// [`Aarch64VcpuSnapshot`] `core` — the SAME type the shared engine and the KVM
+/// lane trade in — so the HVF lane no longer duplicates those 21 fields. The
+/// only thing HVF carries on top is the backend-owned `last_exit_class` (the
+/// trap class latched at the exit the snapshot was taken on), which the neutral
+/// type deliberately does NOT model. This is the "neutral core + backend extra"
+/// shape: the per-VMM HVF↔neutral mapping (CPSR ↔ `core.pstate`, the `*_EL1`
+/// sysreg names ↔ their neutral aliases, and HVF seeding SP_EL1 from
+/// `core.sp_el0` since it captures no separate SP_EL1) lives in
+/// `snapshot_vcpu_from`/`restore_vcpu*`. The TTBR1_EL1 (Rosetta x86-64 high-half
+/// root) / ACTLR_EL1 (Rosetta EnTSO) / TPIDR*_EL0 (musl TLS, vDSO/rseq) capture
+/// rationales are documented on the neutral fields.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone)]
 pub(crate) struct VcpuSnapshot {
-    pub(crate) gprs: [u64; 31], // X0..X30
-    pub(crate) pc: u64,
-    pub(crate) cpsr: u64,
-    pub(crate) sp_el0: u64,
-    pub(crate) sctlr_el1: u64,
-    pub(crate) tcr_el1: u64,
-    pub(crate) ttbr0_el1: u64,
-    /// TTBR1_EL1 (upper-half root). The captured `tcr_el1` enables TTBR1
-    /// (EPD1=0) for the x86-64 high-half under Rosetta, so a fork/clone that
-    /// rebuilds the vCPU MUST also restore TTBR1_EL1 — otherwise it walks from
-    /// base 0 and every high-VA access (incl. the signal frame on a post-fork
-    /// rt_sigreturn) faults/reads garbage.
-    pub(crate) ttbr1_el1: u64,
-    /// ACTLR_EL1 (incl. EnTSO, set by Rosetta's prctl(PR_SET_MEM_MODEL,TSO)).
-    /// Restored across fork/clone so the rebuilt vCPU keeps hardware x86 TSO.
-    pub(crate) actlr_el1: u64,
-    pub(crate) mair_el1: u64,
-    pub(crate) vbar_el1: u64,
-    pub(crate) cpacr_el1: u64,
-    pub(crate) spsr_el1: u64,
-    pub(crate) elr_el1: u64,
-    /// EL0 thread pointer. Set by musl during thread init via the asm
-    /// `msr tpidr_el0, x?` and read back via `mrs x?, TPIDR_EL0`. If
-    /// we don't restore it post-fork, the child's musl post-clone
-    /// path computes thread-struct offsets relative to bogus zero
-    /// and either writes to unmapped memory or loops indefinitely
-    /// because the thread's tid never lands at the expected slot.
-    pub(crate) tpidr_el0: u64,
-    /// TPIDRRO_EL0 (read-only EL0 thread ptr). `hv_vcpu_create` zeroes it and the
-    /// guest can only READ it (EL1 writes it), so a fork/clone or a destroy/recreate
-    /// reclaim must restore it — some runtimes (vDSO cpu-id, rseq) read it.
-    pub(crate) tpidrro_el0: u64,
-    /// TPIDR_EL1 — carrick stamps the guest tid here for the fast `gettid` path
-    /// (`run_until_syscall`). `hv_vcpu_create` zeroes it; a destroy/recreate reclaim
-    /// that doesn't restore it makes `gettid()` return 0/stale.
-    pub(crate) tpidr_el1: u64,
+    /// The ISA-neutral architectural register file (GPRs, EL1 sysregs, V-regs, FP
+    /// control) shared with the engine and the KVM lane.
+    pub(crate) core: Aarch64VcpuSnapshot,
+    /// Backend-only: the HVF trap class latched at the exit this snapshot was
+    /// taken on. Engine-owned and intentionally absent from the neutral snapshot;
+    /// restored onto the rebuilt vCPU's `last_exit_class` so a reclaim/fork
+    /// resumes with the correct exit-class context.
     pub(crate) last_exit_class: u64,
-    /// V0-V31 + FPSR/FPCR, captured/restored across fork(2)/clone. A forked
-    /// child (and the parent — both rebuild a fresh vCPU) would otherwise resume
-    /// with the vector file zeroed by hv_vcpu_create, corrupting any runtime
-    /// that keeps live caller-saved V-state across a raw clone svc (Go, inline
-    /// NEON). Restored via the set_simd_fp_reg_v shim. (audit M2; probe forkfpregs)
-    pub(crate) vregs: [u128; 32],
-    pub(crate) fpsr: u32,
-    pub(crate) fpcr: u32,
 }
 
 // Off macOS/aarch64 the HVF backend is cfg'd out entirely (no `applevisor`, no
@@ -2896,7 +2873,7 @@ impl HvfVmState {
         } else {
             unsafe { libc::getpid() }
         };
-        crate::probes::fork_post(post_pid, snap.pc, snap.elr_el1);
+        crate::probes::fork_post(post_pid, snap.core.pc, snap.core.elr_el1);
         if is_child {
             // The child has a new pid, but its inherited USDT DOF is registered
             // with the kernel under the PARENT's pid. Re-register so DTrace's
@@ -3170,29 +3147,36 @@ impl HvfInner {
             fpsr = vcpu.get_reg(Reg::FPSR).map_err(hvf_error)? as u32;
             fpcr = vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
         }
+        let sp_el0 = vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
         Ok(VcpuSnapshot {
-            gprs,
-            pc: vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
-            cpsr: vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
-            sp_el0: vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?,
-            sctlr_el1: vcpu.get_sys_reg(SysReg::SCTLR_EL1).map_err(hvf_error)?,
-            tcr_el1: vcpu.get_sys_reg(SysReg::TCR_EL1).map_err(hvf_error)?,
-            ttbr0_el1: vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?,
-            ttbr1_el1: vcpu.get_sys_reg(SysReg::TTBR1_EL1).map_err(hvf_error)?,
-            actlr_el1: vcpu.get_sys_reg(SysReg::ACTLR_EL1).map_err(hvf_error)?,
-            mair_el1: vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
-            vbar_el1: vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
-            cpacr_el1: vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
-            spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
-            elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
-            tpidr_el0: vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
-            tpidrro_el0: vcpu.get_sys_reg(SysReg::TPIDRRO_EL0).map_err(hvf_error)?,
-            tpidr_el1: vcpu.get_sys_reg(SysReg::TPIDR_EL1).map_err(hvf_error)?,
+            core: Aarch64VcpuSnapshot {
+                gprs,
+                pc: vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
+                pstate: vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
+                sp_el0,
+                // HVF captures no separate SP_EL1 (its EL1 trampoline never pushes a
+                // kernel stack); mirror sp_el0 so the neutral round-trip is total —
+                // `restore_vcpu*` seeds SP_EL1 from `core.sp_el0`, not this field.
+                sp_el1: sp_el0,
+                elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
+                spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
+                ttbr0: vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?,
+                ttbr1: vcpu.get_sys_reg(SysReg::TTBR1_EL1).map_err(hvf_error)?,
+                tcr: vcpu.get_sys_reg(SysReg::TCR_EL1).map_err(hvf_error)?,
+                sctlr: vcpu.get_sys_reg(SysReg::SCTLR_EL1).map_err(hvf_error)?,
+                mair: vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
+                vbar: vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
+                cpacr: vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
+                tpidr_el0: vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
+                tpidrro_el0: vcpu.get_sys_reg(SysReg::TPIDRRO_EL0).map_err(hvf_error)?,
+                tpidr_el1: vcpu.get_sys_reg(SysReg::TPIDR_EL1).map_err(hvf_error)?,
+                actlr_el1: vcpu.get_sys_reg(SysReg::ACTLR_EL1).map_err(hvf_error)?,
+                vregs,
+                fpsr,
+                fpcr,
+            },
             // The engine owns last_exit_class; the snapshot carries 0 for it.
             last_exit_class: 0,
-            vregs,
-            fpsr,
-            fpcr,
         })
     }
 
@@ -3203,63 +3187,64 @@ impl HvfInner {
         snap: &VcpuSnapshot,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
-        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
+        for (reg, value) in GPR_TABLE.iter().zip(snap.core.gprs.iter()) {
             vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
         }
-        vcpu.set_reg(Reg::PC, snap.pc).map_err(hvf_error)?;
-        vcpu.set_reg(Reg::CPSR, snap.cpsr).map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
+        vcpu.set_reg(Reg::PC, snap.core.pc).map_err(hvf_error)?;
+        vcpu.set_reg(Reg::CPSR, snap.core.pstate)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SP_EL0, snap.core.sp_el0)
             .map_err(hvf_error)?;
         // Order matters: program TCR/MAIR/TTBR0 before flipping SCTLR.M.
-        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
+        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.core.mair)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
+        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.core.tcr)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.core.ttbr0)
             .map_err(hvf_error)?;
         // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO)
         // are part of the guest's live state; the captured TCR enables TTBR1, so
         // restoring TTBR0 alone would leave TTBR1 walking from base 0 and lose
         // hardware TSO — both required for the post-fork/clone guest to run.
-        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
+        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.core.ttbr1)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
+        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.core.actlr_el1)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.core.cpacr)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
+        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.core.vbar)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::SPSR_EL1, snap.spsr_el1)
+        vcpu.set_sys_reg(SysReg::SPSR_EL1, snap.core.spsr_el1)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.elr_el1)
+        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.core.elr_el1)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
+        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
             .map_err(hvf_error)?;
         // TPIDRRO_EL0 (guest-readable thread ptr) + TPIDR_EL1 (carrick's fast-gettid
         // tid stamp) are zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or
         // a destroy/recreate reclaim) must restore both.
-        vcpu.set_sys_reg(SysReg::TPIDRRO_EL0, snap.tpidrro_el0)
+        vcpu.set_sys_reg(SysReg::TPIDRRO_EL0, snap.core.tpidrro_el0)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::TPIDR_EL1, snap.tpidr_el1)
+        vcpu.set_sys_reg(SysReg::TPIDR_EL1, snap.core.tpidr_el1)
             .map_err(hvf_error)?;
         // Apply SCTLR last so the MMU enable lands with the new tables.
-        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.core.sctlr)
             .map_err(hvf_error)?;
         // Restore V0-V31 + FPSR/FPCR via the C shim (NOT applevisor's
         // set_simd_fp_reg, which zeroes via the wrong register class). (audit M2)
         if fpsimd_save_enabled() {
             let vcpu_id = vcpu.id();
             for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
-                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.vregs[i]);
+                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.core.vregs[i]);
                 if rc != 0 {
                     return Err(TrapError::Hypervisor(format!(
                         "fork restore set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
                     )));
                 }
             }
-            vcpu.set_reg(Reg::FPSR, u64::from(snap.fpsr))
+            vcpu.set_reg(Reg::FPSR, u64::from(snap.core.fpsr))
                 .map_err(hvf_error)?;
-            vcpu.set_reg(Reg::FPCR, u64::from(snap.fpcr))
+            vcpu.set_reg(Reg::FPCR, u64::from(snap.core.fpcr))
                 .map_err(hvf_error)?;
         }
         Ok(())
@@ -3270,7 +3255,7 @@ impl HvfInner {
     /// whose vCPU had already done the boot trampoline `eret` into EL0 and merely
     /// resumes), a freshly created vCPU has never transitioned to EL0. We therefore
     /// start it at the EL0 trampoline page (in EL1h) with `SPSR_EL1=EL0t` and
-    /// `ELR_EL1=snap.pc`, so the trampoline's single `eret` drops the vCPU into EL0
+    /// `ELR_EL1=snap.core.pc`, so the trampoline's single `eret` drops the vCPU into EL0
     /// at exactly the post-clone instruction — mirroring `map_plan`'s initial-boot
     /// sequence but with thread-private PC/SP/TLS. (The engine's `restore_thread_start`
     /// routes here for HVF; `last_exit_class` is engine-owned and not restored here.)
@@ -3279,7 +3264,7 @@ impl HvfInner {
         snap: &VcpuSnapshot,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
-        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
+        for (reg, value) in GPR_TABLE.iter().zip(snap.core.gprs.iter()) {
             vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
         }
         // Start at the EL0 trampoline page in EL1h; the trampoline `eret`s into EL0t
@@ -3292,39 +3277,39 @@ impl HvfInner {
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
             .map_err(hvf_error)?;
-        // The child's EL0 resume PC (snap.pc == parent ELR_EL1 == post-svc).
-        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.pc)
+        // The child's EL0 resume PC (snap.core.pc == parent ELR_EL1 == post-svc).
+        vcpu.set_sys_reg(SysReg::ELR_EL1, snap.core.pc)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
+        vcpu.set_sys_reg(SysReg::SP_EL0, snap.core.sp_el0)
             .map_err(hvf_error)?;
         // Same translation regime as the parent (shared address space).
-        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
+        vcpu.set_sys_reg(SysReg::MAIR_EL1, snap.core.mair)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
+        vcpu.set_sys_reg(SysReg::TCR_EL1, snap.core.tcr)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+        vcpu.set_sys_reg(SysReg::TTBR0_EL1, snap.core.ttbr0)
             .map_err(hvf_error)?;
         // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO) are
         // part of the guest's live state; the captured TCR enables TTBR1, so restoring
         // TTBR0 alone would leave TTBR1 walking from base 0 and lose hardware TSO —
         // both required for the post-clone guest to run.
-        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
+        vcpu.set_sys_reg(SysReg::TTBR1_EL1, snap.core.ttbr1)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
+        vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.core.actlr_el1)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.core.cpacr)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
+        vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.core.vbar)
             .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
+        vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
             .map_err(hvf_error)?;
         // SP_EL1 for the brief EL1h trampoline window. The trampoline only executes
         // one `eret` and touches no stack, but give it a sane value (the child's EL0
         // stack works; the trampoline never pushes).
-        vcpu.set_sys_reg(SysReg::SP_EL1, snap.sp_el0)
+        vcpu.set_sys_reg(SysReg::SP_EL1, snap.core.sp_el0)
             .map_err(hvf_error)?;
         // Enable the MMU last, identically to the parent.
-        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.core.sctlr)
             .map_err(hvf_error)?;
         Ok(())
     }
