@@ -21,6 +21,11 @@ workspace = true
 carrick-hal = { path = "../carrick-hal" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+# Process-wide PT-pause barrier (`fork_quiesce::pt_barrier().is_quiescing()`): the
+# coalesce gate reads it so multi-vCPU page-table reclaim is enabled exactly while
+# a sibling-pausing + TLB-broadcasting stage-1 edit holds the barrier. Acyclic:
+# carrick-thread depends only on carrick-hal + carrick-abi.
+carrick-thread = { path = "../carrick-thread" }
 # The shared sigframe glue trades in `carrick_abi::LinuxSiginfo`; the run-elf
 # service loop + fault delivery reference `libc` signal/errno numbers.
 carrick-abi = { path = "../carrick-abi" }

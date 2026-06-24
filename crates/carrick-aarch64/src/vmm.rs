@@ -567,6 +567,20 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         false
     }
 
+    /// True iff this backend's stage-1 maintenance (`run_el1_maintenance`) issues
+    /// an inner-shareable TLB broadcast (`tlbi vmalle1is`) that also flushes the
+    /// PAUSED sibling vCPUs' stage-1 walk-caches. When it does, a page-table page
+    /// freed by coalescing under the process-wide PT-pause barrier can be safely
+    /// reused — once a paused sibling resumes it holds no stale walk reference to
+    /// the freed page, so multi-vCPU page-table reclaim is sound. HVF's
+    /// EL1-maintenance trampoline does this; KVM-aarch64's MMIO-sentinel
+    /// maintenance vehicle is not yet proven to reach PARKED vCPUs, so it keeps the
+    /// default `false` (coalesce/reclaim stays single-vCPU-only there — fail-safe:
+    /// the pool leaks under churn rather than reusing a page unsafely).
+    fn pt_pause_flushes_sibling_tlbs(&self) -> bool {
+        false
+    }
+
     /// Multithreaded fork — sibling side, step 1: snapshot + destroy THIS vCPU
     /// (raw destroy; only the owning thread may) and publish this thread's regions
     /// so the forker can re-map them into the rebuilt parent VM. KVM no-op.

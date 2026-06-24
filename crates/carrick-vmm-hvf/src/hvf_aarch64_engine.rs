@@ -317,6 +317,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     type KickHandle = crate::vcpu_kick::VcpuKickHandle;
     type SiblingBuilder = ThreadSpec;
 
+    /// HVF's `run_el1_maintenance` trampoline issues an inner-shareable
+    /// `tlbi vmalle1is`, which flushes the PAUSED siblings' stage-1 walk-caches —
+    /// so page-table coalescing under the PT-pause barrier may safely reuse freed
+    /// table pages across vCPUs. See [`Aarch64Vmm::pt_pause_flushes_sibling_tlbs`].
+    fn pt_pause_flushes_sibling_tlbs(&self) -> bool {
+        true
+    }
+
     // ── memory windows + stage-2 ──
 
     fn map_stage2(
