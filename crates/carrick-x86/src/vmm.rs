@@ -15,9 +15,14 @@
 use std::sync::Arc;
 
 use carrick_guest_mem::{MemoryError, X8664SyscallFrame};
-use carrick_hal::{TrapError, VcpuKick, VcpuRegistry};
+use carrick_hal::{GuestVmBackend, TrapError, VcpuKick, VcpuRegistry};
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
+
+/// COW-inherit vs eager full-RAM copy at `fork(2)`. Re-exported from
+/// [`carrick_hal`] (the single canonical definition, shared with the aarch64 lane)
+/// so existing `crate::vmm::ForkRamStrategy` references keep resolving.
+pub use carrick_hal::ForkRamStrategy;
 
 /// The shared x86 register view the engine reads/writes through the backend. The
 /// union of KVM's `kvm_regs` named fields, bhyve's `vm_reg_name` ordinals, and
@@ -149,21 +154,6 @@ pub enum MsrInstall {
     NeedsRing0Blob,
 }
 
-/// COW-inherit vs eager full-RAM copy at `fork(2)`. POLICY only: the shared
-/// `fork_x86` reads this to decide *whether* to freeze; the `EagerCopy`
-/// MECHANISM (frozen-RAM memcpy, fresh named child VM) stays in the backend,
-/// exposed as `freeze_ram`/`rebuild_child_vm` that `fork_x86` *calls* but does
-/// not own (§2.5b).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForkRamStrategy {
-    /// KVM `MAP_PRIVATE` / NVMM host-fork COW: the child inherits RAM for free,
-    /// nothing is copied.
-    Cow,
-    /// bhyve kernel-owned non-COW RAM: the parent freezes the whole segment into
-    /// a host buffer pre-fork and the child rebuilds a fresh named VM from it.
-    EagerCopy,
-}
-
 /// One region of the guest address space the bring-up wants mapped: a `va`/`gpa`
 /// pair of `len` bytes with `perms`. The ordered list is the *union* of both
 /// backends' needs (§2.5a): KVM reads it as N per-region slots; bhyve reads
@@ -219,7 +209,7 @@ impl WindowPlan {
 /// `fresh_fork_kicker` / `set_guest_sp`) the generic engine's `ThreadedEngine`
 /// impl drives — these are the per-backend "spawn a sibling vCPU on the same VM"
 /// and "kick a vCPU thread" mechanisms, which differ per VMM.
-pub trait X86Vmm: Sized {
+pub trait X86Vmm: Sized + GuestVmBackend {
     type Vcpu: X86Vcpu;
 
     /// The per-backend vCPU-kick handle (`KvmKickHandle` / `BhyveKickHandle`).
@@ -235,18 +225,8 @@ pub trait X86Vmm: Sized {
     /// decision (§2.5a).
     fn setup_memory(&mut self, plan: &WindowPlan) -> Result<(), TrapError>;
 
-    /// Copy `bytes` into guest physical memory at `gpa`.
-    fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), TrapError>;
-
-    /// The host pointer backing `[gpa, gpa + len)`, or `None` if unmapped. The
-    /// engine's `GuestMemory` impl copies through this.
-    fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8>;
-
-    /// Mutable variant of [`Self::host_ptr`]. Backends with sparse/lazy backing
-    /// may materialize the requested range before returning the host pointer.
-    fn host_ptr_mut(&mut self, gpa: u64, len: usize) -> Option<*mut u8> {
-        self.host_ptr(gpa, len)
-    }
+    // NOTE: `write_gpa` / `host_ptr` / `host_ptr_mut` are inherited from the shared
+    // [`GuestVmBackend`] supertrait (ISA-neutral, signature-identical with aarch64).
 
     /// Host virtual address of the `len`-byte futex word at guest-physical `gpa`,
     /// but ONLY when that word lies in a `MAP_SHARED` window whose backing is the
@@ -405,9 +385,8 @@ pub trait X86Vmm: Sized {
         None
     }
 
-    /// POLICY: whether `fork(2)` can inherit RAM via COW or must eagerly copy
-    /// the whole segment (§2.5b).
-    fn fork_ram_strategy(&self) -> ForkRamStrategy;
+    // NOTE: `fork_ram_strategy` is inherited from the shared [`GuestVmBackend`]
+    // supertrait (ISA-neutral POLICY, signature-identical with aarch64).
 
     /// `EagerCopy` mechanism (no-op / unreachable for `Cow` backends): snapshot
     /// the full segment into a host buffer pre-fork. Returns the frozen RAM the
@@ -510,35 +489,21 @@ pub trait X86Vmm: Sized {
         ))
     }
 
-    /// Tear down per-process VM resources on a guest process `_exit` (§2.5c). A
-    /// HOOK, not `Drop` — the forked child `_exit`s skipping Rust Drops. Default
-    /// no-op (KVM `MAP_PRIVATE` / NVMM host-fork RAM is reclaimed by the OS on
-    /// `_exit`); bhyve overrides it to `vm_destroy` its `/dev/vmm` node (skipping
-    /// a vfork-shared/borrowed VM the parent still owns). The run loop's
-    /// child-exit path calls the engine's `process_exit_cleanup`, which delegates
-    /// here.
-    fn process_exit_cleanup(&mut self) {}
+    // NOTE: `process_exit_cleanup` is inherited from the shared [`GuestVmBackend`]
+    // supertrait (ISA-neutral hook, signature-identical with aarch64). bhyve
+    // overrides it to `vm_destroy` its `/dev/vmm` node; KVM/NVMM keep the no-op
+    // default. The run loop's child-exit path calls the engine's
+    // `process_exit_cleanup`, which delegates here.
 
     // ── Threaded-lifecycle surface (the generic ThreadedEngine drives these) ──
 
     /// A kick handle for the current vCPU thread (the engine's `kick_handle`).
     fn kick_handle(&self) -> Self::KickHandle;
 
-    /// Backend admission gate before a new vCPU thread runs (HVF's concurrent-
-    /// vCPU cap; a no-op on KVM/bhyve).
-    fn wait_for_vcpu_slot() {}
-
-    /// Live concurrent-vCPU budget N for the M:N admission scheduler. `usize::MAX`
-    /// = no carrick-side cap (KVM); bhyve returns `hw.vmm.maxcpu`.
-    fn vcpu_budget() -> usize {
-        usize::MAX
-    }
-
-    /// Whether this backend RECLAIMS a thread's vCPU slot on block (M:N reclaim).
-    /// `false` (default) = Phase-1 lifetime-binding (KVM); bhyve returns `true`.
-    fn reclaims(&self) -> bool {
-        false
-    }
+    // NOTE: `wait_for_vcpu_slot` / `vcpu_budget` / `reclaims` are inherited from the
+    // shared [`GuestVmBackend`] supertrait (ISA-neutral, signature-identical with
+    // aarch64). bhyve returns `hw.vmm.maxcpu` for `vcpu_budget` and `true` for
+    // `reclaims`; KVM/NVMM keep the defaults.
 
     /// Save THIS thread's full guest CPU state (GPRs + RSP/RFLAGS + FS/GS base +
     /// FP/AVX) before releasing its vCPU slot at a block point.
