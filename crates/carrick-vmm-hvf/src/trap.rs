@@ -3913,11 +3913,11 @@ fn hvf_mem_perms(perms: carrick_hal::MemPerms) -> applevisor::memory::MemPerms {
 }
 
 /// The HVF concurrent-vCPU budget (cap − fork-rebuild reserve) for the bounded
-/// M:N scheduler the engine installs via `Aarch64Vmm::vcpu_budget`. Same value
+/// M:N scheduler the engine installs via `GuestVmBackend::vcpu_budget`. Same value
 /// the retired `vcpu_gate` enforced; reclaim recycles vCPUs so >cap guest threads
 /// run instead of hanging. macOS/HVF-only: `vcpu_gate` (and the whole HVF backend)
 /// is cfg'd out off the HVF lane, and the only caller (the new module's
-/// `Aarch64Vmm::vcpu_budget`) is macOS-only too.
+/// `GuestVmBackend::vcpu_budget`) is macOS-only too.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hvf_vcpu_budget() -> usize {
     vcpu_gate::budget().max(1) as usize

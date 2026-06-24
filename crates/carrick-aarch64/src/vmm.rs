@@ -433,7 +433,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
 
     /// Freeze the guest RAM segment on the PARENT before `libc::fork`, so an
     /// `EagerCopy` backend's child can rebuild from a coherent image. Only invoked
-    /// by the shared `fork()` when [`Self::fork_ram_strategy`] is `EagerCopy`
+    /// by the shared `fork()` when [`carrick_hal::GuestVmBackend::fork_ram_strategy`] is `EagerCopy`
     /// (HVF, whose windows are `MAP_SHARED`); the `Cow` default (KVM) is a no-op.
     /// Mirrors the x86 `freeze_ram`.
     fn freeze_ram_for_fork(&mut self) -> Result<(), TrapError> {
