@@ -313,10 +313,10 @@ impl SyscallDispatcher {
             return DispatchOutcome::errno(LINUX_ENOMEM);
         };
         if memory
-            .write_bytes(ring_addr, &vec![0u8; layout.ring_bytes])
+            .zero_guest_range(ring_addr, layout.ring_bytes)
             .is_err()
             || memory
-                .write_bytes(sqes_addr, &vec![0u8; layout.sqes_bytes])
+                .zero_guest_range(sqes_addr, layout.sqes_bytes)
                 .is_err()
         {
             return DispatchOutcome::errno(LINUX_EFAULT);

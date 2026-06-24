@@ -730,8 +730,7 @@ where
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             for (addr, len) in &clear_on_timeout {
-                                let zeros = vec![0u8; *len];
-                                let _ = engine.write_bytes(*addr, &zeros);
+                                let _ = engine.zero_guest_range(*addr, *len);
                             }
                             break Ok(DispatchOutcome::Returned { value: 0 });
                         }

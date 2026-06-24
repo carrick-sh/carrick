@@ -1304,8 +1304,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     // zero them here before completing.
                     WaitResult::TimedOut => {
                         for (addr, len) in &clear_on_timeout {
-                            let zeros = vec![0u8; *len];
-                            let _ = memory.write_bytes(*addr, &zeros);
+                            let _ = memory.zero_guest_range(*addr, *len);
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
