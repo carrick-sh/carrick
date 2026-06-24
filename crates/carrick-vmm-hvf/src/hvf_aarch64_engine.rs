@@ -62,63 +62,22 @@ pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
 
 // ─── neutral ⟷ HVF VcpuSnapshot ──────────────────────────────────────────────
 //
-// The neutral `Aarch64VcpuSnapshot` carries every field HVF's `VcpuSnapshot` does
-// (incl. ACTLR_EL1/TPIDRRO_EL0/TPIDR_EL1, added in F7 step 4 for exactly this).
-// `last_exit_class` is engine-owned (not in the neutral snapshot); HVF restores it
-// from the vCPU's own latched class, so it is not carried across this seam.
+// HVF's `VcpuSnapshot` is now `{ core: Aarch64VcpuSnapshot, last_exit_class }`, so
+// the neutral view IS the `core` and these conversions are trivial. The
+// per-register HVF↔neutral mapping (CPSR ↔ pstate, the `*_EL1` sysreg names, HVF
+// seeding SP_EL1 from `core.sp_el0`) lives in `snapshot_vcpu_from`/`restore_vcpu*`,
+// not here. `last_exit_class` is engine-owned and not part of the neutral
+// snapshot, so `to_neutral` drops it and `from_neutral` re-attaches a
+// caller-supplied value (0 except on the engine-owned reclaim path).
 
 pub(crate) fn to_neutral(s: &VcpuSnapshot) -> Aarch64VcpuSnapshot {
-    Aarch64VcpuSnapshot {
-        gprs: s.gprs,
-        pc: s.pc,
-        pstate: s.cpsr,
-        sp_el0: s.sp_el0,
-        // HVF's snapshot does not separately carry SP_EL1 (the EL1 trampoline never
-        // pushes); `restore_vcpu`/thread-start seed it from sp_el0. Carry sp_el0 so a
-        // neutral round-trip is total.
-        sp_el1: s.sp_el0,
-        elr_el1: s.elr_el1,
-        spsr_el1: s.spsr_el1,
-        ttbr0: s.ttbr0_el1,
-        ttbr1: s.ttbr1_el1,
-        tcr: s.tcr_el1,
-        sctlr: s.sctlr_el1,
-        mair: s.mair_el1,
-        vbar: s.vbar_el1,
-        cpacr: s.cpacr_el1,
-        tpidr_el0: s.tpidr_el0,
-        tpidrro_el0: s.tpidrro_el0,
-        tpidr_el1: s.tpidr_el1,
-        actlr_el1: s.actlr_el1,
-        vregs: s.vregs,
-        fpsr: s.fpsr,
-        fpcr: s.fpcr,
-    }
+    s.core.clone()
 }
 
 pub(crate) fn from_neutral(s: &Aarch64VcpuSnapshot, last_exit_class: u64) -> VcpuSnapshot {
     VcpuSnapshot {
-        gprs: s.gprs,
-        pc: s.pc,
-        cpsr: s.pstate,
-        sp_el0: s.sp_el0,
-        sctlr_el1: s.sctlr,
-        tcr_el1: s.tcr,
-        ttbr0_el1: s.ttbr0,
-        ttbr1_el1: s.ttbr1,
-        actlr_el1: s.actlr_el1,
-        mair_el1: s.mair,
-        vbar_el1: s.vbar,
-        cpacr_el1: s.cpacr,
-        spsr_el1: s.spsr_el1,
-        elr_el1: s.elr_el1,
-        tpidr_el0: s.tpidr_el0,
-        tpidrro_el0: s.tpidrro_el0,
-        tpidr_el1: s.tpidr_el1,
+        core: s.clone(),
         last_exit_class,
-        vregs: s.vregs,
-        fpsr: s.fpsr,
-        fpcr: s.fpcr,
     }
 }
 
