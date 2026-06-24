@@ -138,7 +138,7 @@ pub fn request_platform(req: &CliRunRequest) -> Platform {
 /// strings are user-facing (surfaced by `carrick run`/`create`), so they name
 /// the actionable fix. This is a no-op on a native run, the common case.
 pub fn check_platform_runnable(platform: Platform) -> Result<(), String> {
-    match platform.host_execution() {
+    match carrick_spec::BackendCapabilities::current().host_execution(platform) {
         carrick_spec::HostExecution::Native => Ok(()),
         carrick_spec::HostExecution::RosettaTranslated => {
             if carrick_runtime::rosetta_available() {

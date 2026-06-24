@@ -271,6 +271,115 @@ pub enum HostExecution {
     Unsupported,
 }
 
+/// The host operating system carrick was built for. Fixed at compile time —
+/// carrick always runs as a host-native binary — but modelled explicitly,
+/// instead of left implicit in `cfg(target_os)` scattered through the
+/// runnability logic, so the backend capability table can gate translators per
+/// host OS (Apple Rosetta exists on macOS and Apple-Silicon Linux, but not the
+/// BSD lanes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOs {
+    /// Apple macOS (the HVF lane).
+    Macos,
+    /// Linux (the KVM lane); on arm64 it can expose Rosetta-for-Linux.
+    Linux,
+    /// FreeBSD (the bhyve lane).
+    FreeBsd,
+    /// NetBSD (the NVMM lane).
+    NetBsd,
+    /// Any other host OS carrick was not built to target.
+    Other,
+}
+
+impl HostOs {
+    /// The host OS this carrick binary was compiled for.
+    pub const fn current() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::Macos
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            Self::FreeBsd
+        }
+        #[cfg(target_os = "netbsd")]
+        {
+            Self::NetBsd
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        )))]
+        {
+            Self::Other
+        }
+    }
+}
+
+/// What the carrick binary in front of you can actually run: the host OS and ISA
+/// it was built for, and — via [`host_execution`](Self::host_execution) — which
+/// guest [`Platform`]s it admits natively versus through a translator. This is
+/// the "backend capability table" seam: it keeps apart the three concerns
+/// `Platform::host_execution` used to fuse — the GUEST ISA ([`Platform`]), the
+/// HOST build target (this descriptor), and the EXECUTION MECHANISM
+/// ([`HostExecution`]). A new (host_os, host_isa, guest) execution path is a new
+/// arm in [`host_execution`](Self::host_execution), not an edit scattered across
+/// `Platform`.
+///
+/// The VMM backend (HVF/KVM/bhyve/NVMM) is a fourth dimension the audit names,
+/// but today it is fixed by the compile-time `platform-*` feature and fully
+/// implied by `host_os`, so it is not carried here yet — it joins this descriptor
+/// when the per-VMM runtime-platform descriptor lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    /// The host OS this build targets.
+    pub host_os: HostOs,
+    /// The host CPU ISA this build runs on (the ISA a guest runs natively).
+    pub host_isa: Platform,
+}
+
+impl BackendCapabilities {
+    /// The capabilities of the carrick binary you are running — derived from the
+    /// compile-time host OS and ISA.
+    pub const fn current() -> Self {
+        Self {
+            host_os: HostOs::current(),
+            host_isa: Platform::host_native(),
+        }
+    }
+
+    /// Classify how this host would run a `guest` [`Platform`]:
+    /// [`Native`](HostExecution::Native) when the guest ISA matches the host
+    /// ISA; [`RosettaTranslated`](HostExecution::RosettaTranslated) for an
+    /// x86_64 guest on an aarch64 host on the macOS or Linux lanes (Apple
+    /// Rosetta 2 / Rosetta-for-Linux — the one cross-ISA path carrick models,
+    /// and only where a translator can exist);
+    /// [`Unsupported`](HostExecution::Unsupported) otherwise (an arm64 guest on
+    /// an x86_64 host has no reverse translation, and the BSD arm lanes have no
+    /// translator). This is the STATIC capability answer; the caller still probes
+    /// that the translator is actually installed
+    /// (`carrick_engine::check_platform_runnable` →
+    /// `carrick_runtime::rosetta_available`).
+    pub const fn host_execution(&self, guest: Platform) -> HostExecution {
+        match (self.host_isa, guest) {
+            (Platform::Aarch64, Platform::Aarch64) | (Platform::Amd64, Platform::Amd64) => {
+                HostExecution::Native
+            }
+            (Platform::Aarch64, Platform::Amd64) => match self.host_os {
+                HostOs::Macos | HostOs::Linux => HostExecution::RosettaTranslated,
+                HostOs::FreeBsd | HostOs::NetBsd | HostOs::Other => HostExecution::Unsupported,
+            },
+            (Platform::Amd64, Platform::Aarch64) => HostExecution::Unsupported,
+        }
+    }
+}
+
 impl Platform {
     /// The host's native guest ISA — what `carrick run` targets when
     /// `--platform` is omitted. carrick always runs as a host-native binary
@@ -293,20 +402,6 @@ impl Platform {
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             Self::Aarch64
-        }
-    }
-
-    /// Classify how running this guest platform would behave on the host carrick
-    /// was built for. `Native` when it matches the host ISA; `RosettaTranslated`
-    /// for an x86_64 guest on an aarch64 host (needs Rosetta 2); `Unsupported`
-    /// for an arm64 guest on an x86_64 host (no reverse translation). This is the
-    /// pure, host-arch-only half of the runnability decision — the caller layers
-    /// the Rosetta-installed check on top (see `carrick_engine::check_platform_runnable`).
-    pub const fn host_execution(self) -> HostExecution {
-        match (Self::host_native(), self) {
-            (Self::Aarch64, Self::Aarch64) | (Self::Amd64, Self::Amd64) => HostExecution::Native,
-            (Self::Aarch64, Self::Amd64) => HostExecution::RosettaTranslated,
-            (Self::Amd64, Self::Aarch64) => HostExecution::Unsupported,
         }
     }
 
@@ -449,20 +544,26 @@ mod tests {
     #[test]
     fn test_host_native_and_execution() {
         // `Default` follows the host architecture, and the native guest always
-        // runs without translation.
+        // runs without translation through the current backend capabilities. (The
+        // full host_os × isa × guest matrix is in the backend_caps_* tests; here
+        // we pin the compiled host's own defaults.)
+        let caps = BackendCapabilities::current();
         assert_eq!(Platform::default(), Platform::host_native());
         assert_eq!(
-            Platform::host_native().host_execution(),
+            caps.host_execution(Platform::host_native()),
             HostExecution::Native
         );
 
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(Platform::default(), Platform::Aarch64);
-            assert_eq!(Platform::Aarch64.host_execution(), HostExecution::Native);
-            // x86_64 guest on Apple Silicon → Rosetta path.
             assert_eq!(
-                Platform::Amd64.host_execution(),
+                caps.host_execution(Platform::Aarch64),
+                HostExecution::Native
+            );
+            // x86_64 guest on an Apple-Silicon macOS/Linux host → Rosetta path.
+            assert_eq!(
+                caps.host_execution(Platform::Amd64),
                 HostExecution::RosettaTranslated
             );
         }
@@ -470,13 +571,93 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         {
             assert_eq!(Platform::default(), Platform::Amd64);
-            assert_eq!(Platform::Amd64.host_execution(), HostExecution::Native);
+            assert_eq!(caps.host_execution(Platform::Amd64), HostExecution::Native);
             // arm64 guest on an x86_64 host → no reverse translation.
             assert_eq!(
-                Platform::Aarch64.host_execution(),
+                caps.host_execution(Platform::Aarch64),
                 HostExecution::Unsupported
             );
         }
+    }
+
+    #[test]
+    fn backend_caps_native_when_guest_isa_matches_host() {
+        for host_os in [
+            HostOs::Macos,
+            HostOs::Linux,
+            HostOs::FreeBsd,
+            HostOs::NetBsd,
+        ] {
+            for isa in [Platform::Aarch64, Platform::Amd64] {
+                let caps = BackendCapabilities {
+                    host_os,
+                    host_isa: isa,
+                };
+                assert_eq!(
+                    caps.host_execution(isa),
+                    HostExecution::Native,
+                    "{host_os:?}/{isa:?} runs its own ISA natively"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backend_caps_amd64_on_arm_is_rosetta_only_on_macos_and_linux() {
+        let on = |host_os| BackendCapabilities {
+            host_os,
+            host_isa: Platform::Aarch64,
+        };
+        // Apple Rosetta 2 (macOS) and Rosetta-for-Linux translate amd64 → arm64.
+        assert_eq!(
+            on(HostOs::Macos).host_execution(Platform::Amd64),
+            HostExecution::RosettaTranslated
+        );
+        assert_eq!(
+            on(HostOs::Linux).host_execution(Platform::Amd64),
+            HostExecution::RosettaTranslated
+        );
+        // The BSD arm lanes have no translator → reject, not a false "translatable".
+        assert_eq!(
+            on(HostOs::FreeBsd).host_execution(Platform::Amd64),
+            HostExecution::Unsupported
+        );
+        assert_eq!(
+            on(HostOs::NetBsd).host_execution(Platform::Amd64),
+            HostExecution::Unsupported
+        );
+    }
+
+    #[test]
+    fn backend_caps_arm64_on_x86_is_unsupported_on_every_host_os() {
+        for host_os in [
+            HostOs::Macos,
+            HostOs::Linux,
+            HostOs::FreeBsd,
+            HostOs::NetBsd,
+        ] {
+            let caps = BackendCapabilities {
+                host_os,
+                host_isa: Platform::Amd64,
+            };
+            assert_eq!(
+                caps.host_execution(Platform::Aarch64),
+                HostExecution::Unsupported,
+                "no reverse arm64-on-x86_64 translation on {host_os:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_caps_current_reflects_the_compiled_host() {
+        let caps = BackendCapabilities::current();
+        assert_eq!(caps.host_isa, Platform::host_native());
+        assert_eq!(caps.host_os, HostOs::current());
+        // Whatever host this is, it runs its own native ISA without translation.
+        assert_eq!(
+            caps.host_execution(Platform::host_native()),
+            HostExecution::Native
+        );
     }
 
     #[test]
