@@ -1841,10 +1841,29 @@ fn guest_committed_vm_kb(ctx: &SyntheticProcContext, host_virtual_bytes: u64) ->
             }
             total = total.saturating_add(end.saturating_sub(r.start));
         }
-        return total / 1024;
+        // A non-empty VMA snapshot is the precise source; use it. An empty/zero
+        // snapshot (no regions captured on this backend) falls through to the
+        // host-virtual-size estimate below so VmSize is never spuriously 0.
+        if total > 0 {
+            return total / 1024;
+        }
     }
+    // Fallback (no VMA snapshot): derive from the host virtual size. On
+    // macOS/HVF that size INCLUDES the large sparse mmap-arena window mapped at
+    // boot (≫ the 32 GiB arena), which must be subtracted so the guest doesn't
+    // look like a ~half-TiB process. On the x86 backends (bhyve/KVM) the host
+    // virtual size is `kinfo_proc.ki_size` / statm — the REAL committed guest
+    // address space, which does NOT include that sparse window, so subtracting
+    // the arena would wrongly drive VmSize to 0 (saturating_sub underflow). Only
+    // subtract the arena when the host size actually exceeds it (the macOS case);
+    // otherwise report the host size directly. Either way VmSize stays positive
+    // whenever the host size is, keeping VmRSS ≤ VmSize.
     let arena = crate::memory::mmap_arena_size();
-    host_virtual_bytes.saturating_sub(arena) / 1024
+    if host_virtual_bytes > arena {
+        (host_virtual_bytes - arena) / 1024
+    } else {
+        host_virtual_bytes / 1024
+    }
 }
 
 fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {

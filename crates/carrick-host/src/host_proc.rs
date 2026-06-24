@@ -463,19 +463,107 @@ mod imp {
     }
 }
 
-/// Linux (KVM lane): the host kernel's own `/proc` is the source of truth.
-/// carrick forks each guest process as a real Linux process (the trees mirror,
-/// same as macOS), so a sibling guest's identity/state is read straight from
-/// the REAL `/proc/<pid>/stat` — the synthetic guest `/proc` then re-renders
-/// it in the guest's namespace. Reads degrade to `None`/`false` on any parse
-/// or IO failure (also keeping a non-Linux non-macOS build inert).
+/// Non-macOS hosts (KVM / bhyve / NVMM lanes): the host kernel is the source of
+/// truth, same as macOS. carrick forks each guest process as a real host
+/// process (the trees mirror), so a sibling guest's identity/state and a
+/// process's own resource usage come straight from the host kernel — the
+/// synthetic guest `/proc` then re-renders them in the guest's namespace.
+///
+/// Two host-kernel surfaces are used, picked per OS at the call sites below:
+///   * **Linux** — the real `/proc/<pid>/stat` + `/proc/self/statm` +
+///     `getrusage`. (FreeBSD/NetBSD have NO Linux-format `/proc`; on FreeBSD
+///     procfs is not even mounted by default — `/proc/<pid>/stat` reads fail,
+///     so the Linux path is inert there and returned zeros.)
+///   * **FreeBSD** — `sysctl(KERN_PROC_PID)` → `struct kinfo_proc`, the BSD
+///     analogue of `/proc/<pid>/stat`: it carries ppid/pgid/state/comm/creds
+///     AND the resident/virtual size and a full `struct rusage` (maxrss, CPU,
+///     faults) for ANY pid the caller may signal. This is the durable,
+///     fork-coherent, cross-process kernel bookkeeping the project prefers over
+///     in-process shadow state.
+///
+/// Reads degrade to `None`/`false` on any failure (also keeping a host with
+/// neither surface — e.g. NetBSD until its `kinfo_proc2` path lands — inert).
 #[cfg(not(target_os = "macos"))]
 mod imp {
     use super::{GuestProcInfo, ResourceUsage};
 
+    /// FreeBSD `kinfo_proc` via `sysctl(KERN_PROC_PID)` — the BSD source of truth
+    /// for a process's identity, state, and resource usage. Used by `pid_info`
+    /// (sibling `/proc/<pid>/stat`), `is_guest_process` (the ppid-chain guard),
+    /// and `self_resource_usage` (statm/status/getrusage memory + CPU). procfs
+    /// is not mounted on FreeBSD by default, so the Linux `/proc` reader is inert
+    /// there; this is the working path.
+    #[cfg(target_os = "freebsd")]
+    mod freebsd {
+        /// Read the kernel's `kinfo_proc` for `pid` via `sysctl(KERN_PROC_PID)`.
+        /// `None` if the pid does not exist or the call fails. The mib is the
+        /// documented `{ CTL_KERN, KERN_PROC, KERN_PROC_PID, pid }` (sysctl(3));
+        /// the kernel writes exactly one fixed-size `kinfo_proc` (`ki_structsize`
+        /// matches `size_of::<kinfo_proc>()` on a matching libc, so a short read
+        /// is treated as failure rather than parsed).
+        pub(super) fn read_kinfo(pid: u32) -> Option<libc::kinfo_proc> {
+            let mut mib: [libc::c_int; 4] = [
+                libc::CTL_KERN,
+                libc::KERN_PROC,
+                libc::KERN_PROC_PID,
+                pid as libc::c_int,
+            ];
+            let mut kp: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::kinfo_proc>();
+            // SAFETY: a documented 4-element KERN_PROC_PID mib and a correctly
+            // sized, zeroed out-buffer of exactly one kinfo_proc. The kernel
+            // writes at most `len` bytes and updates `len` to what it wrote.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as libc::c_uint,
+                    &mut kp as *mut libc::kinfo_proc as *mut libc::c_void,
+                    &mut len,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            // rc==0 AND a full struct written (a live pid yields exactly one
+            // record; an empty result leaves len < struct size).
+            if rc == 0 && len >= std::mem::size_of::<libc::kinfo_proc>() {
+                Some(kp)
+            } else {
+                None
+            }
+        }
+
+        /// The Linux `/proc/<pid>/stat` state char for a FreeBSD `ki_stat`.
+        /// SRUN → 'R'; SSLEEP/SWAIT/SLOCK (interruptible / kernel waits) → 'S';
+        /// SSTOP → 'T'; SZOMB → 'Z'; SIDL (being created) → 'R' (runnable on
+        /// Linux during setup). Mirrors the macOS mapping's R/S/T/Z surface.
+        pub(super) fn state_char(ki_stat: libc::c_char) -> char {
+            match ki_stat {
+                libc::SRUN | libc::SIDL => 'R',
+                libc::SSTOP => 'T',
+                libc::SZOMB => 'Z',
+                // SSLEEP / SWAIT / SLOCK — blocked in the kernel.
+                _ => 'S',
+            }
+        }
+
+        /// `ki_comm` (NUL-padded `c_char` array) as a Rust String, truncated at
+        /// the first NUL (Linux `comm` semantics).
+        pub(super) fn comm(kp: &libc::kinfo_proc) -> String {
+            let bytes: Vec<u8> = kp
+                .ki_comm
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
     /// Parse a Linux `/proc/<pid>/stat` line into `(comm, state, ppid, pgrp)`.
     /// The comm is delimited by the FIRST `(` and LAST `)` — it may itself
-    /// contain spaces or parens (proc_pid_stat(5)).
+    /// contain spaces or parens (proc_pid_stat(5)). Linux-only; FreeBSD reads
+    /// the same facts from `kinfo_proc` (no procfs).
+    #[cfg(target_os = "linux")]
     fn parse_stat(line: &str) -> Option<(String, char, u32, u32)> {
         let open = line.find('(')?;
         let close = line.rfind(')')?;
@@ -487,6 +575,7 @@ mod imp {
         Some((comm, state, ppid, pgrp))
     }
 
+    #[cfg(target_os = "linux")]
     fn read_stat(path: &str) -> Option<(String, char, u32, u32)> {
         parse_stat(&std::fs::read_to_string(path).ok()?)
     }
@@ -497,6 +586,8 @@ mod imp {
     /// thread — a guest spinning in userspace would otherwise read 'S' from
     /// the parked leader. Any running task ⇒ 'R'; otherwise the leader state
     /// stands (a blocked guest parks every carrick thread, so it reads 'S').
+    /// Linux-only (FreeBSD's `ki_stat` is already a whole-process state).
+    #[cfg(target_os = "linux")]
     fn aggregate_state(pid: u32, leader: char) -> char {
         if leader == 'Z' || leader == 'T' {
             return leader;
@@ -517,6 +608,7 @@ mod imp {
         leader
     }
 
+    #[cfg(target_os = "linux")]
     pub fn pid_info(pid: u32) -> Option<GuestProcInfo> {
         let (comm, leader_state, ppid, pgid) = read_stat(&format!("/proc/{pid}/stat"))?;
         // Real uid/gid of the host process (`/proc/<pid>` is owned by it). The
@@ -537,9 +629,52 @@ mod imp {
         })
     }
 
-    /// True iff `pid` is a carrick GUEST process — same ppid-chain walk as the
-    /// macOS impl (chain must reach the root guest pid or this process), read
-    /// from the real `/proc`. Bounded so a cycle can't loop forever.
+    /// FreeBSD `pid_info`: read the `kinfo_proc` directly (no procfs). The
+    /// process state is `ki_stat`, which already reflects the whole process (a
+    /// guest spinning on a vCPU thread shows SRUN), so no per-thread aggregation
+    /// pass is needed — the macOS/Linux `task`-walk exists only because their
+    /// leader-only stat under-reports a busy worker thread.
+    #[cfg(target_os = "freebsd")]
+    pub fn pid_info(pid: u32) -> Option<GuestProcInfo> {
+        let kp = freebsd::read_kinfo(pid)?;
+        Some(GuestProcInfo {
+            state: freebsd::state_char(kp.ki_stat),
+            ppid: kp.ki_ppid.max(0) as u32,
+            pgid: kp.ki_pgid.max(0) as u32,
+            uid: kp.ki_ruid as u32,
+            gid: kp.ki_rgid as u32,
+            comm: freebsd::comm(&kp),
+        })
+    }
+
+    /// Any other non-macOS host without a wired process source (e.g. NetBSD
+    /// until `kinfo_proc2` lands): inert.
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    pub fn pid_info(_pid: u32) -> Option<GuestProcInfo> {
+        None
+    }
+
+    /// The host parent pid of `cur`, or `None` if it has no live host record.
+    /// The one per-OS primitive the `is_guest_process` chain-walk needs: Linux
+    /// reads `/proc/<pid>/stat`, FreeBSD reads `kinfo_proc.ki_ppid` (no procfs).
+    #[cfg(target_os = "linux")]
+    fn parent_pid(cur: u32) -> Option<u32> {
+        read_stat(&format!("/proc/{cur}/stat")).map(|(_, _, pp, _)| pp)
+    }
+    #[cfg(target_os = "freebsd")]
+    fn parent_pid(cur: u32) -> Option<u32> {
+        freebsd::read_kinfo(cur).map(|kp| kp.ki_ppid.max(0) as u32)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn parent_pid(_cur: u32) -> Option<u32> {
+        None
+    }
+
+    /// True iff `pid` is a carrick GUEST process — the ppid-chain walk (chain
+    /// must reach the root guest pid or this process), via the per-OS host kernel
+    /// `parent_pid`. Bounded so a cycle can't loop forever. The guard that keeps
+    /// a guest from probing arbitrary host processes: only carrick's own
+    /// descendants are exposable via `/proc`.
     pub fn is_guest_process(pid: u32) -> bool {
         if pid == 0 {
             return false;
@@ -551,7 +686,7 @@ mod imp {
         }
         let mut cur = pid;
         for _ in 0..256 {
-            let Some((_, _, pp, _)) = read_stat(&format!("/proc/{cur}/stat")) else {
+            let Some(pp) = parent_pid(cur) else {
                 return false;
             };
             if pp == me || (root != 0 && pp == root) {
@@ -618,7 +753,61 @@ mod imp {
             }
             Some(usage)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "freebsd")]
+        {
+            let mut usage = ResourceUsage::default();
+
+            // CPU + peak RSS from getrusage(RUSAGE_SELF) — always accurate for
+            // self, regardless of procfs. ru_maxrss is KiB on FreeBSD (as Linux).
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: getrusage(RUSAGE_SELF) fills `ru`; a zeroed rusage is a
+            // valid out-buffer.
+            let ru_ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0;
+            if ru_ok {
+                let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+                usage.user_us = to_us(ru.ru_utime);
+                usage.system_us = to_us(ru.ru_stime);
+                usage.maxrss_bytes = (ru.ru_maxrss.max(0) as u64).saturating_mul(1024);
+                usage.majflt = ru.ru_majflt.max(0) as u64;
+            }
+
+            // RUSAGE_CHILDREN for reaped children (tms_cutime / RUSAGE_CHILDREN).
+            let mut ruc: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: same contract for RUSAGE_CHILDREN.
+            if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ruc) } == 0 {
+                let to_us = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64;
+                usage.child_user_us = to_us(ruc.ru_utime);
+                usage.child_system_us = to_us(ruc.ru_stime);
+            }
+
+            // Current VSZ / RSS from the live kinfo_proc — the BSD analogue of
+            // /proc/self/statm (FreeBSD has no procfs by default). ki_size is the
+            // virtual size in BYTES; ki_rssize is the resident set in PAGES.
+            let mut kinfo_ok = false;
+            if let Some(kp) = freebsd::read_kinfo(std::process::id()) {
+                // SAFETY: sysconf(_SC_PAGESIZE) has no side effects; >0 on FreeBSD.
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64;
+                usage.virtual_bytes = kp.ki_size as u64;
+                usage.resident_bytes = (kp.ki_rssize.max(0) as u64).saturating_mul(page);
+                kinfo_ok = true;
+            }
+
+            // FreeBSD's getrusage(RUSAGE_SELF).ru_maxrss is the PEAK RSS, but the
+            // kernel only updates it as the process accumulates resident pages —
+            // a freshly-started process reads 0 (verified: a hello-world reports
+            // ru_maxrss=0). Peak RSS is by definition ≥ the current RSS, so floor
+            // it to the live resident size: this keeps VmHWM/ru_maxrss positive
+            // and consistent (peak ≥ current) without ever over-reporting.
+            if usage.maxrss_bytes < usage.resident_bytes {
+                usage.maxrss_bytes = usage.resident_bytes;
+            }
+
+            if !ru_ok && !kinfo_ok {
+                return None;
+            }
+            Some(usage)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         {
             None
         }
@@ -651,7 +840,7 @@ mod imp {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     mod stat_parse_tests {
         use super::parse_stat;
 
@@ -695,6 +884,19 @@ mod accounting_smoke {
         {
             let u = u.expect("resource usage available");
             assert!(u.virtual_bytes > 0, "vsize should be > 0");
+        }
+        // FreeBSD reads kinfo_proc via sysctl: the live process always has a
+        // positive virtual + resident size and a non-negative peak RSS. This is
+        // exactly what /proc/self/statm + /proc/self/status + getrusage(maxrss)
+        // surface to the guest (the accounting probe). Linux uses the same
+        // surfaces but `self_resource_usage` is a no-op stub there (guest_cpu
+        // supplies CPU), so this stronger assert is FreeBSD-only.
+        #[cfg(target_os = "freebsd")]
+        {
+            let u = u.expect("resource usage available on freebsd");
+            assert!(u.virtual_bytes > 0, "vsize should be > 0");
+            assert!(u.resident_bytes > 0, "rss should be > 0");
+            assert!(u.maxrss_bytes > 0, "maxrss should be > 0");
         }
         let _ = u;
     }
