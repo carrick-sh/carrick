@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::MemoryError;
-use carrick_hal::TrapError;
+use carrick_hal::{GuestVmBackend, TrapError};
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
 use carrick_x86::{
@@ -171,6 +171,67 @@ pub struct KvmSiblingBuilder {
     ticket: VcpuLiveTicket,
 }
 
+impl GuestVmBackend for KvmVmm {
+    fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), TrapError> {
+        // GuestRam::write_gpa takes &mut self; the bring-up holds &mut, but the
+        // trait is &self. The window host pointers are stable, so copy directly
+        // through host_ptr.
+        let host = self.ram.host_ptr(gpa, bytes.len()).ok_or_else(|| {
+            TrapError::Hypervisor(format!("kvm-x86: write_gpa 0x{gpa:x} unmapped"))
+        })?;
+        // SAFETY: host_ptr proved [host, host+len) is within a live window.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len()) };
+        Ok(())
+    }
+
+    fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
+        self.ram.host_ptr(gpa, len)
+    }
+
+    fn fork_ram_strategy(&self) -> ForkRamStrategy {
+        // KVM: MAP_PRIVATE windows inherit via COW; nothing is frozen/copied.
+        ForkRamStrategy::Cow
+    }
+
+    fn process_exit_cleanup(&mut self) {
+        crate::kvm::print_kvm_stats_once("process-exit");
+    }
+
+    fn wait_for_vcpu_slot() {
+        // Admission is enforced by the carrick-hal VcpuScheduler installed for
+        // `vcpu_budget()` (a bounded HostCondvarScheduler since the budget is
+        // finite); this backend hook stays a no-op.
+    }
+
+    fn vcpu_budget() -> usize {
+        // KVM_CAP_MAX_VCPUS is the hard per-VM cap; a guest thread beyond it would
+        // EINVAL KVM_CREATE_VCPU. Bound the live admitted set to (cap - reserve)
+        // so total created vcpu ids stay ≤ cap (the exit+block recycle reuses ids
+        // within that bound). The reserve mirrors bhyve/HVF: headroom for the
+        // boot vCPU + a fork-rebuild in flight. A query failure falls back to a
+        // safe constant well under the typical ~512 cap.
+        //
+        // CARRICK_KVM_BUDGET overrides it (testing): the real cap is ~512, far
+        // above any practical thread count, so force a low budget to exercise the
+        // block-recycle reclaim with a small barrier.
+        if let Some(n) = std::env::var("CARRICK_KVM_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+        {
+            return n;
+        }
+        kvm_max_vcpus().saturating_sub(VCPU_BUDGET_RESERVE).max(1)
+    }
+
+    fn reclaims(&self) -> bool {
+        // KVM reclaims so a guest with MORE concurrent threads than the budget can
+        // run: a blocking thread parks its vCPU into the recycle pool and another
+        // thread pops it (pool-swap / block-recycle).
+        true
+    }
+}
+
 impl X86Vmm for KvmVmm {
     type Vcpu = KvmVcpu;
     type KickHandle = KvmKickHandle;
@@ -189,22 +250,6 @@ impl X86Vmm for KvmVmm {
         // This hook is a no-op for KVM because `bring_up` constructs an already-
         // memory-mapped `KvmVmm`; it exists for backends that defer memory setup.
         Ok(())
-    }
-
-    fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), TrapError> {
-        // GuestRam::write_gpa takes &mut self; the bring-up holds &mut, but the
-        // trait is &self. The window host pointers are stable, so copy directly
-        // through host_ptr.
-        let host = self.ram.host_ptr(gpa, bytes.len()).ok_or_else(|| {
-            TrapError::Hypervisor(format!("kvm-x86: write_gpa 0x{gpa:x} unmapped"))
-        })?;
-        // SAFETY: host_ptr proved [host, host+len) is within a live window.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len()) };
-        Ok(())
-    }
-
-    fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
-        self.ram.host_ptr(gpa, len)
     }
 
     /// Resolve a futex word's GPA to the host address of its `MAP_SHARED`
@@ -374,11 +419,6 @@ impl X86Vmm for KvmVmm {
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
-    fn fork_ram_strategy(&self) -> ForkRamStrategy {
-        // KVM: MAP_PRIVATE windows inherit via COW; nothing is frozen/copied.
-        ForkRamStrategy::Cow
-    }
-
     fn rebuild_child_after_fork(
         &mut self,
         vcpu: &mut Self::Vcpu,
@@ -445,10 +485,6 @@ impl X86Vmm for KvmVmm {
         }
     }
 
-    fn process_exit_cleanup(&mut self) {
-        crate::kvm::print_kvm_stats_once("process-exit");
-    }
-
     fn restore_vcpu(
         &self,
         vcpu: &mut Self::Vcpu,
@@ -487,40 +523,6 @@ impl X86Vmm for KvmVmm {
 
     fn kick_handle(&self) -> Self::KickHandle {
         KvmKickHandle::for_current_thread()
-    }
-
-    fn wait_for_vcpu_slot() {
-        // Admission is enforced by the carrick-hal VcpuScheduler installed for
-        // `vcpu_budget()` (a bounded HostCondvarScheduler since the budget is
-        // finite); this backend hook stays a no-op.
-    }
-
-    fn vcpu_budget() -> usize {
-        // KVM_CAP_MAX_VCPUS is the hard per-VM cap; a guest thread beyond it would
-        // EINVAL KVM_CREATE_VCPU. Bound the live admitted set to (cap - reserve)
-        // so total created vcpu ids stay ≤ cap (the exit+block recycle reuses ids
-        // within that bound). The reserve mirrors bhyve/HVF: headroom for the
-        // boot vCPU + a fork-rebuild in flight. A query failure falls back to a
-        // safe constant well under the typical ~512 cap.
-        //
-        // CARRICK_KVM_BUDGET overrides it (testing): the real cap is ~512, far
-        // above any practical thread count, so force a low budget to exercise the
-        // block-recycle reclaim with a small barrier.
-        if let Some(n) = std::env::var("CARRICK_KVM_BUDGET")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-        {
-            return n;
-        }
-        kvm_max_vcpus().saturating_sub(VCPU_BUDGET_RESERVE).max(1)
-    }
-
-    fn reclaims(&self) -> bool {
-        // KVM reclaims so a guest with MORE concurrent threads than the budget can
-        // run: a blocking thread parks its vCPU into the recycle pool and another
-        // thread pops it (pool-swap / block-recycle).
-        true
     }
 
     fn save_guest_state(&self) -> Vec<u8> {

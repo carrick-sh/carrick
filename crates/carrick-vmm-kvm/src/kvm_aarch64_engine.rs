@@ -30,7 +30,8 @@ use carrick_guest_mem::MemoryError;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::zero_range_chunked;
 use carrick_hal::{
-    GuestEntryRegs, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, TrapError, VcpuExit, VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, TrapError,
+    VcpuExit, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 
@@ -240,13 +241,7 @@ pub struct KvmAarch64Vmm {
     ram: GuestRam,
 }
 
-impl Aarch64Vmm for KvmAarch64Vmm {
-    type Vcpu = KvmVcpu;
-    type KickHandle = KvmKickHandle;
-    type SiblingBuilder = KvmAarch64SiblingBuilder;
-
-    // ── memory windows + stage-2 ──
-
+impl GuestVmBackend for KvmAarch64Vmm {
     fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
         self.ram.host_ptr(gpa, len)
     }
@@ -259,6 +254,25 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len()) };
         Ok(())
     }
+
+    fn fork_ram_strategy(&self) -> ForkRamStrategy {
+        // KVM: MAP_PRIVATE windows inherit via COW; nothing is frozen/copied.
+        ForkRamStrategy::Cow
+    }
+
+    fn wait_for_vcpu_slot() {
+        // NO-OP for KVM: there is no Apple-HVF-style concurrent-vCPU cap (HVF
+        // limits ~64 concurrent vCPUs; KVM has no such admission gate), so a
+        // sibling never has to wait for a slot before KVM_CREATE_VCPU.
+    }
+}
+
+impl Aarch64Vmm for KvmAarch64Vmm {
+    type Vcpu = KvmVcpu;
+    type KickHandle = KvmKickHandle;
+    type SiblingBuilder = KvmAarch64SiblingBuilder;
+
+    // ── memory windows + stage-2 ──
 
     fn map_stage2(
         &mut self,
@@ -398,11 +412,6 @@ impl Aarch64Vmm for KvmAarch64Vmm {
 
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
         self.vm.add_vcpu().map_err(os_to_trap)
-    }
-
-    fn fork_ram_strategy(&self) -> ForkRamStrategy {
-        // KVM: MAP_PRIVATE windows inherit via COW; nothing is frozen/copied.
-        ForkRamStrategy::Cow
     }
 
     fn rebuild_child_after_fork(
@@ -553,12 +562,6 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         // cross-thread `pthread_kill(tid, SIGRTMIN)` forces this vCPU out of
         // KVM_RUN. (The shared loop calls this on the owning vCPU thread.)
         KvmKickHandle::for_current_thread()
-    }
-
-    fn wait_for_vcpu_slot() {
-        // NO-OP for KVM: there is no Apple-HVF-style concurrent-vCPU cap (HVF
-        // limits ~64 concurrent vCPUs; KVM has no such admission gate), so a
-        // sibling never has to wait for a slot before KVM_CREATE_VCPU.
     }
 
     fn save_guest_state(
