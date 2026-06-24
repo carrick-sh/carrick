@@ -291,17 +291,27 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // spare sub-tables into the pool — a break-before-make table↔block flip
         // plus a page free, unsafe only if another vCPU holds a stale walk-cache
         // reference to the freed page. So coalesce is safe iff the edit is
-        // EXCLUSIVE. The single-vCPU case (count==1) is provably exclusive here,
-        // so re-enable coalescing then (the OutOfTables→ENOMEM-under-churn fix
-        // for a single-threaded guest). The multi-vCPU case stays conservative
-        // (unsafe_to_coalesce = true): the generic loop's Pause-Modify-Resume DOES
-        // pause siblings + `tlbi vmalle1is`-broadcast around every threaded stage-1
-        // editor (vcpu_loop.rs pt_pause), making coalesce safe there too, but the
-        // engine cannot read that barrier from this crate (it lives in
-        // carrick-runtime), so it keeps today's conservative flag rather than
-        // assume the PMR is held. (HVF, which CAN read the barrier, uses
-        // `live_multi && !is_quiescing()`.)
-        let unsafe_to_coalesce = Arc::strong_count(&pt) > 1;
+        // EXCLUSIVE. Two cases make it exclusive:
+        //   * sole vCPU (`live_multi == false`) — provably no sibling (the
+        //     OutOfTables→ENOMEM-under-churn fix for a single-threaded guest); OR
+        //   * this edit holds the process-wide PT-pause barrier: the runtime's
+        //     threaded loop wraps every multi-vCPU stage-1 editor
+        //     (munmap/mremap/mmap/mprotect) in `pt_pause`, which drains all
+        //     siblings OUT of guest and the edit's `run_el1_maintenance` then
+        //     broadcasts an inner-shareable `tlbi vmalle1is` BEFORE they resume —
+        //     so no resumed sibling holds a stale walk reference to a freed page.
+        //     The engine reads the barrier via `pt_barrier().is_quiescing()`.
+        // The barrier flush is only sibling-reaching on a backend whose
+        // maintenance vehicle is an inner-shareable broadcast: HVF's EL1-trampoline
+        // `tlbi vmalle1is` is, so `pt_pause_flushes_sibling_tlbs()` is `true` there;
+        // KVM-aarch64 shares this engine but its MMIO-sentinel maintenance is not
+        // yet proven to reach PARKED vCPUs, so it keeps the default `false` and the
+        // conservative single-vCPU-only reclaim (fail-safe: it leaks, never reuses
+        // unsafely).
+        let live_multi = Arc::strong_count(&pt) > 1;
+        let unsafe_to_coalesce = live_multi
+            && !(self.vm.pt_pause_flushes_sibling_tlbs()
+                && carrick_thread::fork_quiesce::pt_barrier().is_quiescing());
         let mut guard = pt.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             // Build from the live guest backing (the boot tables) on first edit —
