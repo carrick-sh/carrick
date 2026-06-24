@@ -26,12 +26,10 @@ pub use kvm_signal_backend::KvmGlue;
 // loop constructs that directly, so this backend has no SignalArrival module.
 pub mod timer_delivery;
 
-// aarch64-only modules: fork snapshot/restore, the MMIO-sentinel trap engine,
-// and the aarch64 standalone run-elf loop all use ARM-specific KVM APIs
-// (KVM_GET/SET_ONE_REG, ARM sysregs, EL1 vector, vDSO vvar) that do not exist
-// on x86_64.  The x86_64 analogues live in the cfg(x86_64) stubs below.
-#[cfg(target_arch = "aarch64")]
-pub mod fork;
+// aarch64-only modules: the MMIO-sentinel trap engine and the aarch64 standalone
+// run-elf loop all use ARM-specific KVM APIs (KVM_GET/SET_ONE_REG, ARM sysregs,
+// EL1 vector, vDSO vvar) that do not exist on x86_64.  The x86_64 analogues live
+// in the cfg(x86_64) stubs below.
 // The KVM aarch64 lane on the shared `carrick-aarch64` scaffold (Stage 2-KVM):
 // `KvmAarch64Vmm`/`impl Aarch64Vcpu for KvmVcpu` + `bring_up` →
 // `Aarch64EngineCore<KvmAarch64Vmm>`. Replaces the hand-rolled `KvmTrapEngine`.

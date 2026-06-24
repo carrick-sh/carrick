@@ -747,7 +747,7 @@ impl GuestRam {
     /// via [`KvmVm::add_vcpu`]). PRIVATE windows are the Linux-COW copies; the
     /// `MAP_SHARED` aperture re-registers the SAME (inherited) host pages, so its
     /// writes stay coherent across the fork. The vCPU is returned UNPROGRAMMED;
-    /// the caller restores the parent's `VcpuSnapshot` onto it.
+    /// the caller restores the parent's `Aarch64VcpuSnapshot` onto it.
     pub(crate) fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
         let mut vm = KvmVm::create_empty()?;
         let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
