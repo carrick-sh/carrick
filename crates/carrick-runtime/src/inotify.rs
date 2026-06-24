@@ -239,106 +239,73 @@ struct Inner {
     pending: std::collections::VecDeque<Vec<u8>>,
     /// Linux only: native-inotify watch descriptor → guest wd. The kernel hands
     /// out its own wd from `inotify_add_watch`; the guest sees our `wd`, so a
-    /// record read off the native fd is rewritten through this map.
+    /// record read off the native fd is rewritten through this map. Kept on the
+    /// shared `Inner` (not the backend) so all bookkeeping lives under the single
+    /// `inner` lock — a backend-owned copy would force a two-lock dance and a
+    /// deadlock hazard.
     #[cfg(feature = "platform-linux")]
     native_wd_to_guest: HashMap<i32, i32>,
 }
 
-/// One inotify instance: a readiness backend plus its watch-descriptor table.
-/// Owns every watched fd and closes them on `rm_watch`/drop.
-///
-/// On macOS the backend is a boxed `EventMultiplexer`
-/// (kqueue-backed via `EVFILT_VNODE`); the watch register/drain go through the
-/// trait. On Linux the backend is a native `inotify` fd read directly.
-pub(crate) struct InotifyState {
-    /// macOS readiness backend. `Mutex` because the trait's register/drain
-    /// methods need `&mut` yet `InotifyState` is shared via `Arc` and exposes
-    /// `&self` methods; the lock is only ever held for a non-blocking kqueue
-    /// change or a zero-timeout drain.
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
-    mux: Mutex<Box<dyn EventMultiplexer>>,
-    /// The native Linux inotify fd (`IN_NONBLOCK | IN_CLOEXEC`). Pollable
-    /// directly; `read(2)` returns native `inotify_event` records.
-    #[cfg(feature = "platform-linux")]
-    inotify_fd: RawFd,
-    /// Cached pollable fd — stable for the instance's life, read lock-free
-    /// (`mux.poll_fd()` on macOS, the inotify fd on Linux).
-    poll_fd: RawFd,
-    inner: Mutex<Inner>,
-}
-
-impl std::fmt::Debug for InotifyState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InotifyState")
-            .field("poll_fd", &self.poll_fd())
-            .finish_non_exhaustive()
-    }
-}
-
-impl InotifyState {
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
-    pub(crate) fn new() -> Option<Self> {
-        let mux = crate::event_mux::make_event_multiplexer().ok()?;
-        let poll_fd = mux.poll_fd();
-        Some(Self {
-            mux: Mutex::new(mux),
-            poll_fd,
-            inner: Mutex::new(Inner {
-                next_wd: 1,
-                watches: HashMap::new(),
-                wd_by_fd: HashMap::new(),
-                pending: std::collections::VecDeque::new(),
-            }),
-        })
-    }
-
-    #[cfg(feature = "platform-linux")]
-    pub(crate) fn new() -> Option<Self> {
-        // SAFETY: inotify_init1 takes a flags int and returns an fd or -1.
-        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if fd < 0 {
-            return None;
+impl Inner {
+    /// Construct the shared watch-descriptor bookkeeping for a fresh instance.
+    fn new() -> Self {
+        Inner {
+            next_wd: 1,
+            watches: HashMap::new(),
+            wd_by_fd: HashMap::new(),
+            pending: std::collections::VecDeque::new(),
+            #[cfg(feature = "platform-linux")]
+            native_wd_to_guest: HashMap::new(),
         }
-        Some(Self {
-            inotify_fd: fd,
-            poll_fd: fd,
-            inner: Mutex::new(Inner {
-                next_wd: 1,
-                watches: HashMap::new(),
-                wd_by_fd: HashMap::new(),
-                pending: std::collections::VecDeque::new(),
-                native_wd_to_guest: HashMap::new(),
-            }),
-        })
     }
+}
 
-    /// The backing pollable fd (the kqueue fd on macOS, the inotify fd on
-    /// Linux), so poll/epoll/blocking-read can wait on inotify readiness the
-    /// same way they do for timerfd/pidfd.
-    pub(crate) fn poll_fd(&self) -> RawFd {
-        self.poll_fd
-    }
-
-    /// Register a watch on an already-open host fd, taking ownership of it.
-    /// If `host_fd`'s vnode is already watched, updates the mask and returns the
-    /// existing wd (matching inotify, which returns the same wd for a re-add).
-    pub(crate) fn add_watch(&self, host_fd: RawFd, mask: u32) -> Result<i32, i32> {
-        self.add_watch_fds(vec![crate::vfs::WatchFd::unnamed(host_fd)], mask)
-    }
-
-    #[cfg(feature = "platform-linux")]
-    pub(crate) fn add_watch_fds(
+/// The platform readiness/watch backend behind [`InotifyState`]. Each variant
+/// owns its host-side machinery (a native `inotify` fd on Linux, a boxed
+/// `EventMultiplexer` on macOS/BSD) and implements the watch register/drain in
+/// terms of the shared [`Inner`] bookkeeping. Methods that mutate `Inner` take
+/// `&Mutex<Inner>` and lock it exactly where the old per-`cfg` bodies did, so
+/// the single `inner` lock still serializes every table update.
+trait InotifyBackend: Send + Sync {
+    /// The backing pollable fd (the kqueue fd on macOS, the inotify fd on Linux).
+    fn poll_fd(&self) -> RawFd;
+    /// Register a batch of watched fds under one guest wd; mirrors the old
+    /// per-platform `add_watch_fds`. Takes ownership of the fds.
+    fn add_watch_fds(
         &self,
         watch_fds: Vec<crate::vfs::WatchFd>,
         mask: u32,
+        inner: &Mutex<Inner>,
+    ) -> Result<i32, i32>;
+    /// Tear down the backend-side registration for one watched fd of a wd being
+    /// removed. Called by `rm_watch`, which already holds the `inner` lock, so it
+    /// takes `&mut Inner`.
+    fn deregister(&self, host_fd: RawFd, wd: i32, inner: &mut Inner);
+    /// Drain newly-ready changes and return up to `max_bytes` of encoded Linux
+    /// `inotify_event` records; mirrors the old per-platform `read_records`.
+    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, i32>;
+}
+
+/// Native Linux backend: a real kernel `inotify` instance read directly.
+#[cfg(feature = "platform-linux")]
+struct NativeLinuxInotify {
+    /// The native Linux inotify fd (`IN_NONBLOCK | IN_CLOEXEC`). Pollable
+    /// directly; `read(2)` returns native `inotify_event` records.
+    inotify_fd: RawFd,
+}
+
+#[cfg(feature = "platform-linux")]
+impl InotifyBackend for NativeLinuxInotify {
+    fn poll_fd(&self) -> RawFd {
+        self.inotify_fd
+    }
+
+    fn add_watch_fds(
+        &self,
+        watch_fds: Vec<crate::vfs::WatchFd>,
+        mask: u32,
+        inner: &Mutex<Inner>,
     ) -> Result<i32, i32> {
         if watch_fds.is_empty() {
             return Err(LINUX_EINVAL);
@@ -362,7 +329,7 @@ impl InotifyState {
             }
         }
 
-        let mut inner = self.inner.lock();
+        let mut inner = inner.lock();
         if watch_fds.len() == 1
             && let Some(existing) = inner.wd_by_fd.get(&watch_fds[0].host_fd).cloned()
         {
@@ -388,119 +355,23 @@ impl InotifyState {
         Ok(wd)
     }
 
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
-    pub(crate) fn add_watch_fds(
-        &self,
-        watch_fds: Vec<crate::vfs::WatchFd>,
-        mask: u32,
-    ) -> Result<i32, i32> {
-        if watch_fds.is_empty() {
-            return Err(LINUX_EINVAL);
+    fn deregister(&self, _host_fd: RawFd, wd: i32, inner: &mut Inner) {
+        // Drop the kernel watch(es) that map to this guest wd.
+        let native: Vec<i32> = inner
+            .native_wd_to_guest
+            .iter()
+            .filter(|&(_, &g)| g == wd)
+            .map(|(&n, _)| n)
+            .collect();
+        for native_wd in native {
+            inner.native_wd_to_guest.remove(&native_wd);
+            // SAFETY: inotify_rm_watch on our owned inotify fd + valid wd.
+            unsafe { libc::inotify_rm_watch(self.inotify_fd, native_wd) };
         }
-        let host_fds: Vec<RawFd> = watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect();
-
-        // Register each watched vnode for the requested `NOTE_*` set. The token
-        // is the host fd so `read_records` can map a fired event back to its wd.
-        let registered = {
-            let events = linux_mask_to_vnode_events(mask);
-            let mut mux = self.mux.lock();
-            host_fds.iter().try_for_each(|host_fd| {
-                mux.register_vnode(*host_fd, *host_fd as u64, events)
-                    .map_err(|_| ())
-            })
-        };
-        if registered.is_err() {
-            // Registration failed: we own the fds, so don't leak them.
-            for host_fd in host_fds {
-                unsafe { libc::close(host_fd) };
-            }
-            return Err(LINUX_ENOSPC);
-        }
-        let mut inner = self.inner.lock();
-        if watch_fds.len() == 1
-            && watch_fds[0].name.is_none()
-            && let Some(existing) = inner.wd_by_fd.get(&watch_fds[0].host_fd).cloned()
-        {
-            let wd = existing.wd;
-            if let Some(w) = inner.watches.get_mut(&wd) {
-                w.mask = mask;
-            }
-            // The caller's duplicate fd is redundant; drop it.
-            unsafe { libc::close(watch_fds[0].host_fd) };
-            return Ok(wd);
-        }
-        let wd = inner.next_wd;
-        inner.next_wd += 1;
-        for watch_fd in &watch_fds {
-            let scan_dir = watch_fd.scan_dir.as_ref().and_then(|path| {
-                scan_dir_entries(path).ok().map(|entries| ScannedDir {
-                    path: path.clone(),
-                    entries,
-                })
-            });
-            inner.wd_by_fd.insert(
-                watch_fd.host_fd,
-                WatchedFd {
-                    wd,
-                    name: watch_fd.name.clone(),
-                    scan_dir,
-                },
-            );
-        }
-        inner.watches.insert(wd, Watch { host_fds, mask });
-        Ok(wd)
     }
 
-    /// Remove a watch by descriptor; closes its fd. Unknown wd → EINVAL.
-    pub(crate) fn rm_watch(&self, wd: i32) -> Result<(), i32> {
-        let mut inner = self.inner.lock();
-        let Some(watch) = inner.watches.remove(&wd) else {
-            return Err(LINUX_EINVAL);
-        };
-        for host_fd in watch.host_fds {
-            inner.wd_by_fd.remove(&host_fd);
-            #[cfg(any(
-                feature = "platform-macos",
-                feature = "platform-freebsd",
-                feature = "platform-netbsd"
-            ))]
-            {
-                let _ = self.mux.lock().deregister(host_fd);
-            }
-            #[cfg(feature = "platform-linux")]
-            {
-                // Drop the kernel watch(es) that map to this guest wd.
-                let native: Vec<i32> = inner
-                    .native_wd_to_guest
-                    .iter()
-                    .filter(|&(_, &g)| g == wd)
-                    .map(|(&n, _)| n)
-                    .collect();
-                for native_wd in native {
-                    inner.native_wd_to_guest.remove(&native_wd);
-                    // SAFETY: inotify_rm_watch on our owned inotify fd + valid wd.
-                    unsafe { libc::inotify_rm_watch(self.inotify_fd, native_wd) };
-                }
-            }
-            unsafe { libc::close(host_fd) };
-        }
-        Ok(())
-    }
-
-    /// Read up to `max_bytes` of encoded Linux `inotify_event` records. First
-    /// drains any newly-ready changes (the kqueue on macOS, the native inotify
-    /// fd on Linux), then returns whole records up to the caller's buffer size,
-    /// keeping the remainder queued (`pending`) for the next read.
-    /// An empty return means no events are ready (caller maps to EAGAIN / a
-    /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
-    /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
-    #[cfg(feature = "platform-linux")]
-    pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
-        let mut inner = self.inner.lock();
+    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, i32> {
+        let mut inner = inner.lock();
         // Drain whatever the kernel has queued on the native inotify fd, rewrite
         // each record's wd from the host's space into the guest's, and enqueue
         // the (already Linux-formatted) records. The kernel reports basenames
@@ -552,13 +423,102 @@ impl InotifyState {
         }
         drain_pending(&mut inner, max_bytes)
     }
+}
 
-    #[cfg(any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ))]
-    pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
+/// macOS/BSD backend: bridges Linux inotify to kqueue `EVFILT_VNODE` via the
+/// boxed `EventMultiplexer`, pairing the vnode write with a directory
+/// snapshot/diff to synthesize Linux-style basename child events.
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+struct VnodeDiffInotify {
+    /// macOS readiness backend. `Mutex` because the trait's register/drain
+    /// methods need `&mut` yet the backend is shared via `Arc` and exposes
+    /// `&self` methods; the lock is only ever held for a non-blocking kqueue
+    /// change or a zero-timeout drain.
+    mux: Mutex<Box<dyn EventMultiplexer>>,
+}
+
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+impl InotifyBackend for VnodeDiffInotify {
+    fn poll_fd(&self) -> RawFd {
+        self.mux.lock().poll_fd()
+    }
+
+    fn add_watch_fds(
+        &self,
+        watch_fds: Vec<crate::vfs::WatchFd>,
+        mask: u32,
+        inner: &Mutex<Inner>,
+    ) -> Result<i32, i32> {
+        if watch_fds.is_empty() {
+            return Err(LINUX_EINVAL);
+        }
+        let host_fds: Vec<RawFd> = watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect();
+
+        // Register each watched vnode for the requested `NOTE_*` set. The token
+        // is the host fd so `read_records` can map a fired event back to its wd.
+        let registered = {
+            let events = linux_mask_to_vnode_events(mask);
+            let mut mux = self.mux.lock();
+            host_fds.iter().try_for_each(|host_fd| {
+                mux.register_vnode(*host_fd, *host_fd as u64, events)
+                    .map_err(|_| ())
+            })
+        };
+        if registered.is_err() {
+            // Registration failed: we own the fds, so don't leak them.
+            for host_fd in host_fds {
+                unsafe { libc::close(host_fd) };
+            }
+            return Err(LINUX_ENOSPC);
+        }
+        let mut inner = inner.lock();
+        if watch_fds.len() == 1
+            && watch_fds[0].name.is_none()
+            && let Some(existing) = inner.wd_by_fd.get(&watch_fds[0].host_fd).cloned()
+        {
+            let wd = existing.wd;
+            if let Some(w) = inner.watches.get_mut(&wd) {
+                w.mask = mask;
+            }
+            // The caller's duplicate fd is redundant; drop it.
+            unsafe { libc::close(watch_fds[0].host_fd) };
+            return Ok(wd);
+        }
+        let wd = inner.next_wd;
+        inner.next_wd += 1;
+        for watch_fd in &watch_fds {
+            let scan_dir = watch_fd.scan_dir.as_ref().and_then(|path| {
+                scan_dir_entries(path).ok().map(|entries| ScannedDir {
+                    path: path.clone(),
+                    entries,
+                })
+            });
+            inner.wd_by_fd.insert(
+                watch_fd.host_fd,
+                WatchedFd {
+                    wd,
+                    name: watch_fd.name.clone(),
+                    scan_dir,
+                },
+            );
+        }
+        inner.watches.insert(wd, Watch { host_fds, mask });
+        Ok(wd)
+    }
+
+    fn deregister(&self, host_fd: RawFd, _wd: i32, _inner: &mut Inner) {
+        let _ = self.mux.lock().deregister(host_fd);
+    }
+
+    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, i32> {
         // Non-blocking drain of newly-ready vnode changes, normalized to a list
         // of `(watched host fd, fired NOTE_* fflags)`.
         let fired: Vec<(RawFd, u32)> = {
@@ -573,7 +533,7 @@ impl InotifyState {
                 })
                 .collect()
         };
-        let mut inner = self.inner.lock();
+        let mut inner = inner.lock();
         for &(fd, fflags) in &fired {
             let Some(watched) = inner.wd_by_fd.get(&fd).cloned() else {
                 continue;
@@ -582,7 +542,7 @@ impl InotifyState {
             let requested = inner.watches.get(&wd).map(|w| w.mask).unwrap_or(0);
             if let Some(scan_dir) = watched.scan_dir
                 && let Some(records) =
-                    Self::scan_directory_records(&mut inner, fd, wd, requested, scan_dir)
+                    scan_directory_records(&mut inner, fd, wd, requested, scan_dir)
                 && !records.is_empty()
             {
                 inner.pending.extend(records);
@@ -598,55 +558,179 @@ impl InotifyState {
         }
         drain_pending(&mut inner, max_bytes)
     }
+}
 
+/// Snapshot/diff a watched directory and synthesize Linux basename
+/// CREATE/DELETE records for entries added/removed since the last scan,
+/// refreshing the stored snapshot. macOS-only, like the vnode emulation itself.
+#[cfg(any(
+    feature = "platform-macos",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+fn scan_directory_records(
+    inner: &mut Inner,
+    fd: RawFd,
+    wd: i32,
+    requested: u32,
+    mut scan_dir: ScannedDir,
+) -> Option<Vec<Vec<u8>>> {
+    let current = scan_dir_entries(&scan_dir.path).ok()?;
+    let mut records = Vec::new();
+    let mut added: Vec<Vec<u8>> = current.difference(&scan_dir.entries).cloned().collect();
+    let mut removed: Vec<Vec<u8>> = scan_dir.entries.difference(&current).cloned().collect();
+    added.sort();
+    removed.sort();
+
+    let create_mask = requested & IN_CREATE;
+    let delete_mask = requested & IN_DELETE;
+    let fallback_mask = requested & IN_MODIFY;
+    for name in added {
+        let mask = if create_mask != 0 {
+            create_mask
+        } else {
+            fallback_mask
+        };
+        if mask != 0 {
+            records.push(encode_event(wd, mask, Some(&name)));
+        }
+    }
+    for name in removed {
+        let mask = if delete_mask != 0 {
+            delete_mask
+        } else {
+            fallback_mask
+        };
+        if mask != 0 {
+            records.push(encode_event(wd, mask, Some(&name)));
+        }
+    }
+
+    scan_dir.entries = current;
+    if let Some(watched) = inner.wd_by_fd.get_mut(&fd) {
+        watched.scan_dir = Some(scan_dir);
+    }
+    Some(records)
+}
+
+/// Construct the platform inotify backend, mirroring
+/// [`crate::event_mux::make_event_multiplexer`]'s cfg pattern: a native
+/// `inotify` fd on Linux, a kqueue-backed `EventMultiplexer` on macOS/BSD, and
+/// `None` (unsupported) on any other host.
+fn make_inotify_backend() -> Option<Box<dyn InotifyBackend>> {
+    #[cfg(feature = "platform-linux")]
+    {
+        // SAFETY: inotify_init1 takes a flags int and returns an fd or -1.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        Some(Box::new(NativeLinuxInotify { inotify_fd: fd }))
+    }
     #[cfg(any(
         feature = "platform-macos",
         feature = "platform-freebsd",
         feature = "platform-netbsd"
     ))]
-    fn scan_directory_records(
-        inner: &mut Inner,
-        fd: RawFd,
-        wd: i32,
-        requested: u32,
-        mut scan_dir: ScannedDir,
-    ) -> Option<Vec<Vec<u8>>> {
-        let current = scan_dir_entries(&scan_dir.path).ok()?;
-        let mut records = Vec::new();
-        let mut added: Vec<Vec<u8>> = current.difference(&scan_dir.entries).cloned().collect();
-        let mut removed: Vec<Vec<u8>> = scan_dir.entries.difference(&current).cloned().collect();
-        added.sort();
-        removed.sort();
+    {
+        let mux = crate::event_mux::make_event_multiplexer().ok()?;
+        Some(Box::new(VnodeDiffInotify {
+            mux: Mutex::new(mux),
+        }))
+    }
+    #[cfg(not(any(
+        feature = "platform-macos",
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    )))]
+    {
+        None
+    }
+}
 
-        let create_mask = requested & IN_CREATE;
-        let delete_mask = requested & IN_DELETE;
-        let fallback_mask = requested & IN_MODIFY;
-        for name in added {
-            let mask = if create_mask != 0 {
-                create_mask
-            } else {
-                fallback_mask
-            };
-            if mask != 0 {
-                records.push(encode_event(wd, mask, Some(&name)));
-            }
-        }
-        for name in removed {
-            let mask = if delete_mask != 0 {
-                delete_mask
-            } else {
-                fallback_mask
-            };
-            if mask != 0 {
-                records.push(encode_event(wd, mask, Some(&name)));
-            }
-        }
+/// One inotify instance: a readiness backend plus its watch-descriptor table.
+/// Owns every watched fd and closes them on `rm_watch`/drop.
+///
+/// On macOS the backend is a boxed `EventMultiplexer`
+/// (kqueue-backed via `EVFILT_VNODE`); the watch register/drain go through the
+/// trait. On Linux the backend is a native `inotify` fd read directly. The
+/// platform fork lives behind [`InotifyBackend`]; this struct holds no cfg
+/// fields.
+pub(crate) struct InotifyState {
+    /// Platform readiness/watch backend (native inotify on Linux, kqueue
+    /// `EVFILT_VNODE` on macOS/BSD).
+    backend: Box<dyn InotifyBackend>,
+    /// Cached pollable fd — stable for the instance's life, read lock-free
+    /// (`mux.poll_fd()` on macOS, the inotify fd on Linux).
+    poll_fd: RawFd,
+    inner: Mutex<Inner>,
+}
 
-        scan_dir.entries = current;
-        if let Some(watched) = inner.wd_by_fd.get_mut(&fd) {
-            watched.scan_dir = Some(scan_dir);
+impl std::fmt::Debug for InotifyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InotifyState")
+            .field("poll_fd", &self.poll_fd())
+            .finish_non_exhaustive()
+    }
+}
+
+impl InotifyState {
+    pub(crate) fn new() -> Option<Self> {
+        let backend = make_inotify_backend()?;
+        let poll_fd = backend.poll_fd();
+        Some(Self {
+            backend,
+            poll_fd,
+            inner: Mutex::new(Inner::new()),
+        })
+    }
+
+    /// The backing pollable fd (the kqueue fd on macOS, the inotify fd on
+    /// Linux), so poll/epoll/blocking-read can wait on inotify readiness the
+    /// same way they do for timerfd/pidfd.
+    pub(crate) fn poll_fd(&self) -> RawFd {
+        self.poll_fd
+    }
+
+    /// Register a watch on an already-open host fd, taking ownership of it.
+    /// If `host_fd`'s vnode is already watched, updates the mask and returns the
+    /// existing wd (matching inotify, which returns the same wd for a re-add).
+    pub(crate) fn add_watch(&self, host_fd: RawFd, mask: u32) -> Result<i32, i32> {
+        self.add_watch_fds(vec![crate::vfs::WatchFd::unnamed(host_fd)], mask)
+    }
+
+    pub(crate) fn add_watch_fds(
+        &self,
+        watch_fds: Vec<crate::vfs::WatchFd>,
+        mask: u32,
+    ) -> Result<i32, i32> {
+        self.backend.add_watch_fds(watch_fds, mask, &self.inner)
+    }
+
+    /// Remove a watch by descriptor; closes its fd. Unknown wd → EINVAL.
+    pub(crate) fn rm_watch(&self, wd: i32) -> Result<(), i32> {
+        let mut inner = self.inner.lock();
+        let Some(watch) = inner.watches.remove(&wd) else {
+            return Err(LINUX_EINVAL);
+        };
+        for host_fd in watch.host_fds {
+            inner.wd_by_fd.remove(&host_fd);
+            self.backend.deregister(host_fd, wd, &mut inner);
+            unsafe { libc::close(host_fd) };
         }
-        Some(records)
+        Ok(())
+    }
+
+    /// Read up to `max_bytes` of encoded Linux `inotify_event` records. First
+    /// drains any newly-ready changes (the kqueue on macOS, the native inotify
+    /// fd on Linux), then returns whole records up to the caller's buffer size,
+    /// keeping the remainder queued (`pending`) for the next read.
+    /// An empty return means no events are ready (caller maps to EAGAIN / a
+    /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
+    /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
+    pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
+        self.backend.read_records(max_bytes, &self.inner)
     }
 }
 
@@ -753,9 +837,18 @@ impl Drop for InotifyState {
                 unsafe { libc::close(*host_fd) };
             }
         }
-        // The native inotify fd is owned here on Linux; close it last so any
-        // outstanding watches are torn down with it.
-        #[cfg(feature = "platform-linux")]
+        // The native inotify fd (Linux) is owned by the backend, which closes it
+        // in its own `Drop` after this runs (struct fields drop in declaration
+        // order, so `backend` drops after `inner`).
+    }
+}
+
+#[cfg(feature = "platform-linux")]
+impl Drop for NativeLinuxInotify {
+    fn drop(&mut self) {
+        // Close the native inotify fd; any outstanding watches are torn down
+        // with it.
+        // SAFETY: we own the inotify fd for the backend's lifetime.
         unsafe {
             libc::close(self.inotify_fd);
         }
