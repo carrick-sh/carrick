@@ -6302,14 +6302,17 @@ impl SyscallDispatcher {
                         OpenDescription::SyntheticFile { path, .. }
                             if crate::vfs::proc::is_writable_tunable_path(path) =>
                         {
-                            // oom_score_adj/oom_adj/loginuid/timerslack_ns are rw
-                            // in Linux; carrick has no live OOM/audit/timer-slack
-                            // state, so accept-and-ignore the write (the whole
-                            // buffer is "consumed") rather than EBADF — this is
-                            // what systemd/runc expect when lowering their OOM
-                            // priority at startup.
-                            return Ok(DispatchOutcome::Returned {
-                                value: bytes.len() as i64,
+                            // oom_score_adj PERSISTS the value (per-process,
+                            // fork-inherited): tst_test's OOM protection
+                            // (tst_memutils.c) writes -1000 to /proc/<pid>/oom_score_adj
+                            // then reads it back, and every test that enables it TBROKs
+                            // in setup otherwise. The rest (oom_adj/loginuid/
+                            // timerslack_ns) carrick has no live state for, so
+                            // accept-and-ignore. `write_tunable` normalizes the
+                            // `/proc/<self-pid>/` form and dispatches.
+                            return Ok(match crate::vfs::proc::write_tunable(path, &bytes) {
+                                Ok(n) => DispatchOutcome::Returned { value: n as i64 },
+                                Err(errno) => DispatchOutcome::errno(errno as i32),
                             });
                         }
                         _ => return Ok(LINUX_EBADF.into()),
