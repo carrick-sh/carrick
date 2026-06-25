@@ -93,6 +93,14 @@ pub(crate) const INOTIFY_MAX_QUEUED_EVENTS: usize = 16384;
 const LINUX_EINVAL: i32 = 22;
 const LINUX_ENOSPC: i32 = 28;
 
+/// Event bits the kernel delivers to a watch regardless of the mask it was
+/// added with: `IN_IGNORED` (watch auto-/explicitly removed), `IN_Q_OVERFLOW`,
+/// and `IN_UNMOUNT`. `IN_ALL_EVENTS` does not include these, so the per-watch
+/// mask filter in [`dispatch_in`] must let them through unconditionally.
+const UNCONDITIONAL_EVENT_BITS: u32 = carrick_abi::LINUX_IN_IGNORED
+    | carrick_abi::LINUX_IN_Q_OVERFLOW
+    | carrick_abi::LINUX_IN_UNMOUNT;
+
 /// macOS analogue producing the [`VnodeEvents`] the [`EventMultiplexer`]
 /// register API consumes. Requests the kqueue `NOTE_*` set corresponding to the
 /// Linux watch mask; a mask with no recognized data-changing bit falls back to
@@ -257,6 +265,16 @@ impl Inner {
     /// that `inotify05` asserts.
     fn push_record(&mut self, record: Vec<u8>) {
         if self.overflowed {
+            return;
+        }
+        // Event coalescing (inotify(7)): "If successive output inotify events
+        // produced on the inotify file descriptor are identical (same wd, mask,
+        // cookie, and name), then they are coalesced into a single event if the
+        // older event has not yet been read." The whole encoded record carries
+        // exactly wd|mask|cookie|len|name, so a byte-equal tail record is an
+        // identical event — drop the new one. (inotify02 renames the watched dir
+        // twice back-to-back, expecting a single coalesced IN_MOVE_SELF.)
+        if self.pending.back().is_some_and(|tail| *tail == record) {
             return;
         }
         if self.pending.len() >= INOTIFY_MAX_QUEUED_EVENTS {
@@ -816,6 +834,32 @@ impl InotifyState {
     pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
         self.backend.read_records(max_bytes, &self.inner)
     }
+
+    /// Render the per-watch `/proc/<pid>/fdinfo/<fd>` lines for this inotify
+    /// instance, one per live watch, in ascending wd order:
+    /// `inotify wd:<wd> ino:<ino> sdev:<sdev> mask:<mask> ...` (proc_pid_fdinfo(5)).
+    /// The mask is the exact value the watch was added with (including
+    /// `IN_ONESHOT`/`IN_EXCL_UNLINK`), which `inotify12` parses and asserts. `ino`
+    /// and `sdev` are synthetic placeholders — the test scans them with `%*x`
+    /// (skip-assignment) and only checks `mask`. Hex fields are lowercase, matching
+    /// the kernel's `%08x`/`%x` formatting.
+    pub(crate) fn fdinfo_lines(&self) -> String {
+        let inner = self.inner.lock();
+        let mut wds: Vec<i32> = inner.watches.keys().copied().collect();
+        wds.sort_unstable();
+        let mut out = String::new();
+        for wd in wds {
+            if let Some(watch) = inner.watches.get(&wd) {
+                // ino/sdev are skip-assigned by the test (`%*x`); only mask is
+                // load-bearing. mask is %08x in the kernel; render it the same.
+                out.push_str(&format!(
+                    "inotify wd:{wd} ino:0 sdev:0 mask:{:08x} ignored_mask:0 fhandle-bytes:0 fhandle-type:0 f_handle:0\n",
+                    watch.mask
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// Pop whole `inotify_event` records from `inner.pending` up to `max_bytes`.
@@ -977,19 +1021,44 @@ impl InotifyRegistry {
     /// file, or the directory-self form. `name` is `None` (self events carry no
     /// basename). `is_dir` sets `IN_ISDIR`.
     pub(crate) fn notify_self(&self, path: &str, mask: u32, is_dir: bool) {
-        self.dispatch(&normalize_watch_path(path), mask, is_dir, None, 0);
+        self.dispatch(&normalize_watch_path(path), mask, is_dir, None, 0, false);
     }
 
     /// Emit a *child* event on the directory containing `path`: e.g. an
     /// `IN_CREATE`/`IN_DELETE` with `name = basename(path)` delivered to a watch
     /// on the parent directory. `is_dir` sets `IN_ISDIR` (the child is a dir).
     pub(crate) fn notify_child(&self, path: &str, mask: u32, is_dir: bool) {
+        self.notify_child_excl(path, mask, is_dir, false);
+    }
+
+    /// `notify_child`, plus the `IN_EXCL_UNLINK` discriminator: when
+    /// `child_unlinked` is true the named child has been unlinked from the
+    /// watched directory, so a watch added with `IN_EXCL_UNLINK` must NOT receive
+    /// this event (inotify(7): "events are not generated for children after they
+    /// have been unlinked from the watched directory"). Watches without the flag
+    /// still get it (the default behaviour — events continue for an unlinked-but-
+    /// still-open child). Used by the read/write/close hooks, which fire on an fd
+    /// whose path may already be unlinked.
+    pub(crate) fn notify_child_excl(
+        &self,
+        path: &str,
+        mask: u32,
+        is_dir: bool,
+        child_unlinked: bool,
+    ) {
         let norm = normalize_watch_path(path);
         let (parent, name) = split_parent_name(&norm);
         if name.is_empty() {
             return;
         }
-        self.dispatch(parent, mask, is_dir, Some(name.as_bytes()), 0);
+        self.dispatch(
+            parent,
+            mask,
+            is_dir,
+            Some(name.as_bytes()),
+            0,
+            child_unlinked,
+        );
     }
 
     /// Emit a rename pair: `IN_MOVED_FROM` (basename of `from`) on `from`'s
@@ -1016,6 +1085,7 @@ impl InotifyRegistry {
                 c
             }
         };
+        let mut fired_oneshot: Vec<OneshotFire> = Vec::new();
         if !from_name.is_empty() {
             dispatch_in(
                 &by_path,
@@ -1023,7 +1093,9 @@ impl InotifyRegistry {
                 carrick_abi::LINUX_IN_MOVED_FROM,
                 is_dir,
                 Some(from_name.as_bytes()),
+                false,
                 &mut cookie_for,
+                &mut fired_oneshot,
             );
         }
         if !to_name.is_empty() {
@@ -1033,39 +1105,103 @@ impl InotifyRegistry {
                 carrick_abi::LINUX_IN_MOVED_TO,
                 is_dir,
                 Some(to_name.as_bytes()),
+                false,
                 &mut cookie_for,
+                &mut fired_oneshot,
             );
         }
+        drop(by_path);
+        self.retire_oneshot(fired_oneshot);
     }
 
     /// Core fan-out: deliver `mask` (optionally `| IN_ISDIR`) to every watch on
-    /// `path`, masked by what each watch requested.
-    fn dispatch(&self, path: &str, mask: u32, is_dir: bool, name: Option<&[u8]>, cookie: u32) {
-        let by_path = self.by_path.read();
-        let mut noop = |_: &std::sync::Arc<InotifyState>| cookie;
-        dispatch_in(&by_path, path, mask, is_dir, name, &mut noop);
+    /// `path`, masked by what each watch requested. `child_unlinked` gates the
+    /// `IN_EXCL_UNLINK` watches; any `IN_ONESHOT` watch that fires is retired
+    /// (removed + `IN_IGNORED`) after the read lock is released.
+    fn dispatch(
+        &self,
+        path: &str,
+        mask: u32,
+        is_dir: bool,
+        name: Option<&[u8]>,
+        cookie: u32,
+        child_unlinked: bool,
+    ) {
+        let mut fired_oneshot: Vec<OneshotFire> = Vec::new();
+        {
+            let by_path = self.by_path.read();
+            let mut const_cookie = |_: &std::sync::Arc<InotifyState>| cookie;
+            dispatch_in(
+                &by_path,
+                path,
+                mask,
+                is_dir,
+                name,
+                child_unlinked,
+                &mut const_cookie,
+                &mut fired_oneshot,
+            );
+        }
+        self.retire_oneshot(fired_oneshot);
     }
+
+    /// Retire every `IN_ONESHOT` watch that just delivered its single event:
+    /// emit the auto-removal `IN_IGNORED` (the kernel always follows a oneshot
+    /// fire with one), drop the per-instance watch, and remove the registry
+    /// entry. Runs after the dispatch read lock is dropped so it can take the
+    /// write lock. (inotify12 #1: `IN_MODIFY | IN_ONESHOT` fires exactly once;
+    /// the second write then sees no watch and the read returns EAGAIN.)
+    fn retire_oneshot(&self, fired: Vec<OneshotFire>) {
+        for fire in fired {
+            // The watch is gone after one event; IN_IGNORED announces that.
+            fire.state
+                .enqueue(fire.wd, carrick_abi::LINUX_IN_IGNORED, 0, None);
+            let _ = fire.state.rm_watch(fire.wd);
+            self.unregister(&fire.state, fire.wd);
+        }
+    }
+}
+
+/// A fired `IN_ONESHOT` watch awaiting retirement (collected under the dispatch
+/// read lock, acted on after it is released).
+struct OneshotFire {
+    state: std::sync::Arc<InotifyState>,
+    wd: i32,
 }
 
 /// Deliver one event to every watch registered on `path`, filtered by each
 /// watch's requested mask, drawing the cookie from `cookie_for`. Free function
 /// so both [`InotifyRegistry::dispatch`] and `notify_move` can share it while
-/// holding the read lock.
+/// holding the read lock. Any `IN_ONESHOT` watch that fires is pushed to
+/// `fired_oneshot` for the caller to retire once the lock is released.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_in(
     by_path: &HashMap<String, Vec<RegisteredWatch>>,
     path: &str,
     mask: u32,
     is_dir: bool,
     name: Option<&[u8]>,
+    child_unlinked: bool,
     cookie_for: &mut dyn FnMut(&std::sync::Arc<InotifyState>) -> u32,
+    fired_oneshot: &mut Vec<OneshotFire>,
 ) {
     let Some(watches) = by_path.get(path) else {
         return;
     };
     for watch in watches {
-        // The kernel reports only the bits the watch asked for (plus the
-        // unconditional self-events, handled by the caller's mask choice).
-        let delivered = mask & watch.mask;
+        // IN_EXCL_UNLINK: once a child is unlinked from the watched directory, a
+        // watch carrying this flag stops receiving its events (inotify12 #2).
+        // Watches without the flag keep getting them (the default).
+        if child_unlinked && watch.mask & carrick_abi::LINUX_IN_EXCL_UNLINK != 0 {
+            continue;
+        }
+        // The kernel reports only the bits the watch asked for, EXCEPT the
+        // unconditional info events (IN_IGNORED on watch removal, IN_Q_OVERFLOW,
+        // IN_UNMOUNT), which are delivered regardless of the watch mask. Without
+        // this an `IN_ALL_EVENTS` watch — whose mask excludes IN_IGNORED
+        // (0x8000) — would have its auto-removal IN_IGNORED filtered out
+        // (inotify04 asserts exactly that IN_IGNORED).
+        let delivered = (mask & watch.mask) | (mask & UNCONDITIONAL_EVENT_BITS);
         if delivered == 0 {
             continue;
         }
@@ -1076,6 +1212,13 @@ fn dispatch_in(
         };
         let cookie = cookie_for(&watch.state);
         watch.state.enqueue(watch.wd, out_mask, cookie, name);
+        // IN_ONESHOT: the watch is removed after its first delivered event.
+        if watch.mask & carrick_abi::LINUX_IN_ONESHOT != 0 {
+            fired_oneshot.push(OneshotFire {
+                state: std::sync::Arc::clone(&watch.state),
+                wd: watch.wd,
+            });
+        }
     }
 }
 
@@ -1363,17 +1506,35 @@ mod registry_tests {
     #[test]
     fn bounded_queue_appends_single_overflow_marker_then_drops() {
         let mut inner = Inner::new();
-        // Fill exactly to the ceiling with header-only records.
-        for _ in 0..INOTIFY_MAX_QUEUED_EVENTS {
-            inner.push_record(encode_event_raw(1, carrick_abi::LINUX_IN_MODIFY, 0, None));
+        // Fill exactly to the ceiling. Use a distinct cookie per record so the
+        // event-coalescing rule (identical successive records collapse into one)
+        // does not collapse the fill — each push must be a NEW event, exactly
+        // like inotify05's alternating ACCESS/MODIFY stream that drives overflow.
+        for i in 0..INOTIFY_MAX_QUEUED_EVENTS {
+            inner.push_record(encode_event_raw(
+                1,
+                carrick_abi::LINUX_IN_MODIFY,
+                i as u32,
+                None,
+            ));
         }
         assert_eq!(inner.pending.len(), INOTIFY_MAX_QUEUED_EVENTS);
         assert!(!inner.overflowed);
         // The next push trips overflow: a single IN_Q_OVERFLOW marker is
         // appended and further pushes are dropped.
-        inner.push_record(encode_event_raw(1, carrick_abi::LINUX_IN_MODIFY, 0, None));
+        inner.push_record(encode_event_raw(
+            1,
+            carrick_abi::LINUX_IN_MODIFY,
+            INOTIFY_MAX_QUEUED_EVENTS as u32,
+            None,
+        ));
         assert!(inner.overflowed);
-        inner.push_record(encode_event_raw(1, carrick_abi::LINUX_IN_MODIFY, 0, None));
+        inner.push_record(encode_event_raw(
+            1,
+            carrick_abi::LINUX_IN_MODIFY,
+            INOTIFY_MAX_QUEUED_EVENTS as u32 + 1,
+            None,
+        ));
         assert_eq!(
             inner.pending.len(),
             INOTIFY_MAX_QUEUED_EVENTS + 1,
@@ -1390,6 +1551,39 @@ mod registry_tests {
         let _ = drain_pending(&mut inner, usize::MAX);
         assert!(!inner.overflowed);
         assert!(inner.pending.is_empty());
+    }
+
+    #[test]
+    fn identical_successive_records_coalesce_until_read() {
+        let mut inner = Inner::new();
+        // inotify(7): identical successive events (same wd|mask|cookie|name)
+        // coalesce into one while the older is still queued. (inotify02's two
+        // back-to-back IN_MOVE_SELF collapse to a single event.)
+        let rec = || encode_event_raw(1, carrick_abi::LINUX_IN_MOVE_SELF, 0, None);
+        inner.push_record(rec());
+        inner.push_record(rec());
+        inner.push_record(rec());
+        assert_eq!(inner.pending.len(), 1, "identical records coalesce to one");
+        // A DIFFERENT event in between breaks the run, so the next identical one
+        // is a fresh event (it is no longer the tail).
+        inner.push_record(encode_event_raw(1, carrick_abi::LINUX_IN_ATTRIB, 0, None));
+        inner.push_record(rec());
+        assert_eq!(
+            inner.pending.len(),
+            3,
+            "a differing event breaks coalescing"
+        );
+        // Once the older identical event is read (drained), a later identical one
+        // is queued anew rather than coalesced.
+        let _ = drain_pending(&mut inner, usize::MAX);
+        assert!(inner.pending.is_empty());
+        inner.push_record(rec());
+        inner.push_record(rec());
+        assert_eq!(
+            inner.pending.len(),
+            1,
+            "after a full drain, a repeat still coalesces against the new tail"
+        );
     }
 
     #[test]

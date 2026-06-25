@@ -327,8 +327,16 @@ impl SyscallDispatcher {
         let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
             return;
         };
+        // The self watch (on the file itself) always fires — an unlinked-but-open
+        // file still generates events for a watch ON it. For the parent-directory
+        // (child) watch, IN_EXCL_UNLINK suppresses events once the child name is
+        // gone from the directory; signal that by checking whether the child path
+        // still resolves (inotify12 #2: write to an unlinked-but-open fd).
+        let child_unlinked = !self.path_exists(&path);
         self.fs.inotify_registry.notify_self(&path, mask, is_dir);
-        self.fs.inotify_registry.notify_child(&path, mask, is_dir);
+        self.fs
+            .inotify_registry
+            .notify_child_excl(&path, mask, is_dir, child_unlinked);
     }
 
     /// Emit `IN_CLOSE_WRITE` (fd was writable) or `IN_CLOSE_NOWRITE` (read-only)
@@ -357,10 +365,18 @@ impl SyscallDispatcher {
                 carrick_abi::LINUX_IN_CLOSE_NOWRITE
             }
         };
+        let is_dir = {
+            let open = open_file.description.read();
+            matches!(&*open, OpenDescription::Directory { .. })
+        };
         let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
             return;
         };
+        // IN_CLOSE_* is delivered BOTH to a watch on the object itself (self) AND
+        // to a watch on its parent directory (child, name = basename) — inotify02
+        // watches the dir and asserts IN_CLOSE_WRITE with name=test_file1.
         self.inotify_self(&path, mask);
+        self.fs.inotify_registry.notify_child(&path, mask, is_dir);
     }
 
     pub(in crate::dispatch) fn pipe_reader(&self, fd: i32) -> Option<(PipeRef, u64)> {
