@@ -256,8 +256,17 @@ fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     if pid == 0 || pid > i32::MAX as u64 {
         return false;
     }
+    // The guest names processes by ns-pid (what getpid() reports), so a
+    // sched_*(getpid(), …) issued by a forked child targets the PARENT's ns-pid,
+    // not a host pid. Translate ns -> host before probing liveness, else we'd
+    // libc::kill an unrelated HOST pid that happens to share the numeric value
+    // (LTP sched_getparam01/sched_rr_get_interval01). An ns-pid that maps to no
+    // member doesn't exist (ESRCH); identity when namespaces are off.
+    let Some(host_pid) = crate::namespace::pid::ns_to_host_or_self(pid as u32) else {
+        return false;
+    };
     unsafe {
-        libc::kill(pid as i32, 0) == 0
+        libc::kill(host_pid as i32, 0) == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 }
