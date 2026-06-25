@@ -100,6 +100,7 @@ syscall_table! {
     69 => preadv,
     70 => pwritev,
     71 => sendfile,
+    75 => vmsplice,
     76 => splice,
     78 => readlinkat,
     79 => newfstatat,
@@ -137,7 +138,7 @@ syscall_table! {
     43 => sys_statfs,
     44 => sys_fstatfs,
     45 => sys_truncate,
-    75 | 77 => sys_bootstrap_enosys,
+    77 => sys_bootstrap_enosys,
 }
 mod access;
 mod fd_helpers;
@@ -5816,6 +5817,107 @@ impl SyscallDispatcher {
 
             Ok(DispatchOutcome::Returned { value })
 
+        }
+
+        fn vmsplice(this, cx, fd: Fd, iov: GuestPtr, nr_segs: u64, flags: u64) {
+
+            // vmsplice(2): fd must be a pipe; the pipe END selects the direction —
+            // the WRITE end gathers user pages into the pipe, the READ end extracts
+            // pipe bytes into user pages. SPLICE_F_GIFT/MOVE/MORE are advisory hints
+            // for our copy-based path (no zero-copy page stealing); SPLICE_F_NONBLOCK
+            // forces EAGAIN rather than blocking. A valid non-pipe fd is EINVAL; a
+            // bad fd is EBADF.
+            if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let tid = cx.tid();
+            let nr =
+                usize::try_from(nr_segs).map_err(|_| DispatchError::LengthTooLarge(nr_segs))?;
+            let memory = &mut *cx.memory;
+            let iovecs = read_iovecs(memory, iov.0, nr)?;
+            let nonblocking = flags & LINUX_SPLICE_F_NONBLOCK != 0;
+
+            let Some(open_file) = this.open_file(fd.0) else {
+                return Ok(LINUX_EBADF.into());
+            };
+
+            enum VmDir {
+                Write,
+                ReadHost(i32, Option<HostFdRef>),
+                ReadMem,
+            }
+            let dir = {
+                let open = open_file.description.read();
+                match &*open {
+                    OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end,
+                        ..
+                    } => {
+                        if *is_read_end {
+                            VmDir::ReadHost(*host_fd, open_file.host_fd_owner.clone())
+                        } else {
+                            VmDir::Write
+                        }
+                    }
+                    OpenDescription::PipeWriter { .. } => VmDir::Write,
+                    OpenDescription::PipeReader { .. } => VmDir::ReadMem,
+                    _ => return Ok(LINUX_EINVAL.into()),
+                }
+            };
+
+            match dir {
+                VmDir::Write => {
+                    let bytes = match gather_bounded_iovec_bytes(memory, &iovecs) {
+                        Ok(Some(bytes)) => bytes,
+                        Ok(None) => return Ok(LINUX_EINVAL.into()),
+                        Err(errno) => return Ok(errno.into()),
+                    };
+                    if bytes.is_empty() {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    Ok(this.splice_write_out(fd.0, 0, &bytes, memory, tid))
+                }
+                VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
+                    memory,
+                    &iovecs,
+                    hfd,
+                    owner,
+                    nonblocking,
+                )),
+                VmDir::ReadMem => {
+                    let Some((pipe, status_flags)) = this.pipe_reader(fd.0) else {
+                        return Ok(LINUX_EINVAL.into());
+                    };
+                    let want: usize = iovecs
+                        .iter()
+                        .map(|v| usize::try_from(v.iov_len).unwrap_or(0))
+                        .sum();
+                    if want == 0 {
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    let bytes = take_pipe_bytes(&pipe, want, status_flags)?;
+                    let mut off = 0usize;
+                    for v in &iovecs {
+                        if off >= bytes.len() {
+                            break;
+                        }
+                        let len =
+                            usize::try_from(v.iov_len).unwrap_or(0).min(bytes.len() - off);
+                        if len == 0 {
+                            continue;
+                        }
+                        if memory
+                            .write_bytes(v.iov_base, &bytes[off..off + len])
+                            .is_err()
+                        {
+                            return Ok(LINUX_EFAULT.into());
+                        }
+                        off += len;
+                    }
+                    Ok(DispatchOutcome::Returned { value: off as i64 })
+                }
+            }
         }
 
         fn inotify_init1(this, cx, flags: u64) {
