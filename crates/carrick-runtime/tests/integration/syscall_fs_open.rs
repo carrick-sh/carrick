@@ -10,6 +10,8 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
+#[cfg(target_os = "macos")]
+use carrick_runtime::fs_backend::HostFsBackend;
 use carrick_runtime::fs_backend::{
     BackendError, FsBackend, MemoryBackend, OverlayEntry, OverlayEntryKind,
 };
@@ -1263,6 +1265,255 @@ fn open_o_tmpfile_materializes_via_proc_self_fd_linkat() {
         CREATE_MODE,
         "materialized mode == creation mode"
     );
+}
+
+/// open14:209 / openat03:200 — materializing an O_TMPFILE created with the
+/// set-user-ID and set-group-ID bits set (test_perms includes `07777`) must
+/// preserve ALL twelve permission bits, including 06000. This exercises the
+/// `--fs host` `HostFile` arm specifically: macOS strips setuid/setgid when an
+/// unprivileged process fchmods the anonymous inode, so a host `fstat` of the
+/// anon fd reads back e.g. 01755 for a 07755 create. The materialization helper
+/// must therefore source the mode from the stored guest creation mode (which
+/// records the full 07755), not the host fstat — otherwise the linked file stats
+/// as 01755 and the test FAILs.
+///
+/// Gated to macOS because `HostFsBackend` (the cap-std `--fs host` backend) is
+/// macOS-only and the setuid-stripping is a macOS host behaviour.
+#[cfg(target_os = "macos")]
+#[test]
+fn open_o_tmpfile_materialize_preserves_setuid_setgid_host_backend() {
+    const LINUX_O_TMPFILE: u64 = 0o20000000;
+    const LINUX_AT_SYMLINK_FOLLOW: u64 = 0x400;
+    // 07755 == setuid|setgid|sticky? No: 07755 == setuid(4000)|setgid(2000)|
+    // sticky(1000)|0755. The load-bearing bits are the setuid|setgid 06000 that
+    // a macOS host fstat would drop.
+    const CREATE_MODE: u64 = 0o7755;
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_existing_dir(dir);
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // openat(AT_FDCWD, ".", O_TMPFILE|O_RDWR, 07755) → a real anon host fd.
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0,
+            LINUX_O_TMPFILE | LINUX_O_RDWR,
+            CREATE_MODE,
+            0,
+            0,
+        ],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat O_TMPFILE: {other:?}"),
+    };
+
+    // write some bytes so the materialized size is non-zero.
+    memory.write_bytes(0x4100, b"setid!!!").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 64, [fd, 0x4100, 8, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 8 }
+    );
+
+    // linkat(AT_FDCWD, "/proc/self/fd/<fd>", AT_FDCWD, "/setidfile", AT_SYMLINK_FOLLOW)
+    let src = format!("/proc/self/fd/{fd}\0");
+    memory.write_bytes(0x4200, src.as_bytes()).unwrap();
+    memory.write_bytes(0x4300, b"/setidfile\0").unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            37,
+            [
+                LINUX_AT_FDCWD,
+                0x4200,
+                LINUX_AT_FDCWD,
+                0x4300,
+                LINUX_AT_SYMLINK_FOLLOW,
+                0
+            ]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // newfstatat(AT_FDCWD, "/setidfile", &st, 0) — the FULL 07755 must survive.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4300, 0x4400, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let st = read_stat(&memory, 0x4400);
+    assert_eq!(st.st_mode & LINUX_S_IFMT, LINUX_S_IFREG, "regular file");
+    assert_eq!(
+        u64::from(st.st_mode & 0o7777),
+        CREATE_MODE,
+        "materialized mode must keep setuid|setgid (got {:04o}, want {CREATE_MODE:04o})",
+        st.st_mode & 0o7777
+    );
+}
+
+/// fcntl31 — signal-driven I/O setup on a pipe. The test sets `O_ASYNC` via
+/// `F_SETFL`, `F_SETOWN` (owner pid) and `F_SETSIG` (SIGUSR1), then expects a
+/// write to the pipe to signal the owner. This pins the parts the dispatcher
+/// owns: `F_SETFL` must RETAIN `O_ASYNC` (it was previously masked out of the
+/// mutable status bits, so `F_GETFL` never reported it — red-first here);
+/// `F_SETOWN`/`F_GETOWN` and `F_SETSIG`/`F_GETSIG` round-trip; and arming
+/// `O_ASYNC` registers the pipe inode in the fork-coherent FASYNC registry with
+/// the owner + signal (so a writer process can deliver). The cross-process
+/// signal DELIVERY itself is verified end-to-end by the human against HVF + the
+/// Docker oracle (fcntl31's true gate).
+#[test]
+fn fcntl_async_io_setup_retains_o_async_and_round_trips_owner_and_sig() {
+    const LINUX_F_GETFL: u64 = 3;
+    const LINUX_F_SETFL: u64 = 4;
+    const LINUX_F_SETOWN: u64 = 8;
+    const LINUX_F_GETOWN: u64 = 9;
+    const LINUX_F_SETSIG: u64 = 10;
+    const LINUX_F_GETSIG: u64 = 11;
+    const LINUX_O_ASYNC: u64 = 0o20000;
+    const LINUX_SIGUSR1: u64 = 10;
+
+    // The fork-coherent FASYNC registry must be mapped before arming.
+    carrick_signal_core::fasync::fasync_init();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // pipe2(pipefd, 0) → read end at fds[0], write end at fds[1].
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 59, [0x4000, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+
+    // fcntl(read_fd, F_SETFL, O_ASYNC) — must succeed AND be retained.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [read_fd, LINUX_F_SETFL, LINUX_O_ASYNC, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // F_GETFL must now report O_ASYNC (the bug masked it out → 0).
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        25,
+        [read_fd, LINUX_F_GETFL, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => assert_ne!(
+            value as u64 & LINUX_O_ASYNC,
+            0,
+            "F_GETFL must report O_ASYNC after F_SETFL set it (got {value:#o})"
+        ),
+        other => panic!("F_GETFL: {other:?}"),
+    }
+
+    // F_SETOWN(pid) then F_GETOWN round-trip.
+    let my_pid = std::process::id() as u64;
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [read_fd, LINUX_F_SETOWN, my_pid, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [read_fd, LINUX_F_GETOWN, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: my_pid as i64
+        }
+    );
+
+    // F_SETSIG(SIGUSR1) then F_GETSIG round-trip.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [read_fd, LINUX_F_SETSIG, LINUX_SIGUSR1, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [read_fd, LINUX_F_GETSIG, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: LINUX_SIGUSR1 as i64
+        }
+    );
+
+    // Clearing O_ASYNC (F_SETFL with 0) must succeed and stop reporting it — the
+    // disarm side of the FASYNC wiring. (The registry arm/disarm mechanics and
+    // the end-to-end cross-process signal delivery are covered by the
+    // carrick-signal-core::fasync unit tests + the human's HVF/Docker gate.)
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [read_fd, LINUX_F_SETFL, 0, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        25,
+        [read_fd, LINUX_F_GETFL, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => assert_eq!(
+            value as u64 & LINUX_O_ASYNC,
+            0,
+            "F_GETFL must not report O_ASYNC after it was cleared (got {value:#o})"
+        ),
+        other => panic!("F_GETFL: {other:?}"),
+    }
 }
 
 #[test]
