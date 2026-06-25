@@ -19,10 +19,12 @@ use support::*;
 #[test]
 fn inotify_init_add_watch_read_dispatch_plumbing() {
     // The event mechanism itself is unit-tested against a real vnode in
-    // src/inotify.rs; here we verify the syscall plumbing at the dispatch seam.
-    // The in-memory backend has no host vnode, so watching an existing path is
-    // ENOSPC (inotify watches require `--fs host`); we exercise the fd
-    // lifecycle and the error paths.
+    // src/inotify.rs; here we verify the syscall plumbing at the dispatch seam,
+    // INCLUDING the dispatch-layer event synthesis that works even on the
+    // in-memory backend (no host vnode): the watch is a virtual one fed by the
+    // open/write/read hooks, so a write through the dispatcher enqueues an
+    // IN_MODIFY the guest can read back. The old behavior (ENOSPC for in-memory
+    // watches) was the bug this fixes.
     const IN_NONBLOCK: u64 = 0o4000;
     const IN_MODIFY: u64 = 0x2;
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
@@ -62,17 +64,63 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
         DispatchOutcome::Errno { errno: 11 }
     );
 
-    // add_watch on an existing in-memory path -> ENOSPC (28): no host vnode.
+    // add_watch on an existing in-memory path -> a valid wd (>= 1). The
+    // dispatch-layer registry backs the watch even without a host vnode.
     memory.write_bytes(0x4200, b"/etc/motd\0").unwrap();
+    let wd = match run(
+        &mut dispatcher,
+        &mut memory,
+        27,
+        [ifd, 0x4200, IN_MODIFY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => {
+            assert!(value >= 1, "add_watch wd {value}");
+            value
+        }
+        other => panic!("add_watch on existing path: {other:?}"),
+    };
+
+    // Open the watched file O_RDWR and write to it through the dispatcher; the
+    // write hook synthesizes IN_MODIFY into the inotify queue.
+    let wfd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56, // openat
+        [LINUX_AT_FDCWD, 0x4200, LINUX_O_RDWR, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat watched file: {other:?}"),
+    };
+    memory.write_bytes(0x4380, b"xyz").unwrap();
     assert_eq!(
-        run(
-            &mut dispatcher,
-            &mut memory,
-            27,
-            [ifd, 0x4200, IN_MODIFY, 0, 0, 0]
-        ),
-        DispatchOutcome::Errno { errno: 28 }
+        run(&mut dispatcher, &mut memory, 64, [wfd, 0x4380, 3, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 3 },
+        "write 3 bytes to the watched file"
     );
+
+    // read the inotify fd: one IN_MODIFY record for wd, no name (len 0).
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        63,
+        [ifd, 0x4100, 256, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => {
+            assert!(
+                value as usize >= 16,
+                "expected an inotify_event, got {value}"
+            );
+            let rec = memory.read_bytes(0x4100, 16).unwrap();
+            let got_wd = i32::from_ne_bytes(rec[0..4].try_into().unwrap());
+            let mask = u32::from_ne_bytes(rec[4..8].try_into().unwrap());
+            assert_eq!(got_wd as i64, wd, "record wd matches the watch");
+            assert_eq!(
+                mask, IN_MODIFY as u32,
+                "IN_MODIFY synthesized for the write"
+            );
+        }
+        other => panic!("read inotify after write: {other:?}"),
+    }
 
     // add_watch on a nonexistent path -> ENOENT (2).
     memory.write_bytes(0x4280, b"/no/such\0").unwrap();
@@ -160,14 +208,33 @@ fn inotify_add_watch_under_bind_mount_uses_host_vnode() {
         DispatchOutcome::Returned { value } => assert!(value >= 1, "watch descriptor {value}"),
         other => panic!("inotify_add_watch: {other:?}"),
     }
-    std::fs::write(
-        scratch.path().join("nodejs-bindwatch/watch_file"),
-        b"changed payload",
-    )
-    .unwrap();
+    // Modify the watched file THROUGH the dispatcher (the real guest path the
+    // inotify synthesis hooks observe), not via an out-of-band host write.
+    let wfd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat watched file: {other:?}"),
+    };
+    memory.write_bytes(0x4180, b"changed payload").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 64, [wfd, 0x4180, 15, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 15 }
+    );
     match run(&mut dispatcher, &mut memory, 63, [ifd, 0x4100, 64, 0, 0, 0]) {
-        DispatchOutcome::Returned { value } => assert!(value >= 16, "inotify bytes {value}"),
-        other => panic!("inotify read after bind write: {other:?}"),
+        DispatchOutcome::Returned { value } => {
+            assert!(value >= 16, "inotify bytes {value}");
+            let mask = u32::from_ne_bytes(
+                memory.read_bytes(0x4100 + 4, 4).unwrap()[..]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(mask, IN_MODIFY as u32, "IN_MODIFY for the dispatched write");
+        }
+        other => panic!("inotify read after dispatched write: {other:?}"),
     }
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -305,14 +372,25 @@ fn bind_mount_cwd_relative_stat_open_mkdir_and_inotify_use_host_tree() {
         DispatchOutcome::Returned { value } => assert!(value >= 1, "dir wd {value}"),
         other => panic!("relative inotify_add_watch cwd: {other:?}"),
     }
-    std::fs::write(
-        scratch.path().join("nodejs-bindcwd/watch_file"),
-        b"changed payload",
-    )
-    .unwrap();
+    // Modify the watched file through the dispatcher (real guest path) — open
+    // the cwd-relative "watch_file" and write to it.
+    let wfd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x40a0, LINUX_O_RDWR, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat watch_file: {other:?}"),
+    };
+    memory.write_bytes(0x4480, b"changed payload").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 64, [wfd, 0x4480, 15, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 15 }
+    );
     match run(&mut dispatcher, &mut memory, 63, [ifd, 0x4400, 64, 0, 0, 0]) {
         DispatchOutcome::Returned { value } => assert!(value >= 16, "inotify bytes {value}"),
-        other => panic!("relative inotify read after bind write: {other:?}"),
+        other => panic!("relative inotify read after dispatched write: {other:?}"),
     }
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -334,6 +412,7 @@ fn bind_mount_directory_inotify_reports_child_file_write_name() {
         .write_bytes(0x4000, b"/tmp/nodejs-binddirwatch\0")
         .unwrap();
     memory.write_bytes(0x4040, b".\0").unwrap();
+    memory.write_bytes(0x4060, b"watch_file\0").unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.register_mount(
@@ -371,11 +450,22 @@ fn bind_mount_directory_inotify_reports_child_file_write_name() {
         DispatchOutcome::Returned { value } => assert!(value >= 1, "dir wd {value}"),
         other => panic!("directory inotify_add_watch: {other:?}"),
     }
-    std::fs::write(
-        scratch.path().join("nodejs-binddirwatch/watch_file"),
-        b"changed payload",
-    )
-    .unwrap();
+    // Modify the child file through the dispatcher (the real guest path): the
+    // write hook reports IN_MODIFY to the DIRECTORY watch with the child's name.
+    let wfd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4060, LINUX_O_RDWR, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat child watch_file: {other:?}"),
+    };
+    memory.write_bytes(0x4180, b"changed payload").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 64, [wfd, 0x4180, 15, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 15 }
+    );
     match run(
         &mut dispatcher,
         &mut memory,
@@ -386,6 +476,8 @@ fn bind_mount_directory_inotify_reports_child_file_write_name() {
         other => panic!("directory inotify read after child write: {other:?}"),
     }
     let event = memory.read_bytes(0x4100, 32).unwrap();
+    let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
+    assert_eq!(mask, IN_MODIFY as u32, "IN_MODIFY on the directory watch");
     let name_len = u32::from_ne_bytes(event[12..16].try_into().unwrap()) as usize;
     assert!(name_len >= "watch_file\0".len(), "name len {name_len}");
     assert_eq!(&event[16..16 + "watch_file".len()], b"watch_file");

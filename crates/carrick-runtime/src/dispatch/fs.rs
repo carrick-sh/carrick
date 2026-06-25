@@ -1110,9 +1110,35 @@ impl SyscallDispatcher {
         {
             self.fs.vfs_mounts.override_path(&path);
         }
+        // For inotify, note whether a VFS-mounted (bind/dev/proc) path already
+        // existed before the open, so a created child emits IN_CREATE (not just
+        // IN_OPEN). Only when something is watched, to avoid a wasted lookup.
+        let vfs_preexisted = if want_create && !self.fs.inotify_registry.is_empty() {
+            self.path_exists(&path)
+        } else {
+            true
+        };
         let vfs_outcome = self.try_vfs_open(&path, access, flags, vfs_create_mode);
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
+                // inotify: a VFS-mount open bypasses the rootfs tail below, so
+                // synthesize its events here. A freshly-created child is
+                // IN_CREATE on the parent dir; every successful open is IN_OPEN
+                // on the object. The fd's path is recorded by try_vfs_open's
+                // install path already (host-backed) or below for read hooks.
+                if !self.fs.inotify_registry.is_empty() {
+                    let is_dir = self.inotify_path_kind(&path).unwrap_or(false);
+                    if want_create && !vfs_preexisted {
+                        self.inotify_child(&path, carrick_abi::LINUX_IN_CREATE, is_dir);
+                    }
+                    self.fs
+                        .inotify_registry
+                        .notify_self(&path, carrick_abi::LINUX_IN_OPEN, is_dir);
+                    // Ensure read/write/close hooks can recover this fd's path.
+                    if self.lookup_recorded_fd_open_path(fd).is_none() {
+                        self.record_fd_open_path(fd, path.clone());
+                    }
+                }
                 return Ok(DispatchOutcome::Returned { value: fd as i64 });
             }
             VfsOpenAttempt::Errno(errno) => {
@@ -1250,6 +1276,13 @@ impl SyscallDispatcher {
         // Remember the guest path so readlink(/proc/self/fd/N) can recover it
         // (host-fd-backed descriptions store no path of their own).
         let record_path = path.clone();
+        // Whether this open materialized a new file (O_CREAT on a missing path):
+        // the inotify hook below emits IN_CREATE for it vs IN_OPEN for an
+        // existing-file open. Captured before the match consumes `dispatch_result`.
+        let inotify_created = matches!(
+            &dispatch_result,
+            Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate)
+        );
         let (description, host_fd_owner) = match dispatch_result {
             Ok(crate::vfs::rootfs::OpenDispatchResult::File {
                 metadata,
@@ -1414,6 +1447,7 @@ impl SyscallDispatcher {
             &description,
             OpenDescription::File { .. } | OpenDescription::Directory { .. }
         );
+        let opened_is_dir = matches!(&description, OpenDescription::Directory { .. });
         let open_file = OpenFile {
             description: Arc::new(RwLock::new(description)),
             fd_flags: linux_fd_flags_from_open_flags(flags),
@@ -1422,8 +1456,25 @@ impl SyscallDispatcher {
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Ok(linux_errno::EMFILE.into());
         };
-        if needs_recorded_path {
-            self.record_fd_open_path(fd, record_path);
+        // Always record the path for inotify's read/write/close hooks, even for
+        // in-memory File/Directory descriptions (they otherwise skip recording);
+        // the recorded entry is dropped when the fd closes. This is the only path
+        // by which a later read(2)/write(2) recovers the watched guest path.
+        if needs_recorded_path || !self.fs.inotify_registry.is_empty() {
+            self.record_fd_open_path(fd, record_path.clone());
+        }
+        // inotify: O_CREAT that created the file is IN_CREATE on the parent dir;
+        // any other successful open is IN_OPEN on the object itself (and, for a
+        // directory open, IN_OPEN|IN_ISDIR). The registry fast-exits when nothing
+        // is watched, so this is ~free in the common case.
+        if !self.fs.inotify_registry.is_empty() {
+            if inotify_created {
+                self.inotify_child(&record_path, carrick_abi::LINUX_IN_CREATE, opened_is_dir);
+                // A create also "opens" the new file for the returned fd.
+                self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
+            } else {
+                self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
+            }
         }
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
@@ -2415,12 +2466,34 @@ impl SyscallDispatcher {
         if old_is_vfs_mount {
             return Ok(crate::linux_abi::LINUX_EXDEV.into());
         }
+        // Capture the source kind before the move (for IN_ISDIR) only when
+        // something is watching.
+        let moved_is_dir = if self.fs.inotify_registry.is_empty() {
+            false
+        } else {
+            self.inotify_path_kind(&resolved_old).unwrap_or(false)
+        };
         match self
             .fs
             .rootfs_vfs
             .rename_with_flags(&resolved_old, &resolved_new, no_replace)
         {
-            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Ok(()) => {
+                if !self.fs.inotify_registry.is_empty() {
+                    // IN_MOVED_FROM (old name) + IN_MOVED_TO (new name), cookie-
+                    // tied, to watches on the respective parent directories.
+                    self.inotify_move(&resolved_old, &resolved_new, moved_is_dir);
+                    // A watch ON the moved object follows it and also sees
+                    // IN_MOVE_SELF (inotify02's directory self-rename). Emitted on
+                    // the OLD path key, where the watch still lives, BEFORE the
+                    // registry migrates the key to the new path.
+                    self.inotify_self(&resolved_old, carrick_abi::LINUX_IN_MOVE_SELF);
+                    self.fs
+                        .inotify_registry
+                        .rename_path(&resolved_old, &resolved_new);
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
             Err(errno) => Ok(errno.into()),
         }
     }
@@ -2766,12 +2839,16 @@ impl SyscallDispatcher {
         let mode = self.maybe_clear_setgid(&resolved, (mode & 0o7777) as u32);
         if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
             return match m.vfs.chmod(&m.full_path, mode) {
-                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Ok(()) => {
+                    self.inotify_attrib(&resolved);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
                 Err(errno) => Ok(errno.into()),
             };
         }
         match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
             Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+                self.inotify_attrib(&resolved);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(_) => Ok(DispatchOutcome::Returned { value: 0 }),
@@ -4576,6 +4653,10 @@ impl SyscallDispatcher {
                 this.io.closed_stdio.lock()[fd.0 as usize] = true;
             }
             this.io.splice_pushback.lock().remove(&fd.0);
+            // inotify IN_CLOSE_WRITE/IN_CLOSE_NOWRITE for a watched regular file
+            // or directory — emitted while the fd is still in the table so its
+            // description (writability) and recorded path are still readable.
+            this.inotify_close_for_fd(fd.0);
             // Auto-remove this fd from every epoll interest set BEFORE freeing
             // the fd number from open_files. ORDER IS LOAD-BEARING: the instant
             // the fd leaves open_files another thread's open/pipe/dup can recycle
@@ -4885,6 +4966,10 @@ impl SyscallDispatcher {
             // wait on EAGAIN instead of blocking under the dispatcher lock. (read has no
             // per-call non-blocking flag.) Computed before the open_files borrow.
             let nonblocking = this.io_is_nonblocking(fd.0, 0);
+            // inotify IN_ACCESS: a read(2) against a watched regular file emits
+            // IN_ACCESS on that file. The kernel reports it per read syscall,
+            // independent of bytes returned. Fast-exits when nothing is watched.
+            this.inotify_emit_for_fd(fd.0, carrick_abi::LINUX_IN_ACCESS);
             // A stdio fd the guest explicitly closed (and did not reopen) is a
             // genuinely closed descriptor: read is EBADF, not a host-stdin read.
             if this.stdio_is_closed(fd.0) {
@@ -6121,50 +6206,77 @@ impl SyscallDispatcher {
                 return Ok(LINUX_ENOENT.into());
             }
             let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
-            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-                return match m.vfs.watch_fds(&m.full_path) {
-                    Ok(watch_fds) => Ok(match state.add_watch_fds(watch_fds, mask as u32) {
-                        Ok(wd) => DispatchOutcome::Returned { value: wd as i64 },
-                        Err(errno) => errno.into(),
-                    }),
-                    Err(errno) if errno == LINUX_ENOSYS => Ok(crate::linux_abi::LINUX_ENOSPC.into()),
-                    Err(errno) => Ok(errno.into()),
-                };
-            }
-            match this.fs.rootfs_vfs.watch_fds(&path) {
-                Ok(watch_fds) => {
-                    return Ok(match state.add_watch_fds(watch_fds, mask as u32) {
-                        Ok(wd) => DispatchOutcome::Returned { value: wd as i64 },
-                        Err(errno) => errno.into(),
-                    });
+            let mask = mask as u32;
+            // Try the per-instance backend first (kqueue host-vnode watch on
+            // macOS/BSD, native inotify on Linux) so cross-process directory
+            // changes — a forked guest child mutating a watched dir — still
+            // wake the parent. Whatever wd results (a real backend watch, or a
+            // virtual dispatch-only one when the backend declines) is recorded
+            // in the dispatch registry so the fs handlers can synthesize the
+            // precise same-process events the coarse kqueue NOTE_* set misses.
+            let wd = if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                match m.vfs.watch_fds(&m.full_path) {
+                    Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
+                        Ok(wd) => wd,
+                        Err(errno) => return Ok(errno.into()),
+                    },
+                    // Backend can't hand back a host vnode: fall back to a
+                    // dispatch-only watch iff the path exists.
+                    Err(errno) if errno == LINUX_ENOSYS => {
+                        if !this.path_exists(&path) {
+                            return Ok(crate::linux_abi::LINUX_ENOENT.into());
+                        }
+                        state.add_virtual_watch(mask)
+                    }
+                    Err(errno) => return Ok(errno.into()),
                 }
-                Err(errno) if errno == LINUX_ENOSYS => {}
-                Err(errno) => return Ok(errno.into()),
-            }
-            // A watchable host vnode can still come from the legacy host-file
-            // open path when the writable backend has no host path to hand to
-            // the directory snapshot/diff implementation.
-            match this
-                .fs
-                .rootfs_vfs
-                .open_for_dispatch(&path, false, false, false, false)
-            {
-                Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
-                    Ok(match state.add_watch(host_fd, mask as u32) {
-                        Ok(wd) => DispatchOutcome::Returned { value: wd as i64 },
-                        Err(errno) => errno.into(),
-                    })
+            } else {
+                match this.fs.rootfs_vfs.watch_fds(&path) {
+                    Ok(watch_fds) => match state.add_watch_fds(watch_fds, mask) {
+                        Ok(wd) => wd,
+                        Err(errno) => return Ok(errno.into()),
+                    },
+                    Err(errno) if errno == LINUX_ENOSYS => {
+                        // The legacy host-file open path can still yield a real
+                        // host vnode (writable backend with no snapshot path).
+                        match this
+                            .fs
+                            .rootfs_vfs
+                            .open_for_dispatch(&path, false, false, false, false)
+                        {
+                            Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
+                                match state.add_watch(host_fd, mask) {
+                                    Ok(wd) => wd,
+                                    Err(errno) => return Ok(errno.into()),
+                                }
+                            }
+                            // No host vnode (in-memory overlay): dispatch-only.
+                            Ok(_) => state.add_virtual_watch(mask),
+                            Err(errno) => return Ok(errno.into()),
+                        }
+                    }
+                    Err(errno) => return Ok(errno.into()),
                 }
-                Ok(_) => Ok(crate::linux_abi::LINUX_ENOSPC.into()),
-                Err(errno) => Ok(errno.into()),
-            }
+            };
+            this.fs.inotify_registry.register(&path, &state, wd, mask);
+            // The dispatch registry now owns same-process event generation for
+            // this instance; suppress the kqueue backend's duplicate synthesis
+            // (it stays a poll_fd readiness source only).
+            state.mark_dispatch_authoritative();
+            Ok(DispatchOutcome::Returned { value: wd as i64 })
         }
 
         fn inotify_rm_watch(this, cx, fd: Fd, wd: u64) {
             let Some(state) = this.inotify_state(fd.0) else {
                 return Ok(LINUX_EINVAL.into());
             };
-            Ok(match state.rm_watch(wd as i32) {
+            let wd = wd as i32;
+            // rm_watch removes the per-instance watch (virtual watches live in
+            // the same `watches` table with no host fds, so it finds them too).
+            // Drop the dispatch-registry entry to match.
+            let result = state.rm_watch(wd);
+            this.fs.inotify_registry.unregister(&state, wd);
+            Ok(match result {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                 Err(errno) => errno.into(),
             })
@@ -6425,6 +6537,13 @@ impl SyscallDispatcher {
             };
 
             let nonblocking = this.io_is_nonblocking(fd, 0);
+
+            // inotify IN_MODIFY: a non-empty write(2) to a watched regular file
+            // emits IN_MODIFY on it. A zero-length write touches nothing and
+            // generates no event, matching Linux. Fast-exits when unwatched.
+            if length > 0 {
+                this.inotify_emit_for_fd(fd, carrick_abi::LINUX_IN_MODIFY);
+            }
 
             #[cfg(feature = "trace-io")]
             if !bytes.is_empty() {
@@ -7214,6 +7333,8 @@ impl SyscallDispatcher {
                             Some(creds.egid),
                             false,
                         );
+                        // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
+                        this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
                         Ok(DispatchOutcome::Returned { value: 0 })
                     }
                     Err(errno) => Ok(errno.into()),
@@ -7272,6 +7393,8 @@ impl SyscallDispatcher {
                             .overlay
                             .set_owner(&resolved, creds.euid, owner_gid);
                     }
+                    // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
+                    this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(errno.into()),
@@ -7329,6 +7452,8 @@ impl SyscallDispatcher {
                         _ => {}
                     }
                 }
+                // inotify IN_ATTRIB (chmod is a metadata change).
+                this.inotify_attrib(&path);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 
@@ -7775,6 +7900,13 @@ impl SyscallDispatcher {
                     Err(errno) => Ok(errno.into()),
                 };
             }
+            // Capture the target kind BEFORE the delete (for IN_ISDIR), only
+            // when something is watching (the lookup is otherwise wasted work).
+            let unlinked_is_dir = if this.fs.inotify_registry.is_empty() {
+                false
+            } else {
+                this.inotify_path_kind(&resolved).unwrap_or(remove_dir)
+            };
             let result = if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
                 if remove_dir { m.vfs.rmdir(&m.full_path) } else { m.vfs.unlink(&m.full_path) }
             } else if remove_dir {
@@ -7783,7 +7915,20 @@ impl SyscallDispatcher {
                 this.fs.rootfs_vfs.unlink(&resolved)
             };
             match result {
-                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Ok(()) => {
+                    // inotify: IN_DELETE (name) to a watch on the parent dir, plus
+                    // IN_DELETE_SELF then IN_IGNORED to a watch on the entry itself
+                    // (the watch is auto-removed when its target is deleted).
+                    this.inotify_child(
+                        &resolved,
+                        carrick_abi::LINUX_IN_DELETE,
+                        unlinked_is_dir,
+                    );
+                    this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
+                    this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
+                    this.fs.inotify_registry.unregister_path(&resolved);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
                 Err(errno) => Ok(errno.into()),
             }
 

@@ -2030,15 +2030,28 @@ impl SyscallDispatcher {
         let last_ref = Arc::strong_count(&open_file.description) == 1;
         let mut pty_master_index = None;
         let mut fifo_host_fd = None;
-        if last_ref
-            && let OpenDescription::HostPipe { pty, host_fd, .. } = &*open_file.description.read()
-        {
-            fifo_host_fd = Some(*host_fd);
-            if let Some(role) = pty
-                && role.is_master
-            {
-                pty_master_index = Some(role.index);
+        let mut closing_inotify = None;
+        if last_ref {
+            match &*open_file.description.read() {
+                OpenDescription::HostPipe { pty, host_fd, .. } => {
+                    fifo_host_fd = Some(*host_fd);
+                    if let Some(role) = pty
+                        && role.is_master
+                    {
+                        pty_master_index = Some(role.index);
+                    }
+                }
+                // The inotify fd is closing for good: drop every dispatch-registry
+                // entry it owned so stale watches don't keep firing (and so the
+                // registry doesn't pin the InotifyState alive via its Arc).
+                OpenDescription::Inotify { state, .. } => {
+                    closing_inotify = Some(Arc::clone(state));
+                }
+                _ => {}
             }
+        }
+        if let Some(state) = closing_inotify {
+            self.fs.inotify_registry.unregister_all(&state);
         }
         close_open_file(open_file);
         if let Some(index) = pty_master_index {
