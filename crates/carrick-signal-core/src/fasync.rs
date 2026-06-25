@@ -12,10 +12,15 @@
 //! process. An in-memory map would silently diverge across fork (see
 //! AGENTS.md). The durable, fork-coherent mechanism is a `MAP_SHARED|MAP_ANON`
 //! table — allocated once pre-fork and inherited by every guest process,
-//! exactly like the xsignal ring ([`crate::xsig`]). It is keyed by the host
-//! pipe/socket inode identity (`st_dev`, `st_ino`), which is the SAME for both
-//! ends of a pipe and survives fork, so a writer can look up the reader's
-//! arming and deliver the signal.
+//! exactly like the xsignal ring ([`crate::xsig`]). It is keyed by a single
+//! carrick "pipe id" (`u64`) — a value assigned at pipe creation and stored on
+//! BOTH ends' `OpenDescription`s, so it is identical for the reader and the
+//! writer and is inherited unchanged across fork. (On Linux both pipe ends
+//! share one host inode, but on macOS the two ends have DIFFERENT `st_ino`, so
+//! a per-fd host-inode key armed on the read end would never match the
+//! write-end write that triggers the signal — the pipe id collapses both ends
+//! onto one stable key.) A writer can therefore look up the reader's arming and
+//! deliver the signal.
 //!
 //! This module is the platform-NEUTRAL core (the slot layout, the
 //! `MAP_SHARED|MAP_ANON` allocation, arm/disarm/lookup). The actual signal
@@ -31,10 +36,10 @@ const FASYNC_SLOTS: usize = 256;
 struct FasyncSlot {
     /// 0 = free, 1 = claiming (payload not yet valid), 2 = armed.
     used: AtomicU32,
-    /// Host inode identity of the pipe/socket object: the join key shared by
-    /// both ends and stable across fork. `(0, 0)` is never a valid armed key.
-    dev: AtomicU64,
-    ino: AtomicU64,
+    /// carrick pipe id of the pipe/socket object: the join key shared by both
+    /// ends and stable across fork (see the module docs). `0` is never a valid
+    /// armed key.
+    pipe_id: AtomicU64,
     /// `F_SETOWN`/`F_SETOWN_EX` target (guest ns-pid == host pid in carrick).
     owner_pid: AtomicU32,
     /// `F_OWNER_TID` (0) / `F_OWNER_PID` (1) / `F_OWNER_PGRP` (2).
@@ -99,12 +104,10 @@ fn table() -> Option<&'static FasyncTable> {
     }
 }
 
-/// Find the slot armed for `(dev, ino)`, if any. Returns the slot index.
-fn find_armed(t: &FasyncTable, dev: u64, ino: u64) -> Option<usize> {
+/// Find the slot armed for `pipe_id`, if any. Returns the slot index.
+fn find_armed(t: &FasyncTable, pipe_id: u64) -> Option<usize> {
     t.slots.iter().position(|s| {
-        s.used.load(Ordering::Acquire) == 2
-            && s.dev.load(Ordering::Acquire) == dev
-            && s.ino.load(Ordering::Acquire) == ino
+        s.used.load(Ordering::Acquire) == 2 && s.pipe_id.load(Ordering::Acquire) == pipe_id
     })
 }
 
@@ -119,18 +122,18 @@ pub fn any_armed() -> bool {
     }
 }
 
-/// Arm (or re-arm) signal-driven I/O for the pipe/socket inode `(dev, ino)`. A
-/// later `lookup` on the same key returns `owner`/`sig`. Re-arming the same key
+/// Arm (or re-arm) signal-driven I/O for the pipe/socket `pipe_id`. A later
+/// `lookup` on the same key returns `owner`/`sig`. Re-arming the same key
 /// overwrites the previous owner/signal (Linux's per-fd FASYNC + F_SETOWN +
 /// F_SETSIG can each be re-set). Best-effort: a full or absent table drops the
 /// arm silently.
-pub fn arm(dev: u64, ino: u64, owner: FasyncOwner) {
+pub fn arm(pipe_id: u64, owner: FasyncOwner) {
     let Some(t) = table() else {
         return;
     };
     // Re-arm an existing entry in place (Relaxed stores are fine: the slot is
     // already published at `used == 2` and `lookup` re-reads each field).
-    if let Some(idx) = find_armed(t, dev, ino)
+    if let Some(idx) = find_armed(t, pipe_id)
         && let Some(slot) = t.slots.get(idx)
     {
         slot.owner_pid
@@ -147,8 +150,7 @@ pub fn arm(dev: u64, ino: u64, owner: FasyncOwner) {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            slot.dev.store(dev, Ordering::Relaxed);
-            slot.ino.store(ino, Ordering::Relaxed);
+            slot.pipe_id.store(pipe_id, Ordering::Relaxed);
             slot.owner_pid
                 .store(owner.owner_pid as u32, Ordering::Relaxed);
             slot.owner_type
@@ -160,27 +162,26 @@ pub fn arm(dev: u64, ino: u64, owner: FasyncOwner) {
     }
 }
 
-/// Disarm signal-driven I/O for `(dev, ino)` (clearing `O_ASYNC`, or the last
-/// close of the inode). A no-op if no entry is armed for the key.
-pub fn disarm(dev: u64, ino: u64) {
+/// Disarm signal-driven I/O for `pipe_id` (clearing `O_ASYNC`, or the last
+/// close of the pipe). A no-op if no entry is armed for the key.
+pub fn disarm(pipe_id: u64) {
     let Some(t) = table() else {
         return;
     };
-    if let Some(idx) = find_armed(t, dev, ino)
+    if let Some(idx) = find_armed(t, pipe_id)
         && let Some(slot) = t.slots.get(idx)
     {
-        slot.dev.store(0, Ordering::Relaxed);
-        slot.ino.store(0, Ordering::Relaxed);
+        slot.pipe_id.store(0, Ordering::Relaxed);
         slot.used.store(0, Ordering::Release);
     }
 }
 
-/// Look up the FASYNC owner armed for `(dev, ino)`, if any. Called on the fd's
+/// Look up the FASYNC owner armed for `pipe_id`, if any. Called on the fd's
 /// readiness edge (e.g. a guest write to a pipe whose read end is armed) to
 /// decide whether — and to whom — to deliver the I/O signal.
-pub fn lookup(dev: u64, ino: u64) -> Option<FasyncOwner> {
+pub fn lookup(pipe_id: u64) -> Option<FasyncOwner> {
     let t = table()?;
-    let idx = find_armed(t, dev, ino)?;
+    let idx = find_armed(t, pipe_id)?;
     let slot = t.slots.get(idx)?;
     Some(FasyncOwner {
         owner_pid: slot.owner_pid.load(Ordering::Acquire) as i32,
@@ -200,8 +201,7 @@ mod tests {
         if let Some(t) = table() {
             for slot in t.slots.iter() {
                 slot.used.store(0, Ordering::Release);
-                slot.dev.store(0, Ordering::Relaxed);
-                slot.ino.store(0, Ordering::Relaxed);
+                slot.pipe_id.store(0, Ordering::Relaxed);
             }
         }
     }
@@ -220,9 +220,8 @@ mod tests {
     fn arm_then_lookup_round_trips() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        assert_eq!(lookup(7, 42), None);
+        assert_eq!(lookup(42), None);
         arm(
-            7,
             42,
             FasyncOwner {
                 owner_pid: 1234,
@@ -231,15 +230,15 @@ mod tests {
             },
         );
         assert_eq!(
-            lookup(7, 42),
+            lookup(42),
             Some(FasyncOwner {
                 owner_pid: 1234,
                 owner_type: 1,
                 sig: 10,
             })
         );
-        // A different inode is not armed.
-        assert_eq!(lookup(7, 43), None);
+        // A different pipe id is not armed.
+        assert_eq!(lookup(43), None);
         reset();
     }
 
@@ -249,16 +248,14 @@ mod tests {
         reset();
         arm(
             1,
-            1,
             FasyncOwner {
                 owner_pid: 100,
                 owner_type: 1,
                 sig: 0,
             },
         );
-        // F_SETOWN then F_SETSIG re-arm the SAME inode with new owner/sig.
+        // F_SETOWN then F_SETSIG re-arm the SAME pipe id with new owner/sig.
         arm(
-            1,
             1,
             FasyncOwner {
                 owner_pid: 200,
@@ -267,7 +264,7 @@ mod tests {
             },
         );
         assert_eq!(
-            lookup(1, 1),
+            lookup(1),
             Some(FasyncOwner {
                 owner_pid: 200,
                 owner_type: 2,
@@ -292,7 +289,6 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         arm(
-            5,
             6,
             FasyncOwner {
                 owner_pid: 9,
@@ -300,12 +296,12 @@ mod tests {
                 sig: 29,
             },
         );
-        assert!(lookup(5, 6).is_some());
-        disarm(5, 6);
-        assert_eq!(lookup(5, 6), None);
+        assert!(lookup(6).is_some());
+        disarm(6);
+        assert_eq!(lookup(6), None);
         // Disarming an unarmed key is a harmless no-op.
-        disarm(5, 6);
-        assert_eq!(lookup(5, 6), None);
+        disarm(6);
+        assert_eq!(lookup(6), None);
         reset();
     }
 }
