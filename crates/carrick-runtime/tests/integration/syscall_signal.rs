@@ -814,3 +814,118 @@ fn rt_sigtimedwait_writes_full_siginfo_from_queued_payload() {
     assert_eq!(rd(16), 1234, "si_pid from the queued payload");
     assert_eq!(rd(20), 5678, "si_uid from the queued payload");
 }
+
+/// End-to-end signal-driven I/O (`O_ASYNC` / FASYNC): a guest arms a pipe read
+/// end for SIGUSR1 with itself as the owner (`F_SETFL O_ASYNC` + `F_SETOWN` +
+/// `F_SETSIG`), writes the write end, then `rt_sigtimedwait`s for the I/O
+/// signal. The readiness edge must deliver SIGUSR1 to the owner, and the
+/// blocking wait must consume it (return the signum) rather than parking. This
+/// is the kernel path LTP fcntl31/fcntl31_64 exercise (parent arms + waits,
+/// child writes); a regression here resurfaces as fcntl31's
+/// "sigtimedwait() failed" TBROK.
+///
+/// The whole chain runs in one process against the `SyscallDispatcher`: pipe2
+/// allocates a real host pipe, the FASYNC registry arms on the readiness edge,
+/// the self-owner send routes through `raise_for_self` into the dispatcher's
+/// process-directed pending set, and `rt_sigtimedwait`'s entry-time pending
+/// scan (which consults the dispatcher set, the host-signal core, AND the
+/// cross-process xsignal ring) returns the signum.
+#[test]
+fn fasync_self_owner_delivers_io_signal_to_sigtimedwait() {
+    // The FASYNC registry lives in a MAP_SHARED table the production runtime
+    // maps at startup (host_signal init); a bare lib test must init it itself or
+    // arm/lookup silently no-op and nothing is delivered.
+    carrick_signal_core::fasync::fasync_init();
+
+    const SYS_PIPE2: u64 = 59;
+    const SYS_FCNTL: u64 = 25;
+    const SYS_WRITE: u64 = 64;
+    const SYS_RT_SIGTIMEDWAIT: u64 = 137;
+    const F_SETFL: u64 = 4;
+    const F_SETOWN: u64 = 8;
+    const F_SETSIG: u64 = 10;
+    const O_ASYNC: u64 = 0o20000;
+    const SIGUSR1: u64 = 10;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0u8; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // pipe2(&fds @0x4000, flags=0): [0] read end, [1] write end.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(SYS_PIPE2, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let read_int = |off: u64| {
+        i32::from_le_bytes(memory.read_bytes(off, 4).unwrap().try_into().unwrap()) as u64
+    };
+    let rfd = read_int(0x4000);
+    let wfd = read_int(0x4004);
+
+    let mut fcntl = |fd: u64, cmd: u64, arg: u64| {
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(SYS_FCNTL, SyscallArgs::from([fd, cmd, arg, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+    };
+    // Arm signal-driven I/O on the read end: O_ASYNC, then owner=self pid, then
+    // the delivered signal = SIGUSR1 (fcntl31 sets the signal last).
+    assert_eq!(
+        fcntl(rfd, F_SETFL, O_ASYNC),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        fcntl(rfd, F_SETOWN, std::process::id() as u64),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        fcntl(rfd, F_SETSIG, SIGUSR1),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // Write one byte to the write end → the read end becomes readable → the
+    // FASYNC edge fires and delivers SIGUSR1 to the owner (self).
+    memory.write_bytes(0x4100, b"c").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(SYS_WRITE, SyscallArgs::from([wfd, 0x4100, 1, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    // rt_sigtimedwait({SIGUSR1}, info=NULL, timeout=NULL, size=8) must consume
+    // the delivered I/O signal immediately (NOT park in WaitOnSignals).
+    memory
+        .write_bytes(0x4200, &(1u64 << (SIGUSR1 - 1)).to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_RT_SIGTIMEDWAIT,
+                    SyscallArgs::from([0x4200, 0, 0, 8, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: SIGUSR1 as i64
+        },
+        "the FASYNC readiness edge must deliver SIGUSR1 and sigtimedwait must \
+         return it"
+    );
+}
