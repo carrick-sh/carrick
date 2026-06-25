@@ -2565,6 +2565,28 @@ pub const LINUX_TIOCNOTTY: u64 = 0x5422;
 pub const LINUX_TIOCGSID: u64 = 0x5429;
 pub const LINUX_SIOCGIFNAME: u64 = 0x8910;
 pub const LINUX_SIOCGIFINDEX: u64 = 0x8933;
+/// `SIOCATMARK` — is the read pointer at the out-of-band mark? (`<asm-generic/sockios.h>`)
+pub const LINUX_SIOCATMARK: u64 = 0x8905;
+/// `SIOCGIFCONF` — return a list of interface (transport-layer) addresses. (`<linux/sockios.h>`)
+pub const LINUX_SIOCGIFCONF: u64 = 0x8912;
+/// `SIOCGIFFLAGS` — get interface active flags. (`<linux/sockios.h>`)
+pub const LINUX_SIOCGIFFLAGS: u64 = 0x8913;
+/// `SIOCSIFFLAGS` — set interface active flags. (`<linux/sockios.h>`)
+pub const LINUX_SIOCSIFFLAGS: u64 = 0x8914;
+/// `SIOCGIFADDR` — get interface address. (`<linux/sockios.h>`)
+pub const LINUX_SIOCGIFADDR: u64 = 0x8915;
+/// `SIOCGIFBRDADDR` — get broadcast address. (`<linux/sockios.h>`)
+pub const LINUX_SIOCGIFBRDADDR: u64 = 0x8919;
+/// `SIOCGIFNETMASK` — get network mask. (`<linux/sockios.h>`)
+pub const LINUX_SIOCGIFNETMASK: u64 = 0x891b;
+/// `SIOCGIFMTU` — get interface MTU. (`<linux/sockios.h>`)
+pub const LINUX_SIOCGIFMTU: u64 = 0x8921;
+/// Linux `struct ifreq` size (16-byte name + 24-byte union) on 64-bit. (`<net/if.h>`)
+pub const LINUX_IFREQ_SIZE: usize = 40;
+/// Linux `IFNAMSIZ` — interface-name field width in `struct ifreq`. (`<net/if.h>`)
+pub const LINUX_IFNAMSIZ: usize = 16;
+/// Linux `struct ifconf` size (4-byte len + 4 pad + 8-byte pointer) on 64-bit. (`<net/if.h>`)
+pub const LINUX_IFCONF_SIZE: usize = 16;
 pub const LINUX_BOOTSTRAP_PGID: i32 = 1;
 pub const LINUX_BOOTSTRAP_SID: i32 = 1;
 pub const LINUX_PIPE_BUF_SIZE: i64 = 65_536;

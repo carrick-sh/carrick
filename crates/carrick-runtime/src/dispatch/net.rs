@@ -1203,7 +1203,7 @@ impl SyscallDispatcher {
     }
 
     /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
-    fn host_socket_lookup(&self, fd: i32) -> Result<(i32, i32), i32> {
+    pub(in crate::dispatch) fn host_socket_lookup(&self, fd: i32) -> Result<(i32, i32), i32> {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
@@ -1213,6 +1213,23 @@ impl SyscallDispatcher {
                 host_fd, family, ..
             } => Ok((*host_fd, *family)),
             _ => Err(LINUX_ENOTSOCK),
+        }
+    }
+
+    /// Read the per-description `connect_in_progress` flag for `fd` (false if the
+    /// fd is missing or not a HostSocket). See `OpenDescriptionBase.connect_in_progress`.
+    fn socket_connect_in_progress(&self, fd: i32) -> bool {
+        self.open_file(fd).is_some_and(|of| {
+            matches!(&*of.description.read(), OpenDescription::HostSocket { base, .. } if base.connect_in_progress())
+        })
+    }
+
+    /// Set/clear the per-description `connect_in_progress` flag for `fd`.
+    fn set_socket_connect_in_progress(&self, fd: i32, on: bool) {
+        if let Some(open_file) = self.open_file(fd)
+            && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
+        {
+            base.set_connect_in_progress(on);
         }
     }
 
@@ -1233,7 +1250,7 @@ impl SyscallDispatcher {
     /// The GUEST-requested socket type for `fd` (e.g. SOCK_SEQPACKET), which can
     /// differ from the host backing — carrick backs a guest AF_UNIX SEQPACKET
     /// with a host SOCK_STREAM, so the host's SO_TYPE would mis-report it.
-    fn socket_guest_type(&self, fd: i32) -> Option<i32> {
+    pub(in crate::dispatch) fn socket_guest_type(&self, fd: i32) -> Option<i32> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
@@ -1428,10 +1445,16 @@ impl SyscallDispatcher {
             return connect_success_or_pending_error(host_fd);
         }
         let e = HostSyscallError::last().linux_errno();
+        // See `fn connect` for why EISCONN is split on connect_in_progress.
         if e == LINUX_EISCONN {
-            return connect_success_or_pending_error(host_fd);
+            if self.socket_connect_in_progress(fd) {
+                self.set_socket_connect_in_progress(fd, false);
+                return connect_success_or_pending_error(host_fd);
+            }
+            return LINUX_EISCONN.into();
         }
         if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
+            self.set_socket_connect_in_progress(fd, true);
             return DispatchOutcome::WaitOnFds {
                 fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
                 timeout: None,
@@ -3486,13 +3509,23 @@ impl SyscallDispatcher {
                 return Ok(connect_success_or_pending_error(host_fd));
             }
             let e = HostSyscallError::last().linux_errno();
-            // EISCONN: the async connect completed (we're back via the POLLOUT
-            // re-dispatch). macOS reports EISCONN even when it FAILED, so the real
-            // result is in SO_ERROR — surface ECONNREFUSED etc. at connect time
-            // instead of deferring it to the first recv (which breaks a blocking
-            // guest connect + create_connection's IPv6->IPv4 address fallback).
+            // EISCONN: macOS reports it BOTH when an async connect we deferred
+            // completes (the POLLOUT re-dispatch) AND when the guest calls
+            // connect() on an already-established socket. Only the former should
+            // be folded to success: distinguish via the per-description
+            // connect_in_progress flag (set when we first deferred this connect).
+            //   - in-progress set ⇒ async completion: consult SO_ERROR so a FAILED
+            //     async connect (macOS still says EISCONN) surfaces ECONNREFUSED
+            //     etc. at connect time rather than deferring it to the first recv
+            //     (which breaks blocking connect + the IPv6->IPv4 address fallback).
+            //   - in-progress clear ⇒ a real re-connect of an established socket:
+            //     surface EISCONN to the guest (Linux connect01 "already connected").
             if e == LINUX_EISCONN {
-                return Ok(connect_success_or_pending_error(host_fd));
+                if this.socket_connect_in_progress(fd) {
+                    this.set_socket_connect_in_progress(fd, false);
+                    return Ok(connect_success_or_pending_error(host_fd));
+                }
+                return Ok(LINUX_EISCONN.into());
             }
             if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
                 if nonblocking {
@@ -3501,7 +3534,9 @@ impl SyscallDispatcher {
                 }
                 // Blocking guest: wait (lock released) for the socket to become
                 // writable, then re-dispatch — connect then returns EISCONN or the
-                // real connect error.
+                // real connect error. Mark the connect as deferred so the EISCONN
+                // we expect on re-dispatch is recognised as async-completion above.
+                this.set_socket_connect_in_progress(fd, true);
                 return Ok(DispatchOutcome::WaitOnFds {
                     fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
                     timeout: None,
@@ -3648,11 +3683,23 @@ impl SyscallDispatcher {
             let host_addr = if dest_addr == 0 {
                 None
             } else {
+                // Linux's move_addr_to_kernel rejects a negative addrlen with
+                // EINVAL before touching the buffer (sendto01 "invalid to buffer
+                // length", tolen = -1). read_linux_sockaddr reads addrlen as u32
+                // and would instead fault on the huge length (EFAULT) — guard here.
+                if (dest_len as i32) < 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
                 match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
                     Ok(b) => Some(b),
                     Err(errno) => return Ok(errno.into()),
                 }
             };
+            // A send on an unconnected STREAM socket: Linux returns EPIPE
+            // (tcp_sendmsg with no peer), but macOS returns ENOTCONN. Remap only
+            // for stream sockets so datagram ENOTCONN (a real Linux errno) is
+            // untouched. (sendto01 "not connected TCP")
+            let is_stream = this.socket_guest_type(fd) == Some(libc::SOCK_STREAM);
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let send_to = this
@@ -3681,7 +3728,10 @@ impl SyscallDispatcher {
                         )
                     },
                 };
-                n.host_syscall_errno().map(|value| value as i64)
+                match n.host_syscall_errno().map(|value| value as i64) {
+                    Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
+                    other => other,
+                }
             });
             Ok(outcome)
 
@@ -3717,6 +3767,21 @@ impl SyscallDispatcher {
             const LINUX_MSG_ERRQUEUE: i32 = 0x2000;
             if flags & LINUX_MSG_ERRQUEUE != 0 {
                 return Ok(LINUX_EAGAIN.into());
+            }
+            // When the caller wants the source address back, Linux's
+            // move_addr_to_user reads the in/out length as a *signed* int and
+            // returns EINVAL for a negative value (recvfrom01 "invalid socket
+            // addr length", fromlen = -1). carrick's write_linux_sockaddr reads
+            // it as u32, so it would never reject it — validate here.
+            if src_addr != 0 && src_len_addr != 0 {
+                match memory.read_bytes(src_len_addr, 4) {
+                    Ok(b) => {
+                        if i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0 {
+                            return Ok(LINUX_EINVAL.into());
+                        }
+                    }
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                }
             }
             // Native fd mode preserved; force this CALL non-blocking with
             // MSG_DONTWAIT and route through blocking_io: on EAGAIN a blocking-mode
