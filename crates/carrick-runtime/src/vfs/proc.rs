@@ -303,6 +303,10 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // Default 64-bit Linux pid ceiling. LTP (setpgid02) reads this to bound pid
     // scans; without it tst_test aborts with ENOENT.
     ("/proc/sys/kernel/pid_max", Sysctl::Static(b"4194304\n")),
+    // Kernel taint flags: 0 = untainted. The LTP tst_test framework reads this at
+    // setup/teardown for tests with `.taint_check` to detect kernel warnings/oopses;
+    // a missing file made every such test TBROK in setup (tst_taint.c ENOENT).
+    ("/proc/sys/kernel/tainted", Sysctl::Static(b"0\n")),
     // Highest capability number carrick models — libcap/systemd/runc loop
     // 0..=cap_last_cap dropping bounding-set caps.
     ("/proc/sys/kernel/cap_last_cap", Sysctl::Static(b"40\n")),
