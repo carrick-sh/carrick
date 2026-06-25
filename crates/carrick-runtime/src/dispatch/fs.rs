@@ -361,8 +361,15 @@ fn forward_record_lock<M: GuestMemory>(
             out[8..16].copy_from_slice(&(fl.l_start as i64).to_le_bytes());
             out[16..24].copy_from_slice(&(fl.l_len as i64).to_le_bytes());
             // OFD locks are not process-owned: Linux reports a conflicting OFD
-            // lock's l_pid as -1.
-            let l_pid_back: i32 = if is_ofd { -1 } else { fl.l_pid as i32 };
+            // lock's l_pid as -1. A classic lock's holder pid comes back from
+            // macOS flock as the HOST pid; present it in the caller's PID
+            // namespace (LTP fcntl11/17/19/20/21/31/32 assert l_pid == the
+            // holder's ns-pid, the same translation gettid/semctl(GETPID) use).
+            let l_pid_back: i32 = if is_ofd {
+                -1
+            } else {
+                crate::namespace::pid::host_to_ns_or_self(fl.l_pid as u32) as i32
+            };
             out[24..28].copy_from_slice(&l_pid_back.to_le_bytes());
             if memory.write_bytes(arg, &out).is_err() {
                 return DispatchOutcome::errno(LINUX_EFAULT);
