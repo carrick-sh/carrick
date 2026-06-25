@@ -1470,11 +1470,14 @@ impl SyscallDispatcher {
         if !self.fs.inotify_registry.is_empty() {
             if inotify_created {
                 self.inotify_child(&record_path, carrick_abi::LINUX_IN_CREATE, opened_is_dir);
-                // A create also "opens" the new file for the returned fd.
-                self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
-            } else {
-                self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
             }
+            // Any successful open is IN_OPEN, delivered BOTH to a watch on the
+            // object itself (self) AND to a watch on its parent directory (child,
+            // name = basename) — the kernel reports a child's open to the dir
+            // watch with the child's name (inotify02 watches the dir and asserts
+            // IN_OPEN with name=test_file1). A create also "opens" the new file.
+            self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
+            self.inotify_child(&record_path, carrick_abi::LINUX_IN_OPEN, opened_is_dir);
         }
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
@@ -1503,7 +1506,13 @@ impl SyscallDispatcher {
         };
         drop(desc);
         let ino = self.fd_stat_record(n).map(|r| r.ino).unwrap_or(0);
-        Some(format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t24\nino:\t{ino}\n").into_bytes())
+        let mut out = format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t24\nino:\t{ino}\n");
+        // An inotify fd's fdinfo also carries one `inotify wd:...mask:...` line
+        // per live watch (proc_pid_fdinfo(5)); inotify12 parses the mask from it.
+        if let Some(state) = self.inotify_state(n) {
+            out.push_str(&state.fdinfo_lines());
+        }
+        Some(out.into_bytes())
     }
 
     /// Install a read-only synthetic-bytes fd (e.g. a rendered fdinfo file).
@@ -7916,12 +7925,25 @@ impl SyscallDispatcher {
                     Err(errno) => Ok(errno.into()),
                 };
             }
-            // Capture the target kind BEFORE the delete (for IN_ISDIR), only
-            // when something is watching (the lookup is otherwise wasted work).
-            let unlinked_is_dir = if this.fs.inotify_registry.is_empty() {
-                false
-            } else {
+            // Capture the target kind and (for a file) its pre-delete link count
+            // BEFORE the delete, only when something is watching (the lookups are
+            // otherwise wasted work). The link count distinguishes "a link was
+            // removed but the inode survives" (IN_ATTRIB only) from "the last link
+            // is gone, the file is removed" (IN_ATTRIB → IN_DELETE_SELF →
+            // IN_IGNORED) — see inotify04 and inotify(7).
+            let watching = !this.fs.inotify_registry.is_empty();
+            let unlinked_is_dir = if watching {
                 this.inotify_path_kind(&resolved).unwrap_or(remove_dir)
+            } else {
+                false
+            };
+            // nlink only matters for the file (non-dir) self-watch sequence.
+            let nlink_before = if watching && !unlinked_is_dir {
+                this.path_stat_record(dirfd, &path, 0)
+                    .map(|r| r.nlink)
+                    .unwrap_or(1)
+            } else {
+                0
             };
             let result = if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
                 if remove_dir { m.vfs.rmdir(&m.full_path) } else { m.vfs.unlink(&m.full_path) }
@@ -7932,17 +7954,33 @@ impl SyscallDispatcher {
             };
             match result {
                 Ok(()) => {
-                    // inotify: IN_DELETE (name) to a watch on the parent dir, plus
-                    // IN_DELETE_SELF then IN_IGNORED to a watch on the entry itself
-                    // (the watch is auto-removed when its target is deleted).
+                    // inotify: IN_DELETE (name) to a watch on the parent dir.
                     this.inotify_child(
                         &resolved,
                         carrick_abi::LINUX_IN_DELETE,
                         unlinked_is_dir,
                     );
-                    this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
-                    this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
-                    this.fs.inotify_registry.unregister_path(&resolved);
+                    // To a watch ON the entry itself:
+                    // - A directory (rmdir) has no link-count subtlety:
+                    //   IN_DELETE_SELF → IN_IGNORED.
+                    // - A file whose link count just dropped to 0 (the last link):
+                    //   IN_ATTRIB (link count changed) → IN_DELETE_SELF → IN_IGNORED.
+                    // - A file with surviving hardlinks (link count was > 1): the
+                    //   inode lives on, so only IN_ATTRIB — no self-delete/ignore.
+                    if unlinked_is_dir {
+                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
+                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
+                        this.fs.inotify_registry.unregister_path(&resolved);
+                    } else {
+                        // The unlinked name changes the inode's link count → IN_ATTRIB.
+                        this.inotify_self(&resolved, carrick_abi::LINUX_IN_ATTRIB);
+                        if nlink_before <= 1 {
+                            // Last link gone: the watched object is destroyed.
+                            this.inotify_self(&resolved, carrick_abi::LINUX_IN_DELETE_SELF);
+                            this.inotify_self(&resolved, carrick_abi::LINUX_IN_IGNORED);
+                            this.fs.inotify_registry.unregister_path(&resolved);
+                        }
+                    }
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(errno) => Ok(errno.into()),
