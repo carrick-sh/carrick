@@ -2492,6 +2492,22 @@ impl SyscallDispatcher {
                         .inotify_registry
                         .rename_path(&resolved_old, &resolved_new);
                 }
+                // A process whose cwd IS the renamed directory (or sits under it)
+                // must follow the move: Linux's cwd is an inode, but carrick tracks
+                // it as a path string, so rewrite the prefix. Without this a later
+                // relative path resolves against the stale cwd and returns ENOENT
+                // (inotify02 renames its own cwd, then unlinks a child by relative
+                // name). Same-process only; a cross-process ancestor rename does not
+                // update another process's cwd string (its inode would, on Linux).
+                let cwd = self.cwd();
+                if cwd == resolved_old {
+                    self.set_cwd(&resolved_new);
+                } else if cwd.starts_with(&resolved_old)
+                    && cwd.as_bytes().get(resolved_old.len()) == Some(&b'/')
+                {
+                    let rest = &cwd[resolved_old.len() + 1..];
+                    self.set_cwd(&format!("{resolved_new}/{rest}"));
+                }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(errno) => Ok(errno.into()),
