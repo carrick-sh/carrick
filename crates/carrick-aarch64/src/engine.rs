@@ -284,34 +284,28 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .vm
             .host_ptr(PT_BASE, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
-        let pt = Arc::clone(&self.page_tables);
         // `Arc::strong_count > 1` ⟺ a `clone(CLONE_THREAD)` sibling shares THIS
         // page-table manager (the spec clones the Arc into each sibling engine);
         // `== 1` ⟺ this is the SOLE vCPU over the backing. Coalescing reclaims
         // spare sub-tables into the pool — a break-before-make table↔block flip
         // plus a page free, unsafe only if another vCPU holds a stale walk-cache
         // reference to the freed page. So coalesce is safe iff the edit is
-        // EXCLUSIVE. Two cases make it exclusive:
-        //   * sole vCPU (`live_multi == false`) — provably no sibling (the
-        //     OutOfTables→ENOMEM-under-churn fix for a single-threaded guest); OR
-        //   * this edit holds the process-wide PT-pause barrier: the runtime's
-        //     threaded loop wraps every multi-vCPU stage-1 editor
-        //     (munmap/mremap/mmap/mprotect) in `pt_pause`, which drains all
-        //     siblings OUT of guest and the edit's `run_el1_maintenance` then
-        //     broadcasts an inner-shareable `tlbi vmalle1is` BEFORE they resume —
-        //     so no resumed sibling holds a stale walk reference to a freed page.
-        //     The engine reads the barrier via `pt_barrier().is_quiescing()`.
-        // The barrier flush is only sibling-reaching on a backend whose
-        // maintenance vehicle is an inner-shareable broadcast: HVF's EL1-trampoline
-        // `tlbi vmalle1is` is, so `pt_pause_flushes_sibling_tlbs()` is `true` there;
-        // KVM-aarch64 shares this engine but its MMIO-sentinel maintenance is not
-        // yet proven to reach PARKED vCPUs, so it keeps the default `false` and the
-        // conservative single-vCPU-only reclaim (fail-safe: it leaks, never reuses
-        // unsafely).
-        let live_multi = Arc::strong_count(&pt) > 1;
-        let unsafe_to_coalesce = live_multi
-            && !(self.vm.pt_pause_flushes_sibling_tlbs()
-                && carrick_thread::fork_quiesce::pt_barrier().is_quiescing());
+        // EXCLUSIVE. The single-vCPU case is provably exclusive here, so re-enable
+        // coalescing then (the OutOfTables→ENOMEM-under-churn fix for a
+        // single-threaded guest). The multi-vCPU case stays conservative
+        // (unsafe_to_coalesce = true): the generic loop's Pause-Modify-Resume pauses
+        // siblings + `tlbi vmalle1is`-broadcasts around every threaded stage-1 editor
+        // (vcpu_loop.rs pt_pause), but the engine cannot read that barrier from this
+        // crate, so it keeps the conservative flag rather than assume the PMR is held.
+        //
+        // Measure the count BEFORE the local `pt` clone below — the clone adds a
+        // reference, so `strong_count(&pt)` is 2 for a SOLE vCPU and `> 1` is
+        // ALWAYS true, leaving the sole-vCPU reclaim DEAD and leaking the 440-page
+        // table pool under single-threaded mmap churn (CPython multiprocessing's
+        // 400+ SemLock map/unmap cycles exhausted it: "stage-1 page-table pool
+        // exhausted"). `strong_count(&self.page_tables)` == the live engine count.
+        let unsafe_to_coalesce = Arc::strong_count(&self.page_tables) > 1;
+        let pt = Arc::clone(&self.page_tables);
         let mut guard = pt.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             // Build from the live guest backing (the boot tables) on first edit —
