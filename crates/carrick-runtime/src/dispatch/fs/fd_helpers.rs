@@ -220,6 +220,149 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Existence + kind probe for the inotify path: `Some(is_dir)` when `path`
+    /// resolves to a live entry (in a VFS mount or the rootfs+overlay),
+    /// `None` if it doesn't exist. Used by `inotify_add_watch` (a watch on a
+    /// nonexistent path is ENOENT) and to set `IN_ISDIR` on self events.
+    pub(in crate::dispatch) fn path_exists(&self, path: &str) -> bool {
+        self.inotify_path_kind(path).is_some()
+    }
+
+    /// `Some(is_dir)` if `path` exists, else `None`. Checks the VFS mount table
+    /// first (so `/proc`, `/dev`, bind mounts resolve), then the rootfs+overlay.
+    pub(in crate::dispatch) fn inotify_path_kind(&self, path: &str) -> Option<bool> {
+        use crate::vfs::Vfs as _;
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            return m
+                .vfs
+                .lookup(&m.full_path)
+                .ok()
+                .map(|md| md.kind == crate::vfs::EntryKind::Directory);
+        }
+        self.fs
+            .rootfs_vfs
+            .lookup(path)
+            .ok()
+            .map(|md| md.kind == crate::vfs::EntryKind::Directory)
+    }
+
+    /// Emit a *self* inotify event (the watched object itself was acted on):
+    /// `IN_OPEN`/`IN_ACCESS`/`IN_MODIFY`/`IN_ATTRIB`/`IN_CLOSE_*` etc. A no-op
+    /// (single `is_empty` read) when nothing is watched — the overwhelmingly
+    /// common case — so the fs hot paths pay almost nothing. `is_dir` is
+    /// resolved lazily only when a watch actually exists.
+    pub(in crate::dispatch) fn inotify_self(&self, path: &str, mask: u32) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
+        let is_dir = self.inotify_path_kind(path).unwrap_or(false);
+        self.fs.inotify_registry.notify_self(path, mask, is_dir);
+    }
+
+    /// Emit a *child* inotify event on the parent directory of `path` (e.g.
+    /// `IN_CREATE`/`IN_DELETE` with `name = basename(path)`). `is_dir` says
+    /// whether the child entry is itself a directory (sets `IN_ISDIR`). Caller
+    /// passes `is_dir` explicitly because for a delete the entry may already be
+    /// gone by the time this runs.
+    pub(in crate::dispatch) fn inotify_child(&self, path: &str, mask: u32, is_dir: bool) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
+        self.fs.inotify_registry.notify_child(path, mask, is_dir);
+    }
+
+    /// Emit an `IN_MOVED_FROM`/`IN_MOVED_TO` pair (cookie-tied) for a rename of
+    /// `from` → `to`. `is_dir` says whether the moved entry is a directory.
+    pub(in crate::dispatch) fn inotify_move(&self, from: &str, to: &str, is_dir: bool) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
+        self.fs.inotify_registry.notify_move(from, to, is_dir);
+    }
+
+    /// Emit `IN_ATTRIB` for a metadata change (chmod/chown/utimes) on `path`:
+    /// to a watch on the object itself (self, name=None) AND to a watch on its
+    /// parent directory (child, name=basename). The kernel delivers both — e.g.
+    /// `inotify12` watches a file and its parent dir and expects the file's watch
+    /// to see a nameless `IN_ATTRIB` and the parent's to see `IN_ATTRIB` + name.
+    pub(in crate::dispatch) fn inotify_attrib(&self, path: &str) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
+        let is_dir = self.inotify_path_kind(path).unwrap_or(false);
+        self.fs
+            .inotify_registry
+            .notify_self(path, carrick_abi::LINUX_IN_ATTRIB, is_dir);
+        self.fs
+            .inotify_registry
+            .notify_child(path, carrick_abi::LINUX_IN_ATTRIB, is_dir);
+    }
+
+    /// Emit an inotify event for a read/write/close on `fd`, iff `fd` is a
+    /// regular file or directory the guest opened at a recoverable path (the
+    /// read/write/close hooks). Delivers to BOTH a watch on the object itself
+    /// (self, name=None) AND a watch on its parent directory (child,
+    /// name=basename) — the kernel reports a child file's IN_ACCESS/IN_MODIFY to
+    /// the directory watch with the child's name. No-op when nothing is watched,
+    /// when `fd` has no recorded path, or when `fd` is a pipe/socket/anon inode.
+    pub(in crate::dispatch) fn inotify_emit_for_fd(&self, fd: i32, mask: u32) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
+        // Only regular files / directories generate these events. Skip the
+        // non-file descriptions early so a pipe/socket read doesn't misfire.
+        let Some(open_file) = self.open_file(fd) else {
+            return;
+        };
+        let is_dir = {
+            let open = open_file.description.read();
+            match &*open {
+                OpenDescription::File { .. }
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::HostFile { .. } => false,
+                OpenDescription::Directory { .. } => true,
+                _ => return,
+            }
+        };
+        let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
+            return;
+        };
+        self.fs.inotify_registry.notify_self(&path, mask, is_dir);
+        self.fs.inotify_registry.notify_child(&path, mask, is_dir);
+    }
+
+    /// Emit `IN_CLOSE_WRITE` (fd was writable) or `IN_CLOSE_NOWRITE` (read-only)
+    /// for a `close(2)` on a watched regular file/directory. Called from the
+    /// close path before the fd leaves the table. No-op when unwatched, when the
+    /// fd has no recorded path, or for non-file descriptions.
+    pub(in crate::dispatch) fn inotify_close_for_fd(&self, fd: i32) {
+        if self.fs.inotify_registry.is_empty() {
+            return;
+        }
+        let Some(open_file) = self.open_file(fd) else {
+            return;
+        };
+        let mask = {
+            let open = open_file.description.read();
+            let writable = match &*open {
+                OpenDescription::File { writable, .. }
+                | OpenDescription::HostFile { writable, .. } => *writable,
+                // A synthetic file or a directory is always read-only.
+                OpenDescription::SyntheticFile { .. } | OpenDescription::Directory { .. } => false,
+                _ => return,
+            };
+            if writable {
+                carrick_abi::LINUX_IN_CLOSE_WRITE
+            } else {
+                carrick_abi::LINUX_IN_CLOSE_NOWRITE
+            }
+        };
+        let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
+            return;
+        };
+        self.inotify_self(&path, mask);
+    }
+
     pub(in crate::dispatch) fn pipe_reader(&self, fd: i32) -> Option<(PipeRef, u64)> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();

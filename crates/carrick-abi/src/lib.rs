@@ -2422,6 +2422,56 @@ pub const LINUX_EPOLLRDHUP: u32 = 0x2000;
 pub const LINUX_EPOLLET: u32 = 0x8000_0000;
 pub const LINUX_EPOLLONESHOT: u32 = 0x4000_0000;
 pub const LINUX_EPOLLEXCLUSIVE: u32 = 0x1000_0000;
+// inotify(7) event-mask bits (asm-generic `linux/inotify.h`; shared by every
+// arch carrick targets). Both the watch mask passed to `inotify_add_watch` and
+// the `mask` field of a returned `struct inotify_event` use this layout.
+pub const LINUX_IN_ACCESS: u32 = 0x0000_0001;
+pub const LINUX_IN_MODIFY: u32 = 0x0000_0002;
+pub const LINUX_IN_ATTRIB: u32 = 0x0000_0004;
+pub const LINUX_IN_CLOSE_WRITE: u32 = 0x0000_0008;
+pub const LINUX_IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+pub const LINUX_IN_OPEN: u32 = 0x0000_0020;
+pub const LINUX_IN_MOVED_FROM: u32 = 0x0000_0040;
+pub const LINUX_IN_MOVED_TO: u32 = 0x0000_0080;
+pub const LINUX_IN_CREATE: u32 = 0x0000_0100;
+pub const LINUX_IN_DELETE: u32 = 0x0000_0200;
+pub const LINUX_IN_DELETE_SELF: u32 = 0x0000_0400;
+pub const LINUX_IN_MOVE_SELF: u32 = 0x0000_0800;
+// Events the kernel sends regardless of the watch mask, plus read-side info bits.
+pub const LINUX_IN_UNMOUNT: u32 = 0x0000_2000;
+pub const LINUX_IN_Q_OVERFLOW: u32 = 0x0000_4000;
+pub const LINUX_IN_IGNORED: u32 = 0x0000_8000;
+// Helper / control bits OR'd into a watch mask (not delivered as event masks,
+// except IN_ISDIR which the kernel sets on a returned event for a directory).
+pub const LINUX_IN_ONLYDIR: u32 = 0x0100_0000;
+pub const LINUX_IN_DONT_FOLLOW: u32 = 0x0200_0000;
+pub const LINUX_IN_EXCL_UNLINK: u32 = 0x0400_0000;
+pub const LINUX_IN_MASK_CREATE: u32 = 0x1000_0000;
+pub const LINUX_IN_MASK_ADD: u32 = 0x2000_0000;
+pub const LINUX_IN_ISDIR: u32 = 0x4000_0000;
+pub const LINUX_IN_ONESHOT: u32 = 0x8000_0000;
+/// `IN_CLOSE = IN_CLOSE_WRITE | IN_CLOSE_NOWRITE`, `IN_MOVE = IN_MOVED_FROM |
+/// IN_MOVED_TO` (convenience aggregates from `linux/inotify.h`).
+pub const LINUX_IN_CLOSE: u32 = LINUX_IN_CLOSE_WRITE | LINUX_IN_CLOSE_NOWRITE;
+pub const LINUX_IN_MOVE: u32 = LINUX_IN_MOVED_FROM | LINUX_IN_MOVED_TO;
+/// `IN_ALL_EVENTS`: every event-generating bit (the set `inotify_add_watch`
+/// accepts as "watch for everything"). Excludes the control/info bits above.
+pub const LINUX_IN_ALL_EVENTS: u32 = LINUX_IN_ACCESS
+    | LINUX_IN_MODIFY
+    | LINUX_IN_ATTRIB
+    | LINUX_IN_CLOSE_WRITE
+    | LINUX_IN_CLOSE_NOWRITE
+    | LINUX_IN_OPEN
+    | LINUX_IN_MOVED_FROM
+    | LINUX_IN_MOVED_TO
+    | LINUX_IN_CREATE
+    | LINUX_IN_DELETE
+    | LINUX_IN_DELETE_SELF
+    | LINUX_IN_MOVE_SELF;
+/// Wire size of the fixed header of `struct inotify_event { __s32 wd; __u32
+/// mask; __u32 cookie; __u32 len; char name[]; }` — 16 bytes, name follows,
+/// NUL-padded so the next record is 4-byte aligned.
+pub const LINUX_INOTIFY_EVENT_HEADER_SIZE: usize = 16;
 pub const LINUX_LOCK_SH: u64 = 1;
 pub const LINUX_LOCK_EX: u64 = 2;
 pub const LINUX_LOCK_NB: u64 = 4;
