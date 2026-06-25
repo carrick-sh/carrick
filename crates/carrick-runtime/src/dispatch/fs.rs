@@ -655,6 +655,16 @@ impl SyscallDispatcher {
         (is_stdio_fd(fd) && !self.stdio_is_closed(fd)) || self.fd_table_contains(fd)
     }
 
+    /// True if `fd` was opened with `O_PATH`. Such a descriptor names a
+    /// filesystem location but is not "open" for I/O: read/write/fchmod/fchown/
+    /// ioctl/fgetxattr must all fail with EBADF (LTP open13). The flag is
+    /// preserved in the description's status_flags at open time.
+    pub(super) fn fd_is_o_path(&self, fd: i32) -> bool {
+        self.open_file(fd).is_some_and(|of| {
+            of.description.read().status_flags() & crate::linux_abi::LINUX_O_PATH != 0
+        })
+    }
+
     /// Build a [`StatRecord`] from a real backing stat, applying the `mknod(2)`
     /// device-node override (S_IFCHR/S_IFBLK type + st_rdev) when `path` is a
     /// device marker. The marker's FULL guest mode (including the device type
@@ -2636,7 +2646,18 @@ impl SyscallDispatcher {
         } else {
             match self.open_file(dirfd as i32).as_ref() {
                 Some(open_file) => match &*open_file.description.read() {
-                    OpenDescription::Directory { path: dir, .. } => dir.clone(),
+                    OpenDescription::Directory { path: dir, .. } => {
+                        // A relative *at op through a dirfd whose directory has
+                        // since been removed (rmdir) resolves to ENOENT on Linux:
+                        // the open fd persists but its path no longer exists.
+                        // carrick keeps the Directory description cached, so
+                        // re-verify the anchor still exists in the layered view
+                        // (symlinkat01/linkat01 deldirfd cases → ENOENT).
+                        if self.layered_metadata(dir).is_err() {
+                            return Err(LINUX_ENOENT);
+                        }
+                        dir.clone()
+                    }
                     _ => return Err(LINUX_ENOTDIR),
                 },
                 // A valid fd that isn't in the table (e.g. a stdio fd) is still a
@@ -2918,6 +2939,42 @@ impl SyscallDispatcher {
     fn chown_arg(arg: u64) -> Option<u32> {
         let value = arg as u32;
         (value != u32::MAX).then_some(value)
+    }
+
+    /// Stamp the owner (and, when inherited, the setgid bit) on a freshly
+    /// created special node (mknod FIFO/device/socket), mirroring mkdirat's
+    /// rule: a new inode's group is the creator's egid, UNLESS the parent
+    /// directory is setgid (S_ISGID), in which case it inherits the parent's
+    /// group and the node itself becomes setgid. Without this the host assigns
+    /// its own gid and a later stat reports the wrong st_gid (LTP mknod08
+    /// expects st_gid == the process egid because the parent isn't setgid).
+    fn stamp_new_node_owner(&self, path: &str, node_mode: u32) {
+        const S_ISGID: u32 = 0o2000;
+        let creds = self.cred_snapshot();
+        let mut owner_gid = creds.egid;
+        let mut inherited_gid = false;
+        if let Some(parent) = Path::new(path).parent() {
+            let parent_str = display_rootfs_path(parent);
+            if let Ok(pmd) = self.layered_metadata(&parent_str)
+                && pmd.mode & S_ISGID != 0
+                && let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str)
+            {
+                owner_gid = pgid;
+                inherited_gid = true;
+                let _ = self
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .set_mode(path, node_mode | S_ISGID);
+            }
+        }
+        if creds.euid != 0 || owner_gid != 0 || inherited_gid {
+            let _ = self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .set_owner(path, creds.euid, owner_gid);
+        }
     }
 
     fn chown_permission_errno(&self, uid: Option<u32>, gid: Option<u32>) -> Option<i32> {
@@ -3750,6 +3807,11 @@ impl SyscallDispatcher {
             if !this.fd_is_valid(fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
+            // An O_PATH descriptor is not open for I/O — ioctl on it is EBADF
+            // (open13 issues FIGETBSZ on an O_PATH fd).
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
 
             // ── Rosetta 2 virtualization handshake ──────────────────────────────────
             // At startup Apple's Rosetta issues a small set of ioctls on its
@@ -4431,6 +4493,13 @@ impl SyscallDispatcher {
             if length <= 0 || offset < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
+            // The resulting file size (offset + len) must fit the off_t maximum;
+            // overflowing the max LFS file size is EFBIG on Linux, not the EINVAL
+            // a too-large host ftruncate would yield (fallocate02 cases 7-8 pass
+            // offset/len ≈ LLONG_MAX so offset+len overflows i64).
+            if offset.checked_add(length).is_none() {
+                return Ok(LINUX_EFBIG.into());
+            }
             if is_stdio_fd(fd.0) {
                 return Ok(LINUX_ESPIPE.into());
             }
@@ -4986,6 +5055,10 @@ impl SyscallDispatcher {
         fn read(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
 
             let fd: Fd = fd;
+            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -5320,6 +5393,10 @@ impl SyscallDispatcher {
         fn pread64(this, cx, fd: Fd, buf: GuestPtr, count: u64, offset: u64) {
 
             let fd: Fd = fd;
+            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             let buffer = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -5501,6 +5578,10 @@ impl SyscallDispatcher {
         fn pwrite64(this, cx, fd: Fd, buf: GuestPtr, count: u64, offset: u64) {
 
             let fd: Fd = fd;
+            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -6346,6 +6427,11 @@ impl SyscallDispatcher {
 
         fn sys_setxattr_fd(this, cx, fd: Fd, name: GuestPtr, value: GuestPtr, size: u64, flags: u64) {
 
+            // An O_PATH descriptor is not open for I/O — fd-based xattr ops on it
+            // are EBADF (LTP open13 issues fgetxattr on an O_PATH fd).
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             this.setxattr(cx.memory, XattrTarget::Fd(fd), name, value, size, flags)
 
         }
@@ -6358,6 +6444,9 @@ impl SyscallDispatcher {
 
         fn sys_getxattr_fd(this, cx, fd: Fd, name: GuestPtr, value: GuestPtr, size: u64) {
 
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             this.getxattr(cx.memory, XattrTarget::Fd(fd), name, value, size)
 
         }
@@ -6370,6 +6459,9 @@ impl SyscallDispatcher {
 
         fn sys_listxattr_fd(this, cx, fd: Fd, list: GuestPtr, size: u64) {
 
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             this.listxattr(cx.memory, XattrTarget::Fd(fd), list, size)
 
         }
@@ -6383,6 +6475,9 @@ impl SyscallDispatcher {
 
         fn sys_removexattr_fd(this, cx, fd: Fd, name: GuestPtr) {
 
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             this.removexattr(cx.memory, XattrTarget::Fd(fd), name)
 
         }
@@ -6552,6 +6647,10 @@ impl SyscallDispatcher {
         fn write(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
 
             let fd = fd.0;
+            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+            if this.fd_is_o_path(fd) {
+                return Ok(LINUX_EBADF.into());
+            }
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -7257,7 +7356,10 @@ impl SyscallDispatcher {
                             .overlay
                             .create_fifo(&materialize_path, fifo_mode)
                         {
-                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Ok(()) => {
+                                this.stamp_new_node_owner(&materialize_path, fifo_mode);
+                                DispatchOutcome::Returned { value: 0 }
+                            }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
                                 LINUX_EPERM.into()
                             }
@@ -7283,7 +7385,10 @@ impl SyscallDispatcher {
                             .overlay
                             .create_device(&materialize_path, full_mode, dev)
                         {
-                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Ok(()) => {
+                                this.stamp_new_node_owner(&materialize_path, full_mode);
+                                DispatchOutcome::Returned { value: 0 }
+                            }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
                                 LINUX_EPERM.into()
                             }
@@ -7308,7 +7413,10 @@ impl SyscallDispatcher {
                             .overlay
                             .create_socket(&materialize_path, sock_mode)
                         {
-                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Ok(()) => {
+                                this.stamp_new_node_owner(&materialize_path, sock_mode);
+                                DispatchOutcome::Returned { value: 0 }
+                            }
                             Err(crate::fs_backend::BackendError::Unsupported) => {
                                 LINUX_EPERM.into()
                             }
@@ -7335,6 +7443,7 @@ impl SyscallDispatcher {
                             .overlay
                             .set_mode(&materialize_path, mode & 0o7777);
                     }
+                    this.stamp_new_node_owner(&materialize_path, mode & 0o7777);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 Err(crate::fs_backend::BackendError::Unsupported) => Ok(LINUX_EROFS.into()),
@@ -7440,6 +7549,10 @@ impl SyscallDispatcher {
             if !this.fd_is_valid(fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
+            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+            if this.fd_is_o_path(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             let mode = (mode & 0o7777) as u32;
             // Resolve the fd to its path and route through the backend's set_mode,
             // so the guest-visible mode lands in the carrick mode xattr (what
@@ -7495,6 +7608,10 @@ impl SyscallDispatcher {
 
             let fd: Fd = fd;
             if !this.fd_is_valid(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
+            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+            if this.fd_is_o_path(fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
             let uid = Self::chown_arg(owner);
@@ -7665,6 +7782,15 @@ impl SyscallDispatcher {
             let Some(src) = resolved_old else {
                 return Ok(LINUX_EROFS.into());
             };
+            // A hard link whose source lives on a synthetic pseudo-filesystem
+            // (/proc, /sys) crosses a device boundary into the rootfs overlay →
+            // EXDEV, not the EROFS a failed overlay hard_link would yield
+            // (linkat01 case 20 links /proc/cpuinfo into a real dir).
+            if crate::vfs::is_synthetic_virtual_file(&src, &this.synthetic_proc_context())
+                && this.fs.vfs_mounts.resolve(&resolved_new).is_none()
+            {
+                return Ok(crate::linux_abi::LINUX_EXDEV.into());
+            }
             // Route a hard link whose NEW path is under a VFS mount (e.g.
             // /dev/shm, a BindVfs) to that mount's link() — the rootfs overlay
             // can't hard-link mount-backed paths and would wrongly return EROFS.
@@ -8122,6 +8248,11 @@ impl SyscallDispatcher {
 
         fn newfstatat(this, cx, dirfd: u64, pathname: GuestPtr, statbuf: GuestPtr, flags: u64) {
 
+            // Only AT_SYMLINK_NOFOLLOW, AT_NO_AUTOMOUNT and AT_EMPTY_PATH are
+            // valid; any other bit is EINVAL (fstatat01 case 4 passes flags=9999).
+            if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT | LINUX_AT_EMPTY_PATH) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             let pathname = pathname.0;
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
@@ -8172,6 +8303,11 @@ impl SyscallDispatcher {
 
         fn x86_newfstatat(this, cx, dirfd: u64, pathname: GuestPtr, statbuf: GuestPtr, flags: u64) {
 
+            // Only AT_SYMLINK_NOFOLLOW, AT_NO_AUTOMOUNT and AT_EMPTY_PATH are
+            // valid; any other bit is EINVAL (fstatat01 case 4 passes flags=9999).
+            if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT | LINUX_AT_EMPTY_PATH) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             let pathname = pathname.0;
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
