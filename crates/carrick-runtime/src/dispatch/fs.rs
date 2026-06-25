@@ -2216,6 +2216,109 @@ impl SyscallDispatcher {
         })
     }
 
+    /// The host pipe/socket object identity `(st_dev, st_ino)` behind a guest
+    /// `fd`, if it is a host-backed pipe or socket. The SAME key for both ends of
+    /// a pipe (the inode is shared) and stable across fork — the join key for the
+    /// fork-coherent FASYNC registry. `None` for non-pipe/socket fds or a failed
+    /// fstat.
+    fn host_pipe_inode_key(&self, fd: i32) -> Option<(u64, u64)> {
+        let open_file = self.open_file(fd)?;
+        let host_fd = match &*open_file.description.read() {
+            OpenDescription::HostPipe { host_fd, .. }
+            | OpenDescription::HostSocket { host_fd, .. } => *host_fd,
+            _ => return None,
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(host_fd, &mut st) } != 0 {
+            return None;
+        }
+        Some((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// Reconcile the fork-coherent FASYNC registry with `fd`'s current
+    /// description after an `O_ASYNC` / `F_SETOWN` / `F_SETSIG` change. If
+    /// `O_ASYNC` is set on a host pipe/socket, arm `(dev, ino)` with the fd's
+    /// owner + signal so a writer in another guest process can deliver the I/O
+    /// signal on the readiness edge; if `O_ASYNC` is clear, disarm it. A no-op
+    /// for non-pipe/socket fds (FASYNC delivery is only wired for the
+    /// pipe/socket readiness edge carrick can observe).
+    fn sync_fasync_registration(&self, fd: i32) {
+        let Some(key) = self.host_pipe_inode_key(fd) else {
+            return;
+        };
+        let Some(open_file) = self.open_file(fd) else {
+            return;
+        };
+        let desc = open_file.description.read();
+        let armed = desc.status_flags() & LINUX_O_ASYNC != 0;
+        if !armed {
+            drop(desc);
+            carrick_signal_core::fasync::disarm(key.0, key.1);
+            return;
+        }
+        let (owner_type, owner_pid) = desc.owner();
+        let sig = desc.async_sig();
+        drop(desc);
+        carrick_signal_core::fasync::arm(
+            key.0,
+            key.1,
+            carrick_signal_core::fasync::FasyncOwner {
+                owner_pid,
+                owner_type,
+                sig,
+            },
+        );
+    }
+
+    /// Deliver the FASYNC (signal-driven I/O) signal after a guest write to a
+    /// host pipe/socket made it readable. Looks up the pipe inode in the
+    /// fork-coherent registry; if armed, sends the owner's `F_SETSIG` signal
+    /// (default `SIGIO`) through the same cross-process kill path as a guest
+    /// `kill(2)`. This is the readiness EDGE the writer can observe: a write that
+    /// added bytes transitions the reader's fd to readable, which is exactly when
+    /// Linux raises the owner's I/O signal. (`written <= 0` — a short/blocked
+    /// write that added nothing — is not an edge and delivers nothing.)
+    fn fasync_notify_after_write(&self, fd: i32, written: i64) {
+        if written <= 0 {
+            return;
+        }
+        // Hot path: skip the per-write inode fstat entirely unless some fd
+        // somewhere is armed for signal-driven I/O (the common case is none).
+        if !carrick_signal_core::fasync::any_armed() {
+            return;
+        }
+        let Some((dev, ino)) = self.host_pipe_inode_key(fd) else {
+            return;
+        };
+        let Some(owner) = carrick_signal_core::fasync::lookup(dev, ino) else {
+            return;
+        };
+        if owner.owner_pid == 0 {
+            return;
+        }
+        let signum = if owner.sig == 0 {
+            LINUX_SIGIO
+        } else {
+            owner.sig
+        };
+        // F_OWNER_TID → tid-directed; F_OWNER_PGRP → a process group (negative
+        // target); F_OWNER_PID → a positive pid. carrick maps guest ns-pids 1:1
+        // onto host pids, so the owner id is also the host id.
+        let (target, tid_required) = match owner.owner_type {
+            LINUX_F_OWNER_TID => (owner.owner_pid as i64, true),
+            LINUX_F_OWNER_PGRP => (-(owner.owner_pid as i64), false),
+            _ => (owner.owner_pid as i64, false),
+        };
+        // caller_euid = None: kernel-internal I/O-signal delivery is not gated by
+        // the writer's euid (it is the kernel sending on the owner's behalf).
+        let _ = crate::dispatch::signal::bootstrap_signal_send_as(
+            target,
+            tid_required,
+            signum as u64,
+            None,
+        );
+    }
+
     /// True iff `fd` refers to a pipe / socket / character device — kinds with
     /// no `->fsync` file op, so `fsync`/`fdatasync` on them is EINVAL on Linux
     /// (e.g. fdatasync02 on `/dev/null`, which carrick serves as a `HostPipe`).
@@ -2670,9 +2773,17 @@ impl SyscallDispatcher {
                     read = read.saturating_add(n as usize);
                 }
                 buf.truncate(read);
-                // The host inode's mode bits ARE the guest creation mode (forced
-                // via fchmod at open time); take the low perm bits.
-                (buf, (st.st_mode as u32) & 0o7777)
+                // The GUEST creation mode is the one stamped on the description at
+                // O_TMPFILE open time (`create_mode`), NOT the host inode's
+                // fstat'd mode. macOS silently strips set-user-ID / set-group-ID
+                // from a file an unprivileged process fchmods, so the host fstat
+                // would report e.g. 01755 for a 07755 create — dropping the
+                // setuid/setgid bits the guest asked for (open14/openat03 test03
+                // links an O_TMPFILE created with 07777 and asserts the materialized
+                // file keeps all 12 permission bits). Source the mode from the
+                // stored metadata so set_mode below records the full guest mode in
+                // the CARRICK_MODE_XATTR; only the SIZE/bytes come from the live fd.
+                (buf, metadata.mode & 0o7777)
             }
             // In-memory O_TMPFILE / memfd fallback (`--fs memory`): the bytes and
             // creation mode live on the description itself.
@@ -3872,10 +3983,12 @@ impl SyscallDispatcher {
                     // only the mutable status bits from `arg`, so a later F_GETFL
                     // reports the Linux-correct combination instead of whatever
                     // junk the guest passed. (audit M4; probe fsetfl)
-                    // O_APPEND + O_NONBLOCK are the mutable status bits a guest
-                    // realistically toggles via F_SETFL (O_DIRECT/O_NOATIME/
-                    // O_ASYNC have no carrick const yet and aren't exercised).
-                    const LINUX_F_SETFL_MUTABLE: u64 = LINUX_O_APPEND | LINUX_O_NONBLOCK;
+                    // O_APPEND + O_NONBLOCK + O_ASYNC are the mutable status bits a
+                    // guest realistically toggles via F_SETFL (O_DIRECT/O_NOATIME
+                    // are still ignored). O_ASYNC enables signal-driven I/O (the
+                    // kernel signals the F_SETOWN owner on a readiness edge).
+                    const LINUX_F_SETFL_MUTABLE: u64 =
+                        LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
                     let open = open_file.description.read();
                     let next_flags =
                         (open.status_flags() & LINUX_O_ACCMODE) | (arg & LINUX_F_SETFL_MUTABLE);
@@ -3892,6 +4005,11 @@ impl SyscallDispatcher {
                     }
                     drop(open);
                     open_file.description.write().set_status_flags(next_flags);
+                    // Reflect the new O_ASYNC state into the fork-coherent FASYNC
+                    // registry so a WRITER in another guest process can deliver the
+                    // owner's signal on the readiness edge (the arming lives on the
+                    // reader's description, invisible to the writer process).
+                    this.sync_fasync_registration(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 // Classic POSIX advisory record locks (F_SETLK/F_SETLKW/
@@ -4049,6 +4167,9 @@ impl SyscallDispatcher {
                         (LINUX_F_OWNER_PID, a)
                     };
                     open_file.description.write().set_owner(owner_type, owner_pid);
+                    // Refresh the FASYNC registry if O_ASYNC is already armed on
+                    // this fd (the owner can be set after O_ASYNC — LTP fcntl31).
+                    this.sync_fasync_registration(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_F_GETOWN => {
@@ -4078,6 +4199,7 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EINVAL.into());
                     }
                     open_file.description.write().set_owner(owner_type, owner_pid);
+                    this.sync_fasync_registration(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_F_GETOWN_EX => {
@@ -4101,6 +4223,10 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EINVAL.into());
                     }
                     open_file.description.write().set_async_sig(sig);
+                    // Refresh the registry: F_SETSIG can follow O_ASYNC + F_SETOWN
+                    // (LTP fcntl31 sets the signal last), so the armed entry must
+                    // pick up the new signal.
+                    this.sync_fasync_registration(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_F_GETSIG => {
@@ -7208,13 +7334,24 @@ impl SyscallDispatcher {
                                 cx.tid(),
                                 true,
                             );
+                            // Signal-driven I/O: a write that added bytes makes the
+                            // pipe's read end readable — the FASYNC readiness edge.
+                            // Deliver the read end's owner signal (default SIGIO)
+                            // via the fork-coherent registry (LTP fcntl31).
+                            let written = match &out {
+                                DispatchOutcome::Returned { value } => *value,
+                                _ => 0,
+                            };
+                            let key_fd = fd;
+                            drop(open);
+                            this.fasync_notify_after_write(key_fd, written);
                             return Ok(this.raise_sigpipe_on_epipe(cx, out));
                         }
                         OpenDescription::HostSocket { host_fd, .. } => {
                             // write(2) on a connected socket maps directly to a
                             // host write(2). Unconnected sockets will surface
                             // their own ENOTCONN via the host.
-                            return Ok(write_host_pipe_owned(
+                            let out = write_host_pipe_owned(
                                 bytes,
                                 *host_fd,
                                 open_file.host_fd_owner.clone(),
@@ -7222,7 +7359,16 @@ impl SyscallDispatcher {
                                 HostWriteKind::SocketLike,
                                 cx.tid(),
                                 false,
-                            ));
+                            );
+                            // Signal-driven I/O readiness edge on the socket peer.
+                            let written = match &out {
+                                DispatchOutcome::Returned { value } => *value,
+                                _ => 0,
+                            };
+                            let key_fd = fd;
+                            drop(open);
+                            this.fasync_notify_after_write(key_fd, written);
+                            return Ok(out);
                         }
                         OpenDescription::HostFile {
                             base,

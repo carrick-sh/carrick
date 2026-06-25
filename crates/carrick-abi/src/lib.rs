@@ -2303,6 +2303,11 @@ pub const LINUX_O_CREAT: u64 = 0o100;
 pub const LINUX_O_EXCL: u64 = 0o200;
 pub const LINUX_O_TRUNC: u64 = 0o1000;
 pub const LINUX_O_APPEND: u64 = 0o2000;
+/// `O_ASYNC` / `FASYNC` (asm-generic `020000`): enables signal-driven I/O. When
+/// set on an fd that has an `F_SETOWN` owner, the kernel sends a signal (the
+/// `F_SETSIG` signal, default `SIGIO`) to the owner whenever the fd becomes
+/// ready. A mutable file-status flag toggled via `fcntl(F_SETFL)` (LTP fcntl31).
+pub const LINUX_O_ASYNC: u64 = 0o20000;
 // aarch64 fcntl flag values (asm-generic): O_DIRECTORY=0o40000,
 // O_NOFOLLOW=0o100000, O_DIRECT=0o200000, O_LARGEFILE=0o400000. carrick had
 // O_DIRECTORY/O_DIRECT swapped (and O_NOFOLLOW wrong), so O_DIRECTORY never
