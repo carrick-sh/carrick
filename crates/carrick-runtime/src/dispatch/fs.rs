@@ -272,6 +272,15 @@ fn forward_record_lock<M: GuestMemory>(
     const LINUX_F_WRLCK: i16 = 1;
     const LINUX_F_UNLCK: i16 = 2;
 
+    // OFD locks (F_OFD_*) are owned by the open file description, not the process.
+    // macOS has them natively (F_OFD_SETLK/SETLKW/GETLK = 90/91/92), so we forward
+    // exactly like the classic commands; the only divergence is that F_OFD_GETLK
+    // reports l_pid = -1 for a conflicting lock (OFD locks are not process-owned).
+    let is_ofd = matches!(
+        linux_cmd,
+        LINUX_F_OFD_GETLK | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW
+    );
+
     let bytes = match memory.read_bytes(arg, 32) {
         Ok(b) => b,
         Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
@@ -305,6 +314,9 @@ fn forward_record_lock<M: GuestMemory>(
         LINUX_F_GETLK => libc::F_GETLK,
         LINUX_F_SETLK => libc::F_SETLK,
         LINUX_F_SETLKW => libc::F_SETLKW,
+        LINUX_F_OFD_GETLK => libc::F_OFD_GETLK,
+        LINUX_F_OFD_SETLK => libc::F_OFD_SETLK,
+        LINUX_F_OFD_SETLKW => libc::F_OFD_SETLKW,
         _ => return DispatchOutcome::errno(LINUX_EINVAL),
     };
 
@@ -319,8 +331,9 @@ fn forward_record_lock<M: GuestMemory>(
         return DispatchOutcome::errno(errno);
     }
 
-    // F_GETLK: write the (possibly conflicting) lock back in Linux layout.
-    if linux_cmd == LINUX_F_GETLK {
+    // F_GETLK / F_OFD_GETLK: write the (possibly conflicting) lock back in Linux
+    // layout.
+    if matches!(linux_cmd, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
         let host_type = fl.l_type as i32;
         if host_type == libc::F_UNLCK as i32 {
             // No conflicting lock. Linux leaves the caller's struct UNCHANGED
@@ -347,7 +360,10 @@ fn forward_record_lock<M: GuestMemory>(
             out[2..4].copy_from_slice(&fl.l_whence.to_le_bytes());
             out[8..16].copy_from_slice(&(fl.l_start as i64).to_le_bytes());
             out[16..24].copy_from_slice(&(fl.l_len as i64).to_le_bytes());
-            out[24..28].copy_from_slice(&(fl.l_pid as i32).to_le_bytes());
+            // OFD locks are not process-owned: Linux reports a conflicting OFD
+            // lock's l_pid as -1.
+            let l_pid_back: i32 = if is_ofd { -1 } else { fl.l_pid as i32 };
+            out[24..28].copy_from_slice(&l_pid_back.to_le_bytes());
             if memory.write_bytes(arg, &out).is_err() {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
@@ -3361,17 +3377,29 @@ impl SyscallDispatcher {
                         Err(errno) => DispatchOutcome::errno(errno),
                     }
                 }
-                // OFD locks (F_OFD_*) are owned by the open file description,
-                // not the process. macOS has no OFD-lock primitive, so we keep
-                // the single-tenant no-op success for them rather than
-                // mis-forwarding to classic (process-owned) locks, whose
-                // ownership semantics differ. Tracked for a future shared
-                // OFD-lock registry.
+                // OFD locks (F_OFD_*) are owned by the open file description, not
+                // the process. macOS has them natively (F_OFD_SETLK/SETLKW/GETLK),
+                // and carrick's fork model maps a guest OFD 1:1 onto a host OFD
+                // (dup shares the description + host fd; clone(2) forks a real host
+                // process that inherits the host fd table), so the macOS kernel
+                // arbitrates OFD conflicts/inheritance with Linux semantics.
+                // Forward exactly like the classic commands; fall back to the
+                // single-tenant no-op for non-host-backed (--fs memory/synthetic)
+                // fds, after the same front-door flock validation.
                 LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW | LINUX_F_OFD_GETLK => {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(LINUX_EBADF.into());
                     }
-                    DispatchOutcome::Returned { value: 0 }
+                    match this.host_file_fd_for_flush(fd.0) {
+                        Ok(Some(host_fd)) => {
+                            forward_record_lock(&mut *cx.memory, host_fd, command, arg)
+                        }
+                        Ok(None) => match validate_flock_arg(&*cx.memory, arg) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        },
+                        Err(errno) => DispatchOutcome::errno(errno),
+                    }
                 }
                 // File leases (F_SETLEASE/F_GETLEASE). macOS has no lease
                 // primitive, so the lease type is recorded on the open-file
