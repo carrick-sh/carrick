@@ -1016,11 +1016,16 @@ impl SyscallDispatcher {
                 // set_tid_address(2) returns the caller's TID. The MAIN thread's
                 // tid equals the process's host pid, so in a PID namespace it
                 // must read as the process's ns-pid (a thread whose tid == its
-                // tgid) — mirror gettid's translation. Worker tids are
-                // per-process and not ns-translated. Identity when ns are off.
+                // tgid). It MUST equal getpid() for the main thread (LTP
+                // set_tid_address01: TST_EXP_VAL(set_tid_address(&t), getpid())).
+                // getpid() uses self_ns_pid(), which falls back to the real host
+                // pid for an unregistered process; host_to_ns_or_self() instead
+                // falls back to 0, so an unregistered child (the test runs under
+                // `sh -c`) would diverge. Use the same source as getpid() for the
+                // main thread; worker tids stay per-process untranslated.
                 let tid = t.tid as u32;
                 let ns_tid = if tid == std::process::id() {
-                    crate::namespace::pid::host_to_ns_or_self(tid)
+                    crate::namespace::pid::self_ns_pid()
                 } else {
                     tid
                 };

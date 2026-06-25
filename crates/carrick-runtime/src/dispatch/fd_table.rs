@@ -247,6 +247,16 @@ pub(super) struct OpenDescriptionBase {
     /// SO_PASSCRED: when set, recvmsg attaches an SCM_CREDENTIALS ancillary
     /// message with the peer's `struct ucred`. (audit M2)
     so_passcred: bool,
+    /// True while carrick has DEFERRED a blocking connect (returned WaitOnFds on
+    /// POLLOUT) and is waiting to re-dispatch it. macOS reports EISCONN both when
+    /// an async connect completes AND when the guest calls connect() on an
+    /// already-established socket — only the former should be folded to success.
+    /// This flag is set when the first connect() yields EINPROGRESS/EALREADY/
+    /// EAGAIN and consulted on a subsequent EISCONN: set ⇒ async completion
+    /// (return success), clear ⇒ a real re-connect of an established socket
+    /// (surface EISCONN to the guest, matching Linux connect01 case "already
+    /// connected").
+    connect_in_progress: bool,
 }
 
 impl OpenDescriptionBase {
@@ -257,6 +267,7 @@ impl OpenDescriptionBase {
             so_rcvbuf: None,
             so_sndbuf: None,
             so_passcred: false,
+            connect_in_progress: false,
             lease: crate::linux_abi::LINUX_F_UNLCK,
             recv_timeout: None,
             send_timeout: None,
@@ -369,6 +380,12 @@ impl OpenDescriptionBase {
     }
     pub(super) fn set_so_passcred(&mut self, on: bool) {
         self.so_passcred = on;
+    }
+    pub(super) fn connect_in_progress(&self) -> bool {
+        self.connect_in_progress
+    }
+    pub(super) fn set_connect_in_progress(&mut self, on: bool) {
+        self.connect_in_progress = on;
     }
 }
 
