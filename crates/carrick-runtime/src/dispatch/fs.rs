@@ -2340,13 +2340,26 @@ impl SyscallDispatcher {
         } else {
             owner.sig
         };
-        // F_OWNER_TID → tid-directed; F_OWNER_PGRP → a process group (negative
-        // target); F_OWNER_PID → a positive pid. carrick maps guest ns-pids 1:1
-        // onto host pids, so the owner id is also the host id.
+        // owner_pid is the F_SETOWN value as the guest set it (a PID-namespace id
+        // from the owner's getpid()); bootstrap_signal_send_as wants a HOST pid
+        // (it compares against the host pid for self-detection), so translate
+        // ns -> host exactly as the guest kill(2) path does. Under an active PID
+        // namespace the owner's ns-pid (e.g. fcntl31's 2) is NOT its host pid, so
+        // sending the raw ns id delivered the SIGIO to the wrong process.
+        let ns = owner.owner_pid as u32;
         let (target, tid_required) = match owner.owner_type {
-            LINUX_F_OWNER_TID => (owner.owner_pid as i64, true),
-            LINUX_F_OWNER_PGRP => (-(owner.owner_pid as i64), false),
-            _ => (owner.owner_pid as i64, false),
+            LINUX_F_OWNER_PGRP => (
+                -(crate::namespace::pid::ns_to_host_pgid(ns).unwrap_or(ns) as i64),
+                false,
+            ),
+            LINUX_F_OWNER_TID => (
+                crate::namespace::pid::ns_to_host_or_self(ns).unwrap_or(ns) as i64,
+                true,
+            ),
+            _ => (
+                crate::namespace::pid::ns_to_host_or_self(ns).unwrap_or(ns) as i64,
+                false,
+            ),
         };
         // caller_euid = None: kernel-internal I/O-signal delivery is not gated by
         // the writer's euid (it is the kernel sending on the owner's behalf).
