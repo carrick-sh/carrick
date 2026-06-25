@@ -3946,6 +3946,19 @@ impl SyscallDispatcher {
                 if ip_membership || ipv6_membership {
                     return Ok(a::LINUX_ENODEV.into());
                 }
+                // Protocol-independent multicast source-filter API
+                // (MCAST_JOIN_GROUP=42 .. MCAST_LEAVE_SOURCE_GROUP=47, RFC 3678).
+                // The LTP networking framework sets MCAST_JOIN_GROUP during setup;
+                // real Linux returns 0 (verified against the arm64 Docker oracle on
+                // both TCP and UDP). macOS has no MCAST_* optnames, so
+                // accept-and-ignore (no-op success) instead of the ENOPROTOOPT that
+                // TBROK'd accept02/connect02 et al.
+                let mcast_family = (level == a::LINUX_SOL_IP
+                    || level == a::LINUX_SOL_IPV6)
+                    && (42..=47).contains(&optname);
+                if mcast_family {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
             }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,
