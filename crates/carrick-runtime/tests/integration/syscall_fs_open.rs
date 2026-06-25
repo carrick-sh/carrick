@@ -1177,6 +1177,174 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
 }
 
 #[test]
+fn open_o_tmpfile_materializes_via_proc_self_fd_linkat() {
+    // open14 / openat03: open an O_TMPFILE, write N bytes, then materialize it
+    // with linkat(AT_FDCWD, "/proc/self/fd/<fd>", AT_FDCWD, target,
+    // AT_SYMLINK_FOLLOW). The target must then stat with size == bytes-written
+    // and mode == the O_TMPFILE creation mode.
+    const LINUX_O_TMPFILE: u64 = 0o20000000;
+    const LINUX_AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const CREATE_MODE: u64 = 0o640;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // openat(AT_FDCWD, ".", O_TMPFILE|O_RDWR, 0640)
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0,
+            LINUX_O_TMPFILE | LINUX_O_RDWR,
+            CREATE_MODE,
+            0,
+            0,
+        ],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat O_TMPFILE: {other:?}"),
+    };
+
+    // write(fd, "payload!!", 9)
+    memory.write_bytes(0x4100, b"payload!!").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 64, [fd, 0x4100, 9, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 9 }
+    );
+
+    // linkat(AT_FDCWD, "/proc/self/fd/<fd>", AT_FDCWD, "/tmpfile", AT_SYMLINK_FOLLOW)
+    let src = format!("/proc/self/fd/{fd}\0");
+    memory.write_bytes(0x4200, src.as_bytes()).unwrap();
+    memory.write_bytes(0x4300, b"/tmpfile\0").unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            37,
+            [
+                LINUX_AT_FDCWD,
+                0x4200,
+                LINUX_AT_FDCWD,
+                0x4300,
+                LINUX_AT_SYMLINK_FOLLOW,
+                0
+            ]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // newfstatat(AT_FDCWD, "/tmpfile", &st, 0) — size and mode must match.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4300, 0x4400, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let st = read_stat(&memory, 0x4400);
+    let size = st.st_size;
+    let mode = st.st_mode;
+    assert_eq!(size, 9, "materialized size");
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFREG, "regular file");
+    assert_eq!(
+        u64::from(mode & 0o7777),
+        CREATE_MODE,
+        "materialized mode == creation mode"
+    );
+}
+
+#[test]
+fn fcntl_setlease_wrlck_conflicts_with_a_second_opener() {
+    // fcntl32: F_SETLEASE,F_WRLCK requires this be the ONLY open description for
+    // the file. With a second open of the same file it must fail (EAGAIN); once
+    // the second fd is closed it succeeds. A read lease (F_RDLCK) tolerates other
+    // read-only openers but not a writer.
+    const LINUX_F_SETLEASE: u64 = 1024;
+    const LINUX_F_RDLCK: u64 = 0;
+    const LINUX_F_WRLCK: u64 = 1;
+    const LINUX_O_RDONLY: u64 = 0;
+    const EAGAIN: i32 = 11;
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/leased",
+        b"lease fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/etc/leased\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+    let open = |d: &mut SyscallDispatcher, m: &mut LinearMemory, acc: u64| match run(
+        d,
+        m,
+        56,
+        [(-100_i64) as u64, 0x4000, acc, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat: {other:?}"),
+    };
+
+    // Two read-only opens of the same file → two open file descriptions.
+    let fd1 = open(&mut dispatcher, &mut memory, LINUX_O_RDONLY);
+    let fd2 = open(&mut dispatcher, &mut memory, LINUX_O_RDONLY);
+
+    // F_SETLEASE,F_WRLCK with a second opener present → EAGAIN.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [fd1, LINUX_F_SETLEASE, LINUX_F_WRLCK, 0, 0, 0]
+        ),
+        DispatchOutcome::Errno { errno: EAGAIN }
+    );
+    // A read lease is fine while the only other opener is read-only.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [fd1, LINUX_F_SETLEASE, LINUX_F_RDLCK, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // Close the second opener; now fd1 is the sole description.
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 57, [fd2, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            25,
+            [fd1, LINUX_F_SETLEASE, LINUX_F_WRLCK, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+#[test]
 fn dup_shares_rootfs_file_offset_with_original_fd() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

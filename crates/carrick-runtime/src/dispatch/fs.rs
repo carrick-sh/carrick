@@ -413,6 +413,16 @@ fn check_path_length(path: &str) -> Result<(), i32> {
     Ok(())
 }
 
+/// Same-file identity used for F_SETLEASE conflict accounting (see
+/// [`SyscallDispatcher::same_file_other_openers`]). Two open descriptions
+/// conflict for lease purposes iff they name the same underlying file: the host
+/// inode under `--fs host`, or the guest open-path for the in-memory backing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeaseFileId {
+    Inode { dev: u64, ino: u64 },
+    Path(String),
+}
+
 /// `/dev/fd` and `/dev/std{in,out,err}` are symlinks into `/proc/self/fd` on
 /// Linux — bash process substitution (`cat <(...)`) passes `/dev/fd/N` to the
 /// spawned command, which `open()`s it to dup the pipe. Rewrite an ABSOLUTE
@@ -448,6 +458,15 @@ fn reset_fd_open_path_inserts() {
 #[cfg(test)]
 fn fd_open_path_inserts() -> usize {
     FD_OPEN_PATH_INSERTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// True if `path` is the synthetic sentinel carrick stamps on an ANONYMOUS file
+/// description — an `O_TMPFILE` inode (`/__carrick_o_tmpfile`) or a
+/// `memfd_create` inode (`/memfd:<name>`). Such a file has no real directory
+/// entry, so `linkat(/proc/self/fd/<n>, AT_SYMLINK_FOLLOW)` must MATERIALIZE it
+/// at the target rather than hard-link a nonexistent source path.
+fn is_anon_overlay_path(path: &str) -> bool {
+    path == "/__carrick_o_tmpfile" || path.starts_with("/memfd:")
 }
 
 fn proc_self_fd_number(path: &str) -> Option<i32> {
@@ -750,6 +769,69 @@ impl SyscallDispatcher {
 
     pub(super) fn fd_is_valid(&self, fd: i32) -> bool {
         (is_stdio_fd(fd) && !self.stdio_is_closed(fd)) || self.fd_table_contains(fd)
+    }
+
+    /// Access modes (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) of every OTHER open file
+    /// description that refers to the SAME underlying file as `fd` — i.e. a
+    /// distinct `open(2)` of the same inode, not a `dup(2)` (which shares the
+    /// description, identified by `Arc` pointer identity). Used by F_SETLEASE to
+    /// enforce Linux's lease-conflict rules: "a write lease may be placed on a
+    /// file only if there are no other open file descriptors for the file".
+    ///
+    /// Same-file identity is the host inode under `--fs host` (`fstat` dev+ino on
+    /// the HostFile's kernel fd, which is fork-coherent), falling back to the
+    /// guest open-path for the in-memory `File` backing. Descriptions that are
+    /// not regular files (pipes/sockets/anon-inodes) never share inode identity
+    /// with a regular-file lease target and are skipped.
+    fn same_file_other_openers(&self, fd: i32) -> Vec<u64> {
+        let Some(target) = self.open_file(fd) else {
+            return Vec::new();
+        };
+        let target_id = {
+            let desc = target.description.read();
+            Self::lease_file_identity(&desc)
+        };
+        let Some(target_id) = target_id else {
+            return Vec::new();
+        };
+        let mut others = Vec::new();
+        for (other_fd, open_file) in self.io.open_files.read().iter() {
+            if *other_fd == fd {
+                continue;
+            }
+            // A `dup(2)`/inherited fd shares the same description `Arc`; it is the
+            // same open file description, not a separate opener, so it does not
+            // conflict.
+            if Arc::ptr_eq(&open_file.description, &target.description) {
+                continue;
+            }
+            let desc = open_file.description.read();
+            if Self::lease_file_identity(&desc).as_ref() == Some(&target_id) {
+                others.push(desc.status_flags() & LINUX_O_ACCMODE);
+            }
+        }
+        others
+    }
+
+    /// Inode-level identity used to decide whether two open descriptions name the
+    /// same file for lease-conflict accounting. `None` for descriptions that
+    /// cannot be a lease target's peer (pipes, sockets, anon-inodes).
+    fn lease_file_identity(desc: &OpenDescription) -> Option<LeaseFileId> {
+        match desc {
+            OpenDescription::HostFile { host_fd, .. } => {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
+                    Some(LeaseFileId::Inode {
+                        dev: st.st_dev as u64,
+                        ino: st.st_ino as u64,
+                    })
+                } else {
+                    None
+                }
+            }
+            OpenDescription::File { path, .. } => Some(LeaseFileId::Path(path.clone())),
+            _ => None,
+        }
     }
 
     /// True if `fd` was opened with `O_PATH`. Such a descriptor names a
@@ -2540,6 +2622,85 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Materialize an ANONYMOUS file fd (an `O_TMPFILE`/`memfd_create` inode that
+    /// has no name in any directory) to `target` in the writable overlay. This
+    /// is what `linkat(AT_FDCWD, "/proc/self/fd/<n>", AT_FDCWD, target,
+    /// AT_SYMLINK_FOLLOW)` does on Linux: the magic `/proc/self/fd` symlink, when
+    /// FOLLOWED, names the unnamed inode and gives it a directory entry, copying
+    /// nothing — the inode is the SAME. carrick has no shared-inode primitive for
+    /// the in-memory backing and the host anon inode is unlinked, so it
+    /// materializes a fresh target from the fd's LIVE bytes + creation mode (the
+    /// O_TMPFILE test only stats size + mode, never inode identity).
+    ///
+    /// Returns `None` if `fd` is not such an anonymous file (the caller falls
+    /// through to ordinary hard-link handling), else the create result. The mode
+    /// is the fd's stored creation mode (already `& ~umask` from open time), and
+    /// the size is whatever the guest has written so far.
+    fn materialize_anon_fd_to(&self, fd: i32, target: &str) -> Option<Result<(), i32>> {
+        let open_file = self.open_file(fd)?;
+        let desc = open_file.description.read();
+        let (bytes, mode) = match &*desc {
+            // Real anonymous host inode (`--fs host` O_TMPFILE / memfd). The
+            // metadata path is the synthetic "/__carrick_o_tmpfile" sentinel set
+            // at open time — a name that exists in no namespace. Read its live
+            // size + mode via fstat and its bytes via pread (the kernel owns the
+            // offset; pread leaves it untouched).
+            OpenDescription::HostFile {
+                host_fd, metadata, ..
+            } if is_anon_overlay_path(&metadata.path.to_string_lossy()) => {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(*host_fd, &mut st) } != 0 {
+                    return Some(Err(LINUX_EBADF));
+                }
+                let size = st.st_size.max(0) as usize;
+                let mut buf = vec![0u8; size];
+                let mut read = 0usize;
+                while read < size {
+                    let n = unsafe {
+                        libc::pread(
+                            *host_fd,
+                            buf[read..].as_mut_ptr() as *mut libc::c_void,
+                            size - read,
+                            read as libc::off_t,
+                        )
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                    read = read.saturating_add(n as usize);
+                }
+                buf.truncate(read);
+                // The host inode's mode bits ARE the guest creation mode (forced
+                // via fchmod at open time); take the low perm bits.
+                (buf, (st.st_mode as u32) & 0o7777)
+            }
+            // In-memory O_TMPFILE / memfd fallback (`--fs memory`): the bytes and
+            // creation mode live on the description itself.
+            OpenDescription::File {
+                path,
+                contents,
+                metadata,
+                ..
+            } if is_anon_overlay_path(path) => (contents.to_vec(), metadata.mode & 0o7777),
+            _ => return None,
+        };
+        drop(desc);
+        // Create the target from the captured bytes, then apply the creation
+        // mode (set_file_contents creates with the host umask; set_mode forces
+        // the O_TMPFILE create mode the test stats).
+        if self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents(target, bytes)
+            .is_err()
+        {
+            return Some(Err(LINUX_EROFS));
+        }
+        let _ = self.fs.rootfs_vfs.overlay.set_mode(target, mode);
+        Some(Ok(()))
+    }
+
     fn do_renameat(
         &self,
         olddirfd: u64,
@@ -2550,6 +2711,7 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         const RENAME_NOREPLACE: u64 = 1;
+        const RENAME_EXCHANGE: u64 = 2;
         let old = read_guest_c_string(memory, oldpath)?;
         let new_path = read_guest_c_string(memory, newpath)?;
         if old.is_empty() || new_path.is_empty() {
@@ -2561,6 +2723,49 @@ impl SyscallDispatcher {
             || crate::vfs::is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
         {
             return Ok(LINUX_EROFS.into());
+        }
+        // RENAME_EXCHANGE: atomically swap two EXISTING entries. Both must
+        // exist (a missing side → ENOENT, renameat201 case 3); the swap lands
+        // in the writable overlay backend, which preserves each entry's
+        // mode/contents (renameat202). EXCHANGE that touches a VFS mount
+        // (/dev/shm, bind mounts) is not supported by the overlay swap → EINVAL.
+        if flags & RENAME_EXCHANGE != 0 {
+            if self.fs.vfs_mounts.resolve(&resolved_old).is_some()
+                || self.fs.vfs_mounts.resolve(&resolved_new).is_some()
+            {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let old_exists = self.layered_metadata(&resolved_old).is_ok();
+            let new_exists = self.layered_metadata(&resolved_new).is_ok();
+            if !old_exists || !new_exists {
+                return Ok(LINUX_ENOENT.into());
+            }
+            // Capture dir-ness before the swap for inotify IN_ISDIR.
+            let (old_is_dir, new_is_dir) = if self.fs.inotify_registry.is_empty() {
+                (false, false)
+            } else {
+                (
+                    self.inotify_path_kind(&resolved_old).unwrap_or(false),
+                    self.inotify_path_kind(&resolved_new).unwrap_or(false),
+                )
+            };
+            return match self
+                .fs
+                .rootfs_vfs
+                .exchange_with_flags(&resolved_old, &resolved_new)
+            {
+                Ok(()) => {
+                    if !self.fs.inotify_registry.is_empty() {
+                        // A swap is two moves: each name now holds the other's
+                        // object, so emit IN_MOVED_FROM/IN_MOVED_TO for both
+                        // directions, cookie-tied per direction.
+                        self.inotify_move(&resolved_old, &resolved_new, old_is_dir);
+                        self.inotify_move(&resolved_new, &resolved_old, new_is_dir);
+                    }
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+                Err(errno) => Ok(errno.into()),
+            };
         }
         let no_replace = flags & RENAME_NOREPLACE != 0;
         // Renaming OVER an OVERRIDABLE single-file injection (/etc/services,
@@ -3765,10 +3970,16 @@ impl SyscallDispatcher {
                 }
                 // File leases (F_SETLEASE/F_GETLEASE). macOS has no lease
                 // primitive, so the lease type is recorded on the open-file
-                // description (shared across dup). The single-fd round-trip
-                // (fcntl23-26) is exact; cross-PROCESS open-conflict EAGAIN
-                // (fcntl27/32) needs an inode-wide opener count — a tracked
-                // follow-up. Lease-break SIGIO delivery is likewise deferred.
+                // description (shared across dup). Conflict enforcement mirrors
+                // fcntl(2): a WRITE lease (F_WRLCK) requires this to be the ONLY
+                // open file description for the file; a READ lease (F_RDLCK)
+                // requires no other description hold the file open for writing
+                // (and that the calling fd itself be read-only). Conflicts return
+                // EAGAIN. The opener census comes from `same_file_other_openers`
+                // (host-inode identity under `--fs host`, path under `--fs
+                // memory`); a dup'd fd shares the description and never conflicts.
+                // Lease-break SIGIO delivery to a conflicting opener is a tracked
+                // follow-up.
                 LINUX_F_SETLEASE => {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(LINUX_EBADF.into());
@@ -3780,14 +3991,34 @@ impl SyscallDispatcher {
                     {
                         return Ok(LINUX_EINVAL.into());
                     }
-                    // A read lease requires the fd be opened read-only: an fd
-                    // open for writing is itself a conflicting writer → EAGAIN,
-                    // matching Linux.
-                    if lease == LINUX_F_RDLCK {
-                        let acc = open_file.description.read().status_flags() & LINUX_O_ACCMODE;
-                        if acc != LINUX_O_RDONLY {
-                            return Ok(LINUX_EAGAIN.into());
+                    let self_acc =
+                        open_file.description.read().status_flags() & LINUX_O_ACCMODE;
+                    match lease {
+                        // A write lease demands exclusive access: any other open
+                        // file description for the file is a conflict.
+                        LINUX_F_WRLCK => {
+                            if !this.same_file_other_openers(fd.0).is_empty() {
+                                return Ok(LINUX_EAGAIN.into());
+                            }
                         }
+                        // A read lease forbids any writer. The calling fd must be
+                        // read-only (an fd open for writing is itself a writer),
+                        // and no other description may hold the file open for
+                        // writing.
+                        LINUX_F_RDLCK => {
+                            if self_acc != LINUX_O_RDONLY {
+                                return Ok(LINUX_EAGAIN.into());
+                            }
+                            let writer_exists = this
+                                .same_file_other_openers(fd.0)
+                                .into_iter()
+                                .any(|acc| acc != LINUX_O_RDONLY);
+                            if writer_exists {
+                                return Ok(LINUX_EAGAIN.into());
+                            }
+                        }
+                        // F_UNLCK: removing a lease never conflicts.
+                        _ => {}
                     }
                     open_file.description.write().set_lease(lease);
                     DispatchOutcome::Returned { value: 0 }
@@ -7986,6 +8217,24 @@ impl SyscallDispatcher {
             if old.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
                 return Ok(LINUX_ENOENT.into());
             }
+            // O_TMPFILE / memfd materialization candidate. The source can name an
+            // ANONYMOUS inode (an O_TMPFILE/memfd fd with no directory entry) two
+            // ways:
+            //   - linkat(AT_FDCWD, "/proc/self/fd/<n>", ..., AT_SYMLINK_FOLLOW)
+            //     — the magic symlink FOLLOWED to the unnamed inode (open14,
+            //     openat03). AT_SYMLINK_FOLLOW must be set, else linkat would
+            //     hard-link the symlink itself.
+            //   - linkat(fd, "", ..., AT_EMPTY_PATH) — link the fd's inode
+            //     directly.
+            // Resolved here BEFORE the ordinary source-existence check, because
+            // the anon inode has no namespace path that check would find.
+            let anon_fd_candidate = if old.is_empty() {
+                Some(olddirfd as i32)
+            } else if flags & LINUX_AT_SYMLINK_FOLLOW != 0 {
+                proc_self_fd_number(&old)
+            } else {
+                None
+            };
             let resolved_old = if old.is_empty() {
                 if !this.fd_is_valid(olddirfd as i32) {
                     return Ok(LINUX_EBADF.into());
@@ -7995,7 +8244,12 @@ impl SyscallDispatcher {
                 let resolved = this.resolve_at_path(olddirfd, &old)?;
                 let exists =
                     crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context())
-                        || this.layered_metadata(&resolved).is_ok();
+                        || this.layered_metadata(&resolved).is_ok()
+                        // An anon fd's magic symlink has no layered metadata; its
+                        // existence is the live fd, validated below in the
+                        // materialize branch.
+                        || anon_fd_candidate
+                            .is_some_and(|n| this.fd_table_contains(n) || is_stdio_fd(n));
                 if !exists {
                     return Ok(LINUX_ENOENT.into());
                 }
@@ -8006,6 +8260,21 @@ impl SyscallDispatcher {
                 || this.layered_metadata(&resolved_new).is_ok()
             {
                 return Ok(LINUX_EEXIST.into());
+            }
+            // Linux gives the unnamed inode a name in place (same inode); carrick
+            // has no shared-inode primitive for the overlay, so it materializes a
+            // fresh entry from the fd's live bytes + creation mode. The O_TMPFILE
+            // tests only stat size + mode, so a content+mode copy is
+            // observationally exact. `materialize_anon_fd_to` returns None when
+            // the fd is NOT an anon file (a real /proc/self/fd/<n> to a named
+            // file), so the ordinary hard-link path below still handles those.
+            if let Some(n) = anon_fd_candidate
+                && let Some(result) = this.materialize_anon_fd_to(n, &resolved_new)
+            {
+                return Ok(match result {
+                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                    Err(errno) => errno.into(),
+                });
             }
             // Create a real hard link in the writable backend (cap-std
             // hard_link). dpkg link()s e.g. /var/lib/dpkg/status -> status-old.
@@ -8149,15 +8418,24 @@ impl SyscallDispatcher {
         fn renameat2(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr, flags: u64) {
 
             // RENAME_NOREPLACE=1, RENAME_EXCHANGE=2, RENAME_WHITEOUT=4. We
-            // implement the common subset (no flags or NOREPLACE). EXCHANGE
-            // and WHITEOUT are not supported by overlayfs in our limited
-            // mode either, so reject them.
+            // implement NOREPLACE and EXCHANGE; WHITEOUT (an overlayfs-internal
+            // marker) is not. renameat2(2): any unknown flag → EINVAL, and the
+            // flags are mutually exclusive — RENAME_NOREPLACE|RENAME_EXCHANGE
+            // and RENAME_WHITEOUT|RENAME_EXCHANGE both → EINVAL (renameat201
+            // cases 5,6). do_renameat performs the swap for RENAME_EXCHANGE.
             const RENAME_NOREPLACE: u64 = 1;
             const RENAME_EXCHANGE: u64 = 2;
-            if flags & !RENAME_NOREPLACE != 0 {
-                if flags & RENAME_EXCHANGE != 0 {
-                    return Ok(LINUX_EINVAL.into());
-                }
+            const RENAME_WHITEOUT: u64 = 4;
+            const RENAME_KNOWN: u64 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
+            if flags & !RENAME_KNOWN != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // RENAME_EXCHANGE is incompatible with NOREPLACE and WHITEOUT.
+            if flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // WHITEOUT on its own (or with NOREPLACE) is unsupported here.
+            if flags & RENAME_WHITEOUT != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             this.do_renameat(

@@ -828,6 +828,124 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
 }
 
 #[test]
+fn renameat2_exchange_swaps_content_and_rejects_invalid_flag_combos() {
+    // renameat201/renameat202: RENAME_EXCHANGE (flag 2) atomically swaps two
+    // EXISTING entries, content and mode following the entry; a missing target
+    // is ENOENT; RENAME_NOREPLACE|RENAME_EXCHANGE and RENAME_WHITEOUT|
+    // RENAME_EXCHANGE are EINVAL.
+    const RENAME_EXCHANGE: u64 = 2;
+    const RENAME_NOREPLACE: u64 = 1;
+    const RENAME_WHITEOUT: u64 = 4;
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([
+        ("a.txt", b"content-A".as_slice()),
+        ("b.txt", b"BB".as_slice()),
+    ]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory.write_bytes(0x4000, b"/a.txt\0").unwrap();
+    memory.write_bytes(0x4020, b"/b.txt\0").unwrap();
+    memory.write_bytes(0x4040, b"/missing.txt\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // RENAME_EXCHANGE with a missing target → ENOENT.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            276,
+            [
+                LINUX_AT_FDCWD,
+                0x4000,
+                LINUX_AT_FDCWD,
+                0x4040,
+                RENAME_EXCHANGE,
+                0
+            ]
+        ),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+    // Mutually-exclusive flag combos → EINVAL.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            276,
+            [
+                LINUX_AT_FDCWD,
+                0x4000,
+                LINUX_AT_FDCWD,
+                0x4020,
+                RENAME_EXCHANGE | RENAME_NOREPLACE,
+                0
+            ]
+        ),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            276,
+            [
+                LINUX_AT_FDCWD,
+                0x4000,
+                LINUX_AT_FDCWD,
+                0x4020,
+                RENAME_EXCHANGE | RENAME_WHITEOUT,
+                0
+            ]
+        ),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    // The swap itself: a.txt <-> b.txt.
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            276,
+            [
+                LINUX_AT_FDCWD,
+                0x4000,
+                LINUX_AT_FDCWD,
+                0x4020,
+                RENAME_EXCHANGE,
+                0
+            ]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // /a.txt now holds "BB"; /b.txt now holds "content-A".
+    let read_all = |d: &mut SyscallDispatcher, m: &mut LinearMemory, path_ptr: u64| -> Vec<u8> {
+        let fd = match run(d, m, 56, [(-100_i64) as u64, path_ptr, 0, 0, 0, 0]) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("openat: {other:?}"),
+        };
+        let n = match run(d, m, 63, [fd, 0x4800, 64, 0, 0, 0]) {
+            DispatchOutcome::Returned { value } => value as usize,
+            other => panic!("read: {other:?}"),
+        };
+        let out = m.read_bytes(0x4800, n).unwrap();
+        run(d, m, 57, [fd, 0, 0, 0, 0, 0]);
+        out
+    };
+    assert_eq!(read_all(&mut dispatcher, &mut memory, 0x4000), b"BB");
+    assert_eq!(read_all(&mut dispatcher, &mut memory, 0x4020), b"content-A");
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     const AT_REMOVEDIR: u64 = 0x200;
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
