@@ -1085,7 +1085,19 @@ fn sysv_semctl<M: GuestMemory>(
         LINUX_IPC_RMID | LINUX_GETPID | LINUX_GETVAL | LINUX_GETNCNT | LINUX_GETZCNT => {
             let rc = unsafe { carrick_portable::semctl0(semid, semnum, host_cmd) };
             match rc.host_syscall_errno() {
-                Ok(v) => Ok(DispatchOutcome::Returned { value: v as i64 }),
+                Ok(v) => {
+                    // GETPID returns sempid (the last process to semop). The host
+                    // tracks its raw host pid; present it in the caller's PID
+                    // namespace so it matches the fork()-returned pid the guest
+                    // sees (semctl07). The other commands here return non-pid
+                    // values (semval/ncnt/zcnt/0) and pass through unchanged.
+                    let value = if cmd == LINUX_GETPID && v > 0 {
+                        i64::from(crate::namespace::pid::host_to_ns_or_self(v as u32))
+                    } else {
+                        v as i64
+                    };
+                    Ok(DispatchOutcome::Returned { value })
+                }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
