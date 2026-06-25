@@ -732,6 +732,18 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         host_fd: i32,
         is_read_end: bool,
+        /// Globally-unique carrick id for the pipe OBJECT, identical on BOTH
+        /// ends and inherited unchanged across `clone`/fork. This is the
+        /// fork-coherent FASYNC (signal-driven I/O) join key: arming the read
+        /// end stores `pipe_id` in the shared registry, and a write-end write in
+        /// any process looks the SAME `pipe_id` up to deliver the I/O signal.
+        /// Keyed by pipe id rather than the per-fd host inode because macOS
+        /// gives a pipe's two ends DIFFERENT `st_ino` (Linux shares one), so an
+        /// inode key armed on the read end would never match the write-end
+        /// trigger. Assigned at pipe creation from the host inode of one end
+        /// (globally unique, and fixed before any fork). `0` for ends with no
+        /// real pipe object to share (e.g. a duped stdio grab).
+        pipe_id: u64,
         /// `Some` iff this fd is a pty master/slave end. Data I/O is
         /// identical to a plain host pipe; this only changes ioctl
         /// handling and close cleanup. `None` for ordinary host pipes,

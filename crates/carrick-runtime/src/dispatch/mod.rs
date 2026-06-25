@@ -5583,6 +5583,7 @@ mod overlay_dispatch_tests {
                 base: OpenDescriptionBase::new(0),
                 host_fd: fds[0],
                 is_read_end: true,
+                pipe_id: 0,
                 pty: None,
                 bidirectional: false,
                 write_kind: HostWriteKind::PipeLike,

@@ -154,6 +154,20 @@ fn get_last_error() -> i32 {
     carrick_portable::errno()
 }
 
+/// Derive a globally-unique carrick pipe id from a host fd's inode, used to
+/// stamp BOTH ends of a freshly-created pipe with one shared FASYNC join key.
+/// The host inode is globally unique and is read here at pipe creation (before
+/// any fork), so the value both ends store is identical and fork-stable. Returns
+/// `0` if the fstat fails (FASYNC delivery then degrades for that pipe, never
+/// crashes); `0` is never a valid armed key.
+fn host_inode_pipe_id(host_fd: i32) -> u64 {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(host_fd, &mut st) } != 0 {
+        return 0;
+    }
+    st.st_ino as u64
+}
+
 fn gather_bounded_iovec_bytes(
     memory: &impl GuestMemory,
     iovecs: &[LinuxIovec],
@@ -1381,6 +1395,11 @@ impl SyscallDispatcher {
                     let description = OpenDescription::HostPipe {
                         host_fd,
                         is_read_end: access != LINUX_O_WRONLY,
+                        // A named FIFO's two ends are opened separately but share
+                        // ONE on-disk inode, so the host inode is a join key both
+                        // ends agree on (the FASYNC arm/trigger across ends works
+                        // for FIFOs as it does for anonymous pipes).
+                        pipe_id: host_inode_pipe_id(host_fd),
                         base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                         pty: None,
                         bidirectional: access == LINUX_O_RDWR,
@@ -1834,6 +1853,10 @@ impl SyscallDispatcher {
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
                         is_read_end: old_fd == 0,
+                        // A duped stdio fd has no separate pipe peer to coordinate
+                        // a FASYNC arm/trigger with; the host inode is still a
+                        // unique id (FASYNC is not exercised on bare stdio).
+                        pipe_id: host_inode_pipe_id(duped),
                         base: OpenDescriptionBase::new(0),
                         pty,
                         bidirectional: false,
@@ -1904,6 +1927,10 @@ impl SyscallDispatcher {
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
                         is_read_end: old_fd == 0,
+                        // A duped stdio fd has no separate pipe peer to coordinate
+                        // a FASYNC arm/trigger with; the host inode is still a
+                        // unique id (FASYNC is not exercised on bare stdio).
+                        pipe_id: host_inode_pipe_id(duped),
                         base: OpenDescriptionBase::new(0),
                         pty,
                         bidirectional: false,
@@ -2052,6 +2079,9 @@ impl SyscallDispatcher {
                     OpenDescription::HostPipe {
                         host_fd,
                         is_read_end,
+                        // A VFS host stream (e.g. /dev/null, a chardev) has no
+                        // separate pipe peer; the host inode is a unique id.
+                        pipe_id: host_inode_pipe_id(host_fd),
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: None,
                         // A VFS stream opened O_RDWR must serve BOTH directions
@@ -2112,6 +2142,9 @@ impl SyscallDispatcher {
                         // A pty end is bidirectional; route reads and
                         // writes through the host fd like /dev/null.
                         is_read_end: true,
+                        // A pty end's host inode is a unique id (FASYNC is not
+                        // exercised on ptys).
+                        pipe_id: host_inode_pipe_id(host_fd),
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: Some(crate::vfs::PtyRole {
                             index: pts_index,
@@ -2216,23 +2249,30 @@ impl SyscallDispatcher {
         })
     }
 
-    /// The host pipe/socket object identity `(st_dev, st_ino)` behind a guest
-    /// `fd`, if it is a host-backed pipe or socket. The SAME key for both ends of
-    /// a pipe (the inode is shared) and stable across fork — the join key for the
-    /// fork-coherent FASYNC registry. `None` for non-pipe/socket fds or a failed
-    /// fstat.
-    fn host_pipe_inode_key(&self, fd: i32) -> Option<(u64, u64)> {
+    /// The fork-coherent FASYNC join key behind a guest `fd`, if it is a
+    /// host-backed pipe or socket. For a `HostPipe` it is the shared `pipe_id`
+    /// stamped on BOTH ends at creation (identical on the read and write ends,
+    /// inherited unchanged across fork — the property an inode key lacks on
+    /// macOS, where a pipe's two ends have different `st_ino`). For a
+    /// `HostSocket` there is no creation-time shared id, so the socket's host
+    /// inode is used (the existing socket-fasync behaviour). `None` for
+    /// non-pipe/socket fds, a `pipe_id` of `0` (no real pipe object), or a failed
+    /// socket fstat.
+    fn host_pipe_pipe_id(&self, fd: i32) -> Option<u64> {
         let open_file = self.open_file(fd)?;
-        let host_fd = match &*open_file.description.read() {
-            OpenDescription::HostPipe { host_fd, .. }
-            | OpenDescription::HostSocket { host_fd, .. } => *host_fd,
+        let host_socket_fd = match &*open_file.description.read() {
+            OpenDescription::HostPipe { pipe_id, .. } => {
+                return (*pipe_id != 0).then_some(*pipe_id);
+            }
+            OpenDescription::HostSocket { host_fd, .. } => *host_fd,
             _ => return None,
         };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(host_fd, &mut st) } != 0 {
+        if unsafe { libc::fstat(host_socket_fd, &mut st) } != 0 {
             return None;
         }
-        Some((st.st_dev as u64, st.st_ino as u64))
+        let ino = st.st_ino as u64;
+        (ino != 0).then_some(ino)
     }
 
     /// Reconcile the fork-coherent FASYNC registry with `fd`'s current
@@ -2243,7 +2283,7 @@ impl SyscallDispatcher {
     /// for non-pipe/socket fds (FASYNC delivery is only wired for the
     /// pipe/socket readiness edge carrick can observe).
     fn sync_fasync_registration(&self, fd: i32) {
-        let Some(key) = self.host_pipe_inode_key(fd) else {
+        let Some(pipe_id) = self.host_pipe_pipe_id(fd) else {
             return;
         };
         let Some(open_file) = self.open_file(fd) else {
@@ -2253,15 +2293,14 @@ impl SyscallDispatcher {
         let armed = desc.status_flags() & LINUX_O_ASYNC != 0;
         if !armed {
             drop(desc);
-            carrick_signal_core::fasync::disarm(key.0, key.1);
+            carrick_signal_core::fasync::disarm(pipe_id);
             return;
         }
         let (owner_type, owner_pid) = desc.owner();
         let sig = desc.async_sig();
         drop(desc);
         carrick_signal_core::fasync::arm(
-            key.0,
-            key.1,
+            pipe_id,
             carrick_signal_core::fasync::FasyncOwner {
                 owner_pid,
                 owner_type,
@@ -2287,10 +2326,10 @@ impl SyscallDispatcher {
         if !carrick_signal_core::fasync::any_armed() {
             return;
         }
-        let Some((dev, ino)) = self.host_pipe_inode_key(fd) else {
+        let Some(pipe_id) = self.host_pipe_pipe_id(fd) else {
             return;
         };
-        let Some(owner) = carrick_signal_core::fasync::lookup(dev, ino) else {
+        let Some(owner) = carrick_signal_core::fasync::lookup(pipe_id) else {
             return;
         };
         if owner.owner_pid == 0 {
@@ -3691,10 +3730,18 @@ impl SyscallDispatcher {
             read_base.set_pipe_capacity_cell(Arc::clone(&cap_cell));
             let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock);
             write_base.set_pipe_capacity_cell(cap_cell);
+            // One globally-unique pipe id shared by BOTH ends — the fork-coherent
+            // FASYNC join key (LTP fcntl31 arms the read end, the forked child
+            // writes the write end). Derived from the read end's host inode:
+            // globally unique, and assigned here at creation before any fork, so
+            // both ends inherit the SAME id. (macOS gives the two ends DIFFERENT
+            // st_ino, so a per-fd inode key would never match across ends.)
+            let pipe_id = host_inode_pipe_id(host_read);
             let read_open = OpenFile::with_host_fd(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: host_read,
                     is_read_end: true,
+                    pipe_id,
                     base: read_base,
                     pty: None,
                     bidirectional: false,
@@ -3707,6 +3754,7 @@ impl SyscallDispatcher {
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: host_write,
                     is_read_end: false,
+                    pipe_id,
                     base: write_base,
                     pty: None,
                     bidirectional: false,
