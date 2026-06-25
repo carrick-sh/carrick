@@ -2519,6 +2519,32 @@ fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u
     }
 }
 
+/// Path-based u32 xattr WRITE (macOS, following symlinks). Like
+/// `path_get_u32_xattr` it issues NO open(), so it can stamp a node whose
+/// open() would block — namely a writer-less FIFO. Used to record a FIFO's
+/// guest owner uid/gid (LTP mknod08): the fd-based `write_owner_xattr` would
+/// open the FIFO and wedge the dispatcher.
+#[cfg(target_os = "macos")]
+fn path_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32) {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(abs) = sandbox_abs_path(dir, rel) else {
+        return;
+    };
+    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
+        return;
+    };
+    let v = val.to_le_bytes();
+    unsafe {
+        carrick_portable::setxattr(
+            cpath.as_ptr(),
+            name.as_ptr() as *const libc::c_char,
+            v.as_ptr() as *const libc::c_void,
+            v.len(),
+            0,
+        );
+    }
+}
+
 /// Prefix for a per-symlink xattr SIDECAR file (non-macOS). Linux (and every
 /// Linux filesystem) forbids `user.*`/`trusted.*` xattrs ON A SYMLINK at the VFS
 /// layer, so a symlink's carrick-owned uid/gid (`lchown`) cannot be stored in an
@@ -3609,6 +3635,27 @@ impl FsBackend for HostFsBackend {
         let m = dir.symlink_metadata(&at_rel).ok();
         let is_dir = m.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let symlink = m.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
+        // A FIFO can't be opened to fset the xattr (O_RDONLY blocks a
+        // writer-less FIFO and would wedge the dispatcher). On macOS, stamp the
+        // owner via PATH-based setxattr (no open) so a freshly mknod'd FIFO
+        // still records its guest owner (LTP mknod08 reads st_gid back).
+        #[cfg(target_os = "macos")]
+        {
+            use cap_std::fs::MetadataExt as _;
+            let is_fifo = m
+                .as_ref()
+                .map(|m| m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32)
+                .unwrap_or(false);
+            if !symlink && is_fifo {
+                if uid != u32::MAX {
+                    path_set_u32_xattr(&dir, &at_rel, CARRICK_UID_XATTR, uid);
+                }
+                if gid != u32::MAX {
+                    path_set_u32_xattr(&dir, &at_rel, CARRICK_GID_XATTR, gid);
+                }
+                return Ok(());
+            }
+        }
         write_owner_xattr(&dir, &at_rel, is_dir, symlink, uid, gid);
         Ok(())
     }
@@ -3619,9 +3666,19 @@ impl FsBackend for HostFsBackend {
         let rel = Self::rel_path(&normalized)?;
         let (dir, at_rel) = self.at(rel).ok()?;
         let meta = dir.symlink_metadata(&at_rel).ok()?;
-        // A FIFO has no owner xattr and reading one would open() the node
-        // (O_RDONLY blocks a writer-less FIFO) — report root (0,0) directly.
+        // A FIFO must NOT be opened to read its owner xattr (O_RDONLY blocks a
+        // writer-less FIFO and would wedge the dispatcher). On macOS, read the
+        // owner via PATH-based getxattr (no open) so a mknod'd FIFO reports the
+        // guest owner stamped by set_owner (LTP mknod08). Elsewhere the fd-based
+        // path would block, so report root (0,0) as before.
         if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+            #[cfg(target_os = "macos")]
+            {
+                let uid = path_get_u32_xattr(&dir, &at_rel, CARRICK_UID_XATTR, false);
+                let gid = path_get_u32_xattr(&dir, &at_rel, CARRICK_GID_XATTR, false);
+                return Some((uid.unwrap_or(0), gid.unwrap_or(0)));
+            }
+            #[cfg(not(target_os = "macos"))]
             return Some((0, 0));
         }
         let (uid, gid) = read_owner_xattr(&dir, &at_rel, meta.is_dir(), meta.is_symlink());
@@ -4094,9 +4151,29 @@ impl FsBackend for HostFsBackend {
         // mode lives on the real node (set by create_fifo). Skip the xattr for
         // both; use the real on-disk mode.
         let (override_mode, owner) = if kind == RootFsEntryKind::Fifo {
-            // A FIFO's owner xattr can't be read (open() of a writer-less
-            // FIFO blocks); report none.
-            (None, (None, None))
+            // A FIFO must NOT be opened to read its xattrs (O_RDONLY blocks a
+            // writer-less FIFO and wedges the dispatcher); its MODE lives on the
+            // real node (set by create_fifo), so override_mode stays None. On
+            // macOS the OWNER can still be read via PATH-based getxattr (no
+            // open), so a mknod'd FIFO reports the guest owner that
+            // stamp_new_node_owner recorded (LTP mknod08 reads st_gid back).
+            #[cfg(target_os = "macos")]
+            {
+                match &anchored {
+                    Some((dir, at_rel)) => (
+                        None,
+                        (
+                            path_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR, false),
+                            path_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR, false),
+                        ),
+                    ),
+                    None => (None, (None, None)),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                (None, (None, None))
+            }
         } else if kind == RootFsEntryKind::Symlink {
             // A symlink's mode is always 0o777; its owner lives on the link
             // itself (XATTR_NOFOLLOW), so lchown round-trips through lstat.

@@ -560,6 +560,103 @@ fn reportable_status_flags(raw: u64) -> u64 {
     raw & !CREATION_ONLY
 }
 
+/// One host interface with an IPv4 address: `(name, flags_host, sin_addr_be)`
+/// where `flags_host` is the host's raw `ifa_flags` and `sin_addr_be` is the
+/// 4-byte network-order IPv4 address. Built from `getifaddrs(3)`, which every
+/// supported host provides. SIOCGIFCONF reports exactly the AF_INET interfaces.
+struct HostInet4Iface {
+    name: String,
+    flags_host: u32,
+    addr_be: [u8; 4],
+}
+
+/// Enumerate host interfaces that have an IPv4 address, in `getifaddrs` order.
+/// Used to service the `SIOCGIFCONF`/`SIOCGIFFLAGS`/`SIOCGIFADDR` family — we
+/// never fabricate interfaces; the list is whatever the host kernel reports.
+fn host_inet4_interfaces() -> Vec<HostInet4Iface> {
+    let mut out: Vec<HostInet4Iface> = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates a list we free with freeifaddrs below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+        return out;
+    }
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: cur is a non-null node in the getifaddrs list.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_name.is_null() || ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_addr is non-null; sa_family is the first field.
+        if unsafe { (*ifa.ifa_addr).sa_family } as i32 != libc::AF_INET {
+            continue;
+        }
+        // SAFETY: an AF_INET ifa_addr is a sockaddr_in.
+        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let addr_be = sin.sin_addr.s_addr.to_ne_bytes();
+        // SAFETY: ifa_name is a non-null NUL-terminated C string.
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        out.push(HostInet4Iface {
+            name,
+            flags_host: ifa.ifa_flags,
+            addr_be,
+        });
+    }
+    // SAFETY: free the list getifaddrs allocated.
+    unsafe { libc::freeifaddrs(head) };
+    out
+}
+
+/// Translate a host's BSD/Linux `ifa_flags` bitmask to the Linux `IFF_*` flag
+/// values a guest expects in `ifr_flags`. Most low bits (UP/BROADCAST/DEBUG/
+/// LOOPBACK/POINTOPOINT/RUNNING/NOARP/PROMISC) share values across BSD and
+/// Linux; MULTICAST differs (BSD 0x8000 vs Linux 0x1000) — translate by name
+/// via the host's `libc::IFF_*` so this is correct on every host.
+fn host_iff_to_linux(flags_host: u32) -> u16 {
+    const LINUX_IFF_UP: u16 = 0x1;
+    const LINUX_IFF_BROADCAST: u16 = 0x2;
+    const LINUX_IFF_DEBUG: u16 = 0x4;
+    const LINUX_IFF_LOOPBACK: u16 = 0x8;
+    const LINUX_IFF_POINTOPOINT: u16 = 0x10;
+    const LINUX_IFF_RUNNING: u16 = 0x40;
+    const LINUX_IFF_NOARP: u16 = 0x80;
+    const LINUX_IFF_PROMISC: u16 = 0x100;
+    const LINUX_IFF_MULTICAST: u16 = 0x1000;
+    let h = flags_host as i32;
+    let mut out: u16 = 0;
+    let set = |out: &mut u16, host_bit: i32, linux_bit: u16| {
+        if h & host_bit != 0 {
+            *out |= linux_bit;
+        }
+    };
+    set(&mut out, libc::IFF_UP, LINUX_IFF_UP);
+    set(&mut out, libc::IFF_BROADCAST, LINUX_IFF_BROADCAST);
+    set(&mut out, libc::IFF_DEBUG, LINUX_IFF_DEBUG);
+    set(&mut out, libc::IFF_LOOPBACK, LINUX_IFF_LOOPBACK);
+    set(&mut out, libc::IFF_POINTOPOINT, LINUX_IFF_POINTOPOINT);
+    set(&mut out, libc::IFF_RUNNING, LINUX_IFF_RUNNING);
+    set(&mut out, libc::IFF_NOARP, LINUX_IFF_NOARP);
+    set(&mut out, libc::IFF_PROMISC, LINUX_IFF_PROMISC);
+    set(&mut out, libc::IFF_MULTICAST, LINUX_IFF_MULTICAST);
+    out
+}
+
+/// Build one Linux `struct ifreq` (40 bytes) carrying `name` and an
+/// `AF_INET` `ifr_addr` for `addr_be`. The trailing union bytes are zero.
+fn linux_ifreq_inet4(name: &str, addr_be: [u8; 4]) -> [u8; LINUX_IFREQ_SIZE] {
+    let mut req = [0u8; LINUX_IFREQ_SIZE];
+    let nb = name.as_bytes();
+    let n = nb.len().min(LINUX_IFNAMSIZ - 1);
+    req[..n].copy_from_slice(&nb[..n]);
+    // ifr_addr starts at offset IFNAMSIZ: sockaddr_in { family(2) port(2) addr(4) }.
+    req[LINUX_IFNAMSIZ..LINUX_IFNAMSIZ + 2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+    req[LINUX_IFNAMSIZ + 4..LINUX_IFNAMSIZ + 8].copy_from_slice(&addr_be);
+    req
+}
+
 impl SyscallDispatcher {
     fn record_fd_open_path(&self, fd: i32, path: String) {
         #[cfg(test)]
@@ -4421,6 +4518,141 @@ impl SyscallDispatcher {
                     },
                     None => DispatchOutcome::errno(LINUX_ENOTTY),
                 },
+                LINUX_SIOCATMARK => match this.host_socket_lookup(fd.0) {
+                    Ok(_) => {
+                        // SIOCATMARK reports whether the next read sits at the
+                        // out-of-band mark. It is a STREAM-only op: Linux returns
+                        // ENOTTY on a datagram socket (sockioctl01 "ATMARK on UDP"
+                        // resets the expected errno to ENOTTY). A NULL arg faults
+                        // (sockioctl01 "invalid option buffer"). carrick keeps no
+                        // OOB queue, so a valid stream socket reports atmark = 0
+                        // (man sockatmark: 0 ⇒ not at the mark), which is the true
+                        // state for any socket with no urgent data pending.
+                        if this.socket_guest_type(fd.0) != Some(LINUX_SOCK_STREAM) {
+                            DispatchOutcome::errno(LINUX_ENOTTY)
+                        } else if arg == 0 {
+                            DispatchOutcome::errno(LINUX_EFAULT)
+                        } else {
+                            write_packed(&mut *cx.memory, arg, &0i32.to_le_bytes())
+                        }
+                    }
+                    // A non-socket fd (e.g. a FIFO): Linux's vfs_ioctl returns
+                    // ENOTTY for SIOCATMARK, not ENOTSOCK (sockioctl01 "not a
+                    // socket" resets the expected errno to ENOTTY).
+                    Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
+                },
+                LINUX_SIOCGIFCONF => match this.host_socket_lookup(fd.0) {
+                    Ok(_) => {
+                        // struct ifconf: ifc_len (off 0, i32), ifc_buf (off 8, ptr).
+                        if arg == 0 {
+                            return Ok(LINUX_EFAULT.into());
+                        }
+                        let Ok(hdr) = cx.memory.read_bytes(arg, LINUX_IFCONF_SIZE) else {
+                            return Ok(LINUX_EFAULT.into());
+                        };
+                        let ifc_len =
+                            i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]).max(0) as usize;
+                        let ifc_buf = u64::from_le_bytes([
+                            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+                        ]);
+                        let ifaces = host_inet4_interfaces();
+                        // Linux convention: a NULL ifc_buf is a size query that
+                        // reports the bytes required without writing entries.
+                        let cap = if ifc_buf == 0 {
+                            usize::MAX
+                        } else {
+                            ifc_len / LINUX_IFREQ_SIZE
+                        };
+                        let mut written = 0usize;
+                        let mut blob: Vec<u8> = Vec::new();
+                        for iface in ifaces.iter() {
+                            if written >= cap {
+                                break;
+                            }
+                            let req = linux_ifreq_inet4(&iface.name, iface.addr_be);
+                            blob.extend_from_slice(&req);
+                            written += 1;
+                        }
+                        if ifc_buf != 0
+                            && !blob.is_empty()
+                            && cx.memory.write_bytes(ifc_buf, &blob).is_err()
+                        {
+                            return Ok(LINUX_EFAULT.into());
+                        }
+                        let new_len = (written * LINUX_IFREQ_SIZE) as i32;
+                        write_packed(&mut *cx.memory, arg, &new_len.to_le_bytes())
+                    }
+                    Err(errno) => DispatchOutcome::errno(errno),
+                },
+                LINUX_SIOCGIFFLAGS
+                | LINUX_SIOCGIFADDR
+                | LINUX_SIOCGIFBRDADDR
+                | LINUX_SIOCGIFNETMASK
+                | LINUX_SIOCGIFMTU => match this.host_socket_lookup(fd.0) {
+                    Ok(_) => {
+                        // ifr_name occupies the first IFNAMSIZ bytes; a NULL arg
+                        // faults (sockioctl01 "SIOCGIFFLAGS with invalid ifr").
+                        if arg == 0 {
+                            return Ok(LINUX_EFAULT.into());
+                        }
+                        let Ok(name_bytes) = cx.memory.read_bytes(arg, LINUX_IFNAMSIZ) else {
+                            return Ok(LINUX_EFAULT.into());
+                        };
+                        let end = name_bytes
+                            .iter()
+                            .position(|b| *b == 0)
+                            .unwrap_or(name_bytes.len());
+                        let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+                        let ifaces = host_inet4_interfaces();
+                        let Some(iface) = ifaces.iter().find(|i| i.name == name) else {
+                            return Ok(LINUX_ENODEV.into());
+                        };
+                        match ioctl_request {
+                            LINUX_SIOCGIFFLAGS => {
+                                // ifr_flags is a `short` at offset IFNAMSIZ.
+                                let flags = host_iff_to_linux(iface.flags_host);
+                                write_packed(
+                                    &mut *cx.memory,
+                                    arg + LINUX_IFNAMSIZ as u64,
+                                    &flags.to_le_bytes(),
+                                )
+                            }
+                            LINUX_SIOCGIFADDR | LINUX_SIOCGIFNETMASK | LINUX_SIOCGIFBRDADDR => {
+                                // ifr_addr (sockaddr_in) at offset IFNAMSIZ.
+                                let mut sa = [0u8; 16];
+                                sa[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+                                // Address: the interface IPv4 for SIOCGIFADDR; a
+                                // /32 mask / broadcast best-effort for the others.
+                                if ioctl_request == LINUX_SIOCGIFNETMASK {
+                                    sa[4..8].copy_from_slice(&[255, 255, 255, 255]);
+                                } else {
+                                    sa[4..8].copy_from_slice(&iface.addr_be);
+                                }
+                                write_packed(&mut *cx.memory, arg + LINUX_IFNAMSIZ as u64, &sa)
+                            }
+                            // SIOCGIFMTU: ifr_mtu (i32) at offset IFNAMSIZ.
+                            _ => write_packed(
+                                &mut *cx.memory,
+                                arg + LINUX_IFNAMSIZ as u64,
+                                &1500i32.to_le_bytes(),
+                            ),
+                        }
+                    }
+                    Err(errno) => DispatchOutcome::errno(errno),
+                },
+                LINUX_SIOCSIFFLAGS => match this.host_socket_lookup(fd.0) {
+                    Ok(_) => {
+                        // Setting interface flags needs CAP_NET_ADMIN; a NULL arg
+                        // faults first (sockioctl01 "SIOCSIFFLAGS with invalid
+                        // ifr"). carrick never mutates host interface state.
+                        if arg == 0 {
+                            DispatchOutcome::errno(LINUX_EFAULT)
+                        } else {
+                            DispatchOutcome::errno(LINUX_EPERM)
+                        }
+                    }
+                    Err(errno) => DispatchOutcome::errno(errno),
+                },
                 LINUX_TIOCGSID => match this.tty_ioctl_fd_kind(fd.0) {
                     Ok(TtyFdKind::Stdio) => {
                         // Under `-t` stdio is a real pty slave. Ask Darwin for
@@ -7782,6 +8014,16 @@ impl SyscallDispatcher {
             let Some(src) = resolved_old else {
                 return Ok(LINUX_EROFS.into());
             };
+            // Hard-linking a DIRECTORY is forbidden: Linux's vfs_link returns
+            // EPERM for S_ISDIR (only a privileged FS-specific path could, which
+            // carrick never offers). Check before the overlay hard_link, which
+            // would otherwise surface EROFS (linkat01 case 21 links ".").
+            if matches!(
+                this.layered_metadata(&src).map(|md| md.kind),
+                Ok(RootFsEntryKind::Directory)
+            ) {
+                return Ok(LINUX_EPERM.into());
+            }
             // A hard link whose source lives on a synthetic pseudo-filesystem
             // (/proc, /sys) crosses a device boundary into the rootfs overlay →
             // EXDEV, not the EROFS a failed overlay hard_link would yield
