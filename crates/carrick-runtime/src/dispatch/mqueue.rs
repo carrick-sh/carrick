@@ -537,10 +537,9 @@ impl SyscallDispatcher {
                         if deadline_expired(deadline) {
                             return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
                         }
-                        // A signal that should interrupt the block (additive
-                        // semantics: no syscall-supplied sigmask, so the thread's
-                        // persistent mask gates it) wins over the deadline.
-                        if this.has_deliverable_dispatch_pending_for_wait(tid, 0, false) {
+                        // A deliverable signal interrupts the block (carrick does
+                        // not auto-restart). It wins over the deadline.
+                        if mq_wait_interrupted(this, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -606,10 +605,9 @@ impl SyscallDispatcher {
                         if deadline_expired(deadline) {
                             return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
                         }
-                        // A signal that should interrupt the block (additive
-                        // semantics: no syscall-supplied sigmask) wins over the
-                        // deadline.
-                        if this.has_deliverable_dispatch_pending_for_wait(tid, 0, false) {
+                        // A deliverable signal interrupts the block (carrick does
+                        // not auto-restart). It wins over the deadline.
+                        if mq_wait_interrupted(this, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -740,6 +738,17 @@ fn read_queue_owner(path: &str) -> Option<u32> {
         return None;
     }
     Some(rd_u32(&hdr, OFF_OWNER_UID))
+}
+
+/// Does a deliverable signal want to interrupt a blocking mq op? Checks all
+/// three pending stores: the dispatcher's injected set, the HVF cross-process
+/// xsignal ring (where a `kill` from another guest process lands), and
+/// signal-core's process/thread pending (the KVM cross-process path). carrick
+/// does not auto-restart, so a deliverable pending signal -> EINTR.
+fn mq_wait_interrupted(this: &SyscallDispatcher, tid: crate::thread::ThreadId) -> bool {
+    this.has_deliverable_dispatch_pending_for_wait(tid, 0, false)
+        || carrick_signal_core::xsig::xsig_has_unblocked_for_self(0)
+        || carrick_signal_core::has_pending_for(tid)
 }
 
 /// Parse an absolute-timeout `struct timespec` pointer for a timed mq op. NULL
