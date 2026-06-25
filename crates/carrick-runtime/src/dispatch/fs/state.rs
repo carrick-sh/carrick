@@ -25,6 +25,14 @@ pub(in crate::dispatch) struct FsState {
     /// /dev/pts mounts. The ioctl (TIOCSPTLCK) and close (free-on-master-
     /// close) paths reach it through the dispatcher.
     pub(in crate::dispatch) pty_table: std::sync::Arc<parking_lot::Mutex<crate::vfs::PtyTable>>,
+
+    /// Dispatch-layer inotify watch table, keyed by guest path. Populated by
+    /// `inotify_add_watch`, drained by the fs handlers, which synthesize the
+    /// precise `IN_OPEN`/`IN_ACCESS`/`IN_MODIFY`/`IN_CLOSE_*`/`IN_CREATE`/
+    /// `IN_DELETE`/`IN_MOVED_*` events the coarse kqueue `NOTE_*` set cannot
+    /// express for same-process operations. Empty (the common case) → the
+    /// handlers' notify calls are a single `is_empty` read and return.
+    pub(in crate::dispatch) inotify_registry: crate::inotify::InotifyRegistry,
 }
 
 /// Owned I/O-subsystem state. Split out of `SyscallDispatcher` so the I/O
@@ -223,6 +231,7 @@ impl FsState {
             },
             rootfs_vfs: crate::vfs::RootFsVfs::new(),
             pty_table,
+            inotify_registry: crate::inotify::InotifyRegistry::default(),
         }
     }
 }
