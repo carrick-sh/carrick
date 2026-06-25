@@ -3449,7 +3449,7 @@ fn write_stat_record(
         st_nlink: record.nlink,
         st_uid: record.uid,
         st_gid: record.gid,
-        st_rdev: 0,
+        st_rdev: record.rdev,
         __pad1: 0,
         st_size: record.size as i64,
         st_blksize: 4096,
@@ -3488,7 +3488,7 @@ fn write_x8664_stat_record(
         st_uid: record.uid,
         st_gid: record.gid,
         __pad0: 0,
-        st_rdev: 0,
+        st_rdev: record.rdev,
         st_size: record.size as i64,
         st_blksize: 4096,
         st_blocks: blocks_512(size),
@@ -3594,8 +3594,8 @@ fn write_statx_record(
         stx_btime: zero_time,
         stx_ctime: stx_ts(record.ctime),
         stx_mtime: stx_ts(record.mtime),
-        stx_rdev_major: 0,
-        stx_rdev_minor: 0,
+        stx_rdev_major: linux_dev_major(record.rdev),
+        stx_rdev_minor: linux_dev_minor(record.rdev),
         stx_dev_major: 0,
         stx_dev_minor: 1,
         stx_mnt_id: 1,
@@ -4149,6 +4149,21 @@ fn read_from_file_contents_at(
         }
     }
     Ok(total)
+}
+
+/// Decode the major number from a raw Linux `dev_t` (the glibc `gnu_dev_major`
+/// encoding documented in makedev(3)): the major occupies bits 8..20 and 32..64,
+/// the minor bits 0..8 and 20..64 (interleaved so a 32-bit dev_t stays
+/// compatible). `stat`/`mknod` carry the raw `dev_t` verbatim; only `statx`
+/// reports the split fields, so the decode lives here. Clean-room from the man
+/// page, not glibc source.
+fn linux_dev_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
+}
+
+/// Decode the minor number from a raw Linux `dev_t` (see `linux_dev_major`).
+fn linux_dev_minor(dev: u64) -> u32 {
+    ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
 }
 
 fn linux_mode(metadata: &RootFsMetadata) -> u32 {

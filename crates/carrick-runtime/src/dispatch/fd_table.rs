@@ -50,7 +50,8 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::linux_abi::{
-    LINUX_EFBIG, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFREG, LINUX_S_IFSOCK, LinuxEpollEvent,
+    LINUX_EFBIG, LINUX_S_IFCHR, LINUX_S_IFIFO, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_S_IFSOCK,
+    LinuxEpollEvent,
 };
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
@@ -922,6 +923,10 @@ pub(super) struct StatRecord {
     pub(super) nlink: u32,
     pub(super) uid: u32,
     pub(super) gid: u32,
+    /// Device id this entry REPRESENTS (`st_rdev`) — non-zero only for a
+    /// character/block device node materialised by `mknod(2)` (see
+    /// `FsBackend::create_device`). Zero for every ordinary file/dir/etc.
+    pub(super) rdev: u64,
     pub(super) size: u64,
     pub(super) atime: (i64, i64),
     pub(super) mtime: (i64, i64),
@@ -940,6 +945,7 @@ impl StatRecord {
             },
             uid: 0,
             gid: 0,
+            rdev: 0,
             size: metadata.size as u64,
             atime: (0, 0),
             mtime: (0, 0),
@@ -961,6 +967,7 @@ impl StatRecord {
             nlink: real.nlink,
             uid: real.uid,
             gid: real.gid,
+            rdev: 0,
             size: real.size,
             atime: real.atime,
             mtime: real.mtime,
@@ -976,10 +983,24 @@ impl StatRecord {
             nlink: 1,
             uid: 0,
             gid: 0,
+            rdev: 0,
             size: size as u64,
             atime: (0, 0),
             mtime: (0, 0),
             ctime: (0, 0),
+        }
+    }
+
+    /// Override the reported file TYPE and `st_rdev` for a `mknod(2)` character/
+    /// block device node. `dev` is `(type_bits, rdev)` from
+    /// [`FsBackend::device_node`](crate::fs_backend::FsBackend::device_node), so
+    /// this ONLY fires for a real device marker — `None` leaves a regular file's
+    /// record completely unchanged. The permission bits are preserved; only the
+    /// `S_IFMT` type field is replaced with the device type.
+    pub(super) fn apply_device_node(&mut self, dev: Option<(u32, u64)>) {
+        if let Some((type_bits, rdev)) = dev {
+            self.mode = (self.mode & !LINUX_S_IFMT) | type_bits;
+            self.rdev = rdev;
         }
     }
 
