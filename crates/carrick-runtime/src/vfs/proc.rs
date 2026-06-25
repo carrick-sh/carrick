@@ -686,6 +686,31 @@ const PROC_NS_TYPES: &[(&str, u64)] = &[
     ("uts", 4026531838),
 ];
 
+/// The stable initial-namespace inode for ns `<type>` (e.g. `"uts"`), or `None`
+/// if `<type>` is not a recognised namespace. This is the SAME inode the
+/// `<type>:[<inode>]` readlink reports, so an fd opened on the magic link can
+/// fstat to a `st_ino` that matches — two opens of the same ns type then compare
+/// equal (the invariant `ioctl_ns` checks). `*_for_children` map to their base
+/// type's inode.
+pub(crate) fn ns_type_inode(ns_type: &str) -> Option<u64> {
+    PROC_NS_TYPES
+        .iter()
+        .find(|(name, _)| *name == ns_type)
+        .map(|(_, ino)| *ino)
+}
+
+/// The initial-namespace inode for a `/proc/{self,…,<pid>}/ns/<type>` path, if
+/// it is one. Unlike `ns_type_inode` this takes the FULL path; it is the fstat
+/// `st_ino` source for an fd opened on the nsfs magic link, so two opens of the
+/// same ns type report the same inode. No liveness gate: the fd already exists,
+/// so this only needs the type → inode mapping.
+pub(crate) fn ns_link_inode(path: &str) -> Option<u64> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (_pid, leaf) = rest.split_once('/')?;
+    let ns_type = leaf.strip_prefix("ns/")?;
+    ns_type_inode(ns_type)
+}
+
 /// True iff `path` is a `/proc/<pid>/ns` directory of a live process.
 fn proc_ns_is_dir(path: &str) -> bool {
     matches!(proc_pid_subpath(path), Some((_, "ns")))
