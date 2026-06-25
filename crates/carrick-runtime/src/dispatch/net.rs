@@ -1171,6 +1171,10 @@ impl SyscallDispatcher {
             OpenDescription::HostPipe {
                 host_fd,
                 is_read_end: false,
+                // A pipe end received over SCM_RIGHTS: its host inode (already
+                // fstat'd above) is the same kernel-object identity in this
+                // process, so it serves as a stable FASYNC join key.
+                pipe_id: st.st_ino as u64,
                 pty: None,
                 bidirectional: true,
                 write_kind: HostWriteKind::PipeLike,
