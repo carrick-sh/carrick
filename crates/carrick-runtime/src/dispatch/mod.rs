@@ -2379,7 +2379,15 @@ impl SyscallDispatcher {
             96 => {
                 let addr = request.arg(0);
                 registry.set_clear_child_tid(tid, addr);
-                DispatchOutcome::Returned { value: tid as i64 }
+                // set_tid_address(2) returns the caller's TID. In a PID namespace
+                // the MAIN thread's host tid (== host pid) must read as the
+                // process's ns-pid — identical to gettid (178)/getpid, so LTP
+                // set_tid_address01 (which asserts the return == getpid()) holds.
+                // `tid` is the caller's own live tid, so guest_visible_tid is
+                // always Some; worker tids (> main_tid) are per-process and not
+                // ns-translated. Identity when namespaces are off.
+                let visible = guest_visible_tid(tid, registry).map_or(tid as i64, i64::from);
+                DispatchOutcome::Returned { value: visible }
             }
             98 => dispatch_threaded_futex(request, memory, reporter, futex, tid, registry),
             99 => {
