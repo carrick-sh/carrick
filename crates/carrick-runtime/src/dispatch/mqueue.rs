@@ -95,7 +95,12 @@ const OFF_NEXT_SEQ: usize = 16;
 const OFF_NOTIFY_PID: usize = 20;
 const OFF_SIGEV_NOTIFY: usize = 24;
 const OFF_SIGEV_SIGNO: usize = 28;
-const HEADER_SIZE: usize = 32;
+/// Guest euid of the queue's creator, stamped at create time so `mq_unlink` can
+/// enforce the same owner check Linux applies to removing the name from the
+/// (sticky) mqueue filesystem — a non-root, non-owner unlink is EACCES
+/// (mq_unlink01 entry 1, `as_nobody`).
+const OFF_OWNER_UID: usize = 32;
+const HEADER_SIZE: usize = 40;
 
 // Per-slot header byte offsets (relative to the slot start).
 const SLOT_USED: usize = 0;
@@ -392,6 +397,9 @@ impl SyscallDispatcher {
                 wr_u32(&mut hdr, OFF_MAGIC, MQ_MAGIC);
                 wr_u32(&mut hdr, OFF_MAXMSG, maxmsg);
                 wr_u32(&mut hdr, OFF_MSGSIZE, msgsize);
+                // Stamp the creator's guest euid (fork-coherent in the file) so
+                // mq_unlink can enforce the owner check Linux applies.
+                wr_u32(&mut hdr, OFF_OWNER_UID, this.cred_snapshot().euid);
                 let written = unsafe {
                     libc::pwrite(
                         host_fd,
@@ -442,8 +450,14 @@ impl SyscallDispatcher {
         /// mq_unlink(name). Remove the queue's name; the backing file is
         /// unlinked. Existing open descriptors keep working (Linux semantics:
         /// the queue persists until the last close).
+        ///
+        /// Removing the name is a directory operation on the (sticky)
+        /// `/dev/mqueue` filesystem, so Linux requires the caller to own the
+        /// queue (or be root): a non-root euid that did not create the queue
+        /// gets EACCES (mq_unlink01 entry 1, `as_nobody`). carrick stores the
+        /// creator's guest euid in the backing-file header and enforces the same
+        /// check against the calling guest's euid here.
         fn mq_unlink(this, cx, name: GuestPtr) {
-            let _ = this;
             let name = match read_guest_c_string(&*cx.memory, name.0) {
                 Ok(s) => s,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -452,10 +466,24 @@ impl SyscallDispatcher {
                 Ok(p) => p,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let cpath = match std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+            let path_str = path.to_string_lossy().into_owned();
+            let cpath = match std::ffi::CString::new(path_str.as_bytes()) {
                 Ok(c) => c,
                 Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
+
+            // Owner check: a non-root guest may only unlink a queue it created.
+            // Read the stored creator euid from the header; root (euid 0)
+            // bypasses, matching the kernel's CAP_FOWNER / dir-owner allowances.
+            let euid = this.cred_snapshot().euid;
+            if euid != 0 {
+                if let Some(owner) = read_queue_owner(&path_str) {
+                    if owner != euid {
+                        return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                    }
+                }
+            }
+
             match unsafe { libc::unlink(cpath.as_ptr()) }.host_syscall_errno() {
                 Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -495,6 +523,9 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
 
+            // The current guest thread, so the blocking poll can return EINTR
+            // when a deliverable signal arrives (mq_timedsend01 entry 14).
+            let tid = cx.tid();
             loop {
                 match mq_try_send(&mq, prio as u32, &payload) {
                     Ok(true) => return Ok(DispatchOutcome::Returned { value: 0 }),
@@ -505,6 +536,12 @@ impl SyscallDispatcher {
                         }
                         if deadline_expired(deadline) {
                             return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
+                        }
+                        // A signal that should interrupt the block (additive
+                        // semantics: no syscall-supplied sigmask, so the thread's
+                        // persistent mask gates it) wins over the deadline.
+                        if this.has_deliverable_dispatch_pending_for_wait(tid, 0, false) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
@@ -536,6 +573,12 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
 
+            // The current guest thread, captured before the loop (it is `Copy`)
+            // so the later `cx.memory` mutable use in the success arm does not
+            // conflict with the immutable `cx.tid()` borrow. Lets the blocking
+            // poll return EINTR on a deliverable signal (mq_timedreceive01 entry
+            // 14).
+            let tid = cx.tid();
             loop {
                 match mq_try_receive(&mq) {
                     Ok(Some((prio, payload))) => {
@@ -562,6 +605,12 @@ impl SyscallDispatcher {
                         }
                         if deadline_expired(deadline) {
                             return Ok(DispatchOutcome::errno(LINUX_ETIMEDOUT));
+                        }
+                        // A signal that should interrupt the block (additive
+                        // semantics: no syscall-supplied sigmask) wins over the
+                        // deadline.
+                        if this.has_deliverable_dispatch_pending_for_wait(tid, 0, false) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
@@ -673,16 +722,38 @@ impl SyscallDispatcher {
     }
 }
 
+/// Read the creator's guest euid stamped in a queue's backing-file header.
+/// Returns `None` if the queue does not exist, is unreadable, or predates the
+/// owner field (a torn/legacy file): callers treat "owner unknown" as "no extra
+/// restriction" and fall back to the host `unlink` result. The owner is
+/// immutable after create, so a lock-free positional header read is sufficient.
+fn read_queue_owner(path: &str) -> Option<u32> {
+    let cpath = std::ffi::CString::new(path.as_bytes()).ok()?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return None;
+    }
+    let mut hdr = [0u8; HEADER_SIZE];
+    let n = unsafe { libc::pread(fd, hdr.as_mut_ptr() as *mut libc::c_void, HEADER_SIZE, 0) };
+    unsafe { libc::close(fd) };
+    if n != HEADER_SIZE as isize || rd_u32(&hdr, OFF_MAGIC) != MQ_MAGIC {
+        return None;
+    }
+    Some(rd_u32(&hdr, OFF_OWNER_UID))
+}
+
 /// Parse an absolute-timeout `struct timespec` pointer for a timed mq op. NULL
-/// means "block forever" (`None`). A negative-nsec or out-of-range nsec is
-/// EINVAL (Linux validates the timespec). Returns the deadline as a wall-clock
-/// `(secs, nsecs)`, or `None` for "no timeout".
+/// means "block forever" (`None`). Linux validates the WHOLE timespec before
+/// blocking: `tv_sec` must be >= 0 and `tv_nsec` in `[0, 1e9)` — any of a
+/// negative `tv_sec`, a negative `tv_nsec`, or an out-of-range `tv_nsec` is
+/// EINVAL (mq_timedsend01/mq_timedreceive01 entries 10/11/12). Returns the
+/// deadline as a wall-clock `(secs, nsecs)`, or `None` for "no timeout".
 fn read_abs_deadline(memory: &impl GuestMemory, addr: u64) -> Result<Option<(i64, i64)>, i32> {
     if addr == 0 {
         return Ok(None);
     }
     let ts = read_timespec(memory, addr)?;
-    if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return Err(LINUX_EINVAL);
     }
     Ok(Some((ts.tv_sec, ts.tv_nsec)))
