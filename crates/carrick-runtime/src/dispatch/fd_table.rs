@@ -1159,9 +1159,17 @@ impl OpenDescription {
                 host_fd: *host_fd,
                 metadata: metadata.clone(),
             },
-            OpenDescription::SyntheticFile { path, contents, .. } => OpenStatSource::Record(
-                StatRecord::synthetic(path, contents.len(), LINUX_S_IFREG | 0o444),
-            ),
+            OpenDescription::SyntheticFile { path, contents, .. } => {
+                let mut record = StatRecord::synthetic(path, contents.len(), LINUX_S_IFREG | 0o444);
+                // An nsfs fd (opened from /proc/<pid>/ns/<type>) reports the
+                // STABLE initial-namespace inode, not a hash of the path, so two
+                // opens of the same ns type fstat to the same st_ino (the
+                // same-namespace equality invariant ioctl_ns checks).
+                if let Some(ino) = crate::vfs::proc::ns_link_inode(path) {
+                    record.ino = ino;
+                }
+                OpenStatSource::Record(record)
+            }
             OpenDescription::EventFd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[eventfd]", 0, 0o600))
             }

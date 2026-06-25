@@ -490,6 +490,38 @@ fn proc_self_magic_link(path: &str) -> Option<&'static str> {
     }
 }
 
+/// If `path` is a `/proc/{self,thread-self,curproc,this,<pid>}/ns/<type>` magic
+/// symlink of a LIVE process, the namespace `<type>` (e.g. `"uts"`). These are
+/// `nsfs` magic links: open(2) resolves them to an opaque namespace OBJECT, NOT
+/// by following the `<type>:[<inode>]` readlink target as a path. The liveness
+/// gate (`proc_live_pid`) makes a dead or foreign pid return `None` → ENOENT,
+/// mirroring `proc_self_magic_link`. carrick models exactly one initial ns per
+/// type, so every live pid's link names the same object.
+fn proc_ns_link(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid, leaf) = rest.split_once('/')?;
+    crate::vfs::proc::proc_live_pid(pid)?;
+    let ns_type = leaf.strip_prefix("ns/")?;
+    crate::vfs::proc::ns_type_inode(ns_type).map(|_| ns_type)
+}
+
+/// The `CLONE_NEW*` flag identifying namespace `<type>` — the value `NS_GET_NSTYPE`
+/// returns (ioctl_ns(2)). `*_for_children` map to their base type's flag. `None`
+/// for an unrecognised type.
+fn ns_type_clone_flag(ns_type: &str) -> Option<u64> {
+    Some(match ns_type {
+        "mnt" => LINUX_CLONE_NEWNS,
+        "uts" => LINUX_CLONE_NEWUTS,
+        "ipc" => LINUX_CLONE_NEWIPC,
+        "net" => LINUX_CLONE_NEWNET,
+        "pid" | "pid_for_children" => LINUX_CLONE_NEWPID,
+        "user" => LINUX_CLONE_NEWUSER,
+        "cgroup" => LINUX_CLONE_NEWCGROUP,
+        "time" | "time_for_children" => LINUX_CLONE_NEWTIME,
+        _ => return None,
+    })
+}
+
 /// The fd number `N` of a `/proc/<self>/fdinfo/N` path, if it is one. Self only
 /// (the contents are this process's live fd state); a foreign pid falls through.
 fn proc_self_fdinfo_number(path: &str) -> Option<i32> {
@@ -958,6 +990,18 @@ impl SyscallDispatcher {
             });
         }
 
+        // `/proc/<pid>/ns/<type>` is an nsfs magic link: open(2) resolves it to
+        // an opaque namespace OBJECT, NOT by following the `<type>:[<inode>]`
+        // readlink as a path. Intercept BEFORE canonicalize_following — which
+        // would lstat→Symlink, readlink to "uts:[…]", JOIN it as a relative
+        // component, and ENOENT. Install a 0-byte SyntheticFile (an nsfs fd is
+        // not read(2) by the ioctl_ns tests); its recorded `path` is what the
+        // NS_GET_* ioctl handler keys on. O_RDONLY|O_CLOEXEC are covered by
+        // install_proc_synthetic_bytes / OpenDescriptionBase.
+        if proc_ns_link(&path).is_some() {
+            return Ok(self.install_proc_synthetic_bytes(&path, Vec::new(), flags));
+        }
+
         // `/proc/self/exe` (and the thread-self/curproc/this aliases) are
         // symlinks to the running executable that Linux lets you open() directly
         // to get an fd on the backing file. Resolve to the executable path so
@@ -1412,6 +1456,18 @@ impl SyscallDispatcher {
     }
 
     /// Install a read-only synthetic-bytes fd (e.g. a rendered fdinfo file).
+    /// The namespace type (`"uts"`, `"user"`, …) for an fd opened on a
+    /// `/proc/<pid>/ns/<type>` nsfs magic link, or `None` if the fd is not such
+    /// a link. The fd is a 0-byte `SyntheticFile` whose recorded `path` is the
+    /// magic-link path; `proc_ns_link` recognises it. Keys the `NS_GET_*` ioctls.
+    fn fd_ns_link_type(&self, fd: i32) -> Option<String> {
+        let table = self.io.open_files.read();
+        let open_file = table.get(&fd)?;
+        let description = open_file.description.read();
+        let path = description.open_path()?;
+        proc_ns_link(path).map(|t| t.to_owned())
+    }
+
     fn install_proc_synthetic_bytes(
         &self,
         path: &str,
@@ -3871,6 +3927,48 @@ impl SyscallDispatcher {
                             ),
                         }
                     }
+                    _ => {
+                        cx.reporter
+                            .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));
+                        DispatchOutcome::errno(LINUX_ENOTTY)
+                    }
+                });
+            }
+
+            // ── nsfs NS_GET_* ioctls (ioctl_ns(2)) ──────────────────────────────────
+            // When `fd` is an nsfs fd (opened from /proc/<pid>/ns/<type>), the
+            // NS_GET_* ioctls introspect the namespace. carrick models exactly
+            // ONE initial namespace per type, so the answers are synthetic but
+            // stable. Gated on the fd being an ns-link SyntheticFile so a plain
+            // file/tty fd still falls through to the tty/default arms below.
+            if let Some(ns_type) = this.fd_ns_link_type(fd.0) {
+                return Ok(match ioctl_request {
+                    // The CLONE_NEW* flag for this link's type, as the RETURN
+                    // value (not written to *arg).
+                    LINUX_NS_GET_NSTYPE => match ns_type_clone_flag(&ns_type) {
+                        Some(flag) => DispatchOutcome::Returned { value: flag as i64 },
+                        None => DispatchOutcome::errno(LINUX_EINVAL),
+                    },
+                    // The owning user namespace's uid. The initial user ns is
+                    // owned by root → 0. EINVAL on a non-user-ns fd (the kernel
+                    // only answers this for a user namespace).
+                    LINUX_NS_GET_OWNER_UID => {
+                        if ns_type == "user" {
+                            write_packed(&mut *cx.memory, arg, &0u32.to_le_bytes())
+                        } else {
+                            DispatchOutcome::errno(LINUX_EINVAL)
+                        }
+                    }
+                    // carrick models exactly one initial ns per type, so there is
+                    // no accessible parent — EPERM (the linchpin ioctl_ns03 checks).
+                    LINUX_NS_GET_PARENT => DispatchOutcome::errno(LINUX_EPERM),
+                    // Every namespace object is owned by the one initial user
+                    // namespace; return a fresh fd on /proc/self/ns/user.
+                    LINUX_NS_GET_USERNS => this.install_proc_synthetic_bytes(
+                        "/proc/self/ns/user",
+                        Vec::new(),
+                        LINUX_O_RDONLY | LINUX_O_CLOEXEC,
+                    ),
                     _ => {
                         cx.reporter
                             .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));
