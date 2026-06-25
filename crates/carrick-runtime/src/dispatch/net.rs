@@ -999,6 +999,21 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLOUT;
                 }
             }
+            // A POSIX message queue is readable iff it holds at least one
+            // message and writable iff it has room — read the backing file's
+            // header (under its OFD lock) to decide. (mq_overview(7)/poll(2).)
+            OpenDescription::Mqueue {
+                host_fd, max_msg, ..
+            } => {
+                let (readable, writable) =
+                    crate::dispatch::mqueue::poll_readiness(*host_fd, *max_msg);
+                if requested_events & LINUX_POLLIN != 0 && readable {
+                    ready |= LINUX_POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 && writable {
+                    ready |= LINUX_POLLOUT;
+                }
+            }
         }
         ready
     }

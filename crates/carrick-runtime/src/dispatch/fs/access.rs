@@ -234,6 +234,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
+            | OpenDescription::Mqueue { .. }
             | OpenDescription::Netlink { .. } => synthetic_readonly_access(mode),
         }
     }

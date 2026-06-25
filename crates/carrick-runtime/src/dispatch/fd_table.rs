@@ -775,6 +775,32 @@ pub(super) enum OpenDescription {
         /// Bytes queued by a dump request, drained by recvmsg/recvfrom.
         recv_queue: VecDeque<u8>,
     },
+    /// A POSIX message-queue descriptor (`mq_open(3)`). macOS has no POSIX
+    /// mqueue, so carrick emulates it on a real host file under
+    /// `/tmp/carrick-mqueue/` (see [`crate::dispatch::mqueue`]): the `mqd_t` IS a
+    /// real fd (installed with a `host_fd_owner` so `close`/`dup`/`poll` work for
+    /// free), but the message data lives in the backing file, guarded by an OFD
+    /// lock. The mqueue syscalls (`mq_timedsend`/`mq_timedreceive`/…) operate on
+    /// the file by re-opening it through the fd here; ordinary `read`/`write` on
+    /// the fd are EINVAL/EBADF (Linux rejects them on a mqd too).
+    Mqueue {
+        base: OpenDescriptionBase,
+        /// Real host fd to the backing file under `/tmp/carrick-mqueue/`. Owned
+        /// for close by the `OpenFile::host_fd_owner` (installed via
+        /// `with_host_fd`), so this field is only read for poll/readiness. Every
+        /// read-modify-write opens a FRESH fd against `path` and takes an OFD
+        /// lock on it, so a `libc::fork`-shared description's OFD lock can never
+        /// be self-re-entrant and the serialization is true across processes.
+        host_fd: i32,
+        /// Absolute host path of the backing file (under `/tmp/carrick-mqueue/`),
+        /// re-opened per operation for the OFD-locked RMW.
+        path: String,
+        /// `mq_msgsize` the queue was created with (a send EMSGSIZEs above it; a
+        /// receive EMSGSIZEs below it).
+        msg_size: usize,
+        /// `mq_maxmsg` the queue was created with (capacity of the ring).
+        max_msg: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -866,6 +892,7 @@ impl OpenDescription {
             OpenDescription::Pidfd { .. } => "anon_inode:[pidfd]".to_owned(),
             OpenDescription::Inotify { .. } => "anon_inode:[inotify]".to_owned(),
             OpenDescription::SignalFd { .. } => "anon_inode:[signalfd]".to_owned(),
+            OpenDescription::Mqueue { .. } => "anon_inode:[mqueue]".to_owned(),
             // A pty slave readlinks to its /dev/pts/N node (ttyname(3)); the
             // master has no /dev path, so report a stable anon label.
             OpenDescription::HostPipe {
@@ -1064,7 +1091,8 @@ impl OpenDescription {
             | OpenDescription::HostSocket { base, .. }
             | OpenDescription::Inotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
-            | OpenDescription::Netlink { base, .. } => base,
+            | OpenDescription::Netlink { base, .. }
+            | OpenDescription::Mqueue { base, .. } => base,
         }
     }
 
@@ -1084,7 +1112,8 @@ impl OpenDescription {
             | OpenDescription::HostSocket { base, .. }
             | OpenDescription::Inotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
-            | OpenDescription::Netlink { base, .. } => base,
+            | OpenDescription::Netlink { base, .. }
+            | OpenDescription::Mqueue { base, .. } => base,
         }
     }
 
@@ -1187,6 +1216,9 @@ impl OpenDescription {
             }
             OpenDescription::SignalFd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[signalfd]", 0, 0o600))
+            }
+            OpenDescription::Mqueue { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[mqueue]", 0, 0o600))
             }
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic(
