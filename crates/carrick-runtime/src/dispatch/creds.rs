@@ -395,13 +395,17 @@ impl SyscallDispatcher {
                 let _ = memory.write_bytes(header_address.0, &pref.to_le_bytes());
                 return Ok(LINUX_EINVAL.into());
             }
-            // pid < 0 is EINVAL (not ESRCH); a positive pid that isn't this
-            // process is ESRCH. carrick is a single guest process, so only
-            // 0 / our pid / the bootstrap alias exist (LTP capget02).
+            // pid < 0 is EINVAL (not ESRCH). A positive pid that isn't the caller
+            // is ESRCH. The guest sees NS-pids — getpid() returns self_ns_pid()
+            // (e.g. 1), NOT carrick's host pid — so a process querying its OWN caps
+            // via capget(getpid()) (exactly what the LTP tst_capget framework
+            // helper does) must be matched against the ns-pid, not
+            // std::process::id(). pid 0 means "the calling process".
             if header.pid < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             if header.pid > 0
+                && header.pid != crate::namespace::pid::self_ns_pid() as i32
                 && header.pid != std::process::id() as i32
                 && header.pid != LINUX_BOOTSTRAP_PID as i32
             {
