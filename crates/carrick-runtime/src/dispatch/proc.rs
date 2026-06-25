@@ -1013,8 +1013,19 @@ impl SyscallDispatcher {
         fn set_tid_address(this, cx, addr: GuestPtr) {
             if let Some(t) = cx.thread {
                 t.registry.set_clear_child_tid(t.tid, addr.0);
+                // set_tid_address(2) returns the caller's TID. The MAIN thread's
+                // tid equals the process's host pid, so in a PID namespace it
+                // must read as the process's ns-pid (a thread whose tid == its
+                // tgid) — mirror gettid's translation. Worker tids are
+                // per-process and not ns-translated. Identity when ns are off.
+                let tid = t.tid as u32;
+                let ns_tid = if tid == std::process::id() {
+                    crate::namespace::pid::host_to_ns_or_self(tid)
+                } else {
+                    tid
+                };
                 return Ok(DispatchOutcome::Returned {
-                    value: t.tid as i64,
+                    value: i64::from(ns_tid),
                 });
             }
             Ok(this.getpid())

@@ -2314,6 +2314,10 @@ pub const LINUX_O_NOFOLLOW: u64 = 0o100000;
 /// `__O_TMPFILE | O_DIRECTORY`). The `pathname` names the parent directory and
 /// the kernel returns an unnamed regular file in it.
 pub const LINUX_O_TMPFILE: u64 = 0o20000000;
+/// `O_PATH` (asm-generic `010000000`): obtain a descriptor that names a location
+/// in the filesystem tree without opening the file. read/write/fchmod/fchown/
+/// ioctl/fgetxattr on such a descriptor all fail with EBADF (LTP open13).
+pub const LINUX_O_PATH: u64 = 0o10000000;
 pub const LINUX_PROT_READ: u64 = 0x1;
 pub const LINUX_PROT_WRITE: u64 = 0x2;
 pub const LINUX_PROT_EXEC: u64 = 0x4;
