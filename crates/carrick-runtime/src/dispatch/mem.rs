@@ -675,6 +675,25 @@ impl SyscallDispatcher {
                             };
                             let _ = n;
                         }
+                        // `/dev/zero` (and other zero-fill char devices) open as a
+                        // HostPipe — carrick routes all `/dev/*` chardevs through the
+                        // pipe variant. Linux maps `/dev/zero` as zero-fill memory, so
+                        // MAP_PRIVATE of it must SUCCEED with a zeroed region, not the
+                        // spurious EBADF this catch-all gave (LTP mmap10 maps
+                        // `/dev/zero` MAP_PRIVATE and asserts success). `bytes` is
+                        // already zeroed; only fail a genuine pipe/FIFO (not a char
+                        // device), which Linux rejects with ENODEV. Narrow probe via
+                        // fstat S_IFCHR so a real pipe still fails.
+                        OpenDescription::HostPipe { host_fd, .. } => {
+                            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                            let is_chardev = unsafe { libc::fstat(*host_fd, &mut st) } == 0
+                                && (st.st_mode as u32 & libc::S_IFMT as u32)
+                                    == libc::S_IFCHR as u32;
+                            if !is_chardev {
+                                return Ok(linux_errno::ENODEV.into());
+                            }
+                            // chardev zero-fill: keep `bytes` zeroed (no read).
+                        }
                         _ => {
                             return Ok(LINUX_EBADF.into());
                         }
@@ -1172,6 +1191,25 @@ impl SyscallDispatcher {
                 }
                 if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
                     return Ok(LINUX_EINVAL.into());
+                }
+                // Linux mprotect returns ENOMEM when the range covers unmapped VA
+                // (a hole in the address space). carrick previously SUCCEEDED on any
+                // page-aligned address regardless of whether it was mapped (LTP
+                // mprotect01's "call succeeded unexpectedly" — it mprotects an
+                // unmapped page at addr=NULL and asserts ENOMEM). Probe the start
+                // page with the BACKING-ONLY read (`read_bytes_raw`), NOT the
+                // PROT_NONE-gated `read_bytes`: a legitimately-mapped region the guest
+                // already mprotect'd to PROT_NONE (glibc/Go/jemalloc guard pages —
+                // the dominant re-mprotect pattern) is no_access, so the gated read
+                // would FALSELY report it unmapped and ENOMEM the common case.
+                // `read_bytes_raw` faults only on a genuine backing hole (an address
+                // in no mapped region, e.g. NULL), exactly Linux's "unmapped VA"
+                // condition. It is strictly more permissive than Linux (which requires
+                // the WHOLE range mapped — we only probe the start page), so it never
+                // rejects a valid mapping. Probe BEFORE mutating no_access so we don't
+                // stamp tracking onto a foreign/unmapped range.
+                if cx.memory.read_bytes_raw(address.0, 1).is_err() {
+                    return Ok(LINUX_ENOMEM.into());
                 }
                 if let Ok(len) = usize::try_from(length) {
                     let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
