@@ -112,6 +112,10 @@ pub use carrick_signal_core::xsig::{
     mark_xsig_dirty, xsig_drain_for_self, xsig_enqueue, xsig_has_pending,
     xsig_has_unblocked_for_self, xsig_init,
 };
+// The fork-coherent FASYNC (signal-driven I/O) registry shares the xsignal
+// ring's pre-fork MAP_SHARED lifetime; init it alongside the ring so every
+// guest process inherits the one table.
+pub use carrick_signal_core::fasync::fasync_init;
 
 // The `(linux, host)` signal-number translation table that DIFFERS between Linux
 // and the BSDs (SIGUSR1/SIGCHLD/SIGSTOP/SIGURG/…) is the ONE BSD-family table in
@@ -1052,6 +1056,10 @@ pub fn install_default_handlers() {
     // SIGINFO disposition are inherited across fork (this runs once per process
     // via the INSTALLED guard; the forked child keeps the inherited copies).
     xsig_init();
+    // The FASYNC registry is MAP_SHARED with the same pre-fork lifetime as the
+    // xsignal ring; map it here so a writer process can look up a reader's
+    // signal-driven-I/O arming.
+    fasync_init();
     // SAFETY: zero-initialised sigaction; we fill sa_sigaction before libc.
     unsafe {
         let mut action: libc::sigaction = core::mem::zeroed();

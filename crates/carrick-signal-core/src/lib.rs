@@ -26,6 +26,7 @@
 
 pub mod backend;
 pub mod child_watch;
+pub mod fasync;
 pub mod host_disposition;
 pub mod host_glue;
 pub mod xsig;
