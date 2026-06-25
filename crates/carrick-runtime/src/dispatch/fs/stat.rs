@@ -156,13 +156,31 @@ impl SyscallDispatcher {
                     let mut real = super::real_stat_from_libc(&st);
                     // The real file's mode was forced owner-accessible; the
                     // guest-visible mode + owner live in xattrs on the same fd.
-                    if let Some(m) = crate::fs_backend::fget_mode_xattr(host_fd) {
-                        real.mode = m;
-                    }
+                    // For a mknod(2) device-node MARKER the mode xattr carries the
+                    // FULL guest mode (S_IFCHR/S_IFBLK type bits); RealStat.mode is
+                    // perms-only, so keep just the perms here and recover the
+                    // device TYPE + st_rdev below via apply_device_node.
+                    let device = match crate::fs_backend::fget_mode_xattr(host_fd) {
+                        Some(m) => {
+                            real.mode = m & 0o7777;
+                            let type_bits = m & LINUX_S_IFMT;
+                            if type_bits == LINUX_S_IFCHR || type_bits == LINUX_S_IFBLK {
+                                Some((
+                                    type_bits,
+                                    crate::fs_backend::fget_rdev_xattr(host_fd).unwrap_or(0),
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
                     let (uid, gid) = crate::fs_backend::fget_owner_xattr(host_fd);
                     real.uid = uid.unwrap_or(0);
                     real.gid = gid.unwrap_or(0);
-                    return Ok(StatRecord::from_real(&path, &real));
+                    let mut record = StatRecord::from_real(&path, &real);
+                    record.apply_device_node(device);
+                    return Ok(record);
                 }
                 Ok(StatRecord::from_metadata(&metadata))
             }
