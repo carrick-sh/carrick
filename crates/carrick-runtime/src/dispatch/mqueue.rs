@@ -11,7 +11,7 @@
 //!
 //! # File layout (carrick-private, little-endian — NOT a Linux ABI)
 //!
-//! A fixed [`Header`] (`magic`, `mq_maxmsg`, `mq_msgsize`, `curmsgs`, an
+//! A fixed header (`magic`, `mq_maxmsg`, `mq_msgsize`, `curmsgs`, an
 //! insertion sequence counter, and a one-shot `mq_notify` registration) followed
 //! by a fixed ring of `mq_maxmsg` slots. Each slot is a [`SLOT_HEADER`]
 //! (`used`, `prio`, `len`, `seq`) followed by exactly `mq_msgsize` payload bytes.
@@ -32,7 +32,7 @@
 //! self-re-entrant (no serialization between parent and child), so each
 //! operation opens its own fd. macOS has OFD locks natively
 //! (`F_OFD_SETLK`/`SETLKW`/`GETLK` = 90/91/92), the same primitive
-//! [`super::fs::forward_record_lock`] forwards for guest `fcntl`.
+//! `forward_record_lock` (in `super::fs`) forwards for guest `fcntl`.
 //!
 //! # What is and isn't implemented
 //!

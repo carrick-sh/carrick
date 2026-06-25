@@ -137,7 +137,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 293
         | 424
         | 434
-        | 186..=197 => SyscallHandler::Process,
+        | 180..=197 => SyscallHandler::Process,
         93 | 94 | 220 | 221 | 260 | 435 => SyscallHandler::Lifecycle,
         74 | 129..=139 => SyscallHandler::Signal,
         96 | 98 | 99 | 124 | 178 => SyscallHandler::ThreadLocal,
