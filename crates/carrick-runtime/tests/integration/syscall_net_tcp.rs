@@ -69,20 +69,20 @@ fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
         "signalfd4 with sizemask != 8 should return EINVAL"
     );
 
-    // vmsplice (75) and tee (77) are not yet implemented; carrick returns ENOSYS.
-    for number in [75_u64, 77] {
-        assert_eq!(
-            dispatcher
-                .dispatch(
-                    SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap(),
-            DispatchOutcome::Errno { errno: 38 },
-            "syscall {number} should return ENOSYS"
-        );
-    }
+    // tee (77) is not yet implemented; carrick returns ENOSYS. (vmsplice, nr 75,
+    // is now implemented — see the vmsplice handler + its conformance probe — so
+    // it no longer belongs in this bootstrap-ENOSYS check.)
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(77, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 38 },
+        "tee should return ENOSYS"
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
