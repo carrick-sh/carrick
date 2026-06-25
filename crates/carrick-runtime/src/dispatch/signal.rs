@@ -1166,7 +1166,14 @@ impl SyscallDispatcher {
             if let Some(routed) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
             }
-            if signal_is_self_target(tid) {
+            // raise()/pthread_kill name the caller as tkill(gettid()). Under a
+            // PID namespace gettid() reports the caller's ns-pid (the main thread
+            // reads as the process ns-pid), so a self-target arrives as that
+            // ns-pid — recognize it with the ns-aware `names_self_pid`, not
+            // `signal_is_self_target` (which only knows the host/bootstrap pid and
+            // would send the ns-pid to a nonexistent host tid → ESRCH). Mirrors
+            // tgkill below (LTP tkill01).
+            if names_self_pid(tid) {
                 let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
                 return Ok(this.raise_self(self_tid, signum));
             }
