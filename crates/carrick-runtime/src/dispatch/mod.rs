@@ -646,6 +646,7 @@ mod proc;
 mod proctitle;
 #[macro_use]
 mod signal;
+mod mqueue;
 mod sysv;
 #[macro_use]
 mod time;
@@ -1679,6 +1680,7 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
         .or_else(|| time::dispatch_time(number))
         .or_else(|| creds::dispatch_creds(number))
         .or_else(|| sysv::dispatch_sysv(number))
+        .or_else(|| mqueue::dispatch_mqueue(number))
 }
 
 impl SyscallDispatcher {

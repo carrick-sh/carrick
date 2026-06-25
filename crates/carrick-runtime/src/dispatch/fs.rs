@@ -3051,6 +3051,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
             })
 
@@ -4817,6 +4818,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(LINUX_ESPIPE.into());
                 }
@@ -4861,6 +4863,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. } => {}
             }
             Ok(DispatchOutcome::Returned { value: next })
@@ -5019,6 +5022,7 @@ impl SyscallDispatcher {
                 }
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::PipeWriter { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -5185,6 +5189,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -5255,6 +5260,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. } => {
                     // Positional read on a non-seekable fd (pipe/socket/anon) is
                     // ESPIPE on Linux; a directory is EISDIR (above). pread02.
@@ -5362,6 +5368,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. } => {
                     // Positional read on a non-seekable fd → ESPIPE; directory →
                     // EISDIR (above). preadv02.
@@ -5435,6 +5442,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -5525,6 +5533,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -6312,6 +6321,7 @@ impl SyscallDispatcher {
                     | OpenDescription::Pidfd { .. }
                     | OpenDescription::Inotify { .. }
                     | OpenDescription::SignalFd { .. }
+                    | OpenDescription::Mqueue { .. }
                     | OpenDescription::Netlink { .. }
             );
             if is_special {

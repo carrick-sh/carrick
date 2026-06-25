@@ -877,6 +877,56 @@ pub struct LinuxTimerfdExpirations {
     pub expirations: u64,
 }
 
+/// Linux `struct mq_attr` (mq_getattr(3)/mq_setattr(3)). On a 64-bit kernel it
+/// is `long mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs` followed by `long
+/// __reserved[4]` — eight `long`s total = 64 bytes. carrick fills the four named
+/// fields and zeroes the reserved tail.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxMqAttr {
+    /// O_NONBLOCK iff the queue description is non-blocking (the only bit Linux
+    /// reports/accepts here). mq_open's `attr` argument ignores this field.
+    pub mq_flags: i64,
+    /// Max number of messages the queue can hold.
+    pub mq_maxmsg: i64,
+    /// Max byte size of a single message.
+    pub mq_msgsize: i64,
+    /// Messages currently queued.
+    pub mq_curmsgs: i64,
+    /// Kernel-reserved padding (`long __reserved[4]`), always zero.
+    pub __reserved: [i64; 4],
+}
+
+/// Linux aarch64 `struct sigevent` as the kernel reads it for `mq_notify(3)`.
+/// The kernel only consults the first three members (`sigev_value`,
+/// `sigev_signo`, `sigev_notify`); the trailing `_sigev_un` union is padding for
+/// the cases the kernel surface needs (SIGEV_SIGNAL / SIGEV_NONE), so the whole
+/// struct is modelled as a 64-byte blob. `sigev_value` is the `union sigval`
+/// (a pointer-or-int, 8 bytes on aarch64). The named members sit at fixed
+/// offsets: value@0, signo@8, notify@12.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxSigevent {
+    /// `union sigval` — the value delivered with a SIGEV_SIGNAL notification.
+    pub sigev_value: u64,
+    /// Signal number to deliver for SIGEV_SIGNAL.
+    pub sigev_signo: i32,
+    /// SIGEV_SIGNAL(0) / SIGEV_NONE(1) / SIGEV_THREAD(2).
+    pub sigev_notify: i32,
+    /// `_sigev_un` union tail (sigev_notify_function/_attribute/_tid + pad). The
+    /// kernel surface never reads these, so they are opaque padding here.
+    pub _sigev_un: [u8; 48],
+}
+
+/// `sigev_notify` values (sigevent(7)).
+pub const LINUX_SIGEV_SIGNAL: i32 = 0;
+pub const LINUX_SIGEV_NONE: i32 = 1;
+pub const LINUX_SIGEV_THREAD: i32 = 2;
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1891,6 +1941,25 @@ kernel_abi!(
     19,
     "dirent64 fixed header is d_ino+d_off+d_reclen+d_type"
 );
+kernel_abi!(
+    LinuxMqAttr,
+    64,
+    "mq_attr is eight long (4 named + 4 reserved) on a 64-bit kernel"
+);
+const _: () = assert!(
+    core::mem::size_of::<LinuxMqAttr>() == 64,
+    "LinuxMqAttr must be exactly 64 bytes (8 * i64)"
+);
+kernel_abi!(
+    LinuxSigevent,
+    64,
+    "sigevent is value:u64 + signo:i32 + notify:i32 + 48-byte _sigev_un tail"
+);
+const _: () = assert!(
+    core::mem::size_of::<LinuxSigevent>() == 64,
+    "LinuxSigevent must be exactly 64 bytes"
+);
+assert_layout!(LinuxSigevent, sigev_value @ 0, sigev_signo @ 8, sigev_notify @ 12);
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
 pub const LINUX_EPERM: i32 = 1;

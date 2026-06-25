@@ -167,6 +167,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
+            | OpenDescription::Mqueue { .. }
             | OpenDescription::Netlink { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
@@ -221,6 +222,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
+            | OpenDescription::Mqueue { .. }
             | OpenDescription::Netlink { .. } => return Err(LINUX_EINVAL),
         };
         Ok(bytes)
