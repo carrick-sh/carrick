@@ -17,7 +17,29 @@ fn main() {
 
     char_device();
     block_device();
+    socket_node();
     eexist();
+}
+
+/// mknod a socket node (S_IFSOCK, dev=0) and stat it back: type must be S_IFSOCK,
+/// perms the umask-free 0o600. (A filesystem socket inode, distinct from a bound
+/// AF_UNIX socket.)
+fn socket_node() {
+    let path = "/tmp/sdev";
+    let rc = mknod(path, libc::S_IFSOCK | 0o600, 0);
+    if rc != 0 {
+        println!("sock_mknod=ERR:{}", errno());
+        return;
+    }
+    let Some(st) = stat(path) else {
+        println!("sock_stat=ERR:{}", errno());
+        return;
+    };
+    println!(
+        "sock_is_sock={}",
+        (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+    );
+    println!("sock_perms={:o}", st.st_mode & 0o777);
 }
 
 /// mknod a character device with makedev(1, 3) (the Linux /dev/null pairing) and

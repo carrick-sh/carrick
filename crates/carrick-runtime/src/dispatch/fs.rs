@@ -7034,8 +7034,28 @@ impl SyscallDispatcher {
                 }
                 // AF_UNIX socket node via mknod is bind(2) territory (out of
                 // scope here); report EPERM as before.
+                // mknod(S_IFSOCK) creates a socket INODE (a filesystem node,
+                // distinct from a bound AF_UNIX socket). Reuse the socket-node
+                // marker the bind path uses — stat then reports it as S_IFSOCK
+                // via RootFsEntryKind::Socket, so no device-override is needed.
+                // (A later bind(2) to this path is EADDRINUSE, matching Linux.)
                 t if t == LINUX_S_IFSOCK => {
-                    return Ok(LINUX_EPERM.into());
+                    let umask = this.cred_snapshot().umask & 0o777;
+                    let sock_mode = (mode & 0o7777) & !umask;
+                    return Ok(
+                        match this
+                            .fs
+                            .rootfs_vfs
+                            .overlay
+                            .create_socket(&materialize_path, sock_mode)
+                        {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(crate::fs_backend::BackendError::Unsupported) => {
+                                LINUX_EPERM.into()
+                            }
+                            Err(_) => LINUX_EROFS.into(),
+                        },
+                    );
                 }
                 // Regular file (0 or S_IFREG): materialised below.
                 0 => {}
