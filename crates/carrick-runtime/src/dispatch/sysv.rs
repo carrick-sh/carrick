@@ -163,6 +163,25 @@ pub(super) struct LinuxShmidDs {
 const _: () = assert!(core::mem::size_of::<LinuxShmidDs>() == 112);
 const _: () = assert!(core::mem::size_of::<LinuxIpcPerm>() == 48);
 
+/// Linux aarch64 `struct semid64_ds` (UAPI, `include/uapi/asm-generic/sembuf.h`
+/// — 64-bit time_t form). 88 bytes: ipc64_perm(48), sem_otime@48, sem_ctime@56,
+/// sem_nsems@64, then two reserved u64. (On a 64-bit-time_t arch the kernel's
+/// legacy otime/ctime-high split words read as zero, so the reserved tail is 0.)
+/// LTP semctl01 reads sem_perm.mode, the owner ids, sem_nsems and sem_otime/
+/// sem_ctime.
+#[repr(C, packed)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+pub(super) struct LinuxSemidDs {
+    pub sem_perm: LinuxIpcPerm, // 48
+    pub sem_otime: u64,         // 8 — last semop time
+    pub sem_ctime: u64,         // 8 — creation/last-IPC_SET time
+    pub sem_nsems: u64,         // 8 — number of semaphores in the set
+    pub __unused3: u64,         // 8
+    pub __unused4: u64,         // 8
+}
+
+const _: () = assert!(core::mem::size_of::<LinuxSemidDs>() == 88);
+
 /// Host directory for SysV shmem backing files. World-writable + sticky so
 /// any carrick guest process (including a forked child running as the same
 /// uid) can attach to a segment a peer created.
@@ -370,11 +389,17 @@ pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), i3
 }
 
 /// Fill a Linux `shmid_ds` (the 112-byte aarch64 UAPI form) from the
-/// segment's metadata. LTP shmctl01 reads every populated field.
-pub(super) fn shmid_ds_bytes(segment: &ShmSegment) -> [u8; 112] {
+/// segment's metadata. LTP shmctl01 reads every populated field, including the
+/// owner/creator ids in `shm_perm` — those come from the GUEST creds (carrick's
+/// host process is not the guest uid), not the host stat.
+pub(super) fn shmid_ds_bytes(segment: &ShmSegment, creds: &super::creds::CredState) -> [u8; 112] {
     let pid = std::process::id() as i32;
     let ds = LinuxShmidDs {
         shm_perm: LinuxIpcPerm {
+            uid: creds.euid,
+            gid: creds.egid,
+            cuid: creds.euid,
+            cgid: creds.egid,
             mode: segment.mode,
             ..Default::default()
         },
@@ -514,7 +539,7 @@ impl SyscallDispatcher {
                     if buf == 0 {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
-                    let bytes = shmid_ds_bytes(&segment);
+                    let bytes = shmid_ds_bytes(&segment, &this.cred_snapshot());
                     let memory = &mut *cx.memory;
                     if memory.write_bytes(buf, &bytes).is_err() {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -542,7 +567,7 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     };
                     if buf != 0 {
-                        let bytes = shmid_ds_bytes(&segment);
+                        let bytes = shmid_ds_bytes(&segment, &this.cred_snapshot());
                         let memory = &mut *cx.memory;
                         if memory.write_bytes(buf, &bytes).is_err() {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -917,8 +942,11 @@ impl SyscallDispatcher {
         /// interpreted per command (int for SETVAL, u16[] for GET/SETALL,
         /// semid_ds* for IPC_STAT/SET).
         fn semctl(this, cx, semid: u64, semnum: u64, cmd: u64, arg: u64) {
-            let _ = this;
-            sysv_semctl(cx, semid as i32, semnum as i32, cmd, arg)
+            // IPC_STAT needs the GUEST creds for the owner ids (carrick's host
+            // process is not the guest uid); snapshot them here where `this` is
+            // in scope and hand them to the free fn.
+            let creds = this.cred_snapshot();
+            sysv_semctl(cx, semid as i32, semnum as i32, cmd, arg, &creds)
         }
     }
 }
@@ -1045,6 +1073,7 @@ fn sysv_semctl<M: GuestMemory>(
     semnum: i32,
     cmd: u64,
     arg: u64,
+    creds: &super::creds::CredState,
 ) -> Result<DispatchOutcome, DispatchError> {
     let Some(host_cmd) = linux_semctl_cmd_to_host(cmd) else {
         // SEM_STAT/SEM_INFO and friends: not supported on macOS.
@@ -1113,28 +1142,77 @@ fn sysv_semctl<M: GuestMemory>(
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
         }
-        LINUX_IPC_STAT | LINUX_IPC_SET => {
-            // semid_ds translation. LTP's sem tests mostly read sem_nsems +
-            // sem_perm; fill those from the host. Full IPC_SET (writing perms)
-            // is a best-effort no-op success for now.
-            if cmd == LINUX_IPC_SET {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            let nsems = match host_sem_nsems(semid) {
-                Ok(n) => n,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
-            // Linux semid_ds: ipc_perm(48) then sem_otime(8) sem_ctime(8)
-            // sem_nsems(8)... Write a zeroed buffer with sem_nsems filled at
-            // the Linux offset (ipc_perm 48 + otime 8 + ctime 8 = 64).
-            if arg != 0 {
-                let mut buf = [0u8; 104];
-                buf[64..72].copy_from_slice(&(nsems as u64).to_le_bytes());
-                if cx.memory.write_bytes(arg, &buf).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-            }
+        LINUX_IPC_SET => {
+            // Full IPC_SET (writing perms) is a best-effort no-op success for now.
             Ok(DispatchOutcome::Returned { value: 0 })
+        }
+        LINUX_IPC_STAT => {
+            // semid_ds translation into the 88-byte aarch64 semid64_ds form.
+            // macOS is the reference lane: read the host `semid_ds` by NAME and
+            // fill the Linux ipc64_perm (mode/key/seq + sem_otime/sem_ctime) from
+            // the host's truth, with the owner/creator ids coming from the GUEST
+            // creds (carrick's host process is not the guest uid). The bring-up
+            // lanes (linux/freebsd/netbsd) keep the older zeroed-buffer + nsems
+            // behavior — the macOS lane is what the conformance gate measures.
+            #[cfg(target_os = "macos")]
+            {
+                // macOS `libc::semid_ds` exposes `sem_perm` (an `ipc_perm`:
+                // uid/gid/cuid/cgid/mode/_seq/_key), `sem_otime` and `sem_ctime`
+                // by name. This is the same host call `host_sem_nsems` makes,
+                // just keeping the whole struct rather than only `sem_nsems`.
+                let mut ds: libc::semid_ds = unsafe { core::mem::zeroed() };
+                let rc = unsafe {
+                    libc::semctl(semid, 0, libc::IPC_STAT, &mut ds as *mut libc::semid_ds)
+                };
+                if let Err(errno) = rc.host_syscall_errno() {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+                if arg != 0 {
+                    let out = LinuxSemidDs {
+                        sem_perm: LinuxIpcPerm {
+                            key: ds.sem_perm._key as i32,
+                            uid: creds.euid,
+                            gid: creds.egid,
+                            cuid: creds.euid,
+                            cgid: creds.egid,
+                            mode: ds.sem_perm.mode as u32,
+                            seq: ds.sem_perm._seq as u16,
+                            ..Default::default()
+                        },
+                        sem_otime: ds.sem_otime as u64,
+                        sem_ctime: ds.sem_ctime as u64,
+                        sem_nsems: ds.sem_nsems as u64,
+                        __unused3: 0,
+                        __unused4: 0,
+                    };
+                    if cx.memory.write_bytes(arg, out.as_bytes()).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Bring-up lanes: fill only sem_nsems (the field LTP's GETALL/
+                // SETALL path needs) at the Linux offset, zero elsewhere. A
+                // host-truth by-name fill is a follow-up once a conformance box
+                // for the lane can bless the layout.
+                let _ = creds;
+                let nsems = match host_sem_nsems(semid) {
+                    Ok(n) => n,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                if arg != 0 {
+                    let mut buf = [0u8; 88];
+                    // semid64_ds: ipc64_perm(48) + sem_otime(8) + sem_ctime(8),
+                    // so sem_nsems sits at offset 64.
+                    buf[64..72].copy_from_slice(&(nsems as u64).to_le_bytes());
+                    if cx.memory.write_bytes(arg, &buf).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
         }
         _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
     }
