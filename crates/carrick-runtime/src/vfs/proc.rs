@@ -176,6 +176,48 @@ pub(crate) fn write_userns_map(path: &str, data: &[u8]) -> Result<usize, i64> {
     .map(|()| data.len())
 }
 
+/// Per-process `oom_score_adj` (the modern OOM-killer bias knob). A
+/// process-global atomic IS the per-process store: each guest is a real host
+/// process, so fork-COW gives exactly Linux's semantics — inherited at fork,
+/// then independent per-process, shared by the process's threads. `tst_test`'s
+/// OOM-protection setup (`tst_memutils.c`) writes -1000 then reads it back
+/// expecting -1000; without persistence every test that enables OOM protection
+/// TBROKs in setup, hiding all its real assertions.
+static OOM_SCORE_ADJ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+const OOM_SCORE_ADJ_MIN: i32 = -1000;
+const OOM_SCORE_ADJ_MAX: i32 = 1000;
+
+/// Apply a write(2) to a writable `/proc/<self>/...` tunable. Normalizes the
+/// `/proc/<self-pid>/` form to `/proc/self/` (the framework writes the explicit
+/// pid, e.g. `/proc/1/oom_score_adj`), then dispatches: oom_score_adj persists
+/// the value; the rest carrick has no live state for, so accept-and-ignore.
+pub(crate) fn write_tunable(path: &str, data: &[u8]) -> Result<usize, i64> {
+    match normalize_self_pid_path(path).as_ref() {
+        "/proc/self/oom_score_adj" => write_oom_score_adj(data),
+        _ => Ok(data.len()),
+    }
+}
+
+/// Store a write to `/proc/self/oom_score_adj`. Returns EINVAL (negative errno)
+/// for an unparseable or out-of-range value, mirroring Linux.
+pub(crate) fn write_oom_score_adj(data: &[u8]) -> Result<usize, i64> {
+    let value: i32 = std::str::from_utf8(data)
+        .map_err(|_| crate::namespace::user::EINVAL)?
+        .trim()
+        .parse()
+        .map_err(|_| crate::namespace::user::EINVAL)?;
+    if !(OOM_SCORE_ADJ_MIN..=OOM_SCORE_ADJ_MAX).contains(&value) {
+        return Err(crate::namespace::user::EINVAL);
+    }
+    OOM_SCORE_ADJ.store(value, std::sync::atomic::Ordering::Relaxed);
+    Ok(data.len())
+}
+
+/// The current `/proc/self/oom_score_adj` value (default 0).
+pub(crate) fn oom_score_adj() -> i32 {
+    OOM_SCORE_ADJ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The instant carrick's guest "booted" (first time anything asks). Drives
 /// `/proc/uptime` and `/proc/stat`'s `btime` so they report seconds-since-boot
 /// rather than seconds-since-the-UNIX-epoch (the old bug made uptime ~56 years
@@ -462,10 +504,11 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/mountinfo" => Some(synthetic_proc_self_mountinfo().to_vec()),
         "/proc/self/mounts" => Some(synthetic_proc_mounts().to_vec()),
         "/proc/self/mountstats" => Some(Vec::new()),
-        // oom_score is volatile (0 is acceptable); the two adj knobs default 0.
-        "/proc/self/oom_score" | "/proc/self/oom_score_adj" | "/proc/self/oom_adj" => {
-            Some(b"0\n".to_vec())
-        }
+        // oom_score is the volatile computed score (0 is acceptable); oom_adj is
+        // the legacy knob (0). oom_score_adj persists writes (per-process,
+        // fork-inherited) so tst_test's OOM-protection read-back sees its -1000.
+        "/proc/self/oom_score" | "/proc/self/oom_adj" => Some(b"0\n".to_vec()),
+        "/proc/self/oom_score_adj" => Some(format!("{}\n", oom_score_adj()).into_bytes()),
         // 8-digit hex personality flags (default ADDR/Linux = 0), no newline.
         "/proc/self/personality" => Some(b"00000000".to_vec()),
         "/proc/self/schedstat" => Some(b"0 0 1\n".to_vec()),
