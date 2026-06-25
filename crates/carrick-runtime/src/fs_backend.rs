@@ -292,6 +292,17 @@ pub trait FsBackend: Send + Sync {
     /// backend first.
     fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError>;
 
+    /// Atomically EXCHANGE the two entries `a` and `b` (`renameat2(2)`
+    /// `RENAME_EXCHANGE`): each path ends up referring to what the other named,
+    /// with all metadata (mode/owner/inode/contents) following the entry, not
+    /// the name. BOTH paths must already exist in the backend (the dispatcher
+    /// has verified existence and materialised any rootfs-only source first);
+    /// `Ok(false)` means a path was not backend-owned and the caller must
+    /// materialise it before retrying. Default: unsupported.
+    fn exchange_overlay_entries(&self, _a: &str, _b: &str) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
     /// Open a REAL host file descriptor for `path`. For a disk-backed
     /// backend this is a normal kernel file: shared offset, and —
     /// crucially — it survives `libc::fork(2)`, so a forked child's
@@ -996,12 +1007,32 @@ impl FsBackend for MemoryBackend {
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
-        // Only socket nodes track a mode in-memory (regular files/dirs report a
-        // fixed mode); chmod on those stays tmpfs-no-op success (default trait).
+        let mode = mode & 0o7777;
+        // Socket nodes track a mode directly.
         if let Some(slot) = inner.sockets.get_mut(&normalized) {
-            *slot = mode & 0o7777;
+            *slot = mode;
             return Ok(());
         }
+        // A regular file: upgrade its in-memory representation so the mode
+        // STICKS (a bare `Dense` has no mode field and reports 0o644). This is
+        // what lets a materialized O_TMPFILE (linkat from /proc/self/fd) report
+        // its creation mode under `--fs memory`, matching `--fs host` (which
+        // chmods the real inode). The contents are preserved verbatim.
+        if let Some(existing) = inner.files.get(&normalized) {
+            let bytes = existing.to_vec();
+            let len = bytes.len();
+            inner.files.insert(
+                normalized,
+                MemoryFile::RootFsBacked {
+                    base: Arc::from(bytes),
+                    dirty: BTreeMap::new(),
+                    len,
+                    mode,
+                },
+            );
+            return Ok(());
+        }
+        // Dirs report a fixed mode; chmod on those stays a tmpfs-no-op success.
         Err(BackendError::Unsupported)
     }
 
@@ -1115,6 +1146,63 @@ impl FsBackend for MemoryBackend {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn exchange_overlay_entries(&self, a: &str, b: &str) -> Result<bool, BackendError> {
+        let a_norm = normalize(a).ok_or(BackendError::Invalid)?;
+        let b_norm = normalize(b).ok_or(BackendError::Invalid)?;
+        let mut inner = self.inner.write();
+        // Classify each side as a backend-owned file or directory. Anything not
+        // present here (rootfs-only, or a tombstone) → Ok(false): the dispatcher
+        // must materialise it into the overlay first, then retry.
+        #[derive(Clone)]
+        enum Slot {
+            File(MemoryFile),
+            Dir,
+        }
+        let classify = |state: &MemoryBackendState, p: &PathBuf| -> Option<Slot> {
+            if state.deletions.contains(p) {
+                return None;
+            }
+            if let Some(f) = state.files.get(p) {
+                return Some(Slot::File(f.clone()));
+            }
+            if state.dirs.contains(p) {
+                return Some(Slot::Dir);
+            }
+            None
+        };
+        let (Some(a_slot), Some(b_slot)) = (classify(&inner, &a_norm), classify(&inner, &b_norm))
+        else {
+            return Ok(false);
+        };
+        // Remove both, then re-insert each side's payload under the OTHER name.
+        // The MemoryFile value carries its own mode + contents, so swapping the
+        // values preserves all per-entry metadata.
+        inner.files.remove(&a_norm);
+        inner.files.remove(&b_norm);
+        inner.dirs.remove(&a_norm);
+        inner.dirs.remove(&b_norm);
+        match a_slot {
+            Slot::File(f) => {
+                inner.files.insert(b_norm.clone(), f);
+            }
+            Slot::Dir => {
+                inner.dirs.insert(b_norm.clone());
+            }
+        }
+        match b_slot {
+            Slot::File(f) => {
+                inner.files.insert(a_norm.clone(), f);
+            }
+            Slot::Dir => {
+                inner.dirs.insert(a_norm.clone());
+            }
+        }
+        // Neither name is gone after a swap; clear any stale tombstones.
+        inner.deletions.remove(&a_norm);
+        inner.deletions.remove(&b_norm);
+        Ok(true)
     }
 
     fn open_raw_fd(&self, _path: &str, _write: bool, _create: bool, _trunc: bool) -> Option<i32> {
@@ -3345,6 +3433,91 @@ impl FsBackend for HostFsBackend {
         // (the single case the per-hit revalidation can't detect, since
         // ino/ctime are unchanged). Renames are rare relative to stats — drop
         // the whole cache. No-op when the cache is disabled/empty.
+        if self.use_stat_cache {
+            self.stat_cache.lock().clear();
+        }
+        Ok(true)
+    }
+
+    fn exchange_overlay_entries(&self, a: &str, b: &str) -> Result<bool, BackendError> {
+        let a_norm = normalize(a).ok_or(BackendError::Invalid)?;
+        let b_norm = normalize(b).ok_or(BackendError::Invalid)?;
+        let a_rel = Self::rel_path(&a_norm)
+            .ok_or(BackendError::Invalid)?
+            .to_path_buf();
+        let b_rel = Self::rel_path(&b_norm)
+            .ok_or(BackendError::Invalid)?
+            .to_path_buf();
+        // Both entries must exist on disk in the cap-std scratch (the source of
+        // truth). A missing side means a rootfs-only entry the dispatcher must
+        // materialise first → Ok(false).
+        let Ok((a_dir, a_at)) = self.at(&a_rel) else {
+            return Ok(false);
+        };
+        if a_dir.symlink_metadata(&a_at).is_err() {
+            return Ok(false);
+        }
+        let Ok((b_dir, b_at)) = self.at(&b_rel) else {
+            return Ok(false);
+        };
+        if b_dir.symlink_metadata(&b_at).is_err() {
+            return Ok(false);
+        }
+        // macOS exposes a TRUE atomic swap via renameatx_np(RENAME_SWAP); both
+        // entries' inodes (and thus all metadata) are exchanged in one step.
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let a_c = cstring_from_osstr(a_at.as_os_str()).ok_or(BackendError::Invalid)?;
+            let b_c = cstring_from_osstr(b_at.as_os_str()).ok_or(BackendError::Invalid)?;
+            let rc = unsafe {
+                libc::renameatx_np(
+                    a_dir.as_raw_fd(),
+                    a_c.as_ptr(),
+                    b_dir.as_raw_fd(),
+                    b_c.as_ptr(),
+                    libc::RENAME_SWAP,
+                )
+            };
+            if rc != 0 {
+                return Err(BackendError::Io);
+            }
+        }
+        // Portable fallback (Linux/BSD host backends): a three-step rename dance
+        // through a unique temp name in A's directory. Not atomic, but each
+        // step moves a WHOLE entry, so every inode/mode/owner follows its data
+        // — no metadata is lost. (A native renameat2(RENAME_EXCHANGE) atomic
+        // path on Linux hosts is a possible follow-up.)
+        #[cfg(not(target_os = "macos"))]
+        {
+            let seq = ANON_FD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pid = unsafe { libc::getpid() } as u64;
+            let tmp_name = format!(".carrick_exchange.{pid}.{seq}");
+            let tmp_rel = match a_at.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.join(&tmp_name),
+                _ => PathBuf::from(&tmp_name),
+            };
+            // A -> tmp (in A's dir)
+            a_dir
+                .rename(&a_at, &a_dir, &tmp_rel)
+                .map_err(|_| BackendError::Io)?;
+            // B -> A
+            if let Err(e) = b_dir.rename(&b_at, &a_dir, &a_at) {
+                // Roll back A so a failure leaves the namespace intact.
+                let _ = a_dir.rename(&tmp_rel, &a_dir, &a_at);
+                let _ = e;
+                return Err(BackendError::Io);
+            }
+            // tmp -> B
+            if let Err(e) = a_dir.rename(&tmp_rel, &b_dir, &b_at) {
+                // Best-effort rollback: A (now holding B's data) back to B, tmp
+                // (A's data) back to A.
+                let _ = b_dir.rename(&a_at, &b_dir, &b_at);
+                let _ = a_dir.rename(&tmp_rel, &a_dir, &a_at);
+                let _ = e;
+                return Err(BackendError::Io);
+            }
+        }
         if self.use_stat_cache {
             self.stat_cache.lock().clear();
         }

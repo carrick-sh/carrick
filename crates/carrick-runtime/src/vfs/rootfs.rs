@@ -578,6 +578,62 @@ impl RootFsVfs {
         Ok(())
     }
 
+    /// Atomically EXCHANGE the two entries `a` and `b` (`renameat2(2)`
+    /// `RENAME_EXCHANGE`): each path ends up referring to what the other named,
+    /// with all metadata following the entry. BOTH must exist in the layered
+    /// view (the dispatcher returns ENOENT otherwise); any rootfs-only side is
+    /// materialised into the writable backend first so the backend's atomic
+    /// swap operates on two backend-owned entries, then a tombstone hides the
+    /// resurrectable rootfs copy.
+    pub fn exchange_with_flags(&self, a: &str, b: &str) -> Result<(), VfsError> {
+        // Materialise a rootfs-only entry into the overlay so the backend owns
+        // both names before the swap. Returns the entry's layered kind so a
+        // tombstone can be left for the OTHER name's pre-swap rootfs copy.
+        let materialise = |path: &str| -> Result<(), VfsError> {
+            // Already overlay-owned (not a tombstone)? Nothing to do.
+            match self.overlay.lookup(path) {
+                Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
+                Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => return Ok(()),
+                None => {}
+            }
+            // Pull it from the rootfs into the writable overlay.
+            let md = self
+                .rootfs
+                .as_ref()
+                .and_then(|r| r.symlink_metadata(path).ok())
+                .ok_or(LINUX_ENOENT)?;
+            match md.kind {
+                RootFsEntryKind::Directory => {
+                    self.overlay.make_dir(path).map_err(|_| LINUX_EINVAL)?;
+                }
+                RootFsEntryKind::File
+                | RootFsEntryKind::Symlink
+                | RootFsEntryKind::CharDevice
+                | RootFsEntryKind::Fifo
+                | RootFsEntryKind::Socket => {
+                    let bytes = self
+                        .rootfs
+                        .as_ref()
+                        .and_then(|r| r.read(path).ok())
+                        .unwrap_or_default();
+                    self.overlay
+                        .set_file_contents(path, bytes)
+                        .map_err(|_| LINUX_EINVAL)?;
+                }
+            }
+            Ok(())
+        };
+        materialise(a)?;
+        materialise(b)?;
+        match self.overlay.exchange_overlay_entries(a, b) {
+            Ok(true) => Ok(()),
+            // Backend couldn't own both sides even after materialise (Ok(false)),
+            // or has no swap primitive (Unsupported), or the swap I/O failed:
+            // surface a coherent errno rather than corrupt the namespace.
+            Ok(false) | Err(_) => Err(LINUX_EINVAL),
+        }
+    }
+
     /// Layered "is this path a directory" check. Used by the
     /// dispatcher to validate mkdir/rename parent paths.
     pub fn is_directory(&self, path: &str) -> bool {
