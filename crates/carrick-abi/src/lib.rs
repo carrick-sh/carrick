@@ -2601,6 +2601,20 @@ pub const LINUX_CLONE_NEWIPC: u64 = 0x0800_0000;
 pub const LINUX_CLONE_NEWUSER: u64 = 0x1000_0000;
 pub const LINUX_CLONE_NEWPID: u64 = 0x2000_0000;
 pub const LINUX_CLONE_NEWNET: u64 = 0x4000_0000;
+pub const LINUX_CLONE_NEWTIME: u64 = 0x0000_0080;
+
+// `nsfs` `NS_GET_*` ioctls (ioctl_ns(2)). These use the `0xb7` type byte in the
+// `_IO(type, nr)` form — no size/direction bits, so the request is just
+// `(0xb7 << 8) | nr`. They operate on an fd obtained by opening a
+// `/proc/<pid>/ns/<type>` magic link. carrick models exactly one initial
+// namespace per type, so the answers are synthetic but stable: NS_GET_NSTYPE
+// returns the CLONE_NEW* flag for the link's type, NS_GET_OWNER_UID is the
+// initial user namespace's owner (root, uid 0), NS_GET_USERNS returns the one
+// initial user namespace, and NS_GET_PARENT has no accessible parent.
+pub const LINUX_NS_GET_USERNS: u64 = 0xb701;
+pub const LINUX_NS_GET_PARENT: u64 = 0xb702;
+pub const LINUX_NS_GET_NSTYPE: u64 = 0xb703;
+pub const LINUX_NS_GET_OWNER_UID: u64 = 0xb704;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2680,6 +2694,7 @@ bitflags! {
         const NEWUSER = LINUX_CLONE_NEWUSER;
         const NEWPID = LINUX_CLONE_NEWPID;
         const NEWNET = LINUX_CLONE_NEWNET;
+        const NEWTIME = LINUX_CLONE_NEWTIME;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3175,7 +3190,7 @@ const _: () = {
 
 // Namespace-creation clone flags must occupy disjoint bit positions.
 const _: () = {
-    const NS_FLAGS: [u64; 7] = [
+    const NS_FLAGS: [u64; 8] = [
         LINUX_CLONE_NEWNS,
         LINUX_CLONE_NEWCGROUP,
         LINUX_CLONE_NEWUTS,
@@ -3183,6 +3198,7 @@ const _: () = {
         LINUX_CLONE_NEWUSER,
         LINUX_CLONE_NEWPID,
         LINUX_CLONE_NEWNET,
+        LINUX_CLONE_NEWTIME,
     ];
     let mut i = 0;
     while i < NS_FLAGS.len() {
