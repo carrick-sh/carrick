@@ -216,6 +216,30 @@ pub trait FsBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
+    /// Materialise a CHARACTER or BLOCK device node at the guest `path`.
+    /// `full_mode` carries the `S_IFCHR`/`S_IFBLK` type bits plus permission bits
+    /// (already umask-applied); `dev` is the raw guest `dev_t` (stored verbatim —
+    /// the Linux major/minor encoding round-trips). macOS/cap-std can't
+    /// `mknod(S_IFCHR|S_IFBLK)` as a non-root process, so the host backend writes
+    /// a MARKER regular file tagged with the device xattrs (see
+    /// `CARRICK_RDEV_XATTR`); `real_stat`/the stat reconstruction then report the
+    /// device type + `st_rdev`. The in-memory backend has no host inode to tag
+    /// and returns `Unsupported` (→ guest `EPERM`, matching unprivileged mknod
+    /// and the FIFO/socket degradation). Default: unsupported.
+    fn create_device(&self, _path: &str, _full_mode: u32, _dev: u64) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// If `path` is a device-node marker created by `create_device`, return its
+    /// `(type_bits, dev)` — `type_bits` being `S_IFCHR` or `S_IFBLK` from the
+    /// stored full mode, and `dev` the raw `dev_t`. `None` for every other path
+    /// (a plain regular file, a directory, anything with no device xattr), so the
+    /// stat reconstruction leaves normal files completely unaffected. Default:
+    /// none (backends with no host inode can't carry the marker).
+    fn device_node(&self, _path: &str) -> Option<(u32, u64)> {
+        None
+    }
+
     /// Replace the contents of `path`. Used by write/writev/pwrite/
     /// ftruncate writeback and by rename-into-overlay.
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError>;
@@ -2063,6 +2087,19 @@ pub(crate) const CARRICK_MODE_XATTR_NAME: &str = "user.carrick.mode";
 const CARRICK_UID_XATTR: &[u8] = b"user.carrick.uid\0";
 const CARRICK_GID_XATTR: &[u8] = b"user.carrick.gid\0";
 
+/// Device-node id xattr (`st_rdev`). macOS/cap-std can't `mknod(S_IFCHR|S_IFBLK)`
+/// as a non-root process, so a guest device node created by `mknod(2)` is a
+/// MARKER regular file: its full guest mode (type + perms) lives in
+/// `CARRICK_MODE_XATTR` and the raw guest `dev_t` is stored VERBATIM here (the
+/// Linux dev_t major/minor encoding round-trips as an opaque u64 — no decode
+/// needed). `real_stat`/`metadata` and the stat reconstruction read these two
+/// together to report `S_IFCHR`/`S_IFBLK` with the right `st_rdev`. Fork-coherent
+/// (lives on the real on-disk file) and hidden from the guest's xattr syscalls
+/// like the others.
+const CARRICK_RDEV_XATTR: &[u8] = b"user.carrick.rdev\0";
+#[allow(dead_code)]
+pub(crate) const CARRICK_RDEV_XATTR_NAME: &str = "user.carrick.rdev";
+
 /// Marker xattr that flags a regular scratch file as an `AF_UNIX` socket node
 /// materialised by `bind(2)` (see `FsBackend::create_socket`). macOS can't
 /// `mknod(S_IFSOCK)` as non-root, so the guest-facing node is a regular file;
@@ -2154,6 +2191,41 @@ fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
 
 pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
     fget_u32_xattr(fd, CARRICK_MODE_XATTR)
+}
+
+/// 8-byte little-endian xattr write/read, mirroring the u32 helpers above. Used
+/// for the device-node `st_rdev` (a 64-bit `dev_t`).
+fn fset_u64_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u64) {
+    let v = val.to_le_bytes();
+    // Portable fd-xattr (carrick-portable maps the per-OS position/options args).
+    unsafe {
+        carrick_portable::fsetxattr(
+            fd,
+            name.as_ptr() as *const libc::c_char,
+            v.as_ptr() as *const libc::c_void,
+            v.len(),
+            0,
+        );
+    }
+}
+
+fn fget_u64_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u64> {
+    let mut v = [0u8; 8];
+    let n = unsafe {
+        carrick_portable::fgetxattr(
+            fd,
+            name.as_ptr() as *const libc::c_char,
+            v.as_mut_ptr() as *mut libc::c_void,
+            v.len(),
+        )
+    };
+    (n == 8).then(|| u64::from_le_bytes(v))
+}
+
+/// Read carrick's device-node id (`st_rdev`) xattr for an open fd. `None` when
+/// the file is not a device-node marker (so callers leave `st_rdev` at 0).
+pub(crate) fn fget_rdev_xattr(fd: std::os::fd::RawFd) -> Option<u64> {
+    fget_u64_xattr(fd, CARRICK_RDEV_XATTR)
 }
 
 /// Read carrick's guest metadata (mode / owner uid+gid / AF_UNIX-socket marker)
@@ -2278,6 +2350,37 @@ pub(crate) fn write_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool,
     });
 }
 
+/// Read the device-node id (`st_rdev`) xattr for the regular `rel` under `dir`.
+/// `None` => the file is not a device-node marker. Mirrors `read_mode_xattr`
+/// (read-only, atime-preserving on macOS).
+fn read_rdev_xattr(dir: &cap_std::fs::Dir, rel: &Path) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        path_get_u64_xattr(dir, rel, CARRICK_RDEV_XATTR, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Devices are never directories, so a plain (non-dir) read-only fd peek.
+        with_entry_fd(dir, rel, false, false, |fd| {
+            fget_u64_xattr(fd, CARRICK_RDEV_XATTR)
+        })
+        .flatten()
+    }
+}
+
+/// Stamp a regular `rel` under `dir` as a guest DEVICE NODE: persist the FULL
+/// guest mode (type + perms) in `CARRICK_MODE_XATTR` and the raw guest `dev_t`
+/// in `CARRICK_RDEV_XATTR`. Used by `create_device`. Best-effort, like the other
+/// xattr writers (a failed write leaves the file looking like a plain regular
+/// file). `full_mode` carries the `S_IFCHR`/`S_IFBLK` type bits so the stat
+/// reconstruction can recover the device type.
+fn write_device_xattrs(dir: &cap_std::fs::Dir, rel: &Path, full_mode: u32, dev: u64) {
+    let _ = with_entry_fd(dir, rel, false, true, |fd| {
+        fset_u32_xattr(fd, CARRICK_MODE_XATTR, full_mode);
+        fset_u64_xattr(fd, CARRICK_RDEV_XATTR, dev);
+    });
+}
+
 /// `true` iff `rel` carries the `AF_UNIX`-socket marker xattr (see
 /// `CARRICK_SOCKET_XATTR`). A read-only `O_EVTONLY` peek that preserves atime,
 /// just like `read_mode_xattr`.
@@ -2354,6 +2457,39 @@ fn path_get_u32_xattr(
         }
     };
     (n == 4).then(|| u32::from_le_bytes(v))
+}
+
+/// Path-based 8-byte LE xattr read (macOS), mirroring `path_get_u32_xattr`.
+/// Issues no open() and never bumps atime. Used for the device-node `st_rdev`.
+#[cfg(target_os = "macos")]
+fn path_get_u64_xattr(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    name: &[u8],
+    nofollow: bool,
+) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let abs = sandbox_abs_path(dir, rel)?;
+    let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
+    let mut v = [0u8; 8];
+    let n = unsafe {
+        if nofollow {
+            carrick_portable::lgetxattr(
+                cpath.as_ptr(),
+                name.as_ptr() as *const libc::c_char,
+                v.as_mut_ptr() as *mut libc::c_void,
+                v.len(),
+            )
+        } else {
+            carrick_portable::getxattr(
+                cpath.as_ptr(),
+                name.as_ptr() as *const libc::c_char,
+                v.as_mut_ptr() as *mut libc::c_void,
+                v.len(),
+            )
+        }
+    };
+    (n == 8).then(|| u64::from_le_bytes(v))
 }
 
 #[cfg(target_os = "macos")]
@@ -2903,6 +3039,52 @@ impl FsBackend for HostFsBackend {
             fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode & 0o7777);
         });
         Ok(())
+    }
+
+    fn create_device(&self, path: &str, full_mode: u32, dev: u64) -> Result<(), BackendError> {
+        // macOS can't `mknod(S_IFCHR|S_IFBLK)` as a non-root process, so the
+        // guest-facing node is a MARKER regular file on the scratch (mirrors
+        // `create_socket`): a real, fork-coherent file the guest can stat/unlink,
+        // tagged with the device xattrs. The stat reconstruction reads the full
+        // mode (type bits) + raw dev_t back and reports S_IFCHR/S_IFBLK + st_rdev.
+        // Unlike create_file, mknod(2) does NOT create intermediate directories;
+        // the dispatcher already vetted the parent (ENOENT) before calling here.
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        dir.open_with(&at_rel, &opts)
+            .map_err(|_| BackendError::Io)?;
+        write_device_xattrs(&dir, &at_rel, full_mode, dev);
+        Ok(())
+    }
+
+    fn device_node(&self, path: &str) -> Option<(u32, u64)> {
+        let normalized = normalize(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        // Only a plain regular file can be a device-node marker; skip dirs and
+        // symlinks (a symlink's xattr read would follow the link). A real
+        // S_IFCHR/S_IFBLK device can never exist on the cap-std scratch, so the
+        // host on-disk type is always regular for a marker.
+        let meta = dir.symlink_metadata(&at_rel).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        // The full mode (type + perms) lives in CARRICK_MODE_XATTR; only treat the
+        // file as a device when those type bits are S_IFCHR/S_IFBLK. A regular
+        // file's mode xattr carries no type bits, so it returns None here and
+        // normal stat is untouched.
+        let full_mode = read_mode_xattr(&dir, &at_rel, false)?;
+        let type_bits = full_mode & crate::linux_abi::LINUX_S_IFMT;
+        if type_bits != crate::linux_abi::LINUX_S_IFCHR
+            && type_bits != crate::linux_abi::LINUX_S_IFBLK
+        {
+            return None;
+        }
+        let dev = read_rdev_xattr(&dir, &at_rel).unwrap_or(0);
+        Some((type_bits, dev))
     }
 
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {

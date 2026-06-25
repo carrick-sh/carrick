@@ -616,6 +616,48 @@ impl SyscallDispatcher {
         (is_stdio_fd(fd) && !self.stdio_is_closed(fd)) || self.fd_table_contains(fd)
     }
 
+    /// Build a [`StatRecord`] from a real backing stat, applying the `mknod(2)`
+    /// device-node override (S_IFCHR/S_IFBLK type + st_rdev) when `path` is a
+    /// device marker. The marker's FULL guest mode (including the device type
+    /// bits) is carried VERBATIM in `RealStat.mode` (the host backend stores it
+    /// raw in `CARRICK_MODE_XATTR`); `from_real`/`linux_mode` masks those type
+    /// bits off, so we recover the device type from `real.mode` here WITHOUT a
+    /// second xattr read — the common stat hot path pays nothing. Only when the
+    /// type bits actually name a device do we fetch the (rare) `st_rdev` xattr.
+    /// A plain regular file (no device type bits) is returned unchanged.
+    pub(super) fn stat_record_with_device(
+        &self,
+        path: &str,
+        real: &crate::fs_backend::RealStat,
+    ) -> StatRecord {
+        let mut record = StatRecord::from_real(path, real);
+        let type_bits = real.mode & LINUX_S_IFMT;
+        if type_bits == LINUX_S_IFCHR || type_bits == LINUX_S_IFBLK {
+            let rdev = self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .device_node(path)
+                .map(|(_, dev)| dev)
+                .unwrap_or(0);
+            record.apply_device_node(Some((type_bits, rdev)));
+        }
+        record
+    }
+
+    /// `statx` twin of [`stat_record_with_device`](Self::stat_record_with_device):
+    /// write a statx record from a real backing stat with the `mknod(2)`
+    /// device-node override applied (S_IFCHR/S_IFBLK + stx_rdev_{major,minor}).
+    fn write_statx_real_with_device(
+        &self,
+        memory: &mut impl GuestMemory,
+        statxbuf: u64,
+        path: &str,
+        real: &crate::fs_backend::RealStat,
+    ) -> DispatchOutcome {
+        write_statx_record(memory, statxbuf, &self.stat_record_with_device(path, real))
+    }
+
     fn path_stat_record(&self, dirfd: u64, path: &str, flags: u64) -> Result<StatRecord, i32> {
         if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
             return self.fd_stat_record(dirfd as i32);
@@ -640,7 +682,7 @@ impl SyscallDispatcher {
             && !path.split('/').any(|c| c == "..")
             && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
         {
-            return Ok(StatRecord::from_real(path, &real));
+            return Ok(self.stat_record_with_device(path, &real));
         }
 
         let path = self.resolve_at_path(dirfd, path)?;
@@ -666,7 +708,7 @@ impl SyscallDispatcher {
             if requires_dir && real.kind != RootFsEntryKind::Directory {
                 return Err(LINUX_ENOTDIR);
             }
-            return Ok(StatRecord::from_real(&path, &real));
+            return Ok(self.stat_record_with_device(&path, &real));
         }
         if follow
             && let Some(link) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
@@ -681,7 +723,7 @@ impl SyscallDispatcher {
             path
         };
         if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
-            return Ok(StatRecord::from_real(&path, &real));
+            return Ok(self.stat_record_with_device(&path, &real));
         }
 
         use crate::vfs::Vfs as _;
@@ -6964,11 +7006,35 @@ impl SyscallDispatcher {
                         },
                     );
                 }
-                // Device/socket nodes: a valid type carrick can't back → EPERM.
-                t if t == LINUX_S_IFCHR
-                    || t == LINUX_S_IFBLK
-                    || t == LINUX_S_IFSOCK =>
-                {
+                // Character/block device nodes: macOS/cap-std can't mknod a real
+                // device as a non-root process, so materialise a MARKER regular
+                // file tagged with the device xattrs (full mode + raw dev_t,
+                // fork-coherent on the scratch). The stat reconstruction reads
+                // them back and reports S_IFCHR/S_IFBLK with the right st_rdev.
+                // mknod(2) applies the umask to the permission bits only; the
+                // type bits are preserved. The MemoryBackend has no host inode to
+                // tag → Unsupported → EPERM (unprivileged-mknod errno).
+                t if t == LINUX_S_IFCHR || t == LINUX_S_IFBLK => {
+                    let umask = this.cred_snapshot().umask & 0o777;
+                    let full_mode = t | ((mode & 0o7777) & !umask);
+                    return Ok(
+                        match this
+                            .fs
+                            .rootfs_vfs
+                            .overlay
+                            .create_device(&materialize_path, full_mode, dev)
+                        {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(crate::fs_backend::BackendError::Unsupported) => {
+                                LINUX_EPERM.into()
+                            }
+                            Err(_) => LINUX_EROFS.into(),
+                        },
+                    );
+                }
+                // AF_UNIX socket node via mknod is bind(2) territory (out of
+                // scope here); report EPERM as before.
+                t if t == LINUX_S_IFSOCK => {
                     return Ok(LINUX_EPERM.into());
                 }
                 // Regular file (0 or S_IFREG): materialised below.
@@ -7818,7 +7884,7 @@ impl SyscallDispatcher {
                 && !path.split('/').any(|c| c == "..")
                 && let Some(real) = this.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
             {
-                return Ok(write_statx_real(memory, statxbuf, &path, &real));
+                return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
             }
 
             let path = this.resolve_at_path(dirfd, &path)?;
@@ -7848,7 +7914,7 @@ impl SyscallDispatcher {
                 if requires_dir && real.kind != RootFsEntryKind::Directory {
                     return Ok(LINUX_ENOTDIR.into());
                 }
-                return Ok(write_statx_real(memory, statxbuf, &path, &real));
+                return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
             }
             // DANGLING SYMLINK: following statx of a symlink whose target does
             // not exist is ENOENT on Linux (mirrors the newfstatat path above).
