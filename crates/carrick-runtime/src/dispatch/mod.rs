@@ -3409,6 +3409,23 @@ fn linux_access_flags_are_supported(flags: u64) -> bool {
 }
 
 fn realtime_duration() -> Duration {
+    // On macOS/HVF, compute REALTIME the SAME way the guest's vDSO fast path does
+    // — the suspend-excluding uptime counter plus the shared realtime_off the vvar
+    // page was stamped with — so the trapping clock_gettime read and the userspace
+    // vDSO read agree by construction. Reading a live SystemTime::now() here used
+    // an unrelated base (wall clock vs guest CNTVCT + boot-stamped offset), so LTP
+    // clock_gettime04 (which reads each clock via BOTH paths) saw REALTIME travel
+    // backwards. The offset is itself `unix_ns - uptime_ns`, so this still tracks
+    // the wall clock (within the boot-stamp's NTP slew, sub-µs over a test). The
+    // #[cfg(target_os = "linux")] path keeps the native time-ns-virtualized wall.
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Some(off_ns) = crate::vdso::realtime_off_ns()
+            && let Some(uptime) = host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW)
+        {
+            return Duration::from_nanos((uptime.as_nanos() as u64).wrapping_add(off_ns));
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)

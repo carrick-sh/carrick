@@ -37,6 +37,40 @@ pub const VVAR_OFF_RNG_GENERATION: usize = 24;
 /// x86_64 vDSO only: `CLOCK_MONOTONIC` offset from guest TSC nanoseconds.
 pub const VVAR_OFF_MONOTONIC_OFF_NS: usize = 32;
 
+/// The single shared definition of the guest's `CLOCK_REALTIME` base offset
+/// (`unix_ns - uptime_ns`), so the userspace vDSO fast path (which adds
+/// `VVAR_OFF_REALTIME_OFF_NS` to the guest CNTVCT) and the trapping
+/// `clock_gettime` syscall handler both compute REALTIME as `uptime + this` and
+/// cannot drift apart. Before this existed the syscall path read a live
+/// `SystemTime::now()` against an unrelated base while the vDSO used a
+/// boot-stamped counter offset, so LTP clock_gettime04 — which reads each clock
+/// via BOTH paths and forbids backwards travel — saw REALTIME jitter backwards.
+///
+/// The VMM's vvar stamper publishes the IDENTICAL value it writes at
+/// `VVAR_OFF_REALTIME_OFF_NS` (see [`set_realtime_off_ns`]); the dispatch layer
+/// reads it back via [`realtime_off_ns`]. `0` means "not yet calibrated" (a
+/// Unix-epoch nanosecond delta is never legitimately 0). A process-local atomic
+/// suffices: a forked guest child COW-inherits the parent's value, which stays
+/// valid because the guest counter epoch is continuous across the carrick fork.
+static REALTIME_OFF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the guest's CLOCK_REALTIME base offset (`unix_ns - uptime_ns`). Call
+/// from the vvar stamper with the SAME value written to `VVAR_OFF_REALTIME_OFF_NS`
+/// so the syscall path and the vDSO compute REALTIME identically.
+pub fn set_realtime_off_ns(off_ns: u64) {
+    REALTIME_OFF_NS.store(off_ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The published CLOCK_REALTIME base offset, or `None` if the vvar has not been
+/// stamped yet (syscall-shim disabled, or before the first stamp — fall back to a
+/// live wall-clock read then).
+pub fn realtime_off_ns() -> Option<u64> {
+    match REALTIME_OFF_NS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
 /// The assembled clock functions (aarch64). Offsets within this blob:
 /// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x84,
 /// `__kernel_clock_getres` @ 0xdc, `__kernel_rt_sigreturn` @ 0x104,
