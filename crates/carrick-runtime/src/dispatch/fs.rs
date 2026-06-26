@@ -1630,8 +1630,21 @@ impl SyscallDispatcher {
                 // uid/gid (Linux semantics). carrick stamps it so a guest that
                 // setuid()'d to e.g. "nobody" before creating sees the right
                 // owner. Root (0,0) is the default, so only stamp non-root.
-                let create_uid = creds.euid;
-                let create_gid = creds.egid;
+                let create_uid = creds.fsuid;
+                let mut create_gid = creds.fsgid;
+                // A new file in a SETGID directory inherits THAT directory's
+                // group, not the creator's fsgid (creat08/open10/mknod05). The
+                // file's own setgid bit is carried by `mode`; here we only fix
+                // the owning group.
+                if let Some(parent) = Path::new(&path).parent() {
+                    let parent_str = display_rootfs_path(parent);
+                    if let Ok(pmd) = self.layered_metadata(&parent_str)
+                        && pmd.mode & 0o2000 != 0
+                        && let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str)
+                    {
+                        create_gid = pgid;
+                    }
+                }
                 let stamp_owner = create_uid != 0 || create_gid != 0;
                 if let Some(host_fd) = self
                     .fs
