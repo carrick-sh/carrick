@@ -623,20 +623,26 @@ impl SyscallDispatcher {
         /// DIFFERENT pid is already registered. Delivery happens in
         /// mq_timedsend.
         fn mq_notify(this, cx, mqd: u64, sevp: GuestPtr) {
-            let mq = match this.mq_fd(mqd as i32) {
-                Ok(v) => v,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
             let me = std::process::id() as i32;
 
             if sevp.0 == 0 {
-                // Clear THIS pid's registration (and only this pid's).
+                // Clear THIS pid's registration (and only this pid's). The
+                // unregister path has no sigevent to validate, so it needs the
+                // descriptor up front.
+                let mq = match this.mq_fd(mqd as i32) {
+                    Ok(v) => v,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 return Ok(match mq_clear_notify(&mq, me) {
                     Ok(()) => DispatchOutcome::Returned { value: 0 },
                     Err(errno) => DispatchOutcome::errno(errno),
                 });
             }
 
+            // Validate the sigevent BEFORE resolving the descriptor: Linux reports
+            // a bad sigev_notify as EINVAL even when the descriptor is itself
+            // invalid (LTP mq_notify02: mq_notify(0, &bad_sevp) is EINVAL, not the
+            // EBADF that the descriptor lookup would otherwise produce first).
             let sev: crate::linux_abi::LinuxSigevent =
                 match read_kernel_struct(&*cx.memory, sevp.0) {
                     Ok(s) => s,
@@ -647,9 +653,20 @@ impl SyscallDispatcher {
                 // SIGEV_THREAD is glibc layered on SIGEV_SIGNAL; the kernel
                 // surface is the signal, so treat it like SIGEV_SIGNAL.
                 crate::linux_abi::LINUX_SIGEV_SIGNAL | crate::linux_abi::LINUX_SIGEV_THREAD => {
-                    sev.sigev_signo
+                    // Copy out of the #[repr(packed)] sigevent before taking a ref.
+                    // SIGEV_SIGNAL requires a valid signal number; an out-of-range
+                    // signo is EINVAL (LTP mq_notify02's second bad-sevp case).
+                    let s = sev.sigev_signo;
+                    if !(1..=64).contains(&s) {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    s
                 }
                 _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            };
+            let mq = match this.mq_fd(mqd as i32) {
+                Ok(v) => v,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             Ok(match mq_register_notify(&mq, me, sev.sigev_notify, signo) {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
