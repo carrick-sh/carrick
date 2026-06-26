@@ -3400,6 +3400,13 @@ impl SyscallDispatcher {
                     // is ENOTDIR, matching Linux.
                     RootFsEntryKind::Symlink => match self.canonicalize_following(&prefix) {
                         Ok(target) if self.path_is_directory(&target) => {}
+                        // A self-referential / over-deep intermediate symlink is
+                        // a CYCLE → ELOOP, not ENOTDIR. canonicalize_following
+                        // caps at 40 hops and returns ELOOP; propagate it rather
+                        // than collapsing to the non-dir ENOTDIR below
+                        // (lstat02/stat03/truncate03/readlink03 assert ELOOP on
+                        // an intermediate self-linking component).
+                        Err(e) if e == crate::linux_abi::LINUX_ELOOP => return Err(e),
                         _ => return Err(LINUX_ENOTDIR),
                     },
                     // A regular file / char device can't be a path component.
