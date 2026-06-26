@@ -925,6 +925,20 @@ where
     }
 }
 
+/// Wall-clock budget for the trap watchdog: a guest that keeps trapping but makes
+/// NO signal-handler progress for this long is treated as genuinely wedged. The
+/// default (30s) is comfortably above any legitimate syscall-bound burst (e.g. a
+/// 10s SIGALRM-bounded `gettimeofday` loop) yet below the conformance harness's
+/// outer per-run timeout (~40s), so a real wedge aborts cleanly here rather than
+/// via the harness SIGKILL. Override with `CARRICK_MAX_WALL_MS`.
+fn trap_watchdog_wall_window() -> std::time::Duration {
+    let ms = std::env::var("CARRICK_MAX_WALL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Run one vCPU (one guest thread) until it exits the process, finishes its own
 /// thread, or hits the trap limit. Holds NO lock during the vCPU run; takes the
 /// dispatcher lock only to dispatch + complete each syscall.
@@ -969,14 +983,32 @@ where
         // guest delivers no handlers and still trips the limit.
         let mut budget_floor = 0usize;
         let mut seen_signal_progress = signal_progress_count();
+        let mut last_progress = std::time::Instant::now();
+        let max_wall = trap_watchdog_wall_window();
         for traps in 1.. {
             let progress = signal_progress_count();
             if progress != seen_signal_progress {
                 seen_signal_progress = progress;
                 budget_floor = traps - 1;
+                last_progress = std::time::Instant::now();
             }
             if traps - budget_floor > state.max_traps {
-                break;
+                // `max_traps` is now a cheap pre-filter interval, NOT a hard
+                // ceiling: tripping it means the guest issued that many syscalls
+                // since the last delivered signal handler. That is not a hang if
+                // it is still doing real work — a syscall-bound loop bounded by a
+                // SIGALRM (LTP gettimeofday02 issues ~1M raw __NR_gettimeofday in a
+                // 10s alarm window) makes forward progress, and the conformance
+                // harness already wraps every run in an outer wall-clock timeout.
+                // Abort ONLY if there has been NO wall-clock progress (no delivered
+                // handler) for `max_wall` — a genuinely wedged guest; otherwise
+                // reset the count budget and keep running. `last_progress` is
+                // re-sampled rarely (handler delivery + this pre-filter), so the
+                // hot per-syscall path takes no Instant::now().
+                if last_progress.elapsed() >= max_wall {
+                    break;
+                }
+                budget_floor = traps;
             }
             if kernel.exec_replacing_other_thread(state.this_tid) {
                 return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
