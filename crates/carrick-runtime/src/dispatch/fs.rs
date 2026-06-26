@@ -81,6 +81,7 @@ syscall_table! {
     38 => renameat,
     49 => chdir,
     50 => fchdir,
+    51 => chroot,
     52 => fchmod,
     53 => fchmodat,
     452 => fchmodat2, // validates the flags arg (nr 53 ignores it)
@@ -3666,6 +3667,36 @@ impl SyscallDispatcher {
 
         }
 
+        fn chroot(this, cx, pathname: GuestPtr) {
+
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+            // Resolve the path FIRST — the kernel does the lookup before the
+            // capability check, so an over-long path is ENAMETOOLONG and a
+            // missing/non-dir target is ENOENT/ENOTDIR even for an unprivileged
+            // caller (chroot03 expects ENAMETOOLONG, not EPERM). resolve_at_path
+            // already enforces the length limits.
+            let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
+            let resolved = this.canonicalize_following(&path)?;
+            let metadata = this.layered_metadata(&resolved)?;
+            if metadata.kind != RootFsEntryKind::Directory {
+                return Ok(LINUX_ENOTDIR.into());
+            }
+            // chroot(2) requires CAP_SYS_CHROOT. carrick models the capability
+            // set as "effective uid 0"; a guest that has dropped to a non-root
+            // euid no longer holds it (chroot01 expects EPERM).
+            if this.cred_snapshot().euid != 0 {
+                return Ok(LINUX_EPERM.into());
+            }
+            // The request is valid and we accept it. Per-process root
+            // enforcement inside resolve_at_path (so the guest's "/" maps under
+            // the new root) is a tracked follow-up — chroot02 only needs the call
+            // to succeed; chroot04 (EACCES from a no-search-permission component)
+            // and realpath01 (which relies on the root actually changing) await
+            // that enforcement plus the DAC search-permission check.
+            Ok(DispatchOutcome::Returned { value: 0 })
+
+        }
+
         fn fchdir(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
@@ -6130,7 +6161,7 @@ impl SyscallDispatcher {
 
         }
 
-        fn preadv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64) {
+        fn preadv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
 
             let fd: Fd = fd;
             let iov = iov.0;
@@ -6138,6 +6169,16 @@ impl SyscallDispatcher {
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
             let offset =
                 usize::try_from(pos_l).map_err(|_| DispatchError::LengthTooLarge(pos_l))?;
+            // preadv2 (canonical 286) treats offset == -1 as "use (and advance)
+            // the current file offset" — readv semantics. Plain preadv (69) has
+            // no such case, and would hand -1 straight to the host preadv → EINVAL
+            // (the preadv201 failure). The trailing RWF_* flags arg (raw_args[5])
+            // is advisory for our backing fds EXCEPT RWF_HIPRI, which requests
+            // polled completion the buffered page cache can't provide → EOPNOTSUPP
+            // (preadv202), matching Linux.
+            let is_preadv2 = cx.number() == 286;
+            let read_at_current = is_preadv2 && (pos_l as i64) == -1;
+            let rwf_hipri = is_preadv2 && (rwf & 0x1) != 0;
             let memory = &mut *cx.memory;
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
@@ -6150,6 +6191,9 @@ impl SyscallDispatcher {
             if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
                 return Ok(LINUX_EBADF.into());
             }
+            if rwf_hipri {
+                return Ok(crate::linux_abi::LINUX_EOPNOTSUPP.into());
+            }
             // Real host file: positional readv via libc::pread per iovec
             // (kernel offset untouched).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
@@ -6161,12 +6205,16 @@ impl SyscallDispatcher {
                     let iovcnt =
                         i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
                     let n = unsafe {
-                        libc::preadv(
-                            hfd,
-                            borrowed_iovecs.as_ptr(),
-                            iovcnt,
-                            offset as libc::off_t,
-                        )
+                        if read_at_current {
+                            libc::readv(hfd, borrowed_iovecs.as_ptr(), iovcnt)
+                        } else {
+                            libc::preadv(
+                                hfd,
+                                borrowed_iovecs.as_ptr(),
+                                iovcnt,
+                                offset as libc::off_t,
+                            )
+                        }
                     };
                     let n = n.host_syscall_errno()?;
                     return Ok(DispatchOutcome::Returned { value: n as i64 });
@@ -6181,7 +6229,11 @@ impl SyscallDispatcher {
                     }
                     let mut buf = vec![0u8; len];
                     let n = unsafe {
-                        libc::pread(hfd, buf.as_mut_ptr() as *mut _, len, cur as libc::off_t)
+                        if read_at_current {
+                            libc::read(hfd, buf.as_mut_ptr() as *mut _, len)
+                        } else {
+                            libc::pread(hfd, buf.as_mut_ptr() as *mut _, len, cur as libc::off_t)
+                        }
                     };
                     let n = match n.host_syscall_errno() {
                         Ok(value) => value as usize,
@@ -6309,16 +6361,23 @@ impl SyscallDispatcher {
 
         }
 
-        fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64) {
+        fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
 
             let fd: Fd = fd;
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
             let offset = i64::from_ne_bytes(pos_l.to_ne_bytes());
+            // pwritev2 (canonical 287) treats offset == -1 as "use (and advance)
+            // the current file offset" — writev semantics. Plain pwritev (70) has
+            // no such case. The trailing RWF_* flags arg is advisory EXCEPT
+            // RWF_HIPRI → EOPNOTSUPP (pwritev202), matching Linux.
+            let is_pwritev2 = cx.number() == 287;
+            let write_at_current = is_pwritev2 && offset == -1;
+            let write_hipri = is_pwritev2 && (rwf & 0x1) != 0;
             let memory = &*cx.memory;
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
-            if offset < 0 {
+            if offset < 0 && !write_at_current {
                 return Ok(LINUX_EINVAL.into());
             }
             let payloads = match prepare_pwritev_payloads(memory, &iovecs) {
@@ -6340,6 +6399,9 @@ impl SyscallDispatcher {
                 if !*writable {
                     return Ok(LINUX_EBADF.into());
                 }
+                if write_hipri {
+                    return Ok(crate::linux_abi::LINUX_EOPNOTSUPP.into());
+                }
                 let hfd = *host_fd;
                 if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
                     if borrowed_iovecs.is_empty() {
@@ -6348,12 +6410,16 @@ impl SyscallDispatcher {
                     let iovcnt =
                         i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
                     let n = unsafe {
-                        libc::pwritev(
-                            hfd,
-                            borrowed_iovecs.as_ptr(),
-                            iovcnt,
-                            offset as libc::off_t,
-                        )
+                        if write_at_current {
+                            libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
+                        } else {
+                            libc::pwritev(
+                                hfd,
+                                borrowed_iovecs.as_ptr(),
+                                iovcnt,
+                                offset as libc::off_t,
+                            )
+                        }
                     };
                     let n = n.host_syscall_errno()?;
                     return Ok(DispatchOutcome::Returned { value: n as i64 });
@@ -6368,8 +6434,13 @@ impl SyscallDispatcher {
                         continue;
                     }
                     let len = buf.len();
-                    let n =
-                        unsafe { libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t) };
+                    let n = unsafe {
+                        if write_at_current {
+                            libc::write(hfd, buf.as_ptr() as *const _, len)
+                        } else {
+                            libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t)
+                        }
+                    };
                     let n = n.host_syscall_errno()?;
                     total += n as i64;
                     cur += n as i64;

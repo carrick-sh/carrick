@@ -882,7 +882,10 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //
     // Now shimmed in normalize_syscall (above): 34 pause → ppoll(NULL,0,NULL);
     // 37 alarm → private alarm shim; 111 getpgrp → getpgid(0); 232 epoll_wait →
-    // epoll_pwait(…, NULL, 0).
+    // epoll_pwait(…, NULL, 0); 213 epoll_create → epoll_create1(0); 253
+    // inotify_init → inotify_init1(0); 282 signalfd → signalfd4(…, 0); 284
+    // eventfd → eventfd2(…, 0). (Each was an ENOSYS that TBROK'd a whole test
+    // family at setup.)
     // Also LEFT OUT (no asm-generic equivalent AT ALL → honest -ENOSYS, NOT a
     // shim candidate): 134 uselib, 136 ustat,
     // 139 sysfs, 154 modify_ldt, 156 _sysctl, 172 iopl, 173 ioperm,

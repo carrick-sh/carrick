@@ -94,6 +94,7 @@ syscall_table! {
     pub(crate) fn dispatch_net;
     19 => eventfd2,
     20 => epoll_create1,
+    carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE => x86_epoll_create,
     21 => epoll_ctl,
     22 => epoll_pwait,
     // x86_64 poll(2): shares the ppoll handler, which branches on the
@@ -1723,6 +1724,32 @@ impl SyscallDispatcher {
                 kqueue: Arc::new(epoll_kqueue),
             };
             Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
+
+        }
+
+        fn x86_epoll_create(this, cx, size: u64) {
+
+            // x86_64 legacy epoll_create(size): the size is ignored since 2.6.8
+            // but the kernel still rejects size <= 0 with EINVAL (epoll-ltp /
+            // epoll_create02). Validate, then create exactly as epoll_create1(0).
+            if (size as i32) <= 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let epoll_kqueue = {
+                let mut mux = match crate::event_mux::make_event_multiplexer() {
+                    Ok(m) => m,
+                    Err(_) => return Ok(crate::linux_abi::LINUX_EMFILE.into()),
+                };
+                let _ = mux.register_user(0);
+                crate::dispatch::EpollKqueue::new(mux)
+            };
+            let description = OpenDescription::Epoll {
+                interest: HashMap::new(),
+                base: OpenDescriptionBase::new(0),
+                pending_ready: VecDeque::new(),
+                kqueue: Arc::new(epoll_kqueue),
+            };
+            Ok(this.install_fd(description, linux_fd_flags_from_open_flags(0)))
 
         }
 
@@ -4484,6 +4511,12 @@ impl SyscallDispatcher {
             self.host_socket_lookup(fd)?
         };
         let msg = read_linux_msghdr(memory, msg_addr)?;
+        // Linux caps the iovec array at UIO_MAXIOV (1024); a larger msg_iovlen is
+        // EMSGSIZE, not the EINVAL that read_iovecs' length guard would raise
+        // (recvmsg01 "invalid iovec count").
+        if msg.iovlen as usize > 1024 {
+            return Ok(crate::linux_abi::LINUX_EMSGSIZE.into());
+        }
         let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
         // AF_NETLINK: drain the queued dump reply into the iovecs, fill in
         // the source sockaddr_nl (kernel; pid=0), and zero controllen/flags.
