@@ -692,7 +692,77 @@ impl SyscallDispatcher {
                         Err(errno) => Ok(DispatchOutcome::errno(errno)),
                     }
                 }
-                LINUX_IPC_SET => Ok(DispatchOutcome::Returned { value: 0 }),
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                LINUX_IPC_SET => {
+                    // Forward msg_qbytes (the IPC_SET field LTP msgctl02 lowers and
+                    // re-reads) to the host SysV queue; carrick backs msg queues
+                    // with real host queues, so IPC_STAT-after-SET reflects it.
+                    // Owner/perm changes aren't applied — carrick is one host
+                    // identity, not the guest uid.
+                    if buf == 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    let new_qbytes = match cx.memory.read_bytes(buf + LIN_MSG_QBYTES as u64, 8) {
+                        Ok(b) => {
+                            let mut a = [0u8; 8];
+                            a.copy_from_slice(&b);
+                            u64::from_le_bytes(a)
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    let mut ds: libc::msqid_ds = unsafe { core::mem::zeroed() };
+                    if unsafe {
+                        libc::msgctl(msqid as i32, libc::IPC_STAT, &mut ds as *mut libc::msqid_ds)
+                    }
+                    .host_syscall_errno()
+                    .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    ds.msg_qbytes = new_qbytes as _;
+                    let rc = unsafe {
+                        libc::msgctl(msqid as i32, libc::IPC_SET, &mut ds as *mut libc::msqid_ds)
+                    };
+                    match rc.host_syscall_errno() {
+                        Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                LINUX_IPC_SET => {
+                    // macOS + NetBSD: no libc `msqid_ds` by name — round-trip the
+                    // host struct as a raw buffer and patch msg_qbytes at the
+                    // measured offset, the IPC_SET twin of the raw-buffer IPC_STAT
+                    // arm below.
+                    if buf == 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    let new_qbytes = match cx.memory.read_bytes(buf + LIN_MSG_QBYTES as u64, 8) {
+                        Ok(b) => {
+                            let mut a = [0u8; 8];
+                            a.copy_from_slice(&b);
+                            u64::from_le_bytes(a)
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    let mut ds = [0u8; MACOS_MSQID_DS_SIZE];
+                    if unsafe {
+                        msgctl(msqid as i32, libc::IPC_STAT, ds.as_mut_ptr() as *mut libc::c_void)
+                    }
+                    .host_syscall_errno()
+                    .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    ds[MAC_MSG_QBYTES..MAC_MSG_QBYTES + 8].copy_from_slice(&new_qbytes.to_le_bytes());
+                    let rc = unsafe {
+                        msgctl(msqid as i32, libc::IPC_SET, ds.as_mut_ptr() as *mut libc::c_void)
+                    };
+                    match rc.host_syscall_errno() {
+                        Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                    }
+                }
                 #[cfg(target_os = "linux")]
                 LINUX_IPC_STAT => {
                     // On a Linux host the kernel returns a NATIVE msqid_ds
