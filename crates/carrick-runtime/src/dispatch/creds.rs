@@ -421,13 +421,28 @@ impl SyscallDispatcher {
         }
 
         fn capset(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
-            let memory = &*cx.memory;
+            let memory = &mut *cx.memory;
             let header = read_capability_header(memory, header_address.0)?;
             if !linux_capability_version_is_supported(header.version) {
+                // Mirror capget: write the kernel's PREFERRED version back into
+                // the header so a probing caller can retry with the right one,
+                // then EINVAL (capset02).
+                let pref = crate::linux_abi::LINUX_CAPABILITY_VERSION_3;
+                let _ = memory.write_bytes(header_address.0, &pref.to_le_bytes());
                 return Ok(LINUX_EINVAL.into());
             }
             if header.pid < 0 {
                 return Ok(LINUX_ESRCH.into());
+            }
+            // capset (unlike capget) can only modify the CALLING process: a
+            // nonzero pid that isn't the caller is EPERM, even for root
+            // (capset03). The guest sees NS-pids, so match against self_ns_pid().
+            if header.pid > 0
+                && header.pid != crate::namespace::pid::self_ns_pid() as i32
+                && header.pid != std::process::id() as i32
+                && header.pid != LINUX_BOOTSTRAP_PID as i32
+            {
+                return Ok(LINUX_EPERM.into());
             }
             let words = linux_capability_data_words(header.version);
             let data = read_capability_data(memory, data_address.0, words)?;
