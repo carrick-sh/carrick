@@ -401,7 +401,18 @@ impl SyscallDispatcher {
                 // to PRIVATE rather than rejecting it with EINVAL.
                 let map_type = {
                     let t = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
-                    if t == 0 && map_flags.contains(LinuxMmapFlags::DROPPABLE) {
+                    if t == (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE) {
+                        // MAP_SHARED_VALIDATE (0x3): a valid map type that, unlike
+                        // plain MAP_SHARED, STRICTLY validates the flag word — an
+                        // unknown flag bit is EOPNOTSUPP, not the EINVAL that
+                        // plain MAP_SHARED gets (which silently ignores unknown
+                        // bits for back-compat). mmap20. Otherwise behaves like
+                        // MAP_SHARED.
+                        if flags & !LinuxMmapFlags::SUPPORTED_MASK != 0 {
+                            return Ok(crate::linux_abi::LINUX_EOPNOTSUPP.into());
+                        }
+                        LINUX_MAP_SHARED
+                    } else if t == 0 && map_flags.contains(LinuxMmapFlags::DROPPABLE) {
                         LINUX_MAP_PRIVATE
                     } else {
                         t

@@ -2582,13 +2582,15 @@ impl SyscallDispatcher {
 
         fn pselect6(this, cx, nfds: u64, readfds: GuestPtr, writefds: GuestPtr, exceptfds: GuestPtr, timeout: GuestPtr, sigmask: GuestPtr) {
 
-            // Linux rejects nfds < 0 with EINVAL BEFORE anything else. The guest
-            // passes nfds as a (sign-extended) int; -1 arrives as u64::MAX.
-            // Without this, pselect6(-1, NULL, NULL, NULL, NULL, mask) — LTP
-            // pselect02 case 2 — falls through to the empty-fd-set NULL-timeout
-            // path and blocks the test child forever (the tst_test watchdog then
-            // SIGALRM-kills it → TBROK). Validate first.
-            if (nfds as i64) < 0 {
+            // Linux rejects nfds < 0 with EINVAL BEFORE anything else. nfds is an
+            // `int`: read the LOW 32 bits as signed. The guest may pass a negative
+            // either sign-extended (0xFFFF..FFFF) or, on x86_64 where an int arg
+            // leaves the upper register bits undefined, zero-extended (0xFFFFFFFF)
+            // — `as i32` catches both, whereas `as i64` missed the zero-extended
+            // form and fell through to an EFAULT on the bad fd_set pointer
+            // (select03). Without this, pselect6(-1, ...) — LTP pselect02 case 2 —
+            // also blocks the test child forever (watchdog SIGALRM → TBROK).
+            if (nfds as i32) < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             let nfds = GuestLen::try_from_arg(nfds)?.0;
