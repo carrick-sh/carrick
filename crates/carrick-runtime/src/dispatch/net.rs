@@ -3879,6 +3879,17 @@ impl SyscallDispatcher {
                 let _ = (level, optname, optval_addr, optlen);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            // LTP setsockopt01: a closed fd is EBADF and a non-socket fd is
+            // ENOTSOCK; host_socket_lookup collapses both to EINVAL. (netlink is
+            // handled above.)
+            match this.open_file(fd) {
+                None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                Some(of) => {
+                    if !matches!(&*of.description.read(), OpenDescription::HostSocket { .. }) {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+                    }
+                }
+            }
             let (host_fd, _family) = this.host_socket_lookup(fd)?;
             // Record the GUEST-intended SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF so
             // getsockopt reports what the guest set rather than carrick's
@@ -4104,6 +4115,16 @@ impl SyscallDispatcher {
                 let _ = memory.write_bytes(optval_addr, &val.to_ne_bytes());
                 let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
                 return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // LTP getsockopt01: closed fd -> EBADF, non-socket fd -> ENOTSOCK,
+            // before the carrick-side SO_TYPE/SO_DOMAIN answers. (netlink above.)
+            match this.open_file(fd) {
+                None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                Some(of) => {
+                    if !matches!(&*of.description.read(), OpenDescription::HostSocket { .. }) {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+                    }
+                }
             }
             // SO_TYPE must report the GUEST-requested type, not the host backing:
             // a guest AF_UNIX SOCK_SEQPACKET is backed by a host SOCK_STREAM, but
