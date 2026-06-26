@@ -3111,6 +3111,65 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, i32> {
+        let resolved = self.resolve_at_path_inner(dirfd, path)?;
+        self.check_search_access(&resolved)?;
+        Ok(resolved)
+    }
+
+    /// Linux DAC search-permission check: resolving a path requires search
+    /// (execute) permission on EVERY directory component leading to the final
+    /// name. carrick runs every guest op as host-root, so the host kernel never
+    /// enforces this — but when the guest has dropped to a non-root euid we
+    /// must, or a no-search-permission component wrongly succeeds (lstat02,
+    /// stat03, truncate03, readlink03, … all assert EACCES here). Root (euid 0)
+    /// holds CAP_DAC_OVERRIDE and is exempt, which is also the hot path: the
+    /// overwhelming majority of guests run as root, so this returns immediately.
+    fn check_search_access(&self, abs: &str) -> Result<(), i32> {
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return Ok(());
+        }
+        let trimmed = abs.trim_end_matches('/');
+        let parent = match trimmed.rsplit_once('/') {
+            Some((p, _)) if !p.is_empty() => p,
+            _ => return Ok(()),
+        };
+        let mut prefix = String::new();
+        for comp in parent.split('/').filter(|c| !c.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(comp);
+            // A missing or non-directory component is ENOENT/ENOTDIR, surfaced
+            // by the existence checks elsewhere — not our concern here.
+            let Ok(md) = self.layered_metadata(&prefix) else {
+                return Ok(());
+            };
+            if md.kind != RootFsEntryKind::Directory {
+                return Ok(());
+            }
+            let (uid, gid) = self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .get_owner(&prefix)
+                .unwrap_or((0, 0));
+            // Pick the permission class: owner, then group, else other. (carrick
+            // tracks the primary fsgid, not the full supplementary set — a close
+            // approximation that the LTP search-permission cases exercise.)
+            let x_bit = if creds.fsuid == uid {
+                0o100
+            } else if creds.fsgid == gid {
+                0o010
+            } else {
+                0o001
+            };
+            if md.mode & x_bit == 0 {
+                return Err(LINUX_EACCES);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_at_path_inner(&self, dirfd: u64, path: &str) -> Result<String, i32> {
         // dirfd is an `int` in the kernel ABI: only the low 32 bits are
         // meaningful, and AT_FDCWD (-100) may arrive zero-extended (0xFFFFFF9C)
         // or sign-extended (0xFFFF..FF9C) depending on how the guest libc
