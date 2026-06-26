@@ -2284,6 +2284,15 @@ pub const CARRICK_PRIVATE_X86_POLL: u64 = u64::MAX - 0x28;
 /// number routes select to the pselect6 handler's select branch, which reads
 /// the timeout as a timeval and uses no sigmask.
 pub const CARRICK_PRIVATE_X86_SELECT: u64 = u64::MAX - 0x29;
+/// Carrick-internal normalized syscall number for x86_64 legacy `epoll_create(2)`.
+///
+/// x86_64 exposes `epoll_create(size)` as syscall 213; asm-generic/aarch64 has
+/// only `epoll_create1(flags)`. The `size` hint has been ignored since 2.6.8
+/// BUT the kernel still rejects `size <= 0` with EINVAL — a check that is lost if
+/// we fold straight into `epoll_create1(0)` (epoll-ltp / epoll_create02 assert
+/// the EINVAL). This private number routes the legacy call to a handler that
+/// validates `size` and then creates the instance.
+pub const CARRICK_PRIVATE_X86_EPOLL_CREATE: u64 = u64::MAX - 0x2a;
 /// Carrick-internal normalized syscall number for x86_64 `alarm(2)`.
 ///
 /// x86_64 exposes legacy `alarm(seconds)` as syscall 37, while asm-generic has

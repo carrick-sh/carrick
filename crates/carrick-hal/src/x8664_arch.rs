@@ -157,8 +157,17 @@ where
     const ARCH_GET_FS: u64 = 0x1003;
     /// `ARCH_GET_GS`.
     const ARCH_GET_GS: u64 = 0x1004;
+    /// `ARCH_GET_CPUID` / `ARCH_SET_CPUID` (arch_prctl(2)) — read/toggle the
+    /// CPUID-faulting bit. carrick runs guest `CPUID` natively and cannot
+    /// intercept it, so the feature is genuinely unavailable. The kernel returns
+    /// `ENODEV` for these when CPUID faulting is unsupported (arch_prctl01
+    /// asserts exactly this), NOT the `EINVAL` an unknown subfunction gets.
+    const ARCH_GET_CPUID: u64 = 0x1011;
+    const ARCH_SET_CPUID: u64 = 0x1012;
     /// `-EINVAL` (asm-generic errno 22) for an unknown subfunction.
     const NEG_EINVAL: i64 = -22;
+    /// `-ENODEV` (asm-generic errno 19) — feature present but unavailable.
+    const NEG_ENODEV: i64 = -19;
     Ok(match code {
         ARCH_SET_FS => {
             engine.seg_set_fs_base(addr)?;
@@ -178,6 +187,7 @@ where
             let _ = engine.write_bytes(addr, &v.to_le_bytes());
             0
         }
+        ARCH_GET_CPUID | ARCH_SET_CPUID => NEG_ENODEV,
         _ => NEG_EINVAL,
     })
 }
@@ -758,6 +768,27 @@ const X86_NR_EPOLL_WAIT: u64 = 232;
 /// Canonical (asm-generic / aarch64) `epoll_pwait` number — the target for x86
 /// `epoll_wait` (epoll_pwait(epfd, events, maxevents, timeout, NULL, 0)).
 const CANONICAL_EPOLL_PWAIT: u64 = 22;
+/// x86-64 `epoll_create(2)` (213). LEGACY x86_64-only — asm-generic has only
+/// `epoll_create1`. The `size` hint has been ignored by Linux since 2.6.8, so
+/// `epoll_create(size)` is faithfully `epoll_create1(0)`. Without this shim every
+/// glibc/LTP `SAFE_EPOLL_CREATE` ENOSYS'd, TBROKing the whole epoll test family
+/// at setup ("fail to create epoll instance: ENOSYS").
+const X86_NR_EPOLL_CREATE: u64 = 213;
+/// x86-64 `inotify_init(2)` (253). LEGACY — asm-generic has only
+/// `inotify_init1`. `inotify_init()` takes no args → `inotify_init1(0)`.
+const X86_NR_INOTIFY_INIT: u64 = 253;
+/// Canonical (asm-generic / aarch64) `inotify_init1` number.
+const CANONICAL_INOTIFY_INIT1: u64 = 26;
+/// x86-64 `signalfd(2)` (282). LEGACY — asm-generic has only `signalfd4`.
+/// `signalfd(fd, mask, sizemask)` → `signalfd4(fd, mask, sizemask, flags=0)`.
+const X86_NR_SIGNALFD: u64 = 282;
+/// Canonical (asm-generic / aarch64) `signalfd4` number.
+const CANONICAL_SIGNALFD4: u64 = 74;
+/// x86-64 `eventfd(2)` (284). LEGACY — asm-generic has only `eventfd2`.
+/// `eventfd(initval)` → `eventfd2(initval, flags=0)`.
+const X86_NR_EVENTFD: u64 = 284;
+/// Canonical (asm-generic / aarch64) `eventfd2` number.
+const CANONICAL_EVENTFD2: u64 = 19;
 /// x86-64 `getpgrp(2)` (syscalls(2)). LEGACY x86_64-only — asm-generic has NO
 /// `getpgrp`, only `getpgid(2)` (POSIX defines `getpgrp()` == `getpgid(0)`).
 /// glibc emits the raw `getpgrp` syscall, whereas musl implements `getpgrp()` as
@@ -957,6 +988,42 @@ impl X8664GuestArch {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
                 number: CANONICAL_EPOLL_PWAIT,
                 args: [args[0], args[1], args[2], args[3], 0, 0],
+            });
+        }
+        if x86_number == X86_NR_EPOLL_CREATE {
+            // epoll_create(size): the size hint is ignored since 2.6.8 but the
+            // kernel STILL rejects size <= 0 with EINVAL. Route to a private
+            // handler that keeps the size (in arg0) so it can validate before
+            // creating the instance — folding straight to epoll_create1(0) would
+            // lose that check (epoll-ltp / epoll_create02).
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                number: carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE,
+                args: [args[0], 0, 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_INOTIFY_INIT {
+            // inotify_init() takes no args → inotify_init1(flags=0).
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                number: CANONICAL_INOTIFY_INIT1,
+                args: [0, 0, 0, 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_SIGNALFD {
+            // signalfd(fd, mask, sizemask) → signalfd4(fd, mask, sizemask, 0).
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                number: CANONICAL_SIGNALFD4,
+                args: [args[0], args[1], args[2], 0, 0, 0],
+            });
+        }
+        if x86_number == X86_NR_EVENTFD {
+            // eventfd(initval) → eventfd2(initval, flags=0).
+            return SyscallNorm::Plain(RawSyscall {
+                guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                number: CANONICAL_EVENTFD2,
+                args: [args[0], 0, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_GETPGRP {
@@ -1293,6 +1360,46 @@ mod normalize_tests {
                 assert_eq!(rs.args[4], 0xC, "args[4] becomes child_tid");
             }
             _ => panic!("clone must be Plain"),
+        }
+    }
+
+    #[test]
+    fn legacy_fd_creators_desugar_to_at_variants() {
+        // The no-flags legacy x86_64 fd-creators map to their asm-generic
+        // *2/*1/*4 successors with flags=0 (the gap that TBROK'd the epoll /
+        // inotify / signalfd / eventfd test families at setup via ENOSYS).
+        // epoll_create(size=128) → private handler, size kept in arg0 (it
+        // validates size>0 before creating the instance).
+        match X8664GuestArch::normalize_syscall(&frame(213, [128, 0, 0, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE);
+                assert_eq!(rs.args, [128, 0, 0, 0, 0, 0]);
+            }
+            _ => panic!("epoll_create must be Plain"),
+        }
+        // inotify_init() → inotify_init1(26) flags=0.
+        match X8664GuestArch::normalize_syscall(&frame(253, [0; 6])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 26);
+                assert_eq!(rs.args, [0, 0, 0, 0, 0, 0]);
+            }
+            _ => panic!("inotify_init must be Plain"),
+        }
+        // signalfd(fd=5, mask=0x9, sizemask=8) → signalfd4(74) appending flags=0.
+        match X8664GuestArch::normalize_syscall(&frame(282, [5, 0x9, 8, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 74);
+                assert_eq!(rs.args, [5, 0x9, 8, 0, 0, 0]);
+            }
+            _ => panic!("signalfd must be Plain"),
+        }
+        // eventfd(initval=3) → eventfd2(19) appending flags=0.
+        match X8664GuestArch::normalize_syscall(&frame(284, [3, 0, 0, 0, 0, 0])) {
+            SyscallNorm::Plain(rs) => {
+                assert_eq!(rs.number, 19);
+                assert_eq!(rs.args, [3, 0, 0, 0, 0, 0]);
+            }
+            _ => panic!("eventfd must be Plain"),
         }
     }
 
