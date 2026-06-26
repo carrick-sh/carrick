@@ -998,6 +998,15 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let path = read_guest_c_string(memory, pathname.0)?;
         let path = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
+        // statfs(2) follows symlinks; a symlink CYCLE is ELOOP. resolve_at_path
+        // doesn't cap symlink depth, so canonicalize here to surface a cycle as
+        // ELOOP (LTP statfs02/statvfs02). Other resolution errors fall through to
+        // layered_metadata, which reports ENOENT/ENOTDIR/ENAMETOOLONG as before.
+        let path = match self.canonicalize_following(&path) {
+            Ok(resolved) => resolved,
+            Err(e) if e == crate::linux_abi::LINUX_ELOOP => return Ok(e.into()),
+            Err(_) => path,
+        };
         // Consult the layered view (overlay/disk first, then rootfs) so
         // that files the guest created in the overlay are visible here
         // too — a rootfs-direct lookup would miss them.
