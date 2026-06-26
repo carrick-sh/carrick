@@ -1155,8 +1155,43 @@ fn sysv_semctl<M: GuestMemory>(
             }
         }
         LINUX_IPC_SET => {
-            // Full IPC_SET (writing perms) is a best-effort no-op success for now.
-            Ok(DispatchOutcome::Returned { value: 0 })
+            // IPC_SET writes the perms from the guest's semid_ds at `arg`. carrick
+            // runs as a single host identity so it cannot reassign the host
+            // object's owner, but it CAN apply the permission bits — the field LTP
+            // semctl01 verifies after SET (mode == SEM_RA|066). Read the new mode
+            // (LinuxIpcPerm.mode is at offset 20 in the semid_ds) and push it to
+            // the host sem; the kernel re-adds its SEM_ALLOC flag, which IPC_STAT
+            // masks back off.
+            if arg == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            let new_mode = match cx.memory.read_bytes(arg + 20, 4) {
+                Ok(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+            };
+            #[cfg(target_os = "macos")]
+            {
+                let mut ds: libc::semid_ds = unsafe { core::mem::zeroed() };
+                if unsafe { libc::semctl(semid, 0, libc::IPC_STAT, &mut ds as *mut libc::semid_ds) }
+                    .host_syscall_errno()
+                    .is_err()
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                ds.sem_perm.mode = (ds.sem_perm.mode & !(0o777 as libc::mode_t))
+                    | ((new_mode & 0o777) as libc::mode_t);
+                let rc = unsafe {
+                    libc::semctl(semid, 0, libc::IPC_SET, &mut ds as *mut libc::semid_ds)
+                };
+                match rc.host_syscall_errno() {
+                    Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
         }
         LINUX_IPC_STAT => {
             // semid_ds translation into the 88-byte aarch64 semid64_ds form.
@@ -1187,7 +1222,12 @@ fn sysv_semctl<M: GuestMemory>(
                             gid: creds.egid,
                             cuid: creds.euid,
                             cgid: creds.egid,
-                            mode: ds.sem_perm.mode as u32,
+                            // macOS sets the SEM_ALLOC flag (0o1000) in
+                            // ipc_perm.mode for an allocated SysV object; Linux's
+                            // sem_perm.mode is just the permission bits. Mask to
+                            // 0o777 so the guest sees the mode it created with
+                            // (LTP semctl01 asserts mode == SEM_RA exactly).
+                            mode: (ds.sem_perm.mode as u32) & 0o777,
                             seq: ds.sem_perm._seq as u16,
                             ..Default::default()
                         },
