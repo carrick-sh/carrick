@@ -3461,13 +3461,22 @@ fn boottime_duration() -> Duration {
     {
         return host_clock_duration(libc::CLOCK_BOOTTIME).unwrap_or_else(monotonic_duration);
     }
-    // Linux CLOCK_BOOTTIME = CLOCK_MONOTONIC + time spent suspended. macOS
-    // CLOCK_MONOTONIC (backed by mach_continuous_time) is exactly that: it
-    // continues to advance while the system sleeps, so it is >= the
-    // suspend-excluding `monotonic_duration` above.
+    // On macOS/HVF the guest's BOOTTIME must MATCH its own vDSO fast path, which
+    // serves CLOCK_BOOTTIME (clock id 7) as the bare guest CNTVCT/freq — i.e.
+    // suspend-EXCLUDING, identical to MONOTONIC (vdso_fns.s clock-7 path). HVF
+    // gives the guest a virtual counter aligned to CLOCK_UPTIME_RAW that does NOT
+    // advance through host sleep (trap.rs documents the guest CNTVCT tracks
+    // CLOCK_UPTIME_RAW while the raw hardware MRS runs hours ahead after suspend),
+    // so the guest's timeline never "suspends" in its own frame. Reading
+    // mach_continuous_time (macOS CLOCK_MONOTONIC, suspend-INCLUDING) here made
+    // the trapping syscall disagree with the vDSO by the host's accumulated sleep
+    // (seconds) — LTP clock_gettime04 reads BOTH paths and sees time travel
+    // backwards. Use the SAME suspend-excluding base as monotonic_duration so the
+    // two paths agree and BOOTTIME >= MONOTONIC holds (as equality). The Linux
+    // branch keeps native CLOCK_BOOTTIME (true suspend-inclusive, time-ns aware).
     #[cfg(not(target_os = "linux"))]
     {
-        host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or_else(monotonic_duration)
+        host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW).unwrap_or_else(monotonic_duration)
     }
 }
 
