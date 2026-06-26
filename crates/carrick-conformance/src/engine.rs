@@ -287,6 +287,19 @@ fn run_one(
         }
     };
 
+    // Reap any guest processes that escaped this run's process group — a guest
+    // that did setsid/setpgid (LTP process-group tests), or a forked child that
+    // re-parented to init when the carrick parent exited. The in-loop
+    // kill_scoped only fires on TIMEOUT, so a normally-completing test that
+    // leaked a re-parented child would leave it lingering; across a 1429-suite
+    // run these accumulate and drive box load up, which spuriously TIMEOUTs
+    // *other* concurrent suites (turning a clean ~33 CRASH_TIMEOUT baseline into
+    // 160+). The pkill is scoped to this run's unique `--name` and is a no-op
+    // when nothing escaped, so always running it after the wait is safe.
+    if matches!(engine, Engine::Carrick) {
+        kill_scoped(pid, run_id, engine, cleanup.as_ref());
+    }
+
     Ok(RunOutput {
         stdout_path,
         stderr_path,
@@ -333,15 +346,23 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
             Engine::Carrick,
             Some(CarrickCleanup::KvmLocal | CarrickCleanup::BhyveLocal | CarrickCleanup::NvmmLocal),
         ) => {
-            // Local Linux/KVM, FreeBSD/bhyve, and NetBSD/NVMM: carrick may have
-            // escaped its original process group, and non-macOS builds keep the
-            // original argv instead of macOS proctitle rewriting. Reap only this
-            // run's named process tree.
-            let _ = Command::new("pkill")
-                .args(["-9", "-f", &format!("run --name {run_id} ")])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            // Local Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM: a guest may have
+            // escaped its process group (setsid/setpgid), so kill by name, not
+            // by tree. TWO patterns, both scoped to this run's unique id:
+            //   - the top-level carrick parent keeps its argv `run --name <id>`
+            //   - the guest CHILDREN rewrite their argv/comm to
+            //     `carrick:<id>: <test>` (the proctitle IS rewritten on Linux —
+            //     a prior comment claiming otherwise was wrong), so the first
+            //     pattern misses them and they leak (re-parented to init). Over
+            //     a full suite the leaked guests accumulate and drive box load
+            //     up, spuriously TIMEOUTing other concurrent suites.
+            for pat in [format!("run --name {run_id} "), format!("carrick:{run_id}")] {
+                let _ = Command::new("pkill")
+                    .args(["-9", "-f", &pat])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
         (Engine::Carrick, Some(CarrickCleanup::Hvf) | None) => {
             // Belt for a guest that escaped its group (setpgid/setsid): the
