@@ -139,7 +139,7 @@ syscall_table! {
     43 => sys_statfs,
     44 => sys_fstatfs,
     45 => sys_truncate,
-    77 => sys_bootstrap_enosys,
+    77 => tee,
 }
 mod access;
 mod fd_helpers;
@@ -426,6 +426,32 @@ fn check_path_length(path: &str) -> Result<(), i32> {
         }
     }
     Ok(())
+}
+
+/// Host passthrough for tee(2). On Linux the guest pipes are real host kernel
+/// pipes, so the host tee(2) gives exact zero-consume semantics; on other hosts
+/// (macOS) there is no tee(2), so it stays ENOSYS as before.
+#[cfg(target_os = "linux")]
+fn tee_host_passthrough(
+    in_fd: i32,
+    out_fd: i32,
+    count: usize,
+    flags: u64,
+) -> Result<DispatchOutcome, DispatchError> {
+    let n = unsafe { libc::tee(in_fd, out_fd, count, flags as libc::c_uint) };
+    Ok(DispatchOutcome::Returned {
+        value: n.host_syscall_errno()? as i64,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tee_host_passthrough(
+    _in_fd: i32,
+    _out_fd: i32,
+    _count: usize,
+    _flags: u64,
+) -> Result<DispatchOutcome, DispatchError> {
+    Ok(crate::linux_abi::LINUX_ENOSYS.into())
 }
 
 /// Same-file identity used for F_SETLEASE conflict accounting (see
@@ -2230,10 +2256,6 @@ impl SyscallDispatcher {
                 VfsOpenAttempt::Installed(new_fd)
             }
         }
-    }
-
-    fn bootstrap_enosys(&self) -> DispatchOutcome {
-        DispatchOutcome::errno(LINUX_ENOSYS)
     }
 
     // === Normalized shim-wrappers ===
@@ -6728,6 +6750,37 @@ impl SyscallDispatcher {
 
         }
 
+        fn tee(this, cx, fd_in: Fd, fd_out: Fd, len: u64, flags: u64) {
+
+            // tee(2) duplicates up to `len` bytes of pipe data from fd_in to
+            // fd_out WITHOUT consuming the source. carrick's pipes are real host
+            // kernel pipes (HostPipe), so on Linux we pass straight through to
+            // the host tee(2) — exact, fork-coherent semantics with no userspace
+            // ring to peek. macOS has no tee(2): it stays ENOSYS (as before).
+            let _ = cx;
+            if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // Both fds must be pipes — fd_in a READ end, fd_out a WRITE end —
+            // else EINVAL (tee01 setup). The read and write end of the SAME pipe
+            // object is also EINVAL (tee02), detected via the shared pipe_id.
+            let Some((in_fd, in_pipe)) = this.host_pipe_end(fd_in.0, true) else {
+                return Ok(LINUX_EINVAL.into());
+            };
+            let Some((out_fd, out_pipe)) = this.host_pipe_end(fd_out.0, false) else {
+                return Ok(LINUX_EINVAL.into());
+            };
+            if in_pipe != 0 && in_pipe == out_pipe {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let count = usize::try_from(len).map_err(|_| DispatchError::LengthTooLarge(len))?;
+            if count == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            tee_host_passthrough(in_fd, out_fd, count, flags)
+
+        }
+
         fn splice(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
 
             let tid = cx.tid();
@@ -7227,12 +7280,6 @@ impl SyscallDispatcher {
         fn sys_truncate(this, cx, path: GuestPtr, length: u64) {
 
             this.truncate(path, length, &*cx.memory)
-
-        }
-
-        fn sys_bootstrap_enosys(this, cx) {
-
-            Ok(this.bootstrap_enosys())
 
         }
 

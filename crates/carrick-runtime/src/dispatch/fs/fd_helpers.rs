@@ -426,6 +426,28 @@ impl SyscallDispatcher {
         }
     }
 
+    /// `(host_fd, pipe_id)` for a HostPipe fd that is the requested end (a read
+    /// end when `want_read`, a write end otherwise), else `None`. tee(2) uses
+    /// this to require fd_in be a readable pipe and fd_out a writable one, and to
+    /// detect the two-ends-of-the-same-pipe EINVAL case via the shared pipe_id.
+    pub(in crate::dispatch) fn host_pipe_end(
+        &self,
+        fd: i32,
+        want_read: bool,
+    ) -> Option<(i32, u64)> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end,
+                pipe_id,
+                ..
+            } if *is_read_end == want_read => Some((*host_fd, *pipe_id)),
+            _ => None,
+        }
+    }
+
     pub(in crate::dispatch) fn splice_output_errno(&self, fd: i32) -> Option<i32> {
         if is_stdio_fd(fd) {
             return None;
