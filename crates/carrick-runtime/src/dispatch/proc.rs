@@ -132,39 +132,53 @@ static IOPRIO_VALUE: std::sync::atomic::AtomicU32 =
 /// caller's `len` to equal this exactly; get_robust_list reports it.
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 
-fn translate_setpgid_args(pid: i32, pgid: i32) -> Result<(i32, i32), i32> {
+fn translate_setpgid_args(pid: NsPid, pgid: NsPid) -> Result<(i32, i32), i32> {
+    // A negative pgid is EINVAL, checked before any pid/pgid lookup (Linux
+    // checks it first; under a namespace we translate, so the host would never
+    // otherwise see the raw negative value — LTP setpgid02 case 1).
+    if pgid.raw() < 0 {
+        return Err(LINUX_EINVAL);
+    }
     if !crate::namespace::pid::enabled() {
-        return Ok((pid, pgid));
+        return Ok((pid.raw(), pgid.raw()));
     }
 
-    let target_ns_pid = if pid == 0 {
+    let target_ns_pid = if pid.raw() == 0 {
         crate::namespace::pid::self_ns_pid()
     } else {
-        pid as u32
+        pid.raw() as u32
     };
-    let idempotent_init_self_setpgid = pid == 0
+    let idempotent_init_self_setpgid = pid.raw() == 0
         && target_ns_pid == crate::namespace::pid::NS_INIT_PID
-        && (pgid == 0 || pgid as u32 == target_ns_pid);
+        && (pgid.raw() == 0 || pgid.raw() as u32 == target_ns_pid);
     if crate::namespace::pid::ns_pid_is_session_leader(target_ns_pid)
         && !idempotent_init_self_setpgid
     {
         return Err(LINUX_EPERM);
     }
 
-    let host_pid = if pid == 0 {
+    // pid 0 = "the calling process" (host 0 passthrough); a non-zero ns-pid that
+    // names no member is ESRCH.
+    let host_pid = if pid.raw() == 0 {
         0
     } else {
-        match crate::namespace::pid::ns_to_host_or_self(pid as u32) {
-            Some(host_pid) => host_pid as i32,
+        match pid.to_host() {
+            Some(h) => h.get() as i32,
             None => return Err(LINUX_ESRCH),
         }
     };
-    let host_pgid = if pgid == 0 {
+    // pgid 0 = "same as pid"; pgid == pid creates a new group led by the target.
+    // Any other pgid must name an EXISTING group — one that resolves to no host
+    // group cannot be joined → EPERM (NOT ESRCH): setpgid02 case 3 passes the
+    // system pid_max as a guaranteed-invalid pgid and expects EPERM.
+    let host_pgid = if pgid.raw() == 0 {
         0
+    } else if pgid.raw() == pid.raw() {
+        host_pid
     } else {
-        match crate::namespace::pid::ns_to_host_pgid(pgid as u32) {
-            Some(host_pgid) => host_pgid as i32,
-            None => return Err(LINUX_ESRCH),
+        match pgid.to_host_pgid() {
+            Some(h) => h.get() as i32,
+            None => return Err(LINUX_EPERM),
         }
     };
     Ok((host_pid, host_pgid))
@@ -1713,7 +1727,7 @@ impl SyscallDispatcher {
             // pid 0 = "the calling process", pgid 0 = "same as pid" — both pass
             // through (0 means self to the host too). A non-zero ns-pid that
             // isn't a member is ESRCH. Identity when ns is off.
-            let (hpid, hpgid) = match translate_setpgid_args(pid.0, pgid.0) {
+            let (hpid, hpgid) = match translate_setpgid_args(pid, pgid) {
                 Ok(args) => args,
                 Err(errno) => return Ok(errno.into()),
             };
@@ -2488,7 +2502,7 @@ fn build_sigchld_siginfo(
 
 #[cfg(test)]
 mod setpgid_tests {
-    use super::translate_setpgid_args;
+    use super::{NsPid, translate_setpgid_args};
     use crate::linux_abi::LINUX_EPERM;
 
     #[test]
@@ -2499,11 +2513,13 @@ mod setpgid_tests {
             let ok = unsafe { libc::setpgid(0, 0) } >= 0
                 && crate::namespace::pid::init(std::process::id())
                 && crate::namespace::pid::self_ns_pid() == crate::namespace::pid::NS_INIT_PID
-                && translate_setpgid_args(1, 1) == Err(LINUX_EPERM)
-                && translate_setpgid_args(1, 0) == Err(LINUX_EPERM)
-                && translate_setpgid_args(0, 0) == Ok((0, 0))
-                && translate_setpgid_args(0, crate::namespace::pid::NS_INIT_PID as i32)
-                    == Ok((0, unsafe { libc::getpgrp() }));
+                && translate_setpgid_args(NsPid(1), NsPid(1)) == Err(LINUX_EPERM)
+                && translate_setpgid_args(NsPid(1), NsPid(0)) == Err(LINUX_EPERM)
+                && translate_setpgid_args(NsPid(0), NsPid(0)) == Ok((0, 0))
+                && translate_setpgid_args(
+                    NsPid(0),
+                    NsPid(crate::namespace::pid::NS_INIT_PID as i32),
+                ) == Ok((0, unsafe { libc::getpgrp() }));
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
 
