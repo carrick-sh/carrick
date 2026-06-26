@@ -289,6 +289,24 @@ fn run() -> anyhow::Result<ExitCode> {
     let cpython_workers = cpython_worker_count(args.cpython_workers, workers);
     let lanes = SchedulerLanes::new(cpython_workers);
 
+    // The oracle is cached for routine runs, so a suite's verdict is fully known
+    // the moment its carrick run finishes — no docker needed. Load the cache +
+    // per-suite cached oracle side UP FRONT so Phase 1 can STREAM a report line
+    // per suite as it completes: the jsonl then grows during the long carrick
+    // phase (live progress instead of a 0-byte file), and a crashed/killed run
+    // leaves partial results behind. The authoritative file is still rewritten
+    // in full at the end (after flake-retries), so this is purely additive.
+    let mut cache = oracle::OracleCache::load(&args.oracle_cache);
+    let cached: Vec<Option<parsers::SuiteResult>> = if args.refresh_oracle {
+        vec![None; n]
+    } else {
+        selected
+            .iter()
+            .map(|s| cache.get(s, docker_platform))
+            .collect()
+    };
+    let stream = Mutex::new(std::fs::File::create(&args.jsonl).ok());
+
     // ---- Phase 1: ALL carrick (weight-aware; never overlapping docker). ----
     eprintln!("phase 1/3: {n} carrick runs (workers={workers}, cpython-workers={cpython_workers})");
     let all_indices: Vec<usize> = (0..n).collect();
@@ -300,22 +318,35 @@ fn run() -> anyhow::Result<ExitCode> {
         let run_id = format!("conf-{pid}-c{i:02}");
         let out = engine::run_carrick(s, &carrick_bin, &run_id, &lane);
         eprintln!("  [carrick] {}", s.name);
+        // Stream this suite's report NOW if its oracle is cached (the common
+        // case). Un-cached suites still need docker (Phase 2) and are emitted
+        // only by the final authoritative write.
+        if let Some(res) = cached.get(i).and_then(|c| c.as_ref()) {
+            let docker = DockerSide {
+                result: res.clone(),
+                run_id: "<cached>".to_string(),
+                argv: engine::docker_dry_run(s, "<cached>", docker_platform),
+            };
+            let cout = out.as_ref().ok();
+            let rep = build_report(s, cout, &docker, &baseline);
+            if let Ok(line) = serde_json::to_string(&rep)
+                && let Ok(mut guard) = stream.lock()
+                && let Some(f) = guard.as_mut()
+            {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+        }
         out
     });
+    drop(stream);
 
     // ---- Phase 2: docker — but ONLY for suites whose oracle is not already
     // cached. The docker oracle for a deterministic suite is stable, so it needs
     // to run once, ever; a cached suite contributes its committed result and
     // runs no container. Strictly after phase 1 (carrick ‖ docker never overlap).
-    let mut cache = oracle::OracleCache::load(&args.oracle_cache);
-    let cached: Vec<Option<parsers::SuiteResult>> = if args.refresh_oracle {
-        vec![None; n]
-    } else {
-        selected
-            .iter()
-            .map(|s| cache.get(s, docker_platform))
-            .collect()
-    };
+    // (`cache`/`cached` were loaded before Phase 1 for the live-stream above.)
     let need_docker: Vec<usize> = (0..n).filter(|&i| cached[i].is_none()).collect();
     eprintln!(
         "phase 2/3: {} docker run(s), {} cached oracle(s){} (workers={workers}, cpython-workers={cpython_workers})",
