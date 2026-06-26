@@ -1,0 +1,199 @@
+accept02 :: accept02.c:71: TFAIL: Multicast group was copied!
+accept03 :: accept03.c:46: TFAIL: accept() on O_PATH file expected EBADF: ENOTSOCK (88)
+adjtimex03 :: adjtimex03.c:55: TBROK: adjtimex(): Unexpeceted error, expecting EINVAL with mode 0x8000: EPERM (1)
+arch_prctl01 :: arch_prctl01.c:56: TFAIL: arch_prctl_set(ARCH_SET_CPUID, index) expected ENODEV: EINVAL (22)
+capset02 :: capset02.c:74: TFAIL: kernel doesn't return preferred linux capability version when using bad version
+capset03 :: capset03.c:30: TFAIL: capset() succeeded
+capset04 :: capset04.c:35: TFAIL: capset() succeeded
+chroot01 :: chroot01.c:21: TFAIL: unprivileged chroot() expected EPERM: ENOSYS (38)
+chroot02 :: chroot02.c:28: TFAIL: chroot(/tmp/LTP_chrPEBIWB) failed: ENOSYS (38)
+chroot03 :: chroot03.c:52: TFAIL: chroot(longer than VFS_MAXNAMELEN) expected ENAMETOOLONG: ENOSYS (38)
+chroot04 :: chroot04.c:25: TFAIL: no search permission chroot() expected EACCES: ENOSYS (38)
+clock_getres01 :: clock_getres01.c:77: TFAIL: clock_getres(-1, ...) failed: SUCCESS (0)
+clock_gettime04 :: clock_gettime04.c:161: TFAIL: CLOCK_REALTIME: Time travelled backwards (1): -85987304 ns
+clock_nanosleep01 :: clock_nanosleep01.c:195: TFAIL: The clock_nanosleep() haven't updated timespec or it's not valid: EINTR (4)
+clone01 :: clone01.c:32: TBROK: wait(0xfffffef964) failed: ECHILD (10)
+clone02 :: clone02 1 TBROK : clone02.c:249: chdir((null)) failed: errno=EFAULT(14): Bad address
+clone03 :: clone03.c:36: TFAIL: pid(0) retval 32927 != 0: SUCCESS (0)
+clone06 :: tst_test.c:1705: TBROK: Test haven't reported results!
+clone07 :: clone07.c:37: TBROK: waitpid(0,0xfffffef964,0) failed: ECHILD (10)
+clone08 :: tst_test.c:1721: TBROK: Test 0 haven't reported results!
+clone302 :: clone302.c:97: TFAIL: extra size: clone3() should fail with EFAULT: EINVAL (22)
+connect01 :: connect01 5 TFAIL : connect01.c:149: already connected ; returned 0 (expected -1), errno 0 (expected 106)
+connect02 :: connect02.c:103: TBROK: connect(5, sock_ntop: unknown AF_xxx: 0, len: 16, 16) failed: ECONNRESET (104)
+creat08 :: creat08.c:55: TFAIL: dir_b/nosetgid: Incorrect group, 65534 != 11
+epoll-ltp :: epoll01 1 TFAIL : epoll-ltp.c:217: epoll_create with negative set size succeeded unexpectedly: errno=SUCCESS(0): Success
+epoll_create02 :: epoll_create02.c:30: TFAIL: epoll_create(0) invalid retval 3: SUCCESS (0)
+epoll_ctl04 :: epoll_ctl04.c:61: TFAIL: epoll_ctl(..., EPOLL_CTL_ADD, ...) with number of nesting is 5 succeeded
+epoll_ctl05 :: epoll_ctl05.c:61: TFAIL: epoll_ctl(..., EPOLL_CTL_ADD, ...) succeeded
+epoll_wait05 :: epoll_wait05.c:81: TFAIL: Wrong number of events reported 0
+epoll_wait06 :: epoll_wait06.c:78: TFAIL: write() failed invalid retval 4096: SUCCESS (0)
+eventfd2_03 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+execve02 :: execve_child.c:27: TFAIL: execve_child shouldn't be executed
+execve03 :: execve03.c:106: TFAIL: execve failed unexpectedly; expected File name too long: ENOENT (2)
+execveat02 :: execveat_errno.c:17: TFAIL: execveat() passes unexpectedly
+fchdir03 :: fchdir03.c:33: TFAIL: fchdir() succeeded unexpectedly
+fcntl15 :: fcntl15.c:100: TFAIL: Failed to lock now unlocked region one: EAGAIN/EWOULDBLOCK (11)
+fcntl15_64 :: fcntl15.c:100: TFAIL: Failed to lock now unlocked region one: EAGAIN/EWOULDBLOCK (11)
+fcntl36 :: fcntl36.c:126: TBROK: fcntl(4,F_SETLKW,...) failed: EINTR (4)
+fcntl36_64 :: fcntl36.c:126: TBROK: fcntl(4,F_SETLKW,...) failed: EINTR (4)
+fcntl37 :: fcntl37.c:45: TFAIL: F_SETPIPE_SZ succeed and return 1048576
+fcntl37_64 :: fcntl37.c:45: TFAIL: F_SETPIPE_SZ succeed and return 1048576
+fork_procs :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+futex_cmp_requeue01 :: futex_cmp_requeue01.c:163: TFAIL: requeued 0 waiters, expected range: (7, 7)
+futex_wait03 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+futex_wake02 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+getpgid01 :: getpgid01.c:18: TBROK: Failed to open FILE '/proc/1/stat' for reading: ENOENT (2)
+getsockopt01 :: getsockopt01.c:70: TFAIL: invalid option buffer succeeded
+inotify01 :: inotify01.c:91: TFAIL: get unnecessary event: wd=1 mask=20 cookie=0 len=0
+inotify02 :: inotify02.c:121: TFAIL: get unnecessary event: wd=1 mask=40000020 cookie=0 len=0 name=""
+inotify04 :: inotify04.c:127: TFAIL: got unnecessary event: wd=1 mask=40000020 cookie=0 len=0 name=""
+inotify10 :: inotify10.c:169: TFAIL: got event: wd=2 (expected 1) mask=40000004 (expected 40000004) len=0 name="" (expected "test_dir")
+inotify11 :: inotify11.c:76: TBROK: read(3,0x10003ba40,1024) failed, returned -1: EAGAIN/EWOULDBLOCK (11)
+ioctl01 :: ioctl01.c:62: TFAIL: Termio address is invalid expected EFAULT: ENOTTY (25)
+ioctl07 :: ioctl07.c:27: TBROK: ioctl(3,((((2U) << (((0+8)+8)+14)) | ((('R')) << (0+8)) | (((0x00)) << 0) | ((((sizeof(int)))) << ((0+8)+8)))),...) failed: ENOTT
+ioctl_ficlone04 :: ioctl_ficlone04.c:30: TFAIL: ioctl(file, FICLONE, directory) expected EOPNOTSUPP, EPERM, EISDIR, EBADF, EINVAL, EXDEV: ENOTTY (25)
+ioctl_ns02 :: ioctl_ns02.c:42: TFAIL: unexpected ioctl error: EPERM (1)
+ioctl_ns04 :: ioctl_ns04.c:43: TFAIL: call to ioctl succeded
+link04 :: link04.c:99: TFAIL: link(<regfile>, <path contains a non-existent file>) returned 0, expected -1, errno:2
+llseek01 :: llseek01.c:39: TFAIL: write successful after file size limit
+lseek11 :: lseek11.c:196: TBROK: Short read(3,0xfffffef530,6) returned only 0
+lstat02 :: lstat02.c:66: TFAIL: lstat() returned 0, expected -1: SUCCESS (0)
+lstat02_64 :: lstat02.c:66: TFAIL: lstat() returned 0, expected -1: SUCCESS (0)
+madvise02 :: tst_test.c:1948: TBROK: Test killed by SIGSEGV!
+madvise05 :: madvise05.c:45: TBROK: madvise failed: ENOMEM (12)
+membarrier01 :: membarrier01.c:290: TFAIL: membarrier(2): cmd_global_success reported as not supported
+memfd_create01 :: memfd_create_common.c:212: TBROK: fcntl(3,F_GET_SEALS,...) failed: EINVAL (22)
+mincore03 :: mincore03.c:68: TFAIL: mincore reports resident pages as 3, but expected 0
+mknod03 :: mknod03.c:35: TFAIL: buf.st_gid (0) != free_gid (11)
+mknod04 :: mknod04.c:36: TFAIL: buf.st_mode & S_ISGID (1024) != 0 (0)
+mknod05 :: mknod05.c:36: TFAIL: buf.st_gid (0) != free_gid (11)
+mknod08 :: mknod08.c:36: TFAIL: buf.st_gid (0) != nobody_gid (65534)
+mlock05 :: mlock05.c:44: TBROK: Mapping 6000219000 not found in /proc/self/smaps
+mmap04 :: mmap04.c:63: TBROK: Expected 1 conversions got 0 FILE '/proc/self/maps'
+mmap05 :: tst_test.c:1936: TBROK: Child returned with 125
+mmap06 :: mmap06.c:57: TFAIL: mmap(NULL, tc->length, tc->prot, tc->flags, fd, 0) succeeded
+mmap12 :: mmap12.c:47: TFAIL: pen dev pagemap failed: ENOENT (2)
+mmap13 :: tst_test.c:1936: TBROK: Child returned with 125
+mmap14 :: mmap14.c:63: TFAIL: Expected 1024K locked, get 0K locked
+mmap15 :: tst_test.c:1936: TBROK: Child returned with 125
+mmap17 :: mmap17.c:59: TFAIL: mmap failed, with unexpected error code, expected EEXIST: ENOTTY (25)
+mmap18 :: mmap18.c:163: TFAIL: Child: killed by SIGSEGV
+mmap20 :: mmap20.c:50: TFAIL: mmap() failed with unexpected error: EINVAL (22)
+mprotect01 :: mprotect01 3 TFAIL : mprotect01.c:104: call succeeded unexpectedly
+mprotect03 :: mprotect03 1 TFAIL : mprotect03.c:111: child returned unexpected status
+mprotect05 :: tst_test.c:1948: TBROK: Test killed by SIGBUS!
+mq_notify01 :: tst_test.c:1948: TBROK: Test killed by SIGIOT/SIGABRT!
+mq_notify03 :: mq_notify03.c:55: TFAIL: mq_notify(m, &sev) failed: ENOENT (2)
+mremap01 :: mremap01 1 TFAIL : mremap01.c:117: mremap failed: errno=EINVAL(22): Invalid argument
+mremap04 :: mremap04 1 TFAIL : mremap04.c:146: mremap() failed, Unexpected errno 22
+mremap05 :: mremap05 1 TFAIL : mremap05.c:152: MREMAP_FIXED requires MREMAP_MAYMOVE: errno=ENOMEM(12): Cannot allocate memory
+msgctl04 :: msgctl04.c:79: TFAIL: msgctl(1, 2, 0x10003eb20) succeeded
+msgctl12 :: msgctl12.c:50: TBROK: msgctl(6, 3, 0x10003dac0) failed: EINVAL (22)
+msgget02 :: msgget02.c:50: TFAIL: msgget(1627459590, 256) succeeded
+msgrcv02 :: msgrcv02.c:66: TFAIL: msgrcv(9, 0x10003f000, 1024, 2, 0) succeeded
+msgrcv05 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+msgrcv06 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+msgsnd02 :: msgsnd02.c:64: TFAIL: msgsnd(18, 0x10003e020, 1024, 0) succeeded
+msgsnd05 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+msgsnd06 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+msync03 :: msync03 1 TFAIL : msync03.c:141: msync succeeded unexpectedly
+munlock02 :: munlock02.c:23: TFAIL: munlock(0x600021b000, 32768) succeeded
+munlockall01 :: munlockall01.c:30: TBROK: Locked memory after mlockall() should be > 0
+nanosleep02 :: nanosleep02.c:65: TFAIL: nanosleep() remaining time 1099511560764317587us, expected 4046836us, diff 1099511560760270752us
+newuname01 :: newuname01.c:38: TFAIL: name->release (6.12.0-carrick) != proc_val (6.6.0-carrick)
+nftw01 :: nftw01 15 TFAIL : tools.c:267: Test failed
+nftw6401 :: nftw6401 15 TFAIL : tools64.c:267: Test failed
+open02 :: open02.c:47: TFAIL: open() unprivileged O_RDONLY | O_NOATIME succeeded
+open10 :: open10.c:53: TFAIL: dir_b/nosetgid: Incorrect group, 65534 != 11
+open13 :: open13.c:76: TFAIL: mmap() on original FD succeeded
+pathconf02 :: pathconf02.c:58: TFAIL: pathconf() fail with path is an empty string invalid retval 127: SUCCESS (0)
+pidfd_open04 :: pidfd_open04.c:31: TBROK: tst_checkpoint_wait(0, 10000) failed: ETIMEDOUT (110)
+pidfd_send_signal01 :: pidfd_send_signal01.c:35: TFAIL: Received wrong signal and/or data!
+pidfd_send_signal02 :: pidfd_send_signal02.c:72: TBROK: open(/proc/1,589824,0000) failed: ENOENT (2)
+pipe15 :: pipe15.c:53: TBROK: Failed to open FILE '/proc/sys/fs/pipe-user-pages-soft' for reading: ENOENT (2)
+pipe2_04 :: pipe2_04.c:40: TFAIL: write() succeeded unexpectedly
+ppoll01 :: tst_test.c:1948: TBROK: Test killed by SIGIOT/SIGABRT!
+prctl02 :: prctl02.c:155: TFAIL: prctl() succeeded unexpectedly
+prctl03 :: prctl03.c:53: TFAIL: prctl(PR_GET_CHILD_SUBREAPER) got 1, expected 0
+prctl05 :: prctl05.c:68: TFAIL: /proc/self/comm != 'prctl05_test' got 'prctl05'
+prctl08 :: prctl08.c:73: TFAIL: /proc/self/timerslack_ns != 1 got 50000
+prctl10 :: prctl10.c:72: TFAIL: prctl(PR_SET_TSC, tc->read_stat) failed: EINVAL (22)
+preadv201 :: tst_test.c:1948: TBROK: Test killed by SIGIOT/SIGABRT!
+preadv201_64 :: tst_test.c:1948: TBROK: Test killed by SIGIOT/SIGABRT!
+pselect02 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+pselect02_64 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+ptrace02 :: ptrace02.c:47: TFAIL: ptrace() expected EPERM, but got: ENOSYS (38)
+ptrace03 :: ptrace03.c:57: TFAIL: ptrace() failed unexpectedly, expected ESRCH: ENOSYS (38)
+ptrace06 :: ptrace06.c:205: TFAIL: ptrace(PEEKUSER, ..., 929, 0) failed as expected expected EIO, EFAULT: ENOSYS (38)
+ptrace07 :: ptrace07.c:122: TBROK: PTRACE_ATTACH failed: ENOSYS (38)
+ptrace08 :: ptrace08.c:81: TBROK: ptrace() failed: ENOSYS (38)
+ptrace09 :: ptrace09.c:58: TBROK: ptrace() failed: ENOSYS (38)
+ptrace10 :: ptrace10.c:47: TBROK: ptrace() failed: ENOSYS (38)
+pwrite04 :: pwrite04.c:61: TFAIL: file size is 2048 != K3
+pwrite04_64 :: pwrite04.c:61: TFAIL: file size is 2048 != K3
+readlink03 :: readlink03.c:66: TFAIL: readlink() sueeeeded unexpectedly
+readlinkat01 :: readlinkat01.c:72: TBROK: open(readlink_symlink,2228224,0000) failed: ELOOP (40)
+realpath01 :: realpath01.c:28: TBROK: chroot(cve-2018-1000001) failed: ENOSYS (38)
+recvmmsg01 :: recvmmsg01.c:86: TFAIL: recvmmsg() bad socket file descriptor expected EBADF: EFAULT (14)
+recvmsg01 :: recvmsg01.c:242: TFAIL: invalid iovec count: expected EMSGSIZE: EINVAL (22)
+remap_file_pages01 :: remap_file_pages01 1 TFAIL : remap_file_pages01.c:174: remap_file_pages error for page=0x10000000000, remap_sz=8192, window_pages=14: errno=ENOSYS(38)
+rename09 :: rename09.c:49: TFAIL: rename() succeeded
+rt_sigtimedwait01 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+sched_setparam05 :: sched_setparam05.c:29: TFAIL: sched_setparam(152338, 0) succeeded
+select03 :: select03.c:71: TFAIL: Negative nfds: select()() should fail with EINVAL: EFAULT (14)
+semctl01 :: semctl01.c:45: TFAIL: semaphore STAT info is incorrect
+semctl02 :: semctl02.c:26: TFAIL: semctl(IPC_STAT) with nobody user succeeded
+semctl04 :: semctl04.c:42: TFAIL: semctl() with nobody user in child succeeded
+semctl07 :: semctl07.c:39: TFAIL: sem_nsems = 0, expected 1
+semget01 :: semget01.c:27: TFAIL: un_arg.buf->sem_nsems (0) != PSEMS (10)
+semget02 :: semget02.c:53: TFAIL: semget(1627459652, 10, 384) succeeded
+semop02 :: semop02.c:102: TBROK: semctl() IPC_INFO failed: EINVAL (22)
+semop03 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+send02 :: send02.c:103: TFAIL: recv() read 16 bytes, expected 0, step 1
+sendfile04 :: sendfile04.c:60: TFAIL: sendfile(..) with pass_unmapped_buffer, protection=3 succeeded
+sendfile04_64 :: sendfile04.c:60: TFAIL: sendfile(..) with pass_unmapped_buffer, protection=3 succeeded
+sendmmsg02 :: sendmmsg02.c:48: TFAIL: sendmmsg() bad file descriptor expected EBADF: EFAULT (14)
+setfsuid04 :: setfsuid04 0 TINFO : Child process returned TFAIL
+setgroups03 :: setgroups03.c:48: TFAIL: setgroups(1, groups_list) succeeded
+setgroups04 :: setgroups04 1 TFAIL : setgroups04.c:113: setgroups() returned 0, expected -1, errno=14
+setpgid03 :: setpgid03.c:56: TFAIL: setpgid(child_pid, getppid()) expected EACCES: EPERM (1)
+setpriority02 :: setpriority02.c:65: TFAIL: setpriority(1, 0, -2) as unprivileged user succeeds unexpectedly returned 0
+setrlimit02 :: setrlimit02.c:35: TFAIL: call succeeded unexpectedly
+setrlimit03 :: setrlimit03.c:45: TFAIL: call succeeded unexpectedly (nr_open=1048576 rlim_cur=1024 rlim_max=1048577)
+setsockopt01 :: setsockopt01.c:104: TFAIL: setsockopt() returned unexpected error: EINVAL (22)
+setsockopt02 :: setsockopt02.c:60: TBROK: setsockopt(sk, SOL_PACKET, PACKET_VERSION, TPACKET_V3): ENOPROTOOPT (92)
+shmat01 :: shmat01.c:109: TFAIL: shared memory address 0x10000600000 is not correct, expected 0x10000200000
+shmat02 :: shmat02.c:47: TFAIL: shmat(*tc->shmid, *tc->shmaddr, 0) succeeded
+shmctl01 :: shmctl01.c:118: TFAIL: after child shmat() shm_nattcg=0 expected 20
+shmctl02 :: shmctl02.c:95: TFAIL: shmctl(790616, 2, 0x10003ea40) succeeded
+shmctl03 :: shmctl03.c:29: TFAIL: shmmin = 0, expected 1
+shmctl07 :: shmctl07.c:27: TFAIL: shmctl(790617, SHM_LOCK, NULL): EINVAL (22)
+shmctl08 :: shmctl08.c:44: TFAIL: shm_perm.mode=1666, expected 438
+shmdt01 :: shmdt01.c:44: TFAIL: shared memory was not detached correctly
+shmget03 :: shmget03.c:37: TBROK: fopen(/proc/sysvipc/shm,r) failed: ENOENT (2)
+shmget04 :: shmget04.c:41: TFAIL: shmget(1627459677, 2048, 256) succeeded
+sigtimedwait01 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+sigwaitinfo01 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+splice02 :: splice02.c:70: TFAIL: splice failed: EAGAIN/EWOULDBLOCK (11)
+splice03 :: splice03.c:81: TFAIL: splice() returned 0 expected EBADF
+splice07 :: tst_fd.c:151: TCONF: Skipping fanotify: ENOSYS (38)
+splice08 :: splice08.c:39: TFAIL: Only part 0 bytes of 1009 were spliced
+stat03 :: stat03.c:47: TFAIL: stat(tc->pathname, &stat_buf) succeeded
+stat03_64 :: stat03.c:47: TFAIL: stat(tc->pathname, &stat_buf) succeeded
+statfs03 :: statfs03.c:36: TFAIL: statfs(TEMP_DIR2, &buf) succeeded
+statfs03_64 :: statfs03.c:36: TFAIL: statfs(TEMP_DIR2, &buf) succeeded
+tee01 :: tee01.c:65: TBROK: tee() failed: ENOSYS (38)
+tee02 :: tee02.c:64: TFAIL: tee() failed unexpectedly; expected: 22 - EINVAL: ENOSYS (38)
+tgkill02 :: tgkill02.c:57: TFAIL: tgkill() should have failed with EAGAIN: SUCCESS (0)
+tgkill03 :: tgkill03.c:103: TFAIL: Defunct tgid should have failed with ESRCH: SUCCESS (0)
+timer_settime03 :: timer_settime03.c:114: TFAIL: Timer overrun counter is wrong: 1; expected 2147483647 or negative number
+timerfd_settime02 :: timerfd_settime02.c:89: TBROK: timerfd_settime(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) failed: EINVAL (22)
+truncate03 :: truncate03.c:118: TFAIL: truncate(tc->pathname, tc->length) succeeded
+truncate03_64 :: truncate03.c:118: TFAIL: truncate(tc->pathname, tc->length) succeeded
+utime07 :: utime07.c:69: TFAIL: utime(symname, &utimes) succeeded
+vmsplice01 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+vmsplice02 :: vmsplice02.c:73: TFAIL: vmsplice() failed unexpectedly; expected: 9 - EBADF: EINVAL (22)
+vmsplice04 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+waitid07 :: tst_test.c:1944: TBROK: Test killed! (timeout?)
+waitid08 :: tst_test.c:1944: TBROK: Test killed! (timeout?)

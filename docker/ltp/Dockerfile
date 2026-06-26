@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config flex bison m4 \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin to a release tag for reproducibility.
-ARG LTP_REF=20240930
+# Pin to a release tag for reproducibility (latest LTP release).
+ARG LTP_REF=20260529
 RUN git clone --depth 1 --branch ${LTP_REF} https://github.com/linux-test-project/ltp.git /src
 WORKDIR /src
 

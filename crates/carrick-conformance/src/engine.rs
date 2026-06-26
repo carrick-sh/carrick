@@ -61,6 +61,30 @@ fn env_args(envs: &[&[EnvKv]]) -> Vec<String> {
     v
 }
 
+/// The command to actually launch for a suite.
+///
+/// LTP's `tst_test` framework forks the test body into a child and the main
+/// process reaps it. When the test binary is PID 1 the kernel drops un-handled
+/// signals to it, so the framework's reap/watchdog path breaks and EVERY test
+/// TBROKs with "Main test process might have exit!" / "Test killed! (timeout?)".
+/// This bites BOTH sides on current LTP (20260529 tightened the monitor):
+/// carrick runs the binary as guest PID 1 over its host-process fork model, and
+/// docker runs it as container PID 1. carrick is being *faithful* to Linux PID-1
+/// semantics here — real Docker added `--init` for exactly this class of app.
+///
+/// Run the LTP test under `/bin/sh -c` instead, so the shell is PID 1 (a proper
+/// reaper) and the test is its child — the same way `scripts/ltp-baseline.py`
+/// and LTP's own runners invoke it. Applied identically to carrick AND docker so
+/// the differential stays symmetric (both: sh=PID1 -> test=child). Scoped to
+/// LTP; cpython/go/node keep their bare cmd.
+fn effective_cmd(suite: &Suite) -> Vec<String> {
+    if matches!(suite.ecosystem, crate::manifest::Ecosystem::Ltp) {
+        vec!["/bin/sh".to_string(), "-c".to_string(), suite.cmd.join(" ")]
+    } else {
+        suite.cmd.clone()
+    }
+}
+
 /// Build the carrick argv: `run --name <run-id> <envelope flags> <image> <cmd...>`.
 /// `--name` gives carrick the SAME single handle docker gets — carrick derives
 /// the proctitle / scoped-kill id from it (precedence: CARRICK_RUN_ID -> --name
@@ -84,7 +108,7 @@ pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Ve
     }
     a.extend(env_args(&[&suite.env, &suite.env_carrick]));
     a.push(suite.image.clone());
-    a.extend(suite.cmd.iter().cloned());
+    a.extend(effective_cmd(suite));
     a
 }
 
@@ -113,7 +137,7 @@ fn docker_argv(suite: &Suite, run_id: &str, platform: crate::lane::DockerPlatfor
     }
     a.extend(env_args(&[&suite.env, &suite.env_docker]));
     a.push(suite.image.clone());
-    a.extend(suite.cmd.iter().cloned());
+    a.extend(effective_cmd(suite));
     a
 }
 
