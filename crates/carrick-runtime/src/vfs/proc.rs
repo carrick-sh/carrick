@@ -2091,9 +2091,19 @@ fn synthetic_proc_self_stat(executable_path: &str) -> String {
     let pid = std::process::id();
     let ppid = unsafe { libc::getppid() } as u32;
     let nthreads = crate::current_thread_states().len().max(1);
-    proc_stat_line(pid, &comm, 'R', ppid, pid, pid, nthreads)
+    proc_stat_line(
+        pid,
+        &comm,
+        'R',
+        ppid,
+        pid,
+        pid,
+        nthreads,
+        self_utime_ticks(),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn proc_stat_line(
     pid: u32,
     comm: &str,
@@ -2102,7 +2112,14 @@ fn proc_stat_line(
     pgrp: u32,
     session: u32,
     num_threads: usize,
+    utime_ticks: u64,
 ) -> String {
+    // Field 14 is utime (user CPU, in clock ticks). It MUST advance: a real test
+    // setup spins `do { read } while (utime == 0)` to confirm CPU was consumed
+    // before timing the clocks (LTP clock_gettime01) — a hardcoded 0 hangs it
+    // forever. Callers source it from the CHEAP guest_cpu accumulator (atomic,
+    // no syscall) so /proc/self/stat stays trap-free under tight read loops.
+    //
     // Field 20 is num_threads: CPython's os.fork() reads it from /proc/self/stat
     // to decide whether to emit the multi-threaded-fork DeprecationWarning
     // (test_threading.test_*_after_fork). Was a hardcoded 1.
@@ -2112,10 +2129,19 @@ fn proc_stat_line(
     // the tail (Go runtime, ps, monitoring agents) reads a short array if any
     // are missing. The final `0` is field 52.
     format!(
-        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 -1 4194560 0 0 0 0 0 0 0 0 \
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 -1 4194560 0 0 0 0 {utime_ticks} 0 0 0 \
 20 0 {num_threads} 0 1 10485760 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 \
 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
+}
+
+/// This process's accumulated guest user-CPU time in clock ticks (field 14 of
+/// `/proc/<pid>/stat`). Reads only the cheap cross-process `guest_cpu` atomic
+/// accumulator — NO syscall — so it is safe to call on every `/proc/self/stat`
+/// read (which tight loops hammer). All guest cycles count as user time; there
+/// is no cheap cross-platform user/system split, so `stime` stays 0.
+fn self_utime_ticks() -> u64 {
+    crate::guest_cpu::total_us().saturating_mul(carrick_abi::LINUX_CLK_TCK as u64) / 1_000_000
 }
 
 fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<u8>> {
@@ -2150,8 +2176,17 @@ fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<
         match rest {
             "stat" => {
                 return Some(
-                    proc_stat_line(pid, &name, state, ppid, me, me, own_threads.len().max(1))
-                        .into_bytes(),
+                    proc_stat_line(
+                        pid,
+                        &name,
+                        state,
+                        ppid,
+                        me,
+                        me,
+                        own_threads.len().max(1),
+                        self_utime_ticks(),
+                    )
+                    .into_bytes(),
                 );
             }
             "comm" => return Some(format!("{name}\n").into_bytes()),
@@ -2226,9 +2261,9 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         // Another guest process: we don't track its thread registry, so report
         // a single thread (num_threads=1). The multi-threaded-fork warning only
         // reads the caller's OWN /proc/self/stat, which uses the live count.
-        "stat" => {
-            Some(proc_stat_line(pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1).into_bytes())
-        }
+        "stat" => Some(
+            proc_stat_line(pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1, 0).into_bytes(),
+        ),
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
             let mut b = comm.clone().into_bytes();
