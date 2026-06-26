@@ -5,8 +5,97 @@ use super::{DispatchError, GuestMemory, SyscallCtx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fd(pub i32);
+/// A PID/TID **argument supplied by the guest** — an ns-namespace value (what
+/// the guest's `getpid()`/`gettid()` reported), NOT a host pid. Operate on it
+/// only after translating to a [`HostPid`] via [`NsPid::to_host`]; test
+/// self-identity with [`NsPid::names_self`]. Keeping it distinct from `HostPid`
+/// turns "forgot to translate" into a compile error instead of an ESRCH bug —
+/// the recurring class (tkill / sched / setpgid / fcntl-owner / fasync / …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pid(pub i32);
+pub struct NsPid(pub i32);
+/// A **host** pid/pgid carrick passes to libc or reads back from the host.
+/// Present it to the guest via [`HostPid::to_guest`] (host→ns) — never leak a
+/// raw host pid across the ns boundary into a guest-visible return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostPid(pub u32);
+/// Back-compat alias: existing handler signatures spell the guest pid arg
+/// `Pid`; it IS an ns value. New/converted code uses the explicit `NsPid`.
+pub type Pid = NsPid;
+
+impl NsPid {
+    /// The raw ns value the guest passed (for sentinel/sign checks like `-1`,
+    /// or `0`/negative whole-group targets the caller interprets itself).
+    #[inline]
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+
+    /// True iff this names the CALLING PROCESS: the host pid, the bootstrap pid
+    /// (1), or — under a PID namespace — the caller's own ns-pid (directly, or
+    /// an ns value that maps back to our host pid). Deliberately NOT `0` (for
+    /// signals `0` targets the caller's process GROUP, not self) and NOT sibling
+    /// threads (resolve those through the thread registry); callers that want
+    /// either add them explicitly. The ONE canonical self-check — the drift
+    /// between four ad-hoc copies caused the tkill01 / sched ns-pid bugs.
+    pub fn names_self(self) -> bool {
+        let host = std::process::id();
+        if self.0 == host as i32 || self.0 == carrick_abi::LINUX_BOOTSTRAP_PID as i32 {
+            return true;
+        }
+        if self.0 > 0 && crate::namespace::pid::enabled() {
+            let v = self.0 as u32;
+            if v == crate::namespace::pid::self_ns_pid()
+                || crate::namespace::pid::ns_to_host_or_self(v) == Some(host)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Translate to the host pid to operate on (libc::kill, `/proc`, …). `None`
+    /// (→ ESRCH) for a positive ns-pid naming no namespace member. Identity when
+    /// namespaces are off. Only meaningful for a concrete pid (`> 0`); `0` and
+    /// negative sentinels (whole-group, "any child") are the caller's to read.
+    pub fn to_host(self) -> Option<HostPid> {
+        if self.0 <= 0 {
+            return None;
+        }
+        crate::namespace::pid::ns_to_host_or_self(self.0 as u32).map(HostPid)
+    }
+
+    /// Translate a guest ns-PGID to the host pgid. `None` (→ ESRCH) for an ns
+    /// pgid naming no group. (`0` = "the caller's own pgid" — caller resolves.)
+    pub fn to_host_pgid(self) -> Option<HostPid> {
+        if self.0 <= 0 {
+            return None;
+        }
+        crate::namespace::pid::ns_to_host_pgid(self.0 as u32).map(HostPid)
+    }
+}
+
+impl HostPid {
+    /// This process's own host pid.
+    #[inline]
+    pub fn current() -> Self {
+        HostPid(std::process::id())
+    }
+
+    /// The raw host pid (for libc calls that take a bare `pid_t`).
+    #[inline]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Present this host pid to the guest as its ns-pid (host→ns). Use for every
+    /// pid carrick RETURNS to the guest (getpid/getppid, fcntl `l_pid`, `si_pid`,
+    /// wait status…) so the guest never observes a raw host pid.
+    #[inline]
+    pub fn to_guest(self) -> i64 {
+        i64::from(crate::namespace::pid::host_to_ns_or_self(self.0))
+    }
+}
+
 /// A signal number argument (`int` in the kernel ABI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signal(pub i32);
@@ -23,9 +112,9 @@ impl FromGuestArg for Fd {
         Fd(raw as i32)
     }
 }
-impl FromGuestArg for Pid {
+impl FromGuestArg for NsPid {
     fn from_arg(raw: u64) -> Self {
-        Pid(raw as i32)
+        NsPid(raw as i32)
     }
 }
 impl FromGuestArg for Signal {
