@@ -80,21 +80,10 @@ syscall_table! {
 static NICE_VALUE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn is_self_priority_target(who: i32) -> bool {
-    if who == 0 || who == LINUX_BOOTSTRAP_PID as i32 || who == std::process::id() as i32 {
-        return true;
-    }
-    // Under a PID namespace the guest names itself (PRIO_PROCESS with its own
-    // pid/tid) by its NS-pid, not the host pid. Accept the caller's ns-pid and
-    // any ns-pid that maps back to our host pid.
-    if crate::namespace::pid::enabled() && who > 0 {
-        let w = who as u32;
-        if w == crate::namespace::pid::self_ns_pid()
-            || crate::namespace::pid::ns_to_host_or_self(w) == Some(std::process::id())
-        {
-            return true;
-        }
-    }
-    false
+    // PRIO_PROCESS names the caller by 0 (self for setpriority, unlike signals)
+    // or by its (ns-)pid — the process-level cases are the canonical
+    // NsPid::names_self (host pid, bootstrap pid, or the caller's ns-pid).
+    who == 0 || NsPid(who).names_self()
 }
 
 /// Owned credentials-subsystem state. Split out of `SyscallDispatcher`.

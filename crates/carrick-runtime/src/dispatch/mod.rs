@@ -668,7 +668,7 @@ mod time;
 pub use proctitle::{init as proctitle_init, set_host_process_name};
 
 pub use crate::vfs::ProcMapsEntry;
-pub use abi_args::{Fd, GuestLen, GuestPtr, Pid, Signal};
+pub use abi_args::{Fd, GuestLen, GuestPtr, HostPid, NsPid, Pid, Signal};
 use fd_table::*;
 
 #[derive(Debug, Clone)]
