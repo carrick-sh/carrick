@@ -1785,15 +1785,14 @@ fn rt_sigtimedwait_deliver(
 /// accept it, LINUX_BOOTSTRAP_PID (1), and — for the pid form — 0
 /// (process-group, which is just us in the single-process bootstrap).
 fn signal_is_self_target(target: i64) -> bool {
-    let host_pid = std::process::id() as i64;
-    let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-    // NOTE: pid 0 is deliberately NOT self here. kill(0, sig) targets the
-    // caller's whole PROCESS GROUP (which after a fork includes child guest
-    // processes); routing it through the self path would deliver only to the
-    // caller and leave the group members unsignalled (LTP kill02 "Process 1 did
-    // not receive"). It must fall through to bootstrap_signal_send_as's host
-    // group-kill. (tgkill/tkill use tid_required=true and never pass 0.)
-    target == host_pid || target == bootstrap_pid
+    // Self-target for kill(2): the canonical NsPid::names_self (host pid,
+    // bootstrap pid, or the caller's ns-pid). pid 0 is deliberately NOT self —
+    // kill(0, sig) targets the caller's whole PROCESS GROUP (which after a fork
+    // includes child guest processes); it must fall through to
+    // bootstrap_signal_send_as's host group-kill (LTP kill02 "Process 1 did not
+    // receive"). names_self also excludes 0, so that group path is preserved.
+    // (tgkill/tkill pass tid_required=true and never 0.)
+    NsPid(target as i32).names_self()
 }
 
 /// True iff `x` names THIS process (or thread) — host pid, bootstrap pid, or,
@@ -1802,19 +1801,9 @@ fn signal_is_self_target(target: i64) -> bool {
 /// (which target getpid()/gettid()) as a self-signal even when the guest is
 /// PID-namespaced.
 fn names_self_pid(x: i64) -> bool {
-    let host_pid = std::process::id() as i64;
-    if x == host_pid || x == LINUX_BOOTSTRAP_PID as i64 {
-        return true;
-    }
-    if crate::namespace::pid::enabled() && x > 0 {
-        let w = x as u32;
-        if w == crate::namespace::pid::self_ns_pid()
-            || crate::namespace::pid::ns_to_host_or_self(w) == Some(std::process::id())
-        {
-            return true;
-        }
-    }
-    false
+    // The canonical self-check lives on NsPid; this i64 wrapper stays for the
+    // signal handlers that hold a raw pid_t (tgkill/tkill).
+    NsPid(x as i32).names_self()
 }
 
 pub(crate) fn bootstrap_signal_send(

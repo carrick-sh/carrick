@@ -228,10 +228,12 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
 /// guest-init alias used elsewhere); threaded dispatch also carries the current
 /// guest tid.
 fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+    // 0 and the caller's own thread tid are self for sched_*; the process-level
+    // self cases (host pid, bootstrap, ns-pid) are the canonical
+    // NsPid::names_self (which the old body lacked the ns-pid arm of).
     pid == 0
-        || pid == std::process::id() as u64
-        || pid == LINUX_BOOTSTRAP_PID
         || cx.thread.is_some_and(|thread| pid == thread.tid as u64)
+        || NsPid(pid as i32).names_self()
 }
 
 /// True when `pid` names a live sibling thread in this Carrick guest process.
@@ -1605,7 +1607,7 @@ impl SyscallDispatcher {
             let host_pid = |pid: Pid| -> Option<Pid> {
                 if crate::namespace::pid::enabled() && pid.0 > 0 {
                     crate::namespace::pid::ns_to_host_or_self(pid.0 as u32)
-                        .map(|host| Pid(host as i32))
+                        .map(|host| NsPid(host as i32))
                 } else {
                     Some(pid)
                 }
@@ -1938,7 +1940,7 @@ impl SyscallDispatcher {
             // when namespaces are off.
             let pid = if crate::namespace::pid::enabled() && pid.0 > 0 {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                    Some(h) => Pid(h as i32),
+                    Some(h) => NsPid(h as i32),
                     None => return Ok(crate::linux_abi::LINUX_ECHILD.into()),
                 }
             } else {
