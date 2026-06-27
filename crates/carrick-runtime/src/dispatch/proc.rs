@@ -2147,7 +2147,7 @@ impl SyscallDispatcher {
                     return Ok(LINUX_EFAULT.into());
                 }
             }
-            let host_status = translate_wait_status(host_status);
+            let host_status = translate_child_wait_status(result as u32, host_status);
             if wstatus_addr.0 != 0 {
                 let bytes = host_status.to_ne_bytes();
                 memory.write_bytes(wstatus_addr.0, &bytes)?;
@@ -2455,6 +2455,29 @@ fn translate_wait_status_darwin(status: i32) -> i32 {
         // Exited normally: high byte is the exit code, left untouched.
         status
     }
+}
+
+/// Wait-status translation that first honours a forked-child signal-death marker.
+/// On a BSD host `forked_child_die_by_signal` `_exit(128+N)`s (and drops a marker)
+/// when the host signal for a default-TERMINATE Linux signal is itself
+/// default-IGNORE (Linux SIGPOLL 29 → BSD SIGIO 23, Linux SIGSTKFLT 16 → BSD
+/// SIGURG 16). Reconstruct the `WIFSIGNALED(N)` status the guest's wait4 must
+/// observe; otherwise fall through to the plain host→guest translation. A pure
+/// no-op on a Linux host (no marker is ever written there — `consume_sigdeath_marker`
+/// is a compile-time `None`).
+fn translate_child_wait_status(host_pid: u32, status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        // forked_child_die_by_signal exits 128+signum for signum in 1..=64.
+        if (129..=128 + 64).contains(&code) {
+            if let Some(sig) = crate::exec_helpers::consume_sigdeath_marker(host_pid) {
+                if sig == code - 128 {
+                    return (sig & 0x7f) | core_dump_bit_for(sig);
+                }
+            }
+        }
+    }
+    translate_wait_status(status)
 }
 
 fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
