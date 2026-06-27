@@ -390,23 +390,34 @@ pub fn sem_nsems(ds: &SemidDs) -> usize {
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 fn bsd_extattr_ns(name: &std::ffi::CStr) -> (libc::c_int, std::ffi::CString) {
     let bytes = name.to_bytes();
-    for (prefix, ns) in [
-        (&b"user."[..], libc::EXTATTR_NAMESPACE_USER as libc::c_int),
-        (
-            &b"system."[..],
-            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
-        ),
-        (
-            &b"trusted."[..],
-            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
-        ),
-        (
-            &b"security."[..],
-            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
-        ),
+    // FreeBSD/NetBSD extattr has only USER and SYSTEM namespaces, and the kernel
+    // REJECTS any attr name that begins with a namespace name ("user."/"system.")
+    // with EINVAL, so the Linux name can't be stored verbatim. Linux has four
+    // namespaces (user/system/trusted/security): user.* lives in USER stripped
+    // (USER unambiguously means user.*); the privileged three share SYSTEM but
+    // carry a 1-char tag ("s."/"t."/"c.") so a list round-trip can tell them apart.
+    // Without a tag all three collapsed to one indistinguishable SYSTEM:<name>, so
+    // a `security.foo` set came back from listxattr as `system.foo` (LTP
+    // flistxattr01/listxattr01). `flistxattr` below decodes the tags. The tag is
+    // 1 char, so the stored name never exceeds the Linux name (EXTATTR_MAXNAMELEN
+    // 255). Tags are not namespace prefixes, so the kernel accepts them.
+    if let Some(rest) = bytes.strip_prefix(&b"user."[..]) {
+        return (
+            libc::EXTATTR_NAMESPACE_USER as libc::c_int,
+            std::ffi::CString::new(rest).unwrap_or_default(),
+        );
+    }
+    for (prefix, tag) in [
+        (&b"system."[..], &b"s."[..]),
+        (&b"trusted."[..], &b"t."[..]),
+        (&b"security."[..], &b"c."[..]),
     ] {
         if let Some(rest) = bytes.strip_prefix(prefix) {
-            return (ns, std::ffi::CString::new(rest).unwrap_or_default());
+            let tagged = [tag, rest].concat();
+            return (
+                libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+                std::ffi::CString::new(tagged).unwrap_or_default(),
+            );
         }
     }
     (
@@ -512,12 +523,9 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
         // namespaces and re-emit Linux-style NUL-terminated `"prefix.name\0"`
         // entries.
         let mut out: Vec<u8> = Vec::new();
-        for (ns, prefix) in [
-            (libc::EXTATTR_NAMESPACE_USER as libc::c_int, &b"user."[..]),
-            (
-                libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
-                &b"system."[..],
-            ),
+        for ns in [
+            libc::EXTATTR_NAMESPACE_USER as libc::c_int,
+            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
         ] {
             let need = unsafe { libc::extattr_list_fd(fd, ns, std::ptr::null_mut(), 0) };
             if need <= 0 {
@@ -536,10 +544,28 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
                 if i + nlen > raw.len() {
                     break;
                 }
-                out.extend_from_slice(prefix);
-                out.extend_from_slice(&raw[i..i + nlen]);
-                out.push(0);
+                let stored = &raw[i..i + nlen];
                 i += nlen;
+                // Decode back to the Linux namespace (inverse of bsd_extattr_ns):
+                // USER holds user.* verbatim ("user." re-added); SYSTEM holds the
+                // privileged three under 1-char tags. An UNtagged SYSTEM name is a
+                // host/OS attribute, not a guest one — skip it.
+                let decoded: Option<Vec<u8>> = if ns == libc::EXTATTR_NAMESPACE_USER as libc::c_int
+                {
+                    Some([&b"user."[..], stored].concat())
+                } else if let Some(r) = stored.strip_prefix(&b"s."[..]) {
+                    Some([&b"system."[..], r].concat())
+                } else if let Some(r) = stored.strip_prefix(&b"t."[..]) {
+                    Some([&b"trusted."[..], r].concat())
+                } else if let Some(r) = stored.strip_prefix(&b"c."[..]) {
+                    Some([&b"security."[..], r].concat())
+                } else {
+                    None
+                };
+                if let Some(name) = decoded {
+                    out.extend_from_slice(&name);
+                    out.push(0);
+                }
             }
         }
         if size == 0 {
