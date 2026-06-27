@@ -573,6 +573,14 @@ impl BhyveVm {
             unsafe { vm_destroy(inner.ctx) };
             inner.ctx = std::ptr::null_mut();
         }
+        // NOTE (leak, not yet fixed): for a forked child the engine holds the VM
+        // as a `BhyveSharedVm` clone (a 2nd Arc holder), so `Arc::get_mut` fails
+        // and the `/dev/vmm/<name>` node leaks on `_exit` (Drop never runs). A
+        // naive "destroy via the shared ctx anyway" HANGS the run — a live holder
+        // (sibling vCPU / pump / shared-alias flush) is still using the node when
+        // we'd tear it down. The correct fix must quiesce + drop every other
+        // in-process holder FIRST, then destroy with sole ownership. Until then
+        // the conformance lane mitigates with a dead-pid VM reaper.
     }
 
     /// Map memory segment `segid` into the guest at `[gpa, gpa+len)`.
