@@ -4914,6 +4914,22 @@ fn write_host_pipe_payload(
         }
         crate::probes::host_pipe_io(host_fd, 1, n as i64);
         if let Err(e) = n.host_syscall_errno() {
+            // FreeBSD's AF_UNIX (notably DGRAM) write returns ENOBUFS when the peer
+            // receive buffer is full; Linux reports EAGAIN for a non-blocking socket
+            // that can't proceed (and blocks a blocking one until it drains). LTP
+            // sendfile07 fills an out_fd socket buffer in a loop, treating EAGAIN as
+            // "full, stop" but ENOBUFS as a hard setup error. Route a socket-write
+            // ENOBUFS through the same readiness path as EAGAIN (EAGAIN if
+            // non-blocking, else park on POLLOUT). No-op on Linux, which uses EAGAIN.
+            #[cfg(not(target_os = "linux"))]
+            if e == crate::linux_abi::LINUX_ENOBUFS && write_kind == HostWriteKind::SocketLike {
+                return would_block_outcome(
+                    host_fd,
+                    libc::POLLOUT,
+                    nonblocking,
+                    host_fd_owner.clone(),
+                );
+            }
             // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
             // Route through the readiness wait rather than leaking it to the guest
             // (see read_host_pipe).
