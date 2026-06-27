@@ -348,6 +348,53 @@ pub fn reap_leaked_child_vm(host_pid: u32) {
     }
 }
 
+/// Startup sweep: reap leaked `/dev/vmm/carrick-<pid>-*` nodes whose owning pid is
+/// DEAD — the bhyve analog of the host-fs dead-flock scratch sweeper
+/// (`fs_backend::sweep_orphans`). The wait4 reap hook ([`reap_leaked_child_vm`])
+/// only covers a child reaped by its GUEST parent; a guest SIGKILL'd by the
+/// orchestrator or the conformance babysit is orphaned and its node leaks. Since
+/// each conformance suite spawns a fresh carrick process, sweeping on the first VM
+/// create per process reclaims prior suites' orphaned nodes, keeping `/dev/vmm`
+/// bounded across a long gate — else they pile up until the host OOMs (measured
+/// live VMs 3→259 in 10 min on a 16G box during a full LTP run).
+fn sweep_dead_vm_nodes() {
+    let Ok(rd) = std::fs::read_dir("/dev/vmm") else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let fname = ent.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        // Node name is `carrick-<pid>-<seq>`; pull the owning pid.
+        let Some(pid) = name
+            .strip_prefix("carrick-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|p| p.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // Alive if kill(pid, 0) succeeds or fails EPERM; dead only on ESRCH.
+        // SAFETY: signal 0 only probes existence, it never delivers a signal.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if alive {
+            continue;
+        }
+        let Ok(cname) = CString::new(name) else {
+            continue;
+        };
+        // SAFETY: open the orphaned (dead-owner) node, then destroy it. No live
+        // holder remains, so this is the final teardown and cannot hang.
+        unsafe {
+            let ctx = vm_openf(cname.as_ptr(), 0);
+            if !ctx.is_null() {
+                vm_destroy(ctx);
+            }
+        }
+    }
+}
+
 pub struct BhyveVm {
     /// The shared inner carries the `owns` flag (robust-by-construction): a
     /// borrowed handle is a DISTINCT non-owning inner over the same `ctx`, so its
@@ -429,6 +476,11 @@ impl BhyveVm {
         static REGISTER_REAP: std::sync::Once = std::sync::Once::new();
         REGISTER_REAP.call_once(|| {
             carrick_hal::vm_backend::set_reap_child_vm_hook(reap_leaked_child_vm);
+            // Reclaim any /dev/vmm node orphaned by a prior SIGKILL'd guest (the
+            // reap hook only covers guest-parent-reaped children). Per-process, so
+            // each conformance suite's fresh carrick sweeps the prior suites'
+            // leaks, keeping /dev/vmm bounded across a long gate.
+            sweep_dead_vm_nodes();
         });
         // Process-global VM sequence — distinct name per create() in this process.
         static VM_SEQ: AtomicU32 = AtomicU32::new(0);
