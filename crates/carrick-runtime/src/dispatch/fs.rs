@@ -6662,6 +6662,14 @@ impl SyscallDispatcher {
                             }
                         });
                     }
+                    // FreeBSD sendfile(2) only supports STREAM sockets; an AF_UNIX
+                    // (especially DGRAM) out_fd is rejected with EINVAL. Linux
+                    // sendfile handles any socket destination, so fall through to the
+                    // buffer path below (read in_fd, then write_output_fd, which
+                    // honours the socket's EAGAIN/ENOBUFS backpressure) when the host
+                    // sendfile rejects the destination outright with nothing sent
+                    // (LTP sendfile07 sendfiles to a full non-blocking AF_UNIX fd).
+                    Err(e) if e == LINUX_EINVAL && sent == 0 => {}
                     Err(e) => return Ok(e.into()),
                 }
             }
