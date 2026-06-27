@@ -3258,6 +3258,15 @@ impl SyscallDispatcher {
             crate::fs_backend::ParentResolve::NotDir => return Err(LINUX_ENOTDIR),
             crate::fs_backend::ParentResolve::Slow => {}
         }
+        // ELOOP: Linux caps the CUMULATIVE symlinks followed across the whole path
+        // at MAXSYMLINKS (40). carrick's per-component resolvers each cap at 40 but
+        // don't share a budget, so a path stacking many shallow intermediate
+        // symlinks (LTP stat03/lstat02/truncate03 build `test_eloop -> ../test_eloop`
+        // repeated ~43×) would otherwise resolve to a directory instead of failing.
+        // Surface the overflow here, on the slow (symlink-bearing) path only.
+        if self.symlink_follow_budget_exceeded(&abs) {
+            return Err(crate::linux_abi::LINUX_ELOOP);
+        }
         // ENOTDIR: an existing intermediate component that is not a directory
         // can't be traversed. carrick previously let the final lookup return
         // ENOENT (or leniently resolved through it). Synthesize ENOTDIR here so
