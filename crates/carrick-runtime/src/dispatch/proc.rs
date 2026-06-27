@@ -1932,6 +1932,9 @@ impl SyscallDispatcher {
                     let child_guest_us =
                         crate::guest_cpu::reap_child_guest_ns(carrick_portable::si_pid(&info) as u32) / 1000;
                     crate::guest_cpu::add_reaped_child(child_guest_us, 0);
+                    // Tear down the now-dead child's leaked host VM node (bhyve);
+                    // no-op on KVM/HVF. See the wait4 reap path.
+                    carrick_hal::vm_backend::reap_child_vm(carrick_portable::si_pid(&info) as u32);
                     true
                 } else {
                     false
@@ -2124,6 +2127,11 @@ impl SyscallDispatcher {
             let terminal_reap = libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status);
             if terminal_reap {
                 let _ = crate::host_signal::take_child_exit_parent(result);
+                // The child host process is now dead; tear down its leaked host VM
+                // node (bhyve's named /dev/vmm/carrick-<pid>-* persists past the
+                // child's _exit). Sole, non-hanging teardown — no live holder. No-op
+                // on KVM/HVF. `result` is the reaped HOST pid.
+                carrick_hal::vm_backend::reap_child_vm(result as u32);
             }
             let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
             let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
