@@ -363,8 +363,21 @@ fn reflink_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
             return Ok(());
         }
     }
-    // Reflink unavailable on this volume — `std::fs::copy` overwrites the empty
-    // file the failed clone left behind (it create/truncates the destination).
+    // Reflink unavailable on this volume. Flag it ONCE via the fs-op probe (no
+    // stderr pollution — carrick's tracing defaults to `warn`, which conformance
+    // captures — and traceable by `carrick trace`/bpftrace/dtrace) so "is the
+    // rootfs seed getting the fast reflink / ZFS-block-clone path, or a slow full
+    // copy?" is answerable. On a non-reflink fs (ext4; ZFS without block_cloning)
+    // every per-run seed is a full byte copy — slow, and if runs leak their
+    // scratch, disk-heavy (it filled a 40G ext4 box mid-LTP-gate). On macOS
+    // (clonefile), Linux btrfs/XFS (FICLONE) and FreeBSD ZFS-block_cloning
+    // (copy_file_range) this never fires.
+    static FALLBACK_FLAGGED: std::sync::Once = std::sync::Once::new();
+    FALLBACK_FLAGGED.call_once(|| {
+        crate::probes::fs_op("seed-no-reflink-full-copy", &dst.to_string_lossy(), 0);
+    });
+    // `std::fs::copy` overwrites the empty file the failed clone left behind (it
+    // create/truncates the destination).
     std::fs::copy(src, dst)?; // nosemgrep
     Ok(())
 }
