@@ -93,6 +93,17 @@ pub(crate) fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Ve
     let mut a = vec![carrick_bin.to_string(), "run".to_string()];
     a.push("--name".to_string());
     a.push(run_id.to_string());
+    // Disable carrick's trap watchdog for conformance. It counts SYSCALL traps
+    // as a proxy for "stuck", but that proxy is wrong: a legitimate fork- or
+    // file-heavy test (fork_procs; getcwd04 creating/renaming thousands of
+    // files) exceeds the 1M-trap default and is wrongly recorded CRASH before
+    // it ever reaches its real verdict — verified: fork_procs PASSES with a
+    // raised budget. The authoritative "stuck" guards in the gate are the
+    // per-suite TIMEOUT (mac-side kill / guest-side `timeout`) and each LTP
+    // test's own 30s SIGALRM watchdog, so the trap counter is pure downside.
+    // A suite may still override this via its own carrick_flags (added below).
+    a.push("--max-traps".to_string());
+    a.push(usize::MAX.to_string());
     a.extend(suite.carrick_flags.iter().cloned());
     if let Some(ep) = suite.entrypoint.as_ref().and_then(|e| e.for_carrick()) {
         a.push("--entrypoint".to_string());
