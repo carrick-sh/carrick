@@ -329,9 +329,9 @@ fn forward_record_lock<M: GuestMemory>(
         LINUX_F_GETLK => libc::F_GETLK,
         LINUX_F_SETLK => libc::F_SETLK,
         LINUX_F_SETLKW => libc::F_SETLKW,
-        LINUX_F_OFD_GETLK => libc::F_OFD_GETLK,
-        LINUX_F_OFD_SETLK => libc::F_OFD_SETLK,
-        LINUX_F_OFD_SETLKW => libc::F_OFD_SETLKW,
+        LINUX_F_OFD_GETLK => carrick_portable::F_OFD_GETLK,
+        LINUX_F_OFD_SETLK => carrick_portable::F_OFD_SETLK,
+        LINUX_F_OFD_SETLKW => carrick_portable::F_OFD_SETLKW,
         _ => return DispatchOutcome::errno(LINUX_EINVAL),
     };
 

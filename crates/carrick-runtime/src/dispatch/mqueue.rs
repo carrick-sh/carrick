@@ -189,7 +189,13 @@ impl MqLock {
         fl.l_len = 0;
         // BLOCKING-IO-OK: the OFD lock wait is bounded by peer RMWs (each is a
         // header+slot memcpy, microseconds), not by guest I/O.
-        let rc = unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &mut fl as *mut libc::flock) };
+        let rc = unsafe {
+            libc::fcntl(
+                fd,
+                carrick_portable::F_OFD_SETLKW,
+                &mut fl as *mut libc::flock,
+            )
+        };
         if let Err(errno) = rc.host_syscall_errno() {
             unsafe { libc::close(fd) };
             return Err(errno);
