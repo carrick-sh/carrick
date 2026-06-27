@@ -15,6 +15,36 @@
 //! `fork(2)`) shared by both fork paths.
 
 use crate::TrapError;
+use std::sync::OnceLock;
+
+/// Process-global hook to tear down a reaped forked child's leaked host VM node.
+///
+/// A bhyve VM is a NAMED `/dev/vmm/<name>` node that persists until `vm_destroy`
+/// (unlike KVM/HVF, whose VMs are fd/process-lifetime bound and released by the OS
+/// on `_exit`). A forked guest child `_exit`s past every Drop, and its in-process
+/// `process_exit_cleanup` cannot tear the node down — the engine keeps a
+/// `BhyveSharedVm` clone, so a live-holder destroy HANGS. Instead the PARENT, when
+/// it reaps the child (`wait4`/`waitid`), calls [`reap_child_vm`] with the dead
+/// child's HOST pid: the owning process is gone, so opening + destroying the
+/// orphaned node is the sole, unambiguous, non-hanging teardown. No-op until a
+/// backend installs a hook.
+static REAP_CHILD_VM_HOOK: OnceLock<fn(u32)> = OnceLock::new();
+
+/// Install the reap-child-VM hook (set-once; the fn is the same code address in
+/// every forked process, so one registration is inherited across `fork`). `f`
+/// receives the dead child's host pid.
+pub fn set_reap_child_vm_hook(f: fn(u32)) {
+    let _ = REAP_CHILD_VM_HOOK.set(f);
+}
+
+/// Tear down a reaped child's leaked host VM node, if a backend installed a hook.
+/// Called from the dispatcher's `wait4`/`waitid` reap with the dead child's host
+/// pid. No-op on KVM/HVF.
+pub fn reap_child_vm(host_pid: u32) {
+    if let Some(f) = REAP_CHILD_VM_HOOK.get() {
+        f(host_pid);
+    }
+}
 
 /// COW-inherit vs eager full-RAM copy at `fork(2)`. POLICY only: the shared fork
 /// path (aarch64 or x86) reads this to decide *whether* to freeze; the per-backend
