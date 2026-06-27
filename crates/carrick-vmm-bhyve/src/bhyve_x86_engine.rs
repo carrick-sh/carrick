@@ -1156,6 +1156,86 @@ impl GuestVmBackend for BhyveVmm {
     }
 }
 
+/// Number of slots in the fork-coherent futex mirror (open-addressed by futex-word VA).
+const FUTEX_MIRROR_SLOTS: usize = 8192;
+
+/// One fork-coherent futex-mirror slot: the guest futex-word VA (the open-addressing
+/// key; 0 = empty), the cross-process mirror of that word's value, and a parked-waiter
+/// count. The waiter count exists because FreeBSD `_umtx_op(UMTX_OP_WAKE)` returns 0 on
+/// success — NOT the number of waiters woken, which Linux `FUTEX_WAKE` returns and which
+/// `tst_checkpoint_wake` loops on. The umtx wait/wake path (carrick-host) bumps/reads it
+/// at `value`+4 so a shared WAKE can report a Linux-faithful woken count. LAYOUT IS
+/// LOAD-BEARING: `value` at offset 8, `waiters` at offset 12 (== the wake addr + 4).
+#[repr(C, align(16))]
+struct FutexMirrorSlot {
+    key: std::sync::atomic::AtomicU64,
+    value: std::sync::atomic::AtomicU32,
+    waiters: std::sync::atomic::AtomicU32,
+}
+
+/// Fork-coherent "futex mirror" for the bhyve cross-process futex. bhyve cannot share
+/// guest sysmem across a fork (the vmmapi memseg model can't back a guest segment with
+/// a host fd from userspace — see `map_host_alias`), so each forked process holds a
+/// PRIVATE copy of every guest MAP_SHARED word; a cross-process futex keyed on the
+/// per-VM word never rendezvouses. This ONE host `MAP_SHARED|MAP_ANON` slot array,
+/// allocated before the guest's first fork (so every child inherits the SAME physical
+/// pages), holds the shared word the umtx waits/wakes on, open-addressed by the
+/// futex-word VA — which is stable across the fork (the child inherits the page tables)
+/// and so resolves to the same slot in parent and child. (Indexing by GPA would need a
+/// per-VA→GPA translation the engine doesn't expose here; the VA is the natural key.)
+static SHARED_FUTEX_MIRROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Base of the futex-mirror slot array; `None` if the mmap failed.
+fn shared_futex_mirror_base() -> Option<usize> {
+    let base = *SHARED_FUTEX_MIRROR.get_or_init(|| {
+        let len = FUTEX_MIRROR_SLOTS * std::mem::size_of::<FutexMirrorSlot>();
+        // SAFETY: a fresh anonymous shared mapping; a null hint lets the kernel place it.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED { 0 } else { p as usize }
+    });
+    (base != 0).then_some(base)
+}
+
+/// Resolve a guest futex-word VA to the host address of its fork-coherent mirror word,
+/// claiming an open-addressed slot on first sight. `None` if the mmap failed or the
+/// table is full (in which case the cross-process futex degrades to the old behaviour).
+fn shared_futex_mirror_slot(key: u64) -> Option<usize> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let base = shared_futex_mirror_base()?;
+    let slots = base as *const FutexMirrorSlot;
+    let mut idx = ((key >> 2) as usize) % FUTEX_MIRROR_SLOTS;
+    for _ in 0..FUTEX_MIRROR_SLOTS {
+        // SAFETY: idx < FUTEX_MIRROR_SLOTS and `base` is a live array of that many slots.
+        let slot = unsafe { &*slots.add(idx) };
+        let cur = slot.key.load(Acquire);
+        if cur == key {
+            return Some(&slot.value as *const _ as usize);
+        }
+        if cur == 0 {
+            match slot.key.compare_exchange(0, key, AcqRel, Acquire) {
+                Ok(_) => return Some(&slot.value as *const _ as usize),
+                // Lost the race to a peer claiming the SAME key — still ours to use.
+                Err(actual) if actual == key => {
+                    return Some(&slot.value as *const _ as usize);
+                }
+                // Claimed by a different key — keep probing.
+                Err(_) => {}
+            }
+        }
+        idx = (idx + 1) % FUTEX_MIRROR_SLOTS;
+    }
+    None
+}
+
 impl X86Vmm for BhyveVmm {
     type Vcpu = BhyveX86Vcpu;
     type KickHandle = BhyveKickHandle;
@@ -1164,8 +1244,19 @@ impl X86Vmm for BhyveVmm {
     fn setup_memory(&mut self, _plan: &WindowPlan) -> Result<(), TrapError> {
         // bhyve realizes the plan as ONE contiguous lowmem segment (§2.5a). The
         // segment + the window table are built by `bring_up`; this hook is a
-        // no-op (the BhyveVmm `bring_up` produces returns is already mapped).
+        // no-op (the BhyveVmm `bring_up` produces returns is already mapped). The
+        // fork-coherent futex mirror is allocated in `freeze_ram` (the guaranteed
+        // pre-fork hook), not here.
         Ok(())
+    }
+
+    fn shared_futex_host_addr(&self, key: u64, _len: usize) -> Option<usize> {
+        // Cross-process futex coherence on bhyve: the per-VM guest word is NOT shared
+        // across the fork (vmmapi limitation, see SHARED_FUTEX_MIRROR). `key` is the
+        // futex-word VA (syscall_buffer_gpa is identity on bhyve) — stable across the
+        // fork — so resolve it to its fork-coherent mirror slot. The dispatch syncs the
+        // per-VM guest word <-> the mirror at the WAIT/WAKE boundaries (proc.rs).
+        shared_futex_mirror_slot(key)
     }
 
     fn is_guest_reserved(&self, va: u64) -> bool {
@@ -1559,6 +1650,11 @@ impl X86Vmm for BhyveVmm {
     }
 
     fn freeze_ram(&self) -> Result<Vec<u8>, TrapError> {
+        // Allocate the fork-coherent futex mirror NOW — in the PARENT, immediately
+        // before `libc::fork` — so every child inherits the SAME MAP_SHARED pages. A
+        // lazy first-touch alloc would run post-fork and hand parent and child SEPARATE
+        // mirrors (the bug: identical key → different host addrs). Idempotent OnceLock.
+        let _ = shared_futex_mirror_base();
         // Snapshot the parent's LIVE high-water [0, total_size()) — NOT the full
         // 512 MiB pool — into a private heap buffer BEFORE libc::fork, while the
         // parent vCPU is suspended at the trap (atomic). The child copies from THIS

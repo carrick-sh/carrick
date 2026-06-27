@@ -42,6 +42,15 @@ mod imp {
     /// Returns `>= 0` when woken or the value already differed, or `-errno`
     /// (`-ETIMEDOUT`, `-EINTR`, …).
     pub fn wait(host_addr: usize, value: u32, timeout_us: u32) -> i64 {
+        // Register as a parked waiter in the mirror slot's `waiters` field (the host
+        // word at `host_addr` is the slot's `value`; `waiters` is the next u32, at
+        // `host_addr + 4`). A concurrent shared WAKE reads this to report a Linux-
+        // faithful woken count, which FreeBSD `_umtx_op(UMTX_OP_WAKE)` itself never does
+        // (it returns 0 on success). Held across the wait, decremented on every return.
+        // SAFETY: host_addr is the mirror slot's `value` word (bhyve always routes a
+        // shared futex through a FutexMirrorSlot); `value`+4 is its `waiters` field.
+        let waiters = unsafe { &*((host_addr + 4) as *const std::sync::atomic::AtomicU32) };
+        waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: host_addr is a live 4-byte-aligned host MAP_SHARED word;
         // _umtx_op reads 4 bytes for the compare.
         let rc = unsafe {
@@ -71,6 +80,7 @@ mod imp {
                 )
             }
         };
+        waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         if rc < 0 { neg_errno() } else { rc as i64 }
     }
 
@@ -80,6 +90,15 @@ mod imp {
             libc::c_int::MAX as libc::c_ulong
         } else {
             1
+        };
+        // Snapshot the parked-waiter count (mirror slot `waiters` at value+4) BEFORE the
+        // wake. FreeBSD UMTX_OP_WAKE returns 0 on success, but Linux FUTEX_WAKE — and
+        // tst_checkpoint_wake's retry loop — expect the NUMBER of waiters woken, so
+        // report min(parked, requested) instead of the umtx 0.
+        // SAFETY: host_addr is the mirror slot's `value`; `value`+4 is its `waiters`.
+        let waiters = unsafe {
+            (*((host_addr + 4) as *const std::sync::atomic::AtomicU32))
+                .load(std::sync::atomic::Ordering::SeqCst)
         };
         // SAFETY: plain libc call against a live shared host address.
         let rc = unsafe {
@@ -91,7 +110,10 @@ mod imp {
                 std::ptr::null_mut(),
             )
         };
-        if rc < 0 { neg_errno() } else { rc as i64 }
+        if rc < 0 {
+            return neg_errno();
+        }
+        (u64::from(waiters)).min(n as u64) as i64
     }
 }
 

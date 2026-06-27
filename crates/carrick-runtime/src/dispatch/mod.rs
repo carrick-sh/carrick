@@ -2916,6 +2916,16 @@ fn dispatch_threaded_futex(
     match command {
         LINUX_FUTEX_WAKE => {
             if let Some(host_addr) = shared_host_addr {
+                // Publish the waker's current word to the fork-coherent host word
+                // before the wake so a WAITer (possibly in another process) observes
+                // it. No-op on HVF/KVM (host_addr IS the guest word); load-bearing on
+                // bhyve, whose per-VM word is not shared across the fork (see proc.rs /
+                // SHARED_FUTEX_MIRROR).
+                // SAFETY: host_addr is a live 4-byte-aligned host word.
+                unsafe {
+                    (*(host_addr as *const std::sync::atomic::AtomicU32))
+                        .store(word, std::sync::atomic::Ordering::SeqCst);
+                }
                 // Cross-PROCESS (MAP_SHARED) wake: route through the
                 // `PlatformFutex::shared_wake` seam (the wake counterpart of the
                 // `SharedFutexWait` outcome) so the wake reaches a waiter parked
@@ -2934,7 +2944,25 @@ fn dispatch_threaded_futex(
             }
         }
         LINUX_FUTEX_WAIT => {
-            if word != value {
+            // For a SHARED (cross-process) futex the authoritative current value is at
+            // the fork-coherent host word (the mirror on bhyve; == the guest word on
+            // HVF/KVM). Compare THAT, not the possibly stale per-VM sysmem copy, and
+            // publish it back to the guest word so the caller's retry loop re-reads what
+            // another process wrote instead of spinning on the stale value (see proc.rs).
+            let current = if let Some(host_addr) = shared_host_addr {
+                // SAFETY: host_addr is a live 4-byte-aligned host word.
+                let mirror = unsafe {
+                    (*(host_addr as *const std::sync::atomic::AtomicU32))
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                };
+                if mirror != word {
+                    let _ = memory.write_bytes(address, &mirror.to_ne_bytes());
+                }
+                mirror
+            } else {
+                word
+            };
+            if current != value {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EAGAIN,
                 };
