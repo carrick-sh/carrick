@@ -1510,6 +1510,14 @@ impl SyscallDispatcher {
             Ok(match command {
                 LINUX_FUTEX_WAKE => {
                     if let Some(host_addr) = shared_host_addr {
+                        // Publish the waker's current word value to the fork-coherent
+                        // host word BEFORE waking, so a WAITer (possibly in another
+                        // process) observes the change the waker just made to its own
+                        // guest word. No-op on HVF/KVM (host_addr IS the guest word);
+                        // load-bearing on bhyve, whose per-VM sysmem copy of the word
+                        // is not shared across the fork — the umtx waits/wakes on this
+                        // mirror, not on the divergent per-process copies.
+                        shared_futex_store(host_addr, word);
                         // Cross-process (MAP_SHARED) wake: route through the
                         // `PlatformFutex::shared_wake` seam (the wake counterpart
                         // of `SharedFutexWait`) so HVF's __ulock (one-at-a-time +
@@ -1526,7 +1534,22 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_FUTEX_WAIT => {
-                    if word != value {
+                    // For a SHARED (cross-process) futex the authoritative current
+                    // value lives at the fork-coherent host word (the mirror on bhyve;
+                    // == the guest word on HVF/KVM). Compare THAT, not the possibly
+                    // stale per-VM sysmem copy, and publish it back into the guest word
+                    // so the caller's retry loop (tst_checkpoint_wait &c.) re-reads what
+                    // another process wrote instead of spinning on the stale value.
+                    let current = if let Some(host_addr) = shared_host_addr {
+                        let mirror = shared_futex_load(host_addr);
+                        if mirror != word {
+                            let _ = memory.write_bytes(address.0, &mirror.to_ne_bytes());
+                        }
+                        mirror
+                    } else {
+                        word
+                    };
+                    if current != value {
                         return Ok(LINUX_EAGAIN.into());
                     }
                     let timeout = if timeout_address.0 == 0 {
@@ -2478,6 +2501,31 @@ fn translate_child_wait_status(host_pid: u32, status: i32) -> i32 {
         }
     }
     translate_wait_status(status)
+}
+
+/// Atomically load a cross-process futex word from its fork-coherent host address
+/// (the shared aperture on HVF/KVM, the bhyve futex mirror on bhyve). Atomic to
+/// match the guest's own atomic access to the same word.
+#[inline]
+fn shared_futex_load(host_addr: usize) -> u32 {
+    // SAFETY: host_addr is a live 4-byte-aligned host word from shared_futex_host_addr.
+    unsafe {
+        (*(host_addr as *const std::sync::atomic::AtomicU32))
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Atomically publish a value to a cross-process futex word's fork-coherent host
+/// address. On HVF/KVM the address IS the guest word's host memory, so this is a
+/// self-store (harmless no-op); on bhyve it pushes the value into the shared mirror
+/// the umtx waits/wakes on (the per-VM sysmem copy is NOT shared across the fork).
+#[inline]
+fn shared_futex_store(host_addr: usize, value: u32) {
+    // SAFETY: as in shared_futex_load.
+    unsafe {
+        (*(host_addr as *const std::sync::atomic::AtomicU32))
+            .store(value, std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
