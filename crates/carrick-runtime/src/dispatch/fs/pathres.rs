@@ -157,4 +157,70 @@ impl SyscallDispatcher {
         }
         Err(crate::linux_abi::LINUX_ELOOP)
     }
+
+    /// Linux caps the TOTAL symlinks followed in a SINGLE pathname resolution at
+    /// MAXSYMLINKS (40); exceeding it is ELOOP. carrick resolves each intermediate
+    /// symlink with its OWN 40-hop cap (`canonicalize_following` /
+    /// `resolve_intermediate_symlinks` run per component), so a path that STACKS
+    /// many shallow intermediate symlinks never accumulates to the cap and wrongly
+    /// resolves. LTP's ELOOP cases (stat03/lstat02/truncate03/readlink03/open13)
+    /// build exactly that: a `test_eloop` directory holding `test_eloop ->
+    /// ../test_eloop`, with the path repeating `test_eloop` ~43 times — each hop is
+    /// a single follow that the per-component resolvers reset. Walk the path once,
+    /// following each component's symlink chain against a SHARED budget, and report
+    /// a cumulative overflow. Only the slow (symlink-bearing) resolution path calls
+    /// this, so symlink-free lookups pay nothing. Resolves entirely through the
+    /// layered view (not the host), so it isn't bounded by the host's own
+    /// MAXSYMLINKS (FreeBSD's 32 < Linux's 40).
+    pub(super) fn symlink_follow_budget_exceeded(&self, abs: &str) -> bool {
+        // Only INTERMEDIATE components are followed here — the FINAL component's
+        // symlink is the caller's to interpret (lstat/readlink READ it; stat
+        // follows it via canonicalize_following). Following the final here would
+        // wrongly ELOOP an lstat/readlink of a self-referential link (lstat02,
+        // readlink03, truncate03's cases that pass a trailing self-link).
+        let comps: Vec<&str> = abs
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        if comps.len() < 2 {
+            return false;
+        }
+        let mut follows = 0usize;
+        let mut base = String::new();
+        for comp in &comps[..comps.len() - 1] {
+            if *comp == ".." {
+                if let Some(i) = base.rfind('/') {
+                    base.truncate(i);
+                }
+                continue;
+            }
+            let mut cur = format!("{base}/{comp}");
+            // Follow this component's symlink chain; every hop counts against the
+            // SHARED budget. A self-referential link keeps `cur` fixed, so the
+            // budget — not a position change — is what terminates the walk.
+            while let Ok(md) = self.layered_lstat(&cur) {
+                if md.kind != RootFsEntryKind::Symlink {
+                    break;
+                }
+                follows += 1;
+                if follows > 40 {
+                    return true;
+                }
+                let Some(target) = self.readlink_layered(&cur) else {
+                    return false;
+                };
+                cur = if target.starts_with('/') {
+                    join_rootfs_path("/", &target)
+                } else {
+                    let parent = Path::new(&cur)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "/".to_string());
+                    join_rootfs_path(&parent, &target)
+                };
+            }
+            base = cur;
+        }
+        false
+    }
 }
