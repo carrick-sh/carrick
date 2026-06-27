@@ -249,6 +249,33 @@ pub(crate) fn forked_child_exit(
     unsafe { libc::_exit(code) };
 }
 
+/// Host-fs marker path for a forked-child signal death the BSD host kernel could
+/// not represent as WIFSIGNALED. Keyed by the globally-unique host pid (so it
+/// never collides across concurrent guests or carrick instances).
+#[cfg(not(target_os = "linux"))]
+fn sigdeath_marker_path(host_pid: u32) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(".carrick-sigdeath-{host_pid}"))
+}
+
+/// Parent side: consume the signal-death marker a just-reaped forked child left,
+/// returning the Linux signal it died by. `Some` only for a BSD-host child whose
+/// default-TERMINATE Linux signal mapped to a default-IGNORE host signal
+/// (SIGPOLL→SIGIO, SIGSTKFLT→SIGURG) and so could only `_exit(128+N)`; `None` on
+/// the normal host-signalled path. Always `None` on a Linux host (host signal
+/// numbers and dispositions match Linux, so the marker is never written).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn consume_sigdeath_marker(host_pid: u32) -> Option<i32> {
+    let path = sigdeath_marker_path(host_pid);
+    let sig = *std::fs::read(&path).ok()?.first()? as i32;
+    let _ = std::fs::remove_file(&path);
+    Some(sig)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn consume_sigdeath_marker(_host_pid: u32) -> Option<i32> {
+    None
+}
+
 /// Called from a forked child when a default-action signal (no installed
 /// handler) must terminate it. Flushes buffered stdio to the inherited host
 /// fds, then makes THIS host process die *by* `signum` — resetting the
@@ -277,9 +304,16 @@ pub(crate) fn forked_child_die_by_signal(
         libc::sigaddset(&mut set, host_signum);
         libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
         libc::raise(host_signum);
-        // Only reached if the signal didn't terminate us (e.g. a Linux signal
-        // number that is default-ignore on macOS). Preserve the conventional
-        // shell exit code so behaviour degrades gracefully.
+        // Only reached if the host signal did NOT terminate us. On the BSDs the
+        // host signal mapped from some default-TERMINATE Linux signals is itself
+        // default-IGNORE (Linux SIGPOLL 29 → BSD SIGIO 23, Linux SIGSTKFLT 16 →
+        // BSD SIGURG 16), so `raise` is a silent no-op. The child cannot make its
+        // OWN host wait status WIFSIGNALED, so leave a marker keyed by host pid:
+        // the parent's wait4 reap reconstructs WIFSIGNALED(signum) from it instead
+        // of reporting `exited 128+signum` (LTP waitpid01: a SIGPOLL child would
+        // otherwise read as "exited 157" rather than "killed by SIGPOLL").
+        #[cfg(not(target_os = "linux"))]
+        let _ = std::fs::write(sigdeath_marker_path(std::process::id()), [signum as u8]);
         libc::_exit(128 + signum)
     }
 }
