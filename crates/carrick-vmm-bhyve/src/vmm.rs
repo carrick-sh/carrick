@@ -311,6 +311,43 @@ impl Drop for BhyveVmInner {
     }
 }
 
+/// Tear down a reaped forked child's leaked `/dev/vmm/carrick-<host_pid>-*`
+/// node(s). Installed as the carrick-hal reap-child-VM hook; the PARENT calls it
+/// from its `wait4`/`waitid` reap, where the child host process is already DEAD.
+/// Opening the orphaned node (flags 0 = open, no create) and `vm_destroy`-ing it
+/// is the sole, final teardown — it cannot race a live in-process holder, so
+/// (unlike the in-child `process_exit_cleanup`, which the engine's surviving
+/// `BhyveSharedVm` clone keeps referenced and would HANG to destroy) it never
+/// hangs. The child may have superseded earlier VMs (seq 0,1 destroyed on the
+/// child's own Drop as it rebuilt); only the final live node leaks, but matching
+/// the whole `carrick-<pid>-` prefix reaps any stragglers too.
+pub fn reap_leaked_child_vm(host_pid: u32) {
+    let prefix = format!("carrick-{host_pid}-");
+    let Ok(rd) = std::fs::read_dir("/dev/vmm") else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let fname = ent.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(cname) = CString::new(name) else {
+            continue;
+        };
+        // SAFETY: open the orphaned node (no create) to get its ctx, then destroy
+        // it. The owning process is dead, so this is the single, final vm_destroy.
+        unsafe {
+            let ctx = vm_openf(cname.as_ptr(), 0);
+            if !ctx.is_null() {
+                vm_destroy(ctx);
+            }
+        }
+    }
+}
+
 pub struct BhyveVm {
     /// The shared inner carries the `owns` flag (robust-by-construction): a
     /// borrowed handle is a DISTINCT non-owning inner over the same `ctx`, so its
@@ -384,6 +421,15 @@ impl BhyveVm {
     /// `vm_destroy` of the shared ctx then failed EINVAL on the duplicate.
     pub fn create() -> Result<Self, OsError> {
         use std::sync::atomic::AtomicU32;
+        // Install the reap-child-VM hook once per process: a bhyve VM is a named
+        // /dev/vmm node that leaks when a forked guest child `_exit`s past Drop,
+        // so the PARENT tears it down from its wait4/waitid reap (the child is
+        // dead → no live holder → no hang). Idempotent; the fn address is the
+        // same in every forked process, so this registration is fork-inherited.
+        static REGISTER_REAP: std::sync::Once = std::sync::Once::new();
+        REGISTER_REAP.call_once(|| {
+            carrick_hal::vm_backend::set_reap_child_vm_hook(reap_leaked_child_vm);
+        });
         // Process-global VM sequence — distinct name per create() in this process.
         static VM_SEQ: AtomicU32 = AtomicU32::new(0);
         let seq = VM_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -573,14 +619,14 @@ impl BhyveVm {
             unsafe { vm_destroy(inner.ctx) };
             inner.ctx = std::ptr::null_mut();
         }
-        // NOTE (leak, not yet fixed): for a forked child the engine holds the VM
-        // as a `BhyveSharedVm` clone (a 2nd Arc holder), so `Arc::get_mut` fails
-        // and the `/dev/vmm/<name>` node leaks on `_exit` (Drop never runs). A
-        // naive "destroy via the shared ctx anyway" HANGS the run — a live holder
-        // (sibling vCPU / pump / shared-alias flush) is still using the node when
-        // we'd tear it down. The correct fix must quiesce + drop every other
-        // in-process holder FIRST, then destroy with sole ownership. Until then
-        // the conformance lane mitigates with a dead-pid VM reaper.
+        // NOTE: for a forked child the engine holds the VM as a `BhyveSharedVm`
+        // clone (a 2nd Arc holder), so `Arc::get_mut` fails here and this in-child
+        // path CANNOT tear the node down — a naive "destroy via the shared ctx
+        // anyway" HANGS the run (a live holder — sibling vCPU / pump / shared-alias
+        // flush — is still using the node). The leak is instead reclaimed by the
+        // PARENT from its wait4/waitid reap: `reap_leaked_child_vm` (installed via
+        // the carrick-hal reap-child-VM hook) destroys the orphaned node once the
+        // child host process is DEAD, where there is no live holder to race.
     }
 
     /// Map memory segment `segid` into the guest at `[gpa, gpa+len)`.
