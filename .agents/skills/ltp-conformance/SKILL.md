@@ -220,9 +220,36 @@ surface blind spots in the areas you haven't curated. Distinguish, in any
 report, "verified (assertions ran and matched)" from "skipped both sides
 (TCONF)" and "excluded (Docker-VM jitter, individually confirmed)".
 
+## Cross-platform grind (bhyve and the other non-macOS lanes)
+
+The same differential method runs on the other VMM backends on real hardware:
+the harness shells out to the built `carrick` binary, so `--lane bhyve-local`
+(FreeBSD), `--lane kvm-local` (Linux), `--lane nvmm-local` (NetBSD) run the same
+LTP gate against x86_64 guests. Off macOS, build with `cargo build -p carrick-cli
+--no-default-features --features platform-<freebsd|linux|netbsd>,syscall-shim`
+(the default `platform-macos` pulls in HVF/applevisor and won't compile).
+
+**The bhyve parity grind has a harness:** `scripts/conformance/bhyve-grind.sh
+{build|run|char|reap|full|stillfail}` — rsync local crates to the FreeBSD box,
+build the bhyve binary, run specific LTP suites against the COMMITTED oracle
+(carrick-only, no Docker), report verdicts or raw `TFAIL`/`TBROK`, babysit baked
+in. Loop: edit a crate → `build` → `run <the affected suites>` (confirm they
+flip and nothing nearby regresses) → commit → periodically `full` for the
+comprehensive no-regression gate. See `project_bhyve_parity_campaign` memory for
+the prioritized backlog and what's already fixed.
+
+**Attribute before fixing — bhyve-specific or shared?** A bhyve regression that
+ALSO fails on `kvm-local` is a shared runtime/engine gap (the carrick-x86 engine
+is shared bhyve↔KVM), NOT the bhyve-parity target. Diff the bhyve-fail set
+against KVM-pass to isolate the genuinely bhyve-specific suites; those are
+host-OS (FreeBSD-vs-Linux ABI) or VMM-backend diffs. Keep host-OS emulation
+host-gated (`cfg(not(target_os = "linux"))`) so KVM keeps native behaviour, and
+prefer a real Linux-semantics emulation over a per-error-code hack.
+
 ## Pointers
 
-- Memory: `project_ltp_go_coverage.md` (this campaign + the Darwin-as-truth
-  research backlog), `project_ltp_conformance.md` (harness origins).
+- Memory: `project_bhyve_parity_campaign.md` (the bhyve↔KVM grind: harness,
+  prioritized backlog, fixes), `project_ltp_go_coverage.md` (this campaign + the
+  Darwin-as-truth research backlog), `project_ltp_conformance.md` (harness origins).
 - `docs/ltp-baseline/BASELINE.md` — the summarized baseline tally.
 - `handoff.md` (repo root) — current state, open gaps, next steps.
