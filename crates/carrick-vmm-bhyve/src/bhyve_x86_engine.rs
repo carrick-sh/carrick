@@ -80,6 +80,7 @@ use crate::vmm_x86::{
     VM_REG_GUEST_RDI, VM_REG_GUEST_RDX, VM_REG_GUEST_RFLAGS, VM_REG_GUEST_RIP, VM_REG_GUEST_RSI,
     VM_REG_GUEST_RSP, VM_REG_GUEST_SS,
 };
+use crate::vmm_x86::{VM_REG_GUEST_GDTR, VM_REG_GUEST_IDTR};
 
 /// The bhyve x86 kernel-window GPA layout (the §2.5a/`BringupLayout` per-backend
 /// choice). bhyve folds the trampoline/GDT/PML4 into its single contiguous
@@ -840,10 +841,29 @@ impl X86Vcpu for BhyveX86Vcpu {
                 NativeExit::Suspended { how } => {
                     let rip = self.get_raw(VM_REG_GUEST_RIP).unwrap_or(u64::MAX);
                     let cs = self.get_raw(VM_REG_GUEST_CS).unwrap_or(u64::MAX);
+                    // A SUSPENDED/TRIPLEFAULT exit is fatal and opaque; dump the
+                    // ring-0 state (CR/segment/GDTR/IDTR) so the next ring-0
+                    // bring-up regression is diagnosable from a single run — this
+                    // is how the fork-blob ring-0 RSP triple fault was root-caused.
+                    let cr0 = self.get_raw(VM_REG_GUEST_CR0).unwrap_or(u64::MAX);
+                    let cr3 = self.get_raw(VM_REG_GUEST_CR3).unwrap_or(u64::MAX);
+                    let cr4 = self.get_raw(VM_REG_GUEST_CR4).unwrap_or(u64::MAX);
+                    let efer = self.get_raw(VM_REG_GUEST_EFER).unwrap_or(u64::MAX);
+                    let ss = self.get_raw(VM_REG_GUEST_SS).unwrap_or(u64::MAX);
+                    let rsp = self.get_raw(VM_REG_GUEST_RSP).unwrap_or(u64::MAX);
+                    let rflags = self.get_raw(VM_REG_GUEST_RFLAGS).unwrap_or(u64::MAX);
+                    let (csb, csl, csa) =
+                        self.get_desc(VM_REG_GUEST_CS).unwrap_or((u64::MAX, 0, 0));
+                    let (gsb, _, _) = self.get_desc(VM_REG_GUEST_GS).unwrap_or((u64::MAX, 0, 0));
+                    let (gdtb, gdtl, _) =
+                        self.get_desc(VM_REG_GUEST_GDTR).unwrap_or((u64::MAX, 0, 0));
+                    let (idtb, idtl, _) =
+                        self.get_desc(VM_REG_GUEST_IDTR).unwrap_or((u64::MAX, 0, 0));
                     return Err(TrapError::Hypervisor(format!(
-                        "bhyve-x86: VM_EXITCODE_SUSPENDED how={how} (4=TRIPLEFAULT) \
-                     rip={rip:#x} cs={cs:#x} (cpl={}); the guest suspended before \
-                     reaching a handled syscall/fault doorbell",
+                        "bhyve-x86: TRIPLEFAULT how={how} rip={rip:#x} cs={cs:#x} cpl={} \
+                     cr0={cr0:#x} cr3={cr3:#x} cr4={cr4:#x} efer={efer:#x} ss={ss:#x} \
+                     rsp={rsp:#x} rflags={rflags:#x} cs[b={csb:#x} l={csl:#x} ar={csa:#x}] \
+                     gdtr[b={gdtb:#x} l={gdtl:#x}] idtr[b={idtb:#x} l={idtl:#x}] gs.base={gsb:#x}",
                         cs & 3
                     )));
                 }
