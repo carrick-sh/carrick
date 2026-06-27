@@ -88,6 +88,25 @@ pub fn set_errno(value: i32) {
     }
 }
 
+/// OFD (open file description) lock fcntl commands. Linux and macOS libc define
+/// `F_OFD_*`; FreeBSD and NetBSD have no OFD locks, so we map them to the regular
+/// (process) lock commands — the lock still takes effect, with per-process rather
+/// than per-open-file-description semantics. carrick translates the guest's Linux
+/// `F_OFD_*` to these for the host `fcntl(2)`. (The Linux ABI values the GUEST
+/// sends live in `carrick-abi`; these are the matching HOST command numbers.)
+#[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+pub const F_OFD_GETLK: i32 = libc::F_OFD_GETLK;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+pub const F_OFD_GETLK: i32 = libc::F_GETLK;
+#[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+pub const F_OFD_SETLK: i32 = libc::F_OFD_SETLK;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+pub const F_OFD_SETLK: i32 = libc::F_SETLK;
+#[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+pub const F_OFD_SETLKW: i32 = libc::F_OFD_SETLKW;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+pub const F_OFD_SETLKW: i32 = libc::F_SETLKW;
+
 /// Nanosecond fields in `struct stat`. NetBSD's libc names these
 /// `st_*timensec`; the other supported hosts expose `st_*time_nsec`. The field
 /// is `c_long` (== `i64` on carrick's 64-bit hosts); the cast spells out the
