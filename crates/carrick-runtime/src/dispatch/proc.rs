@@ -1530,10 +1530,24 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EAGAIN.into());
                     }
                     let timeout = if timeout_address.0 == 0 {
+                        // NULL timespec ptr = no timeout (block indefinitely).
                         None
                     } else {
+                        // A non-NULL timespec ALWAYS specifies a deadline — even
+                        // {0,0}, which means "time out IMMEDIATELY" (ETIMEDOUT
+                        // now), NOT "infinite". duration_from_linux_timespec maps
+                        // {0,0} to None ("no duration"); collapsing that to the
+                        // `timeout_address == 0` None made the threaded futex park
+                        // (wait_prepared_for_thread) compute no deadline and spin
+                        // forever on a zero-timeout WAIT that Linux returns
+                        // ETIMEDOUT from at once (futex_wait03 old-kernel-spec hung
+                        // 110s). Force the zero case to a ZERO duration so the park
+                        // deadline is `now` and fires immediately.
                         let timespec = read_timespec(memory, timeout_address.0)?;
-                        duration_from_linux_timespec(timespec)?
+                        Some(
+                            duration_from_linux_timespec(timespec)?
+                                .unwrap_or(std::time::Duration::ZERO),
+                        )
                     };
                     if let Some(host_addr) = shared_host_addr {
                         return Ok(DispatchOutcome::SharedFutexWait {
