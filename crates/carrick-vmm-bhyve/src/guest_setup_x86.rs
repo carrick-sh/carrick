@@ -2594,9 +2594,25 @@ pub fn program_x86_vcpu_longmode_entry(
     let blob_gpa = X86_INIT_BLOB_GPA + slot;
     let ring0_rsp = blob_gpa + 256;
 
-    // Sibling MSR blob: WRMSR LSTAR/STAR/SFMASK, then iretq → ring-3 at
-    // child_rip with child_rsp and rax = 0 (clear_rax = true).
-    let blob = msr_init_blob(
+    // Sibling MSR blob, prefixed with `mov rsp, ring0_rsp` so it OWNS its ring-0
+    // scratch stack: WRMSR LSTAR/STAR/SFMASK, then iretq → ring-3 at child_rip with
+    // child_rsp and rax = 0 (clear_rax = true).
+    //
+    // The leading `mov rsp, imm64` is load-bearing. `set_reg_raw(RSP, ring0_rsp)`
+    // below sets the entry RSP, but the shared post-fork completion
+    // (`complete_syscall` → the restore resume) can re-stamp RSP with the USER rsp
+    // AFTER this: the bhyve fork-entry suppressor (`set_gpr`/`set_gprs`) protects
+    // only RIP, not RSP. Without the blob owning its stack, its iretq-frame pushes
+    // land on the user stack; a child whose user rsp sits just above an uncommitted
+    // page #PFs INSIDE the ring-0 blob (no demand-commit at a non-syscall boundary)
+    // → an unrecoverable TRIPLE FAULT (rip = the first push). KVM never hits this —
+    // its MAP_PRIVATE COW fork hands the child every page free. Self-setting RSP
+    // here makes the blob immune to whatever RSP it is entered with.
+    let mut blob = Vec::with_capacity(176);
+    blob.push(0x48); // REX.W ┐ mov rsp, imm64(ring0_rsp)
+    blob.push(0xBC); //       ┘
+    blob.extend_from_slice(&ring0_rsp.to_le_bytes());
+    blob.extend_from_slice(&msr_init_blob(
         regs.lstar,
         regs.star,
         regs.sfmask,
@@ -2610,7 +2626,7 @@ pub fn program_x86_vcpu_longmode_entry(
         // `call *0` and #PF at RIP=0 (the bhyve Go bring-up crash).
         snap.gpr[GPR_IDX_RDX],
         snap.gpr[GPR_IDX_RCX],
-    );
+    ));
     write_gpa(vm, blob_gpa, &blob)?;
 
     // Inherit the parent's integer state. We do NOT call restore_x86_bhyve here
