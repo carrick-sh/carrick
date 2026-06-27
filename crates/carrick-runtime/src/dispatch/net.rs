@@ -139,6 +139,21 @@ pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
 /// (IPv6 `::1` → IPv4 `127.0.0.1`) never triggers and CPython's network suites
 /// (ftplib/httplib/imaplib/docxmlrpc) wrongly fail. `SO_ERROR` is the
 /// authoritative async-connect result; a healthy socket reports 0.
+/// Linux `connect()` treats INADDR_ANY (0.0.0.0) as the loopback (127.0.0.1), but
+/// FreeBSD/macOS return ENETUNREACH for it. Rewrite an unspecified IPv4 connect target
+/// to loopback so a guest connecting to `0.0.0.0:port` behaves like Linux (LTP
+/// send01/recv01/sendto01/recvfrom01). `sin_addr` is at offset 4 in both the Linux and
+/// BSD `sockaddr_in`. A no-op on a Linux host, where the kernel already does this.
+#[cfg(not(target_os = "linux"))]
+fn rewrite_unspecified_connect_loopback(family: i32, host_addr: &mut [u8]) {
+    if family == libc::AF_INET && host_addr.len() >= 8 && host_addr[4..8] == [0, 0, 0, 0] {
+        host_addr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rewrite_unspecified_connect_loopback(_family: i32, _host_addr: &mut [u8]) {}
+
 fn connect_success_or_pending_error(host_fd: i32) -> DispatchOutcome {
     let mut host_err: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -1434,10 +1449,11 @@ impl SyscallDispatcher {
             Ok(t) => t,
             Err(errno) => return errno.into(),
         };
-        let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
+        let mut host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
             Ok(bytes) => bytes,
             Err(errno) => return errno.into(),
         };
+        rewrite_unspecified_connect_loopback(family, &mut host_addr);
         set_host_nonblocking(host_fd);
         let rc = unsafe {
             libc::connect(
@@ -3479,7 +3495,8 @@ impl SyscallDispatcher {
             let addr_addr = addr.0;
             let addrlen = addrlen as u32;
             let (host_fd, family) = this.host_socket_lookup(fd)?;
-            let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+            let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+            rewrite_unspecified_connect_loopback(family, &mut host_addr);
             // connect(AF_UNSPEC) is the UDP "disconnect" (dissolve the peer
             // association); Linux returns 0. macOS disconnects too but may then
             // report EAFNOSUPPORT/EINVAL — treat those as success below.
