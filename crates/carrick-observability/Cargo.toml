@@ -24,12 +24,13 @@ parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-# usdt is non-target-gated on purpose. On macOS/FreeBSD it provides the REAL
-# DTrace provider machinery the `probes::real` module fires; on Linux/NetBSD the
-# crate compiles as a pure-Rust no-op, but its `usdt::Error` type is still needed
-# by the `probes::stub` `register_dtrace_probes` signature (which the dispatcher
-# calls on every platform). This mirrors carrick-runtime's existing usage and is
-# the proven cross-platform pattern — target-gating usdt would break the stub
-# signature on Linux. The real provider mod is itself cfg'd to macOS/FreeBSD, so
-# DTrace asm anchors are only emitted where usdt supports them.
+# usdt is non-target-gated on purpose. On macOS/FreeBSD/Linux it provides the
+# REAL provider machinery the `probes::real` module fires (macOS/FreeBSD via
+# DTrace, Linux via SystemTap SDT `.note.stapsdt` anchors read by bpftrace); on
+# other targets (e.g. NetBSD) the crate compiles as a pure-Rust no-op, but its
+# `usdt::Error` type is still needed by the `probes::stub` `register_dtrace_probes`
+# signature (which the dispatcher calls on every platform). This mirrors
+# carrick-runtime's existing usage and is the proven cross-platform pattern —
+# target-gating usdt would break the stub signature. The real provider mod is
+# cfg'd to macOS/FreeBSD/Linux (usdt >=0.6 emits Linux probes on stable Rust).
 usdt.workspace = true

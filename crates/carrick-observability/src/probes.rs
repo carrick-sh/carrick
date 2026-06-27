@@ -1,31 +1,38 @@
 //! USDT (DTrace) probe provider — SHARED across the DTrace-capable backends.
 //!
 //! This module hosts the carrick USDT provider so EVERY backend whose host OS
-//! supports `usdt` (macOS and FreeBSD) fires REAL probes, while the others
-//! (Linux, NetBSD) link a no-op stub with identical signatures. It was formerly
-//! private to carrick-vmm-hvf (macOS-only); hoisting it here lets the FreeBSD
-//! bhyve build get the genuine provider too, and lets the dispatcher call one
-//! `crate::probes::…` surface on all platforms.
+//! supports `usdt` (macOS, FreeBSD, and Linux) fires REAL probes, while the
+//! others (e.g. NetBSD) link a no-op stub with identical signatures. It was
+//! formerly private to carrick-vmm-hvf (macOS-only); hoisting it here lets the
+//! FreeBSD bhyve build get the genuine provider too, and lets the dispatcher
+//! call one `crate::probes::…` surface on all platforms.
+//!
+//! Linux gets REAL probes via usdt's SystemTap SDT backend (`.note.stapsdt`
+//! anchors), read by `bpftrace -l 'usdt:<carrick-bin>:carrick:*'` — e.g.
+//! `carrick:futex-route`, `carrick:fork-quiesce`. usdt ≥0.6 emits these on
+//! stable Rust (the old `asm` feature is now a no-op); `register_dtrace_probes`
+//! (called from carrick-cli `main`) registers them at startup. (An earlier
+//! comment gated Linux out as "no-op"; that predated usdt's Linux support.)
 //!
 //! Layout:
 //!   * `real` — the genuine `#[usdt::provider]` plus its safe wrappers, compiled
-//!     ONLY where usdt can emit DTrace asm anchors (`macos`/`freebsd`).
+//!     where usdt can emit probe anchors (`macos`/`freebsd`/`linux`).
 //!   * `stub` — a byte-for-byte signature mirror with empty bodies, compiled on
 //!     every OTHER target. The non-probe helpers (`guest_mem_probe_points`,
 //!     `guest_mem_copy`, `guest_mem_point`) carry their REAL bodies in BOTH arms
 //!     so behaviour is identical regardless of platform.
 //!
-//! `usdt` is a non-target-gated dependency of this crate: on Linux/NetBSD it
+//! `usdt` is a non-target-gated dependency of this crate: on stub targets it
 //! compiles as a pure-Rust no-op, but `usdt::Error` is still needed by the
 //! stub's `register_dtrace_probes` return type (the dispatcher calls it on every
 //! platform). See the crate manifest comment for why this is the correct choice.
 
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "linux"))]
 pub use real::*;
-#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
 pub use stub::*;
 
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "linux"))]
 mod real {
     //! THEORY OF OPERATION
     //!
@@ -971,7 +978,7 @@ mod real {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
 mod stub {
     //! No-op probe surface for backends whose host OS does not support `usdt`
     //! (Linux, NetBSD). Every public item the `real` module exports is mirrored
