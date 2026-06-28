@@ -6338,6 +6338,10 @@ impl SyscallDispatcher {
                         continue;
                     }
                     let mut buf = vec![0u8; len];
+                    // BLOCKING-IO-OK: hfd is an OpenDescription::HostFile (the
+                    // `if let HostFile` arm above; stdio returned ESPIPE earlier) —
+                    // a regular host file, never a pipe/socket/tty — so this read
+                    // cannot block the vCPU waiting on a peer.
                     let n = unsafe {
                         if read_at_current {
                             libc::read(hfd, buf.as_mut_ptr() as *mut _, len)
@@ -6544,6 +6548,10 @@ impl SyscallDispatcher {
                         continue;
                     }
                     let len = buf.len();
+                    // BLOCKING-IO-OK: hfd is an OpenDescription::HostFile (the
+                    // `if let HostFile` arm above; stdio returned ESPIPE earlier) —
+                    // a regular host file, never a pipe/socket/tty — so this write
+                    // cannot block the vCPU waiting on a peer.
                     let n = unsafe {
                         if write_at_current {
                             libc::write(hfd, buf.as_ptr() as *const _, len)

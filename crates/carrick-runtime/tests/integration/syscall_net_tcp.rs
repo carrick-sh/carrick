@@ -48,7 +48,7 @@ fn socket_syscalls_dispatch_to_real_host_handlers() {
 }
 
 #[test]
-fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
+fn signalfd4_and_tee_return_einval_not_enosys_stub() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -69,9 +69,11 @@ fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
         "signalfd4 with sizemask != 8 should return EINVAL"
     );
 
-    // tee (77) is not yet implemented; carrick returns ENOSYS. (vmsplice, nr 75,
-    // is now implemented — see the vmsplice handler + its conformance probe — so
-    // it no longer belongs in this bootstrap-ENOSYS check.)
+    // tee (77) is implemented (host tee(2) passthrough on Linux). With non-pipe
+    // fds — fd_in/fd_out=0 here are not registered guest pipe ends — it rejects
+    // with EINVAL before any host call, matching Linux tee(2) (LTP tee01/tee02).
+    // vmsplice (nr 75) is likewise implemented now, so neither is the ENOSYS
+    // bootstrap stub this assertion once covered.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -80,8 +82,8 @@ fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 38 },
-        "tee should return ENOSYS"
+        DispatchOutcome::Errno { errno: 22 },
+        "tee with non-pipe fds should return EINVAL"
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
