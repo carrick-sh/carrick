@@ -1,8 +1,8 @@
 # Design: Linux `ptrace(2)` on carrick (Darwin / HVF)
 
 Status: **Phase 1 IMPLEMENTED + verified (2026-05-26)**; Phases 2–4 remain
-design. Author: research agent, 2026-05-26. Driven via the superpowers
-`brainstorming` skill (context exploration → approach comparison →
+design. Author: research agent, 2026-05-26. Produced by a structured
+brainstorming pass (context exploration → approach comparison →
 recommendation → written design).
 
 > **Phase 1 landed.** Guest `BRK`/step/HW-debug exceptions now deliver SIGTRAP

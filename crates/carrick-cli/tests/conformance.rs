@@ -1238,7 +1238,7 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     // the per-case deadline. Standalone Carrick and Docker runs match.
     "mmaprecl",
     // futex wake-COUNT probes: macOS __ulock can report zombie wake successes
-    // for ~µs after a wake under contention (see project_macos_ulock_zombie),
+    // for ~µs after a wake under contention,
     // so exact counts flake under the parallel CPU load — quarantine them.
     "futexwakecount",
     "futexrequeue",

@@ -235,8 +235,7 @@ build the bhyve binary, run specific LTP suites against the COMMITTED oracle
 (carrick-only, no Docker), report verdicts or raw `TFAIL`/`TBROK`, babysit baked
 in. Loop: edit a crate → `build` → `run <the affected suites>` (confirm they
 flip and nothing nearby regresses) → commit → periodically `full` for the
-comprehensive no-regression gate. See `project_bhyve_parity_campaign` memory for
-the prioritized backlog and what's already fixed.
+comprehensive no-regression gate.
 
 **Attribute before fixing — bhyve-specific or shared?** A bhyve regression that
 ALSO fails on `kvm-local` is a shared runtime/engine gap (the carrick-x86 engine
@@ -248,8 +247,5 @@ prefer a real Linux-semantics emulation over a per-error-code hack.
 
 ## Pointers
 
-- Memory: `project_bhyve_parity_campaign.md` (the bhyve↔KVM grind: harness,
-  prioritized backlog, fixes), `project_ltp_go_coverage.md` (this campaign + the
-  Darwin-as-truth research backlog), `project_ltp_conformance.md` (harness origins).
 - `docs/ltp-baseline/BASELINE.md` — the summarized baseline tally.
 - `handoff.md` (repo root) — current state, open gaps, next steps.

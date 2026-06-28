@@ -14,10 +14,10 @@ use the best host mechanism available while satisfying the same Linux ABI
 contract at the runtime boundary.
 
 > [!IMPORTANT]
-> This document describes the current crate architecture. Historical plans under
-> `docs/superpowers/specs/` and `docs/superpowers/plans/` are useful archaeology,
-> but some still use old crate names such as `carrick-hvf`, `carrick-linux`, or
-> `carrick-bhyve`. Treat current source and this document as authoritative.
+> This document describes the current crate architecture. Some older design
+> notes in git history still use old crate names such as `carrick-hvf`,
+> `carrick-linux`, or `carrick-bhyve`. Treat current source and this document as
+> authoritative.
 
 ---
 

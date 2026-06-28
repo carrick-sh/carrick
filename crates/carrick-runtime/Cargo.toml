@@ -53,8 +53,8 @@ trace-elf = ["carrick-mem/trace-elf"]
 # features, so the only way to pull in carrick-vmm-hvf is via `platform-macos`.
 platform-macos = ["dep:carrick-vmm-hvf", "dep:carrick-host-bsd"]
 platform-linux = ["dep:carrick-vmm-kvm", "dep:carrick-host-linux"]
-# FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2 — see
-# docs/superpowers/adr/2026-06-06-bhyve-backend-design.md). Mirrors platform-linux.
+# FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2).
+# Mirrors platform-linux.
 # Pulls in carrick-host-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
 platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd"]
 platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]

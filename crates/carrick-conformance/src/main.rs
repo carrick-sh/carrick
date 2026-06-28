@@ -7,7 +7,6 @@
 //! `docs/support-matrix.md`. A pure orchestrator — it links none of the guest
 //! stack; it shells out to the signed `carrick` binary and the `docker` CLI.
 //!
-//! Design contract: docs/superpowers/specs/2026-06-03-conformance-harness-design.md.
 //! Invariants: identical trailing argv to both engines; carrick‖docker never
 //! overlap (two-phase); every kill is SCOPED to one run-id (no unscoped reap).
 

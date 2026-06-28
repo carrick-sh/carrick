@@ -339,7 +339,7 @@ impl Engine {
     /// happens here and it is safe to drive inside a tokio runtime. The caller
     /// drops the runtime (joining its blocking pool in the parent) BEFORE
     /// calling `carrick_runtime::Runtime::execute`, so tokio is never alive
-    /// across a fork. See docs/superpowers/specs/2026-06-06-tokio-fork-isolation.
+    /// across a fork.
     pub async fn resolve(&self, req: CliRunRequest) -> Result<RunSpec, anyhow::Error> {
         let image_ref = carrick_spec::ImageReference::parse(&req.image_ref)
             .map_err(|e| anyhow::anyhow!("invalid image reference: {}", e))?;

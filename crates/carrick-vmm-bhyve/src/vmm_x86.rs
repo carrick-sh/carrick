@@ -3,7 +3,7 @@
 //! uses instead of the aarch64-named `HvVcpu` surface.
 //!
 //! Every constant and layout here is transcribed from the TARGET BOX's headers
-//! (FreeBSD 15.1-RC3 amd64, root@<lab-ip>): `/usr/include/machine/vmm.h`
+//! (FreeBSD 15.1-RC3 amd64): `/usr/include/machine/vmm.h`
 //! and `/usr/include/vmmapi.h` — cited by line number — and cross-checked by a
 //! compiled-on-box C probe (sizeof/offsetof/bitfield packing, 2026-06-12).
 //! FreeBSD headers are the *host* API and explicitly allowed (clean-room
