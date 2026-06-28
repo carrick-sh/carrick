@@ -7,7 +7,7 @@ diffed per test-id. Harness: `scripts/cpython-parity.py`. The CPython test suite
 is stripped from the official python images, so the matching `Lib/test` is
 mounted on PYTHONPATH (see harness header). Data: `baseline.jsonl`.
 
-Baseline date: 2026-05-30. First baseline AFTER the CTR_EL0 fix (commit afd6ca2)
+Baseline date: 2026-05-30. First baseline AFTER the CTR_EL0 fix
 that unblocked glibc-2.41 startup. ~40 representative modules across the goal's
 areas (fork/exec, threads, signals, fs+locking, sockets, select/poll/epoll, mmap,
 subprocess, os/io) + pure-compute sanity modules.
@@ -70,7 +70,7 @@ CPython's `subprocess`/`script_helper` forks while the regrtest faulthandler
 **watchdog thread** (a native thread, not a Python `threading.Thread`) is alive,
 so every spawn is a **multithreaded fork** + execve. Two separate carrick bugs:
 
-**Bug A — fork-quiesce deadlock on a sleeping sibling. FIXED (commit b682d67).**
+**Bug A — fork-quiesce deadlock on a sleeping sibling. FIXED.**
 A sibling blocked in `nanosleep` never reached the run-loop top to park, so the
 fork-quiesce spun forever (carrick-trace: fork-quiesce phase-1 ~18/s). Fixed by
 routing sleeps through the run loop (`DispatchOutcome::WaitOnSleep`) so they park

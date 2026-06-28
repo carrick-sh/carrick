@@ -4132,7 +4132,7 @@ impl FsBackend for HostFsBackend {
             }
         };
         // macOS fremovexattr; ENOATTR (absent attribute) maps to Linux ENODATA
-        // via host_syscall_errno (commit d9b1822).
+        // via host_syscall_errno.
         let rc = unsafe { carrick_portable::fremovexattr(host_fd, cname.as_ptr()) };
         let err = rc.host_syscall_errno().map(|_| ());
         unsafe { libc::close(host_fd) };

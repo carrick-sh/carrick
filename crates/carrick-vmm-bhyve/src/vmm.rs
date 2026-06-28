@@ -13,10 +13,10 @@
 //! `HvVm`/`HvVcpu` traits are deliberately NOT implemented (Phase 2 decision;
 //! the x86 backend uses the inherent surface instead).
 //!
-//! SCAFFOLD:
-//! aarch64 interfaces are transcribed from FreeBSD 15.1 `/usr/include/vmmapi.h`,
-//! `machine/vmm_dev.h`, and `sys/arm64/include/vmm.h` (releng/15.1) and remain
-//! compile-verified only (bhyve runs same-arch guests; the box is amd64).
+//! Bring-up status: the aarch64 interfaces are transcribed from FreeBSD 15.1
+//! `/usr/include/vmmapi.h`, `machine/vmm_dev.h`, and `sys/arm64/include/vmm.h`
+//! (releng/15.1) and remain compile-verified only (bhyve runs same-arch guests;
+//! the development box is amd64).
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -49,7 +49,8 @@ const VMMAPI_OPEN_CREATE: c_int = 0x01;
 
 // aarch64 `enum vm_reg_name` (sys/arm64/include/vmm.h, releng/15.1).
 // X0..X29 = 0..29; LR(X30)=30; SP=31; PC=32; CPSR=33; then the MMU sysregs.
-// CONFIRM these ordinals on the aarch64 target.
+// These ordinals are unverified on an aarch64 bhyve host (the development box
+// is amd64); they may need confirmation when that path runs.
 #[cfg(target_arch = "aarch64")]
 const VM_REG_GUEST_X0: c_int = 0; // X0..X30 = 0..30 (LR is X30)
 #[cfg(target_arch = "aarch64")]

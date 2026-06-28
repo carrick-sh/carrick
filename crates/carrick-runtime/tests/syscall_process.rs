@@ -442,7 +442,7 @@ fn blocking_wait4_for_specific_child_parks_on_proc_exit() {
         outcome,
         DispatchOutcome::WaitOnProcExit {
             pid: child,
-            // c81fd54: the blocking wait folds the default-ignored signals
+            // The blocking wait folds the default-ignored signals
             // (SIGCHLD|SIGURG|SIGWINCH) into its block mask so an inert pending
             // signal can't spuriously EINTR it. A fresh dispatcher has no
             // installed handlers, so that default-ignore set is the whole mask.
@@ -522,7 +522,7 @@ fn waitid_wexited_ignores_stopped_child() {
         outcome,
         DispatchOutcome::WaitOnProcExit {
             pid: child,
-            // c81fd54: the blocking wait folds the default-ignored signals
+            // The blocking wait folds the default-ignored signals
             // (SIGCHLD|SIGURG|SIGWINCH) into its block mask so an inert pending
             // signal can't spuriously EINTR it. A fresh dispatcher has no
             // installed handlers, so that default-ignore set is the whole mask.

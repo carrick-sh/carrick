@@ -5,7 +5,7 @@
 //! Motivation: a carrick bug returned `st_mtime = 0` from `fstat(fd)` while
 //! `statx(path)` returned the real mtime. apt's cache cross-check compares the
 //! two and aborted install with "Cache is out of sync, can't x-ref a package
-//! file". Fixed in cf6de43; this probe guards against regression.
+//! file". This probe guards against regression.
 //!
 //! Deterministic only: prints BOOLEAN agreement of the three stat views (the
 //! absolute mtimes differ between carrick and real Linux, so we never print a

@@ -1,7 +1,7 @@
 # fork-wait4 — freestanding KVM fork(2) test fixture
 
 A hand-written, libc-free aarch64 Linux ELF that exercises the raw `fork(2)`
-primitive (Phase 2, Task 2) as serviced by the carrick-linux KVM thin shim.
+primitive (Phase 2, Task 2) as serviced by the carrick-vmm-kvm thin shim.
 
 ## What it does
 
@@ -28,7 +28,7 @@ into a static executable.
 
 ## Running
 
-The fixture is run by `scripts/kvm-smoke-lima.sh` against the carrick-linux thin
+The fixture is run by `scripts/kvm-smoke-lima.sh` against the carrick-vmm-kvm thin
 shim inside the nested-KVM Lima VM (`just kvm-smoke-lima`). Expected stdout is
 `fork-ok\n` (see `oracle.expected`); expected exit code is 0.
 

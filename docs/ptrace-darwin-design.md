@@ -71,10 +71,10 @@ facts established by reading the code:
 
 - GP/PC/SP/PSTATE/sysreg access: `applevisor` `Vcpu::get_reg`/`set_reg`/
   `get_sys_reg`/`set_sys_reg`, used pervasively in
-  `crates/carrick-runtime/src/trap.rs` (e.g. the `Aarch64SyscallFrame` build at
-  `trap.rs:1530`, the EL0Fault snapshot at `trap.rs:1457`).
+  `crates/carrick-vmm-hvf/src/trap.rs` (e.g. the `Aarch64SyscallFrame` build
+  and the EL0Fault snapshot).
 - FP/SIMD V0–V31 + FPSR/FPCR: `save_fpsimd_into`/`restore_fpsimd_from`
-  (`trap.rs:2079`, `trap.rs:2105`), routed through a C shim (`set_simd_fp_reg_v`,
+  (in `crates/carrick-vmm-hvf/src/trap.rs`), routed through a C shim (`set_simd_fp_reg_v`,
   `trap.rs:344`) to work around an `applevisor` vector-class FFI bug
   (documented in memory: "SIMD/FP register restore ABI bug").
 - Guest memory: `GuestMemory` trait + VFS; `read_guest_bytes`/`write_guest_bytes`
@@ -552,10 +552,9 @@ single-step, and continue a simple single-threaded Go/C guest; `TestGdb*`/
 
 Read during this research; cited as the integration points:
 
-- `crates/carrick-runtime/src/trap.rs` — exception classification
-  (`run_until_syscall` ~`:1451`), `inject_signal` (`:1867`),
-  `restore_from_sigframe` (`:2150`), debug-reg/single-step (HVF) accessors;
-  `aarch64_exception_class` (`:2750`).
+- `crates/carrick-vmm-hvf/src/trap.rs` — exception classification
+  (`run_until_syscall`), `inject_signal`, `restore_from_sigframe`,
+  debug-reg/single-step (HVF) accessors; `aarch64_exception_class`.
 - `crates/carrick-runtime/src/runtime.rs` — `el0_fault_signal` (`:2007`) →
   add `el0_debug_signal`; `deliver_fault_signal` (`:2040`); the EL0Fault arm
   (`:1619`); `deliver_pending_signal` (`:1854`) for ptrace signal-stop; Fork/
@@ -565,21 +564,21 @@ Read during this research; cited as the integration points:
   (`:833`/`:925`) for TRACECLONE; pidfd (`:180`) for liveness.
 - `crates/carrick-runtime/src/dispatch/signal.rs` — `tkill`/`tgkill`
   (`:217`/`:237`), `route_thread_signal`, `bootstrap_signal_send` (`:646`).
-- `crates/carrick-runtime/src/host_signal.rs` — pending/translation
-  (`:48`,`:62`,`:162`,`:179`).
-- `crates/carrick-runtime/src/fork_quiesce.rs` — `PtQuiesce`/`pt_barrier`
-  (`:144`+) reused for tracee group-stop.
-- `crates/carrick-runtime/src/vcpu_kick.rs` — `VcpuKicker::kick` to stop a
+- `crates/carrick-vmm-hvf/src/host_signal.rs` — pending/translation.
+- `crates/carrick-vmm-hvf/src/fork_quiesce.rs` (neutral barrier core in
+  `crates/carrick-thread/src/fork_quiesce.rs`) — `PtQuiesce`/`pt_barrier`
+  reused for tracee group-stop.
+- `crates/carrick-vmm-hvf/src/vcpu_kick.rs` — `VcpuKicker::kick` to stop a
   running tracee.
-- `crates/carrick-runtime/src/host_proc.rs` — Mach `ThreadPort` (`:384`),
-  `pid_info` (`:209`) for the optional Mach fast-path / liveness.
-- `crates/carrick-runtime/src/vfs/proc.rs` — `TracerPid` lines (`:431`,`:570`).
-- `crates/carrick-runtime/src/linux_abi.rs` — `LinuxSignalContext`/
-  `LinuxFpsimdContext`/`CarrickSigframe`/`LinuxSiginfo` (`:830`+) reused for
-  regset marshalling; add ptrace structs.
-- `crates/carrick-runtime/src/ulock.rs` — cross-process futex, candidate for a
+- `crates/carrick-host/src/host_proc.rs` — Mach `ThreadPort`, `pid_info` for
+  the optional Mach fast-path / liveness.
+- `crates/carrick-runtime/src/vfs/proc.rs` — `TracerPid` lines.
+- `crates/carrick-abi/src/` — `LinuxSignalContext`/`LinuxFpsimdContext`/
+  `CarrickSigframe`/`LinuxSiginfo` signal-context types reused for regset
+  marshalling; add ptrace structs.
+- `crates/carrick-host/src/ulock.rs` — cross-process futex, candidate for a
   shared-memory broker variant.
-- `crates/carrick-runtime/src/syscall.rs` — ptrace `SupportLevel` (`:243`).
+- `crates/carrick-abi/src/syscall.rs` — ptrace `SupportLevel`.
 
 External sources consulted:
 

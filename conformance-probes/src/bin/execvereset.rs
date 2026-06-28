@@ -8,8 +8,8 @@
 //!
 //! Carrick's old image's handler ADDRESS used to leak into the new image; when
 //! the new image then took the signal, carrick jumped to that stale address.
-//! This stands in for the LTP shell-wrapped-test "mass segfault" class (the
-//! 34e1c9a fix) that bit dash's SIGCHLD handler through every `/bin/sh -c CMD`.
+//! This stands in for the LTP shell-wrapped-test "mass segfault" class
+//! that bit dash's SIGCHLD handler through every `/bin/sh -c CMD`.
 //!
 //! Single-binary probe with two stages: stage1 sets the dispositions up and
 //! `execve`s itself with arg "stage2"; stage2 queries the new image's state and

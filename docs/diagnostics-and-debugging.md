@@ -67,7 +67,7 @@ written as root: `cat`/`grep` it without sudo, `rm` may need sudo.
 ### USDT probe families
 
 The probes are static USDT, wired at the translation boundaries via the `usdt`
-crate (`crates/carrick-vmm-hvf/src/probes.rs`, `#[usdt::provider(provider =
+crate (`crates/carrick-observability/src/probes.rs`, `#[usdt::provider(provider =
 "carrick")]`). Three families let you triangulate guest vs host:
 
 - **carrick USDT (`carrick*:::`)** — the guest's Linux syscalls and carrick
@@ -135,7 +135,8 @@ crate (`crates/carrick-vmm-hvf/src/probes.rs`, `#[usdt::provider(provider =
 
 ### Bundled and custom scripts
 
-The repo ships ~46 `scripts/trace-*.d` programs plus the default
+The repo ships a small set of `scripts/dtrace/*.d` programs (the trace-*.d
+fork/futex/fd families) plus the default
 [`scripts/dtrace/syscalls.d`](../scripts/dtrace/syscalls.d); run any with `-s`. Notable ones:
 [`trace-host-fds.d`](../scripts/dtrace/trace-host-fds.d) (correlate guest pipe I/O with
 host `pipe`/`dup`/`close` — the go-to for fd bugs),
@@ -294,7 +295,7 @@ carrick run --json <image> -- <cmd>
 everything carrick could **not** fully service: unhandled syscalls (by number +
 name, with invocation counts), partially-implemented syscalls, unhandled
 `ioctl(2)` requests, unimplemented `/proc` and `/sys` read paths, unsupported
-signals, and unknown syscall-flag bits (`crates/carrick-vmm-hvf/src/compat.rs`,
+signals, and unknown syscall-flag bits (`crates/carrick-observability/src/compat.rs`,
 `CompatReporter` → `CompatReport`). It is the **"what does this workload need
 that we don't handle yet"** tool — point it at a new binary and the report is
 your gap list, sorted by frequency.

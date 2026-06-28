@@ -2,8 +2,8 @@
 
 A hand-written, libc-free aarch64 Linux ELF that issues exactly
 `write(1, "ok\n", 3)` then `exit_group(0)`. It is the L2 success criterion
-for the carrick-linux KVM aarch64 MVP: `just kvm-smoke` runs it under
-`carrick-linux` and diffs the output against `oracle.expected`.
+for the carrick-vmm-kvm aarch64 MVP: `just kvm-smoke` runs it under
+`carrick-vmm-kvm` and diffs the output against `oracle.expected`.
 
 ## Build (Mac-native, no extra toolchain)
 

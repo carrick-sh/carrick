@@ -1,7 +1,7 @@
 //! Cross-process `FUTEX_WAKE` on a `MAP_SHARED` word actually wakes each
 //! parked waiter. The classic shape LTP `futex_wake03` and `tst_checkpoint`
 //! exercise. carrick routes this through `__ulock_wake_by_address_any` in
-//! a loop with `sched_yield` between iterations (commit 3c6c711); the
+//! a loop with `sched_yield` between iterations; the
 //! invariant the suite needs to gate is "the kernel woke every parked
 //! waiter," which we verify by checking that ALL N forked children exit
 //! cleanly + that the accumulated WAKE count is AT LEAST N.
@@ -21,7 +21,7 @@
 //!   futex_wake_N{N}_woke_at_least_N=true|false
 //!   futex_wake_N{N}_all_children_reaped=true|false
 
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{Ordering, compiler_fence};
 use std::time::{Duration, Instant};
 
 const SYS_FUTEX: libc::c_long = 98; // aarch64
@@ -155,7 +155,7 @@ unsafe fn run_round(n: usize) -> (bool, bool) {
     // Flip word so any child arriving at FUTEX_WAIT now sees the mismatch and
     // doesn't park forever. Then WAKE: Linux returns N in one INT_MAX call;
     // macOS's `wake_by_address_any` wakes one-per-call with sched_yield
-    // between iterations (see commit 3c6c711). To stay deterministic across
+    // between iterations. To stay deterministic across
     // both, the probe accepts the ACCUMULATED count across up to N+2
     // INT_MAX-WAKE calls (a small slack for any not-yet-parked child the
     // first burst misses). The invariant is "the sum equals N", which is
@@ -218,8 +218,8 @@ unsafe fn run_round(n: usize) -> (bool, bool) {
 }
 
 fn main() {
-    // N ∈ {2, 5} mirrors the C reproducer cited in 3c6c711's commit
-    // message; the per-PID backing-file path defeats any `__ulock`
+    // N ∈ {2, 5} mirrors the C reproducer the sched_yield invariant is
+    // derived from; the per-PID backing-file path defeats any `__ulock`
     // structure left over from a prior probe's run.
     for &n in &[1usize, 2, 5] {
         let (woke_at_least_n, all_clean) = unsafe { run_round(n) };

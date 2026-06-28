@@ -313,22 +313,21 @@ A duplicate or overlapping constant — invisible by inspection — becomes
 
 ### Syscall-table ordering
 
-`AARCH64_SYSCALLS` in `crates/carrick-vmm-hvf/src/syscall.rs` is looked up via
+`AARCH64_SYSCALLS` in `crates/carrick-abi/src/syscall.rs` is looked up via
 `binary_search_by_key` on the syscall number, which is only correct if the table
-is strictly sorted. A `const _: () = { … }` guard at
-`crates/carrick-vmm-hvf/src/syscall.rs:536` walks the table at compile time and
-asserts each row's number is strictly greater than the previous — guaranteeing
-both binary-search validity and number uniqueness. Insert a row out of order and
-the build fails:
+is strictly sorted. A `const _: () = { … }` guard in that file walks the table at
+compile time and asserts each row's number is strictly greater than the previous
+— guaranteeing both binary-search validity and number uniqueness. Insert a row
+out of order and the build fails:
 
 ```
 error[E0080]: evaluation of constant value failed
-  --> crates/carrick-vmm-hvf/src/syscall.rs:539:9
+  --> crates/carrick-abi/src/syscall.rs
    |
-539 | /         assert!(
-540 | |             AARCH64_SYSCALLS[i - 1].number < AARCH64_SYSCALLS[i].number,
-541 | |             "AARCH64_SYSCALLS must stay strictly sorted by syscall number \
-542 | |              (binary_search validity + number uniqueness)",
+   | /         assert!(
+   | |             AARCH64_SYSCALLS[i - 1].number < AARCH64_SYSCALLS[i].number,
+   | |             "AARCH64_SYSCALLS must stay strictly sorted by syscall number \
+   | |              (binary_search validity + number uniqueness)",
    | |_________________________________________________________^ the evaluated program panicked
 ```
 

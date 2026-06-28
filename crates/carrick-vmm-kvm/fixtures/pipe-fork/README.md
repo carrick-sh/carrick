@@ -2,7 +2,7 @@
 
 A hand-written, libc-free aarch64 Linux ELF that exercises `pipe2(2)`,
 `fork(2)` (via `clone(SIGCHLD)`), and pipe I/O across the fork boundary as
-serviced by the carrick-linux KVM thin shim (Phase 2, Task 3).
+serviced by the carrick-vmm-kvm thin shim (Phase 2, Task 3).
 
 ## What it does
 
@@ -32,7 +32,7 @@ links it into a static executable.
 
 ## Running
 
-The fixture is run by `scripts/kvm-smoke-lima.sh` against the carrick-linux thin
+The fixture is run by `scripts/kvm-smoke-lima.sh` against the carrick-vmm-kvm thin
 shim inside the nested-KVM Lima VM (`just kvm-smoke-lima`). Expected stdout is
 `pipe-ok\n` (see `oracle.expected`); expected exit code is 0.
 

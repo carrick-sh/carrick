@@ -73,9 +73,9 @@ zero. The list is intentionally kept around for future gaps._
 | `sysvshm` | SysV shared memory: shmget(IPC_PRIVATE,…) → shmid; shmat returns a mapped address; r/w roundtrip; cross-process coherence after fork; shmdt returns 0; shmctl(IPC_RMID) returns 0. Backed by host files under `/tmp/carrick-shm/` so forked guests see the same inode (LTP `kill07` MATCH; `kill05` advances past the prior `shmget ENOSYS` TBROK). |
 | `killuidperm` | `kill(2)` permission model: root → other-uid is allowed; non-root cross-uid returns -1/EPERM; non-root same-uid is allowed. Backed by per-process `/tmp/carrick-cred-<host_pid>` so a peer carrick process publishes the euid the kill check reads (LTP `kill05` MATCH 1/1). |
 | `rtsigqueueinfoxthread` | rt_sigqueueinfo(sibling_tid, SIGUSR1, &info) delivers the signal to the sibling thread's SA_SIGINFO handler and propagates si_value — the LTP `rt_sigqueueinfo01` shape (now MATCHing 2/2 assertions after route_thread_signal routing in rt_sigqueueinfo). |
-| `futexwakecount` | `FUTEX_WAKE(INT_MAX)` returns EXACTLY N when N waiters are parked on a MAP_SHARED word — the `sched_yield` between `__ulock_wake_any` iterations invariant from commit 3c6c711 (and the no-phantom-counts invariant from commit e0dd202). Stands in for LTP `futex_wake03`. |
-| `coredumpbit` | `WCOREDUMP(status)` is TRUE for the Linux core-dumping signal set (SIGABRT/SIGSEGV/SIGQUIT/…) and FALSE for non-core signals (SIGTERM/SIGKILL). Synthesizes the 0x80 bit even though macOS's default RLIMIT_CORE=0 suppresses it on the host wait status — commit 0b55501. Stands in for LTP `abort01`. |
-| `unlinkatbindmount` | `unlinkat(AT_FDCWD, "/dev/shm/<f>", 0)` removes a file created via the same bind-mounted path. Mirrors openat's vfs_mounts.resolve routing for unlink/unlinkat (commit 063ccf4) — without this, every `tst_checkpoint`-using LTP test TBROKs at setup_ipc. |
+| `futexwakecount` | `FUTEX_WAKE(INT_MAX)` returns EXACTLY N when N waiters are parked on a MAP_SHARED word — the `sched_yield`-between-iterations invariant for `__ulock_wake_any` (and the no-phantom-counts invariant). Stands in for LTP `futex_wake03`. |
+| `coredumpbit` | `WCOREDUMP(status)` is TRUE for the Linux core-dumping signal set (SIGABRT/SIGSEGV/SIGQUIT/…) and FALSE for non-core signals (SIGTERM/SIGKILL). Synthesizes the 0x80 bit even though macOS's default RLIMIT_CORE=0 suppresses it on the host wait status. Stands in for LTP `abort01`. |
+| `unlinkatbindmount` | `unlinkat(AT_FDCWD, "/dev/shm/<f>", 0)` removes a file created via the same bind-mounted path. Mirrors openat's vfs_mounts.resolve routing for unlink/unlinkat — without this, every `tst_checkpoint`-using LTP test TBROKs at setup_ipc. |
 | `reparenttoinit` | Double-fork orphans a grandchild; after the intermediate parent exits, `getppid()` in the orphan returns 1 (the PID-namespace init). Process-tree mirror must reparent on the macOS host the same way Linux does in its PID namespace. Stands in for LTP `getpid01`. |
 | `prctldumpable` | `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` round-trip: initial=1, set 0→get 0, set 1→get 1, set 2 returns OBSERVED rc/errno (newer kernels reject with EINVAL — probe records the tuple), set 99→EINVAL. Stands in for LTP `prctl04`/`prctl08`. |
 | `waitidspec` | `waitid(2)` siginfo encoding: CLD_EXITED+si_status, CLD_KILLED+si_status==SIGKILL, WNOWAIT peek-then-reap leaves the zombie, P_ALL+WNOHANG→ECHILD with no children. Distinct ABI from wait4 (covered by `proclife`/`waitrestart`). Stands in for LTP `waitid01`/`waitid02`/`waitid03`. |
@@ -197,7 +197,7 @@ underlying gap got fixed):
 | Cross-process futex WAIT/WAKE on MAP_SHARED word (`__ulock`) | ✅ `futexshare` | futex_wait02/03, futex_wake02/03 |
 | **`FUTEX_WAKE(INT_MAX)` returns exactly N when N waiters are parked on a MAP_SHARED word — `__ulock_wake_any` lock-structure zombie window neutralised by sched_yield between iterations** | ✅ `futexwakecount` | futex_wake03 |
 | **Distinct futex words in the same `MAP_SHARED` page remain independent wait keys: waking word A once cannot wake or consume the waiter parked on word B** | ✅ `futexsharedalias` | CPython forkserver/process-pool diagnostic; rules out same-page shared futex word aliasing |
-| **Diagnostic: `FUTEX_WAKE` on a fresh MAP_SHARED page with no waiters returns 0 (no phantom counts)** | ✅ `futexghost` | (no LTP equiv — repro for e0dd202) |
+| **Diagnostic: `FUTEX_WAKE` on a fresh MAP_SHARED page with no waiters returns 0 (no phantom counts)** | ✅ `futexghost` | (no LTP equiv — no-phantom-counts repro) |
 | sched affinity / getcpu / hw cpu count | ✅ `cpucount` | sched_getaffinity01, getcpu01/02 |
 | POSIX timers: create/settime/gettime remaining/getoverrun/delete + stale-id EINVAL; SIGEV_SIGNAL delivers SIGUSR1 | ✅ `posixtimers` | timer_create01–07, timer_settime01/02, timer_gettime01, timer_delete01, timer_getoverrun01 |
 | sched_* invariants: get_priority_{max,min} for OTHER/FIFO/RR; getscheduler→SCHED_OTHER; getparam priority=0; rr_get_interval non-neg | ✅ `schedparam` | sched_get_priority_max01, sched_get_priority_min01, sched_getparam01, sched_getscheduler01, sched_rr_get_interval01, sched_setparam01, sched_setscheduler01 |
@@ -382,6 +382,6 @@ gaps (test_posix/test_shutil/test_zipfile/test_subprocess/test_cmd_line_script/t
 Per-module verdicts in `docs/cpython-baseline/`.
 
 **Incidental carrick gaps found during the runs:** `/dev/fd/N` process substitution
-(FIXED, commit 8b7b5c4); `diff <(...)` aborts on the `/proc/self/fd/N` magic-symlink
+(FIXED); `diff <(...)` aborts on the `/proc/self/fd/N` magic-symlink
 `st_size=0`; `--user <name>` resolution (numeric uid only); `setpriv` capability-prctl
 EINVAL.
