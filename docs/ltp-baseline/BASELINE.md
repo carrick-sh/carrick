@@ -69,7 +69,7 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
 | **TOTAL**  | **568** | **7** | **170** | **135** | **16** | **540** | **1436** | **568/896 = 63%** |
 
-_Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
+_Last refresh (2026-05-28): the functional-FIFO cluster added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
 the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (real `mkfifoat` FIFOs). fs 171→176, epoll_poll 31→32; DIFF 223→219, TBROK
@@ -77,67 +77,55 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, ipc): semctl SETVAL/SETALL value-range → ERANGE
-(commit `bf12b31`): semctl05 → MATCH (+1). ipc MATCH 14→15 (**38%**); total
+_Last refresh (2026-05-29, ipc): semctl SETVAL/SETALL value-range → ERANGE: semctl05 → MATCH (+1). ipc MATCH 14→15 (**38%**); total
 verified-MATCH 567→568/896. Probe `semctlrange`._
 
-_Earlier 2026-05-29 (sched): /proc/self/status Pid/Tgid match getpid()
-(commit `eafdbe2`): gettid01 → MATCH (+1). sched MATCH 36→37 (**76%**); total
+_Earlier 2026-05-29 (sched): /proc/self/status Pid/Tgid match getpid(): gettid01 → MATCH (+1). sched MATCH 36→37 (**76%**); total
 verified-MATCH 566→567/896. Probe `procselfpid`._
 
-_Earlier 2026-05-29 (net): getpeername output-pointer validation (commit
-`7c6a13f`): getpeername01 → MATCH (+1) — NULL ptr→EFAULT, negative *addrlen→
+_Earlier 2026-05-29 (net): getpeername output-pointer validation: getpeername01 → MATCH (+1) — NULL ptr→EFAULT, negative *addrlen→
 EINVAL (symmetric with getsockname). net MATCH 15→16 (**43%**); total
 verified-MATCH 565→566/896. Probe `getsocknameval` (+getpeername leg)._
 
 _Earlier 2026-05-29 (process): waitpid on an invalid process group →
-ESRCH (commit `e145339`): waitpid04 → MATCH (+1). process MATCH 114→115
+ESRCH: waitpid04 → MATCH (+1). process MATCH 114→115
 (**62%**); total verified-MATCH 564→565/896. Probe `waitpgid`._
 
-_Earlier 2026-05-29 (fs): guest DAC extended to symlink creation (commit
-`3dba76d`): symlink03 → MATCH (+1). fs MATCH 205→206 (**68%**); total
+_Earlier 2026-05-29 (fs): guest DAC extended to symlink creation: symlink03 → MATCH (+1). fs MATCH 205→206 (**68%**); total
 verified-MATCH 563→564/896. Probe `dirdac` (+symlink assertion)._
 
-_Earlier 2026-05-29 (fs): guest DAC for directory-modify (commit
-`cfa24b4`): an unprivileged guest mkdir/rmdir/unlink needs write+search on the
+_Earlier 2026-05-29 (fs): guest DAC for directory-modify: an unprivileged guest mkdir/rmdir/unlink needs write+search on the
 parent (else EACCES) + sticky-bit ownership to remove (else EPERM); root
 bypasses (demos unaffected). `mkdir04`/`rmdir03`/`unlink08` → MATCH (+3). fs
 MATCH 202→205 (**68%**); total verified-MATCH 560→563/896 (**63%**). Probe
 `dirdac`. The DAC machinery extends to open/chmod/chown for more EACCES-class
 tests (open02/open08/lchown/statfs03/mknod08) next._
 
-_Earlier 2026-05-29 (net): getsockname output-pointer validation (commit
-`95fb8f7`): getsockname01 → MATCH (+1) — NULL addr/addrlen→EFAULT, negative
+_Earlier 2026-05-29 (net): getsockname output-pointer validation: getsockname01 → MATCH (+1) — NULL addr/addrlen→EFAULT, negative
 *addrlen→EINVAL. net MATCH 14→15 (**40%**); total verified-MATCH 559→560/896
 (62.5%). Probe `getsocknameval`._
 
-_Earlier 2026-05-29 (net): recv MSG_ERRQUEUE empty → EAGAIN (commit
-`15686fe`): recv01 → MATCH (+1). net MATCH 13→14 (**38%**); total verified-MATCH
+_Earlier 2026-05-29 (net): recv MSG_ERRQUEUE empty → EAGAIN: recv01 → MATCH (+1). net MATCH 13→14 (**38%**); total verified-MATCH
 558→559/896. Probe `recverrqueue`._
 
-_Earlier 2026-05-29 (fs): SIGPIPE on a broken-pipe write (commit
-`8330dc4`): write05 → MATCH (+1). fs MATCH 201→202 (**67%**); total
+_Earlier 2026-05-29 (fs): SIGPIPE on a broken-pipe write: write05 → MATCH (+1). fs MATCH 201→202 (**67%**); total
 verified-MATCH 557→558/896. Probe `sigpipewrite`._
 
-_Earlier 2026-05-29 (fs): *at dirfd valid-but-non-dir → ENOTDIR (commit
-`6acd4d9`): statx03 → MATCH (+1). fs MATCH 200→201 (**67%**); total
+_Earlier 2026-05-29 (fs): *at dirfd valid-but-non-dir → ENOTDIR: statx03 → MATCH (+1). fs MATCH 200→201 (**67%**); total
 verified-MATCH 556→557/896. Probe `dirfdnotdir`._
 
-_Earlier 2026-05-29 (fs): fchmod refreshes the fd's cached mode (commit
-`6003386`): fchmod04, fchmod05 → MATCH (+2). fs MATCH 198→200 (**66%**); total
+_Earlier 2026-05-29 (fs): fchmod refreshes the fd's cached mode: fchmod04, fchmod05 → MATCH (+2). fs MATCH 198→200 (**66%**); total
 verified-MATCH 554→556/896. Probe `fchmoddir`._
 
-_Earlier 2026-05-29 (fs): read(2) on a write-only fd → EBADF (commit
-`3708461`): open09, creat01 → MATCH (+2). fs MATCH 196→198 (**66%**); total
+_Earlier 2026-05-29 (fs): read(2) on a write-only fd → EBADF: open09, creat01 → MATCH (+2). fs MATCH 196→198 (**66%**); total
 verified-MATCH 552→554/896. Probe `readwronly`._
 
-_Earlier 2026-05-29 (fs): preadv on a non-readable (O_WRONLY) fd → EBADF
-(commit `0ce024b`): preadv02/preadv02_64/preadv202/preadv202_64 → MATCH (+4). fs
+_Earlier 2026-05-29 (fs): preadv on a non-readable (O_WRONLY) fd → EBADF: preadv02/preadv02_64/preadv202/preadv202_64 → MATCH (+4). fs
 MATCH 192→196 (**65%**); total verified-MATCH 548→552/896 (**62%**). Probe
 `preadvwronly`._
 
 _Earlier 2026-05-29 (fs full re-sweep): corrected the aarch64
-O_DIRECTORY/O_NOFOLLOW fcntl constants + O_DIRECTORY→ENOTDIR (commit `c41607d`).
+O_DIRECTORY/O_NOFOLLOW fcntl constants + O_DIRECTORY→ENOTDIR.
 Full fs re-sweep: MATCH 189→192 (open08 + 2 flag-cascade flips), fs **64%**;
 total verified-MATCH 545→548/896. The TBROK 32→23 / TIMEOUT 6→11 shuffle is the
 known flaky tst_test process-lifecycle class (fcntl07/14 blocking-locks,
@@ -145,34 +133,31 @@ mknod06/write04 forked-exec hang, dup05/fsync03/linkat01/lseek02/open06) — tho
 tests never reach verified-MATCH either way; not a regression (every
 flag-sensitive open/openat/symlink test stayed MATCH or was already DIFF)._
 
-_Earlier 2026-05-29 (other): setfsuid/setfsgid fs-id model (commit
-`66bdb2b`): a tracked fsuid/fsgid (default=euid/egid, reset by set*uid/gid) that
+_Earlier 2026-05-29 (other): setfsuid/setfsgid fs-id model: a tracked fsuid/fsgid (default=euid/egid, reset by set*uid/gid) that
 setfs*id returns + updates. `setfsuid01/03`, `setfsgid01/02` → MATCH (+4);
 setfsuid04 stays DIFF (fs-id DAC open() enforcement). other MATCH 51→55
 (**81%**); total verified-MATCH 541→545/896 (**61%**). Probe `setfsid`._
 
-_Earlier 2026-05-29 (sched): the nice value model (commit `8e2167e`):
+_Earlier 2026-05-29 (sched): the nice value model:
 setpriority now clamps the nice to [-20,19] + persists it (getpriority reflects
 it) + EPERM on non-root nice-lowering. `nice02`/`nice03`/`nice04` → MATCH (+3);
 nice01/nice05/setpriority01 are NO_ORACLE (Docker LinuxKit timing/perm). sched
 MATCH 33→36 (**73%**); total verified-MATCH 538→541/896. Probe `nicepriority`._
 
 _Earlier 2026-05-29 (other): get_robust_list (100) + rt_tgsigqueueinfo
-(240) implemented and set_robust_list (99) len-validated (commit `f7d175e`):
+(240) implemented and set_robust_list (99) len-validated:
 `get_robust_list01`, `set_robust_list01`, `rt_tgsigqueueinfo01` → MATCH (+3).
 other MATCH 48→51 (**75%**); total verified-MATCH 535→538/896. Probes
 `robustlist` + `tgsigqueue`._
 
-_Earlier 2026-05-29 (mm): the mmap/munmap correctness fixes (commit
-`4878690`) re-swept the mmap*/munmap* family — `mmap08` (bad-fd-before-length →
+_Earlier 2026-05-29 (mm): the mmap/munmap correctness fixes re-swept the mmap*/munmap* family — `mmap08` (bad-fd-before-length →
 EBADF), `munmap01`/`munmap02` (unmap a MAP_SHARED/MAP_PRIVATE file region), and
 `munmap03` (page-alignment + out-of-range EINVAL edges) all → MATCH. The
 re-sweep also caught up stale mm records from earlier M4 commits: mm MATCH
 19→25, DIFF 30→28, TBROK 23→19 (no test regressed). Probe `mmapmunmap`. Total
 verified-MATCH 529→535/896 (60%); mm 26%→34%._
 
-_Earlier 2026-05-29: the mkdir setgid-directory-inheritance fix (commit
-`f6280ba`) flipped `mkdir02` → MATCH (+1) — a dir created inside an S_ISGID
+_Earlier 2026-05-29: the mkdir setgid-directory-inheritance fix flipped `mkdir02` → MATCH (+1) — a dir created inside an S_ISGID
 parent now inherits the parent's GID + gets S_ISGID. fs 188→189; DIFF 202→201.
 Probe `mkdirsetgid`. `mkdir04` stays DIFF (mkdir-in-non-writable-parent →
 EACCES, the deferred DAC/guest-root class shared with rmdir03/statfs03/mknod08)._
