@@ -58,19 +58,19 @@ Pause any sweep (shared HVF + kill.sh) before building/verifying.
 
 All probe-gated; `cargo test --release --test conformance conformance_probes`
 green at 89 probes. Commits on `main`:
-- `33122d4` #10: pidfd CLOEXEC + fadvise advice/ESPIPE + ftruncate RO-fd EINVAL
+- #10: pidfd CLOEXEC + fadvise advice/ESPIPE + ftruncate RO-fd EINVAL
   (pidfd_open01, posix_fadvise03/04, ftruncate03/03_64). Probe `cluster10errno`.
-- `ebb2411` docs: live tally 52% (462/896).
-- `2c02bf1` #10: fsync/fdatasync on pipe/socket/chardev → EINVAL (fdatasync01/02).
-- `dfd6b86` #4: signalfd4 (syscall 74) emulated fd-flag surface (signalfd4_01/02).
+- docs: live tally 52% (462/896).
+- #10: fsync/fdatasync on pipe/socket/chardev → EINVAL (fdatasync01/02).
+- #4: signalfd4 (syscall 74) emulated fd-flag surface (signalfd4_01/02).
   Probe `signalfd4`; added SignalFd OpenDescription variant.
-- `5e1f1a8` #13: sched negative-pid EINVAL + bad-param-ptr EFAULT + priority ESRCH
+- #13: sched negative-pid EINVAL + bad-param-ptr EFAULT + priority ESRCH
   (sched_getparam03, sched_setparam04, sched_setscheduler01, getpriority02).
   Probe `schedprio`.
-- `a345a80` #17: flock host-forward + removexattr family (flock04/06,
+- #17: flock host-forward + removexattr family (flock04/06,
   removexattr01/02). Probes `flocklock` + `fsx` extended; added
   FsBackend::remove_xattr.
-- `6c2c7e4` #11 (partial): chmod setgid-clear + fchmodat2 flag EINVAL
+- #11 (partial): chmod setgid-clear + fchmodat2 flag EINVAL
   (chmod05, fchmodat02, fchmodat2_02). Probe `chmodsetgid`; added
   FsBackend::get_owner.
 
