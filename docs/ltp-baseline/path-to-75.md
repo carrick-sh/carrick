@@ -4,6 +4,10 @@ Goal: lift differential MATCH-rate 587/896 (65.5%) -> >=672/896 (75%), +85.
 Source: ltp-path-to-75 triage workflow (run wf_8d4c270e-6bb), 2026-05-30.
 Denominator = exercised tests (total 1436 minus 540 NO_ORACLE).
 
+> **Point-in-time snapshot (2026-05-30).** A number of the worklist items below
+> have since landed; items confirmed done are marked ✅ LANDED. For current
+> per-syscall status see `docs/syscalls-emulation-map.md` and `docs/support-matrix.md`.
+
 ## Ranked worklist
 
 ### #1 [TBROK] +5 (cum 5) effort=M
@@ -25,9 +29,9 @@ Denominator = exercised tests (total 1436 minus 540 NO_ORACLE).
 - probe: carrick run --fs host: inotify_init1, inotify_add_watch(dir, IN_CREATE|IN_DELETE), creat(dir/x), then read() one struct inotify_event; assert wd>=0 (not ENOSPC) and the event name=="x" with mask IN_CREATE.
 
 ### #4 [TBROK] +4 (cum 23) effort=S
-**Implement vmsplice(75) and tee(77) (only splice 76 exists)**
+**✅ LANDED — vmsplice(75) and tee(77) implemented (alongside splice 76)**
 - syscalls: vmsplice, tee
-- fix: Remove 75|77 from the `75 | 77 => sys_bootstrap_enosys` arm in dispatch/mod.rs:1171 and add real handlers next to splice(76). tee = copy bytes between two in-process pipe ring buffers without consuming the source; vmsplice = copy guest iovec pages to/from a pipe buffer. Both reuse the existing pipe-buffer plumbing splice already uses. Pure missing-syscall blocker -- each test's setup calls the syscall first.
+- fix (done): real tee/vmsplice handlers now live in dispatch/fs.rs alongside splice(76); the former bootstrap-ENOSYS arm was removed. tee = copy bytes between two in-process pipe ring buffers without consuming the source; vmsplice = copy guest iovec pages to/from a pipe buffer. Both reuse the existing pipe-buffer plumbing splice already uses. Pure missing-syscall blocker -- each test's setup called the syscall first.
 - probe: carrick run: pipe2(p1); pipe2(p2); write 8 bytes into p1; tee(p1[0],p2[1],8,0)==8 and the 8 bytes are readable from BOTH p1 and p2. Separately vmsplice(p[1], iov(buf,8), 1, 0)==8.
 
 ### #5 [TBROK] +4 (cum 27) effort=L

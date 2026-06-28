@@ -1,3 +1,4 @@
+# x86 LTP TFAIL/TBROK capture — 2026-06-26 (historical snapshot; current status: docs/support-matrix.md, docs/syscalls-emulation-map.md)
 accept02 :: accept02.c:71: TFAIL: Multicast group was copied!
 accept03 :: accept03.c:46: TFAIL: accept() on O_PATH file expected EBADF: ENOTSOCK (88)
 adjtimex03 :: adjtimex03.c:55: TBROK: adjtimex(): Unexpeceted error, expecting EINVAL with mode 0x8000: EPERM (1)
