@@ -70,6 +70,11 @@ clippy *ARGS:
     # --workspace --features is rejected on a virtual workspace).
     exec cargo clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
 
+# Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
+# allowlist. Install once with `cargo install cargo-deny`.
+deny:
+    cargo deny check licenses bans sources
+
 # Formatting check (matches CI).
 fmt-check:
     cargo fmt --all -- --check
@@ -143,6 +148,7 @@ ci:
     j() { just --justfile {{justfile()}} "$@"; }
     j fmt-check
     j clippy
+    j deny
     if [ "{{os()}}" = "macos" ]; then
         j check --workspace
     else

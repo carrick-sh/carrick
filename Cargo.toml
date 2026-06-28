@@ -10,6 +10,10 @@ exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes", "bench-nat
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
+repository = "https://github.com/carrick-sh/carrick"
+homepage = "https://carrick.sh"
+description = "Run unmodified Linux binaries as host-native processes via a hardware-virtualized vCPU per guest thread and a Rust syscall-translation layer (experimental)."
+readme = "README.md"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

@@ -111,6 +111,26 @@ jobs:
       - name: Cross-check carrick-hal + carrick-linux for aarch64-linux
         run: just check-linux
 
+  # Dependency license / bans / sources gate. Enforces the deny.toml permissive
+  # allowlist so a copyleft/unknown-license transitive dependency fails CI rather
+  # than slipping in silently. Cheap; runs on a hosted Linux runner, no hypervisor.
+  deny:
+    name: cargo-deny · licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just + cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny
+
+      - name: cargo-deny (licenses · bans · sources)
+        run: just deny
+
   # Full HVF runtime + differential conformance vs Docker. Requires a self-hosted
   # Apple-Silicon runner that (a) holds the com.apple.security.hypervisor
   # entitlement and (b) has Docker available. GitHub-hosted macOS runners can do
