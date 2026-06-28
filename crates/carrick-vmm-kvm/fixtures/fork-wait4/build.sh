@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the freestanding fork-wait4 aarch64 ELF (same toolchain as the
 # hello-aarch64 fixture): clang integrated assembler (.S -> aarch64 ELF .o) +
-# the bundled rust-lld. Output is a static aarch64 Linux ELF the carrick-linux
+# the bundled rust-lld. Output is a static aarch64 Linux ELF the carrick-vmm-kvm
 # KVM MVP loads as its guest to exercise the fork(2) primitive (Task 2).
 set -euo pipefail
 

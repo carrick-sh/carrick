@@ -118,7 +118,7 @@ carrick*:::syscall-entry /arg0 == 64/ {            /* write (aarch64 nr 64) */
 Host correlation — `syscall::write:entry /arg0==1/` shows what carrick actually
 emits to stdout (filter out dtrace's OWN printf-to-stdout, which also hits fd 1).
 
-## Worked example: the argv-`0xFF` corruption (commit ad7f0e0f)
+## Worked example: the argv-`0xFF` corruption
 
 `echo HELLO` on bhyve printed one garbage byte. The method that cracked it:
 1. `bhyve-gpa` the materialized stack top → `/bin/echo\0HELLO\0` IS present (string correct).

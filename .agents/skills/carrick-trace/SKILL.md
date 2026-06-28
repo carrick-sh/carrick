@@ -40,7 +40,7 @@ carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-ar
 
 - Everything after `--` is a normal carrick command, e.g. `run ubuntu:24.04 /usr/bin/sh -c '…'` or `run-elf <static-elf>`.
 - It **auto-sudos** (DTrace needs `/dev/dtrace` / root). Don't prefix `sudo` yourself. (NOPASSWD covers the carrick binary path + `/usr/sbin/dtrace`, so `sudo -n true` failing does NOT mean the trace needs a password — the binary path is what's allowlisted.)
-- With no `--script`, it runs the bundled `scripts/syscalls.d` (per-syscall stream + a frequency-sorted aggregation at exit).
+- With no `--script`, it runs the built-in default syscall tracer (per-syscall stream + a frequency-sorted aggregation at exit; the source lives at the repo's `scripts/dtrace/syscalls.d`).
 - `-s/--script <file.d>` runs a custom/targeted D program. Writing a focused script is almost always faster than reading the full stream.
 - `-o/--trace-out <file>` writes the probe stream + aggregations to `<file>` instead of stdout. **Essential for tracing an interactive `-t` guest** (or any run whose own stdout you care about): without it the probe output intermixes with the guest's terminal stream and is unreadable. With it, the guest pty stays clean and you read events from `<file>` (it's written as root, so `cat`/`grep` it; `rm` may need sudo). The file is opened with `fopen("w")` (truncates per run).
 
@@ -159,7 +159,7 @@ carrick actually did on macOS. Full arg tables: `references/probes.md`.
 
 This skill bundles reusable D programs in [`scripts/`](scripts/). Run one with
 `carrick trace --script <path-to>/scripts/<x>.d -- <run-args>` (in the carrick
-repo the same files also live at the repo's top-level `scripts/`):
+repo the same files also live under `scripts/dtrace/`):
 
 - [`scripts/trace-host-fds.d`](scripts/trace-host-fds.d) — correlate guest pipe
   I/O (`host-pipe-io`) with host `pipe`/`close`/`write`/`dup` syscalls; the

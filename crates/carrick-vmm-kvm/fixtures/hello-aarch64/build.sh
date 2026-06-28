@@ -2,7 +2,7 @@
 # Build the freestanding hello-aarch64 ELF on a Mac with no extra toolchain:
 #   clang integrated assembler (.S -> aarch64 ELF .o) + the bundled rust-lld
 #   (same linker invocation as scripts/build-linux-fixtures.sh). Output is a
-#   static aarch64 Linux ELF the carrick-linux KVM MVP loads as its guest.
+#   static aarch64 Linux ELF the carrick-vmm-kvm MVP loads as its guest.
 set -euo pipefail
 
 fixture_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

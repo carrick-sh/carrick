@@ -163,7 +163,7 @@ before F3 so the trap shell is centralized when F3 wires it in.
 
 ### F7 — `Aarch64EngineCore<V: Aarch64Vmm>` (engine symmetric to carrick_x86)
 - **DONE (slice):** `guest_cpu::timed_run` hoist — the 3 run-loop CPU-timing
-  copies are single-sourced (commit d8791cc8, verified).
+  copies are single-sourced (verified).
 - **Remaining slices:** a shared `TrapError::el0_fault` constructor (LOW value —
   the two sites read different register types: HVF applevisor `Reg`/`SysReg` vs
   KVM `carrick_hal::Reg`, so a clean shared constructor is awkward; reconsider as

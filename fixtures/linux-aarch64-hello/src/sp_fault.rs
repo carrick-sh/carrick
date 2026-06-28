@@ -1,7 +1,7 @@
 // GPR_TABLE[31] out-of-bounds: a faulting load whose base register is SP
 // (Rn==31) must be delivered to the guest as SIGSEGV. carrick's EL0-fault
 // diagnostic does `GPR_TABLE[rn]` with rn possibly 31 into a `[Reg; 31]`
-// (crates/carrick-hvf/src/trap.rs:1751-1752) -> host index-out-of-bounds panic.
+// (crates/carrick-vmm-hvf/src/trap.rs) -> host index-out-of-bounds panic.
 //
 // We mmap a PROT_NONE page, point SP into it, and execute `ldr x0,[sp]` (Rn=31).
 // Real Linux: SIGSEGV with no handler -> the process dies by signal (host exit

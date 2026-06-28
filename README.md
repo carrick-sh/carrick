@@ -183,7 +183,7 @@ tables. See [docs/conformance-testing.md](docs/conformance-testing.md).
 
 ## Directory Map
 
-Carrick is a 24-crate Cargo workspace under [`crates/`](crates/). The high-level
+Carrick is a 25-crate Cargo workspace under [`crates/`](crates/). The high-level
 dependency direction is:
 
 ```text
@@ -199,7 +199,8 @@ platform-freebsd -> carrick-vmm-bhyve + carrick-host-bsd
 platform-netbsd  -> carrick-vmm-nvmm  + carrick-host-bsd
 ```
 
-The x86_64 VMM backends share `carrick-x86`; platform-neutral state lives in
+The x86_64 VMM backends share `carrick-x86`, and the AArch64 path uses the
+shared `carrick-aarch64` engine; platform-neutral state lives in
 `carrick-hal`, `carrick-thread`, `carrick-signal-core`, `carrick-timer-core`,
 `carrick-guest-mem`, and `carrick-observability`.
 

@@ -15,7 +15,7 @@
 
 **Status (authoritative — see "UPDATE 2" at the bottom):** Phases 1+2 IMPLEMENTED + verified
 (2026-06-01), **fast-fs DEFAULT ON** (`CARRICK_FAST_FS=0` opts out). The fork-wedge that briefly
-forced it off is FIXED (commit cf5f6e0 — stale sibling count in the fork quiesce; the fast path was
+forced it off is FIXED (stale sibling count in the fork quiesce; the fast path was
 its reproducer). test_glob TIMEOUT→MATCH (140s→48s; host opens 999,646→405,926). Non-creating
 stat/lookup only; writes/creates stay on cap-std. (Mid-section "default OFF" mentions below are
 historical/superseded.)
@@ -120,11 +120,11 @@ path.** This still captures the entire glob win (the 3,335 guest opens are opend
 
 ## IMPLEMENTED (2026-06-01) — Phases 1+2 landed, test_glob TIMEOUT→MATCH
 
-- **Phase 1** (commit c086d77): path-based `getxattr` for the mode/socket/owner
+- **Phase 1**: path-based `getxattr` for the mode/socket/owner
   xattr peeks (`path_get_u32_xattr`), eliminating the `with_entry_fd` opens.
   999,646 → 622,909 host opens; test_glob 140s → 103s. No atime regression
   (getxattr is metadata, like O_EVTONLY).
-- **Phase 2** (commit 43c396d): `fast_lstat_contained` — one `fstatat` +
+- **Phase 2**: `fast_lstat_contained` — one `fstatat` +
   `openat`+`F_GETPATH` containment — wired into `lookup`/`metadata`/`real_stat`
   (the calls `open_dispatch` makes ~3× per guest open). 622,909 → **405,926**
   host opens; **test_glob 140s → 48s → MATCH** (under the 90s sweep timeout).
@@ -145,8 +145,7 @@ the Phase-1 fast getxattr.
 
 ## UPDATE (2026-06-01) — default flipped to OFF (fork-wedge aggravation)
 
-The full 41-module sweep flagged test_fork1 → CARRICK_TIMEOUT. Isolation
-(commit 2a3e43a):
+The full 41-module sweep flagged test_fork1 → CARRICK_TIMEOUT. Isolation:
 - fast-fs ON: test_fork1.test_threaded_import_lock_fork hangs ~2/3 of runs.
 - fast-fs OFF (cap-std): hangs ~1/4 — i.e. the multithreaded-fork-from-nested HVF
   wedge (the CPython campaign's #1 Heisenbug)
@@ -169,7 +168,7 @@ using this as the repro.
 ## UPDATE 2 (2026-06-01) — fork-wedge FIXED, fast-fs back to default ON
 
 The fast path was a near-deterministic reproducer for the #1 fork-wedge, and that
-cracked it. Root cause (commit cf5f6e0, runtime.rs fork-quiesce loop): the forking
+cracked it. Root cause (runtime.rs fork-quiesce loop): the forking
 thread captured `others = kicker.count()-1` ONCE; vCPUs that EXIT mid-quiesce drop
 the kicker count, so `others` went stale-HIGH and `while !wait_quiesced(others)`
 spun forever (gated diag: `others=4 paused=2 kicker=3`). Fix = recompute `others`

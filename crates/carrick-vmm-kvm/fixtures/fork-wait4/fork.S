@@ -1,4 +1,4 @@
-// Freestanding aarch64 Linux test fixture for the carrick-linux KVM MVP's
+// Freestanding aarch64 Linux test fixture for the carrick-vmm-kvm MVP's
 // fork(2) primitive (Phase 2, Task 2). No libc / no CRT startup so the thin
 // shim (run_elf.rs) can drive it directly — it only services the raw syscalls
 // clone/wait4/write/exit_group, which is exactly the fork primitive under test.

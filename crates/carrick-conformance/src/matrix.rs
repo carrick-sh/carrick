@@ -75,7 +75,7 @@ pub fn render(reports: &[SuiteReport]) -> String {
 
     out.push_str(
         "---\n\nSee also: `crates/carrick-cli/tests/conformance.rs` (the deterministic, \
-         line-exact ABI probe gate) and `.claude/skills/ltp-conformance/scripts/ltp-sweep.sh` \
+         line-exact ABI probe gate) and `.agents/skills/ltp-conformance/scripts/ltp-sweep.sh` \
          (full LTP discovery). This matrix is the coarse behavioral axis; the probe gate is \
          the precise one.\n",
     );

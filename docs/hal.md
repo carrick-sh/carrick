@@ -91,6 +91,8 @@ target builds.
 - `carrick-x86` is the shared x86_64 VMM engine. It owns long-mode bring-up,
   register/snapshot abstractions, fault tables, x86 VDSO helpers, and the
   generic `X86EngineCore<V>` over a backend-provided `X86Vmm`/`X86Vcpu`.
+- `carrick-aarch64` is the shared AArch64 engine (`Aarch64EngineCore`) used by
+  the HVF AArch64 path (and shared with the KVM AArch64 lane).
 
 ### Runtime and product layers
 
@@ -154,8 +156,8 @@ AArch64 instructions at EL0. Carrick owns guest EL1 enough to install vectors,
 trampolines, page tables, and maintenance paths; an `svc #0` enters the EL1
 vector and then exits to the host through `hvc`.
 
-The syscall metadata table for this path is currently in
-`crates/carrick-vmm-hvf/src/syscall.rs`; guest-architecture table abstractions
+The syscall metadata table for this path is in
+`crates/carrick-abi/src/syscall.rs`; guest-architecture table abstractions
 also live in `carrick-hal`.
 
 ### x86_64

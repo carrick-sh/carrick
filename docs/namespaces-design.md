@@ -172,7 +172,7 @@ which *does* span the namespace flag bits (so clone3 with a NEW* flag is accepte
 but silently ignored — it forks an ordinary child). Legacy `clone` (`proc.rs:1431`) only
 inspects the thread mask. `unshare(2)` (nr 97) and `setns(2)` (nr 268) are **not in the
 dispatch table** (`dispatch/mod.rs`) and currently return `ENOSYS` (catalogued
-`Deferred` in `carrick-vmm-hvf/src/syscall.rs:244,414`).
+`Deferred` in `crates/carrick-abi/src/syscall.rs`).
 
 Namespace-flag constants we will add (man-page `clone(2)` values, NOT from headers):
 `CLONE_NEWNS=0x00020000`, `CLONE_NEWCGROUP=0x02000000`, `CLONE_NEWUTS=0x04000000`,

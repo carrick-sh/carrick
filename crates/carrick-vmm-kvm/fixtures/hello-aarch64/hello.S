@@ -1,4 +1,4 @@
-// Freestanding aarch64 Linux test fixture for the carrick-linux KVM MVP.
+// Freestanding aarch64 Linux test fixture for the carrick-vmm-kvm MVP.
 // No libc, no CRT startup: the entry point is _start and the program
 // issues exactly two syscalls — write(1,"ok\n",3) then exit_group(0).
 // aarch64 Linux syscall ABI: number in x8, args x0..x5, trap via `svc #0`,
