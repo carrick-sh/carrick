@@ -163,8 +163,8 @@ the clean manifestation (B in epoll, listener never wakes) is only visible by
 `sample`, which doesn't show the guest-level cause.
 
 This is the documented **#1 HVF nested-fork Heisenbug** (a server forked+exec'd
-from a forkserver-spawned worker fails to function) — same family as
-`[[project_shared_file_coherence]]` (post-spawn coherence on a nested fork).
+from a forkserver-spawned worker fails to function) — same family as the
+SHARED_FILE post-spawn stage-2 coherence bug (stale stage-2 TLB on a nested fork).
 Note: B's listener + epoll are HOST objects (kqueue, host fds), so if the cause
 is host-fd/kqueue state being wrong across the nested fork+exec rather than
 guest-memory stage-2 TLB coherence, that's a distinct (and possibly more

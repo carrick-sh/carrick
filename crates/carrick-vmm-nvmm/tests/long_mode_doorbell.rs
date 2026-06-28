@@ -4,11 +4,10 @@
 //! long-mode bring-up, but overwrite the ring-0 entry stub with a local
 //! `out %al,$0xC5; hlt` doorbell.
 //!
-//! Box-capability gated. On stock NetBSD/NVMM under a hypervisor `kvm_amd`, the
+//! Box-capability gated. On stock NetBSD/NVMM under nested KVM (`kvm_amd`), the
 //! first `nvmm_vcpu_run` of a long-mode guest pauses QEMU with `internal-error`
-//! before the kernel returns (lazy GPA faults under nested SVM; see the
-//! 2026-06-15 monitor-capture note under `docs/superpowers/notes/`). A box with
-//! the eager-fault `nvmm.kmod` (e.g. `<lab-ip>`) faults every mapped GPA
+//! before the kernel returns (lazy GPA faults under nested SVM). A box with
+//! the eager-fault `nvmm.kmod` faults every mapped GPA
 //! page up front and runs this path cleanly — verified 2026-06-19: the live
 //! `hello_runs_to_zero` acceptance test exercises the same long-mode IO-exit
 //! path to completion. So this test is gated on `CARRICK_NVMM_EAGER_FAULT=1`

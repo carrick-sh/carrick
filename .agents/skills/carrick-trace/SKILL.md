@@ -30,7 +30,7 @@ license: Apache-2.0 OR MIT
 libdtrace in-process, spawns the traced `carrick` child under
 `dtrace_proc_create`, and streams events. It is THE tracer for this project —
 improve and use it rather than hand-rolling one-off `dtrace -s` invocations or
-sprinkling `eprintln!`. (See [[feedback_carrick_trace_tracing]].)
+sprinkling `eprintln!`.
 
 ## Invocation
 
@@ -88,7 +88,6 @@ carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-ar
 6. **Build + re-sign before tracing, or you get HV_DENIED (0xfae94007).**
    `cargo build --release` then
    `codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick`.
-   (See [[feedback_carrick_trace_and_match_footgun]].)
 
 7. **A D-script compile error silently kills the trace — and looks like the
    guest dying.** libdtrace fails `dtrace_program_strcompile` BEFORE the child

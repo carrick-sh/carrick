@@ -145,8 +145,7 @@ impl Runtime {
         // session, and guest fork(2)). A live tokio runtime must NOT survive into
         // here — its blocking-pool threads don't survive fork, so a forked child
         // deadlocks in BlockingPool::shutdown. Callers resolve the image under
-        // tokio, DROP the runtime, then call execute. See
-        // docs/superpowers/specs/2026-06-06-tokio-fork-isolation.
+        // tokio, DROP the runtime, then call execute.
         debug_assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "tokio runtime must not be live when Runtime::execute is called \
@@ -628,8 +627,7 @@ fn setup_interactive_stdio(
     // Guardrail: forking with a live tokio runtime deadlocks the child in
     // BlockingPool::shutdown (the blocking-pool worker threads don't survive
     // fork). The CLI must resolve the image under tokio, drop the runtime, then
-    // call execute — so no tokio runtime is current here. See
-    // docs/superpowers/specs/2026-06-06-tokio-fork-isolation.
+    // call execute — so no tokio runtime is current here.
     debug_assert!(
         tokio::runtime::Handle::try_current().is_err(),
         "tokio runtime must not be live across the interactive-session fork \

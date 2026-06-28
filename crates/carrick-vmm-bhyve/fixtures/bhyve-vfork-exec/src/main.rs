@@ -8,8 +8,7 @@
 //! What this proves on bhyve (SP2): the whole vfork+exec path through the trait
 //! DEFAULT `fork_vfork() → self.fork()` (a fork-COPY: a fresh, OWNED child VM,
 //! SP1) — there is NO shared bhyve VM (true cross-process CLONE_VM was proven
-//! infeasible; see the vfork design-correction in
-//! `docs/superpowers/specs/2026-06-14-bhyve-process-model-2-vfork-execve-design.md`).
+//! infeasible).
 //! Flow: the fork-copy child runs its OWN vCPU → hits `execve` → `execve_into`
 //! rebuilds a FRESH VM from the second image AND releases the suspended parent
 //! by writing the vfork pipe → the parent resumes on its LIVE VM and reaps the

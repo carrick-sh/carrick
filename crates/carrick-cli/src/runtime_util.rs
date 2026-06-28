@@ -183,8 +183,7 @@ mod fork_isolation_tests {
     /// The fork-safety invariant: `block_on_oci` builds, uses, and DROPS its
     /// tokio runtime, so after it returns NO runtime is current. This is what
     /// lets the caller fork (`Runtime::execute`) without a live tokio runtime —
-    /// forking with one deadlocks the child in `BlockingPool::shutdown`. See
-    /// docs/superpowers/specs/2026-06-06-tokio-fork-isolation.
+    /// forking with one deadlocks the child in `BlockingPool::shutdown`.
     #[test]
     fn block_on_oci_leaves_no_live_runtime() {
         // Sanity: nothing is current before.

@@ -5,7 +5,7 @@
 //! on the macOS dev machine or a lima aarch64 VM).  They are LIVE: they
 //! actually create a KVM VM, run a vCPU, and observe the guest's stdout.
 //!
-//! Run on container 104 (root@<lab-ip>, x86_64 Ubuntu 24.04 with /dev/kvm):
+//! Run on an x86_64 Linux host with /dev/kvm (e.g. Ubuntu 24.04):
 //! ```
 //! cargo test -p carrick-vmm-kvm --test live_vcpu_x86 -- --nocapture
 //! ```

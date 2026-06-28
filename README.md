@@ -112,7 +112,6 @@ Start here, then follow the map:
 | [docs/conformance-testing.md](docs/conformance-testing.md) | How to run and interpret host tests, differential probes, language suites, oracle cache, and local backend lanes. |
 | [docs/conformance-coverage.md](docs/conformance-coverage.md) | Active probe-gate coverage: which carrick-owned invariant each probe pins down. |
 | [docs/diagnostics-and-debugging.md](docs/diagnostics-and-debugging.md) | `carrick trace`, event ring, lldb helpers, debug commands, and runtime diagnostic env vars. |
-| [docs/superpowers/2026-06-15-portability-session-handoff.md](docs/superpowers/2026-06-15-portability-session-handoff.md) | Recent portability handoff notes. Treat as a verification map, not ground truth. |
 | [docs/archive/](docs/archive/) | Older design-rationale notes still referenced from code comments. |
 
 For per-crate and per-subsystem theory statements, build the private API docs:

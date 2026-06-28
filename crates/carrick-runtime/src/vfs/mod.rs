@@ -74,7 +74,7 @@
 //!
 //! ## History
 //!
-//! This layer was introduced by the VFS refactor (`memory/plan_vfs_refactor.md`):
+//! This layer was introduced by the VFS refactor:
 //! before it, the dispatcher reached into four ad-hoc code paths — inline
 //! `/proc`/`/sys` generators, a `host_dev_passthrough()` + raw `libc::open`
 //! block for `/dev`, and the rootfs/overlay pair — with no common contract.

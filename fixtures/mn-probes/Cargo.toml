@@ -9,7 +9,7 @@ publish = false
 # Differential reproducers isolating the carrick high-P (CARRICK_EXPOSED_CPUS=10)
 # Go stall to signals vs futex vs epoll. Built static-musl in a linux/arm64
 # container; run under carrick (exposed 4 vs 10) and in-container as the
-# real-Linux oracle. See memory project_go_highp_isolation_method.
+# real-Linux oracle.
 
 [dependencies]
 libc = "0.2"

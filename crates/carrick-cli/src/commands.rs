@@ -582,8 +582,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // Resolve (pull + build the spec) under the tokio runtime, then DROP
             // the runtime before executing — so no tokio thread is alive across
             // the fork in Runtime::execute. (Forking with a live tokio runtime
-            // deadlocks the child in BlockingPool::shutdown — see
-            // docs/superpowers/specs/2026-06-06-tokio-fork-isolation.)
+            // deadlocks the child in BlockingPool::shutdown.)
             let spec = match block_on_oci(engine.resolve(req.clone())) {
                 Ok(s) => s,
                 // resolve runs in the PARENT (no fork yet) → normal exit is safe.

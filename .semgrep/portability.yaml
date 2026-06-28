@@ -64,7 +64,6 @@ rules:
       or `any(feature = "platform-linux", feature = "platform-freebsd")` for
       shared non-macOS infrastructure. ABI-shape branches that are not yet behind
       carrick-portable may use the build.rs `carrick_bsd`/`carrick_linux` cfgs.
-      See docs/superpowers/specs/2026-06-13-host-os-portability-layering-design.md.
     paths:
       include:
         - crates/

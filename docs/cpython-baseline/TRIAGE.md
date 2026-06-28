@@ -79,8 +79,7 @@ for the quiesce. Verified: trace shows phase-1 spin gone; sleeper parks/resumes.
 **Bug B — racy HVF VM-rebuild fork wedge in a NESTED process. OPEN, #1 blocker.**
 After Bug A, a multithreaded fork from a guest process that was itself
 `fork+exec`'d (a "grandchild": carrick → `/bin/sh -c` → probe) still wedges in
-`engine.fork()` / `hv_vm_destroy` (the known **HV_BUSY / leaked-vCPU** area — see
-project_go_osexec_mtfork). Key facts:
+`engine.fork()` / `hv_vm_destroy` (the known **HV_BUSY / leaked-vCPU** area). Key facts:
 - **Path-dependent, reliable per path**: `run-elf` (probe = MAIN guest process)
   passes 12/12; `carrick run … /bin/sh -c <probe>` (probe = grandchild) DIFFs
   5/5. So it's a fork from a previously-execve'd (nested) process that breaks.
@@ -135,7 +134,7 @@ Fanned out the ~441 unbaselined CPython 3.12 modules across 12 agents
 **356 MATCH / 74 DIFF / 9 CARRICK_TIMEOUT / 42 BOTH_EMPTY(benign skips) / 1 DOCKER_TIMEOUT**
 ≈ 81% of comparable (non-both-empty) modules at parity.
 
-### Clusters (synthesis; root causes are HYPOTHESES to re-verify, per feedback_verify_diagnoses_empirically):
+### Clusters (synthesis; root causes are HYPOTHESES to re-verify empirically):
 - **Multiprocessing nested fork-exec worker bring-up** [sev=critical, fix=hard, 19 modules]: HYPOTHESIS=TRIAGE Bug B/task4 nested-fork HVF wedge; verify forksleepfork flake-rate not trace
   - modules: test.test_concurrent_futures.test_shutdown, test.test_concurrent_futures.test_wait, test.test_concurrent_futures.test_as_completed, test.test_concurrent_futures.test_deadlock, test.test_concurrent_futures.test_init, test.test_concurrent_futures.test_process_pool, test.test_concurrent_futures.test_thread_pool, test.test_multiprocessing_spawn.test_processes, test.test_multiprocessing_spawn.test_threads, test.test_multiprocessing_spawn.test_manager, test.test_multiprocessing_spawn.test_misc, test.test_multiprocessing_fork.test_manager, test.test_multiprocessing_fork.test_misc, test.test_multiprocessing_fork.test_processes, test.test_multiprocessing_fork.test_threads, test.test_multiprocessing_forkserver.test_manager, test.test_multiprocessing_forkserver.test_misc, test.test_multiprocessing_forkserver.test_processes, test.test_multiprocessing_forkserver.test_threads
 - **Non-UTF8 undecodable filename handling** [sev=high, fix=moderate, 8 modules]: HYPOTHESIS fs.rs to_string_lossy/from_utf8_lossy drops non-UTF8 path bytes; fix raw bytes as OsStr

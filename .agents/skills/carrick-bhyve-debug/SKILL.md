@@ -10,9 +10,9 @@ Debugging it means reading GUEST state — guest-physical memory, the guest page
 tables, the guest's Linux syscalls — from the host carrick process. Two
 first-class tools on FreeBSD: **lldb** (the carrick-bhyve plugin) for guest
 memory + page tables, and **DTrace** for guest syscalls + host correlation.
-Prefer these over `eprintln!` (see [[feedback_use_debuggers]]).
+Prefer these over `eprintln!` (real debuggers don't perturb timing or ship debug spam).
 
-Test box: `root@<lab-ip>` (FreeBSD 15.1 amd64), carrick at `/path/to/carrick`.
+Test box: `root@<freebsd-box>` (FreeBSD 15.1 amd64), carrick at `/path/to/carrick`.
 Build: `cargo build --release -p carrick-cli --no-default-features --features platform-freebsd`.
 Always set `CARRICK_RUN_ID=<id>` and reap with `pkill -9 -f "carrick:<id>"` — never a bare carrick pkill.
 
@@ -46,7 +46,7 @@ carrick. It auto-captures the `struct vmctx *` from the first `vm_map_gpa` call
 ```
 lldb19 -b \
   -o 'command script import /path/to/carrick/scripts/carrick_bhyve_lldb.py' \
-  -o 'settings set target.env-vars CARRICK_INSECURE_REGISTRIES=<lab-ip>:5005 CARRICK_RUN_ID=dbg' \
+  -o 'settings set target.env-vars CARRICK_INSECURE_REGISTRIES=<registry-host>:5005 CARRICK_RUN_ID=dbg' \
   -o 'breakpoint set --name vm_run' \   # stop once the guest starts: ALL of memory is materialized
   -o run \
   -o 'bhyve-walk 0xfffffefffa' \         # walk a guest VA through the page tables -> GPA
@@ -97,7 +97,7 @@ need it; the guest's later forks do.
 ## DTrace: guest syscalls + host correlation
 
 The carrick USDT probes WORK on FreeBSD but the invocation matters
-(see [[reference_freebsd_dtrace_usdt]] — the "usdt no-op" was a verification error):
+(the "usdt no-op" was a verification error):
 - pass **`-Z`** (zero-match-at-compile, bind late — the probes only exist after
   the process registers them), and
 - the process must be ALIVE; the guest is short-lived, so use `dtrace -Z -c`.
@@ -144,5 +144,5 @@ directly, no ring-0 blob) — divergence there is the tell.
 - The `"no plugin for the language 'rust'"` warning prints lazily on the first
   Rust-frame stop — its absence early does NOT mean providers loaded.
 - Remote driving from macOS: `lldb-server19 platform --server --listen "0.0.0.0:PORT"`
-  on the box; `platform select remote-freebsd` + `platform connect connect://<lab-ip>:PORT`
+  on the box; `platform select remote-freebsd` + `platform connect connect://<freebsd-box>:PORT`
   on the mac (keep a local copy of the amd64 binary for DWARF).

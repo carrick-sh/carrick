@@ -23,7 +23,7 @@
 //! a reader that polls strictly before any writer opens isn't covered (rare; the
 //! netpoller pattern opens/writes before the read loop). Writers in a different
 //! process that did not inherit the beacon via `fork` (a separate carrick guest,
-//! or the macOS host) aren't counted. See `project_go_os_package_campaign`.
+//! or the macOS host) aren't counted.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};

@@ -8,7 +8,7 @@ license.workspace = true
 # under `carrick run` AND `docker run` (the Linux oracle), diffs outcome categories,
 # and renders the committed support matrix. A pure orchestrator — it links NONE of the
 # guest stack (no carrick-runtime, no HVF); it shells out to the signed `carrick` binary
-# and the `docker` CLI. See docs/superpowers/specs/2026-06-03-conformance-harness-design.md.
+# and the `docker` CLI.
 [[bin]]
 name = "carrick-conformance"
 path = "src/main.rs"

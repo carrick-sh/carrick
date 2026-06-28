@@ -1,6 +1,5 @@
 //! `carrick serve --docker-api`: an optional Docker Engine API server over a
-//! unix socket. Server-as-translator — see
-//! docs/superpowers/specs/2026-06-05-carrick-serve-engine-api-design.md.
+//! unix socket. Server-as-translator.
 
 mod build;
 mod handlers;
