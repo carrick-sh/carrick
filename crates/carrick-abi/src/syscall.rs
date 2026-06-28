@@ -35,7 +35,6 @@ pub enum SupportLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyscallHandler {
-    BootstrapStub,
     Credentials,
     Filesystem,
     Lifecycle,
@@ -98,7 +97,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 52..=57
         | 59
         | 61..=71
-        | 76
+        | 75..=77
         | 78..=83
         | 88
         | 267
@@ -141,7 +140,6 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         93 | 94 | 220 | 221 | 260 | 435 => SyscallHandler::Lifecycle,
         74 | 129..=139 => SyscallHandler::Signal,
         96 | 98 | 99 | 124 | 178 => SyscallHandler::ThreadLocal,
-        75 | 77 => SyscallHandler::BootstrapStub,
         _ => SyscallHandler::Unimplemented,
     }
 }
@@ -149,8 +147,6 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
 pub const fn compat_note_for_aarch64(number: u64) -> Option<&'static str> {
     match number {
         14..=16 => Some("xattr removal is reported as unsupported for bring-up compatibility"),
-        75 => Some("vmsplice is an explicit bootstrap ENOSYS stub"),
-        77 => Some("tee is an explicit bootstrap ENOSYS stub"),
         281 => Some("execveat remains planned and currently routes to unimplemented ENOSYS"),
         435 => Some("clone3 is partially handled for the clone/fork modes Carrick supports"),
         _ => None,

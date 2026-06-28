@@ -117,6 +117,12 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     memory.write_bytes(0x10800, &0u32.to_le_bytes()).unwrap();
 
+    // Register a live sibling so the process is genuinely multi-threaded: a lone
+    // thread reports getpid() for set_tid_address/gettid (a single-threaded
+    // process's gettid() == getpid()), whereas with a sibling, tid 10 is a
+    // distinct worker whose set_tid_address returns its own tid.
+    registry.register_child(0);
+
     let set_tid = dispatcher
         .dispatch_threaded(
             SyscallRequest::new(96, SyscallArgs::from([0x10840, 0, 0, 0, 0, 0])),
