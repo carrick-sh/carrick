@@ -1549,7 +1549,7 @@ pub fn msr_init_blob(
     // guest's AVX instructions (glibc/Go emit VZEROUPPER / VMOVDQA ymm) don't
     // #UD. CR4.OSXSAVE is already set (snap.cr4 = 0x4_0620, OSXSAVE bit 18), and
     // the blob runs in ring 0 where XSETBV is legal. SSE(1) MUST accompany AVX(2)
-    // or XSETBV #GPs. Mirrors KVM's KVM_SET_XCRS (commit d1414d37); bhyve has no
+    // or XSETBV #GPs. Mirrors KVM's KVM_SET_XCRS; bhyve has no
     // host XCR0 API, so we do it from guest code. ECX/EAX/EDX are already clobbered
     // by the WRMSRs above; RAX is reloaded by the iretq-frame pushes below.
     //   xor ecx,ecx ; mov eax,7 ; xor edx,edx ; xsetbv

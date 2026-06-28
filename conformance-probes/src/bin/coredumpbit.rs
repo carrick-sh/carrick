@@ -4,7 +4,7 @@
 //! Linux core-dumping signal set (SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS,
 //! SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ, SIGSYS) in `translate_wait_status` so
 //! that Linux apps (glibc abort(), LTP, etc.) see the bit they expect.
-//! Commit 0b55501 added the synthesis; this probe gates it.
+//! This probe gates that synthesis.
 //!
 //! Output shape per case: bool(WIFSIGNALED) && bool(WCOREDUMP). The probe
 //! sets `RLIMIT_CORE` to `RLIM_INFINITY` so a real Linux container (Docker)

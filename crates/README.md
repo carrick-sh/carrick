@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 24-crate Cargo workspace. The product path is:
+Carrick is a 25-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
@@ -51,6 +51,7 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-vmm-bhyve` | FreeBSD/bhyve backend; x86_64 lane through the shared x86 engine plus bhyve-specific host/VMM glue. |
 | `carrick-vmm-nvmm` | NetBSD/NVMM backend; x86_64 lane through the shared x86 engine plus NVMM-specific host/VMM glue. |
 | `carrick-x86` | Shared x86_64 engine: long-mode bring-up, register/snapshot model, fault tables, VDSO helpers, generic `X86EngineCore<V>`. |
+| `carrick-aarch64` | Shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane). |
 
 ## Test and Harness Support
 

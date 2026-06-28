@@ -10,7 +10,7 @@ runtime handler model.
 
 The authority for *which* numbers exist and their support level is the static
 table `AARCH64_SYSCALLS` in
-[`crates/carrick-vmm-hvf/src/syscall.rs`](../crates/carrick-vmm-hvf/src/syscall.rs) —
+[`crates/carrick-abi/src/syscall.rs`](../crates/carrick-abi/src/syscall.rs) —
 every assigned aarch64 number `0..=462` is listed (gaps `244..=259`,
 `295..=402`, `415` are unassigned on aarch64 and intentionally absent), so
 `lookup_aarch64()` can name *any* syscall a guest issues. The table is the input
@@ -26,9 +26,9 @@ Each row carries a `SupportLevel`, which maps to the **Quality** column below:
 | `Planned` | **Stub** | Recognized by name but routes to `ENOSYS` today. Only two: `execveat` (#281) and `clone3` (#435) — the latter is partially wired for the clone/fork modes carrick supports (`compat_note_for_aarch64`). |
 | `Deferred` | **Not implemented** | `ENOSYS`, surfaced by its real name (e.g. `io_uring_register`, `userfaultfd`) so the compat report shows `userfaultfd`, not `unknown 282`. |
 
-**~210 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
-the remaining 127 table rows are `Deferred`. Counts are from the table itself
-(`rg 'SupportLevel::BringUp' crates/carrick-vmm-hvf/src/syscall.rs | wc -l`).
+**~216 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
+the remaining 121 table rows are `Deferred`. Counts are from the table itself
+(`rg 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs | wc -l`).
 
 > [!NOTE]
 > "Deferred → ENOSYS" is deliberate and load-bearing: glibc/musl and most
@@ -292,9 +292,9 @@ remaining unassigned/reserved numbers.
 - To regenerate the BringUp/Planned/Deferred split from source:
 
   ```sh
-  rg 'SupportLevel::BringUp'  crates/carrick-vmm-hvf/src/syscall.rs | wc -l
-  rg 'SupportLevel::Planned'  crates/carrick-vmm-hvf/src/syscall.rs
-  rg 'SupportLevel::Deferred' crates/carrick-vmm-hvf/src/syscall.rs | wc -l
+  rg 'SupportLevel::BringUp'  crates/carrick-abi/src/syscall.rs | wc -l
+  rg 'SupportLevel::Planned'  crates/carrick-abi/src/syscall.rs
+  rg 'SupportLevel::Deferred' crates/carrick-abi/src/syscall.rs | wc -l
   ```
 
 - To see what a *specific workload* actually exercises (and which calls fell

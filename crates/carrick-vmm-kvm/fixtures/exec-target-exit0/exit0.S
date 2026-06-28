@@ -1,4 +1,4 @@
-// Freestanding aarch64 Linux execve TARGET for the carrick-linux KVM
+// Freestanding aarch64 Linux execve TARGET for the carrick-vmm-kvm
 // execve_into primitive (Phase 2, Task 4). No libc / no CRT startup so the
 // thin shim (run_elf.rs) can run it directly after `execve_into` replaces the
 // guest image in place: it issues a single `exit_group(0)` and nothing else.

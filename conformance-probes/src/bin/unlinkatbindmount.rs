@@ -1,9 +1,8 @@
 //! `unlinkat(AT_FDCWD, "/dev/shm/<f>", 0)` must remove a file created via the
-//! same bind-mounted path. carrick mounts `/dev/shm` as a host-backed BindVfs
-//! (commit 01571cb), but until 063ccf4 the unlink/unlinkat dispatcher went
-//! straight to `rootfs_vfs` and bypassed `vfs_mounts.resolve` — so a file
-//! created through the bind mount could never be removed through the same
-//! guest path. LTP's `tst_test setup_ipc` creates `/dev/shm/ltp_<…>` with
+//! same bind-mounted path. carrick mounts `/dev/shm` as a host-backed BindVfs;
+//! the unlink/unlinkat dispatcher must route through `vfs_mounts.resolve` (not
+//! straight to `rootfs_vfs`) or a file created through the bind mount could
+//! never be removed through the same guest path. LTP's `tst_test setup_ipc` creates `/dev/shm/ltp_<…>` with
 //! `O_CREAT|O_EXCL` and `SAFE_UNLINK`s the name immediately (the mapping
 //! survives); a busted unlink path TBROKs the entire `tst_checkpoint`-using
 //! signals suite.

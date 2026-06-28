@@ -1,4 +1,4 @@
-// Freestanding aarch64 Linux fixture for the carrick-linux KVM backend that
+// Freestanding aarch64 Linux fixture for the carrick-vmm-kvm backend that
 // EXERCISES THE INITIAL STACK (Phase C / C1: full memory map + initial stack).
 //
 // Unlike hello.S (which never touches SP), this reads argc from [sp] and does

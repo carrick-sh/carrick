@@ -332,8 +332,8 @@ fn futex_requeue_private_no_waiters_returns_zero() {
 
     // Real Linux FUTEX_REQUEUE returns the count of waiters woken+requeued
     // (0 with no waiters parked) and SUCCEEDS — verified vs docker linux/arm64
-    // (rc=0 errno=0). It is no longer an ENOSYS stub (impl: parking_lot
-    // unpark_requeue, commit 1372821); a PRIVATE futex records NO compat gap.
+    // (rc=0 errno=0). It is implemented via parking_lot unpark_requeue, not an
+    // ENOSYS stub; a PRIVATE futex records NO compat gap.
     assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
     let report = reporter.finish();
     assert_eq!(report.summary.distinct_partial_syscalls, 0);

@@ -2098,4 +2098,4 @@ Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a tra
 
 ---
 
-See also: `crates/carrick-cli/tests/conformance.rs` (the deterministic, line-exact ABI probe gate) and `.claude/skills/ltp-conformance/scripts/ltp-sweep.sh` (full LTP discovery). This matrix is the coarse behavioral axis; the probe gate is the precise one.
+See also: `crates/carrick-cli/tests/conformance.rs` (the deterministic, line-exact ABI probe gate) and `.agents/skills/ltp-conformance/scripts/ltp-sweep.sh` (full LTP discovery). This matrix is the coarse behavioral axis; the probe gate is the precise one.

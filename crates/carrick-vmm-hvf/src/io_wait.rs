@@ -731,8 +731,8 @@ impl ThreadWaiter {
         // Cap every kevent slice at 50 ms so a pending guest signal (poked onto
         // the self-pipe) is observed within one slice even when the kqueue wake
         // edge is lost — a freshly forked child can race signal-pump/self-pipe
-        // reinitialisation and never see the wake (this is the exact bug d97a47a
-        // fixed for wait4; ppoll(0,0,NULL,...), which musl uses for pause() on
+        // reinitialisation and never see the wake (this is the same lost-wake
+        // race the wait4 path must guard against; ppoll(0,0,NULL,...), which musl uses for pause() on
         // aarch64, needs the same retry). The finite-timeout arm gets the SAME
         // backstop: without it a `select([pipe],…,10s)` in a forked child sleeps
         // the full 10 s instead of waking on a mid-wait SIGALRM. Total wait stays

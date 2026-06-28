@@ -2,7 +2,7 @@
 //! delivers to its PARENT on exit (SIGCHLD if that byte == SIGCHLD; a different
 //! signum, e.g. SIGUSR1, if the guest asks for it; 0 = no exit signal at all).
 //! carrick hardcodes SIGCHLD on every fork-style child exit
-//! (carrick-hvf/src/vcpu_kick.rs:321-324 publishes LINUX_SIGCHLD regardless of
+//! (crates/carrick-vmm-hvf/src/vcpu_kick.rs publishes LINUX_SIGCHLD regardless of
 //! what the guest requested), so a clone(SIGUSR1) child exit wrongly delivers
 //! SIGCHLD instead of SIGUSR1.
 //!

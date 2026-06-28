@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the freestanding exec-target-exit1 aarch64 ELF (same toolchain as the fork-wait4 /
 # pipe-fork fixtures): clang integrated assembler (.S -> aarch64 ELF .o) + the
-# bundled rust-lld. Output is a static aarch64 Linux ELF the carrick-linux KVM
+# bundled rust-lld. Output is a static aarch64 Linux ELF the carrick-vmm-kvm
 # MVP loads as its guest to exercise execve_into target (exit_group 1) (Phase 2, Task 4).
 set -euo pipefail
 

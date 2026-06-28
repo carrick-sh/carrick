@@ -95,7 +95,7 @@ sync with `rustup update stable`.
 
 ## Repository map
 
-24-crate Cargo workspace under [`crates/`](crates/) (see
+25-crate Cargo workspace under [`crates/`](crates/) (see
 [`crates/README.md`](crates/README.md)). Dependency direction:
 `cli → engine → {image, runtime} → spec`. The HAL/platform split
 ([`docs/hal.md`](docs/hal.md)) separates platform-neutral contracts from
@@ -109,6 +109,7 @@ without pulling in HVF/applevisor. Use the `carrick-vmm-*` names for VMM crates
 - `carrick-vmm-bhyve` — FreeBSD/bhyve backend (x86_64 lane on FreeBSD/amd64).
 - `carrick-vmm-nvmm` — NetBSD/NVMM backend (x86_64 lane; target-host behavior matters).
 - `carrick-x86` — shared x86_64 VMM-backend engine used by KVM/bhyve/NVMM.
+- `carrick-aarch64` — shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane).
 
 **Host backends** (host-primitive impls)
 - `carrick-host` — Darwin host-primitive helpers for the runtime.
@@ -132,7 +133,7 @@ without pulling in HVF/applevisor. Use the `carrick-vmm-*` names for VMM crates
 **Support:** `carrick-conformance` (harness), `carrick-test-support` (integration/CLI helpers, rootfs assembly).
 
 ### Where key subsystems live
-- **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-vmm-hvf/src/syscall.rs` and guest-arch tables under `carrick-hal`.
+- **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-abi/src/syscall.rs` and guest-arch tables under `carrick-hal`.
 - **VFS / rootfs** — `crates/carrick-runtime/src/dispatch/fs.rs`, `crates/carrick-runtime/src/vfs/` (in-memory OCI layer merge; `--fs host` cap-std backend — see [`docs/fs-host-capstd-amplification.md`](docs/fs-host-capstd-amplification.md)).
 - **Memory / paging** — `crates/carrick-mem/src/memory.rs` (stage-1 identity map, EL0 trampoline, FEAT_PAN3 workaround); mmap arena `crates/carrick-runtime/src/dispatch/mem.rs`.
 - **Signals** — `crates/carrick-runtime/src/dispatch/signal.rs` (Linux↔macOS signum translation, sigreturn trampoline).

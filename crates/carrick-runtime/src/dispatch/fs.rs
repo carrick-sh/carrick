@@ -1289,7 +1289,7 @@ impl SyscallDispatcher {
             // O_CREAT (without O_EXCL) follows a trailing DANGLING symlink and
             // creates its target — so resolve to the (possibly-missing) target
             // path here and let the create below make it. A plain open keeps the
-            // strict resolver (a broken symlink is ENOENT, per d364391/fwalk).
+            // strict resolver (a broken symlink is ENOENT).
             let resolved = if want_create {
                 self.canonicalize_following_allow_missing(&path)
             } else {

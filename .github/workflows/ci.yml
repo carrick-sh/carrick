@@ -108,7 +108,7 @@ jobs:
         with:
           tool: just
 
-      - name: Cross-check carrick-hal + carrick-linux for aarch64-linux
+      - name: Cross-check carrick-hal + carrick-vmm-kvm for aarch64-linux
         run: just check-linux
 
   # Dependency license / bans / sources gate. Enforces the deny.toml permissive
