@@ -149,7 +149,7 @@ The full 41-module sweep flagged test_fork1 → CARRICK_TIMEOUT. Isolation
 (commit 2a3e43a):
 - fast-fs ON: test_fork1.test_threaded_import_lock_fork hangs ~2/3 of runs.
 - fast-fs OFF (cap-std): hangs ~1/4 — i.e. the multithreaded-fork-from-nested HVF
-  wedge (the campaign's #1 Heisenbug, see project_cpython_conformance_campaign)
+  wedge (the CPython campaign's #1 Heisenbug)
   is INTERMITTENT IN THE BASELINE; fast-fs's extra openat/close-per-stat churn
   just perturbs syscall timing in the fork window and roughly doubles the rate.
 

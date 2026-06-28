@@ -6,9 +6,7 @@
 //! `fork_vfork() → self.fork()` — vfork is a fork-COPY (a fresh, OWNED child VM
 //! eagerly copied from the parent's guest RAM, SP1), NOT a shared parent VM.
 //! True cross-process `CLONE_VM` (two processes on ONE bhyve VM) was proven
-//! infeasible (permanent `active_cpus` + suspend rendezvous + `vm_run` EINVAL);
-//! see the vfork design-correction in
-//! `docs/superpowers/specs/2026-06-14-bhyve-process-model-2-vfork-execve-design.md`.
+//! infeasible (permanent `active_cpus` + suspend rendezvous + `vm_run` EINVAL).
 //! This is correct for every conforming vfork user (POSIX: the child may only
 //! `exec`/`_exit`), and matches the KVM x86 lane. The generic loop's vfork-pipe
 //! suspends the parent until the child `_exit`s (write end closed → pipe EOF);

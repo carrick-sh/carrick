@@ -8,3 +8,9 @@
 .claude/
 /rust_out
 /.bench-scratch/
+# Editor / agent-tool session state (never publish)
+.antigravitycli/
+.gemini/
+# Python bytecode (the .py sources are tracked; the cache is not)
+__pycache__/
+*.pyc

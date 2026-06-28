@@ -691,8 +691,8 @@ caps modulate it.
 
 A userns is **shared among all its members** and survives fork. carrick forks real macOS
 processes, so an in-memory `HashMap<NsId, UserNs>` in one process is invisible to a forked
-sibling (per `[[feedback_durable_macos_gap_fills]]`). Storage options, in order of
-preference:
+sibling (in-process maps are not fork-coherent; prefer durable macOS-native state).
+Storage options, in order of preference:
 
 - **Preferred: a durable file-backed registry** under a per-run scratch dir, e.g.
   `/tmp/carrick-ns-<root_guest_pid>/user/<ns_id>` containing the serialized maps +

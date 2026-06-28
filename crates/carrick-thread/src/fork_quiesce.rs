@@ -39,8 +39,6 @@
 //!     not a count — then edits, then resumes. [`PtQuiesce::pause_guard`] mints an
 //!     RAII guard so the resume fires on every exit path of the editing syscall,
 //!     including `?`-propagated errors.
-//!
-//! See docs/archive/superpowers/specs/2026-05-24-multithreaded-fork-design.md.
 // INVARIANT: every `.unwrap()` in this module is on a std::sync Mutex/Condvar
 // guard. `lock()`/`wait()` only return `Err` on poisoning — a thread panicking
 // while holding the guard — which cannot occur in this no-panic codebase. The

@@ -56,7 +56,7 @@ use crate::guest_setup::{GuestRam, WindowKind};
 /// Base of the x86 KVM "kernel window" — trampoline + GDT + PML4 tables.
 ///
 /// 256 MiB: above typical ELF load regions (≤ 4 MiB), below the 64 GiB
-/// physical-address limit observed on 8 GiB a hypervisor LXC KVM hosts.
+/// physical-address limit observed on 8 GiB unprivileged-container KVM hosts.
 pub const X86_KERNEL_WINDOW_BASE: u64 = 0x1000_0000; // 256 MiB
 
 /// GPA of the LSTAR trampoline (OUT 0xC5 + SYSRETQ) for the x86 KVM backend.
@@ -77,7 +77,7 @@ pub const X86_GDT_BASE: u64 = X86_KERNEL_WINDOW_BASE + 0x1000; // +4 KiB
 /// The PML4 tables region is [`X86_PML4_CAPACITY`] bytes.
 ///
 /// **Must be below the host's physical-address ceiling** (36 bits / 64 GiB on
-/// the reference a hypervisor LXC host).  At 256 MiB + 8 KiB this is comfortably
+/// a typical unprivileged-container KVM host).  At 256 MiB + 8 KiB this is comfortably
 /// within any x86_64 machine with ≥ 256 MiB of RAM.
 pub const X86_PML4_BASE: u64 = X86_KERNEL_WINDOW_BASE + 0x2000; // +8 KiB
 

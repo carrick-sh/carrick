@@ -356,8 +356,12 @@ mod tests {
             gateway: "host.lima.internal".into(),
             timeout_scale: 1.0,
         });
-        let argv =
-            carrick_invocation_argv(&s, "/home/user/ct/release/carrick", "conf-1-2", &lane);
+        let argv = carrick_invocation_argv(
+            &s,
+            "/home/user/carrick/target/release/carrick",
+            "conf-1-2",
+            &lane,
+        );
         // Kvm: limactl shell <vm> -- sg kvm -c '<shell-quoted: env …=host.lima.internal:5005 <carrick> run … <rewritten image> …>'
         assert_eq!(
             argv[0..7],
@@ -366,7 +370,7 @@ mod tests {
         assert_eq!(argv.len(), 8, "the sg command string is one final arg");
         let inner = &argv[7]; // the single shell-string `sg kvm -c` runs
         assert!(inner.contains("CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005"));
-        assert!(inner.contains("/home/user/ct/release/carrick"));
+        assert!(inner.contains("/home/user/carrick/target/release/carrick"));
         assert!(inner.contains(" run "));
         // image-ref host rewritten to the gateway, un-rewritten host absent:
         assert!(inner.contains("host.lima.internal:5005/carrick-go-conformance:1.24"));
@@ -383,7 +387,9 @@ mod tests {
         // The kill pattern is ^-anchored to the carrick bin (so it can never
         // match the wrapper shell, whose -c script embeds the same text) and
         // ends at the run-id token (prefix safety: conf-1-2 vs conf-1-20).
-        assert!(inner.contains("'^/home/user/ct/release/carrick run --name conf-1-2 '"));
+        assert!(
+            inner.contains("'^/home/user/carrick/target/release/carrick run --name conf-1-2 '")
+        );
         assert!(inner.ends_with("; exit $rc"));
     }
 

@@ -2,8 +2,6 @@
 //! slot ids. Phase 1 is admission + recycle only (lifetime-bind); Phase 2 adds
 //! reclaim-on-block. The default impl leans on a host Mutex+Condvar (generalizing
 //! the HVF `vcpu_gate`) and the host thread scheduler for the M.
-//!
-//! See `docs/superpowers/specs/2026-06-20-mn-vcpu-scheduler-design.md`.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};

@@ -13,8 +13,7 @@
 //! `HvVm`/`HvVcpu` traits are deliberately NOT implemented (Phase 2 decision;
 //! the x86 backend uses the inherent surface instead).
 //!
-//! SCAFFOLD (see `docs/superpowers/adr/2026-06-06-bhyve-backend-design.md` and
-//! `docs/superpowers/specs/2026-06-13-x86_64-bhyve-phase2-design.md`):
+//! SCAFFOLD:
 //! aarch64 interfaces are transcribed from FreeBSD 15.1 `/usr/include/vmmapi.h`,
 //! `machine/vmm_dev.h`, and `sys/arm64/include/vmm.h` (releng/15.1) and remain
 //! compile-verified only (bhyve runs same-arch guests; the box is amd64).

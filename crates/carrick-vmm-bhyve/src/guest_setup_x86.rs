@@ -1896,8 +1896,7 @@ pub fn bring_up_x86() -> Result<BroughtUpX86, OsError> {
     // which loads CS=0x23/SS=0x1B by walking the GDT and latching their hidden
     // state itself — VT-x does NOT require pre-loading the iretq target's hidden
     // state (the earlier theory that it did was wrong: it forced a CPL-3 boot
-    // that #GP'd the WRMSRs, and the iretq triple-faults independently — see
-    // docs/superpowers/notes/2026-06-13-m1-iretq-ring3-blocker.md). Here we only
+    // that #GP'd the WRMSRs, and the iretq triple-faults independently). Here we only
     // give DS/ES/FS/GS valid RING-0 data descriptors for a clean VT-x entry; the
     // iretq nulls/reloads them on the privilege change per the architecture.
     for reg in [

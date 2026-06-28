@@ -2,8 +2,8 @@
 
 Derived 2026-05-30 from man-pages + LWN prose + **observed** Docker linux/arm64
 behavior (strace of a glibc getrandom program) + disassembly of the on-oracle
-vDSO binary. **No Linux kernel/glibc source was read** (see
-`feedback_no_linux_source`). Oracle: Docker LinuxKit kernel 6.12.76, glibc 2.41.
+vDSO binary. **No Linux kernel/glibc source was read** (clean-room only).
+Oracle: Docker LinuxKit kernel 6.12.76, glibc 2.41.
 
 ## ABI (observed)
 

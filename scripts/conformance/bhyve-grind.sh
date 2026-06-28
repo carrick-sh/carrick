@@ -3,8 +3,7 @@
 #
 # Why this exists: closing the bhyve<->KVM LTP gap is a long grind of small,
 # per-suite fixes (the high-leverage clusters — ring-0 fork, signal-death,
-# cross-process futex, connect(0.0.0.0) — are done; the rest is +1..2 each, see
-# `project_bhyve_parity_campaign` memory for the prioritized backlog). This wraps
+# cross-process futex, connect(0.0.0.0) — are done; the rest is +1..2 each). This wraps
 # the repetitive parts: rsync the local crates to the FreeBSD bhyve box, build the
 # bhyve binary, run specific LTP suites against the COMMITTED oracle (carrick-only,
 # no Docker), and report verdicts or raw failure modes. The babysit (kill wedged
@@ -13,8 +12,8 @@
 # The bhyve lane runs x86_64 guests on a FreeBSD/amd64 host; sockets/clocks/etc.
 # hit the FreeBSD host, so most remaining failures are FreeBSD-vs-Linux ABI diffs.
 #
-# Config (env): BHYVE_BOX (default root@<lab-ip> — see the FreeBSD test box),
-#   BHYVE_DIR (default /path/to/carrick-conf), BHYVE_REG (insecure registry serving
+# Config (env): BHYVE_BOX (REQUIRED — ssh target for the FreeBSD bhyve box, e.g. root@bhyve-host),
+#   BHYVE_DIR (default ~/carrick-conf), BHYVE_REG (insecure registry serving
 #   localhost:5050/ltp:arm64), BHYVE_IMG (default localhost:5050/ltp:arm64).
 #
 # Usage:
@@ -31,8 +30,8 @@
 # `ltp-` prefix (e.g. `stat03 stat03_64`).
 
 set -eu
-BOX="${BHYVE_BOX:-root@<lab-ip>}"
-DIR="${BHYVE_DIR:-/path/to/carrick-conf}"
+BOX="${BHYVE_BOX:-root@bhyve-host}"
+DIR="${BHYVE_DIR:-~/carrick-conf}"
 REG="${BHYVE_REG:-localhost:5050}"
 IMG="${BHYVE_IMG:-localhost:5050/ltp:arm64}"
 SSH="ssh -o ConnectTimeout=15 -o ServerAliveInterval=20 -o ServerAliveCountMax=400 -o BatchMode=yes"
