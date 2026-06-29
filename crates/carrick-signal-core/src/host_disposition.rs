@@ -119,6 +119,14 @@ pub fn is_host_routable(signum: i32) -> bool {
 mod tests {
     use super::*;
 
+    /// `INSTALLED_MASK` is a process-global `static`, so the two tests that
+    /// mutate it (`mark`/`clear`/`clear_all`) must NOT run concurrently — cargo
+    /// runs tests in one binary in parallel, and one test's `clear_all` racing
+    /// another's assertions flakes under load. Serialize just those two; the
+    /// `is_host_routable` classification tests touch no shared state. Poison-
+    /// recovering so a panic in one test doesn't cascade-fail the other.
+    static MASK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn standard_catchable_signals_are_routable() {
         // The signals a sibling's host kill could otherwise terminate us with.
@@ -176,6 +184,9 @@ mod tests {
 
     #[test]
     fn installed_mask_mark_clear_roundtrip() {
+        let _serialize = MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_all();
         assert!(!is_installed(10));
         assert_eq!(installed_mask(), 0);
@@ -200,6 +211,9 @@ mod tests {
 
     #[test]
     fn out_of_range_mark_is_inert_and_reports_installed() {
+        let _serialize = MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_all();
         // Out-of-range marks report "already installed" (skip) and never set a bit.
         assert!(mark_installed(0));

@@ -210,8 +210,20 @@ impl Drop for OwnedHostMapping {
 mod tests {
     use super::*;
 
+    /// All three tests in this binary mmap into the SHARED process address space.
+    /// `owned_host_mapping_unmaps_on_drop` asserts that a just-FREED address is
+    /// unmapped — which races any concurrent mmap (cargo runs the binary's tests
+    /// in parallel): a sibling test can reuse the freed address in the window
+    /// before the check, so `msync` succeeds instead of ENOMEM (flaky under load).
+    /// Serialize the mmap tests so none maps during another's freed-address check.
+    /// Poison-recovering so a panic in one test doesn't cascade-fail the others.
+    static MMAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn owned_host_mapping_unmaps_on_drop() {
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mapping = OwnedHostMapping::map_shared_anon(16 * 1024, HostMappingKind::PrivateAnon)
             .expect("anonymous mapping");
         let ptr = mapping.as_ptr();
@@ -264,6 +276,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn map_shared_file_does_not_leak_host_fds_across_cycles() {
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A real backing file (mmap of an anonymous/closed fd is not portable);
         // 16 KiB so it is a single HVF granule.
         let len = 16 * 1024usize;
@@ -340,6 +355,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn cow_snapshot_isolates_source_and_clone_writes() {
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let len = 4 * 16 * 1024;
         let source = OwnedHostMapping::map_shared_anon(len, HostMappingKind::PrivateAnon)
             .expect("source mapping");
