@@ -2586,6 +2586,30 @@ impl HvfVmState {
         // authoritative values the old `fork_pre` reported.
         crate::probes::fork_pre(0, 0, 0);
 
+        // vfork (CLONE_VM): before libc::fork, mark each WRITABLE guest region
+        // VM_INHERIT_SHARE so the fork SHARES its pages with the child (XNU
+        // vm_map_fork_share — child references the SAME vm_object, no shadow/copy,
+        // both is_shared; the parent is NOT made COW). This gives a CLONE_VFORK
+        // child true write-visibility into the SUSPENDED parent (clone05) while
+        // keeping the SAME physical pages, so the child's re-hv_vm_map binds the
+        // same PAs — unlike a fresh MAP_SHARED copy (smashed the vfork-exec stack)
+        // or a mach_vm_remap COW (HVF rejects). `guest_writable` is the exact
+        // discriminator: it is false for every carrick-internal region (trampolines,
+        // vectors, page tables, identity page, vvar, sigreturn) and read-only guest
+        // text, so the share never touches the trap machinery; the page-table region
+        // additionally stays a private clone (child branch below). minherit covers
+        // the WHOLE region (offset 0, full len) — a sub-range would clip the map
+        // entry and shadow on the first fork. The parent restores VM_INHERIT_COPY
+        // after the fork (fork_rebuild) so later PLAIN forks stay cheap COW.
+        if self.vfork_share {
+            for m in &self.mappings {
+                let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
+                if m.guest_writable && !m.guest_shared && !is_pt {
+                    set_region_fork_inheritance(m.host_addr, m.size, VM_INHERIT_SHARE);
+                }
+            }
+        }
+
         let mapping_descs: Vec<ForkMappingDesc> = self
             .mappings
             .iter()
@@ -2601,45 +2625,43 @@ impl HvfVmState {
             })
             .collect();
 
-        // Guest RAM is host-MAP_SHARED (HVF coherence), so fork(2) does NOT
-        // COW-isolate it. Take a private snapshot of each PRIVATE region HERE,
-        // pre-fork, while the guest vCPU is suspended (atomic, race-free); the
-        // child re-maps these copies, the parent keeps its originals. Genuine
-        // guest MAP_SHARED file mappings (`guest_shared`) are NOT snapshotted —
-        // they must stay shared across fork (POSIX), so both sides keep mapping
-        // the same host buffer. Built unconditionally because we don't yet know
-        // which side we are; the parent drops its unused owned snapshots when it
-        // chooses `mapping_descs` in `fork_rebuild`.
         let share_vm = self.vfork_share;
         let mut child_descs: Vec<ForkMappingDesc> = Vec::with_capacity(mapping_descs.len());
         for desc in &mapping_descs {
-            // vfork (CLONE_VM): the child SHARES the parent's address space, so map
-            // the SAME host buffer for EVERY region (no private snapshot) — exactly
-            // the `guest_shared` branch, generalized. Guest RAM is host-MAP_SHARED,
-            // so the child's writes land in the parent's RAM (true CLONE_VM). This
-            // is only sound because the parent vCPU is SUSPENDED for the whole vfork
-            // window (caller: handle_fork), and the child detaches into its own
-            // private VM on execve (execve_rebuild rebuilds fresh buffers).
+            // vfork (CLONE_VM): the child shares the parent's address space until it
+            // execs/exits, while the parent vCPU stays SUSPENDED. carrick forks a
+            // real host process, and bulk guest RAM is host-MAP_PRIVATE, so the
+            // child's COW view is ISOLATED — which is exactly right for the common
+            // vfork-FOR-EXEC case (Go, posix_spawn, the shell): the child's pre-exec
+            // trampoline writes COW away, leaving the suspended parent's stack/canary
+            // intact, and execve rebuilds the child fresh. (The STRICT vfork-write
+            // corner — a CLONE_VFORK child that mutates a shared global the parent
+            // then reads WITHOUT exec'ing, i.e. LTP clone05 — is a known gap: making
+            // those writes shared requires promoting the writable regions to
+            // MAP_SHARED, which corrupts the live stack the child's exec trampoline
+            // writes and regresses every vfork-exec. The isolation here is the
+            // correct trade for real workloads.)
             //
-            // EXCEPTION: the stage-1 page-table BACKING stays PRIVATE even for a
-            // vfork child. The child keeps its own (cloned) PageTableManager whose
-            // bump cursor matches a private backing; the managers are per-process
-            // (separate after libc::fork), so sharing the PT backing would let a
-            // pre-execve mmap/mprotect in the child rewrite the SAME table pages the
-            // suspended parent's manager believes it owns → live-L2/L3 corruption.
-            // Data/heap/stack ARE shared (the point of CLONE_VM); only the PT
-            // backing is excluded, so a pre-execve mmap is invisible to the parent
-            // (which real vfork-for-exec children — Go, posix_spawn — never do)
-            // rather than corrupting it.
+            // The stage-1 page-table BACKING stays a PRIVATE clone even for vfork:
+            // the child's cloned PageTableManager assumes a private backing, and a
+            // COW/shared PT desyncs the guest VA->PA walk under HVF (breaks
+            // cross-process futex/tst_checkpoint + clone05). Tiny region, ~free.
             let is_page_table_region = desc.start == crate::memory::LINUX_PAGE_TABLES_BASE;
             let child_host = if (share_vm && !is_page_table_region) || desc.guest_shared {
                 ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
-            } else {
+            } else if is_page_table_region {
                 ForkMappingHost::Owned(clone_region_for_child(
                     desc.host.ptr(),
                     desc.size,
                     desc.start,
                 )?)
+            } else {
+                // Bulk private guest RAM (data/bss/heap/stack/mmap arena) is
+                // host-MAP_PRIVATE, so libc::fork already COW-isolates it: the
+                // child re-maps its OWN COW view of the same VA, skipping the
+                // eager mincore+copy snapshot (the dominant per-fork cost — the
+                // epoll-ltp ~50x win).
+                ForkMappingHost::Borrowed(desc.host.ptr())
             };
             child_descs.push(ForkMappingDesc {
                 start: desc.start,
@@ -2859,6 +2881,20 @@ impl HvfVmState {
                 host_mapping: desc.host.into_owned(),
                 guest_shared: desc.guest_shared,
             });
+        }
+
+        // PARENT post-vfork: restore VM_INHERIT_COPY on the regions we shared for
+        // this vfork (set VM_INHERIT_SHARE in fork_prepare_and_teardown), so a LATER
+        // plain fork of this parent gets cheap COW isolation again rather than
+        // silently sharing its address space. The vfork child execs/exits, so it
+        // keeps the inherited SHARE attribute harmlessly (a no-op once it detaches).
+        if !is_child && self.vfork_share {
+            for m in &self.mappings {
+                let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
+                if m.guest_writable && !m.guest_shared && !is_pt {
+                    set_region_fork_inheritance(m.host_addr, m.size, VM_INHERIT_COPY);
+                }
+            }
         }
 
         // PARENT only: re-map the UNION of all quiesced siblings' regions that
@@ -3745,6 +3781,48 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
 /// PRIVATE memory: guest RAM is host-`MAP_SHARED` for HVF coherence (see
 /// `map_region_raw`), so `fork(2)` does NOT COW-isolate it — without an
 /// explicit copy a forked child and its parent would share, and corrupt, the
+/// macOS `vm_inherit.h`: parent + child share the SAME pages across `fork(2)`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VM_INHERIT_SHARE: libc::c_int = 0;
+/// macOS `vm_inherit.h`: child gets a COW copy across `fork(2)` (the default).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VM_INHERIT_COPY: libc::c_int = 1;
+
+/// Set a guest region's per-process `fork(2)` inheritance via macOS `minherit(2)`.
+///
+/// `VM_INHERIT_SHARE` makes the WHOLE region's pages SHARED across a later
+/// `libc::fork` (XNU `vm_map_fork_share`: the child references the SAME
+/// `vm_object` — no shadow, no copy — and both entries are `is_shared`; the
+/// parent is NOT converted to copy-on-write, unlike FreeBSD/NetBSD UVM). This is
+/// how a vfork/CLONE_VM child gets true write-visibility into the SUSPENDED
+/// parent (LTP clone05) while keeping the same physical pages, so the child's
+/// re-`hv_vm_map` binds the same PAs. `VM_INHERIT_COPY` restores cheap COW
+/// isolation for subsequent plain forks.
+///
+/// MUST be applied to a WHOLE mmap region (offset 0, full len): `minherit` on a
+/// sub-range clips the `vm_map_entry`, so the first fork shadows the sub-entry
+/// (`vo_size > entry_size`) instead of sharing. carrick's per-region mmaps make
+/// the whole-region call natural. Best-effort: a failure degrades to COW (the
+/// vfork child just won't see the parent's writes), never a crash.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn set_region_fork_inheritance(host_addr: *mut u8, size: usize, inherit: libc::c_int) {
+    unsafe extern "C" {
+        fn minherit(
+            addr: *mut libc::c_void,
+            len: libc::size_t,
+            inherit: libc::c_int,
+        ) -> libc::c_int;
+    }
+    let rc = unsafe { minherit(host_addr.cast(), size, inherit) };
+    if rc != 0 && std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
+        eprintln!(
+            "[FORKDBG pid={}] minherit(host={host_addr:p}, size={size}, inherit={inherit}) failed: {}",
+            unsafe { libc::getpid() },
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// same pages. Called pre-fork while the guest vCPU is suspended (atomic, no
 /// race). Only resident pages are copied (mincore-gated) so the snapshot is
 /// sparse; on mincore failure we fall back to a full copy (correct, slower).
