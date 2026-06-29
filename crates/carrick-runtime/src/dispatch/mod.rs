@@ -2965,7 +2965,16 @@ fn dispatch_threaded_futex(
                     (*(host_addr as *const std::sync::atomic::AtomicU32))
                         .load(std::sync::atomic::Ordering::SeqCst)
                 };
-                if mirror != word {
+                // On bhyve (separate mirror) sync the mirror -> the waiter's
+                // per-VM guest word so its retry loop re-reads what a peer wrote.
+                // On HVF/KVM host_addr IS the guest word, so this write-back is
+                // redundant AND races exactly like the FUTEX_WAKE store-back: a
+                // concurrent peer write landing between the load above and this
+                // store reverts the peer's update, desyncing the protocol (the
+                // residual that hung multiprocessing test_thousand). Gate it on
+                // the mirror flag — `mirror` is already the authoritative current
+                // value used for the compare below regardless.
+                if mirror != word && memory.shared_futex_uses_mirror() {
                     let _ = memory.write_bytes(address, &mirror.to_ne_bytes());
                 }
                 mirror
