@@ -938,26 +938,31 @@ mod tests {
         let to = 0x2222_0000_u64;
         const N: usize = 4;
 
-        let parked = Arc::new(AtomicUsize::new(0));
         let returned = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for _ in 0..N {
             let t = Arc::clone(&table);
-            let parked = Arc::clone(&parked);
             let returned = Arc::clone(&returned);
             handles.push(std::thread::spawn(move || {
-                parked.fetch_add(1, Ordering::SeqCst);
                 // Park on `from`; a requeue relinks us to `to` transparently.
                 let _ = t.wait(from, Some(Duration::from_secs(5)), &|| false);
                 returned.fetch_add(1, Ordering::SeqCst);
             }));
         }
-        // Wait for all parked, plus a beat to enter park().
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while parked.load(Ordering::SeqCst) < N && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
+        // Wait until all N are actually ENQUEUED on `from` (race-free via
+        // `waiter_count`; a thread-side counter incremented BEFORE parking plus a
+        // fixed grace-sleep TOCTOUs under load — a thread past the counter but not
+        // yet enqueued makes `requeue` wake 0 instead of 1). Bounded so a genuine
+        // hang fails loudly instead of blocking forever.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while table.waiter_count(from) < N {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {N} waiters enqueued",
+                table.waiter_count(from)
+            );
+            std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(50));
 
         let (woken, requeued) = table.requeue(from, to, 1, u32::MAX);
         assert_eq!(woken, 1, "exactly one waiter woken");
@@ -987,21 +992,28 @@ mod tests {
         let to = 0x4444_0000_u64;
         const N: usize = 5;
 
-        let parked = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for _ in 0..N {
             let t = Arc::clone(&table);
-            let parked = Arc::clone(&parked);
             handles.push(std::thread::spawn(move || {
-                parked.fetch_add(1, Ordering::SeqCst);
                 let _ = t.wait(from, Some(Duration::from_secs(5)), &|| false);
             }));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while parked.load(Ordering::SeqCst) < N && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
+        // Wait until all N are actually ENQUEUED on `from`. `waiter_count` reports
+        // exactly the enqueued set that `requeue`/`wake` operate on, so this is
+        // race-free — unlike a thread-side counter incremented BEFORE parking,
+        // whose fixed grace-sleep TOCTOUs under host load (a thread past the
+        // counter but not yet enqueued made requeue/wake miss it). Bounded so a
+        // genuine hang fails loudly instead of blocking forever.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while table.waiter_count(from) < N {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {N} waiters enqueued",
+                table.waiter_count(from)
+            );
+            std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(50));
 
         // Wake 0, requeue exactly 2 of the 5.
         let (woken, requeued) = table.requeue(from, to, 0, 2);

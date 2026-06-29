@@ -907,7 +907,21 @@ impl ThreadWaiter {
                     if now >= dl {
                         return WaitResult::TimedOut;
                     }
-                    (dl - now).as_millis().min(SLICE_MS as u128) as i32
+                    // CEIL the remaining to whole ms (poll's resolution) before
+                    // capping at SLICE_MS. Flooring (`as_millis`) makes the FINAL
+                    // slice SHORTER than the real remaining (a sub-ms remainder is
+                    // dropped), so `poll` returns 0 BEFORE the deadline; the
+                    // `n == 0` arm below then mistakes the slice boundary for an
+                    // epoll-backend re-sample point and returns `Ready` instead of
+                    // `TimedOut`. That is a spurious early-Ready for any short guest
+                    // poll, and the flaky `short_finite_poll_wait_observes_deadline`
+                    // under load. Ceil guarantees the last slice reaches the
+                    // deadline; long waits still cap at SLICE_MS and get the
+                    // backstop re-sample.
+                    (dl - now)
+                        .as_nanos()
+                        .div_ceil(1_000_000)
+                        .min(SLICE_MS as u128) as i32
                 }
                 None => SLICE_MS,
             };
@@ -1093,6 +1107,12 @@ mod tests {
 
     #[test]
     fn unbounded_poll_wait_retries_after_backstop_slice() {
+        // Serialize with the host_signal/pump tests (shared process-global signal
+        // pump) + reset on entry; otherwise a concurrent pump test makes the wait
+        // return `Interrupted` instead of `Ready`. See
+        // `short_finite_poll_wait_observes_deadline`.
+        let _g = crate::host_signal::PUMP_STATE_TEST_LOCK.lock();
+        crate::host_signal::reset_after_supervisor_fork();
         let mut fds = [-1, -1];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let read_fd = fds[0];
@@ -1108,8 +1128,12 @@ mod tests {
             }
         });
 
+        // Generous budget: the wait returns at the ~50 ms backstop slice, but
+        // thread scheduling under a loaded CI host can delay the channel recv well
+        // past a few slices. This only asserts the wait RETURNS (doesn't block
+        // forever); 5 s is plenty of margin without re-introducing load-flakiness.
         let result = rx
-            .recv_timeout(std::time::Duration::from_millis(250))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect("unbounded poll wait should return to let the dispatcher re-sample");
         assert_eq!(result, super::WaitResult::Ready);
         assert_eq!(unsafe { libc::close(write_fd) }, 0);
@@ -1117,6 +1141,12 @@ mod tests {
 
     #[test]
     fn long_finite_poll_wait_retries_before_deadline() {
+        // Serialize with the host_signal/pump tests (shared process-global signal
+        // pump) + reset on entry; otherwise a concurrent pump test makes the wait
+        // return `Interrupted` instead of `Ready`. See
+        // `short_finite_poll_wait_observes_deadline`.
+        let _g = crate::host_signal::PUMP_STATE_TEST_LOCK.lock();
+        crate::host_signal::reset_after_supervisor_fork();
         let mut fds = [-1, -1];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let read_fd = fds[0];
@@ -1136,8 +1166,11 @@ mod tests {
             }
         });
 
+        // Generous budget (see `unbounded_poll_wait_retries_after_backstop_slice`):
+        // asserts the long finite wait RETURNS at the ~50 ms backstop, robust to
+        // scheduling delay under host load. The 60 s guest deadline is never hit.
         let result = rx
-            .recv_timeout(std::time::Duration::from_millis(250))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect("long finite poll wait should retry before the guest deadline");
         assert_eq!(result, super::WaitResult::Ready);
         assert_eq!(unsafe { libc::close(write_fd) }, 0);
@@ -1145,6 +1178,14 @@ mod tests {
 
     #[test]
     fn short_finite_poll_wait_observes_deadline() {
+        // A `ThreadWaiter` consults the PROCESS-GLOBAL signal pump
+        // (`should_interrupt` -> `has_unblocked_pending_for`), so it must
+        // serialize with the host_signal/pump tests that reset/mark that state —
+        // otherwise a concurrent pump test makes this wait return `Interrupted`
+        // instead of its real result. Join the SAME `PUMP_STATE_TEST_LOCK` and
+        // reset the pump on entry (drains stale PENDING) exactly as those tests do.
+        let _g = crate::host_signal::PUMP_STATE_TEST_LOCK.lock();
+        crate::host_signal::reset_after_supervisor_fork();
         let mut fds = [-1, -1];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let waiter = super::ThreadWaiter::new(7);
