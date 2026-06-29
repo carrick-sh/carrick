@@ -158,3 +158,71 @@ fn mach_cow_vs_explicit_snapshot_probe() {
         libc::munmap(src.cast(), len);
     }
 }
+
+/// Isolate why the child's `hv_vm_map` of a `mach_vm_remap(copy=TRUE)` COW region
+/// fails with HV_ERROR: does the COW clone lose EXEC in its `max_protection`
+/// (H1 — `hv_vm_map(HV_MEMORY_EXEC)` rejected) or keep it (→ H2, a wiring issue)?
+#[test]
+#[allow(deprecated)] // libc::mach_task_self_ is the stable task port here
+fn cow_region_protection_probe() {
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+    const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+    // VM_PROT bits: READ=1 WRITE=2 EXECUTE=4
+    unsafe extern "C" {
+        fn mach_vm_region(
+            target_task: libc::vm_map_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: i32,
+            info: *mut i32,
+            info_count: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    fn prot(addr: *mut u8) -> (i32, i32) {
+        let mut a = addr as libc::mach_vm_address_t;
+        let mut sz: libc::mach_vm_size_t = 0;
+        let mut info = [0i32; 16];
+        let mut cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        let mut obj: libc::mach_port_t = 0;
+        let kr = unsafe {
+            mach_vm_region(
+                libc::mach_task_self_,
+                &mut a,
+                &mut sz,
+                VM_REGION_BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut cnt,
+                &mut obj,
+            )
+        };
+        assert_eq!(kr, 0, "mach_vm_region kr={kr}");
+        (info[0], info[1]) // protection (cur), max_protection
+    }
+
+    let len = 4 * 16 * 1024;
+    let src = OwnedHostMapping::map_shared_anon(len, HostMappingKind::PrivateAnon).expect("src");
+    unsafe { src.as_ptr().write_volatile(1) };
+    let (sc, sm) = prot(src.as_ptr());
+    let cow = unsafe {
+        OwnedHostMapping::remap_copy(src.as_ptr(), len, HostMappingKind::ChildPrivateSnapshot)
+    }
+    .expect("cow");
+    let (cc, cm) = prot(cow.as_ptr());
+
+    println!("PROBE-PROT source cur={sc} max={sm}  (R=1 W=2 X=4)");
+    println!("PROBE-PROT cow    cur={cc} max={cm}");
+    println!(
+        "PROBE-PROT source max EXEC={} | cow max EXEC={}",
+        sm & 4 != 0,
+        cm & 4 != 0
+    );
+    let verdict = if sm & 4 == 0 {
+        "source itself lacks EXEC in max → HVF must ignore max for direct mmap; COW HV_ERROR is H2 (wiring)"
+    } else if cm & 4 == 0 {
+        "H1 — COW clone LOST EXEC in max_protection → hv_vm_map(EXEC) rejected; fix = EXEC-able COW"
+    } else {
+        "COW retains EXEC in max → protection is NOT the cause → H2 (wiring)"
+    };
+    println!("PROBE-PROT VERDICT: {verdict}");
+}

@@ -48,6 +48,14 @@ pub struct OwnedHostMapping {
 
 impl OwnedHostMapping {
     pub fn map_shared_anon(len: usize, kind: HostMappingKind) -> Result<Self, std::io::Error> {
+        // EXPERIMENT: map private guest RAM as MAP_PRIVATE so host fork(2)
+        // COW-isolates it for free (cheap fork) — testing whether MAP_PRIVATE
+        // stays coherent under hv_vm_map (the disputed "desync"). Shared regions
+        // (aperture, signal rings, shared files) MUST stay MAP_SHARED.
+        let share = match kind {
+            HostMappingKind::PrivateAnon => libc::MAP_PRIVATE,
+            _ => libc::MAP_SHARED,
+        };
         #[allow(deprecated)] // MAP_NORESERVE: removed in FreeBSD 11, harmless no-op elsewhere
         let host = unsafe {
             libc::mmap(
@@ -60,7 +68,7 @@ impl OwnedHostMapping {
                 // reserves swap backing for the full extent — re-paid per forked
                 // guest. RSS is already lazy regardless. (On Darwin MAP_NORESERVE may
                 // be accepted-but-ignored; harmless either way.)
-                libc::MAP_ANON | libc::MAP_SHARED | libc::MAP_NORESERVE,
+                libc::MAP_ANON | share | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
