@@ -478,13 +478,76 @@ fn register_shared_alias(b: AliasBacking) {
     }
 }
 
+/// Is the host backing of an alias entry actually mapped in THIS process? The
+/// `alias_registry` is a process-global `static` COW-inherited across `fork(2)`,
+/// so a forked child inherits entries whose `host_addr` names the PARENT's
+/// mapping — a host VA that is NOT backed in the child (a different process's
+/// address space). Resolving a guest syscall (e.g. a `read_futex_word`) through
+/// such an entry and dereferencing `host_addr` is a carrick HOST SIGSEGV
+/// (EXC_BAD_ACCESS) inside the child — the cpython multiprocessing FORKSERVER
+/// SyncManager crash. `mincore` returns `-1/ENOMEM` iff the range has an
+/// unmapped page, so it cheaply rejects a dead inherited backing. Only ever
+/// called on the alias FALLBACK (after the per-thread `self.mappings` fast path
+/// misses), never per guest instruction. Conservative: on any other mincore
+/// outcome treat the backing as live (the caller's read still bounds-checks).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn alias_backing_is_live(host_addr: usize) -> bool {
+    if host_addr == 0 {
+        return false;
+    }
+    // macOS `mincore` is NO USE here: it returns 0/success even for an unmapped
+    // page or an outright gap address. Use `mach_vm_region`, which returns the
+    // region AT OR AFTER the queried address — `host_addr` is mapped iff that
+    // region actually contains it. (This is the same query the crash report's
+    // "0x… is not in any region" annotation came from.)
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+    const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+    unsafe extern "C" {
+        fn mach_vm_region(
+            target_task: libc::vm_map_t,
+            address: *mut libc::mach_vm_address_t,
+            size: *mut libc::mach_vm_size_t,
+            flavor: i32,
+            info: *mut i32,
+            info_count: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let mut addr = host_addr as libc::mach_vm_address_t;
+    let mut size: libc::mach_vm_size_t = 0;
+    let mut info = [0i32; 16];
+    let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+    let mut obj: libc::mach_port_t = 0;
+    // SAFETY: queries this task's VM map; reads no guest data. mach_task_self_ is
+    // the stable task port.
+    #[allow(deprecated)]
+    let kr = unsafe {
+        mach_vm_region(
+            libc::mach_task_self_,
+            &mut addr,
+            &mut size,
+            VM_REGION_BASIC_INFO_64,
+            info.as_mut_ptr(),
+            &mut count,
+            &mut obj,
+        )
+    };
+    kr == 0
+        && (addr as usize) <= host_addr
+        && host_addr < (addr as usize).saturating_add(size as usize)
+}
+
 /// Find the registered alias whose `hv_vm_map`'d IPA window contains `ipa`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
     alias_registry()
         .lock()
         .iter()
-        .find(|e| ipa >= e.ipa && ipa < e.ipa.saturating_add(e.size as u64))
+        .find(|e| {
+            ipa >= e.ipa
+                && ipa < e.ipa.saturating_add(e.size as u64)
+                && alias_backing_is_live(e.host_addr)
+        })
         .copied()
 }
 
@@ -513,7 +576,15 @@ fn lookup_shared_alias_by_va(va: u64, len: usize) -> Option<AliasBacking> {
         .lock()
         .iter()
         .rev()
-        .find(|e| va >= e.start && end <= e.start.saturating_add(e.size as u64))
+        .find(|e| {
+            va >= e.start
+                && end <= e.start.saturating_add(e.size as u64)
+                // Reject an entry whose backing is not mapped in THIS process
+                // (a parent's host_addr COW-inherited into a forked child) —
+                // dereferencing it would HOST-SIGSEGV the child. See
+                // `alias_backing_is_live`.
+                && alias_backing_is_live(e.host_addr.saturating_add((va - e.start) as usize))
+        })
         .copied()
 }
 
