@@ -44,6 +44,25 @@ impl SharedFutexSyscall for HvfShared {
     /// signal nudge (the shared loop re-checks the deadline + interrupt), `Error`
     /// for any other terminal `-errno` (EFAULT agrees macOS↔Linux at 14).
     fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
+        // Re-validate the shared word at the TOP of every slice before re-parking.
+        // A macOS os_sync wake can be LOST: `os_sync_wake_by_address` fires before
+        // the waiter is parked (the cross-process wake-before-park race), and
+        // `os_sync_wait_on_address` does NOT re-observe *addr once parked. So a
+        // value change that landed while we were parked in the PREVIOUS slice is
+        // invisible to os_sync, and the waiter blocks until its deadline (or
+        // forever). The Linux kernel re-checks the futex word atomically under the
+        // bucket lock; do that explicitly here so a lost cross-process wake is
+        // recovered within one ≤20 ms slice: if the word no longer equals the wait
+        // value the condition changed, so report Woken (Linux FUTEX_WAIT returns 0)
+        // and let the guest re-check and proceed.
+        // SAFETY: host_addr is a live 4-byte-aligned host word in the shared page.
+        let current = unsafe {
+            (*(host_addr as *const std::sync::atomic::AtomicU32))
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        if current != val {
+            return SharedWaitStep::Woken;
+        }
         let slice_us = u32::try_from((slice_ns / 1_000).min(i64::from(SHARED_FUTEX_MAX_SLICE_US)))
             .unwrap_or(SHARED_FUTEX_MAX_SLICE_US);
         crate::probes::ulock_wait(host_addr as u64, val, slice_us, 0, 0);

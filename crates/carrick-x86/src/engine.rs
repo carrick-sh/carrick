@@ -397,6 +397,13 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         self.vm.shared_futex_host_addr(gpa, 4)
     }
 
+    /// True only on a VMM whose `shared_futex_host_addr` returns a SEPARATE
+    /// mirror (bhyve); KVM/NVMM share the guest word across fork. Drives whether
+    /// a `FUTEX_WAKE` must publish the waker's word to the mirror.
+    fn shared_futex_uses_mirror(&self) -> bool {
+        self.vm.shared_futex_uses_mirror()
+    }
+
     /// x86-specific WRITE gate (the analog of HVF's `validate_guest_write_range`):
     /// a syscall write faults if the buffer is PROT_NONE (any access) OR read-only
     /// (`no_write`). Reads from a read-only mapping are fine (handled by the shared

@@ -1259,6 +1259,15 @@ impl X86Vmm for BhyveVmm {
         shared_futex_mirror_slot(key)
     }
 
+    /// bhyve's `shared_futex_host_addr` returns a SEPARATE mirror slot (the per-VM
+    /// guest word is not fork-shared), so a `FUTEX_WAKE` MUST publish the waker's
+    /// word into that mirror for a cross-process waiter to observe it. (On
+    /// HVF/KVM this is false and the publish is skipped — host_addr IS the guest
+    /// word, so republishing would race and revert a concurrent peer update.)
+    fn shared_futex_uses_mirror(&self) -> bool {
+        true
+    }
+
     fn is_guest_reserved(&self, va: u64) -> bool {
         // A reserved (lazily anon-backed) VA the guest has not touched has no
         // window yet; the engine's read path treats it as kernel zero-fill

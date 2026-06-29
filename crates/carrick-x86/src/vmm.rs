@@ -246,6 +246,16 @@ pub trait X86Vmm: Sized + GuestVmBackend {
         None
     }
 
+    /// Whether [`Self::shared_futex_host_addr`] returns a SEPARATE mirror word
+    /// (bhyve, whose per-VM guest word is not shared across `fork(2)`) rather
+    /// than the guest word itself (KVM/NVMM share it). When true a `FUTEX_WAKE`
+    /// publishes the waker's word into the mirror; when false that publish is
+    /// skipped (the guest already wrote the shared word — republishing would race
+    /// and revert a concurrent peer update). Default: false.
+    fn shared_futex_uses_mirror(&self) -> bool {
+        false
+    }
+
     /// Whether `va` lies in a guest memory RESERVATION that is not yet committed
     /// (a lazily-backed `mmap`/`brk` page the guest has never touched). On a
     /// demand-paged backend (bhyve), such a page has no `host_ptr` until first
