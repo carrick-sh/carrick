@@ -56,7 +56,18 @@ impl SharedFutexSyscall for HvfShared {
         if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
             return SharedWaitStep::Retry;
         }
-        SharedWaitStep::Error(r)
+        // ABI guard: a Linux FUTEX_WAIT only ever reports 0 / EAGAIN / EINTR /
+        // ETIMEDOUT (the value-mismatch EAGAIN is handled before the wait), and
+        // glibc's nptl FATALLY aborts on any other errno ("the futex facility
+        // returned an unexpected error code"). `os_sync_wait_on_address` can
+        // return a Darwin-specific errno (e.g. EINVAL) that has no Linux-futex
+        // meaning — surfacing it raw killed cpython multiprocessing workers
+        // waiting on a process-shared semaphore. A FUTEX_WAIT is permitted to
+        // wake SPURIOUSLY, so map any such errno to a spurious wake: the guest
+        // re-reads its word and re-waits. Never propagate a non-Linux futex
+        // errno across the ABI boundary. (phase=2 = unexpected-errno, for trace.)
+        crate::probes::ulock_wait(host_addr as u64, val, 0, 2, r);
+        SharedWaitStep::Woken
     }
 
     /// Wake up to `n` waiters on the shared-page word. macOS's
