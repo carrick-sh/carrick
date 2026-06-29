@@ -592,8 +592,10 @@ fn lookup_shared_alias_by_va(va: u64, len: usize) -> Option<AliasBacking> {
 /// `[va, va+len)` — called on a guest `munmap` of a high-VA alias (the only point
 /// the backing is actually freed), BEFORE the stage-1 invalidate, so a stale
 /// `host_addr` is never resolved after the OwnedHostMapping unmaps it. A thread
-/// exit LEAKS the backing (HvfTrapEngine::Drop is a no-op), so no unregister is
-/// needed there. Keyed on the VA `start` because `munmap` supplies a VA.
+/// exit LEAKS the backing (`impl Drop for HvfVmState` `mem::forget`s
+/// `self.mappings`), so no unregister is needed there — and critically MUST not
+/// `munmap` it, since the buffer is shared with sibling threads + this registry.
+/// Keyed on the VA `start` because `munmap` supplies a VA.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn unregister_alias(va: u64, len: usize) {
     let end = va.saturating_add(len as u64);
@@ -1012,6 +1014,28 @@ pub(crate) struct HvfVmState {
     /// populated between the two halves of a single fork.
     fork_mapping_descs: Vec<ForkMappingDesc>,
     fork_child_descs: Vec<ForkMappingDesc>,
+}
+
+/// Thread/process exit must LEAK the per-thread host backings, never `munmap`
+/// them. All sibling threads share ONE host address space, and the
+/// process-global [`alias_registry`] holds NON-OWNING raw `host_addr`s into
+/// these same buffers. A clone thread exiting (its `run_vcpu_until_exit` returns
+/// → this `Drop` runs on its `HvfVmState`) that `munmap`'d a buffer it happens
+/// to OWN — e.g. a `kind=SharedFile` `MAP_SHARED` semaphore alias it
+/// `add_alias`'d — would yank that buffer out from under every sibling thread
+/// AND leave a DANGLING registry entry that a later syscall (`read_futex_word`
+/// on the process-shared semaphore) resolves to a dead pointer → a carrick HOST
+/// SIGSEGV. That is the cpython multiprocessing FORKSERVER SyncManager crash:
+/// the Manager's pool teardown exits a clone thread whose `self.mappings` owned
+/// the live sem buffer. The kernel reclaims every mapping at process exit; the
+/// fork/execve rebuilds already `mem::forget` `self.mappings` for exactly this
+/// reason. (Restores the leak-until-exit discipline the pre-`Aarch64EngineCore`
+/// refactor's no-op engine `Drop` provided — see the `unregister_alias` doc.)
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvfVmState {
+    fn drop(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.mappings));
+    }
 }
 
 /// Owns ONLY the three vCPU-touching associated functions the shared engine
