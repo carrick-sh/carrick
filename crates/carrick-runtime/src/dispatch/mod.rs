@@ -2916,15 +2916,25 @@ fn dispatch_threaded_futex(
     match command {
         LINUX_FUTEX_WAKE => {
             if let Some(host_addr) = shared_host_addr {
-                // Publish the waker's current word to the fork-coherent host word
-                // before the wake so a WAITer (possibly in another process) observes
-                // it. No-op on HVF/KVM (host_addr IS the guest word); load-bearing on
-                // bhyve, whose per-VM word is not shared across the fork (see proc.rs /
-                // SHARED_FUTEX_MIRROR).
-                // SAFETY: host_addr is a live 4-byte-aligned host word.
-                unsafe {
-                    (*(host_addr as *const std::sync::atomic::AtomicU32))
-                        .store(word, std::sync::atomic::Ordering::SeqCst);
+                // Publish the waker's word to the SHARED MIRROR before the wake so
+                // a cross-process WAITer observes it — but ONLY on a backend that
+                // actually uses a separate mirror (bhyve, whose per-VM guest word
+                // is not shared across fork). On HVF/KVM `host_addr` IS the guest
+                // word, which the waker already wrote before this FUTEX_WAKE
+                // syscall: republishing here is redundant AND races — the value we
+                // could write is necessarily a slightly stale snapshot, so it
+                // would OVERWRITE a concurrent peer update and REVERT it (measured
+                // ~3% of wakes), which desynced cross-process semaphores/barriers
+                // and hung cpython multiprocessing. So gate the publish on
+                // `shared_futex_uses_mirror()` and, when it IS needed, read the
+                // word FRESH (not the stale top-of-handler `word`).
+                if memory.shared_futex_uses_mirror() {
+                    let fresh = read_futex_word(memory, address).unwrap_or(word);
+                    // SAFETY: host_addr is a live 4-byte-aligned host mirror word.
+                    unsafe {
+                        (*(host_addr as *const std::sync::atomic::AtomicU32))
+                            .store(fresh, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 // Cross-PROCESS (MAP_SHARED) wake: route through the
                 // `PlatformFutex::shared_wake` seam (the wake counterpart of the

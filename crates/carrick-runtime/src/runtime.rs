@@ -1779,6 +1779,9 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
         self.mem.shared_futex_host_addr(guest_addr)
     }
+    fn shared_futex_uses_mirror(&self) -> bool {
+        self.mem.shared_futex_uses_mirror()
+    }
 }
 
 impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {

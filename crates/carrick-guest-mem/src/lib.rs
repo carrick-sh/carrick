@@ -343,6 +343,19 @@ pub trait GuestMemory {
         None
     }
 
+    /// Whether [`Self::shared_futex_host_addr`] returns a SEPARATE mirror word
+    /// rather than the guest word itself. True only on bhyve, whose per-VM guest
+    /// word is not shared across `fork(2)` (a vmmapi limitation), so a
+    /// cross-process `FUTEX_WAKE` must publish the waker's word into the shared
+    /// mirror. False on HVF/KVM, where the shared host backing IS the guest word
+    /// — the guest already wrote it before the wake syscall, so republishing a
+    /// (necessarily slightly stale) snapshot would race and REVERT a concurrent
+    /// peer update, desyncing cross-process futex/semaphore protocols. Default:
+    /// false.
+    fn shared_futex_uses_mirror(&self) -> bool {
+        false
+    }
+
     /// Host pointer for a CONTIGUOUS guest range usable for zero-copy host I/O
     /// (send straight out of / recv straight into guest memory), valid IFF the
     /// whole `[address, address+len)` lives in one mapped region so the host
