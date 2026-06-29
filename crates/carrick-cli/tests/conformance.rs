@@ -62,11 +62,15 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // epollstaledel FIXED in M3 (pending_ready keyed by fd) — now PASSES.
 ];
 
-/// Probes kept as standalone REDUCERS but NOT run by the gate: they reproduce a
-/// real but as-yet-UNFIXED failure whose root cause is not yet verified, and run
-/// them is costly/destabilizing in the gate (a hard-wedged guest burns the case
-/// deadline and perturbs the timing-sensitive quarantine). Run them by hand with
-/// `scripts/run-probe.sh <name>`. Do NOT use this to hide a real regression.
+/// Probes kept as standalone REDUCERS but NOT run by the gate, for one of two
+/// reasons: (1) they reproduce a real but as-yet-UNFIXED carrick failure whose
+/// root cause is not yet verified, and whose hard-wedge is costly/destabilizing
+/// in the gate (it burns the case deadline and perturbs the timing-sensitive
+/// quarantine); or (2) the DIFFERENTIAL ORACLE itself cannot exercise the
+/// behaviour on this host, so there is no MATCH to be had — carrick is correct,
+/// the oracle is incapable. Run them by hand with `scripts/run-probe.sh <name>`,
+/// or gate them on a host whose oracle CAN run them. Do NOT use this to hide a
+/// real regression.
 const GATE_SKIP_PROBES: &[&str] = &[
     // forksleepfork: a multithreaded fork from a NESTED (fork+exec'd) process
     // wedges — empirically reproduces the failure, but the root cause is NOT yet
@@ -92,6 +96,16 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // reducer (run it alongside other guests to reproduce); NOT a gate signal
     // until the underlying contention bug is fixed. See project memory.
     "manythreads",
+    // mqueue: exercises the full POSIX message-queue family (mq_open/mq_timedsend/
+    // mq_timedreceive/mq_getsetattr/mq_unlink), which carrick emulates correctly
+    // on a host-file backing (see carrick-runtime dispatch/mqueue.rs). Reason (2)
+    // above — the ORACLE is the limited side: Docker Desktop's LinuxKit kernel
+    // refuses mq_open(O_CREAT) with EACCES even under --privileged and --ipc=host
+    // (the mqueue fs is mounted rw, but creation is blocked at the VM-kernel
+    // level), so carrick's correct success can never MATCH the oracle's EACCES.
+    // Kept as a reducer; gate it against a native-Linux oracle (the kvm/bhyve
+    // lanes), where mq_open actually works.
+    "mqueue",
 ];
 use std::time::{Duration, Instant};
 
