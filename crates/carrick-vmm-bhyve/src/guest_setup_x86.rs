@@ -1223,6 +1223,17 @@ impl RamInner {
         }
         None
     }
+
+    /// True iff `va` lies inside a registered cross-process `MAP_SHARED` alias —
+    /// i.e. the fork-coherent shm aperture. Used to gate the futex MIRROR: only a
+    /// genuinely shared word (visible to a forked peer) belongs on the mirror; a
+    /// private/anon word (a thread descriptor's `pd->tid`, a process-private
+    /// mutex) must stay on the per-VM guest word.
+    fn is_shared_va(&self, va: u64) -> bool {
+        self.shm_aliases
+            .iter()
+            .any(|a| va >= a.va && va < a.va.saturating_add(a.len as u64))
+    }
 }
 
 impl BhyveGuestRam {
@@ -1302,6 +1313,13 @@ impl BhyveGuestRam {
     /// Resolve a guest VA → backing GPA (used by the engine's host_ptr).
     pub fn resolve(&self, va: u64, len: usize) -> Option<u64> {
         self.lock().resolve(va, len)
+    }
+
+    /// True iff `va` is inside a registered cross-process `MAP_SHARED` shm alias.
+    /// Gates the futex mirror so private/anon words use the guest word (see
+    /// `RamInner::is_shared_va` and `BhyveVmm::shared_futex_host_addr`).
+    pub fn is_shared_va(&self, va: u64) -> bool {
+        self.lock().is_shared_va(va)
     }
 
     /// Snapshot the window table (boot-time PML4 build + tests read it).
@@ -2744,6 +2762,45 @@ mod tests {
     #[test]
     fn doorbell_ports_are_distinct() {
         assert_ne!(SYSCALL_DOORBELL_PORT, MAINT_DOORBELL_PORT);
+    }
+
+    /// The bhyve futex MIRROR is for CROSS-PROCESS (`MAP_SHARED`) words only.
+    /// `is_shared_va` gates `BhyveVmm::shared_futex_host_addr` so a private/anon
+    /// word — a thread descriptor's `pd->tid` that glibc's `pthread_join` waits on
+    /// with a NON-private `FUTEX_WAIT` — is NOT routed to an unseeded (==0) mirror
+    /// that would spuriously `EAGAIN` the join (the bhyve immediate-`pthread_join`
+    /// failure; works on KVM, which has no separate mirror). Only a registered shm
+    /// alias is shared.
+    #[test]
+    fn is_shared_va_scopes_futex_mirror_to_shm_aliases() {
+        let ram = BhyveGuestRam::new();
+        let private_va = 0x6000_8009_90; // a glibc thread-stack pd->tid VA
+        assert!(
+            !ram.is_shared_va(private_va),
+            "anon thread descriptor word must be private (guest word, not mirror)"
+        );
+
+        // Register a one-page cross-process MAP_SHARED shm alias. A real fd is
+        // needed because `ShmAlias::drop` closes it.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "open /dev/null");
+        let shm_va = 0x7000_0000_0000u64;
+        let shm_len = 0x1000usize;
+        ram.register_shm_alias(shm_va, 0x5000, shm_len, fd, 0, shm_len);
+
+        assert!(ram.is_shared_va(shm_va), "shm-alias base is shared");
+        assert!(
+            ram.is_shared_va(shm_va + 0xff0),
+            "within the alias is shared"
+        );
+        assert!(
+            !ram.is_shared_va(shm_va + shm_len as u64),
+            "one byte past the alias is private again"
+        );
+        assert!(
+            !ram.is_shared_va(private_va),
+            "an unrelated private word stays private"
+        );
     }
 
     /// M1 blob: byte-pin the instruction encodings and verify the inline

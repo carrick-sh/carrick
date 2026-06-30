@@ -237,26 +237,37 @@ probes/workloads as the KVM lane under bhyve:
   `threads_sleepn` N=2/N=4 now run all workers with a COHERENT shared atomic (isum=3/10 = correct).
   It was never memory incoherence, never a nested-host artifact — a carrick fault-resume bug.**
 
-  **Residual (separate, tracked) — pinned to `pthread_join`, NOT the barrier:** a program that
-  joins a worker *immediately* (no sleep/work between create and join) still reads `isum=0`,
-  because **`pthread_join` returns early before the worker runs**, then main `_exit`s and kills it.
-  Discriminated empirically: `threads_sleepn` (sleep) → correct; `threads_barr` (barrier, no sleep)
-  → fails BUT `threads_barsl` (barrier **+ sleep**) → correct; `threads_join` (no barrier, no sleep,
-  immediate join) → fails. So the barrier/FP are red herrings; the variable is the **immediate
-  join**. Traced: carrick's host-side `write_bytes` of the child/parent TID to the worker's fresh
-  glibc thread descriptor (`&pd->tid`) **succeeds host-side (`ok=true`)**, but the **guest reads it
-  as stale 0** — glibc's join then sees `pd->tid==0`, treats the thread as already-exited, and skips
-  the wait (the join FUTEX_WAIT with the tid value NEVER fires in a per-exit trace). So this is a
-  **bhyve host-write → guest-read coherence gap on a fresh demand-page** (the campaign's known-hard
-  bhyve guest-RAM area), distinct from the suppressor. It bites any program that joins quickly after
-  spawning (including `pthread_barrier_wait`, whose `threads_paramn`/`threads_barr` join right after
-  create). Next: confirm host-vs-guest divergence on the exact GPA (carrick's VA→GPA walk vs the
-  guest hardware walk / the bhyve demand-commit), then make a host-side write to a guest VA commit
-  the GPA guest-coherently. Repro: `threads_join` on the FreeBSD box.
+  **Residual — pinned to `pthread_join`, NOT the barrier — FIXED (futex-mirror scope bug):** a
+  program that joins a worker *immediately* (no sleep/work between create and join) read `isum=0`
+  because **`pthread_join` returned without waiting**, so main `_exit`d and tore down the
+  still-materializing worker before it ran a single instruction. Discriminated empirically:
+  `threads_sleepn` (sleep) → correct; `threads_barr` (barrier, no sleep) → fails BUT `threads_barsl`
+  (barrier **+ sleep**) → correct; `threads_join` (immediate join) → fails. The "stale-read"
+  diagnosis above was a RED HERRING: a manual guest load of `pd->tid` returns the correct tid (the
+  host write IS coherent — proved by reading `[pd+0x2d0]` from the guest), and a guest-PT walk of
+  the tid VA matches the window GPA (no VA→GPA divergence, CR3 coherent on both vCPUs). The actual
+  cause, from a parent-syscall trace: glibc's `pthread_join` issues `FUTEX(uaddr=&pd->tid, op=0x109,
+  val=tid)` — `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME`, **NO `FUTEX_PRIVATE_FLAG`** (the
+  CLONE_CHILD_CLEARTID waker is the "kernel", so the wait must be shared-flavored). On bhyve,
+  `BhyveVmm::shared_futex_host_addr` returned a fork-coherent MIRROR slot for **every** non-private
+  futex — violating the documented `GuestMemory` contract (return `None` for private/anon; HVF/KVM
+  honor it via `guest_shared`). The freshly-claimed mirror reads `0`, so the value check sees
+  `mirror(0) != val(tid)` → `EAGAIN`, **and clobbers the guest word `pd->tid` to the mirror's 0**, so
+  glibc re-reads 0 and the join returns. **Works on KVM precisely because KVM has no separate mirror
+  — the host word IS the guest word (= tid).** The Heisenbug (dtrace/sleep "fix" it) was just the
+  worker winning the race and exiting first. **Fix (this commit): scope the mirror to genuinely
+  cross-process `MAP_SHARED` words — `shared_futex_host_addr` returns `None` unless the VA is in a
+  registered shm alias (`BhyveGuestRam::is_shared_va`)**; a private thread futex uses the per-VM
+  guest word its sibling waker already shares. Verified: `threads_join` N∈{1,2,4,8} → correct,
+  12/12 stress, cross-process shm-futex rendezvous still works, unit test
+  `is_shared_va_scopes_futex_mirror_to_shm_aliases`. Repro: `threads_join`/`freeze`/`tidread` on the
+  FreeBSD box.
 
   (Lesson, per "verify diagnoses empirically": I wrongly concluded "nested-SVM artifact" twice
-  before the per-exit RIP-write trace found the suppressor — the user's host comparison (KVM backend
-  works) was the right prior to keep chasing carrick.)
+  AND "host-write→guest-read coherence gap" once — three wrong diagnoses — before a parent-syscall
+  trace showed the join's actual `FUTEX` op. The "manual guest load reads the correct tid" datapoint
+  killed the coherence theory; the `op=0x109` non-private flag named the real bug. The user's host
+  comparison (KVM works) was the right prior to keep chasing a carrick bhyve-specific bug.)
 
 ## R6 — conformance gating: fleet population
 
