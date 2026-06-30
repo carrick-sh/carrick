@@ -641,8 +641,8 @@ mod imp {
             state: freebsd::state_char(kp.ki_stat),
             ppid: kp.ki_ppid.max(0) as u32,
             pgid: kp.ki_pgid.max(0) as u32,
-            uid: kp.ki_ruid as u32,
-            gid: kp.ki_rgid as u32,
+            uid: kp.ki_ruid,
+            gid: kp.ki_rgid,
             comm: freebsd::comm(&kp),
         })
     }
