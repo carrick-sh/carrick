@@ -178,6 +178,15 @@ mod real {
         /// Fires for each iteration of the dispatcher's FUTEX_WAKE loop:
         /// `pid`, `host_addr`, `iter`, `rc` (0 on wake-one success, <0 on ENOENT).
         fn ulock__wake(_: u32, _: u64, _: i32, _: i64) {}
+        /// A cross-process futex wait slice returned a host errno OUTSIDE the
+        /// Linux FUTEX_WAIT set (not ETIMEDOUT/EINTR), which the shared ABI guard
+        /// folds to a spurious wake instead of leaking it (glibc nptl would abort
+        /// on it). `pid`, `host_addr`, `errno` (the raw host errno swallowed).
+        /// Fires on EVERY backend (HVF/KVM/bhyve/NVMM) from the one shared seam,
+        /// so a host whose futex primitive returns a surprising errno is visible
+        /// on the bring-up lanes, not just macOS. Frequent fires = a real
+        /// host-futex mismatch worth a spec, not just noise.
+        fn futex__unexpected__errno(_: u32, _: u64, _: i32) {}
         /// Fires at each `deliver_pending_signal` cycle. `tid` is the delivering
         /// thread; `pending` the signum it drained (0 = nothing deliverable to it).
         /// Pair with `signal-publish` to see a signal published for tid X but never
@@ -398,6 +407,10 @@ mod real {
 
     pub fn ulock_wake(host_addr: u64, iter: i32, rc: i64) {
         carrick_usdt::ulock__wake!(|| (std::process::id(), host_addr, iter, rc));
+    }
+
+    pub fn futex_unexpected_errno(host_addr: u64, errno: i32) {
+        carrick_usdt::futex__unexpected__errno!(|| (std::process::id(), host_addr, errno));
     }
 
     pub fn guest_exit(code: i32) {
@@ -1002,6 +1015,7 @@ mod stub {
     stub!(futex_route(addr: u64, op: i32, shared: i32, host_addr: u64));
     stub!(ulock_wait(host_addr: u64, value: u32, timeout_us: u32, phase: i32, rc: i64));
     stub!(ulock_wake(host_addr: u64, iter: i32, rc: i64));
+    stub!(futex_unexpected_errno(host_addr: u64, errno: i32));
     stub!(guest_exit(code: i32));
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
