@@ -923,6 +923,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_FORK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_CLONE,
                 args: [LINUX_SIGCHLD, 0, 0, 0, 0, 0],
             });
@@ -930,6 +931,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_VFORK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_CLONE,
                 args: [
                     LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
@@ -948,6 +950,7 @@ impl X8664GuestArch {
             // timeout pointer → infinite wait (musl startup wedge).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_POLL,
                 args: [args[0], args[1], args[2], 0, 0, 0],
             });
@@ -958,6 +961,7 @@ impl X8664GuestArch {
             // no sigmask. pselect6(72) keeps the *timespec + sigmask decode.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_SELECT,
                 args: [args[0], args[1], args[2], args[3], args[4], 0],
             });
@@ -973,6 +977,7 @@ impl X8664GuestArch {
             // timeout_ms = return-now, which would re-introduce the spin).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_PPOLL,
                 args: [0, 0, 0, 0, 0, 0],
             });
@@ -986,6 +991,7 @@ impl X8664GuestArch {
             // synthesised as NULL/0.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_EPOLL_PWAIT,
                 args: [args[0], args[1], args[2], args[3], 0, 0],
             });
@@ -998,6 +1004,7 @@ impl X8664GuestArch {
             // lose that check (epoll-ltp / epoll_create02).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE,
                 args: [args[0], 0, 0, 0, 0, 0],
             });
@@ -1006,6 +1013,7 @@ impl X8664GuestArch {
             // inotify_init() takes no args → inotify_init1(flags=0).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_INOTIFY_INIT1,
                 args: [0, 0, 0, 0, 0, 0],
             });
@@ -1014,6 +1022,7 @@ impl X8664GuestArch {
             // signalfd(fd, mask, sizemask) → signalfd4(fd, mask, sizemask, 0).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_SIGNALFD4,
                 args: [args[0], args[1], args[2], 0, 0, 0],
             });
@@ -1022,6 +1031,7 @@ impl X8664GuestArch {
             // eventfd(initval) → eventfd2(initval, flags=0).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_EVENTFD2,
                 args: [args[0], 0, 0, 0, 0, 0],
             });
@@ -1032,6 +1042,7 @@ impl X8664GuestArch {
             // process-group id instead of ENOSYS (-1).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_GETPGID,
                 args: [0, 0, 0, 0, 0, 0],
             });
@@ -1039,6 +1050,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_DUP2 {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_DUP2,
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
@@ -1046,6 +1058,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_ALARM {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_ALARM,
                 args: [args[0], 0, 0, 0, 0, 0],
             });
@@ -1053,6 +1066,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_ACCESS {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_FACCESSAT,
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
@@ -1060,6 +1074,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_STAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_STAT,
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
@@ -1067,6 +1082,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_FSTAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_FSTAT,
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
@@ -1074,6 +1090,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_LSTAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_LSTAT,
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
@@ -1081,6 +1098,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_NEWFSTATAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT,
                 args: [args[0], args[1], args[2], args[3], 0, 0],
             });
@@ -1088,6 +1106,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_PIPE {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_PIPE2,
                 args: [args[0], 0, 0, 0, 0, 0],
             });
@@ -1106,6 +1125,7 @@ impl X8664GuestArch {
             }
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_PIPE2,
                 args: [args[0], flags, 0, 0, 0, 0],
             });
@@ -1113,6 +1133,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_READLINK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_READLINKAT,
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
@@ -1120,6 +1141,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_MKDIR {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_MKDIRAT,
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
@@ -1133,6 +1155,7 @@ impl X8664GuestArch {
             // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_OPENAT,
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
@@ -1149,6 +1172,7 @@ impl X8664GuestArch {
             // but the x86 flags word needs the O_* bit translation.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_OPENAT,
                 args: [
                     args[0],
@@ -1166,6 +1190,7 @@ impl X8664GuestArch {
             // (args[1]) lands in the openat MODE slot (a3), not the flags slot.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_OPENAT,
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
@@ -1183,6 +1208,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_UNLINK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_UNLINKAT,
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], 0, 0, 0, 0],
             });
@@ -1190,6 +1216,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_RMDIR {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_UNLINKAT,
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
@@ -1205,6 +1232,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_RENAME {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_RENAMEAT,
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
@@ -1220,6 +1248,7 @@ impl X8664GuestArch {
             // flags=0 mirrors link(2) (no AT_SYMLINK_FOLLOW).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_LINKAT,
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
@@ -1236,6 +1265,7 @@ impl X8664GuestArch {
             // symlink(target, linkpath) → symlinkat(target, AT_FDCWD, linkpath).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_SYMLINKAT,
                 args: [args[0], carrick_abi::LINUX_AT_FDCWD, args[1], 0, 0, 0],
             });
@@ -1244,6 +1274,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_MKNOD {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_MKNODAT,
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
@@ -1252,6 +1283,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_CHMOD {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_FCHMODAT,
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
@@ -1261,6 +1293,7 @@ impl X8664GuestArch {
             // flags=0: chown FOLLOWS symlinks. owner/group -1 sentinel passes through.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_FCHOWNAT,
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
@@ -1268,6 +1301,7 @@ impl X8664GuestArch {
         if x86_number == X86_NR_LCHOWN {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+                native_number: x86_number,
                 number: CANONICAL_FCHOWNAT,
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
@@ -1299,6 +1333,7 @@ impl X8664GuestArch {
         }
         SyscallNorm::Plain(RawSyscall {
             guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
+            native_number: x86_number,
             number: canonical,
             args,
         })
