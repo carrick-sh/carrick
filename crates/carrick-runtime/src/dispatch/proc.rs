@@ -2667,3 +2667,131 @@ mod affinity_tests {
         assert!(padded[1..].iter().all(|b| *b == 0));
     }
 }
+
+#[cfg(test)]
+mod futex_timeout_tests {
+    use super::*;
+    use crate::thread::{FutexTable, ThreadRegistry};
+    use std::time::Duration;
+
+    /// A present (non-NULL) `{tv_sec:0, tv_nsec:0}` `FUTEX_WAIT` timeout means
+    /// "expire NOW" (ETIMEDOUT immediately), NOT "block forever" (the NULL-timeout
+    /// case). Collapsing `{0,0}` to "no deadline" made the threaded futex park
+    /// compute no deadline and spin forever (futex_wait03 hung ~110s). Guard the
+    /// fix at the handler: the parked `FutexWait` must carry `Some(Duration::ZERO)`
+    /// (a deadline of `now`), never `None`.
+    #[test]
+    fn futex_wait_zero_but_present_timeout_parks_with_zero_deadline() {
+        const LINUX_FUTEX_WAIT: u64 = 0;
+        const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
+
+        let dispatcher = SyscallDispatcher::new();
+        let reporter = CompatReporter::default();
+        let registry = ThreadRegistry::new(10);
+        let futex = FutexTable::new();
+        // A live sibling so the process is genuinely multi-threaded.
+        registry.register_child(0);
+
+        let word_addr = 0x10800u64;
+        let timeout_addr = 0x10810u64;
+        let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+        // Futex word == the expected value, so WAIT does not short-circuit to
+        // EAGAIN and must consult the timeout.
+        memory.write_bytes(word_addr, &7u32.to_le_bytes()).unwrap();
+        // A present (non-NULL) timespec of {0, 0}.
+        memory.write_bytes(timeout_addr, &[0u8; 16]).unwrap();
+
+        let thread = ThreadCtx {
+            tid: 10,
+            registry: &registry,
+            futex: &futex,
+        };
+        let out = dispatcher
+            .dispatch_normalized(
+                SyscallRequest::new(
+                    98,
+                    SyscallArgs::from([
+                        word_addr,
+                        LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG,
+                        7,
+                        timeout_addr,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+                Some(thread),
+            )
+            .expect("the futex handler claims syscall 98")
+            .expect("futex dispatch must not be a fatal DispatchError");
+
+        match out {
+            DispatchOutcome::FutexWait { timeout, .. } => assert_eq!(
+                timeout,
+                Some(Duration::ZERO),
+                "a present {{0,0}} timeout must park with a zero deadline (expire now), \
+                 not None (block forever)"
+            ),
+            other => panic!("expected a FutexWait park outcome, got {other:?}"),
+        }
+    }
+}
+
+// `translate_child_wait_status` reconstructs `WIFSIGNALED` from a forked-child
+// signal-death marker. This only applies off Linux, where some default-TERMINATE
+// Linux signals map to default-IGNORE host signals (SIGPOLL 29 → BSD SIGIO,
+// SIGSTKFLT 16 → BSD SIGURG) and the child could only `_exit(128+N)` + drop a
+// marker. On Linux the marker is never written, so the test is compiled out.
+#[cfg(all(test, not(target_os = "linux")))]
+mod wait_status_tests {
+    use super::*;
+
+    /// A host wait status for a normal `_exit(code)`: low 7 bits are 0
+    /// (WIFEXITED), the exit code sits in bits 8..15. Encoding matches Linux.
+    fn exited(code: i32) -> i32 {
+        (code & 0xff) << 8
+    }
+
+    #[test]
+    fn ignore_signal_child_death_reconstructs_wifsignaled() {
+        // A SIGPOLL (29) child on a BSD host could only `_exit(128+29)` and leave
+        // a marker; the parent's wait4 must still observe WIFSIGNALED(29), not
+        // "exited 157" (LTP waitpid01). `plant` overwrites any stale marker.
+        let host_pid = 0x7FFE_0001u32;
+        crate::exec_helpers::plant_sigdeath_marker_for_test(host_pid, 29);
+
+        let status = translate_child_wait_status(host_pid, exited(128 + 29));
+        assert!(
+            libc::WIFSIGNALED(status),
+            "an ignore-signal child death must report killed-by-signal, got {status:#x}"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            29,
+            "the reconstructed termination signal must be SIGPOLL (29)"
+        );
+    }
+
+    #[test]
+    fn sigstkflt_child_death_reconstructs_wifsignaled() {
+        // SIGSTKFLT (16) is the other default-TERMINATE→default-IGNORE mapping.
+        let host_pid = 0x7FFE_0002u32;
+        crate::exec_helpers::plant_sigdeath_marker_for_test(host_pid, 16);
+
+        let status = translate_child_wait_status(host_pid, exited(128 + 16));
+        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
+        assert_eq!(libc::WTERMSIG(status), 16);
+    }
+
+    #[test]
+    fn genuine_exit_without_marker_stays_wifexited() {
+        // A real `exit(5)` is outside the 128+N marker window, so the marker is
+        // never consulted: it must pass through as WIFEXITED(5), never be misread
+        // as a signal death.
+        let host_pid = 0x7FFE_0003u32;
+        let status = translate_child_wait_status(host_pid, exited(5));
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), 5);
+    }
+}
