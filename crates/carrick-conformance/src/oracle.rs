@@ -85,19 +85,23 @@ pub struct OracleCache {
 
 impl OracleCache {
     /// Load the cache, tolerating a missing file (first run -> empty) and
-    /// skipping any unparseable line.
+    /// COUNTING (not silently dropping) any unparseable line. A bulk parse
+    /// failure is the loud symptom of a determinant-field schema change that
+    /// invalidated the committed cache (see [`oracle_key`]): instead of quietly
+    /// reading `0 cached oracle(s)` and triggering a full fresh Docker pass, warn
+    /// so the operator knows to re-bless (`--refresh-oracle`).
     pub fn load(path: &Path) -> Self {
-        let mut by_key = BTreeMap::new();
-        if let Ok(text) = std::fs::read_to_string(path) {
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(rec) = serde_json::from_str::<OracleRecord>(line) {
-                    by_key.insert(rec.key.clone(), rec);
-                }
-            }
+        let (by_key, skipped) = match std::fs::read_to_string(path) {
+            Ok(text) => parse_cache_records(&text),
+            Err(_) => (BTreeMap::new(), 0),
+        };
+        if skipped > 0 {
+            eprintln!(
+                "oracle cache: skipped {skipped} unparseable record(s) in {} — a \
+                 determinant-field (OracleKey) change invalidates committed records; \
+                 re-bless with --refresh-oracle to rewrite the cache.",
+                path.display()
+            );
         }
         OracleCache {
             path: path.to_path_buf(),
@@ -192,6 +196,28 @@ impl OracleCache {
 /// cached; a crash/hang/empty must be retried.
 fn is_cacheable(result: &SuiteResult) -> bool {
     matches!(result.result, SuiteOutcome::Success | SuiteOutcome::Failure)
+}
+
+/// Parse the committed JSONL cache body into records keyed by determinant,
+/// returning `(records, skipped)` where `skipped` counts non-empty lines that
+/// failed to deserialize (the schema-mismatch signal surfaced by [`OracleCache::load`]).
+/// Pure (no IO) so the skip-count behavior is unit-testable.
+fn parse_cache_records(text: &str) -> (BTreeMap<String, OracleRecord>, usize) {
+    let mut by_key = BTreeMap::new();
+    let mut skipped = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<OracleRecord>(line) {
+            Ok(rec) => {
+                by_key.insert(rec.key.clone(), rec);
+            }
+            Err(_) => skipped += 1,
+        }
+    }
+    (by_key, skipped)
 }
 
 /// Reconstruct the docker oracle [`SuiteResult`] from a completed gate's
@@ -338,6 +364,58 @@ mod tests {
             oracle_key(&s, crate::lane::DockerPlatform::LinuxArm64),
             oracle_key(&s, crate::lane::DockerPlatform::LinuxAmd64),
             "linux/arm64 and linux/amd64 oracles must not share cache keys"
+        );
+    }
+
+    #[test]
+    fn golden_oracle_key_pins_the_determinant_schema() {
+        // A FIXED OracleKey input -> a FIXED serialized string. Adding, removing,
+        // renaming, or reordering a determinant field changes this string and
+        // fails the test LOUDLY — forcing a conscious re-bless, because the same
+        // change silently invalidates EVERY committed oracle-cache.jsonl key at
+        // once (the gate then logs `0 cached oracle(s)` and runs a full fresh
+        // Docker pass). When you intend the schema change: re-bless the cache
+        // (`--refresh-oracle`) and update this golden string in the same commit.
+        let mut s = base_suite();
+        s.name = "golden".into();
+        s.image = "localhost:5005/golden:1".into();
+        s.cmd = vec!["/bin/echo".into(), "hi".into()];
+        s.docker_flags = vec![];
+        s.entrypoint = None;
+        s.bind_mounts = vec![];
+        s.env = vec![];
+        s.env_docker = vec![];
+        s.workdir = None;
+        s.verdict = VerdictKind::Shell;
+
+        let key = oracle_key(&s, crate::lane::DockerPlatform::LinuxArm64);
+        assert_eq!(
+            key,
+            r#"{"docker_platform":"linux/arm64","image":"localhost:5005/golden:1","cmd":["/bin/echo","hi"],"docker_flags":[],"entrypoint":null,"bind_mounts":[],"env":[],"workdir":null,"verdict":"shell"}"#,
+            "OracleKey determinant schema changed — if intentional, re-bless the \
+             committed oracle cache (--refresh-oracle) and update this golden string"
+        );
+    }
+
+    #[test]
+    fn parse_cache_records_counts_schema_mismatches() {
+        // One valid record + blank/whitespace lines (ignored) + two non-empty
+        // lines that fail to deserialize (a renamed/added determinant field, or
+        // outright junk) -> kept=1, skipped=2. The skip count is what load()
+        // turns into the operator-facing re-bless warning.
+        let valid = serde_json::to_string(&OracleRecord {
+            name: "s".into(),
+            key: "k1".into(),
+            result: result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
+        })
+        .unwrap();
+        let text = format!("{valid}\n\n   \n{{\"not\":\"an-oracle-record\"}}\ntotally not json\n");
+        let (recs, skipped) = parse_cache_records(&text);
+        assert_eq!(recs.len(), 1, "the one valid record is kept");
+        assert!(recs.contains_key("k1"));
+        assert_eq!(
+            skipped, 2,
+            "two non-empty unparseable lines counted (blank lines ignored)"
         );
     }
 
