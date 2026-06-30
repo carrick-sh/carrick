@@ -1248,8 +1248,9 @@ fn sysv_semctl<M: GuestMemory>(
                 {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                ds.sem_perm.mode = (ds.sem_perm.mode & !(0o777 as libc::mode_t))
-                    | ((new_mode & 0o777) as libc::mode_t);
+                ds.sem_perm.mode =
+                    carrick_portable::ipc_set_apply_mode(ds.sem_perm.mode as u32, new_mode)
+                        as libc::mode_t;
                 let rc = unsafe {
                     libc::semctl(semid, 0, libc::IPC_SET, &mut ds as *mut libc::semid_ds)
                 };
@@ -1290,20 +1291,27 @@ fn sysv_semctl<M: GuestMemory>(
                     return Ok(DispatchOutcome::errno(errno));
                 }
                 if arg != 0 {
+                    // macOS sets the SEM_ALLOC flag (0o1000) in ipc_perm.mode for
+                    // an allocated SysV object; Linux's sem_perm.mode is just the
+                    // permission bits. `IpcPermFields::from_host` masks the mode to
+                    // 0o777 (LTP semctl01 asserts mode == SEM_RA exactly) and packs
+                    // the owner/creator ids from the guest creds.
+                    let perm = carrick_portable::IpcPermFields::from_host(
+                        ds.sem_perm._key as i32,
+                        creds.euid,
+                        creds.egid,
+                        ds.sem_perm.mode as u32,
+                        ds.sem_perm._seq as u16,
+                    );
                     let out = LinuxSemidDs {
                         sem_perm: LinuxIpcPerm {
-                            key: ds.sem_perm._key as i32,
-                            uid: creds.euid,
-                            gid: creds.egid,
-                            cuid: creds.euid,
-                            cgid: creds.egid,
-                            // macOS sets the SEM_ALLOC flag (0o1000) in
-                            // ipc_perm.mode for an allocated SysV object; Linux's
-                            // sem_perm.mode is just the permission bits. Mask to
-                            // 0o777 so the guest sees the mode it created with
-                            // (LTP semctl01 asserts mode == SEM_RA exactly).
-                            mode: (ds.sem_perm.mode as u32) & 0o777,
-                            seq: ds.sem_perm._seq as u16,
+                            key: perm.key,
+                            uid: perm.uid,
+                            gid: perm.gid,
+                            cuid: perm.cuid,
+                            cgid: perm.cgid,
+                            mode: perm.mode,
+                            seq: perm.seq,
                             ..Default::default()
                         },
                         sem_otime: ds.sem_otime as u64,
@@ -1324,6 +1332,10 @@ fn sysv_semctl<M: GuestMemory>(
                 // SETALL path needs) at the Linux offset, zero elsewhere. A
                 // host-truth by-name fill is a follow-up once a conformance box
                 // for the lane can bless the layout.
+                // TODO(parent): replace the zeroed ipc_perm with a host-truth fill
+                // via carrick_portable::IpcPermFields::from_host(key, euid, egid,
+                // host_mode, seq) once the lane reads the host semid_ds perm fields
+                // (the pure packer + tests already live in carrick-portable).
                 let _ = creds;
                 let nsems = match host_sem_nsems(semid) {
                     Ok(n) => n,
