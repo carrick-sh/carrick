@@ -1495,7 +1495,19 @@ impl SyscallDispatcher {
             // `tst_checkpoint_wake … ETIMEDOUT`. Route shared addresses
             // through `__ulock` (the same path the multi-threaded
             // dispatcher uses) so the wakeup keys on the physical page.
-            let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+            // A non-PRIVATE futex on a live thread's CLONE_CHILD_CLEARTID address
+            // (glibc's `pthread_join` waits on `pd->tid` non-PRIVATE) is woken by
+            // carrick's IN-PROCESS `handle_thread_exit` (`futex.wake`), NOT a guest
+            // `FUTEX_WAKE` — so it must use the in-process futex table, never a
+            // cross-process mirror. On bhyve the mirror is a SEPARATE word and a
+            // mirror `__ulock` WAIT would never be woken by the in-process exit-wake,
+            // so the join HANGS (the immediate-`pthread_join` failure; KVM is immune —
+            // its "mirror" IS the guest word). A no-op on HVF/KVM, where this private
+            // descriptor word never resolved to a mirror anyway. This is the one
+            // non-PRIVATE word whose waker is the host, not the guest.
+            let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE)
+                || thread.registry.is_clear_child_tid_addr(address.0)
+            {
                 None
             } else {
                 memory.shared_futex_host_addr(address.0)

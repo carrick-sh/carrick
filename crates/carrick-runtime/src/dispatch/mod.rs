@@ -2919,7 +2919,18 @@ fn dispatch_threaded_futex(
     // inter-process rendezvous: route it through the host __ulock keyed on the
     // shared physical page so a waker in another carrick process is reached.
     // Private/anon futexes stay in the in-process parking-lot table.
-    let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+    //
+    // EXCEPT a non-PRIVATE futex on a live thread's CLONE_CHILD_CLEARTID address:
+    // glibc's `pthread_join` waits on `pd->tid` non-PRIVATE, but its waker is
+    // carrick's IN-PROCESS `handle_thread_exit` (`futex.wake`), not a guest
+    // `FUTEX_WAKE`. It must stay in the in-process table — on bhyve the cross-process
+    // mirror is a SEPARATE word and a mirror `__ulock` WAIT would never be woken by
+    // the in-process exit-wake, so the join HANGS (the immediate-`pthread_join`
+    // failure; KVM is immune — its mirror IS the guest word). No-op on HVF/KVM, where
+    // this private descriptor word never resolved to a mirror anyway.
+    let shared_host_addr = if futex_flags.contains(LinuxFutexFlags::PRIVATE)
+        || registry.is_clear_child_tid_addr(address)
+    {
         None
     } else {
         memory.shared_futex_host_addr(address)
