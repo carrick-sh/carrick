@@ -222,20 +222,34 @@ build-x86-fixture:
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).
 # Runs on the Mac (no nested VM needed) — matches the CI cross-check job.
+# `carrick-host-linux` (native-epoll host glue) is in the closure so an
+# aarch64-linux compile break is caught here; its native unit tests run on the
+# ubuntu CI runner (see .github/workflows/ci.yml `cross-check-linux`).
 check-linux:
-    cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm
+    cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm -p carrick-host-linux
     ./scripts/closure-assert-no-hvf.sh
 
 # Cross-check the FULL carrick-cli + carrick-runtime closure for
 # x86_64-unknown-freebsd — including the C deps (ring via oci-client), so the
 # whole platform-freebsd binary is covered, not just the no-HVF backend crates.
-# The CALLER must export the FreeBSD cross C toolchain so ring's build.rs targets
-# freebsd: CC_x86_64_unknown_freebsd / AR_x86_64_unknown_freebsd /
+# `--all-targets` so the crates' #[test] modules compile too (a test-only break
+# is still a break). The CALLER must export the FreeBSD cross C toolchain so
+# ring's build.rs targets freebsd: CC_x86_64_unknown_freebsd /
+# AR_x86_64_unknown_freebsd /
 # CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsdN --sysroot=<base.txz extract>".
 # CI (.github/workflows/ci.yml) fetches the sysroot + sets these. `cargo check`
 # does NOT link, so no FreeBSD linker is needed — only the cross C compiler.
 check-freebsd:
-    cargo check --target x86_64-unknown-freebsd --no-default-features --features platform-freebsd -p carrick-cli -p carrick-runtime
+    cargo check --target x86_64-unknown-freebsd --no-default-features --features platform-freebsd --all-targets -p carrick-cli -p carrick-runtime
+
+# Cross-check the NetBSD/NVMM backend closure for x86_64-unknown-netbsd. NVMM's
+# crate (carrick-vmm-nvmm) depends only on the shared backend/host crates — NOT
+# carrick-runtime — so it cross-compiles WITHOUT ring's C deps or a NetBSD
+# sysroot: `cargo check` needs only the std target (declared in
+# rust-toolchain.toml). This catches an nvmm trait-signature break that CI
+# previously could not see at all.
+check-netbsd:
+    cargo check --target x86_64-unknown-netbsd --all-targets -p carrick-vmm-nvmm
 
 # Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
 closure-linux:
