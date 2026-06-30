@@ -203,17 +203,34 @@ probes/workloads as the KVM lane under bhyve:
   correctly). Explicitly tested on the box and did NOT fix it: adding HALT_EXIT in
   `materialize_sibling` (already set), and skipping `vcpu_reset` for fresh siblings.
 
-  So the bug is **bhyve-level: a sibling (AP, vcpuid≥1) vCPU's port `OUT` does not cause a
-  `VM_EXITCODE_INOUT`**, while the BSP's (vcpuid 0) does (its FAULT doorbells were observed exiting
-  in run()). This is what carrick's entire trap/doorbell substrate depends on, so the AP runs zero
-  guest user instructions. **Key lever for the fix:** `VM_CAP_HALT_EXIT` *is* honored on the AP
-  (it's set in the restore path) — i.e. a guest `HLT` *does* exit even when `OUT` does not — so a
-  **HLT-based doorbell** (replace the `OUT $0xCx` doorbells with `HLT` + a reason marker, disambig
-  in run()'s `VM_EXITCODE_HLT` arm) is a viable carrick-side fix that sidesteps the AP I/O-exit
-  defect. The alternative is to root-cause why the AP's VMX I/O-exit control isn't active (a bhyve
-  VMCS-init question; not resolvable from carrick without bhyve VMX internals). Next: prototype the
-  HLT-doorbell on the fault stub and confirm the sibling reaches the host, then extend to the
-  syscall/FP doorbells.
+  **FINAL ROOT CAUSE (2026-06-30, via FreeBSD kernel source + dtrace/bhyvectl — supersedes the
+  "OUT does not exit" reading above, which was wrong):** the box is **AMD (SVM), and bhyve runs
+  NESTED under Proxmox/KVM (the willow fleet)** — the kernel profile shows the sibling thread
+  spinning in `vmm.ko\`svm_run` (not `vmx_run`). Per-vCPU `bhyvectl --get-stats` over a 20s window:
+  - **BSP (vcpuid 0):** 291 exits, 198 nested-page-faults — healthy.
+  - **AP (vcpuid 1):** 2517 exits = **2511 external-interrupt** + 5 NPF, and **253 handled in
+    userspace**. A per-exit trace of the AP's `run_x86` returns: **1 `Inout{port:199=0xC7}`**
+    (its FIRST `#PF` fault doorbell DOES reach carrick) then **241 `Bogus` exits**.
+
+  So the `OUT` *does* exit and the doorbell *does* reach carrick. The AP services its first demand
+  fault, then **every subsequent re-entry returns `VM_EXITCODE_BOGUS`** — svm_vmexit's *default*
+  exitcode (svm.c:1371), set when an exit is unhandled or happens during event delivery. carrick's
+  `run()` loop blindly re-runs on `Bogus` (bhyve_x86_engine.rs:705 "re-run on spurious un-requested
+  BOGUS"), so the AP spins forever and never reaches the worker.
+
+  **This is almost certainly a NESTED-SVM artifact, NOT a carrick/bhyve bug.** bhyve's L1 config is
+  correct (IOPM `memset 0xFF` = trap-all, shared per-VM, every VMCB; IO + HALT intercepts;
+  all-dirty on first run). The BSP — whose L2 VMCB is set up at guest boot — works. Only the
+  **dynamically-created AP** (vcpuid 1, opened + run *after* the L2 guest is already running) loops
+  on persistent `Bogus`. That signature points at **KVM (L0) mishandling a dynamically-created L2
+  AP vCPU's shadow VMCB / event-injection state under nested SVM**, which carrick cannot fix.
+
+  **To confirm + unblock:** run the repro on **real (non-nested) AMD or Intel hardware** — bhyve's
+  config is correct, so threads should work there. If a real box also fails, the next lead is the
+  AP's post-fault VMCB event-injection state (svm.c:1020-1035 / 1729-1735 `exitintinfo`
+  re-injection) producing the `Bogus`. A carrick-side mitigation (bound the blind `Bogus` re-run in
+  run() and surface a diagnostic instead of spinning) is worth adding regardless, but it treats the
+  symptom, not the cause.
 
 ## R6 — conformance gating: fleet population
 
