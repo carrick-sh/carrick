@@ -939,6 +939,44 @@ fn trap_watchdog_wall_window() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// One progress-aware trap-watchdog checkpoint decision.
+#[derive(Debug, PartialEq, Eq)]
+enum TrapWatchdog {
+    /// Under the count pre-filter — keep running (the cheap hot-path case).
+    KeepRunning,
+    /// Over the count pre-filter, but the guest made wall-clock progress within
+    /// `max_wall` (a syscall-bound-but-progressing loop) — reset the count budget
+    /// and keep running, do NOT abort.
+    ResetBudget,
+    /// Over the count pre-filter AND no signal-handler progress for `max_wall`
+    /// (a genuine wedge) — abort the vCPU loop.
+    Trip,
+}
+
+/// Decide what the progress-aware trap watchdog should do at one checkpoint.
+///
+/// The watchdog trips on a WALL-TIME stall, not on raw syscall count:
+/// `traps_since_signal` exceeding `max_traps` is only a cheap pre-filter (it
+/// gates the comparatively expensive wall-clock read at the call site). Once the
+/// pre-filter fires, the guest is aborted only if there has ALSO been no
+/// delivered-signal progress for `elapsed >= max_wall`; otherwise the count
+/// budget is reset and the guest keeps running. Pure so the trip / no-trip
+/// boundaries are unit-testable without a live vCPU.
+fn trap_watchdog_decision(
+    traps_since_signal: usize,
+    max_traps: usize,
+    elapsed: std::time::Duration,
+    max_wall: std::time::Duration,
+) -> TrapWatchdog {
+    if traps_since_signal <= max_traps {
+        TrapWatchdog::KeepRunning
+    } else if elapsed >= max_wall {
+        TrapWatchdog::Trip
+    } else {
+        TrapWatchdog::ResetBudget
+    }
+}
+
 /// Run one vCPU (one guest thread) until it exits the process, finishes its own
 /// thread, or hits the trap limit. Holds NO lock during the vCPU run; takes the
 /// dispatcher lock only to dispatch + complete each syscall.
@@ -1004,11 +1042,19 @@ where
                 // handler) for `max_wall` — a genuinely wedged guest; otherwise
                 // reset the count budget and keep running. `last_progress` is
                 // re-sampled rarely (handler delivery + this pre-filter), so the
-                // hot per-syscall path takes no Instant::now().
-                if last_progress.elapsed() >= max_wall {
-                    break;
+                // hot per-syscall path takes no Instant::now(). The outer count
+                // guard guarantees we are past the pre-filter, so the decision is
+                // only ever `Trip` or `ResetBudget` here.
+                match trap_watchdog_decision(
+                    traps - budget_floor,
+                    state.max_traps,
+                    last_progress.elapsed(),
+                    max_wall,
+                ) {
+                    TrapWatchdog::Trip => break,
+                    TrapWatchdog::ResetBudget => budget_floor = traps,
+                    TrapWatchdog::KeepRunning => {}
                 }
-                budget_floor = traps;
             }
             if kernel.exec_replacing_other_thread(state.this_tid) {
                 return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
@@ -1500,6 +1546,66 @@ fn service_signals_threaded<E: ThreadedEngine>(
 mod tests {
     use super::signal::lower_el0_fault;
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn trap_watchdog_keeps_running_below_count_prefilter() {
+        // Below the count pre-filter, the wall clock is irrelevant — never trip,
+        // even after a long elapsed window.
+        assert_eq!(
+            trap_watchdog_decision(100, 1000, Duration::from_secs(60), Duration::from_secs(30)),
+            TrapWatchdog::KeepRunning
+        );
+        // Exactly AT the count threshold is still under (the guard uses `>`).
+        assert_eq!(
+            trap_watchdog_decision(1000, 1000, Duration::from_secs(60), Duration::from_secs(30)),
+            TrapWatchdog::KeepRunning
+        );
+    }
+
+    #[test]
+    fn trap_watchdog_resets_budget_when_count_exceeded_but_wall_intact() {
+        // Over the count pre-filter but the guest made wall-clock progress
+        // recently (a syscall-bound-but-progressing loop) → reset, do not abort.
+        assert_eq!(
+            trap_watchdog_decision(
+                1001,
+                1000,
+                Duration::from_millis(100),
+                Duration::from_secs(30)
+            ),
+            TrapWatchdog::ResetBudget
+        );
+        // Just under the wall window is still a reset (the trip uses `>=`).
+        assert_eq!(
+            trap_watchdog_decision(
+                2_000_000,
+                1000,
+                Duration::from_millis(29_999),
+                Duration::from_millis(30_000)
+            ),
+            TrapWatchdog::ResetBudget
+        );
+    }
+
+    #[test]
+    fn trap_watchdog_trips_on_count_and_wall_stall() {
+        // Over the count pre-filter AND no progress for >= max_wall → abort.
+        // The boundary is inclusive (`>=`): exactly max_wall trips.
+        assert_eq!(
+            trap_watchdog_decision(1001, 1000, Duration::from_secs(30), Duration::from_secs(30)),
+            TrapWatchdog::Trip
+        );
+        assert_eq!(
+            trap_watchdog_decision(
+                1_000_000,
+                1000,
+                Duration::from_secs(45),
+                Duration::from_secs(30)
+            ),
+            TrapWatchdog::Trip
+        );
+    }
 
     #[test]
     fn default_ignore_signals_are_not_terminating() {
