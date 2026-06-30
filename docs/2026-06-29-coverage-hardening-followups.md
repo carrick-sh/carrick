@@ -184,12 +184,36 @@ probes/workloads as the KVM lane under bhyve:
   - `VM_CAP_HALT_EXIT` is enabled on the main (BSP) vCPU but NOT on siblings — a real latent gap,
     but enabling it did NOT fix this (it is a spin, not a halt).
 
-  **Open question for the fix:** what is at guest VA `0x1153a4`, and why does the sibling spin
-  there — a carrick guest stub self-loop the `iretq` lands on, a demand-fault loop where the
-  sibling's page commit isn't visible to its own EPT (that WOULD be a per-vCPU coherence bug), or
-  glibc's `clone3` child spinning on a bad TLS/`tid`. Next step: read the instruction bytes at
-  that GPA + single-step the sibling vCPU one trap past bring-up. This is a bhyve sibling-vCPU
-  **bring-up** bug, not a guest-RAM-sharing project.
+  **EXACT ROOT CAUSE (2026-06-30, pinned):** guest VA `0x1153a4` is the `jmp .` (`EB FE`) at the
+  end of the **per-vCPU `#PF` fault stub** (`fault_slot_gpa(X86_FAULT_STUB_GPA=0x114000, id=1)` =
+  `0x115000`; vector-14 stub + offset `0x24`). The bhyve fault stub
+  (`guest_setup_x86::fault_stub_for_vector`) is `…store fault frame to scratch; OUT %al,$0xC7
+  (E6 C7); jmp . (EB FE)` — it signals the host via the **`OUT $0xC7` doorbell** then *parks at
+  the `jmp .`* until the host services the fault and moves RIP off it. The sibling takes a demand
+  `#PF` (first touch of its fresh thread stack), runs the stub, but **its `OUT $0xC7` does NOT
+  VM-exit** — so the host never sees the doorbell (verified: an id-keyed probe in run()'s
+  `FAULT_DOORBELL` arm never fires for `id!=0`), and the AP parks in the `jmp .` forever. carrick's
+  syscall (`OUT $0xC5`) and FP (`OUT $0xC6`) doorbells are the same `OUT`-based mechanism, so the
+  AP can't make a syscall either — it can do *nothing* that exits via I/O.
+
+  Ruled out (carrick-side setup is COMPLETE for the sibling): `program_x86_vcpu_longmode_entry`
+  (the restore path, via `set_syscall_msrs`) already does `program_fault_tables(id)` (IDT/TR for
+  the sibling's slot) AND `set_capability(VM_CAP_HALT_EXIT,1)` — so fault tables, HALT_EXIT,
+  segments, and the blob+iretq are all correct (the iretq delivered rax=0 + child-stack
+  correctly). Explicitly tested on the box and did NOT fix it: adding HALT_EXIT in
+  `materialize_sibling` (already set), and skipping `vcpu_reset` for fresh siblings.
+
+  So the bug is **bhyve-level: a sibling (AP, vcpuid≥1) vCPU's port `OUT` does not cause a
+  `VM_EXITCODE_INOUT`**, while the BSP's (vcpuid 0) does (its FAULT doorbells were observed exiting
+  in run()). This is what carrick's entire trap/doorbell substrate depends on, so the AP runs zero
+  guest user instructions. **Key lever for the fix:** `VM_CAP_HALT_EXIT` *is* honored on the AP
+  (it's set in the restore path) — i.e. a guest `HLT` *does* exit even when `OUT` does not — so a
+  **HLT-based doorbell** (replace the `OUT $0xCx` doorbells with `HLT` + a reason marker, disambig
+  in run()'s `VM_EXITCODE_HLT` arm) is a viable carrick-side fix that sidesteps the AP I/O-exit
+  defect. The alternative is to root-cause why the AP's VMX I/O-exit control isn't active (a bhyve
+  VMCS-init question; not resolvable from carrick without bhyve VMX internals). Next: prototype the
+  HLT-doorbell on the fault stub and confirm the sibling reaches the host, then extend to the
+  syscall/FP doorbells.
 
 ## R6 — conformance gating: fleet population
 
