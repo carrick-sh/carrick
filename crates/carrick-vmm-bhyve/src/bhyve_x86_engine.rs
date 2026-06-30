@@ -1223,7 +1223,7 @@ fn shared_futex_mirror_base() -> Option<usize> {
 
 /// Resolve a guest futex-word VA to the host address of its fork-coherent mirror word,
 /// claiming an open-addressed slot on first sight. `None` if the mmap failed or the
-/// table is full (in which case the cross-process futex degrades to the old behaviour).
+/// table is full (the cross-process futex then degrades to the old per-VM behaviour).
 fn shared_futex_mirror_slot(key: u64) -> Option<usize> {
     use std::sync::atomic::Ordering::{AcqRel, Acquire};
     let base = shared_futex_mirror_base()?;
@@ -1273,23 +1273,14 @@ impl X86Vmm for BhyveVmm {
         // fork — so resolve it to its fork-coherent mirror slot. The dispatch syncs the
         // per-VM guest word <-> the mirror at the WAIT/WAKE boundaries (proc.rs).
         //
-        // HONOR THE GuestMemory CONTRACT: a SEPARATE mirror is ONLY for genuinely
-        // cross-process (`MAP_SHARED`) words — return `None` for private/anon, so
-        // those futexes use the per-VM guest word (HVF/KVM do the same via
-        // `guest_shared`). The mirror starts at 0 and is only ever published by a
-        // cross-process `FUTEX_WAKE`; a PRIVATE word set to a nonzero value by a
-        // host write — e.g. a thread descriptor's `pd->tid`, which carrick writes
-        // for `CLONE_*_SETTID` and which glibc's `pthread_join` then waits on with
-        // a non-PRIVATE `FUTEX_WAIT` — would see mirror(0) != tid, spuriously
-        // `EAGAIN`, and (worse) get its guest word clobbered to the mirror's 0, so
-        // the join returns WITHOUT waiting and the freshly-created thread is torn
-        // down before it runs (the bhyve immediate-`pthread_join` failure; works on
-        // KVM precisely because KVM has no separate mirror — the word IS the guest
-        // word). The mirror's sibling waker shares THIS VM's sysmem, so the guest
-        // word is already coherent for it.
-        if !self.ram.is_shared_va(key) {
-            return None;
-        }
+        // NOTE: the ONE non-PRIVATE futex that must NOT use this mirror is a thread
+        // descriptor's `pd->tid` (glibc's `pthread_join` waits on it non-PRIVATE), whose
+        // waker is carrick's IN-PROCESS `CLONE_CHILD_CLEARTID` (`handle_thread_exit` →
+        // `futex.wake`), not a guest `FUTEX_WAKE` — a mirror `__ulock` WAIT would never be
+        // woken and the join would HANG. The host-neutral dispatch routes that word to the
+        // in-process table BEFORE reaching here (it recognises a live thread's
+        // `clear_child_tid` address); see `dispatch/proc.rs`. Everything else — every
+        // genuine `MAP_SHARED` (file or anon) cross-process futex — keeps the mirror.
         shared_futex_mirror_slot(key)
     }
 
@@ -2107,4 +2098,24 @@ pub fn engine_from_brought_up(bux: BroughtUpX86) -> X86EngineCore<BhyveVmm> {
         pml4_lock: Arc::new(std::sync::Mutex::new(())),
     };
     X86EngineCore::from_parts(vmm, vcpu, BHYVE_X86_LAYOUT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A futex-word key resolves to a STABLE mirror slot (open-addressing claims it
+    /// once and re-finds it thereafter).
+    #[test]
+    fn mirror_slot_is_stable_per_key() {
+        // A key unlikely to collide with any real guest VA the process-global table
+        // may already hold from a sibling test.
+        let key = 0xDEAD_BEEF_1000u64;
+        let a1 = shared_futex_mirror_slot(key).expect("mirror slot");
+        let a2 = shared_futex_mirror_slot(key).expect("mirror slot");
+        assert_eq!(
+            a1, a2,
+            "the same key resolves to the same mirror value addr"
+        );
+    }
 }

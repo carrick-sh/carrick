@@ -255,19 +255,35 @@ probes/workloads as the KVM lane under bhyve:
   `mirror(0) != val(tid)` → `EAGAIN`, **and clobbers the guest word `pd->tid` to the mirror's 0**, so
   glibc re-reads 0 and the join returns. **Works on KVM precisely because KVM has no separate mirror
   — the host word IS the guest word (= tid).** The Heisenbug (dtrace/sleep "fix" it) was just the
-  worker winning the race and exiting first. **Fix (this commit): scope the mirror to genuinely
-  cross-process `MAP_SHARED` words — `shared_futex_host_addr` returns `None` unless the VA is in a
-  registered shm alias (`BhyveGuestRam::is_shared_va`)**; a private thread futex uses the per-VM
-  guest word its sibling waker already shares. Verified: `threads_join` N∈{1,2,4,8} → correct,
-  12/12 stress, cross-process shm-futex rendezvous still works, unit test
-  `is_shared_va_scopes_futex_mirror_to_shm_aliases`. Repro: `threads_join`/`freeze`/`tidread` on the
-  FreeBSD box.
+  worker winning the race and exiting first.
 
-  (Lesson, per "verify diagnoses empirically": I wrongly concluded "nested-SVM artifact" twice
-  AND "host-write→guest-read coherence gap" once — three wrong diagnoses — before a parent-syscall
-  trace showed the join's actual `FUTEX` op. The "manual guest load reads the correct tid" datapoint
-  killed the coherence theory; the `op=0x109` non-private flag named the real bug. The user's host
-  comparison (KVM works) was the right prior to keep chasing a carrick bhyve-specific bug.)
+  **The fix took THREE tries — the first two regressed other futexes (caught by attribution + dtrace,
+  not assumption):** (1) scope the mirror to file-backed shm aliases (`is_shared_va`) — fixed
+  `pthread_join` but **regressed `MAP_SHARED|MAP_ANON` cross-process futexes** (LTP `futex_wait02`:
+  pre-fix MATCH → TIMEOUT), proven by running `futex_wait02` on the pre-fix vs fixed binary on the
+  SAME image. (2) keep the mirror for all non-private but SEED it from the guest word on first claim
+  — **hung the join**: the tid futex's waker is carrick's in-process `handle_thread_exit`
+  (`futex.wake`), so a seeded mirror `__ulock` WAIT is never woken (the join's WAIT and the CLEARTID
+  WAKE land on different channels). A high-VA-threshold variant fixed the join but STILL left
+  `futex_wait02` TIMEOUT (its cross-process futex word is BELOW the 1 TiB aperture). **Correct fix
+  (this commit): route ONLY a non-PRIVATE futex on a live thread's `CLONE_CHILD_CLEARTID` address to
+  the in-process table** (`ThreadRegistry::is_clear_child_tid_addr`, checked in BOTH
+  `dispatch_threaded_futex` (the threaded hot path — the first edit wrongly landed in the
+  single-threaded `futex` fn, caught by dtracing `carrick:::futex-route`) and the single-threaded
+  `futex`). That is the ONE non-PRIVATE word whose waker is the host, not the guest; everything else
+  keeps the mirror unchanged. **dtrace-verified:** the four `pthread_join` tid VAs (`0x6000…`, ~384
+  GiB) route `inproc` with `isum=10`, while `cross_futex`'s shm word (`0x10000000000`, the 1 TiB
+  aperture) routes `MIRROR`. Conformance (same image): `futex_wait02` back to MATCH, `futex_wait05` /
+  `futex_wait_bitset01` / `futex_wake01` MATCH, `cross_futex` OK; `futex_cmp_requeue01` /
+  `futex_wake03` still fail identically on the pre-fix binary (image skew, not this change). Repros:
+  `threads_join`/`cross_futex` on the FreeBSD box; routing probe `carrick:::futex-route` (arg3=shared).
+
+  (Lesson, per "verify diagnoses empirically": FIVE wrong turns — "nested-SVM artifact" ×2,
+  "host-write→guest-read coherence gap", the shm-scoping regression, and the seed-then-hang — each
+  killed by a MEASUREMENT not an argument: a parent-syscall trace named the real `op=0x109` bug; a
+  pre-fix-vs-fixed same-image run attributed the `futex_wait02` regression; and dtracing
+  `futex-route` caught the fix landing in dead code (single-threaded path) AND confirmed the final
+  routing. The user's "KVM works" prior and "use dtrace/lldb" nudge were both decisive.)
 
 ## R6 — conformance gating: fleet population
 

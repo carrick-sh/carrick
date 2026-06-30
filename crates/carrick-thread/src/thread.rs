@@ -173,6 +173,22 @@ impl ThreadRegistry {
         }
     }
 
+    /// True iff `addr` is the live (nonzero) `CLONE_CHILD_CLEARTID` address of ANY
+    /// thread — i.e. a `pd->tid` word that carrick's IN-PROCESS `handle_thread_exit`
+    /// clears + wakes on thread exit. A non-PRIVATE `FUTEX_WAIT` on such a word
+    /// (glibc's `pthread_join` waits on `pd->tid` non-PRIVATE) must take the
+    /// in-process futex table, NOT a cross-process mirror — its waker is in-process,
+    /// so a mirror wait would never be woken (the bhyve immediate-`pthread_join`
+    /// hang; a no-op on HVF/KVM, where such a private word never had a mirror).
+    pub fn is_clear_child_tid_addr(&self, addr: u64) -> bool {
+        addr != 0
+            && self
+                .inner
+                .lock()
+                .values()
+                .any(|e| e.clear_child_tid == addr)
+    }
+
     /// Returns true if this was the last live thread (process should exit).
     pub fn exit(&self, tid: ThreadId) -> bool {
         let mut map = self.inner.lock();
