@@ -19,11 +19,12 @@
 
 use std::path::PathBuf;
 
+use carrick_hal::GuestVmBackend;
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::x8664_arch::X8664GuestArch;
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
-use carrick_x86::{X86_PML4_CAPACITY, X86Exit, X86Reg, X86Vcpu, X86Vmm};
+use carrick_x86::{X86_PML4_CAPACITY, X86Exit, X86Reg, X86Vcpu};
 
 const ENTRY_STUB_OFF: u64 = 0x100;
 const LONG_MODE_DOORBELL: &[u8] = &[0xb0, 0xc5, 0xe6, 0xc5, 0xf4];
