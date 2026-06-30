@@ -107,6 +107,34 @@ Keep the backend-specific mapping calls in the backends.
 
 ---
 
+## Fleet-verification findings (2026-06-30, x86_64 KVM box root@10.14.14.66)
+
+Driving the seccomp R2 fix end-to-end on a real x86 KVM guest (build my branch
+in `/root/carrick-campaign`, run a static x86_64 ELF that installs the
+Docker-prologue filter under `carrick run --platform linux/amd64 -v …`) surfaced
+two things:
+
+- ✅ **A second, general seccomp bug — `KILL_PROCESS` silently ignored (LANDED, 98651926).**
+  `SeccompState::check` chose the most-restrictive stacked action with a raw
+  `action < result` compare. That holds for every `SECCOMP_RET_*` EXCEPT
+  `KILL_PROCESS = 0x8000_0000` (the largest u32, yet the most severe), so a
+  guest's `RET_KILL_PROCESS` filter NEVER won and was ignored on every lane —
+  and it masked the R2 arch fix (the libseccomp/Docker arch-mismatch action is
+  KILL_PROCESS). Fixed with an explicit severity rank; red-first unit test +
+  verified end-to-end: unconditional-KILL now SIGSYS-kills (exit 159); the
+  `arch != X86_64 -> KILL` prologue ALLOWS the x86_64 guest (SURVIVED); an
+  `arch != AARCH64 -> KILL` prologue KILLS it. This pair (T2 survives + T3 kills)
+  is the definitive proof the R2 arch fix reports x86_64 on a real x86 guest.
+- ⚠️ **NEW: clean guest exit returns 139 (SIGSEGV) on the x86 debug build.** The
+  x86_64-gate test printed `SURVIVED` then carrick reported exit **139** (128+11)
+  instead of the guest's `exit(0)`. Unrelated to seccomp (the syscall ran), but a
+  real x86 guest-teardown/exit-path issue worth a focused repro: a static x86_64
+  ELF that just `write`s and `return 0`s, run under `carrick run` on the KVM lane,
+  exits 139. Reproduce, then trace the exit_group/teardown path.
+
+Box note: `/root/carrick-campaign` (1.2 GB, my branch + a built debug `carrick`)
+is left on the box for inspection — `rm -rf` it to reclaim space.
+
 ## R6 — conformance gating: fleet population
 
 The harness mechanisms (lane-derived overlays, `--bless --lane`, the per-probe
