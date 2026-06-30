@@ -9,3 +9,12 @@
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
+# Cross-compile targets the gates need, declared on the PINNED toolchain (not
+# just added to CI's moving @stable). The host-integration suite builds a static
+# aarch64-unknown-linux-musl fixture ELF (scripts/build-linux-fixtures.sh), and
+# the aarch64-linux cross-check runs `cargo check --target
+# aarch64-unknown-linux-gnu`. Declaring them here makes rustup install them for
+# 1.96.0 in every environment, so the targets land on the toolchain cargo
+# actually uses — not a sibling `stable` toolchain that this file then overrides
+# (which is exactly how a fresh CI runner ended up missing them).
+targets = ["aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl"]
