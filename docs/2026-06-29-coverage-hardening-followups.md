@@ -237,14 +237,26 @@ probes/workloads as the KVM lane under bhyve:
   `threads_sleepn` N=2/N=4 now run all workers with a COHERENT shared atomic (isum=3/10 = correct).
   It was never memory incoherence, never a nested-host artifact — a carrick fault-resume bug.**
 
-  **Residual (separate, tracked):** a worker that hits a glibc thread-startup **futex / barrier**
-  during bring-up (e.g. `pthread_barrier_wait`, `threads_paramn`/`threads_barr`) still fails — it
-  parks before its first instruction and never wakes (no fault-resume, no output). That is a
-  distinct sibling futex/reclaim-during-bring-up issue, not the suppressor. Repro:
-  `threads_barr`/`threads_paramn` on the FreeBSD box. (Lesson, per the "verify diagnoses
-  empirically" rule: I wrongly concluded "nested artifact" twice before the per-exit RIP-write trace
-  showed the suppressor — the host comparison the user pointed out, KVM-backend works, was the right
-  prior to keep chasing carrick.)
+  **Residual (separate, tracked) — pinned to `pthread_join`, NOT the barrier:** a program that
+  joins a worker *immediately* (no sleep/work between create and join) still reads `isum=0`,
+  because **`pthread_join` returns early before the worker runs**, then main `_exit`s and kills it.
+  Discriminated empirically: `threads_sleepn` (sleep) → correct; `threads_barr` (barrier, no sleep)
+  → fails BUT `threads_barsl` (barrier **+ sleep**) → correct; `threads_join` (no barrier, no sleep,
+  immediate join) → fails. So the barrier/FP are red herrings; the variable is the **immediate
+  join**. Traced: carrick's host-side `write_bytes` of the child/parent TID to the worker's fresh
+  glibc thread descriptor (`&pd->tid`) **succeeds host-side (`ok=true`)**, but the **guest reads it
+  as stale 0** — glibc's join then sees `pd->tid==0`, treats the thread as already-exited, and skips
+  the wait (the join FUTEX_WAIT with the tid value NEVER fires in a per-exit trace). So this is a
+  **bhyve host-write → guest-read coherence gap on a fresh demand-page** (the campaign's known-hard
+  bhyve guest-RAM area), distinct from the suppressor. It bites any program that joins quickly after
+  spawning (including `pthread_barrier_wait`, whose `threads_paramn`/`threads_barr` join right after
+  create). Next: confirm host-vs-guest divergence on the exact GPA (carrick's VA→GPA walk vs the
+  guest hardware walk / the bhyve demand-commit), then make a host-side write to a guest VA commit
+  the GPA guest-coherently. Repro: `threads_join` on the FreeBSD box.
+
+  (Lesson, per "verify diagnoses empirically": I wrongly concluded "nested-SVM artifact" twice
+  before the per-exit RIP-write trace found the suppressor — the user's host comparison (KVM backend
+  works) was the right prior to keep chasing carrick.)
 
 ## R6 — conformance gating: fleet population
 
