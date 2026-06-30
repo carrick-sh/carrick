@@ -55,6 +55,12 @@ jobs:
       - name: Build
         run: just check --workspace
 
+      # Keep the fuzz harness (separate excluded workspace) compiling so a
+      # carrick-runtime ABI-decode change doesn't silently bit-rot it. Check
+      # only — running the fuzzer needs the nightly sanitizer toolchain.
+      - name: Fuzz harness compile-check
+        run: just check-fuzz
+
       # Rustdoc gate: broken intra-doc links / unclosed-HTML-tag lints fail the
       # build, mirroring the clippy gate (--document-private-items because
       # carrick is internal — most of its substance lives on private items).

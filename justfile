@@ -48,6 +48,13 @@ run *ARGS: build
 check *ARGS:
     cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
 
+# Compile-check the fuzz harness (a separate `[workspace]` excluded from the main
+# build, so a bit-rotted target / a changed carrick-runtime ABI-decode entry
+# point is otherwise invisible to CI). `cargo check` only — `cargo fuzz run`
+# needs the nightly sanitizer toolchain; this just keeps the harness compiling.
+check-fuzz:
+    cargo check --manifest-path fuzz/Cargo.toml
+
 # Install git hooks (.githooks/): fmt-check at commit, clippy gate at push.
 install-hooks:
     git config core.hooksPath .githooks
