@@ -28,7 +28,18 @@ turnkey on the right box.
 
 ## R4-x86 — the carrick-x86 / reclaim consolidation (fleet)
 
-### 1. bhyve reclaim: fail loud instead of silent FP/FS-GS corruption (correctness; do first)
+### 1. bhyve reclaim: fail loud instead of silent FP/FS-GS corruption — ✅ LANDED (d6672417)
+
+> **Done 2026-06-30**, compile-verified on x86_64 FreeBSD 15.1 (the real bhyve
+> target). Implemented the no-trait-change design below: `save_guest_state`
+> `?`-propagates the register/desc/FP reads inside a `Result` closure (Ok(None)
+> stays the legit no-FP case) and returns an EMPTY buffer on error;
+> `rebind_to_slot` rejects a too-short buffer with a clean `TrapError` and
+> propagates the FP-restore error. Happy-path buffer format is byte-identical, so
+> normal reclaim is unchanged. **Remaining:** a full reclaim-stress run (an x86
+> thread-stress fixture under bhyve) to exercise the path end-to-end — the change
+> is safe-by-construction, so this is confirmation, not a blocker.
+
 
 `crates/carrick-vmm-bhyve/src/bhyve_x86_engine.rs::save_guest_state` (the M:N
 reclaim-on-block path) silently swallows every read error:
