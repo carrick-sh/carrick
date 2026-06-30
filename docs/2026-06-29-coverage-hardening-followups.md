@@ -163,9 +163,33 @@ probes/workloads as the KVM lane under bhyve:
   `forkshared` / MAP_SHARED-anon / cross-process-futex-mirror work). It breaks
   most multithreaded guests (Go, Python-with-threads, …). **Repro:** a 2-thread
   `pthread_barrier_wait` + `atomic_fetch_add(&global, id)` under `carrick run
-  --platform linux/amd64` on bhyve → `isum=0`. Root cause is architectural (the
-  per-thread-vCPU fork model must share the FULL guest sysmem for CLONE_VM, not
-  just explicit MAP_SHARED regions); a real fix is a focused bhyve-memory project.
+  --platform linux/amd64` on bhyve → `isum=0`.
+
+  **CORRECTED ROOT CAUSE (2026-06-30, after a workflow design + dtrace/lldb/bhyvectl dig — the
+  "memory coherence" framing above is WRONG):** the shared counter reads 0 because the worker
+  threads **never execute a single instruction of guest user code** — not because their writes
+  are lost. Evidence chain:
+  - A glibc NPTL `pthread_create` issues `clone3` with the full `THREAD_MASK` (`flags=0x3d0f00`),
+    so the dispatcher routes it to the **in-process sibling path** (`vcpu_loop/threads.rs` →
+    `materialize_sibling`), NOT the `EagerCopy` fork path. The fork/`ForkRamStrategy` redesign is
+    the wrong target (the adversarial review caught this).
+  - The sibling reaches `run_vcpu_until_exit` → `next_syscall` → bhyve `run_x86` → the `VM_RUN`
+    ioctl, and **never returns** from that first run. A native `lldb` backtrace of the wedged
+    `guest-tid-*` thread shows it in `__sys_ioctl` ← `BhyveVcpu::run_x86` (vmm_x86.rs:242). It is
+    NOT blocked: per-thread CPU climbs ~+5s/5s at ~70-80% — the vCPU **spins in guest code**.
+  - `bhyvectl --vm=… --cpu=1` shows the sibling vCPU pinned at a **fixed** `rip=0x1153a4` (a tight
+    self-loop), with `rax=0` and `rsp`=child-stack — so the ring-0 blob's `iretq` *did* deliver
+    the clone-child context. It just spins at one instruction, issuing no syscall/fault/HLT, so
+    the worker never runs and `pthread_join` returns the moment the process `_exit`s.
+  - `VM_CAP_HALT_EXIT` is enabled on the main (BSP) vCPU but NOT on siblings — a real latent gap,
+    but enabling it did NOT fix this (it is a spin, not a halt).
+
+  **Open question for the fix:** what is at guest VA `0x1153a4`, and why does the sibling spin
+  there — a carrick guest stub self-loop the `iretq` lands on, a demand-fault loop where the
+  sibling's page commit isn't visible to its own EPT (that WOULD be a per-vCPU coherence bug), or
+  glibc's `clone3` child spinning on a bad TLS/`tid`. Next step: read the instruction bytes at
+  that GPA + single-step the sibling vCPU one trap past bring-up. This is a bhyve sibling-vCPU
+  **bring-up** bug, not a guest-RAM-sharing project.
 
 ## R6 — conformance gating: fleet population
 
