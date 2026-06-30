@@ -757,6 +757,11 @@ pub struct SyscallRequest {
     pub number: u64,
     pub args: SyscallArgs,
     pub guest_abi: LinuxGuestAbi,
+    /// The guest's architecture-native syscall number (see
+    /// [`carrick_hal::RawSyscall::native_number`]): equals `number` for aarch64
+    /// guests, the raw x86_64 UAPI number for x86_64 guests. seccomp filters are
+    /// evaluated against this, not the normalized `number`.
+    pub native_number: u64,
 }
 
 /// Uniform context handed to every *normalized* syscall handler, so all
@@ -845,6 +850,7 @@ impl SyscallRequest {
             number,
             args,
             guest_abi: LinuxGuestAbi::Aarch64,
+            native_number: number,
         }
     }
 
@@ -870,6 +876,7 @@ impl SyscallRequest {
             // Linux loops are type-erased over the ISA). Reading it off `raw`
             // means no call site can forget it and mis-marshal the x86 path.
             guest_abi: raw.guest_abi,
+            native_number: raw.native_number,
         }
     }
 }
@@ -2167,12 +2174,15 @@ impl SyscallDispatcher {
         if !self.seccomp.is_active() {
             return None;
         }
-        let data = crate::seccomp::SeccompData {
-            nr: request.number as i32,
-            arch: crate::seccomp::AUDIT_ARCH_AARCH64,
-            instruction_pointer: 0,
-            args: request.args.0,
-        };
+        // Feed the filter the guest's ISA-native arch + syscall number. Using
+        // the canonical (aarch64) number or a hardcoded aarch64 arch makes an
+        // x86_64 guest fail its own Docker/libseccomp profile, which gates on
+        // `arch == AUDIT_ARCH_X86_64` then switches on x86_64 syscall numbers.
+        let data = crate::seccomp::SeccompData::for_guest(
+            request.native_number as i32,
+            request.guest_abi,
+            request.args.0,
+        );
         let ret = self.seccomp.check(&data);
         match ret & crate::seccomp::SECCOMP_RET_ACTION_FULL {
             crate::seccomp::SECCOMP_RET_ALLOW
