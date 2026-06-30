@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Nightly: catches @stable toolchain drift and drives the dormant
+  # self-hosted guest-execution lane (kvm-smoke) once a runner is registered.
+  schedule:
+    - cron: "0 7 * * *"
 
 # Cancel superseded runs on the same ref to save runner minutes.
 concurrency:
@@ -108,8 +112,15 @@ jobs:
         with:
           tool: just
 
-      - name: Cross-check carrick-hal + carrick-vmm-kvm for aarch64-linux
+      - name: Cross-check carrick-hal + carrick-vmm-kvm + carrick-host-linux for aarch64-linux
         run: just check-linux
+
+      # The native-epoll host backend (carrick-host-linux) only runs its real
+      # logic on Linux — cross-compiling it above proves it builds, but its
+      # EV_EOF→EPOLLHUP / IN_IGNORED edge tests need a live kernel. This runner
+      # IS x86_64-linux, so run them natively. No /dev/kvm, no guest needed.
+      - name: Native unit tests for carrick-host-linux
+        run: cargo test -p carrick-host-linux
 
   # Cross-compile the FULL carrick-cli + carrick-runtime closure for
   # x86_64-unknown-freebsd — INCLUDING the C deps (ring via oci-client), handled
@@ -168,6 +179,63 @@ jobs:
           CFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
           CXXFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
         run: just check-freebsd
+
+  # Cross-compile the NetBSD/NVMM backend (carrick-vmm-nvmm) for
+  # x86_64-unknown-netbsd. Unlike the FreeBSD job this needs NO sysroot / C
+  # toolchain: carrick-vmm-nvmm depends only on the shared backend/host crates
+  # (NOT carrick-runtime → ring), so `cargo check` builds it from the netbsd std
+  # target alone. Without this job an nvmm trait-signature break is invisible to
+  # CI — exactly the class of break `just check-netbsd --all-targets` surfaced.
+  cross-check-netbsd:
+    name: x86_64-netbsd cross-check · nvmm backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (+ netbsd target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-netbsd
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Cross-check carrick-vmm-nvmm for x86_64-netbsd
+        run: just check-netbsd
+
+  # R1 — the ONLY CI lane that actually EXECUTES a guest vCPU. Runs the
+  # freestanding hello-aarch64 ELF under carrick-vmm-kvm on real /dev/kvm
+  # (`just kvm-smoke`, no Docker) so a broken syscall translation, a shared
+  # carrick-x86 / carrick-aarch64 engine fault, or a reclaim deadlock surfaces
+  # in CI instead of waiting for a manual gate. Requires a self-hosted Linux
+  # runner WITH /dev/kvm whose arch matches the fixture (aarch64 for
+  # hello-aarch64; nested virt is NOT guaranteed on GitHub-hosted Ubuntu).
+  # DORMANT until a runner is registered AND the repo var
+  # CARRICK_SELF_HOSTED_KVM=true is set — mirroring the hvf-conformance pattern.
+  # Scheduled (nightly) / manual only, so PRs are not blocked on the fleet.
+  kvm-smoke:
+    name: KVM guest smoke · real /dev/kvm
+    if: ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: [self-hosted, linux, kvm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: KVM smoke — run-elf hello-aarch64 on /dev/kvm
+        run: just kvm-smoke
 
   # Dependency license / bans / sources gate. Enforces the deny.toml permissive
   # allowlist so a copyleft/unknown-license transitive dependency fails CI rather
