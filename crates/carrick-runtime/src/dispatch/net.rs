@@ -154,6 +154,75 @@ fn rewrite_unspecified_connect_loopback(family: i32, host_addr: &mut [u8]) {
 #[cfg(target_os = "linux")]
 fn rewrite_unspecified_connect_loopback(_family: i32, _host_addr: &mut [u8]) {}
 
+// The transform only exists (and only matters) on a non-Linux host, where the
+// kernel does NOT itself remap 0.0.0.0 → loopback; on Linux it is a no-op, so
+// the test is compiled out there rather than asserting an intentional no-op.
+#[cfg(all(test, not(target_os = "linux")))]
+mod connect_loopback_tests {
+    use super::*;
+
+    /// A host `sockaddr_in` laid out as `[sa_family:u16][sin_port:u16 BE][sin_addr:4][pad:8]`.
+    fn sockaddr_in(family: i32, addr: [u8; 4], port_be: [u8; 2]) -> Vec<u8> {
+        let mut buf = vec![0u8; 16];
+        buf[0..2].copy_from_slice(&(family as u16).to_ne_bytes());
+        buf[2..4].copy_from_slice(&port_be);
+        buf[4..8].copy_from_slice(&addr);
+        buf
+    }
+
+    #[test]
+    fn inaddr_any_rewrites_to_loopback_preserving_port() {
+        // 0.0.0.0:8080 (port 0x1f90 big-endian) must become 127.0.0.1:8080.
+        let mut buf = sockaddr_in(libc::AF_INET, [0, 0, 0, 0], [0x1f, 0x90]);
+        rewrite_unspecified_connect_loopback(libc::AF_INET, &mut buf);
+        assert_eq!(
+            &buf[4..8],
+            &[127, 0, 0, 1],
+            "INADDR_ANY (0.0.0.0) must be rewritten to loopback"
+        );
+        assert_eq!(&buf[2..4], &[0x1f, 0x90], "the port must be preserved");
+        // sa_family must be untouched.
+        assert_eq!(
+            u16::from_ne_bytes([buf[0], buf[1]]),
+            libc::AF_INET as u16,
+            "the address family must be preserved"
+        );
+    }
+
+    #[test]
+    fn real_ipv4_address_is_left_untouched() {
+        let mut buf = sockaddr_in(libc::AF_INET, [10, 0, 0, 5], [0x00, 0x50]);
+        rewrite_unspecified_connect_loopback(libc::AF_INET, &mut buf);
+        assert_eq!(
+            &buf[4..8],
+            &[10, 0, 0, 5],
+            "a non-unspecified address must NOT be rewritten"
+        );
+    }
+
+    #[test]
+    fn non_inet_family_is_untouched_even_when_address_is_zero() {
+        // The loopback quirk is IPv4-only: an AF_INET6 (or any non-AF_INET)
+        // sockaddr with a zeroed addr field must be left exactly as-is.
+        let mut buf = sockaddr_in(libc::AF_INET6, [0, 0, 0, 0], [0x01, 0xbb]);
+        rewrite_unspecified_connect_loopback(libc::AF_INET6, &mut buf);
+        assert_eq!(
+            &buf[4..8],
+            &[0, 0, 0, 0],
+            "IPv6 / other families must never be rewritten"
+        );
+    }
+
+    #[test]
+    fn buffer_shorter_than_sin_addr_is_a_noop_not_a_panic() {
+        // A truncated buffer (< 8 bytes) must be left alone rather than panicking
+        // on the [4..8] slice.
+        let mut buf = vec![0u8; 4];
+        rewrite_unspecified_connect_loopback(libc::AF_INET, &mut buf);
+        assert_eq!(buf, vec![0u8; 4]);
+    }
+}
+
 fn connect_success_or_pending_error(host_fd: i32) -> DispatchOutcome {
     let mut host_err: i32 = 0;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
