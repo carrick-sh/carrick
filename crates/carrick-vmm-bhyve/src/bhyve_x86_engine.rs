@@ -1272,6 +1272,24 @@ impl X86Vmm for BhyveVmm {
         // futex-word VA (syscall_buffer_gpa is identity on bhyve) — stable across the
         // fork — so resolve it to its fork-coherent mirror slot. The dispatch syncs the
         // per-VM guest word <-> the mirror at the WAIT/WAKE boundaries (proc.rs).
+        //
+        // HONOR THE GuestMemory CONTRACT: a SEPARATE mirror is ONLY for genuinely
+        // cross-process (`MAP_SHARED`) words — return `None` for private/anon, so
+        // those futexes use the per-VM guest word (HVF/KVM do the same via
+        // `guest_shared`). The mirror starts at 0 and is only ever published by a
+        // cross-process `FUTEX_WAKE`; a PRIVATE word set to a nonzero value by a
+        // host write — e.g. a thread descriptor's `pd->tid`, which carrick writes
+        // for `CLONE_*_SETTID` and which glibc's `pthread_join` then waits on with
+        // a non-PRIVATE `FUTEX_WAIT` — would see mirror(0) != tid, spuriously
+        // `EAGAIN`, and (worse) get its guest word clobbered to the mirror's 0, so
+        // the join returns WITHOUT waiting and the freshly-created thread is torn
+        // down before it runs (the bhyve immediate-`pthread_join` failure; works on
+        // KVM precisely because KVM has no separate mirror — the word IS the guest
+        // word). The mirror's sibling waker shares THIS VM's sysmem, so the guest
+        // word is already coherent for it.
+        if !self.ram.is_shared_va(key) {
+            return None;
+        }
         shared_futex_mirror_slot(key)
     }
 
