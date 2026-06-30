@@ -939,4 +939,110 @@ mod tests {
         assert_eq!(child.rsp, 0x1111, "fork child inherits parent rsp");
         assert_eq!(child.fs_base, 0x2222, "fork child inherits parent fs_base");
     }
+
+    /// Minimal `X86Vcpu` that just records `set_gpr` calls — enough to assert
+    /// what `program_longmode_entry` programs into the entry registers. The
+    /// methods it does not touch are never called here.
+    #[derive(Default)]
+    struct RecordingVcpu {
+        gprs: Vec<(X86Reg, u64)>,
+    }
+    impl RecordingVcpu {
+        fn last(&self, r: X86Reg) -> Option<u64> {
+            self.gprs
+                .iter()
+                .rev()
+                .find(|(x, _)| *x == r)
+                .map(|(_, v)| *v)
+        }
+    }
+    impl X86Vcpu for RecordingVcpu {
+        fn get_gpr(&self, _r: X86Reg) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+        fn set_gpr(&mut self, r: X86Reg, v: u64) -> Result<(), TrapError> {
+            self.gprs.push((r, v));
+            Ok(())
+        }
+        fn set_segment(&mut self, _s: X86Seg, _b: u64, _l: u32, _a: u32) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn get_fs_base(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+        fn set_fs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn get_gs_base(&self) -> Result<u64, TrapError> {
+            Ok(0)
+        }
+        fn set_gs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+        fn set_syscall_msrs(&mut self, _l: u64, _s: u64, _m: u64) -> Result<MsrInstall, TrapError> {
+            Ok(MsrInstall::Direct)
+        }
+        fn get_fp(&self) -> Result<Option<[u8; 512]>, TrapError> {
+            Ok(None)
+        }
+        fn set_fp(&mut self, _fx: &[u8; 512]) -> Result<bool, TrapError> {
+            Ok(true)
+        }
+        fn run(&mut self) -> Result<crate::vmm::X86Exit, TrapError> {
+            Err(TrapError::Hypervisor(
+                "RecordingVcpu::run unused".to_owned(),
+            ))
+        }
+        fn enable_halt_exit(&mut self) -> Result<(), TrapError> {
+            Ok(())
+        }
+    }
+
+    /// Regression guard for the static-binary exit-139 bug: the initial x86 entry
+    /// must ZERO the GPRs (Linux `ELF_PLAT_INIT`). RDX especially — the SysV ABI
+    /// defines it at entry as `rtld_fini`, which glibc registers via `__cxa_atexit`
+    /// and CALLS during exit teardown, so leftover garbage there makes a static
+    /// binary jump to a bogus address at exit and SIGSEGV.
+    #[test]
+    fn program_longmode_entry_zeroes_entry_gprs() {
+        let mut v = RecordingVcpu::default();
+        let entry_rip = 0x4000_1234u64;
+        let rsp = 0x7fff_ffff_e000u64;
+        program_longmode_entry(&mut v, test_layout(), entry_rip, rsp)
+            .expect("program_longmode_entry");
+        // RSP / RIP keep their values; only the scratch GPRs are zeroed.
+        assert_eq!(
+            v.last(X86Reg::Rsp),
+            Some(rsp),
+            "RSP must keep the user stack"
+        );
+        assert_eq!(
+            v.last(X86Reg::Rip),
+            Some(entry_rip),
+            "RIP must be the entry"
+        );
+        for r in [
+            X86Reg::Rax,
+            X86Reg::Rbx,
+            X86Reg::Rcx,
+            X86Reg::Rdx,
+            X86Reg::Rsi,
+            X86Reg::Rdi,
+            X86Reg::Rbp,
+            X86Reg::R8,
+            X86Reg::R9,
+            X86Reg::R10,
+            X86Reg::R11,
+            X86Reg::R12,
+            X86Reg::R13,
+            X86Reg::R14,
+            X86Reg::R15,
+        ] {
+            assert_eq!(
+                v.last(r),
+                Some(0),
+                "entry GPR {r:?} must be zeroed (rtld_fini/RDX is the load-bearing one)"
+            );
+        }
+    }
 }
