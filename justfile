@@ -226,6 +226,17 @@ check-linux:
     cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm
     ./scripts/closure-assert-no-hvf.sh
 
+# Cross-check the FULL carrick-cli + carrick-runtime closure for
+# x86_64-unknown-freebsd — including the C deps (ring via oci-client), so the
+# whole platform-freebsd binary is covered, not just the no-HVF backend crates.
+# The CALLER must export the FreeBSD cross C toolchain so ring's build.rs targets
+# freebsd: CC_x86_64_unknown_freebsd / AR_x86_64_unknown_freebsd /
+# CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsdN --sysroot=<base.txz extract>".
+# CI (.github/workflows/ci.yml) fetches the sysroot + sets these. `cargo check`
+# does NOT link, so no FreeBSD linker is needed — only the cross C compiler.
+check-freebsd:
+    cargo check --target x86_64-unknown-freebsd --no-default-features --features platform-freebsd -p carrick-cli -p carrick-runtime
+
 # Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
 closure-linux:
     ./scripts/closure-assert-no-hvf.sh
