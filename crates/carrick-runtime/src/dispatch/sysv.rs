@@ -518,7 +518,9 @@ impl SyscallDispatcher {
         /// shmctl(shmid, cmd, buf).
         ///   IPC_RMID — unlink the backing file (mappings remain valid).
         ///   IPC_STAT — write a shmid_ds (112 bytes on aarch64) into `buf`.
-        ///   IPC_SET  — no-op success (we don't enforce perms).
+        ///   IPC_SET  — apply the requested permission bits (and refresh
+        ///              shm_ctime) in carrick's owned segment bookkeeping so a
+        ///              following IPC_STAT reads them back.
         fn shmctl(this, cx, shmid: u64, cmd: u64, buf: u64) {
             let shmid = shmid as i32;
             match cmd {
@@ -546,7 +548,42 @@ impl SyscallDispatcher {
                     }
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
-                LINUX_IPC_SET => Ok(DispatchOutcome::Returned { value: 0 }),
+                LINUX_IPC_SET => {
+                    // IPC_SET applies the permission bits from the guest's
+                    // shmid_ds (the low 0o777 of shm_perm.mode) to carrick's
+                    // OWNED segment metadata and refreshes shm_ctime, mirroring
+                    // Linux `ipc_update_perm`. carrick runs as a single host
+                    // identity so it can't reassign the owner uid/gid, but it CAN
+                    // store the mode — a SysV shm segment here is carrick's own
+                    // /tmp backing file plus this bookkeeping, NOT a host SysV
+                    // object, so the store lands in `state.segments` and a
+                    // following IPC_STAT (which reads `segment.mode` via
+                    // `shmid_ds_bytes`) reads it back. It was previously a silent
+                    // no-op, dropping the mode change on every lane (the semctl/
+                    // msgctl IPC_SET twins already apply their fields).
+                    if buf == 0 {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    // shm_perm.mode lives at offset 20 in the shmid_ds
+                    // (LinuxIpcPerm.mode), the same offset semctl IPC_SET reads.
+                    let new_mode = match cx.memory.read_bytes(buf + 20, 4) {
+                        Ok(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut state = this.sysv.lock();
+                    match state.segments.get_mut(&shmid) {
+                        Some(seg) => {
+                            seg.mode = (seg.mode & !0o777) | (new_mode & 0o777);
+                            seg.ctime = now;
+                            Ok(DispatchOutcome::Returned { value: 0 })
+                        }
+                        None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    }
+                }
                 LINUX_SHM_STAT | LINUX_SHM_STAT_ANY => {
                     // SHM_STAT takes an INDEX into the kernel's segment
                     // table (NOT a shmid). It writes the shmid_ds for the
@@ -1351,4 +1388,85 @@ fn host_sem_nsems(semid: i32) -> Result<usize, i32> {
     let rc = unsafe { carrick_portable::semctl_ptr(semid, 0, libc::IPC_STAT, &mut ds) };
     rc.host_syscall_errno()
         .map(|_| carrick_portable::sem_nsems(&ds))
+}
+
+#[cfg(test)]
+mod ipc_set_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// `shmctl(IPC_SET)` must APPLY the requested permission bits to carrick's
+    /// owned shm-segment bookkeeping — it was a silent no-op on every lane, so
+    /// the mode change a guest requested was dropped. After IPC_SET, an IPC_STAT
+    /// must read the new mode back. (Mirrors the semctl/msgctl IPC_SET twins,
+    /// which already apply their supplied fields.) Pre-fix the stat read-back
+    /// would still report the unchanged 0o600.
+    #[test]
+    fn shmctl_ipc_set_stores_mode_and_round_trips_via_ipc_stat() {
+        let dispatcher = SyscallDispatcher::new();
+        let reporter = CompatReporter::default();
+
+        // Seed a segment with an initial mode of 0o600. IPC_SET/IPC_STAT operate
+        // purely on carrick's metadata, so no host backing file is needed.
+        let shmid: i32 = 4242;
+        dispatcher.sysv.lock().segments.insert(
+            shmid,
+            ShmSegment {
+                path: PathBuf::from("/tmp/carrick-shm/test-ipc-set"),
+                size: 4096,
+                mode: 0o600,
+                nattch: 0,
+                ctime: 1,
+                atime: 0,
+                dtime: 0,
+            },
+        );
+
+        // Guest shmid_ds whose shm_perm.mode (offset 20) requests 0o666.
+        let buf_addr = 0x10000u64;
+        let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x400]);
+        memory
+            .write_bytes(buf_addr + 20, &0o666u32.to_le_bytes())
+            .unwrap();
+
+        let set = dispatcher
+            .dispatch_normalized(
+                SyscallRequest::new(
+                    195,
+                    SyscallArgs::from([shmid as u64, LINUX_IPC_SET, buf_addr, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .expect("shmctl is a claimed syscall")
+            .expect("shmctl IPC_SET must not be a fatal DispatchError");
+        assert_eq!(set, DispatchOutcome::Returned { value: 0 });
+
+        // IPC_STAT into a fresh region of the same buffer.
+        let stat_addr = 0x10100u64;
+        let stat = dispatcher
+            .dispatch_normalized(
+                SyscallRequest::new(
+                    195,
+                    SyscallArgs::from([shmid as u64, LINUX_IPC_STAT, stat_addr, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .expect("shmctl is a claimed syscall")
+            .expect("shmctl IPC_STAT must not be a fatal DispatchError");
+        assert_eq!(stat, DispatchOutcome::Returned { value: 0 });
+
+        // shm_perm.mode is at offset 20 of the shmid_ds written by IPC_STAT.
+        let b = memory.read_bytes(stat_addr + 20, 4).unwrap();
+        let mode = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        assert_eq!(
+            mode & 0o777,
+            0o666,
+            "IPC_SET must store the requested mode so IPC_STAT reads it back \
+             (pre-fix IPC_SET was a no-op and this stayed 0o600)"
+        );
+    }
 }
