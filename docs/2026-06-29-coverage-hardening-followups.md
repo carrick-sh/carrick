@@ -141,6 +141,32 @@ two things:
 Box note: `/root/carrick-campaign` (1.2 GB, my branch + a built debug `carrick`)
 is left on the box for inspection — `rm -rf` it to reclaim space.
 
+## bhyve fleet verification (2026-06-30, FreeBSD 15.1 root@10.14.14.189)
+
+Built this branch on the FreeBSD box (`/root/carrick-campaign`) and ran the same
+probes/workloads as the KVM lane under bhyve:
+
+- ✅ **All three shared fixes carry to bhyve.** `seccompenforce` is all-true
+  (KILL_PROCESS→SIGSYS, native arch, native number) and a static `write+return 0`
+  ELF exits 0 — confirming the seccomp dispatcher fixes and the carrick-x86
+  entry-GPR static-exit fix (which is in shared `program_longmode_entry`) all fix
+  bhyve too, not just KVM. Single-threaded demand-paging + mremap is also correct.
+- 🐞 **NEW (pre-existing) bhyve bug: `CLONE_VM` threads do not coherently share
+  BSS/heap.** A pthread program where N threads `atomic_fetch_add` a shared
+  global reports `isum=0` (all writes lost) for **N=2 and up** — i.e. NOT
+  reclaim-related (hw.vmm.maxcpu=8; it fails well below that), and not my
+  regression (none of my changes touch bhyve's clone/guest-memory model; the
+  original Jun-23 binary crashed earlier on the same test, mine runs far enough to
+  show the wrong result). The same binary is correct natively and under
+  Linux/KVM. So threads aren't sharing the main thread's address space on bhyve —
+  this is the campaign's known-hard "bhyve guest-memory coherence" area (see the
+  `forkshared` / MAP_SHARED-anon / cross-process-futex-mirror work). It breaks
+  most multithreaded guests (Go, Python-with-threads, …). **Repro:** a 2-thread
+  `pthread_barrier_wait` + `atomic_fetch_add(&global, id)` under `carrick run
+  --platform linux/amd64` on bhyve → `isum=0`. Root cause is architectural (the
+  per-thread-vCPU fork model must share the FULL guest sysmem for CLONE_VM, not
+  just explicit MAP_SHARED regions); a real fix is a focused bhyve-memory project.
+
 ## R6 — conformance gating: fleet population
 
 The harness mechanisms (lane-derived overlays, `--bless --lane`, the per-probe
