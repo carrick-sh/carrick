@@ -29,7 +29,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-const SYS_FUTEX: libc::c_long = 98; // aarch64
+// Per-target: libc resolves to 98 on aarch64-linux, 202 on x86_64-linux. A raw
+// `98` ran getrusage on the x86_64 lanes and false-MATCHed.
+const SYS_FUTEX: libc::c_long = libc::SYS_futex;
 const FUTEX_WAIT: libc::c_int = 0;
 const FUTEX_WAKE: libc::c_int = 1;
 const FUTEX_REQUEUE: libc::c_int = 3;
