@@ -558,6 +558,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "carrick-hal",
+ "carrick-observability",
  "libc",
  "parking_lot",
  "parking_lot_core",

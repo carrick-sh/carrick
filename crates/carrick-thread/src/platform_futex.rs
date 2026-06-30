@@ -55,6 +55,32 @@ pub trait SharedFutexSyscall: Send + Sync {
     fn pre_wait(&self, _host_addr: usize, _val: u32) {}
 }
 
+/// Classify one cross-process futex wait slice's raw host return into a
+/// [`SharedWaitStep`] (the Linux `FUTEX_WAIT` errno ABI guard from
+/// [`carrick_hal::classify_wait_slice`]) AND record the silent fold when a
+/// non-`{ETIMEDOUT,EINTR}` host errno is swallowed into a spurious wake.
+///
+/// This is the ONE seam every host shim (HVF `os_sync`, KVM `SYS_futex`, bhyve
+/// `_umtx_op`, NVMM futex) routes its raw kernel result through, so the guard AND
+/// its observability are single-sourced: the `futex-unexpected-errno` USDT probe
+/// fires on every backend, not just HVF. `host_etimedout`/`host_eintr` are passed
+/// in because the numeric errno values differ per host OS.
+#[inline]
+pub fn classify_observed_wait_slice(
+    raw: i64,
+    host_addr: usize,
+    host_etimedout: i32,
+    host_eintr: i32,
+) -> SharedWaitStep {
+    let step = carrick_hal::classify_wait_slice(raw, host_etimedout, host_eintr);
+    // A wake is `raw >= 0`; the only way `raw < 0` yields `Woken` is the
+    // unexpected-errno guard folding a non-Linux-futex errno into a spurious wake.
+    if raw < 0 && matches!(step, SharedWaitStep::Woken) {
+        carrick_observability::probes::futex_unexpected_errno(host_addr as u64, (-raw) as i32);
+    }
+    step
+}
+
 /// The one `PlatformFutex` impl: a process-private [`FutexTable`] (the private
 /// path, byte-identical across every backend) paired with a host
 /// [`SharedFutexSyscall`] (the shared, cross-process path). Replaces the
