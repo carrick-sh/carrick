@@ -378,52 +378,155 @@ pub fn sem_nsems(ds: &SemidDs) -> usize {
     ds.sem_nsems as usize
 }
 
+// ---- SysV IPC permission fields ----
+// The Linux `ipc64_perm` owner/permission fields the guest reads back from an
+// IPC_STAT (msgctl/semctl/shmctl) are a pure transform of the host object's
+// `ipc_perm` (plus the guest's own creds). carrick runs as ONE host identity, so
+// the owner and creator ids coincide. The host `mode` carries allocation flags
+// the Linux ABI does not (macOS `SEM_ALLOC` = 0o1000, etc.); the guest must see
+// only the 9 permission bits. Keeping the packing/masking here makes it testable
+// on every host and shareable across the per-VMM lanes — the non-macOS lanes
+// currently return a ZEROED perm (see carrick-runtime `dispatch/sysv.rs`
+// IPC_STAT), which these helpers let a host-truth fill replace.
+
+/// Permission-bit mask of a SysV IPC `mode` (rwx for owner/group/other).
+pub const IPC_PERM_MODE_MASK: u32 = 0o777;
+
+/// Mask a host IPC `mode` down to the Linux-visible permission bits, dropping
+/// host allocation flags (e.g. macOS `SEM_ALLOC`). Used to fill `ipc_perm.mode`
+/// for an IPC_STAT so the guest sees exactly the mode it created with.
+#[inline]
+pub fn ipc_perm_mode_to_linux(host_mode: u32) -> u32 {
+    host_mode & IPC_PERM_MODE_MASK
+}
+
+/// Apply an IPC_SET `mode`: replace the host mode's permission bits with the
+/// guest-supplied ones, preserving the host's non-permission (allocation) bits
+/// so a subsequent IPC_STAT still reflects them. The host kernel re-adds its own
+/// allocation flag regardless; this just keeps any other high bits intact.
+#[inline]
+pub fn ipc_set_apply_mode(host_mode: u32, guest_new_mode: u32) -> u32 {
+    (host_mode & !IPC_PERM_MODE_MASK) | (guest_new_mode & IPC_PERM_MODE_MASK)
+}
+
+/// The Linux `ipc64_perm` owner/permission fields, built from host primitives.
+/// (The full on-wire `ipc64_perm`/`semid64_ds` struct with its padding lives in
+/// the runtime; this is only the value-carrying subset the transform decides.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IpcPermFields {
+    pub key: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub mode: u32,
+    pub seq: u16,
+}
+
+impl IpcPermFields {
+    /// Build the `ipc_perm` fields from host-provided primitives. `owner_uid`/
+    /// `owner_gid` are the effective owner (carrick is a single host identity,
+    /// so creator == owner). `host_mode` is masked to the permission bits;
+    /// `key`/`seq` come straight from the host `ipc_perm`.
+    #[inline]
+    pub fn from_host(key: i32, owner_uid: u32, owner_gid: u32, host_mode: u32, seq: u16) -> Self {
+        Self {
+            key,
+            uid: owner_uid,
+            gid: owner_gid,
+            cuid: owner_uid,
+            cgid: owner_gid,
+            mode: ipc_perm_mode_to_linux(host_mode),
+            seq,
+        }
+    }
+}
+
 // ---- extended attributes ----
 // Darwin's f*xattr take a trailing `position` (resource-fork offset, always 0
 // for the xattrs carrick uses) that Linux lacks; the `flags`/`options` arg also
 // shifts position. These wrappers expose the common (Linux-shaped) signature.
 
-/// On BSD extattr hosts, parse a Linux-style xattr name (`"user.foo"`,
-/// `"system.foo"`, …)
-/// into a `(namespace, attr_name)` pair for the `extattr_*_fd` API.
-/// Unmapped prefixes fall back to `EXTATTR_NAMESPACE_USER`.
-#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-fn bsd_extattr_ns(name: &std::ffi::CStr) -> (libc::c_int, std::ffi::CString) {
-    let bytes = name.to_bytes();
-    // FreeBSD/NetBSD extattr has only USER and SYSTEM namespaces, and the kernel
-    // REJECTS any attr name that begins with a namespace name ("user."/"system.")
-    // with EINVAL, so the Linux name can't be stored verbatim. Linux has four
-    // namespaces (user/system/trusted/security): user.* lives in USER stripped
-    // (USER unambiguously means user.*); the privileged three share SYSTEM but
-    // carry a 1-char tag ("s."/"t."/"c.") so a list round-trip can tell them apart.
-    // Without a tag all three collapsed to one indistinguishable SYSTEM:<name>, so
-    // a `security.foo` set came back from listxattr as `system.foo` (LTP
-    // flistxattr01/listxattr01). `flistxattr` below decodes the tags. The tag is
-    // 1 char, so the stored name never exceeds the Linux name (EXTATTR_MAXNAMELEN
-    // 255). Tags are not namespace prefixes, so the kernel accepts them.
-    if let Some(rest) = bytes.strip_prefix(&b"user."[..]) {
-        return (
-            libc::EXTATTR_NAMESPACE_USER as libc::c_int,
-            std::ffi::CString::new(rest).unwrap_or_default(),
-        );
+/// Which BSD `extattr` namespace a Linux xattr name maps to. FreeBSD/NetBSD
+/// expose only USER and SYSTEM `extattr` namespaces; the BSD call site turns this
+/// enum into the matching `libc::EXTATTR_NAMESPACE_*` constant. Those constants
+/// are BSD-only and do not exist on macOS, so the *mapping* lives here as a pure
+/// transform that compiles and is unit-tested on every CI host (it regressed once
+/// — commit 0660b721 — precisely because it could only be exercised on BSD).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BsdExtattrNamespace {
+    /// `EXTATTR_NAMESPACE_USER` — holds Linux `user.*` (and any unprefixed name).
+    User,
+    /// `EXTATTR_NAMESPACE_SYSTEM` — holds the three privileged Linux namespaces
+    /// (`system.`/`trusted.`/`security.`), distinguished by a 1-char stored tag.
+    System,
+}
+
+/// Map a Linux-style xattr name to a BSD `(namespace, stored_name)` pair for the
+/// `extattr_*` API.
+///
+/// FreeBSD/NetBSD `extattr` has only USER and SYSTEM namespaces, and the kernel
+/// REJECTS any attr name that begins with a namespace name (`"user."`/`"system."`)
+/// with EINVAL, so the Linux name can't be stored verbatim. Linux has four
+/// namespaces (user/system/trusted/security): `user.*` lives in USER stripped
+/// (USER unambiguously means `user.*`); the privileged three share SYSTEM but
+/// carry a 1-char tag (`"s."`/`"t."`/`"c."`) so a list round-trip can tell them
+/// apart. Without a tag all three collapsed to one indistinguishable
+/// `SYSTEM:<name>`, so a `security.foo` set came back from listxattr as
+/// `system.foo` (LTP flistxattr01/listxattr01). The tag is 1 char, so the stored
+/// name never exceeds the Linux name (EXTATTR_MAXNAMELEN 255). Tags are not
+/// namespace prefixes, so the kernel accepts them. An unrecognized prefix falls
+/// back to USER, stored verbatim. [`bsd_xattr_to_linux`] is the inverse.
+pub fn linux_xattr_to_bsd(name: &[u8]) -> (BsdExtattrNamespace, Vec<u8>) {
+    if let Some(rest) = name.strip_prefix(&b"user."[..]) {
+        return (BsdExtattrNamespace::User, rest.to_vec());
     }
     for (prefix, tag) in [
         (&b"system."[..], &b"s."[..]),
         (&b"trusted."[..], &b"t."[..]),
         (&b"security."[..], &b"c."[..]),
     ] {
-        if let Some(rest) = bytes.strip_prefix(prefix) {
-            let tagged = [tag, rest].concat();
-            return (
-                libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
-                std::ffi::CString::new(tagged).unwrap_or_default(),
-            );
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return (BsdExtattrNamespace::System, [tag, rest].concat());
         }
     }
-    (
-        libc::EXTATTR_NAMESPACE_USER as libc::c_int,
-        std::ffi::CString::new(bytes).unwrap_or_default(),
-    )
+    (BsdExtattrNamespace::User, name.to_vec())
+}
+
+/// Inverse of [`linux_xattr_to_bsd`]: decode a BSD `(namespace, stored_name)`
+/// back to its Linux xattr name. Returns `None` for an UNtagged SYSTEM entry —
+/// that is a host/OS attribute, not a guest one, and `listxattr` must skip it.
+pub fn bsd_xattr_to_linux(ns: BsdExtattrNamespace, stored: &[u8]) -> Option<Vec<u8>> {
+    match ns {
+        BsdExtattrNamespace::User => Some([&b"user."[..], stored].concat()),
+        BsdExtattrNamespace::System => {
+            // Inverse of the tagging in `linux_xattr_to_bsd`.
+            for (tag, prefix) in [
+                (&b"s."[..], &b"system."[..]),
+                (&b"t."[..], &b"trusted."[..]),
+                (&b"c."[..], &b"security."[..]),
+            ] {
+                if let Some(rest) = stored.strip_prefix(tag) {
+                    return Some([prefix, rest].concat());
+                }
+            }
+            None
+        }
+    }
+}
+
+/// On BSD extattr hosts, parse a Linux-style xattr name into the
+/// `(EXTATTR_NAMESPACE_*, attr_name)` pair the `extattr_*` API wants. Thin
+/// BSD-only adapter over the pure [`linux_xattr_to_bsd`] transform: it only maps
+/// the namespace enum to the libc constant and converts to a `CString`.
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+fn bsd_extattr_ns(name: &std::ffi::CStr) -> (libc::c_int, std::ffi::CString) {
+    let (ns, attr) = linux_xattr_to_bsd(name.to_bytes());
+    let ns_const = match ns {
+        BsdExtattrNamespace::User => libc::EXTATTR_NAMESPACE_USER as libc::c_int,
+        BsdExtattrNamespace::System => libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+    };
+    (ns_const, std::ffi::CString::new(attr).unwrap_or_default())
 }
 
 /// `fsetxattr` with the portable `(fd, name, value, size, flags)` shape.
@@ -523,9 +626,15 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
         // namespaces and re-emit Linux-style NUL-terminated `"prefix.name\0"`
         // entries.
         let mut out: Vec<u8> = Vec::new();
-        for ns in [
-            libc::EXTATTR_NAMESPACE_USER as libc::c_int,
-            libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+        for (ns, ns_enum) in [
+            (
+                libc::EXTATTR_NAMESPACE_USER as libc::c_int,
+                BsdExtattrNamespace::User,
+            ),
+            (
+                libc::EXTATTR_NAMESPACE_SYSTEM as libc::c_int,
+                BsdExtattrNamespace::System,
+            ),
         ] {
             let need = unsafe { libc::extattr_list_fd(fd, ns, std::ptr::null_mut(), 0) };
             if need <= 0 {
@@ -549,20 +658,8 @@ pub unsafe fn flistxattr(fd: i32, list: *mut libc::c_char, size: usize) -> isize
                 // Decode back to the Linux namespace (inverse of bsd_extattr_ns):
                 // USER holds user.* verbatim ("user." re-added); SYSTEM holds the
                 // privileged three under 1-char tags. An UNtagged SYSTEM name is a
-                // host/OS attribute, not a guest one — skip it.
-                let decoded: Option<Vec<u8>> = if ns == libc::EXTATTR_NAMESPACE_USER as libc::c_int
-                {
-                    Some([&b"user."[..], stored].concat())
-                } else if let Some(r) = stored.strip_prefix(&b"s."[..]) {
-                    Some([&b"system."[..], r].concat())
-                } else if let Some(r) = stored.strip_prefix(&b"t."[..]) {
-                    Some([&b"trusted."[..], r].concat())
-                } else if let Some(r) = stored.strip_prefix(&b"c."[..]) {
-                    Some([&b"security."[..], r].concat())
-                } else {
-                    None
-                };
-                if let Some(name) = decoded {
+                // host/OS attribute, not a guest one — `bsd_xattr_to_linux` skips it.
+                if let Some(name) = bsd_xattr_to_linux(ns_enum, stored) {
                     out.extend_from_slice(&name);
                     out.push(0);
                 }
@@ -794,7 +891,38 @@ pub unsafe fn lsetxattr(
     }
 }
 
-/// Zero-copy regular-file → socket transfer. Returns bytes sent, or `-errno`.
+/// Resolve a Darwin/FreeBSD `sendfile(2)` outcome to the Linux-shaped result.
+///
+/// Those hosts return `0` on success with the byte count in an out-parameter
+/// (`*len`/`*sbytes`), and `-1` with `errno` set on failure — but on a partial
+/// transfer over a non-blocking socket (or a signal) they set the out-parameter
+/// to the bytes that DID reach the wire AND still return `-1` with `EAGAIN`/
+/// `EINTR`. Linux's `sendfile` instead returns that partial count directly.
+///
+/// Given the raw host `rc`, the out-parameter `bytes_sent`, and `errno`, this
+/// returns the value the guest should see: the byte count on full or partial
+/// success, or a NEGATED errno on a hard error. Surfacing the partial count
+/// (rather than `-EAGAIN`) is load-bearing — see commit f52046d5 and
+/// `macos_sendfile_tests`: discarding it makes the caller re-send from the same
+/// offset and duplicate everything already buffered.
+#[inline]
+pub fn resolve_sendfile_result(rc: i64, bytes_sent: usize, errno: i32) -> i64 {
+    if rc == 0 {
+        // Full success: all bytes are in the out-parameter.
+        bytes_sent as i64
+    } else if bytes_sent > 0 && (errno == libc::EAGAIN || errno == libc::EINTR) {
+        // Partial transfer: report what reached the wire so the caller advances
+        // the offset rather than re-sending and duplicating data.
+        bytes_sent as i64
+    } else {
+        // Hard error (incl. EAGAIN/EINTR with nothing sent → caller should wait
+        // for POLLOUT and retry from the same offset).
+        -(errno as i64)
+    }
+}
+
+/// Zero-copy regular-file → socket transfer. Returns bytes sent, or `-1` with the
+/// thread-local `errno` set (Linux shape).
 /// Darwin: `sendfile(file, sock, off, *len_in_out, hdtr, flags)`. Linux:
 /// `sendfile(out_sock, in_file, *off, count)` — note the swapped fd order.
 ///
@@ -806,8 +934,9 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
     {
         let mut len: libc::off_t = count as libc::off_t;
         // Darwin sendfile returns 0 on success (bytes in `len`) or -1 (errno set).
-        // Normalize to the Linux shape: bytes on success, -1 (errno set) on error,
-        // so callers can recover the errno from the thread-local.
+        // Normalize to the Linux shape via `resolve_sendfile_result`: bytes on
+        // full/partial success, -1 (errno preserved in the thread-local) on a
+        // hard error, so callers can recover the errno.
         let rc = unsafe {
             libc::sendfile(
                 file_fd,
@@ -818,18 +947,12 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
                 0,
             )
         };
-        let err = errno();
-        if rc == 0 {
-            len as isize
-        } else if len > 0 && (err == libc::EAGAIN || err == libc::EINTR) {
-            // Partial transfer on a non-blocking socket (or a signal): Darwin set
-            // `len` to the bytes actually sent but still returned -1/EAGAIN. Surface
-            // the partial count (Linux returns it directly) so the caller advances
-            // the offset by exactly what reached the wire. Returning -1 here makes
-            // the caller re-send from the same offset and duplicate the bytes
-            // already buffered — see `macos_sendfile_tests`.
-            len as isize
+        let resolved = resolve_sendfile_result(rc as i64, len.max(0) as usize, errno());
+        if resolved >= 0 {
+            resolved as isize
         } else {
+            // Hard error: the host call already set errno; preserve the
+            // -1-with-errno-in-thread-local contract callers expect.
             rc as isize
         }
     }
@@ -856,15 +979,10 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
                 0,
             )
         };
-        let err = errno();
-        if rc == 0 {
-            sbytes as isize
-        } else if sbytes > 0 && (err == libc::EAGAIN || err == libc::EINTR) {
-            // Partial transfer on a non-blocking socket (or a signal): FreeBSD set
-            // `*sbytes` to the bytes actually sent but returned -1/EAGAIN. Surface
-            // the partial count (Linux shape) so the caller advances the offset
-            // rather than re-sending and duplicating data already on the wire.
-            sbytes as isize
+        // Same Linux-shape normalization as the Darwin arm (shared transform).
+        let resolved = resolve_sendfile_result(rc as i64, sbytes.max(0) as usize, errno());
+        if resolved >= 0 {
+            resolved as isize
         } else {
             rc as isize
         }
@@ -1318,5 +1436,227 @@ mod bsd_extattr_tests {
             )
         };
         assert_eq!(ln, 0, "lsetxattr failed: errno {}", super::errno());
+    }
+}
+
+/// Host-neutral tests for the PURE transforms (no syscalls). These run on the
+/// macOS CI host — the very point of hoisting the logic here — covering the BSD
+/// xattr-namespace mapping, the SysV `ipc_perm` packing/masking, and the
+/// `sendfile` partial-count resolution that were previously trapped behind
+/// BSD-only `cfg`s and exercised on zero CI lanes.
+#[cfg(test)]
+mod pure_transform_tests {
+    use super::*;
+
+    // ---- BSD xattr namespace tag round-trip (commit 0660b721) ----
+
+    #[test]
+    fn xattr_user_round_trips() {
+        let (ns, stored) = linux_xattr_to_bsd(b"user.foo");
+        assert_eq!(ns, BsdExtattrNamespace::User);
+        // user.* is stored STRIPPED in the USER namespace (no tag).
+        assert_eq!(stored, b"foo");
+        assert_eq!(
+            bsd_xattr_to_linux(ns, &stored).as_deref(),
+            Some(&b"user.foo"[..])
+        );
+    }
+
+    #[test]
+    fn xattr_system_round_trips() {
+        let (ns, stored) = linux_xattr_to_bsd(b"system.foo");
+        assert_eq!(ns, BsdExtattrNamespace::System);
+        // system.* shares SYSTEM but carries the "s." tag so it stays distinct
+        // from trusted.*/security.* on a list round-trip.
+        assert_eq!(stored, b"s.foo");
+        assert_eq!(
+            bsd_xattr_to_linux(ns, &stored).as_deref(),
+            Some(&b"system.foo"[..])
+        );
+    }
+
+    #[test]
+    fn xattr_trusted_round_trips() {
+        let (ns, stored) = linux_xattr_to_bsd(b"trusted.foo");
+        assert_eq!(ns, BsdExtattrNamespace::System);
+        assert_eq!(stored, b"t.foo");
+        assert_eq!(
+            bsd_xattr_to_linux(ns, &stored).as_deref(),
+            Some(&b"trusted.foo"[..])
+        );
+    }
+
+    #[test]
+    fn xattr_security_round_trips() {
+        let (ns, stored) = linux_xattr_to_bsd(b"security.foo");
+        assert_eq!(ns, BsdExtattrNamespace::System);
+        assert_eq!(stored, b"c.foo");
+        // The regression guard: without the tag this came back as `system.foo`.
+        assert_eq!(
+            bsd_xattr_to_linux(ns, &stored).as_deref(),
+            Some(&b"security.foo"[..])
+        );
+    }
+
+    #[test]
+    fn xattr_no_dot_falls_back_to_user() {
+        // An unrecognized prefix (no namespace dot) is stored verbatim in USER.
+        let (ns, stored) = linux_xattr_to_bsd(b"nodot");
+        assert_eq!(ns, BsdExtattrNamespace::User);
+        assert_eq!(stored, b"nodot");
+        // On the way back out it is presented under the user namespace.
+        assert_eq!(
+            bsd_xattr_to_linux(ns, &stored).as_deref(),
+            Some(&b"user.nodot"[..])
+        );
+    }
+
+    #[test]
+    fn xattr_each_namespace_decodes_distinctly() {
+        // All three privileged namespaces share SYSTEM; the tags must keep them
+        // from colliding (the original bug collapsed them to one).
+        let cases: [(&[u8], &[u8]); 3] = [
+            (b"system.x", b"system.x"),
+            (b"trusted.x", b"trusted.x"),
+            (b"security.x", b"security.x"),
+        ];
+        for (linux_name, expected) in cases {
+            let (ns, stored) = linux_xattr_to_bsd(linux_name);
+            assert_eq!(ns, BsdExtattrNamespace::System);
+            assert_eq!(
+                bsd_xattr_to_linux(ns, &stored).as_deref(),
+                Some(expected),
+                "round-trip failed for {linux_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xattr_untagged_system_is_skipped() {
+        // A SYSTEM entry that was NOT written by carrick (no s./t./c. tag) is a
+        // host/OS attribute and must be skipped by listxattr.
+        assert_eq!(
+            bsd_xattr_to_linux(BsdExtattrNamespace::System, b"posix_acl"),
+            None
+        );
+        assert_eq!(bsd_xattr_to_linux(BsdExtattrNamespace::System, b""), None);
+    }
+
+    #[test]
+    fn xattr_empty_user_name() {
+        // "user." with nothing after it stores an empty name and round-trips.
+        let (ns, stored) = linux_xattr_to_bsd(b"user.");
+        assert_eq!(ns, BsdExtattrNamespace::User);
+        assert_eq!(stored, b"");
+        assert_eq!(
+            bsd_xattr_to_linux(ns, &stored).as_deref(),
+            Some(&b"user."[..])
+        );
+    }
+
+    // ---- SysV ipc_perm fill (sysv.rs IPC_STAT/IPC_SET) ----
+
+    #[test]
+    fn ipc_perm_mode_masks_allocation_flags() {
+        // macOS sets SEM_ALLOC (0o1000) in the host mode; the guest must see only
+        // the 9 permission bits.
+        assert_eq!(ipc_perm_mode_to_linux(0o1666), 0o666);
+        assert_eq!(ipc_perm_mode_to_linux(0o600), 0o600);
+        assert_eq!(ipc_perm_mode_to_linux(0o777), 0o777);
+        // Even higher host bits are dropped.
+        assert_eq!(ipc_perm_mode_to_linux(0xffff_f000 | 0o644), 0o644);
+    }
+
+    #[test]
+    fn ipc_set_mode_replaces_perm_bits_preserving_high() {
+        // IPC_SET: take the guest's new perm bits, keep the host's allocation bits.
+        assert_eq!(ipc_set_apply_mode(0o1666, 0o600), 0o1600);
+        assert_eq!(ipc_set_apply_mode(0o1666, 0o000), 0o1000);
+        // Guest mode wider than 0o777 is masked before being applied.
+        assert_eq!(ipc_set_apply_mode(0o1000, 0o7777), 0o1777);
+        // No host high bits → just the guest perm bits.
+        assert_eq!(ipc_set_apply_mode(0o644, 0o600), 0o600);
+    }
+
+    #[test]
+    fn ipc_perm_fields_from_host_packs_owner_and_creator() {
+        let p = IpcPermFields::from_host(0x1234, 1000, 2000, 0o1640, 7);
+        assert_eq!(p.key, 0x1234);
+        assert_eq!(p.uid, 1000);
+        assert_eq!(p.gid, 2000);
+        // creator ids mirror the owner (single host identity).
+        assert_eq!(p.cuid, 1000);
+        assert_eq!(p.cgid, 2000);
+        // mode masked to permission bits (SEM_ALLOC dropped).
+        assert_eq!(p.mode, 0o640);
+        assert_eq!(p.seq, 7);
+    }
+
+    #[test]
+    fn ipc_perm_fields_default_is_zeroed() {
+        let p = IpcPermFields::default();
+        assert_eq!(
+            p,
+            IpcPermFields {
+                key: 0,
+                uid: 0,
+                gid: 0,
+                cuid: 0,
+                cgid: 0,
+                mode: 0,
+                seq: 0
+            }
+        );
+    }
+
+    // ---- sendfile partial-count resolution (commit f52046d5) ----
+
+    #[test]
+    fn sendfile_full_success_reports_all_bytes() {
+        // rc==0 → full success; bytes are in the out-parameter.
+        assert_eq!(resolve_sendfile_result(0, 4096, 0), 4096);
+        assert_eq!(resolve_sendfile_result(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn sendfile_partial_eagain_reports_partial_not_errno() {
+        // The load-bearing case: -1/EAGAIN with bytes on the wire → report the
+        // partial count, NOT -EAGAIN (else the caller re-sends and duplicates).
+        assert_eq!(resolve_sendfile_result(-1, 512, libc::EAGAIN), 512);
+        assert_eq!(resolve_sendfile_result(-1, 512, libc::EINTR), 512);
+        assert_eq!(resolve_sendfile_result(-1, 1, libc::EAGAIN), 1);
+    }
+
+    #[test]
+    fn sendfile_would_block_with_nothing_sent_is_hard_eagain() {
+        // EAGAIN with zero bytes sent is a genuine "would block" → -EAGAIN so the
+        // caller waits for POLLOUT and retries from the same offset.
+        assert_eq!(
+            resolve_sendfile_result(-1, 0, libc::EAGAIN),
+            -(libc::EAGAIN as i64)
+        );
+        assert_eq!(
+            resolve_sendfile_result(-1, 0, libc::EINTR),
+            -(libc::EINTR as i64)
+        );
+    }
+
+    #[test]
+    fn sendfile_hard_error_reports_negated_errno() {
+        // A real failure (EPIPE, EBADF, …) → negated errno regardless of any
+        // partial count, since errno is not EAGAIN/EINTR.
+        assert_eq!(
+            resolve_sendfile_result(-1, 0, libc::EPIPE),
+            -(libc::EPIPE as i64)
+        );
+        assert_eq!(
+            resolve_sendfile_result(-1, 0, libc::EBADF),
+            -(libc::EBADF as i64)
+        );
+        // Even with a stray byte count, a non-retryable errno is a hard error.
+        assert_eq!(
+            resolve_sendfile_result(-1, 100, libc::EPIPE),
+            -(libc::EPIPE as i64)
+        );
     }
 }
