@@ -1436,6 +1436,51 @@ mod tests {
         assert_eq!(r, vec![(0x1000, 0x3000)]);
     }
 
+    // mincore (syscall 232) failure-arm guards: a guest-controlled `length` must
+    // never drive the residency-vec allocation past the actual mapping (the
+    // `vec![1u8; pages]` is uncatchable on alloc failure). Both arms must report
+    // ENOMEM (errno 12), never panic/abort. The success path is covered by the
+    // integration test `mm_lock_msync_mincore_stubs_validate_args_and_succeed`.
+    fn mincore(memory: &mut LinearMemory, address: u64, length: u64) -> DispatchOutcome {
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(232, SyscallArgs::from([address, length, address, 0, 0, 0])),
+                memory,
+                &reporter,
+            )
+            .expect("mincore dispatch must not be a fatal DispatchError")
+    }
+
+    #[test]
+    fn mincore_unmapped_end_page_is_enomem_not_abort() {
+        // One mapped page at the base; a length that spans into the unmapped next
+        // page must be ENOMEM — Linux requires the WHOLE range mapped, and the
+        // unmapped end caps the residency-vec bound.
+        let base = LINUX_MMAP_BASE;
+        let mut memory = LinearMemory::new(base, vec![0u8; LINUX_PAGE_SIZE as usize]);
+        assert_eq!(
+            mincore(&mut memory, base, 2 * LINUX_PAGE_SIZE),
+            DispatchOutcome::Errno { errno: 12 },
+            "a range whose end page is unmapped must be ENOMEM"
+        );
+    }
+
+    #[test]
+    fn mincore_overflowing_length_is_enomem_not_abort() {
+        // address + length overflows u64: the bound guard must turn this into
+        // ENOMEM rather than computing a u64::MAX-page residency vec (an
+        // uncatchable allocation abort).
+        let base = LINUX_MMAP_BASE;
+        let mut memory = LinearMemory::new(base, vec![0u8; LINUX_PAGE_SIZE as usize]);
+        assert_eq!(
+            mincore(&mut memory, base, u64::MAX),
+            DispatchOutcome::Errno { errno: 12 },
+            "a length that overflows the [address, address+length) range must be ENOMEM"
+        );
+    }
+
     #[test]
     fn free_regions_coalesce_overlap_and_keep_disjoint() {
         let mut r = vec![];
