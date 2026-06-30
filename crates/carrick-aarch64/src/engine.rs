@@ -767,6 +767,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                         number,
                         args,
                         guest_abi,
+                        // aarch64 guests already issue canonical numbers, so the
+                        // ISA-native number equals the dispatch number.
+                        native_number: number,
                     }));
                 }
                 Aarch64Exit::EL0Fault {

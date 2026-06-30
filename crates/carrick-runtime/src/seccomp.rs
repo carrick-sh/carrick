@@ -71,8 +71,11 @@
 use parking_lot::Mutex;
 
 // Linux AUDIT_ARCH for the guest. Filters compare seccomp_data.arch against
-// this; aarch64 guests see AUDIT_ARCH_AARCH64.
+// this; an aarch64 guest sees AUDIT_ARCH_AARCH64, an x86_64 guest
+// AUDIT_ARCH_X86_64. The guest's ISA — not the host's — selects this, because a
+// Docker/libseccomp default profile begins `if arch != <its ISA> -> KILL`.
 pub(crate) const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
+pub(crate) const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 
 // seccomp filter actions (high 16 bits of the cBPF return value); the low bits
 // carry RET_DATA (e.g. the errno for RET_ERRNO). The kernel picks the *most
@@ -130,6 +133,29 @@ pub(crate) struct SeccompData {
 }
 
 impl SeccompData {
+    /// Build the filter input for one guest syscall. `arch` follows the guest's
+    /// reported ISA (`abi`) so an x86_64 profile's leading
+    /// `arch != AUDIT_ARCH_X86_64 -> KILL` clause passes for an x86_64 guest;
+    /// `native_nr` is the guest's architecture-native syscall number (the raw
+    /// x86_64 number, NOT carrick's canonical aarch64 number), because filters
+    /// switch on native numbering. See `SyscallRequest::native_number`.
+    pub(crate) fn for_guest(
+        native_nr: i32,
+        abi: carrick_abi::LinuxGuestAbi,
+        args: [u64; 6],
+    ) -> Self {
+        let arch = match abi {
+            carrick_abi::LinuxGuestAbi::Aarch64 => AUDIT_ARCH_AARCH64,
+            carrick_abi::LinuxGuestAbi::X86_64 => AUDIT_ARCH_X86_64,
+        };
+        Self {
+            nr: native_nr,
+            arch,
+            instruction_pointer: 0,
+            args,
+        }
+    }
+
     /// Load the 32-bit word at byte `offset` into the `seccomp_data` layout
     /// (nr@0, arch@4, ip@8, args@16..64). Out-of-range offsets read as 0,
     /// matching the kernel's bounded BPF_LD|BPF_ABS over the 64-byte struct.
@@ -327,6 +353,70 @@ mod tests {
             instruction_pointer: 0,
             args: [0; 6],
         }
+    }
+
+    /// The prologue every libseccomp/Docker default profile emits:
+    ///   LD  [4]            ; A = seccomp_data.arch
+    ///   JEQ want, 1, 0     ; if arch == want skip the KILL, else fall to it
+    ///   RET KILL_PROCESS
+    ///   RET ALLOW
+    fn arch_gate_then_allow(want: u32) -> Vec<SockFilter> {
+        vec![
+            SockFilter {
+                code: BPF_LD | 0x20,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ,
+                jt: 1,
+                jf: 0,
+                k: want,
+            },
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            },
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
+        ]
+    }
+
+    #[test]
+    fn seccomp_data_arch_follows_guest_abi() {
+        use carrick_abi::LinuxGuestAbi;
+        let x = SeccompData::for_guest(1 /*x86 write*/, LinuxGuestAbi::X86_64, [0; 6]);
+        assert_eq!(x.arch, AUDIT_ARCH_X86_64);
+        assert_eq!(x.nr, 1);
+        let a = SeccompData::for_guest(64 /*aarch64 write*/, LinuxGuestAbi::Aarch64, [0; 6]);
+        assert_eq!(a.arch, AUDIT_ARCH_AARCH64);
+        assert_eq!(a.nr, 64);
+    }
+
+    #[test]
+    fn x86_guest_survives_its_own_arch_gated_profile() {
+        use carrick_abi::LinuxGuestAbi;
+        // The Docker default profile prologue for an x86_64 image.
+        let prog = arch_gate_then_allow(AUDIT_ARCH_X86_64);
+        // Pre-fix, the dispatcher fed this filter arch=AARCH64 and the guest was
+        // KILLed on its first syscall. With the arch sourced from the guest ABI,
+        // an x86_64 guest is allowed.
+        let x86 = SeccompData::for_guest(1, LinuxGuestAbi::X86_64, [0; 6]);
+        assert_eq!(eval_filter(&prog, &x86), SECCOMP_RET_ALLOW);
+        // A genuinely aarch64-arch view of the same syscall is still killed —
+        // proving the arch we feed is load-bearing, not cosmetic.
+        let arm = SeccompData::for_guest(64, LinuxGuestAbi::Aarch64, [0; 6]);
+        assert_eq!(
+            eval_filter(&prog, &arm) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_KILL_PROCESS
+        );
     }
 
     #[test]

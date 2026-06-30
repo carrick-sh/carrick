@@ -35,6 +35,18 @@ pub struct RawSyscall {
     /// reads it, so a call site cannot forget the guest ABI and mis-marshal
     /// epoll/stat/sigset layouts on the x86 path.
     pub guest_abi: carrick_abi::LinuxGuestAbi,
+    /// The guest's *architecture-native* syscall number — what the guest
+    /// actually put in its syscall register (`x8` on aarch64, `rax` on x86_64),
+    /// BEFORE carrick normalizes it to the canonical aarch64 number in
+    /// [`number`](Self::number). For aarch64 guests this equals `number`; for
+    /// x86_64 guests it is the x86_64 UAPI number (`write == 1`, not the
+    /// canonical `64`), and survives fork/vfork/poll/select desugaring.
+    ///
+    /// Carried because seccomp(2) filters compare `seccomp_data.nr` against the
+    /// guest ISA's native numbering: an x86_64 Docker/libseccomp profile gates
+    /// on `arch == AUDIT_ARCH_X86_64` then switches on x86_64 numbers, so the
+    /// dispatcher must hand the filter the native number, not the canonical one.
+    pub native_number: u64,
 }
 
 /// A register/V-reg access through [`crate::RegAccess`] failed mid-sigframe
