@@ -3014,8 +3014,17 @@ fn dispatch_threaded_futex(
                         futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
                     ))
                 } else {
+                    // A present (non-NULL) relative timespec ALWAYS specifies a
+                    // deadline — even {0,0}, which means "expire IMMEDIATELY"
+                    // (ETIMEDOUT now), NOT "infinite". duration_from_linux_timespec
+                    // maps {0,0} to None ("no duration"); collapsing that to the
+                    // `timeout_address == 0` None (block forever) made the threaded
+                    // park (FutexWait) compute no deadline and spin forever on a
+                    // zero-timeout WAIT that Linux returns ETIMEDOUT from at once.
+                    // Force the zero case to a ZERO duration so the park deadline is
+                    // `now` and fires immediately (mirrors the proc.rs fix 519dd40f).
                     match duration_from_linux_timespec(timespec) {
-                        Ok(t) => t,
+                        Ok(t) => Some(t.unwrap_or(std::time::Duration::ZERO)),
                         Err(errno) => return DispatchOutcome::Errno { errno },
                     }
                 }
@@ -7135,6 +7144,52 @@ mod overlay_dispatch_tests {
             },
             "a shared FUTEX_WAKE must defer to the PlatformFutex::shared_wake seam"
         );
+    }
+
+    /// On the LIVE multithreaded futex path (`dispatch_threaded_futex`), a present
+    /// (non-NULL) `{tv_sec:0, tv_nsec:0}` relative `FUTEX_WAIT` timeout means
+    /// "expire NOW" (ETIMEDOUT immediately), NOT "block forever" (the NULL-timeout
+    /// case). Commit 519dd40f fixed this on the proc.rs `dispatch_normalized` path
+    /// but the threaded path still collapsed `{0,0}` to `None`, parking forever.
+    /// The parked `FutexWait` must carry `Some(Duration::ZERO)` (a deadline of
+    /// `now`), never `None`.
+    #[test]
+    fn threaded_futex_wait_zero_but_present_timeout_parks_with_zero_deadline() {
+        let mut memory = CountingMemory::new(0x10000, vec![0u8; 0x1000]);
+        // Futex word == the expected value, so WAIT does not short-circuit to
+        // EAGAIN and must consult the timeout.
+        memory.write_bytes(0x10800, &7u32.to_le_bytes()).unwrap();
+        // A present (non-NULL) relative timespec of {0, 0} at 0x10810.
+        memory.write_bytes(0x10810, &[0u8; 16]).unwrap();
+        let reporter = CompatReporter::default();
+        let futex = crate::thread::FutexTable::new();
+        let registry = crate::thread::ThreadRegistry::new(1000);
+        // Private FUTEX_WAIT (no shared mapping) so the park stays in the
+        // in-process parking-lot table and returns a `FutexWait` outcome.
+        let request = SyscallRequest::new(
+            98,
+            SyscallArgs::from([
+                0x10800,
+                LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(),
+                7,
+                0x10810,
+                0,
+                0,
+            ]),
+        );
+
+        let outcome =
+            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+
+        match outcome {
+            DispatchOutcome::FutexWait { timeout, .. } => assert_eq!(
+                timeout,
+                Some(std::time::Duration::ZERO),
+                "a present {{0,0}} timeout must park with a zero deadline (expire now), \
+                 not None (block forever)"
+            ),
+            other => panic!("expected a FutexWait park outcome, got {other:?}"),
+        }
     }
 
     #[test]
