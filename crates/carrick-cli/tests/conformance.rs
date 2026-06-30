@@ -357,6 +357,49 @@ fn set_gates_here(lane: &Lane, set: &ProbeSet) -> bool {
     }
 }
 
+/// Curated allowlist of x86_64 probes permitted to GATE (fail the build red) on
+/// the amd64 lane even though the lane as a whole is report-only carrick-x86
+/// BRING-UP. A probe here gates on the native x86_64 fleet; everything else stays
+/// report-only, so the ~34 open carrick-x86 ABI gaps (SEGVs on aliassize/mapfixed
+/// private-overlay, SysV msg, CLOCK_BOOTTIME, si_value, …) don't flip the gate.
+///
+/// INTENTIONALLY EMPTY for now. A probe earns a slot only once a *native
+/// x86_64 fleet* run (Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM) proves it MATCHes
+/// the oracle — which can NOT be confirmed from the macOS reference box this
+/// change is authored on. Add only ISA-neutral, pure-logic probes (no x86
+/// register / FP / signal-frame specifics; they already PASS on ARM64), so that
+/// a future regression on a probe carrick already passes flips the gate red
+/// instead of silently sliding back into the report-only pile.
+///
+/// TODO(fleet): populate from a green native-x86_64 fleet conformance run, one
+/// probe at a time, each cited with the run that proved it green.
+const X86_GATING_PROBES: &[&str] = &[];
+
+/// Pure per-probe gating decision (host-arch-independent inputs, so it is
+/// unit-testable off the x86 fleet). A probe gates iff its SET already gates
+/// here (`set_gates`, the native-ISA intent-gating path) OR it is an explicitly
+/// allowlisted x86 probe on a host where carrick itself executes the x86_64
+/// guest (`native_amd64` — never the macOS-via-Rosetta path, where Rosetta, not
+/// carrick, does the translation).
+fn probe_gates_decision(set_gates: bool, native_amd64: bool, allowlisted: bool) -> bool {
+    set_gates || (native_amd64 && allowlisted)
+}
+
+/// Whether one probe's DIFF should fail the gate on this host — the per-probe
+/// replacement for the lane-wide `set_gates_here`, so a curated subset of x86
+/// probes can gate while the rest of the bring-up lane stays report-only.
+fn probe_gates(lane: &Lane, set: &ProbeSet, name: &str) -> bool {
+    // Bind the host-arch cfg to a value first: a bare `&& cfg!(...)` reduces to
+    // `x && false` off-x86_64, which clippy flags as an always-false expression.
+    let host_is_x86_64 = cfg!(target_arch = "x86_64");
+    let native_amd64 = host_is_x86_64 && lane.platform == "linux/amd64";
+    probe_gates_decision(
+        set_gates_here(lane, set),
+        native_amd64,
+        X86_GATING_PROBES.contains(&name),
+    )
+}
+
 /// True if `bin` already carries the hypervisor entitlement.
 fn is_signed_with_hypervisor(bin: &PathBuf) -> bool {
     Command::new("codesign")
@@ -1378,9 +1421,80 @@ fn classify_probe(
         (None, false) => ProbeOutcome::Pass,
         (None, true) => ProbeOutcome::UnexpectedPass,
         (Some(diff), false) => ProbeOutcome::Fail(diff),
-        (Some(diff), true) => ProbeOutcome::Xfail(diff),
+        // An excused (known-gap) DIFF: Xfail ONLY while the carrick-side output
+        // still matches the recorded excuse fingerprint — otherwise the
+        // divergence itself changed and a NEW regression is hiding behind the
+        // name-keyed excuse, so fail.
+        (Some(diff), true) => {
+            excused_probe_outcome(diff, excuse_fingerprint(lane_label, &name), carrick_out)
+        }
     };
     (name, outcome)
+}
+
+/// Recorded carrick-SIDE output fingerprints for excused (known-gap) probes. An
+/// entry pins the EXACT carrick output behind a known-gap excuse, so a CHANGE in
+/// that output (a new, different regression) is no longer masked by the
+/// name-keyed excuse — it surfaces as a real Fail instead of a silent Xfail.
+/// `"*"` in the lane slot matches any lane (a global `KNOWN_PROBE_GAPS` excuse);
+/// a concrete lane label matches a `KNOWN_LANE_GAPS` excuse. The fingerprint is
+/// `carrick_side_fingerprint` of the normalized carrick output.
+///
+/// INTENTIONALLY EMPTY for now: capturing a probe's canonical carrick-side
+/// output requires a run on the host that owns the excuse (the amd64 fleet for
+/// the `KNOWN_LANE_GAPS` entries), which can't be done from the macOS reference
+/// box. An excuse with no recorded fingerprint falls back to the legacy
+/// Xfail-any-diff behavior (`excused_probe_outcome` with `None`), so this is a
+/// pure tightening: adding a fingerprint can only ever turn a masked regression
+/// into a visible Fail, never the reverse.
+///
+/// TODO(fleet): record `(lane, probe, carrick_side_fingerprint(output))` for each
+/// `KNOWN_LANE_GAPS` excuse from a fleet run that exhibits the excused divergence.
+const EXCUSE_FINGERPRINTS: &[(&str, &str, &str)] = &[];
+
+/// The recorded carrick-side fingerprint for an excused probe, if one is pinned.
+/// Matches a lane-specific entry first, then a global `"*"` entry.
+fn excuse_fingerprint(lane_label: &str, name: &str) -> Option<&'static str> {
+    EXCUSE_FINGERPRINTS
+        .iter()
+        .find(|(l, n, _)| *n == name && (*l == lane_label || *l == "*"))
+        .map(|(_, _, fp)| *fp)
+}
+
+/// Stable (Rust-version-independent) content fingerprint of a probe's carrick-
+/// side output — FNV-1a 64. Unlike `DefaultHasher` this is reproducible across
+/// toolchains, so a recorded constant in `EXCUSE_FINGERPRINTS` stays comparable.
+fn carrick_side_fingerprint(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in s.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("{hash:016x}")
+}
+
+/// Outcome for a probe whose DIFF is EXCUSED by a name-keyed known-gap. A
+/// name-only excuse would Xfail ANY divergence, masking a NEW regression whose
+/// carrick-side output changed. So when the excuse pins an expected carrick-side
+/// fingerprint (`recorded_fp`), require the live carrick output to still match
+/// it: a mismatch means the divergence changed → real Fail, not Xfail. An excuse
+/// with no recorded fingerprint (`None`) keeps the legacy Xfail-any-diff behavior
+/// (the conservative default until a fleet run supplies the fingerprint). Pure —
+/// unit-tested directly.
+fn excused_probe_outcome(
+    diff: String,
+    recorded_fp: Option<&str>,
+    carrick_side: &str,
+) -> ProbeOutcome {
+    match recorded_fp {
+        None => ProbeOutcome::Xfail(diff),
+        Some(fp) if fp == carrick_side_fingerprint(carrick_side) => ProbeOutcome::Xfail(diff),
+        Some(_) => ProbeOutcome::Fail(format!(
+            "EXCUSED DIVERGENCE CHANGED — carrick-side output no longer matches the \
+             recorded excuse fingerprint, so a NEW regression is hiding behind the \
+             known-gap excuse. Re-triage (do NOT just re-bless the fingerprint):\n{diff}"
+        )),
+    }
 }
 
 /// Run `f(0..n_items)` across `n_workers` threads, returning results in index
@@ -1469,7 +1583,11 @@ fn conformance_probes() {
         // guest natively (set_gates_here): the macOS amd64-via-Rosetta lane is
         // report-only because Rosetta, not carrick, is translating it.
         for set in lane.probe_sets {
-            let gates = set_gates_here(lane, set);
+            // Set-level gating (whole-set intent-gating native ISA) drives the
+            // report-only SUMMARY; individual probes additionally gate via the
+            // per-probe `probe_gates` allowlist below (so a curated x86 subset can
+            // gate while the rest of the bring-up lane stays report-only).
+            let set_gates = set_gates_here(lane, set);
             let dir = probes_dir(set.target);
             if !dir.exists() {
                 eprintln!(
@@ -1621,12 +1739,15 @@ fn conformance_probes() {
             let mut set_diffs = 0usize;
             for (name, outcome) in &results {
                 let qualified = format!("{}:{}:{name}", lane.label, set.libc);
+                // Per-probe gating: the whole set may be report-only while a
+                // curated x86 subset (X86_GATING_PROBES) still gates.
+                let gates = probe_gates(lane, set, name);
                 match outcome {
                     ProbeOutcome::Pass => eprintln!("PASS {qualified}"),
                     ProbeOutcome::UnexpectedPass => {
                         // A known-gap probe started passing → the gap is fixed.
-                        // Only a GATING set asserts: remove it from
-                        // KNOWN_PROBE_GAPS. (report-only sets don't.)
+                        // Only a GATING probe asserts: remove it from
+                        // KNOWN_PROBE_GAPS. (report-only probes don't.)
                         eprintln!(
                             "UNEXPECTED PASS {qualified} (remove from KNOWN_PROBE_GAPS / KNOWN_LANE_GAPS)"
                         );
@@ -1662,7 +1783,7 @@ fn conformance_probes() {
                     }
                 }
             }
-            if !gates {
+            if !set_gates {
                 eprintln!(
                     "SUMMARY {}:{} (report-only): {}/{} probes DIFF from Linux",
                     lane.label,
@@ -1774,6 +1895,66 @@ fn probe_oracle_entry_roundtrip() {
     assert_eq!(body, output);
     // A probe with no source file gets the stable sentinel hash.
     assert_eq!(probe_src_hash("__definitely_not_a_real_probe__"), "nosrc");
+}
+
+#[test]
+fn probe_gates_decision_allowlist_logic() {
+    // A set that already gates (native ISA, intent-gating) gates every probe,
+    // regardless of allowlist / host.
+    assert!(probe_gates_decision(true, false, false));
+    assert!(probe_gates_decision(true, true, true));
+    // A report-only set gates an INDIVIDUAL probe iff it is allowlisted AND the
+    // host runs the x86_64 guest natively (carrick-x86 is under test).
+    assert!(probe_gates_decision(false, true, true));
+    // Allowlisted but not native (e.g. amd64-via-Rosetta on macOS) -> no gate.
+    assert!(!probe_gates_decision(false, false, true));
+    // Native but not allowlisted -> stays report-only (the ~34 bring-up gaps).
+    assert!(!probe_gates_decision(false, true, false));
+    // Neither -> report-only.
+    assert!(!probe_gates_decision(false, false, false));
+    // The shipped allowlist is intentionally empty until fleet confirmation, so
+    // a sample probe does not gate the amd64 lane by allowlist alone today.
+    assert!(!probe_gates_decision(
+        false,
+        true,
+        X86_GATING_PROBES.contains(&"icmp")
+    ));
+}
+
+#[test]
+fn excused_probe_outcome_fingerprint_guard() {
+    // FNV-1a is stable & deterministic for a given input.
+    let carrick_side = "line1\nline2\n";
+    let fp = carrick_side_fingerprint(carrick_side);
+    assert_eq!(fp, carrick_side_fingerprint(carrick_side), "deterministic");
+
+    // No recorded fingerprint -> legacy Xfail-any-diff (conservative default).
+    assert!(matches!(
+        excused_probe_outcome("d".into(), None, carrick_side),
+        ProbeOutcome::Xfail(_)
+    ));
+    // Recorded fingerprint MATCHES the live carrick output -> still Xfail (the
+    // SAME, already-triaged divergence).
+    assert!(matches!(
+        excused_probe_outcome("d".into(), Some(fp.as_str()), carrick_side),
+        ProbeOutcome::Xfail(_)
+    ));
+    // Recorded fingerprint does NOT match (the carrick-side output changed) -> a
+    // new regression hiding behind the excuse, so FAIL not Xfail.
+    assert!(matches!(
+        excused_probe_outcome("d".into(), Some("0000000000000000"), carrick_side),
+        ProbeOutcome::Fail(_)
+    ));
+    // A different carrick output produces a different fingerprint.
+    assert_ne!(fp, carrick_side_fingerprint("line1\nDIFFERENT\n"));
+}
+
+#[test]
+fn excuse_fingerprint_lookup_misses_when_unrecorded() {
+    // The shipped table is empty (fleet-population pending), so every lookup
+    // currently misses -> excuses fall back to the legacy Xfail-any-diff path.
+    assert_eq!(excuse_fingerprint("amd64", "icmp"), None);
+    assert_eq!(excuse_fingerprint("arm64", "uname_m"), None);
 }
 
 #[test]
