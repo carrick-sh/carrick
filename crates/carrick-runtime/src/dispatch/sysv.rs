@@ -1260,6 +1260,11 @@ fn sysv_semctl<M: GuestMemory>(
             }
             #[cfg(not(target_os = "macos"))]
             {
+                // The bring-up lanes stub IPC_SET as a success no-op (the host
+                // object's perms are not reassigned). `new_mode` was still read
+                // above, so a bad `arg` pointer is rejected with EFAULT on every
+                // platform; the value itself is only applied on the macOS lane.
+                let _ = new_mode;
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
         }
