@@ -293,17 +293,39 @@ impl SeccompState {
 
     /// Evaluate all installed filters against `data` and return the winning
     /// (most restrictive) cBPF value, or `SECCOMP_RET_ALLOW` if none installed.
-    /// The kernel takes the numerically-smallest action across filters.
     pub(crate) fn check(&self, data: &SeccompData) -> u32 {
         let filters = self.filters.lock();
         let mut result = SECCOMP_RET_ALLOW;
         for prog in filters.iter() {
             let ret = eval_filter(prog, data);
-            if (ret & SECCOMP_RET_ACTION_FULL) < (result & SECCOMP_RET_ACTION_FULL) {
+            if action_severity(ret) < action_severity(result) {
                 result = ret;
             }
         }
         result
+    }
+}
+
+/// Severity rank of a seccomp action — LOWER is more restrictive, so the winning
+/// action across stacked filters is the one with the smallest rank.
+///
+/// This is NOT a raw numeric comparison of the action word: `SECCOMP_RET_*` are
+/// *almost* ordered "smaller value = more severe", but `SECCOMP_RET_KILL_PROCESS`
+/// is `0x8000_0000` — the LARGEST u32 — even though it is the MOST severe action.
+/// A naive `action < result` (what this used to do) therefore NEVER selected
+/// KILL_PROCESS, so a guest's `RET_KILL_PROCESS` filter (e.g. the libseccomp /
+/// Docker default arch-mismatch action) was silently ineffective on every lane.
+/// Rank it explicitly. An unmodelled action ranks as most severe (fail-closed).
+fn action_severity(action_word: u32) -> u8 {
+    match action_word & SECCOMP_RET_ACTION_FULL {
+        SECCOMP_RET_KILL_PROCESS => 0,
+        SECCOMP_RET_KILL_THREAD => 1,
+        SECCOMP_RET_TRAP => 2,
+        SECCOMP_RET_ERRNO => 3,
+        SECCOMP_RET_TRACE => 4,
+        SECCOMP_RET_LOG => 5,
+        SECCOMP_RET_ALLOW => 6,
+        _ => 0,
     }
 }
 
@@ -520,5 +542,37 @@ mod tests {
             SECCOMP_RET_ERRNO
         );
         assert_eq!(state.check(&data_for(63)), SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn kill_process_filter_is_not_silently_ignored() {
+        // SECCOMP_RET_KILL_PROCESS is 0x8000_0000 — the LARGEST u32 — so a naive
+        // "numerically-smallest action wins" comparison treated it as the LEAST
+        // severe action and never selected it: a guest's unconditional-kill
+        // filter (and the libseccomp/Docker default arch-mismatch KILL) survived
+        // every syscall. The most-severe action must win.
+        let state = SeccompState::default();
+        state.install(vec![SockFilter {
+            code: BPF_RET,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_KILL_PROCESS,
+        }]);
+        assert_eq!(
+            state.check(&data_for(172)) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_KILL_PROCESS,
+            "an unconditional KILL_PROCESS filter must KILL, not be ignored"
+        );
+        // Stacked with an allow-all filter, KILL_PROCESS (most severe) still wins.
+        state.install(vec![SockFilter {
+            code: BPF_RET,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        }]);
+        assert_eq!(
+            state.check(&data_for(172)) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_KILL_PROCESS
+        );
     }
 }
