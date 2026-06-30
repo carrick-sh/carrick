@@ -111,6 +111,64 @@ jobs:
       - name: Cross-check carrick-hal + carrick-vmm-kvm for aarch64-linux
         run: just check-linux
 
+  # Cross-compile the FULL carrick-cli + carrick-runtime closure for
+  # x86_64-unknown-freebsd — INCLUDING the C deps (ring via oci-client), handled
+  # with a FreeBSD base.txz sysroot + clang. Proves the platform-freebsd binary
+  # builds without a FreeBSD machine. `cargo check` does not link, so only the
+  # cross C toolchain (not a FreeBSD linker) is needed; the freebsd std target is
+  # declared in rust-toolchain.toml so it lands on the pinned 1.96.0 toolchain.
+  cross-check-freebsd:
+    name: x86_64-freebsd cross-check · cli + runtime
+    runs-on: ubuntu-latest
+    env:
+      # Bump when this release is archived off the main mirror (the fetch 404s).
+      FBSD_VERSION: 14.3-RELEASE
+      FBSD_MAJOR: "14"
+      FBSD_SYSROOT: ${{ github.workspace }}/.freebsd-sysroot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (+ freebsd target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Install clang + llvm (cross C toolchain for ring)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      - name: Cache FreeBSD sysroot
+        id: fbsd-sysroot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FBSD_SYSROOT }}
+          key: freebsd-sysroot-${{ env.FBSD_VERSION }}
+
+      - name: Fetch FreeBSD sysroot (headers + libs for ring's C compile)
+        if: steps.fbsd-sysroot.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$FBSD_SYSROOT"
+          curl -fSL "https://download.freebsd.org/releases/amd64/${FBSD_VERSION}/base.txz" -o /tmp/base.txz
+          tar -xf /tmp/base.txz -C "$FBSD_SYSROOT" ./usr/include ./usr/lib ./lib
+
+      # Point the cc crate (ring's build.rs) at the cross C toolchain. The
+      # underscore-target env form is required because shells can't export the
+      # dashed target name. No linker var: `cargo check` never links.
+      - name: Cross-check carrick-cli + carrick-runtime for x86_64-freebsd
+        env:
+          CC_x86_64_unknown_freebsd: clang
+          CXX_x86_64_unknown_freebsd: clang++
+          AR_x86_64_unknown_freebsd: llvm-ar
+          CFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
+          CXXFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
+        run: just check-freebsd
+
   # Dependency license / bans / sources gate. Enforces the deny.toml permissive
   # allowlist so a copyleft/unknown-license transitive dependency fails CI rather
   # than slipping in silently. Cheap; runs on a hosted Linux runner, no hypervisor.
