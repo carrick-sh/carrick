@@ -2193,13 +2193,21 @@ impl SyscallDispatcher {
                 let errno = (ret & crate::seccomp::SECCOMP_RET_DATA).min(4095) as i32;
                 Some(DispatchOutcome::Errno { errno })
             }
-            // KILL_PROCESS / KILL_THREAD / TRAP (and any unmodelled action):
-            // fail closed by terminating the guest with SIGSYS's wait status
-            // (128 + SIGSYS). A *catchable* SIGSYS for RET_TRAP is a follow-up.
+            // KILL_PROCESS / KILL_THREAD / TRAP (and any unmodelled action): fail
+            // closed by KILLING the guest with SIGSYS — a real signal DEATH, so a
+            // waiting parent sees WIFSIGNALED + SIGSYS (libseccomp's own tests and
+            // container runtimes check exactly that), not WIFEXITED(159). Using
+            // `Exit{128+31}` produced the same shell $? but the wrong wait status.
+            // A *catchable* SIGSYS with SYS_SECCOMP si_code for RET_TRAP is a
+            // follow-up.
             crate::seccomp::SECCOMP_RET_KILL_PROCESS
             | crate::seccomp::SECCOMP_RET_KILL_THREAD
-            | crate::seccomp::SECCOMP_RET_TRAP => Some(DispatchOutcome::Exit { code: 128 + 31 }),
-            _ => Some(DispatchOutcome::Exit { code: 128 + 31 }),
+            | crate::seccomp::SECCOMP_RET_TRAP => Some(DispatchOutcome::SignalDeath {
+                signum: crate::linux_abi::LINUX_SIGSYS,
+            }),
+            _ => Some(DispatchOutcome::SignalDeath {
+                signum: crate::linux_abi::LINUX_SIGSYS,
+            }),
         }
     }
 
