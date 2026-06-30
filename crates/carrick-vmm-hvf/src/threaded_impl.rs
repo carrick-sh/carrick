@@ -71,22 +71,20 @@ impl SharedFutexSyscall for HvfShared {
         if r >= 0 {
             return SharedWaitStep::Woken;
         }
-        let host_errno = (-r) as i32;
-        if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
-            return SharedWaitStep::Retry;
-        }
-        // ABI guard: a Linux FUTEX_WAIT only ever reports 0 / EAGAIN / EINTR /
-        // ETIMEDOUT (the value-mismatch EAGAIN is handled before the wait), and
-        // glibc's nptl FATALLY aborts on any other errno ("the futex facility
-        // returned an unexpected error code"). `os_sync_wait_on_address` can
-        // return a Darwin-specific errno (e.g. EINVAL) that has no Linux-futex
-        // meaning — surfacing it raw killed cpython multiprocessing workers
-        // waiting on a process-shared semaphore. A FUTEX_WAIT is permitted to
-        // wake SPURIOUSLY, so map any such errno to a spurious wake: the guest
-        // re-reads its word and re-waits. Never propagate a non-Linux futex
-        // errno across the ABI boundary. (phase=2 = unexpected-errno, for trace.)
-        crate::probes::ulock_wait(host_addr as u64, val, 0, 2, r);
-        SharedWaitStep::Woken
+        // Shared ABI guard + observability (single-sourced with bhyve/NVMM):
+        // ETIMEDOUT/EINTR -> Retry; ANY other host errno -> a SPURIOUS wake, never
+        // leaked raw, and fires the `futex-unexpected-errno` probe.
+        // `os_sync_wait_on_address` can return a Darwin-specific errno (e.g.
+        // EINVAL) with no Linux-futex meaning, and glibc's nptl FATALLY aborts on
+        // anything but 0/EAGAIN/EINTR/ETIMEDOUT — surfacing it raw once killed
+        // cpython multiprocessing workers on a process-shared semaphore. (The
+        // shared probe supersedes the old HVF-only ulock_wait phase=2 trace.)
+        carrick_thread::platform_futex::classify_observed_wait_slice(
+            r,
+            host_addr,
+            libc::ETIMEDOUT,
+            libc::EINTR,
+        )
     }
 
     /// Wake up to `n` waiters on the shared-page word. macOS's

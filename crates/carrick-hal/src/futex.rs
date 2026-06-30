@@ -28,6 +28,40 @@ pub enum SharedWaitStep {
     Error(i64),
 }
 
+/// Classify one cross-process futex wait slice's raw host return into a
+/// [`SharedWaitStep`], enforcing the Linux `FUTEX_WAIT` errno ABI in ONE place
+/// so the three backends cannot diverge on it.
+///
+/// - `rc >= 0` — a wake (or an at-entry value mismatch the backend already
+///   resolved): [`SharedWaitStep::Woken`] (guest `FUTEX_WAIT` returns 0).
+/// - `-ETIMEDOUT` / `-EINTR` — slice termination: [`SharedWaitStep::Retry`], so
+///   the shared loop re-checks the deadline / interrupt rather than returning.
+/// - ANY OTHER terminal `-errno` — mapped to a SPURIOUS [`SharedWaitStep::Woken`],
+///   **never leaked to the guest**. A Linux futex wait only ever surfaces
+///   `0`/`EAGAIN`/`EINTR`/`ETIMEDOUT`, and glibc's nptl FATALLY aborts ("the
+///   futex facility returned an unexpected error code") on anything else — so a
+///   host-specific errno (a Darwin/FreeBSD/NetBSD `EINVAL` etc. with no
+///   Linux-futex meaning) must surface as a harmless spurious wake: the guest
+///   simply re-checks its word and re-waits. HVF already did this; bhyve and
+///   NVMM returned `Error(raw_host_errno)` and could thus abort a guest's nptl.
+///
+/// `host_etimedout` / `host_eintr` are passed in because the numeric errno
+/// values differ per host OS (Linux `ETIMEDOUT` is 110, the BSDs/macOS use 60);
+/// `carrick-hal` stays host-neutral and never references `libc`.
+pub fn classify_wait_slice(rc: i64, host_etimedout: i32, host_eintr: i32) -> SharedWaitStep {
+    if rc >= 0 {
+        return SharedWaitStep::Woken;
+    }
+    let host_errno = (-rc) as i32;
+    if host_errno == host_etimedout || host_errno == host_eintr {
+        SharedWaitStep::Retry
+    } else {
+        // ABI guard: a non-Linux-futex errno becomes a spurious wake, never a
+        // raw error leaked across the guest boundary.
+        SharedWaitStep::Woken
+    }
+}
+
 /// The shared cross-process-futex wait loop: slice each kernel wait to ≤20 ms so
 /// a pending guest signal is observed promptly, re-check `interrupted()` and the
 /// (optional, relative) `timeout` deadline between slices, and fold
@@ -63,6 +97,68 @@ pub fn shared_wait_sliced(
             SharedWaitStep::Woken => return 0,
             SharedWaitStep::Retry => continue,
             SharedWaitStep::Error(e) => return e,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Use Linux's ETIMEDOUT (110) to prove the classifier does NOT assume the
+    // host's value; EINTR is 4 everywhere.
+    const ETIMEDOUT: i32 = 110;
+    const EINTR: i32 = 4;
+
+    fn step_name(s: &SharedWaitStep) -> &'static str {
+        match s {
+            SharedWaitStep::Woken => "woken",
+            SharedWaitStep::Retry => "retry",
+            SharedWaitStep::Error(_) => "error",
+        }
+    }
+
+    #[test]
+    fn wake_and_mismatch_are_woken() {
+        assert_eq!(
+            step_name(&classify_wait_slice(0, ETIMEDOUT, EINTR)),
+            "woken"
+        );
+        assert_eq!(
+            step_name(&classify_wait_slice(1, ETIMEDOUT, EINTR)),
+            "woken"
+        );
+    }
+
+    #[test]
+    fn timeout_and_eintr_retry() {
+        assert_eq!(
+            step_name(&classify_wait_slice(
+                -i64::from(ETIMEDOUT),
+                ETIMEDOUT,
+                EINTR
+            )),
+            "retry"
+        );
+        assert_eq!(
+            step_name(&classify_wait_slice(-i64::from(EINTR), ETIMEDOUT, EINTR)),
+            "retry"
+        );
+    }
+
+    #[test]
+    fn unexpected_host_errno_becomes_spurious_wake_not_error() {
+        // The bug this guards: bhyve/NVMM returned Error(raw_host_errno) for any
+        // non-{ETIMEDOUT,EINTR} errno, which glibc's nptl FATALLY aborts on. EINVAL
+        // (22), EFAULT (14), and a wholly host-specific value must all fold to a
+        // harmless spurious wake — never an Error.
+        for errno in [22i32, 14, 35, 60, 78] {
+            let step = classify_wait_slice(-i64::from(errno), ETIMEDOUT, EINTR);
+            assert_eq!(
+                step_name(&step),
+                "woken",
+                "errno {errno} must fold to a spurious wake, not leak across the ABI"
+            );
         }
     }
 }

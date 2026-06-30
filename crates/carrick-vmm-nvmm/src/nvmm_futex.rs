@@ -18,14 +18,16 @@ impl SharedFutexSyscall for NvmmSharedFutex {
     fn wait_one_slice(&self, host_addr: usize, val: u32, slice_ns: i64) -> SharedWaitStep {
         let slice_us = u32::try_from((slice_ns / 1_000).max(0)).unwrap_or(u32::MAX);
         let r = carrick_host::netbsd_futex::wait(host_addr, val, slice_us);
-        if r >= 0 {
-            return SharedWaitStep::Woken;
-        }
-        let host_errno = (-r) as i32;
-        if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
-            return SharedWaitStep::Retry;
-        }
-        SharedWaitStep::Error(r)
+        // Shared ABI guard + observability: a non-{ETIMEDOUT,EINTR} NetBSD futex
+        // errno folds to a spurious wake (never `Error(raw)` — a raw NetBSD errno
+        // leaked here fatally aborts the guest's glibc nptl) and fires the
+        // `futex-unexpected-errno` probe. Single-sourced with HVF/bhyve.
+        carrick_thread::platform_futex::classify_observed_wait_slice(
+            r,
+            host_addr,
+            libc::ETIMEDOUT,
+            libc::EINTR,
+        )
     }
 
     fn wake(&self, host_addr: usize, n: u32) -> i64 {

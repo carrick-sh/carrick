@@ -18,6 +18,11 @@ workspace = true
 [dependencies]
 carrick-hal = { path = "../carrick-hal" }
 carrick-abi = { path = "../carrick-abi" }
+# Neutral USDT provider: the shared cross-process-futex seam fires the
+# `futex-unexpected-errno` probe so the silent ABI-guard fold is observable on
+# EVERY backend, not just HVF. Acyclic (carrick-observability deps neither
+# carrick-thread nor carrick-hal upward).
+carrick-observability = { path = "../carrick-observability" }
 libc.workspace = true
 parking_lot.workspace = true
 parking_lot_core.workspace = true
