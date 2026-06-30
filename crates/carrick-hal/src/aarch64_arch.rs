@@ -233,4 +233,238 @@ mod tests {
             [0; 4]
         );
     }
+
+    // ── aarch64 sigframe codec round-trip + bad-frame rejection ───────────────
+    //
+    // The shared aarch64 `rt_sigframe` codec (`crate::sigframe::build_sigframe` /
+    // `restore_sigframe`, reached through the `Aarch64GuestArch` seam) had no unit
+    // test, while the x86_64 twin in `x8664_arch.rs` did. These drive the REAL
+    // encode→decode path against a host-neutral in-memory engine double (no HVF,
+    // no guest — plain `cargo test`), mirroring the x86 `SigframeRoundtrip` setup.
+
+    /// A round-trippable aarch64 signal-frame engine: sparse guest memory plus the
+    /// GPR / SP / ELR_EL1 / SPSR_EL1 + V-register state the codec reads and writes.
+    /// Enough to drive `build_sigframe → restore_sigframe` through the real
+    /// `write_bytes` / `read_bytes`.
+    struct SigframeEngine {
+        mem: std::collections::HashMap<u64, u8>,
+        /// x0..x30 (31 GPRs).
+        x: [u64; 31],
+        sp: u64,
+        pc: u64,
+        elr_el1: u64,
+        spsr_el1: u64,
+        vregs: [u128; 32],
+        fpsr: u64,
+        fpcr: u64,
+    }
+
+    impl carrick_guest_mem::GuestMemory for SigframeEngine {
+        fn read_bytes_raw(
+            &self,
+            a: u64,
+            l: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            Ok((0..l as u64)
+                .map(|i| *self.mem.get(&a.wrapping_add(i)).unwrap_or(&0))
+                .collect())
+        }
+        fn write_bytes_raw(
+            &mut self,
+            a: u64,
+            b: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            for (i, &byte) in b.iter().enumerate() {
+                self.mem.insert(a.wrapping_add(i as u64), byte);
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::RegAccess for SigframeEngine {
+        fn get_reg(&self, r: crate::Reg) -> Result<u64, crate::OsError> {
+            Ok(match r {
+                crate::Reg::X(i) => self.x[i as usize],
+                crate::Reg::Sp => self.sp,
+                crate::Reg::Pc => self.pc,
+                crate::Reg::ElrEl1 => self.elr_el1,
+                crate::Reg::SpsrEl1 => self.spsr_el1,
+                _ => 0,
+            })
+        }
+        fn set_reg(&mut self, r: crate::Reg, v: u64) -> Result<(), crate::OsError> {
+            match r {
+                crate::Reg::X(i) => self.x[i as usize] = v,
+                crate::Reg::Sp => self.sp = v,
+                crate::Reg::Pc => self.pc = v,
+                crate::Reg::ElrEl1 => self.elr_el1 = v,
+                crate::Reg::SpsrEl1 => self.spsr_el1 = v,
+                _ => {}
+            }
+            Ok(())
+        }
+        fn get_sys_reg(&self, _: crate::SysReg) -> Result<u64, crate::OsError> {
+            Ok(0)
+        }
+        fn set_sys_reg(&mut self, _: crate::SysReg, _: u64) -> Result<(), crate::OsError> {
+            Ok(())
+        }
+        fn get_vreg(&self, n: u32) -> Result<u128, crate::OsError> {
+            Ok(self.vregs[n as usize])
+        }
+        fn set_vreg(&mut self, n: u32, v: u128) -> Result<(), crate::OsError> {
+            self.vregs[n as usize] = v;
+            Ok(())
+        }
+        fn get_fpcr(&self) -> Result<u64, crate::OsError> {
+            Ok(self.fpcr)
+        }
+        fn set_fpcr(&mut self, v: u64) -> Result<(), crate::OsError> {
+            self.fpcr = v;
+            Ok(())
+        }
+        fn get_fpsr(&self) -> Result<u64, crate::OsError> {
+            Ok(self.fpsr)
+        }
+        fn set_fpsr(&mut self, v: u64) -> Result<(), crate::OsError> {
+            self.fpsr = v;
+            Ok(())
+        }
+    }
+
+    fn empty_engine() -> SigframeEngine {
+        SigframeEngine {
+            mem: std::collections::HashMap::new(),
+            x: [0; 31],
+            sp: 0,
+            pc: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
+            vregs: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+        }
+    }
+
+    /// An `InjectParams` for a plain (no-fault, no-altstack, no-restart) signal
+    /// delivery carrying the given interrupted PSTATE. `fpsimd_enabled` is on so
+    /// the V-register save/restore path is exercised too.
+    fn inject_params(pstate_source: u64) -> crate::sigframe::InjectParams {
+        crate::sigframe::InjectParams {
+            signum: 11,
+            handler: 0x4444_0000,
+            sa_restorer: 0x5555_0000,
+            pending_syscall_retval: None,
+            interrupted_pc: None,
+            altstack: None,
+            saved_sigmask: 0x00FF,
+            fault_siginfo: None,
+            queued_siginfo: None,
+            restart_syscall: false,
+            pstate_source,
+            orig_x0: 0,
+            fault_esr: 0,
+            fpsimd_enabled: true,
+            sigreturn_trampoline_base: 0x6666_0000,
+        }
+    }
+
+    #[test]
+    fn aarch64_sigframe_round_trips_gprs_pstate_pc() {
+        let mut e = empty_engine();
+        // Distinctive pre-signal register state.
+        for i in 0..31 {
+            e.x[i] = 0x1000 + i as u64;
+        }
+        e.sp = 0x20_0000; // 16-aligned user stack
+        e.elr_el1 = 0xDEAD_BEE0; // becomes saved_pc (interrupted_pc == None)
+        // EL0t PSTATE: mode bits [3:0] == 0, NZCV all set to prove the condition
+        // flags survive verbatim through the frame.
+        let pstate = 0xF000_0000u64;
+        for i in 0..32 {
+            e.vregs[i] = ((i as u128) << 64) | 0xCAFE_F00D_ABCD;
+        }
+        e.fpsr = 0x11;
+        e.fpcr = 0x22;
+
+        let saved_x = e.x;
+        let saved_sp = e.sp;
+        let saved_pc = e.elr_el1;
+        let saved_vregs = e.vregs;
+
+        let inject = Aarch64GuestArch::build_sigframe(&mut e, inject_params(pstate))
+            .expect("build_sigframe writes the frame to the engine's guest memory");
+
+        // build redirected the LIVE registers to the handler-entry ABI (x0=signum,
+        // x1/x2 = &siginfo/&ucontext, x30 = restorer, SP = the new frame). The
+        // ORIGINALS live only in the frame now. Simulate the handler returning via
+        // rt_sigreturn: SP already points at the frame (build set it), so clobber
+        // the live GPR/V state to prove restore truly reloads from the frame.
+        assert_eq!(e.sp, inject.new_sp, "build leaves SP at the new frame");
+        e.x = [0; 31];
+        e.vregs = [0; 32];
+
+        let restore = Aarch64GuestArch::restore_sigframe(&mut e, true)
+            .expect("restore_sigframe reads the frame back");
+
+        assert_eq!(e.x, saved_x, "x0..x30 must round-trip through the sigframe");
+        assert_eq!(e.sp, saved_sp, "SP_EL0 must round-trip");
+        assert_eq!(e.elr_el1, saved_pc, "resume PC (ELR_EL1) must round-trip");
+        assert_eq!(e.spsr_el1, pstate, "PSTATE (incl. NZCV) must round-trip");
+        assert_eq!(restore.saved_pc, saved_pc, "reported saved_pc matches");
+        assert_eq!(
+            restore.sigmask, 0x00FF,
+            "uc_sigmask must round-trip for the caller's resmask"
+        );
+        assert_eq!(e.vregs, saved_vregs, "V0..V31 must round-trip");
+    }
+
+    #[test]
+    fn aarch64_sigframe_rejects_non_el0_pstate() {
+        use carrick_guest_mem::GuestMemory;
+        use zerocopy::IntoBytes;
+        // A readable-but-INVALID frame: the restored PSTATE selects a non-EL0
+        // exception level (EL1h, mode bits 0b0101). Linux's `valid_user_regs`
+        // refuses such a frame at rt_sigreturn; carrick must return
+        // SignalDeliveryFault (→ guest force_sigsegv), NOT silently `eret` the vCPU
+        // into EL1 garbage. The frame is fully written to guest memory first, so
+        // the read SUCCEEDS — this exercises the PSTATE-validation arm, not the
+        // bad-SP read-fault arm.
+        let mut e = empty_engine();
+        let frame_addr = 0x30_0000u64;
+
+        // Build the bad frame via whole-substruct assignment (the packed structs
+        // forbid taking references to nested fields).
+        let mut mc = carrick_abi::LinuxSignalContext::empty();
+        mc.pstate = 0b0101; // EL1h: low nibble != 0 → must be rejected
+        mc.regs = [0xBAD0_0000; 31]; // values that MUST NOT be applied
+        mc.sp = 0xDEAD;
+        mc.pc = 0xBEEF;
+        let mut uc = carrick_abi::LinuxUcontext::empty();
+        uc.uc_mcontext = mc;
+        let mut frame = carrick_abi::CarrickSigframe::empty();
+        frame.ucontext = uc;
+        e.write_bytes(frame_addr, frame.as_bytes())
+            .expect("seed the bad frame into guest memory");
+        e.sp = frame_addr;
+
+        let before_x = e.x;
+        let before_elr = e.elr_el1;
+        match Aarch64GuestArch::restore_sigframe(&mut e, false) {
+            Err(crate::TrapError::SignalDeliveryFault) => {}
+            Err(other) => panic!(
+                "a non-EL0 restored PSTATE must be rejected with SignalDeliveryFault, got {other:?}"
+            ),
+            Ok(_) => {
+                panic!("a non-EL0 restored PSTATE must be rejected, not silently restored")
+            }
+        }
+        // The validation arm fires BEFORE any register write, so the bad frame's
+        // contents must not have leaked into the vCPU.
+        assert_eq!(e.x, before_x, "rejected frame must not mutate the GPRs");
+        assert_eq!(
+            e.elr_el1, before_elr,
+            "rejected frame must not set the resume PC"
+        );
+    }
 }
