@@ -706,7 +706,23 @@ impl X86Vcpu for BhyveX86Vcpu {
         // recursion could blow the stack on a wedged guest.
         loop {
             let mut v_cpu = self.h.as_bhyve();
-            match v_cpu.run_x86().map_err(Self::reg_err)? {
+            let native_exit = v_cpu.run_x86().map_err(Self::reg_err)?;
+            // The fork/clone-restore one-shot RIP suppressor (`fork_entry_pending`,
+            // see `set_gpr`) only needs to protect the ring-0 MSR-blob entry from a
+            // PRE-run `complete_syscall` RIP write. Once the vCPU has actually run
+            // (the blob executed and iretq'd to ring-3) the flag is moot — and it
+            // MUST be cleared here, because an in-process clone SIBLING never issues
+            // that `complete_syscall` (its rax=0 + clone-return entry come from the
+            // restored snapshot and the blob's iretq frame, not a syscall
+            // completion). A still-armed flag would otherwise silently eat the
+            // sibling's FIRST fault-resume `set_gpr(Rip)` — the worker thread
+            // demand-faulting on its own fresh code/stack page during bring-up —
+            // leaving the vCPU parked at the fault-stub forever (it then only spins
+            // on host-preemption BOGUS exits). The fork child's `complete_syscall`
+            // runs BEFORE the first `run()` and has already consumed the flag, so
+            // this clear is a harmless no-op for it.
+            self.h.fork_entry_pending.store(false, Ordering::SeqCst);
+            match native_exit {
                 // SYSCALL doorbell: OUT 0xC5. bhyve carries rip + inst_length
                 // SEPARATELY; the engine owns the pending state, so we compute
                 // resume_pc = rip + inst_length HERE (= the sysretq after the `out`).
