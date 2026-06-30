@@ -209,11 +209,107 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-aarch64"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-host",
+ "carrick-mem",
+ "libc",
+]
+
+[[package]]
+name = "carrick-abi"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "serde",
+ "zerocopy",
+]
+
+[[package]]
 name = "carrick-fuzz"
 version = "0.0.0"
 dependencies = [
  "carrick-runtime",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "carrick-guest-mem"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "carrick-hal"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-mem",
+ "carrick-signal-core",
+ "carrick-timer-core",
+ "libc",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "carrick-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "carrick-host-bsd"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-hal",
+ "carrick-host",
+ "libc",
+]
+
+[[package]]
+name = "carrick-mem"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "goblin",
+ "libc",
+ "parking_lot",
+ "serde",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "carrick-observability"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "libc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "usdt",
+]
+
+[[package]]
+name = "carrick-portable"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -226,8 +322,19 @@ dependencies = [
  "bitflags",
  "camino",
  "cap-std",
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-host",
+ "carrick-host-bsd",
+ "carrick-mem",
+ "carrick-observability",
+ "carrick-portable",
+ "carrick-signal-core",
  "carrick-spec",
- "cc",
+ "carrick-thread",
+ "carrick-timer-core",
+ "carrick-vmm-hvf",
  "clap",
  "fd-lock",
  "flate2",
@@ -251,6 +358,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-signal-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-spec"
 version = "0.1.0"
 dependencies = [
@@ -259,6 +373,57 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "carrick-thread"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-hal",
+ "carrick-observability",
+ "libc",
+ "parking_lot",
+ "parking_lot_core",
+ "serde",
+]
+
+[[package]]
+name = "carrick-timer-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-host",
+ "carrick-portable",
+]
+
+[[package]]
+name = "carrick-vmm-hvf"
+version = "0.1.0"
+dependencies = [
+ "applevisor",
+ "applevisor-sys",
+ "carrick-aarch64",
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-host",
+ "carrick-host-bsd",
+ "carrick-mem",
+ "carrick-observability",
+ "carrick-signal-core",
+ "carrick-thread",
+ "carrick-timer-core",
+ "cc",
+ "clap",
+ "libc",
+ "parking_lot",
+ "parking_lot_core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "usdt",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1862,6 +2027,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2053,6 +2228,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
