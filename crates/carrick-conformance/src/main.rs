@@ -91,10 +91,14 @@ struct Args {
     baseline: PathBuf,
     /// Additional baseline UNIONed onto `--baseline` before classification: a
     /// divergence is excused iff it matches the shared baseline OR this overlay.
-    /// Used by the KVM lane (`baseline.kvm.jsonl`, starts empty) so every KVM
-    /// divergence is a gap until proven environmental. Absent/empty -> no-op.
-    #[arg(long, default_value = "scripts/conformance/baseline.kvm.jsonl")]
-    baseline_overlay: PathBuf,
+    /// DEFAULT IS LANE-DERIVED (`baseline.<lane>.jsonl` next to `--baseline`):
+    /// the kvm/bhyve/nvmm bring-up lanes each carry their OWN overlay (starts
+    /// empty) so every lane-only divergence is a gap until proven environmental,
+    /// and the mature hvf lane carries NO overlay (it IS the shared ground
+    /// truth). Pass an explicit path to override the lane-derived default;
+    /// absent/empty -> no-op.
+    #[arg(long)]
+    baseline_overlay: Option<PathBuf>,
     #[arg(long, default_value = "target/conformance/results.jsonl")]
     jsonl: PathBuf,
     /// Rewrite baseline.jsonl + support-matrix.md from this run (guarded).
@@ -262,12 +266,21 @@ fn run() -> anyhow::Result<ExitCode> {
         preflight(&args.carrick_bin)?;
     }
 
-    // Load the shared baseline, then UNION the overlay onto it (a no-op when the
-    // overlay is absent/empty). A divergence is "expected" iff it matches the
-    // shared baseline OR the overlay; the KVM lane carries an (initially empty)
-    // overlay so every KVM-only divergence is a gap until proven environmental.
-    let baseline =
-        load_baseline(&args.baseline).with_overlay(load_baseline(&args.baseline_overlay));
+    // Load the shared baseline, then UNION the lane's overlay onto it (a no-op
+    // when the overlay is absent/empty). A divergence is "expected" iff it
+    // matches the shared baseline OR the overlay. The overlay path is LANE-
+    // DERIVED by default (`baseline.<lane>.jsonl` beside `--baseline`): each
+    // bring-up lane (kvm/bhyve/nvmm) carries its OWN initially-empty overlay so
+    // every lane-only divergence is a gap until proven environmental, while the
+    // mature hvf lane carries none. An explicit `--baseline-overlay` overrides.
+    let overlay_path = args
+        .baseline_overlay
+        .clone()
+        .or_else(|| lane_overlay_path(&args.baseline, &args.lane));
+    let baseline = match &overlay_path {
+        Some(p) => load_baseline(&args.baseline).with_overlay(load_baseline(p)),
+        None => load_baseline(&args.baseline),
+    };
 
     let pid = std::process::id();
     let carrick_bin = args.carrick_bin.to_string_lossy().into_owned();
@@ -586,6 +599,35 @@ fn seed_oracle(
     Ok(())
 }
 
+/// What a `--bless` on a given lane is permitted to rewrite. The mature `hvf`
+/// lane rewrites the SHARED baseline + `support-matrix.md` (the ground truth); a
+/// kvm/bhyve/nvmm bring-up lane rewrites ONLY its own overlay
+/// (`baseline.<key>.jsonl`) — never the shared baseline, never the matrix — so a
+/// lane's observations can never overwrite the hvf ground truth. An unrecognized
+/// lane is refused outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlessTarget {
+    /// hvf: rewrite the shared `baseline.jsonl` + `docs/support-matrix.md`.
+    SharedBaseline,
+    /// kvm/bhyve/nvmm: rewrite ONLY `baseline.<key>.jsonl` (the overlay).
+    LaneOverlay(&'static str),
+}
+
+/// Pure bless-guard decision (no IO): which artifact `--bless` may rewrite on
+/// `lane`. Unit-tested directly — the side-effecting `bless` dispatches on this.
+fn bless_target(lane: &str) -> Result<BlessTarget, String> {
+    if lane == "hvf" {
+        return Ok(BlessTarget::SharedBaseline);
+    }
+    match lane_overlay_key(lane) {
+        Some(key) => Ok(BlessTarget::LaneOverlay(key)),
+        None => Err(format!(
+            "--bless: unrecognized lane {lane:?} — bless is the hvf lane (shared \
+             baseline + matrix) or a kvm/bhyve/nvmm bring-up lane (its overlay only)"
+        )),
+    }
+}
+
 fn bless(
     args: &Args,
     selected: &[Suite],
@@ -597,16 +639,10 @@ fn bless(
             "--bless requires a full-tier, unfiltered run (no --tier smoke / --ecosystem / --suite)"
         );
     }
-    // The blessed baseline.jsonl + support-matrix.md are the SHARED (hvf-lane)
-    // ground truth; a kvm-lane bless would overwrite them with KVM-lane
-    // observations. KVM-only excuses belong in the overlay (baseline.kvm.jsonl).
-    if args.lane != "hvf" {
-        anyhow::bail!(
-            "--bless is hvf-lane only (lane={}); record KVM-lane excuses in the \
-             baseline overlay (scripts/conformance/baseline.kvm.jsonl) instead",
-            args.lane
-        );
-    }
+    // The shared baseline.jsonl + support-matrix.md are the hvf-lane ground
+    // truth; a bring-up-lane bless writes ONLY that lane's overlay instead, so it
+    // can never overwrite them with lane-specific observations.
+    let target = bless_target(&args.lane).map_err(|e| anyhow::anyhow!(e))?;
     let bad: Vec<&str> = reports
         .iter()
         .filter(|r| {
@@ -624,13 +660,26 @@ fn bless(
         );
     }
     let _ = selected; // (kept for symmetry / future per-suite bless)
-    write_reports(&args.baseline, reports)?;
-    let md = matrix::render(reports);
-    write_matrix(&md)?;
-    eprintln!(
-        "blessed: wrote {} and docs/support-matrix.md",
-        args.baseline.display()
-    );
+    match target {
+        BlessTarget::SharedBaseline => {
+            write_reports(&args.baseline, reports)?;
+            let md = matrix::render(reports);
+            write_matrix(&md)?;
+            eprintln!(
+                "blessed: wrote {} and docs/support-matrix.md",
+                args.baseline.display()
+            );
+        }
+        BlessTarget::LaneOverlay(key) => {
+            // ONLY the lane overlay — the shared baseline + matrix stay untouched.
+            let overlay = overlay_path_for_key(&args.baseline, key);
+            write_reports(&overlay, reports)?;
+            eprintln!(
+                "blessed {key} lane overlay: wrote {} (shared baseline + matrix left untouched)",
+                overlay.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1024,6 +1073,40 @@ fn load_baseline(path: &Path) -> Baseline {
     }
 }
 
+// ---- lane-derived baseline overlays (§4.4) ----
+//
+// Each carrick VMM bring-up lane carries its OWN baseline overlay so a
+// lane-only divergence is a tracked gap in that lane, not a regression smuggled
+// into the shared (hvf) ground truth. The overlay file is named
+// `baseline.<key>.jsonl` and lives beside the shared `baseline.jsonl`.
+
+/// The overlay KEY for a lane string (the `<key>` in `baseline.<key>.jsonl`).
+/// kvm/bhyve/nvmm — including their `*-local` and long aliases — each map to
+/// their own overlay; the mature `hvf` lane (and any unknown string) has NONE,
+/// because hvf IS the shared baseline ground truth.
+fn lane_overlay_key(lane: &str) -> Option<&'static str> {
+    match lane {
+        "kvm" | "kvm-local" | "linux-kvm" => Some("kvm"),
+        "bhyve-local" | "freebsd-bhyve" => Some("bhyve"),
+        "nvmm-local" | "netbsd-nvmm" => Some("nvmm"),
+        _ => None,
+    }
+}
+
+/// Build the overlay path for a key beside the shared baseline:
+/// `<baseline-dir>/baseline.<key>.jsonl`.
+fn overlay_path_for_key(baseline: &Path, key: &str) -> PathBuf {
+    let dir = baseline.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("baseline.{key}.jsonl"))
+}
+
+/// The lane-derived overlay path for a lane, or `None` for hvf/unknown (no
+/// overlay). Derived from the shared baseline's directory so it tracks
+/// `--baseline` if the operator relocates it.
+fn lane_overlay_path(baseline: &Path, lane: &str) -> Option<PathBuf> {
+    lane_overlay_key(lane).map(|key| overlay_path_for_key(baseline, key))
+}
+
 // ---- binary preflight (§4.5) ----
 
 fn preflight(bin: &Path) -> anyhow::Result<()> {
@@ -1309,6 +1392,64 @@ mod tests {
                 "cpython-b"
             ]
         );
+    }
+
+    #[test]
+    fn lane_overlay_path_is_lane_derived() {
+        let baseline = Path::new("scripts/conformance/baseline.jsonl");
+        // Each bring-up lane (and its aliases) derives its OWN overlay file
+        // beside the shared baseline.
+        for (lane, want) in [
+            ("kvm", "scripts/conformance/baseline.kvm.jsonl"),
+            ("kvm-local", "scripts/conformance/baseline.kvm.jsonl"),
+            ("linux-kvm", "scripts/conformance/baseline.kvm.jsonl"),
+            ("bhyve-local", "scripts/conformance/baseline.bhyve.jsonl"),
+            ("freebsd-bhyve", "scripts/conformance/baseline.bhyve.jsonl"),
+            ("nvmm-local", "scripts/conformance/baseline.nvmm.jsonl"),
+            ("netbsd-nvmm", "scripts/conformance/baseline.nvmm.jsonl"),
+        ] {
+            assert_eq!(
+                lane_overlay_path(baseline, lane).as_deref(),
+                Some(Path::new(want)),
+                "lane {lane} overlay path"
+            );
+        }
+        // hvf (the shared ground truth) and any unknown lane have NO overlay.
+        assert_eq!(lane_overlay_path(baseline, "hvf"), None);
+        assert_eq!(lane_overlay_path(baseline, "bogus"), None);
+    }
+
+    #[test]
+    fn lane_overlay_path_tracks_baseline_directory() {
+        // The overlay lives beside whatever `--baseline` points at, not a
+        // hard-coded scripts/conformance prefix.
+        assert_eq!(
+            lane_overlay_path(Path::new("/tmp/custom/baseline.jsonl"), "bhyve-local").as_deref(),
+            Some(Path::new("/tmp/custom/baseline.bhyve.jsonl"))
+        );
+    }
+
+    #[test]
+    fn bless_target_guards_per_lane() {
+        // hvf rewrites the shared baseline + matrix.
+        assert_eq!(bless_target("hvf"), Ok(BlessTarget::SharedBaseline));
+        // Each bring-up lane writes ONLY its own overlay key, never the shared
+        // baseline.
+        assert_eq!(bless_target("kvm"), Ok(BlessTarget::LaneOverlay("kvm")));
+        assert_eq!(
+            bless_target("kvm-local"),
+            Ok(BlessTarget::LaneOverlay("kvm"))
+        );
+        assert_eq!(
+            bless_target("bhyve-local"),
+            Ok(BlessTarget::LaneOverlay("bhyve"))
+        );
+        assert_eq!(
+            bless_target("nvmm-local"),
+            Ok(BlessTarget::LaneOverlay("nvmm"))
+        );
+        // An unrecognized lane is refused outright (no silent shared-baseline write).
+        assert!(bless_target("rosetta").is_err());
     }
 
     #[test]
