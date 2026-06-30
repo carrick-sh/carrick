@@ -300,6 +300,32 @@ pub fn program_longmode_entry<C: X86Vcpu>(
     vcpu.set_gpr(X86Reg::Rip, entry_rip)?;
     vcpu.set_gpr(X86Reg::Rsp, rsp)?;
     vcpu.set_gpr(X86Reg::Rflags, boot.rflags)?;
+    // Zero every other GPR, matching the Linux ELF loader (`ELF_PLAT_INIT`),
+    // which clears them at exec so no kernel/bringup state leaks to the guest.
+    // RDX is the load-bearing one: the System V x86-64 ABI defines it at process
+    // entry as `rtld_fini` (0 = none). glibc's `__libc_start_main` registers RDX
+    // via `__cxa_atexit` and CALLS it during exit teardown — so leftover init-blob
+    // garbage in RDX makes a STATIC binary jump to a bogus address at exit and
+    // SIGSEGV (a dynamic binary is unharmed: ld.so overwrites RDX before _start).
+    for r in [
+        X86Reg::Rax,
+        X86Reg::Rbx,
+        X86Reg::Rcx,
+        X86Reg::Rdx,
+        X86Reg::Rsi,
+        X86Reg::Rdi,
+        X86Reg::Rbp,
+        X86Reg::R8,
+        X86Reg::R9,
+        X86Reg::R10,
+        X86Reg::R11,
+        X86Reg::R12,
+        X86Reg::R13,
+        X86Reg::R14,
+        X86Reg::R15,
+    ] {
+        vcpu.set_gpr(r, 0)?;
+    }
 
     // ── SYSCALL MSRs (LSTAR = trampoline GPA) ─────────────────────────────────
     vcpu.set_syscall_msrs(layout.trampoline_base, boot.star, boot.sfmask)
