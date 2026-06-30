@@ -1859,6 +1859,85 @@ mod normalize_tests {
             _ => panic!("newfstatat must be Plain"),
         }
     }
+
+    /// x86_64 syscall numbers <= the highest number carrick maps that are
+    /// DELIBERATELY left unsupported (-ENOSYS): obsolete/legacy x86_64-only calls
+    /// with no asm-generic equivalent (uselib, ustat, _sysctl, iopl, ...) plus the
+    /// unassigned gaps in the x86_64 number space. A number that normalizes to the
+    /// unsupported sink WITHOUT appearing here is a forgotten shim; a number listed
+    /// here that is now handled is stale. Both fail the test, so adding/dropping x86
+    /// coverage forces a conscious edit instead of silent drift.
+    ///
+    /// (Names per the per-entry comments in `carrick_abi::syscall_x86_64`.)
+    #[rustfmt::skip]
+    const DEFERRED_X86_SHIMS: &[u64] = &[
+        // getdents(78): legacy; the guest uses getdents64 (canonical 61) instead.
+        78,
+        // utime(132)/utimes(235)/futimesat(261): legacy utimbuf/timeval time
+        // setters — need a struct-converting shim to canonical utimensat(88), not
+        // a plain arg shuffle (see the deferred-shim note in normalize_syscall).
+        132, 235, 261,
+        // Obsolete / never-implemented x86_64-only calls with NO asm-generic
+        // equivalent: uselib(134), ustat(136), sysfs(139), _sysctl(156),
+        // create_module(174), get_kernel_syms(177), query_module(178),
+        // nfsservctl(180), vserver(236).
+        134, 136, 139, 156, 174, 177, 178, 180, 236,
+        // x86-private LDT / I/O-port / thread-area ops, NO asm-generic equivalent:
+        // modify_ldt(154), iopl(172), ioperm(173), set_thread_area(205),
+        // get_thread_area(211). (x86_64 TLS goes through arch_prctl instead.)
+        154, 172, 173, 205, 211,
+        // Reserved / never-implemented numbers (STREAMS & misc): getpmsg(181),
+        // putpmsg(182), afs_syscall(183), tuxcall(184), security(185).
+        181, 182, 183, 184, 185,
+        // time(201): legacy x86_64-only; asm-generic reads the clock via
+        // clock_gettime / gettimeofday instead.
+        201,
+        // epoll_ctl_old(214)/epoll_wait_old(215): obsolete, never implemented.
+        214, 215,
+        // The large unassigned gap in the x86_64 number space between
+        // rseq(334) and pidfd_send_signal(424) — no syscall is allocated here.
+        335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346,
+        347, 348, 349, 350, 351, 352, 353, 354, 355, 356, 357, 358,
+        359, 360, 361, 362, 363, 364, 365, 366, 367, 368, 369, 370,
+        371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381, 382,
+        383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394,
+        395, 396, 397, 398, 399, 400, 401, 402, 403, 404, 405, 406,
+        407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
+        419, 420, 421, 422, 423,
+    ];
+
+    #[test]
+    fn every_x86_number_up_to_max_is_mapped_or_deferred() {
+        use carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED;
+        let max = carrick_abi::syscall_x86_64::X86_64_SYSCALLS
+            .last()
+            .expect("x86_64 table is non-empty")
+            .number;
+        let deferred: std::collections::BTreeSet<u64> =
+            DEFERRED_X86_SHIMS.iter().copied().collect();
+        let mut unexpected_sinks = Vec::new();
+        let mut stale_deferred = Vec::new();
+        for n in 0..=max {
+            let hits_sink = match X8664GuestArch::normalize_syscall(&frame(n, [0; 6])) {
+                SyscallNorm::ArchPrctl { .. } => false,
+                SyscallNorm::Plain(rs) => rs.number == CARRICK_PRIVATE_X86_UNSUPPORTED,
+            };
+            match (hits_sink, deferred.contains(&n)) {
+                (true, false) => unexpected_sinks.push(n),
+                (false, true) => stale_deferred.push(n),
+                _ => {}
+            }
+        }
+        assert!(
+            unexpected_sinks.is_empty(),
+            "x86_64 numbers hit the -ENOSYS sink but are not in DEFERRED_X86_SHIMS \
+             (forgotten shim? add a mapping or list them): {unexpected_sinks:?}"
+        );
+        assert!(
+            stale_deferred.is_empty(),
+            "DEFERRED_X86_SHIMS lists numbers now actually handled — remove them: {stale_deferred:?}"
+        );
+    }
 }
 
 #[cfg(test)]
