@@ -2354,6 +2354,23 @@ impl SyscallDispatcher {
         );
     }
 
+    /// Resolve the host signal target for an fasync (signal-driven I/O) owner from
+    /// the ns→host translation of its owner pid/pgid. Returns `None` — meaning DROP
+    /// the SIGIO, deliver nothing — when the owner's ns id has no host mapping
+    /// (`host_target == None`), matching the `kill(2)` path's ESRCH intent: a
+    /// translation MISS must NOT fall back to the raw ns value reinterpreted as a
+    /// host pid, which would signal an unrelated process. `Some((target,
+    /// tid_required))` feeds `bootstrap_signal_send_as`; a negative `target` is a
+    /// process group (`F_OWNER_PGRP`).
+    fn fasync_signal_target(owner_type: i32, host_target: Option<u32>) -> Option<(i64, bool)> {
+        let host = host_target?;
+        Some(match owner_type {
+            LINUX_F_OWNER_PGRP => (-(host as i64), false),
+            LINUX_F_OWNER_TID => (host as i64, true),
+            _ => (host as i64, false),
+        })
+    }
+
     /// Deliver the FASYNC (signal-driven I/O) signal after a guest write to a
     /// host pipe/socket made it readable. Looks up the pipe inode in the
     /// fork-coherent registry; if armed, sends the owner's `F_SETSIG` signal
@@ -2392,19 +2409,15 @@ impl SyscallDispatcher {
         // namespace the owner's ns-pid (e.g. fcntl31's 2) is NOT its host pid, so
         // sending the raw ns id delivered the SIGIO to the wrong process.
         let ns = owner.owner_pid as u32;
-        let (target, tid_required) = match owner.owner_type {
-            LINUX_F_OWNER_PGRP => (
-                -(crate::namespace::pid::ns_to_host_pgid(ns).unwrap_or(ns) as i64),
-                false,
-            ),
-            LINUX_F_OWNER_TID => (
-                crate::namespace::pid::ns_to_host_or_self(ns).unwrap_or(ns) as i64,
-                true,
-            ),
-            _ => (
-                crate::namespace::pid::ns_to_host_or_self(ns).unwrap_or(ns) as i64,
-                false,
-            ),
+        let host_target = match owner.owner_type {
+            LINUX_F_OWNER_PGRP => crate::namespace::pid::ns_to_host_pgid(ns),
+            _ => crate::namespace::pid::ns_to_host_or_self(ns),
+        };
+        let Some((target, tid_required)) =
+            Self::fasync_signal_target(owner.owner_type, host_target)
+        else {
+            // No host target for this ns owner → drop (no wrong-target signal).
+            return;
         };
         // caller_euid = None: kernel-internal I/O-signal delivery is not gated by
         // the writer's euid (it is the kernel sending on the owner's behalf).
@@ -9404,6 +9417,47 @@ impl SyscallDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fasync_signal_target_drops_on_ns_translation_miss() {
+        // A translation MISS (no host mapping for the owner's ns id) must DROP the
+        // SIGIO — returning None — never fall back to the raw ns value reinterpreted
+        // as a host pid (which would signal an unrelated process). Matches the
+        // kill-path ESRCH intent.
+        assert_eq!(
+            SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_TID, None),
+            None,
+            "an owner whose ns-pid has no host mapping must not deliver to a bogus pid"
+        );
+        assert_eq!(
+            SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PGRP, None),
+            None
+        );
+        assert_eq!(
+            SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PID, None),
+            None
+        );
+    }
+
+    #[test]
+    fn fasync_signal_target_resolves_by_owner_kind() {
+        // A successful translation routes by owner kind: PID (and the default)
+        // target that pid with no tid requirement; TID targets that tid
+        // (tid_required); PGRP targets the NEGATED pgid (a process-group target
+        // for bootstrap_signal_send_as).
+        assert_eq!(
+            SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PID, Some(42)),
+            Some((42, false))
+        );
+        assert_eq!(
+            SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_TID, Some(42)),
+            Some((42, true))
+        );
+        assert_eq!(
+            SyscallDispatcher::fasync_signal_target(LINUX_F_OWNER_PGRP, Some(7)),
+            Some((-7, false))
+        );
+    }
 
     #[test]
     fn vfs_open_fallthrough_does_not_build_open_context() {
