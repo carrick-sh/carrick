@@ -218,19 +218,33 @@ probes/workloads as the KVM lane under bhyve:
   `run()` loop blindly re-runs on `Bogus` (bhyve_x86_engine.rs:705 "re-run on spurious un-requested
   BOGUS"), so the AP spins forever and never reaches the worker.
 
-  **This is almost certainly a NESTED-SVM artifact, NOT a carrick/bhyve bug.** bhyve's L1 config is
-  correct (IOPM `memset 0xFF` = trap-all, shared per-VM, every VMCB; IO + HALT intercepts;
-  all-dirty on first run). The BSP — whose L2 VMCB is set up at guest boot — works. Only the
-  **dynamically-created AP** (vcpuid 1, opened + run *after* the L2 guest is already running) loops
-  on persistent `Bogus`. That signature points at **KVM (L0) mishandling a dynamically-created L2
-  AP vCPU's shadow VMCB / event-injection state under nested SVM**, which carrick cannot fix.
+  The `Bogus` loop is the SYMPTOM (host-preemption astpending exits while the guest spins), not the
+  cause: the AP was parked at the fault stub `jmp .` and could make no progress, so every re-entry
+  immediately re-exited.
 
-  **To confirm + unblock:** run the repro on **real (non-nested) AMD or Intel hardware** — bhyve's
-  config is correct, so threads should work there. If a real box also fails, the next lead is the
-  AP's post-fault VMCB event-injection state (svm.c:1020-1035 / 1729-1735 `exitintinfo`
-  re-injection) producing the `Bogus`. A carrick-side mitigation (bound the blind `Bogus` re-run in
-  run() and surface a diagnostic instead of spinning) is worth adding regardless, but it treats the
-  symptom, not the cause.
+  **ACTUAL ROOT CAUSE + FIX (carrick bug — FIXED in `f7d32f90`; the "nested-SVM artifact" guess
+  above was WRONG):** the `fork_entry_pending` one-shot RIP-override suppressor (`set_gpr`) is armed
+  by `set_syscall_msrs` on every fork/clone restore to stop the post-fork `complete_syscall` from
+  clobbering the ring-0 MSR-blob entry. But an **in-process clone SIBLING never issues that
+  `complete_syscall`** — its `rax=0` + clone-return entry come from the restored snapshot and the
+  blob's iretq frame, not a syscall completion. So the armed flag survived until the sibling's FIRST
+  fault-resume `set_gpr(Rip)` (the worker demand-faulting on its own fresh code/stack page during
+  bring-up) and **silently ate it**, parking the vCPU at the fault stub forever. Proven by tracing
+  the RIP-write lifecycle: `set_gpr(Rip,glibc) pending=false → set_syscall_msrs ARMS → set_gpr(Rip,
+  glibc+13) pending=true → SUPPRESSED`. Fix: clear the flag in `run()` right after `run_x86()`
+  returns (once the blob has run + iretq'd the flag is moot; the fork child's `complete_syscall` runs
+  before the first `run()` and already consumed it — no-op for fork). **Verified on the bhyve box:
+  `threads_sleepn` N=2/N=4 now run all workers with a COHERENT shared atomic (isum=3/10 = correct).
+  It was never memory incoherence, never a nested-host artifact — a carrick fault-resume bug.**
+
+  **Residual (separate, tracked):** a worker that hits a glibc thread-startup **futex / barrier**
+  during bring-up (e.g. `pthread_barrier_wait`, `threads_paramn`/`threads_barr`) still fails — it
+  parks before its first instruction and never wakes (no fault-resume, no output). That is a
+  distinct sibling futex/reclaim-during-bring-up issue, not the suppressor. Repro:
+  `threads_barr`/`threads_paramn` on the FreeBSD box. (Lesson, per the "verify diagnoses
+  empirically" rule: I wrongly concluded "nested artifact" twice before the per-exit RIP-write trace
+  showed the suppressor — the host comparison the user pointed out, KVM-backend works, was the right
+  prior to keep chasing carrick.)
 
 ## R6 — conformance gating: fleet population
 
