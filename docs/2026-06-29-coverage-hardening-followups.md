@@ -125,12 +125,18 @@ two things:
   `arch != X86_64 -> KILL` prologue ALLOWS the x86_64 guest (SURVIVED); an
   `arch != AARCH64 -> KILL` prologue KILLS it. This pair (T2 survives + T3 kills)
   is the definitive proof the R2 arch fix reports x86_64 on a real x86 guest.
-- ⚠️ **NEW: clean guest exit returns 139 (SIGSEGV) on the x86 debug build.** The
-  x86_64-gate test printed `SURVIVED` then carrick reported exit **139** (128+11)
-  instead of the guest's `exit(0)`. Unrelated to seccomp (the syscall ran), but a
-  real x86 guest-teardown/exit-path issue worth a focused repro: a static x86_64
-  ELF that just `write`s and `return 0`s, run under `carrick run` on the KVM lane,
-  exits 139. Reproduce, then trace the exit_group/teardown path.
+- ✅ **NEW bug found + fixed: static x86 binaries SIGSEGV at exit (was 139) — entry RDX not zeroed (LANDED, e96cb54a).**
+  The x86_64-gate test printed `SURVIVED` then exited **139**. Root-caused on the
+  KVM box with a fault diagnostic: `rip=cr2=0x600` (an instruction-fetch #PF — the
+  guest CALLED a garbage pointer at exit), STATIC-only and x86-only (the same
+  static aarch64 binary exits cleanly under HVF; dynamic x86 binaries are clean).
+  Cause: `program_longmode_entry` set RIP/RSP/RFLAGS but left the other entry GPRs
+  as leftover init-blob state; the SysV x86-64 ABI defines RDX at entry as
+  `rtld_fini` (0 = none), which glibc registers via `__cxa_atexit` and CALLS at
+  exit — so a static binary jumped to garbage. Fixed by zeroing the entry GPRs
+  (matching Linux `ELF_PLAT_INIT`). Verified end-to-end: static `write+return 0`
+  now exits 0; dynamic guests unchanged. **Regression guard TODO (fits R6):** a
+  `staticexit` conformance probe (a static ELF that returns 0 → MATCH exit 0).
 
 Box note: `/root/carrick-campaign` (1.2 GB, my branch + a built debug `carrick`)
 is left on the box for inspection — `rm -rf` it to reclaim space.
