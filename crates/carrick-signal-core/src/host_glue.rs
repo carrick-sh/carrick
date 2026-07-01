@@ -148,10 +148,15 @@ pub fn set_host_default<G: HostSignalGlue>(linux_signum: i32) {
 
 /// Reset host dispositions installed only to route guest caught-signal handlers, as
 /// a guest `execve` does (caught -> default; `SIG_IGN` preserved). Walks the shared
-/// install mask; for each installed signal NOT in `ignored_mask` (indexed by bit
-/// `signum`, the dispatcher ABI) reset the host to `SIG_DFL`. `G`-claimed signals
-/// are skipped defensively.
-pub fn reset_routed_handlers_after_execve<G: HostSignalGlue>(ignored_mask: u64) {
+/// install mask; for each installed signal NOT in `ignored` reset the host to
+/// `SIG_DFL`. `G`-claimed signals are skipped defensively.
+///
+/// `ignored` is a typed [`carrick_abi::SigSet`] — this function previously took a
+/// bare `u64` in a bit=SIGNUM convention (bit 0 unused) while computing the
+/// install bit as `1 << (signum - 1)` three lines up: two bit conventions on
+/// identical raw types in one function, self-consistent only by luck. The
+/// `SigSet` newtype (bit `signum-1` everywhere) retires the second convention.
+pub fn reset_routed_handlers_after_execve<G: HostSignalGlue>(ignored: carrick_abi::SigSet) {
     let installed = host_disposition::installed_mask();
     for linux_signum in 1..=64i32 {
         let install_bit = 1u64 << (linux_signum - 1);
@@ -161,8 +166,7 @@ pub fn reset_routed_handlers_after_execve<G: HostSignalGlue>(ignored_mask: u64) 
         if G::skip_execve_reset(linux_signum) {
             continue;
         }
-        let ignored_bit = 1u64 << linux_signum;
-        if ignored_mask & ignored_bit != 0 {
+        if ignored.contains(linux_signum) {
             continue; // the new image keeps it ignored
         }
         install_sigaction::<G>(linux_signum, libc::SIG_DFL);
@@ -364,7 +368,9 @@ mod tests {
         assert!(host_disposition::is_installed(SIG_KEEP));
         assert!(host_disposition::is_installed(SIG_RESET));
 
-        reset_routed_handlers_after_execve::<IdentityGlue>(1u64 << SIG_KEEP);
+        reset_routed_handlers_after_execve::<IdentityGlue>(
+            carrick_abi::SigSet::EMPTY.with(SIG_KEEP),
+        );
         assert!(
             host_disposition::is_installed(SIG_KEEP),
             "ignored-mask kept"

@@ -1018,8 +1018,8 @@ pub fn set_host_default(linux_signum: i32) {
 /// default while preserving `SIG_IGN`; because Carrick does not host-exec, the
 /// host process would otherwise keep catching those signals after the emulated
 /// disposition was gone.
-pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
-    carrick_signal_core::host_glue::reset_routed_handlers_after_execve::<HvfGlue>(ignored_mask);
+pub fn reset_routed_handlers_after_execve(ignored: carrick_abi::SigSet) {
+    carrick_signal_core::host_glue::reset_routed_handlers_after_execve::<HvfGlue>(ignored);
 }
 
 /// Install the host SIGINT handler. Subsequent calls are no-ops. Safe
