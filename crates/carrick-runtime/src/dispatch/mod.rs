@@ -1536,6 +1536,9 @@ pub struct SyscallDispatcher {
     /// SysV shared-memory registry (per-process; host-file-backed so forked
     /// guests share segments by inode through `/tmp/carrick-shm/`).
     sysv: Mutex<sysv::SysvShmState>,
+    /// Active network namespace provider lease for this run. Host mode uses a
+    /// no-op provider; bridge mode carries the socket namespace provider.
+    network: std::sync::Arc<crate::network::RuntimeNetwork>,
     /// The supplementary group set installed by `setgroups(2)`, or `None` if the
     /// guest never called it (then `getgroups` falls back to the /etc/group-
     /// derived membership for `id(1)` compatibility). `setgroups` replaces this
@@ -1788,6 +1791,7 @@ impl SyscallDispatcher {
             fs: fs::FsState::new(),
             seccomp: crate::seccomp::SeccompState::default(),
             sysv: Mutex::new(sysv::SysvShmState::new()),
+            network: std::sync::Arc::new(crate::network::RuntimeNetwork::host_default()),
             setgroups_override: Mutex::new(None),
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             // Default: bare run-elf boot — allow the host-fs execve fallback.
@@ -1795,6 +1799,12 @@ impl SyscallDispatcher {
             // `sandbox_exec_to_container`).
             exec_host_fs_fallback: true,
         }
+    }
+
+    pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
+        let mut dispatcher = Self::new();
+        dispatcher.network = network;
+        dispatcher
     }
 
     pub(crate) fn request_signal_pump(&self) {
