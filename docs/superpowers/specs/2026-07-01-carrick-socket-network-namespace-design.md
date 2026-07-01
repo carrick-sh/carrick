@@ -208,8 +208,13 @@ host 127.0.0.1:8080 or 0.0.0.0:8080
 This is user-space forwarding, but only for published host ingress. It does not
 place the normal container-to-container datapath on a user-space TCP/IP stack.
 
-The listener must support TCP first. UDP can follow once the registry and
-datagram address translation are proven.
+The listener supports TCP streams and UDP datagrams. UDP published ingress uses
+a Carrick-owned host UDP socket, resolves the current registered virtual
+container endpoint, forwards the datagram to the loopback host socket backing
+that endpoint, and temporarily exposes the proxy backend socket as a
+guest-visible bridge-gateway source so guest replies route back to the host
+client. This preserves app-socket Docker behavior without claiming multicast,
+broadcast, raw socket, or packet-level NAT fidelity.
 
 ### Outbound Connectivity
 
@@ -307,7 +312,5 @@ packet features that the selected provider explicitly does not claim.
 - Exact bridge subnet defaults and conflict detection policy.
 - Whether v1 published ports bind loopback-only by default or match Docker's
   broader host bind behavior.
-- Whether UDP published ports are part of the first implementation or a follow-up
-  milestone.
 - Whether `/etc/hosts` name injection is sufficient for the first bridge milestone
   or if the gateway DNS responder should be part of v1.
