@@ -114,6 +114,9 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // bridge_udp_peer must run under `--net bridge`; the generic probe runner
     // uses the default host network. Covered by conformance_bridge_udp_peer.
     "bridge_udp_peer",
+    // bridge_net_identity must run under `--net bridge`; the generic probe
+    // runner uses the default host network. Covered by conformance_bridge_net_identity.
+    "bridge_net_identity",
 ];
 use std::time::{Duration, Instant};
 
@@ -646,6 +649,56 @@ fn conformance_bridge_udp_peer() {
         output.contains("bridge_udp_reply=ok"),
         "missing reply line in output:\n{output}"
     );
+}
+
+#[test]
+fn conformance_bridge_net_identity() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_bridge_net_identity: target/release/carrick not built");
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_net_identity: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_net_identity: Docker not reachable");
+        return;
+    }
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_net_identity");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_net_identity: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let raw = std::fs::read(&probe).expect("read bridge_net_identity probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let carrick_out = run_bridge_probe(&bin, lane, &encoded);
+    let docker_out = run_docker_probe(lane, &encoded).expect("docker bridge identity probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge net identity conformance mismatch:\n{diff}");
+    }
 }
 
 fn rosetta_available() -> bool {

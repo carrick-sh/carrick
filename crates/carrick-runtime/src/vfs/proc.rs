@@ -104,6 +104,8 @@ pub struct SyntheticProcContext {
     pub environ: Vec<Vec<u8>>,
     /// The guest's currently-open fd numbers, for the `/proc/self/fd` listing.
     pub open_fds: Vec<i32>,
+    /// The active Linux-visible network namespace model.
+    pub network: carrick_spec::NetworkNamespaceSpec,
     /// The serialized ELF auxv byte image (type/value pairs through AT_NULL) the
     /// guest received on its stack, surfaced verbatim via `/proc/self/auxv`.
     pub auxv: Vec<u8>,
@@ -547,7 +549,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
             // /proc/net/<f>, plus the namespace-correct /proc/self/net/<f> and
             // /proc/<pid>/net/<f> aliases, share one renderer (proc_net(5)).
             if let Some(name) = proc_net_basename(path)
-                && let Some(v) = synthetic_proc_net_file(name)
+                && let Some(v) = synthetic_proc_net_file(name, &ctx.network)
             {
                 return Some(v);
             }
@@ -838,7 +840,19 @@ fn proc_symlink_metadata(size: u64) -> Metadata {
 /// (awdl/llw/utun/bridge/gif/stf/…) are dropped so a guest never sees macOS-isms
 /// or tries `if_nametoindex("en0")`. Feeds dev/igmp/igmp6/dev_mcast so the iface
 /// NAME correlates across all of /proc/net.
-fn linux_interfaces() -> Vec<(u32, String, bool, bool)> {
+fn linux_interfaces(
+    network: &carrick_spec::NetworkNamespaceSpec,
+) -> Vec<(u32, String, bool, bool)> {
+    if network.mode == carrick_spec::NetworkMode::Bridge {
+        return vec![
+            (1, "lo".to_owned(), true, true),
+            (2, "eth0".to_owned(), true, false),
+        ];
+    }
+    host_linux_interfaces()
+}
+
+fn host_linux_interfaces() -> Vec<(u32, String, bool, bool)> {
     let mut out: Vec<(u32, String, bool, bool)> = Vec::new();
     let mut have_eth = false;
     for (_idx, name, v4, v6) in host_mc_interfaces() {
@@ -863,13 +877,16 @@ fn linux_interfaces() -> Vec<(u32, String, bool, bool)> {
 /// header-only — the high-fidelity idle case; a present, correctly-headered file
 /// beats ENOENT for ss/netstat/lsof/node_exporter. Counters tables (snmp/netstat/
 /// sockstat) carry the exact LABELS parsers key on, with zero values.
-fn synthetic_proc_net_file(name: &str) -> Option<Vec<u8>> {
+fn synthetic_proc_net_file(
+    name: &str,
+    network: &carrick_spec::NetworkNamespaceSpec,
+) -> Option<Vec<u8>> {
     let bytes: Vec<u8> = match name {
-        "dev" => return Some(synthetic_proc_net_dev()),
-        "igmp" => return Some(synthetic_proc_net_igmp()),
-        "igmp6" => return Some(synthetic_proc_net_igmp6()),
-        "dev_mcast" => return Some(synthetic_proc_net_dev_mcast()),
-        "if_inet6" => synthetic_proc_net_if_inet6(),
+        "dev" => return Some(synthetic_proc_net_dev(network)),
+        "igmp" => return Some(synthetic_proc_net_igmp(network)),
+        "igmp6" => return Some(synthetic_proc_net_igmp6(network)),
+        "dev_mcast" => return Some(synthetic_proc_net_dev_mcast(network)),
+        "if_inet6" => synthetic_proc_net_if_inet6(network),
         "tcp" => b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n".to_vec(),
         "tcp6" => b"  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n".to_vec(),
         "udp" => b"   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n".to_vec(),
@@ -879,7 +896,7 @@ fn synthetic_proc_net_file(name: &str) -> Option<Vec<u8>> {
         "unix" => b"Num       RefCount Protocol Flags    Type St Inode Path\n".to_vec(),
         "packet" => b"sk               RefCnt Type Proto  Iface R Rmem   User   Inode\n".to_vec(),
         "arp" => b"IP address       HW type     Flags       HW address            Mask     Device\n".to_vec(),
-        "route" => synthetic_proc_net_route(),
+        "route" => synthetic_proc_net_route(network),
         "ipv6_route" => synthetic_proc_net_ipv6_route(),
         "snmp" => synthetic_proc_net_snmp(),
         "snmp6" => synthetic_proc_net_snmp6(),
@@ -893,9 +910,9 @@ fn synthetic_proc_net_file(name: &str) -> Option<Vec<u8>> {
 
 /// `/proc/net/if_inet6`: one row per IPv6 interface (proc_net(5)). Loopback's
 /// `::1/128` plus a row per mapped uplink; glibc's `__check_pf` reads this.
-fn synthetic_proc_net_if_inet6() -> Vec<u8> {
+fn synthetic_proc_net_if_inet6(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, _v4, v6) in linux_interfaces() {
+    for (idx, name, _v4, v6) in linux_interfaces(network) {
         if name == "lo" {
             s.push_str(&format!(
                 "00000000000000000000000000000001 {idx:02x} 80 10 80 {name:>9}\n"
@@ -911,12 +928,12 @@ fn synthetic_proc_net_if_inet6() -> Vec<u8> {
 
 /// `/proc/net/dev`: the two verbatim header lines (proc_net(5) quotes them
 /// exactly) then one all-zero-counter row per Linux-mapped interface.
-fn synthetic_proc_net_dev() -> Vec<u8> {
+fn synthetic_proc_net_dev(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
     let mut s = String::from(
         "Inter-|   Receive                                                |  Transmit\n \
 face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
     );
-    for (_idx, name, _v4, _v6) in linux_interfaces() {
+    for (_idx, name, _v4, _v6) in linux_interfaces(network) {
         s.push_str(&format!(
             "{name:>6}: 0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n"
         ));
@@ -926,9 +943,9 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
 
 /// `/proc/net/dev_mcast`: the standard all-nodes multicast MAC memberships per
 /// interface (333300000001 = IPv6 all-nodes, 01005e000001 = IPv4 all-hosts).
-fn synthetic_proc_net_dev_mcast() -> Vec<u8> {
+fn synthetic_proc_net_dev_mcast(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, v4, v6) in linux_interfaces() {
+    for (idx, name, v4, v6) in linux_interfaces(network) {
         if v6 {
             s.push_str(&format!("{idx:<4} {name:<15} 1     0     333300000001\n"));
         }
@@ -941,11 +958,19 @@ fn synthetic_proc_net_dev_mcast() -> Vec<u8> {
 
 /// `/proc/net/route`: header + an on-link default route via the primary uplink
 /// and a loopback route. Addresses are little-endian hex (proc_net(5)).
-fn synthetic_proc_net_route() -> Vec<u8> {
+fn synthetic_proc_net_route(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
     let mut s = String::from(
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
     );
-    let eth = linux_interfaces()
+    if network.mode == carrick_spec::NetworkMode::Bridge {
+        s.push_str(&format!(
+            "eth0\t00000000\t{}\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
+            proc_net_route_hex_v4(network.gateway_v4)
+        ));
+        s.push_str("eth0\t00001FAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n");
+        return s.into_bytes();
+    }
+    let eth = linux_interfaces(network)
         .into_iter()
         .find(|(_, n, _, _)| n == "eth0")
         .map(|(_, n, _, _)| n);
@@ -956,6 +981,14 @@ fn synthetic_proc_net_route() -> Vec<u8> {
         ));
     }
     s.into_bytes()
+}
+
+fn proc_net_route_hex_v4(addr: std::net::Ipv4Addr) -> String {
+    let octets = addr.octets();
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}",
+        octets[3], octets[2], octets[1], octets[0]
+    )
 }
 
 /// `/proc/net/ipv6_route`: loopback rows in the fixed 32-hex-digit layout, no
@@ -1059,9 +1092,9 @@ fn host_mc_interfaces() -> Vec<(u32, String, bool, bool)> {
 /// `/proc/net/igmp`: one block per IPv4 interface listing the all-hosts group
 /// (224.0.0.1), matching the format Go's `parseProcNetIGMP` reads (the group is
 /// the address in NATIVE/little-endian hex).
-fn synthetic_proc_net_igmp() -> Vec<u8> {
+fn synthetic_proc_net_igmp(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
     let mut s = String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
-    for (idx, name, v4, _v6) in linux_interfaces() {
+    for (idx, name, v4, _v6) in linux_interfaces(network) {
         if !v4 {
             continue;
         }
@@ -1075,9 +1108,9 @@ fn synthetic_proc_net_igmp() -> Vec<u8> {
 /// `/proc/net/igmp6`: the all-nodes link-local (ff02::1) and interface-local
 /// (ff01::1) groups per IPv6 interface — the address is straight network-order
 /// hex, as Go's `parseProcNetIGMP6` reads.
-fn synthetic_proc_net_igmp6() -> Vec<u8> {
+fn synthetic_proc_net_igmp6(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
     let mut s = String::new();
-    for (idx, name, _v4, v6) in linux_interfaces() {
+    for (idx, name, _v4, v6) in linux_interfaces(network) {
         if !v6 {
             continue;
         }
@@ -1560,6 +1593,7 @@ impl Vfs for ProcVfs {
             guest_arch: ctx.guest_arch,
             environ: ctx.environ.unwrap_or(&[]).to_vec(),
             open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
+            network: ctx.network.cloned().unwrap_or_default(),
             auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
@@ -3141,6 +3175,23 @@ mod tests {
     }
 
     #[test]
+    fn proc_net_route_uses_bridge_gateway() {
+        let ctx = SyntheticProcContext {
+            network: carrick_spec::NetworkNamespaceSpec::bridge_default(
+                Some("web".to_string()),
+                Vec::new(),
+                Vec::new(),
+            ),
+            ..SyntheticProcContext::default()
+        };
+        let route = String::from_utf8(synthetic_file("/proc/net/route", &ctx).unwrap()).unwrap();
+        assert!(
+            route.contains("eth0\t00000000\t01001FAC"),
+            "bridge route should report default gateway 172.31.0.1 in /proc/net/route: {route}"
+        );
+    }
+
+    #[test]
     fn self_is_traversable_dir_that_readlinks_to_pid() {
         let v = ProcVfs::new();
         // Modeled as a traversable directory (so /proc/self/<file> descends),
@@ -3382,7 +3433,10 @@ mod tests {
 
     #[test]
     fn net_dev_uses_linux_iface_names_not_darwin() {
-        let dev = String::from_utf8(synthetic_proc_net_dev()).unwrap();
+        let dev = String::from_utf8(synthetic_proc_net_dev(
+            &carrick_spec::NetworkNamespaceSpec::default(),
+        ))
+        .unwrap();
         assert!(dev.contains("lo:"), "dev lists lo");
         // Never leak macOS pseudo-interfaces into the guest.
         for darwin in ["en0", "awdl0", "llw0", "utun", "lo0"] {
