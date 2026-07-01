@@ -91,6 +91,7 @@ where
         engine: &mut E,
         pidfd_out: Option<u64>,
         exit_signal: u32,
+        child_stack: u64,
         vfork: Option<u64>,
     ) -> Result<Option<i64>, RuntimeError> {
         // vfork (CLONE_VM|CLONE_VFORK): the child SHARES the parent's guest RAM
@@ -469,13 +470,16 @@ where
                     unsafe { libc::close(vf_read) };
                     self.vfork_release_fd = Some(vf_write);
                 }
-                // vfork with an explicit child_stack (clone's stack arg != 0): run
-                // the child on it.
-                if let Some(child_stack) = vfork
-                    && child_stack != 0
-                    && let Err(e) = engine.set_guest_sp_el0(child_stack)
+                // An explicit child stack (clone's stack arg != 0, vfork or
+                // ordinary fork-like clone): run the child on it, exactly as
+                // the kernel does — glibc/musl's `__clone` stub pops the child
+                // function off the NEW stack (LTP clone01 crashed on the
+                // parent's frames without this).
+                let requested_stack = vfork.unwrap_or(child_stack);
+                if requested_stack != 0
+                    && let Err(e) = engine.set_guest_sp_el0(requested_stack)
                 {
-                    tracing::warn!(?e, "vfork: failed to set child SP_EL0");
+                    tracing::warn!(?e, "clone: failed to set child stack pointer");
                 }
                 // Don't inherit the parent's accumulated guest CPU time.
                 crate::guest_cpu::reset();
