@@ -255,6 +255,7 @@ pub enum NetworkMode {
     #[default]
     Host,
     Bridge,
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -313,6 +314,10 @@ pub struct NetworkNamespaceSpec {
     pub ipv4: Ipv4Addr,
     pub gateway_v4: Ipv4Addr,
     pub dns_servers: Vec<IpAddr>,
+    #[serde(default)]
+    pub dns_search: Vec<String>,
+    #[serde(default)]
+    pub dns_options: Vec<String>,
     pub published_ports: Vec<PortMapping>,
 }
 
@@ -322,18 +327,43 @@ impl NetworkNamespaceSpec {
         aliases: Vec<String>,
         published_ports: Vec<PortMapping>,
     ) -> Self {
+        let ipv4 = bridge_ipv4_for_name(container_name.as_deref());
         Self {
             mode: NetworkMode::Bridge,
             namespace_id: Some(NetworkNamespaceId::new("default")),
             bridge_id: BridgeId::default_bridge(),
             container_name,
             aliases,
-            ipv4: Ipv4Addr::new(172, 31, 0, 2),
+            ipv4,
             gateway_v4: Ipv4Addr::new(172, 31, 0, 1),
             dns_servers: vec![IpAddr::V4(Ipv4Addr::new(172, 31, 0, 1))],
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
             published_ports,
         }
     }
+
+    pub fn none() -> Self {
+        Self {
+            mode: NetworkMode::None,
+            ..Self::default()
+        }
+    }
+}
+
+fn bridge_ipv4_for_name(container_name: Option<&str>) -> Ipv4Addr {
+    let Some(name) = container_name.filter(|name| !name.is_empty()) else {
+        return Ipv4Addr::new(172, 31, 0, 2);
+    };
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let bucket = hash % (253 * 253);
+    let third = 1 + (bucket / 253) as u8;
+    let fourth = 2 + (bucket % 253) as u8;
+    Ipv4Addr::new(172, 31, third, fourth)
 }
 
 impl Default for NetworkNamespaceSpec {
@@ -347,6 +377,8 @@ impl Default for NetworkNamespaceSpec {
             ipv4: Ipv4Addr::new(0, 0, 0, 0),
             gateway_v4: Ipv4Addr::new(0, 0, 0, 0),
             dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
             published_ports: Vec::new(),
         }
     }
@@ -599,6 +631,10 @@ pub struct RunSpec {
     /// Network namespace mode and resolved bridge view.
     #[serde(default)]
     pub network: NetworkNamespaceSpec,
+    /// Docker-compatible `/etc/hosts` additions, expressed as `name:ip` or
+    /// `name=ip`.
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
     /// Initial guest user id (`docker run --user` / image `USER`). The guest's
     /// real/effective/saved/fs uid are all seeded to this. Defaults to 0 (root).
     #[serde(default)]
@@ -653,10 +689,23 @@ mod tests {
         let decoded: NetworkNamespaceSpec = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded.mode, NetworkMode::Bridge);
         assert_eq!(decoded.bridge_id.as_str(), "carrick0");
-        assert_eq!(decoded.ipv4.to_string(), "172.31.0.2");
+        assert_eq!(decoded.ipv4.octets()[0..2], [172, 31]);
         assert_eq!(decoded.gateway_v4.to_string(), "172.31.0.1");
         assert_eq!(decoded.aliases, vec!["api"]);
         assert_eq!(decoded.published_ports[0].container_port, 80);
+    }
+
+    #[test]
+    fn named_bridge_specs_get_stable_distinct_ipv4_addresses() {
+        let db = NetworkNamespaceSpec::bridge_default(Some("db".to_string()), vec![], vec![]);
+        let db_again = NetworkNamespaceSpec::bridge_default(Some("db".to_string()), vec![], vec![]);
+        let web = NetworkNamespaceSpec::bridge_default(Some("web".to_string()), vec![], vec![]);
+
+        assert_eq!(db.ipv4, db_again.ipv4);
+        assert_ne!(db.ipv4, web.ipv4);
+        assert_ne!(db.ipv4, Ipv4Addr::new(172, 31, 0, 2));
+        assert_eq!(db.ipv4.octets()[0..2], [172, 31]);
+        assert_eq!(web.ipv4.octets()[0..2], [172, 31]);
     }
 
     #[test]

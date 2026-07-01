@@ -1803,8 +1803,8 @@ impl SyscallDispatcher {
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         let mut dispatcher = Self::new();
-        if network.spec.mode == carrick_spec::NetworkMode::Bridge {
-            let contents = format!("nameserver {}\n", network.spec.gateway_v4).into_bytes();
+        if should_mount_network_resolv_conf(&network.spec) {
+            let contents = resolv_conf_contents_for_network(&network.spec);
             dispatcher.fs.vfs_mounts.mount(
                 "/etc/resolv.conf",
                 Box::new(crate::vfs::ResolvConfVfs::from_contents(contents)),
@@ -5301,6 +5301,39 @@ fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String
     )?))
 }
 
+fn should_mount_network_resolv_conf(spec: &carrick_spec::NetworkNamespaceSpec) -> bool {
+    spec.mode == carrick_spec::NetworkMode::Bridge
+        || !spec.dns_servers.is_empty()
+        || !spec.dns_search.is_empty()
+        || !spec.dns_options.is_empty()
+}
+
+fn resolv_conf_contents_for_network(spec: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
+    let mut out = String::new();
+    let nameservers =
+        if spec.dns_servers.is_empty() && spec.mode == carrick_spec::NetworkMode::Bridge {
+            vec![std::net::IpAddr::V4(spec.gateway_v4)]
+        } else {
+            spec.dns_servers.clone()
+        };
+    for server in nameservers {
+        out.push_str("nameserver ");
+        out.push_str(&server.to_string());
+        out.push('\n');
+    }
+    if !spec.dns_search.is_empty() {
+        out.push_str("search ");
+        out.push_str(&spec.dns_search.join(" "));
+        out.push('\n');
+    }
+    if !spec.dns_options.is_empty() {
+        out.push_str("options ");
+        out.push_str(&spec.dns_options.join(" "));
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod routing_tests {
     //! Characterization test for the per-module syscall routing refactor
@@ -7581,6 +7614,22 @@ mod overlay_dispatch_tests {
             vec![index],
             "inserted index must be visible through the dispatcher accessor"
         );
+    }
+
+    #[test]
+    fn dns_overrides_render_resolv_conf() {
+        let spec = carrick_spec::NetworkNamespaceSpec {
+            dns_servers: vec!["1.1.1.1".parse().unwrap(), "9.9.9.9".parse().unwrap()],
+            dns_search: vec!["example.test".to_string()],
+            dns_options: vec!["ndots:2".to_string()],
+            ..Default::default()
+        };
+
+        let contents = String::from_utf8(resolv_conf_contents_for_network(&spec)).unwrap();
+        assert!(contents.contains("nameserver 1.1.1.1\n"));
+        assert!(contents.contains("nameserver 9.9.9.9\n"));
+        assert!(contents.contains("search example.test\n"));
+        assert!(contents.contains("options ndots:2\n"));
     }
 
     /// The Linux errno constants we publish must match the
