@@ -111,6 +111,9 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // probe runner only injects and waits, so this probe is covered by the
     // dedicated conformance_bridge_publish_tcp test below.
     "bridge_publish_tcp",
+    // bridge_udp_peer must run under `--net bridge`; the generic probe runner
+    // uses the default host network. Covered by conformance_bridge_udp_peer.
+    "bridge_udp_peer",
 ];
 use std::time::{Duration, Instant};
 
@@ -325,10 +328,78 @@ fn bridge_publish_probe_args(platform: &str, image: &str, host_port: u16) -> Vec
     ]
 }
 
+fn bridge_probe_args(platform: &str, image: &str) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--platform".to_string(),
+        platform.to_string(),
+        "--raw".to_string(),
+        "--fs".to_string(),
+        "host".to_string(),
+        "--net".to_string(),
+        "bridge".to_string(),
+        image.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        PROBE_SNIPPET.to_string(),
+    ]
+}
+
 fn free_loopback_port() -> u16 {
     let listener =
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
     listener.local_addr().expect("local addr").port()
+}
+
+fn run_bridge_probe(bin: &PathBuf, lane: Lane, stdin_bytes: &[u8]) -> String {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+
+    let run_id = case_run_id();
+    let mut child = Command::new(bin)
+        .args(bridge_probe_args(lane.platform, lane.image))
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn bridge probe");
+    let pid = child.id() as i32;
+    {
+        let mut stdin = child.stdin.take().expect("carrick stdin");
+        let bytes = stdin_bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        let run_id = run_id.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > CASE_DEADLINE {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    scoped_kill_guests(&run_id);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let out = child.wait_with_output().expect("wait bridge probe");
+    done.store(true, Ordering::Relaxed);
+    let timed_out = watcher.join().unwrap_or(false);
+    if timed_out {
+        return format!("<TIMEOUT after {}s>", CASE_DEADLINE.as_secs());
+    }
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    normalize(&combined)
 }
 
 fn run_bridge_publish_probe(
@@ -479,6 +550,18 @@ fn bridge_publish_probe_args_enable_bridge_and_publish() {
 }
 
 #[test]
+fn bridge_probe_args_enable_bridge() {
+    let args = bridge_probe_args("linux/arm64", "docker.io/library/ubuntu:24.04");
+    assert!(args.windows(2).any(|w| w == ["--net", "bridge"]));
+    let image_pos = args
+        .iter()
+        .position(|arg| arg == "docker.io/library/ubuntu:24.04")
+        .expect("image arg");
+    let net_pos = args.iter().position(|arg| arg == "--net").expect("net arg");
+    assert!(net_pos < image_pos);
+}
+
+#[test]
 fn conformance_bridge_publish_tcp() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -519,6 +602,49 @@ fn conformance_bridge_publish_tcp() {
     assert!(
         output.contains("bridge_publish_tcp_ok=true"),
         "missing completion line in output:\n{output}"
+    );
+}
+
+#[test]
+fn conformance_bridge_udp_peer() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_bridge_udp_peer: target/release/carrick not built");
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_udp_peer: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_udp_peer");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_udp_peer: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let raw = std::fs::read(&probe).expect("read bridge_udp_peer probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let output = run_bridge_probe(&bin, lane, &encoded);
+    assert!(
+        output.contains("bridge_udp_sendto_ok=true"),
+        "missing sendto completion line in output:\n{output}"
+    );
+    assert!(
+        output.contains("bridge_udp_reply=ok"),
+        "missing reply line in output:\n{output}"
     );
 }
 

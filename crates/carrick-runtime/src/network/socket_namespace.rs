@@ -1,5 +1,6 @@
 use super::{
-    BindTarget, ConnectTarget, NetworkCapabilities, NetworkLease, NetworkLeaseId, NetworkProvider,
+    BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr, NetworkCapabilities, NetworkLease,
+    NetworkLeaseId, NetworkProvider,
 };
 use carrick_spec::{BridgeId, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol};
 use std::collections::HashMap;
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub struct SocketNamespaceProvider {
-    registry: Arc<Mutex<HashMap<VirtualEndpoint, SocketAddr>>>,
+    registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
     endpoint_dir: Arc<PathBuf>,
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
     socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
@@ -25,15 +26,15 @@ pub struct SocketNamespaceProvider {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VirtualEndpoint {
     bridge_id: BridgeId,
-    addr: SocketAddr,
+    addr: GuestSocketAddr,
     protocol: PortProtocol,
 }
 
 #[derive(Debug, Clone, Default)]
 struct SocketAddressState {
-    guest_local: Option<SocketAddr>,
-    _host_local: Option<SocketAddr>,
-    guest_peer: Option<SocketAddr>,
+    guest_local: Option<GuestSocketAddr>,
+    _host_local: Option<HostSocketAddr>,
+    guest_peer: Option<GuestSocketAddr>,
 }
 
 #[derive(Debug)]
@@ -78,9 +79,9 @@ impl SocketNamespaceProvider {
         &self,
         bridge_id: BridgeId,
         _namespace_id: NetworkNamespaceId,
-        virtual_addr: SocketAddr,
+        virtual_addr: GuestSocketAddr,
         protocol: PortProtocol,
-        host_addr: SocketAddr,
+        host_addr: HostSocketAddr,
     ) -> Result<(), String> {
         let key = VirtualEndpoint {
             bridge_id,
@@ -100,9 +101,9 @@ impl SocketNamespaceProvider {
     pub fn resolve_registered_connect(
         &self,
         bridge_id: &BridgeId,
-        virtual_addr: SocketAddr,
+        virtual_addr: GuestSocketAddr,
         protocol: PortProtocol,
-    ) -> Result<Option<SocketAddr>, String> {
+    ) -> Result<Option<HostSocketAddr>, String> {
         let key = VirtualEndpoint {
             bridge_id: bridge_id.clone(),
             addr: virtual_addr,
@@ -122,12 +123,12 @@ impl SocketNamespaceProvider {
     pub fn materialize_bridge_bind(
         &self,
         spec: &NetworkNamespaceSpec,
-        requested: SocketAddr,
+        requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<BindTarget, String> {
-        match requested.ip() {
+        match requested.0.ip() {
             IpAddr::V4(ip) if ip == spec.ipv4 || ip == Ipv4Addr::UNSPECIFIED => {
-                let host = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+                let host = HostSocketAddr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
                 if let Some(namespace_id) = spec.namespace_id.clone() {
                     let virtual_ip = if ip == Ipv4Addr::UNSPECIFIED {
                         spec.ipv4
@@ -137,7 +138,10 @@ impl SocketNamespaceProvider {
                     self.register_virtual_endpoint(
                         spec.bridge_id.clone(),
                         namespace_id,
-                        SocketAddr::new(IpAddr::V4(virtual_ip), requested.port()),
+                        GuestSocketAddr(SocketAddr::new(
+                            IpAddr::V4(virtual_ip),
+                            requested.0.port(),
+                        )),
                         protocol,
                         host,
                     )?;
@@ -146,7 +150,8 @@ impl SocketNamespaceProvider {
             }
             IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST => Ok(BindTarget::Unchanged),
             _ => Err(format!(
-                "address is not assigned to network namespace: {requested}"
+                "address is not assigned to network namespace: {}",
+                requested.0
             )),
         }
     }
@@ -154,14 +159,14 @@ impl SocketNamespaceProvider {
     pub fn resolve_bridge_connect(
         &self,
         spec: &NetworkNamespaceSpec,
-        requested: SocketAddr,
+        requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
         if let Some(host) = self.resolve_registered_connect(&spec.bridge_id, requested, protocol)? {
             return Ok(ConnectTarget::Host(host));
         }
 
-        match requested.ip() {
+        match requested.0.ip() {
             IpAddr::V4(ip) if ip.octets()[0] == 172 && ip.octets()[1] == 31 => {
                 Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED))
             }
@@ -172,9 +177,9 @@ impl SocketNamespaceProvider {
     pub fn record_socket_addresses(
         &self,
         guest_fd: i32,
-        guest_local: Option<SocketAddr>,
-        host_local: Option<SocketAddr>,
-        guest_peer: Option<SocketAddr>,
+        guest_local: Option<GuestSocketAddr>,
+        host_local: Option<HostSocketAddr>,
+        guest_peer: Option<GuestSocketAddr>,
         protocol: PortProtocol,
     ) -> Result<(), String> {
         let mut socket_addrs = self
@@ -200,7 +205,7 @@ impl SocketNamespaceProvider {
                 namespaces
                     .iter()
                     .filter_map(|(namespace_id, spec)| {
-                        let IpAddr::V4(guest_ip) = guest.ip() else {
+                        let IpAddr::V4(guest_ip) = guest.0.ip() else {
                             return None;
                         };
                         if guest_ip == spec.ipv4 || guest_ip == Ipv4Addr::UNSPECIFIED {
@@ -212,7 +217,10 @@ impl SocketNamespaceProvider {
                             Some((
                                 spec.bridge_id.clone(),
                                 namespace_id.clone(),
-                                SocketAddr::new(IpAddr::V4(virtual_ip), guest.port()),
+                                GuestSocketAddr(SocketAddr::new(
+                                    IpAddr::V4(virtual_ip),
+                                    guest.0.port(),
+                                )),
                             ))
                         } else {
                             None
@@ -233,7 +241,10 @@ impl SocketNamespaceProvider {
         Ok(())
     }
 
-    pub fn guest_visible_local_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+    pub fn guest_visible_local_addr(
+        &self,
+        guest_fd: i32,
+    ) -> Result<Option<GuestSocketAddr>, String> {
         let socket_addrs = self
             .socket_addrs
             .lock()
@@ -241,12 +252,29 @@ impl SocketNamespaceProvider {
         Ok(socket_addrs.get(&guest_fd).and_then(|s| s.guest_local))
     }
 
-    pub fn guest_visible_peer_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+    pub fn guest_visible_peer_addr(
+        &self,
+        guest_fd: i32,
+    ) -> Result<Option<GuestSocketAddr>, String> {
         let socket_addrs = self
             .socket_addrs
             .lock()
             .map_err(|_| "socket address registry lock poisoned".to_string())?;
         Ok(socket_addrs.get(&guest_fd).and_then(|s| s.guest_peer))
+    }
+
+    pub fn translate_host_source(
+        &self,
+        host_addr: HostSocketAddr,
+        protocol: PortProtocol,
+    ) -> Result<Option<GuestSocketAddr>, String> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
+        Ok(registry.iter().find_map(|(endpoint, host)| {
+            (*host == host_addr && endpoint.protocol == protocol).then_some(endpoint.addr)
+        }))
     }
 
     fn first_namespace_spec(&self) -> Result<NetworkNamespaceSpec, String> {
@@ -273,7 +301,10 @@ impl SocketNamespaceProvider {
         let stop = Arc::new(AtomicBool::new(false));
         let target = VirtualEndpoint {
             bridge_id: spec.bridge_id,
-            addr: SocketAddr::new(IpAddr::V4(spec.ipv4), mapping.container_port),
+            addr: GuestSocketAddr(SocketAddr::new(
+                IpAddr::V4(spec.ipv4),
+                mapping.container_port,
+            )),
             protocol: PortProtocol::Tcp,
         };
         let registry = Arc::clone(&self.registry);
@@ -302,7 +333,7 @@ impl SocketNamespaceProvider {
     fn write_endpoint_file(
         &self,
         endpoint: &VirtualEndpoint,
-        host_addr: SocketAddr,
+        host_addr: HostSocketAddr,
     ) -> Result<(), String> {
         write_endpoint_file(&self.endpoint_dir, endpoint, host_addr)
     }
@@ -315,33 +346,36 @@ fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
         PortProtocol::Tcp => "tcp",
         PortProtocol::Udp => "udp",
     };
-    let ip = endpoint.addr.ip().to_string().replace(':', "_");
+    let ip = endpoint.addr.0.ip().to_string().replace(':', "_");
     endpoint_dir.join(format!(
         "{}-{ip}-{}-{protocol}",
         endpoint.bridge_id.as_str(),
-        endpoint.addr.port()
+        endpoint.addr.0.port()
     ))
 }
 
 fn write_endpoint_file(
     endpoint_dir: &Path,
     endpoint: &VirtualEndpoint,
-    host_addr: SocketAddr,
+    host_addr: HostSocketAddr,
 ) -> Result<(), String> {
     fs::create_dir_all(endpoint_dir)
         .map_err(|e| format!("failed to create socket namespace endpoint directory: {e}"))?;
-    fs::write(endpoint_path(endpoint_dir, endpoint), host_addr.to_string())
-        .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))
+    fs::write(
+        endpoint_path(endpoint_dir, endpoint),
+        host_addr.0.to_string(),
+    )
+    .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))
 }
 
-fn read_endpoint_file(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> Option<SocketAddr> {
+fn read_endpoint_file(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> Option<HostSocketAddr> {
     let raw = fs::read_to_string(endpoint_path(endpoint_dir, endpoint)).ok()?;
-    raw.trim().parse().ok()
+    raw.trim().parse().ok().map(HostSocketAddr)
 }
 
 fn published_tcp_accept_loop(
     listener: TcpListener,
-    registry: Arc<Mutex<HashMap<VirtualEndpoint, SocketAddr>>>,
+    registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
     endpoint_dir: Arc<PathBuf>,
     target: VirtualEndpoint,
     stop: Arc<AtomicBool>,
@@ -358,7 +392,7 @@ fn published_tcp_accept_loop(
                     let _ = thread::Builder::new()
                         .name("carrick-bridge-publish-tcp-stream".to_string())
                         .spawn(move || {
-                            let _ = proxy_tcp_stream(inbound, target_addr);
+                            let _ = proxy_tcp_stream(inbound, target_addr.0);
                         });
                 }
             }
@@ -453,7 +487,7 @@ impl NetworkProvider for SocketNamespaceProvider {
     fn materialize_bind(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
-        requested: SocketAddr,
+        requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<BindTarget, String> {
         let Some(namespace_id) = namespace_id else {
@@ -475,7 +509,7 @@ impl NetworkProvider for SocketNamespaceProvider {
     fn resolve_connect(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
-        requested: SocketAddr,
+        requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
         let Some(namespace_id) = namespace_id else {
@@ -497,20 +531,28 @@ impl NetworkProvider for SocketNamespaceProvider {
     fn record_socket_addresses(
         &self,
         guest_fd: i32,
-        guest_local: Option<SocketAddr>,
-        host_local: Option<SocketAddr>,
-        guest_peer: Option<SocketAddr>,
+        guest_local: Option<GuestSocketAddr>,
+        host_local: Option<HostSocketAddr>,
+        guest_peer: Option<GuestSocketAddr>,
         protocol: PortProtocol,
     ) -> Result<(), String> {
         self.record_socket_addresses(guest_fd, guest_local, host_local, guest_peer, protocol)
     }
 
-    fn guest_visible_local_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+    fn guest_visible_local_addr(&self, guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
         self.guest_visible_local_addr(guest_fd)
     }
 
-    fn guest_visible_peer_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+    fn guest_visible_peer_addr(&self, guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
         self.guest_visible_peer_addr(guest_fd)
+    }
+
+    fn translate_recv_addr(
+        &self,
+        host_addr: HostSocketAddr,
+        protocol: PortProtocol,
+    ) -> Result<Option<GuestSocketAddr>, String> {
+        self.translate_host_source(host_addr, protocol)
     }
 }
 
@@ -527,15 +569,26 @@ mod tests {
         listener.local_addr().expect("local addr").port()
     }
 
+    fn guest(addr: SocketAddr) -> GuestSocketAddr {
+        GuestSocketAddr(addr)
+    }
+
+    fn host(addr: SocketAddr) -> HostSocketAddr {
+        HostSocketAddr(addr)
+    }
+
     fn provider_with_endpoint() -> SocketNamespaceProvider {
         let provider = SocketNamespaceProvider::new();
         provider
             .register_virtual_endpoint(
                 BridgeId::new("carrick0"),
                 NetworkNamespaceId::new("a"),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)), 80),
+                guest(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)),
+                    80,
+                )),
                 PortProtocol::Tcp,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152),
+                host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152)),
             )
             .expect("register endpoint");
         provider
@@ -547,14 +600,17 @@ mod tests {
         let target = provider
             .resolve_registered_connect(
                 &BridgeId::new("carrick0"),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)), 80),
+                guest(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)),
+                    80,
+                )),
                 PortProtocol::Tcp,
             )
             .expect("lookup")
             .expect("registered target");
         assert_eq!(
             target,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152)
+            host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152))
         );
     }
 
@@ -564,7 +620,10 @@ mod tests {
         let target = provider
             .resolve_registered_connect(
                 &BridgeId::new("carrick1"),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)), 80),
+                guest(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)),
+                    80,
+                )),
                 PortProtocol::Tcp,
             )
             .expect("lookup");
@@ -578,12 +637,12 @@ mod tests {
         provider.create_namespace(&spec).expect("namespace");
         let requested = SocketAddr::new(IpAddr::V4(spec.ipv4), 80);
         let target = provider
-            .materialize_bridge_bind(&spec, requested, PortProtocol::Tcp)
+            .materialize_bridge_bind(&spec, guest(requested), PortProtocol::Tcp)
             .expect("bind target");
         match target {
             BindTarget::Host(host) => {
-                assert_eq!(host.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-                assert_eq!(host.port(), 0);
+                assert_eq!(host.0.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_eq!(host.0.port(), 0);
             }
             other => panic!("expected host bind target, got {other:?}"),
         }
@@ -595,7 +654,7 @@ mod tests {
         let provider = SocketNamespaceProvider::new();
         let requested = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 99)), 80);
         let err = provider
-            .materialize_bridge_bind(&spec, requested, PortProtocol::Tcp)
+            .materialize_bridge_bind(&spec, guest(requested), PortProtocol::Tcp)
             .expect_err("foreign address should fail");
         assert!(err.contains("address is not assigned"));
     }
@@ -610,31 +669,40 @@ mod tests {
             .register_virtual_endpoint(
                 spec.bridge_id.clone(),
                 spec.namespace_id.clone().unwrap(),
-                peer,
+                guest(peer),
                 PortProtocol::Tcp,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080),
+                host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080)),
             )
             .expect("register");
 
         let target = provider
-            .resolve_bridge_connect(&spec, peer, PortProtocol::Tcp)
+            .resolve_bridge_connect(&spec, guest(peer), PortProtocol::Tcp)
             .expect("resolve");
         assert_eq!(
             target,
-            ConnectTarget::Host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080))
+            ConnectTarget::Host(host(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                50080
+            )))
         );
     }
 
     #[test]
     fn records_guest_visible_local_address_for_rewritten_bind() {
         let provider = SocketNamespaceProvider::new();
-        let guest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)), 80);
-        let host = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080);
+        let guest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)), 80);
+        let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080);
         provider
-            .record_socket_addresses(7, Some(guest), Some(host), None, PortProtocol::Tcp)
+            .record_socket_addresses(
+                7,
+                Some(guest(guest_addr)),
+                Some(host(host_addr)),
+                None,
+                PortProtocol::Tcp,
+            )
             .expect("record");
         let visible = provider.guest_visible_local_addr(7).expect("visible addr");
-        assert_eq!(visible, Some(guest));
+        assert_eq!(visible, Some(guest(guest_addr)));
     }
 
     #[test]
@@ -644,7 +712,7 @@ mod tests {
         let lease = provider.create_namespace(&spec).expect("namespace");
         let peer = VirtualEndpoint {
             bridge_id: spec.bridge_id.clone(),
-            addr: SocketAddr::new(IpAddr::V4(spec.ipv4), 8080),
+            addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 8080)),
             protocol: PortProtocol::Tcp,
         };
         provider
@@ -653,7 +721,7 @@ mod tests {
                 spec.namespace_id.clone().expect("namespace id"),
                 peer.addr,
                 peer.protocol,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080),
+                host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080)),
             )
             .expect("register endpoint");
         let endpoint_file = endpoint_path(&provider.endpoint_dir, &peer);
@@ -699,9 +767,9 @@ mod tests {
             .register_virtual_endpoint(
                 spec.bridge_id.clone(),
                 spec.namespace_id.clone().expect("namespace id"),
-                peer,
+                guest(peer),
                 PortProtocol::Tcp,
-                target_addr,
+                host(target_addr),
             )
             .expect("register");
 
@@ -738,11 +806,11 @@ mod tests {
         });
         let peer = VirtualEndpoint {
             bridge_id: spec.bridge_id.clone(),
-            addr: SocketAddr::new(IpAddr::V4(spec.ipv4), 8080),
+            addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 8080)),
             protocol: PortProtocol::Tcp,
         };
         provider
-            .write_endpoint_file(&peer, target_addr)
+            .write_endpoint_file(&peer, host(target_addr))
             .expect("write endpoint file");
         {
             let registry = provider.registry.lock().expect("registry");
