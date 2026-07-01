@@ -2211,36 +2211,67 @@ pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
 pub const LINUX_F_ADD_SEALS: u64 = 1033;
 pub const LINUX_F_GET_SEALS: u64 = 1034;
 pub const LINUX_FD_CLOEXEC: u64 = 1;
+/// Ordinals for the carrick-internal ("private") normalized x86 syscall
+/// numbers below. Each public constant derives its value from THIS enum's
+/// sequential discriminants via [`private_x86_number`], so two entries can
+/// never share a number — the compiler rejects duplicate discriminants and
+/// sequential assignment leaves no hand-numbered gaps to fat-finger (alarm(2)
+/// briefly shared 0x2a with epoll_create by exactly that mistake, silently
+/// dispatching guest alarm() as epoll_create). Append new entries at the END;
+/// values are internal-only and may shift, every consumer goes through the
+/// named constants.
+#[derive(Clone, Copy)]
+enum PrivateX86Ordinal {
+    Dup2,
+    Stat,
+    Fstat,
+    Lstat,
+    Newfstatat,
+    Unsupported,
+    Utime,
+    Utimes,
+    Poll,
+    Select,
+    EpollCreate,
+    Alarm,
+}
+
+/// The private numbers grow DOWN from `u64::MAX - 0x20`, far outside any real
+/// Linux syscall-number range on any ISA.
+const fn private_x86_number(ordinal: PrivateX86Ordinal) -> u64 {
+    u64::MAX - 0x20 - ordinal as u64
+}
+
 /// Carrick-internal normalized syscall number for x86_64 `dup2(2)`.
 ///
 /// The asm-generic/canonical table has `dup3(2)` but no `dup2(2)`, and using
 /// canonical number 33 would collide with `mknodat(2)`. Keep this outside the
 /// Linux syscall-number range so x86 normalization can preserve `dup2` semantics
 /// without weakening canonical `dup3(oldfd, oldfd, flags)` handling.
-pub const CARRICK_PRIVATE_X86_DUP2: u64 = u64::MAX - 0x20;
+pub const CARRICK_PRIVATE_X86_DUP2: u64 = private_x86_number(PrivateX86Ordinal::Dup2);
 /// Carrick-internal normalized syscall number for x86_64 `stat(2)`.
 ///
 /// The path lookup is equivalent to `newfstatat(AT_FDCWD, path, flags=0)`, but
 /// the guest-visible output buffer is x86_64's 144-byte `struct stat`, not the
 /// canonical asm-generic/aarch64 layout. Keep it private so the dispatcher can
 /// select the x86 ABI writer without changing canonical `newfstatat`.
-pub const CARRICK_PRIVATE_X86_STAT: u64 = u64::MAX - 0x21;
+pub const CARRICK_PRIVATE_X86_STAT: u64 = private_x86_number(PrivateX86Ordinal::Stat);
 /// Carrick-internal normalized syscall number for x86_64 `fstat(2)`.
 ///
 /// Canonical syscall 80 is also named `fstat`, but it writes the
 /// asm-generic/aarch64 `struct stat` layout. x86_64 legacy `fstat` needs the
 /// same fd lookup with a LinuxX8664Stat writer.
-pub const CARRICK_PRIVATE_X86_FSTAT: u64 = u64::MAX - 0x22;
+pub const CARRICK_PRIVATE_X86_FSTAT: u64 = private_x86_number(PrivateX86Ordinal::Fstat);
 /// Carrick-internal normalized syscall number for x86_64 `lstat(2)`.
 ///
 /// Semantically this is `newfstatat(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW)` with
 /// x86_64's legacy `struct stat` output layout.
-pub const CARRICK_PRIVATE_X86_LSTAT: u64 = u64::MAX - 0x23;
+pub const CARRICK_PRIVATE_X86_LSTAT: u64 = private_x86_number(PrivateX86Ordinal::Lstat);
 /// Carrick-internal normalized syscall number for x86_64 `newfstatat(2)`.
 ///
 /// The arguments match canonical `newfstatat`, but x86_64 still expects the
 /// legacy 144-byte `struct stat` output layout.
-pub const CARRICK_PRIVATE_X86_NEWFSTATAT: u64 = u64::MAX - 0x24;
+pub const CARRICK_PRIVATE_X86_NEWFSTATAT: u64 = private_x86_number(PrivateX86Ordinal::Newfstatat);
 /// Carrick-internal sink for unsupported x86_64 syscalls after normalization.
 ///
 /// Leaving an x86-only number unchanged is unsafe: the canonical asm-generic
@@ -2248,7 +2279,7 @@ pub const CARRICK_PRIVATE_X86_NEWFSTATAT: u64 = u64::MAX - 0x24;
 /// example x86_64 `mkdir`=83 collides with canonical `fdatasync`=83). Normalize
 /// unsupported x86 syscalls to this out-of-range number so they return ENOSYS
 /// instead of mis-dispatching with the wrong argument shape.
-pub const CARRICK_PRIVATE_X86_UNSUPPORTED: u64 = u64::MAX - 0x25;
+pub const CARRICK_PRIVATE_X86_UNSUPPORTED: u64 = private_x86_number(PrivateX86Ordinal::Unsupported);
 /// Carrick-internal normalized syscall number for x86_64 `utime(2)`.
 ///
 /// `utime(path, *utimbuf)` differs from canonical `utimensat(dfd, path,
@@ -2257,14 +2288,14 @@ pub const CARRICK_PRIVATE_X86_UNSUPPORTED: u64 = u64::MAX - 0x25;
 /// `Direct(88)` would mis-dispatch the path pointer into the dirfd slot and feed
 /// the wrong struct, so it routes to a private handler that converts utimbuf ->
 /// `timespec[2]` (tv_nsec=0) then calls `utimensat(AT_FDCWD, path, &times, 0)`.
-pub const CARRICK_PRIVATE_X86_UTIME: u64 = u64::MAX - 0x26;
+pub const CARRICK_PRIVATE_X86_UTIME: u64 = private_x86_number(PrivateX86Ordinal::Utime);
 /// Carrick-internal normalized syscall number for x86_64 `utimes(2)`.
 ///
 /// `utimes(path, *timeval[2])` carries microsecond timevals; the private handler
 /// converts `timeval[2]` -> `timespec[2]` (tv_nsec = tv_usec*1000) then calls
 /// `utimensat(AT_FDCWD, path, &times, flags=0)`. Out-of-range tv_usec
 /// (outside `0..=999999`) -> -EINVAL; an unreadable guest pointer -> -EFAULT.
-pub const CARRICK_PRIVATE_X86_UTIMES: u64 = u64::MAX - 0x27;
+pub const CARRICK_PRIVATE_X86_UTIMES: u64 = private_x86_number(PrivateX86Ordinal::Utimes);
 /// Carrick-internal normalized syscall number for x86_64 `poll(2)`.
 ///
 /// x86_64 `poll(fds, nfds, timeout_ms)` carries an INT timeout (milliseconds:
@@ -2274,7 +2305,7 @@ pub const CARRICK_PRIVATE_X86_UTIMES: u64 = u64::MAX - 0x27;
 /// non-blocking probe as an infinite wait (musl's startup `poll([0,1,2],3,0)`
 /// then wedges the guest). This private number routes `poll` to the ppoll
 /// handler's poll branch, which reads arg2 as `timeout_ms` and uses no sigmask.
-pub const CARRICK_PRIVATE_X86_POLL: u64 = u64::MAX - 0x28;
+pub const CARRICK_PRIVATE_X86_POLL: u64 = private_x86_number(PrivateX86Ordinal::Poll);
 /// Carrick-internal normalized syscall number for x86_64 `select(2)`.
 ///
 /// x86_64 `select(nfds, r, w, e, *timeval)` carries a `*timeval` timeout
@@ -2283,7 +2314,7 @@ pub const CARRICK_PRIVATE_X86_POLL: u64 = u64::MAX - 0x28;
 /// select in would mis-read the timeval's tv_usec as tv_nsec. This private
 /// number routes select to the pselect6 handler's select branch, which reads
 /// the timeout as a timeval and uses no sigmask.
-pub const CARRICK_PRIVATE_X86_SELECT: u64 = u64::MAX - 0x29;
+pub const CARRICK_PRIVATE_X86_SELECT: u64 = private_x86_number(PrivateX86Ordinal::Select);
 /// Carrick-internal normalized syscall number for x86_64 legacy `epoll_create(2)`.
 ///
 /// x86_64 exposes `epoll_create(size)` as syscall 213; asm-generic/aarch64 has
@@ -2292,13 +2323,14 @@ pub const CARRICK_PRIVATE_X86_SELECT: u64 = u64::MAX - 0x29;
 /// we fold straight into `epoll_create1(0)` (epoll-ltp / epoll_create02 assert
 /// the EINVAL). This private number routes the legacy call to a handler that
 /// validates `size` and then creates the instance.
-pub const CARRICK_PRIVATE_X86_EPOLL_CREATE: u64 = u64::MAX - 0x2a;
+pub const CARRICK_PRIVATE_X86_EPOLL_CREATE: u64 =
+    private_x86_number(PrivateX86Ordinal::EpollCreate);
 /// Carrick-internal normalized syscall number for x86_64 `alarm(2)`.
 ///
 /// x86_64 exposes legacy `alarm(seconds)` as syscall 37, while asm-generic has
 /// no canonical `alarm` entry. Route it privately so glibc/CPython can use the
 /// same interval-timer state and SIGALRM delivery path as `setitimer`.
-pub const CARRICK_PRIVATE_X86_ALARM: u64 = u64::MAX - 0x2b;
+pub const CARRICK_PRIVATE_X86_ALARM: u64 = private_x86_number(PrivateX86Ordinal::Alarm);
 
 // Every CARRICK_PRIVATE_X86_* number must be UNIQUE: a collision silently
 // routes one syscall through another's handler (alarm(2) briefly shared
