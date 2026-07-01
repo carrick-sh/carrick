@@ -1,4 +1,6 @@
-use carrick_spec::{NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping};
+use carrick_spec::{
+    NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol,
+};
 use std::net::SocketAddr;
 
 pub mod socket_namespace;
@@ -46,11 +48,13 @@ pub trait NetworkProvider: Send + Sync {
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
         requested: SocketAddr,
+        protocol: PortProtocol,
     ) -> Result<BindTarget, String>;
     fn resolve_connect(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
         requested: SocketAddr,
+        protocol: PortProtocol,
     ) -> Result<ConnectTarget, String>;
 }
 
@@ -90,6 +94,7 @@ impl NetworkProvider for HostNetworkProvider {
         &self,
         _namespace_id: Option<&NetworkNamespaceId>,
         _requested: SocketAddr,
+        _protocol: PortProtocol,
     ) -> Result<BindTarget, String> {
         Ok(BindTarget::Unchanged)
     }
@@ -98,6 +103,7 @@ impl NetworkProvider for HostNetworkProvider {
         &self,
         _namespace_id: Option<&NetworkNamespaceId>,
         _requested: SocketAddr,
+        _protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
         Ok(ConnectTarget::Unchanged)
     }
