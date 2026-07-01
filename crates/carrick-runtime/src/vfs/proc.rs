@@ -855,7 +855,7 @@ fn proc_symlink_metadata(size: u64) -> Metadata {
 fn linux_interfaces(
     network: &carrick_spec::NetworkNamespaceSpec,
 ) -> Vec<(u32, String, bool, bool)> {
-    if network.mode == carrick_spec::NetworkMode::Bridge {
+    if network.mode != carrick_spec::NetworkMode::Host {
         return crate::network::model::LinuxNetworkModel::from_spec(network)
             .links
             .into_iter()
@@ -942,7 +942,7 @@ fn synthetic_proc_net_if_inet6(network: &carrick_spec::NetworkNamespaceSpec) -> 
 /// `/proc/net/dev`: the two verbatim header lines (proc_net(5) quotes them
 /// exactly) then one all-zero-counter row per Linux-mapped interface.
 fn synthetic_proc_net_dev(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
-    if network.mode == carrick_spec::NetworkMode::Bridge {
+    if network.mode != carrick_spec::NetworkMode::Host {
         return crate::network::model::LinuxNetworkModel::from_spec(network).render_proc_net_dev();
     }
     let mut s = String::from(
@@ -978,7 +978,7 @@ fn synthetic_proc_net_route(network: &carrick_spec::NetworkNamespaceSpec) -> Vec
     let mut s = String::from(
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
     );
-    if network.mode == carrick_spec::NetworkMode::Bridge {
+    if network.mode != carrick_spec::NetworkMode::Host {
         return crate::network::model::LinuxNetworkModel::from_spec(network)
             .render_proc_net_route();
     }
@@ -3237,6 +3237,24 @@ mod tests {
         assert!(
             route.contains("eth1\t000020AC\t00000000"),
             "secondary connected route missing: {route}"
+        );
+    }
+
+    #[test]
+    fn proc_net_for_none_mode_does_not_leak_host_uplink() {
+        let network = carrick_spec::NetworkNamespaceSpec::none();
+
+        let dev = String::from_utf8(synthetic_proc_net_dev(&network)).unwrap();
+        assert!(dev.contains("    lo:"), "loopback should be present: {dev}");
+        assert!(
+            !dev.contains("  eth0:"),
+            "none mode leaked host eth0: {dev}"
+        );
+
+        let route = String::from_utf8(synthetic_proc_net_route(&network)).unwrap();
+        assert!(
+            !route.contains("eth0\t"),
+            "none mode leaked host eth0 route: {route}"
         );
     }
 
