@@ -83,7 +83,7 @@
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
-use crate::network::BindTarget;
+use crate::network::{BindTarget, ConnectTarget};
 use carrick_spec::PortProtocol;
 
 syscall_table! {
@@ -3661,6 +3661,25 @@ impl SyscallDispatcher {
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             rewrite_unspecified_connect_loopback(family, &mut host_addr);
+            if family == libc::AF_INET
+                && let Some(protocol) = this.socket_port_protocol(fd)
+                && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
+            {
+                match this.network.provider.resolve_connect(
+                    this.network.spec.namespace_id.as_ref(),
+                    requested,
+                    protocol,
+                ) {
+                    Ok(ConnectTarget::Host(host)) => {
+                        if let Some(mapped) = socket_addr_to_host_sockaddr(host) {
+                            host_addr = mapped;
+                        }
+                    }
+                    Ok(ConnectTarget::Unchanged) => {}
+                    Ok(ConnectTarget::Denied(errno)) => return Ok(errno.into()),
+                    Err(_) => return Ok(carrick_abi::LINUX_ECONNREFUSED.into()),
+                }
+            }
             // connect(AF_UNSPEC) is the UDP "disconnect" (dissolve the peer
             // association); Linux returns 0. macOS disconnects too but may then
             // report EAFNOSUPPORT/EINVAL — treat those as success below.
