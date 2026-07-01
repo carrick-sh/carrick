@@ -2224,6 +2224,103 @@ networks:
 }
 
 #[tokio::test]
+#[ignore = "requires docker compose client, built aarch64 probes, and boots an HVF guest"]
+async fn docker_compose_host_gateway_smoke() {
+    if !docker_compose_available() {
+        eprintln!("SKIP docker_compose_host_gateway_smoke: docker compose is not available");
+        return;
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    let Some(probe) = ["debug", "release"]
+        .into_iter()
+        .map(|profile| probe_target.join(profile).join("host_gateway_client"))
+        .find(|path| path.exists())
+    else {
+        eprintln!(
+            "SKIP docker_compose_host_gateway_smoke: probe host_gateway_client not built under {}",
+            probe_target.display()
+        );
+        return;
+    };
+
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    let host_server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 18];
+        std::io::Read::read_exact(&mut stream, &mut request).unwrap();
+        assert_eq!(&request, b"host-gateway-ping\n");
+        std::io::Write::write_all(&mut stream, b"host-gateway-pong\n").unwrap();
+    });
+
+    let (_server, sock, _dir) = spawn_server();
+    let tmp = tempfile::tempdir().unwrap();
+    let copied_probe = tmp.path().join("host_gateway_client");
+    std::fs::copy(&probe, &copied_probe).unwrap();
+    let compose = tmp.path().join("host-gateway.yml");
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  client:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/host_gateway_client"]
+    environment:
+      CARRICK_PROBE_LABEL: host_gateway
+      CARRICK_PROBE_HOST: host.docker.internal
+      CARRICK_PROBE_PORT: "{host_port}"
+      CARRICK_PROBE_EXPECT_GATEWAY: 172.31.0.1
+    networks:
+      appnet: {{}}
+    volumes:
+      - type: bind
+        source: {probe}
+        target: /opt/carrick/host_gateway_client
+        read_only: true
+networks:
+  appnet:
+    driver: bridge
+"#,
+            probe = copied_probe.display()
+        ),
+    )
+    .unwrap();
+
+    let project = compose_project("hostgateway");
+    run_compose(&sock, &compose, &project, &["up", "-d", "--remove-orphans"]);
+    let logs = wait_for_compose_logs(
+        &sock,
+        &compose,
+        &project,
+        &[
+            "host_gateway_resolved=172.31.0.1:",
+            "host_gateway_connect_ok=true",
+            "host_gateway_response=host-gateway-pong",
+        ],
+    );
+    assert!(
+        logs.contains("host_gateway_response=host-gateway-pong"),
+        "host-gateway probe did not complete\nlogs:\n{logs}"
+    );
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &["down", "-v", "--remove-orphans"],
+    );
+    host_server.join().unwrap();
+}
+
+#[tokio::test]
 #[ignore]
 async fn docker_compose_multi_network_dns_smoke() {
     if !docker_compose_available() {
