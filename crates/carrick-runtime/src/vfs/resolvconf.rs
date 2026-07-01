@@ -34,6 +34,10 @@ impl ResolvConfVfs {
             contents: synthesize_resolv_conf(),
         }
     }
+
+    pub fn from_contents(contents: Vec<u8>) -> Self {
+        Self { contents }
+    }
 }
 
 impl Default for ResolvConfVfs {

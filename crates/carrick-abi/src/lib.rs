@@ -930,6 +930,7 @@ pub const LINUX_RTM_GETNEIGH: u16 = 30;
 // rtattr types inside an rtmsg (RTM_*ROUTE).
 pub const LINUX_RTA_DST: u16 = 1;
 pub const LINUX_RTA_OIF: u16 = 4;
+pub const LINUX_RTA_GATEWAY: u16 = 5;
 // rtm_table / rtm_protocol / rtm_type / rtm_scope values for a connected route.
 pub const LINUX_RT_TABLE_MAIN: u8 = 254;
 pub const LINUX_RTPROT_KERNEL: u8 = 2;

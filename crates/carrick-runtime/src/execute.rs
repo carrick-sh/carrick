@@ -11,7 +11,7 @@ use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
 use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
-use carrick_spec::{FsBackendKind, PidMode, Platform, RunSpec};
+use carrick_spec::{FsBackendKind, NetworkMode, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
 use std::path::PathBuf;
 
 /// True when a runtime error means the ENTRYPOINT executable (or its loader)
@@ -269,7 +269,7 @@ impl Runtime {
                 }
                 dispatcher.set_credentials(spec.uid, spec.gid);
 
-                seed_guest_baseline(&mut host, None);
+                seed_guest_baseline(&mut host, None, &spec.network);
 
                 // Install custom bind mounts on dispatcher
                 for mount in &spec.mounts {
@@ -465,7 +465,8 @@ fn install_fs_backend(
             Err(err) => host_failure_fallback(&format!("--fs host failed ({err})"))?,
         },
     };
-    seed_guest_baseline(&mut *backend, dispatcher.rootfs());
+    let default_network = NetworkNamespaceSpec::default();
+    seed_guest_baseline(&mut *backend, dispatcher.rootfs(), &default_network);
     let _ = dispatcher.set_fs_backend(backend);
     if host_seeded {
         dispatcher.drop_rootfs_layer();
@@ -483,7 +484,11 @@ pub fn guest_hostname() -> &'static str {
     carrick_host::host_facts::host_short_hostname().unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
 }
 
-fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
+fn seed_guest_baseline(
+    backend: &mut dyn FsBackend,
+    rootfs: Option<&RootFs>,
+    network: &NetworkNamespaceSpec,
+) {
     use std::net::ToSocketAddrs;
     for dir in [
         "/tmp",
@@ -537,11 +542,22 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
          ff02::1\tip6-allnodes\n\
          ff02::2\tip6-allrouters\n",
     );
-    // Self-mapping: Debian convention puts the configured hostname on a dedicated
-    // 127.0.1.1, distinct from 127.0.0.1 localhost. The name is the canonical UTS
-    // nodename so it stays in lockstep with uname(2), /etc/hostname, and
-    // /proc/sys/kernel/hostname. --net=host: one global hostname on loopback.
-    hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
+    // Self-mapping: host networking keeps the Debian 127.0.1.1 convention.
+    // Bridge networking maps the configured container name and aliases to the
+    // virtual eth0 address visible inside the guest namespace.
+    if network.mode == NetworkMode::Bridge {
+        let mut names = Vec::new();
+        if let Some(name) = &network.container_name {
+            names.push(name.as_str());
+        }
+        names.extend(network.aliases.iter().map(String::as_str));
+        if names.is_empty() {
+            names.push(guest_hostname());
+        }
+        hosts_content.push_str(&format!("{}\t{}\n", network.ipv4, names.join(" ")));
+    } else {
+        hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
+    }
     // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
     // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a profile
     // showed it was the #2 cost after diskutil. It predates carrick synthesizing
