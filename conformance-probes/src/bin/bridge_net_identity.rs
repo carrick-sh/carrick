@@ -1,6 +1,7 @@
 //! Bridge network identity probe. It checks only Docker-stable shape: a
 //! non-loopback eth0 IPv4 address, rtnetlink visibility for link/address/route,
-//! bridge-shaped /proc/net files, and runtime-managed hosts/resolv.conf.
+//! bridge-shaped /proc/net and /sys/class/net files, and runtime-managed
+//! hosts/resolv.conf.
 
 use std::ffi::CStr;
 use std::fs;
@@ -41,6 +42,8 @@ fn main() {
         "bridge_proc_route_default_gateway={}",
         proc_route_has_default_gateway()
     );
+    println!("bridge_sysfs_has_eth0={}", sysfs_has_eth0());
+    println!("bridge_sysfs_hides_host_en0={}", !fs::metadata("/sys/class/net/en0").is_ok());
 
     let link_messages = unsafe { netlink_dump(RTM_GETLINK) };
     let addr_messages = unsafe { netlink_dump(RTM_GETADDR) };
@@ -124,6 +127,15 @@ fn proc_route_has_default_gateway() -> bool {
             let cols = line.split_whitespace().collect::<Vec<_>>();
             cols.len() > 2 && cols[0] == "eth0" && cols[1] == "00000000" && cols[2] != "00000000"
         })
+    })
+}
+
+fn sysfs_has_eth0() -> bool {
+    fs::read_to_string("/sys/class/net/eth0/ifindex").is_ok_and(|contents| {
+        contents
+            .trim()
+            .parse::<u32>()
+            .is_ok_and(|index| index > 1)
     })
 }
 
