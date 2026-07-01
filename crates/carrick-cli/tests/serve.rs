@@ -3742,6 +3742,78 @@ async fn network_connect_disconnect_updates_container_and_network_views() {
 }
 
 #[tokio::test]
+async fn disconnect_last_custom_endpoint_preserves_host_config_network_mode() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 5, bollard::API_DEFAULT_VERSION).unwrap();
+
+    let name = "m0disconnectprimary";
+    let net = "m0_disconnect_primary_net";
+    let _ = docker.remove_container(name, None).await;
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", name])
+        .output();
+    let _ = docker.remove_network(net).await;
+
+    docker
+        .create_network(bollard::network::CreateNetworkOptions {
+            name: net,
+            driver: "bridge",
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: name.to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(net.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .disconnect_network(
+            net,
+            bollard::network::DisconnectNetworkOptions {
+                container: name,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let inspected = docker.inspect_container(name, None).await.unwrap();
+    assert_eq!(
+        inspected
+            .host_config
+            .as_ref()
+            .and_then(|host| host.network_mode.as_deref()),
+        Some(net)
+    );
+    assert!(
+        inspected
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .is_none_or(std::collections::HashMap::is_empty),
+        "disconnecting the only endpoint should leave no host/bridge/none endpoint"
+    );
+
+    let _ = docker.remove_container(name, None).await;
+    let _ = docker.remove_network(net).await;
+}
+
+#[tokio::test]
 async fn predefined_bridge_connect_disconnect_updates_container_and_network_views() {
     let (_server, sock, _dir) = spawn_server();
     let docker =
