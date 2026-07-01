@@ -55,6 +55,12 @@ struct OwnedEndpointFile {
     contents: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NamespaceFile {
+    Live(String),
+    Stale(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ListenerReservation {
     host_addr: HostSocketAddr,
@@ -951,8 +957,20 @@ fn remove_endpoint_files(files: Vec<(PathBuf, String)>) {
 
 fn read_endpoint_file(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> Option<HostSocketAddr> {
     let path = endpoint_path(endpoint_dir, endpoint);
-    let raw = read_live_namespace_file(&path)?;
-    raw.lines().next()?.trim().parse().ok().map(HostSocketAddr)
+    match read_namespace_file(&path)? {
+        NamespaceFile::Live(raw) => raw.lines().next()?.trim().parse().ok().map(HostSocketAddr),
+        NamespaceFile::Stale(raw) => {
+            if let Ok(host_addr) = raw.lines().next()?.trim().parse::<SocketAddr>() {
+                let reverse_path = reverse_endpoint_path(
+                    endpoint_dir,
+                    HostSocketAddr(host_addr),
+                    endpoint.protocol,
+                );
+                let _ = read_namespace_file(&reverse_path);
+            }
+            None
+        }
+    }
 }
 
 fn read_reverse_endpoint_file(
@@ -966,14 +984,21 @@ fn read_reverse_endpoint_file(
 }
 
 fn read_live_namespace_file(path: &Path) -> Option<String> {
+    match read_namespace_file(path)? {
+        NamespaceFile::Live(raw) => Some(raw),
+        NamespaceFile::Stale(_) => None,
+    }
+}
+
+fn read_namespace_file(path: &Path) -> Option<NamespaceFile> {
     let raw = fs::read_to_string(path).ok()?;
     let owner_pid = raw.lines().find_map(|line| line.strip_prefix("pid="))?;
     let owner_pid = owner_pid.parse::<i32>().ok()?;
     if process_is_alive(owner_pid) {
-        return Some(raw);
+        return Some(NamespaceFile::Live(raw));
     }
     let _ = fs::remove_file(path);
-    None
+    Some(NamespaceFile::Stale(raw))
 }
 
 fn process_is_alive(pid: i32) -> bool {
@@ -1837,6 +1862,42 @@ mod tests {
         reader
             .destroy_namespace(NetworkLeaseId(1))
             .expect("reader cleanup");
+    }
+
+    #[test]
+    fn stale_endpoint_file_reclaims_reverse_record() {
+        let provider = SocketNamespaceProvider::new();
+        let peer = VirtualEndpoint {
+            scope: EndpointScope::Bridge(BridgeId::new("stale-pair")),
+            addr: guest(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(172, 31, 42, 9)),
+                8080,
+            )),
+            protocol: PortProtocol::Tcp,
+        };
+        let host_addr = host(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            free_loopback_port(),
+        ));
+        let endpoint_file = endpoint_path(&provider.endpoint_dir, &peer);
+        let reverse_file = reverse_endpoint_path(&provider.endpoint_dir, host_addr, peer.protocol);
+        fs::create_dir_all(&*provider.endpoint_dir).expect("endpoint dir");
+        fs::write(&endpoint_file, format!("{}\npid=0\n", host_addr.0)).expect("endpoint file");
+        fs::write(&reverse_file, format!("{}\npid=0\n", peer.addr.0)).expect("reverse file");
+
+        let resolved = provider
+            .resolve_registered_connect(&BridgeId::new("stale-pair"), peer.addr, peer.protocol)
+            .expect("resolve stale endpoint");
+
+        assert_eq!(resolved, None);
+        assert!(
+            !endpoint_file.exists(),
+            "stale endpoint file should be reclaimed"
+        );
+        assert!(
+            !reverse_file.exists(),
+            "paired reverse endpoint file should be reclaimed"
+        );
     }
 
     #[test]
