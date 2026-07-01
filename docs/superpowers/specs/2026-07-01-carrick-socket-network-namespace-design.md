@@ -134,13 +134,16 @@ Capabilities must be explicit:
 - packet-level isolation;
 - raw socket support;
 - multicast or broadcast support;
+- PF NAT and PF rdr ownership;
+- NetworkExtension policy integration;
 - requires privilege.
 
 This avoids provider names becoming semantic promises. For example, the v1
 socket provider can satisfy app-socket same-bridge connectivity, multi-network
 attachment routing, embedded service-name DNS, outbound connectivity, and
-published TCP ports while explicitly not satisfying host-routable IPs or
-packet-level isolation.
+published TCP/UDP ports while explicitly not satisfying host-routable IPs,
+kernel datapath, PF NAT/rdr, NetworkExtension policy, or packet-level
+isolation.
 
 ## Socket Namespace Provider
 
