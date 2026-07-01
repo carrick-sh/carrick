@@ -83,6 +83,8 @@
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
+use crate::network::BindTarget;
+use carrick_spec::PortProtocol;
 
 syscall_table! {
     /// Per-module syscall routing for the `net` subsystem (Task A1).
@@ -123,6 +125,33 @@ syscall_table! {
     242 => accept4,
     243 => sys_recvmmsg,
     269 => sys_sendmmsg,
+}
+
+fn host_sockaddr_to_socket_addr(bytes: &[u8]) -> Option<std::net::SocketAddr> {
+    if bytes.len() < 16 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as i32;
+    #[cfg(not(target_os = "linux"))]
+    let family = bytes[1] as i32;
+    if family != libc::AF_INET {
+        return None;
+    }
+    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+    Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))
+}
+
+fn socket_addr_to_host_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {
+    let std::net::SocketAddr::V4(v4) = addr else {
+        return None;
+    };
+    let mut out = vec![0_u8; 16];
+    set_host_sockaddr_header(&mut out, libc::AF_INET);
+    out[2..4].copy_from_slice(&v4.port().to_be_bytes());
+    out[4..8].copy_from_slice(&v4.ip().octets());
+    Some(out)
 }
 mod support;
 use support::*;
@@ -1357,6 +1386,14 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::HostSocket { type_, .. } => Some(*type_),
             OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
+            _ => None,
+        }
+    }
+
+    fn socket_port_protocol(&self, fd: i32) -> Option<PortProtocol> {
+        match self.socket_guest_type(fd)? {
+            LINUX_SOCK_STREAM => Some(PortProtocol::Tcp),
+            LINUX_SOCK_DGRAM => Some(PortProtocol::Udp),
             _ => None,
         }
     }
@@ -3495,7 +3532,25 @@ impl SyscallDispatcher {
             } else {
                 None
             };
-            let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+            let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+            if family == libc::AF_INET
+                && let Some(protocol) = this.socket_port_protocol(fd)
+                && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
+            {
+                match this.network.provider.materialize_bind(
+                    this.network.spec.namespace_id.as_ref(),
+                    requested,
+                    protocol,
+                ) {
+                    Ok(BindTarget::Host(host)) => {
+                        if let Some(mapped) = socket_addr_to_host_sockaddr(host) {
+                            host_addr = mapped;
+                        }
+                    }
+                    Ok(BindTarget::Unchanged) => {}
+                    Err(_) => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
+                }
+            }
             // AF_UNIX pathname sockets are bound at a stable host path (see
             // unix_socket_host_path). The guest's unlink only tombstones a VFS
             // overlay entry, so it can't clear a real host socket left by a
