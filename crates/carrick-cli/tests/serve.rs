@@ -1175,8 +1175,8 @@ networks:
             _ => {}
         }
     }
-    let db_id = db_id.expect("db container id");
-    let web_id = web_id.expect("web container id");
+    let db_id = db_id.unwrap_or_else(|| panic!("db container id"));
+    let web_id = web_id.unwrap_or_else(|| panic!("web container id"));
     let db = docker.inspect_container(&db_id, None).await.unwrap();
     let web = docker.inspect_container(&web_id, None).await.unwrap();
     let network_name = format!("{project}_appnet");
@@ -1306,6 +1306,1471 @@ networks:
         volumes_after_down.is_empty(),
         "compose down -v should remove project volumes"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose client, built aarch64 probes, and boots multiple HVF guests"]
+async fn docker_compose_probe_workload_smoke() {
+    if !docker_compose_available() {
+        eprintln!("SKIP docker_compose_probe_workload_smoke: docker compose is not available");
+        return;
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    let find_probe = |name: &str| {
+        ["debug", "release"]
+            .into_iter()
+            .map(|profile| probe_target.join(profile).join(name))
+            .find(|path| path.exists())
+    };
+    let Some(server_probe) = find_probe("bridge_compose_server") else {
+        eprintln!(
+            "SKIP docker_compose_probe_workload_smoke: server probe not built under {}",
+            probe_target.display()
+        );
+        return;
+    };
+    let Some(client_probe) = find_probe("bridge_compose_client") else {
+        eprintln!(
+            "SKIP docker_compose_probe_workload_smoke: client probe not built under {}",
+            probe_target.display()
+        );
+        return;
+    };
+
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let copied_server = tmp.path().join("bridge_compose_server");
+    let copied_client = tmp.path().join("bridge_compose_client");
+    std::fs::copy(&server_probe, &copied_server).unwrap();
+    std::fs::copy(&client_probe, &copied_client).unwrap();
+
+    let compose = tmp.path().join("compose.yml");
+    let host_port = free_loopback_port();
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/bridge_compose_server"]
+    networks:
+      appnet:
+        aliases:
+          - database
+    volumes:
+      - type: bind
+        source: {server}
+        target: /opt/carrick/bridge_compose_server
+        read_only: true
+      - data:/data
+  web:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/bridge_compose_client"]
+    depends_on:
+      - db
+    ports:
+      - "127.0.0.1:{host_port}:8080"
+    networks:
+      appnet:
+        aliases:
+          - api
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/bridge_compose_client
+        read_only: true
+volumes:
+  data: {{}}
+networks:
+  appnet:
+    driver: bridge
+"#,
+            server = copied_server.display(),
+            client = copied_client.display()
+        ),
+    )
+    .unwrap();
+    let project = compose_project("probe");
+
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &[
+            "up",
+            "--abort-on-container-exit",
+            "--exit-code-from",
+            "web",
+            "--remove-orphans",
+        ],
+    );
+    let ps = run_compose_output(&sock, &compose, &project, &["ps", "-a"]);
+    let ps_stdout = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        ps_stdout.contains("db") && ps_stdout.contains("web"),
+        "compose ps did not list both services\nstdout:\n{ps_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    let logs = run_compose_output(&sock, &compose, &project, &["logs", "--no-color"]);
+    let logs_stdout = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs_stdout.contains("bridge_compose_client_response=pong"),
+        "compose logs did not include client ping/pong completion\nstdout:\n{logs_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    assert!(
+        logs_stdout.contains("bridge_compose_server_done=true"),
+        "compose logs did not include server completion\nstdout:\n{logs_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    let run = run_compose_output(
+        &sock,
+        &compose,
+        &project,
+        &["run", "--rm", "web", "/bin/echo", "hello_compose_probe_run"],
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("hello_compose_probe_run"),
+        "compose run did not return command output\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let project_filter = format!("com.docker.compose.project={project}");
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let containers = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(
+        containers.len() >= 2,
+        "Compose should create at least db and web containers"
+    );
+
+    let mut db_id = None;
+    let mut web_id = None;
+    for container in &containers {
+        match container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+            .map(String::as_str)
+        {
+            Some("db") => db_id = container.id.clone(),
+            Some("web") => web_id = container.id.clone(),
+            _ => {}
+        }
+    }
+    let db_id = db_id.unwrap_or_else(|| panic!("db container id"));
+    let web_id = web_id.unwrap_or_else(|| panic!("web container id"));
+    let db = docker.inspect_container(&db_id, None).await.unwrap();
+    let web = docker.inspect_container(&web_id, None).await.unwrap();
+    let network_name = format!("{project}_appnet");
+    let db_endpoint = db
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .and_then(|networks| networks.get(&network_name))
+        .unwrap_or_else(|| panic!("db missing endpoint for {network_name}"));
+    let web_endpoint = web
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .and_then(|networks| networks.get(&network_name))
+        .unwrap_or_else(|| panic!("web missing endpoint for {network_name}"));
+    let db_ip = db_endpoint.ip_address.as_deref().unwrap_or_default();
+    let web_ip = web_endpoint.ip_address.as_deref().unwrap_or_default();
+    assert!(db_ip.starts_with("172.31."), "db bridge IP: {db_ip:?}");
+    assert!(web_ip.starts_with("172.31."), "web bridge IP: {web_ip:?}");
+    assert_ne!(db_ip, web_ip);
+    assert!(
+        db_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"db".to_string()))
+    );
+    assert!(
+        db_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"database".to_string()))
+    );
+    assert!(
+        web_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"web".to_string()))
+    );
+    assert!(
+        web_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"api".to_string()))
+    );
+    let web_ports = web
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.ports.as_ref())
+        .unwrap();
+    assert_eq!(
+        web_ports
+            .get("8080/tcp")
+            .and_then(|bindings| bindings.as_ref())
+            .and_then(|bindings| bindings.first())
+            .and_then(|binding| binding.host_port.as_deref()),
+        Some(host_port.to_string().as_str())
+    );
+
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let networks = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(networks.len(), 1);
+    assert_eq!(networks[0].name.as_deref(), Some(network_name.as_str()));
+
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let volumes = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].name, format!("{project}_data"));
+
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &["down", "-v", "--remove-orphans"],
+    );
+
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let containers_after_down = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(
+        containers_after_down.is_empty(),
+        "compose down should remove project containers"
+    );
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let networks_after_down = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        networks_after_down.is_empty(),
+        "compose down should remove project networks"
+    );
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![project_filter]);
+    let volumes_after_down = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert!(
+        volumes_after_down.is_empty(),
+        "compose down -v should remove project volumes"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose client, built aarch64 probes, and boots multiple HVF guests"]
+async fn docker_compose_shared_network_namespace_smoke() {
+    if !docker_compose_available() {
+        eprintln!(
+            "SKIP docker_compose_shared_network_namespace_smoke: docker compose is not available"
+        );
+        return;
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    let find_probe = |name: &str| {
+        ["debug", "release"]
+            .into_iter()
+            .map(|profile| probe_target.join(profile).join(name))
+            .find(|path| path.exists())
+    };
+    let required_probes = [
+        "sidecar_loopback_server",
+        "sidecar_loopback_client",
+        "sidecar_loopback_isolated_client",
+        "bridge_compose_server",
+        "bridge_compose_client",
+    ];
+    let mut probes = std::collections::HashMap::new();
+    for name in required_probes {
+        let Some(path) = find_probe(name) else {
+            eprintln!(
+                "SKIP docker_compose_shared_network_namespace_smoke: probe {name} not built under {}",
+                probe_target.display()
+            );
+            return;
+        };
+        probes.insert(name, path);
+    }
+
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut copied = std::collections::HashMap::new();
+    for (name, source) in &probes {
+        let target = tmp.path().join(name);
+        std::fs::copy(source, &target).unwrap();
+        copied.insert(*name, target);
+    }
+
+    let sidecar_compose = tmp.path().join("sidecar.yml");
+    std::fs::write(
+        &sidecar_compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/sidecar_loopback_server"]
+    networks:
+      appnet:
+        aliases:
+          - database
+    volumes:
+      - data:/data
+      - type: bind
+        source: {server}
+        target: /opt/carrick/sidecar_loopback_server
+        read_only: true
+  sidecar:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/sidecar_loopback_client"]
+    depends_on:
+      - db
+    network_mode: "service:db"
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/sidecar_loopback_client
+        read_only: true
+  web:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/sidecar_loopback_isolated_client"]
+    depends_on:
+      - db
+    networks:
+      appnet:
+        aliases:
+          - api
+    volumes:
+      - type: bind
+        source: {isolated}
+        target: /opt/carrick/sidecar_loopback_isolated_client
+        read_only: true
+volumes:
+  data: {{}}
+networks:
+  appnet:
+    driver: bridge
+"#,
+            server = copied["sidecar_loopback_server"].display(),
+            client = copied["sidecar_loopback_client"].display(),
+            isolated = copied["sidecar_loopback_isolated_client"].display()
+        ),
+    )
+    .unwrap();
+    let sidecar_project = compose_project("sidecarns");
+    run_compose(
+        &sock,
+        &sidecar_compose,
+        &sidecar_project,
+        &["up", "-d", "--remove-orphans"],
+    );
+    let sidecar_logs = wait_for_compose_logs(
+        &sock,
+        &sidecar_compose,
+        &sidecar_project,
+        &[
+            "sidecar_loopback_client_response=sidecar-pong",
+            "sidecar_loopback_bridge_peer_isolated=true",
+            "sidecar_loopback_server_done=true",
+        ],
+    );
+    assert!(
+        sidecar_logs.contains("sidecar_loopback_server_peer_loopback=true"),
+        "shared namespace server did not see a loopback peer\nlogs:\n{sidecar_logs}"
+    );
+    // Let the loopback server finish normally so runtime drop removes its
+    // fork-coherent endpoint files before the next compose graph starts.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+
+    let sidecar_ps = run_compose_output(&sock, &sidecar_compose, &sidecar_project, &["ps", "-a"]);
+    let sidecar_ps_stdout = String::from_utf8_lossy(&sidecar_ps.stdout);
+    assert!(
+        sidecar_ps_stdout.contains("db")
+            && sidecar_ps_stdout.contains("sidecar")
+            && sidecar_ps_stdout.contains("web"),
+        "compose ps did not list db, sidecar, and web\nstdout:\n{sidecar_ps_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&sidecar_ps.stderr)
+    );
+
+    let sidecar_filter = format!("com.docker.compose.project={sidecar_project}");
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![sidecar_filter.clone()]);
+    let containers = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut db_id = None;
+    let mut sidecar_id = None;
+    for container in &containers {
+        match container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+            .map(String::as_str)
+        {
+            Some("db") => db_id = container.id.clone(),
+            Some("sidecar") => sidecar_id = container.id.clone(),
+            _ => {}
+        }
+    }
+    let db_id = db_id.unwrap_or_else(|| panic!("db container id"));
+    let sidecar_id = sidecar_id.unwrap_or_else(|| panic!("sidecar container id"));
+    let sidecar = docker.inspect_container(&sidecar_id, None).await.unwrap();
+    let expected_network_mode = format!("container:{db_id}");
+    assert_eq!(
+        sidecar
+            .host_config
+            .as_ref()
+            .and_then(|host| host.network_mode.as_deref()),
+        Some(expected_network_mode.as_str())
+    );
+    assert!(
+        sidecar
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .is_some_and(|networks| networks.is_empty()),
+        "sidecar should report no independent network endpoint"
+    );
+
+    run_compose(
+        &sock,
+        &sidecar_compose,
+        &sidecar_project,
+        &["down", "-v", "--remove-orphans"],
+    );
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![sidecar_filter.clone()]);
+    let containers_after_down = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(
+        containers_after_down.is_empty(),
+        "compose down should remove shared-netns project containers"
+    );
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![sidecar_filter.clone()]);
+    let networks_after_down = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        networks_after_down.is_empty(),
+        "compose down should remove shared-netns project networks"
+    );
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![sidecar_filter]);
+    let volumes_after_down = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert!(
+        volumes_after_down.is_empty(),
+        "compose down -v should remove shared-netns project volumes"
+    );
+
+    let bridge_compose = tmp.path().join("bridge.yml");
+    std::fs::write(
+        &bridge_compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/bridge_compose_server"]
+    networks:
+      appnet:
+        aliases:
+          - database
+    volumes:
+      - type: bind
+        source: {server}
+        target: /opt/carrick/bridge_compose_server
+        read_only: true
+  web:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/bridge_compose_client"]
+    depends_on:
+      - db
+    networks:
+      appnet:
+        aliases:
+          - api
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/bridge_compose_client
+        read_only: true
+volumes:
+  data: {{}}
+networks:
+  appnet:
+    driver: bridge
+"#,
+            server = copied["bridge_compose_server"].display(),
+            client = copied["bridge_compose_client"].display()
+        ),
+    )
+    .unwrap();
+    let bridge_project = compose_project("sidecarbridge");
+    run_compose(
+        &sock,
+        &bridge_compose,
+        &bridge_project,
+        &["up", "-d", "--remove-orphans"],
+    );
+    let bridge_logs = wait_for_compose_logs(
+        &sock,
+        &bridge_compose,
+        &bridge_project,
+        &[
+            "bridge_compose_client_response=pong",
+            "bridge_compose_server_done=true",
+        ],
+    );
+    assert!(
+        bridge_logs.contains("bridge_compose_server_peer_is_bridge=true"),
+        "ordinary bridge path did not preserve bridge peer identity\nlogs:\n{bridge_logs}"
+    );
+    run_compose(
+        &sock,
+        &bridge_compose,
+        &bridge_project,
+        &["down", "-v", "--remove-orphans"],
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose client, built aarch64 probes, and boots multiple HVF guests"]
+async fn docker_compose_multi_network_smoke() {
+    if !docker_compose_available() {
+        eprintln!("SKIP docker_compose_multi_network_smoke: docker compose is not available");
+        return;
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    let find_probe = |name: &str| {
+        ["debug", "release"]
+            .into_iter()
+            .map(|profile| probe_target.join(profile).join(name))
+            .find(|path| path.exists())
+    };
+    let required_probes = ["multi_network_server", "multi_network_client"];
+    let mut probes = std::collections::HashMap::new();
+    for name in required_probes {
+        let Some(path) = find_probe(name) else {
+            eprintln!(
+                "SKIP docker_compose_multi_network_smoke: probe {name} not built under {}",
+                probe_target.display()
+            );
+            return;
+        };
+        probes.insert(name, path);
+    }
+
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut copied = std::collections::HashMap::new();
+    for (name, source) in &probes {
+        let target = tmp.path().join(name);
+        std::fs::copy(source, &target).unwrap();
+        copied.insert(*name, target);
+    }
+
+    let compose = tmp.path().join("multi-network.yml");
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_server"]
+    environment:
+      CARRICK_PROBE_LABEL: db
+      CARRICK_PROBE_BRIDGE_ACCEPTS: "2"
+    networks:
+      backend:
+        aliases:
+          - database
+    volumes:
+      - data:/data
+      - type: bind
+        source: {server}
+        target: /opt/carrick/multi_network_server
+        read_only: true
+  web:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_server"]
+    depends_on:
+      - db
+    environment:
+      CARRICK_PROBE_LABEL: web
+      CARRICK_PROBE_BRIDGE_ACCEPTS: "1"
+      CARRICK_PROBE_LOOPBACK_ACCEPTS: "1"
+      CARRICK_PROBE_CONNECT_TARGET: db
+    networks:
+      frontend:
+        aliases:
+          - api
+      backend:
+        aliases:
+          - app
+    volumes:
+      - type: bind
+        source: {server}
+        target: /opt/carrick/multi_network_server
+        read_only: true
+  cache:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_client"]
+    depends_on:
+      - web
+    environment:
+      CARRICK_PROBE_LABEL: cache_to_web
+      CARRICK_PROBE_TARGET: web
+      CARRICK_PROBE_EXPECT: success
+    networks:
+      frontend:
+        aliases:
+          - cache
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_client
+        read_only: true
+  cache_isolated:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_client"]
+    depends_on:
+      - db
+    environment:
+      CARRICK_PROBE_LABEL: cache_to_db
+      CARRICK_PROBE_TARGET: db
+      CARRICK_PROBE_EXPECT: failure
+    networks:
+      frontend: {{}}
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_client
+        read_only: true
+  sidecar_loopback:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_client"]
+    depends_on:
+      - web
+    network_mode: "service:web"
+    environment:
+      CARRICK_PROBE_LABEL: sidecar_loopback
+      CARRICK_PROBE_TARGET: 127.0.0.1
+      CARRICK_PROBE_PORT: "15432"
+      CARRICK_PROBE_EXPECT: success
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_client
+        read_only: true
+  sidecar_to_db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_client"]
+    depends_on:
+      - db
+      - web
+    network_mode: "service:web"
+    environment:
+      CARRICK_PROBE_LABEL: sidecar_to_db
+      CARRICK_PROBE_TARGET: db
+      CARRICK_PROBE_EXPECT: success
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_client
+        read_only: true
+volumes:
+  data: {{}}
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+"#,
+            server = copied["multi_network_server"].display(),
+            client = copied["multi_network_client"].display()
+        ),
+    )
+    .unwrap();
+
+    let project = compose_project("multinet");
+    run_compose(&sock, &compose, &project, &["up", "-d", "--remove-orphans"]);
+    let logs = wait_for_compose_logs(
+        &sock,
+        &compose,
+        &project,
+        &[
+            "web_connect_response=pong",
+            "cache_to_web_response=pong",
+            "cache_to_db_isolated=true",
+            "sidecar_loopback_response=pong",
+            "sidecar_to_db_response=pong",
+            "db_server_done=true",
+            "web_server_done=true",
+        ],
+    );
+    assert!(
+        logs.contains("web_bridge_server_peer_0_loopback=false"),
+        "web should see frontend bridge peer for cache\nlogs:\n{logs}"
+    );
+    assert!(
+        logs.contains("web_loopback_server_peer_0_loopback=true"),
+        "web should see loopback peer for sidecar\nlogs:\n{logs}"
+    );
+
+    let project_filter = format!("com.docker.compose.project={project}");
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let containers = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for container in &containers {
+        if let (Some(service), Some(id)) = (
+            container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("com.docker.compose.service")),
+            container.id.as_ref(),
+        ) {
+            ids.insert(service.clone(), id.clone());
+        }
+    }
+    let web_id = ids.get("web").unwrap_or_else(|| panic!("web id"));
+    let db = docker
+        .inspect_container(ids.get("db").unwrap_or_else(|| panic!("db id")), None)
+        .await
+        .unwrap();
+    let web = docker.inspect_container(web_id, None).await.unwrap();
+    let cache = docker
+        .inspect_container(ids.get("cache").unwrap_or_else(|| panic!("cache id")), None)
+        .await
+        .unwrap();
+    let sidecar = docker
+        .inspect_container(
+            ids.get("sidecar_loopback")
+                .unwrap_or_else(|| panic!("sidecar_loopback id")),
+            None,
+        )
+        .await
+        .unwrap();
+    let frontend = format!("{project}_frontend");
+    let backend = format!("{project}_backend");
+    assert_endpoint_networks(&db, &[backend.as_str()]);
+    assert_endpoint_networks(&web, &[backend.as_str(), frontend.as_str()]);
+    assert_endpoint_networks(&cache, &[frontend.as_str()]);
+    assert_eq!(
+        sidecar
+            .host_config
+            .as_ref()
+            .and_then(|host| host.network_mode.as_deref()),
+        Some(format!("container:{web_id}").as_str())
+    );
+    assert!(
+        sidecar
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .is_some_and(|networks| networks.is_empty()),
+        "sidecar should report no independent endpoint"
+    );
+
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &["down", "-v", "--remove-orphans"],
+    );
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let containers_after_down = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(
+        containers_after_down.is_empty(),
+        "compose down should remove multi-network project containers"
+    );
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let networks_after_down = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        networks_after_down.is_empty(),
+        "compose down should remove multi-network project networks"
+    );
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![project_filter]);
+    let volumes_after_down = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert!(
+        volumes_after_down.is_empty(),
+        "compose down -v should remove multi-network project volumes"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn docker_compose_multi_network_dns_smoke() {
+    if !docker_compose_available() {
+        eprintln!("SKIP docker_compose_multi_network_dns_smoke: docker compose is not available");
+        return;
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    let Some(dns_probe) = ["debug", "release"]
+        .into_iter()
+        .map(|profile| probe_target.join(profile).join("multi_network_dns_client"))
+        .find(|path| path.exists())
+    else {
+        eprintln!(
+            "SKIP docker_compose_multi_network_dns_smoke: probe multi_network_dns_client not built under {}",
+            probe_target.display()
+        );
+        return;
+    };
+
+    let (_server, sock, _dir) = spawn_server();
+    let tmp = tempfile::tempdir().unwrap();
+    let copied_probe = tmp.path().join("multi_network_dns_client");
+    std::fs::copy(&dns_probe, &copied_probe).unwrap();
+    let compose = tmp.path().join("multi-network-dns.yml");
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/bin/sleep", "20"]
+    networks:
+      backend:
+        aliases:
+          - database
+  web:
+    image: ubuntu:24.04
+    command: ["/bin/sleep", "20"]
+    depends_on:
+      - db
+      - cache
+    networks:
+      frontend:
+        aliases:
+          - api
+      backend:
+        aliases:
+          - app
+  cache:
+    image: ubuntu:24.04
+    command: ["/bin/sleep", "20"]
+    networks:
+      frontend:
+        aliases:
+          - cache
+  cache_dns_web:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_dns_client"]
+    depends_on:
+      - web
+    environment:
+      CARRICK_PROBE_LABEL: cache_dns_web
+      CARRICK_PROBE_TARGET: web
+      CARRICK_PROBE_EXPECT: success
+    networks:
+      frontend: {{}}
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_dns_client
+        read_only: true
+  cache_dns_db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_dns_client"]
+    depends_on:
+      - db
+    environment:
+      CARRICK_PROBE_LABEL: cache_dns_db
+      CARRICK_PROBE_TARGET: db
+      CARRICK_PROBE_EXPECT: failure
+    networks:
+      frontend: {{}}
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_dns_client
+        read_only: true
+  web_dns_db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_dns_client"]
+    depends_on:
+      - db
+      - web
+    network_mode: "service:web"
+    environment:
+      CARRICK_PROBE_LABEL: web_dns_db
+      CARRICK_PROBE_TARGET: db
+      CARRICK_PROBE_EXPECT: success
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_dns_client
+        read_only: true
+  web_dns_cache:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/multi_network_dns_client"]
+    depends_on:
+      - cache
+      - web
+    network_mode: "service:web"
+    environment:
+      CARRICK_PROBE_LABEL: web_dns_cache
+      CARRICK_PROBE_TARGET: cache
+      CARRICK_PROBE_EXPECT: success
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/multi_network_dns_client
+        read_only: true
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+"#,
+            client = copied_probe.display()
+        ),
+    )
+    .unwrap();
+
+    let project = compose_project("multinetdns");
+    run_compose(&sock, &compose, &project, &["up", "-d", "--remove-orphans"]);
+    let logs = wait_for_compose_logs(
+        &sock,
+        &compose,
+        &project,
+        &[
+            "cache_dns_web_dns_ok=true",
+            "cache_dns_db_dns_isolated=true",
+            "web_dns_db_dns_ok=true",
+            "web_dns_cache_dns_ok=true",
+        ],
+    );
+    assert!(
+        logs.contains("cache_dns_web_dns_addrs="),
+        "cache should receive a DNS A answer for web\nlogs:\n{logs}"
+    );
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &["down", "-v", "--remove-orphans"],
+    );
+}
+
+fn assert_endpoint_networks(
+    inspected: &bollard::models::ContainerInspectResponse,
+    expected: &[&str],
+) {
+    let networks = inspected
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .unwrap_or_else(|| panic!("inspect networks"));
+    let mut actual = networks.keys().map(String::as_str).collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+fn find_aarch64_probe(name: &str) -> Option<std::path::PathBuf> {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    ["debug", "release"]
+        .into_iter()
+        .map(|profile| probe_target.join(profile).join(name))
+        .find(|path| path.exists())
+}
+
+async fn wait_container_exit(docker: &bollard::Docker, name: &str) {
+    let mut waits = docker.wait_container(
+        name,
+        None::<bollard::container::WaitContainerOptions<String>>,
+    );
+    let _ = waits
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("wait result"))
+        .unwrap_or_else(|e| panic!("wait ok: {e}"));
+}
+
+async fn container_output(docker: &bollard::Docker, name: &str) -> String {
+    let mut logs_stream = docker.logs(
+        name,
+        Some(bollard::container::LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            ..Default::default()
+        }),
+    );
+    let mut output = String::new();
+    while let Some(log) = logs_stream.next().await {
+        output.push_str(&log.unwrap_or_else(|e| panic!("log chunk: {e}")).to_string());
+    }
+    output
+}
+
+#[tokio::test]
+#[ignore = "requires built aarch64 probes and boots multiple HVF guests"]
+async fn network_connect_created_container_is_runtime_visible_after_start() {
+    let Some(server_probe) = find_aarch64_probe("multi_network_server") else {
+        eprintln!(
+            "SKIP network_connect_created_container_is_runtime_visible_after_start: probe multi_network_server not built"
+        );
+        return;
+    };
+    let Some(client_probe) = find_aarch64_probe("multi_network_client") else {
+        eprintln!(
+            "SKIP network_connect_created_container_is_runtime_visible_after_start: probe multi_network_client not built"
+        );
+        return;
+    };
+
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let net = "m0_runtime_connect_net";
+    let server_name = "m0runtimeconnectsrv";
+    let client_name = "m0runtimeconnectclient";
+    let _ = docker
+        .remove_container(
+            server_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            client_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker.remove_network(net).await;
+
+    docker
+        .create_network(bollard::network::CreateNetworkOptions {
+            name: net,
+            driver: "bridge",
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: server_name.to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/opt/carrick/multi_network_server".to_string()]),
+                env: Some(vec![
+                    "CARRICK_PROBE_LABEL=runtime_connect_server".to_string(),
+                    "CARRICK_PROBE_BRIDGE_ACCEPTS=1".to_string(),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some("none".to_string()),
+                    binds: Some(vec![format!(
+                        "{}:/opt/carrick/multi_network_server:ro",
+                        server_probe.display()
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .connect_network(
+            net,
+            bollard::network::ConnectNetworkOptions {
+                container: server_name,
+                endpoint_config: bollard::models::EndpointSettings {
+                    aliases: Some(vec!["runtime-web".to_string()]),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            server_name,
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: client_name.to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/opt/carrick/multi_network_client".to_string()]),
+                env: Some(vec![
+                    "CARRICK_PROBE_LABEL=runtime_connect_client".to_string(),
+                    "CARRICK_PROBE_TARGET=runtime-web".to_string(),
+                    "CARRICK_PROBE_EXPECT=success".to_string(),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(net.to_string()),
+                    binds: Some(vec![format!(
+                        "{}:/opt/carrick/multi_network_client:ro",
+                        client_probe.display()
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            client_name,
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+    wait_container_exit(&docker, client_name).await;
+    wait_container_exit(&docker, server_name).await;
+    let client_logs = container_output(&docker, client_name).await;
+    let server_logs = container_output(&docker, server_name).await;
+    assert!(
+        client_logs.contains("runtime_connect_client_response=pong"),
+        "client did not reach connected server\nclient logs:\n{client_logs}\nserver logs:\n{server_logs}"
+    );
+    assert!(
+        server_logs.contains("runtime_connect_server_server_done=true"),
+        "server did not observe runtime-connected client\nserver logs:\n{server_logs}"
+    );
+
+    let _ = docker
+        .remove_container(
+            client_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            server_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker.remove_network(net).await;
+}
+
+#[tokio::test]
+#[ignore = "requires built aarch64 probes and boots multiple HVF guests"]
+async fn network_disconnect_stopped_container_is_runtime_invisible_after_restart() {
+    let Some(client_probe) = find_aarch64_probe("multi_network_client") else {
+        eprintln!(
+            "SKIP network_disconnect_stopped_container_is_runtime_invisible_after_restart: probe multi_network_client not built"
+        );
+        return;
+    };
+
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let net = "m0_runtime_disconnect_net";
+    let server_name = "m0runtimedisconnectsrv";
+    let client_name = "m0runtimedisconnectclient";
+    let _ = docker
+        .remove_container(
+            server_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            client_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker.remove_network(net).await;
+
+    docker
+        .create_network(bollard::network::CreateNetworkOptions {
+            name: net,
+            driver: "bridge",
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut endpoints = std::collections::HashMap::new();
+    endpoints.insert(
+        net.to_string(),
+        bollard::models::EndpointSettings {
+            aliases: Some(vec!["runtime-web".to_string()]),
+            ..Default::default()
+        },
+    );
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: server_name.to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/bin/sleep".to_string(), "20".to_string()]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(net.to_string()),
+                    ..Default::default()
+                }),
+                networking_config: Some(bollard::container::NetworkingConfig {
+                    endpoints_config: endpoints,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            server_name,
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+    docker.stop_container(server_name, None).await.unwrap();
+    docker
+        .disconnect_network(
+            net,
+            bollard::network::DisconnectNetworkOptions {
+                container: server_name,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            server_name,
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: client_name.to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/opt/carrick/multi_network_client".to_string()]),
+                env: Some(vec![
+                    "CARRICK_PROBE_LABEL=runtime_disconnect_client".to_string(),
+                    "CARRICK_PROBE_TARGET=runtime-web".to_string(),
+                    "CARRICK_PROBE_EXPECT=failure".to_string(),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(net.to_string()),
+                    binds: Some(vec![format!(
+                        "{}:/opt/carrick/multi_network_client:ro",
+                        client_probe.display()
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(
+            client_name,
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+    wait_container_exit(&docker, client_name).await;
+    let client_logs = container_output(&docker, client_name).await;
+    assert!(
+        client_logs.contains("runtime_disconnect_client_isolated=true"),
+        "client unexpectedly reached disconnected server name\nclient logs:\n{client_logs}"
+    );
+
+    let _ = docker
+        .remove_container(
+            client_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker
+        .remove_container(
+            server_name,
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    let _ = docker.remove_network(net).await;
 }
 
 #[tokio::test]
@@ -1563,6 +3028,29 @@ fn run_compose_output(
     output
 }
 
+fn wait_for_compose_logs(
+    sock: &str,
+    file: &std::path::Path,
+    project: &str,
+    needles: &[&str],
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut latest_stdout = String::new();
+    let mut latest_stderr = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = run_compose_output(sock, file, project, &["logs", "--no-color"]);
+        latest_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        latest_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if needles.iter().all(|needle| latest_stdout.contains(needle)) {
+            return latest_stdout;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "compose logs did not contain expected lines {needles:?}\nstdout:\n{latest_stdout}\nstderr:\n{latest_stderr}"
+    );
+}
+
 #[tokio::test]
 async fn network_disconnect_requires_existing_endpoint_even_with_force() {
     let (_server, sock, _dir) = spawn_server();
@@ -1816,7 +3304,9 @@ async fn network_connect_disconnect_updates_container_and_network_views() {
     docker
         .remove_network("m0_attach_rm_net")
         .await
-        .expect("removing a network with only created endpoints should succeed");
+        .unwrap_or_else(|e| {
+            panic!("removing a network with only created endpoints should succeed: {e}")
+        });
     docker
         .inspect_network(
             "m0_attach_net",
@@ -3735,7 +5225,7 @@ async fn streams_build_over_socket() {
     while let Some(item) = stream.next().await {
         // bollard turns an `error:` frame into a DockerStreamError; surfacing it
         // here fails the test with kaniko's captured message.
-        let info = item.expect("build stream yielded an error frame");
+        let info = item.unwrap_or_else(|e| panic!("build stream yielded an error frame: {e}"));
         if let Some(s) = &info.stream {
             saw_stream = true;
             if s.contains("Successfully built") {
