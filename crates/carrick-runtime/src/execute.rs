@@ -12,7 +12,7 @@ use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
 use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
-use carrick_spec::{FsBackendKind, NetworkMode, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
+use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
 use std::path::PathBuf;
 
 /// True when a runtime error means the ENTRYPOINT executable (or its loader)
@@ -508,11 +508,6 @@ fn seed_guest_baseline(
     extra_hosts: &[String],
 ) {
     use std::net::ToSocketAddrs;
-    let host_gateway = (network.mode == NetworkMode::Bridge).then_some(network.gateway_v4);
-    let parsed_extra_hosts = extra_hosts
-        .iter()
-        .filter_map(|entry| parse_extra_host(entry, host_gateway))
-        .collect::<Vec<_>>();
     for dir in [
         "/tmp",
         "/var",
@@ -559,56 +554,17 @@ fn seed_guest_baseline(
     // find their IP. Docker images typically ship an EMPTY /etc/hosts and rely on
     // the runtime to populate it, so an existence guard here would (wrongly) leave
     // the guest unable to resolve itself (Go os Test...; CPython test_socket).
-    let mut hosts_content = String::from(
-        "127.0.0.1\tlocalhost\n\
-         ::1\tlocalhost ip6-localhost ip6-loopback\n\
-         ff02::1\tip6-allnodes\n\
-         ff02::2\tip6-allrouters\n",
-    );
-    // Self-mapping: host networking keeps the Debian 127.0.1.1 convention.
-    // Bridge networking maps the configured container name and aliases to the
-    // virtual eth0 address visible inside the guest namespace.
-    if network.mode == NetworkMode::Bridge {
-        let mut wrote_bridge_entry = false;
-        for entry in network_hosts_entries {
-            if entry.names.is_empty() {
-                continue;
-            }
-            hosts_content.push_str(&format!("{}\t{}\n", entry.addr, entry.names.join(" ")));
-            wrote_bridge_entry = true;
-        }
-        if !wrote_bridge_entry {
-            let mut names = Vec::new();
-            if let Some(name) = &network.container_name {
-                names.push(name.as_str());
-            }
-            names.extend(network.aliases.iter().map(String::as_str));
-            if names.is_empty() {
-                names.push(guest_hostname());
-            }
-            hosts_content.push_str(&format!("{}\t{}\n", network.ipv4, names.join(" ")));
-        }
-        let explicit_names = parsed_extra_hosts
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>();
-        let gateway_names = ["host.docker.internal", "gateway.docker.internal"]
-            .into_iter()
-            .filter(|name| !explicit_names.contains(name))
-            .collect::<Vec<_>>();
-        if !gateway_names.is_empty() {
-            hosts_content.push_str(&format!(
-                "{}\t{}\n",
-                network.gateway_v4,
-                gateway_names.join(" ")
-            ));
-        }
-    } else {
-        hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
-    }
-    for (name, addr) in parsed_extra_hosts {
-        hosts_content.push_str(&format!("{addr}\t{name}\n"));
-    }
+    let network_model = crate::network::model::LinuxNetworkModel::from_spec(network);
+    let mut hosts_content = network_model
+        .hosts_config(
+            network,
+            network_hosts_entries
+                .iter()
+                .map(|entry| (entry.addr, entry.names.clone())),
+            extra_hosts,
+            guest_hostname(),
+        )
+        .render();
     // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
     // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a profile
     // showed it was the #2 cost after diskutil. It predates carrick synthesizing
@@ -666,22 +622,6 @@ fn seed_guest_baseline(
         "/etc/hostname",
         format!("{}\n", guest_hostname()).into_bytes(),
     );
-}
-
-fn parse_extra_host(
-    entry: &str,
-    host_gateway: Option<std::net::Ipv4Addr>,
-) -> Option<(&str, String)> {
-    let (name, addr) = entry.split_once('=').or_else(|| entry.split_once(':'))?;
-    let name = name.trim();
-    let addr = addr.trim();
-    if name.is_empty() || addr.is_empty() {
-        return None;
-    }
-    if addr == "host-gateway" {
-        return host_gateway.map(|gateway| (name, gateway.to_string()));
-    }
-    Some((name, addr.to_string()))
 }
 
 fn set_baseline_file_if_missing(
