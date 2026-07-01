@@ -475,9 +475,25 @@ impl SyscallDispatcher {
             OpenDescription::HostSocket { .. } => None,
             // Splicing FROM a pipe INTO a regular file is valid on Linux (only
             // ONE end must be a pipe). The write + offset advance is handled by
-            // write_output_fd. A read-only fd is EBADF.
-            OpenDescription::HostFile { writable: true, .. }
-            | OpenDescription::File { writable: true, .. } => None,
+            // write_output_fd. A read-only fd is EBADF; an O_APPEND destination
+            // is EINVAL (splice(2): "fd_out has the O_APPEND flag set" — LTP
+            // splice03's appendfd case, which carrick previously spliced into).
+            OpenDescription::HostFile {
+                base,
+                writable: true,
+                ..
+            }
+            | OpenDescription::File {
+                base,
+                writable: true,
+                ..
+            } => {
+                if base.status_flags() & crate::linux_abi::LINUX_O_APPEND != 0 {
+                    Some(LINUX_EINVAL)
+                } else {
+                    None
+                }
+            }
             OpenDescription::HostFile { .. } | OpenDescription::File { .. } => Some(LINUX_EBADF),
             _ => Some(LINUX_EINVAL),
         }

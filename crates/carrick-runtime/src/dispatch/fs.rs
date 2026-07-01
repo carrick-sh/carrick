@@ -6911,16 +6911,22 @@ impl SyscallDispatcher {
             if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
+            // A closed/negative fd_in is EBADF before any routing — the
+            // file→pipe fallthrough otherwise read an empty byte stream from
+            // the dead fd and "spliced" 0 bytes (LTP splice03 badfd case).
+            if in_fd.0 < 0 || (in_fd.0 > 2 && this.open_file(in_fd.0).is_none()) {
+                return Ok(LINUX_EBADF.into());
+            }
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
 
             if let Some((pipe, status_flags)) = this.pipe_reader(in_fd.0) {
-                // A pipe/socket source has no seekable offset → off_in must be
-                // NULL. off_out IS allowed (honored below) when fd_out is a
-                // regular file (test_os.test_splice_offset_out).
+                // A pipe source has no seekable offset → a non-NULL off_in is
+                // ESPIPE (splice(2)). off_out IS allowed (honored below) when
+                // fd_out is a regular file (test_os.test_splice_offset_out).
                 if off_in_address != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(LINUX_ESPIPE.into());
                 }
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(errno.into());
@@ -6934,11 +6940,11 @@ impl SyscallDispatcher {
             // `pipe2`/`fcntl` now hand back HostPipe descriptions, so splice must
             // recognise them just like the legacy in-memory PipeReader above).
             if let Some(host_fd) = this.host_pipe_read_fd(in_fd.0) {
-                // A pipe/socket source has no seekable offset → off_in must be
-                // NULL. off_out IS allowed (honored below) when fd_out is a
-                // regular file (test_os.test_splice_offset_out).
+                // A pipe source has no seekable offset → a non-NULL off_in is
+                // ESPIPE (splice(2)). off_out IS allowed (honored below) when
+                // fd_out is a regular file (test_os.test_splice_offset_out).
                 if off_in_address != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(LINUX_ESPIPE.into());
                 }
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(errno.into());
@@ -7051,15 +7057,18 @@ impl SyscallDispatcher {
                 });
             }
 
-            if off_out_address != 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
             match this.fd_is_pipe_writer(out_fd.0) {
                 Ok(true) => {}
+                // Neither side is a pipe → EINVAL (splice(2)); the pipe-source
+                // shapes were all handled above.
                 Ok(false) => {
                     return Ok(LINUX_EINVAL.into());
                 }
                 Err(errno) => return Ok(errno.into()),
+            }
+            // fd_out IS a pipe here, so a non-NULL off_out is ESPIPE.
+            if off_out_address != 0 {
+                return Ok(LINUX_ESPIPE.into());
             }
 
             let mut offset = this.sendfile_offset(in_fd.0, off_in_address, memory)??;
@@ -7137,7 +7146,10 @@ impl SyscallDispatcher {
                     }
                     OpenDescription::PipeWriter { .. } => VmDir::Write,
                     OpenDescription::PipeReader { .. } => VmDir::ReadMem,
-                    _ => return Ok(LINUX_EINVAL.into()),
+                    // vmsplice(2): a valid fd that does not refer to a pipe is
+                    // EBADF ("fd either not valid, or doesn't refer to a
+                    // pipe"), NOT EINVAL — LTP vmsplice02's file-fd case.
+                    _ => return Ok(LINUX_EBADF.into()),
                 }
             };
 
