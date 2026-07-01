@@ -73,6 +73,7 @@ use camino::Utf8PathBuf;
 use oci_client::Reference;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -245,6 +246,110 @@ pub enum PidMode {
     Private,
     /// Share the host PID namespace (`docker run --pid=host`).
     Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum NetworkMode {
+    #[default]
+    Host,
+    Bridge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NetworkNamespaceId(String);
+
+impl NetworkNamespaceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BridgeId(String);
+
+impl BridgeId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn default_bridge() -> Self {
+        Self("carrick0".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMapping {
+    pub host_ip: Option<IpAddr>,
+    pub host_port: Option<u16>,
+    pub container_port: u16,
+    pub protocol: PortProtocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkNamespaceSpec {
+    pub mode: NetworkMode,
+    pub namespace_id: Option<NetworkNamespaceId>,
+    pub bridge_id: BridgeId,
+    pub container_name: Option<String>,
+    pub aliases: Vec<String>,
+    pub ipv4: Ipv4Addr,
+    pub gateway_v4: Ipv4Addr,
+    pub dns_servers: Vec<IpAddr>,
+    pub published_ports: Vec<PortMapping>,
+}
+
+impl NetworkNamespaceSpec {
+    pub fn bridge_default(
+        container_name: Option<String>,
+        aliases: Vec<String>,
+        published_ports: Vec<PortMapping>,
+    ) -> Self {
+        Self {
+            mode: NetworkMode::Bridge,
+            namespace_id: Some(NetworkNamespaceId::new("default")),
+            bridge_id: BridgeId::default_bridge(),
+            container_name,
+            aliases,
+            ipv4: Ipv4Addr::new(172, 31, 0, 2),
+            gateway_v4: Ipv4Addr::new(172, 31, 0, 1),
+            dns_servers: vec![IpAddr::V4(Ipv4Addr::new(172, 31, 0, 1))],
+            published_ports,
+        }
+    }
+}
+
+impl Default for NetworkNamespaceSpec {
+    fn default() -> Self {
+        Self {
+            mode: NetworkMode::Host,
+            namespace_id: None,
+            bridge_id: BridgeId::default_bridge(),
+            container_name: None,
+            aliases: Vec::new(),
+            ipv4: Ipv4Addr::new(0, 0, 0, 0),
+            gateway_v4: Ipv4Addr::new(0, 0, 0, 0),
+            dns_servers: Vec::new(),
+            published_ports: Vec::new(),
+        }
+    }
 }
 
 /// The instruction-set architecture of the Linux container to run.
@@ -491,6 +596,9 @@ pub struct RunSpec {
     /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
     #[serde(default)]
     pub pid: PidMode,
+    /// Network namespace mode and resolved bridge view.
+    #[serde(default)]
+    pub network: NetworkNamespaceSpec,
     /// Initial guest user id (`docker run --user` / image `USER`). The guest's
     /// real/effective/saved/fs uid are all seeded to this. Defaults to 0 (root).
     #[serde(default)]
@@ -504,6 +612,52 @@ pub struct RunSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_spec_network_defaults_to_host() {
+        let json = r#"{
+            "executable": "/bin/sh",
+            "argv": ["/bin/sh"],
+            "envp": [],
+            "cwd": "/",
+            "rootfs_layers": [],
+            "fs_backend": "Host",
+            "mounts": [],
+            "tty": false,
+            "raw": true,
+            "interactive": false,
+            "max_traps": 100,
+            "debug_state_path": null
+        }"#;
+
+        let spec: RunSpec = serde_json::from_str(json).expect("legacy spec should deserialize");
+        assert_eq!(spec.network.mode, NetworkMode::Host);
+        assert!(spec.network.namespace_id.is_none());
+        assert!(spec.network.published_ports.is_empty());
+    }
+
+    #[test]
+    fn bridge_network_spec_round_trips() {
+        let spec = NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            vec!["api".to_string()],
+            vec![PortMapping {
+                host_ip: None,
+                host_port: Some(8080),
+                container_port: 80,
+                protocol: PortProtocol::Tcp,
+            }],
+        );
+
+        let encoded = serde_json::to_string(&spec).expect("serialize");
+        let decoded: NetworkNamespaceSpec = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.mode, NetworkMode::Bridge);
+        assert_eq!(decoded.bridge_id.as_str(), "carrick0");
+        assert_eq!(decoded.ipv4.to_string(), "172.31.0.2");
+        assert_eq!(decoded.gateway_v4.to_string(), "172.31.0.1");
+        assert_eq!(decoded.aliases, vec!["api"]);
+        assert_eq!(decoded.published_ports[0].container_port, 80);
+    }
 
     #[test]
     fn test_image_reference_parsing_and_serialization() {
