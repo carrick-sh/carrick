@@ -191,5 +191,20 @@ pub(crate) fn start_container(id: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    wait_until_started(&real, std::time::Duration::from_secs(10))?;
     Ok(())
+}
+
+fn wait_until_started(id: &str, timeout: std::time::Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let state = container::ContainerState::load(id)?;
+        if container::reconciled_status(&state) != container::ContainerStatus::Created {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("container {id} did not leave Created after start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
