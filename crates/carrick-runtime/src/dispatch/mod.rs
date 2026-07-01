@@ -1803,6 +1803,12 @@ impl SyscallDispatcher {
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         let mut dispatcher = Self::new();
+        dispatcher.fs.vfs_mounts.mount(
+            "/sys",
+            Box::new(crate::vfs::SysVfs::from_network_model(
+                network.model.clone(),
+            )),
+        );
         if should_mount_network_resolv_conf(&network.model) {
             let contents = resolv_conf_contents_for_network(&network.model);
             dispatcher.fs.vfs_mounts.mount(
@@ -7622,6 +7628,57 @@ mod overlay_dispatch_tests {
         assert!(contents.contains("nameserver 9.9.9.9\n"));
         assert!(contents.contains("search example.test\n"));
         assert!(contents.contains("options ndots:2\n"));
+    }
+
+    #[test]
+    fn with_network_mounts_sys_class_net_from_model() {
+        let mut spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        spec.attachments = vec![
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("front"),
+                Some("web".to_string()),
+                vec!["web-front".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 31, 0, 44)),
+            ),
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("back"),
+                Some("web".to_string()),
+                vec!["web-back".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 32, 0, 44)),
+            ),
+        ];
+        spec.bridge_id = spec.attachments[0].bridge_id.clone();
+        spec.ipv4 = spec.attachments[0].ipv4;
+        spec.gateway_v4 = spec.attachments[0].gateway_v4;
+        let network = std::sync::Arc::new(crate::network::RuntimeNetwork::create(&spec).unwrap());
+        let dispatcher = SyscallDispatcher::with_network(network);
+        let sys = dispatcher.fs.vfs_mounts.resolve("/sys/class/net").unwrap();
+
+        let names = sys
+            .vfs
+            .readdir("/sys/class/net")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["lo", "eth0", "eth1"]);
+
+        let eth1 = sys
+            .vfs
+            .open(
+                "/sys/class/net/eth1/ifindex",
+                crate::vfs::OpenFlags::default(),
+                &crate::vfs::OpenContext::default(),
+            )
+            .unwrap();
+        let crate::vfs::VfsHandle::Bytes { contents, .. } = eth1 else {
+            panic!("model-backed /sys/class/net ifindex should open as bytes");
+        };
+        assert_eq!(String::from_utf8(contents).unwrap(), "3\n");
     }
 
     /// The Linux errno constants we publish must match the
