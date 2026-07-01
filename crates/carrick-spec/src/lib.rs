@@ -400,6 +400,26 @@ impl NetworkNamespaceSpec {
             ..Self::default()
         }
     }
+
+    pub fn effective_attachments(&self) -> Vec<NetworkAttachmentSpec> {
+        let primary = NetworkAttachmentSpec {
+            bridge_id: self.bridge_id.clone(),
+            container_name: self.container_name.clone(),
+            aliases: self.aliases.clone(),
+            ipv4: self.ipv4,
+            gateway_v4: self.gateway_v4,
+        };
+        if self.attachments.is_empty() {
+            return vec![primary];
+        }
+        if self.attachments.len() == 1 {
+            let only = &self.attachments[0];
+            if only.bridge_id != self.bridge_id || only.ipv4 != self.ipv4 {
+                return vec![primary];
+            }
+        }
+        self.attachments.clone()
+    }
 }
 
 fn bridge_ipv4_for_name(container_name: Option<&str>) -> Ipv4Addr {

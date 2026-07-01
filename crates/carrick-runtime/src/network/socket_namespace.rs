@@ -864,23 +864,7 @@ fn service_names_for(container_name: Option<&String>, aliases: &[String]) -> Vec
 }
 
 fn effective_attachments(spec: &NetworkNamespaceSpec) -> Vec<NetworkAttachmentSpec> {
-    let primary = NetworkAttachmentSpec {
-        bridge_id: spec.bridge_id.clone(),
-        container_name: spec.container_name.clone(),
-        aliases: spec.aliases.clone(),
-        ipv4: spec.ipv4,
-        gateway_v4: spec.gateway_v4,
-    };
-    if spec.attachments.is_empty() {
-        return vec![primary];
-    }
-    if spec.attachments.len() == 1 {
-        let only = &spec.attachments[0];
-        if only.bridge_id != spec.bridge_id || only.ipv4 != spec.ipv4 {
-            return vec![primary];
-        }
-    }
-    spec.attachments.clone()
+    spec.effective_attachments()
 }
 
 fn encode_service_name(addr: Ipv4Addr, name: &str) -> String {

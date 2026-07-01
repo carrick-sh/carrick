@@ -637,40 +637,68 @@ pub(super) struct NetworkLink {
 pub(super) struct NetworkAddress {
     pub addr: std::net::IpAddr,
     pub prefix_len: u8,
+    pub link_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NetworkRoute {
     pub destination: Option<std::net::IpAddr>,
+    pub destination_prefix_len: u8,
     pub gateway: Option<std::net::IpAddr>,
+    pub link_name: String,
 }
 
 impl NetworkLinkSnapshot {
     pub(super) fn from_spec(spec: &carrick_spec::NetworkNamespaceSpec) -> Self {
         if spec.mode == carrick_spec::NetworkMode::Bridge {
+            let attachments = spec.effective_attachments();
+            let mut links = vec![NetworkLink {
+                name: "lo".to_string(),
+            }];
+            links.extend(
+                attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _attachment)| NetworkLink {
+                        name: format!("eth{idx}"),
+                    }),
+            );
+            let mut addresses = vec![NetworkAddress {
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                prefix_len: 8,
+                link_name: "lo".to_string(),
+            }];
+            addresses.extend(attachments.iter().enumerate().map(|(idx, attachment)| {
+                NetworkAddress {
+                    addr: std::net::IpAddr::V4(attachment.ipv4),
+                    prefix_len: 24,
+                    link_name: format!("eth{idx}"),
+                }
+            }));
+            let primary_gateway = attachments
+                .first()
+                .map_or(spec.gateway_v4, |attachment| attachment.gateway_v4);
+            let mut routes = vec![NetworkRoute {
+                destination: None,
+                destination_prefix_len: 0,
+                gateway: Some(std::net::IpAddr::V4(primary_gateway)),
+                link_name: "eth0".to_string(),
+            }];
+            routes.extend(
+                attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, attachment)| NetworkRoute {
+                        destination: Some(std::net::IpAddr::V4(v4_prefix_24(attachment.ipv4))),
+                        destination_prefix_len: 24,
+                        gateway: None,
+                        link_name: format!("eth{idx}"),
+                    }),
+            );
             Self {
-                links: vec![
-                    NetworkLink {
-                        name: "lo".to_string(),
-                    },
-                    NetworkLink {
-                        name: "eth0".to_string(),
-                    },
-                ],
-                addresses: vec![
-                    NetworkAddress {
-                        addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                        prefix_len: 8,
-                    },
-                    NetworkAddress {
-                        addr: std::net::IpAddr::V4(spec.ipv4),
-                        prefix_len: 24,
-                    },
-                ],
-                routes: vec![NetworkRoute {
-                    destination: None,
-                    gateway: Some(std::net::IpAddr::V4(spec.gateway_v4)),
-                }],
+                links,
+                addresses,
+                routes,
             }
         } else {
             Self {
@@ -680,14 +708,29 @@ impl NetworkLinkSnapshot {
                 addresses: vec![NetworkAddress {
                     addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                     prefix_len: 8,
+                    link_name: "lo".to_string(),
                 }],
                 routes: vec![NetworkRoute {
-                    destination: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                    destination: Some(std::net::IpAddr::V4(v4_prefix_8(
+                        std::net::Ipv4Addr::LOCALHOST,
+                    ))),
+                    destination_prefix_len: 8,
                     gateway: None,
+                    link_name: "lo".to_string(),
                 }],
             }
         }
     }
+}
+
+fn v4_prefix_24(addr: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let [a, b, c, _] = addr.octets();
+    std::net::Ipv4Addr::new(a, b, c, 0)
+}
+
+fn v4_prefix_8(addr: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let [a, _, _, _] = addr.octets();
+    std::net::Ipv4Addr::new(a, 0, 0, 0)
 }
 
 /// Count the leading set bits of a netmask's raw address bytes (the CIDR
@@ -1116,12 +1159,7 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 let Some((family, addr)) = ip_addr_bytes(address.addr) else {
                     continue;
                 };
-                let name = if address.addr.is_loopback() {
-                    "lo"
-                } else {
-                    "eth0"
-                };
-                let index = snapshot_link_index(snapshot, name).unwrap_or(1);
+                let index = snapshot_link_index(snapshot, &address.link_name).unwrap_or(1);
                 let mut payload = Vec::new();
                 let ifa = LinuxIfAddrMsg {
                     ifa_family: family,
@@ -1137,7 +1175,7 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 payload.extend_from_slice(ifa.as_bytes());
                 push_rtattr(&mut payload, LINUX_IFA_ADDRESS, &addr);
                 push_rtattr(&mut payload, LINUX_IFA_LOCAL, &addr);
-                let mut label = name.as_bytes().to_vec();
+                let mut label = address.link_name.as_bytes().to_vec();
                 label.push(0);
                 push_rtattr(&mut payload, LINUX_IFA_LABEL, &label);
                 push_nlmsg(&mut out, LINUX_RTM_NEWADDR, seq, pid, &payload);
@@ -1156,7 +1194,11 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 let mut payload = Vec::new();
                 let rtm = LinuxRtMsg {
                     rtm_family: family,
-                    rtm_dst_len: if route.destination.is_some() { 32 } else { 0 },
+                    rtm_dst_len: if route.destination.is_some() {
+                        route.destination_prefix_len
+                    } else {
+                        0
+                    },
                     rtm_src_len: 0,
                     rtm_tos: 0,
                     rtm_table: LINUX_RT_TABLE_MAIN,
@@ -1176,11 +1218,7 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 if route.gateway.is_some() {
                     push_rtattr(&mut payload, LINUX_RTA_GATEWAY, &route_addr);
                 }
-                let oif = if route.gateway.is_some() {
-                    snapshot_link_index(snapshot, "eth0").unwrap_or(1)
-                } else {
-                    snapshot_link_index(snapshot, "lo").unwrap_or(1)
-                };
+                let oif = snapshot_link_index(snapshot, &route.link_name).unwrap_or(1);
                 push_rtattr(&mut payload, LINUX_RTA_OIF, &oif.to_ne_bytes());
                 push_nlmsg(&mut out, LINUX_RTM_NEWROUTE, seq, pid, &payload);
             }
@@ -2571,6 +2609,55 @@ mod tests {
                 .iter()
                 .any(|r| r.gateway == Some(std::net::IpAddr::V4(spec.gateway_v4)))
         );
+    }
+
+    #[test]
+    fn bridge_netlink_snapshot_exposes_each_attachment() {
+        let mut spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        spec.attachments = vec![
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("front"),
+                Some("web".to_string()),
+                vec!["web".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 31, 0, 8)),
+            ),
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("back"),
+                Some("web".to_string()),
+                vec!["api".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 32, 0, 8)),
+            ),
+        ];
+        spec.bridge_id = spec.attachments[0].bridge_id.clone();
+        spec.ipv4 = spec.attachments[0].ipv4;
+        spec.gateway_v4 = spec.attachments[0].gateway_v4;
+
+        let snapshot = NetworkLinkSnapshot::from_spec(&spec);
+        assert_eq!(
+            snapshot
+                .links
+                .iter()
+                .map(|link| link.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lo", "eth0", "eth1"]
+        );
+        assert!(
+            snapshot.addresses.iter().any(|address| address.addr
+                == std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 31, 0, 8)))
+        );
+        assert!(
+            snapshot.addresses.iter().any(|address| address.addr
+                == std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 32, 0, 8)))
+        );
+        assert!(snapshot.routes.iter().any(
+            |route| route.gateway == Some(std::net::IpAddr::V4(spec.attachments[0].gateway_v4))
+        ));
+        assert!(snapshot.routes.iter().any(|route| route.destination
+            == Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 32, 0, 0)))));
     }
 
     #[test]

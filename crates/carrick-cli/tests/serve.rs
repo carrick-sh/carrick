@@ -2321,6 +2321,131 @@ networks:
 }
 
 #[tokio::test]
+#[ignore = "requires docker compose client, built aarch64 probes, and boots an HVF guest"]
+async fn docker_compose_network_surface_smoke() {
+    if !docker_compose_available() {
+        eprintln!("SKIP docker_compose_network_surface_smoke: docker compose is not available");
+        return;
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    let find_probe = |name: &str| {
+        ["debug", "release"]
+            .into_iter()
+            .map(|profile| probe_target.join(profile).join(name))
+            .find(|path| path.exists())
+    };
+    let required_probes = ["bridge_net_identity", "host_gateway_client"];
+    let mut probes = std::collections::HashMap::new();
+    for name in required_probes {
+        let Some(path) = find_probe(name) else {
+            eprintln!(
+                "SKIP docker_compose_network_surface_smoke: probe {name} not built under {}",
+                probe_target.display()
+            );
+            return;
+        };
+        probes.insert(name, path);
+    }
+
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let host_port = listener.local_addr().unwrap().port();
+    let host_server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 18];
+        std::io::Read::read_exact(&mut stream, &mut request).unwrap();
+        assert_eq!(&request, b"host-gateway-ping\n");
+        std::io::Write::write_all(&mut stream, b"host-gateway-pong\n").unwrap();
+    });
+
+    let (_server, sock, _dir) = spawn_server();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut copied = std::collections::HashMap::new();
+    for (name, source) in &probes {
+        let target = tmp.path().join(name);
+        std::fs::copy(source, &target).unwrap();
+        copied.insert(*name, target);
+    }
+
+    let compose = tmp.path().join("network-surface.yml");
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  surface:
+    image: ubuntu:24.04
+    command: ["/bin/sh", "-c", "/opt/carrick/bridge_net_identity && /opt/carrick/host_gateway_client"]
+    environment:
+      CARRICK_PROBE_LABEL: surface_host_gateway
+      CARRICK_PROBE_HOST: host.docker.internal
+      CARRICK_PROBE_PORT: "{host_port}"
+      CARRICK_PROBE_EXPECT_GATEWAY: 172.31.0.1
+    networks:
+      appnet: {{}}
+    volumes:
+      - type: bind
+        source: {identity}
+        target: /opt/carrick/bridge_net_identity
+        read_only: true
+      - type: bind
+        source: {gateway}
+        target: /opt/carrick/host_gateway_client
+        read_only: true
+networks:
+  appnet:
+    driver: bridge
+"#,
+            identity = copied["bridge_net_identity"].display(),
+            gateway = copied["host_gateway_client"].display()
+        ),
+    )
+    .unwrap();
+
+    let project = compose_project("netsurface");
+    run_compose(&sock, &compose, &project, &["up", "-d", "--remove-orphans"]);
+    let logs = wait_for_compose_logs(
+        &sock,
+        &compose,
+        &project,
+        &[
+            "bridge_getifaddrs_eth0=true",
+            "bridge_getifaddrs_nonloopback=true",
+            "bridge_hosts_has_eth0_ip=true",
+            "bridge_host_docker_internal=true",
+            "bridge_gateway_docker_internal=true",
+            "bridge_resolv_has_nameserver=true",
+            "bridge_proc_dev_has_eth0=true",
+            "bridge_proc_route_default_gateway=true",
+            "bridge_netlink_link_eth0=true",
+            "bridge_netlink_addr_eth0_ip=true",
+            "bridge_netlink_default_gateway=true",
+            "surface_host_gateway_resolved=172.31.0.1:",
+            "surface_host_gateway_connect_ok=true",
+            "surface_host_gateway_response=host-gateway-pong",
+        ],
+    );
+    assert!(
+        logs.contains("bridge_netlink_default_gateway=true"),
+        "network surface probe did not complete\nlogs:\n{logs}"
+    );
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &["down", "-v", "--remove-orphans"],
+    );
+    host_server.join().unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires docker compose client, built aarch64 probes, and boots HVF guests"]
 async fn docker_compose_udp_published_port_smoke() {
     if !docker_compose_available() {
