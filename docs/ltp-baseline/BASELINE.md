@@ -50,24 +50,33 @@ count in `docs/conformance-coverage.md` — a MATCH without a probe is not "done
 
 ## Per-area tally
 
-**Complete sweep: 1436 / 1436.** Re-run `python3 scripts/ltp-baseline.py
---tally` for the live table. Includes the fcntl-record-lock, writev-iovec,
-SysV-semaphore, and SysV-msg-queue fixes landed against it.
+**Complete sweep: 1436 / 1436** (re-swept 2026-06-29 against the LTP 20260529
+image, linuxkit 6.12.76; carrick **and** the Docker oracle both run
+`localhost:5050/ltp:arm64` for image consistency). Re-run
+`python3 scripts/ltp-baseline.py --tally` for the live table.
 
 | area | MATCH | PARTIAL | DIFF | TBROK | TIMEOUT | NO_ORACLE | total | verified-MATCH (of oracle-valid) |
 |---|---|---|---|---|---|---|---|---|
-| timers     | 26 | 0 | 2   | 7  | 0 | 20  | 55  | **74%** |
-| signals    | 36 | 0 | 3   | 7  | 3 | 2   | 51  | **73%** |
-| epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
-| sched      | 37 | 0 | 7   | 5  | 0 | 18  | 67  | **76%** |
-| other      | 55 | 2 | 9   | 2  | 0 | 53  | 121 | **81%** |
-| fs         | 206| 0 | 61  | 23 | 11 | 141 | 442 | **68%** |
-| process    | 115| 1 | 28  | 41 | 1 | 206 | 392 | **62%** |
-| ipc        | 15 | 0 | 13  | 12 | 0 | 7   | 47  | **38%** (sem + msg queues functional) |
-| net        | 16 | 0 | 12  | 9  | 0 | 16  | 53  | **43%** |
-| mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
-| xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **568** | **7** | **170** | **135** | **16** | **540** | **1436** | **568/896 = 63%** |
+| timers     | 30 | 0 | 4   | 2  | 0 | 19  | 55  | **83%** |
+| signals    | 40 | 0 | 3   | 3  | 0 | 5   | 51  | **87%** |
+| epoll_poll | 38 | 3 | 8   | 5  | 0 | 8   | 62  | **70%** |
+| sched      | 38 | 0 | 8   | 3  | 0 | 18  | 67  | **78%** |
+| other      | 59 | 2 | 5   | 2  | 0 | 53  | 121 | **87%** |
+| fs         | 257| 1 | 33  | 6  | 1 | 144 | 442 | **86%** |
+| process    | 135| 0 | 37  | 14 | 0 | 206 | 392 | **73%** |
+| ipc        | 17 | 0 | 11  | 12 | 0 | 7   | 47  | **43%** (sem + msg queues functional) |
+| net        | 22 | 1 | 13  | 1  | 0 | 16  | 53  | **59%** |
+| mm         | 31 | 1 | 31  | 11 | 0 | 43  | 117 | **42%** |
+| xattr      | 4  | 0 | 1   | 0  | 0 | 24  | 29  | **80%** |
+| **TOTAL**  | **671** | **8** | **154** | **59** | **1** | **543** | **1436** | **671/893 = 75%** |
+
+_Full re-sweep (2026-06-29) against the refreshed LTP 20260529 image, current
+carrick on `main`: **671/893 = 75%** strict verified-MATCH (679/893 = 76% incl.
+partial), 543 NO_ORACLE excluded. Up from 568/896 (63%) on the prior image.
+Biggest area gains: fs 68→86%, signals 73→87%, timers 74→83%, process 62→73%,
+net 43→59%; mm (42%) and ipc (43%) remain the weakest. The prior committed table
+predated the 2026-06-26 image rebuild; this resweeps carrick AND the oracle on
+the same `localhost:5050/ltp:arm64` so the comparison is internally consistent._
 
 _Last refresh (2026-05-28): the functional-FIFO cluster added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -170,8 +179,9 @@ probe-gated; conformance gate green at 92 probes. fs jumped 142→171._
 
 ### The target (DoD #2)
 
-Live: **59% verified-MATCH** of oracle-valid tests (528/896; full sweep, HEAD;
-60% incl. partial). NOTE: re-measuring the fcntl family surfaced fcntl07/14
+Live: **75% verified-MATCH** of oracle-valid tests (671/893; full re-sweep
+2026-06-29; 76% incl. partial) — the Phase-2 75% whole-suite target below is now
+met. NOTE (historical): re-measuring the fcntl family surfaced fcntl07/14
 (+_64) as TIMEOUT (F_SETLKW cross-process blocking locks — a separate
 blocking-lock/framework-lifecycle cluster, NOT the F_GETLK path this batch
 fixed; the change is dead-code for F_SETLKW and fcntl05 MATCHes). Committed baseline was 47% (425/898). The curated four are
