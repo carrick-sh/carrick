@@ -1668,12 +1668,14 @@ impl SyscallDispatcher {
         }
 
         fn ptrace(this, cx, request: u64, pid: Pid, addr: GuestPtr, data: u64) {
-            let host_pid = |pid: Pid| -> Option<Pid> {
+            // The tracee in the HOST domain (bare i32, NOT re-wrapped in
+            // NsPid: a host pid inside the ns-pid wrapper silently defeats
+            // every downstream `.names_self()`/`.to_host()`).
+            let host_pid = |pid: Pid| -> Option<i32> {
                 if crate::namespace::pid::enabled() && pid.0 > 0 {
-                    crate::namespace::pid::ns_to_host_or_self(pid.0 as u32)
-                        .map(|host| NsPid(host as i32))
+                    crate::namespace::pid::ns_to_host_or_self(pid.0 as u32).map(|host| host as i32)
                 } else {
-                    Some(pid)
+                    Some(pid.0)
                 }
             };
             let host_signal_data = || -> i32 {
@@ -1690,10 +1692,10 @@ impl SyscallDispatcher {
                     carrick_portable::ptrace(carrick_portable::PT_TRACE_ME, 0, 0, 0)
                 },
                 7 => match host_pid(pid) {
-                    Some(pid) => unsafe {
+                    Some(host) => unsafe {
                         carrick_portable::ptrace(
                             carrick_portable::PT_CONTINUE,
-                            pid.0,
+                            host,
                             1,
                             host_signal_data(),
                         )
@@ -1701,16 +1703,16 @@ impl SyscallDispatcher {
                     None => return Ok(LINUX_ESRCH.into()),
                 },
                 8 => match host_pid(pid) {
-                    Some(pid) => unsafe {
-                        carrick_portable::ptrace(carrick_portable::PT_KILL, pid.0, 0, 0)
+                    Some(host) => unsafe {
+                        carrick_portable::ptrace(carrick_portable::PT_KILL, host, 0, 0)
                     },
                     None => return Ok(LINUX_ESRCH.into()),
                 },
                 17 => match host_pid(pid) {
-                    Some(pid) => unsafe {
+                    Some(host) => unsafe {
                         carrick_portable::ptrace(
                             carrick_portable::PT_DETACH,
-                            pid.0,
+                            host,
                             1,
                             host_signal_data(),
                         )
@@ -1721,8 +1723,8 @@ impl SyscallDispatcher {
                 | LINUX_PTRACE_PEEKDATA
                 | LINUX_PTRACE_POKETEXT
                 | LINUX_PTRACE_POKEDATA => match host_pid(pid) {
-                    Some(pid) if pid.0 > 0 => {
-                        let exists = unsafe { libc::kill(pid.0, 0) == 0 }
+                    Some(host) if host > 0 => {
+                        let exists = unsafe { libc::kill(host, 0) == 0 }
                             || std::io::Error::last_os_error().raw_os_error()
                                 == Some(libc::EPERM);
                         if !exists {
@@ -1736,8 +1738,8 @@ impl SyscallDispatcher {
                     _ => return Ok(LINUX_ESRCH.into()),
                 },
                 LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => match host_pid(pid) {
-                    Some(pid) if pid.0 > 0 => {
-                        let exists = unsafe { libc::kill(pid.0, 0) == 0 }
+                    Some(host) if host > 0 => {
+                        let exists = unsafe { libc::kill(host, 0) == 0 }
                             || std::io::Error::last_os_error().raw_os_error()
                                 == Some(libc::EPERM);
                         if !exists {
@@ -2006,13 +2008,20 @@ impl SyscallDispatcher {
             // that names no member is ESRCH. pid <= 0 (any-child / pgrp) stays
             // host-level; only the RESULT is translated back (below). Identity
             // when namespaces are off.
-            let pid = if crate::namespace::pid::enabled() && pid.0 > 0 {
+            // The wait target in the HOST domain: a positive ns-pid translates
+            // to the host pid; `<= 0` sentinels (any-child / process-group)
+            // pass through untranslated. A bare i32 (not HostPid) because the
+            // sentinel values are part of the domain; NOT an NsPid — stuffing
+            // the translated host pid back into NsPid defeated the wrapper's
+            // whole purpose (a downstream `.names_self()`/`.to_host()` would
+            // silently double-translate).
+            let host_target: i32 = if crate::namespace::pid::enabled() && pid.0 > 0 {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                    Some(h) => NsPid(h as i32),
+                    Some(h) => h as i32,
                     None => return Ok(crate::linux_abi::LINUX_ECHILD.into()),
                 }
             } else {
-                pid
+                pid.0
             };
             let mut host_options: i32 = 0;
             if options & crate::linux_abi::LINUX_WNOHANG != 0 {
@@ -2029,16 +2038,16 @@ impl SyscallDispatcher {
             // A ptraced child can become waitable for a signal-delivery stop
             // even without WUNTRACED. EVFILT_PROC/NOTE_EXIT would sleep past
             // that stop, so let Darwin's wait4 observe a published pending stop.
-            let can_park_on_proc_exit = pid.0 > 0
+            let can_park_on_proc_exit = host_target > 0
                 && host_options & libc::WNOHANG == 0
                 && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
                     == 0
-                && !crate::guest_cpu::child_has_ptrace_stop_pending(pid.0 as u32);
+                && !crate::guest_cpu::child_has_ptrace_stop_pending(host_target as u32);
             let result = if can_park_on_proc_exit {
                 let r = loop {
                     let r = unsafe {
                         libc::wait4(
-                            pid.0,
+                            host_target,
                             &mut host_status,
                             host_options | libc::WNOHANG,
                             &mut host_rusage,
@@ -2067,7 +2076,7 @@ impl SyscallDispatcher {
                         let tid = Self::ctx_tid(cx);
                         let non_interrupting = this.non_interrupting_signal_mask(tid);
                         return Ok(DispatchOutcome::WaitOnProcExit {
-                            pid: pid.0,
+                            pid: host_target,
                             sig_mask: carrick_abi::WaitSigMask::Additive(
                                 carrick_abi::SigSet::from_raw(non_interrupting),
                             ),
@@ -2079,7 +2088,7 @@ impl SyscallDispatcher {
             } else {
                 loop {
                     let r =
-                        unsafe { libc::wait4(pid.0, &mut host_status, host_options, &mut host_rusage) };
+                        unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };
                     match r.host_syscall_errno() {
                         Ok(value) => {
                             // KVM lane: absorb (PTRACE_CONT re-inject) a tracee
@@ -2106,7 +2115,7 @@ impl SyscallDispatcher {
                     // the bad pgid (LTP waitpid04 INT_MIN case). Remap only that
                     // case — a valid pgid with no children stays ECHILD, and
                     // every other error passes through unchanged.
-                    if pid.0 < -1 && errno == LINUX_EINVAL {
+                    if host_target < -1 && errno == LINUX_EINVAL {
                         return Ok(LINUX_ESRCH.into());
                     }
                     return Ok(errno.into());
