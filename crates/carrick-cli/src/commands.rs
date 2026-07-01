@@ -96,7 +96,7 @@ use crate::debug::run_debug;
 use crate::fs_setup::install_fs_backend;
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
-    parse_volume_mount, truncate_str, validate_publish,
+    parse_publish_specs, parse_volume_mount, truncate_str,
 };
 #[cfg(target_os = "macos")]
 use crate::trace_cli::{current_supplementary_groups, trace_drop_credentials};
@@ -125,6 +125,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 tty: interactive,
                 interactive,
                 fs: None,
+                network: carrick_spec::NetworkMode::Host,
                 env: vec![],
                 env_file: vec![],
                 workdir: None,
@@ -458,6 +459,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             tty,
             interactive,
             fs,
+            network,
             env,
             env_file,
             workdir,
@@ -484,9 +486,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     unsafe { std::env::set_var(k, v) };
                 }
             }
-            // Reject `-p` maps that can't work under host-only networking
-            // (port remap / random host port) before doing any work — hybrid policy.
-            validate_publish(&publish)?;
+            let published_ports = parse_publish_specs(network, &publish)?;
 
             let mut env_overrides = env.clone();
             // `--env-file` may repeat (docker allows it); later files win.
@@ -525,6 +525,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
                 fs,
                 pid,
+                network,
+                published_ports,
                 stop_signal,
                 stop_timeout,
             };
@@ -686,6 +688,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             platform,
             fs,
             pid,
+            network,
             env,
             env_file,
             workdir,
@@ -730,6 +733,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: None,
                 fs,
                 pid,
+                network,
+                published_ports: parse_publish_specs(network, &Vec::new())?,
                 stop_signal,
                 stop_timeout,
             };

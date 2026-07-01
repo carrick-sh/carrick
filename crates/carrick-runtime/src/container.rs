@@ -80,6 +80,12 @@ pub struct RunConfig {
     pub user: Option<String>,
     /// PID namespace mode — `exec` joins the same region.
     pub pid: carrick_spec::PidMode,
+    /// Container network mode.
+    #[serde(default)]
+    pub network: carrick_spec::NetworkMode,
+    /// Published ports requested at create/run time.
+    #[serde(default)]
+    pub published_ports: Vec<carrick_spec::PortMapping>,
     /// On-disk writable overlay path (`--fs host`), shared with `exec`. `None`
     /// means the container used the in-process memory fs, so `exec` (which needs
     /// a shareable overlay) is unsupported for it.
@@ -125,6 +131,8 @@ impl Default for RunConfig {
             workdir: None,
             user: None,
             pid: carrick_spec::PidMode::default(),
+            network: carrick_spec::NetworkMode::Host,
+            published_ports: Vec::new(),
             scratch_path: None,
             region_path: None,
             entrypoint: None,

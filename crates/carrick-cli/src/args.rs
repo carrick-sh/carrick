@@ -37,7 +37,7 @@ use std::path::PathBuf;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::compat::CompatReportFormat;
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
-use carrick_spec::{FsBackendKind, PidMode};
+use carrick_spec::{FsBackendKind, NetworkMode, PidMode};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -271,6 +271,10 @@ pub(crate) enum Commands {
         /// shares the host PID namespace (no remap).
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
+        /// Container network mode. `host` is the current behavior; `bridge`
+        /// uses Carrick's socket namespace provider.
+        #[arg(long = "net", alias = "network", value_enum, default_value_t = NetworkMode::Host)]
+        network: NetworkMode,
         /// Set environment variables
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -337,6 +341,9 @@ pub(crate) enum Commands {
         fs: Option<FsBackendKind>,
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
+        /// Container network mode.
+        #[arg(long = "net", alias = "network", value_enum, default_value_t = NetworkMode::Host)]
+        network: NetworkMode,
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
         #[arg(long = "env-file", value_name = "FILE")]

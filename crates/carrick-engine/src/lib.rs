@@ -81,7 +81,10 @@ use std::collections::HashMap;
 
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
-pub use carrick_spec::{FsBackendKind, ImageConfig, Mount, PidMode, Platform, RunSpec};
+pub use carrick_spec::{
+    FsBackendKind, ImageConfig, Mount, NetworkMode, NetworkNamespaceSpec, PidMode, Platform,
+    PortMapping, RunSpec,
+};
 
 #[derive(Debug, Clone)]
 pub struct CliRunRequest {
@@ -105,6 +108,8 @@ pub struct CliRunRequest {
     pub fs: Option<FsBackendKind>,
     /// PID namespace mode (`docker run --pid`). Defaults to `Private`.
     pub pid: PidMode,
+    pub network: NetworkMode,
+    pub published_ports: Vec<PortMapping>,
     /// Raw `--stop-signal` value (e.g. `SIGQUIT`/`9`), or `None` to fall back to
     /// the image's OCI `STOPSIGNAL`. Resolved to a host signum at create time
     /// and persisted in the container's `RunConfig`; the engine itself does not
@@ -286,6 +291,14 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         .unwrap_or_else(carrick_runtime::apfs::default_writable_backend_kind);
 
     let debug_state_path = req.debug_state_path.map(Utf8PathBuf::from);
+    let network = match req.network {
+        NetworkMode::Host => NetworkNamespaceSpec::default(),
+        NetworkMode::Bridge => NetworkNamespaceSpec::bridge_default(
+            req.name.clone(),
+            Vec::new(),
+            req.published_ports.clone(),
+        ),
+    };
 
     Ok(RunSpec {
         executable,
@@ -302,6 +315,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         debug_state_path,
         platform,
         pid: req.pid,
+        network,
         uid,
         gid,
     })
@@ -411,9 +425,31 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
+            network: NetworkMode::Host,
+            published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
         }
+    }
+
+    #[test]
+    fn bridge_network_resolves_into_run_spec() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.network = NetworkMode::Bridge;
+        req.name = Some("web".to_string());
+        req.published_ports = vec![PortMapping {
+            host_ip: None,
+            host_port: Some(8080),
+            container_port: 80,
+            protocol: carrick_spec::PortProtocol::Tcp,
+        }];
+
+        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        assert_eq!(spec.network.mode, NetworkMode::Bridge);
+        assert_eq!(spec.network.container_name.as_deref(), Some("web"));
+        assert_eq!(spec.network.bridge_id.as_str(), "carrick0");
+        assert_eq!(spec.network.published_ports[0].host_port, Some(8080));
     }
 
     #[test]
@@ -499,6 +535,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
+            network: NetworkMode::Host,
+            published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
         };
@@ -532,6 +570,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
+            network: NetworkMode::Host,
+            published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
         };
@@ -564,6 +604,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
+            network: NetworkMode::Host,
+            published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
         };
@@ -596,6 +638,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
+            network: NetworkMode::Host,
+            published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
         };
@@ -637,6 +681,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
+            network: NetworkMode::Host,
+            published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
         };
@@ -667,6 +713,8 @@ mod tests {
                 debug_state_path: None,
                 fs: Some(FsBackendKind::Host),
                 pid: PidMode::default(),
+                network: NetworkMode::Host,
+                published_ports: Vec::new(),
                 stop_signal: None,
                 stop_timeout: None,
             };
