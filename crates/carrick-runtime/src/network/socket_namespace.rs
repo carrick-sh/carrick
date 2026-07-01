@@ -293,8 +293,13 @@ impl SocketNamespaceProvider {
         let spec = self.first_namespace_spec()?;
         let host_ip = mapping.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let host_port = mapping.host_port.unwrap_or(0);
-        let listener = TcpListener::bind(SocketAddr::new(host_ip, host_port))
-            .map_err(|e| format!("failed to bind published TCP port {host_ip}:{host_port}: {e}"))?;
+        let listener =
+            TcpListener::bind(SocketAddr::new(host_ip, host_port)).map_err(|e| match e.kind() {
+                io::ErrorKind::AddrInUse => {
+                    format!("published TCP port {host_ip}:{host_port} is already in use")
+                }
+                _ => format!("failed to bind published TCP port {host_ip}:{host_port}: {e}"),
+            })?;
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("failed to configure published TCP listener: {e}"))?;
@@ -737,6 +742,30 @@ mod tests {
         assert!(
             !provider.endpoint_dir.exists(),
             "destroy_namespace must remove socket namespace endpoint dir"
+        );
+    }
+
+    #[test]
+    fn publish_tcp_conflict_reports_stable_error() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy host port");
+        let host_port = occupied.local_addr().expect("occupied addr").port();
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: PortProtocol::Tcp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+
+        let err = provider
+            .publish_port(lease.id, mapping)
+            .expect_err("occupied published host port should fail");
+
+        assert_eq!(
+            err,
+            format!("published TCP port 127.0.0.1:{host_port} is already in use")
         );
     }
 
