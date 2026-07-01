@@ -10,11 +10,14 @@ pub struct NetworkCapabilities {
     pub same_bridge_ip_connectivity: bool,
     pub outbound_connectivity: bool,
     pub published_ports: bool,
+    pub published_udp_ports: bool,
     pub kernel_datapath: bool,
     pub host_routable_container_ips: bool,
     pub packet_level_isolation: bool,
     pub raw_socket_support: bool,
     pub multicast_or_broadcast: bool,
+    pub netfilter: bool,
+    pub guest_created_network_namespaces: bool,
     pub requires_privilege: bool,
 }
 
@@ -98,11 +101,14 @@ impl NetworkProvider for HostNetworkProvider {
             same_bridge_ip_connectivity: false,
             outbound_connectivity: true,
             published_ports: false,
+            published_udp_ports: false,
             kernel_datapath: true,
             host_routable_container_ips: false,
             packet_level_isolation: false,
             raw_socket_support: false,
             multicast_or_broadcast: false,
+            netfilter: false,
+            guest_created_network_namespaces: false,
             requires_privilege: false,
         }
     }
@@ -195,7 +201,10 @@ mod tests {
         assert!(caps.kernel_datapath);
         assert!(caps.outbound_connectivity);
         assert!(!caps.same_bridge_ip_connectivity);
+        assert!(!caps.published_udp_ports);
         assert!(!caps.host_routable_container_ips);
+        assert!(!caps.netfilter);
+        assert!(!caps.guest_created_network_namespaces);
         assert!(!caps.requires_privilege);
     }
 
@@ -209,5 +218,27 @@ mod tests {
         .expect("create bridge network");
         assert_eq!(network.lease.id, NetworkLeaseId(1));
         assert_eq!(network.spec.mode, NetworkMode::Bridge);
+    }
+
+    #[test]
+    fn bridge_provider_reports_v1_socket_capability_boundaries() {
+        let provider = select_provider(&NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let caps = provider.capabilities();
+
+        assert!(caps.same_bridge_ip_connectivity);
+        assert!(caps.outbound_connectivity);
+        assert!(caps.published_ports);
+        assert!(!caps.published_udp_ports);
+        assert!(!caps.host_routable_container_ips);
+        assert!(!caps.packet_level_isolation);
+        assert!(!caps.raw_socket_support);
+        assert!(!caps.multicast_or_broadcast);
+        assert!(!caps.netfilter);
+        assert!(!caps.guest_created_network_namespaces);
+        assert!(!caps.requires_privilege);
     }
 }
