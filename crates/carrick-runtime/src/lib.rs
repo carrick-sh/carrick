@@ -844,17 +844,33 @@ pub mod runtime {
                         }
                     }
                 },
-                DispatchOutcome::WaitOnSignals { wait_set, timeout } => {
+                DispatchOutcome::WaitOnSignals {
+                    wait_set,
+                    block_mask,
+                    timeout,
+                } => {
                     // rt_sigtimedwait/sigwait blocking: a signal already pending
                     // in wait_set was dequeued before this outcome, so we reach
                     // here only to wait. Sleep for the timeout, re-dispatching on
                     // wake to re-check pending (a host signal mapped to the guest,
-                    // or — once cross-process signals land — another process's
-                    // kill). A finite timeout with nothing pending → EAGAIN, the
-                    // sigtimedwait timeout return. Single-threaded: no in-process
-                    // async source, so a finite timeout is deterministic.
-                    match waiter.wait(&[], timeout, !wait_set) {
-                        WaitResult::Ready | WaitResult::Interrupted => continue,
+                    // or another process's kill) — unless the wake is an unblocked
+                    // signal OUTSIDE the wait set, which must EINTR the wait
+                    // (sigtimedwait is never restarted — signal(7)). A finite
+                    // timeout with nothing pending → EAGAIN, the sigtimedwait
+                    // timeout return. Single-threaded: no in-process async
+                    // source, so a finite timeout is deterministic.
+                    match waiter.wait(&[], timeout, block_mask) {
+                        WaitResult::Ready => continue,
+                        WaitResult::Interrupted => {
+                            if dispatcher.signal_wait_should_eintr(
+                                waiter.tid(),
+                                wait_set,
+                                block_mask,
+                            ) {
+                                return Ok(DispatchOutcome::Errno { errno: EINTR });
+                            }
+                            continue;
+                        }
                         WaitResult::TimedOut => {
                             return Ok(DispatchOutcome::Errno {
                                 errno: crate::linux_abi::LINUX_EAGAIN,
@@ -1585,7 +1601,7 @@ pub mod host_signal {
     /// Drain every xsignal-ring entry targeting THIS process, clearing the dirty
     /// flag. Called in dispatch context; the consumer rebuilds siginfo (preserving
     /// `si_value` for RT signals) and marks each signal pending.
-    pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
+    pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64)> {
         carrick_signal_core::xsig::xsig_drain_for_self()
     }
     /// Self-directed `kill(getpid(), sig)` for an UNBLOCKED signal: publish it
@@ -1635,11 +1651,19 @@ pub mod host_signal {
     pub fn xsig_enqueue(
         target_host: i32,
         sig: i32,
+        code: i32,
         sender_ns: i32,
         sender_uid: u32,
         value: i64,
     ) -> bool {
-        carrick_signal_core::xsig::xsig_enqueue(target_host, sig, sender_ns, sender_uid, value)
+        carrick_signal_core::xsig::xsig_enqueue(
+            target_host,
+            sig,
+            code,
+            sender_ns,
+            sender_uid,
+            value,
+        )
     }
     /// Nudge `target_host` (a sibling carrick process) to drain its xsignal ring
     /// — host `SIGRTMIN+1`, a pure wakeup whose handler marks the ring dirty +
@@ -1779,6 +1803,11 @@ pub mod io_wait {
         /// No-op: `ppoll` needs no per-wait setup (the macOS waiter lazily
         /// creates its kqueue here).
         pub fn ensure_full(&mut self) {}
+
+        /// The guest tid this waiter parks on behalf of.
+        pub fn tid(&self) -> crate::thread::ThreadId {
+            self.tid
+        }
 
         pub fn wait(
             &self,

@@ -29,6 +29,11 @@ struct XSigSlot {
     used: AtomicU32, // 0 = free, 1 = claiming (payload not yet valid), 2 = ready, 3 = draining (one consumer claimed it)
     target_host_pid: AtomicI32,
     signum: AtomicI32, // Linux signum
+    /// Linux `si_code` of the SEND (SI_USER for kill(2), SI_TKILL for
+    /// tkill/tgkill, SI_QUEUE for rt_sigqueueinfo). Carried explicitly:
+    /// guessing it from the signum at drain time stamped a plain `kill` of an
+    /// RT signal as SI_QUEUE (LTP sigwaitinfo "struct siginfo mismatch").
+    code: AtomicI32,
     sender_ns_pid: AtomicI32,
     sender_uid: AtomicU32,
     value: AtomicI64, // sigval (rt_sigqueueinfo); 0 otherwise
@@ -92,6 +97,7 @@ pub fn mark_xsig_dirty() {
 pub fn xsig_enqueue(
     target_host_pid: i32,
     signum: i32,
+    code: i32,
     sender_ns_pid: i32,
     sender_uid: u32,
     value: i64,
@@ -111,6 +117,7 @@ pub fn xsig_enqueue(
             slot.target_host_pid
                 .store(target_host_pid, Ordering::Relaxed);
             slot.signum.store(signum, Ordering::Relaxed);
+            slot.code.store(code, Ordering::Relaxed);
             slot.sender_ns_pid.store(sender_ns_pid, Ordering::Relaxed);
             slot.sender_uid.store(sender_uid, Ordering::Relaxed);
             slot.value.store(value, Ordering::Relaxed);
@@ -162,8 +169,8 @@ pub fn xsig_has_unblocked_for_self(block_mask: u64) -> bool {
 
 /// Drain every entry targeting THIS process, clearing the dirty flag. Called in
 /// DISPATCH context (may allocate / take locks). Returns
-/// `(signum, sender_ns_pid, sender_uid, value)` per entry.
-pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
+/// `(signum, code, sender_ns_pid, sender_uid, value)` per entry.
+pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64)> {
     XSIG_DIRTY.store(false, Ordering::SeqCst);
     let mut out = Vec::new();
     let Some(ring) = xsig_ring() else {
@@ -196,11 +203,12 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, u32, i64)> {
             continue;
         }
         let signum = slot.signum.load(Ordering::Relaxed);
+        let code = slot.code.load(Ordering::Relaxed);
         let sp = slot.sender_ns_pid.load(Ordering::Relaxed);
         let su = slot.sender_uid.load(Ordering::Relaxed);
         let v = slot.value.load(Ordering::Acquire);
         slot.used.store(0, Ordering::Release); // free the slot for reuse
-        out.push((signum, sp, su, v));
+        out.push((signum, code, sp, su, v));
     }
     out
 }
@@ -247,7 +255,7 @@ mod tests {
         // Enqueue alone does NOT set DIRTY — the nudge handler does. Simulate the
         // nudge with mark_xsig_dirty.
         assert!(!xsig_has_pending());
-        assert!(xsig_enqueue(std::process::id() as i32, 10, 42, 0, 0));
+        assert!(xsig_enqueue(std::process::id() as i32, 10, 0, 42, 0, 0));
         assert!(!xsig_has_pending(), "enqueue alone must not set DIRTY");
         mark_xsig_dirty();
         assert!(xsig_has_pending());
@@ -261,7 +269,7 @@ mod tests {
         let me = std::process::id() as i32;
         // Lost-nudge case: the sender wrote the SHARED ring but the host nudge
         // that would set the process-local XSIG_DIRTY was dropped.
-        assert!(xsig_enqueue(me, 10, 42, 0, 0));
+        assert!(xsig_enqueue(me, 10, 0, 42, 0, 0));
         assert!(!xsig_has_pending(), "no nudge => local DIRTY stays clear");
         // A parked waiter's recheck must STILL see the entry (ring-authoritative),
         // so it wakes despite the lost nudge — this is the anti-wedge invariant.
@@ -279,12 +287,12 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ring();
         let me = std::process::id() as i32;
-        assert!(xsig_enqueue(me, 12, 4242, 1000, 0x5eed));
+        assert!(xsig_enqueue(me, 12, -1, 4242, 1000, 0x5eed));
         mark_xsig_dirty();
         assert!(xsig_has_pending());
 
         let drained = xsig_drain_for_self();
-        assert_eq!(drained, vec![(12, 4242, 1000, 0x5eed)]);
+        assert_eq!(drained, vec![(12, -1, 4242, 1000, 0x5eed)]);
         // Drain clears DIRTY.
         assert!(!xsig_has_pending());
         // The slot is freed: a second drain returns empty.
@@ -297,7 +305,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_ring();
         let other = std::process::id() as i32 + 1;
-        assert!(xsig_enqueue(other, 17, 99, 0, 0));
+        assert!(xsig_enqueue(other, 17, 0, 99, 0, 0));
         mark_xsig_dirty();
 
         // The entry targets a DIFFERENT pid → not drained for self.
@@ -330,6 +338,7 @@ mod tests {
         assert!(xsig_enqueue(
             me,
             13,
+            -1,
             7777,
             1234,
             0x1234_5678_9abc_def0_u64 as i64
@@ -342,7 +351,7 @@ mod tests {
         let drained = xsig_drain_for_self();
         assert_eq!(
             drained,
-            vec![(13, 7777, 1234, 0x1234_5678_9abc_def0_u64 as i64)],
+            vec![(13, -1, 7777, 1234, 0x1234_5678_9abc_def0_u64 as i64)],
             "published payload must round-trip byte-for-byte"
         );
 
@@ -375,7 +384,7 @@ mod tests {
         let mut total_deliveries = 0usize;
         for round in 0..ROUNDS {
             // Publish exactly ONE entry targeting this process.
-            assert!(xsig_enqueue(me, 20, round as i32, 0, round as i64));
+            assert!(xsig_enqueue(me, 20, 0, round as i32, 0, round as i64));
 
             // Release all drainers together so they contend on the single slot.
             let barrier = Arc::new(Barrier::new(threads));
@@ -411,10 +420,10 @@ mod tests {
         let me = std::process::id() as i32;
         // Fill all 256 slots.
         for _ in 0..XSIG_SLOTS {
-            assert!(xsig_enqueue(me, 10, 1, 0, 0));
+            assert!(xsig_enqueue(me, 10, 0, 1, 0, 0));
         }
         // The 257th must fail (ring full).
-        assert!(!xsig_enqueue(me, 10, 1, 0, 0));
+        assert!(!xsig_enqueue(me, 10, 0, 1, 0, 0));
         reset_ring();
     }
 }

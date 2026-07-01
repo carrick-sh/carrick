@@ -1373,7 +1373,7 @@ mod tests {
 
         let signum = crate::linux_abi::LINUX_SIGUSR1;
         let blocked = thread_pending_bit(signum);
-        assert!(xsig_enqueue(std::process::id() as i32, signum, 42, 0, 0));
+        assert!(xsig_enqueue(std::process::id() as i32, signum, 0, 42, 0, 0));
         mark_xsig_dirty();
 
         assert!(has_pending_for(900_050));
