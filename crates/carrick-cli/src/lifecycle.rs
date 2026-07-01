@@ -181,6 +181,8 @@ fn build_created_state(
         created_secs,
         exit_code: None,
         auto_remove: req.rm,
+        api_auto_remove: false,
+        labels: std::collections::HashMap::new(),
         config: RunConfig {
             platform: req.platform.clone(),
             env: req.env_overrides.clone(),
@@ -188,6 +190,19 @@ fn build_created_state(
             user: req.user.clone(),
             pid: req.pid,
             network: req.network,
+            network_aliases: req.network_aliases.clone(),
+            network_attachments: default_network_attachments(
+                req.network,
+                req.network_bridge.as_deref(),
+                &req.network_aliases,
+                req.network_ipv4.as_deref(),
+            ),
+            network_container: req.network_container.clone(),
+            extra_hosts: req.extra_hosts.clone(),
+            dns_servers: req.dns_servers.clone(),
+            dns_search: req.dns_search.clone(),
+            dns_options: req.dns_options.clone(),
+            volumes_from: req.volumes_from.clone(),
             published_ports: req.published_ports.clone(),
             scratch_path: None,
             region_path: None,
@@ -200,6 +215,30 @@ fn build_created_state(
             stop_signal,
             stop_timeout: req.stop_timeout,
         },
+    }
+}
+
+fn default_network_attachments(
+    network: carrick_spec::NetworkMode,
+    bridge: Option<&str>,
+    aliases: &[String],
+    ipv4_address: Option<&str>,
+) -> Vec<carrick_runtime::container::NetworkAttachment> {
+    match network {
+        carrick_spec::NetworkMode::Bridge => {
+            vec![carrick_runtime::container::NetworkAttachment {
+                name: bridge.unwrap_or("bridge").to_string(),
+                aliases: aliases.to_vec(),
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: ipv4_address.map(str::to_string),
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            }]
+        }
+        carrick_spec::NetworkMode::Host | carrick_spec::NetworkMode::None => Vec::new(),
     }
 }
 
@@ -322,12 +361,67 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         fs: c.fs,
         pid: c.pid,
         network: c.network,
+        network_bridge: bridge_network_name(c),
+        network_container: c.network_container.clone(),
+        network_ipv4: bridge_network_ipv4(c),
+        network_aliases: bridge_network_aliases(c),
+        extra_hosts: c.extra_hosts.clone(),
+        dns_servers: c.dns_servers.clone(),
+        dns_search: c.dns_search.clone(),
+        dns_options: c.dns_options.clone(),
+        volumes_from: c.volumes_from.clone(),
         published_ports: c.published_ports.clone(),
         // The effective host stop signum is already persisted in RunConfig and
         // preserved across relaunch; engine.run ignores these, so leave unset.
         stop_signal: None,
         stop_timeout: None,
     }
+}
+
+fn bridge_network_name(config: &RunConfig) -> Option<String> {
+    if config.network != carrick_spec::NetworkMode::Bridge {
+        return None;
+    }
+    config
+        .network_attachments
+        .iter()
+        .find(|attachment| attachment.name != "bridge")
+        .map(|attachment| attachment.name.clone())
+}
+
+fn bridge_network_aliases(config: &RunConfig) -> Vec<String> {
+    if config.network != carrick_spec::NetworkMode::Bridge {
+        return config.network_aliases.clone();
+    }
+    config
+        .network_attachments
+        .iter()
+        .find(|attachment| attachment.name != "bridge")
+        .or_else(|| {
+            config
+                .network_attachments
+                .iter()
+                .find(|attachment| attachment.name == "bridge")
+        })
+        .map(|attachment| attachment.aliases.clone())
+        .unwrap_or_else(|| config.network_aliases.clone())
+}
+
+fn bridge_network_ipv4(config: &RunConfig) -> Option<String> {
+    if config.network != carrick_spec::NetworkMode::Bridge {
+        return None;
+    }
+    config
+        .network_attachments
+        .iter()
+        .find(|attachment| attachment.name != "bridge")
+        .or_else(|| {
+            config
+                .network_attachments
+                .iter()
+                .find(|attachment| attachment.name == "bridge")
+        })
+        .and_then(|attachment| attachment.ipv4_address.clone())
 }
 
 /// Run `action` over each container spec, printing the returned id/code on
@@ -372,11 +466,12 @@ pub(crate) fn start(
 fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
     let mut state = ContainerState::load(&id)?;
-    if container::reconciled_status(&state) == ContainerStatus::Running {
+    let status = container::reconciled_status(&state);
+    if status == ContainerStatus::Running {
         // docker: starting an already-running container is a no-op success.
         return Ok(id);
     }
-    if state.auto_remove {
+    if state.auto_remove && status != ContainerStatus::Created {
         bail!(
             "container {} was created with --rm and cannot be started/restarted",
             container::short_id(&id)
@@ -706,7 +801,13 @@ fn ps_row_json(c: &ContainerState, st: ContainerStatus, no_trunc: bool) -> serde
 }
 
 fn ps_ports(config: &RunConfig) -> String {
-    if config.network == carrick_spec::NetworkMode::Host {
+    if config.network_container.is_some() {
+        return String::new();
+    }
+    if matches!(
+        config.network,
+        carrick_spec::NetworkMode::Host | carrick_spec::NetworkMode::None
+    ) {
         return String::new();
     }
 
@@ -955,6 +1056,15 @@ pub(crate) fn exec(
         fs: Some(carrick_spec::FsBackendKind::Host),
         pid: state.config.pid,
         network: state.config.network,
+        network_bridge: bridge_network_name(&state.config),
+        network_container: state.config.network_container.clone(),
+        network_ipv4: bridge_network_ipv4(&state.config),
+        network_aliases: bridge_network_aliases(&state.config),
+        extra_hosts: state.config.extra_hosts.clone(),
+        dns_servers: state.config.dns_servers.clone(),
+        dns_search: state.config.dns_search.clone(),
+        dns_options: state.config.dns_options.clone(),
+        volumes_from: state.config.volumes_from.clone(),
         published_ports: Vec::new(),
         // exec is a transient command, not a managed container — it is never
         // `stop`ped, so it carries no stop config.
@@ -1105,7 +1215,273 @@ pub(crate) fn container_to_json(c: &ContainerState, status: ContainerStatus) -> 
             "Env": c.config.env,
             "WorkingDir": c.config.workdir,
             "User": c.config.user,
+            "Labels": c.labels,
         },
+        "HostConfig": {
+            "NetworkMode": docker_network_mode(c),
+            "PortBindings": docker_port_map(c),
+            "ExtraHosts": c.config.extra_hosts.clone(),
+            "Dns": c.config.dns_servers.clone(),
+            "DnsSearch": c.config.dns_search.clone(),
+            "DnsOptions": c.config.dns_options.clone(),
+            "VolumesFrom": c.config.volumes_from.clone(),
+        },
+        "NetworkSettings": {
+            "Networks": docker_networks(c),
+            "Ports": docker_port_map(c),
+        },
+        "Mounts": docker_mounts(c),
+    })
+}
+
+fn docker_network_mode(c: &ContainerState) -> String {
+    if let Some(target) = c.config.network_container.as_deref() {
+        return format!("container:{target}");
+    }
+    c.config
+        .network_attachments
+        .first()
+        .map(|attachment| attachment.name.clone())
+        .unwrap_or_else(|| match c.config.network {
+            carrick_spec::NetworkMode::Bridge => "bridge".to_string(),
+            carrick_spec::NetworkMode::Host => "host".to_string(),
+            carrick_spec::NetworkMode::None => "none".to_string(),
+        })
+}
+
+fn docker_networks(c: &ContainerState) -> serde_json::Value {
+    let mut networks = serde_json::Map::new();
+    if c.config.network_container.is_some() {
+        return serde_json::Value::Object(networks);
+    }
+    if !c.config.network_attachments.is_empty() {
+        for attachment in &c.config.network_attachments {
+            networks.insert(
+                attachment.name.clone(),
+                docker_endpoint(c, &attachment.name, DockerEndpointView::from(attachment)),
+            );
+        }
+    } else if c.config.network == carrick_spec::NetworkMode::Bridge {
+        networks.insert(
+            "bridge".to_string(),
+            docker_endpoint(
+                c,
+                "bridge",
+                DockerEndpointView::with_aliases(c.config.network_aliases.clone()),
+            ),
+        );
+    } else if c.config.network == carrick_spec::NetworkMode::None {
+        networks.insert(
+            "none".to_string(),
+            docker_endpoint(c, "none", DockerEndpointView::default()),
+        );
+    } else if c.config.network == carrick_spec::NetworkMode::Host {
+        networks.insert(
+            "host".to_string(),
+            docker_endpoint(c, "host", DockerEndpointView::default()),
+        );
+    }
+    serde_json::Value::Object(networks)
+}
+
+#[derive(Default)]
+struct DockerEndpointView {
+    aliases: Option<Vec<String>>,
+    links: Option<Vec<String>>,
+    mac_address: Option<String>,
+    gw_priority: i64,
+    ipv4_address: Option<String>,
+    ipv6_address: Option<String>,
+    link_local_ips: Vec<String>,
+    driver_opts: std::collections::HashMap<String, String>,
+}
+
+impl DockerEndpointView {
+    fn with_aliases(aliases: Vec<String>) -> Self {
+        Self {
+            aliases: Some(aliases),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&carrick_runtime::container::NetworkAttachment> for DockerEndpointView {
+    fn from(attachment: &carrick_runtime::container::NetworkAttachment) -> Self {
+        Self {
+            aliases: Some(attachment.aliases.clone()),
+            links: Some(attachment.links.clone()),
+            mac_address: attachment.mac_address.clone(),
+            gw_priority: attachment.gw_priority,
+            ipv4_address: attachment.ipv4_address.clone(),
+            ipv6_address: attachment.ipv6_address.clone(),
+            link_local_ips: attachment.link_local_ips.clone(),
+            driver_opts: attachment.driver_opts.clone(),
+        }
+    }
+}
+
+fn docker_endpoint(
+    c: &ContainerState,
+    network_name: &str,
+    endpoint: DockerEndpointView,
+) -> serde_json::Value {
+    let dns_names = docker_endpoint_dns_names(c, network_name, endpoint.aliases.as_deref());
+    let aliases = endpoint.aliases.clone().unwrap_or_default();
+    let ip_address = crate::serve::resources::endpoint_ipv4_address(
+        c,
+        endpoint.ipv4_address.as_deref(),
+        &aliases,
+    );
+    let has_ipv4 = !ip_address.is_empty();
+    let ipam_config = docker_endpoint_ipam_config(
+        endpoint.ipv4_address.as_deref(),
+        endpoint.ipv6_address.as_deref(),
+        &endpoint.link_local_ips,
+    );
+    serde_json::json!({
+        "IPAMConfig": ipam_config,
+        "Links": endpoint.links,
+        "Aliases": endpoint.aliases,
+        "DriverOpts": (!endpoint.driver_opts.is_empty()).then_some(endpoint.driver_opts),
+        "GwPriority": endpoint.gw_priority,
+        "NetworkID": crate::serve::resources::network_id(network_name).unwrap_or_default(),
+        "EndpointID": crate::serve::resources::endpoint_id(&c.id, network_name),
+        "Gateway": if has_ipv4 { "172.31.0.1" } else { "" },
+        "IPAddress": ip_address,
+        "MacAddress": endpoint.mac_address.unwrap_or_default(),
+        "IPPrefixLen": if has_ipv4 { 16 } else { 0 },
+        "IPv6Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "DNSNames": dns_names,
+    })
+}
+
+fn docker_endpoint_ipam_config(
+    ipv4_address: Option<&str>,
+    ipv6_address: Option<&str>,
+    link_local_ips: &[String],
+) -> Option<serde_json::Value> {
+    if ipv4_address.is_none() && ipv6_address.is_none() && link_local_ips.is_empty() {
+        return None;
+    }
+    let mut ipam = serde_json::Map::new();
+    if let Some(ipv4) = ipv4_address {
+        ipam.insert("IPv4Address".to_string(), serde_json::json!(ipv4));
+    }
+    if let Some(ipv6) = ipv6_address {
+        ipam.insert("IPv6Address".to_string(), serde_json::json!(ipv6));
+    }
+    if !link_local_ips.is_empty() {
+        ipam.insert(
+            "LinkLocalIPs".to_string(),
+            serde_json::json!(link_local_ips),
+        );
+    }
+    Some(serde_json::Value::Object(ipam))
+}
+
+fn docker_endpoint_dns_names(
+    c: &ContainerState,
+    network_name: &str,
+    aliases: Option<&[String]>,
+) -> Option<Vec<String>> {
+    if matches!(network_name, "bridge" | "host" | "none") {
+        return None;
+    }
+    let mut names = Vec::new();
+    if let Some(name) = c.name.as_deref().filter(|name| !name.is_empty()) {
+        names.push(name.to_string());
+    }
+    if let Some(aliases) = aliases {
+        for alias in aliases {
+            if !alias.is_empty() && !names.contains(alias) {
+                names.push(alias.clone());
+            }
+        }
+    }
+    let short_id = c.id[..12].to_string();
+    if !names.contains(&short_id) {
+        names.push(short_id);
+    }
+    Some(names)
+}
+
+fn docker_port_map(c: &ContainerState) -> serde_json::Value {
+    let mut ports = serde_json::Map::new();
+    if matches!(
+        c.config.network,
+        carrick_spec::NetworkMode::Host | carrick_spec::NetworkMode::None
+    ) {
+        return serde_json::Value::Object(ports);
+    }
+    for mapping in &c.config.published_ports {
+        let key = format!(
+            "{}/{}",
+            mapping.container_port,
+            docker_port_protocol(mapping.protocol)
+        );
+        let binding = serde_json::json!({
+            "HostIp": mapping.host_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            "HostPort": mapping.host_port.map(|port| port.to_string()).unwrap_or_default(),
+        });
+        if let Some(array) = ports
+            .entry(key)
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+        {
+            array.push(binding);
+        }
+    }
+    serde_json::Value::Object(ports)
+}
+
+fn docker_port_protocol(protocol: carrick_spec::PortProtocol) -> &'static str {
+    match protocol {
+        carrick_spec::PortProtocol::Tcp => "tcp",
+        carrick_spec::PortProtocol::Udp => "udp",
+    }
+}
+
+fn docker_mounts(c: &ContainerState) -> Vec<serde_json::Value> {
+    c.config
+        .mounts
+        .iter()
+        .map(|mount| {
+            let source = mount.source.as_str();
+            let volume_name = docker_volume_name_for_mount_source(source);
+            let mount_type = if volume_name.is_some() {
+                "volume"
+            } else {
+                "bind"
+            };
+            serde_json::json!({
+                "Type": mount_type,
+                "Name": volume_name,
+                "Source": source,
+                "Destination": mount.target.as_str(),
+                "Driver": if mount_type == "volume" { "local" } else { "" },
+                "Mode": if mount.readonly { "ro" } else { "rw" },
+                "RW": !mount.readonly,
+            })
+        })
+        .collect()
+}
+
+fn docker_volume_name_for_mount_source(source: &str) -> Option<String> {
+    let parts: Vec<String> = std::path::Path::new(source)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    parts.windows(4).rev().find_map(|window| {
+        if window[0] == "docker-api" && window[1] == "volumes" && window[3] == "_data" {
+            Some(window[2].clone())
+        } else {
+            None
+        }
     })
 }
 
@@ -1267,6 +1643,8 @@ mod tests {
             created_secs: 1,
             exit_code: Some(3),
             auto_remove: false,
+            api_auto_remove: false,
+            labels: std::collections::HashMap::new(),
             config: RunConfig {
                 platform: Some("linux/arm64".into()),
                 env: vec!["A=1".into()],
@@ -1274,6 +1652,14 @@ mod tests {
                 user: Some("1000".into()),
                 pid: carrick_spec::PidMode::Private,
                 network: carrick_spec::NetworkMode::Host,
+                network_aliases: vec!["api".into()],
+                network_attachments: Vec::new(),
+                network_container: None,
+                extra_hosts: Vec::new(),
+                dns_servers: Vec::new(),
+                dns_search: Vec::new(),
+                dns_options: Vec::new(),
+                volumes_from: Vec::new(),
                 published_ports: Vec::new(),
                 scratch_path: Some("/s".into()),
                 region_path: Some("/r".into()),
@@ -1314,7 +1700,81 @@ mod tests {
         assert!(req.tty);
         assert_eq!(req.max_traps, 4242);
         assert_eq!(req.pid, carrick_spec::PidMode::Private);
+        assert_eq!(req.network_aliases, vec!["api".to_string()]);
         assert!(!req.rm);
+    }
+
+    #[test]
+    fn rebuild_request_preserves_custom_bridge_network_identity() {
+        let mut state = sample_state();
+        state.config.network = carrick_spec::NetworkMode::Bridge;
+        state.config.network_attachments = vec![carrick_runtime::container::NetworkAttachment {
+            name: "compose_default".to_string(),
+            aliases: vec!["api".to_string()],
+            links: Vec::new(),
+            mac_address: None,
+            gw_priority: 0,
+            ipv4_address: None,
+            ipv6_address: None,
+            link_local_ips: Vec::new(),
+            driver_opts: std::collections::HashMap::new(),
+        }];
+
+        let req = rebuild_request_from_state(&state);
+        let image = carrick_image::ResolvedImage {
+            layers: vec![camino::Utf8PathBuf::from("/layer")],
+            config: carrick_spec::ImageConfig {
+                entrypoint: None,
+                cmd: Some(vec!["/bin/true".to_string()]),
+                env: Vec::new(),
+                working_dir: None,
+                user: None,
+                exposed_ports: None,
+                labels: None,
+                stop_signal: None,
+            },
+        };
+        let spec = carrick_engine::resolve_run_spec(req, image).expect("resolve run spec");
+
+        assert_eq!(spec.network.mode, carrick_spec::NetworkMode::Bridge);
+        assert_eq!(spec.network.bridge_id.as_str(), "compose_default");
+        assert_eq!(spec.network.aliases, vec!["api".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_request_scopes_aliases_to_selected_custom_bridge_network() {
+        let mut state = sample_state();
+        state.config.network = carrick_spec::NetworkMode::Bridge;
+        state.config.network_aliases = vec!["api".to_string(), "private-api".to_string()];
+        state.config.network_attachments = vec![
+            carrick_runtime::container::NetworkAttachment {
+                name: "compose_default".to_string(),
+                aliases: vec!["api".to_string()],
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: None,
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            },
+            carrick_runtime::container::NetworkAttachment {
+                name: "compose_private".to_string(),
+                aliases: vec!["private-api".to_string()],
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: None,
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            },
+        ];
+
+        let req = rebuild_request_from_state(&state);
+
+        assert_eq!(req.network_bridge.as_deref(), Some("compose_default"));
+        assert_eq!(req.network_aliases, vec!["api".to_string()]);
     }
 
     #[test]

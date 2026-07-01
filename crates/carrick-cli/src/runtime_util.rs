@@ -122,6 +122,9 @@ pub(crate) fn parse_publish_specs(
                 "-p {spec:?}: published UDP ports are not supported by --net bridge's socket namespace provider"
             );
         }
+        if network == carrick_spec::NetworkMode::None {
+            anyhow::bail!("-p {spec:?}: published ports are not supported by --net none");
+        }
         if network == carrick_spec::NetworkMode::Host {
             let Some(host_port) = host_port else {
                 anyhow::bail!(
@@ -169,6 +172,45 @@ pub(crate) fn parse_mount_flag(s: &str) -> anyhow::Result<carrick_spec::Mount> {
         target,
         readonly,
     })
+}
+
+pub(crate) fn resolve_volumes_from_specs(
+    specs: &[String],
+) -> anyhow::Result<Vec<carrick_spec::Mount>> {
+    let mut mounts = Vec::new();
+    for spec in specs {
+        let (target, readonly_override) = parse_volumes_from_spec(spec)?;
+        let id = carrick_runtime::container::resolve(target)
+            .map_err(|_| anyhow::anyhow!("No such container: {target}"))?;
+        let state = carrick_runtime::container::ContainerState::load(&id)?;
+        for mount in &state.config.mounts {
+            let mut inherited = mount.clone();
+            if readonly_override == Some(true) {
+                inherited.readonly = true;
+            }
+            mounts.push(inherited);
+        }
+    }
+    Ok(mounts)
+}
+
+fn parse_volumes_from_spec(spec: &str) -> anyhow::Result<(&str, Option<bool>)> {
+    let mut parts = spec.split(':');
+    let target = parts
+        .next()
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("invalid --volumes-from {spec:?}: missing container"))?;
+    let mode = match parts.next() {
+        Some("ro") => Some(true),
+        Some("rw") | None => None,
+        Some(other) => {
+            anyhow::bail!("invalid --volumes-from mode {other:?}: expected ro or rw")
+        }
+    };
+    if parts.next().is_some() {
+        anyhow::bail!("invalid --volumes-from {spec:?}: expected container[:ro|:rw]");
+    }
+    Ok((target, mode))
 }
 
 pub(crate) fn parse_env_file(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
