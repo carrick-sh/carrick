@@ -2450,6 +2450,8 @@ networks:
             "bridge_resolv_has_nameserver=true",
             "bridge_proc_dev_has_eth0=true",
             "bridge_proc_route_default_gateway=true",
+            "bridge_sysfs_has_eth0=true",
+            "bridge_sysfs_hides_host_en0=true",
             "bridge_netlink_link_eth0=true",
             "bridge_netlink_addr_eth0_ip=true",
             "bridge_netlink_default_gateway=true",
