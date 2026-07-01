@@ -306,9 +306,7 @@ mod tests {
     #[test]
     fn publish_remap_rejected() {
         assert!(parse_publish_specs(NetworkMode::Host, &["8080:80".into()]).is_err());
-        assert!(
-            parse_publish_specs(NetworkMode::Host, &["127.0.0.1:8080:80".into()]).is_err()
-        );
+        assert!(parse_publish_specs(NetworkMode::Host, &["127.0.0.1:8080:80".into()]).is_err());
         assert!(parse_publish_specs(NetworkMode::Host, &["80".into()]).is_err());
     }
 
