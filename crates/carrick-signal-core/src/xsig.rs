@@ -131,16 +131,22 @@ pub fn xsig_has_pending() -> bool {
     XSIG_DIRTY.load(Ordering::SeqCst)
 }
 
-/// Whether the ring is dirty AND holds at least one entry targeting THIS process
-/// whose signum is deliverable given `block_mask` (bit `signum-1`). Used by the
-/// backend waiter so a parked thread only wakes for a signal it can actually
-/// deliver.
+/// Whether the SHARED ring holds at least one entry targeting THIS process whose
+/// signum is deliverable given `block_mask` (bit `signum-1`). Used by the backend
+/// waiter so a parked thread only wakes for a signal it can actually deliver.
+///
+/// RING-AUTHORITATIVE: this scans the `MAP_SHARED` ring directly and does NOT
+/// consult the process-local `XSIG_DIRTY` hint. `XSIG_DIRTY` is set only by the
+/// backend nudge handler ([`mark_xsig_dirty`]), and that host nudge is LOSABLE —
+/// it can race the target's ppoll/wait entry (the classic kick-vs-enter window)
+/// or land mid fork-reinit. Gating this recheck on `XSIG_DIRTY` therefore let an
+/// already-enqueued cross-process signal stay permanently invisible to a parked
+/// waiter (the Linux/KVM `do_sys_poll` wedge). Since the sender reliably writes
+/// the shared ring before nudging, scanning the ring is the authoritative test;
+/// `XSIG_DIRTY` survives only as a fast-path hint for [`xsig_has_pending`].
 pub fn xsig_has_unblocked_for_self(block_mask: u64) -> bool {
-    if !XSIG_DIRTY.load(Ordering::SeqCst) {
-        return false;
-    }
     let Some(ring) = xsig_ring() else {
-        return true;
+        return false;
     };
     let me = std::process::id() as i32;
     for slot in ring.slots.iter() {
@@ -245,6 +251,26 @@ mod tests {
         assert!(!xsig_has_pending(), "enqueue alone must not set DIRTY");
         mark_xsig_dirty();
         assert!(xsig_has_pending());
+        reset_ring();
+    }
+
+    #[test]
+    fn has_unblocked_for_self_is_ring_authoritative_without_nudge() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        let me = std::process::id() as i32;
+        // Lost-nudge case: the sender wrote the SHARED ring but the host nudge
+        // that would set the process-local XSIG_DIRTY was dropped.
+        assert!(xsig_enqueue(me, 10, 42, 0, 0));
+        assert!(!xsig_has_pending(), "no nudge => local DIRTY stays clear");
+        // A parked waiter's recheck must STILL see the entry (ring-authoritative),
+        // so it wakes despite the lost nudge — this is the anti-wedge invariant.
+        assert!(
+            xsig_has_unblocked_for_self(0),
+            "recheck must scan the shared ring, not the losable DIRTY flag"
+        );
+        // A fully-blocking mask correctly hides it (not deliverable yet).
+        assert!(!xsig_has_unblocked_for_self(u64::MAX));
         reset_ring();
     }
 
