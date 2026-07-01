@@ -4,7 +4,7 @@
 
 use std::ffi::CStr;
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 const NETLINK_ROUTE: i32 = 0;
@@ -27,6 +27,14 @@ fn main() {
     println!("bridge_getifaddrs_eth0=true");
     println!("bridge_getifaddrs_nonloopback={}", !eth0_ip.is_loopback());
     println!("bridge_hosts_has_eth0_ip={}", file_contains_ip("/etc/hosts", eth0_ip));
+    println!(
+        "bridge_host_docker_internal={}",
+        resolve_host_v4("host.docker.internal") == Some(Ipv4Addr::new(172, 31, 0, 1))
+    );
+    println!(
+        "bridge_gateway_docker_internal={}",
+        resolve_host_v4("gateway.docker.internal") == Some(Ipv4Addr::new(172, 31, 0, 1))
+    );
     println!("bridge_resolv_has_nameserver={}", resolv_has_nameserver());
     println!("bridge_proc_dev_has_eth0={}", proc_dev_has_eth0());
     println!(
@@ -84,6 +92,16 @@ fn eth0_ipv4() -> Ipv4Addr {
 
 fn file_contains_ip(path: &str, ip: Ipv4Addr) -> bool {
     fs::read_to_string(path).is_ok_and(|contents| contents.contains(&ip.to_string()))
+}
+
+fn resolve_host_v4(host: &str) -> Option<Ipv4Addr> {
+    (host, 80)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|addr| match addr.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
 }
 
 fn resolv_has_nameserver() -> bool {

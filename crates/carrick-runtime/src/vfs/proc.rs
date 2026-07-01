@@ -844,10 +844,15 @@ fn linux_interfaces(
     network: &carrick_spec::NetworkNamespaceSpec,
 ) -> Vec<(u32, String, bool, bool)> {
     if network.mode == carrick_spec::NetworkMode::Bridge {
-        return vec![
-            (1, "lo".to_owned(), true, true),
-            (2, "eth0".to_owned(), true, false),
-        ];
+        let mut interfaces = vec![(1, "lo".to_owned(), true, true)];
+        interfaces.extend(
+            network
+                .effective_attachments()
+                .into_iter()
+                .enumerate()
+                .map(|(idx, _attachment)| ((idx + 2) as u32, format!("eth{idx}"), true, false)),
+        );
+        return interfaces;
     }
     host_linux_interfaces()
 }
@@ -963,11 +968,20 @@ fn synthetic_proc_net_route(network: &carrick_spec::NetworkNamespaceSpec) -> Vec
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
     );
     if network.mode == carrick_spec::NetworkMode::Bridge {
+        let attachments = network.effective_attachments();
+        let primary_gateway = attachments
+            .first()
+            .map_or(network.gateway_v4, |attachment| attachment.gateway_v4);
         s.push_str(&format!(
             "eth0\t00000000\t{}\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
-            proc_net_route_hex_v4(network.gateway_v4)
+            proc_net_route_hex_v4(primary_gateway)
         ));
-        s.push_str("eth0\t00001FAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n");
+        for (idx, attachment) in attachments.iter().enumerate() {
+            s.push_str(&format!(
+                "eth{idx}\t{}\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n",
+                proc_net_route_hex_v4(proc_net_v4_24(attachment.ipv4))
+            ));
+        }
         return s.into_bytes();
     }
     let eth = linux_interfaces(network)
@@ -989,6 +1003,11 @@ fn proc_net_route_hex_v4(addr: std::net::Ipv4Addr) -> String {
         "{:02X}{:02X}{:02X}{:02X}",
         octets[3], octets[2], octets[1], octets[0]
     )
+}
+
+fn proc_net_v4_24(addr: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
+    let [a, b, c, _] = addr.octets();
+    std::net::Ipv4Addr::new(a, b, c, 0)
 }
 
 /// `/proc/net/ipv6_route`: loopback rows in the fixed 32-hex-digit layout, no
@@ -3188,6 +3207,50 @@ mod tests {
         assert!(
             route.contains("eth0\t00000000\t01001FAC"),
             "bridge route should report default gateway 172.31.0.1 in /proc/net/route: {route}"
+        );
+    }
+
+    #[test]
+    fn proc_net_exposes_each_bridge_attachment() {
+        let mut network = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        network.attachments = vec![
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("front"),
+                Some("web".to_string()),
+                vec!["web".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 31, 0, 8)),
+            ),
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("back"),
+                Some("web".to_string()),
+                vec!["api".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 32, 0, 8)),
+            ),
+        ];
+        network.bridge_id = network.attachments[0].bridge_id.clone();
+        network.ipv4 = network.attachments[0].ipv4;
+        network.gateway_v4 = network.attachments[0].gateway_v4;
+
+        let dev = String::from_utf8(synthetic_proc_net_dev(&network)).unwrap();
+        assert!(dev.contains("  eth0:"), "primary bridge missing: {dev}");
+        assert!(dev.contains("  eth1:"), "secondary bridge missing: {dev}");
+
+        let route = String::from_utf8(synthetic_proc_net_route(&network)).unwrap();
+        assert!(
+            route.contains("eth0\t00000000\t01001FAC"),
+            "default route should stay on primary bridge: {route}"
+        );
+        assert!(
+            route.contains("eth0\t00001FAC\t00000000"),
+            "primary connected route missing: {route}"
+        );
+        assert!(
+            route.contains("eth1\t000020AC\t00000000"),
+            "secondary connected route missing: {route}"
         );
     }
 
