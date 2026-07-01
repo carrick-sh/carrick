@@ -186,8 +186,11 @@ conformance-kvm *ARGS:
     # ~/.carrick/scratch; 8 concurrent extractions overflow the 30 GiB lima
     # disk (node, the largest image, ENOSPCs). 3 fits comfortably and matches
     # the 6-vCPU guest better anyway (each run is a nested VM).
+    # No explicit --baseline-overlay: the arm64 lima `kvm` lane auto-derives its
+    # OWN overlay (baseline.kvm-arm64.jsonl), kept distinct from the amd64
+    # `kvm-local` lane's baseline.kvm.jsonl so the two arches never cross-excuse.
     cargo run -p carrick-conformance -- --lane kvm --tier smoke --workers 3 \
-        --carrick-bin "$bin" --baseline-overlay scripts/conformance/baseline.kvm.jsonl {{ARGS}}
+        --carrick-bin "$bin" {{ARGS}}
 
 # Re-render docs/support-matrix.md from the latest results (no run).
 matrix:

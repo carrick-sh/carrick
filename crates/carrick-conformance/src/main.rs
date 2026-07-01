@@ -225,7 +225,41 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 
     let tier = parse_tier(&args.tier)?;
-    let selected = select(&manifest.suite, tier, &args.ecosystem, &args.suite);
+    let skip_key = amd64_bringup_key(docker_platform, &args.lane);
+    let selected = select(
+        &manifest.suite,
+        tier,
+        &args.ecosystem,
+        &args.suite,
+        skip_key,
+    );
+    // Transparency: a bring-up lane silently dropping not-yet-applicable
+    // ecosystems could be misread as full coverage, so name what was scoped out.
+    // Only on an unfiltered run — an explicit --ecosystem/--suite already ran it.
+    if let Some(key) = skip_key
+        && args.ecosystem.is_empty()
+        && args.suite.is_empty()
+    {
+        let skipped: Vec<&Suite> = manifest
+            .suite
+            .iter()
+            .filter(|s| {
+                (tier == Tier::Full || s.tier == Tier::Smoke) && !applies_to_lane(s, Some(key))
+            })
+            .collect();
+        if !skipped.is_empty() {
+            let mut ecos: Vec<&str> = skipped.iter().map(|s| s.ecosystem.as_str()).collect();
+            ecos.sort_unstable();
+            ecos.dedup();
+            eprintln!(
+                "lane {}: scoped out {} not-yet-applicable suite(s) ({}) — not brought up on \
+                 this amd64 lane yet; override with --ecosystem/--suite",
+                args.lane,
+                skipped.len(),
+                ecos.join(", ")
+            );
+        }
+    }
     if selected.is_empty() {
         eprintln!("no suites match the selection");
         return Ok(ExitCode::SUCCESS);
@@ -628,6 +662,22 @@ fn bless_target(lane: &str) -> Result<BlessTarget, String> {
     }
 }
 
+/// Whether `verdict` must block a `--bless` on `target`. TIMEOUT/CARRICK_CRASH are
+/// genuine carrick failures and block on EVERY lane. ORACLE_FAIL (Docker produced
+/// nothing comparable for this arch) blocks ONLY the mature hvf shared-baseline
+/// bless: hvf runs the native arm64 oracle, which should always exist, so a missing
+/// one is a broken oracle to fix before re-blessing. A kvm/bhyve/nvmm bring-up lane
+/// blesses only its OWN overlay and runs an amd64 oracle that legitimately cannot
+/// cover every suite yet, so ORACLE_FAIL there is an expected coverage gap, not a
+/// bless blocker. Pure (no IO) so the guard is unit-tested directly.
+fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
+    match verdict {
+        Verdict::Timeout | Verdict::CarrickCrash => true,
+        Verdict::OracleFail => matches!(target, BlessTarget::SharedBaseline),
+        Verdict::Match | Verdict::Diff | Verdict::Regression | Verdict::New => false,
+    }
+}
+
 fn bless(
     args: &Args,
     selected: &[Suite],
@@ -645,17 +695,19 @@ fn bless(
     let target = bless_target(&args.lane).map_err(|e| anyhow::anyhow!(e))?;
     let bad: Vec<&str> = reports
         .iter()
-        .filter(|r| {
-            matches!(
-                r.verdict,
-                Verdict::OracleFail | Verdict::Timeout | Verdict::CarrickCrash
-            )
-        })
+        .filter(|r| bless_blocks(target, r.verdict))
         .map(|r| r.name.as_str())
         .collect();
     if !bad.is_empty() {
+        // A shared-baseline (hvf) bless additionally blocks on ORACLE_FAIL; a
+        // bring-up-lane overlay bless does not, so name only the verdicts that
+        // actually block on this target.
+        let blockers = match target {
+            BlessTarget::SharedBaseline => "ORACLE_FAIL/TIMEOUT/CARRICK_CRASH",
+            BlessTarget::LaneOverlay(_) => "TIMEOUT/CARRICK_CRASH",
+        };
         anyhow::bail!(
-            "--bless refused: resolve or known_gap-annotate these ORACLE_FAIL/TIMEOUT/CARRICK_CRASH suites first: {}",
+            "--bless refused: resolve these {blockers} suites first: {}",
             bad.join(", ")
         );
     }
@@ -918,12 +970,68 @@ fn suite_requires_exclusive_lane(suite: &Suite) -> bool {
     matches!(suite.name.as_str(), "go-net_http")
 }
 
-fn select(suites: &[Suite], tier: Tier, ecos: &[String], names: &[String]) -> Vec<Suite> {
+/// Whether `suite` is applicable on the lane identified by `overlay_key` — the
+/// amd64 bring-up lane's key from [`amd64_bringup_key`], or `None` for any arm64
+/// lane (hvf, the lima `kvm` lane), where everything applies. The x86 bring-up
+/// lanes (kvm/bhyve/nvmm) replay the arm64 manifest under `--platform
+/// linux/amd64`; ecosystems carrick cannot yet run on x86 only yield ORACLE_FAIL
+/// (no amd64 oracle) or CARRICK_CRASH (die at guest init), so an unfiltered run
+/// skips them rather than waste a full fresh Docker pass and clutter the lane
+/// overlay. This is a scope boundary (which ecosystems are brought up on x86),
+/// not a per-testcase excuse — grep here to widen coverage as bring-up lands:
+///   - CPython: no native x86 run exists yet (arm64/HVF-only) -> skip on EVERY
+///     bring-up lane.
+///   - Go / Node: run on kvm for discovery, but die at guest init on bhyve/nvmm
+///     (Go's large pageAlloc PROT_NONE reservation) -> skip there until it lands.
+///
+/// LTP is the mature x86 ecosystem and ALWAYS applies; a missing amd64 LTP oracle
+/// surfaces as a non-blocking ORACLE_FAIL (see `bless_blocks`), never a skip.
+fn applies_to_lane(suite: &Suite, overlay_key: Option<&str>) -> bool {
+    let Some(key) = overlay_key else {
+        return true; // hvf: byte-for-byte the pre-filter behavior
+    };
+    match suite.ecosystem {
+        Ecosystem::Ltp => true,
+        Ecosystem::Cpython => false,
+        Ecosystem::Go | Ecosystem::Node => key == "kvm",
+    }
+}
+
+/// The lane-applicability skip key `select` should use: the bring-up lane's
+/// overlay key (kvm/bhyve/nvmm) ONLY when the lane runs an amd64 guest — the x86
+/// bring-up lanes that replay the arm64 manifest under `--platform linux/amd64`.
+/// Every arm64 lane returns `None` (skip nothing). This is keyed on the guest
+/// ARCH, not the overlay key, precisely because the arm64 lima `kvm` lane and the
+/// amd64 `kvm-local` lane SHARE the "kvm" overlay key but must scope differently:
+/// cpython/go/node run fine on the arm64 lima lane and must not be skipped there.
+fn amd64_bringup_key(
+    docker_platform: lane::DockerPlatform,
+    lane_str: &str,
+) -> Option<&'static str> {
+    match docker_platform {
+        lane::DockerPlatform::LinuxAmd64 => lane_overlay_key(lane_str),
+        lane::DockerPlatform::LinuxArm64 => None,
+    }
+}
+
+fn select(
+    suites: &[Suite],
+    tier: Tier,
+    ecos: &[String],
+    names: &[String],
+    overlay_key: Option<&str>,
+) -> Vec<Suite> {
+    // An explicit --ecosystem/--suite is a deliberate opt-in (e.g. manual x86
+    // discovery of a not-yet-applicable ecosystem), so it OVERRIDES the lane
+    // applicability skip. An unfiltered run — every gate, including --bless —
+    // gets the skip.
+    let explicit = !ecos.is_empty() || !names.is_empty();
     let mut out: Vec<Suite> = suites
         .iter()
         .filter(|s| tier == Tier::Full || s.tier == Tier::Smoke)
         .filter(|s| ecos.is_empty() || ecos.iter().any(|e| e == s.ecosystem.as_str()))
         .filter(|s| names.is_empty() || names.iter().any(|nm| nm == &s.name))
+        .filter(|s| explicit || applies_to_lane(s, overlay_key))
         .cloned()
         .collect();
     // Dispatch order = list order (fan_out hands out ascending indices), so sort
@@ -1081,12 +1189,20 @@ fn load_baseline(path: &Path) -> Baseline {
 // `baseline.<key>.jsonl` and lives beside the shared `baseline.jsonl`.
 
 /// The overlay KEY for a lane string (the `<key>` in `baseline.<key>.jsonl`).
-/// kvm/bhyve/nvmm — including their `*-local` and long aliases — each map to
-/// their own overlay; the mature `hvf` lane (and any unknown string) has NONE,
-/// because hvf IS the shared baseline ground truth.
+/// kvm/bhyve/nvmm each map to their own overlay; the mature `hvf` lane (and any
+/// unknown string) has NONE, because hvf IS the shared baseline ground truth.
+///
+/// The KVM backend runs under two guest arches whose results DIVERGE, so they
+/// must get SEPARATE overlay files — sharing one would let an amd64 bless clobber
+/// the arm64 lane's blessed entries (and cross-excuse arm64 regressions against
+/// amd64 pairs, and vice versa). The amd64 native lane (`kvm-local`/`linux-kvm`)
+/// keeps `baseline.kvm.jsonl` (the x86 bring-up excuse home, per AGENTS.md); the
+/// arm64 lima lane (`kvm`) gets its own `baseline.kvm-arm64.jsonl`. bhyve/nvmm are
+/// amd64-only (no arm64 sibling), so they need no arch suffix.
 fn lane_overlay_key(lane: &str) -> Option<&'static str> {
     match lane {
-        "kvm" | "kvm-local" | "linux-kvm" => Some("kvm"),
+        "kvm-local" | "linux-kvm" => Some("kvm"),
+        "kvm" => Some("kvm-arm64"),
         "bhyve-local" | "freebsd-bhyve" => Some("bhyve"),
         "nvmm-local" | "netbsd-nvmm" => Some("nvmm"),
         _ => None,
@@ -1367,7 +1483,7 @@ mod tests {
             suite("ltp-b", Ltp, Weight::Light),
             suite("go-b", Go, Weight::Heavy),
         ];
-        let out = select(&suites, Tier::Full, &[], &[]);
+        let out = select(&suites, Tier::Full, &[], &[], None);
 
         // LTP dispatched first, CPython last; ecosystem blocks are contiguous
         // and in run-priority order (ltp < go < node < cpython).
@@ -1395,12 +1511,109 @@ mod tests {
     }
 
     #[test]
+    fn applies_to_lane_scopes_ecosystems_per_bringup_lane() {
+        use Ecosystem::*;
+        let ltp = suite("ltp-x", Ltp, Weight::Light);
+        let go = suite("go-x", Go, Weight::Heavy);
+        let node = suite("node-x", Node, Weight::Heavy);
+        let cpy = suite("cpython-x", Cpython, Weight::Heavy);
+
+        // hvf (None): everything applies — the mature lane is unchanged.
+        for s in [&ltp, &go, &node, &cpy] {
+            assert!(applies_to_lane(s, None), "{} on hvf", s.name);
+        }
+
+        // kvm: CPython is not brought up on x86 yet -> skipped; Go/Node run for
+        // discovery; LTP (the mature x86 ecosystem) always applies.
+        assert!(applies_to_lane(&ltp, Some("kvm")));
+        assert!(applies_to_lane(&go, Some("kvm")));
+        assert!(applies_to_lane(&node, Some("kvm")));
+        assert!(!applies_to_lane(&cpy, Some("kvm")));
+
+        // bhyve / nvmm: only LTP — Go/Node die at guest init, CPython unbuilt.
+        for key in ["bhyve", "nvmm"] {
+            assert!(applies_to_lane(&ltp, Some(key)), "ltp on {key}");
+            assert!(!applies_to_lane(&go, Some(key)), "go on {key}");
+            assert!(!applies_to_lane(&node, Some(key)), "node on {key}");
+            assert!(!applies_to_lane(&cpy, Some(key)), "cpython on {key}");
+        }
+    }
+
+    #[test]
+    fn amd64_bringup_key_guards_on_guest_arch() {
+        use lane::DockerPlatform::*;
+        // amd64 bring-up lanes (and their aliases) resolve to their overlay key,
+        // which drives the skip. Note `linux-kvm` is an alias of the amd64
+        // `kvm-local` lane, NOT the arm64 lima lane.
+        assert_eq!(amd64_bringup_key(LinuxAmd64, "kvm-local"), Some("kvm"));
+        assert_eq!(amd64_bringup_key(LinuxAmd64, "linux-kvm"), Some("kvm"));
+        assert_eq!(amd64_bringup_key(LinuxAmd64, "bhyve-local"), Some("bhyve"));
+        assert_eq!(amd64_bringup_key(LinuxAmd64, "nvmm-local"), Some("nvmm"));
+        // arm64 lanes skip NOTHING. The lima `kvm` lane is the collision case: it
+        // is arm64 yet SHARES the "kvm" overlay key with the amd64 `kvm-local`
+        // lane, so keying on arch (not the key) is what stops cpython/go/node being
+        // wrongly skipped on it.
+        assert_eq!(amd64_bringup_key(LinuxArm64, "kvm"), None);
+        assert_eq!(amd64_bringup_key(LinuxArm64, "hvf"), None);
+    }
+
+    #[test]
+    fn select_drops_nonapplicable_ecosystems_on_bringup_lanes() {
+        use Ecosystem::*;
+        let suites = vec![
+            suite("ltp-a", Ltp, Weight::Light),
+            suite("go-a", Go, Weight::Heavy),
+            suite("node-a", Node, Weight::Heavy),
+            suite("cpython-a", Cpython, Weight::Heavy),
+        ];
+
+        // hvf runs everything (byte-for-byte the pre-filter behavior).
+        let hvf: Vec<&str> = select(&suites, Tier::Full, &[], &[], None)
+            .iter()
+            .map(|s| s.ecosystem.as_str())
+            .collect();
+        assert_eq!(hvf, ["ltp", "go", "node", "cpython"]);
+
+        // kvm drops CPython only.
+        let kvm: Vec<&str> = select(&suites, Tier::Full, &[], &[], Some("kvm"))
+            .iter()
+            .map(|s| s.ecosystem.as_str())
+            .collect();
+        assert_eq!(kvm, ["ltp", "go", "node"]);
+
+        // bhyve / nvmm keep LTP only.
+        for key in ["bhyve", "nvmm"] {
+            let got: Vec<&str> = select(&suites, Tier::Full, &[], &[], Some(key))
+                .iter()
+                .map(|s| s.ecosystem.as_str())
+                .collect();
+            assert_eq!(got, ["ltp"], "lane {key}");
+        }
+
+        // An explicit --ecosystem OVERRIDES the skip (manual x86 discovery): asking
+        // for cpython on bhyve still selects it, despite it being non-applicable.
+        let forced: Vec<&str> = select(
+            &suites,
+            Tier::Full,
+            &["cpython".to_string()],
+            &[],
+            Some("bhyve"),
+        )
+        .iter()
+        .map(|s| s.ecosystem.as_str())
+        .collect();
+        assert_eq!(forced, ["cpython"]);
+    }
+
+    #[test]
     fn lane_overlay_path_is_lane_derived() {
         let baseline = Path::new("scripts/conformance/baseline.jsonl");
         // Each bring-up lane (and its aliases) derives its OWN overlay file
-        // beside the shared baseline.
+        // beside the shared baseline. The KVM backend's two guest arches get
+        // SEPARATE files: amd64 native (`kvm-local`/`linux-kvm`) -> baseline.kvm,
+        // arm64 lima (`kvm`) -> baseline.kvm-arm64, so neither clobbers the other.
         for (lane, want) in [
-            ("kvm", "scripts/conformance/baseline.kvm.jsonl"),
+            ("kvm", "scripts/conformance/baseline.kvm-arm64.jsonl"),
             ("kvm-local", "scripts/conformance/baseline.kvm.jsonl"),
             ("linux-kvm", "scripts/conformance/baseline.kvm.jsonl"),
             ("bhyve-local", "scripts/conformance/baseline.bhyve.jsonl"),
@@ -1434,8 +1647,12 @@ mod tests {
         // hvf rewrites the shared baseline + matrix.
         assert_eq!(bless_target("hvf"), Ok(BlessTarget::SharedBaseline));
         // Each bring-up lane writes ONLY its own overlay key, never the shared
-        // baseline.
-        assert_eq!(bless_target("kvm"), Ok(BlessTarget::LaneOverlay("kvm")));
+        // baseline. The two KVM guest arches write SEPARATE overlays: arm64 lima
+        // `kvm` -> "kvm-arm64", amd64 native `kvm-local` -> "kvm".
+        assert_eq!(
+            bless_target("kvm"),
+            Ok(BlessTarget::LaneOverlay("kvm-arm64"))
+        );
         assert_eq!(
             bless_target("kvm-local"),
             Ok(BlessTarget::LaneOverlay("kvm"))
@@ -1450,6 +1667,40 @@ mod tests {
         );
         // An unrecognized lane is refused outright (no silent shared-baseline write).
         assert!(bless_target("rosetta").is_err());
+    }
+
+    #[test]
+    fn bless_blocks_scopes_oracle_fail_to_shared_baseline() {
+        use Verdict::*;
+        let overlay = BlessTarget::LaneOverlay("kvm");
+        let shared = BlessTarget::SharedBaseline;
+
+        // TIMEOUT / CARRICK_CRASH are genuine carrick failures: they block on
+        // EVERY lane, mature or bring-up.
+        for target in [shared, overlay] {
+            assert!(
+                bless_blocks(target, Timeout),
+                "TIMEOUT must block {target:?}"
+            );
+            assert!(
+                bless_blocks(target, CarrickCrash),
+                "CARRICK_CRASH must block {target:?}"
+            );
+        }
+
+        // ORACLE_FAIL blocks the mature hvf shared-baseline bless (the arm64
+        // oracle should always exist)...
+        assert!(bless_blocks(shared, OracleFail));
+        // ...but NOT a bring-up lane's overlay bless, where the amd64 oracle
+        // legitimately can't cover every suite yet.
+        assert!(!bless_blocks(overlay, OracleFail));
+
+        // Comparison verdicts never block a bless on any target.
+        for target in [shared, overlay] {
+            for v in [Match, Diff, Regression, New] {
+                assert!(!bless_blocks(target, v), "{v:?} must not block {target:?}");
+            }
+        }
     }
 
     #[test]
