@@ -109,6 +109,7 @@ network):
 | `bridge_compose_server` + `bridge_compose_client` | Two independent bridge-mode Carrick guests named `db` and `web` exchange a TCP ping/pong after the client resolves `db` by service name through runtime-managed `/etc/hosts`; the guests receive stable distinct bridge IPs, and the server's `accept()` peer address is translated back to the client's bridge IP. Prevents Compose-shaped service graphs from depending on harness-passed IPs, in-process bridge state, or raw loopback peer addresses. |
 | `multi_network_server` + `multi_network_client` | Compose/API tests attach containers to multiple user-defined bridges and assert app-socket traffic can cross only shared bridges. Prevents wildcard listeners, sidecar namespace rebuild, and Docker API connect/disconnect restarts from collapsing runtime routing to a single primary network. |
 | `multi_network_dns_client` | Raw UDP DNS queries to the namespace gateway resolve service/container/alias names only across bridges shared with the querying namespace. Prevents the embedded DNS responder from leaking aliases between networks or relying on `/etc/hosts`/glibc fallback behavior. |
+| `host_gateway_client` | Compose smoke resolves `host.docker.internal` to the bridge gateway and connects through that gateway to a host loopback TCP listener. Prevents host-gateway support from stopping at `/etc/hosts` text without a working app-socket path to host services. |
 
 **Fixed this session** (probes that flipped from gap → MATCH because the
 underlying gap got fixed):
