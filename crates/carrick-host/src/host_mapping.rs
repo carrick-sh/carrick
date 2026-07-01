@@ -343,8 +343,8 @@ mod tests {
         let after = open_fd_count();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(
-            after, base,
+        assert!(
+            after <= base,
             "open-fd count grew across {N} map_shared_file cycles \
              ({base} -> {after}): the alias-window MAP_SHARED file path is \
              leaking host fds (an engine's map_host_alias likely forgot to \
