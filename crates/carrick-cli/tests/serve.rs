@@ -2321,6 +2321,146 @@ networks:
 }
 
 #[tokio::test]
+#[ignore = "requires docker compose client, built aarch64 probes, and boots HVF guests"]
+async fn docker_compose_udp_published_port_smoke() {
+    if !docker_compose_available() {
+        eprintln!("SKIP docker_compose_udp_published_port_smoke: docker compose is not available");
+        return;
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or_else(|| panic!("workspace root"));
+    let probe_target = workspace
+        .join("conformance-probes")
+        .join("target")
+        .join("aarch64-unknown-linux-musl");
+    let find_probe = |name: &str| {
+        ["debug", "release"]
+            .into_iter()
+            .map(|profile| probe_target.join(profile).join(name))
+            .find(|path| path.exists())
+    };
+    let required_probes = ["udp_published_server", "udp_published_client"];
+    let mut probes = std::collections::HashMap::new();
+    for name in required_probes {
+        let Some(path) = find_probe(name) else {
+            eprintln!(
+                "SKIP docker_compose_udp_published_port_smoke: probe {name} not built under {}",
+                probe_target.display()
+            );
+            return;
+        };
+        probes.insert(name, path);
+    }
+
+    let host_port = free_loopback_port();
+    let (_server, sock, _dir) = spawn_server();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut copied = std::collections::HashMap::new();
+    for (name, source) in &probes {
+        let target = tmp.path().join(name);
+        std::fs::copy(source, &target).unwrap();
+        copied.insert(*name, target);
+    }
+
+    let compose = tmp.path().join("udp-published.yml");
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  server:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/udp_published_server"]
+    environment:
+      CARRICK_PROBE_LABEL: udp_server
+      CARRICK_PROBE_PORT: "15555"
+      CARRICK_PROBE_EXPECTS: "2"
+    ports:
+      - "127.0.0.1:{host_port}:15555/udp"
+    networks:
+      appnet: {{}}
+    volumes:
+      - type: bind
+        source: {server}
+        target: /opt/carrick/udp_published_server
+        read_only: true
+  client:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/udp_published_client"]
+    depends_on:
+      - server
+    environment:
+      CARRICK_PROBE_LABEL: udp_client
+      CARRICK_PROBE_TARGET: server
+      CARRICK_PROBE_PORT: "15555"
+    networks:
+      appnet: {{}}
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/udp_published_client
+        read_only: true
+networks:
+  appnet:
+    driver: bridge
+"#,
+            server = copied["udp_published_server"].display(),
+            client = copied["udp_published_client"].display()
+        ),
+    )
+    .unwrap();
+
+    let project = compose_project("udppublish");
+    run_compose(&sock, &compose, &project, &["up", "-d", "--remove-orphans"]);
+    let logs = wait_for_compose_logs(
+        &sock,
+        &compose,
+        &project,
+        &[
+            "udp_server_ready=true",
+            "udp_client_connect_ok=true",
+            "udp_client_response=pong",
+        ],
+    );
+    assert!(
+        logs.contains("udp_client_response=pong"),
+        "service-to-service UDP probe did not complete\nlogs:\n{logs}"
+    );
+
+    let host = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    host.send_to(b"ping\n", (std::net::Ipv4Addr::LOCALHOST, host_port))
+        .unwrap();
+    let mut reply = [0_u8; 128];
+    let (n, _) = match host.recv_from(&mut reply) {
+        Ok(received) => received,
+        Err(err) => {
+            let logs = run_compose_output(&sock, &compose, &project, &["logs", "--no-color"]);
+            panic!(
+                "host UDP published-port receive failed: {err}\nlogs:\n{}",
+                String::from_utf8_lossy(&logs.stdout)
+            );
+        }
+    };
+    assert_eq!(&reply[..n], b"pong\n");
+
+    let logs = wait_for_compose_logs(&sock, &compose, &project, &["udp_server_done=true"]);
+    assert!(
+        logs.contains("udp_server_request_1=ping"),
+        "published UDP host packet did not reach server\nlogs:\n{logs}"
+    );
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &["down", "-v", "--remove-orphans"],
+    );
+}
+
+#[tokio::test]
 #[ignore]
 async fn docker_compose_multi_network_dns_smoke() {
     if !docker_compose_available() {
