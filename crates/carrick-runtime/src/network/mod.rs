@@ -4,6 +4,7 @@ use carrick_spec::{
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub(crate) mod dns;
+pub(crate) mod model;
 pub mod socket_namespace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,12 +257,14 @@ pub fn select_provider(spec: &NetworkNamespaceSpec) -> Box<dyn NetworkProvider> 
 
 pub struct RuntimeNetwork {
     pub spec: NetworkNamespaceSpec,
+    pub(crate) model: model::LinuxNetworkModel,
     pub provider: Box<dyn NetworkProvider>,
     pub lease: NetworkLease,
 }
 
 impl RuntimeNetwork {
     pub fn create(spec: &NetworkNamespaceSpec) -> Result<Self, String> {
+        let model = model::LinuxNetworkModel::from_spec(spec);
         let provider = select_provider(spec);
         let lease = provider.create_namespace(spec)?;
         for mapping in &spec.published_ports {
@@ -269,14 +272,18 @@ impl RuntimeNetwork {
         }
         Ok(Self {
             spec: spec.clone(),
+            model,
             provider,
             lease,
         })
     }
 
     pub fn host_default() -> Self {
+        let spec = NetworkNamespaceSpec::default();
+        let model = model::LinuxNetworkModel::from_spec(&spec);
         Self {
-            spec: NetworkNamespaceSpec::default(),
+            spec,
+            model,
             provider: Box::<HostNetworkProvider>::default(),
             lease: NetworkLease {
                 id: NetworkLeaseId(0),
@@ -332,6 +339,15 @@ mod tests {
         .expect("create bridge network");
         assert_eq!(network.lease.id, NetworkLeaseId(1));
         assert_eq!(network.spec.mode, NetworkMode::Bridge);
+        assert_eq!(
+            network
+                .model
+                .links
+                .iter()
+                .map(|link| link.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lo", "eth0"]
+        );
     }
 
     #[test]
