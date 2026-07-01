@@ -508,6 +508,11 @@ fn seed_guest_baseline(
     extra_hosts: &[String],
 ) {
     use std::net::ToSocketAddrs;
+    let host_gateway = (network.mode == NetworkMode::Bridge).then_some(network.gateway_v4);
+    let parsed_extra_hosts = extra_hosts
+        .iter()
+        .filter_map(|entry| parse_extra_host(entry, host_gateway))
+        .collect::<Vec<_>>();
     for dir in [
         "/tmp",
         "/var",
@@ -583,13 +588,26 @@ fn seed_guest_baseline(
             }
             hosts_content.push_str(&format!("{}\t{}\n", network.ipv4, names.join(" ")));
         }
+        let explicit_names = parsed_extra_hosts
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        let gateway_names = ["host.docker.internal", "gateway.docker.internal"]
+            .into_iter()
+            .filter(|name| !explicit_names.contains(name))
+            .collect::<Vec<_>>();
+        if !gateway_names.is_empty() {
+            hosts_content.push_str(&format!(
+                "{}\t{}\n",
+                network.gateway_v4,
+                gateway_names.join(" ")
+            ));
+        }
     } else {
         hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
     }
-    for entry in extra_hosts {
-        if let Some((name, addr)) = parse_extra_host(entry) {
-            hosts_content.push_str(&format!("{addr}\t{name}\n"));
-        }
+    for (name, addr) in parsed_extra_hosts {
+        hosts_content.push_str(&format!("{addr}\t{name}\n"));
     }
     // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
     // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a profile
@@ -650,14 +668,20 @@ fn seed_guest_baseline(
     );
 }
 
-fn parse_extra_host(entry: &str) -> Option<(&str, &str)> {
+fn parse_extra_host(
+    entry: &str,
+    host_gateway: Option<std::net::Ipv4Addr>,
+) -> Option<(&str, String)> {
     let (name, addr) = entry.split_once('=').or_else(|| entry.split_once(':'))?;
     let name = name.trim();
     let addr = addr.trim();
-    if name.is_empty() || addr.is_empty() || addr == "host-gateway" {
+    if name.is_empty() || addr.is_empty() {
         return None;
     }
-    Some((name, addr))
+    if addr == "host-gateway" {
+        return host_gateway.map(|gateway| (name, gateway.to_string()));
+    }
+    Some((name, addr.to_string()))
 }
 
 fn set_baseline_file_if_missing(
@@ -764,6 +788,68 @@ mod exit_code_tests {
         assert!(
             hosts.contains("10.12.0.7\tdb.local\n"),
             "extra host entry missing from /etc/hosts:\n{hosts}"
+        );
+    }
+
+    #[test]
+    fn seed_guest_baseline_adds_bridge_host_gateway_names() {
+        let mut backend = MemoryBackend::new();
+        let network =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        super::seed_guest_baseline(&mut backend, None, &network, &[], &[]);
+
+        let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
+        assert!(
+            hosts.contains("172.31.0.1\thost.docker.internal gateway.docker.internal\n"),
+            "bridge /etc/hosts should include Docker Desktop host gateway names:\n{hosts}"
+        );
+    }
+
+    #[test]
+    fn seed_guest_baseline_expands_extra_host_gateway_token() {
+        let mut backend = MemoryBackend::new();
+        let network =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        super::seed_guest_baseline(
+            &mut backend,
+            None,
+            &network,
+            &[],
+            &["host.docker.internal:host-gateway".to_string()],
+        );
+
+        let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
+        assert!(
+            hosts.contains("172.31.0.1\thost.docker.internal\n"),
+            "host-gateway token should expand to the bridge gateway:\n{hosts}"
+        );
+    }
+
+    #[test]
+    fn seed_guest_baseline_extra_hosts_override_generated_gateway_name() {
+        let mut backend = MemoryBackend::new();
+        let network =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        super::seed_guest_baseline(
+            &mut backend,
+            None,
+            &network,
+            &[],
+            &["host.docker.internal:10.12.0.7".to_string()],
+        );
+
+        let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
+        assert!(
+            hosts.contains("10.12.0.7\thost.docker.internal\n"),
+            "explicit host entry should be preserved:\n{hosts}"
+        );
+        assert!(
+            !hosts.contains("172.31.0.1\thost.docker.internal"),
+            "explicit host.docker.internal should override the generated gateway entry:\n{hosts}"
+        );
+        assert!(
+            hosts.contains("172.31.0.1\tgateway.docker.internal\n"),
+            "unoverridden gateway.docker.internal should still be generated:\n{hosts}"
         );
     }
 }
