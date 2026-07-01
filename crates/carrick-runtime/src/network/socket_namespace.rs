@@ -140,7 +140,12 @@ impl SocketNamespaceProvider {
         for attachment in effective_attachments(spec) {
             let names = service_names_for(attachment.container_name.as_ref(), &attachment.aliases);
             for name in names {
-                let path = service_name_path(&self.endpoint_dir, &attachment.bridge_id, &name);
+                let path = service_name_path(
+                    &self.endpoint_dir,
+                    &attachment.bridge_id,
+                    &name,
+                    attachment.ipv4,
+                );
                 let contents = encode_service_name(attachment.ipv4, &name);
                 fs::create_dir_all(&*self.endpoint_dir).map_err(|e| {
                     format!("failed to create socket namespace endpoint directory: {e}")
@@ -208,16 +213,29 @@ impl SocketNamespaceProvider {
             .collect::<Vec<_>>();
         let mut addrs = Vec::new();
         for bridge_id in bridge_ids {
-            let path = service_name_path(&self.endpoint_dir, &bridge_id, query_name);
-            let Some(raw) = read_live_namespace_file(&path) else {
+            let Ok(dir) = fs::read_dir(&*self.endpoint_dir) else {
                 continue;
             };
-            if let Some((addr, _)) = decode_service_name(&raw)
-                && !addrs.contains(&addr)
-            {
-                addrs.push(addr);
+            let prefix = service_name_path_prefix(&bridge_id, query_name);
+            for entry in dir.flatten() {
+                let file_name = entry.file_name();
+                let Some(file_name) = file_name.to_str() else {
+                    continue;
+                };
+                if !file_name.starts_with(&prefix) {
+                    continue;
+                }
+                let Some(raw) = read_live_namespace_file(&entry.path()) else {
+                    continue;
+                };
+                if let Some((addr, _)) = decode_service_name(&raw)
+                    && !addrs.contains(&addr)
+                {
+                    addrs.push(addr);
+                }
             }
         }
+        addrs.sort_unstable();
         Ok(addrs)
     }
 
@@ -816,8 +834,21 @@ fn listener_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
     ))
 }
 
-fn service_name_path(endpoint_dir: &Path, bridge_id: &BridgeId, name: &str) -> PathBuf {
-    endpoint_dir.join(format!("service-{}-{}", bridge_id.as_str(), hex_name(name)))
+fn service_name_path(
+    endpoint_dir: &Path,
+    bridge_id: &BridgeId,
+    name: &str,
+    addr: Ipv4Addr,
+) -> PathBuf {
+    let addr = addr.to_string().replace('.', "_");
+    endpoint_dir.join(format!(
+        "{}addr-{addr}",
+        service_name_path_prefix(bridge_id, name)
+    ))
+}
+
+fn service_name_path_prefix(bridge_id: &BridgeId, name: &str) -> String {
+    format!("service-{}-{}-", bridge_id.as_str(), hex_name(name))
 }
 
 fn endpoint_scope(
@@ -2183,6 +2214,62 @@ mod tests {
                 .expect("resolve app")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn dns_service_alias_returns_multiple_same_bridge_records() {
+        let suffix = std::process::id();
+        let bridge = BridgeId::new(format!("test-dns-scale-{suffix}"));
+        let mut api_one = NetworkNamespaceSpec::bridge_default(
+            Some("api-1".to_string()),
+            vec!["api".to_string()],
+            Vec::new(),
+        );
+        api_one.bridge_id = bridge.clone();
+        api_one.ipv4 = Ipv4Addr::new(172, 31, 40, 10);
+        let mut api_two = NetworkNamespaceSpec::bridge_default(
+            Some("api-2".to_string()),
+            vec!["api".to_string()],
+            Vec::new(),
+        );
+        api_two.bridge_id = bridge.clone();
+        api_two.ipv4 = Ipv4Addr::new(172, 31, 40, 11);
+        let mut client = NetworkNamespaceSpec::bridge_default(
+            Some("client".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        client.bridge_id = bridge;
+
+        let api_one_provider = SocketNamespaceProvider::new();
+        let api_one_lease = api_one_provider
+            .create_namespace(&api_one)
+            .expect("api one namespace");
+        let api_two_provider = SocketNamespaceProvider::new();
+        let api_two_lease = api_two_provider
+            .create_namespace(&api_two)
+            .expect("api two namespace");
+        let reader = SocketNamespaceProvider::new();
+
+        let mut addrs = reader
+            .resolve_dns_name(&client, "api")
+            .expect("resolve api");
+        addrs.sort_unstable();
+
+        assert_eq!(
+            addrs,
+            vec![
+                Ipv4Addr::new(172, 31, 40, 10),
+                Ipv4Addr::new(172, 31, 40, 11)
+            ]
+        );
+
+        api_one_provider
+            .destroy_namespace(api_one_lease.id)
+            .expect("api one cleanup");
+        api_two_provider
+            .destroy_namespace(api_two_lease.id)
+            .expect("api two cleanup");
     }
 
     #[test]
