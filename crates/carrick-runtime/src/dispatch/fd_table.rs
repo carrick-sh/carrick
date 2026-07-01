@@ -836,6 +836,7 @@ pub(super) enum OpenDescription {
         host_fd: HostFdRef,
         family: i32,
         type_: i32,
+        synthetic_recv: VecDeque<(Vec<u8>, Vec<u8>)>,
     },
     /// A regular file backed by a REAL macOS file descriptor into the
     /// `--fs host` overlay scratch. Unlike `File` (which caches bytes

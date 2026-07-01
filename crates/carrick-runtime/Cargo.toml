@@ -87,6 +87,7 @@ fd-lock.workspace = true
 flate2.workspace = true
 getrandom.workspace = true
 goblin.workspace = true
+hickory-proto = "0.26.1"
 oci-client.workspace = true
 parking_lot.workspace = true
 parking_lot_core.workspace = true
