@@ -1803,6 +1803,13 @@ impl SyscallDispatcher {
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         let mut dispatcher = Self::new();
+        if network.spec.mode == carrick_spec::NetworkMode::Bridge {
+            let contents = format!("nameserver {}\n", network.spec.gateway_v4).into_bytes();
+            dispatcher.fs.vfs_mounts.mount(
+                "/etc/resolv.conf",
+                Box::new(crate::vfs::ResolvConfVfs::from_contents(contents)),
+            );
+        }
         dispatcher.network = network;
         dispatcher
     }

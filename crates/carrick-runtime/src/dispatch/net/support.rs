@@ -77,8 +77,8 @@ use super::super::*;
 use crate::linux_abi::{
     LINUX_ARPHRD_ETHER, LINUX_IFF_BROADCAST, LINUX_IFF_MULTICAST, LINUX_IFF_POINTOPOINT,
     LINUX_RT_SCOPE_HOST, LINUX_RT_SCOPE_LINK, LINUX_RT_SCOPE_UNIVERSE, LINUX_RT_TABLE_MAIN,
-    LINUX_RTA_DST, LINUX_RTA_OIF, LINUX_RTM_GETNEIGH, LINUX_RTM_GETROUTE, LINUX_RTM_NEWROUTE,
-    LINUX_RTN_UNICAST, LINUX_RTPROT_KERNEL, LinuxRtMsg,
+    LINUX_RTA_DST, LINUX_RTA_GATEWAY, LINUX_RTA_OIF, LINUX_RTM_GETNEIGH, LINUX_RTM_GETROUTE,
+    LINUX_RTM_NEWROUTE, LINUX_RTN_UNICAST, LINUX_RTPROT_KERNEL, LinuxRtMsg,
 };
 
 pub(super) fn read_epoll_event(
@@ -621,6 +621,75 @@ struct HostAddr {
     scope: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NetworkLinkSnapshot {
+    pub links: Vec<NetworkLink>,
+    pub addresses: Vec<NetworkAddress>,
+    pub routes: Vec<NetworkRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NetworkLink {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NetworkAddress {
+    pub addr: std::net::IpAddr,
+    pub prefix_len: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NetworkRoute {
+    pub destination: Option<std::net::IpAddr>,
+    pub gateway: Option<std::net::IpAddr>,
+}
+
+impl NetworkLinkSnapshot {
+    pub(super) fn from_spec(spec: &carrick_spec::NetworkNamespaceSpec) -> Self {
+        if spec.mode == carrick_spec::NetworkMode::Bridge {
+            Self {
+                links: vec![
+                    NetworkLink {
+                        name: "lo".to_string(),
+                    },
+                    NetworkLink {
+                        name: "eth0".to_string(),
+                    },
+                ],
+                addresses: vec![
+                    NetworkAddress {
+                        addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        prefix_len: 8,
+                    },
+                    NetworkAddress {
+                        addr: std::net::IpAddr::V4(spec.ipv4),
+                        prefix_len: 24,
+                    },
+                ],
+                routes: vec![NetworkRoute {
+                    destination: None,
+                    gateway: Some(std::net::IpAddr::V4(spec.gateway_v4)),
+                }],
+            }
+        } else {
+            Self {
+                links: vec![NetworkLink {
+                    name: "lo".to_string(),
+                }],
+                addresses: vec![NetworkAddress {
+                    addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    prefix_len: 8,
+                }],
+                routes: vec![NetworkRoute {
+                    destination: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                    gateway: None,
+                }],
+            }
+        }
+    }
+}
+
 /// Count the leading set bits of a netmask's raw address bytes (the CIDR
 /// prefix length). macOS gives the mask as a sockaddr; we count across its
 /// address octets.
@@ -990,6 +1059,152 @@ pub(super) fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+pub(super) fn build_netlink_reply_for_snapshot(
+    request: &[u8],
+    pid: u32,
+    snapshot: &NetworkLinkSnapshot,
+) -> Vec<u8> {
+    let hdr_size = std::mem::size_of::<LinuxNlMsgHdr>();
+    let (req_type, seq) = if request.len() >= hdr_size {
+        match LinuxNlMsgHdr::read_from_prefix(request) {
+            Ok((h, _)) => (h.nlmsg_type, h.nlmsg_seq),
+            Err(_) => (0u16, 0u32),
+        }
+    } else {
+        (0, 0)
+    };
+
+    let mut out = Vec::new();
+    match req_type {
+        LINUX_RTM_GETLINK => {
+            for (idx, link) in snapshot.links.iter().enumerate() {
+                let index = (idx + 1) as u32;
+                let is_loopback = link.name == "lo";
+                let mut payload = Vec::new();
+                let ifi = LinuxIfInfoMsg {
+                    ifi_family: 0,
+                    ifi_pad: 0,
+                    ifi_type: if is_loopback {
+                        LINUX_ARPHRD_LOOPBACK
+                    } else {
+                        LINUX_ARPHRD_ETHER
+                    },
+                    ifi_index: index as i32,
+                    ifi_flags: if is_loopback {
+                        LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING
+                    } else {
+                        LINUX_IFF_UP | LINUX_IFF_BROADCAST | LINUX_IFF_RUNNING | LINUX_IFF_MULTICAST
+                    },
+                    ifi_change: 0,
+                };
+                payload.extend_from_slice(ifi.as_bytes());
+                let mut name = link.name.clone().into_bytes();
+                name.push(0);
+                push_rtattr(&mut payload, LINUX_IFLA_IFNAME, &name);
+                if !is_loopback {
+                    let hw_addr = vec![0x02, 0, 0, 0, 0, index as u8];
+                    push_rtattr(&mut payload, LINUX_IFLA_ADDRESS, &hw_addr);
+                }
+                push_nlmsg(&mut out, LINUX_RTM_NEWLINK, seq, pid, &payload);
+            }
+            push_nlmsg_done(&mut out, seq, pid);
+        }
+        LINUX_RTM_GETADDR => {
+            for address in &snapshot.addresses {
+                let Some((family, addr)) = ip_addr_bytes(address.addr) else {
+                    continue;
+                };
+                let name = if address.addr.is_loopback() {
+                    "lo"
+                } else {
+                    "eth0"
+                };
+                let index = snapshot_link_index(snapshot, name).unwrap_or(1);
+                let mut payload = Vec::new();
+                let ifa = LinuxIfAddrMsg {
+                    ifa_family: family,
+                    ifa_prefixlen: address.prefix_len,
+                    ifa_flags: 0,
+                    ifa_scope: if address.addr.is_loopback() {
+                        LINUX_RT_SCOPE_HOST
+                    } else {
+                        LINUX_RT_SCOPE_UNIVERSE
+                    },
+                    ifa_index: index,
+                };
+                payload.extend_from_slice(ifa.as_bytes());
+                push_rtattr(&mut payload, LINUX_IFA_ADDRESS, &addr);
+                push_rtattr(&mut payload, LINUX_IFA_LOCAL, &addr);
+                let mut label = name.as_bytes().to_vec();
+                label.push(0);
+                push_rtattr(&mut payload, LINUX_IFA_LABEL, &label);
+                push_nlmsg(&mut out, LINUX_RTM_NEWADDR, seq, pid, &payload);
+            }
+            push_nlmsg_done(&mut out, seq, pid);
+        }
+        LINUX_RTM_GETROUTE => {
+            for route in &snapshot.routes {
+                let route_ip = route.gateway.or(route.destination);
+                let Some(route_ip) = route_ip else {
+                    continue;
+                };
+                let Some((family, route_addr)) = ip_addr_bytes(route_ip) else {
+                    continue;
+                };
+                let mut payload = Vec::new();
+                let rtm = LinuxRtMsg {
+                    rtm_family: family,
+                    rtm_dst_len: if route.destination.is_some() { 32 } else { 0 },
+                    rtm_src_len: 0,
+                    rtm_tos: 0,
+                    rtm_table: LINUX_RT_TABLE_MAIN,
+                    rtm_protocol: LINUX_RTPROT_KERNEL,
+                    rtm_scope: if route.gateway.is_some() {
+                        LINUX_RT_SCOPE_UNIVERSE
+                    } else {
+                        LINUX_RT_SCOPE_HOST
+                    },
+                    rtm_type: LINUX_RTN_UNICAST,
+                    rtm_flags: 0,
+                };
+                payload.extend_from_slice(rtm.as_bytes());
+                if route.destination.is_some() {
+                    push_rtattr(&mut payload, LINUX_RTA_DST, &route_addr);
+                }
+                if route.gateway.is_some() {
+                    push_rtattr(&mut payload, LINUX_RTA_GATEWAY, &route_addr);
+                }
+                let oif = if route.gateway.is_some() {
+                    snapshot_link_index(snapshot, "eth0").unwrap_or(1)
+                } else {
+                    snapshot_link_index(snapshot, "lo").unwrap_or(1)
+                };
+                push_rtattr(&mut payload, LINUX_RTA_OIF, &oif.to_ne_bytes());
+                push_nlmsg(&mut out, LINUX_RTM_NEWROUTE, seq, pid, &payload);
+            }
+            push_nlmsg_done(&mut out, seq, pid);
+        }
+        LINUX_RTM_GETNEIGH => push_nlmsg_done(&mut out, seq, pid),
+        _ => push_nlmsg_done(&mut out, seq, pid),
+    }
+    out
+}
+
+fn snapshot_link_index(snapshot: &NetworkLinkSnapshot, name: &str) -> Option<u32> {
+    snapshot
+        .links
+        .iter()
+        .position(|link| link.name == name)
+        .map(|idx| (idx + 1) as u32)
+}
+
+fn ip_addr_bytes(addr: std::net::IpAddr) -> Option<(u8, Vec<u8>)> {
+    match addr {
+        std::net::IpAddr::V4(ip) => Some((LINUX_AF_INET as u8, ip.octets().to_vec())),
+        std::net::IpAddr::V6(ip) => Some((LINUX_AF_INET6 as u8, ip.octets().to_vec())),
+    }
 }
 
 /// Mask an IPv4/IPv6 address down to its network prefix (`addr & netmask`), so
@@ -2333,6 +2548,29 @@ mod tests {
         let addr_names: Vec<_> = addrs.iter().map(|addr| addr.name.as_str()).collect();
         assert_eq!(addr_names, ["lo", "eth0"]);
         assert!(addrs.iter().all(|addr| addr.index == 1 || addr.index == 2));
+    }
+
+    #[test]
+    fn bridge_netlink_reports_eth0_address_and_default_route() {
+        let spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let snapshot = NetworkLinkSnapshot::from_spec(&spec);
+        assert!(snapshot.links.iter().any(|l| l.name == "eth0"));
+        assert!(
+            snapshot
+                .addresses
+                .iter()
+                .any(|a| a.addr == std::net::IpAddr::V4(spec.ipv4))
+        );
+        assert!(
+            snapshot
+                .routes
+                .iter()
+                .any(|r| r.gateway == Some(std::net::IpAddr::V4(spec.gateway_v4)))
+        );
     }
 
     #[test]
