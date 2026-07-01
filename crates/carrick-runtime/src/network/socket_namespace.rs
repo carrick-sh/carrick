@@ -329,6 +329,16 @@ impl SocketNamespaceProvider {
                 return Ok(ConnectTarget::Host(host));
             }
         }
+        if let IpAddr::V4(ip) = requested.0.ip()
+            && effective_attachments(spec)
+                .into_iter()
+                .any(|attachment| ip == attachment.gateway_v4)
+        {
+            return Ok(ConnectTarget::Host(HostSocketAddr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                requested.0.port(),
+            ))));
+        }
 
         match requested.0.ip() {
             IpAddr::V4(ip) if ip.octets()[0] == 172 && ip.octets()[1] == 31 => {
@@ -1182,6 +1192,23 @@ mod tests {
         assert_eq!(
             target,
             host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152))
+        );
+    }
+
+    #[test]
+    fn bridge_gateway_connects_to_host_loopback() {
+        let provider = SocketNamespaceProvider::new();
+        let spec =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        let requested = SocketAddr::new(IpAddr::V4(spec.gateway_v4), 8080);
+
+        let resolved = provider
+            .resolve_bridge_connect(&spec, guest(requested), PortProtocol::Tcp)
+            .expect("resolve gateway host connect");
+
+        assert_eq!(
+            resolved,
+            ConnectTarget::Host(host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)))
         );
     }
 
