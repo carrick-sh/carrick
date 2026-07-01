@@ -431,11 +431,14 @@ impl NetworkProvider for SocketNamespaceProvider {
             same_bridge_ip_connectivity: true,
             outbound_connectivity: true,
             published_ports: true,
+            published_udp_ports: false,
             kernel_datapath: true,
             host_routable_container_ips: false,
             packet_level_isolation: false,
             raw_socket_support: false,
             multicast_or_broadcast: false,
+            netfilter: false,
+            guest_created_network_namespaces: false,
             requires_privilege: false,
         }
     }
