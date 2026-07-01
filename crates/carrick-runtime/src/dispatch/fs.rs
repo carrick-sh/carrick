@@ -2087,6 +2087,7 @@ impl SyscallDispatcher {
             guest_arch,
             environ: Some(env.as_slice()),
             open_fds: Some(open_fds.as_slice()),
+            network: Some(&self.network.spec),
             auxv: Some(mem.linux_auxv_image.as_slice()),
             address_space_regions: mem.address_space_regions.as_deref(),
             brk_current: mem.brk_current,
