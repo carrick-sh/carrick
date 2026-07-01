@@ -19,6 +19,15 @@ fn main() {
         let (n, peer) = socket.recv_from(&mut buf).expect("recv datagram");
         let request = std::str::from_utf8(&buf[..n]).expect("utf8 request");
         println!("{label}_request_{index}={}", request.trim_end());
+        println!("{label}_peer_{index}={peer}");
+        println!(
+            "{label}_peer_{index}_bridge={}",
+            peer.ip().is_ipv4() && !peer.ip().is_loopback()
+        );
+        println!(
+            "{label}_peer_{index}_gateway={}",
+            peer.ip() == IpAddr::V4(Ipv4Addr::new(172, 31, 0, 1))
+        );
         socket.send_to(b"pong\n", peer).expect("send response");
     }
     println!("{label}_done=true");
