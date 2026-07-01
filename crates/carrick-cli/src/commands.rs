@@ -88,7 +88,7 @@ use carrick_runtime::syscall::lookup_aarch64;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
-use crate::args::{Cli, Commands, RootfsCommand, SystemCommand};
+use crate::args::{Cli, Commands, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand};
 #[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
 // Used only by the macOS-only `run-elf` arm.
@@ -96,7 +96,7 @@ use crate::debug::run_debug;
 use crate::fs_setup::install_fs_backend;
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
-    parse_publish_specs, parse_volume_mount, truncate_str,
+    parse_publish_specs, parse_volume_mount, resolve_volumes_from_specs, truncate_str,
 };
 #[cfg(target_os = "macos")]
 use crate::trace_cli::{current_supplementary_groups, trace_drop_credentials};
@@ -125,13 +125,20 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 tty: interactive,
                 interactive,
                 fs: None,
-                network: carrick_spec::NetworkMode::Host,
+                network: "host".to_string(),
+                network_alias: vec![],
+                ip: None,
+                add_host: vec![],
+                dns: vec![],
+                dns_search: vec![],
+                dns_option: vec![],
                 env: vec![],
                 env_file: vec![],
                 workdir: None,
                 user: None,
                 entrypoint: None,
                 volume: vec![],
+                volumes_from: vec![],
                 mount: vec![],
                 name: None,
                 rm: false,
@@ -396,6 +403,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             SystemCommand::Df => crate::lifecycle::system_df(&store)?,
             SystemCommand::Prune { force: _ } => crate::lifecycle::system_prune(&store)?,
         },
+        Commands::Network { command } => run_network_command(command)?,
         Commands::Login {
             registry,
             username,
@@ -460,12 +468,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             interactive,
             fs,
             network,
+            network_alias,
+            ip,
+            add_host,
+            dns,
+            dns_search,
+            dns_option,
             env,
             env_file,
             workdir,
             user,
             entrypoint,
             volume,
+            volumes_from,
             mount,
             name,
             rm,
@@ -486,7 +501,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     unsafe { std::env::set_var(k, v) };
                 }
             }
-            let published_ports = parse_publish_specs(network, &publish)?;
+            let parsed_network = parse_network_mode_arg(&network)?;
+            let published_ports = parse_publish_specs(parsed_network.mode, &publish)?;
 
             let mut env_overrides = env.clone();
             // `--env-file` may repeat (docker allows it); later files win.
@@ -501,6 +517,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             for m_str in &mount {
                 mounts.push(parse_mount_flag(m_str)?);
             }
+            mounts.extend(resolve_volumes_from_specs(&volumes_from)?);
 
             // `--entrypoint ""` clears the image ENTRYPOINT (run the command
             // alone), like docker — an empty value maps to an empty vec, not a
@@ -525,7 +542,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
                 fs,
                 pid,
-                network,
+                network: parsed_network.mode,
+                network_bridge: parsed_network.bridge,
+                network_container: parsed_network.container,
+                network_ipv4: ip,
+                network_aliases: network_alias,
+                extra_hosts: add_host,
+                dns_servers: dns,
+                dns_search,
+                dns_options: dns_option,
+                volumes_from,
                 published_ports,
                 stop_signal,
                 stop_timeout,
@@ -689,16 +715,25 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             fs,
             pid,
             network,
+            network_alias,
+            ip,
+            add_host,
+            dns,
+            dns_search,
+            dns_option,
             env,
             env_file,
             workdir,
             user,
             entrypoint,
             volume,
+            volumes_from,
             mount,
             name,
+            rm,
             tty,
             interactive,
+            publish,
             stop_signal,
             stop_timeout,
             command,
@@ -714,8 +749,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             for m in &mount {
                 mounts.push(parse_mount_flag(m)?);
             }
+            mounts.extend(resolve_volumes_from_specs(&volumes_from)?);
             let entrypoint_override =
                 entrypoint.map(|ep| if ep.is_empty() { Vec::new() } else { vec![ep] });
+            let parsed_network = parse_network_mode_arg(&network)?;
             let req = carrick_engine::CliRunRequest {
                 image_ref: image,
                 platform,
@@ -727,14 +764,23 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 entrypoint_override,
                 tty,
                 interactive,
-                rm: false,
+                rm,
                 name: None,
                 max_traps: DEFAULT_MAX_TRAPS,
                 debug_state_path: None,
                 fs,
                 pid,
-                network,
-                published_ports: parse_publish_specs(network, &Vec::new())?,
+                network: parsed_network.mode,
+                network_bridge: parsed_network.bridge,
+                network_container: parsed_network.container,
+                network_ipv4: ip,
+                network_aliases: network_alias,
+                extra_hosts: add_host,
+                dns_servers: dns,
+                dns_search,
+                dns_options: dns_option,
+                volumes_from,
+                published_ports: parse_publish_specs(parsed_network.mode, &publish)?,
                 stop_signal,
                 stop_timeout,
             };
@@ -1001,70 +1047,557 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 bail!("carrick trace is only available on macOS (libdtrace).");
             }
         }
-        #[cfg(target_os = "macos")]
-        // The `Volume` variant + VolumeCommand are `#[cfg(target_os = "macos")]`
-        // in args.rs (APFS via `diskutil`), so match that exact gate here.
-        #[cfg(target_os = "macos")]
-        Commands::Volume { command } => match command {
-            crate::args::VolumeCommand::Create { quota } => {
-                let v = carrick_runtime::apfs::create_carrick_volume(quota)
-                    .context("failed to create carrick scratch volume")?;
-                println!(
-                    "{} {} {} case-sensitive={}",
-                    v.device,
-                    v.name,
-                    v.mount_point
-                        .as_deref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "Not Mounted".to_owned()),
-                    v.case_sensitive,
-                );
-            }
-            crate::args::VolumeCommand::Info => {
-                match carrick_runtime::apfs::find_carrick_volume()
-                    .context("failed to query carrick scratch volume")?
-                {
-                    Some(v) => {
-                        println!(
-                            "{} {} {} case-sensitive={}",
-                            v.device,
-                            v.name,
-                            v.mount_point
-                                .as_deref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "Not Mounted".to_owned()),
-                            v.case_sensitive,
-                        );
-                    }
-                    None => {
-                        bail!(
-                            "no carrick scratch volume found; run `carrick volume create` to lay one down"
-                        );
-                    }
-                }
-            }
-            crate::args::VolumeCommand::Delete { yes } => {
-                let Some(v) = carrick_runtime::apfs::find_carrick_volume()
-                    .context("failed to query carrick scratch volume")?
-                else {
-                    println!("no carrick scratch volume to delete");
-                    return Ok(());
-                };
-                if !yes {
-                    println!(
-                        "would delete {} ({}); pass --yes to confirm",
-                        v.device, v.name,
-                    );
-                    return Ok(());
-                }
-                carrick_runtime::apfs::delete_carrick_volume()
-                    .context("failed to delete carrick scratch volume")?;
-                println!("deleted {} ({})", v.device, v.name);
-            }
-        },
+        Commands::Volume { command } => run_volume_command(command)?,
     }
 
     Ok(())
+}
+
+fn run_volume_command(command: VolumeCommand) -> anyhow::Result<()> {
+    match command {
+        VolumeCommand::Create {
+            driver,
+            label,
+            opt,
+            quota,
+            name,
+        } => {
+            if let Some(name) = name {
+                if quota.is_some() {
+                    bail!("--quota applies only to the legacy scratch volume create path");
+                }
+                let labels = parse_key_value_args(label, "--label")?;
+                let driver_opts = parse_key_value_args(opt, "--opt")?;
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "Name": name,
+                    "Driver": driver,
+                    "Labels": labels,
+                    "DriverOpts": driver_opts,
+                }))?;
+                let (status, body) = crate::serve::resources::create_volume(&body);
+                ensure_resource_status(status, &body, &[201])?;
+                let value: serde_json::Value = serde_json::from_str(&body)?;
+                let Some(name) = value.get("Name").and_then(serde_json::Value::as_str) else {
+                    bail!("volume create response missing Name");
+                };
+                println!("{name}");
+            } else {
+                run_scratch_volume_create(quota)?;
+            }
+        }
+        VolumeCommand::Ls {
+            filter,
+            format,
+            quiet,
+        } => {
+            let query = resource_filter_query(filter)?;
+            let (status, body) = crate::serve::resources::list_volumes(&query);
+            ensure_resource_status(status, &body, &[200])?;
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            let volumes = value
+                .get("Volumes")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            print_volume_list(volumes, format.as_deref(), quiet)?;
+        }
+        VolumeCommand::Prune {
+            all,
+            force: _,
+            mut filter,
+        } => {
+            if all {
+                filter.push("all=true".to_string());
+            }
+            let query = resource_filter_query(filter)?;
+            let (status, body) = crate::serve::resources::prune_volumes(&query);
+            ensure_resource_status(status, &body, &[200])?;
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            println!("Deleted Volumes:");
+            if let Some(volumes) = value
+                .get("VolumesDeleted")
+                .and_then(serde_json::Value::as_array)
+            {
+                for volume in volumes.iter().filter_map(serde_json::Value::as_str) {
+                    println!("{volume}");
+                }
+            }
+            let reclaimed = value
+                .get("SpaceReclaimed")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default();
+            println!(
+                "Total reclaimed space: {}",
+                human_size(reclaimed.max(0) as u64)
+            );
+        }
+        VolumeCommand::Inspect { names } => {
+            let mut volumes = Vec::new();
+            for name in names {
+                let (status, body) = crate::serve::resources::inspect_volume(&name);
+                ensure_resource_status(status, &body, &[200])?;
+                volumes.push(serde_json::from_str::<serde_json::Value>(&body)?);
+            }
+            println!("{}", serde_json::to_string(&volumes)?);
+        }
+        VolumeCommand::Rm { force, names } => {
+            let mut had_err = false;
+            for name in names {
+                let (status, body) = crate::serve::resources::remove_volume(&name, force);
+                if status == 204 {
+                    println!("{name}");
+                } else {
+                    had_err = true;
+                    eprintln!("{}", resource_error_message(&body));
+                }
+            }
+            if had_err {
+                bail!("one or more volumes failed to be removed");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        VolumeCommand::Info => run_scratch_volume_info()?,
+        #[cfg(target_os = "macos")]
+        VolumeCommand::Delete { yes } => run_scratch_volume_delete(yes)?,
+    }
+    Ok(())
+}
+
+fn print_volume_list(
+    volumes: Vec<serde_json::Value>,
+    format: Option<&str>,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    if quiet {
+        for volume in volumes {
+            println!("{}", volume_field(&volume, "Name"));
+        }
+        return Ok(());
+    }
+
+    match format {
+        Some("json") => {
+            for volume in volumes {
+                println!("{}", serde_json::to_string(&volume)?);
+            }
+        }
+        Some("table") | None => {
+            println!("DRIVER\tVOLUME NAME");
+            for volume in volumes {
+                println!(
+                    "{}\t{}",
+                    volume_field(&volume, "Driver"),
+                    volume_field(&volume, "Name")
+                );
+            }
+        }
+        Some(template) => {
+            let template = template.strip_prefix("table ").unwrap_or(template);
+            for volume in volumes {
+                println!("{}", render_volume_template(&volume, template));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_volume_template(volume: &serde_json::Value, template: &str) -> String {
+    ["Name", "Driver", "Mountpoint", "Scope"].into_iter().fold(
+        template.to_string(),
+        |rendered, field| {
+            rendered.replace(&format!("{{{{.{field}}}}}"), &volume_field(volume, field))
+        },
+    )
+}
+
+fn volume_field(volume: &serde_json::Value, field: &str) -> String {
+    volume
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn run_scratch_volume_create(quota: Option<u64>) -> anyhow::Result<()> {
+    let v = carrick_runtime::apfs::create_carrick_volume(quota)
+        .context("failed to create carrick scratch volume")?;
+    println!(
+        "{} {} {} case-sensitive={}",
+        v.device,
+        v.name,
+        v.mount_point
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "Not Mounted".to_owned()),
+        v.case_sensitive,
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_scratch_volume_create(_quota: Option<u64>) -> anyhow::Result<()> {
+    bail!("unnamed scratch volume creation is only available on macOS");
+}
+
+#[cfg(target_os = "macos")]
+fn run_scratch_volume_info() -> anyhow::Result<()> {
+    match carrick_runtime::apfs::find_carrick_volume()
+        .context("failed to query carrick scratch volume")?
+    {
+        Some(v) => {
+            println!(
+                "{} {} {} case-sensitive={}",
+                v.device,
+                v.name,
+                v.mount_point
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "Not Mounted".to_owned()),
+                v.case_sensitive,
+            );
+        }
+        None => {
+            bail!("no carrick scratch volume found; run `carrick volume create` to lay one down");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_scratch_volume_delete(yes: bool) -> anyhow::Result<()> {
+    let Some(v) = carrick_runtime::apfs::find_carrick_volume()
+        .context("failed to query carrick scratch volume")?
+    else {
+        println!("no carrick scratch volume to delete");
+        return Ok(());
+    };
+    if !yes {
+        println!(
+            "would delete {} ({}); pass --yes to confirm",
+            v.device, v.name,
+        );
+        return Ok(());
+    }
+    carrick_runtime::apfs::delete_carrick_volume()
+        .context("failed to delete carrick scratch volume")?;
+    println!("deleted {} ({})", v.device, v.name);
+    Ok(())
+}
+
+fn run_network_command(command: NetworkCommand) -> anyhow::Result<()> {
+    match command {
+        NetworkCommand::Create {
+            driver,
+            label,
+            subnet,
+            gateway,
+            ip_range,
+            aux_address,
+            ipam_driver,
+            ipam_opt,
+            scope,
+            internal,
+            attachable,
+            ingress,
+            config_from,
+            config_only,
+            ipv4,
+            ipv6,
+            opt,
+            name,
+        } => {
+            let labels = parse_key_value_args(label, "--label")?;
+            let options = parse_key_value_args(opt, "--opt")?;
+            let ipam = network_ipam_config(
+                &ipam_driver,
+                ipam_opt,
+                &subnet,
+                &gateway,
+                &ip_range,
+                aux_address,
+            )?;
+            let body = serde_json::to_vec(&serde_json::json!({
+                "Name": name,
+                "Driver": driver,
+                "Scope": scope,
+                "Internal": internal,
+                "Attachable": attachable,
+                "Ingress": ingress,
+                "ConfigFrom": config_from.map(|network| serde_json::json!({ "Network": network })),
+                "ConfigOnly": config_only,
+                "EnableIPv4": ipv4.unwrap_or(true),
+                "EnableIPv6": ipv6,
+                "IPAM": ipam,
+                "Options": options,
+                "Labels": labels,
+            }))?;
+            let (status, body) = crate::serve::resources::create_network(&body);
+            ensure_resource_status(status, &body, &[201])?;
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            let Some(id) = value.get("Id").and_then(serde_json::Value::as_str) else {
+                bail!("network create response missing Id");
+            };
+            println!("{id}");
+        }
+        NetworkCommand::Connect {
+            alias,
+            link,
+            ip,
+            ip6,
+            link_local_ip,
+            driver_opt,
+            gw_priority,
+            network,
+            container,
+        } => {
+            let ipam_config =
+                network_connect_ipam_config(ip.as_deref(), ip6.as_deref(), &link_local_ip);
+            let driver_opts = parse_key_value_args(driver_opt, "--driver-opt")?;
+            let body = serde_json::to_vec(&serde_json::json!({
+                "Container": container,
+                "EndpointConfig": {
+                    "Aliases": alias,
+                    "Links": link,
+                    "IPAMConfig": ipam_config,
+                    "DriverOpts": driver_opts,
+                    "GwPriority": gw_priority,
+                },
+            }))?;
+            let (status, body) = crate::serve::resources::connect_network(&network, &body);
+            ensure_resource_status(status, &body, &[200])?;
+        }
+        NetworkCommand::Disconnect {
+            force,
+            network,
+            container,
+        } => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "Container": container,
+                "Force": force,
+            }))?;
+            let (status, body) = crate::serve::resources::disconnect_network(&network, &body);
+            ensure_resource_status(status, &body, &[200])?;
+        }
+        NetworkCommand::Ls => {
+            let (status, body) = crate::serve::resources::list_networks("");
+            ensure_resource_status(status, &body, &[200])?;
+            let networks: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+            println!("NETWORK ID\tNAME\tDRIVER\tSCOPE");
+            for network in networks {
+                let id = network
+                    .get("Id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let short_id = id.get(..12).unwrap_or(id);
+                let name = network
+                    .get("Name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let driver = network
+                    .get("Driver")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let scope = network
+                    .get("Scope")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                println!("{short_id}\t{name}\t{driver}\t{scope}");
+            }
+        }
+        NetworkCommand::Prune { force: _, filter } => {
+            let query = resource_filter_query(filter)?;
+            let (status, body) = crate::serve::resources::prune_networks(&query);
+            ensure_resource_status(status, &body, &[200])?;
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            println!("Deleted Networks:");
+            if let Some(networks) = value
+                .get("NetworksDeleted")
+                .and_then(serde_json::Value::as_array)
+            {
+                for network in networks.iter().filter_map(serde_json::Value::as_str) {
+                    println!("{network}");
+                }
+            }
+        }
+        NetworkCommand::Inspect { names } => {
+            let mut networks = Vec::new();
+            for name in names {
+                let (status, body) = crate::serve::resources::inspect_network(&name);
+                ensure_resource_status(status, &body, &[200])?;
+                networks.push(serde_json::from_str::<serde_json::Value>(&body)?);
+            }
+            println!("{}", serde_json::to_string(&networks)?);
+        }
+        NetworkCommand::Rm { names } => {
+            let mut had_err = false;
+            for name in names {
+                let (status, body) = crate::serve::resources::remove_network(&name);
+                if status == 204 {
+                    println!("{name}");
+                } else {
+                    had_err = true;
+                    eprintln!("{}", resource_error_message(&body));
+                }
+            }
+            if had_err {
+                bail!("one or more networks failed to be removed");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn network_connect_ipam_config(
+    ipv4: Option<&str>,
+    ipv6: Option<&str>,
+    link_local_ips: &[String],
+) -> Option<serde_json::Value> {
+    if ipv4.is_none() && ipv6.is_none() && link_local_ips.is_empty() {
+        return None;
+    }
+    let mut ipam = serde_json::Map::new();
+    if let Some(ipv4) = ipv4 {
+        ipam.insert("IPv4Address".to_string(), serde_json::json!(ipv4));
+    }
+    if let Some(ipv6) = ipv6 {
+        ipam.insert("IPv6Address".to_string(), serde_json::json!(ipv6));
+    }
+    if !link_local_ips.is_empty() {
+        ipam.insert(
+            "LinkLocalIPs".to_string(),
+            serde_json::json!(link_local_ips),
+        );
+    }
+    Some(serde_json::Value::Object(ipam))
+}
+
+fn network_ipam_config(
+    driver: &str,
+    options: Vec<String>,
+    subnets: &[String],
+    gateways: &[String],
+    ip_ranges: &[String],
+    aux_addresses: Vec<String>,
+) -> anyhow::Result<serde_json::Value> {
+    let options = parse_key_value_args(options, "--ipam-opt")?;
+    if driver == "default"
+        && options.is_empty()
+        && subnets.is_empty()
+        && gateways.is_empty()
+        && ip_ranges.is_empty()
+        && aux_addresses.is_empty()
+    {
+        return Ok(serde_json::Value::Null);
+    }
+    if !gateways.is_empty() && gateways.len() != subnets.len() {
+        bail!("--gateway must be specified once per --subnet");
+    }
+    if !ip_ranges.is_empty() && ip_ranges.len() != subnets.len() {
+        bail!("--ip-range must be specified once per --subnet");
+    }
+    if !aux_addresses.is_empty() && subnets.is_empty() {
+        bail!("--aux-address requires at least one --subnet");
+    }
+    let aux_addresses = parse_key_value_args(aux_addresses, "--aux-address")?;
+    let config: Vec<serde_json::Value> = subnets
+        .iter()
+        .enumerate()
+        .map(|(index, subnet)| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("Subnet".to_string(), serde_json::json!(subnet));
+            if let Some(gateway) = gateways.get(index) {
+                entry.insert("Gateway".to_string(), serde_json::json!(gateway));
+            }
+            if let Some(ip_range) = ip_ranges.get(index) {
+                entry.insert("IPRange".to_string(), serde_json::json!(ip_range));
+            }
+            if index == 0 && !aux_addresses.is_empty() {
+                entry.insert(
+                    "AuxiliaryAddresses".to_string(),
+                    serde_json::json!(aux_addresses),
+                );
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "Driver": driver,
+        "Options": options,
+        "Config": config,
+    }))
+}
+
+fn parse_key_value_args(
+    pairs: Vec<String>,
+    flag_name: &str,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut parsed = std::collections::HashMap::new();
+    for pair in pairs {
+        let Some((key, value)) = pair.split_once('=') else {
+            bail!("{flag_name} expects KEY=VALUE");
+        };
+        if key.is_empty() {
+            bail!("{flag_name} key cannot be empty");
+        }
+        parsed.insert(key.to_string(), value.to_string());
+    }
+    Ok(parsed)
+}
+
+fn resource_filter_query(filters: Vec<String>) -> anyhow::Result<String> {
+    if filters.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parsed: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for filter in filters {
+        let Some((key, value)) = filter.split_once('=') else {
+            bail!("--filter expects KEY=VALUE");
+        };
+        if key.is_empty() {
+            bail!("--filter key cannot be empty");
+        }
+        parsed
+            .entry(key.to_string())
+            .or_default()
+            .push(value.to_string());
+    }
+    let json = serde_json::to_string(&parsed)?;
+    Ok(format!("filters={}", percent_encode_query_value(&json)))
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::new();
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b))
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn ensure_resource_status(status: u16, body: &str, expected: &[u16]) -> anyhow::Result<()> {
+    if expected.contains(&status) {
+        return Ok(());
+    }
+    bail!("{}", resource_error_message(body));
+}
+
+fn resource_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| body.to_string())
 }
 
 /// The kaniko executor image, pinned to the spike-validated version. The build
@@ -1369,6 +1902,113 @@ mod build_tests {
     use super::*;
 
     #[test]
+    fn parse_network_mode_accepts_custom_bridge_name() {
+        let parsed = parse_network_mode_arg("compose_default").unwrap();
+        assert_eq!(parsed.mode, carrick_spec::NetworkMode::Bridge);
+        assert_eq!(parsed.bridge.as_deref(), Some("compose_default"));
+        assert_eq!(parsed.container, None);
+    }
+
+    #[test]
+    fn parse_network_mode_accepts_container_target_name() {
+        let entropy = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let id = carrick_runtime::container::make_id(std::process::id() as u64, entropy);
+        let name = format!("m0_cli_net_target_{}", &id[..12]);
+        let config = carrick_runtime::container::RunConfig {
+            network: carrick_spec::NetworkMode::Bridge,
+            network_attachments: vec![carrick_runtime::container::NetworkAttachment {
+                name: "compose_default".to_string(),
+                aliases: Vec::new(),
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: None,
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            }],
+            ..Default::default()
+        };
+        let state = carrick_runtime::container::ContainerState {
+            id: id.clone(),
+            name: Some(name.clone()),
+            image: "ubuntu:24.04".to_string(),
+            command: vec!["/bin/true".to_string()],
+            status: carrick_runtime::container::ContainerStatus::Created,
+            supervisor_pid: 0,
+            init_pid: 0,
+            created_secs: 0,
+            exit_code: None,
+            auto_remove: false,
+            api_auto_remove: false,
+            labels: std::collections::HashMap::new(),
+            config,
+        };
+        let _ = carrick_runtime::container::ContainerState::remove(&id);
+        state.create().unwrap();
+
+        let parsed = parse_network_mode_arg(&format!("container:{name}")).unwrap();
+
+        let _ = carrick_runtime::container::ContainerState::remove(&id);
+        assert_eq!(parsed.mode, carrick_spec::NetworkMode::Bridge);
+        assert_eq!(parsed.bridge.as_deref(), Some("compose_default"));
+        assert_eq!(parsed.container.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn network_ipam_config_preserves_docker_cli_metadata() {
+        let ipam = network_ipam_config(
+            "carrick-ipam",
+            vec!["mode=test".to_string()],
+            &["172.29.0.0/16".to_string()],
+            &["172.29.0.1".to_string()],
+            &["172.29.8.0/24".to_string()],
+            vec!["router=172.29.0.254".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ipam,
+            serde_json::json!({
+                "Driver": "carrick-ipam",
+                "Options": {
+                    "mode": "test",
+                },
+                "Config": [{
+                    "Subnet": "172.29.0.0/16",
+                    "Gateway": "172.29.0.1",
+                    "IPRange": "172.29.8.0/24",
+                    "AuxiliaryAddresses": {
+                        "router": "172.29.0.254",
+                    },
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn network_connect_ipam_config_preserves_ipv4_and_ipv6() {
+        let ipam = network_connect_ipam_config(
+            Some("172.31.44.11"),
+            Some("fd00:carrick::11"),
+            &["169.254.44.11".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ipam,
+            serde_json::json!({
+                "IPv4Address": "172.31.44.11",
+                "IPv6Address": "fd00:carrick::11",
+                "LinkLocalIPs": ["169.254.44.11"],
+            })
+        );
+    }
+
+    #[test]
     fn kaniko_argv_no_push_maps_flags() {
         let argv = kaniko_run_argv(
             "/usr/local/bin/carrick",
@@ -1608,4 +2248,63 @@ mod build_tests {
             "unexpected cache flag in {argv:?}"
         );
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedNetworkMode {
+    mode: carrick_spec::NetworkMode,
+    bridge: Option<String>,
+    container: Option<String>,
+}
+
+fn parse_network_mode_arg(value: &str) -> anyhow::Result<ParsedNetworkMode> {
+    match value {
+        "host" => Ok(ParsedNetworkMode {
+            mode: carrick_spec::NetworkMode::Host,
+            bridge: None,
+            container: None,
+        }),
+        "bridge" => Ok(ParsedNetworkMode {
+            mode: carrick_spec::NetworkMode::Bridge,
+            bridge: None,
+            container: None,
+        }),
+        "none" => Ok(ParsedNetworkMode {
+            mode: carrick_spec::NetworkMode::None,
+            bridge: None,
+            container: None,
+        }),
+        mode if mode.starts_with("container:") => parse_container_network_mode(mode),
+        "" => anyhow::bail!("network mode cannot be empty"),
+        custom_bridge => Ok(ParsedNetworkMode {
+            mode: carrick_spec::NetworkMode::Bridge,
+            bridge: Some(custom_bridge.to_string()),
+            container: None,
+        }),
+    }
+}
+
+fn parse_container_network_mode(value: &str) -> anyhow::Result<ParsedNetworkMode> {
+    let target = value
+        .strip_prefix("container:")
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("network mode \"container\" requires a target"))?;
+    let target_id = carrick_runtime::container::resolve(target)
+        .map_err(|_| anyhow::anyhow!("No such container: {target}"))?;
+    let target_state = carrick_runtime::container::ContainerState::load(&target_id)?;
+    let bridge = if target_state.config.network == carrick_spec::NetworkMode::Bridge {
+        target_state
+            .config
+            .network_attachments
+            .iter()
+            .find(|attachment| attachment.name != "bridge")
+            .map(|attachment| attachment.name.clone())
+    } else {
+        None
+    };
+    Ok(ParsedNetworkMode {
+        mode: target_state.config.network,
+        bridge,
+        container: Some(target_id),
+    })
 }

@@ -4,6 +4,7 @@
 mod build;
 mod handlers;
 mod model;
+pub(crate) mod resources;
 mod router;
 mod spawn;
 

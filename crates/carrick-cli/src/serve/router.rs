@@ -99,6 +99,46 @@ pub(crate) async fn route(
         return Ok(crate::serve::handlers::logs_container(id, follow, tail));
     }
 
+    if method == Method::POST && container_action(&path).map(|(_, a)| a) == Some("attach") {
+        let id = container_action(&path)
+            .map(|(id, _)| id)
+            .unwrap_or_default()
+            .to_string();
+        return Ok(crate::serve::handlers::attach_container_route(id, query, req).await);
+    }
+
+    if method == Method::POST && container_action(&path).map(|(_, a)| a) == Some("wait") {
+        let id = container_action(&path)
+            .map(|(id, _)| id)
+            .unwrap_or_default()
+            .to_string();
+        return Ok(crate::serve::handlers::wait_container_stream(id));
+    }
+
+    if method == Method::GET && container_action(&path).map(|(_, a)| a) == Some("archive") {
+        let id = container_action(&path)
+            .map(|(id, _)| id)
+            .unwrap_or_default()
+            .to_string();
+        return Ok(crate::serve::handlers::download_archive_route(id, query).await);
+    }
+
+    if method == Method::PUT && container_action(&path).map(|(_, a)| a) == Some("archive") {
+        let id = container_action(&path)
+            .map(|(id, _)| id)
+            .unwrap_or_default()
+            .to_string();
+        let body_bytes = match BodyExt::collect(req.into_body()).await {
+            Ok(b) => b.to_bytes(),
+            Err(_) => Bytes::new(),
+        };
+        return Ok(crate::serve::handlers::upload_archive_route(id, query, body_bytes).await);
+    }
+
+    if method == Method::GET && path == "/events" {
+        return Ok(crate::serve::handlers::events_stream(&query));
+    }
+
     if method == Method::POST && path == "/images/create" {
         return Ok(crate::serve::handlers::pull_image(&query));
     }
@@ -123,7 +163,7 @@ pub(crate) async fn route(
         (&Method::GET, "/info") => json(StatusCode::OK, crate::serve::handlers::info_json()),
         (&Method::GET, "/containers/json") => {
             let all = query_param(&query, "all").is_some_and(|v| v == "true" || v == "1");
-            let (status, body) = crate::serve::handlers::list_containers(all);
+            let (status, body) = crate::serve::handlers::list_containers(all, &query);
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -141,6 +181,105 @@ pub(crate) async fn route(
             let name = query_param(&query, "name");
             let (status, body) =
                 crate::serve::handlers::create_container(&body_bytes, name.as_deref());
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, "/networks/create") => {
+            let (status, body) = crate::serve::resources::create_network(&body_bytes);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, "/networks/prune") => {
+            let (status, body) = crate::serve::resources::prune_networks(&query);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, "/networks") => {
+            let (status, body) = crate::serve::resources::list_networks(&query);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, p) if p.strip_prefix("/networks/").is_some_and(|s| !s.is_empty()) => {
+            let id = p.strip_prefix("/networks/").unwrap_or_default();
+            let (status, body) = crate::serve::resources::inspect_network(id);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::DELETE, p) if p.strip_prefix("/networks/").is_some_and(|s| !s.is_empty()) => {
+            let id = p.strip_prefix("/networks/").unwrap_or_default();
+            let (status, body) = crate::serve::resources::remove_network(id);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if p.starts_with("/networks/") && p.ends_with("/connect") => {
+            let id = p
+                .strip_prefix("/networks/")
+                .and_then(|s| s.strip_suffix("/connect"))
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            let (status, body) = crate::serve::resources::connect_network(id, &body_bytes);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, p) if p.starts_with("/networks/") && p.ends_with("/disconnect") => {
+            let id = p
+                .strip_prefix("/networks/")
+                .and_then(|s| s.strip_suffix("/disconnect"))
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            let (status, body) = crate::serve::resources::disconnect_network(id, &body_bytes);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, "/volumes/create") => {
+            let (status, body) = crate::serve::resources::create_volume(&body_bytes);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::POST, "/volumes/prune") => {
+            let (status, body) = crate::serve::resources::prune_volumes(&query);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, "/volumes") => {
+            let (status, body) = crate::serve::resources::list_volumes(&query);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::GET, p) if p.strip_prefix("/volumes/").is_some_and(|s| !s.is_empty()) => {
+            let name = p.strip_prefix("/volumes/").unwrap_or_default();
+            let (status, body) = crate::serve::resources::inspect_volume(name);
+            json(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                body,
+            )
+        }
+        (&Method::DELETE, p) if p.strip_prefix("/volumes/").is_some_and(|s| !s.is_empty()) => {
+            let name = p.strip_prefix("/volumes/").unwrap_or_default();
+            let force = query_param(&query, "force").is_some_and(|v| v == "true" || v == "1");
+            let (status, body) = crate::serve::resources::remove_volume(name, force);
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -181,18 +320,9 @@ pub(crate) async fn route(
                 body,
             )
         }
-        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("wait") => {
-            let id_owned = container_action(p)
-                .map(|(id, _)| id.to_string())
-                .unwrap_or_default();
-            let (status, body) = tokio::task::spawn_blocking(move || {
-                crate::serve::handlers::wait_container(&id_owned)
-            })
-            .await
-            .unwrap_or((
-                500,
-                crate::serve::handlers::error_json("wait task panicked"),
-            ));
+        (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("resize") => {
+            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let (status, body) = crate::serve::handlers::resize_container_tty(id);
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -203,7 +333,10 @@ pub(crate) async fn route(
                 .is_some_and(|s| !s.is_empty() && !s.contains('/')) =>
         {
             let id = p.strip_prefix("/containers/").unwrap_or_default();
-            let (status, body) = crate::serve::handlers::remove_container(id);
+            let force = query_param(&query, "force").is_some_and(|v| v == "true" || v == "1");
+            let remove_volumes = query_param(&query, "v").is_some_and(|v| v == "true" || v == "1");
+            let (status, body) =
+                crate::serve::handlers::remove_container(id, force, remove_volumes);
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
