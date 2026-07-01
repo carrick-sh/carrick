@@ -1389,11 +1389,17 @@ where
                 DispatchOutcome::Fork {
                     pidfd_out,
                     exit_signal,
+                    child_stack,
                     vfork,
                 } => {
-                    if let Some(retval) =
-                        state.handle_fork(&kernel, &mut engine, pidfd_out, exit_signal, vfork)?
-                    {
+                    if let Some(retval) = state.handle_fork(
+                        &kernel,
+                        &mut engine,
+                        pidfd_out,
+                        exit_signal,
+                        child_stack,
+                        vfork,
+                    )? {
                         last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                     }
                 }

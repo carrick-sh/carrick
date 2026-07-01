@@ -971,6 +971,7 @@ where
             DispatchOutcome::Fork {
                 pidfd_out,
                 exit_signal,
+                child_stack: _,
                 vfork,
             } => {
                 // The single-threaded loop (run-elf) keeps the ordinary CoW fork
