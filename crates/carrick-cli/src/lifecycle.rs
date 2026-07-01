@@ -188,6 +188,7 @@ fn build_created_state(
             env: req.env_overrides.clone(),
             workdir: req.workdir.clone(),
             user: req.user.clone(),
+            hostname: req.hostname.clone(),
             pid: req.pid,
             network: req.network,
             api_network_mode: req.network_bridge.clone().or_else(|| match req.network {
@@ -365,6 +366,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         mounts: c.mounts.clone(),
         workdir: c.workdir.clone(),
         user: c.user.clone(),
+        hostname: c.hostname.clone(),
         entrypoint_override: c.entrypoint.clone(),
         tty: c.tty,
         interactive: c.interactive,
@@ -1119,6 +1121,7 @@ pub(crate) fn exec(
         mounts: state.config.mounts.clone(),
         workdir: workdir.or_else(|| state.config.workdir.clone()),
         user: user.or_else(|| state.config.user.clone()),
+        hostname: state.config.hostname.clone(),
         // exec runs the command directly — no image ENTRYPOINT prepended.
         entrypoint_override: Some(vec![]),
         tty,
@@ -1747,6 +1750,7 @@ mod tests {
                 env: vec!["A=1".into()],
                 workdir: Some("/w".into()),
                 user: Some("1000".into()),
+                hostname: None,
                 pid: carrick_spec::PidMode::Private,
                 network: carrick_spec::NetworkMode::Host,
                 api_network_mode: Some("host".into()),

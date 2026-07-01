@@ -128,6 +128,7 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
                 &network.attachments,
                 network.api_network_mode.as_deref(),
                 network.network_container.as_deref(),
+                req.hostname.as_deref(),
                 &labels,
                 api_auto_remove,
             ) {
@@ -431,12 +432,14 @@ fn persist_api_container_metadata(
     attachments: &[carrick_runtime::container::NetworkAttachment],
     api_network_mode: Option<&str>,
     network_container: Option<&str>,
+    hostname: Option<&str>,
     labels: &HashMap<String, String>,
     api_auto_remove: bool,
 ) -> anyhow::Result<()> {
     if attachments.is_empty()
         && api_network_mode.is_none()
         && network_container.is_none()
+        && hostname.is_none()
         && labels.is_empty()
         && !api_auto_remove
     {
@@ -451,6 +454,9 @@ fn persist_api_container_metadata(
     }
     if let Some(target) = network_container {
         state.config.network_container = Some(target.to_string());
+    }
+    if let Some(hostname) = hostname {
+        state.config.hostname = Some(hostname.to_string());
     }
     if !labels.is_empty() {
         state.labels = labels.clone();

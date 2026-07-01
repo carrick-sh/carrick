@@ -1820,6 +1820,10 @@ impl SyscallDispatcher {
         dispatcher
     }
 
+    pub fn set_guest_hostname(&self, hostname: impl Into<String>) {
+        self.proc.lock().guest_hostname = hostname.into();
+    }
+
     pub(crate) fn request_signal_pump(&self) {
         self.signal_pump_requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3908,6 +3912,7 @@ impl SyscallDispatcher {
             executable_path: proc.executable_path.clone(),
             argv: proc.argv.clone(),
             guest_arch: proc.reported_arch(),
+            guest_hostname: proc.guest_hostname().to_string(),
             environ: proc.env.clone(),
             open_fds: self.open_fd_numbers(),
             network: self.network.spec.clone(),

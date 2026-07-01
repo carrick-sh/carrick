@@ -2408,6 +2408,7 @@ async fn docker_compose_network_surface_smoke() {
 services:
   surface:
     image: ubuntu:24.04
+    hostname: surface-host
     command: ["/bin/sh", "-c", "/opt/carrick/bridge_net_identity && /opt/carrick/host_gateway_client"]
     environment:
       CARRICK_PROBE_LABEL: surface_host_gateway
@@ -2419,6 +2420,7 @@ services:
       CARRICK_PROBE_EXPECT_DNS: 1.1.1.1,9.9.9.9
       CARRICK_PROBE_EXPECT_DNS_SEARCH: example.test
       CARRICK_PROBE_EXPECT_DNS_OPTIONS: ndots:2
+      CARRICK_PROBE_EXPECT_HOSTNAME: surface-host
     extra_hosts:
       - "host.docker.internal:10.12.0.7"
     dns:
@@ -4324,6 +4326,7 @@ async fn create_container_lowers_compose_network_and_volume_config() {
             }),
             bollard::container::Config {
                 image: Some("ubuntu:24.04".to_string()),
+                hostname: Some("api-host".to_string()),
                 cmd: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
                 host_config: Some(bollard::models::HostConfig {
                     network_mode: Some("m0_api_net".to_string()),
@@ -4352,6 +4355,7 @@ async fn create_container_lowers_compose_network_and_volume_config() {
     let state = carrick_runtime::container::ContainerState::load(&created.id).unwrap();
     assert_eq!(state.config.network, carrick_spec::NetworkMode::Bridge);
     assert_eq!(state.config.network_aliases, vec!["api"]);
+    assert_eq!(state.config.hostname.as_deref(), Some("api-host"));
     assert_eq!(state.config.extra_hosts, vec!["db.local:10.12.0.7"]);
     assert_eq!(state.config.dns_servers, vec!["1.1.1.1"]);
     assert_eq!(state.config.dns_search, vec!["example.test"]);

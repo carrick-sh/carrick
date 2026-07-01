@@ -2073,6 +2073,7 @@ impl SyscallDispatcher {
         let argv = proc.argv.clone();
         let env = proc.env.clone();
         let guest_arch = proc.reported_arch();
+        let guest_hostname = proc.guest_hostname().to_string();
         drop(proc);
         let open_fds = self.open_fd_numbers();
         let mem = self.mem_snapshot();
@@ -2085,6 +2086,7 @@ impl SyscallDispatcher {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
             guest_arch,
+            guest_hostname: Some(guest_hostname.as_str()),
             environ: Some(env.as_slice()),
             open_fds: Some(open_fds.as_slice()),
             network: Some(&self.network.spec),
