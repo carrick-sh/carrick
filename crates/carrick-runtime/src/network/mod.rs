@@ -20,6 +20,9 @@ pub struct NetworkCapabilities {
     pub raw_socket_support: bool,
     pub multicast_or_broadcast: bool,
     pub netfilter: bool,
+    pub pf_nat: bool,
+    pub pf_rdr: bool,
+    pub network_extension_policy: bool,
     pub guest_created_network_namespaces: bool,
     pub requires_privilege: bool,
 }
@@ -143,6 +146,9 @@ impl NetworkProvider for HostNetworkProvider {
             raw_socket_support: false,
             multicast_or_broadcast: false,
             netfilter: false,
+            pf_nat: false,
+            pf_rdr: false,
+            network_extension_policy: false,
             guest_created_network_namespaces: false,
             requires_privilege: false,
         }
@@ -199,6 +205,9 @@ impl NetworkProvider for NoNetworkProvider {
             raw_socket_support: false,
             multicast_or_broadcast: false,
             netfilter: false,
+            pf_nat: false,
+            pf_rdr: false,
+            network_extension_policy: false,
             guest_created_network_namespaces: false,
             requires_privilege: false,
         }
@@ -306,6 +315,9 @@ mod tests {
         assert!(!caps.published_udp_ports);
         assert!(!caps.host_routable_container_ips);
         assert!(!caps.netfilter);
+        assert!(!caps.pf_nat);
+        assert!(!caps.pf_rdr);
+        assert!(!caps.network_extension_policy);
         assert!(!caps.guest_created_network_namespaces);
         assert!(!caps.requires_privilege);
     }
@@ -337,11 +349,15 @@ mod tests {
         assert!(caps.outbound_connectivity);
         assert!(caps.published_ports);
         assert!(caps.published_udp_ports);
+        assert!(!caps.kernel_datapath);
         assert!(!caps.host_routable_container_ips);
         assert!(!caps.packet_level_isolation);
         assert!(!caps.raw_socket_support);
         assert!(!caps.multicast_or_broadcast);
         assert!(!caps.netfilter);
+        assert!(!caps.pf_nat);
+        assert!(!caps.pf_rdr);
+        assert!(!caps.network_extension_policy);
         assert!(!caps.guest_created_network_namespaces);
         assert!(!caps.requires_privilege);
     }

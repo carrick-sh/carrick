@@ -46,6 +46,15 @@ pub(crate) fn create_network(body: &[u8]) -> (u16, String) {
             crate::serve::handlers::error_json("network already exists"),
         );
     }
+    let driver = req.driver.unwrap_or_else(|| "bridge".to_string());
+    if privileged_provider_driver(&driver) {
+        return (
+            400,
+            crate::serve::handlers::error_json(&format!(
+                "network driver {driver:?} is reserved for a future provider and is not implemented"
+            )),
+        );
+    }
     let _check_duplicate = req.check_duplicate.unwrap_or(false);
     if load_named::<NetworkResource>(NETWORKS, &req.name).is_ok() {
         return (
@@ -60,7 +69,7 @@ pub(crate) fn create_network(body: &[u8]) -> (u16, String) {
         name: req.name,
         created,
         scope: req.scope.unwrap_or_else(|| "local".to_string()),
-        driver: req.driver.unwrap_or_else(|| "bridge".to_string()),
+        driver,
         enable_ipv4: req.enable_ipv4.unwrap_or(true),
         enable_ipv6: req.enable_ipv6.unwrap_or(false),
         ipam: req
@@ -89,6 +98,10 @@ pub(crate) fn create_network(body: &[u8]) -> (u16, String) {
         }
         Err(e) => (500, crate::serve::handlers::error_json(&e.to_string())),
     }
+}
+
+fn privileged_provider_driver(driver: &str) -> bool {
+    matches!(driver, "pf-bridge" | "network-extension" | "linux-netns")
 }
 
 pub(crate) fn list_networks(query: &str) -> (u16, String) {
