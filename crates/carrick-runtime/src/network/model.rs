@@ -126,6 +126,71 @@ impl LinuxNetworkModel {
             || !self.resolver.options.is_empty()
     }
 
+    pub(crate) fn render_proc_net_dev(&self) -> Vec<u8> {
+        let mut out = String::from(
+            "Inter-|   Receive                                                |  Transmit\n \
+face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
+        );
+        for link in &self.links {
+            out.push_str(&format!(
+                "{:>6}: 0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
+                link.name
+            ));
+        }
+        out.into_bytes()
+    }
+
+    pub(crate) fn render_proc_net_route(&self) -> Vec<u8> {
+        let mut out = String::from(
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
+        );
+        for route in &self.routes {
+            let destination = match route.destination {
+                Some(IpAddr::V4(addr)) => addr,
+                Some(IpAddr::V6(_)) => continue,
+                None => Ipv4Addr::UNSPECIFIED,
+            };
+            let gateway = match route.gateway {
+                Some(IpAddr::V4(addr)) => addr,
+                Some(IpAddr::V6(_)) => continue,
+                None => Ipv4Addr::UNSPECIFIED,
+            };
+            let flags = if route.gateway.is_some() {
+                "0003"
+            } else {
+                "0001"
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{flags}\t0\t0\t0\t{}\t0\t0\t0\n",
+                route.link_name,
+                proc_net_route_hex_v4(destination),
+                proc_net_route_hex_v4(gateway),
+                proc_net_route_hex_v4_mask(route.destination_prefix_len),
+            ));
+        }
+        out.into_bytes()
+    }
+
+    pub(crate) fn render_resolv_conf(&self) -> Vec<u8> {
+        let mut out = String::new();
+        for server in &self.resolver.nameservers {
+            out.push_str("nameserver ");
+            out.push_str(&server.to_string());
+            out.push('\n');
+        }
+        if !self.resolver.search.is_empty() {
+            out.push_str("search ");
+            out.push_str(&self.resolver.search.join(" "));
+            out.push('\n');
+        }
+        if !self.resolver.options.is_empty() {
+            out.push_str("options ");
+            out.push_str(&self.resolver.options.join(" "));
+            out.push('\n');
+        }
+        out.into_bytes()
+    }
+
     pub(crate) fn hosts_config<I>(
         &self,
         spec: &NetworkNamespaceSpec,
@@ -320,6 +385,24 @@ pub(crate) fn v4_prefix_24(addr: Ipv4Addr) -> Ipv4Addr {
 pub(crate) fn v4_prefix_8(addr: Ipv4Addr) -> Ipv4Addr {
     let [a, _, _, _] = addr.octets();
     Ipv4Addr::new(a, 0, 0, 0)
+}
+
+fn proc_net_route_hex_v4(addr: Ipv4Addr) -> String {
+    let octets = addr.octets();
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}",
+        octets[3], octets[2], octets[1], octets[0]
+    )
+}
+
+fn proc_net_route_hex_v4_mask(prefix_len: u8) -> String {
+    let prefix = prefix_len.min(32);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    proc_net_route_hex_v4(Ipv4Addr::from(mask))
 }
 
 fn parse_extra_host(entry: &str, host_gateway: Option<Ipv4Addr>) -> Option<(String, String)> {
