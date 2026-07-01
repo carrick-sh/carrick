@@ -624,12 +624,22 @@ impl SocketNamespaceProvider {
             )),
             protocol: PortProtocol::Udp,
         };
+        let gateway_v4 = spec.gateway_v4;
         let registry = Arc::clone(&self.registry);
         let endpoint_dir = Arc::clone(&self.endpoint_dir);
         let thread_stop = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("carrick-bridge-publish-udp".to_string())
-            .spawn(move || published_udp_loop(socket, registry, endpoint_dir, target, thread_stop))
+            .spawn(move || {
+                published_udp_loop(
+                    socket,
+                    registry,
+                    endpoint_dir,
+                    target,
+                    gateway_v4,
+                    thread_stop,
+                )
+            })
             .map_err(|e| format!("failed to start published UDP proxy: {e}"))?;
         let mut published_udp = self
             .published_udp
@@ -913,6 +923,17 @@ fn write_endpoint_file(
     Ok(vec![(path, contents), (reverse_path, reverse_contents)])
 }
 
+fn remove_endpoint_files(files: Vec<(PathBuf, String)>) {
+    for (path, expected_contents) in files {
+        match fs::read_to_string(&path) {
+            Ok(contents) if contents == expected_contents => {
+                let _ = fs::remove_file(path);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn read_endpoint_file(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> Option<HostSocketAddr> {
     let path = endpoint_path(endpoint_dir, endpoint);
     let raw = read_live_namespace_file(&path)?;
@@ -1003,6 +1024,7 @@ fn published_udp_loop(
     registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
     endpoint_dir: Arc<PathBuf>,
     target: VirtualEndpoint,
+    gateway_v4: Ipv4Addr,
     stop: Arc<AtomicBool>,
 ) {
     let mut request = vec![0_u8; 65_535];
@@ -1021,16 +1043,35 @@ fn published_udp_loop(
                 let Ok(outbound) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) else {
                     continue;
                 };
-                let _ = outbound.set_read_timeout(Some(Duration::from_millis(100)));
+                let Ok(outbound_addr) = outbound.local_addr() else {
+                    continue;
+                };
+                let reply_endpoint = VirtualEndpoint {
+                    scope: target.scope.clone(),
+                    addr: GuestSocketAddr(SocketAddr::new(
+                        IpAddr::V4(gateway_v4),
+                        outbound_addr.port(),
+                    )),
+                    protocol: PortProtocol::Udp,
+                };
+                let owned_reply_files = write_endpoint_file(
+                    &endpoint_dir,
+                    &reply_endpoint,
+                    HostSocketAddr(outbound_addr),
+                )
+                .unwrap_or_default();
+                let _ = outbound.set_read_timeout(Some(Duration::from_secs(2)));
                 if outbound
                     .send_to(&request[..request_len], target_addr.0)
                     .is_err()
                 {
+                    remove_endpoint_files(owned_reply_files);
                     continue;
                 }
                 if let Ok((response_len, _)) = outbound.recv_from(&mut response) {
                     let _ = socket.send_to(&response[..response_len], source);
                 }
+                remove_endpoint_files(owned_reply_files);
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
