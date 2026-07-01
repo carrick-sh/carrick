@@ -125,6 +125,8 @@ pub trait NetworkProvider {
 Capabilities must be explicit:
 
 - same-bridge IP connectivity;
+- multi-network attachments;
+- embedded DNS service discovery;
 - outbound connectivity;
 - published ports;
 - kernel datapath;
@@ -135,8 +137,10 @@ Capabilities must be explicit:
 - requires privilege.
 
 This avoids provider names becoming semantic promises. For example, the v1
-socket provider can satisfy same-bridge TCP/UDP connectivity and published ports
-while explicitly not satisfying host-routable IPs or packet-level isolation.
+socket provider can satisfy app-socket same-bridge connectivity, multi-network
+attachment routing, embedded service-name DNS, outbound connectivity, and
+published TCP ports while explicitly not satisfying host-routable IPs or
+packet-level isolation.
 
 ## Socket Namespace Provider
 
@@ -218,14 +222,16 @@ distinction must be visible in capability reporting and documentation.
 
 ## DNS and Name Resolution
 
-The first implementation can materialize `/etc/hosts` entries for known
-same-bridge containers. A later Carrick DNS responder should listen at the
-namespace gateway address and provide Docker-style name and alias resolution.
+The first implementation materialized `/etc/hosts` entries for known same-bridge
+containers. The current bridge implementation also intercepts UDP DNS queries to
+the namespace gateway address and builds Carrick-managed A-record responses with
+Hickory DNS protocol types. Name, container-name, and alias answers are scoped to
+the bridges shared by the querying namespace and the target endpoint.
 
-The model should preserve the distinction between Docker's default bridge and
-user-defined bridge networks. Full automatic container-name DNS belongs with the
-named-network work, but the runtime data model should already include aliases
-and bridge membership.
+The model preserves the distinction between Docker's default bridge and
+user-defined bridge networks by carrying aliases and bridge membership per
+attachment. Multi-homed targets expose only the addresses on bridges shared with
+the querying namespace.
 
 ## Provider Roadmap
 
@@ -270,6 +276,7 @@ Unit tests should cover:
 - same-bridge allow and cross-bridge deny;
 - guest-visible `getsockname` and `getpeername` translation;
 - published port conflict detection;
+- multi-network service and alias DNS visibility;
 - provider capability reporting.
 
 Integration and conformance probes should cover:
@@ -279,7 +286,9 @@ Integration and conformance probes should cover:
 - outbound TCP connect works and guest-visible route state is bridge-shaped;
 - `-p host:container` reaches the container through the Carrick listener;
 - rtnetlink reports `lo`, `eth0`, container IP, gateway, and default route;
-- `/etc/hosts` resolves same-bridge container names once the name surface lands.
+- `/etc/hosts` and gateway DNS resolve same-network container/service names;
+- connect/disconnect mutations on created or stopped containers are reflected
+  when the container is next started.
 
 Docker oracle comparisons should focus on app-level bridge behavior, not raw
 packet features that the selected provider explicitly does not claim.
