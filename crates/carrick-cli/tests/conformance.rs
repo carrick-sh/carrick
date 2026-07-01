@@ -106,6 +106,11 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // Kept as a reducer; gate it against a native-Linux oracle (the kvm/bhyve
     // lanes), where mq_open actually works.
     "mqueue",
+    // bridge_publish_tcp requires the harness to start carrick with `-p` and
+    // connect from the host side after the guest listener is ready. The generic
+    // probe runner only injects and waits, so this probe is covered by the
+    // dedicated conformance_bridge_publish_tcp test below.
+    "bridge_publish_tcp",
 ];
 use std::time::{Duration, Instant};
 
@@ -299,6 +304,212 @@ fn repo_path(path: &str) -> PathBuf {
 fn carrick_bin() -> Option<PathBuf> {
     let p = repo_path("target/release/carrick");
     p.exists().then_some(p)
+}
+
+fn bridge_publish_probe_args(platform: &str, image: &str, host_port: u16) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--platform".to_string(),
+        platform.to_string(),
+        "--raw".to_string(),
+        "--fs".to_string(),
+        "host".to_string(),
+        "--net".to_string(),
+        "bridge".to_string(),
+        "-p".to_string(),
+        format!("127.0.0.1:{host_port}:8080"),
+        image.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        PROBE_SNIPPET.to_string(),
+    ]
+}
+
+fn free_loopback_port() -> u16 {
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
+    listener.local_addr().expect("local addr").port()
+}
+
+fn run_bridge_publish_probe(
+    bin: &PathBuf,
+    lane: Lane,
+    host_port: u16,
+    stdin_bytes: &[u8],
+) -> String {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+
+    let run_id = case_run_id();
+    let mut child = Command::new(bin)
+        .args(bridge_publish_probe_args(lane.platform, lane.image, host_port))
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn bridge publish probe");
+    let pid = child.id() as i32;
+
+    {
+        let mut stdin = child.stdin.take().expect("carrick stdin");
+        let bytes = stdin_bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+
+    let stdout = child.stdout.take().expect("carrick stdout");
+    let stderr = child.stderr.take().expect("carrick stderr");
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            out.push_str(&line);
+            let _ = line_tx.send(line.trim_end().to_string());
+        }
+        out
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut err = String::new();
+        let mut reader = std::io::BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut err);
+        err
+    });
+
+    let ready_deadline = Instant::now() + Duration::from_secs(15);
+    let mut ready = false;
+    while Instant::now() < ready_deadline {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line == "bridge_publish_listener_ready=true" => {
+                ready = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !ready {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        scoped_kill_guests(&run_id);
+        let _ = child.wait();
+        let out = stdout_reader.join().unwrap_or_default();
+        let err = stderr_reader.join().unwrap_or_default();
+        return normalize(&format!("{out}{err}<TIMEOUT waiting for listener>"));
+    }
+
+    let mut stream = connect_loopback_with_retry(host_port).expect("connect published port");
+    stream.write_all(b"ping").expect("write host ping");
+    let mut reply = [0_u8; 2];
+    stream.read_exact(&mut reply).expect("read host reply");
+    assert_eq!(&reply, b"ok");
+
+    let wait_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait().expect("poll bridge publish probe") {
+            Some(status) => {
+                let out = stdout_reader.join().unwrap_or_default();
+                let err = stderr_reader.join().unwrap_or_default();
+                let combined = normalize(&format!("{out}{err}"));
+                assert!(status.success(), "bridge publish probe exited {status}: {combined}");
+                return combined;
+            }
+            None if Instant::now() >= wait_deadline => {
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                scoped_kill_guests(&run_id);
+                let _ = child.wait();
+                let out = stdout_reader.join().unwrap_or_default();
+                let err = stderr_reader.join().unwrap_or_default();
+                return normalize(&format!("{out}{err}<TIMEOUT waiting for exit>"));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+fn connect_loopback_with_retry(port: u16) -> std::io::Result<std::net::TcpStream> {
+    let mut last_error = None;
+    for _ in 0..100 {
+        match std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_error = Some(err);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "connect retry exhausted")
+    }))
+}
+
+#[test]
+fn bridge_publish_probe_args_enable_bridge_and_publish() {
+    let args = bridge_publish_probe_args("linux/arm64", "docker.io/library/ubuntu:24.04", 18080);
+    assert!(args.windows(2).any(|w| w == ["--net", "bridge"]));
+    assert!(args.windows(2).any(|w| w == ["-p", "127.0.0.1:18080:8080"]));
+    let image_pos = args
+        .iter()
+        .position(|arg| arg == "docker.io/library/ubuntu:24.04")
+        .expect("image arg");
+    let net_pos = args.iter().position(|arg| arg == "--net").expect("net arg");
+    let publish_pos = args.iter().position(|arg| arg == "-p").expect("publish arg");
+    assert!(net_pos < image_pos);
+    assert!(publish_pos < image_pos);
+}
+
+#[test]
+fn conformance_bridge_publish_tcp() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_bridge_publish_tcp: target/release/carrick not built");
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_publish_tcp: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_publish_tcp");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_publish_tcp: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let host_port = free_loopback_port();
+    let raw = std::fs::read(&probe).expect("read bridge_publish_tcp probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let output = run_bridge_publish_probe(&bin, lane, host_port, &encoded);
+    assert!(
+        output.contains("bridge_publish_listener_ready=true"),
+        "missing listener-ready line in output:\n{output}"
+    );
+    assert!(
+        output.contains("bridge_publish_tcp_ok=true"),
+        "missing completion line in output:\n{output}"
+    );
 }
 
 fn rosetta_available() -> bool {
