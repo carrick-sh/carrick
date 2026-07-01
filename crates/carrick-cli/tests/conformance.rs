@@ -334,6 +334,22 @@ fn bridge_publish_probe_args(platform: &str, image: &str, host_port: u16) -> Vec
     ]
 }
 
+fn docker_bridge_publish_probe_args(platform: &str, image: &str, host_port: u16) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "-i".to_string(),
+        "--rm".to_string(),
+        "--platform".to_string(),
+        platform.to_string(),
+        "-p".to_string(),
+        format!("127.0.0.1:{host_port}:8080"),
+        image.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        PROBE_SNIPPET.to_string(),
+    ]
+}
+
 fn bridge_probe_args(platform: &str, image: &str) -> Vec<String> {
     vec![
         "run".to_string(),
@@ -521,6 +537,111 @@ fn run_bridge_publish_probe(
     }
 }
 
+fn run_docker_bridge_publish_probe(
+    lane: Lane,
+    host_port: u16,
+    stdin_bytes: &[u8],
+) -> std::io::Result<String> {
+    use std::io::{BufRead, Read, Write};
+    use std::sync::mpsc;
+
+    let mut child = Command::new("docker")
+        .args(docker_bridge_publish_probe_args(
+            lane.platform,
+            lane.image,
+            host_port,
+        ))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = child.stdin.take().expect("docker stdin");
+        let bytes = stdin_bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+
+    let stdout = child.stdout.take().expect("docker stdout");
+    let stderr = child.stderr.take().expect("docker stderr");
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            out.push_str(&line);
+            let _ = line_tx.send(line.trim_end().to_string());
+        }
+        out
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut err = String::new();
+        let mut reader = std::io::BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut err);
+        err
+    });
+
+    let ready_deadline = Instant::now() + Duration::from_secs(15);
+    let mut ready = false;
+    while Instant::now() < ready_deadline {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line == "bridge_publish_listener_ready=true" => {
+                ready = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        let out = stdout_reader.join().unwrap_or_default();
+        let err = stderr_reader.join().unwrap_or_default();
+        return Ok(normalize(&format!(
+            "{out}{err}<TIMEOUT waiting for listener>"
+        )));
+    }
+
+    let mut stream = connect_loopback_with_retry(host_port)?;
+    stream.write_all(b"ping")?;
+    let mut reply = [0_u8; 2];
+    stream.read_exact(&mut reply)?;
+    assert_eq!(&reply, b"ok");
+
+    let wait_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let out = stdout_reader.join().unwrap_or_default();
+                let err = stderr_reader.join().unwrap_or_default();
+                let combined = normalize(&format!("{out}{err}"));
+                assert!(
+                    status.success(),
+                    "docker bridge publish probe exited {status}: {combined}"
+                );
+                return Ok(combined);
+            }
+            None if Instant::now() >= wait_deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let out = stdout_reader.join().unwrap_or_default();
+                let err = stderr_reader.join().unwrap_or_default();
+                return Ok(normalize(&format!("{out}{err}<TIMEOUT waiting for exit>")));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
 fn connect_loopback_with_retry(port: u16) -> std::io::Result<std::net::TcpStream> {
     let mut last_error = None;
     for _ in 0..100 {
@@ -556,6 +677,22 @@ fn bridge_publish_probe_args_enable_bridge_and_publish() {
 }
 
 #[test]
+fn docker_bridge_publish_probe_args_publish_before_image() {
+    let args =
+        docker_bridge_publish_probe_args("linux/arm64", "docker.io/library/ubuntu:24.04", 18080);
+    assert!(args.windows(2).any(|w| w == ["-p", "127.0.0.1:18080:8080"]));
+    let image_pos = args
+        .iter()
+        .position(|arg| arg == "docker.io/library/ubuntu:24.04")
+        .expect("image arg");
+    let publish_pos = args
+        .iter()
+        .position(|arg| arg == "-p")
+        .expect("publish arg");
+    assert!(publish_pos < image_pos);
+}
+
+#[test]
 fn bridge_probe_args_enable_bridge() {
     let args = bridge_probe_args("linux/arm64", "docker.io/library/ubuntu:24.04");
     assert!(args.windows(2).any(|w| w == ["--net", "bridge"]));
@@ -584,6 +721,17 @@ fn conformance_bridge_publish_tcp() {
         );
         return;
     }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_publish_tcp: Docker not reachable");
+        return;
+    }
     let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_publish_tcp");
     if !probe.exists() {
         eprintln!(
@@ -600,15 +748,21 @@ fn conformance_bridge_publish_tcp() {
     let encoded = base64::engine::general_purpose::STANDARD
         .encode(raw)
         .into_bytes();
-    let output = run_bridge_publish_probe(&bin, lane, host_port, &encoded);
+    let carrick_out = run_bridge_publish_probe(&bin, lane, host_port, &encoded);
     assert!(
-        output.contains("bridge_publish_listener_ready=true"),
-        "missing listener-ready line in output:\n{output}"
+        carrick_out.contains("bridge_publish_listener_ready=true"),
+        "missing listener-ready line in output:\n{carrick_out}"
     );
     assert!(
-        output.contains("bridge_publish_tcp_ok=true"),
-        "missing completion line in output:\n{output}"
+        carrick_out.contains("bridge_publish_tcp_ok=true"),
+        "missing completion line in output:\n{carrick_out}"
     );
+    let docker_host_port = free_loopback_port();
+    let docker_out = run_docker_bridge_publish_probe(lane, docker_host_port, &encoded)
+        .expect("docker bridge publish probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge publish tcp conformance mismatch:\n{diff}");
+    }
 }
 
 #[test]
@@ -628,6 +782,17 @@ fn conformance_bridge_udp_peer() {
         );
         return;
     }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_udp_peer: Docker not reachable");
+        return;
+    }
     let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_udp_peer");
     if !probe.exists() {
         eprintln!(
@@ -643,15 +808,19 @@ fn conformance_bridge_udp_peer() {
     let encoded = base64::engine::general_purpose::STANDARD
         .encode(raw)
         .into_bytes();
-    let output = run_bridge_probe(&bin, lane, &encoded);
+    let carrick_out = run_bridge_probe(&bin, lane, &encoded);
     assert!(
-        output.contains("bridge_udp_sendto_ok=true"),
-        "missing sendto completion line in output:\n{output}"
+        carrick_out.contains("bridge_udp_sendto_ok=true"),
+        "missing sendto completion line in output:\n{carrick_out}"
     );
     assert!(
-        output.contains("bridge_udp_reply=ok"),
-        "missing reply line in output:\n{output}"
+        carrick_out.contains("bridge_udp_reply=ok"),
+        "missing reply line in output:\n{carrick_out}"
     );
+    let docker_out = run_docker_probe(lane, &encoded).expect("docker bridge udp peer probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge udp peer conformance mismatch:\n{diff}");
+    }
 }
 
 #[test]
