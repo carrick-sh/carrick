@@ -682,7 +682,12 @@ impl SyscallDispatcher {
     /// async delivery and synchronous waits (`rt_sigtimedwait`/sigwait) both use
     /// this so an xsignal can be consumed by either path.
     pub(crate) fn drain_xsignals_for_tid(&self, tid: crate::thread::ThreadId) {
-        if !crate::host_signal::xsig_has_pending() {
+        // Ring-authoritative gate (mask 0 => "any entry targets this process"),
+        // NOT the losable process-local `XSIG_DIRTY` hint: a dropped host nudge
+        // must not hide an already-enqueued cross-process signal from the drain,
+        // or a re-dispatched `rt_sigtimedwait`/sigwait would never consume it and
+        // the waiter would re-block forever.
+        if !carrick_signal_core::xsig::xsig_has_unblocked_for_self(0) {
             return;
         }
         for (signum, sender_ns, sender_uid, value) in crate::host_signal::xsig_drain_for_self() {
