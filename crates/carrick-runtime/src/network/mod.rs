@@ -1,7 +1,7 @@
 use carrick_spec::{
     NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 pub mod socket_namespace;
 
@@ -36,6 +36,12 @@ pub struct GuestSocketAddr(pub SocketAddr);
 /// A socket address Carrick passes to, or reads from, the host networking stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HostSocketAddr(pub SocketAddr);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkHostsEntry {
+    pub addr: IpAddr,
+    pub names: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindTarget {
@@ -89,6 +95,22 @@ pub trait NetworkProvider: Send + Sync {
         _protocol: PortProtocol,
     ) -> Result<Option<GuestSocketAddr>, String> {
         Ok(None)
+    }
+    fn prepare_listen(
+        &self,
+        _namespace_id: Option<&NetworkNamespaceId>,
+        _guest_local: Option<GuestSocketAddr>,
+        _host_local: Option<HostSocketAddr>,
+        _protocol: PortProtocol,
+        _reuse_port: bool,
+    ) -> Result<(), i32> {
+        Ok(())
+    }
+    fn guest_hosts_entries(
+        &self,
+        _spec: &NetworkNamespaceSpec,
+    ) -> Result<Vec<NetworkHostsEntry>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -146,10 +168,65 @@ impl NetworkProvider for HostNetworkProvider {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct NoNetworkProvider;
+
+impl NetworkProvider for NoNetworkProvider {
+    fn capabilities(&self) -> NetworkCapabilities {
+        NetworkCapabilities {
+            same_bridge_ip_connectivity: false,
+            outbound_connectivity: false,
+            published_ports: false,
+            published_udp_ports: false,
+            kernel_datapath: false,
+            host_routable_container_ips: false,
+            packet_level_isolation: true,
+            raw_socket_support: false,
+            multicast_or_broadcast: false,
+            netfilter: false,
+            guest_created_network_namespaces: false,
+            requires_privilege: false,
+        }
+    }
+
+    fn create_namespace(&self, _spec: &NetworkNamespaceSpec) -> Result<NetworkLease, String> {
+        Ok(NetworkLease {
+            id: NetworkLeaseId(0),
+        })
+    }
+
+    fn destroy_namespace(&self, _lease_id: NetworkLeaseId) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn publish_port(&self, _lease_id: NetworkLeaseId, _mapping: PortMapping) -> Result<(), String> {
+        Err("network mode none does not support published ports".to_string())
+    }
+
+    fn materialize_bind(
+        &self,
+        _namespace_id: Option<&NetworkNamespaceId>,
+        _requested: GuestSocketAddr,
+        _protocol: PortProtocol,
+    ) -> Result<BindTarget, String> {
+        Err("network mode none does not support IPv4 bind".to_string())
+    }
+
+    fn resolve_connect(
+        &self,
+        _namespace_id: Option<&NetworkNamespaceId>,
+        _requested: GuestSocketAddr,
+        _protocol: PortProtocol,
+    ) -> Result<ConnectTarget, String> {
+        Ok(ConnectTarget::Denied(carrick_abi::LINUX_ENETUNREACH))
+    }
+}
+
 pub fn select_provider(spec: &NetworkNamespaceSpec) -> Box<dyn NetworkProvider> {
     match spec.mode {
         NetworkMode::Host => Box::<HostNetworkProvider>::default(),
         NetworkMode::Bridge => Box::new(socket_namespace::SocketNamespaceProvider::new()),
+        NetworkMode::None => Box::<NoNetworkProvider>::default(),
     }
 }
 
@@ -181,6 +258,10 @@ impl RuntimeNetwork {
                 id: NetworkLeaseId(0),
             },
         }
+    }
+
+    pub fn guest_hosts_entries(&self) -> Result<Vec<NetworkHostsEntry>, String> {
+        self.provider.guest_hosts_entries(&self.spec)
     }
 }
 
@@ -240,5 +321,20 @@ mod tests {
         assert!(!caps.netfilter);
         assert!(!caps.guest_created_network_namespaces);
         assert!(!caps.requires_privilege);
+    }
+
+    #[test]
+    fn network_mode_none_denies_ipv4_connects() {
+        let network = RuntimeNetwork::create(&NetworkNamespaceSpec::none()).unwrap();
+        let target = GuestSocketAddr("203.0.113.1:80".parse().unwrap());
+
+        assert_eq!(
+            network
+                .provider
+                .resolve_connect(None, target, PortProtocol::Tcp)
+                .unwrap(),
+            ConnectTarget::Denied(carrick_abi::LINUX_ENETUNREACH)
+        );
+        assert!(!network.provider.capabilities().outbound_connectivity);
     }
 }

@@ -5,6 +5,7 @@ use crate::dispatch::SyscallDispatcher;
 #[cfg(feature = "fs-memory")]
 use crate::fs_backend::MemoryBackend;
 use crate::fs_backend::{FsBackend, HostFsBackend};
+use crate::network::NetworkHostsEntry;
 use crate::rootfs::RootFs;
 #[cfg(feature = "fs-memory")]
 use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
@@ -269,7 +270,16 @@ impl Runtime {
                 }
                 dispatcher.set_credentials(spec.uid, spec.gid);
 
-                seed_guest_baseline(&mut host, None, &spec.network);
+                let hosts_entries = runtime_network.guest_hosts_entries().map_err(|e| {
+                    RuntimeError::Unsupported(format!("network hosts setup failed: {e}"))
+                })?;
+                seed_guest_baseline(
+                    &mut host,
+                    None,
+                    &spec.network,
+                    &hosts_entries,
+                    &spec.extra_hosts,
+                );
 
                 // Install custom bind mounts on dispatcher
                 for mount in &spec.mounts {
@@ -466,7 +476,13 @@ fn install_fs_backend(
         },
     };
     let default_network = NetworkNamespaceSpec::default();
-    seed_guest_baseline(&mut *backend, dispatcher.rootfs(), &default_network);
+    seed_guest_baseline(
+        &mut *backend,
+        dispatcher.rootfs(),
+        &default_network,
+        &[],
+        &[],
+    );
     let _ = dispatcher.set_fs_backend(backend);
     if host_seeded {
         dispatcher.drop_rootfs_layer();
@@ -488,6 +504,8 @@ fn seed_guest_baseline(
     backend: &mut dyn FsBackend,
     rootfs: Option<&RootFs>,
     network: &NetworkNamespaceSpec,
+    network_hosts_entries: &[NetworkHostsEntry],
+    extra_hosts: &[String],
 ) {
     use std::net::ToSocketAddrs;
     for dir in [
@@ -546,17 +564,32 @@ fn seed_guest_baseline(
     // Bridge networking maps the configured container name and aliases to the
     // virtual eth0 address visible inside the guest namespace.
     if network.mode == NetworkMode::Bridge {
-        let mut names = Vec::new();
-        if let Some(name) = &network.container_name {
-            names.push(name.as_str());
+        let mut wrote_bridge_entry = false;
+        for entry in network_hosts_entries {
+            if entry.names.is_empty() {
+                continue;
+            }
+            hosts_content.push_str(&format!("{}\t{}\n", entry.addr, entry.names.join(" ")));
+            wrote_bridge_entry = true;
         }
-        names.extend(network.aliases.iter().map(String::as_str));
-        if names.is_empty() {
-            names.push(guest_hostname());
+        if !wrote_bridge_entry {
+            let mut names = Vec::new();
+            if let Some(name) = &network.container_name {
+                names.push(name.as_str());
+            }
+            names.extend(network.aliases.iter().map(String::as_str));
+            if names.is_empty() {
+                names.push(guest_hostname());
+            }
+            hosts_content.push_str(&format!("{}\t{}\n", network.ipv4, names.join(" ")));
         }
-        hosts_content.push_str(&format!("{}\t{}\n", network.ipv4, names.join(" ")));
     } else {
         hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
+    }
+    for entry in extra_hosts {
+        if let Some((name, addr)) = parse_extra_host(entry) {
+            hosts_content.push_str(&format!("{addr}\t{name}\n"));
+        }
     }
     // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
     // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a profile
@@ -617,6 +650,16 @@ fn seed_guest_baseline(
     );
 }
 
+fn parse_extra_host(entry: &str) -> Option<(&str, &str)> {
+    let (name, addr) = entry.split_once('=').or_else(|| entry.split_once(':'))?;
+    let name = name.trim();
+    let addr = addr.trim();
+    if name.is_empty() || addr.is_empty() || addr == "host-gateway" {
+        return None;
+    }
+    Some((name, addr))
+}
+
 fn set_baseline_file_if_missing(
     backend: &mut dyn FsBackend,
     rootfs: Option<&RootFs>,
@@ -670,8 +713,10 @@ fn setup_interactive_stdio(
 mod exit_code_tests {
     use super::{is_entrypoint_not_executable, is_entrypoint_not_found};
     use crate::elf::ElfInspectError;
+    use crate::fs_backend::{FsBackend, MemoryBackend};
     use crate::memory::AddressSpaceError;
     use crate::runtime::RuntimeError;
+    use carrick_spec::NetworkNamespaceSpec;
     use std::io::{Error as IoError, ErrorKind};
 
     fn rt_io(kind: ErrorKind) -> RuntimeError {
@@ -701,5 +746,24 @@ mod exit_code_tests {
             ErrorKind::PermissionDenied
         )));
         assert!(!is_entrypoint_not_executable(&rt_io(ErrorKind::NotFound)));
+    }
+
+    #[test]
+    fn seed_guest_baseline_writes_extra_hosts_entries() {
+        let mut backend = MemoryBackend::new();
+        let network = NetworkNamespaceSpec::default();
+        super::seed_guest_baseline(
+            &mut backend,
+            None,
+            &network,
+            &[],
+            &["db.local:10.12.0.7".to_string()],
+        );
+
+        let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
+        assert!(
+            hosts.contains("10.12.0.7\tdb.local\n"),
+            "extra host entry missing from /etc/hosts:\n{hosts}"
+        );
     }
 }

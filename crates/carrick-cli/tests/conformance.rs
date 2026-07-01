@@ -123,6 +123,26 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // bridge_loopback_isolation must run under `--net bridge`; the generic probe
     // runner uses the default host network. Covered by conformance_bridge_loopback_isolation.
     "bridge_loopback_isolation",
+    // bridge_tcp_nonblocking_refused must run under `--net bridge`; the generic
+    // probe runner uses the default host network. Covered by
+    // conformance_bridge_tcp_nonblocking_refused.
+    "bridge_tcp_nonblocking_refused",
+    // bridge_udp_connected_unreachable must run under `--net bridge`; the generic
+    // probe runner uses the default host network. Covered by
+    // conformance_bridge_udp_connected_unreachable.
+    "bridge_udp_connected_unreachable",
+    // bridge_udp_sendto_unreachable must run under `--net bridge`; the generic
+    // probe runner uses the default host network. Covered by
+    // conformance_bridge_udp_sendto_unreachable.
+    "bridge_udp_sendto_unreachable",
+    // bridge_reuse_sockopts must run under `--net bridge`; the generic probe
+    // runner uses the default host network. Covered by
+    // conformance_bridge_reuse_sockopts.
+    "bridge_reuse_sockopts",
+    // bridge_compose_* are a multi-process bridge workload and must be launched
+    // by their dedicated harness.
+    "bridge_compose_server",
+    "bridge_compose_client",
 ];
 use std::time::{Duration, Instant};
 
@@ -370,6 +390,37 @@ fn bridge_probe_args(platform: &str, image: &str) -> Vec<String> {
     ]
 }
 
+fn bridge_named_probe_args(
+    platform: &str,
+    image: &str,
+    name: &str,
+    env: &[(&str, String)],
+) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "--platform".to_string(),
+        platform.to_string(),
+        "--raw".to_string(),
+        "--fs".to_string(),
+        "host".to_string(),
+        "--net".to_string(),
+        "bridge".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+    ];
+    for (key, value) in env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    args.extend([
+        image.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        PROBE_SNIPPET.to_string(),
+    ]);
+    args
+}
+
 fn free_loopback_port() -> u16 {
     let listener =
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
@@ -417,6 +468,68 @@ fn run_bridge_probe(bin: &PathBuf, lane: Lane, stdin_bytes: &[u8]) -> String {
         })
     };
     let out = child.wait_with_output().expect("wait bridge probe");
+    done.store(true, Ordering::Relaxed);
+    let timed_out = watcher.join().unwrap_or(false);
+    if timed_out {
+        return format!("<TIMEOUT after {}s>", CASE_DEADLINE.as_secs());
+    }
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    normalize(&combined)
+}
+
+fn run_bridge_named_probe(
+    bin: &PathBuf,
+    lane: Lane,
+    name: &str,
+    env: &[(&str, String)],
+    stdin_bytes: &[u8],
+) -> String {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+
+    let run_id = case_run_id();
+    let mut child = Command::new(bin)
+        .args(bridge_named_probe_args(
+            lane.platform,
+            lane.image,
+            name,
+            env,
+        ))
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn named bridge probe");
+    let pid = child.id() as i32;
+    {
+        let mut stdin = child.stdin.take().expect("carrick stdin");
+        let bytes = stdin_bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        let run_id = run_id.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > CASE_DEADLINE {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    scoped_kill_guests(&run_id);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let out = child.wait_with_output().expect("wait named bridge probe");
     done.store(true, Ordering::Relaxed);
     let timed_out = watcher.join().unwrap_or(false);
     if timed_out {
@@ -538,6 +651,132 @@ fn run_bridge_publish_probe(
             None => std::thread::sleep(Duration::from_millis(100)),
         }
     }
+}
+
+fn run_bridge_compose_pair(
+    bin: &PathBuf,
+    lane: Lane,
+    server_stdin: &[u8],
+    client_stdin: &[u8],
+) -> (String, String) {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+
+    let run_id = case_run_id();
+    let mut server = Command::new(bin)
+        .args(bridge_named_probe_args(
+            lane.platform,
+            lane.image,
+            "db",
+            &[],
+        ))
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn compose server probe");
+    let server_pid = server.id() as i32;
+    {
+        let mut stdin = server.stdin.take().expect("server stdin");
+        let bytes = server_stdin.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+
+    let stdout = server.stdout.take().expect("server stdout");
+    let stderr = server.stderr.take().expect("server stderr");
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let server_stdout_reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            out.push_str(&line);
+            let _ = line_tx.send(line.trim_end().to_string());
+        }
+        out
+    });
+    let server_stderr_reader = std::thread::spawn(move || {
+        let mut err = String::new();
+        let mut reader = std::io::BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut err);
+        err
+    });
+
+    let ready_deadline = Instant::now() + Duration::from_secs(15);
+    let mut server_ip: Option<String> = None;
+    let mut ready = false;
+    while Instant::now() < ready_deadline {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line == "bridge_compose_server_ready=true" => {
+                ready = true;
+                if server_ip.is_some() {
+                    break;
+                }
+            }
+            Ok(line) if line.starts_with("bridge_compose_server_ip=") => {
+                server_ip = Some(line["bridge_compose_server_ip=".len()..].to_string());
+                if ready {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !ready || server_ip.is_none() {
+        unsafe { libc::kill(-server_pid, libc::SIGKILL) };
+        scoped_kill_guests(&run_id);
+        let _ = server.wait();
+        let out = server_stdout_reader.join().unwrap_or_default();
+        let err = server_stderr_reader.join().unwrap_or_default();
+        return (
+            normalize(&format!("{out}{err}<TIMEOUT waiting for compose server>")),
+            String::new(),
+        );
+    }
+
+    let _target_ip = server_ip.expect("server ip recorded");
+    let client_out = run_bridge_named_probe(bin, lane, "web", &[], client_stdin);
+
+    let wait_deadline = Instant::now() + Duration::from_secs(15);
+    let server_out = loop {
+        match server.try_wait().expect("poll compose server") {
+            Some(status) => {
+                let out = server_stdout_reader.join().unwrap_or_default();
+                let err = server_stderr_reader.join().unwrap_or_default();
+                let combined = normalize(&format!("{out}{err}"));
+                assert!(
+                    status.success(),
+                    "compose server exited {status}: {combined}"
+                );
+                break combined;
+            }
+            None if Instant::now() >= wait_deadline => {
+                unsafe { libc::kill(-server_pid, libc::SIGKILL) };
+                scoped_kill_guests(&run_id);
+                let _ = server.wait();
+                let out = server_stdout_reader.join().unwrap_or_default();
+                let err = server_stderr_reader.join().unwrap_or_default();
+                break normalize(&format!(
+                    "{out}{err}<TIMEOUT waiting for compose server exit>"
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    (server_out, client_out)
 }
 
 fn run_docker_bridge_publish_probe(
@@ -874,6 +1113,283 @@ fn conformance_bridge_udp_peer() {
     if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
         panic!("bridge udp peer conformance mismatch:\n{diff}");
     }
+}
+
+#[test]
+fn conformance_bridge_tcp_nonblocking_refused() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP conformance_bridge_tcp_nonblocking_refused: target/release/carrick not built"
+        );
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_tcp_nonblocking_refused: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_tcp_nonblocking_refused: Docker not reachable");
+        return;
+    }
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_tcp_nonblocking_refused");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_tcp_nonblocking_refused: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let raw = std::fs::read(&probe).expect("read bridge_tcp_nonblocking_refused probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let carrick_out = run_bridge_probe(&bin, lane, &encoded);
+    let docker_out =
+        run_docker_probe(lane, &encoded).expect("docker bridge tcp nonblocking refused probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge tcp nonblocking refused conformance mismatch:\n{diff}");
+    }
+}
+
+#[test]
+fn conformance_bridge_udp_connected_unreachable() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP conformance_bridge_udp_connected_unreachable: target/release/carrick not built"
+        );
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_udp_connected_unreachable: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_udp_connected_unreachable: Docker not reachable");
+        return;
+    }
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_udp_connected_unreachable");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_udp_connected_unreachable: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let raw = std::fs::read(&probe).expect("read bridge_udp_connected_unreachable probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let carrick_out = run_bridge_probe(&bin, lane, &encoded);
+    let docker_out =
+        run_docker_probe(lane, &encoded).expect("docker bridge udp connected unreachable probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge udp connected unreachable conformance mismatch:\n{diff}");
+    }
+}
+
+#[test]
+fn conformance_bridge_udp_sendto_unreachable() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP conformance_bridge_udp_sendto_unreachable: target/release/carrick not built"
+        );
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_udp_sendto_unreachable: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_udp_sendto_unreachable: Docker not reachable");
+        return;
+    }
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_udp_sendto_unreachable");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_udp_sendto_unreachable: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let raw = std::fs::read(&probe).expect("read bridge_udp_sendto_unreachable probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let carrick_out = run_bridge_probe(&bin, lane, &encoded);
+    let docker_out =
+        run_docker_probe(lane, &encoded).expect("docker bridge udp sendto unreachable probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge udp sendto unreachable conformance mismatch:\n{diff}");
+    }
+}
+
+#[test]
+fn conformance_bridge_reuse_sockopts() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_bridge_reuse_sockopts: target/release/carrick not built");
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_reuse_sockopts: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_bridge_reuse_sockopts: Docker not reachable");
+        return;
+    }
+    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_reuse_sockopts");
+    if !probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_reuse_sockopts: probe not built ({})",
+            probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    let raw = std::fs::read(&probe).expect("read bridge_reuse_sockopts probe");
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(raw)
+        .into_bytes();
+    let carrick_out = run_bridge_probe(&bin, lane, &encoded);
+    let docker_out = run_docker_probe(lane, &encoded).expect("docker bridge reuse sockopts probe");
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("bridge reuse sockopts conformance mismatch:\n{diff}");
+    }
+}
+
+#[test]
+fn conformance_bridge_compose_pair() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_bridge_compose_pair: target/release/carrick not built");
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP conformance_bridge_compose_pair: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+    let probes = probes_dir("aarch64-unknown-linux-musl");
+    let server_probe = probes.join("bridge_compose_server");
+    if !server_probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_compose_pair: server probe not built ({})",
+            server_probe.display()
+        );
+        return;
+    }
+    let client_probe = probes.join("bridge_compose_client");
+    if !client_probe.exists() {
+        eprintln!(
+            "SKIP conformance_bridge_compose_pair: client probe not built ({})",
+            client_probe.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+    use base64::Engine as _;
+    let server_encoded = base64::engine::general_purpose::STANDARD
+        .encode(std::fs::read(&server_probe).expect("read bridge_compose_server probe"))
+        .into_bytes();
+    let client_encoded = base64::engine::general_purpose::STANDARD
+        .encode(std::fs::read(&client_probe).expect("read bridge_compose_client probe"))
+        .into_bytes();
+
+    let (server_out, client_out) =
+        run_bridge_compose_pair(&bin, lane, &server_encoded, &client_encoded);
+    assert!(
+        client_out.contains("bridge_compose_client_connect_ok=true"),
+        "missing client completion line:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+    assert!(
+        client_out.contains("bridge_compose_client_response=pong"),
+        "missing client response line:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+    assert!(
+        server_out.contains("bridge_compose_server_peer_is_bridge=true"),
+        "server did not see bridge peer:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+    assert!(
+        server_out.contains("bridge_compose_server_peer_is_distinct=true"),
+        "server saw its own bridge IP as peer:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
+    assert!(
+        server_out.contains("bridge_compose_server_done=true"),
+        "server did not complete:\nserver:\n{server_out}\nclient:\n{client_out}"
+    );
 }
 
 #[test]

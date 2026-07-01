@@ -82,8 +82,8 @@ use std::collections::HashMap;
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
 pub use carrick_spec::{
-    FsBackendKind, ImageConfig, Mount, NetworkMode, NetworkNamespaceSpec, PidMode, Platform,
-    PortMapping, RunSpec,
+    BridgeId, FsBackendKind, ImageConfig, Mount, NetworkMode, NetworkNamespaceSpec, PidMode,
+    Platform, PortMapping, RunSpec,
 };
 
 #[derive(Debug, Clone)]
@@ -109,6 +109,15 @@ pub struct CliRunRequest {
     /// PID namespace mode (`docker run --pid`). Defaults to `Private`.
     pub pid: PidMode,
     pub network: NetworkMode,
+    pub network_bridge: Option<String>,
+    pub network_container: Option<String>,
+    pub network_ipv4: Option<String>,
+    pub network_aliases: Vec<String>,
+    pub extra_hosts: Vec<String>,
+    pub dns_servers: Vec<String>,
+    pub dns_search: Vec<String>,
+    pub dns_options: Vec<String>,
+    pub volumes_from: Vec<String>,
     pub published_ports: Vec<PortMapping>,
     /// Raw `--stop-signal` value (e.g. `SIGQUIT`/`9`), or `None` to fall back to
     /// the image's OCI `STOPSIGNAL`. Resolved to a host signum at create time
@@ -293,12 +302,41 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
     let debug_state_path = req.debug_state_path.map(Utf8PathBuf::from);
     let network = match req.network {
         NetworkMode::Host => NetworkNamespaceSpec::default(),
-        NetworkMode::Bridge => NetworkNamespaceSpec::bridge_default(
-            req.name.clone(),
-            Vec::new(),
-            req.published_ports.clone(),
-        ),
+        NetworkMode::None => NetworkNamespaceSpec::none(),
+        NetworkMode::Bridge => {
+            let mut spec = NetworkNamespaceSpec::bridge_default(
+                req.name.clone(),
+                req.network_aliases.clone(),
+                req.published_ports.clone(),
+            );
+            if let Some(bridge) = req.network_bridge.filter(|name| !name.is_empty()) {
+                spec.bridge_id = BridgeId::new(bridge);
+            }
+            spec
+        }
     };
+    let mut network = network;
+    if !req.dns_servers.is_empty() {
+        network.dns_servers = req
+            .dns_servers
+            .iter()
+            .map(|server| {
+                server
+                    .parse()
+                    .map_err(|_| format!("invalid DNS nameserver {server:?}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    network.dns_search = req.dns_search;
+    network.dns_options = req.dns_options;
+    if let Some(ipv4) = req.network_ipv4 {
+        if network.mode != NetworkMode::Bridge {
+            return Err("--ip requires bridge networking".to_string());
+        }
+        network.ipv4 = ipv4
+            .parse()
+            .map_err(|_| format!("invalid IPv4 address {ipv4:?}"))?;
+    }
 
     Ok(RunSpec {
         executable,
@@ -316,6 +354,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         platform,
         pid: req.pid,
         network,
+        extra_hosts: req.extra_hosts,
         uid,
         gid,
     })
@@ -426,6 +465,15 @@ mod tests {
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             network: NetworkMode::Host,
+            network_bridge: None,
+            network_container: None,
+            network_ipv4: None,
+            network_aliases: Vec::new(),
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            volumes_from: Vec::new(),
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
@@ -438,6 +486,7 @@ mod tests {
         let mut req = base_req(None);
         req.network = NetworkMode::Bridge;
         req.name = Some("web".to_string());
+        req.network_aliases = vec!["api".to_string()];
         req.published_ports = vec![PortMapping {
             host_ip: None,
             host_port: Some(8080),
@@ -448,8 +497,52 @@ mod tests {
         let spec = resolve_run_spec(req, image).expect("resolve run spec");
         assert_eq!(spec.network.mode, NetworkMode::Bridge);
         assert_eq!(spec.network.container_name.as_deref(), Some("web"));
+        assert_eq!(spec.network.aliases, vec!["api"]);
         assert_eq!(spec.network.bridge_id.as_str(), "carrick0");
         assert_eq!(spec.network.published_ports[0].host_port, Some(8080));
+    }
+
+    #[test]
+    fn static_bridge_ipv4_resolves_into_run_spec() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.network = NetworkMode::Bridge;
+        req.network_ipv4 = Some("172.31.44.10".to_string());
+
+        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+
+        assert_eq!(spec.network.mode, NetworkMode::Bridge);
+        assert_eq!(spec.network.ipv4.to_string(), "172.31.44.10");
+    }
+
+    #[test]
+    fn extra_hosts_resolve_into_run_spec() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.extra_hosts = vec!["db.local:10.12.0.7".to_string()];
+
+        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        assert_eq!(spec.extra_hosts, vec!["db.local:10.12.0.7"]);
+    }
+
+    #[test]
+    fn dns_overrides_resolve_into_run_spec() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.dns_servers = vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()];
+        req.dns_search = vec!["example.test".to_string()];
+        req.dns_options = vec!["ndots:2".to_string()];
+
+        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        assert_eq!(
+            spec.network.dns_servers,
+            vec![
+                "1.1.1.1".parse::<std::net::IpAddr>().unwrap(),
+                "9.9.9.9".parse::<std::net::IpAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(spec.network.dns_search, vec!["example.test"]);
+        assert_eq!(spec.network.dns_options, vec!["ndots:2"]);
     }
 
     #[test]
@@ -536,6 +629,15 @@ mod tests {
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             network: NetworkMode::Host,
+            network_bridge: None,
+            network_container: None,
+            network_ipv4: None,
+            network_aliases: Vec::new(),
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            volumes_from: Vec::new(),
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
@@ -571,6 +673,15 @@ mod tests {
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             network: NetworkMode::Host,
+            network_bridge: None,
+            network_container: None,
+            network_ipv4: None,
+            network_aliases: Vec::new(),
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            volumes_from: Vec::new(),
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
@@ -605,6 +716,15 @@ mod tests {
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             network: NetworkMode::Host,
+            network_bridge: None,
+            network_container: None,
+            network_ipv4: None,
+            network_aliases: Vec::new(),
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            volumes_from: Vec::new(),
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
@@ -639,6 +759,15 @@ mod tests {
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             network: NetworkMode::Host,
+            network_bridge: None,
+            network_container: None,
+            network_ipv4: None,
+            network_aliases: Vec::new(),
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            volumes_from: Vec::new(),
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
@@ -682,6 +811,15 @@ mod tests {
             fs: Some(FsBackendKind::Host),
             pid: PidMode::default(),
             network: NetworkMode::Host,
+            network_bridge: None,
+            network_container: None,
+            network_ipv4: None,
+            network_aliases: Vec::new(),
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            volumes_from: Vec::new(),
             published_ports: Vec::new(),
             stop_signal: None,
             stop_timeout: None,
@@ -714,6 +852,15 @@ mod tests {
                 fs: Some(FsBackendKind::Host),
                 pid: PidMode::default(),
                 network: NetworkMode::Host,
+                network_bridge: None,
+                network_container: None,
+                network_ipv4: None,
+                network_aliases: Vec::new(),
+                extra_hosts: Vec::new(),
+                dns_servers: Vec::new(),
+                dns_search: Vec::new(),
+                dns_options: Vec::new(),
+                volumes_from: Vec::new(),
                 published_ports: Vec::new(),
                 stop_signal: None,
                 stop_timeout: None,
