@@ -2411,9 +2411,23 @@ services:
     command: ["/bin/sh", "-c", "/opt/carrick/bridge_net_identity && /opt/carrick/host_gateway_client"]
     environment:
       CARRICK_PROBE_LABEL: surface_host_gateway
-      CARRICK_PROBE_HOST: host.docker.internal
+      CARRICK_PROBE_HOST: gateway.docker.internal
       CARRICK_PROBE_PORT: "{host_port}"
       CARRICK_PROBE_EXPECT_GATEWAY: 172.31.0.1
+      CARRICK_PROBE_EXPECT_HOST_DOCKER_INTERNAL: 10.12.0.7
+      CARRICK_PROBE_EXPECT_GATEWAY_DOCKER_INTERNAL: 172.31.0.1
+      CARRICK_PROBE_EXPECT_DNS: 1.1.1.1,9.9.9.9
+      CARRICK_PROBE_EXPECT_DNS_SEARCH: example.test
+      CARRICK_PROBE_EXPECT_DNS_OPTIONS: ndots:2
+    extra_hosts:
+      - "host.docker.internal:10.12.0.7"
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
+    dns_search:
+      - example.test
+    dns_opt:
+      - ndots:2
     networks:
       appnet: {{}}
     volumes:
@@ -2448,6 +2462,9 @@ networks:
             "bridge_host_docker_internal=true",
             "bridge_gateway_docker_internal=true",
             "bridge_resolv_has_nameserver=true",
+            "bridge_resolv_nameservers_match=true",
+            "bridge_resolv_search_match=true",
+            "bridge_resolv_options_match=true",
             "bridge_proc_dev_has_eth0=true",
             "bridge_proc_route_default_gateway=true",
             "bridge_sysfs_has_eth0=true",
