@@ -1803,12 +1803,14 @@ impl SyscallDispatcher {
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         let mut dispatcher = Self::new();
-        dispatcher.fs.vfs_mounts.mount(
-            "/sys",
-            Box::new(crate::vfs::SysVfs::from_network_model(
-                network.model.clone(),
-            )),
-        );
+        if network.spec.mode != carrick_spec::NetworkMode::Host {
+            dispatcher.fs.vfs_mounts.mount(
+                "/sys",
+                Box::new(crate::vfs::SysVfs::from_network_model(
+                    network.model.clone(),
+                )),
+            );
+        }
         if should_mount_network_resolv_conf(&network.model) {
             let contents = resolv_conf_contents_for_network(&network.model);
             dispatcher.fs.vfs_mounts.mount(
@@ -7668,6 +7670,40 @@ mod overlay_dispatch_tests {
             panic!("model-backed /sys/class/net ifindex should open as bytes");
         };
         assert_eq!(String::from_utf8(contents).unwrap(), "3\n");
+    }
+
+    #[test]
+    fn with_host_network_preserves_host_sys_class_net() {
+        let default_dispatcher = SyscallDispatcher::new();
+        let default_sys = default_dispatcher
+            .fs
+            .vfs_mounts
+            .resolve("/sys/class/net")
+            .unwrap();
+        let expected = default_sys
+            .vfs
+            .readdir("/sys/class/net")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        let network = std::sync::Arc::new(crate::network::RuntimeNetwork::host_default());
+        let host_dispatcher = SyscallDispatcher::with_network(network);
+        let host_sys = host_dispatcher
+            .fs
+            .vfs_mounts
+            .resolve("/sys/class/net")
+            .unwrap();
+
+        let actual = host_sys
+            .vfs
+            .readdir("/sys/class/net")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     /// The Linux errno constants we publish must match the
