@@ -3904,6 +3904,7 @@ impl SyscallDispatcher {
             guest_arch: proc.reported_arch(),
             environ: proc.env.clone(),
             open_fds: self.open_fd_numbers(),
+            network: self.network.spec.clone(),
             auxv: mem.linux_auxv_image,
             address_space_regions: mem.address_space_regions,
             brk_current: mem.brk_current,
