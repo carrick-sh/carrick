@@ -2298,7 +2298,41 @@ pub const CARRICK_PRIVATE_X86_EPOLL_CREATE: u64 = u64::MAX - 0x2a;
 /// x86_64 exposes legacy `alarm(seconds)` as syscall 37, while asm-generic has
 /// no canonical `alarm` entry. Route it privately so glibc/CPython can use the
 /// same interval-timer state and SIGALRM delivery path as `setitimer`.
-pub const CARRICK_PRIVATE_X86_ALARM: u64 = u64::MAX - 0x2a;
+pub const CARRICK_PRIVATE_X86_ALARM: u64 = u64::MAX - 0x2b;
+
+// Every CARRICK_PRIVATE_X86_* number must be UNIQUE: a collision silently
+// routes one syscall through another's handler (alarm(2) briefly shared
+// 0x2a with epoll_create, so guest alarm() returned fresh epoll FDS — LTP
+// alarm02's "invalid retval 4/5/6"). Compile-time, like the SIG* table.
+const _: () = {
+    const PRIVATE_X86: [u64; 12] = [
+        CARRICK_PRIVATE_X86_DUP2,
+        CARRICK_PRIVATE_X86_STAT,
+        CARRICK_PRIVATE_X86_FSTAT,
+        CARRICK_PRIVATE_X86_LSTAT,
+        CARRICK_PRIVATE_X86_NEWFSTATAT,
+        CARRICK_PRIVATE_X86_UNSUPPORTED,
+        CARRICK_PRIVATE_X86_UTIME,
+        CARRICK_PRIVATE_X86_UTIMES,
+        CARRICK_PRIVATE_X86_POLL,
+        CARRICK_PRIVATE_X86_SELECT,
+        CARRICK_PRIVATE_X86_EPOLL_CREATE,
+        CARRICK_PRIVATE_X86_ALARM,
+    ];
+    let mut i = 0;
+    while i < PRIVATE_X86.len() {
+        let mut j = i + 1;
+        while j < PRIVATE_X86.len() {
+            assert!(
+                PRIVATE_X86[i] != PRIVATE_X86[j],
+                "duplicate CARRICK_PRIVATE_X86 syscall number"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
