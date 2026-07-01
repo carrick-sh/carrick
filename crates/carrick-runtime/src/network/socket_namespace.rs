@@ -97,6 +97,24 @@ impl SocketNamespaceProvider {
             )),
         }
     }
+
+    pub fn resolve_bridge_connect(
+        &self,
+        spec: &NetworkNamespaceSpec,
+        requested: SocketAddr,
+        protocol: PortProtocol,
+    ) -> Result<ConnectTarget, String> {
+        if let Some(host) = self.resolve_registered_connect(&spec.bridge_id, requested, protocol)? {
+            return Ok(ConnectTarget::Host(host));
+        }
+
+        match requested.ip() {
+            IpAddr::V4(ip) if ip.octets()[0] == 172 && ip.octets()[1] == 31 => {
+                Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED))
+            }
+            _ => Ok(ConnectTarget::Unchanged),
+        }
+    }
 }
 
 impl NetworkProvider for SocketNamespaceProvider {
@@ -159,11 +177,24 @@ impl NetworkProvider for SocketNamespaceProvider {
 
     fn resolve_connect(
         &self,
-        _namespace_id: Option<&NetworkNamespaceId>,
-        _requested: SocketAddr,
-        _protocol: PortProtocol,
+        namespace_id: Option<&NetworkNamespaceId>,
+        requested: SocketAddr,
+        protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
-        Ok(ConnectTarget::Unchanged)
+        let Some(namespace_id) = namespace_id else {
+            return Ok(ConnectTarget::Unchanged);
+        };
+        let spec = {
+            let namespaces = self
+                .namespaces
+                .lock()
+                .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
+            namespaces.get(namespace_id).cloned()
+        };
+        let Some(spec) = spec else {
+            return Ok(ConnectTarget::Unchanged);
+        };
+        self.resolve_bridge_connect(&spec, requested, protocol)
     }
 }
 
@@ -244,5 +275,30 @@ mod tests {
             .materialize_bridge_bind(&spec, requested, PortProtocol::Tcp)
             .expect_err("foreign address should fail");
         assert!(err.contains("address is not assigned"));
+    }
+
+    #[test]
+    fn bridge_connect_to_registered_peer_rewrites_to_loopback() {
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let provider = SocketNamespaceProvider::new();
+        provider.create_namespace(&spec).expect("namespace");
+        let peer = SocketAddr::new(IpAddr::V4(spec.ipv4), 8080);
+        provider
+            .register_virtual_endpoint(
+                spec.bridge_id.clone(),
+                spec.namespace_id.clone().unwrap(),
+                peer,
+                PortProtocol::Tcp,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080),
+            )
+            .expect("register");
+
+        let target = provider
+            .resolve_bridge_connect(&spec, peer, PortProtocol::Tcp)
+            .expect("resolve");
+        assert_eq!(
+            target,
+            ConnectTarget::Host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080))
+        );
     }
 }
