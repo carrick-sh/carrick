@@ -1580,15 +1580,12 @@ pub mod host_signal {
         carrick_signal_core::child_watch::is_tracked(child_pid)
     }
     /// Guest `execve`: reset every mirrored host disposition to default, except
-    /// the signals the new image keeps ignored (the bits set in `ignored_mask`,
-    /// indexed by bit `signum` — the dispatcher's caller ABI). Because carrick
+    /// the signals the new image keeps ignored (`ignored`). Because carrick
     /// does not host-exec, the host process would otherwise keep catching/ignoring
     /// those signals after the emulated disposition was replaced. Delegates to the
     /// carrick-vmm-kvm glue (parallels HVF's reset).
-    pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
-        carrick_signal_core::host_glue::reset_routed_handlers_after_execve::<ActiveGlue>(
-            ignored_mask,
-        );
+    pub fn reset_routed_handlers_after_execve(ignored: carrick_abi::SigSet) {
+        carrick_signal_core::host_glue::reset_routed_handlers_after_execve::<ActiveGlue>(ignored);
     }
     /// Did a cross-process nudge arrive since the last drain? Delegates to the
     /// neutral ring core (the nudge handler in `carrick_vmm_kvm::kvm_xsig` set the
