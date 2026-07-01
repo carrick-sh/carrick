@@ -2601,6 +2601,10 @@ networks:
         logs.contains("udp_client_response=pong"),
         "service-to-service UDP probe did not complete\nlogs:\n{logs}"
     );
+    assert!(
+        logs.contains("udp_server_peer_0_bridge=true"),
+        "same-bridge UDP peer should be a bridge address\nlogs:\n{logs}"
+    );
 
     let host = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -2623,6 +2627,10 @@ networks:
     assert!(
         logs.contains("udp_server_request_1=ping"),
         "published UDP host packet did not reach server\nlogs:\n{logs}"
+    );
+    assert!(
+        logs.contains("udp_server_peer_1_gateway=true"),
+        "published UDP host packet should appear from the bridge gateway\nlogs:\n{logs}"
     );
     run_compose(
         &sock,
