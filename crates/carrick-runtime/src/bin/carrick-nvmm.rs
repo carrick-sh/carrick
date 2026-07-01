@@ -64,6 +64,7 @@ fn main() {
                 debug_state_path: None,
                 platform: carrick_spec::Platform::default(),
                 pid: carrick_spec::PidMode::default(),
+                hostname: None,
                 network: carrick_spec::NetworkNamespaceSpec::default(),
                 extra_hosts: Vec::new(),
                 uid: 0,

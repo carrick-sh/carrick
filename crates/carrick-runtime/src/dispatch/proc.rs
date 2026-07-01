@@ -367,6 +367,9 @@ pub(super) struct ProcState {
     /// would corrupt them (a class of bug carrick has hit before). Captured at
     /// exec; empty until then.
     pub env: Vec<Vec<u8>>,
+    /// Guest UTS hostname. This is per-dispatcher so container/network namespace
+    /// identity can diverge from the host-derived default.
+    pub guest_hostname: String,
     /// `personality(2)` execution-domain flags, recorded and echoed back.
     pub personality: u64,
     /// `prctl(PR_SET_DUMPABLE)` flag (default 1).
@@ -531,6 +534,7 @@ impl ProcState {
             binfmt_interpreted: false,
             native_x86_64: false,
             env: Vec::new(),
+            guest_hostname: crate::execute::guest_hostname().to_string(),
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
@@ -560,6 +564,10 @@ impl ProcState {
         } else {
             crate::vfs::GuestReportedArch::Aarch64
         }
+    }
+
+    pub(super) fn guest_hostname(&self) -> &str {
+        &self.guest_hostname
     }
 }
 
@@ -1668,22 +1676,25 @@ impl SyscallDispatcher {
 
         fn uname(this, cx, address: GuestPtr) {
             let memory = &mut *cx.memory;
-            // nodename is the runtime-resolved guest hostname (the macOS host's
-            // short name under --net=host; `carrick` fallback) so uname(2) agrees
-            // with /proc/sys/kernel/hostname and the /etc/hosts self-mapping.
+            // nodename is the dispatcher-owned guest hostname: a requested
+            // container UTS identity when present, otherwise the host-derived
+            // fallback. Keep it in lockstep with /proc/sys/kernel/hostname and
+            // the /etc/hosts self-mapping.
             // A binfmt-interpreted guest (x86_64 under Rosetta) reports x86_64;
             // otherwise native aarch64. The flag — not executable_path — is the
             // signal, because a faithful binfmt redirect keeps the program's own
             // identity (executable_path stays the target, as on real Linux). Both
             // carry the resolved nodename.
-            let nodename = crate::execute::guest_hostname();
-            let arch = this.proc.lock().reported_arch();
+            let proc = this.proc.lock();
+            let nodename = proc.guest_hostname().to_string();
+            let arch = proc.reported_arch();
+            drop(proc);
             let uts = match arch {
                 crate::vfs::GuestReportedArch::X86_64 => {
-                    LinuxUtsname::carrick_x86_64_with_nodename(nodename)
+                    LinuxUtsname::carrick_x86_64_with_nodename(&nodename)
                 }
                 crate::vfs::GuestReportedArch::Aarch64 => {
-                    LinuxUtsname::carrick_aarch64_with_nodename(nodename)
+                    LinuxUtsname::carrick_aarch64_with_nodename(&nodename)
                 }
             };
             memory.write_bytes(address.0, uts.abi_bytes())?;

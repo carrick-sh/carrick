@@ -13,6 +13,7 @@ use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
 use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 /// True when a runtime error means the ENTRYPOINT executable (or its loader)
@@ -259,6 +260,8 @@ impl Runtime {
                 }
 
                 let mut dispatcher = SyscallDispatcher::with_network(runtime_network.clone());
+                let guest_hostname = effective_guest_hostname(spec);
+                dispatcher.set_guest_hostname(guest_hostname.as_ref());
                 // Sandboxed container fs (extracted OCI layers on a cap-std
                 // overlay): forbid the execve host-fs fallback so a target
                 // absent from the container ENOENTs instead of escaping to the
@@ -279,6 +282,7 @@ impl Runtime {
                     &spec.network,
                     &hosts_entries,
                     &spec.extra_hosts,
+                    guest_hostname.as_ref(),
                 );
 
                 // Install custom bind mounts on dispatcher
@@ -363,12 +367,19 @@ impl Runtime {
                     rootfs.clone(),
                     spec.executable.clone(),
                 );
+                let guest_hostname = effective_guest_hostname(spec);
+                dispatcher.set_guest_hostname(guest_hostname.as_ref());
                 if let Some(cwd) = &spec.cwd {
                     dispatcher.set_cwd(cwd.as_str());
                 }
                 dispatcher.set_credentials(spec.uid, spec.gid);
 
-                install_fs_backend(&mut dispatcher, FsBackendKind::Memory).map_err(|e| {
+                install_fs_backend(
+                    &mut dispatcher,
+                    FsBackendKind::Memory,
+                    guest_hostname.as_ref(),
+                )
+                .map_err(|e| {
                     RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {}", e))
                 })?;
 
@@ -459,6 +470,7 @@ fn host_failure_fallback(reason: &str) -> anyhow::Result<Box<dyn FsBackend>> {
 fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
     kind: FsBackendKind,
+    guest_hostname: &str,
 ) -> anyhow::Result<()> {
     let mut host_seeded = false;
     let mut backend: Box<dyn FsBackend> = match kind {
@@ -482,6 +494,7 @@ fn install_fs_backend(
         &default_network,
         &[],
         &[],
+        guest_hostname,
     );
     let _ = dispatcher.set_fs_backend(backend);
     if host_seeded {
@@ -500,12 +513,21 @@ pub fn guest_hostname() -> &'static str {
     carrick_host::host_facts::host_short_hostname().unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
 }
 
+fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
+    spec.hostname
+        .as_deref()
+        .filter(|hostname| !hostname.is_empty())
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Borrowed(guest_hostname()))
+}
+
 fn seed_guest_baseline(
     backend: &mut dyn FsBackend,
     rootfs: Option<&RootFs>,
     network: &NetworkNamespaceSpec,
     network_hosts_entries: &[NetworkHostsEntry],
     extra_hosts: &[String],
+    guest_hostname: &str,
 ) {
     use std::net::ToSocketAddrs;
     for dir in [
@@ -562,7 +584,7 @@ fn seed_guest_baseline(
                 .iter()
                 .map(|entry| (entry.addr, entry.names.clone())),
             extra_hosts,
-            guest_hostname(),
+            guest_hostname,
         )
         .render();
     // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
@@ -620,7 +642,7 @@ fn seed_guest_baseline(
     // stale image hostname is exactly the bug.
     let _ = backend.set_file_contents(
         "/etc/hostname",
-        format!("{}\n", guest_hostname()).into_bytes(),
+        format!("{}\n", guest_hostname).into_bytes(),
     );
 }
 
@@ -722,6 +744,7 @@ mod exit_code_tests {
             &network,
             &[],
             &["db.local:10.12.0.7".to_string()],
+            "api-host",
         );
 
         let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
@@ -736,7 +759,7 @@ mod exit_code_tests {
         let mut backend = MemoryBackend::new();
         let network =
             NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
-        super::seed_guest_baseline(&mut backend, None, &network, &[], &[]);
+        super::seed_guest_baseline(&mut backend, None, &network, &[], &[], "api-host");
 
         let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
         assert!(
@@ -756,6 +779,7 @@ mod exit_code_tests {
             &network,
             &[],
             &["host.docker.internal:host-gateway".to_string()],
+            "api-host",
         );
 
         let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
@@ -776,6 +800,7 @@ mod exit_code_tests {
             &network,
             &[],
             &["host.docker.internal:10.12.0.7".to_string()],
+            "api-host",
         );
 
         let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
@@ -790,6 +815,23 @@ mod exit_code_tests {
         assert!(
             hosts.contains("172.31.0.1\tgateway.docker.internal\n"),
             "unoverridden gateway.docker.internal should still be generated:\n{hosts}"
+        );
+    }
+
+    #[test]
+    fn seed_guest_baseline_writes_requested_hostname_surfaces() {
+        let mut backend = MemoryBackend::new();
+        let network = NetworkNamespaceSpec::default();
+        super::seed_guest_baseline(&mut backend, None, &network, &[], &[], "api-host");
+
+        let hosts = String::from_utf8(backend.file_contents("/etc/hosts").unwrap()).unwrap();
+        assert!(
+            hosts.contains("127.0.1.1\tapi-host\n"),
+            "requested hostname missing from /etc/hosts:\n{hosts}"
+        );
+        assert_eq!(
+            backend.file_contents("/etc/hostname").unwrap(),
+            b"api-host\n"
         );
     }
 }

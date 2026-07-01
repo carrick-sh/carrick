@@ -41,6 +41,7 @@ pub(crate) struct CreateBody {
     pub tty: Option<bool>,
     pub open_stdin: Option<bool>,
     pub user: Option<String>,
+    pub hostname: Option<String>,
     pub entrypoint: Option<Vec<String>>,
     pub labels: Option<HashMap<String, String>>,
     pub volumes: Option<HashMap<String, serde_json::Value>>,
