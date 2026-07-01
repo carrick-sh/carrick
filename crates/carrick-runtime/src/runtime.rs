@@ -1389,7 +1389,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     }
                 };
                 waiter.ensure_full();
-                match waiter.wait(&[], Some(slice), block_mask) {
+                match waiter.wait(&[], Some(slice), block_mask.raw()) {
                     WaitResult::Ready => continue,
                     WaitResult::Interrupted => {
                         // An unblocked pending signal OUTSIDE the wait set must

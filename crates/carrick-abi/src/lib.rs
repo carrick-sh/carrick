@@ -255,6 +255,118 @@ pub const LINUX_SIGIO: i32 = 29; // macOS 23 (a.k.a. SIGPOLL)
 pub const LINUX_SIGPWR: i32 = 30; // no macOS equivalent
 pub const LINUX_SIGSYS: i32 = 31; // macOS 12
 
+/// A Linux signal SET: bit `signum - 1` for signums `1..=64` (the kernel's
+/// `sigset_t` wire layout for `LINUX_RT_SIGSET_SIZE == 8`). A typed set
+/// instead of a bare `u64` so "which signals" values can't be silently mixed
+/// with counts, masks-of-other-things, or the wrong polarity (see
+/// [`SigBlockMask`]).
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct SigSet(u64);
+
+impl SigSet {
+    pub const EMPTY: SigSet = SigSet(0);
+
+    /// From the kernel wire representation (a guest `sigset_t` read, a stored
+    /// per-thread mask).
+    #[inline]
+    pub const fn from_raw(bits: u64) -> Self {
+        SigSet(bits)
+    }
+
+    /// The kernel wire representation (to write a guest `sigset_t`, to hand a
+    /// waiter/backend boundary that speaks raw bits).
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// True iff `signum` (1..=64) is in the set; out-of-range is never in.
+    #[inline]
+    pub fn contains(self, signum: i32) -> bool {
+        match signum {
+            1..=64 => self.0 & (1u64 << (signum - 1)) != 0,
+            _ => false,
+        }
+    }
+
+    #[inline]
+    pub const fn union(self, other: SigSet) -> SigSet {
+        SigSet(self.0 | other.0)
+    }
+
+    #[inline]
+    pub const fn intersect(self, other: SigSet) -> SigSet {
+        SigSet(self.0 & other.0)
+    }
+
+    /// Every signal NOT in `self`.
+    #[inline]
+    pub const fn complement(self) -> SigSet {
+        SigSet(!self.0)
+    }
+}
+
+impl core::fmt::Debug for SigSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "SigSet({:#x})", self.0)
+    }
+}
+
+/// Signals that must NOT wake a parked signal wait — the OPPOSITE polarity of
+/// [`SigSet`] as a wait/wake set, kept as a distinct type because confusing
+/// the two is exactly how `rt_sigtimedwait(set=∅)` wedged forever (the park
+/// blocked `!wait_set` = everything). There is deliberately NO general
+/// `from_raw`: a block mask can only be built by the named semantic
+/// constructors, so every construction site states what may and may not wake
+/// the park.
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct SigBlockMask(u64);
+
+impl SigBlockMask {
+    /// Nothing blocked: any pending signal wakes the park.
+    pub const NONE: SigBlockMask = SigBlockMask(0);
+
+    /// The park for `rt_sigtimedwait`/`sigwait`: a WAIT-SET signal always
+    /// wakes (sigtimedwait dequeues signals even while blocked — the
+    /// canonical block-then-wait usage); an unblocked CAUGHT signal outside
+    /// the set wakes to EINTR the wait; a signal that is EITHER blocked by
+    /// the thread's mask OR currently ignored-at-delivery must do neither.
+    #[inline]
+    pub const fn for_signal_wait(
+        wait_set: SigSet,
+        thread_mask: SigSet,
+        ignored_dispositions: SigSet,
+    ) -> SigBlockMask {
+        SigBlockMask(!wait_set.0 & (thread_mask.0 | ignored_dispositions.0))
+    }
+
+    /// Everything that must NOT complete the wait with EINTR: the wait set
+    /// itself (a wake for it re-dispatches and dequeues) plus this mask.
+    /// `for_signal_wait`'s output is `!wait_set & …`, so the union is exactly
+    /// `wait_set | thread_mask | ignored` restricted to non-set signals.
+    #[inline]
+    pub const fn non_eintr_union(self, wait_set: SigSet) -> SigSet {
+        SigSet(self.0 | wait_set.0)
+    }
+
+    /// The waiter/backend boundary representation (bit `signum-1` blocked).
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for SigBlockMask {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "SigBlockMask({:#x})", self.0)
+    }
+}
+
 /// `SIG_DFL` / `SIG_IGN` handler sentinel values stored in `sa_handler`.
 pub const LINUX_SIG_DFL: u64 = 0;
 pub const LINUX_SIG_IGN: u64 = 1;

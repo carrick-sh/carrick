@@ -1304,14 +1304,15 @@ pub enum DispatchOutcome {
     /// wait with EINTR after its handler is delivered (sigtimedwait is never
     /// restarted, even under SA_RESTART — signal(7)).
     WaitOnSignals {
-        wait_set: u64,
-        /// Signals that must NOT wake the park: outside `wait_set` AND blocked
-        /// by the thread's persistent mask (`!wait_set & thread_mask`,
-        /// precomputed at dispatch). Passing `!wait_set` here was the
-        /// empty-set hang: `rt_sigtimedwait(set=∅, NULL)` blocked every
-        /// signal, so the unblocked caught signal that must EINTR the wait
-        /// (LTP sigtimedwait01 et al.) could never wake the waiter.
-        block_mask: u64,
+        wait_set: carrick_abi::SigSet,
+        /// Signals that must NOT wake the park
+        /// ([`carrick_abi::SigBlockMask::for_signal_wait`], precomputed at
+        /// dispatch). The distinct TYPE exists because passing `!wait_set`
+        /// here was the empty-set hang: `rt_sigtimedwait(set=∅, NULL)`
+        /// blocked every signal, so the unblocked caught signal that must
+        /// EINTR the wait (LTP sigtimedwait01 et al.) could never wake the
+        /// waiter.
+        block_mask: carrick_abi::SigBlockMask,
         timeout: Option<Duration>,
     },
     /// A relative sleep (`nanosleep`/`clock_nanosleep`). The run loop performs
