@@ -730,27 +730,28 @@ impl SyscallDispatcher {
     /// pending state, while this sees the dispatcher's per-thread and shared
     /// process pending sets.
     ///
-    /// `mask_replaces` selects the wait's effective block mask. For
-    /// `ppoll`/`pselect6`/`epoll_pwait`, `block_mask` is a POSIX sigmask that
-    /// REPLACES the thread mask for the wait, so it is used ALONE — a signal the
-    /// temp mask unblocks must interrupt even if persistently blocked (probe
-    /// `ppollunblock`). For a plain `read`/`recv`/`connect` (additive; `block_mask`
-    /// is `0`), the thread's PERSISTENT mask gates the wait — a blocked-and-pending
-    /// signal must NOT interrupt it (probe `maskfork`). Unioning the two would
-    /// over-block the ppoll-unblock case, so the choice is explicit per call site.
+    /// `sig_mask` selects the wait's effective block mask. For
+    /// `ppoll`/`pselect6`/`epoll_pwait`, [`WaitSigMask::Replace`] carries a
+    /// POSIX sigmask that REPLACES the thread mask for the wait, so it is used
+    /// ALONE — a signal the temp mask unblocks must interrupt even if
+    /// persistently blocked (probe `ppollunblock`). For a plain
+    /// `read`/`recv`/`connect` ([`WaitSigMask::Additive`], usually with an
+    /// empty set), the thread's PERSISTENT mask gates the wait — a
+    /// blocked-and-pending signal must NOT interrupt it (probe `maskfork`).
+    /// Unioning the two would over-block the ppoll-unblock case, so the policy
+    /// travels with the outcome as the enum variant.
     pub(crate) fn has_deliverable_dispatch_pending_for_wait(
         &self,
         tid: crate::thread::ThreadId,
-        block_mask: u64,
-        mask_replaces: bool,
+        sig_mask: carrick_abi::WaitSigMask,
     ) -> bool {
+        use carrick_abi::WaitSigMask;
         let always_deliverable =
             sigmask_bit(LINUX_SIGKILL).unwrap_or(0) | sigmask_bit(LINUX_SIGSTOP).unwrap_or(0);
         let signal = self.signal.lock();
-        let effective_block_mask = if mask_replaces {
-            block_mask
-        } else {
-            signal.mask_for(tid) | block_mask
+        let effective_block_mask = match sig_mask {
+            WaitSigMask::Replace(s) => s.raw(),
+            WaitSigMask::Additive(s) => signal.mask_for(tid) | s.raw(),
         };
         let pending = signal.pendings.get(&tid).copied().unwrap_or(0) | signal.process_pending;
         pending & (!effective_block_mask | always_deliverable) != 0
@@ -804,11 +805,16 @@ impl SyscallDispatcher {
     ) -> bool {
         // Everything that must NOT produce EINTR: the wait set itself (handled
         // by re-dispatch) plus the blocked/ignored remainder the block mask
-        // already encodes.
-        let non_eintr = block_mask.non_eintr_union(wait_set).raw();
-        crate::host_signal::has_unblocked_pending_for(tid, non_eintr)
-            || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_eintr)
-            || self.has_deliverable_dispatch_pending_for_wait(tid, non_eintr, true)
+        // already encodes. That union is already the wait's COMPLETE effective
+        // mask, so hand it to the dispatch-pending predicate as `Replace` (the
+        // persistent thread mask is folded in, not unioned again).
+        let non_eintr = block_mask.non_eintr_union(wait_set);
+        crate::host_signal::has_unblocked_pending_for(tid, non_eintr.raw())
+            || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_eintr.raw())
+            || self.has_deliverable_dispatch_pending_for_wait(
+                tid,
+                carrick_abi::WaitSigMask::Replace(non_eintr),
+            )
     }
 
     /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
@@ -2162,6 +2168,8 @@ mod tests {
 
     #[test]
     fn wait_predicate_sees_shared_process_pending() {
+        use carrick_abi::{SigSet, WaitSigMask};
+
         let d = SyscallDispatcher::new();
         let tid: crate::thread::ThreadId = 42;
         let usr1 = 10;
@@ -2169,21 +2177,26 @@ mod tests {
 
         d.mark_process_signal_pending(usr1);
 
-        // Additive (read/recv, block_mask=0, mask_replaces=false): an UNBLOCKED
-        // pending signal is deliverable and interrupts the wait.
-        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, 0, false));
+        // Additive (read/recv, empty extra set): an UNBLOCKED pending signal is
+        // deliverable and interrupts the wait.
+        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::NONE));
         // Replace (ppoll/pselect/epoll_pwait): a signal the temp mask BLOCKS does
         // not interrupt.
-        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, blocked, true));
+        assert!(!d.has_deliverable_dispatch_pending_for_wait(
+            tid,
+            WaitSigMask::Replace(SigSet::from_raw(blocked))
+        ));
         d.restore_signal_mask(tid, blocked);
         // Additive: a signal blocked by the thread's PERSISTENT mask must NOT
         // interrupt a plain read — this is the `maskfork` invariant.
-        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, 0, false));
+        assert!(!d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::NONE));
         // Replace: an EMPTY temp mask UNBLOCKS that persistently-blocked pending
         // signal, so it MUST be deliverable — POSIX ppoll/pselect replace
         // semantics. Unioning the persistent mask would wrongly suppress it; this
         // guards the `ppollunblock` regression.
-        assert!(d.has_deliverable_dispatch_pending_for_wait(tid, 0, true));
+        assert!(
+            d.has_deliverable_dispatch_pending_for_wait(tid, WaitSigMask::Replace(SigSet::EMPTY))
+        );
     }
 
     #[test]

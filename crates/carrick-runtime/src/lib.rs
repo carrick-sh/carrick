@@ -736,12 +736,11 @@ pub mod runtime {
                     fds,
                     timeout,
                     on_timeout,
-                    block_signals,
-                    // The synchronous waiter blocks `block_signals` directly; the
-                    // additive-vs-replace metadata is for the threaded dispatcher
-                    // pending-signal predicate only.
-                    mask_replaces: _,
-                } => match waiter.wait(&fds, timeout, block_signals) {
+                    // The synchronous waiter blocks the raw mask bits directly;
+                    // the additive-vs-replace policy is for the threaded
+                    // dispatcher pending-signal predicate only.
+                    sig_mask,
+                } => match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -755,8 +754,7 @@ pub mod runtime {
                     fds,
                     timeout,
                     on_timeout,
-                    block_signals,
-                    mask_replaces: _,
+                    sig_mask,
                 } => {
                     let timeout = match timeout {
                         Some(duration) => {
@@ -773,7 +771,7 @@ pub mod runtime {
                             None
                         }
                     };
-                    match waiter.wait_poll(&fds, timeout, block_signals) {
+                    match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
                         WaitResult::Ready => continue,
                         WaitResult::TimedOut => {
                             return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -787,10 +785,9 @@ pub mod runtime {
                 DispatchOutcome::WaitOnFdsSelect {
                     fds,
                     timeout,
-                    block_signals,
+                    sig_mask,
                     clear_on_timeout,
-                    mask_replaces: _,
-                } => match waiter.wait(&fds, timeout, block_signals) {
+                } => match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         // select returns 0 with the fd-sets zeroed; the handler
@@ -880,11 +877,11 @@ pub mod runtime {
                         WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                     }
                 }
-                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                     // wait4/waitid on a child. The single-vCPU backend has no
                     // guest children yet (fork/clone is Phase D), so this is a
                     // clean ECHILD rather than a hang.
-                    match waiter.wait_proc_exit(pid, block_signals) {
+                    match waiter.wait_proc_exit(pid, sig_mask.raw_block_bits()) {
                         WaitResult::Ready => continue,
                         WaitResult::Interrupted | WaitResult::TimedOut => {
                             return Ok(DispatchOutcome::Errno {

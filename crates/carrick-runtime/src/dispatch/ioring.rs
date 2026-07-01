@@ -447,8 +447,7 @@ impl SyscallDispatcher {
                             fds: WaitFds::raw_one(host_fd, events),
                             timeout: None,
                             on_timeout: 0,
-                            block_signals: 0,
-                            mask_replaces: false,
+                            sig_mask: carrick_abi::WaitSigMask::NONE,
                         };
                     }
                 },

@@ -1269,11 +1269,10 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 fds,
                 timeout,
                 on_timeout,
-                block_signals,
-                mask_replaces: _,
+                sig_mask,
             } => {
                 waiter.ensure_full();
-                match waiter.wait(&fds, timeout, block_signals) {
+                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -1291,12 +1290,11 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
             DispatchOutcome::WaitOnFdsSelect {
                 fds,
                 timeout,
-                block_signals,
-                mask_replaces: _,
+                sig_mask,
                 clear_on_timeout,
             } => {
                 waiter.ensure_full();
-                match waiter.wait(&fds, timeout, block_signals) {
+                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
                     // A fd became ready -> re-dispatch; the handler re-reads the
                     // (untouched) input sets and reports the now-ready fds.
                     WaitResult::Ready => continue,
@@ -1323,8 +1321,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 fds,
                 timeout,
                 on_timeout,
-                block_signals,
-                mask_replaces: _,
+                sig_mask,
             } => {
                 waiter.ensure_full();
                 let timeout = match timeout {
@@ -1342,7 +1339,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         None
                     }
                 };
-                match waiter.wait_poll(&fds, timeout, block_signals) {
+                match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -1357,9 +1354,9 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
             }
-            DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+            DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 waiter.ensure_full();
-                match waiter.wait_proc_exit(pid, block_signals) {
+                match waiter.wait_proc_exit(pid, sig_mask.raw_block_bits()) {
                     // Ready (child exited) -> re-dispatch the waitid to reap.
                     WaitResult::Ready => continue,
                     // Interrupted (signal/quiesce) -> EINTR; the guest re-issues.

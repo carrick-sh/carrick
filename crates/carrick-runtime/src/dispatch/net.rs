@@ -835,8 +835,7 @@ impl SyscallDispatcher {
                         fds: WaitFds::raw_one(host_fd, dir.events()),
                         timeout,
                         on_timeout: -(LINUX_EAGAIN as i64),
-                        block_signals: 0,
-                        mask_replaces: false,
+                        sig_mask: carrick_abi::WaitSigMask::NONE,
                     }
                 }
             }
@@ -1549,8 +1548,7 @@ impl SyscallDispatcher {
                 fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
                 timeout: None,
                 on_timeout: -(LINUX_EINPROGRESS as i64),
-                block_signals: 0,
-                mask_replaces: false,
+                sig_mask: carrick_abi::WaitSigMask::NONE,
             };
         }
         e.into()
@@ -2087,6 +2085,14 @@ impl SyscallDispatcher {
                 }
             } else {
                 0
+            };
+            // epoll_pwait's sigmask (when present) REPLACES the thread's
+            // persistent mask for the wait; epoll_wait (NULL mask) is a plain
+            // additive wait.
+            let sig_mask = if sigmask_ptr != 0 {
+                carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_signals))
+            } else {
+                carrick_abi::WaitSigMask::NONE
             };
 
             let Some(open_file) = this.open_file(epfd) else {
@@ -2627,8 +2633,7 @@ impl SyscallDispatcher {
                         fds: WaitFds::raw_one(kq_fd, 0),
                         timeout,
                         on_timeout: 0,
-                        block_signals,
-                        mask_replaces: sigmask_ptr != 0,
+                        sig_mask,
                     });
                 }
                 if !has_interests {
@@ -2640,8 +2645,7 @@ impl SyscallDispatcher {
                         fds: WaitFds::empty(),
                         timeout,
                         on_timeout: 0,
-                        block_signals,
-                        mask_replaces: sigmask_ptr != 0,
+                        sig_mask,
                     });
                 }
                 crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
@@ -2654,8 +2658,7 @@ impl SyscallDispatcher {
                     fds: WaitFds::raw_one(kq_fd, libc::POLLIN),
                     timeout,
                     on_timeout: 0,
-                    block_signals,
-                    mask_replaces: sigmask_ptr != 0,
+                    sig_mask,
                 });
             }
 
@@ -2720,6 +2723,14 @@ impl SyscallDispatcher {
                 }
             } else {
                 0
+            };
+            // pselect6's sigmask (when the outer argpack pointer is non-NULL)
+            // REPLACES the thread's persistent mask for the wait; select /
+            // NULL-mask pselect6 is a plain additive wait.
+            let sig_mask = if sigmask_addr != 0 {
+                carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_signals))
+            } else {
+                carrick_abi::WaitSigMask::NONE
             };
 
             // Decode timespec → millis for libc::poll. NULL = block forever (-1).
@@ -2860,8 +2871,7 @@ impl SyscallDispatcher {
                     fds: WaitFds::empty(),
                     timeout,
                     on_timeout: 0,
-                    block_signals,
-                    mask_replaces: sigmask_addr != 0,
+                    sig_mask,
                 });
             } else if let Some(host_fds) = all_host {
                 let mut pollfds: Vec<libc::pollfd> = host_fds
@@ -2917,8 +2927,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::WaitOnFdsSelect {
                         fds: WaitFds::raw(wait_fds),
                         timeout,
-                        block_signals,
-                        mask_replaces: sigmask_addr != 0,
+                        sig_mask,
                         clear_on_timeout,
                     });
                 }
@@ -3122,6 +3131,14 @@ impl SyscallDispatcher {
             } else {
                 0
             };
+            // ppoll's sigmask (when present) REPLACES the thread's persistent
+            // mask for the wait; poll(2) / NULL-mask ppoll is a plain additive
+            // wait.
+            let sig_mask = if !is_poll && sigmask_addr != 0 {
+                carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_signals))
+            } else {
+                carrick_abi::WaitSigMask::NONE
+            };
 
             // Read all the pollfds up front so we can route them. Fast path:
             // every fd in the set maps to a host fd (stdio bare, HostPipe, or
@@ -3213,8 +3230,7 @@ impl SyscallDispatcher {
                     fds: WaitFds::raw(wait_fds),
                     timeout,
                     on_timeout: 0,
-                    block_signals,
-                    mask_replaces: !is_poll && sigmask_addr != 0,
+                    sig_mask,
                 });
             }
 
@@ -3660,8 +3676,7 @@ impl SyscallDispatcher {
                     fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
                     timeout: None,
                     on_timeout: -(LINUX_EINPROGRESS as i64),
-                    block_signals: 0,
-                    mask_replaces: false,
+                    sig_mask: carrick_abi::WaitSigMask::NONE,
                 });
             }
             if is_unspec_disconnect && (e == LINUX_EAFNOSUPPORT || e == LINUX_EINVAL) {
