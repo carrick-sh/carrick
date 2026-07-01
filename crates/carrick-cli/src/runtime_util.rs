@@ -116,6 +116,12 @@ pub(crate) fn parse_publish_specs(
             ),
             None => None,
         };
+        if network == carrick_spec::NetworkMode::Bridge && proto == carrick_spec::PortProtocol::Udp
+        {
+            anyhow::bail!(
+                "-p {spec:?}: published UDP ports are not supported by --net bridge's socket namespace provider"
+            );
+        }
         if network == carrick_spec::NetworkMode::Host {
             let Some(host_port) = host_port else {
                 anyhow::bail!(
@@ -339,12 +345,13 @@ mod tests {
     }
 
     #[test]
-    fn bridge_publish_accepts_udp() {
-        let mappings = parse_publish_specs(NetworkMode::Bridge, &["5353:53/udp".to_string()])
-            .expect("udp publish should parse");
-        assert_eq!(mappings[0].protocol, PortProtocol::Udp);
-        assert_eq!(mappings[0].host_port, Some(5353));
-        assert_eq!(mappings[0].container_port, 53);
+    fn bridge_publish_rejects_udp() {
+        let err = parse_publish_specs(NetworkMode::Bridge, &["5353:53/udp".to_string()])
+            .expect_err("v1 bridge provider should reject published UDP ports");
+        assert!(
+            err.to_string()
+                .contains("published UDP ports are not supported by --net bridge")
+        );
     }
 
     #[test]
