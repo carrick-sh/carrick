@@ -20,7 +20,17 @@ pub(crate) struct CreateContainerOpts<'a> {
     pub interactive: bool,
     pub user: Option<&'a str>,
     pub entrypoint: Option<&'a [String]>,
+    pub auto_remove: bool,
     pub binds: &'a [String],
+    pub mount_specs: &'a [String],
+    pub publish_specs: &'a [String],
+    pub network: Option<&'a str>,
+    pub network_aliases: &'a [String],
+    pub extra_hosts: &'a [String],
+    pub dns_servers: &'a [String],
+    pub dns_search: &'a [String],
+    pub dns_options: &'a [String],
+    pub volumes_from: &'a [String],
 }
 
 pub(crate) fn create_container(
@@ -60,8 +70,38 @@ pub(crate) fn create_container(
     {
         c.arg("--entrypoint").arg(first);
     }
+    if opts.auto_remove {
+        c.arg("--rm");
+    }
     for b in opts.binds {
         c.arg("-v").arg(b);
+    }
+    for m in opts.mount_specs {
+        c.arg("--mount").arg(m);
+    }
+    for p in opts.publish_specs {
+        c.arg("-p").arg(p);
+    }
+    if let Some(network) = opts.network {
+        c.arg("--network").arg(network);
+    }
+    for alias in opts.network_aliases {
+        c.arg("--network-alias").arg(alias);
+    }
+    for host in opts.extra_hosts {
+        c.arg("--add-host").arg(host);
+    }
+    for server in opts.dns_servers {
+        c.arg("--dns").arg(server);
+    }
+    for search in opts.dns_search {
+        c.arg("--dns-search").arg(search);
+    }
+    for option in opts.dns_options {
+        c.arg("--dns-option").arg(option);
+    }
+    for source in opts.volumes_from {
+        c.arg("--volumes-from").arg(source);
     }
     c.arg(image);
     for a in cmd {
@@ -97,7 +137,9 @@ pub(crate) fn wait_container(id: &str, timeout: std::time::Duration) -> anyhow::
     let real = container::resolve(id).map_err(|e| anyhow::anyhow!(e))?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let state = container::ContainerState::load(&real)?;
+        let Ok(state) = container::ContainerState::load(&real) else {
+            return Ok(0);
+        };
         if matches!(
             container::reconciled_status(&state),
             container::ContainerStatus::Exited
@@ -111,16 +153,20 @@ pub(crate) fn wait_container(id: &str, timeout: std::time::Duration) -> anyhow::
     }
 }
 
-/// Remove a container: `carrick rm -f <id>` (force-kills if running, then drops
-/// the registry entry). Reused rather than reimplemented so kill/grace/cleanup
-/// stay identical to the CLI.
-pub(crate) fn remove_container(id: &str) -> anyhow::Result<()> {
+/// Remove a container: `carrick rm [-f] <id>`. Reused rather than reimplemented
+/// so kill/grace/cleanup stay identical to the CLI.
+pub(crate) fn remove_container(id: &str, force: bool) -> anyhow::Result<()> {
     let real = container::resolve(id).map_err(|e| anyhow::anyhow!(e))?;
     // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
     // itself (current_exe) with operator-controlled API inputs as separate argv
     // entries, never a shell; a CLI that re-execs itself is expected here.
     let exe = std::env::current_exe()?;
-    let out = Command::new(exe).arg("rm").arg("-f").arg(&real).output()?;
+    let mut command = Command::new(exe);
+    command.arg("rm");
+    if force {
+        command.arg("-f");
+    }
+    let out = command.arg(&real).output()?;
     if !out.status.success() {
         anyhow::bail!(
             "carrick rm failed: {}",

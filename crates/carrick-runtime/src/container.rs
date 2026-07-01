@@ -56,6 +56,13 @@ pub struct ContainerState {
     pub exit_code: Option<i32>,
     /// `--rm`: remove the registry entry when the container exits.
     pub auto_remove: bool,
+    /// Docker API `HostConfig.AutoRemove`: the API server owns delayed cleanup so
+    /// attach can drain logs before the registry directory disappears.
+    #[serde(default)]
+    pub api_auto_remove: bool,
+    /// Docker/API-facing labels used for container discovery and filtering.
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
     /// Run configuration needed to `exec` into (and later restart) this
     /// container. Additive: `#[serde(default)]` so registry entries written
     /// before this field existed still load.
@@ -83,6 +90,37 @@ pub struct RunConfig {
     /// Container network mode.
     #[serde(default)]
     pub network: carrick_spec::NetworkMode,
+    /// Bridge-network service aliases.
+    #[serde(default)]
+    pub network_aliases: Vec<String>,
+    /// Docker/API-facing network attachment names and per-network aliases. The
+    /// runtime still has one bridge namespace today; this preserves the Engine
+    /// API resource names Compose clients reconcile against.
+    #[serde(default)]
+    pub network_attachments: Vec<NetworkAttachment>,
+    /// Docker-compatible `--network container:<id>` target. Today the runtime
+    /// lowers this to the target's effective host/bridge/none mode, while this
+    /// field preserves the shared-network relationship for API presentation and
+    /// a future true namespace join.
+    #[serde(default)]
+    pub network_container: Option<String>,
+    /// Docker-compatible extra `/etc/hosts` entries (`--add-host` /
+    /// HostConfig.ExtraHosts), preserved across start and exec.
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
+    /// Docker-compatible resolver overrides, preserved across start and exec.
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+    #[serde(default)]
+    pub dns_search: Vec<String>,
+    #[serde(default)]
+    pub dns_options: Vec<String>,
+    /// Docker-compatible `--volumes-from` / HostConfig.VolumesFrom entries,
+    /// preserved for inspect. The inherited mounts themselves are materialized
+    /// into `mounts` at create time so start/restart do not depend on mutable
+    /// source-container state.
+    #[serde(default)]
+    pub volumes_from: Vec<String>,
     /// Published ports requested at create/run time.
     #[serde(default)]
     pub published_ports: Vec<carrick_spec::PortMapping>,
@@ -123,6 +161,27 @@ fn default_max_traps() -> usize {
     crate::runtime::DEFAULT_MAX_TRAPS
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkAttachment {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub links: Vec<String>,
+    #[serde(default)]
+    pub mac_address: Option<String>,
+    #[serde(default)]
+    pub gw_priority: i64,
+    #[serde(default)]
+    pub ipv4_address: Option<String>,
+    #[serde(default)]
+    pub ipv6_address: Option<String>,
+    #[serde(default)]
+    pub link_local_ips: Vec<String>,
+    #[serde(default)]
+    pub driver_opts: std::collections::HashMap<String, String>,
+}
+
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
@@ -132,6 +191,14 @@ impl Default for RunConfig {
             user: None,
             pid: carrick_spec::PidMode::default(),
             network: carrick_spec::NetworkMode::Host,
+            network_aliases: Vec::new(),
+            network_attachments: Vec::new(),
+            network_container: None,
+            extra_hosts: Vec::new(),
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dns_options: Vec::new(),
+            volumes_from: Vec::new(),
             published_ports: Vec::new(),
             scratch_path: None,
             region_path: None,
@@ -463,6 +530,8 @@ mod tests {
             created_secs: 0,
             exit_code: None,
             auto_remove: false,
+            api_auto_remove: false,
+            labels: std::collections::HashMap::new(),
             config: RunConfig::default(),
         };
         assert_eq!(reconciled_status(&s), ContainerStatus::Exited);

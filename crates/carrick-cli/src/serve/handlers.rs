@@ -3,13 +3,15 @@
 //! in a response with the right status.
 
 use crate::serve::model::{
-    ContainerSummary, CreateBody, CreateResponse, ExecCreateBody, ExecCreateResponse,
+    ContainerSummary, CreateBody, CreateHostConfig, CreateMount, CreateNetworkingConfig,
+    CreatePortBinding, CreateResponse, EndpointSettings, ExecCreateBody, ExecCreateResponse,
     ExecInspectResponse, ExecStartBody, HostConfigSummary, ImageInspectResponse, ImageSummary,
     InfoResponse, NetworkSettingsSummary, TopResponse, VersionResponse, WaitResponse,
 };
 use hyper::body::{Bytes, Frame};
 use hyper::{Response, StatusCode};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
@@ -46,12 +48,57 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
     };
     let cmd = req.cmd.unwrap_or_default();
     let env = req.env.unwrap_or_default();
+    let labels = req.labels.unwrap_or_default();
+    let host_config = req.host_config.as_ref();
     let binds = req
         .host_config
         .as_ref()
         .and_then(|hc| hc.binds.as_ref())
         .cloned()
         .unwrap_or_default();
+    let mount_specs = match create_mount_specs(
+        req.volumes.as_ref(),
+        host_config.and_then(|hc| hc.mounts.as_deref()),
+    ) {
+        Ok(m) => m,
+        Err(e) => return (400, error_json(&e)),
+    };
+    let publish_specs = match publish_specs_from_port_bindings(
+        host_config.and_then(|hc| hc.port_bindings.as_ref()),
+    ) {
+        Ok(p) => p,
+        Err(e) => return (400, error_json(&e)),
+    };
+    let api_auto_remove = host_config.and_then(|hc| hc.auto_remove).unwrap_or(false);
+    let extra_hosts = host_config
+        .and_then(|hc| hc.extra_hosts.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let dns_servers = host_config
+        .and_then(|hc| hc.dns.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let dns_search = host_config
+        .and_then(|hc| hc.dns_search.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let dns_options = host_config
+        .and_then(|hc| hc.dns_options.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let volumes_from = host_config
+        .and_then(|hc| hc.volumes_from.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let network = match create_network_selection(
+        host_config,
+        req.networking_config.as_ref(),
+        !publish_specs.is_empty(),
+    ) {
+        Ok(n) => n,
+        Err(e) => return (400, error_json(&e)),
+    };
+    let network_aliases = network.flat_aliases();
     let opts = crate::serve::spawn::CreateContainerOpts {
         name,
         env: &env,
@@ -60,12 +107,31 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
         interactive: req.open_stdin.unwrap_or(false),
         user: req.user.as_deref(),
         entrypoint: req.entrypoint.as_deref(),
+        auto_remove: false,
         binds: &binds,
+        mount_specs: &mount_specs,
+        publish_specs: &publish_specs,
+        network: network.cli_mode.as_deref(),
+        network_aliases: &network_aliases,
+        extra_hosts: &extra_hosts,
+        dns_servers: &dns_servers,
+        dns_search: &dns_search,
+        dns_options: &dns_options,
+        volumes_from: &volumes_from,
     };
     match crate::serve::spawn::create_container(&image, &cmd, &opts) {
         // `id` is the 64-hex container id `carrick create` generated; the Docker
         // `Id` is always that id, not the (optional) name.
         Ok(id) => {
+            if let Err(e) = persist_api_container_metadata(
+                &id,
+                &network.attachments,
+                network.network_container.as_deref(),
+                &labels,
+                api_auto_remove,
+            ) {
+                return (500, error_json(&e.to_string()));
+            }
             let resp = CreateResponse {
                 id,
                 warnings: vec![],
@@ -77,6 +143,306 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
         }
         Err(e) => (500, error_json(&e.to_string())),
     }
+}
+
+struct CreateNetworkSelection {
+    cli_mode: Option<String>,
+    attachments: Vec<carrick_runtime::container::NetworkAttachment>,
+    network_container: Option<String>,
+}
+
+impl CreateNetworkSelection {
+    fn flat_aliases(&self) -> Vec<String> {
+        let mut aliases = Vec::new();
+        for attachment in &self.attachments {
+            for alias in &attachment.aliases {
+                if !aliases.contains(alias) {
+                    aliases.push(alias.clone());
+                }
+            }
+        }
+        aliases
+    }
+}
+
+fn create_mount_specs(
+    volumes: Option<&HashMap<String, serde_json::Value>>,
+    mounts: Option<&[CreateMount]>,
+) -> Result<Vec<String>, String> {
+    let mut specs = Vec::new();
+    if let Some(volumes) = volumes {
+        let mut targets: Vec<_> = volumes.keys().collect();
+        targets.sort();
+        for target in targets {
+            let (_name, host_source) =
+                crate::serve::resources::create_anonymous_volume_mountpoint()
+                    .map_err(|e| e.to_string())?;
+            specs.push(format!("type=bind,source={host_source},target={target}"));
+        }
+    }
+    if let Some(mounts) = mounts {
+        for mount in mounts {
+            let source = mount
+                .source
+                .as_deref()
+                .ok_or_else(|| "mount missing Source".to_string())?;
+            let target = mount
+                .target
+                .as_deref()
+                .ok_or_else(|| "mount missing Target".to_string())?;
+            let typ = mount.typ.as_deref().unwrap_or("bind");
+            let host_source = match typ {
+                "bind" => source.to_string(),
+                "volume" => crate::serve::resources::resolve_or_create_volume_mountpoint(source)
+                    .map_err(|e| e.to_string())?,
+                other => {
+                    return Err(format!(
+                        "unsupported mount type {other:?}; expected bind or volume"
+                    ));
+                }
+            };
+            let mut spec = format!("type=bind,source={host_source},target={target}");
+            if mount.read_only.unwrap_or(false) {
+                spec.push_str(",readonly");
+            }
+            specs.push(spec);
+        }
+    }
+    Ok(specs)
+}
+
+fn publish_specs_from_port_bindings(
+    bindings: Option<&HashMap<String, Option<Vec<CreatePortBinding>>>>,
+) -> Result<Vec<String>, String> {
+    let Some(bindings) = bindings else {
+        return Ok(Vec::new());
+    };
+    let mut specs = Vec::new();
+    let mut entries: Vec<_> = bindings.iter().collect();
+    entries.sort_by_key(|(container, _)| *container);
+    for (container, host_bindings) in entries {
+        let (container_port, proto) = parse_container_port_key(container)?;
+        let host_bindings = host_bindings.as_deref().unwrap_or(&[]);
+        if host_bindings.is_empty() {
+            specs.push(format!("{container_port}/{proto}"));
+            continue;
+        }
+        for binding in host_bindings {
+            let host_port = binding
+                .host_port
+                .as_deref()
+                .filter(|port| !port.is_empty())
+                .ok_or_else(|| format!("port binding for {container:?} missing HostPort"))?;
+            if let Some(host_ip) = binding.host_ip.as_deref().filter(|ip| !ip.is_empty()) {
+                specs.push(format!("{host_ip}:{host_port}:{container_port}/{proto}"));
+            } else {
+                specs.push(format!("{host_port}:{container_port}/{proto}"));
+            }
+        }
+    }
+    Ok(specs)
+}
+
+fn parse_container_port_key(key: &str) -> Result<(u16, &str), String> {
+    let (port, proto) = key
+        .split_once('/')
+        .ok_or_else(|| format!("invalid PortBindings key {key:?}; expected port/proto"))?;
+    match proto {
+        "tcp" | "udp" => {}
+        other => {
+            return Err(format!(
+                "invalid PortBindings protocol {other:?}; expected tcp or udp"
+            ));
+        }
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("invalid PortBindings container port {port:?}"))?;
+    Ok((port, proto))
+}
+
+fn create_network_selection(
+    host_config: Option<&CreateHostConfig>,
+    networking: Option<&CreateNetworkingConfig>,
+    has_published_ports: bool,
+) -> Result<CreateNetworkSelection, String> {
+    let endpoint_attachments = create_network_attachments(networking);
+    let has_endpoint = !endpoint_attachments.is_empty();
+    match host_config.and_then(|hc| hc.network_mode.as_deref()) {
+        Some("none") if has_endpoint || has_published_ports => Err(
+            "network mode \"none\" cannot be combined with endpoints or published ports"
+                .to_string(),
+        ),
+        Some("none") => Ok(CreateNetworkSelection {
+            cli_mode: Some("none".to_string()),
+            attachments: Vec::new(),
+            network_container: None,
+        }),
+        Some("host") if !has_endpoint => Ok(CreateNetworkSelection {
+            cli_mode: Some("host".to_string()),
+            attachments: Vec::new(),
+            network_container: None,
+        }),
+        Some("host") | Some("bridge") if has_endpoint => Ok(CreateNetworkSelection {
+            cli_mode: Some("bridge".to_string()),
+            attachments: endpoint_attachments,
+            network_container: None,
+        }),
+        Some("bridge") => Ok(CreateNetworkSelection {
+            cli_mode: Some("bridge".to_string()),
+            attachments: Vec::new(),
+            network_container: None,
+        }),
+        Some(mode) if mode.starts_with("container:") => {
+            if has_endpoint || has_published_ports {
+                return Err(
+                    "network mode \"container\" cannot be combined with endpoints or published ports"
+                        .to_string(),
+                );
+            }
+            let target = mode
+                .strip_prefix("container:")
+                .filter(|target| !target.is_empty())
+                .ok_or_else(|| "network mode \"container\" requires a target".to_string())?;
+            let target_id = carrick_runtime::container::resolve(target)
+                .map_err(|_| format!("No such container: {target}"))?;
+            let target_state = carrick_runtime::container::ContainerState::load(&target_id)
+                .map_err(|e| e.to_string())?;
+            Ok(CreateNetworkSelection {
+                cli_mode: Some(effective_cli_network_mode(&target_state).to_string()),
+                attachments: Vec::new(),
+                network_container: Some(target_id),
+            })
+        }
+        Some(mode) if !mode.is_empty() => {
+            let attachments = if has_endpoint {
+                primary_network_first(endpoint_attachments, mode)
+            } else {
+                vec![carrick_runtime::container::NetworkAttachment {
+                    name: mode.to_string(),
+                    aliases: Vec::new(),
+                    links: Vec::new(),
+                    mac_address: None,
+                    gw_priority: 0,
+                    ipv4_address: None,
+                    ipv6_address: None,
+                    link_local_ips: Vec::new(),
+                    driver_opts: std::collections::HashMap::new(),
+                }]
+            };
+            Ok(CreateNetworkSelection {
+                cli_mode: Some("bridge".to_string()),
+                attachments,
+                network_container: None,
+            })
+        }
+        _ if has_endpoint => Ok(CreateNetworkSelection {
+            cli_mode: Some("bridge".to_string()),
+            attachments: endpoint_attachments,
+            network_container: None,
+        }),
+        _ if has_published_ports => Ok(CreateNetworkSelection {
+            cli_mode: Some("bridge".to_string()),
+            attachments: Vec::new(),
+            network_container: None,
+        }),
+        _ => Ok(CreateNetworkSelection {
+            cli_mode: None,
+            attachments: Vec::new(),
+            network_container: None,
+        }),
+    }
+}
+
+fn effective_cli_network_mode(state: &carrick_runtime::container::ContainerState) -> &'static str {
+    match state.config.network {
+        carrick_spec::NetworkMode::Bridge => "bridge",
+        carrick_spec::NetworkMode::Host => "host",
+        carrick_spec::NetworkMode::None => "none",
+    }
+}
+
+fn create_network_attachments(
+    networking: Option<&CreateNetworkingConfig>,
+) -> Vec<carrick_runtime::container::NetworkAttachment> {
+    let Some(endpoints) = networking.and_then(|n| n.endpoints_config.as_ref()) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = endpoints.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    entries
+        .into_iter()
+        .map(
+            |(name, endpoint)| carrick_runtime::container::NetworkAttachment {
+                name: name.clone(),
+                aliases: endpoint.aliases.clone().unwrap_or_default(),
+                links: endpoint.links.clone().unwrap_or_default(),
+                mac_address: endpoint.mac_address.clone(),
+                gw_priority: endpoint.gw_priority.unwrap_or(0),
+                ipv4_address: endpoint
+                    .ipam_config
+                    .as_ref()
+                    .and_then(|ipam| ipam.ipv4_address.clone()),
+                ipv6_address: endpoint
+                    .ipam_config
+                    .as_ref()
+                    .and_then(|ipam| ipam.ipv6_address.clone()),
+                link_local_ips: endpoint
+                    .ipam_config
+                    .as_ref()
+                    .and_then(|ipam| ipam.link_local_ips.clone())
+                    .unwrap_or_default(),
+                driver_opts: endpoint.driver_opts.clone().unwrap_or_default(),
+            },
+        )
+        .collect()
+}
+
+fn primary_network_first(
+    mut attachments: Vec<carrick_runtime::container::NetworkAttachment>,
+    primary: &str,
+) -> Vec<carrick_runtime::container::NetworkAttachment> {
+    let primary_name = crate::serve::resources::resolve_network_name(primary)
+        .unwrap_or_else(|| primary.to_string());
+    if let Some(index) = attachments
+        .iter()
+        .position(|attachment| attachment.name == primary_name)
+    {
+        attachments.swap(0, index);
+    }
+    attachments
+}
+
+fn persist_api_container_metadata(
+    id: &str,
+    attachments: &[carrick_runtime::container::NetworkAttachment],
+    network_container: Option<&str>,
+    labels: &HashMap<String, String>,
+    api_auto_remove: bool,
+) -> anyhow::Result<()> {
+    if attachments.is_empty()
+        && network_container.is_none()
+        && labels.is_empty()
+        && !api_auto_remove
+    {
+        return Ok(());
+    }
+    let mut state = carrick_runtime::container::ContainerState::load(id)?;
+    if !attachments.is_empty() {
+        state.config.network_attachments = attachments.to_vec();
+    }
+    if let Some(target) = network_container {
+        state.config.network_container = Some(target.to_string());
+    }
+    if !labels.is_empty() {
+        state.labels = labels.clone();
+    }
+    state.api_auto_remove = api_auto_remove;
+    state.persist()?;
+    if !attachments.is_empty() {
+        crate::serve::resources::attach_container_to_networks(&state)?;
+    }
+    Ok(())
 }
 
 /// Docker returns 204 No Content on a successful start.
@@ -103,10 +469,77 @@ pub(crate) fn wait_container(id: &str) -> (u16, String) {
     }
 }
 
+pub(crate) fn wait_container_stream(id: String) -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt;
+    use http_body_util::StreamBody;
+
+    let fallback = || {
+        Response::new(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+    };
+
+    let real_id = match carrick_runtime::container::resolve(&id) {
+        Ok(real_id) => real_id,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json")
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+
+    let state_for_cleanup = carrick_runtime::container::ContainerState::load(&real_id).ok();
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(1);
+    tokio::task::spawn_blocking(move || {
+        let (_status, body) = wait_container(&real_id);
+        if state_for_cleanup
+            .as_ref()
+            .is_some_and(|state| state.api_auto_remove)
+            && let Some(state) = state_for_cleanup.as_ref()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::serve::resources::detach_container_from_all_networks(state);
+            let _ = carrick_runtime::container::ContainerState::remove(&real_id);
+        }
+        let _ = tx.blocking_send(Ok(Frame::data(Bytes::from(body))));
+    });
+
+    let stream = crate::serve::build::ReceiverStream { rx };
+    let body = StreamBody::new(stream).boxed();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .unwrap_or_else(|_| fallback())
+}
+
 /// Docker returns 204 No Content on a successful remove.
-pub(crate) fn remove_container(id: &str) -> (u16, String) {
-    match crate::serve::spawn::remove_container(id) {
-        Ok(()) => (204, String::new()),
+pub(crate) fn remove_container(id: &str, force: bool, remove_volumes: bool) -> (u16, String) {
+    let state = carrick_runtime::container::resolve(id)
+        .ok()
+        .and_then(|real| carrick_runtime::container::ContainerState::load(&real).ok());
+    match crate::serve::spawn::remove_container(id, force) {
+        Ok(()) => {
+            if let Some(state) = state.as_ref() {
+                crate::serve::resources::detach_container_from_all_networks(state);
+                if remove_volumes
+                    && let Err(e) =
+                        crate::serve::resources::remove_anonymous_volumes_for_container(state)
+                {
+                    return (500, error_json(&e.to_string()));
+                }
+            }
+            (204, String::new())
+        }
+        Err(e) if e.to_string().contains("is running") => (409, error_json(&e.to_string())),
         Err(e) => (500, error_json(&e.to_string())),
     }
 }
@@ -118,20 +551,26 @@ pub(crate) fn error_json(msg: &str) -> String {
     )
 }
 
-pub(crate) fn list_containers(all: bool) -> (u16, String) {
+pub(crate) fn list_containers(all: bool, query: &str) -> (u16, String) {
+    let filters = crate::serve::resources::docker_filters(query);
     let mut containers = carrick_runtime::container::list();
     // Stable, newest-first by creation time.
     containers.sort_by_key(|c| std::cmp::Reverse(c.created_secs));
 
     let rows: Vec<ContainerSummary> = containers
         .iter()
-        .map(|c| {
+        .filter_map(|c| {
             let status = carrick_runtime::container::reconciled_status(c);
             let state_str = match status {
                 carrick_runtime::container::ContainerStatus::Created => "created",
                 carrick_runtime::container::ContainerStatus::Running => "running",
                 carrick_runtime::container::ContainerStatus::Exited => "exited",
             };
+            if !container_matches_filters(c, state_str, &filters)
+                || (!all && state_str != "running")
+            {
+                return None;
+            }
             let status_str = match status {
                 carrick_runtime::container::ContainerStatus::Created => "Created".to_string(),
                 carrick_runtime::container::ContainerStatus::Running => {
@@ -147,32 +586,301 @@ pub(crate) fn list_containers(all: bool) -> (u16, String) {
                 ),
             };
             let name_str = c.name.clone().unwrap_or_else(|| c.id[..12].to_string());
-            ContainerSummary {
+            Some(ContainerSummary {
                 id: c.id.clone(),
                 names: vec![format!("/{}", name_str)],
                 image: c.image.clone(),
                 image_id: c.image.clone(),
                 command: c.command.join(" "),
                 created: c.created_secs as i64,
-                ports: vec![],
-                labels: std::collections::HashMap::new(),
+                ports: container_summary_ports(c),
+                labels: c.labels.clone(),
                 state: state_str.to_string(),
                 status: status_str,
                 host_config: HostConfigSummary {
-                    network_mode: "host".to_string(),
+                    network_mode: container_network_mode(c),
                 },
                 network_settings: NetworkSettingsSummary {
-                    networks: std::collections::HashMap::new(),
+                    networks: container_networks(c),
                 },
-            }
+            })
         })
-        .filter(|c| all || c.state == "running")
         .collect();
 
     (
         200,
         serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string()),
     )
+}
+
+fn container_matches_filters(
+    c: &carrick_runtime::container::ContainerState,
+    status: &str,
+    filters: &HashMap<String, Vec<String>>,
+) -> bool {
+    filters.iter().all(|(key, values)| match key.as_str() {
+        "id" => crate::serve::resources::any_filter_value(values, |value| c.id.starts_with(value)),
+        "label" => crate::serve::resources::label_filters_match(&c.labels, values),
+        "name" => crate::serve::resources::any_filter_value(values, |value| {
+            container_name_matches(c, value)
+        }),
+        "network" => crate::serve::resources::any_filter_value(values, |value| {
+            container_network_matches(c, value)
+        }),
+        "status" => crate::serve::resources::any_filter_value(values, |value| status == value),
+        _ => true,
+    })
+}
+
+fn container_name_matches(c: &carrick_runtime::container::ContainerState, value: &str) -> bool {
+    if c.id.starts_with(value) {
+        return true;
+    }
+    let name = c.name.as_deref().unwrap_or_default();
+    name.contains(value) || format!("/{name}").contains(value)
+}
+
+fn container_network_matches(c: &carrick_runtime::container::ContainerState, value: &str) -> bool {
+    if c.config.network_container.is_some() {
+        return false;
+    }
+    let resolved = crate::serve::resources::resolve_network_name(value);
+    if !c.config.network_attachments.is_empty() {
+        return c.config.network_attachments.iter().any(|attachment| {
+            attachment.name == value || resolved.as_deref() == Some(attachment.name.as_str())
+        });
+    }
+    match c.config.network {
+        carrick_spec::NetworkMode::Bridge => value == "bridge",
+        carrick_spec::NetworkMode::Host => value == "host",
+        carrick_spec::NetworkMode::None => value == "none",
+    }
+}
+
+fn container_network_mode(c: &carrick_runtime::container::ContainerState) -> String {
+    if let Some(target) = c.config.network_container.as_deref() {
+        return format!("container:{target}");
+    }
+    c.config
+        .network_attachments
+        .first()
+        .map(|attachment| attachment.name.clone())
+        .unwrap_or_else(|| match c.config.network {
+            carrick_spec::NetworkMode::Bridge => "bridge".to_string(),
+            carrick_spec::NetworkMode::Host => "host".to_string(),
+            carrick_spec::NetworkMode::None => "none".to_string(),
+        })
+}
+
+fn container_networks(
+    c: &carrick_runtime::container::ContainerState,
+) -> std::collections::HashMap<String, EndpointSettings> {
+    if c.config.network_container.is_some() {
+        return std::collections::HashMap::new();
+    }
+    if !c.config.network_attachments.is_empty() {
+        return c
+            .config
+            .network_attachments
+            .iter()
+            .map(|attachment| {
+                (
+                    attachment.name.clone(),
+                    endpoint_settings(c, &attachment.name, EndpointView::from(attachment)),
+                )
+            })
+            .collect();
+    }
+    if c.config.network == carrick_spec::NetworkMode::Bridge {
+        return std::iter::once((
+            "bridge".to_string(),
+            endpoint_settings(
+                c,
+                "bridge",
+                EndpointView::with_aliases(c.config.network_aliases.clone()),
+            ),
+        ))
+        .collect();
+    }
+    if c.config.network == carrick_spec::NetworkMode::None {
+        return std::iter::once((
+            "none".to_string(),
+            endpoint_settings(c, "none", EndpointView::default()),
+        ))
+        .collect();
+    }
+    if c.config.network == carrick_spec::NetworkMode::Host {
+        return std::iter::once((
+            "host".to_string(),
+            endpoint_settings(c, "host", EndpointView::default()),
+        ))
+        .collect();
+    }
+    std::collections::HashMap::new()
+}
+
+#[derive(Default)]
+struct EndpointView {
+    aliases: Option<Vec<String>>,
+    links: Option<Vec<String>>,
+    mac_address: Option<String>,
+    gw_priority: i64,
+    ipv4_address: Option<String>,
+    ipv6_address: Option<String>,
+    link_local_ips: Vec<String>,
+    driver_opts: std::collections::HashMap<String, String>,
+}
+
+impl EndpointView {
+    fn with_aliases(aliases: Vec<String>) -> Self {
+        Self {
+            aliases: Some(aliases),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&carrick_runtime::container::NetworkAttachment> for EndpointView {
+    fn from(attachment: &carrick_runtime::container::NetworkAttachment) -> Self {
+        Self {
+            aliases: Some(attachment.aliases.clone()),
+            links: Some(attachment.links.clone()),
+            mac_address: attachment.mac_address.clone(),
+            gw_priority: attachment.gw_priority,
+            ipv4_address: attachment.ipv4_address.clone(),
+            ipv6_address: attachment.ipv6_address.clone(),
+            link_local_ips: attachment.link_local_ips.clone(),
+            driver_opts: attachment.driver_opts.clone(),
+        }
+    }
+}
+
+fn endpoint_settings(
+    c: &carrick_runtime::container::ContainerState,
+    network_name: &str,
+    endpoint: EndpointView,
+) -> EndpointSettings {
+    let dns_names = endpoint_dns_names(c, network_name, endpoint.aliases.as_deref());
+    let aliases = endpoint.aliases.clone().unwrap_or_default();
+    let ip_address = crate::serve::resources::endpoint_ipv4_address(
+        c,
+        endpoint.ipv4_address.as_deref(),
+        &aliases,
+    );
+    let has_ipv4 = !ip_address.is_empty();
+    let ipam_config = endpoint_ipam_config(
+        endpoint.ipv4_address.as_deref(),
+        endpoint.ipv6_address.as_deref(),
+        &endpoint.link_local_ips,
+    );
+    EndpointSettings {
+        ipam_config,
+        links: endpoint.links,
+        aliases: endpoint.aliases,
+        driver_opts: (!endpoint.driver_opts.is_empty()).then_some(endpoint.driver_opts),
+        gw_priority: endpoint.gw_priority,
+        network_id: crate::serve::resources::network_id(network_name).unwrap_or_default(),
+        endpoint_id: crate::serve::resources::endpoint_id(&c.id, network_name),
+        gateway: if has_ipv4 {
+            "172.31.0.1".to_string()
+        } else {
+            String::new()
+        },
+        ip_address,
+        mac_address: endpoint.mac_address.unwrap_or_default(),
+        ip_prefix_len: if has_ipv4 { 16 } else { 0 },
+        ipv6_gateway: String::new(),
+        global_ipv6_address: String::new(),
+        global_ipv6_prefix_len: 0,
+        dns_names,
+    }
+}
+
+fn endpoint_ipam_config(
+    ipv4_address: Option<&str>,
+    ipv6_address: Option<&str>,
+    link_local_ips: &[String],
+) -> Option<serde_json::Value> {
+    if ipv4_address.is_none() && ipv6_address.is_none() && link_local_ips.is_empty() {
+        return None;
+    }
+    let mut ipam = serde_json::Map::new();
+    if let Some(ipv4) = ipv4_address {
+        ipam.insert("IPv4Address".to_string(), serde_json::json!(ipv4));
+    }
+    if let Some(ipv6) = ipv6_address {
+        ipam.insert("IPv6Address".to_string(), serde_json::json!(ipv6));
+    }
+    if !link_local_ips.is_empty() {
+        ipam.insert(
+            "LinkLocalIPs".to_string(),
+            serde_json::json!(link_local_ips),
+        );
+    }
+    Some(serde_json::Value::Object(ipam))
+}
+
+fn endpoint_dns_names(
+    c: &carrick_runtime::container::ContainerState,
+    network_name: &str,
+    aliases: Option<&[String]>,
+) -> Option<Vec<String>> {
+    if matches!(network_name, "bridge" | "host" | "none") {
+        return None;
+    }
+    let mut names = Vec::new();
+    if let Some(name) = c.name.as_deref().filter(|name| !name.is_empty()) {
+        names.push(name.to_string());
+    }
+    if let Some(aliases) = aliases {
+        for alias in aliases {
+            if !alias.is_empty() && !names.contains(alias) {
+                names.push(alias.clone());
+            }
+        }
+    }
+    let short_id = c.id[..12].to_string();
+    if !names.contains(&short_id) {
+        names.push(short_id);
+    }
+    Some(names)
+}
+
+fn container_summary_ports(
+    c: &carrick_runtime::container::ContainerState,
+) -> Vec<serde_json::Value> {
+    if matches!(
+        c.config.network,
+        carrick_spec::NetworkMode::Host | carrick_spec::NetworkMode::None
+    ) {
+        return Vec::new();
+    }
+    c.config
+        .published_ports
+        .iter()
+        .map(|mapping| {
+            let mut value = serde_json::json!({
+                "PrivatePort": mapping.container_port,
+                "Type": port_protocol_str(mapping.protocol),
+            });
+            if let Some(obj) = value.as_object_mut() {
+                if let Some(host_port) = mapping.host_port {
+                    obj.insert("PublicPort".to_string(), serde_json::json!(host_port));
+                }
+                if let Some(host_ip) = mapping.host_ip {
+                    obj.insert("IP".to_string(), serde_json::json!(host_ip.to_string()));
+                }
+            }
+            value
+        })
+        .collect()
+}
+
+fn port_protocol_str(protocol: carrick_spec::PortProtocol) -> &'static str {
+    match protocol {
+        carrick_spec::PortProtocol::Tcp => "tcp",
+        carrick_spec::PortProtocol::Udp => "udp",
+    }
 }
 
 pub(crate) fn inspect_container(id: &str) -> (u16, String) {
@@ -190,6 +898,176 @@ pub(crate) fn inspect_container(id: &str) -> (u16, String) {
         200,
         serde_json::to_string(&json_val).unwrap_or_else(|_| "{}".to_string()),
     )
+}
+
+pub(crate) fn events_stream(query: &str) -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt;
+    use http_body_util::StreamBody;
+
+    let filters = crate::serve::resources::docker_filters(query);
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(64);
+    tokio::spawn(async move {
+        run_events_task(filters, tx).await;
+    });
+
+    let stream = crate::serve::build::ReceiverStream { rx };
+    let body = StreamBody::new(stream).boxed();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .unwrap_or_else(|_| {
+            Response::new(
+                http_body_util::Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+        })
+}
+
+#[derive(Clone)]
+struct ContainerEventSnapshot {
+    id: String,
+    name: String,
+    image: String,
+    labels: HashMap<String, String>,
+    status: carrick_runtime::container::ContainerStatus,
+}
+
+impl ContainerEventSnapshot {
+    fn from_state(state: &carrick_runtime::container::ContainerState) -> Self {
+        Self {
+            id: state.id.clone(),
+            name: state
+                .name
+                .clone()
+                .unwrap_or_else(|| state.id[..12].to_string()),
+            image: state.image.clone(),
+            labels: state.labels.clone(),
+            status: carrick_runtime::container::reconciled_status(state),
+        }
+    }
+}
+
+async fn run_events_task(
+    filters: HashMap<String, Vec<String>>,
+    tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+) {
+    let mut known: HashMap<String, ContainerEventSnapshot> = current_event_snapshots()
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect();
+
+    loop {
+        let current: HashMap<String, ContainerEventSnapshot> = current_event_snapshots()
+            .into_iter()
+            .map(|s| (s.id.clone(), s))
+            .collect();
+
+        for snapshot in current.values() {
+            match known.get(&snapshot.id) {
+                None => {
+                    if !send_container_event(&tx, snapshot, "create", &filters).await {
+                        return;
+                    }
+                }
+                Some(previous) if previous.status != snapshot.status => {
+                    if let Some(action) = event_action_for_status(snapshot.status)
+                        && !send_container_event(&tx, snapshot, action, &filters).await
+                    {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let current_ids: HashSet<_> = current.keys().cloned().collect();
+        for snapshot in known.values() {
+            if !current_ids.contains(&snapshot.id)
+                && !send_container_event(&tx, snapshot, "destroy", &filters).await
+            {
+                return;
+            }
+        }
+
+        known = current;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn current_event_snapshots() -> Vec<ContainerEventSnapshot> {
+    carrick_runtime::container::list()
+        .iter()
+        .map(ContainerEventSnapshot::from_state)
+        .collect()
+}
+
+fn event_action_for_status(
+    status: carrick_runtime::container::ContainerStatus,
+) -> Option<&'static str> {
+    match status {
+        carrick_runtime::container::ContainerStatus::Created => Some("create"),
+        carrick_runtime::container::ContainerStatus::Running => Some("start"),
+        carrick_runtime::container::ContainerStatus::Exited => Some("die"),
+    }
+}
+
+async fn send_container_event(
+    tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    snapshot: &ContainerEventSnapshot,
+    action: &str,
+    filters: &HashMap<String, Vec<String>>,
+) -> bool {
+    if !container_event_matches_filters(snapshot, action, filters) {
+        return true;
+    }
+    let now = now_unix_secs();
+    let mut attributes = snapshot.labels.clone();
+    attributes.insert("name".to_string(), snapshot.name.clone());
+    attributes.insert("image".to_string(), snapshot.image.clone());
+    let event = serde_json::json!({
+        "Type": "container",
+        "Action": action,
+        "Actor": {
+            "ID": snapshot.id,
+            "Attributes": attributes,
+        },
+        "scope": "local",
+        "time": now,
+        "timeNano": now.saturating_mul(1_000_000_000),
+    });
+    let mut line = match serde_json::to_vec(&event) {
+        Ok(bytes) => bytes,
+        Err(_) => return true,
+    };
+    line.push(b'\n');
+    tx.send(Ok(Frame::data(Bytes::from(line)))).await.is_ok()
+}
+
+fn container_event_matches_filters(
+    snapshot: &ContainerEventSnapshot,
+    action: &str,
+    filters: &HashMap<String, Vec<String>>,
+) -> bool {
+    filters.iter().all(|(key, values)| match key.as_str() {
+        "container" => crate::serve::resources::any_filter_value(values, |value| {
+            snapshot.id.starts_with(value)
+                || snapshot.name == value
+                || format!("/{}", snapshot.name) == value
+        }),
+        "event" => crate::serve::resources::any_filter_value(values, |value| action == value),
+        "label" => crate::serve::resources::label_filters_match(&snapshot.labels, values),
+        "type" => crate::serve::resources::any_filter_value(values, |value| value == "container"),
+        _ => true,
+    })
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 pub(crate) fn stop_container(id: &str, time: Option<u64>) -> (u16, String) {
@@ -217,6 +1095,17 @@ pub(crate) fn restart_container(id: &str, time: Option<u64>) -> (u16, String) {
     }
     match crate::serve::spawn::start_container(id) {
         Ok(()) => (204, String::new()),
+        Err(e) => (500, error_json(&e.to_string())),
+    }
+}
+
+pub(crate) fn resize_container_tty(id: &str) -> (u16, String) {
+    let real = match carrick_runtime::container::resolve(id) {
+        Ok(r) => r,
+        Err(e) => return (404, error_json(&e)),
+    };
+    match carrick_runtime::container::ContainerState::load(&real) {
+        Ok(_) => (200, String::new()),
         Err(e) => (500, error_json(&e.to_string())),
     }
 }
@@ -295,6 +1184,511 @@ pub(crate) fn logs_container(
         .header("Content-Type", "application/octet-stream")
         .body(body)
         .unwrap_or_else(|_| fallback())
+}
+
+pub(crate) async fn attach_container_route(
+    id: String,
+    query: String,
+    mut req: hyper::Request<hyper::body::Incoming>,
+) -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt;
+    use hyper::body::Bytes;
+
+    let fallback = || {
+        Response::new(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+    };
+
+    let real_id = match carrick_runtime::container::resolve(&id) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+    let state = match carrick_runtime::container::ContainerState::load(&real_id) {
+        Ok(s) => s,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+    let path = match carrick_runtime::container::log_path(&real_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+
+    let options = AttachOptions {
+        tty: state.config.tty,
+        logs: query_bool(&query, "logs"),
+        stream: query_bool(&query, "stream"),
+        stdout: query_bool(&query, "stdout"),
+        stderr: query_bool(&query, "stderr"),
+    };
+    let upgraded = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        match upgraded.await {
+            Ok(upgraded) => {
+                let io = hyper_util::rt::TokioIo::new(upgraded);
+                if let Err(e) = run_attach_task(real_id, path, options, io).await
+                    && !is_broken_pipe(&e)
+                {
+                    tracing::error!("container attach error: {e}");
+                }
+            }
+            Err(e) => tracing::error!("container attach upgrade error: {e}"),
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "tcp")
+        .header(
+            "Content-Type",
+            if state.config.tty {
+                "application/vnd.docker.raw-stream"
+            } else {
+                "application/vnd.docker.multiplexed-stream"
+            },
+        )
+        .body(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap_or_else(|_| fallback())
+}
+
+pub(crate) async fn download_archive_route(
+    id: String,
+    query: String,
+) -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt;
+
+    let fallback = || {
+        Response::new(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+    };
+
+    let real_id = match carrick_runtime::container::resolve(&id) {
+        Ok(real_id) => real_id,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json")
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+    let Some(raw_path) = crate::serve::router::query_param(&query, "path") else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Content-Type", "application/json")
+            .body(
+                http_body_util::Full::new(Bytes::from(error_json("archive path is required")))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap_or_else(|_| fallback());
+    };
+    let guest_path = crate::serve::build::url_decode(&raw_path);
+    let Some((parent, entry)) = archive_path_args(&guest_path) else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Content-Type", "application/json")
+            .body(
+                http_body_util::Full::new(Bytes::from(error_json("invalid archive path")))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap_or_else(|_| fallback());
+    };
+
+    let entry_for_tar = entry.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        wait_until_running_for_archive(&real_id, std::time::Duration::from_secs(10))?;
+        let exe = std::env::current_exe()?;
+        let out = std::process::Command::new(exe)
+            .arg("exec")
+            .arg(&real_id)
+            .arg("/usr/bin/tar")
+            .arg("-C")
+            .arg(parent)
+            .arg("-cf")
+            .arg("-")
+            .arg(&entry_for_tar)
+            .output()?;
+        anyhow::Ok(out)
+    })
+    .await;
+    let output = match output {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/json")
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/json")
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+    if !output.status.success() {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "application/json")
+            .body(
+                http_body_util::Full::new(Bytes::from(error_json(&String::from_utf8_lossy(
+                    &output.stderr,
+                ))))
+                .map_err(|never| match never {})
+                .boxed(),
+            )
+            .unwrap_or_else(|_| fallback());
+    }
+    let stat_header = archive_stat_header(&entry, &output.stdout);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-tar")
+        .header("X-Docker-Container-Path-Stat", stat_header)
+        .body(
+            http_body_util::Full::new(Bytes::from(output.stdout))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap_or_else(|_| fallback())
+}
+
+pub(crate) async fn upload_archive_route(
+    id: String,
+    query: String,
+    body_bytes: Bytes,
+) -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt;
+
+    let fallback = || {
+        Response::new(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+    };
+
+    let real_id = match carrick_runtime::container::resolve(&id) {
+        Ok(real_id) => real_id,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json")
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+    let Some(raw_path) = crate::serve::router::query_param(&query, "path") else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Content-Type", "application/json")
+            .body(
+                http_body_util::Full::new(Bytes::from(error_json("archive path is required")))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap_or_else(|_| fallback());
+    };
+    let guest_path = crate::serve::build::url_decode(&raw_path);
+    if guest_path.is_empty() {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("Content-Type", "application/json")
+            .body(
+                http_body_util::Full::new(Bytes::from(error_json("invalid archive path")))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap_or_else(|_| fallback());
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        wait_until_running_for_archive(&real_id, std::time::Duration::from_secs(10))?;
+        let exe = std::env::current_exe()?;
+        let mut child = std::process::Command::new(exe)
+            .arg("exec")
+            .arg(&real_id)
+            .arg("-i")
+            .arg("/usr/bin/tar")
+            .arg("-C")
+            .arg(&guest_path)
+            .arg("-xf")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(&body_bytes)?;
+        }
+        let out = child.wait_with_output()?;
+        anyhow::Ok(out)
+    })
+    .await;
+    let output = match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/json")
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("Content-Type", "application/json")
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+    };
+    if !output.status.success() {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("Content-Type", "application/json")
+            .body(
+                http_body_util::Full::new(Bytes::from(error_json(&String::from_utf8_lossy(
+                    &output.stderr,
+                ))))
+                .map_err(|never| match never {})
+                .boxed(),
+            )
+            .unwrap_or_else(|_| fallback());
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap_or_else(|_| fallback())
+}
+
+fn wait_until_running_for_archive(id: &str, timeout: std::time::Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match carrick_runtime::container::ContainerState::load(id) {
+            Ok(state) => {
+                if carrick_runtime::container::reconciled_status(&state)
+                    == carrick_runtime::container::ContainerStatus::Running
+                {
+                    return Ok(());
+                }
+            }
+            Err(e) => anyhow::bail!(e),
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "container {} is not running",
+                carrick_runtime::container::short_id(id)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn archive_stat_header(entry: &str, tar_bytes: &[u8]) -> String {
+    use base64::Engine as _;
+
+    let name = tar_header_name(tar_bytes).unwrap_or_else(|| entry.to_string());
+    let size = tar_header_octal(tar_bytes, 124, 12).unwrap_or(0);
+    let mode = tar_header_octal(tar_bytes, 100, 8).unwrap_or(0o644);
+    let stat = serde_json::json!({
+        "name": name,
+        "size": size,
+        "mode": mode,
+        "mtime": "1970-01-01T00:00:00Z",
+        "linkTarget": "",
+    });
+    base64::engine::general_purpose::STANDARD.encode(stat.to_string())
+}
+
+fn tar_header_name(tar_bytes: &[u8]) -> Option<String> {
+    let header = tar_bytes.get(..100)?;
+    let end = header.iter().position(|b| *b == 0).unwrap_or(header.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&header[..end]).into_owned())
+}
+
+fn tar_header_octal(tar_bytes: &[u8], offset: usize, len: usize) -> Option<u64> {
+    let field = tar_bytes.get(offset..offset.checked_add(len)?)?;
+    let text = String::from_utf8_lossy(field);
+    let trimmed = text.trim_matches(char::from(0)).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(trimmed, 8).ok()
+}
+
+fn archive_path_args(path: &str) -> Option<(String, String)> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "/" {
+        return Some(("/".to_string(), ".".to_string()));
+    }
+    match trimmed.rsplit_once('/') {
+        Some(("", entry)) if !entry.is_empty() => Some(("/".to_string(), entry.to_string())),
+        Some((parent, entry)) if !parent.is_empty() && !entry.is_empty() => {
+            Some((parent.to_string(), entry.to_string()))
+        }
+        None => Some((".".to_string(), trimmed.to_string())),
+        _ => None,
+    }
+}
+
+fn query_bool(query: &str, key: &str) -> bool {
+    crate::serve::router::query_param(query, key)
+        .is_some_and(|value| value == "true" || value == "1")
+}
+
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
+struct AttachOptions {
+    tty: bool,
+    logs: bool,
+    stream: bool,
+    stdout: bool,
+    stderr: bool,
+}
+
+async fn run_attach_task(
+    id: String,
+    path: std::path::PathBuf,
+    options: AttachOptions,
+    mut io: hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
+) -> anyhow::Result<()> {
+    let mut offset = 0;
+    if options.logs {
+        let data = tokio::fs::read(&path).await.unwrap_or_default();
+        offset = data.len() as u64;
+        write_attach_bytes(&mut io, &data, &options).await?;
+    } else if let Ok(metadata) = tokio::fs::metadata(&path).await {
+        offset = metadata.len();
+    }
+
+    if !options.stream {
+        return Ok(());
+    }
+
+    loop {
+        if let Ok((new_data, new_offset)) = read_appended_async(&path, offset).await {
+            if !new_data.is_empty() {
+                write_attach_bytes(&mut io, &new_data, &options).await?;
+            }
+            offset = new_offset;
+        }
+
+        match carrick_runtime::container::ContainerState::load(&id) {
+            Ok(state) => {
+                if carrick_runtime::container::reconciled_status(&state)
+                    == carrick_runtime::container::ContainerStatus::Exited
+                {
+                    if let Ok((new_data, _)) = read_appended_async(&path, offset).await
+                        && !new_data.is_empty()
+                    {
+                        write_attach_bytes(&mut io, &new_data, &options).await?;
+                    }
+                    return Ok(());
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn write_attach_bytes(
+    io: &mut hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
+    data: &[u8],
+    options: &AttachOptions,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    if data.is_empty() || (!options.stdout && !options.stderr) {
+        return Ok(());
+    }
+    let stream_type = if options.stdout { 1 } else { 2 };
+    let framed = frame_stream_data(data, stream_type, options.tty);
+    io.write_all(&framed).await?;
+    io.flush().await?;
+    Ok(())
 }
 
 /// Build a Docker raw-stream frame: 8-byte header (stream type + big-endian

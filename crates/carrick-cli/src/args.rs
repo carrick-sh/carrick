@@ -37,7 +37,7 @@ use std::path::PathBuf;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::compat::CompatReportFormat;
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
-use carrick_spec::{FsBackendKind, NetworkMode, PidMode};
+use carrick_spec::{FsBackendKind, PidMode};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -207,6 +207,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: SystemCommand,
     },
+    /// Manage Docker-compatible network resources (like `docker network`).
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommand,
+    },
     /// Log in to a container registry (like `docker login`). Stores the
     /// credential in carrick's own config; `~/.docker/config.json` is read
     /// read-only as a fallback and never modified.
@@ -271,10 +276,27 @@ pub(crate) enum Commands {
         /// shares the host PID namespace (no remap).
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
-        /// Container network mode. `host` is the current behavior; `bridge`
-        /// uses Carrick's socket namespace provider.
-        #[arg(long = "net", alias = "network", value_enum, default_value_t = NetworkMode::Host)]
-        network: NetworkMode,
+        /// Container network mode: host, bridge, none, or container:<id|name>.
+        #[arg(long = "net", alias = "network", default_value = "host")]
+        network: String,
+        /// Add a service alias on the bridge network.
+        #[arg(long = "network-alias", value_name = "ALIAS")]
+        network_alias: Vec<String>,
+        /// Assign a static IPv4 address on the bridge network.
+        #[arg(long = "ip", value_name = "IPv4")]
+        ip: Option<String>,
+        /// Add a custom host-to-IP mapping in the guest's /etc/hosts.
+        #[arg(long = "add-host", value_name = "HOST:IP")]
+        add_host: Vec<String>,
+        /// Set a custom DNS nameserver.
+        #[arg(long = "dns", value_name = "IP")]
+        dns: Vec<String>,
+        /// Set a custom DNS search domain.
+        #[arg(long = "dns-search", value_name = "DOMAIN")]
+        dns_search: Vec<String>,
+        /// Set a custom DNS resolver option.
+        #[arg(long = "dns-option", value_name = "OPTION")]
+        dns_option: Vec<String>,
         /// Set environment variables
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -297,6 +319,9 @@ pub(crate) enum Commands {
             value_name = "host-src:container-dest[:ro|rw]"
         )]
         volume: Vec<String>,
+        /// Mount volumes from another container.
+        #[arg(long = "volumes-from", value_name = "CONTAINER[:ro|:rw]")]
+        volumes_from: Vec<String>,
         /// Attach a filesystem mount to the container
         #[arg(
             long = "mount",
@@ -341,9 +366,27 @@ pub(crate) enum Commands {
         fs: Option<FsBackendKind>,
         #[arg(long, value_enum, default_value_t = PidMode::Private)]
         pid: PidMode,
-        /// Container network mode.
-        #[arg(long = "net", alias = "network", value_enum, default_value_t = NetworkMode::Host)]
-        network: NetworkMode,
+        /// Container network mode: host, bridge, none, or container:<id|name>.
+        #[arg(long = "net", alias = "network", default_value = "host")]
+        network: String,
+        /// Add a service alias on the bridge network.
+        #[arg(long = "network-alias", value_name = "ALIAS")]
+        network_alias: Vec<String>,
+        /// Assign a static IPv4 address on the bridge network.
+        #[arg(long = "ip", value_name = "IPv4")]
+        ip: Option<String>,
+        /// Add a custom host-to-IP mapping in the guest's /etc/hosts.
+        #[arg(long = "add-host", value_name = "HOST:IP")]
+        add_host: Vec<String>,
+        /// Set a custom DNS nameserver.
+        #[arg(long = "dns", value_name = "IP")]
+        dns: Vec<String>,
+        /// Set a custom DNS search domain.
+        #[arg(long = "dns-search", value_name = "DOMAIN")]
+        dns_search: Vec<String>,
+        /// Set a custom DNS resolver option.
+        #[arg(long = "dns-option", value_name = "OPTION")]
+        dns_option: Vec<String>,
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
         #[arg(long = "env-file", value_name = "FILE")]
@@ -360,14 +403,23 @@ pub(crate) enum Commands {
             value_name = "host-src:container-dest[:ro|rw]"
         )]
         volume: Vec<String>,
+        /// Mount volumes from another container.
+        #[arg(long = "volumes-from", value_name = "CONTAINER[:ro|:rw]")]
+        volumes_from: Vec<String>,
         #[arg(long = "mount", value_name = "type=bind,source=...,target=...")]
         mount: Vec<String>,
         #[arg(long = "name", value_name = "NAME")]
         name: Option<String>,
+        /// Automatically remove the container when it exits
+        #[arg(long = "rm")]
+        rm: bool,
         #[arg(short = 't', long = "tty")]
         tty: bool,
         #[arg(short = 'i', long = "interactive")]
         interactive: bool,
+        /// Publish a container's port(s) to the host.
+        #[arg(short = 'p', long = "publish", value_name = "hostPort:containerPort")]
+        publish: Vec<String>,
         /// Signal to stop the container (overrides the image `STOPSIGNAL`).
         #[arg(long = "stop-signal", value_name = "SIGNAL")]
         stop_signal: Option<String>,
@@ -601,35 +653,69 @@ pub(crate) enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Manage the dedicated APFS subvolume Carrick uses for its
-    /// writable scratch space. The volume is case-sensitive (which
-    /// Linux paths require) and lives at /Volumes/carrick. Internally
-    /// this shells out to `diskutil(8)` - no Apple private framework
-    /// dependency, no FFI surface.
-    #[cfg(target_os = "macos")]
+    /// Manage Docker-compatible named volumes. On macOS, `volume create`
+    /// without a name keeps the legacy APFS scratch-volume setup behavior.
     Volume {
         #[command(subcommand)]
         command: VolumeCommand,
     },
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Subcommand)]
 pub(crate) enum VolumeCommand {
-    /// Create the carrick scratch volume if it doesn't exist. Adds a
-    /// case-sensitive APFS subvolume (APFSX) to the boot container so
-    /// it shares the boot disk's free space. Idempotent.
+    /// Create a Docker-compatible named volume. With no NAME on macOS, create
+    /// Carrick's case-sensitive APFS scratch volume.
     Create {
-        /// Optional quota in bytes. Without one the volume grows up
-        /// to the container's free space.
+        #[arg(short = 'd', long = "driver", default_value = "local")]
+        driver: String,
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        label: Vec<String>,
+        #[arg(short = 'o', long = "opt", value_name = "KEY=VALUE")]
+        opt: Vec<String>,
+        /// Optional quota in bytes for the legacy APFS scratch volume path.
         #[arg(long)]
         quota: Option<u64>,
+        name: Option<String>,
+    },
+    /// List Docker-compatible named volumes.
+    #[command(visible_alias = "list")]
+    Ls {
+        #[arg(short = 'f', long = "filter", value_name = "KEY=VALUE")]
+        filter: Vec<String>,
+        #[arg(long = "format", value_name = "FORMAT")]
+        format: Option<String>,
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
+    },
+    /// Remove unused Docker-compatible named volumes.
+    Prune {
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+        #[arg(long = "filter", value_name = "KEY=VALUE")]
+        filter: Vec<String>,
+    },
+    /// Inspect a Docker-compatible named volume.
+    Inspect {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Remove one or more Docker-compatible named volumes.
+    #[command(visible_alias = "remove")]
+    Rm {
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+        #[arg(required = true)]
+        names: Vec<String>,
     },
     /// Print the carrick scratch volume's device, mount point, and
     /// case-sensitivity flag. Nonzero exit if no volume exists yet.
+    #[cfg(target_os = "macos")]
     Info,
     /// Delete the carrick scratch volume. Destructive - anything on
     /// the volume is lost. Idempotent.
+    #[cfg(target_os = "macos")]
     Delete {
         /// Required confirmation; without `--yes` this is a no-op
         /// that prints the volume info and exits 0.
@@ -674,4 +760,115 @@ pub(crate) enum SystemCommand {
         #[arg(short = 'f', long = "force")]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum NetworkCommand {
+    /// Create a Docker-compatible network resource.
+    Create {
+        #[arg(short = 'd', long = "driver", default_value = "bridge")]
+        driver: String,
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        label: Vec<String>,
+        #[arg(long = "subnet", value_name = "CIDR")]
+        subnet: Vec<String>,
+        #[arg(long = "gateway", value_name = "IPv4")]
+        gateway: Vec<String>,
+        #[arg(long = "ip-range", value_name = "CIDR")]
+        ip_range: Vec<String>,
+        #[arg(long = "aux-address", value_name = "KEY=VALUE")]
+        aux_address: Vec<String>,
+        #[arg(long = "ipam-driver", default_value = "default")]
+        ipam_driver: String,
+        #[arg(long = "ipam-opt", value_name = "KEY=VALUE")]
+        ipam_opt: Vec<String>,
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scope: Option<String>,
+        #[arg(long = "internal")]
+        internal: bool,
+        #[arg(long = "attachable")]
+        attachable: bool,
+        #[arg(long = "ingress")]
+        ingress: bool,
+        #[arg(long = "config-from", value_name = "NETWORK")]
+        config_from: Option<String>,
+        #[arg(long = "config-only")]
+        config_only: bool,
+        #[arg(long = "ipv4", value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+        ipv4: Option<bool>,
+        #[arg(long = "ipv6")]
+        ipv6: bool,
+        #[arg(short = 'o', long = "opt", value_name = "KEY=VALUE")]
+        opt: Vec<String>,
+        name: String,
+    },
+    /// Connect a container to a Docker-compatible network resource.
+    Connect {
+        #[arg(long = "alias", value_name = "ALIAS")]
+        alias: Vec<String>,
+        #[arg(long = "link", value_name = "LINK")]
+        link: Vec<String>,
+        #[arg(long = "ip", value_name = "IPv4")]
+        ip: Option<String>,
+        #[arg(long = "ip6", value_name = "IPv6")]
+        ip6: Option<String>,
+        #[arg(long = "link-local-ip", value_name = "IP")]
+        link_local_ip: Vec<String>,
+        #[arg(long = "driver-opt", value_name = "KEY=VALUE")]
+        driver_opt: Vec<String>,
+        #[arg(long = "gw-priority", value_name = "INT")]
+        gw_priority: Option<i64>,
+        network: String,
+        container: String,
+    },
+    /// Disconnect a container from a Docker-compatible network resource.
+    Disconnect {
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+        network: String,
+        container: String,
+    },
+    /// List Docker-compatible network resources.
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Remove unused Docker-compatible network resources.
+    Prune {
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+        #[arg(long = "filter", value_name = "KEY=VALUE")]
+        filter: Vec<String>,
+    },
+    /// Inspect a Docker-compatible network resource.
+    Inspect {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Remove one or more Docker-compatible network resources.
+    #[command(visible_alias = "remove")]
+    Rm {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn network_inspect_accepts_multiple_names_like_docker() {
+        assert!(
+            Cli::try_parse_from(["carrick", "network", "inspect", "net1", "net2"]).is_ok(),
+            "network inspect should accept multiple names"
+        );
+    }
+
+    #[test]
+    fn volume_inspect_accepts_multiple_names_like_docker() {
+        assert!(
+            Cli::try_parse_from(["carrick", "volume", "inspect", "vol1", "vol2"]).is_ok(),
+            "volume inspect should accept multiple names"
+        );
+    }
 }

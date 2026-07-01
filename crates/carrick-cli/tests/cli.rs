@@ -1872,15 +1872,632 @@ fn run_elf_command_drives_pie_hello_static_fixture() {
 
 #[test]
 fn run_accepts_tty_flag() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+    let run_out = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
         .args(["run", "--help"])
         .output()
         .unwrap();
-    let help = String::from_utf8_lossy(&out.stdout);
+    let help = String::from_utf8_lossy(&run_out.stdout);
     assert!(
         help.contains("--tty"),
         "run --help should mention --tty:\n{help}"
     );
+    assert!(
+        help.contains("--add-host"),
+        "run --help should mention --add-host:\n{help}"
+    );
+    assert!(
+        help.contains("--dns"),
+        "run --help should mention --dns:\n{help}"
+    );
+    assert!(
+        help.contains("--dns-search"),
+        "run --help should mention --dns-search:\n{help}"
+    );
+    assert!(
+        help.contains("--dns-option"),
+        "run --help should mention --dns-option:\n{help}"
+    );
+    assert!(
+        help.contains("--volumes-from"),
+        "run --help should mention --volumes-from:\n{help}"
+    );
+    assert!(
+        help.contains("--ip"),
+        "run --help should mention --ip:\n{help}"
+    );
+
+    let create_out = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["create", "--help"])
+        .output()
+        .unwrap();
+    let create_help = String::from_utf8_lossy(&create_out.stdout);
+    assert!(
+        create_help.contains("--add-host"),
+        "create --help should mention --add-host:\n{create_help}"
+    );
+    assert!(
+        create_help.contains("--dns"),
+        "create --help should mention --dns:\n{create_help}"
+    );
+    assert!(
+        create_help.contains("--dns-search"),
+        "create --help should mention --dns-search:\n{create_help}"
+    );
+    assert!(
+        create_help.contains("--dns-option"),
+        "create --help should mention --dns-option:\n{create_help}"
+    );
+    assert!(
+        create_help.contains("--volumes-from"),
+        "create --help should mention --volumes-from:\n{create_help}"
+    );
+    assert!(
+        create_help.contains("--ip"),
+        "create --help should mention --ip:\n{create_help}"
+    );
+}
+
+#[test]
+fn network_cli_manages_docker_style_resources() {
+    // The Docker API resource store is rooted next to the container registry,
+    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
+    // there so this CLI test never mutates the operator's real network store.
+    if std::path::Path::new("/Volumes/carrick").is_dir() {
+        eprintln!("SKIP network_cli: shared /Volumes/carrick volume present");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let network_name = "carrick_cli_network";
+    let other_network_name = "carrick_cli_network_other";
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "network",
+            "create",
+            "--subnet",
+            "172.29.0.0/16",
+            "--gateway",
+            "172.29.0.1",
+            "--ip-range",
+            "172.29.8.0/24",
+            "--aux-address",
+            "router=172.29.0.254",
+            "--ipam-driver",
+            "carrick-ipam",
+            "--ipam-opt",
+            "mode=test",
+            "--scope",
+            "swarm",
+            "--internal",
+            "--attachable",
+            "--ingress",
+            "--config-only",
+            "--ipv4=false",
+            "--opt",
+            "com.docker.network.bridge.name=carrick-test0",
+            network_name,
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_match(r"^[0-9a-f]{64}\n$").unwrap());
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "create", other_network_name])
+        .assert()
+        .success();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "inspect", network_name, other_network_name])
+        .assert()
+        .success()
+        .stdout(contains("\"Name\":\"carrick_cli_network\""))
+        .stdout(contains("\"Name\":\"carrick_cli_network_other\""))
+        .stdout(contains("\"Internal\":true"))
+        .stdout(contains("\"Attachable\":true"))
+        .stdout(contains("\"Ingress\":true"))
+        .stdout(contains("\"ConfigOnly\":true"))
+        .stdout(contains("\"Scope\":\"swarm\""))
+        .stdout(contains("\"EnableIPv4\":false"))
+        .stdout(contains("\"Subnet\":\"172.29.0.0/16\""))
+        .stdout(contains("\"IPRange\":\"172.29.8.0/24\""))
+        .stdout(contains("\"Gateway\":\"172.29.0.1\""))
+        .stdout(contains("\"Driver\":\"carrick-ipam\""))
+        .stdout(contains("\"Options\":{\"mode\":\"test\"}"))
+        .stdout(contains(
+            "\"AuxiliaryAddresses\":{\"router\":\"172.29.0.254\"}",
+        ))
+        .stdout(contains(
+            "\"Options\":{\"com.docker.network.bridge.name\":\"carrick-test0\"}",
+        ));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_network"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "network",
+            "create",
+            "--config-from",
+            network_name,
+            "carrick_cli_network_from_config",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "inspect", "carrick_cli_network_from_config"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "\"ConfigFrom\":{\"Network\":\"carrick_cli_network\"}",
+        ));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "network",
+            "rm",
+            network_name,
+            other_network_name,
+            "carrick_cli_network_from_config",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_network"))
+        .stdout(contains("carrick_cli_network_other"))
+        .stdout(contains("carrick_cli_network_from_config"));
+}
+
+#[test]
+fn network_cli_connects_and_disconnects_container_resources() {
+    // The Docker API resource store is rooted next to the container registry,
+    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
+    // there so this CLI test never mutates the operator's real container or
+    // network store.
+    if std::path::Path::new("/Volumes/carrick").is_dir() {
+        eprintln!("SKIP network_connect_cli: shared /Volumes/carrick volume present");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let id = "b".repeat(64);
+    let cdir = home.path().join("containers").join(&id);
+    std::fs::create_dir_all(&cdir).unwrap();
+    let state = serde_json::json!({
+        "id": id, "name": "carrick_cli_attach", "image": "img", "command": [],
+        "status": "created", "supervisor_pid": 0, "init_pid": 0,
+        "created_secs": 0, "exit_code": serde_json::Value::Null, "auto_remove": false,
+    });
+    std::fs::write(cdir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "create", "carrick_cli_attach_net"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "network",
+            "connect",
+            "--alias",
+            "worker",
+            "--ip",
+            "172.31.44.11",
+            "--ip6",
+            "fd00:carrick::11",
+            "--link-local-ip",
+            "169.254.44.11",
+            "--driver-opt",
+            "mode=bridge",
+            "--gw-priority",
+            "42",
+            "carrick_cli_attach_net",
+            "carrick_cli_attach",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "inspect", "carrick_cli_attach_net"])
+        .assert()
+        .success()
+        .stdout(contains(&id))
+        .stdout(contains("carrick_cli_attach"))
+        .stdout(contains("172.31.44.11"))
+        .stdout(contains("fd00:carrick::11"))
+        .stdout(contains("169.254.44.11"))
+        .stdout(contains("\"GwPriority\":42"))
+        .stdout(contains("\"DriverOpts\":{\"mode\":\"bridge\"}"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "rm", "carrick_cli_attach_net"])
+        .assert()
+        .failure()
+        .stderr(contains("active endpoints"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "network",
+            "disconnect",
+            "--force",
+            "carrick_cli_attach_net",
+            "carrick_cli_attach",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "inspect", "carrick_cli_attach_net"])
+        .assert()
+        .success()
+        .stdout(contains(&id).not());
+}
+
+#[test]
+fn network_cli_accepts_docker_resource_commands() {
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["network", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("create"))
+        .stdout(contains("connect"))
+        .stdout(contains("disconnect"))
+        .stdout(contains("inspect"))
+        .stdout(contains("ls"))
+        .stdout(contains("prune"))
+        .stdout(contains("rm"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["network", "create", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--subnet"))
+        .stdout(contains("--gateway"))
+        .stdout(contains("--ip-range"))
+        .stdout(contains("--aux-address"))
+        .stdout(contains("--ipam-driver"))
+        .stdout(contains("--ipam-opt"))
+        .stdout(contains("--scope"))
+        .stdout(contains("--internal"))
+        .stdout(contains("--attachable"))
+        .stdout(contains("--ingress"))
+        .stdout(contains("--config-from"))
+        .stdout(contains("--config-only"))
+        .stdout(contains("--ipv4"))
+        .stdout(contains("--opt"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["network", "connect", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--ip"))
+        .stdout(contains("--ip6"))
+        .stdout(contains("--link-local-ip"))
+        .stdout(contains("--driver-opt"))
+        .stdout(contains("--gw-priority"))
+        .stdout(contains("--link <LINK>"));
+}
+
+#[test]
+fn volume_cli_manages_docker_style_resources() {
+    // The Docker API resource store is rooted next to the container registry,
+    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
+    // there so this CLI test never mutates the operator's real volume store.
+    if std::path::Path::new("/Volumes/carrick").is_dir() {
+        eprintln!("SKIP volume_cli: shared /Volumes/carrick volume present");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let volume_name = "carrick_cli_volume";
+    let other_volume_name = "carrick_cli_volume_other";
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "volume",
+            "create",
+            "--label",
+            "com.docker.compose.project=clivol",
+            "--opt",
+            "type=none",
+            "--opt",
+            "device=/tmp/carrick-cli-volume",
+            volume_name,
+        ])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_volume"));
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "create", volume_name])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_volume"));
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "create", other_volume_name])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_volume_other"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "inspect", volume_name, other_volume_name])
+        .assert()
+        .success()
+        .stdout(contains("\"Name\":\"carrick_cli_volume\""))
+        .stdout(contains("\"Name\":\"carrick_cli_volume_other\""))
+        .stdout(contains(
+            "\"Options\":{\"device\":\"/tmp/carrick-cli-volume\",\"type\":\"none\"}",
+        ))
+        .stdout(contains("\"Mountpoint\""));
+
+    let id = "c".repeat(64);
+    let cdir = home.path().join("containers").join(&id);
+    std::fs::create_dir_all(&cdir).unwrap();
+    let mountpoint = home
+        .path()
+        .join("docker-api/volumes")
+        .join(volume_name)
+        .join("_data");
+    let state = serde_json::json!({
+        "id": id, "name": "carrick_cli_volume_user", "image": "img", "command": [],
+        "status": "created", "supervisor_pid": 0, "init_pid": 0,
+        "created_secs": 0, "exit_code": serde_json::Value::Null, "auto_remove": false,
+        "config": {
+            "mounts": [{
+                "source": mountpoint.to_str().unwrap(),
+                "target": "/data",
+                "readonly": false,
+            }]
+        },
+    });
+    std::fs::write(cdir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "rm", volume_name])
+        .assert()
+        .failure()
+        .stderr(contains("volume is in use"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "rm", "-f", volume_name])
+        .assert()
+        .failure()
+        .stderr(contains("volume is in use"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "rm", "-f", "carrick_cli_missing_volume"])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_missing_volume"));
+
+    std::fs::remove_dir_all(cdir).unwrap();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "ls"])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_volume"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=clivol",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_volume"))
+        .stdout(contains("DRIVER").not())
+        .stdout(contains("carrick_cli_volume_other").not());
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "ls", "--format", "{{.Name}}"])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_volume"))
+        .stdout(contains("carrick_cli_volume_other"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "rm", volume_name, other_volume_name])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_volume"))
+        .stdout(contains("carrick_cli_volume_other"));
+}
+
+#[test]
+fn resource_cli_prune_honors_filters() {
+    // The Docker API resource store is rooted next to the container registry,
+    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
+    // there so this CLI test never mutates the operator's real resource store.
+    if std::path::Path::new("/Volumes/carrick").is_dir() {
+        eprintln!("SKIP resource_prune_cli: shared /Volumes/carrick volume present");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "network",
+            "create",
+            "--label",
+            "com.docker.compose.project=cliprune",
+            "carrick_cli_prune_net",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["network", "create", "carrick_cli_prune_other"])
+        .assert()
+        .success();
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "network",
+            "prune",
+            "--force",
+            "--filter",
+            "label=com.docker.compose.project=cliprune",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_prune_net"))
+        .stdout(contains("carrick_cli_prune_other").not());
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "volume",
+            "create",
+            "--label",
+            "com.docker.compose.project=cliprune",
+            "carrick_cli_prune_volume",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "create", "carrick_cli_prune_other_volume"])
+        .assert()
+        .success();
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "volume",
+            "prune",
+            "--force",
+            "--filter",
+            "label=com.docker.compose.project=cliprune",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_prune_volume").not())
+        .stdout(contains("carrick_cli_prune_other_volume").not());
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["volume", "inspect", "carrick_cli_prune_volume"])
+        .assert()
+        .success();
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args([
+            "volume",
+            "prune",
+            "--force",
+            "--all",
+            "--filter",
+            "label=com.docker.compose.project=cliprune",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("carrick_cli_prune_volume"))
+        .stdout(contains("carrick_cli_prune_other_volume").not());
+}
+
+#[test]
+fn volume_cli_accepts_docker_resource_commands() {
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["volume", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("create"))
+        .stdout(contains("inspect"))
+        .stdout(contains("ls"))
+        .stdout(contains("prune"))
+        .stdout(contains("rm"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["volume", "rm", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--force"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["volume", "create", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--opt"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["volume", "prune", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--all"))
+        .stdout(contains("--filter"));
+
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["volume", "ls", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--filter"))
+        .stdout(contains("--quiet"))
+        .stdout(contains("--format"));
 }
 
 #[test]
