@@ -788,6 +788,7 @@ impl SyscallDispatcher {
         DispatchOutcome::Fork {
             pidfd_out,
             exit_signal,
+            child_stack: args.stack.wrapping_add(args.stack_size),
             vfork,
         }
     }
@@ -2279,7 +2280,9 @@ impl SyscallDispatcher {
             let vfork = (flags & LinuxCloneFlags::VFORK.bits() != 0
                 && flags & LinuxCloneFlags::VM.bits() != 0)
                 .then_some(stack);
+            // Legacy clone's `stack` IS the child SP (clone3 passes base+len).
             Ok(DispatchOutcome::Fork {
+                child_stack: stack,
                 pidfd_out,
                 exit_signal,
                 vfork,

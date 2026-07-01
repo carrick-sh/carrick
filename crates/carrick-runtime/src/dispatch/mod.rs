@@ -1062,6 +1062,13 @@ pub enum DispatchOutcome {
         /// `exit_signal`). Delivered to the parent on child exit instead of a
         /// hardcoded SIGCHLD. `0` means "no exit signal" (e.g. `clone(0)`).
         exit_signal: u32,
+        /// The clone's stack argument for an ORDINARY (non-vfork) fork-like
+        /// clone: `0` (fork/clone(SIGCHLD, NULL) — the common case) keeps the
+        /// parent's SP; a nonzero value runs the CHILD on that stack, exactly
+        /// as the kernel does — glibc/musl's `__clone` stub then pops the
+        /// child function off the NEW stack (LTP clone01 et al. crashed
+        /// without this, the child resuming on the parent's frames).
+        child_stack: u64,
         /// `CLONE_VFORK` (+`CLONE_VM`): the vfork-for-exec shape (Go `os/exec`,
         /// glibc `posix_spawn`). `Some(child_stack)` requests the vfork path — the
         /// runtime forks a child that SHARES the parent's guest RAM (not a CoW
