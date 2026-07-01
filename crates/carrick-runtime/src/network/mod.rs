@@ -1,6 +1,4 @@
-use carrick_spec::{
-    NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping,
-};
+use carrick_spec::{NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping};
 use std::net::SocketAddr;
 
 pub mod socket_namespace;
@@ -84,11 +82,7 @@ impl NetworkProvider for HostNetworkProvider {
         Ok(())
     }
 
-    fn publish_port(
-        &self,
-        _lease_id: NetworkLeaseId,
-        _mapping: PortMapping,
-    ) -> Result<(), String> {
+    fn publish_port(&self, _lease_id: NetworkLeaseId, _mapping: PortMapping) -> Result<(), String> {
         Ok(())
     }
 
