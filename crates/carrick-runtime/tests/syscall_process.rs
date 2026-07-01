@@ -444,10 +444,13 @@ fn blocking_wait4_for_specific_child_parks_on_proc_exit() {
         DispatchOutcome::WaitOnProcExit {
             pid: child,
             // The blocking wait folds the default-ignored signals
-            // (SIGCHLD|SIGURG|SIGWINCH) into its block mask so an inert pending
-            // signal can't spuriously EINTR it. A fresh dispatcher has no
-            // installed handlers, so that default-ignore set is the whole mask.
-            block_signals: (1 << 16) | (1 << 22) | (1 << 27),
+            // (SIGCHLD|SIGURG|SIGWINCH) into its ADDITIVE block set so an inert
+            // pending signal can't spuriously EINTR it. A fresh dispatcher has
+            // no installed handlers, so that default-ignore set is the whole
+            // set.
+            sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::from_raw(
+                (1 << 16) | (1 << 22) | (1 << 27)
+            )),
         }
     );
 }
@@ -524,10 +527,13 @@ fn waitid_wexited_ignores_stopped_child() {
         DispatchOutcome::WaitOnProcExit {
             pid: child,
             // The blocking wait folds the default-ignored signals
-            // (SIGCHLD|SIGURG|SIGWINCH) into its block mask so an inert pending
-            // signal can't spuriously EINTR it. A fresh dispatcher has no
-            // installed handlers, so that default-ignore set is the whole mask.
-            block_signals: (1 << 16) | (1 << 22) | (1 << 27),
+            // (SIGCHLD|SIGURG|SIGWINCH) into its ADDITIVE block set so an inert
+            // pending signal can't spuriously EINTR it. A fresh dispatcher has
+            // no installed handlers, so that default-ignore set is the whole
+            // set.
+            sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::from_raw(
+                (1 << 16) | (1 << 22) | (1 << 27)
+            )),
         }
     );
 }

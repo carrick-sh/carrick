@@ -1919,8 +1919,7 @@ impl SyscallDispatcher {
                             fds: WaitFds::raw_one(host_fd, libc::POLLIN),
                             timeout: None,
                             on_timeout: 0,
-                            block_signals: 0,
-                            mask_replaces: false,
+                            sig_mask: carrick_abi::WaitSigMask::NONE,
                         });
                     }
                 if idtype == LINUX_P_PID {
@@ -1929,10 +1928,12 @@ impl SyscallDispatcher {
                     // Park on the HOST pid (host_id), not the guest ns-pid —
                     // WaitOnProcExit watches the real host process (§5.3).
                     let tid = Self::ctx_tid(cx);
-                    let block_signals = this.non_interrupting_signal_mask(tid);
+                    let non_interrupting = this.non_interrupting_signal_mask(tid);
                     return Ok(DispatchOutcome::WaitOnProcExit {
                         pid: host_id as i32,
-                        block_signals,
+                        sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::from_raw(
+                            non_interrupting,
+                        )),
                     });
                 }
                 loop {
@@ -2064,10 +2065,12 @@ impl SyscallDispatcher {
                         // multi-child reap. A real handler still interrupts
                         // (then SA_RESTART restarts wait4).
                         let tid = Self::ctx_tid(cx);
-                        let block_signals = this.non_interrupting_signal_mask(tid);
+                        let non_interrupting = this.non_interrupting_signal_mask(tid);
                         return Ok(DispatchOutcome::WaitOnProcExit {
                             pid: pid.0,
-                            block_signals,
+                            sig_mask: carrick_abi::WaitSigMask::Additive(
+                                carrick_abi::SigSet::from_raw(non_interrupting),
+                            ),
                         });
                     }
                     Ok(value) => Ok(value),

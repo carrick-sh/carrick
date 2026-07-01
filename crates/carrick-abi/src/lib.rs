@@ -367,6 +367,34 @@ impl core::fmt::Debug for SigBlockMask {
     }
 }
 
+/// The signal-masking POLICY of a blocking fd/child wait — replaces the
+/// boolean-blind `(block_signals: u64, mask_replaces: bool)` pair whose
+/// misuse produced the ppollunblock/maskfork bug class. The variant IS the
+/// semantics: `Replace` is the ppoll/pselect6/epoll_pwait shape (the caller
+/// sigmask REPLACES the thread's persistent mask for the wait — a signal the
+/// temp mask unblocks must interrupt even if persistently blocked); `Additive`
+/// is a plain blocking syscall (the thread's persistent mask gates the wait;
+/// the carried set is ADDITIONALLY blocked, usually empty).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum WaitSigMask {
+    Additive(SigSet),
+    Replace(SigSet),
+}
+
+impl WaitSigMask {
+    /// Plain wait, nothing extra blocked (the overwhelmingly common case).
+    pub const NONE: WaitSigMask = WaitSigMask::Additive(SigSet::EMPTY);
+
+    /// The raw bits handed to the waiter boundary (ppoll/kqueue backends take
+    /// bare `u64` block masks; bit `signum-1`).
+    #[inline]
+    pub const fn raw_block_bits(self) -> u64 {
+        match self {
+            WaitSigMask::Additive(s) | WaitSigMask::Replace(s) => s.raw(),
+        }
+    }
+}
+
 /// `SIG_DFL` / `SIG_IGN` handler sentinel values stored in `sa_handler`.
 pub const LINUX_SIG_DFL: u64 = 0;
 pub const LINUX_SIG_IGN: u64 = 1;
