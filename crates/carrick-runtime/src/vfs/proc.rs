@@ -942,6 +942,9 @@ fn synthetic_proc_net_if_inet6(network: &carrick_spec::NetworkNamespaceSpec) -> 
 /// `/proc/net/dev`: the two verbatim header lines (proc_net(5) quotes them
 /// exactly) then one all-zero-counter row per Linux-mapped interface.
 fn synthetic_proc_net_dev(network: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
+    if network.mode == carrick_spec::NetworkMode::Bridge {
+        return crate::network::model::LinuxNetworkModel::from_spec(network).render_proc_net_dev();
+    }
     let mut s = String::from(
         "Inter-|   Receive                                                |  Transmit\n \
 face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
@@ -976,32 +979,8 @@ fn synthetic_proc_net_route(network: &carrick_spec::NetworkNamespaceSpec) -> Vec
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
     );
     if network.mode == carrick_spec::NetworkMode::Bridge {
-        let model = crate::network::model::LinuxNetworkModel::from_spec(network);
-        for route in model.routes {
-            let destination = match route.destination {
-                Some(std::net::IpAddr::V4(addr)) => addr,
-                Some(std::net::IpAddr::V6(_)) => continue,
-                None => std::net::Ipv4Addr::UNSPECIFIED,
-            };
-            let gateway = match route.gateway {
-                Some(std::net::IpAddr::V4(addr)) => addr,
-                Some(std::net::IpAddr::V6(_)) => continue,
-                None => std::net::Ipv4Addr::UNSPECIFIED,
-            };
-            let flags = if route.gateway.is_some() {
-                "0003"
-            } else {
-                "0001"
-            };
-            s.push_str(&format!(
-                "{}\t{}\t{}\t{flags}\t0\t0\t0\t{}\t0\t0\t0\n",
-                route.link_name,
-                proc_net_route_hex_v4(destination),
-                proc_net_route_hex_v4(gateway),
-                proc_net_route_hex_v4_mask(route.destination_prefix_len),
-            ));
-        }
-        return s.into_bytes();
+        return crate::network::model::LinuxNetworkModel::from_spec(network)
+            .render_proc_net_route();
     }
     let eth = linux_interfaces(network)
         .into_iter()
@@ -1014,24 +993,6 @@ fn synthetic_proc_net_route(network: &carrick_spec::NetworkNamespaceSpec) -> Vec
         ));
     }
     s.into_bytes()
-}
-
-fn proc_net_route_hex_v4(addr: std::net::Ipv4Addr) -> String {
-    let octets = addr.octets();
-    format!(
-        "{:02X}{:02X}{:02X}{:02X}",
-        octets[3], octets[2], octets[1], octets[0]
-    )
-}
-
-fn proc_net_route_hex_v4_mask(prefix_len: u8) -> String {
-    let prefix = prefix_len.min(32);
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    proc_net_route_hex_v4(std::net::Ipv4Addr::from(mask))
 }
 
 /// `/proc/net/ipv6_route`: loopback rows in the fixed 32-hex-digit layout, no
