@@ -427,6 +427,32 @@ async fn network_lifecycle_supports_compose_bridge_resource() {
 }
 
 #[tokio::test]
+async fn network_create_rejects_unimplemented_privileged_provider_drivers() {
+    let (_server, sock, _dir) = spawn_server();
+
+    for driver in ["pf-bridge", "network-extension", "linux-netns"] {
+        let (status, body) = docker_api_json(
+            &sock,
+            "POST",
+            "/networks/create",
+            serde_json::json!({
+                "Name": format!("m0_{driver}").replace('-', "_"),
+                "Driver": driver,
+            }),
+        );
+        assert_eq!(status, 400, "{driver} should be rejected: {body}");
+        assert!(
+            body.get("message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(
+                    |message| message.contains(driver) && message.contains("not implemented")
+                ),
+            "{driver} should return a clear unsupported-provider error: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn network_create_preserves_enable_ipv4_for_compose() {
     let (_server, sock, _dir) = spawn_server();
     let docker =
