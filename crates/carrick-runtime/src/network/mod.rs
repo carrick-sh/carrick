@@ -110,6 +110,43 @@ pub fn select_provider(spec: &NetworkNamespaceSpec) -> Box<dyn NetworkProvider> 
     }
 }
 
+pub struct RuntimeNetwork {
+    pub spec: NetworkNamespaceSpec,
+    pub provider: Box<dyn NetworkProvider>,
+    pub lease: NetworkLease,
+}
+
+impl RuntimeNetwork {
+    pub fn create(spec: &NetworkNamespaceSpec) -> Result<Self, String> {
+        let provider = select_provider(spec);
+        let lease = provider.create_namespace(spec)?;
+        for mapping in &spec.published_ports {
+            provider.publish_port(lease.id, mapping.clone())?;
+        }
+        Ok(Self {
+            spec: spec.clone(),
+            provider,
+            lease,
+        })
+    }
+
+    pub fn host_default() -> Self {
+        Self {
+            spec: NetworkNamespaceSpec::default(),
+            provider: Box::<HostNetworkProvider>::default(),
+            lease: NetworkLease {
+                id: NetworkLeaseId(0),
+            },
+        }
+    }
+}
+
+impl Drop for RuntimeNetwork {
+    fn drop(&mut self) {
+        let _ = self.provider.destroy_namespace(self.lease.id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +160,17 @@ mod tests {
         assert!(!caps.same_bridge_ip_connectivity);
         assert!(!caps.host_routable_container_ips);
         assert!(!caps.requires_privilege);
+    }
+
+    #[test]
+    fn bridge_provider_creates_nonzero_lease() {
+        let network = RuntimeNetwork::create(&NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .expect("create bridge network");
+        assert_eq!(network.lease.id, NetworkLeaseId(1));
+        assert_eq!(network.spec.mode, NetworkMode::Bridge);
     }
 }
