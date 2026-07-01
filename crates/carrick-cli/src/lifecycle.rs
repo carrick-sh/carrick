@@ -190,6 +190,11 @@ fn build_created_state(
             user: req.user.clone(),
             pid: req.pid,
             network: req.network,
+            api_network_mode: req.network_bridge.clone().or_else(|| match req.network {
+                carrick_spec::NetworkMode::Bridge => Some("bridge".to_string()),
+                carrick_spec::NetworkMode::Host => Some("host".to_string()),
+                carrick_spec::NetworkMode::None => Some("none".to_string()),
+            }),
             network_aliases: req.network_aliases.clone(),
             network_attachments: default_network_attachments(
                 req.network,
@@ -1315,6 +1320,9 @@ fn docker_network_mode(c: &ContainerState) -> String {
     if let Some(target) = c.config.network_container.as_deref() {
         return format!("container:{target}");
     }
+    if let Some(mode) = c.config.api_network_mode.as_deref() {
+        return mode.to_string();
+    }
     c.config
         .network_attachments
         .first()
@@ -1329,6 +1337,9 @@ fn docker_network_mode(c: &ContainerState) -> String {
 fn docker_networks(c: &ContainerState) -> serde_json::Value {
     let mut networks = serde_json::Map::new();
     if c.config.network_container.is_some() {
+        return serde_json::Value::Object(networks);
+    }
+    if has_no_effective_network_endpoint(c) {
         return serde_json::Value::Object(networks);
     }
     if !c.config.network_attachments.is_empty() {
@@ -1359,6 +1370,15 @@ fn docker_networks(c: &ContainerState) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(networks)
+}
+
+fn has_no_effective_network_endpoint(c: &ContainerState) -> bool {
+    c.config.network == carrick_spec::NetworkMode::None
+        && c.config.network_attachments.is_empty()
+        && c.config
+            .api_network_mode
+            .as_deref()
+            .is_some_and(|mode| mode != "none")
 }
 
 #[derive(Default)]
@@ -1729,6 +1749,7 @@ mod tests {
                 user: Some("1000".into()),
                 pid: carrick_spec::PidMode::Private,
                 network: carrick_spec::NetworkMode::Host,
+                api_network_mode: Some("host".into()),
                 network_aliases: vec!["api".into()],
                 network_attachments: Vec::new(),
                 network_container: None,

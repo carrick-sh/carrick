@@ -90,6 +90,11 @@ pub struct RunConfig {
     /// Container network mode.
     #[serde(default)]
     pub network: carrick_spec::NetworkMode,
+    /// Docker API-facing HostConfig.NetworkMode. This can outlive the effective
+    /// endpoint set after `docker network disconnect`, so keep it separate from
+    /// the runtime network mode.
+    #[serde(default)]
+    pub api_network_mode: Option<String>,
     /// Bridge-network service aliases.
     #[serde(default)]
     pub network_aliases: Vec<String>,
@@ -191,6 +196,7 @@ impl Default for RunConfig {
             user: None,
             pid: carrick_spec::PidMode::default(),
             network: carrick_spec::NetworkMode::Host,
+            api_network_mode: None,
             network_aliases: Vec::new(),
             network_attachments: Vec::new(),
             network_container: None,
