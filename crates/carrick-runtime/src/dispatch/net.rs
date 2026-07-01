@@ -153,6 +153,33 @@ fn socket_addr_to_host_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {
     out[4..8].copy_from_slice(&v4.ip().octets());
     Some(out)
 }
+
+fn socket_addr_to_linux_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {
+    let std::net::SocketAddr::V4(v4) = addr else {
+        return None;
+    };
+    let mut out = vec![0_u8; 16];
+    out[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+    out[2..4].copy_from_slice(&v4.port().to_be_bytes());
+    out[4..8].copy_from_slice(&v4.ip().octets());
+    Some(out)
+}
+
+fn host_socket_addr(host_fd: i32, family: i32, peer: bool) -> Option<std::net::SocketAddr> {
+    if family != libc::AF_INET {
+        return None;
+    }
+    let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+    let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+    let rc = if peer {
+        unsafe { libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) }
+    } else {
+        unsafe { libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) }
+    };
+    rc.host_syscall_errno().ok()?;
+    let used = (sa_len as usize).min(sa.len());
+    host_sockaddr_to_socket_addr(&sa[..used])
+}
 mod support;
 use support::*;
 pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
@@ -3533,6 +3560,7 @@ impl SyscallDispatcher {
                 None
             };
             let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
+            let mut rewritten_bind: Option<(std::net::SocketAddr, PortProtocol)> = None;
             if family == libc::AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
@@ -3545,6 +3573,7 @@ impl SyscallDispatcher {
                     Ok(BindTarget::Host(host)) => {
                         if let Some(mapped) = socket_addr_to_host_sockaddr(host) {
                             host_addr = mapped;
+                            rewritten_bind = Some((requested, protocol));
                         }
                     }
                     Ok(BindTarget::Unchanged) => {}
@@ -3582,6 +3611,17 @@ impl SyscallDispatcher {
             };
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(DispatchOutcome::errno(errno));
+            }
+            if let Some((guest_local, protocol)) = rewritten_bind
+                && let Some(host_local) = host_socket_addr(host_fd, family, false)
+            {
+                let _ = this.network.provider.record_socket_addresses(
+                    fd,
+                    Some(guest_local),
+                    Some(host_local),
+                    None,
+                    protocol,
+                );
             }
             if family == libc::AF_UNIX && host_addr.len() > 2 {
                 let end = host_addr[2..]
@@ -3661,6 +3701,11 @@ impl SyscallDispatcher {
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             rewrite_unspecified_connect_loopback(family, &mut host_addr);
+            let mut rewritten_connect: Option<(
+                std::net::SocketAddr,
+                std::net::SocketAddr,
+                PortProtocol,
+            )> = None;
             if family == libc::AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
@@ -3673,6 +3718,7 @@ impl SyscallDispatcher {
                     Ok(ConnectTarget::Host(host)) => {
                         if let Some(mapped) = socket_addr_to_host_sockaddr(host) {
                             host_addr = mapped;
+                            rewritten_connect = Some((requested, host, protocol));
                         }
                     }
                     Ok(ConnectTarget::Unchanged) => {}
@@ -3739,7 +3785,26 @@ impl SyscallDispatcher {
                 // A non-blocking host connect reporting success does not prove the
                 // connection completed — consult SO_ERROR (see
                 // connect_success_or_pending_error).
-                return Ok(connect_success_or_pending_error(host_fd.get()));
+                let outcome = connect_success_or_pending_error(host_fd.get());
+                if matches!(outcome, DispatchOutcome::Returned { value: 0 })
+                    && let Some((guest_peer, host_peer, protocol)) = rewritten_connect
+                {
+                    let guest_local = this
+                        .network
+                        .provider
+                        .guest_visible_local_addr(fd)
+                        .ok()
+                        .flatten();
+                    let host_local = host_socket_addr(host_fd, family, false);
+                    let _ = this.network.provider.record_socket_addresses(
+                        fd,
+                        guest_local,
+                        host_local.or(Some(host_peer)),
+                        Some(guest_peer),
+                        protocol,
+                    );
+                }
+                return Ok(outcome);
             }
             let e = HostSyscallError::last().linux_errno();
             // EISCONN: macOS reports it BOTH when an async connect we deferred
@@ -3818,6 +3883,14 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            if let Ok(Some(guest_local)) = this.network.provider.guest_visible_local_addr(fd)
+                && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local)
+            {
+                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
             let rc =
@@ -3859,6 +3932,14 @@ impl SyscallDispatcher {
                 && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if let Ok(Some(guest_peer)) = this.network.provider.guest_visible_peer_addr(fd)
+                && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer)
+            {
+                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
             let used = (sa_len as usize).min(sa.len());
             let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, false);
