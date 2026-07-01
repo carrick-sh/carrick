@@ -299,6 +299,16 @@ impl SigSet {
         SigSet(self.0 | other.0)
     }
 
+    /// `self` plus `signum` (1..=64; out-of-range is a no-op — sigset_t has
+    /// nowhere to put it).
+    #[inline]
+    pub fn with(self, signum: i32) -> SigSet {
+        match signum {
+            1..=64 => SigSet(self.0 | (1u64 << (signum - 1))),
+            _ => self,
+        }
+    }
+
     #[inline]
     pub const fn intersect(self, other: SigSet) -> SigSet {
         SigSet(self.0 & other.0)
