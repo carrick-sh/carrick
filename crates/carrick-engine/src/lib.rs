@@ -105,6 +105,8 @@ pub struct CliRunRequest {
     pub mounts: Vec<Mount>,
     pub workdir: Option<String>,
     pub user: Option<String>,
+    /// Docker-compatible container hostname / UTS identity.
+    pub hostname: Option<String>,
     pub entrypoint_override: Option<Vec<String>>,
     pub tty: bool,
     pub interactive: bool,
@@ -399,6 +401,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         debug_state_path,
         platform,
         pid: req.pid,
+        hostname: req.hostname,
         network,
         extra_hosts: req.extra_hosts,
         uid,
@@ -501,6 +504,7 @@ mod tests {
             mounts: vec![],
             workdir: None,
             user: user.map(|s| s.to_string()),
+            hostname: None,
             entrypoint_override: None,
             tty: false,
             interactive: false,
@@ -571,6 +575,16 @@ mod tests {
 
         let spec = resolve_run_spec(req, image).expect("resolve run spec");
         assert_eq!(spec.extra_hosts, vec!["db.local:10.12.0.7"]);
+    }
+
+    #[test]
+    fn hostname_resolves_into_run_spec() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.hostname = Some("api-host".to_string());
+
+        let spec = resolve_run_spec(req, image).expect("resolve run spec");
+        assert_eq!(spec.hostname.as_deref(), Some("api-host"));
     }
 
     #[test]
@@ -667,6 +681,7 @@ mod tests {
             mounts: vec![],
             workdir: None,
             user: None,
+            hostname: None,
             entrypoint_override: None,
             tty: false,
             interactive: false,
@@ -713,6 +728,7 @@ mod tests {
             mounts: vec![],
             workdir: None,
             user: None,
+            hostname: None,
             entrypoint_override: None,
             tty: false,
             interactive: false,
@@ -758,6 +774,7 @@ mod tests {
             mounts: vec![],
             workdir: None,
             user: None,
+            hostname: None,
             entrypoint_override: Some(vec!["/bin/bash".to_string()]),
             tty: false,
             interactive: false,
@@ -803,6 +820,7 @@ mod tests {
             mounts: vec![],
             workdir: None,
             user: None,
+            hostname: None,
             entrypoint_override: None,
             tty: false,
             interactive: false,
@@ -857,6 +875,7 @@ mod tests {
             mounts: vec![],
             workdir: Some("/user/app".to_string()),
             user: None,
+            hostname: None,
             entrypoint_override: None,
             tty: false,
             interactive: false,
@@ -900,6 +919,7 @@ mod tests {
                 mounts: vec![],
                 workdir: wd.map(|s| s.to_string()),
                 user: None,
+                hostname: None,
                 entrypoint_override: None,
                 tty: false,
                 interactive: false,

@@ -277,6 +277,8 @@ pub struct OpenContext<'a> {
     /// The ISA this guest reports about itself, so `/proc/cpuinfo` agrees with
     /// `uname(2)` for x86_64 guests. See [`GuestReportedArch`].
     pub guest_arch: GuestReportedArch,
+    /// The guest UTS hostname, for `/proc/sys/kernel/hostname`.
+    pub guest_hostname: Option<&'a str>,
     /// Guest environment (`KEY=VALUE`, opaque bytes) for `/proc/self/environ`.
     pub environ: Option<&'a [Vec<u8>]>,
     /// The guest's currently-open fd numbers, for the `/proc/self/fd` directory

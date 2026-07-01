@@ -51,6 +51,17 @@ fn main() {
     );
     println!("bridge_resolv_search_match={}", resolv_search_match());
     println!("bridge_resolv_options_match={}", resolv_options_match());
+    println!("bridge_gethostname_match={}", gethostname_match());
+    println!("bridge_uname_nodename_match={}", uname_nodename_match());
+    println!(
+        "bridge_proc_hostname_match={}",
+        file_trimmed_match("/proc/sys/kernel/hostname", "CARRICK_PROBE_EXPECT_HOSTNAME")
+    );
+    println!(
+        "bridge_etc_hostname_match={}",
+        file_trimmed_match("/etc/hostname", "CARRICK_PROBE_EXPECT_HOSTNAME")
+    );
+    println!("bridge_hosts_has_hostname={}", hosts_has_expected_hostname());
     println!("bridge_proc_dev_has_eth0={}", proc_dev_has_eth0());
     println!(
         "bridge_proc_route_default_gateway={}",
@@ -165,6 +176,53 @@ fn env_list(name: &str) -> Option<Vec<String>> {
             .filter(|entry| !entry.is_empty())
             .map(str::to_string)
             .collect()
+    })
+}
+
+fn expected_hostname() -> Option<String> {
+    std::env::var("CARRICK_PROBE_EXPECT_HOSTNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn gethostname_match() -> bool {
+    let Some(expected) = expected_hostname() else {
+        return true;
+    };
+    let mut buf = [0 as libc::c_char; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return false;
+    }
+    unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy() == expected
+}
+
+fn uname_nodename_match() -> bool {
+    let Some(expected) = expected_hostname() else {
+        return true;
+    };
+    let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return false;
+    }
+    unsafe { CStr::from_ptr(uts.nodename.as_ptr()) }.to_string_lossy() == expected
+}
+
+fn file_trimmed_match(path: &str, env_name: &str) -> bool {
+    let Some(expected) = std::env::var(env_name).ok() else {
+        return true;
+    };
+    fs::read_to_string(path).is_ok_and(|contents| contents.trim() == expected)
+}
+
+fn hosts_has_expected_hostname() -> bool {
+    let Some(expected) = expected_hostname() else {
+        return true;
+    };
+    fs::read_to_string("/etc/hosts").is_ok_and(|contents| {
+        contents
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| line.split_whitespace().skip(1).any(|name| name == expected))
     })
 }
 

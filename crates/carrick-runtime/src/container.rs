@@ -85,6 +85,10 @@ pub struct RunConfig {
     pub workdir: Option<String>,
     /// `-u/--user` (numeric `uid[:gid]` or a name).
     pub user: Option<String>,
+    /// Docker-compatible container hostname / UTS identity. `None` preserves
+    /// the runtime's historical host-derived fallback.
+    #[serde(default)]
+    pub hostname: Option<String>,
     /// PID namespace mode — `exec` joins the same region.
     pub pid: carrick_spec::PidMode,
     /// Container network mode.
@@ -194,6 +198,7 @@ impl Default for RunConfig {
             env: Vec::new(),
             workdir: None,
             user: None,
+            hostname: None,
             pid: carrick_spec::PidMode::default(),
             network: carrick_spec::NetworkMode::Host,
             api_network_mode: None,

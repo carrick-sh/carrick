@@ -99,6 +99,9 @@ pub struct SyntheticProcContext {
     /// The ISA this guest reports about itself, so `/proc/cpuinfo` agrees with
     /// `uname(2)` for x86_64 guests (native x86 backends + Rosetta-translated).
     pub guest_arch: GuestReportedArch,
+    /// The guest UTS hostname, kept in lockstep with `uname(2)` nodename and
+    /// `/etc/hostname`.
+    pub guest_hostname: String,
     /// Guest environment (`KEY=VALUE`) as opaque bytes, surfaced via
     /// `/proc/self/environ` (env values need not be UTF-8).
     pub environ: Vec<Vec<u8>>,
@@ -265,12 +268,19 @@ fn sysctl_boot_id() -> Vec<u8> {
     BOOT_ID.get_or_init(|| format_uuid_v4(random_16())).clone()
 }
 
-/// `/proc/sys/kernel/hostname`: the guest's hostname. Under carrick's
-/// `--net=host` contract this is the macOS host's short name (`carrick`
-/// fallback), kept in lockstep with uname(2) nodename and the /etc/hosts
-/// self-mapping via the single source of truth crate::execute::guest_hostname.
+/// `/proc/sys/kernel/hostname`: fallback hostname for context-free procfs
+/// lookups. Real opens receive a dispatcher snapshot and use the per-container
+/// UTS hostname when one is configured.
 fn sysctl_hostname() -> Vec<u8> {
     format!("{}\n", crate::execute::guest_hostname()).into_bytes()
+}
+
+fn context_guest_hostname(ctx: &SyntheticProcContext) -> &str {
+    if ctx.guest_hostname.is_empty() {
+        crate::execute::guest_hostname()
+    } else {
+        &ctx.guest_hostname
+    }
 }
 
 /// A sysctl leaf value: a fixed byte string or a per-read generator.
@@ -295,9 +305,8 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
         "/proc/sys/kernel/version",
         Sysctl::Static(b"#1 SMP PREEMPT_DYNAMIC\n"),
     ),
-    // Dynamic: the macOS host's short name under --net=host (`carrick` fallback),
-    // kept in lockstep with uname(2) nodename and the /etc/hosts self-mapping via
-    // crate::execute::guest_hostname — the single source of truth.
+    // Context-free fallback; synthetic_file handles this path first when a live
+    // SyntheticProcContext supplies a per-container hostname.
     (
         "/proc/sys/kernel/hostname",
         Sysctl::Dynamic(sysctl_hostname),
@@ -543,6 +552,9 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
                 .to_vec(),
         ),
         _ => {
+            if path == "/proc/sys/kernel/hostname" {
+                return Some(format!("{}\n", context_guest_hostname(ctx)).into_bytes());
+            }
             if let Some(v) = sysctl_value(path) {
                 return Some(v);
             }
@@ -1622,6 +1634,7 @@ impl Vfs for ProcVfs {
             executable_path: ctx.executable_path.unwrap_or("").to_owned(),
             argv: ctx.argv.unwrap_or(&[]).to_vec(),
             guest_arch: ctx.guest_arch,
+            guest_hostname: ctx.guest_hostname.unwrap_or("").to_owned(),
             environ: ctx.environ.unwrap_or(&[]).to_vec(),
             open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
             network: ctx.network.cloned().unwrap_or_default(),
@@ -3411,6 +3424,29 @@ mod tests {
             _ => panic!("expected a Directory handle"),
         }
         assert!(v.lookup("/proc/999999/fdinfo").is_err());
+    }
+
+    #[test]
+    fn proc_sys_hostname_uses_open_context_hostname() {
+        let v = ProcVfs::new();
+        let ctx = OpenContext {
+            guest_hostname: Some("api-host"),
+            ..Default::default()
+        };
+        let h = v
+            .open(
+                "/proc/sys/kernel/hostname",
+                OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .unwrap();
+        match h {
+            VfsHandle::Bytes { contents, .. } => assert_eq!(contents, b"api-host\n"),
+            _ => panic!("expected hostname bytes"),
+        }
     }
 
     #[test]

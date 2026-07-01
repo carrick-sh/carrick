@@ -700,6 +700,10 @@ pub struct RunSpec {
     /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
     #[serde(default)]
     pub pid: PidMode,
+    /// Docker-compatible container hostname / UTS identity. `None` preserves the
+    /// runtime's host-derived fallback for legacy and non-container runs.
+    #[serde(default)]
+    pub hostname: Option<String>,
     /// Network namespace mode and resolved bridge view.
     #[serde(default)]
     pub network: NetworkNamespaceSpec,

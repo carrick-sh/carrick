@@ -1122,7 +1122,10 @@ pub mod runtime {
         all(feature = "platform-linux", target_arch = "x86_64"),
         allow(dead_code)
     )]
-    fn seed_linux_baseline_gaps(backend: &mut dyn crate::fs_backend::FsBackend) {
+    fn seed_linux_baseline_gaps(
+        backend: &mut dyn crate::fs_backend::FsBackend,
+        guest_hostname: &str,
+    ) {
         for dir in [
             "/tmp",
             "/var",
@@ -1167,7 +1170,7 @@ pub mod runtime {
         // (execute.rs seed_guest_baseline). Most OCI images ship an EMPTY
         // /etc/hosts and rely on the runtime to populate it, so an existence guard
         // would (wrongly) leave the guest unable to resolve itself.
-        let host = crate::execute::guest_hostname();
+        let host = guest_hostname;
         let mut hosts_content = String::from(
             "127.0.0.1\tlocalhost\n\
              ::1\tlocalhost ip6-localhost ip6-loopback\n\
@@ -1306,13 +1309,19 @@ pub mod runtime {
             .collect();
         host.extract_layers(&layer_paths)
             .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("extract OCI layers: {e}")))?;
-        seed_linux_baseline_gaps(&mut host);
+        let guest_hostname = spec
+            .hostname
+            .as_deref()
+            .filter(|hostname| !hostname.is_empty())
+            .unwrap_or_else(crate::execute::guest_hostname);
+        seed_linux_baseline_gaps(&mut host, guest_hostname);
 
         // 2. Build the dispatcher rooted at the extracted rootfs. This is a
         //    sandboxed container fs (extracted OCI layers on a cap-std overlay):
         //    forbid the execve host-fs fallback so a target absent from the
         //    rootfs ENOENTs instead of escaping to the host binary.
         let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_guest_hostname(guest_hostname);
         dispatcher.sandbox_exec_to_container();
         dispatcher.set_executable_path(spec.executable.clone());
         if let Some(cwd) = &spec.cwd {
