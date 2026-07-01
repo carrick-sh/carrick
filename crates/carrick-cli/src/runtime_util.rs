@@ -80,42 +80,62 @@ pub(crate) fn parse_volume_mount(s: &str) -> anyhow::Result<carrick_spec::Mount>
     })
 }
 
-/// Validate `-p/--publish` specs under carrick's host-only networking. A port
-/// REMAP (hostPort != containerPort) can never work — the guest binds the host
-/// port directly — so per the hybrid unsupported-flag policy it is a hard error;
-/// an identity map (hostPort == containerPort) is accepted as a documented
-/// no-op. Accepts docker's `[ip:]hostPort:containerPort[/proto]`; a bare
-/// `containerPort` (docker assigns a random host port) is a remap and rejected.
-pub(crate) fn validate_publish(specs: &[String]) -> anyhow::Result<()> {
+pub(crate) fn parse_publish_specs(
+    network: carrick_spec::NetworkMode,
+    specs: &[String],
+) -> anyhow::Result<Vec<carrick_spec::PortMapping>> {
+    let mut mappings = Vec::new();
     for spec in specs {
-        let body = spec.split('/').next().unwrap_or(spec.as_str());
+        let (body, proto) = match spec.rsplit_once('/') {
+            Some((body, "tcp")) => (body, carrick_spec::PortProtocol::Tcp),
+            Some((body, "udp")) => (body, carrick_spec::PortProtocol::Udp),
+            Some((_body, other)) => anyhow::bail!(
+                "invalid -p {spec:?}: unsupported protocol {other:?}; expected tcp or udp"
+            ),
+            None => (spec.as_str(), carrick_spec::PortProtocol::Tcp),
+        };
         let parts: Vec<&str> = body.split(':').collect();
-        let (host, container) = match parts.as_slice() {
-            [c] => (None, *c),
-            [h, c] => (Some(*h), *c),
-            [_ip, h, c] => (Some(*h), *c),
+        let (host_ip, host, container) = match parts.as_slice() {
+            [c] => (None, None, *c),
+            [h, c] => (None, Some(*h), *c),
+            [ip, h, c] => {
+                let ip = ip
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid -p {spec:?}: bad host ip {ip:?}"))?;
+                (Some(ip), Some(*h), *c)
+            }
             _ => anyhow::bail!("invalid -p {spec:?}: expected [ip:]hostPort:containerPort[/proto]"),
         };
-        let cport: u16 = container.parse().map_err(|_| {
+        let container_port: u16 = container.parse().map_err(|_| {
             anyhow::anyhow!("invalid -p {spec:?}: bad container port {container:?}")
         })?;
-        match host {
-            None => anyhow::bail!(
-                "-p {spec:?}: publishing to a random host port is unsupported under carrick's host networking (the guest binds the host directly); use -p {cport}:{cport} or drop -p"
+        let host_port = match host {
+            Some(h) => Some(
+                h.parse()
+                    .map_err(|_| anyhow::anyhow!("invalid -p {spec:?}: bad host port {h:?}"))?,
             ),
-            Some(h) => {
-                let hport: u16 = h
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid -p {spec:?}: bad host port {h:?}"))?;
-                if hport != cport {
-                    anyhow::bail!(
-                        "-p {spec:?}: port remapping {hport}->{cport} is unsupported under carrick's host networking; the container binds {cport} on the host directly. Use -p {cport}:{cport} or drop -p"
-                    );
-                }
+            None => None,
+        };
+        if network == carrick_spec::NetworkMode::Host {
+            let Some(host_port) = host_port else {
+                anyhow::bail!(
+                    "-p {spec:?}: publishing to a random host port is unsupported under carrick's host networking (the guest binds the host directly); use -p {container_port}:{container_port} or drop -p"
+                );
+            };
+            if host_port != container_port {
+                anyhow::bail!(
+                    "-p {spec:?}: port remapping {host_port}->{container_port} is unsupported under carrick's host networking; the container binds {container_port} on the host directly. Use -p {container_port}:{container_port} or drop -p"
+                );
             }
         }
+        mappings.push(carrick_spec::PortMapping {
+            host_ip,
+            host_port,
+            container_port,
+            protocol: proto,
+        });
     }
-    Ok(())
+    Ok(mappings)
 }
 
 pub(crate) fn parse_mount_flag(s: &str) -> anyhow::Result<carrick_spec::Mount> {
@@ -272,27 +292,61 @@ pub(crate) fn human_age(created_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_volume_mount, validate_publish};
+    use super::{parse_publish_specs, parse_volume_mount};
+    use carrick_spec::{NetworkMode, PortProtocol};
 
     #[test]
     fn publish_identity_map_accepted() {
-        assert!(validate_publish(&["80:80".into()]).is_ok());
-        assert!(validate_publish(&["127.0.0.1:80:80".into()]).is_ok());
-        assert!(validate_publish(&["80:80/tcp".into()]).is_ok());
-        assert!(validate_publish(&[]).is_ok());
+        assert!(parse_publish_specs(NetworkMode::Host, &["80:80".into()]).is_ok());
+        assert!(parse_publish_specs(NetworkMode::Host, &["127.0.0.1:80:80".into()]).is_ok());
+        assert!(parse_publish_specs(NetworkMode::Host, &["80:80/tcp".into()]).is_ok());
+        assert!(parse_publish_specs(NetworkMode::Host, &[]).is_ok());
     }
 
     #[test]
     fn publish_remap_rejected() {
-        assert!(validate_publish(&["8080:80".into()]).is_err());
-        assert!(validate_publish(&["127.0.0.1:8080:80".into()]).is_err());
-        assert!(validate_publish(&["80".into()]).is_err()); // random host port
+        assert!(parse_publish_specs(NetworkMode::Host, &["8080:80".into()]).is_err());
+        assert!(
+            parse_publish_specs(NetworkMode::Host, &["127.0.0.1:8080:80".into()]).is_err()
+        );
+        assert!(parse_publish_specs(NetworkMode::Host, &["80".into()]).is_err());
     }
 
     #[test]
     fn publish_malformed_rejected() {
-        assert!(validate_publish(&["a:b:c:d".into()]).is_err());
-        assert!(validate_publish(&["80:notaport".into()]).is_err());
+        assert!(parse_publish_specs(NetworkMode::Host, &["a:b:c:d".into()]).is_err());
+        assert!(parse_publish_specs(NetworkMode::Host, &["80:notaport".into()]).is_err());
+    }
+
+    #[test]
+    fn bridge_publish_accepts_port_remap() {
+        let mappings =
+            parse_publish_specs(NetworkMode::Bridge, &["127.0.0.1:8080:80/tcp".to_string()])
+                .expect("bridge publish should parse");
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].host_ip.unwrap().to_string(), "127.0.0.1");
+        assert_eq!(mappings[0].host_port, Some(8080));
+        assert_eq!(mappings[0].container_port, 80);
+        assert_eq!(mappings[0].protocol, PortProtocol::Tcp);
+    }
+
+    #[test]
+    fn host_publish_still_rejects_remap() {
+        let err = parse_publish_specs(NetworkMode::Host, &["8080:80".to_string()])
+            .expect_err("host networking cannot remap ports");
+        assert!(
+            err.to_string()
+                .contains("unsupported under carrick's host networking")
+        );
+    }
+
+    #[test]
+    fn bridge_publish_accepts_udp() {
+        let mappings = parse_publish_specs(NetworkMode::Bridge, &["5353:53/udp".to_string()])
+            .expect("udp publish should parse");
+        assert_eq!(mappings[0].protocol, PortProtocol::Udp);
+        assert_eq!(mappings[0].host_port, Some(5353));
+        assert_eq!(mappings[0].container_port, 53);
     }
 
     #[test]

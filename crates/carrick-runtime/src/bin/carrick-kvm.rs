@@ -73,6 +73,7 @@ fn main() {
                 debug_state_path: None,
                 platform: carrick_spec::Platform::default(),
                 pid: carrick_spec::PidMode::default(),
+                network: carrick_spec::NetworkNamespaceSpec::default(),
                 uid: 0,
                 gid: 0,
             };
