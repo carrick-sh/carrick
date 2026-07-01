@@ -1,13 +1,16 @@
 use carrick_spec::{
     NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol,
 };
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+pub(crate) mod dns;
 pub mod socket_namespace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkCapabilities {
     pub same_bridge_ip_connectivity: bool,
+    pub multi_network_attachments: bool,
+    pub embedded_dns: bool,
     pub outbound_connectivity: bool,
     pub published_ports: bool,
     pub published_udp_ports: bool,
@@ -75,6 +78,7 @@ pub trait NetworkProvider: Send + Sync {
     ) -> Result<ConnectTarget, String>;
     fn record_socket_addresses(
         &self,
+        _namespace_id: Option<&NetworkNamespaceId>,
         _guest_fd: i32,
         _guest_local: Option<GuestSocketAddr>,
         _host_local: Option<HostSocketAddr>,
@@ -112,6 +116,13 @@ pub trait NetworkProvider: Send + Sync {
     ) -> Result<Vec<NetworkHostsEntry>, String> {
         Ok(Vec::new())
     }
+    fn resolve_dns_name(
+        &self,
+        _spec: &NetworkNamespaceSpec,
+        _name: &str,
+    ) -> Result<Vec<Ipv4Addr>, String> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +132,8 @@ impl NetworkProvider for HostNetworkProvider {
     fn capabilities(&self) -> NetworkCapabilities {
         NetworkCapabilities {
             same_bridge_ip_connectivity: false,
+            multi_network_attachments: false,
+            embedded_dns: false,
             outbound_connectivity: true,
             published_ports: false,
             published_udp_ports: false,
@@ -175,6 +188,8 @@ impl NetworkProvider for NoNetworkProvider {
     fn capabilities(&self) -> NetworkCapabilities {
         NetworkCapabilities {
             same_bridge_ip_connectivity: false,
+            multi_network_attachments: false,
+            embedded_dns: false,
             outbound_connectivity: false,
             published_ports: false,
             published_udp_ports: false,
@@ -263,6 +278,10 @@ impl RuntimeNetwork {
     pub fn guest_hosts_entries(&self) -> Result<Vec<NetworkHostsEntry>, String> {
         self.provider.guest_hosts_entries(&self.spec)
     }
+
+    pub fn resolve_dns_name(&self, name: &str) -> Result<Vec<Ipv4Addr>, String> {
+        self.provider.resolve_dns_name(&self.spec, name)
+    }
 }
 
 impl Drop for RuntimeNetwork {
@@ -282,6 +301,8 @@ mod tests {
         assert!(caps.kernel_datapath);
         assert!(caps.outbound_connectivity);
         assert!(!caps.same_bridge_ip_connectivity);
+        assert!(!caps.multi_network_attachments);
+        assert!(!caps.embedded_dns);
         assert!(!caps.published_udp_ports);
         assert!(!caps.host_routable_container_ips);
         assert!(!caps.netfilter);
@@ -311,6 +332,8 @@ mod tests {
         let caps = provider.capabilities();
 
         assert!(caps.same_bridge_ip_connectivity);
+        assert!(caps.multi_network_attachments);
+        assert!(caps.embedded_dns);
         assert!(caps.outbound_connectivity);
         assert!(caps.published_ports);
         assert!(!caps.published_udp_ports);

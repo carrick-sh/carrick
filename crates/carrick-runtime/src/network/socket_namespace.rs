@@ -2,7 +2,10 @@ use super::{
     BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr, NetworkCapabilities,
     NetworkHostsEntry, NetworkLease, NetworkLeaseId, NetworkProvider,
 };
-use carrick_spec::{BridgeId, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol};
+use carrick_spec::{
+    BridgeId, NetworkAttachmentSpec, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping,
+    PortProtocol,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -27,9 +30,15 @@ pub struct SocketNamespaceProvider {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VirtualEndpoint {
-    bridge_id: BridgeId,
+    scope: EndpointScope,
     addr: GuestSocketAddr,
     protocol: PortProtocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum EndpointScope {
+    Bridge(BridgeId),
+    Namespace(NetworkNamespaceId),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,13 +99,13 @@ impl SocketNamespaceProvider {
     pub fn register_virtual_endpoint(
         &self,
         bridge_id: BridgeId,
-        _namespace_id: NetworkNamespaceId,
+        namespace_id: NetworkNamespaceId,
         virtual_addr: GuestSocketAddr,
         protocol: PortProtocol,
         host_addr: HostSocketAddr,
     ) -> Result<(), String> {
         let key = VirtualEndpoint {
-            bridge_id,
+            scope: endpoint_scope(bridge_id, namespace_id, virtual_addr),
             addr: virtual_addr,
             protocol,
         };
@@ -111,16 +120,18 @@ impl SocketNamespaceProvider {
     }
 
     fn register_service_names(&self, spec: &NetworkNamespaceSpec) -> Result<(), String> {
-        let names = service_names(spec);
-        for name in names {
-            let path = service_name_path(&self.endpoint_dir, &spec.bridge_id, &name);
-            let contents = encode_service_name(spec.ipv4, &name);
-            fs::create_dir_all(&*self.endpoint_dir).map_err(|e| {
-                format!("failed to create socket namespace endpoint directory: {e}")
-            })?;
-            fs::write(&path, &contents)
-                .map_err(|e| format!("failed to record socket namespace service name: {e}"))?;
-            self.track_owned_file(path, contents)?;
+        for attachment in effective_attachments(spec) {
+            let names = service_names_for(attachment.container_name.as_ref(), &attachment.aliases);
+            for name in names {
+                let path = service_name_path(&self.endpoint_dir, &attachment.bridge_id, &name);
+                let contents = encode_service_name(attachment.ipv4, &name);
+                fs::create_dir_all(&*self.endpoint_dir).map_err(|e| {
+                    format!("failed to create socket namespace endpoint directory: {e}")
+                })?;
+                fs::write(&path, &contents)
+                    .map_err(|e| format!("failed to record socket namespace service name: {e}"))?;
+                self.track_owned_file(path, contents)?;
+            }
         }
         Ok(())
     }
@@ -130,7 +141,10 @@ impl SocketNamespaceProvider {
         spec: &NetworkNamespaceSpec,
     ) -> Result<Vec<NetworkHostsEntry>, String> {
         let mut entries = Vec::new();
-        let prefix = format!("service-{}-", spec.bridge_id.as_str());
+        let prefixes = effective_attachments(spec)
+            .into_iter()
+            .map(|attachment| format!("service-{}-", attachment.bridge_id.as_str()))
+            .collect::<Vec<_>>();
         let Ok(dir) = fs::read_dir(&*self.endpoint_dir) else {
             return Ok(entries);
         };
@@ -139,7 +153,7 @@ impl SocketNamespaceProvider {
             let Some(file_name) = file_name.to_str() else {
                 continue;
             };
-            if !file_name.starts_with(&prefix) {
+            if !prefixes.iter().any(|prefix| file_name.starts_with(prefix)) {
                 continue;
             }
             let Some(raw) = read_live_namespace_file(&entry.path()) else {
@@ -162,6 +176,34 @@ impl SocketNamespaceProvider {
         Ok(entries)
     }
 
+    fn resolve_service_name(
+        &self,
+        spec: &NetworkNamespaceSpec,
+        query_name: &str,
+    ) -> Result<Vec<Ipv4Addr>, String> {
+        let query_name = query_name.trim_end_matches('.');
+        if query_name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bridge_ids = effective_attachments(spec)
+            .into_iter()
+            .map(|attachment| attachment.bridge_id)
+            .collect::<Vec<_>>();
+        let mut addrs = Vec::new();
+        for bridge_id in bridge_ids {
+            let path = service_name_path(&self.endpoint_dir, &bridge_id, query_name);
+            let Some(raw) = read_live_namespace_file(&path) else {
+                continue;
+            };
+            if let Some((addr, _)) = decode_service_name(&raw)
+                && !addrs.contains(&addr)
+            {
+                addrs.push(addr);
+            }
+        }
+        Ok(addrs)
+    }
+
     pub fn resolve_registered_connect(
         &self,
         bridge_id: &BridgeId,
@@ -169,19 +211,40 @@ impl SocketNamespaceProvider {
         protocol: PortProtocol,
     ) -> Result<Option<HostSocketAddr>, String> {
         let key = VirtualEndpoint {
-            bridge_id: bridge_id.clone(),
+            scope: EndpointScope::Bridge(bridge_id.clone()),
             addr: virtual_addr,
             protocol,
         };
+        self.resolve_registered_endpoint(&key)
+    }
+
+    fn resolve_registered_namespace_connect(
+        &self,
+        namespace_id: &NetworkNamespaceId,
+        virtual_addr: GuestSocketAddr,
+        protocol: PortProtocol,
+    ) -> Result<Option<HostSocketAddr>, String> {
+        let key = VirtualEndpoint {
+            scope: EndpointScope::Namespace(namespace_id.clone()),
+            addr: virtual_addr,
+            protocol,
+        };
+        self.resolve_registered_endpoint(&key)
+    }
+
+    fn resolve_registered_endpoint(
+        &self,
+        key: &VirtualEndpoint,
+    ) -> Result<Option<HostSocketAddr>, String> {
         let registry = self
             .registry
             .lock()
             .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
-        if let Some(host) = registry.get(&key).copied() {
+        if let Some(host) = registry.get(key).copied() {
             return Ok(Some(host));
         }
         drop(registry);
-        Ok(read_endpoint_file(&self.endpoint_dir, &key))
+        Ok(read_endpoint_file(&self.endpoint_dir, key))
     }
 
     pub fn materialize_bridge_bind(
@@ -190,29 +253,53 @@ impl SocketNamespaceProvider {
         requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<BindTarget, String> {
+        let IpAddr::V4(ip) = requested.0.ip() else {
+            return Err(format!(
+                "address is not assigned to network namespace: {}",
+                requested.0
+            ));
+        };
+        let attachments = effective_attachments(spec);
+        let selected = if ip == Ipv4Addr::UNSPECIFIED {
+            attachments
+        } else if ip.is_loopback() {
+            attachments.into_iter().take(1).collect()
+        } else {
+            attachments
+                .into_iter()
+                .filter(|attachment| attachment.ipv4 == ip)
+                .collect()
+        };
+        if selected.is_empty() {
+            return Err(format!(
+                "address is not assigned to network namespace: {}",
+                requested.0
+            ));
+        }
         match requested.0.ip() {
-            IpAddr::V4(ip) if ip == spec.ipv4 || ip == Ipv4Addr::UNSPECIFIED => {
+            IpAddr::V4(ip) => {
                 let host = HostSocketAddr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
                 if let Some(namespace_id) = spec.namespace_id.clone() {
-                    let virtual_ip = if ip == Ipv4Addr::UNSPECIFIED {
-                        spec.ipv4
-                    } else {
-                        ip
-                    };
-                    self.register_virtual_endpoint(
-                        spec.bridge_id.clone(),
-                        namespace_id,
-                        GuestSocketAddr(SocketAddr::new(
-                            IpAddr::V4(virtual_ip),
-                            requested.0.port(),
-                        )),
-                        protocol,
-                        host,
-                    )?;
+                    for attachment in selected {
+                        let virtual_ip = if ip == Ipv4Addr::UNSPECIFIED {
+                            attachment.ipv4
+                        } else {
+                            ip
+                        };
+                        self.register_virtual_endpoint(
+                            attachment.bridge_id,
+                            namespace_id.clone(),
+                            GuestSocketAddr(SocketAddr::new(
+                                IpAddr::V4(virtual_ip),
+                                requested.0.port(),
+                            )),
+                            protocol,
+                            host,
+                        )?;
+                    }
                 }
                 Ok(BindTarget::Host(host))
             }
-            IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST => Ok(BindTarget::Unchanged),
             _ => Err(format!(
                 "address is not assigned to network namespace: {}",
                 requested.0
@@ -226,8 +313,21 @@ impl SocketNamespaceProvider {
         requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
-        if let Some(host) = self.resolve_registered_connect(&spec.bridge_id, requested, protocol)? {
-            return Ok(ConnectTarget::Host(host));
+        if requested.0.ip().is_loopback() {
+            if let Some(namespace_id) = spec.namespace_id.as_ref()
+                && let Some(host) =
+                    self.resolve_registered_namespace_connect(namespace_id, requested, protocol)?
+            {
+                return Ok(ConnectTarget::Host(host));
+            }
+            return Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED));
+        }
+        for attachment in effective_attachments(spec) {
+            if let Some(host) =
+                self.resolve_registered_connect(&attachment.bridge_id, requested, protocol)?
+            {
+                return Ok(ConnectTarget::Host(host));
+            }
         }
 
         match requested.0.ip() {
@@ -240,6 +340,7 @@ impl SocketNamespaceProvider {
 
     pub fn record_socket_addresses(
         &self,
+        namespace_id: Option<&NetworkNamespaceId>,
         guest_fd: i32,
         guest_local: Option<GuestSocketAddr>,
         host_local: Option<HostSocketAddr>,
@@ -266,31 +367,73 @@ impl SocketNamespaceProvider {
                     .namespaces
                     .lock()
                     .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
-                namespaces
-                    .iter()
-                    .filter_map(|(namespace_id, spec)| {
-                        let IpAddr::V4(guest_ip) = guest.0.ip() else {
-                            return None;
-                        };
-                        if guest_ip == spec.ipv4 || guest_ip == Ipv4Addr::UNSPECIFIED {
-                            let virtual_ip = if guest_ip == Ipv4Addr::UNSPECIFIED {
-                                spec.ipv4
-                            } else {
-                                guest_ip
-                            };
-                            Some((
-                                spec.bridge_id.clone(),
-                                namespace_id.clone(),
-                                GuestSocketAddr(SocketAddr::new(
-                                    IpAddr::V4(virtual_ip),
-                                    guest.0.port(),
-                                )),
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
+                let guest_ip = match guest.0.ip() {
+                    IpAddr::V4(ip) => ip,
+                    IpAddr::V6(_) => return Ok(()),
+                };
+                if guest_ip.is_loopback() {
+                    namespace_id
+                        .and_then(|namespace_id| {
+                            namespaces.get(namespace_id).map(|spec| {
+                                let bridge_id = effective_attachments(spec)
+                                    .into_iter()
+                                    .next()
+                                    .map(|attachment| attachment.bridge_id)
+                                    .unwrap_or_else(|| spec.bridge_id.clone());
+                                (
+                                    bridge_id,
+                                    namespace_id.clone(),
+                                    GuestSocketAddr(SocketAddr::new(
+                                        IpAddr::V4(guest_ip),
+                                        guest.0.port(),
+                                    )),
+                                )
+                            })
+                        })
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    let namespace_specs = namespace_id
+                        .and_then(|namespace_id| {
+                            namespaces
+                                .get(namespace_id)
+                                .map(|spec| vec![(namespace_id.clone(), spec.clone())])
+                        })
+                        .unwrap_or_else(|| {
+                            namespaces
+                                .iter()
+                                .map(|(namespace_id, spec)| (namespace_id.clone(), spec.clone()))
+                                .collect()
+                        });
+                    namespace_specs
+                        .into_iter()
+                        .flat_map(|(namespace_id, spec)| {
+                            effective_attachments(&spec)
+                                .into_iter()
+                                .filter_map(move |attachment| {
+                                    if guest_ip == attachment.ipv4
+                                        || guest_ip == Ipv4Addr::UNSPECIFIED
+                                    {
+                                        let virtual_ip = if guest_ip == Ipv4Addr::UNSPECIFIED {
+                                            attachment.ipv4
+                                        } else {
+                                            guest_ip
+                                        };
+                                        Some((
+                                            attachment.bridge_id,
+                                            namespace_id.clone(),
+                                            GuestSocketAddr(SocketAddr::new(
+                                                IpAddr::V4(virtual_ip),
+                                                guest.0.port(),
+                                            )),
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                }
             };
             for (bridge_id, namespace_id, virtual_addr) in endpoints {
                 self.register_virtual_endpoint(
@@ -353,12 +496,21 @@ impl SocketNamespaceProvider {
                 .lock()
                 .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
             let verified = namespaces.values().any(|spec| {
-                let endpoint = VirtualEndpoint {
-                    bridge_id: spec.bridge_id.clone(),
-                    addr: guest_addr,
-                    protocol,
+                let Some(namespace_id) = spec.namespace_id.clone() else {
+                    return false;
                 };
-                read_endpoint_file(&self.endpoint_dir, &endpoint) == Some(host_addr)
+                effective_attachments(spec).into_iter().any(|attachment| {
+                    let endpoint = VirtualEndpoint {
+                        scope: endpoint_scope(
+                            attachment.bridge_id,
+                            namespace_id.clone(),
+                            guest_addr,
+                        ),
+                        addr: guest_addr,
+                        protocol,
+                    };
+                    read_endpoint_file(&self.endpoint_dir, &endpoint) == Some(host_addr)
+                })
             });
             Ok(verified.then_some(guest_addr))
         })
@@ -392,7 +544,7 @@ impl SocketNamespaceProvider {
             .map_err(|e| format!("failed to configure published TCP listener: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let target = VirtualEndpoint {
-            bridge_id: spec.bridge_id,
+            scope: EndpointScope::Bridge(spec.bridge_id),
             addr: GuestSocketAddr(SocketAddr::new(
                 IpAddr::V4(spec.ipv4),
                 mapping.container_port,
@@ -479,44 +631,68 @@ impl SocketNamespaceProvider {
         let IpAddr::V4(guest_ip) = guest_local.0.ip() else {
             return Ok(());
         };
-        if guest_ip != spec.ipv4 && guest_ip != Ipv4Addr::UNSPECIFIED {
+        let attachments = effective_attachments(&spec);
+        let selected = if guest_ip == Ipv4Addr::UNSPECIFIED {
+            attachments
+        } else if guest_ip.is_loopback() {
+            attachments.into_iter().take(1).collect()
+        } else {
+            attachments
+                .into_iter()
+                .filter(|attachment| attachment.ipv4 == guest_ip)
+                .collect()
+        };
+        if selected.is_empty() {
             return Ok(());
         }
-        let virtual_ip = if guest_ip == Ipv4Addr::UNSPECIFIED {
-            spec.ipv4
-        } else {
-            guest_ip
-        };
-        let endpoint = VirtualEndpoint {
-            bridge_id: spec.bridge_id,
-            addr: GuestSocketAddr(SocketAddr::new(
-                IpAddr::V4(virtual_ip),
-                guest_local.0.port(),
-            )),
-            protocol: PortProtocol::Tcp,
-        };
         let reservation = ListenerReservation {
             host_addr: host_local,
             reuse_port,
         };
+        let endpoints = selected
+            .into_iter()
+            .map(|attachment| {
+                let virtual_ip = if guest_ip == Ipv4Addr::UNSPECIFIED {
+                    attachment.ipv4
+                } else {
+                    guest_ip
+                };
+                let virtual_addr = GuestSocketAddr(SocketAddr::new(
+                    IpAddr::V4(virtual_ip),
+                    guest_local.0.port(),
+                ));
+                VirtualEndpoint {
+                    scope: endpoint_scope(attachment.bridge_id, namespace_id.clone(), virtual_addr),
+                    addr: virtual_addr,
+                    protocol: PortProtocol::Tcp,
+                }
+            })
+            .collect::<Vec<_>>();
         {
             let mut listeners = self
                 .tcp_listeners
                 .lock()
                 .map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
-            if let Some(existing) = listeners.get(&endpoint)
-                && !(existing.reuse_port && reuse_port)
-            {
-                return Err(carrick_abi::LINUX_EADDRINUSE);
+            for endpoint in &endpoints {
+                if let Some(existing) = listeners.get(endpoint)
+                    && !(existing.reuse_port && reuse_port)
+                {
+                    return Err(carrick_abi::LINUX_EADDRINUSE);
+                }
             }
-            listeners.insert(endpoint.clone(), reservation);
+            for endpoint in &endpoints {
+                listeners.insert(endpoint.clone(), reservation);
+            }
         }
         let contents = encode_listener_reservation(reservation);
-        let path = listener_path(&self.endpoint_dir, &endpoint);
         fs::create_dir_all(&*self.endpoint_dir).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
-        fs::write(&path, &contents).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
-        self.track_owned_file(path, contents)
-            .map_err(|_| carrick_abi::LINUX_EADDRINUSE)
+        for endpoint in endpoints {
+            let path = listener_path(&self.endpoint_dir, &endpoint);
+            fs::write(&path, &contents).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+            self.track_owned_file(path, contents.clone())
+                .map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+        }
+        Ok(())
     }
 }
 
@@ -530,9 +706,9 @@ fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
         PortProtocol::Udp => "udp",
     };
     let ip = endpoint.addr.0.ip().to_string().replace(':', "_");
+    let scope = endpoint_scope_path_component(&endpoint.scope);
     endpoint_dir.join(format!(
-        "{}-{ip}-{}-{protocol}",
-        endpoint.bridge_id.as_str(),
+        "{scope}-{ip}-{}-{protocol}",
         endpoint.addr.0.port()
     ))
 }
@@ -552,15 +728,34 @@ fn reverse_endpoint_path(
 
 fn listener_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
     let ip = endpoint.addr.0.ip().to_string().replace(':', "_");
+    let scope = endpoint_scope_path_component(&endpoint.scope);
     endpoint_dir.join(format!(
-        "listen-{}-{ip}-{}-tcp",
-        endpoint.bridge_id.as_str(),
+        "listen-{scope}-{ip}-{}-tcp",
         endpoint.addr.0.port()
     ))
 }
 
 fn service_name_path(endpoint_dir: &Path, bridge_id: &BridgeId, name: &str) -> PathBuf {
     endpoint_dir.join(format!("service-{}-{}", bridge_id.as_str(), hex_name(name)))
+}
+
+fn endpoint_scope(
+    bridge_id: BridgeId,
+    namespace_id: NetworkNamespaceId,
+    virtual_addr: GuestSocketAddr,
+) -> EndpointScope {
+    if virtual_addr.0.ip().is_loopback() {
+        EndpointScope::Namespace(namespace_id)
+    } else {
+        EndpointScope::Bridge(bridge_id)
+    }
+}
+
+fn endpoint_scope_path_component(scope: &EndpointScope) -> String {
+    match scope {
+        EndpointScope::Bridge(bridge) => format!("bridge-{}", hex_name(bridge.as_str())),
+        EndpointScope::Namespace(namespace) => format!("ns-{}", hex_name(namespace.as_str())),
+    }
 }
 
 fn hex_name(name: &str) -> String {
@@ -572,19 +767,39 @@ fn hex_name(name: &str) -> String {
     encoded
 }
 
-fn service_names(spec: &NetworkNamespaceSpec) -> Vec<String> {
+fn service_names_for(container_name: Option<&String>, aliases: &[String]) -> Vec<String> {
     let mut names = Vec::new();
-    if let Some(name) = &spec.container_name
+    if let Some(name) = container_name
         && !name.is_empty()
     {
         names.push(name.clone());
     }
-    for alias in &spec.aliases {
+    for alias in aliases {
         if !alias.is_empty() && !names.iter().any(|name| name == alias) {
             names.push(alias.clone());
         }
     }
     names
+}
+
+fn effective_attachments(spec: &NetworkNamespaceSpec) -> Vec<NetworkAttachmentSpec> {
+    let primary = NetworkAttachmentSpec {
+        bridge_id: spec.bridge_id.clone(),
+        container_name: spec.container_name.clone(),
+        aliases: spec.aliases.clone(),
+        ipv4: spec.ipv4,
+        gateway_v4: spec.gateway_v4,
+    };
+    if spec.attachments.is_empty() {
+        return vec![primary];
+    }
+    if spec.attachments.len() == 1 {
+        let only = &spec.attachments[0];
+        if only.bridge_id != spec.bridge_id || only.ipv4 != spec.ipv4 {
+            return vec![primary];
+        }
+    }
+    spec.attachments.clone()
 }
 
 fn encode_service_name(addr: Ipv4Addr, name: &str) -> String {
@@ -716,6 +931,8 @@ impl NetworkProvider for SocketNamespaceProvider {
     fn capabilities(&self) -> NetworkCapabilities {
         NetworkCapabilities {
             same_bridge_ip_connectivity: true,
+            multi_network_attachments: true,
+            embedded_dns: true,
             outbound_connectivity: true,
             published_ports: true,
             published_udp_ports: false,
@@ -845,13 +1062,21 @@ impl NetworkProvider for SocketNamespaceProvider {
 
     fn record_socket_addresses(
         &self,
+        namespace_id: Option<&NetworkNamespaceId>,
         guest_fd: i32,
         guest_local: Option<GuestSocketAddr>,
         host_local: Option<HostSocketAddr>,
         guest_peer: Option<GuestSocketAddr>,
         protocol: PortProtocol,
     ) -> Result<(), String> {
-        self.record_socket_addresses(guest_fd, guest_local, host_local, guest_peer, protocol)
+        self.record_socket_addresses(
+            namespace_id,
+            guest_fd,
+            guest_local,
+            host_local,
+            guest_peer,
+            protocol,
+        )
     }
 
     fn guest_visible_local_addr(&self, guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
@@ -890,12 +1115,22 @@ impl NetworkProvider for SocketNamespaceProvider {
     ) -> Result<Vec<NetworkHostsEntry>, String> {
         self.service_hosts_entries(spec)
     }
+
+    fn resolve_dns_name(
+        &self,
+        spec: &NetworkNamespaceSpec,
+        name: &str,
+    ) -> Result<Vec<Ipv4Addr>, String> {
+        self.resolve_service_name(spec, name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_spec::{BridgeId, NetworkNamespaceId, PortMapping, PortProtocol};
+    use carrick_spec::{
+        BridgeId, NetworkAttachmentSpec, NetworkNamespaceId, PortMapping, PortProtocol,
+    };
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::thread;
@@ -1024,12 +1259,310 @@ mod tests {
     }
 
     #[test]
+    fn multi_network_bind_and_connect_use_the_matching_attachment_bridge() {
+        let suffix = std::process::id();
+        let backend = BridgeId::new(format!("test-bind-backend-{suffix}"));
+        let frontend = BridgeId::new(format!("test-bind-frontend-{suffix}"));
+        let mut web_spec = NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            vec!["web".to_string()],
+            Vec::new(),
+        );
+        web_spec.bridge_id = backend.clone();
+        web_spec.namespace_id = Some(NetworkNamespaceId::new(format!("web-ns-{suffix}")));
+        web_spec.ipv4 = Ipv4Addr::new(172, 31, 10, 9);
+        web_spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                backend,
+                Some("web".to_string()),
+                vec!["web-backend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 10, 9)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                frontend.clone(),
+                Some("web".to_string()),
+                vec!["web-frontend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 20, 9)),
+            ),
+        ];
+        let mut cache_spec = NetworkNamespaceSpec::bridge_default(
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Vec::new(),
+        );
+        cache_spec.bridge_id = frontend;
+        cache_spec.namespace_id = Some(NetworkNamespaceId::new(format!("cache-ns-{suffix}")));
+        cache_spec.ipv4 = Ipv4Addr::new(172, 31, 20, 10);
+        cache_spec.attachments = vec![NetworkAttachmentSpec::bridge_default(
+            cache_spec.bridge_id.clone(),
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Some(cache_spec.ipv4),
+        )];
+        let provider = SocketNamespaceProvider::new();
+        provider.create_namespace(&web_spec).expect("web namespace");
+        provider
+            .create_namespace(&cache_spec)
+            .expect("cache namespace");
+        let guest_listener = guest(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 31, 20, 9)),
+            8080,
+        ));
+
+        assert_eq!(
+            provider
+                .materialize_bridge_bind(&web_spec, guest_listener, PortProtocol::Tcp)
+                .expect("bind frontend attachment"),
+            BindTarget::Host(host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)))
+        );
+        provider
+            .record_socket_addresses(
+                web_spec.namespace_id.as_ref(),
+                7,
+                Some(guest_listener),
+                Some(host(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    51080,
+                ))),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record frontend listener");
+
+        let target = provider
+            .resolve_bridge_connect(&cache_spec, guest_listener, PortProtocol::Tcp)
+            .expect("resolve frontend endpoint");
+
+        assert_eq!(
+            target,
+            ConnectTarget::Host(host(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                51080
+            )))
+        );
+    }
+
+    #[test]
+    fn multi_network_wildcard_listen_reserves_each_attachment_bridge_port() {
+        let suffix = std::process::id();
+        let backend = BridgeId::new(format!("test-listen-backend-{suffix}"));
+        let frontend = BridgeId::new(format!("test-listen-frontend-{suffix}"));
+        let mut web_spec = NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            vec!["web".to_string()],
+            Vec::new(),
+        );
+        web_spec.bridge_id = backend.clone();
+        web_spec.namespace_id = Some(NetworkNamespaceId::new(format!("web-ns-{suffix}")));
+        web_spec.ipv4 = Ipv4Addr::new(172, 31, 10, 9);
+        web_spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                backend,
+                Some("web".to_string()),
+                vec!["web-backend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 10, 9)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                frontend.clone(),
+                Some("web".to_string()),
+                vec!["web-frontend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 20, 9)),
+            ),
+        ];
+        let mut cache_spec = NetworkNamespaceSpec::bridge_default(
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Vec::new(),
+        );
+        cache_spec.bridge_id = frontend;
+        cache_spec.namespace_id = Some(NetworkNamespaceId::new(format!("cache-ns-{suffix}")));
+        cache_spec.ipv4 = Ipv4Addr::new(172, 31, 20, 10);
+        cache_spec.attachments = vec![NetworkAttachmentSpec::bridge_default(
+            cache_spec.bridge_id.clone(),
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Some(cache_spec.ipv4),
+        )];
+        let provider = SocketNamespaceProvider::new();
+        provider.create_namespace(&web_spec).expect("web namespace");
+        provider
+            .create_namespace(&cache_spec)
+            .expect("cache namespace");
+        let guest_listener = guest(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080));
+        let host_listener = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51080));
+
+        provider
+            .prepare_tcp_listen(
+                web_spec.namespace_id.as_ref(),
+                Some(guest_listener),
+                Some(host_listener),
+                false,
+            )
+            .expect("reserve wildcard listener");
+
+        let duplicate_frontend = provider.prepare_tcp_listen(
+            web_spec.namespace_id.as_ref(),
+            Some(guest(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(172, 31, 20, 9)),
+                8080,
+            ))),
+            Some(host(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                51081,
+            ))),
+            false,
+        );
+
+        assert_eq!(duplicate_frontend, Err(carrick_abi::LINUX_EADDRINUSE));
+    }
+
+    #[test]
+    fn multi_network_wildcard_recording_is_scoped_to_owning_namespace() {
+        let suffix = std::process::id();
+        let bridge = BridgeId::new(format!("test-wildcard-record-{suffix}"));
+        let mut web_spec = NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            vec!["web".to_string()],
+            Vec::new(),
+        );
+        web_spec.bridge_id = bridge.clone();
+        web_spec.namespace_id = Some(NetworkNamespaceId::new(format!("web-ns-{suffix}")));
+        web_spec.ipv4 = Ipv4Addr::new(172, 31, 30, 9);
+        web_spec.attachments = vec![NetworkAttachmentSpec::bridge_default(
+            web_spec.bridge_id.clone(),
+            Some("web".to_string()),
+            vec!["web".to_string()],
+            Some(web_spec.ipv4),
+        )];
+        let mut cache_spec = NetworkNamespaceSpec::bridge_default(
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Vec::new(),
+        );
+        cache_spec.bridge_id = bridge;
+        cache_spec.namespace_id = Some(NetworkNamespaceId::new(format!("cache-ns-{suffix}")));
+        cache_spec.ipv4 = Ipv4Addr::new(172, 31, 30, 10);
+        cache_spec.attachments = vec![NetworkAttachmentSpec::bridge_default(
+            cache_spec.bridge_id.clone(),
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Some(cache_spec.ipv4),
+        )];
+        let provider = SocketNamespaceProvider::new();
+        provider.create_namespace(&web_spec).expect("web namespace");
+        provider
+            .create_namespace(&cache_spec)
+            .expect("cache namespace");
+        let host_listener = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51080));
+
+        provider
+            .record_socket_addresses(
+                web_spec.namespace_id.as_ref(),
+                7,
+                Some(guest(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    8080,
+                ))),
+                Some(host_listener),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record wildcard listener");
+
+        let web_target = provider
+            .resolve_bridge_connect(
+                &cache_spec,
+                guest(SocketAddr::new(IpAddr::V4(web_spec.ipv4), 8080)),
+                PortProtocol::Tcp,
+            )
+            .expect("resolve web endpoint");
+        let cache_target = provider
+            .resolve_bridge_connect(
+                &cache_spec,
+                guest(SocketAddr::new(IpAddr::V4(cache_spec.ipv4), 8080)),
+                PortProtocol::Tcp,
+            )
+            .expect("resolve cache endpoint");
+
+        assert_eq!(web_target, ConnectTarget::Host(host_listener));
+        assert_eq!(
+            cache_target,
+            ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED)
+        );
+    }
+
+    #[test]
+    fn bridge_loopback_endpoint_is_visible_inside_same_namespace() {
+        let mut spec =
+            NetworkNamespaceSpec::bridge_default(Some("db".to_string()), Vec::new(), Vec::new());
+        spec.namespace_id = Some(NetworkNamespaceId::new("db-ns"));
+        let provider = SocketNamespaceProvider::new();
+        provider.create_namespace(&spec).expect("namespace");
+        let guest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432);
+        let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50032);
+        provider
+            .record_socket_addresses(
+                spec.namespace_id.as_ref(),
+                7,
+                Some(guest(guest_addr)),
+                Some(host(host_addr)),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record loopback endpoint");
+
+        let target = provider
+            .resolve_bridge_connect(&spec, guest(guest_addr), PortProtocol::Tcp)
+            .expect("resolve");
+
+        assert_eq!(target, ConnectTarget::Host(host(host_addr)));
+    }
+
+    #[test]
+    fn bridge_loopback_endpoint_is_not_visible_to_different_namespace() {
+        let bridge = BridgeId::new("loopback-test");
+        let mut owner =
+            NetworkNamespaceSpec::bridge_default(Some("db".to_string()), Vec::new(), Vec::new());
+        owner.bridge_id = bridge.clone();
+        owner.namespace_id = Some(NetworkNamespaceId::new("db-ns"));
+        let mut peer =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        peer.bridge_id = bridge;
+        peer.namespace_id = Some(NetworkNamespaceId::new("web-ns"));
+        let provider = SocketNamespaceProvider::new();
+        provider.create_namespace(&owner).expect("owner namespace");
+        provider.create_namespace(&peer).expect("peer namespace");
+        let guest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432);
+        let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50033);
+        provider
+            .record_socket_addresses(
+                owner.namespace_id.as_ref(),
+                7,
+                Some(guest(guest_addr)),
+                Some(host(host_addr)),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record loopback endpoint");
+
+        let target = provider
+            .resolve_bridge_connect(&peer, guest(guest_addr), PortProtocol::Tcp)
+            .expect("resolve");
+
+        assert_eq!(
+            target,
+            ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED)
+        );
+    }
+
+    #[test]
     fn records_guest_visible_local_address_for_rewritten_bind() {
         let provider = SocketNamespaceProvider::new();
         let guest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)), 80);
         let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080);
         provider
             .record_socket_addresses(
+                None,
                 7,
                 Some(guest(guest_addr)),
                 Some(host(host_addr)),
@@ -1047,7 +1580,7 @@ mod tests {
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         let peer = VirtualEndpoint {
-            bridge_id: spec.bridge_id.clone(),
+            scope: EndpointScope::Bridge(spec.bridge_id.clone()),
             addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 8080)),
             protocol: PortProtocol::Tcp,
         };
@@ -1225,7 +1758,7 @@ mod tests {
             stream.write_all(b"ok").expect("write ok");
         });
         let peer = VirtualEndpoint {
-            bridge_id: spec.bridge_id.clone(),
+            scope: EndpointScope::Bridge(spec.bridge_id.clone()),
             addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
             protocol: PortProtocol::Tcp,
         };
@@ -1274,6 +1807,195 @@ mod tests {
     }
 
     #[test]
+    fn multi_network_service_names_are_visible_on_each_attached_bridge() {
+        let suffix = std::process::id();
+        let backend = BridgeId::new(format!("test-multi-backend-{suffix}"));
+        let frontend = BridgeId::new(format!("test-multi-frontend-{suffix}"));
+        let mut web_spec = NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            vec!["api".to_string()],
+            Vec::new(),
+        );
+        web_spec.bridge_id = backend.clone();
+        web_spec.ipv4 = Ipv4Addr::new(172, 31, 10, 9);
+        web_spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                backend,
+                Some("web".to_string()),
+                vec!["api-backend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 10, 9)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                frontend.clone(),
+                Some("web".to_string()),
+                vec!["api-frontend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 20, 9)),
+            ),
+        ];
+        let mut cache_spec = NetworkNamespaceSpec::bridge_default(
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Vec::new(),
+        );
+        cache_spec.bridge_id = frontend;
+
+        let writer = SocketNamespaceProvider::new();
+        writer
+            .create_namespace(&web_spec)
+            .expect("create web namespace");
+
+        let reader = SocketNamespaceProvider::new();
+        let entries = reader
+            .guest_hosts_entries(&cache_spec)
+            .expect("read frontend service hosts entries");
+
+        assert!(entries.iter().any(|entry| {
+            entry.addr == IpAddr::V4(Ipv4Addr::new(172, 31, 20, 9))
+                && entry.names == vec!["web".to_string()]
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.addr == IpAddr::V4(Ipv4Addr::new(172, 31, 20, 9))
+                && entry.names == vec!["api-frontend".to_string()]
+        }));
+        assert!(!entries.iter().any(|entry| {
+            entry.addr == IpAddr::V4(Ipv4Addr::new(172, 31, 10, 9))
+                && entry.names == vec!["api-backend".to_string()]
+        }));
+    }
+
+    #[test]
+    fn multi_network_dns_name_lookup_is_scoped_to_shared_bridges() {
+        let suffix = std::process::id();
+        let backend = BridgeId::new(format!("test-dns-backend-{suffix}"));
+        let frontend = BridgeId::new(format!("test-dns-frontend-{suffix}"));
+        let mut web_spec = NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            vec!["api".to_string()],
+            Vec::new(),
+        );
+        web_spec.bridge_id = backend.clone();
+        web_spec.ipv4 = Ipv4Addr::new(172, 31, 10, 9);
+        web_spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                backend,
+                Some("web".to_string()),
+                vec!["app".to_string()],
+                Some(Ipv4Addr::new(172, 31, 10, 9)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                frontend.clone(),
+                Some("web".to_string()),
+                vec!["api".to_string()],
+                Some(Ipv4Addr::new(172, 31, 20, 9)),
+            ),
+        ];
+        let mut cache_spec = NetworkNamespaceSpec::bridge_default(
+            Some("cache".to_string()),
+            vec!["cache".to_string()],
+            Vec::new(),
+        );
+        cache_spec.bridge_id = frontend;
+
+        let provider = SocketNamespaceProvider::new();
+        provider
+            .create_namespace(&web_spec)
+            .expect("create web namespace");
+
+        assert_eq!(
+            provider
+                .resolve_dns_name(&cache_spec, "web")
+                .expect("resolve web"),
+            vec![Ipv4Addr::new(172, 31, 20, 9)]
+        );
+        assert_eq!(
+            provider
+                .resolve_dns_name(&cache_spec, "api.")
+                .expect("resolve api"),
+            vec![Ipv4Addr::new(172, 31, 20, 9)]
+        );
+        assert!(
+            provider
+                .resolve_dns_name(&cache_spec, "app")
+                .expect("resolve app")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multi_network_guest_hosts_entries_include_all_attached_bridges() {
+        let suffix = std::process::id();
+        let backend = BridgeId::new(format!("test-hosts-backend-{suffix}"));
+        let frontend = BridgeId::new(format!("test-hosts-frontend-{suffix}"));
+        let mut db_spec = NetworkNamespaceSpec::bridge_default(
+            Some("db".to_string()),
+            vec!["database".to_string()],
+            Vec::new(),
+        );
+        db_spec.bridge_id = backend.clone();
+        db_spec.ipv4 = Ipv4Addr::new(172, 31, 10, 11);
+        db_spec.attachments = vec![NetworkAttachmentSpec::bridge_default(
+            db_spec.bridge_id.clone(),
+            Some("db".to_string()),
+            vec!["database".to_string()],
+            Some(db_spec.ipv4),
+        )];
+        let mut cache_spec = NetworkNamespaceSpec::bridge_default(
+            Some("cache".to_string()),
+            vec!["redis".to_string()],
+            Vec::new(),
+        );
+        cache_spec.bridge_id = frontend.clone();
+        cache_spec.ipv4 = Ipv4Addr::new(172, 31, 20, 12);
+        cache_spec.attachments = vec![NetworkAttachmentSpec::bridge_default(
+            cache_spec.bridge_id.clone(),
+            Some("cache".to_string()),
+            vec!["redis".to_string()],
+            Some(cache_spec.ipv4),
+        )];
+        let mut web_spec = NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            vec!["web".to_string()],
+            Vec::new(),
+        );
+        web_spec.bridge_id = backend.clone();
+        web_spec.ipv4 = Ipv4Addr::new(172, 31, 10, 9);
+        web_spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                backend,
+                Some("web".to_string()),
+                vec!["web-backend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 10, 9)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                frontend,
+                Some("web".to_string()),
+                vec!["web-frontend".to_string()],
+                Some(Ipv4Addr::new(172, 31, 20, 9)),
+            ),
+        ];
+
+        let writer = SocketNamespaceProvider::new();
+        writer.create_namespace(&db_spec).expect("db namespace");
+        writer
+            .create_namespace(&cache_spec)
+            .expect("cache namespace");
+
+        let reader = SocketNamespaceProvider::new();
+        let entries = reader
+            .guest_hosts_entries(&web_spec)
+            .expect("read web hosts entries");
+
+        assert!(entries.iter().any(|entry| {
+            entry.addr == IpAddr::V4(Ipv4Addr::new(172, 31, 10, 11))
+                && entry.names == vec!["db".to_string()]
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.addr == IpAddr::V4(Ipv4Addr::new(172, 31, 20, 12))
+                && entry.names == vec!["cache".to_string()]
+        }));
+    }
+
+    #[test]
     fn translates_peer_source_from_different_bridge_namespace() {
         let bridge = BridgeId::new(format!("test-peer-{}", std::process::id()));
         let mut client_spec =
@@ -1291,6 +2013,81 @@ mod tests {
         let guest_source = guest(SocketAddr::new(IpAddr::V4(client_spec.ipv4), 34567));
         writer
             .record_socket_addresses(
+                client_spec.namespace_id.as_ref(),
+                10,
+                Some(guest_source),
+                Some(host_source),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record client source");
+
+        let reader = SocketNamespaceProvider::new();
+        reader
+            .create_namespace(&server_spec)
+            .expect("create server namespace");
+
+        assert_eq!(
+            reader
+                .translate_host_source(host_source, PortProtocol::Tcp)
+                .expect("translate host source"),
+            Some(guest_source)
+        );
+    }
+
+    #[test]
+    fn translates_peer_source_registered_on_attachment_bridge() {
+        let suffix = std::process::id();
+        let primary = BridgeId::new(format!("test-peer-primary-{suffix}"));
+        let attached = BridgeId::new(format!("test-peer-attached-{suffix}"));
+        let mut client_spec =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        client_spec.bridge_id = primary.clone();
+        client_spec.ipv4 = Ipv4Addr::new(172, 31, 70, 10);
+        client_spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                primary.clone(),
+                Some("web".to_string()),
+                Vec::new(),
+                Some(Ipv4Addr::new(172, 31, 70, 10)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                attached.clone(),
+                Some("web".to_string()),
+                Vec::new(),
+                Some(Ipv4Addr::new(172, 31, 70, 20)),
+            ),
+        ];
+        let mut server_spec =
+            NetworkNamespaceSpec::bridge_default(Some("db".to_string()), Vec::new(), Vec::new());
+        server_spec.bridge_id = primary;
+        server_spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                server_spec.bridge_id.clone(),
+                Some("db".to_string()),
+                Vec::new(),
+                Some(Ipv4Addr::new(172, 31, 70, 30)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                attached,
+                Some("db".to_string()),
+                Vec::new(),
+                Some(Ipv4Addr::new(172, 31, 70, 40)),
+            ),
+        ];
+
+        let writer = SocketNamespaceProvider::new();
+        writer
+            .create_namespace(&client_spec)
+            .expect("create client namespace");
+        let host_source = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49153));
+        let guest_source = guest(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 31, 70, 20)),
+            34568,
+        ));
+        writer
+            .record_socket_addresses(
+                client_spec.namespace_id.as_ref(),
                 10,
                 Some(guest_source),
                 Some(host_source),
