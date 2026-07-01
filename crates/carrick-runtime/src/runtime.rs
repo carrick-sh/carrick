@@ -1374,7 +1374,11 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     }
                 }
             }
-            DispatchOutcome::WaitOnSignals { wait_set, timeout } => {
+            DispatchOutcome::WaitOnSignals {
+                wait_set,
+                block_mask,
+                timeout,
+            } => {
                 let slice = match signal_wait_slice(&mut signal_wait_deadline, timeout) {
                     Some(slice) => slice,
                     None => {
@@ -1384,8 +1388,20 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     }
                 };
                 waiter.ensure_full();
-                match waiter.wait(&[], Some(slice), !wait_set) {
-                    WaitResult::Ready | WaitResult::Interrupted => continue,
+                match waiter.wait(&[], Some(slice), block_mask) {
+                    WaitResult::Ready => continue,
+                    WaitResult::Interrupted => {
+                        // An unblocked pending signal OUTSIDE the wait set must
+                        // EINTR the wait (its handler is delivered by the run
+                        // loop's tail); a wait-set signal re-dispatches so the
+                        // dispatcher dequeues it and returns the signum.
+                        if dispatcher.signal_wait_should_eintr(waiter.tid(), wait_set, block_mask) {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                        continue;
+                    }
                     WaitResult::TimedOut => {
                         if signal_wait_expired(signal_wait_deadline) {
                             return Ok(DispatchOutcome::Errno {

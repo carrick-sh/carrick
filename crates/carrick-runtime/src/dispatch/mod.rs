@@ -1290,11 +1290,21 @@ pub enum DispatchOutcome {
     },
     /// `rt_sigtimedwait` found no matching signal already pending and must wait
     /// until one of `wait_set` arrives, or until `timeout` elapses. The runtime
-    /// parks without holding dispatcher locks, wakes only for matching signals,
-    /// then re-dispatches the same syscall so the dispatcher can dequeue the
-    /// signal and write `siginfo_t` through the original guest pointer.
+    /// parks without holding dispatcher locks, wakes for matching signals
+    /// (re-dispatching the same syscall so the dispatcher can dequeue the
+    /// signal and write `siginfo_t` through the original guest pointer) — OR
+    /// for an unblocked signal OUTSIDE `wait_set`, which must interrupt the
+    /// wait with EINTR after its handler is delivered (sigtimedwait is never
+    /// restarted, even under SA_RESTART — signal(7)).
     WaitOnSignals {
         wait_set: u64,
+        /// Signals that must NOT wake the park: outside `wait_set` AND blocked
+        /// by the thread's persistent mask (`!wait_set & thread_mask`,
+        /// precomputed at dispatch). Passing `!wait_set` here was the
+        /// empty-set hang: `rt_sigtimedwait(set=∅, NULL)` blocked every
+        /// signal, so the unblocked caught signal that must EINTR the wait
+        /// (LTP sigtimedwait01 et al.) could never wake the waiter.
+        block_mask: u64,
         timeout: Option<Duration>,
     },
     /// A relative sleep (`nanosleep`/`clock_nanosleep`). The run loop performs

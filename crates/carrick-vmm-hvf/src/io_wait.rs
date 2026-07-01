@@ -291,6 +291,11 @@ impl ThreadWaiter {
         }
     }
 
+    /// The guest tid this waiter parks on behalf of.
+    pub fn tid(&self) -> crate::thread::ThreadId {
+        self.tid
+    }
+
     fn has_dead_wake_pipe(&self) -> bool {
         self.wake_pipe_dead.load(Ordering::SeqCst)
     }

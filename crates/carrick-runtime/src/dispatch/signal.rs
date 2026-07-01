@@ -690,16 +690,16 @@ impl SyscallDispatcher {
         if !carrick_signal_core::xsig::xsig_has_unblocked_for_self(0) {
             return;
         }
-        for (signum, sender_ns, sender_uid, value) in crate::host_signal::xsig_drain_for_self() {
-            let info = if signum >= 32 {
+        for (signum, code, sender_ns, sender_uid, value) in
+            crate::host_signal::xsig_drain_for_self()
+        {
+            // The ring carries the send's REAL si_code: a plain kill(2) of an
+            // RT signal is SI_USER (kill-shaped siginfo), only rt_sigqueueinfo
+            // deliveries are SI_QUEUE with a sigval payload.
+            let info = if code == crate::linux_abi::LINUX_SI_QUEUE {
                 LinuxSiginfo::rt_queue(signum, sender_ns, sender_uid, value)
             } else {
-                LinuxSiginfo::kill(
-                    signum,
-                    crate::linux_abi::LINUX_SI_USER,
-                    sender_ns,
-                    sender_uid,
-                )
+                LinuxSiginfo::kill(signum, code, sender_ns, sender_uid)
             };
             self.record_pending_siginfo(tid, signum, info);
             self.mark_signal_pending(tid, signum);
@@ -754,6 +754,61 @@ impl SyscallDispatcher {
         };
         let pending = signal.pendings.get(&tid).copied().unwrap_or(0) | signal.process_pending;
         pending & (!effective_block_mask | always_deliverable) != 0
+    }
+
+    /// Bitmask (bit `signum-1`) of signals whose CURRENT disposition would be
+    /// ignored at delivery: an installed `SIG_IGN`, or no/`SIG_DFL` handler on
+    /// a default-ignore signal (SIGCHLD/SIGURG/SIGWINCH). A
+    /// [`DispatchOutcome::WaitOnSignals`] park folds these into its block mask:
+    /// on Linux a to-be-ignored signal neither interrupts `sigtimedwait` (no
+    /// handler runs → no EINTR) nor may it busy-wake the park (nothing consumes
+    /// it until the run-loop tail) — the classic case is the SIGCHLD a reaped
+    /// child sends a handler-less parent mid-`sigtimedwait`.
+    pub(crate) fn wait_ignored_disposition_mask(&self) -> u64 {
+        let signal = self.signal.lock();
+        let mut mask = 0u64;
+        for signum in 1..=64i32 {
+            let Some(bit) = sigmask_bit(signum) else {
+                continue;
+            };
+            let ignored = match signal.handlers.get(&signum) {
+                Some(a) if a.sa_handler == crate::linux_abi::LINUX_SIG_IGN => true,
+                Some(a) if a.sa_handler == crate::linux_abi::LINUX_SIG_DFL => {
+                    crate::vcpu_loop::is_default_ignore_signal(signum)
+                }
+                Some(_) => false,
+                None => crate::vcpu_loop::is_default_ignore_signal(signum),
+            };
+            if ignored {
+                mask |= bit;
+            }
+        }
+        mask
+    }
+
+    /// True iff a [`DispatchOutcome::WaitOnSignals`] park woken by a signal
+    /// should complete with EINTR instead of re-dispatching: an unblocked
+    /// pending signal OUTSIDE the wait set (pending in the dispatcher's sets,
+    /// the host slot, or the cross-process xsignal ring). The run loop then
+    /// returns EINTR and its delivery tail runs the handler — re-dispatching
+    /// instead would `take_pending_in(wait_set)`, find nothing, and RE-PARK,
+    /// wedging `rt_sigtimedwait(set=∅)` forever (the kvm-lane LTP
+    /// sigtimedwait01/sigwaitinfo01 TIMEOUT cluster). A wait-set signal (or a
+    /// consumed/spurious wake) returns false: re-dispatch dequeues it and
+    /// completes with the signum.
+    pub(crate) fn signal_wait_should_eintr(
+        &self,
+        tid: crate::thread::ThreadId,
+        wait_set: u64,
+        block_mask: u64,
+    ) -> bool {
+        // Everything that must NOT produce EINTR: the wait set itself (handled
+        // by re-dispatch) plus the thread-mask-blocked remainder. `block_mask`
+        // is `!wait_set & thread_mask`, so this union is `wait_set | mask`.
+        let non_set_block = wait_set | block_mask;
+        crate::host_signal::has_unblocked_pending_for(tid, non_set_block)
+            || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_set_block)
+            || self.has_deliverable_dispatch_pending_for_wait(tid, non_set_block, true)
     }
 
     /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
@@ -1545,7 +1600,19 @@ impl SyscallDispatcher {
             install_host_handlers_for_wait_set(wait_set);
             match timeout {
                 Some(d) if d.is_zero() => Ok(LINUX_EAGAIN.into()),
-                _ => Ok(DispatchOutcome::WaitOnSignals { wait_set, timeout }),
+                _ => Ok(DispatchOutcome::WaitOnSignals {
+                    wait_set,
+                    // Block only signals outside the wait set that are EITHER
+                    // blocked by the thread's mask OR currently ignored: a
+                    // wait-set signal always wakes (sigtimedwait dequeues
+                    // signals even while blocked — the canonical
+                    // block-then-wait usage); an unblocked CAUGHT non-set
+                    // signal must wake to EINTR the wait; a to-be-ignored one
+                    // (e.g. handler-less SIGCHLD) must do neither.
+                    block_mask: !wait_set
+                        & (this.signal_mask_for(tid) | this.wait_ignored_disposition_mask()),
+                    timeout,
+                }),
             }
         }
 
@@ -1706,7 +1773,17 @@ impl SyscallDispatcher {
                     .and_then(|i| i._pad.get(0..8).and_then(|b| b.try_into().ok()))
                     .map(i64::from_le_bytes)
                     .unwrap_or(0);
-                if crate::host_signal::xsig_enqueue(target_host, s, sender_ns, sender_uid, value) {
+                let code = user_info
+                    .map(|i| i.si_code)
+                    .unwrap_or(crate::linux_abi::LINUX_SI_QUEUE);
+                if crate::host_signal::xsig_enqueue(
+                    target_host,
+                    s,
+                    code,
+                    sender_ns,
+                    sender_uid,
+                    value,
+                ) {
                     crate::host_signal::xsig_nudge(target_host);
                     return DispatchOutcome::Returned { value: 0 };
                 }
@@ -1778,7 +1855,13 @@ fn rt_sigtimedwait_deliver(
     if info_ptr != 0 {
         let mut si = queued.unwrap_or_else(LinuxSiginfo::empty);
         si.si_signo = signum;
-        let _ = memory.write_bytes(info_ptr, si.as_bytes());
+        // A bad `info` pointer must surface EFAULT (the kernel's copyout
+        // fault; LTP tse_bad_address). Swallowing it and returning the signum
+        // made glibc's sigwaitinfo copy its own buffer to the bad pointer in
+        // USERSPACE — killing the guest with SIGSEGV where Linux returns -1.
+        if memory.write_bytes(info_ptr, si.as_bytes()).is_err() {
+            return LINUX_EFAULT.into();
+        }
     }
     DispatchOutcome::Returned {
         value: signum as i64,
@@ -1916,8 +1999,14 @@ pub(crate) fn bootstrap_signal_send_as(
     if route_xsig {
         let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
         let sender_uid = caller_euid.unwrap_or_else(|| unsafe { libc::getuid() });
-        if crate::host_signal::xsig_enqueue(target as i32, signum as i32, sender_ns, sender_uid, 0)
-        {
+        if crate::host_signal::xsig_enqueue(
+            target as i32,
+            signum as i32,
+            crate::linux_abi::LINUX_SI_USER,
+            sender_ns,
+            sender_uid,
+            0,
+        ) {
             crate::host_signal::xsig_nudge(target as i32);
             return DispatchOutcome::Returned { value: 0 };
         }

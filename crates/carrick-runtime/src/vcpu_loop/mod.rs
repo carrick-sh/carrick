@@ -317,7 +317,8 @@ pub(crate) use signal::{
 // but no non-test in-crate caller does, so gate them to avoid an unused-import
 // warning on the normal build.
 #[cfg(test)]
-pub(super) use signal::{el0_debug_signal, is_default_ignore_signal};
+pub(super) use signal::el0_debug_signal;
+pub(crate) use signal::is_default_ignore_signal;
 
 // ===================================================================
 // Cross-platform kernel-half state.
@@ -835,7 +836,11 @@ where
                         }
                     }
                 }
-                DispatchOutcome::WaitOnSignals { wait_set, timeout } => {
+                DispatchOutcome::WaitOnSignals {
+                    wait_set,
+                    block_mask,
+                    timeout,
+                } => {
                     let slice = match signal_wait_slice(&mut signal_wait_deadline, timeout) {
                         Some(slice) => slice,
                         None => {
@@ -846,7 +851,7 @@ where
                     };
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait(&[], Some(slice), !wait_set) {
+                    match self.waiter.wait(&[], Some(slice), block_mask) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             if signal_wait_expired(signal_wait_deadline) {
@@ -861,6 +866,19 @@ where
                                 self.release_and_park_vcpu_for_fork(engine)?;
                             }
                             if crate::fork_quiesce::exec_replacing_other_thread(self.this_tid) {
+                                break Ok(DispatchOutcome::Errno {
+                                    errno: crate::linux_abi::LINUX_EINTR,
+                                });
+                            }
+                            // An unblocked pending signal OUTSIDE the wait set:
+                            // EINTR so the loop tail delivers its handler.
+                            // Re-dispatching instead would find nothing in
+                            // `wait_set` and re-park forever.
+                            if kernel.dispatcher.signal_wait_should_eintr(
+                                self.this_tid,
+                                wait_set,
+                                block_mask,
+                            ) {
                                 break Ok(DispatchOutcome::Errno {
                                     errno: crate::linux_abi::LINUX_EINTR,
                                 });
