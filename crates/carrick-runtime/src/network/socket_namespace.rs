@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,7 @@ pub struct SocketNamespaceProvider {
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
     socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
     published_tcp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedTcpProxy>>>,
+    published_udp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedUdpProxy>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -66,7 +67,22 @@ struct PublishedTcpProxy {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Debug)]
+struct PublishedUdpProxy {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
 impl Drop for PublishedTcpProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PublishedUdpProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
@@ -93,6 +109,7 @@ impl SocketNamespaceProvider {
             namespaces: Mutex::new(HashMap::new()),
             socket_addrs: Mutex::new(HashMap::new()),
             published_tcp: Mutex::new(HashMap::new()),
+            published_udp: Mutex::new(HashMap::new()),
         }
     }
 
@@ -584,6 +601,50 @@ impl SocketNamespaceProvider {
         Ok(())
     }
 
+    fn publish_udp(&self, lease_id: NetworkLeaseId, mapping: PortMapping) -> Result<(), String> {
+        let spec = self.first_namespace_spec()?;
+        let host_ip = mapping.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let host_port = mapping.host_port.unwrap_or(0);
+        let socket =
+            UdpSocket::bind(SocketAddr::new(host_ip, host_port)).map_err(|e| match e.kind() {
+                io::ErrorKind::AddrInUse => {
+                    format!("published UDP port {host_ip}:{host_port} is already in use")
+                }
+                _ => format!("failed to bind published UDP port {host_ip}:{host_port}: {e}"),
+            })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to configure published UDP listener: {e}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let target = VirtualEndpoint {
+            scope: EndpointScope::Bridge(spec.bridge_id),
+            addr: GuestSocketAddr(SocketAddr::new(
+                IpAddr::V4(spec.ipv4),
+                mapping.container_port,
+            )),
+            protocol: PortProtocol::Udp,
+        };
+        let registry = Arc::clone(&self.registry);
+        let endpoint_dir = Arc::clone(&self.endpoint_dir);
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("carrick-bridge-publish-udp".to_string())
+            .spawn(move || published_udp_loop(socket, registry, endpoint_dir, target, thread_stop))
+            .map_err(|e| format!("failed to start published UDP proxy: {e}"))?;
+        let mut published_udp = self
+            .published_udp
+            .lock()
+            .map_err(|_| "published UDP registry lock poisoned".to_string())?;
+        published_udp
+            .entry(lease_id)
+            .or_default()
+            .push(PublishedUdpProxy {
+                stop,
+                handle: Some(handle),
+            });
+        Ok(())
+    }
+
     fn write_endpoint_file(
         &self,
         endpoint: &VirtualEndpoint,
@@ -937,6 +998,53 @@ fn proxy_tcp_stream(mut inbound: TcpStream, target: SocketAddr) -> io::Result<()
     Ok(())
 }
 
+fn published_udp_loop(
+    socket: UdpSocket,
+    registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
+    endpoint_dir: Arc<PathBuf>,
+    target: VirtualEndpoint,
+    stop: Arc<AtomicBool>,
+) {
+    let mut request = vec![0_u8; 65_535];
+    let mut response = vec![0_u8; 65_535];
+    while !stop.load(Ordering::SeqCst) {
+        match socket.recv_from(&mut request) {
+            Ok((request_len, source)) => {
+                let target_addr = registry
+                    .lock()
+                    .ok()
+                    .and_then(|registry| registry.get(&target).copied())
+                    .or_else(|| read_endpoint_file(&endpoint_dir, &target));
+                let Some(target_addr) = target_addr else {
+                    continue;
+                };
+                let Ok(outbound) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) else {
+                    continue;
+                };
+                let _ = outbound.set_read_timeout(Some(Duration::from_millis(100)));
+                if outbound
+                    .send_to(&request[..request_len], target_addr.0)
+                    .is_err()
+                {
+                    continue;
+                }
+                if let Ok((response_len, _)) = outbound.recv_from(&mut response) {
+                    let _ = socket.send_to(&response[..response_len], source);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 impl NetworkProvider for SocketNamespaceProvider {
     fn capabilities(&self) -> NetworkCapabilities {
         NetworkCapabilities {
@@ -945,7 +1053,7 @@ impl NetworkProvider for SocketNamespaceProvider {
             embedded_dns: true,
             outbound_connectivity: true,
             published_ports: true,
-            published_udp_ports: false,
+            published_udp_ports: true,
             kernel_datapath: true,
             host_routable_container_ips: false,
             packet_level_isolation: false,
@@ -974,6 +1082,9 @@ impl NetworkProvider for SocketNamespaceProvider {
     fn destroy_namespace(&self, lease_id: NetworkLeaseId) -> Result<(), String> {
         if let Ok(mut published_tcp) = self.published_tcp.lock() {
             published_tcp.remove(&lease_id);
+        }
+        if let Ok(mut published_udp) = self.published_udp.lock() {
+            published_udp.remove(&lease_id);
         }
         if let Ok(mut registry) = self.registry.lock() {
             registry.clear();
@@ -1019,10 +1130,7 @@ impl NetworkProvider for SocketNamespaceProvider {
     fn publish_port(&self, lease_id: NetworkLeaseId, mapping: PortMapping) -> Result<(), String> {
         match mapping.protocol {
             PortProtocol::Tcp => self.publish_tcp(lease_id, mapping),
-            PortProtocol::Udp => Err(format!(
-                "published UDP ports are not supported by the socket namespace provider: {}",
-                mapping.container_port
-            )),
+            PortProtocol::Udp => self.publish_udp(lease_id, mapping),
         }
     }
 
@@ -1142,7 +1250,7 @@ mod tests {
         BridgeId, NetworkAttachmentSpec, NetworkNamespaceId, PortMapping, PortProtocol,
     };
     use std::io::{Read, Write};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::thread;
 
     fn free_loopback_port() -> u16 {
@@ -1807,6 +1915,107 @@ mod tests {
         server.join().expect("server thread");
 
         assert_eq!(&reply, b"ok");
+    }
+
+    #[test]
+    fn publish_udp_conflict_reports_stable_error() {
+        let occupied = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy host port");
+        let host_port = occupied.local_addr().expect("occupied addr").port();
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8081,
+            protocol: PortProtocol::Udp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+
+        let err = provider
+            .publish_port(lease.id, mapping)
+            .expect_err("occupied published UDP host port should fail");
+
+        assert_eq!(
+            err,
+            format!("published UDP port 127.0.0.1:{host_port} is already in use")
+        );
+    }
+
+    #[test]
+    fn destroy_namespace_releases_published_udp_port() {
+        let occupied = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
+        let host_port = occupied.local_addr().expect("occupied addr").port();
+        drop(occupied);
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: PortProtocol::Udp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        provider.publish_port(lease.id, mapping).expect("publish");
+
+        provider
+            .destroy_namespace(lease.id)
+            .expect("destroy namespace");
+
+        let _socket =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, host_port)).expect("published port released");
+    }
+
+    #[test]
+    fn publish_udp_forwards_after_container_endpoint_registers() {
+        let occupied = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
+        let host_port = occupied.local_addr().expect("occupied addr").port();
+        drop(occupied);
+        let container_port = 8081;
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port,
+            protocol: PortProtocol::Udp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        provider.publish_port(lease.id, mapping).expect("publish");
+
+        let target = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+        target
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("target timeout");
+        let target_addr = target.local_addr().expect("target addr");
+        let server = thread::spawn(move || {
+            let mut buf = [0_u8; 8];
+            let (n, peer) = target.recv_from(&mut buf).expect("target recv");
+            assert_eq!(&buf[..n], b"ping");
+            target.send_to(b"ok", peer).expect("target reply");
+        });
+        let peer = SocketAddr::new(IpAddr::V4(spec.ipv4), container_port);
+        provider
+            .register_virtual_endpoint(
+                spec.bridge_id.clone(),
+                spec.namespace_id.clone().expect("namespace id"),
+                guest(peer),
+                PortProtocol::Udp,
+                host(target_addr),
+            )
+            .expect("register");
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client bind");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client timeout");
+        client
+            .send_to(b"ping", (Ipv4Addr::LOCALHOST, host_port))
+            .expect("send ping");
+        let mut reply = [0_u8; 8];
+        let (n, _) = client.recv_from(&mut reply).expect("read reply");
+        server.join().expect("server thread");
+
+        assert_eq!(&reply[..n], b"ok");
     }
 
     #[test]
