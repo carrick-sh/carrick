@@ -40,6 +40,17 @@ pub(crate) struct LinuxResolverConfig {
     pub(crate) options: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinuxHostsConfig {
+    pub(crate) entries: Vec<LinuxHostsEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinuxHostsEntry {
+    pub(crate) addr: String,
+    pub(crate) names: Vec<String>,
+}
+
 impl LinuxNetworkModel {
     pub(crate) fn from_spec(spec: &NetworkNamespaceSpec) -> Self {
         if spec.mode != NetworkMode::Bridge {
@@ -115,6 +126,138 @@ impl LinuxNetworkModel {
             || !self.resolver.options.is_empty()
     }
 
+    pub(crate) fn hosts_config<I>(
+        &self,
+        spec: &NetworkNamespaceSpec,
+        service_entries: I,
+        extra_hosts: &[String],
+        guest_hostname: &str,
+    ) -> LinuxHostsConfig
+    where
+        I: IntoIterator<Item = (IpAddr, Vec<String>)>,
+    {
+        let host_gateway =
+            (spec.mode == NetworkMode::Bridge).then(|| self.primary_gateway_v4(spec));
+        let parsed_extra_hosts = extra_hosts
+            .iter()
+            .filter_map(|entry| parse_extra_host(entry, host_gateway))
+            .collect::<Vec<_>>();
+
+        let mut entries = vec![
+            LinuxHostsEntry {
+                addr: "127.0.0.1".to_string(),
+                names: vec!["localhost".to_string()],
+            },
+            LinuxHostsEntry {
+                addr: "::1".to_string(),
+                names: vec![
+                    "localhost".to_string(),
+                    "ip6-localhost".to_string(),
+                    "ip6-loopback".to_string(),
+                ],
+            },
+            LinuxHostsEntry {
+                addr: "ff02::1".to_string(),
+                names: vec!["ip6-allnodes".to_string()],
+            },
+            LinuxHostsEntry {
+                addr: "ff02::2".to_string(),
+                names: vec!["ip6-allrouters".to_string()],
+            },
+        ];
+
+        if spec.mode == NetworkMode::Bridge {
+            let mut wrote_bridge_entry = false;
+            for (addr, names) in service_entries {
+                if names.is_empty() {
+                    continue;
+                }
+                entries.push(LinuxHostsEntry {
+                    addr: addr.to_string(),
+                    names,
+                });
+                wrote_bridge_entry = true;
+            }
+            if !wrote_bridge_entry {
+                let mut names = Vec::new();
+                if let Some(name) = &spec.container_name {
+                    names.push(name.clone());
+                }
+                names.extend(spec.aliases.iter().cloned());
+                if names.is_empty() {
+                    names.push(guest_hostname.to_string());
+                }
+                entries.push(LinuxHostsEntry {
+                    addr: self.primary_ipv4_address(spec).to_string(),
+                    names,
+                });
+            }
+
+            let explicit_names = parsed_extra_hosts
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            let gateway_names = ["host.docker.internal", "gateway.docker.internal"]
+                .into_iter()
+                .filter(|name| !explicit_names.contains(name))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !gateway_names.is_empty() {
+                entries.push(LinuxHostsEntry {
+                    addr: self.primary_gateway_v4(spec).to_string(),
+                    names: gateway_names,
+                });
+            }
+        } else {
+            entries.push(LinuxHostsEntry {
+                addr: "127.0.1.1".to_string(),
+                names: vec![guest_hostname.to_string()],
+            });
+        }
+
+        entries.extend(
+            parsed_extra_hosts
+                .into_iter()
+                .map(|(name, addr)| LinuxHostsEntry {
+                    addr,
+                    names: vec![name],
+                }),
+        );
+
+        LinuxHostsConfig { entries }
+    }
+
+    fn primary_ipv4_address(&self, spec: &NetworkNamespaceSpec) -> Ipv4Addr {
+        self.addresses
+            .iter()
+            .find_map(|addr| {
+                if addr.link_name == "eth0"
+                    && let IpAddr::V4(v4) = addr.addr
+                {
+                    Some(v4)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(spec.ipv4)
+    }
+
+    fn primary_gateway_v4(&self, spec: &NetworkNamespaceSpec) -> Ipv4Addr {
+        self.routes
+            .iter()
+            .find_map(|route| {
+                if route.destination.is_none()
+                    && route.link_name == "eth0"
+                    && let Some(IpAddr::V4(v4)) = route.gateway
+                {
+                    Some(v4)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(spec.gateway_v4)
+    }
+
     fn loopback_only(spec: &NetworkNamespaceSpec) -> Self {
         Self {
             links: vec![LinuxNetworkLink {
@@ -140,6 +283,22 @@ impl LinuxNetworkModel {
     }
 }
 
+impl LinuxHostsConfig {
+    pub(crate) fn render(&self) -> String {
+        let mut out = String::new();
+        for entry in &self.entries {
+            if entry.names.is_empty() {
+                continue;
+            }
+            out.push_str(&entry.addr);
+            out.push('\t');
+            out.push_str(&entry.names.join(" "));
+            out.push('\n');
+        }
+        out
+    }
+}
+
 fn resolver_from_spec(spec: &NetworkNamespaceSpec) -> LinuxResolverConfig {
     let nameservers = if spec.dns_servers.is_empty() && spec.mode == NetworkMode::Bridge {
         vec![IpAddr::V4(spec.gateway_v4)]
@@ -161,6 +320,19 @@ pub(crate) fn v4_prefix_24(addr: Ipv4Addr) -> Ipv4Addr {
 pub(crate) fn v4_prefix_8(addr: Ipv4Addr) -> Ipv4Addr {
     let [a, _, _, _] = addr.octets();
     Ipv4Addr::new(a, 0, 0, 0)
+}
+
+fn parse_extra_host(entry: &str, host_gateway: Option<Ipv4Addr>) -> Option<(String, String)> {
+    let (name, addr) = entry.split_once('=').or_else(|| entry.split_once(':'))?;
+    let name = name.trim();
+    let addr = addr.trim();
+    if name.is_empty() || addr.is_empty() {
+        return None;
+    }
+    if addr == "host-gateway" {
+        return host_gateway.map(|gateway| (name.to_string(), gateway.to_string()));
+    }
+    Some((name.to_string(), addr.to_string()))
 }
 
 #[cfg(test)]
@@ -312,5 +484,59 @@ mod tests {
         assert_eq!(model.resolver.nameservers, spec.dns_servers);
         assert_eq!(model.resolver.search, vec!["example.test"]);
         assert_eq!(model.resolver.options, vec!["ndots:2"]);
+    }
+
+    #[test]
+    fn hosts_model_uses_primary_address_gateway_and_extra_host_overrides() {
+        let mut spec =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        spec.attachments = vec![
+            NetworkAttachmentSpec::bridge_default(
+                BridgeId::new("front"),
+                Some("web".to_string()),
+                vec!["web-front".to_string()],
+                Some(Ipv4Addr::new(172, 31, 0, 44)),
+            ),
+            NetworkAttachmentSpec::bridge_default(
+                BridgeId::new("back"),
+                Some("web".to_string()),
+                vec!["web-back".to_string()],
+                Some(Ipv4Addr::new(172, 32, 0, 44)),
+            ),
+        ];
+        spec.bridge_id = spec.attachments[0].bridge_id.clone();
+        spec.ipv4 = spec.attachments[0].ipv4;
+        spec.gateway_v4 = spec.attachments[0].gateway_v4;
+        let model = LinuxNetworkModel::from_spec(&spec);
+
+        let hosts = model
+            .hosts_config(
+                &spec,
+                [(Ipv4Addr::new(172, 33, 0, 9).into(), vec!["db".to_string()])],
+                &["host.docker.internal:10.12.0.7".to_string()],
+                "carrick",
+            )
+            .render();
+
+        assert!(
+            hosts.contains("127.0.0.1\tlocalhost\n"),
+            "localhost entry missing: {hosts}"
+        );
+        assert!(
+            hosts.contains("172.33.0.9\tdb\n"),
+            "service entries should be rendered by the model: {hosts}"
+        );
+        assert!(
+            hosts.contains("172.31.0.1\tgateway.docker.internal\n"),
+            "unoverridden gateway name should use the primary model gateway: {hosts}"
+        );
+        assert!(
+            hosts.contains("10.12.0.7\thost.docker.internal\n"),
+            "explicit extra host should override generated gateway name: {hosts}"
+        );
+        assert!(
+            !hosts.contains("172.31.0.1\thost.docker.internal"),
+            "overridden host gateway name should not be generated: {hosts}"
+        );
     }
 }
