@@ -343,6 +343,15 @@ pub(crate) fn create(
 /// instead of double-applying the image entrypoint.
 fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunRequest {
     let c = &state.config;
+    let network_source = shared_network_source_state(c);
+    let effective_network = network_source
+        .as_ref()
+        .map(|state| &state.config)
+        .unwrap_or(c);
+    let effective_name = network_source
+        .as_ref()
+        .and_then(|state| state.name.as_deref())
+        .or(state.name.as_deref());
     carrick_engine::CliRunRequest {
         image_ref: state.image.clone(),
         platform: c.platform.clone(),
@@ -355,16 +364,22 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         tty: c.tty,
         interactive: c.interactive,
         rm: state.auto_remove,
-        name: None,
+        name: state.name.clone(),
         max_traps: c.max_traps,
         debug_state_path: None,
         fs: c.fs,
         pid: c.pid,
         network: c.network,
-        network_bridge: bridge_network_name(c),
+        network_bridge: bridge_network_name(effective_network),
         network_container: c.network_container.clone(),
-        network_ipv4: bridge_network_ipv4(c),
-        network_aliases: bridge_network_aliases(c),
+        network_namespace_id: Some(
+            c.network_container
+                .clone()
+                .unwrap_or_else(|| state.id.clone()),
+        ),
+        network_attachments: bridge_network_attachments(effective_network, effective_name),
+        network_ipv4: bridge_network_ipv4(effective_network, effective_name),
+        network_aliases: bridge_network_aliases(effective_network),
         extra_hosts: c.extra_hosts.clone(),
         dns_servers: c.dns_servers.clone(),
         dns_search: c.dns_search.clone(),
@@ -407,7 +422,7 @@ fn bridge_network_aliases(config: &RunConfig) -> Vec<String> {
         .unwrap_or_else(|| config.network_aliases.clone())
 }
 
-fn bridge_network_ipv4(config: &RunConfig) -> Option<String> {
+fn bridge_network_ipv4(config: &RunConfig, container_name: Option<&str>) -> Option<String> {
     if config.network != carrick_spec::NetworkMode::Bridge {
         return None;
     }
@@ -421,7 +436,52 @@ fn bridge_network_ipv4(config: &RunConfig) -> Option<String> {
                 .iter()
                 .find(|attachment| attachment.name == "bridge")
         })
-        .and_then(|attachment| attachment.ipv4_address.clone())
+        .map(|attachment| attachment_ipv4_address(attachment, container_name))
+}
+
+fn bridge_network_attachments(
+    config: &RunConfig,
+    container_name: Option<&str>,
+) -> Vec<carrick_engine::CliNetworkAttachment> {
+    if config.network != carrick_spec::NetworkMode::Bridge {
+        return Vec::new();
+    }
+    config
+        .network_attachments
+        .iter()
+        .map(|attachment| carrick_engine::CliNetworkAttachment {
+            bridge_id: carrick_spec::BridgeId::new(attachment.name.clone()),
+            aliases: attachment.aliases.clone(),
+            ipv4: Some(attachment_ipv4_address(attachment, container_name)),
+        })
+        .collect()
+}
+
+fn attachment_ipv4_address(
+    attachment: &carrick_runtime::container::NetworkAttachment,
+    container_name: Option<&str>,
+) -> String {
+    if let Some(ipv4) = attachment
+        .ipv4_address
+        .as_deref()
+        .filter(|addr| !addr.is_empty())
+    {
+        return ipv4.to_string();
+    }
+    carrick_spec::NetworkNamespaceSpec::bridge_default(
+        container_name.map(str::to_string),
+        attachment.aliases.clone(),
+        Vec::new(),
+    )
+    .ipv4
+    .to_string()
+}
+
+fn shared_network_source_state(config: &RunConfig) -> Option<ContainerState> {
+    config
+        .network_container
+        .as_deref()
+        .and_then(|target| ContainerState::load(target).ok())
 }
 
 /// Run `action` over each container spec, printing the returned id/code on
@@ -1035,6 +1095,15 @@ pub(crate) fn exec(
     // exec inherits the container's env (image ENV + its `-e`) plus exec's `-e`.
     let mut env_overrides = state.config.env.clone();
     env_overrides.extend(env);
+    let network_source = shared_network_source_state(&state.config);
+    let effective_network = network_source
+        .as_ref()
+        .map(|state| &state.config)
+        .unwrap_or(&state.config);
+    let effective_name = network_source
+        .as_ref()
+        .and_then(|state| state.name.as_deref())
+        .or(state.name.as_deref());
 
     let req = carrick_engine::CliRunRequest {
         image_ref: state.image.clone(),
@@ -1056,10 +1125,18 @@ pub(crate) fn exec(
         fs: Some(carrick_spec::FsBackendKind::Host),
         pid: state.config.pid,
         network: state.config.network,
-        network_bridge: bridge_network_name(&state.config),
+        network_bridge: bridge_network_name(effective_network),
         network_container: state.config.network_container.clone(),
-        network_ipv4: bridge_network_ipv4(&state.config),
-        network_aliases: bridge_network_aliases(&state.config),
+        network_namespace_id: Some(
+            state
+                .config
+                .network_container
+                .clone()
+                .unwrap_or_else(|| state.id.clone()),
+        ),
+        network_attachments: bridge_network_attachments(effective_network, effective_name),
+        network_ipv4: bridge_network_ipv4(effective_network, effective_name),
+        network_aliases: bridge_network_aliases(effective_network),
         extra_hosts: state.config.extra_hosts.clone(),
         dns_servers: state.config.dns_servers.clone(),
         dns_search: state.config.dns_search.clone(),
@@ -1626,9 +1703,9 @@ pub(crate) fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, ContainerStatus, RunConfig, parse_signal, ps_row_json,
-        rebuild_request_from_state, render_format, reset_for_relaunch, resolve_stop_signal,
-        select_tail, stop_grace_secs,
+        ContainerState, ContainerStatus, RunConfig, bridge_network_attachments, parse_signal,
+        ps_row_json, rebuild_request_from_state, render_format, reset_for_relaunch,
+        resolve_stop_signal, select_tail, stop_grace_secs,
     };
 
     fn sample_state() -> ContainerState {
@@ -1775,6 +1852,107 @@ mod tests {
 
         assert_eq!(req.network_bridge.as_deref(), Some("compose_default"));
         assert_eq!(req.network_aliases, vec!["api".to_string()]);
+    }
+
+    #[test]
+    fn rebuild_request_preserves_all_bridge_network_attachments() {
+        let mut state = sample_state();
+        state.name = Some("web".to_string());
+        state.config.network = carrick_spec::NetworkMode::Bridge;
+        state.config.network_attachments = vec![
+            carrick_runtime::container::NetworkAttachment {
+                name: "compose_backend".to_string(),
+                aliases: vec!["web".to_string(), "api-backend".to_string()],
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: Some("172.31.10.9".to_string()),
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            },
+            carrick_runtime::container::NetworkAttachment {
+                name: "compose_frontend".to_string(),
+                aliases: vec!["web".to_string(), "api-frontend".to_string()],
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: Some("172.31.20.9".to_string()),
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            },
+        ];
+
+        let req = rebuild_request_from_state(&state);
+        assert_eq!(req.network_attachments.len(), 2);
+        assert_eq!(
+            req.network_attachments[0].bridge_id.as_str(),
+            "compose_backend"
+        );
+        assert_eq!(
+            req.network_attachments[0].aliases,
+            vec!["web".to_string(), "api-backend".to_string()]
+        );
+        assert_eq!(
+            req.network_attachments[0].ipv4.as_deref(),
+            Some("172.31.10.9")
+        );
+        assert_eq!(
+            req.network_attachments[1].bridge_id.as_str(),
+            "compose_frontend"
+        );
+        assert_eq!(
+            req.network_attachments[1].aliases,
+            vec!["web".to_string(), "api-frontend".to_string()]
+        );
+        assert_eq!(
+            req.network_attachments[1].ipv4.as_deref(),
+            Some("172.31.20.9")
+        );
+    }
+
+    #[test]
+    fn bridge_network_attachments_pin_implicit_ips_to_source_container_name() {
+        let mut config = sample_state().config;
+        config.network = carrick_spec::NetworkMode::Bridge;
+        config.network_attachments = vec![
+            carrick_runtime::container::NetworkAttachment {
+                name: "compose_backend".to_string(),
+                aliases: vec!["web".to_string(), "app".to_string()],
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: None,
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            },
+            carrick_runtime::container::NetworkAttachment {
+                name: "compose_frontend".to_string(),
+                aliases: vec!["web".to_string(), "api".to_string()],
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: None,
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            },
+        ];
+
+        let attachments = bridge_network_attachments(&config, Some("carricksmokemultinet-web-1"));
+        let expected_ip = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some("carricksmokemultinet-web-1".to_string()),
+            Vec::new(),
+            Vec::new(),
+        )
+        .ipv4
+        .to_string();
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].ipv4.as_deref(), Some(expected_ip.as_str()));
+        assert_eq!(attachments[1].ipv4.as_deref(), Some(expected_ip.as_str()));
     }
 
     #[test]

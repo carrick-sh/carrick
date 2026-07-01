@@ -82,9 +82,16 @@ use std::collections::HashMap;
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
 pub use carrick_spec::{
-    BridgeId, FsBackendKind, ImageConfig, Mount, NetworkMode, NetworkNamespaceSpec, PidMode,
-    Platform, PortMapping, RunSpec,
+    BridgeId, FsBackendKind, ImageConfig, Mount, NetworkAttachmentSpec, NetworkMode,
+    NetworkNamespaceId, NetworkNamespaceSpec, PidMode, Platform, PortMapping, RunSpec,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliNetworkAttachment {
+    pub bridge_id: BridgeId,
+    pub aliases: Vec<String>,
+    pub ipv4: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct CliRunRequest {
@@ -111,6 +118,8 @@ pub struct CliRunRequest {
     pub network: NetworkMode,
     pub network_bridge: Option<String>,
     pub network_container: Option<String>,
+    pub network_namespace_id: Option<String>,
+    pub network_attachments: Vec<CliNetworkAttachment>,
     pub network_ipv4: Option<String>,
     pub network_aliases: Vec<String>,
     pub extra_hosts: Vec<String>,
@@ -311,7 +320,44 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
             );
             if let Some(bridge) = req.network_bridge.filter(|name| !name.is_empty()) {
                 spec.bridge_id = BridgeId::new(bridge);
+                if let Some(primary) = spec.attachments.first_mut() {
+                    primary.bridge_id = spec.bridge_id.clone();
+                }
             }
+            if !req.network_attachments.is_empty() {
+                let mut attachments = Vec::with_capacity(req.network_attachments.len());
+                for attachment in req.network_attachments {
+                    let ipv4 = attachment
+                        .ipv4
+                        .as_deref()
+                        .map(|ipv4| {
+                            ipv4.parse().map_err(|_| {
+                                format!("invalid IPv4 address {ipv4:?} for bridge attachment")
+                            })
+                        })
+                        .transpose()?;
+                    attachments.push(NetworkAttachmentSpec::bridge_default(
+                        attachment.bridge_id,
+                        req.name.clone(),
+                        attachment.aliases,
+                        ipv4,
+                    ));
+                }
+                if let Some(primary) = attachments.first() {
+                    spec.bridge_id = primary.bridge_id.clone();
+                    spec.aliases = primary.aliases.clone();
+                    spec.ipv4 = primary.ipv4;
+                    spec.gateway_v4 = primary.gateway_v4;
+                }
+                spec.attachments = attachments;
+            }
+            let namespace_id = req
+                .network_namespace_id
+                .clone()
+                .or_else(|| req.network_container.clone())
+                .or_else(|| req.name.clone())
+                .unwrap_or_else(|| format!("anon-{}", std::process::id()));
+            spec.namespace_id = Some(NetworkNamespaceId::new(namespace_id));
             spec
         }
     };
@@ -467,6 +513,8 @@ mod tests {
             network: NetworkMode::Host,
             network_bridge: None,
             network_container: None,
+            network_namespace_id: None,
+            network_attachments: Vec::new(),
             network_ipv4: None,
             network_aliases: Vec::new(),
             extra_hosts: Vec::new(),
@@ -631,6 +679,8 @@ mod tests {
             network: NetworkMode::Host,
             network_bridge: None,
             network_container: None,
+            network_namespace_id: None,
+            network_attachments: Vec::new(),
             network_ipv4: None,
             network_aliases: Vec::new(),
             extra_hosts: Vec::new(),
@@ -675,6 +725,8 @@ mod tests {
             network: NetworkMode::Host,
             network_bridge: None,
             network_container: None,
+            network_namespace_id: None,
+            network_attachments: Vec::new(),
             network_ipv4: None,
             network_aliases: Vec::new(),
             extra_hosts: Vec::new(),
@@ -718,6 +770,8 @@ mod tests {
             network: NetworkMode::Host,
             network_bridge: None,
             network_container: None,
+            network_namespace_id: None,
+            network_attachments: Vec::new(),
             network_ipv4: None,
             network_aliases: Vec::new(),
             extra_hosts: Vec::new(),
@@ -761,6 +815,8 @@ mod tests {
             network: NetworkMode::Host,
             network_bridge: None,
             network_container: None,
+            network_namespace_id: None,
+            network_attachments: Vec::new(),
             network_ipv4: None,
             network_aliases: Vec::new(),
             extra_hosts: Vec::new(),
@@ -813,6 +869,8 @@ mod tests {
             network: NetworkMode::Host,
             network_bridge: None,
             network_container: None,
+            network_namespace_id: None,
+            network_attachments: Vec::new(),
             network_ipv4: None,
             network_aliases: Vec::new(),
             extra_hosts: Vec::new(),
@@ -854,6 +912,8 @@ mod tests {
                 network: NetworkMode::Host,
                 network_bridge: None,
                 network_container: None,
+                network_namespace_id: None,
+                network_attachments: Vec::new(),
                 network_ipv4: None,
                 network_aliases: Vec::new(),
                 extra_hosts: Vec::new(),

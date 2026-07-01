@@ -305,6 +305,45 @@ pub struct PortMapping {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct NetworkAttachmentSpec {
+    pub bridge_id: BridgeId,
+    pub container_name: Option<String>,
+    pub aliases: Vec<String>,
+    pub ipv4: Ipv4Addr,
+    pub gateway_v4: Ipv4Addr,
+}
+
+impl NetworkAttachmentSpec {
+    pub fn bridge_default(
+        bridge_id: BridgeId,
+        container_name: Option<String>,
+        aliases: Vec<String>,
+        ipv4: Option<Ipv4Addr>,
+    ) -> Self {
+        Self {
+            bridge_id,
+            ipv4: ipv4.unwrap_or_else(|| bridge_ipv4_for_name(container_name.as_deref())),
+            gateway_v4: Ipv4Addr::new(172, 31, 0, 1),
+            container_name,
+            aliases,
+        }
+    }
+}
+
+impl Default for NetworkAttachmentSpec {
+    fn default() -> Self {
+        Self {
+            bridge_id: BridgeId::default_bridge(),
+            container_name: None,
+            aliases: Vec::new(),
+            ipv4: Ipv4Addr::new(0, 0, 0, 0),
+            gateway_v4: Ipv4Addr::new(0, 0, 0, 0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NetworkNamespaceSpec {
     pub mode: NetworkMode,
     pub namespace_id: Option<NetworkNamespaceId>,
@@ -319,6 +358,8 @@ pub struct NetworkNamespaceSpec {
     #[serde(default)]
     pub dns_options: Vec<String>,
     pub published_ports: Vec<PortMapping>,
+    #[serde(default)]
+    pub attachments: Vec<NetworkAttachmentSpec>,
 }
 
 impl NetworkNamespaceSpec {
@@ -328,18 +369,28 @@ impl NetworkNamespaceSpec {
         published_ports: Vec<PortMapping>,
     ) -> Self {
         let ipv4 = bridge_ipv4_for_name(container_name.as_deref());
+        let bridge_id = BridgeId::default_bridge();
+        let gateway_v4 = Ipv4Addr::new(172, 31, 0, 1);
+        let attachment = NetworkAttachmentSpec {
+            bridge_id: bridge_id.clone(),
+            container_name: container_name.clone(),
+            aliases: aliases.clone(),
+            ipv4,
+            gateway_v4,
+        };
         Self {
             mode: NetworkMode::Bridge,
             namespace_id: Some(NetworkNamespaceId::new("default")),
-            bridge_id: BridgeId::default_bridge(),
+            bridge_id,
             container_name,
             aliases,
             ipv4,
-            gateway_v4: Ipv4Addr::new(172, 31, 0, 1),
+            gateway_v4,
             dns_servers: vec![IpAddr::V4(Ipv4Addr::new(172, 31, 0, 1))],
             dns_search: Vec::new(),
             dns_options: Vec::new(),
             published_ports,
+            attachments: vec![attachment],
         }
     }
 
@@ -380,6 +431,7 @@ impl Default for NetworkNamespaceSpec {
             dns_search: Vec::new(),
             dns_options: Vec::new(),
             published_ports: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 }

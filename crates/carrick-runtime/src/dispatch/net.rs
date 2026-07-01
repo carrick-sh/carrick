@@ -1123,13 +1123,21 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLIN | LINUX_POLLHUP;
                 }
             }
-            OpenDescription::HostSocket { host_fd, base, .. } => {
+            OpenDescription::HostSocket {
+                host_fd,
+                base,
+                synthetic_recv,
+                ..
+            } => {
                 if base.pending_socket_error().is_some() {
                     let mut ready = LINUX_POLLERR;
                     if requested_events & LINUX_POLLOUT != 0 {
                         ready |= LINUX_POLLOUT;
                     }
                     return ready;
+                }
+                if requested_events & LINUX_POLLIN != 0 && !synthetic_recv.is_empty() {
+                    ready |= LINUX_POLLIN;
                 }
                 // Poll the real host fd so the guest's poll loop reflects
                 // actual kernel readiness for the socket.
@@ -1261,6 +1269,7 @@ impl SyscallDispatcher {
                 family,
                 type_: base_type,
                 base: OpenDescriptionBase::new(status_flags),
+                synthetic_recv: std::collections::VecDeque::new(),
             })),
             fd_flags,
         );
@@ -1328,6 +1337,7 @@ impl SyscallDispatcher {
                 family: libc::AF_UNIX,
                 type_: so_type,
                 base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                synthetic_recv: std::collections::VecDeque::new(),
             }
         } else if kind == libc::S_IFIFO {
             // A pipe end. Probe its direction so reads/writes route correctly;
@@ -1473,12 +1483,17 @@ impl SyscallDispatcher {
                     (family == libc::AF_INET
                         && self.network.spec.mode == carrick_spec::NetworkMode::Bridge)
                         .then_some(GuestSocketAddr(std::net::SocketAddr::new(
-                            std::net::IpAddr::V4(self.network.spec.ipv4),
+                            if guest_peer.ip().is_loopback() {
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                            } else {
+                                std::net::IpAddr::V4(self.network.spec.ipv4)
+                            },
                             local.port(),
                         )))
                 })
             });
         let _ = self.network.provider.record_socket_addresses(
+            self.network.spec.namespace_id.as_ref(),
             fd,
             guest_local,
             host_local.map(HostSocketAddr).or(Some(host_peer)),
@@ -1638,6 +1653,58 @@ impl SyscallDispatcher {
         recv_queue.drain(..take).collect()
     }
 
+    fn maybe_queue_dns_response(
+        &self,
+        fd: i32,
+        request: &[u8],
+        requested: std::net::SocketAddr,
+    ) -> bool {
+        if !self.is_dns_gateway_addr(requested) {
+            return false;
+        }
+        let Some(source) = socket_addr_to_linux_sockaddr(requested) else {
+            return false;
+        };
+        let Some(response) = crate::network::dns::build_a_response(request, |name| {
+            self.network.resolve_dns_name(name).unwrap_or_default()
+        }) else {
+            return false;
+        };
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        let mut open = open_file.description.write();
+        let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
+            return false;
+        };
+        synthetic_recv.push_back((response, source));
+        true
+    }
+
+    fn synthetic_datagram_drain(&self, fd: i32) -> Option<(Vec<u8>, Vec<u8>)> {
+        let open_file = self.open_file(fd)?;
+        let mut open = open_file.description.write();
+        let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
+            return None;
+        };
+        synthetic_recv.pop_front()
+    }
+
+    fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {
+        addr.port() == 53
+            && matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip == self.network.spec.gateway_v4)
+    }
+
+    fn connected_dns_peer(&self, fd: i32) -> Option<std::net::SocketAddr> {
+        self.network
+            .provider
+            .guest_visible_peer_addr(fd)
+            .ok()
+            .flatten()
+            .map(|addr| addr.0)
+            .filter(|addr| self.is_dns_gateway_addr(*addr))
+    }
+
     pub(in crate::dispatch) fn accept_common(
         &self,
         fd: Fd,
@@ -1768,6 +1835,7 @@ impl SyscallDispatcher {
                 family,
                 type_,
                 base: OpenDescriptionBase::new(status_flags),
+                synthetic_recv: std::collections::VecDeque::new(),
             })),
             fd_flags,
         );
@@ -1786,6 +1854,7 @@ impl SyscallDispatcher {
                 .flatten();
             let host_local = host_socket_addr(new_host, family, false);
             let _ = self.network.provider.record_socket_addresses(
+                self.network.spec.namespace_id.as_ref(),
                 linux_fd,
                 guest_local,
                 host_local.map(HostSocketAddr),
@@ -3637,6 +3706,7 @@ impl SyscallDispatcher {
                     family,
                     type_: base_type,
                     base: OpenDescriptionBase::new(status_flags),
+                    synthetic_recv: std::collections::VecDeque::new(),
                 })),
                 fd_flags,
             );
@@ -3646,6 +3716,7 @@ impl SyscallDispatcher {
                     family,
                     type_: base_type,
                     base: OpenDescriptionBase::new(status_flags),
+                    synthetic_recv: std::collections::VecDeque::new(),
                 })),
                 fd_flags,
             );
@@ -3785,40 +3856,19 @@ impl SyscallDispatcher {
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
             {
-                if this.network.spec.mode == carrick_spec::NetworkMode::Bridge {
-                    match requested.ip() {
-                        std::net::IpAddr::V4(ip)
-                            if ip == this.network.spec.ipv4
-                                || ip == std::net::Ipv4Addr::UNSPECIFIED =>
-                        {
-                            if let Some(mapped) =
-                                socket_addr_to_host_sockaddr(std::net::SocketAddr::new(
-                                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                                    0,
-                                ))
-                            {
-                                host_addr = mapped;
-                                rewritten_bind = Some((requested, protocol));
-                            }
+                match this.network.provider.materialize_bind(
+                    this.network.spec.namespace_id.as_ref(),
+                    GuestSocketAddr(requested),
+                    protocol,
+                ) {
+                    Ok(BindTarget::Host(host)) => {
+                        if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
+                            host_addr = mapped;
+                            rewritten_bind = Some((requested, protocol));
                         }
-                        std::net::IpAddr::V4(ip) if ip.is_loopback() => {}
-                        _ => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
                     }
-                } else {
-                    match this.network.provider.materialize_bind(
-                        this.network.spec.namespace_id.as_ref(),
-                        GuestSocketAddr(requested),
-                        protocol,
-                    ) {
-                        Ok(BindTarget::Host(host)) => {
-                            if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
-                                host_addr = mapped;
-                                rewritten_bind = Some((requested, protocol));
-                            }
-                        }
-                        Ok(BindTarget::Unchanged) => {}
-                        Err(_) => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
-                    }
+                    Ok(BindTarget::Unchanged) => {}
+                    Err(_) => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
                 }
             }
             // AF_UNIX pathname sockets are bound at a stable host path (see
@@ -3893,6 +3943,7 @@ impl SyscallDispatcher {
                     guest_local
                 };
                 let _ = this.network.provider.record_socket_addresses(
+                    this.network.spec.namespace_id.as_ref(),
                     fd,
                     Some(GuestSocketAddr(guest_local)),
                     Some(HostSocketAddr(host_local)),
@@ -4000,6 +4051,20 @@ impl SyscallDispatcher {
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
             {
+                if protocol == PortProtocol::Udp
+                    && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
+                    && this.is_dns_gateway_addr(requested)
+                {
+                    let synthetic_host_peer = std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        requested.port(),
+                    );
+                    if let Some(mapped) = socket_addr_to_host_sockaddr(synthetic_host_peer) {
+                        host_addr = mapped;
+                        rewritten_connect =
+                            Some((requested, HostSocketAddr(synthetic_host_peer), protocol));
+                    }
+                } else {
                 match this.network.provider.resolve_connect(
                     this.network.spec.namespace_id.as_ref(),
                     GuestSocketAddr(requested),
@@ -4050,6 +4115,7 @@ impl SyscallDispatcher {
                         }
                     }
                     Err(_) => return Ok(carrick_abi::LINUX_ECONNREFUSED.into()),
+                }
                 }
             }
             // connect(AF_UNSPEC) is the UDP "disconnect" (dissolve the peer
@@ -4372,7 +4438,15 @@ impl SyscallDispatcher {
                 && let Some(requested) = host_addr
                     .as_deref()
                     .and_then(host_sockaddr_to_socket_addr)
+                    .or_else(|| this.connected_dns_peer(fd))
             {
+                if protocol == PortProtocol::Udp
+                    && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
+                    && let Ok(bytes) = memory.read_bytes(buf_addr, len)
+                    && this.maybe_queue_dns_response(fd, &bytes, requested)
+                {
+                    return Ok(DispatchOutcome::Returned { value: len as i64 });
+                }
                 match this.network.provider.resolve_connect(
                     this.network.spec.namespace_id.as_ref(),
                     GuestSocketAddr(requested),
@@ -4471,6 +4545,19 @@ impl SyscallDispatcher {
             // (from_bits_retain: recv IGNORES other unknown flag bits.)
             if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+            }
+            if let Some((payload, source)) = this.synthetic_datagram_drain(fd) {
+                let take = payload.len().min(len);
+                if take > 0 && memory.write_bytes(buf_addr, &payload[..take]).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                if src_addr != 0
+                    && src_len_addr != 0
+                    && write_linux_sockaddr(memory, src_addr, src_len_addr, &source).is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                return Ok(DispatchOutcome::Returned { value: take as i64 });
             }
             if let Some(errno) = this.take_socket_pending_error(fd) {
                 return Ok(errno.into());
@@ -5150,6 +5237,19 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
         };
+        if family == libc::AF_INET
+            && self.socket_port_protocol(fd) == Some(PortProtocol::Udp)
+            && self.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
+            && let Some(requested) = host_addr
+                .as_deref()
+                .and_then(host_sockaddr_to_socket_addr)
+                .or_else(|| self.connected_dns_peer(fd))
+            && self.maybe_queue_dns_response(fd, &data, requested)
+        {
+            return Ok(DispatchOutcome::Returned {
+                value: data.len() as i64,
+            });
+        }
         // SCM_RIGHTS ancillary data (passing fds over AF_UNIX). Read the guest's
         // Linux-layout control buffer, extract the guest fds, map each to its
         // backing host fd, and build a host-layout control buffer for the real
@@ -5281,6 +5381,50 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: n as i64 });
         }
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
+        if let Some((payload, source)) = self.synthetic_datagram_drain(fd) {
+            let n = payload.len().min(total);
+            let mut remaining = n;
+            let mut cursor = 0usize;
+            for iov in &iovecs {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(iov.iov_len as usize);
+                if take > 0 {
+                    if memory
+                        .write_bytes(iov.iov_base, &payload[cursor..cursor + take])
+                        .is_err()
+                    {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                    cursor += take;
+                    remaining -= take;
+                }
+            }
+            if msg.name != 0 && msg.namelen != 0 {
+                let write_len = (source.len() as u32).min(msg.namelen);
+                if write_len > 0
+                    && memory
+                        .write_bytes(msg.name, &source[..write_len as usize])
+                        .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                let _ = memory.write_bytes(
+                    msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
+                    &(source.len() as u32).to_ne_bytes(),
+                );
+            }
+            let _ = memory.write_bytes(
+                msg_addr + core::mem::offset_of!(LinuxMsghdr, controllen) as u64,
+                &0u64.to_ne_bytes(),
+            );
+            let _ = memory.write_bytes(
+                msg_addr + core::mem::offset_of!(LinuxMsghdr, flags) as u64,
+                &0i32.to_ne_bytes(),
+            );
+            return Ok(DispatchOutcome::Returned { value: n as i64 });
+        }
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
         let recv_to = self
