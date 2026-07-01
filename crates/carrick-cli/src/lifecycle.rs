@@ -187,6 +187,8 @@ fn build_created_state(
             workdir: req.workdir.clone(),
             user: req.user.clone(),
             pid: req.pid,
+            network: req.network,
+            published_ports: req.published_ports.clone(),
             scratch_path: None,
             region_path: None,
             entrypoint: req.entrypoint_override.clone(),
@@ -319,6 +321,8 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         debug_state_path: None,
         fs: c.fs,
         pid: c.pid,
+        network: c.network,
+        published_ports: c.published_ports.clone(),
         // The effective host stop signum is already persisted in RunConfig and
         // preserved across relaunch; engine.run ignores these, so leave unset.
         stop_signal: None,
@@ -924,6 +928,8 @@ pub(crate) fn exec(
         debug_state_path: None,
         fs: Some(carrick_spec::FsBackendKind::Host),
         pid: state.config.pid,
+        network: state.config.network,
+        published_ports: Vec::new(),
         // exec is a transient command, not a managed container — it is never
         // `stop`ped, so it carries no stop config.
         stop_signal: None,
@@ -1240,6 +1246,8 @@ mod tests {
                 workdir: Some("/w".into()),
                 user: Some("1000".into()),
                 pid: carrick_spec::PidMode::Private,
+                network: carrick_spec::NetworkMode::Host,
+                published_ports: Vec::new(),
                 scratch_path: Some("/s".into()),
                 region_path: Some("/r".into()),
                 entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
