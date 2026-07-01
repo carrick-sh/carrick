@@ -3,9 +3,11 @@ use super::{
 };
 use carrick_spec::{BridgeId, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol};
 use std::collections::HashMap;
+use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,6 +16,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct SocketNamespaceProvider {
     registry: Arc<Mutex<HashMap<VirtualEndpoint, SocketAddr>>>,
+    endpoint_dir: Arc<PathBuf>,
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
     socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
     published_tcp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedTcpProxy>>>,
@@ -56,8 +59,15 @@ impl Default for SocketNamespaceProvider {
 
 impl SocketNamespaceProvider {
     pub fn new() -> Self {
+        let endpoint_dir = std::env::temp_dir().join(format!(
+            "carrick-netns-{}-{}",
+            std::process::id(),
+            NEXT_ENDPOINT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&endpoint_dir);
         Self {
             registry: Arc::new(Mutex::new(HashMap::new())),
+            endpoint_dir: Arc::new(endpoint_dir),
             namespaces: Mutex::new(HashMap::new()),
             socket_addrs: Mutex::new(HashMap::new()),
             published_tcp: Mutex::new(HashMap::new()),
@@ -81,7 +91,9 @@ impl SocketNamespaceProvider {
             .registry
             .lock()
             .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
-        registry.insert(key, host_addr);
+        registry.insert(key.clone(), host_addr);
+        drop(registry);
+        self.write_endpoint_file(&key, host_addr)?;
         Ok(())
     }
 
@@ -100,7 +112,11 @@ impl SocketNamespaceProvider {
             .registry
             .lock()
             .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
-        Ok(registry.get(&key).copied())
+        if let Some(host) = registry.get(&key).copied() {
+            return Ok(Some(host));
+        }
+        drop(registry);
+        Ok(read_endpoint_file(&self.endpoint_dir, &key))
     }
 
     pub fn materialize_bridge_bind(
@@ -261,10 +277,13 @@ impl SocketNamespaceProvider {
             protocol: PortProtocol::Tcp,
         };
         let registry = Arc::clone(&self.registry);
+        let endpoint_dir = Arc::clone(&self.endpoint_dir);
         let thread_stop = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("carrick-bridge-publish-tcp".to_string())
-            .spawn(move || published_tcp_accept_loop(listener, registry, target, thread_stop))
+            .spawn(move || {
+                published_tcp_accept_loop(listener, registry, endpoint_dir, target, thread_stop)
+            })
             .map_err(|e| format!("failed to start published TCP proxy: {e}"))?;
         let mut published_tcp = self
             .published_tcp
@@ -279,11 +298,51 @@ impl SocketNamespaceProvider {
             });
         Ok(())
     }
+
+    fn write_endpoint_file(
+        &self,
+        endpoint: &VirtualEndpoint,
+        host_addr: SocketAddr,
+    ) -> Result<(), String> {
+        write_endpoint_file(&self.endpoint_dir, endpoint, host_addr)
+    }
+}
+
+static NEXT_ENDPOINT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
+    let protocol = match endpoint.protocol {
+        PortProtocol::Tcp => "tcp",
+        PortProtocol::Udp => "udp",
+    };
+    let ip = endpoint.addr.ip().to_string().replace(':', "_");
+    endpoint_dir.join(format!(
+        "{}-{ip}-{}-{protocol}",
+        endpoint.bridge_id.as_str(),
+        endpoint.addr.port()
+    ))
+}
+
+fn write_endpoint_file(
+    endpoint_dir: &Path,
+    endpoint: &VirtualEndpoint,
+    host_addr: SocketAddr,
+) -> Result<(), String> {
+    fs::create_dir_all(endpoint_dir)
+        .map_err(|e| format!("failed to create socket namespace endpoint directory: {e}"))?;
+    fs::write(endpoint_path(endpoint_dir, endpoint), host_addr.to_string())
+        .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))
+}
+
+fn read_endpoint_file(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> Option<SocketAddr> {
+    let raw = fs::read_to_string(endpoint_path(endpoint_dir, endpoint)).ok()?;
+    raw.trim().parse().ok()
 }
 
 fn published_tcp_accept_loop(
     listener: TcpListener,
     registry: Arc<Mutex<HashMap<VirtualEndpoint, SocketAddr>>>,
+    endpoint_dir: Arc<PathBuf>,
     target: VirtualEndpoint,
     stop: Arc<AtomicBool>,
 ) {
@@ -293,7 +352,8 @@ fn published_tcp_accept_loop(
                 let target_addr = registry
                     .lock()
                     .ok()
-                    .and_then(|registry| registry.get(&target).copied());
+                    .and_then(|registry| registry.get(&target).copied())
+                    .or_else(|| read_endpoint_file(&endpoint_dir, &target));
                 if let Some(target_addr) = target_addr {
                     let _ = thread::Builder::new()
                         .name("carrick-bridge-publish-tcp-stream".to_string())
@@ -587,6 +647,53 @@ mod tests {
                 target_addr,
             )
             .expect("register");
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect");
+        client.write_all(b"ping").expect("write ping");
+        let mut reply = [0_u8; 2];
+        client.read_exact(&mut reply).expect("read reply");
+        server.join().expect("server thread");
+
+        assert_eq!(&reply, b"ok");
+    }
+
+    #[test]
+    fn publish_tcp_forwards_from_fork_coherent_endpoint_file() {
+        let host_port = free_loopback_port();
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: PortProtocol::Tcp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        provider.publish_port(lease.id, mapping).expect("publish");
+
+        let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("target accept");
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).expect("read ping");
+            stream.write_all(b"ok").expect("write ok");
+        });
+        let peer = VirtualEndpoint {
+            bridge_id: spec.bridge_id.clone(),
+            addr: SocketAddr::new(IpAddr::V4(spec.ipv4), 8080),
+            protocol: PortProtocol::Tcp,
+        };
+        provider
+            .write_endpoint_file(&peer, target_addr)
+            .expect("write endpoint file");
+        {
+            let registry = provider.registry.lock().expect("registry");
+            assert!(
+                !registry.contains_key(&peer),
+                "test must exercise the fork-coherent endpoint path"
+            );
+        }
 
         let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect");
         client.write_all(b"ping").expect("write ping");
