@@ -56,6 +56,22 @@ pub trait NetworkProvider: Send + Sync {
         requested: SocketAddr,
         protocol: PortProtocol,
     ) -> Result<ConnectTarget, String>;
+    fn record_socket_addresses(
+        &self,
+        _guest_fd: i32,
+        _guest_local: Option<SocketAddr>,
+        _host_local: Option<SocketAddr>,
+        _guest_peer: Option<SocketAddr>,
+        _protocol: PortProtocol,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn guest_visible_local_addr(&self, _guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+        Ok(None)
+    }
+    fn guest_visible_peer_addr(&self, _guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Default)]

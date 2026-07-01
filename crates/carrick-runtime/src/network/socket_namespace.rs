@@ -10,6 +10,7 @@ use std::sync::Mutex;
 pub struct SocketNamespaceProvider {
     registry: Mutex<HashMap<VirtualEndpoint, SocketAddr>>,
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
+    socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -19,11 +20,19 @@ struct VirtualEndpoint {
     protocol: PortProtocol,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SocketAddressState {
+    guest_local: Option<SocketAddr>,
+    _host_local: Option<SocketAddr>,
+    guest_peer: Option<SocketAddr>,
+}
+
 impl SocketNamespaceProvider {
     pub fn new() -> Self {
         Self {
             registry: Mutex::new(HashMap::new()),
             namespaces: Mutex::new(HashMap::new()),
+            socket_addrs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -115,6 +124,86 @@ impl SocketNamespaceProvider {
             _ => Ok(ConnectTarget::Unchanged),
         }
     }
+
+    pub fn record_socket_addresses(
+        &self,
+        guest_fd: i32,
+        guest_local: Option<SocketAddr>,
+        host_local: Option<SocketAddr>,
+        guest_peer: Option<SocketAddr>,
+        protocol: PortProtocol,
+    ) -> Result<(), String> {
+        let mut socket_addrs = self
+            .socket_addrs
+            .lock()
+            .map_err(|_| "socket address registry lock poisoned".to_string())?;
+        socket_addrs.insert(
+            guest_fd,
+            SocketAddressState {
+                guest_local,
+                _host_local: host_local,
+                guest_peer,
+            },
+        );
+        drop(socket_addrs);
+
+        if let (Some(guest), Some(host)) = (guest_local, host_local) {
+            let endpoints = {
+                let namespaces = self
+                    .namespaces
+                    .lock()
+                    .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
+                namespaces
+                    .iter()
+                    .filter_map(|(namespace_id, spec)| {
+                        let IpAddr::V4(guest_ip) = guest.ip() else {
+                            return None;
+                        };
+                        if guest_ip == spec.ipv4 || guest_ip == Ipv4Addr::UNSPECIFIED {
+                            let virtual_ip = if guest_ip == Ipv4Addr::UNSPECIFIED {
+                                spec.ipv4
+                            } else {
+                                guest_ip
+                            };
+                            Some((
+                                spec.bridge_id.clone(),
+                                namespace_id.clone(),
+                                SocketAddr::new(IpAddr::V4(virtual_ip), guest.port()),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (bridge_id, namespace_id, virtual_addr) in endpoints {
+                self.register_virtual_endpoint(
+                    bridge_id,
+                    namespace_id,
+                    virtual_addr,
+                    protocol,
+                    host,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn guest_visible_local_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+        let socket_addrs = self
+            .socket_addrs
+            .lock()
+            .map_err(|_| "socket address registry lock poisoned".to_string())?;
+        Ok(socket_addrs.get(&guest_fd).and_then(|s| s.guest_local))
+    }
+
+    pub fn guest_visible_peer_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+        let socket_addrs = self
+            .socket_addrs
+            .lock()
+            .map_err(|_| "socket address registry lock poisoned".to_string())?;
+        Ok(socket_addrs.get(&guest_fd).and_then(|s| s.guest_peer))
+    }
 }
 
 impl NetworkProvider for SocketNamespaceProvider {
@@ -195,6 +284,25 @@ impl NetworkProvider for SocketNamespaceProvider {
             return Ok(ConnectTarget::Unchanged);
         };
         self.resolve_bridge_connect(&spec, requested, protocol)
+    }
+
+    fn record_socket_addresses(
+        &self,
+        guest_fd: i32,
+        guest_local: Option<SocketAddr>,
+        host_local: Option<SocketAddr>,
+        guest_peer: Option<SocketAddr>,
+        protocol: PortProtocol,
+    ) -> Result<(), String> {
+        self.record_socket_addresses(guest_fd, guest_local, host_local, guest_peer, protocol)
+    }
+
+    fn guest_visible_local_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+        self.guest_visible_local_addr(guest_fd)
+    }
+
+    fn guest_visible_peer_addr(&self, guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+        self.guest_visible_peer_addr(guest_fd)
     }
 }
 
@@ -300,5 +408,17 @@ mod tests {
             target,
             ConnectTarget::Host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080))
         );
+    }
+
+    #[test]
+    fn records_guest_visible_local_address_for_rewritten_bind() {
+        let provider = SocketNamespaceProvider::new();
+        let guest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)), 80);
+        let host = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080);
+        provider
+            .record_socket_addresses(7, Some(guest), Some(host), None, PortProtocol::Tcp)
+            .expect("record");
+        let visible = provider.guest_visible_local_addr(7).expect("visible addr");
+        assert_eq!(visible, Some(guest));
     }
 }
