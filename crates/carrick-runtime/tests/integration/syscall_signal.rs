@@ -194,9 +194,11 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .unwrap(),
         DispatchOutcome::WaitOnSignals {
             wait_set: 1u64 << 9,
-            // Nothing blocked by the thread mask, so only wait-set signals are
-            // exempt from waking the park (and nothing else is blocked).
-            block_mask: 0,
+            // Nothing blocked by the thread mask and no handlers installed, so
+            // the park blocks exactly the DEFAULT-IGNORE dispositions
+            // (SIGCHLD/SIGURG/SIGWINCH): a to-be-ignored signal must neither
+            // interrupt the wait nor busy-wake it.
+            block_mask: (1u64 << 16) | (1u64 << 22) | (1u64 << 27),
             timeout: None
         }
     );
