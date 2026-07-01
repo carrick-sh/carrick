@@ -78,12 +78,31 @@ fn main() {
         println!("handler_ran={}", USR1_HITS.load(Ordering::SeqCst) == 1);
 
         // Case 2: a BLOCKED wait-set signal is dequeued and returned as the
-        // signum; no handler involvement (none installed for SIGUSR2).
+        // signum; no handler involvement (none installed for SIGUSR2). The
+        // dequeued siginfo must name the LIVE killer child (si_pid) with
+        // si_code == SI_USER — the host-kill routed path must synthesize the
+        // sender, not hand back an empty siginfo (LTP tse_unmasked_matching).
         let _ = block_signal(libc::SIGUSR2);
         let child = fork_killer(libc::SIGUSR2, 150);
-        let (rc, _) = rt_sigtimedwait(1u64 << (libc::SIGUSR2 - 1), Some(Duration::from_secs(6)));
+        let mut info = [0u8; 128];
+        let set = 1u64 << (libc::SIGUSR2 - 1);
+        let ts = libc::timespec {
+            tv_sec: 6,
+            tv_nsec: 0,
+        };
+        let rc = libc::syscall(
+            libc::SYS_rt_sigtimedwait,
+            &set as *const u64,
+            info.as_mut_ptr(),
+            &ts as *const libc::timespec,
+            8usize,
+        ) as i64;
+        let si_code = i32::from_le_bytes(info[8..12].try_into().unwrap());
+        let si_pid = i32::from_le_bytes(info[16..20].try_into().unwrap());
         reap(child);
         println!("waitset_signum_ok={}", rc == libc::SIGUSR2 as i64);
+        println!("waitset_si_code_is_user={}", si_code == 0);
+        println!("waitset_si_pid_is_child={}", si_pid == child);
 
         // Case 3: bounded empty-set wait, nothing pending → EAGAIN.
         let (rc, err) = rt_sigtimedwait(0, Some(Duration::from_millis(300)));

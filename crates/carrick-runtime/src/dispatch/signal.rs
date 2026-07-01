@@ -1853,6 +1853,20 @@ fn rt_sigtimedwait_deliver(
     queued: Option<LinuxSiginfo>,
 ) -> DispatchOutcome {
     if info_ptr != 0 {
+        // No carrick-queued payload (the host-kill routed path): synthesize the
+        // SI_USER siginfo from the recorded last sender, exactly as async
+        // delivery (`deliver_pending_signal`) does — LTP tse_unmasked_matching
+        // checks the dequeued si_pid names the killer child, and an empty
+        // si_pid=0 siginfo fails it on the kvm/bhyve lanes where standard
+        // cross-process signals arrive as real host signals.
+        let queued = queued.or_else(|| {
+            let sender_host = crate::host_signal::last_sender_for(signum);
+            (sender_host > 0).then(|| {
+                let ns_pid = crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
+                let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
+                LinuxSiginfo::kill(signum, crate::linux_abi::LINUX_SI_USER, ns_pid, uid)
+            })
+        });
         let mut si = queued.unwrap_or_else(LinuxSiginfo::empty);
         si.si_signo = signum;
         // A bad `info` pointer must surface EFAULT (the kernel's copyout
