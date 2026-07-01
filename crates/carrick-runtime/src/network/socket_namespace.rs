@@ -773,6 +773,28 @@ mod tests {
     }
 
     #[test]
+    fn destroy_namespace_releases_published_tcp_port() {
+        let host_port = free_loopback_port();
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: PortProtocol::Tcp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        provider.publish_port(lease.id, mapping).expect("publish");
+
+        provider
+            .destroy_namespace(lease.id)
+            .expect("destroy namespace");
+
+        let _listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, host_port)).expect("published port released");
+    }
+
+    #[test]
     fn publish_tcp_forwards_after_container_endpoint_registers() {
         let host_port = free_loopback_port();
         let mapping = PortMapping {
