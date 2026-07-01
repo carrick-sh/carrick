@@ -80,16 +80,26 @@ pub(super) struct EpollInterest {
 
 #[derive(Debug)]
 pub(super) struct EventFdState {
-    pub(super) counter: Mutex<u64>,
-    pub(super) readable: Condvar,
-    /// Host pipe whose read end mirrors "counter > 0": exactly one byte is
-    /// present iff the eventfd is readable. This gives the eventfd a REAL host
-    /// fd that the epoll instance kqueue watches via `EVFILT_READ` natively
+    /// Slot in the cross-process counter slab (`crate::eventfd_shm`) — the
+    /// counter must be FORK-COHERENT (carrick forks real host processes;
+    /// LTP eventfd2_03's children semaphore-ping-pong across the fork), so it
+    /// lives in `MAP_SHARED` host memory, not in this (per-process) struct.
+    /// `None` = slab unavailable/exhausted → `local` fallback (correct within
+    /// one process, silently non-coherent across forks — the pre-slab
+    /// behavior).
+    slot: Option<usize>,
+    local: std::sync::atomic::AtomicU64,
+    /// Host pipe whose read end mirrors "counter > 0": a byte is present iff
+    /// the eventfd is readable. This gives the eventfd a REAL host fd that the
+    /// epoll instance kqueue watches via `EVFILT_READ` natively
     /// (level-triggered -> can't be lost), so Go's netpollBreak wakes the poller
-    /// without relying on the coarse `EVFILT_USER` broadcast. `-1` if pipe
-    /// creation failed (then readiness falls back to the in-memory recompute +
-    /// broadcast). The bytes are managed entirely by carrick (write_eventfd /
-    /// read_eventfd); the guest never reads the pipe directly.
+    /// without relying on the coarse `EVFILT_USER` broadcast — and that a
+    /// BLOCKING guest read parks on (`WaitOnFds`), which a kernel-shared pipe
+    /// makes work across forked guest processes. `-1` if pipe creation failed
+    /// (then readiness falls back to the in-memory recompute + broadcast and
+    /// blocking reads degrade to EAGAIN). The bytes are managed entirely by
+    /// carrick (write_eventfd / read_eventfd); the guest never reads the pipe
+    /// directly.
     pub(super) read_fd: std::os::fd::RawFd,
     pub(super) write_fd: std::os::fd::RawFd,
 }
@@ -104,21 +114,37 @@ impl EventFdState {
             unsafe { libc::write(write_fd, byte.as_ptr().cast(), 1) };
         }
         Self {
-            counter: Mutex::new(counter),
-            readable: Condvar::new(),
+            slot: crate::eventfd_shm::alloc(counter),
+            local: std::sync::atomic::AtomicU64::new(counter),
             read_fd,
             write_fd,
         }
     }
 
-    /// Make `read_fd` readable iff `count > 0`: ensure exactly one byte present
-    /// when readable, drained when not. Called under the counter lock.
+    /// The eventfd counter — the shared-slab slot when available (coherent
+    /// across forked guest processes), else the per-process fallback.
+    pub(super) fn counter_ref(&self) -> &std::sync::atomic::AtomicU64 {
+        self.slot
+            .and_then(crate::eventfd_shm::counter)
+            .unwrap_or(&self.local)
+    }
+
+    /// Current counter value (racy snapshot — poll/epoll readiness only).
+    pub(super) fn counter_value(&self) -> u64 {
+        self.counter_ref().load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make `read_fd` readable iff `count > 0`: ensure a byte is present when
+    /// readable, drained when not. `count` is the caller's post-update view.
+    /// Cross-process race guard: after draining for a 0 count, RE-CHECK the
+    /// shared counter — a concurrent writer's 0→n byte may have been eaten by
+    /// this drain, and a parked reader would then sleep past a ready counter.
     pub(super) fn sync_readiness(&self, count: u64) {
         if self.read_fd < 0 {
             return;
         }
         if count > 0 {
-            // Ensure a byte is present (idempotent: a full 1-deep pipe EAGAINs).
+            // Ensure a byte is present (idempotent: a full pipe EAGAINs).
             let byte = [1u8];
             // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
             unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), 1) };
@@ -131,6 +157,11 @@ impl EventFdState {
                 if n <= 0 {
                     break;
                 }
+            }
+            if self.counter_value() > 0 {
+                let byte = [1u8];
+                // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
+                unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), 1) };
             }
         }
     }

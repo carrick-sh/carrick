@@ -3854,36 +3854,50 @@ fn read_eventfd(
             errno: LINUX_EINVAL,
         };
     }
-    let mut counter = state.counter.lock();
-    while *counter == 0 {
-        if nonblocking {
+    // The counter is a cross-process shared atomic (forked guest processes
+    // share the eventfd — LTP eventfd2_03's semaphore ping-pong), so takes are
+    // CAS loops and a BLOCKING read parks on the readiness pipe (kernel-shared
+    // → a sibling process's write wakes the park) instead of a per-process
+    // condvar that another process's write can never signal — which also
+    // removes a dispatcher-blocking wait the fork-quiesce could deadlock on.
+    let counter = state.counter_ref();
+    loop {
+        let current = counter.load(std::sync::atomic::Ordering::SeqCst);
+        if current == 0 {
+            return would_block_outcome(state.read_fd, libc::POLLIN, nonblocking, None);
+        }
+        let taken = if semaphore { 1 } else { current };
+        if counter
+            .compare_exchange(
+                current,
+                current - taken,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            continue; // raced another reader/writer — re-derive
+        }
+        let eventfd_value = LinuxEventfdValue {
+            value: if semaphore { 1 } else { current },
+        };
+        if memory
+            .write_bytes(address, eventfd_value.as_bytes())
+            .is_err()
+        {
+            // Copyout fault: put the tokens back before surfacing EFAULT.
+            counter.fetch_add(taken, std::sync::atomic::Ordering::SeqCst);
             return DispatchOutcome::Errno {
-                errno: LINUX_EAGAIN,
+                errno: LINUX_EFAULT,
             };
         }
-        state.readable.wait(&mut counter);
-    }
-    let value = if semaphore { 1 } else { *counter };
-    let eventfd_value = LinuxEventfdValue { value };
-    if memory
-        .write_bytes(address, eventfd_value.as_bytes())
-        .is_err()
-    {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
+        // Keep the host readiness pipe in sync (drains it when the counter
+        // hits 0, so the read end stops being readable; EFD_SEMAPHORE keeps it
+        // readable while the counter is still > 0).
+        state.sync_readiness(current - taken);
+        return DispatchOutcome::Returned {
+            value: core::mem::size_of::<LinuxEventfdValue>() as i64,
         };
-    }
-    if semaphore {
-        *counter -= 1;
-    } else {
-        *counter = 0;
-    }
-    // Keep the host readiness pipe in sync (drains it when the counter hits 0,
-    // so the read end stops being readable; EFD_SEMAPHORE keeps it readable
-    // while the counter is still > 0).
-    state.sync_readiness(*counter);
-    DispatchOutcome::Returned {
-        value: core::mem::size_of::<LinuxEventfdValue>() as i64,
     }
 }
 
@@ -3904,28 +3918,44 @@ fn write_eventfd(bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
             errno: LINUX_EINVAL,
         };
     }
-    let mut counter = state.counter.lock();
-    let Some(next) = (*counter).checked_add(increment) else {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EAGAIN,
+    let counter = state.counter_ref();
+    loop {
+        let current = counter.load(std::sync::atomic::Ordering::SeqCst);
+        let next = match current.checked_add(increment) {
+            // Linux caps the counter at u64::MAX - 1; a write that would
+            // exceed it fails EAGAIN (poll's POLLOUT check mirrors this).
+            Some(next) if next < u64::MAX => next,
+            _ => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                };
+            }
         };
-    };
-    let was_zero = *counter == 0;
-    *counter = next;
-    // Mirror readiness onto the host pipe so the epoll instance kqueue sees it
-    // natively (level-triggered, can't be lost) — the robust path for Go's
-    // netpollBreak.
-    state.sync_readiness(next);
-    if was_zero && next > 0 {
-        state.readable.notify_all();
-        // Belt-and-suspenders for any epoll instance that (rarely) registered
-        // the eventfd before its host fd was available: also poke the in-memory
-        // wake broadcast. Redundant with the host-backed pipe above; harmless.
-        drop(counter);
-        notify_inmem_epoll();
-    }
-    DispatchOutcome::Returned {
-        value: core::mem::size_of::<LinuxEventfdValue>() as i64,
+        if counter
+            .compare_exchange(
+                current,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            continue; // raced another writer/reader — re-derive
+        }
+        // Mirror readiness onto the host pipe so the epoll instance kqueue sees
+        // it natively (level-triggered, can't be lost) — the robust path for
+        // Go's netpollBreak — and so a sibling PROCESS parked on the pipe wakes.
+        state.sync_readiness(next);
+        if current == 0 && next > 0 {
+            // Belt-and-suspenders for any epoll instance that (rarely)
+            // registered the eventfd before its host fd was available: also
+            // poke the in-memory wake broadcast. Redundant with the host-backed
+            // pipe above; harmless.
+            notify_inmem_epoll();
+        }
+        return DispatchOutcome::Returned {
+            value: core::mem::size_of::<LinuxEventfdValue>() as i64,
+        };
     }
 }
 
