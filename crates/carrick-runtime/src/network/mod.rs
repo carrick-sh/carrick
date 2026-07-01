@@ -336,7 +336,7 @@ mod tests {
         assert!(caps.embedded_dns);
         assert!(caps.outbound_connectivity);
         assert!(caps.published_ports);
-        assert!(!caps.published_udp_ports);
+        assert!(caps.published_udp_ports);
         assert!(!caps.host_routable_container_ips);
         assert!(!caps.packet_level_isolation);
         assert!(!caps.raw_socket_support);
