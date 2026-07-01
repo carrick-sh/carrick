@@ -3,14 +3,20 @@ use super::{
 };
 use carrick_spec::{BridgeId, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol};
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SocketNamespaceProvider {
-    registry: Mutex<HashMap<VirtualEndpoint, SocketAddr>>,
+    registry: Arc<Mutex<HashMap<VirtualEndpoint, SocketAddr>>>,
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
     socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
+    published_tcp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedTcpProxy>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -27,12 +33,34 @@ struct SocketAddressState {
     guest_peer: Option<SocketAddr>,
 }
 
+#[derive(Debug)]
+struct PublishedTcpProxy {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for PublishedTcpProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Default for SocketNamespaceProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SocketNamespaceProvider {
     pub fn new() -> Self {
         Self {
-            registry: Mutex::new(HashMap::new()),
+            registry: Arc::new(Mutex::new(HashMap::new())),
             namespaces: Mutex::new(HashMap::new()),
             socket_addrs: Mutex::new(HashMap::new()),
+            published_tcp: Mutex::new(HashMap::new()),
         }
     }
 
@@ -204,6 +232,98 @@ impl SocketNamespaceProvider {
             .map_err(|_| "socket address registry lock poisoned".to_string())?;
         Ok(socket_addrs.get(&guest_fd).and_then(|s| s.guest_peer))
     }
+
+    fn first_namespace_spec(&self) -> Result<NetworkNamespaceSpec, String> {
+        let namespaces = self
+            .namespaces
+            .lock()
+            .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
+        namespaces
+            .values()
+            .next()
+            .cloned()
+            .ok_or_else(|| "no network namespace exists for published port".to_string())
+    }
+
+    fn publish_tcp(&self, lease_id: NetworkLeaseId, mapping: PortMapping) -> Result<(), String> {
+        let spec = self.first_namespace_spec()?;
+        let host_ip = mapping.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let host_port = mapping.host_port.unwrap_or(0);
+        let listener = TcpListener::bind(SocketAddr::new(host_ip, host_port))
+            .map_err(|e| format!("failed to bind published TCP port {host_ip}:{host_port}: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to configure published TCP listener: {e}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let target = VirtualEndpoint {
+            bridge_id: spec.bridge_id,
+            addr: SocketAddr::new(IpAddr::V4(spec.ipv4), mapping.container_port),
+            protocol: PortProtocol::Tcp,
+        };
+        let registry = Arc::clone(&self.registry);
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("carrick-bridge-publish-tcp".to_string())
+            .spawn(move || published_tcp_accept_loop(listener, registry, target, thread_stop))
+            .map_err(|e| format!("failed to start published TCP proxy: {e}"))?;
+        let mut published_tcp = self
+            .published_tcp
+            .lock()
+            .map_err(|_| "published TCP registry lock poisoned".to_string())?;
+        published_tcp
+            .entry(lease_id)
+            .or_default()
+            .push(PublishedTcpProxy {
+                stop,
+                handle: Some(handle),
+            });
+        Ok(())
+    }
+}
+
+fn published_tcp_accept_loop(
+    listener: TcpListener,
+    registry: Arc<Mutex<HashMap<VirtualEndpoint, SocketAddr>>>,
+    target: VirtualEndpoint,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((inbound, _)) => {
+                let target_addr = registry
+                    .lock()
+                    .ok()
+                    .and_then(|registry| registry.get(&target).copied());
+                if let Some(target_addr) = target_addr {
+                    let _ = thread::Builder::new()
+                        .name("carrick-bridge-publish-tcp-stream".to_string())
+                        .spawn(move || {
+                            let _ = proxy_tcp_stream(inbound, target_addr);
+                        });
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn proxy_tcp_stream(mut inbound: TcpStream, target: SocketAddr) -> io::Result<()> {
+    let mut outbound = TcpStream::connect(target)?;
+    let mut inbound_clone = inbound.try_clone()?;
+    let mut outbound_clone = outbound.try_clone()?;
+    let left = thread::spawn(move || io::copy(&mut inbound_clone, &mut outbound));
+    let right = thread::spawn(move || io::copy(&mut outbound_clone, &mut inbound));
+    let _ = left.join();
+    let _ = right.join();
+    Ok(())
 }
 
 impl NetworkProvider for SocketNamespaceProvider {
@@ -238,8 +358,14 @@ impl NetworkProvider for SocketNamespaceProvider {
         Ok(())
     }
 
-    fn publish_port(&self, _lease_id: NetworkLeaseId, _mapping: PortMapping) -> Result<(), String> {
-        Ok(())
+    fn publish_port(&self, lease_id: NetworkLeaseId, mapping: PortMapping) -> Result<(), String> {
+        match mapping.protocol {
+            PortProtocol::Tcp => self.publish_tcp(lease_id, mapping),
+            PortProtocol::Udp => Err(format!(
+                "published UDP ports are not supported by the socket namespace provider: {}",
+                mapping.container_port
+            )),
+        }
     }
 
     fn materialize_bind(
@@ -309,8 +435,15 @@ impl NetworkProvider for SocketNamespaceProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_spec::{BridgeId, NetworkNamespaceId, PortProtocol};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use carrick_spec::{BridgeId, NetworkNamespaceId, PortMapping, PortProtocol};
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::thread;
+
+    fn free_loopback_port() -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
+        listener.local_addr().expect("local addr").port()
+    }
 
     fn provider_with_endpoint() -> SocketNamespaceProvider {
         let provider = SocketNamespaceProvider::new();
@@ -420,5 +553,47 @@ mod tests {
             .expect("record");
         let visible = provider.guest_visible_local_addr(7).expect("visible addr");
         assert_eq!(visible, Some(guest));
+    }
+
+    #[test]
+    fn publish_tcp_forwards_after_container_endpoint_registers() {
+        let host_port = free_loopback_port();
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: PortProtocol::Tcp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        provider.publish_port(lease.id, mapping).expect("publish");
+
+        let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("target accept");
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).expect("read ping");
+            stream.write_all(b"ok").expect("write ok");
+        });
+        let peer = SocketAddr::new(IpAddr::V4(spec.ipv4), 8080);
+        provider
+            .register_virtual_endpoint(
+                spec.bridge_id.clone(),
+                spec.namespace_id.clone().expect("namespace id"),
+                peer,
+                PortProtocol::Tcp,
+                target_addr,
+            )
+            .expect("register");
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect");
+        client.write_all(b"ping").expect("write ping");
+        let mut reply = [0_u8; 2];
+        client.read_exact(&mut reply).expect("read reply");
+        server.join().expect("server thread");
+
+        assert_eq!(&reply, b"ok");
     }
 }
