@@ -110,6 +110,7 @@ network):
 | `multi_network_server` + `multi_network_client` | Compose/API tests attach containers to multiple user-defined bridges and assert app-socket traffic can cross only shared bridges. Prevents wildcard listeners, sidecar namespace rebuild, and Docker API connect/disconnect restarts from collapsing runtime routing to a single primary network. |
 | `multi_network_dns_client` | Raw UDP DNS queries to the namespace gateway resolve service/container/alias names only across bridges shared with the querying namespace. Prevents the embedded DNS responder from leaking aliases between networks or relying on `/etc/hosts`/glibc fallback behavior. |
 | `host_gateway_client` | Compose smoke resolves `host.docker.internal` to the bridge gateway and connects through that gateway to a host loopback TCP listener. Prevents host-gateway support from stopping at `/etc/hosts` text without a working app-socket path to host services. |
+| `udp_published_server` + `udp_published_client` | Compose smoke sends UDP between same-bridge services and through a host-published UDP port. Prevents bridge UDP publish support from accepting `/udp` metadata while dropping guest replies because the proxy backend source is not guest-routable. |
 
 **Fixed this session** (probes that flipped from gap → MATCH because the
 underlying gap got fixed):
