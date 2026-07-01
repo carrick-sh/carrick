@@ -357,7 +357,7 @@ impl SyscallDispatcher {
         let open = open_file.description.read();
         match &*open {
             OpenDescription::EventFd { state, .. }
-                if *state.counter.lock() > 0 && requested_events & LINUX_EPOLLIN != 0 =>
+                if state.counter_value() > 0 && requested_events & LINUX_EPOLLIN != 0 =>
             {
                 LINUX_EPOLLIN
             }
@@ -917,7 +917,7 @@ impl SyscallDispatcher {
             }
             OpenDescription::Directory { .. } => {}
             OpenDescription::EventFd { state, .. } => {
-                let counter = *state.counter.lock();
+                let counter = state.counter_value();
                 if requested_events & LINUX_POLLIN != 0 && counter > 0 {
                     ready |= LINUX_POLLIN;
                 }
