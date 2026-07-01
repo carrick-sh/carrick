@@ -949,31 +949,24 @@ fn blocking_eventfd_read_waits_until_writer_updates_counter() {
         panic!("expected eventfd2 success, got {eventfd:?}");
     };
 
-    let (tx, rx) = mpsc::channel();
-    let read_dispatcher = Arc::clone(&dispatcher);
-    let read_reporter = Arc::clone(&reporter);
-    let read_registry = Arc::clone(&registry);
-    let read_futex = Arc::clone(&futex);
-    let reader = std::thread::spawn(move || {
-        let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-        let outcome = read_dispatcher
-            .dispatch_threaded(
-                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
-                &mut memory,
-                &read_reporter,
-                10,
-                &read_registry,
-                &read_futex,
-            )
-            .unwrap();
-        let value = read_eventfd_value(&memory, 0x4000).value;
-        tx.send((outcome, value)).unwrap();
-    });
-
-    std::thread::sleep(Duration::from_millis(25));
+    // A blocking read of a zero counter must NOT block inside the dispatcher:
+    // it returns a WaitOnFds park on the readiness pipe (the run loop parks;
+    // a sibling PROCESS's write can then wake it — the fork-coherent
+    // contract), and the run loop RE-dispatches the read after the wake.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+            10,
+            &registry,
+            &futex,
+        )
+        .unwrap();
     assert!(
-        rx.try_recv().is_err(),
-        "blocking read returned before writer"
+        matches!(outcome, DispatchOutcome::WaitOnFds { .. }),
+        "blocking read of an empty eventfd must park via WaitOnFds, got {outcome:?}"
     );
 
     let mut write_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
@@ -994,12 +987,21 @@ fn blocking_eventfd_read_waits_until_writer_updates_counter() {
         DispatchOutcome::Returned { value: 8 }
     );
 
-    let (outcome, value) = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("blocking eventfd reader should wake");
+    // The re-dispatch (what the run loop does after the pipe wake) consumes
+    // the posted counter.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+            10,
+            &registry,
+            &futex,
+        )
+        .unwrap();
     assert_eq!(outcome, DispatchOutcome::Returned { value: 8 });
-    assert_eq!(value, 5);
-    reader.join().expect("reader thread panicked");
+    let read_back = read_eventfd_value(&memory, 0x4000).value;
+    assert_eq!(read_back, 5);
 }
 
 #[test]
