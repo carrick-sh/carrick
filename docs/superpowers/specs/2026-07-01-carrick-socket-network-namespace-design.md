@@ -233,6 +233,15 @@ user-defined bridge networks by carrying aliases and bridge membership per
 attachment. Multi-homed targets expose only the addresses on bridges shared with
 the querying namespace.
 
+Bridge-mode `/etc/hosts` also materializes Docker Desktop-style host gateway
+names. `host.docker.internal` and `gateway.docker.internal` resolve to the
+namespace gateway address unless an explicit `ExtraHosts` entry overrides that
+name. Compose/API `host-gateway` extra-host tokens expand to the namespace
+gateway. The socket namespace provider maps TCP connects to an attached bridge
+gateway onto host loopback on the requested port, so ordinary host-local
+services are reachable without claiming host-routable container IPs or a packet
+NAT datapath.
+
 ## Provider Roadmap
 
 The provider boundary is intended to support these future implementations:
