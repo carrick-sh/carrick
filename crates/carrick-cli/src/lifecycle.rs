@@ -516,7 +516,7 @@ pub(crate) fn ps(
             ps_command(&c.command, no_trunc),
             human_age(c.created_secs),
             ps_status(c, *st),
-            "", // PORTS — carrick is host-networked; no published ports.
+            ps_ports(&c.config),
             c.name.as_deref().unwrap_or("")
         );
     }
@@ -695,7 +695,7 @@ fn ps_row_json(c: &ContainerState, st: ContainerStatus, no_trunc: bool) -> serde
         "CreatedAt": human_age(c.created_secs),
         "RunningFor": human_age(c.created_secs),
         "Status": ps_status(c, st),
-        "Ports": "",
+        "Ports": ps_ports(&c.config),
         "Names": c.name.as_deref().unwrap_or(""),
         "State": match st {
             ContainerStatus::Created => "created",
@@ -703,6 +703,32 @@ fn ps_row_json(c: &ContainerState, st: ContainerStatus, no_trunc: bool) -> serde
             ContainerStatus::Exited => "exited",
         },
     })
+}
+
+fn ps_ports(config: &RunConfig) -> String {
+    if config.network == carrick_spec::NetworkMode::Host {
+        return String::new();
+    }
+
+    config
+        .published_ports
+        .iter()
+        .map(|mapping| {
+            let host_ip = mapping
+                .host_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            let host_port = mapping.host_port.unwrap_or(0);
+            let protocol = match mapping.protocol {
+                carrick_spec::PortProtocol::Tcp => "tcp",
+                carrick_spec::PortProtocol::Udp => "udp",
+            };
+            format!(
+                "{host_ip}:{host_port}->{}/{protocol}",
+                mapping.container_port
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `carrick stop` — send the container's stop signal (its `--stop-signal` /
@@ -1224,8 +1250,9 @@ pub(crate) fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, ContainerStatus, RunConfig, parse_signal, rebuild_request_from_state,
-        render_format, reset_for_relaunch, resolve_stop_signal, select_tail, stop_grace_secs,
+        ContainerState, ContainerStatus, RunConfig, parse_signal, ps_row_json,
+        rebuild_request_from_state, render_format, reset_for_relaunch, resolve_stop_signal,
+        select_tail, stop_grace_secs,
     };
 
     fn sample_state() -> ContainerState {
@@ -1305,6 +1332,33 @@ mod tests {
         // configured --stop-signal / --stop-timeout across `restart`/`start`).
         assert_eq!(s.config.stop_signal, Some(libc::SIGQUIT));
         assert_eq!(s.config.stop_timeout, Some(15));
+    }
+
+    #[test]
+    fn ps_row_json_renders_bridge_published_ports() {
+        let mut s = sample_state();
+        s.config.network = carrick_spec::NetworkMode::Bridge;
+        s.config.published_ports = vec![
+            carrick_spec::PortMapping {
+                host_ip: Some("127.0.0.1".parse().expect("host ip")),
+                host_port: Some(18080),
+                container_port: 8080,
+                protocol: carrick_spec::PortProtocol::Tcp,
+            },
+            carrick_spec::PortMapping {
+                host_ip: None,
+                host_port: Some(5353),
+                container_port: 53,
+                protocol: carrick_spec::PortProtocol::Udp,
+            },
+        ];
+
+        let row = ps_row_json(&s, ContainerStatus::Running, false);
+
+        assert_eq!(
+            row.get("Ports").and_then(serde_json::Value::as_str),
+            Some("127.0.0.1:18080->8080/tcp, 0.0.0.0:5353->53/udp")
+        );
     }
 
     #[test]
