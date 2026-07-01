@@ -860,7 +860,7 @@ pub mod runtime {
                     // timeout with nothing pending → EAGAIN, the sigtimedwait
                     // timeout return. Single-threaded: no in-process async
                     // source, so a finite timeout is deterministic.
-                    match waiter.wait(&[], timeout, block_mask) {
+                    match waiter.wait(&[], timeout, block_mask.raw()) {
                         WaitResult::Ready => continue,
                         WaitResult::Interrupted => {
                             if dispatcher.signal_wait_should_eintr(

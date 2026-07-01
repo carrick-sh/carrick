@@ -799,16 +799,16 @@ impl SyscallDispatcher {
     pub(crate) fn signal_wait_should_eintr(
         &self,
         tid: crate::thread::ThreadId,
-        wait_set: u64,
-        block_mask: u64,
+        wait_set: carrick_abi::SigSet,
+        block_mask: carrick_abi::SigBlockMask,
     ) -> bool {
         // Everything that must NOT produce EINTR: the wait set itself (handled
-        // by re-dispatch) plus the thread-mask-blocked remainder. `block_mask`
-        // is `!wait_set & thread_mask`, so this union is `wait_set | mask`.
-        let non_set_block = wait_set | block_mask;
-        crate::host_signal::has_unblocked_pending_for(tid, non_set_block)
-            || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_set_block)
-            || self.has_deliverable_dispatch_pending_for_wait(tid, non_set_block, true)
+        // by re-dispatch) plus the blocked/ignored remainder the block mask
+        // already encodes.
+        let non_eintr = block_mask.non_eintr_union(wait_set).raw();
+        crate::host_signal::has_unblocked_pending_for(tid, non_eintr)
+            || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_eintr)
+            || self.has_deliverable_dispatch_pending_for_wait(tid, non_eintr, true)
     }
 
     /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
@@ -1601,16 +1601,16 @@ impl SyscallDispatcher {
             match timeout {
                 Some(d) if d.is_zero() => Ok(LINUX_EAGAIN.into()),
                 _ => Ok(DispatchOutcome::WaitOnSignals {
-                    wait_set,
-                    // Block only signals outside the wait set that are EITHER
-                    // blocked by the thread's mask OR currently ignored: a
-                    // wait-set signal always wakes (sigtimedwait dequeues
-                    // signals even while blocked — the canonical
-                    // block-then-wait usage); an unblocked CAUGHT non-set
-                    // signal must wake to EINTR the wait; a to-be-ignored one
-                    // (e.g. handler-less SIGCHLD) must do neither.
-                    block_mask: !wait_set
-                        & (this.signal_mask_for(tid) | this.wait_ignored_disposition_mask()),
+                    wait_set: carrick_abi::SigSet::from_raw(wait_set),
+                    // The named constructor states the park policy: wait-set
+                    // signals always wake, unblocked caught non-set signals
+                    // wake to EINTR, thread-blocked or to-be-ignored ones
+                    // (e.g. handler-less SIGCHLD) do neither.
+                    block_mask: carrick_abi::SigBlockMask::for_signal_wait(
+                        carrick_abi::SigSet::from_raw(wait_set),
+                        carrick_abi::SigSet::from_raw(this.signal_mask_for(tid)),
+                        carrick_abi::SigSet::from_raw(this.wait_ignored_disposition_mask()),
+                    ),
                     timeout,
                 }),
             }

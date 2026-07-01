@@ -851,7 +851,7 @@ where
                     };
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
-                    match self.waiter.wait(&[], Some(slice), block_mask) {
+                    match self.waiter.wait(&[], Some(slice), block_mask.raw()) {
                         crate::io_wait::WaitResult::Ready => continue,
                         crate::io_wait::WaitResult::TimedOut => {
                             if signal_wait_expired(signal_wait_deadline) {
