@@ -1216,19 +1216,17 @@ pub enum DispatchOutcome {
         /// blocking recv/accept with a finite SO_RCVTIMEO (a timeout means
         /// "would have blocked"). Only consulted when `timeout` is `Some`.
         on_timeout: i64,
-        /// Signals (bit `signum-1`) this syscall temporarily blocks for the
-        /// duration of the wait — an `epoll_pwait`/`ppoll`/`pselect6` sigmask. A
-        /// signal blocked here does NOT interrupt the wait (it stays pending and
-        /// is delivered after the syscall, per the persistent mask). `0` = none.
-        block_signals: u64,
-        /// True iff `block_signals` is a POSIX sigmask that REPLACES the thread's
-        /// persistent mask for the wait (`ppoll`/`pselect6`/`epoll_pwait`): a
-        /// signal the temp mask UNBLOCKS must interrupt even if persistently
-        /// blocked, so the interrupt predicate uses `block_signals` ALONE. `false`
-        /// (the default for plain `read`/`recv`/`connect`, whose `block_signals`
-        /// is `0`) means additive: the effective wait mask is the thread's
-        /// persistent mask. (probe `ppollunblock` vs `maskfork`.)
-        mask_replaces: bool,
+        /// The wait's signal-masking policy. `Replace(set)` carries a POSIX
+        /// sigmask that REPLACES the thread's persistent mask for the wait
+        /// (`ppoll`/`pselect6`/`epoll_pwait`): a signal blocked by the set does
+        /// NOT interrupt the wait (it stays pending and is delivered after the
+        /// syscall), and a signal the set UNBLOCKS must interrupt even if
+        /// persistently blocked — the interrupt predicate uses the set ALONE.
+        /// `Additive(set)` (the default for plain `read`/`recv`/`connect`,
+        /// usually with an empty set) means the effective wait mask is the
+        /// thread's persistent mask plus the set. (probe `ppollunblock` vs
+        /// `maskfork`.)
+        sig_mask: carrick_abi::WaitSigMask,
     },
     /// A blocking `write(2)` to a host FIFO made partial progress and then hit
     /// host EAGAIN. Re-dispatching the original syscall would duplicate the
@@ -1257,11 +1255,9 @@ pub enum DispatchOutcome {
         fds: WaitFds,
         /// `None` = wait forever (signal-interruptible).
         timeout: Option<Duration>,
-        /// Temporarily-blocked sigmask for the wait (pselect6); `0` = none.
-        block_signals: u64,
-        /// True iff `block_signals` REPLACES the persistent mask (pselect6 always
-        /// supplies a sigmask). See [`DispatchOutcome::WaitOnFds::mask_replaces`].
-        mask_replaces: bool,
+        /// The wait's signal-masking policy (`Replace` when pselect6 supplies a
+        /// sigmask). See [`DispatchOutcome::WaitOnFds::sig_mask`].
+        sig_mask: carrick_abi::WaitSigMask,
         /// Guest `(address, byte length)` of each present fd-set to zero if the
         /// wait times out. Empty when no fd-set was supplied.
         clear_on_timeout: Vec<(u64, usize)>,
@@ -1278,22 +1274,21 @@ pub enum DispatchOutcome {
         timeout: Option<Duration>,
         /// Value to complete the syscall with if the wait times out.
         on_timeout: i64,
-        /// Signals (bit `signum-1`) temporarily blocked for the wait.
-        block_signals: u64,
-        /// True iff `block_signals` REPLACES the persistent mask (`ppoll`/
-        /// `epoll_pwait` with a sigmask). See
-        /// [`DispatchOutcome::WaitOnFds::mask_replaces`].
-        mask_replaces: bool,
+        /// The wait's signal-masking policy (`Replace` when `ppoll`/
+        /// `epoll_pwait` supplies a sigmask). See
+        /// [`DispatchOutcome::WaitOnFds::sig_mask`].
+        sig_mask: carrick_abi::WaitSigMask,
     },
     /// A blocking `waitid(P_PID, pid, …)` whose target child hasn't changed
     /// state yet. The runtime parks the vCPU thread on the child's exit via the
     /// per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (interruptible by a signal
     /// or a fork quiesce — unlike a raw `libc::waitid`), then re-dispatches the
-    /// waitid to reap. `block_signals` is the temporarily-blocked sigmask (0 for
-    /// a plain waitid).
+    /// waitid to reap. `sig_mask` is always `Additive` here: waitpid/waitid
+    /// carry no POSIX temp sigmask, only extra temporarily-blocked signals
+    /// (empty for a plain waitid).
     WaitOnProcExit {
         pid: i32,
-        block_signals: u64,
+        sig_mask: carrick_abi::WaitSigMask,
     },
     /// `rt_sigtimedwait` found no matching signal already pending and must wait
     /// until one of `wait_set` arrives, or until `timeout` elapses. The runtime
@@ -5160,8 +5155,7 @@ fn would_block_outcome(
             fds: WaitFds::anchored_one(host_fd, events, host_fd_owner),
             timeout: None,
             on_timeout: -(LINUX_EAGAIN as i64),
-            block_signals: 0,
-            mask_replaces: false,
+            sig_mask: carrick_abi::WaitSigMask::NONE,
         }
     }
 }

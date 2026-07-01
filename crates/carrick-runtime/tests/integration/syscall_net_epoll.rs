@@ -1372,27 +1372,25 @@ fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
             fds,
             timeout,
             on_timeout,
-            block_signals,
-            mask_replaces: _,
+            sig_mask,
         } => {
             assert_eq!(fds.len(), 1);
             assert!(fds[0].fd() >= 0);
             assert!(fds[0].events() == 0 || fds[0].events() & libc::POLLIN == libc::POLLIN);
             assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
             assert_eq!(on_timeout, 0);
-            assert_eq!(block_signals, 0);
+            assert_eq!(sig_mask.raw_block_bits(), 0);
         }
         DispatchOutcome::WaitOnFds {
             fds,
             timeout,
             on_timeout,
-            block_signals,
-            mask_replaces: _,
+            sig_mask,
         } => {
             assert!(fds.is_empty());
             assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
             assert_eq!(on_timeout, 0);
-            assert_eq!(block_signals, 0);
+            assert_eq!(sig_mask.raw_block_bits(), 0);
         }
         other => panic!("expected timed epoll wait handoff, got {other:?}"),
     }
@@ -1462,8 +1460,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
         fds,
         timeout,
         on_timeout,
-        block_signals,
-        mask_replaces: _,
+        sig_mask,
     } = outcome
     else {
         panic!("expected epoll wait handoff, got {outcome:?}");
@@ -1473,7 +1470,7 @@ fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
     assert_eq!(fds[0].events() & libc::POLLIN, libc::POLLIN);
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
-    assert_eq!(block_signals, 0);
+    assert_eq!(sig_mask.raw_block_bits(), 0);
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -1571,8 +1568,7 @@ fn epoll_latched_host_edge_parks_on_signal_wait_instead_of_kqueue_fd() {
         fds,
         timeout,
         on_timeout,
-        block_signals,
-        mask_replaces: _,
+        sig_mask,
     } = outcome
     else {
         panic!("expected latch-masked level event to park on retry wait, got {outcome:?}");
@@ -1582,7 +1578,7 @@ fn epoll_latched_host_edge_parks_on_signal_wait_instead_of_kqueue_fd() {
     assert_eq!(fds[0].events(), 0);
     assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
     assert_eq!(on_timeout, 0);
-    assert_eq!(block_signals, 0);
+    assert_eq!(sig_mask.raw_block_bits(), 0);
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -2077,11 +2073,10 @@ fn dispatch_with_wait(
                 fds,
                 timeout,
                 on_timeout,
-                block_signals,
-                mask_replaces: _,
+                sig_mask,
             } => {
                 let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
-                match waiter.wait(&fds, timeout, block_signals) {
+                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
@@ -2096,11 +2091,10 @@ fn dispatch_with_wait(
                 fds,
                 timeout,
                 on_timeout,
-                block_signals,
-                mask_replaces: _,
+                sig_mask,
             } => {
                 let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
-                match waiter.wait_poll(&fds, timeout, block_signals) {
+                match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
@@ -2246,14 +2240,13 @@ fn dispatch_threaded_with_wait_notify(
                 fds,
                 timeout,
                 on_timeout,
-                block_signals,
-                mask_replaces: _,
+                sig_mask,
             } => {
                 if let Some(sender) = wait_notify.take() {
                     sender.send(fds.clone()).unwrap();
                 }
                 let waiter = ThreadWaiter::new(tid);
-                match waiter.wait(&fds, timeout, block_signals) {
+                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
@@ -2268,14 +2261,13 @@ fn dispatch_threaded_with_wait_notify(
                 fds,
                 timeout,
                 on_timeout,
-                block_signals,
-                mask_replaces: _,
+                sig_mask,
             } => {
                 if let Some(sender) = wait_notify.take() {
                     sender.send(fds.clone()).unwrap();
                 }
                 let waiter = ThreadWaiter::new(tid);
-                match waiter.wait_poll(&fds, timeout, block_signals) {
+                match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {

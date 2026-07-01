@@ -672,21 +672,18 @@ where
                     fds,
                     timeout,
                     on_timeout,
-                    block_signals,
-                    mask_replaces,
+                    sig_mask,
                 } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
-                        block_signals,
+                        sig_mask.raw_block_bits(),
                         || {
-                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
-                                self.this_tid,
-                                block_signals,
-                                mask_replaces,
-                            )
+                            kernel
+                                .dispatcher
+                                .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     ) {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -710,8 +707,7 @@ where
                 DispatchOutcome::WaitOnFdsSelect {
                     fds,
                     timeout,
-                    block_signals,
-                    mask_replaces,
+                    sig_mask,
                     clear_on_timeout,
                 } => {
                     self.waiter.ensure_full();
@@ -719,13 +715,11 @@ where
                     match self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
-                        block_signals,
+                        sig_mask.raw_block_bits(),
                         || {
-                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
-                                self.this_tid,
-                                block_signals,
-                                mask_replaces,
-                            )
+                            kernel
+                                .dispatcher
+                                .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     ) {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -753,8 +747,7 @@ where
                     fds,
                     timeout,
                     on_timeout,
-                    block_signals,
-                    mask_replaces,
+                    sig_mask,
                 } => {
                     self.waiter.ensure_full();
                     let timeout = match timeout {
@@ -776,13 +769,11 @@ where
                     match self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,
-                        block_signals,
+                        sig_mask.raw_block_bits(),
                         || {
-                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
-                                self.this_tid,
-                                block_signals,
-                                mask_replaces,
-                            )
+                            kernel
+                                .dispatcher
+                                .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     ) {
                         crate::io_wait::WaitResult::Ready => continue,
@@ -803,21 +794,19 @@ where
                         }
                     }
                 }
-                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                     self.waiter.ensure_full();
                     crate::run_state::publish(crate::run_state::RunState::Blocked);
                     match self.waiter.wait_proc_exit_with_dispatch_pending(
                         pid,
-                        block_signals,
+                        sig_mask.raw_block_bits(),
                         || {
-                            // waitpid is additive: block_signals is
+                            // waitpid carries WaitSigMask::Additive: its set is
                             // `non_interrupting_signal_mask` (a persistent-mask
                             // superset), so the persistent-mask union is a no-op.
-                            kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
-                                self.this_tid,
-                                block_signals,
-                                false,
-                            )
+                            kernel
+                                .dispatcher
+                                .has_deliverable_dispatch_pending_for_wait(self.this_tid, sig_mask)
                         },
                     ) {
                         crate::io_wait::WaitResult::Ready => continue,
