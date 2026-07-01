@@ -25,18 +25,32 @@ const RTA_GATEWAY: u16 = 5;
 
 fn main() {
     let eth0_ip = eth0_ipv4();
+    let expected_host_gateway = expected_ipv4(
+        "CARRICK_PROBE_EXPECT_HOST_DOCKER_INTERNAL",
+        Ipv4Addr::new(172, 31, 0, 1),
+    );
+    let expected_gateway = expected_ipv4(
+        "CARRICK_PROBE_EXPECT_GATEWAY_DOCKER_INTERNAL",
+        Ipv4Addr::new(172, 31, 0, 1),
+    );
     println!("bridge_getifaddrs_eth0=true");
     println!("bridge_getifaddrs_nonloopback={}", !eth0_ip.is_loopback());
     println!("bridge_hosts_has_eth0_ip={}", file_contains_ip("/etc/hosts", eth0_ip));
     println!(
         "bridge_host_docker_internal={}",
-        resolve_host_v4("host.docker.internal") == Some(Ipv4Addr::new(172, 31, 0, 1))
+        resolve_host_v4("host.docker.internal") == Some(expected_host_gateway)
     );
     println!(
         "bridge_gateway_docker_internal={}",
-        resolve_host_v4("gateway.docker.internal") == Some(Ipv4Addr::new(172, 31, 0, 1))
+        resolve_host_v4("gateway.docker.internal") == Some(expected_gateway)
     );
     println!("bridge_resolv_has_nameserver={}", resolv_has_nameserver());
+    println!(
+        "bridge_resolv_nameservers_match={}",
+        resolv_nameservers_match()
+    );
+    println!("bridge_resolv_search_match={}", resolv_search_match());
+    println!("bridge_resolv_options_match={}", resolv_options_match());
     println!("bridge_proc_dev_has_eth0={}", proc_dev_has_eth0());
     println!(
         "bridge_proc_route_default_gateway={}",
@@ -57,6 +71,13 @@ fn main() {
         "bridge_netlink_default_gateway={}",
         netlink_route_has_default_gateway(&route_messages)
     );
+}
+
+fn expected_ipv4(var: &str, fallback: Ipv4Addr) -> Ipv4Addr {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
 }
 
 fn eth0_ipv4() -> Ipv4Addr {
@@ -113,6 +134,55 @@ fn resolv_has_nameserver() -> bool {
             .lines()
             .any(|line| line.split_whitespace().next() == Some("nameserver"))
     })
+}
+
+fn resolv_nameservers_match() -> bool {
+    let Some(expected) = env_list("CARRICK_PROBE_EXPECT_DNS") else {
+        return true;
+    };
+    resolv_directive_values("nameserver").is_some_and(|actual| actual == expected)
+}
+
+fn resolv_search_match() -> bool {
+    let Some(expected) = env_list("CARRICK_PROBE_EXPECT_DNS_SEARCH") else {
+        return true;
+    };
+    resolv_directive_values("search").is_some_and(|actual| actual == expected)
+}
+
+fn resolv_options_match() -> bool {
+    let Some(expected) = env_list("CARRICK_PROBE_EXPECT_DNS_OPTIONS") else {
+        return true;
+    };
+    resolv_directive_values("options").is_some_and(|actual| actual == expected)
+}
+
+fn env_list(name: &str) -> Option<Vec<String>> {
+    std::env::var(name).ok().map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn resolv_directive_values(directive: &str) -> Option<Vec<String>> {
+    let contents = fs::read_to_string("/etc/resolv.conf").ok()?;
+    Some(
+        contents
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                if fields.next() != Some(directive) {
+                    return None;
+                }
+                Some(fields.map(str::to_string).collect::<Vec<_>>())
+            })
+            .flatten()
+            .collect(),
+    )
 }
 
 fn proc_dev_has_eth0() -> bool {
