@@ -291,13 +291,17 @@ pub(crate) fn disconnect_network(name_or_id: &str, body: &[u8]) -> (u16, String)
             )),
         );
     }
+    let previous_api_network_mode = api_network_mode_for_state(&state);
     state
         .config
         .network_attachments
         .retain(|attachment| attachment.name != network_name);
     state.config.network_aliases = flat_aliases(&state.config.network_attachments);
     if state.config.network_attachments.is_empty() {
-        state.config.network = carrick_spec::NetworkMode::Host;
+        if state.config.api_network_mode.is_none() {
+            state.config.api_network_mode = Some(previous_api_network_mode);
+        }
+        state.config.network = carrick_spec::NetworkMode::None;
     }
     if let Err(e) = state.persist() {
         return (500, crate::serve::handlers::error_json(&e.to_string()));
@@ -877,6 +881,20 @@ fn container_has_network_endpoint(state: &container::ContainerState, network_nam
         || (network_name == "bridge"
             && state.config.network == carrick_spec::NetworkMode::Bridge
             && state.config.network_attachments.is_empty())
+}
+
+fn api_network_mode_for_state(state: &container::ContainerState) -> String {
+    if let Some(mode) = state.config.api_network_mode.as_deref() {
+        return mode.to_string();
+    }
+    if let Some(attachment) = state.config.network_attachments.first() {
+        return attachment.name.clone();
+    }
+    match state.config.network {
+        carrick_spec::NetworkMode::Bridge => "bridge".to_string(),
+        carrick_spec::NetworkMode::Host => "host".to_string(),
+        carrick_spec::NetworkMode::None => "none".to_string(),
+    }
 }
 
 fn attach_container_to_network(

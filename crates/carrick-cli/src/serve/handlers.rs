@@ -126,6 +126,7 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
             if let Err(e) = persist_api_container_metadata(
                 &id,
                 &network.attachments,
+                network.api_network_mode.as_deref(),
                 network.network_container.as_deref(),
                 &labels,
                 api_auto_remove,
@@ -147,6 +148,7 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
 
 struct CreateNetworkSelection {
     cli_mode: Option<String>,
+    api_network_mode: Option<String>,
     attachments: Vec<carrick_runtime::container::NetworkAttachment>,
     network_container: Option<String>,
 }
@@ -275,21 +277,25 @@ fn create_network_selection(
         ),
         Some("none") => Ok(CreateNetworkSelection {
             cli_mode: Some("none".to_string()),
+            api_network_mode: Some("none".to_string()),
             attachments: Vec::new(),
             network_container: None,
         }),
         Some("host") if !has_endpoint => Ok(CreateNetworkSelection {
             cli_mode: Some("host".to_string()),
+            api_network_mode: Some("host".to_string()),
             attachments: Vec::new(),
             network_container: None,
         }),
         Some("host") | Some("bridge") if has_endpoint => Ok(CreateNetworkSelection {
             cli_mode: Some("bridge".to_string()),
+            api_network_mode: Some("bridge".to_string()),
             attachments: endpoint_attachments,
             network_container: None,
         }),
         Some("bridge") => Ok(CreateNetworkSelection {
             cli_mode: Some("bridge".to_string()),
+            api_network_mode: Some("bridge".to_string()),
             attachments: Vec::new(),
             network_container: None,
         }),
@@ -310,6 +316,7 @@ fn create_network_selection(
                 .map_err(|e| e.to_string())?;
             Ok(CreateNetworkSelection {
                 cli_mode: Some(effective_cli_network_mode(&target_state).to_string()),
+                api_network_mode: Some(format!("container:{target_id}")),
                 attachments: Vec::new(),
                 network_container: Some(target_id),
             })
@@ -332,22 +339,28 @@ fn create_network_selection(
             };
             Ok(CreateNetworkSelection {
                 cli_mode: Some("bridge".to_string()),
+                api_network_mode: Some(mode.to_string()),
                 attachments,
                 network_container: None,
             })
         }
         _ if has_endpoint => Ok(CreateNetworkSelection {
             cli_mode: Some("bridge".to_string()),
+            api_network_mode: endpoint_attachments
+                .first()
+                .map(|attachment| attachment.name.clone()),
             attachments: endpoint_attachments,
             network_container: None,
         }),
         _ if has_published_ports => Ok(CreateNetworkSelection {
             cli_mode: Some("bridge".to_string()),
+            api_network_mode: Some("bridge".to_string()),
             attachments: Vec::new(),
             network_container: None,
         }),
         _ => Ok(CreateNetworkSelection {
             cli_mode: None,
+            api_network_mode: None,
             attachments: Vec::new(),
             network_container: None,
         }),
@@ -416,11 +429,13 @@ fn primary_network_first(
 fn persist_api_container_metadata(
     id: &str,
     attachments: &[carrick_runtime::container::NetworkAttachment],
+    api_network_mode: Option<&str>,
     network_container: Option<&str>,
     labels: &HashMap<String, String>,
     api_auto_remove: bool,
 ) -> anyhow::Result<()> {
     if attachments.is_empty()
+        && api_network_mode.is_none()
         && network_container.is_none()
         && labels.is_empty()
         && !api_auto_remove
@@ -430,6 +445,9 @@ fn persist_api_container_metadata(
     let mut state = carrick_runtime::container::ContainerState::load(id)?;
     if !attachments.is_empty() {
         state.config.network_attachments = attachments.to_vec();
+    }
+    if let Some(mode) = api_network_mode {
+        state.config.api_network_mode = Some(mode.to_string());
     }
     if let Some(target) = network_container {
         state.config.network_container = Some(target.to_string());
@@ -644,6 +662,9 @@ fn container_network_matches(c: &carrick_runtime::container::ContainerState, val
     if c.config.network_container.is_some() {
         return false;
     }
+    if has_no_effective_network_endpoint(c) {
+        return false;
+    }
     let resolved = crate::serve::resources::resolve_network_name(value);
     if !c.config.network_attachments.is_empty() {
         return c.config.network_attachments.iter().any(|attachment| {
@@ -661,6 +682,9 @@ fn container_network_mode(c: &carrick_runtime::container::ContainerState) -> Str
     if let Some(target) = c.config.network_container.as_deref() {
         return format!("container:{target}");
     }
+    if let Some(mode) = c.config.api_network_mode.as_deref() {
+        return mode.to_string();
+    }
     c.config
         .network_attachments
         .first()
@@ -676,6 +700,9 @@ fn container_networks(
     c: &carrick_runtime::container::ContainerState,
 ) -> std::collections::HashMap<String, EndpointSettings> {
     if c.config.network_container.is_some() {
+        return std::collections::HashMap::new();
+    }
+    if has_no_effective_network_endpoint(c) {
         return std::collections::HashMap::new();
     }
     if !c.config.network_attachments.is_empty() {
@@ -717,6 +744,15 @@ fn container_networks(
         .collect();
     }
     std::collections::HashMap::new()
+}
+
+fn has_no_effective_network_endpoint(c: &carrick_runtime::container::ContainerState) -> bool {
+    c.config.network == carrick_spec::NetworkMode::None
+        && c.config.network_attachments.is_empty()
+        && c.config
+            .api_network_mode
+            .as_deref()
+            .is_some_and(|mode| mode != "none")
 }
 
 #[derive(Default)]
