@@ -343,7 +343,11 @@ fn run_bridge_publish_probe(
 
     let run_id = case_run_id();
     let mut child = Command::new(bin)
-        .args(bridge_publish_probe_args(lane.platform, lane.image, host_port))
+        .args(bridge_publish_probe_args(
+            lane.platform,
+            lane.image,
+            host_port,
+        ))
         .env("CARRICK_RUN_ID", &run_id)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -421,7 +425,10 @@ fn run_bridge_publish_probe(
                 let out = stdout_reader.join().unwrap_or_default();
                 let err = stderr_reader.join().unwrap_or_default();
                 let combined = normalize(&format!("{out}{err}"));
-                assert!(status.success(), "bridge publish probe exited {status}: {combined}");
+                assert!(
+                    status.success(),
+                    "bridge publish probe exited {status}: {combined}"
+                );
                 return combined;
             }
             None if Instant::now() >= wait_deadline => {
@@ -463,7 +470,10 @@ fn bridge_publish_probe_args_enable_bridge_and_publish() {
         .position(|arg| arg == "docker.io/library/ubuntu:24.04")
         .expect("image arg");
     let net_pos = args.iter().position(|arg| arg == "--net").expect("net arg");
-    let publish_pos = args.iter().position(|arg| arg == "-p").expect("publish arg");
+    let publish_pos = args
+        .iter()
+        .position(|arg| arg == "-p")
+        .expect("publish arg");
     assert!(net_pos < image_pos);
     assert!(publish_pos < image_pos);
 }
