@@ -83,7 +83,7 @@
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
-use crate::network::{BindTarget, ConnectTarget};
+use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_spec::PortProtocol;
 
 syscall_table! {
@@ -3572,11 +3572,11 @@ impl SyscallDispatcher {
             {
                 match this.network.provider.materialize_bind(
                     this.network.spec.namespace_id.as_ref(),
-                    requested,
+                    GuestSocketAddr(requested),
                     protocol,
                 ) {
                     Ok(BindTarget::Host(host)) => {
-                        if let Some(mapped) = socket_addr_to_host_sockaddr(host) {
+                        if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
                             host_addr = mapped;
                             rewritten_bind = Some((requested, protocol));
                         }
@@ -3620,10 +3620,15 @@ impl SyscallDispatcher {
             if let Some((guest_local, protocol)) = rewritten_bind
                 && let Some(host_local) = host_socket_addr(host_fd, family, false)
             {
+                let guest_local = if guest_local.port() == 0 {
+                    std::net::SocketAddr::new(guest_local.ip(), host_local.port())
+                } else {
+                    guest_local
+                };
                 let _ = this.network.provider.record_socket_addresses(
                     fd,
-                    Some(guest_local),
-                    Some(host_local),
+                    Some(GuestSocketAddr(guest_local)),
+                    Some(HostSocketAddr(host_local)),
                     None,
                     protocol,
                 );
@@ -3708,7 +3713,7 @@ impl SyscallDispatcher {
             rewrite_unspecified_connect_loopback(family, &mut host_addr);
             let mut rewritten_connect: Option<(
                 std::net::SocketAddr,
-                std::net::SocketAddr,
+                HostSocketAddr,
                 PortProtocol,
             )> = None;
             if family == libc::AF_INET
@@ -3717,11 +3722,11 @@ impl SyscallDispatcher {
             {
                 match this.network.provider.resolve_connect(
                     this.network.spec.namespace_id.as_ref(),
-                    requested,
+                    GuestSocketAddr(requested),
                     protocol,
                 ) {
                     Ok(ConnectTarget::Host(host)) => {
-                        if let Some(mapped) = socket_addr_to_host_sockaddr(host) {
+                        if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
                             host_addr = mapped;
                             rewritten_connect = Some((requested, host, protocol));
                         }
@@ -3804,8 +3809,8 @@ impl SyscallDispatcher {
                     let _ = this.network.provider.record_socket_addresses(
                         fd,
                         guest_local,
-                        host_local.or(Some(host_peer)),
-                        Some(guest_peer),
+                        host_local.map(HostSocketAddr).or(Some(host_peer)),
+                        Some(GuestSocketAddr(guest_peer)),
                         protocol,
                     );
                 }
@@ -3889,7 +3894,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Ok(Some(guest_local)) = this.network.provider.guest_visible_local_addr(fd)
-                && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local)
+                && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local.0)
             {
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
                     return Ok(LINUX_EFAULT.into());
@@ -3939,7 +3944,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Ok(Some(guest_peer)) = this.network.provider.guest_visible_peer_addr(fd)
-                && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer)
+                && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer.0)
             {
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
                     return Ok(LINUX_EFAULT.into());
@@ -3998,7 +4003,7 @@ impl SyscallDispatcher {
             // Read the destination sockaddr (if any) from guest memory up front,
             // then send with MSG_DONTWAIT through blocking_io: a full socket buffer
             // (EAGAIN) on a blocking fd waits for POLLOUT losslessly.
-            let host_addr = if dest_addr == 0 {
+            let mut host_addr = if dest_addr == 0 {
                 None
             } else {
                 // Linux's move_addr_to_kernel rejects a negative addrlen with
@@ -4013,6 +4018,27 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             };
+            if family == libc::AF_INET
+                && let Some(protocol) = this.socket_port_protocol(fd)
+                && let Some(requested) = host_addr
+                    .as_deref()
+                    .and_then(host_sockaddr_to_socket_addr)
+            {
+                match this.network.provider.resolve_connect(
+                    this.network.spec.namespace_id.as_ref(),
+                    GuestSocketAddr(requested),
+                    protocol,
+                ) {
+                    Ok(ConnectTarget::Host(host)) => {
+                        if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
+                            host_addr = Some(mapped);
+                        }
+                    }
+                    Ok(ConnectTarget::Unchanged) => {}
+                    Ok(ConnectTarget::Denied(errno)) => return Ok(errno.into()),
+                    Err(_) => return Ok(carrick_abi::LINUX_ECONNREFUSED.into()),
+                }
+            }
             // A send on an unconnected STREAM socket: Linux returns EPIPE
             // (tcp_sendmsg with no peer), but macOS returns ENOTCONN. Remap only
             // for stream sockets so datagram ENOTCONN (a real Linux errno) is
@@ -4123,6 +4149,8 @@ impl SyscallDispatcher {
             let recv_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read().recv_timeout());
+            let recv_protocol = this.socket_port_protocol(fd);
+            let received_source = std::cell::RefCell::new(None::<Vec<u8>>);
             let outcome = this.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
                 let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
@@ -4167,13 +4195,31 @@ impl SyscallDispatcher {
                 }
                 if used_addr && src_addr != 0 && src_len_addr != 0 {
                     let used = (sa_len as usize).min(sa.len());
-                    let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, true);
-                    if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
-                        return Err(LINUX_EFAULT);
-                    }
+                    received_source.borrow_mut().replace(sa[..used].to_vec());
                 }
                 Ok(n as i64)
             });
+            if matches!(outcome, DispatchOutcome::Returned { .. })
+                && src_addr != 0
+                && src_len_addr != 0
+                && let Some(host_source) = received_source.into_inner()
+            {
+                let linux_bytes = if let Some(protocol) = recv_protocol
+                    && let Some(host_addr) = host_sockaddr_to_socket_addr(&host_source)
+                    && let Ok(Some(guest_addr)) =
+                        this.network
+                            .provider
+                            .translate_recv_addr(HostSocketAddr(host_addr), protocol)
+                    && let Some(guest_sockaddr) = socket_addr_to_linux_sockaddr(guest_addr.0)
+                {
+                    guest_sockaddr
+                } else {
+                    host_to_linux_sockaddr(&host_source, family, true)
+                };
+                if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
             Ok(outcome)
 
         }

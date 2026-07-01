@@ -26,15 +26,23 @@ pub struct NetworkLease {
     pub id: NetworkLeaseId,
 }
 
+/// A socket address as observed by the Linux guest namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuestSocketAddr(pub SocketAddr);
+
+/// A socket address Carrick passes to, or reads from, the host networking stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostSocketAddr(pub SocketAddr);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindTarget {
-    Host(SocketAddr),
+    Host(HostSocketAddr),
     Unchanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectTarget {
-    Host(SocketAddr),
+    Host(HostSocketAddr),
     Unchanged,
     Denied(i32),
 }
@@ -47,29 +55,36 @@ pub trait NetworkProvider: Send + Sync {
     fn materialize_bind(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
-        requested: SocketAddr,
+        requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<BindTarget, String>;
     fn resolve_connect(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
-        requested: SocketAddr,
+        requested: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<ConnectTarget, String>;
     fn record_socket_addresses(
         &self,
         _guest_fd: i32,
-        _guest_local: Option<SocketAddr>,
-        _host_local: Option<SocketAddr>,
-        _guest_peer: Option<SocketAddr>,
+        _guest_local: Option<GuestSocketAddr>,
+        _host_local: Option<HostSocketAddr>,
+        _guest_peer: Option<GuestSocketAddr>,
         _protocol: PortProtocol,
     ) -> Result<(), String> {
         Ok(())
     }
-    fn guest_visible_local_addr(&self, _guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+    fn guest_visible_local_addr(&self, _guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
         Ok(None)
     }
-    fn guest_visible_peer_addr(&self, _guest_fd: i32) -> Result<Option<SocketAddr>, String> {
+    fn guest_visible_peer_addr(&self, _guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
+        Ok(None)
+    }
+    fn translate_recv_addr(
+        &self,
+        _host_addr: HostSocketAddr,
+        _protocol: PortProtocol,
+    ) -> Result<Option<GuestSocketAddr>, String> {
         Ok(None)
     }
 }
@@ -109,7 +124,7 @@ impl NetworkProvider for HostNetworkProvider {
     fn materialize_bind(
         &self,
         _namespace_id: Option<&NetworkNamespaceId>,
-        _requested: SocketAddr,
+        _requested: GuestSocketAddr,
         _protocol: PortProtocol,
     ) -> Result<BindTarget, String> {
         Ok(BindTarget::Unchanged)
@@ -118,7 +133,7 @@ impl NetworkProvider for HostNetworkProvider {
     fn resolve_connect(
         &self,
         _namespace_id: Option<&NetworkNamespaceId>,
-        _requested: SocketAddr,
+        _requested: GuestSocketAddr,
         _protocol: PortProtocol,
     ) -> Result<ConnectTarget, String> {
         Ok(ConnectTarget::Unchanged)
