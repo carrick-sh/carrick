@@ -1084,9 +1084,236 @@ async fn network_and_volume_prune_honor_compose_filters() {
 
 #[tokio::test]
 #[ignore = "requires docker compose client and boots multiple HVF guests"]
+async fn docker_compose_two_service_smoke() {
+    if !docker_compose_available() {
+        eprintln!("SKIP docker_compose_two_service_smoke: docker compose is not available");
+        return;
+    }
+
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let compose = tmp.path().join("compose.yml");
+    let host_port = free_loopback_port();
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/bin/sh", "-c", "echo db-ready; sleep 30"]
+    networks:
+      appnet:
+        aliases:
+          - database
+    volumes:
+      - data:/data
+  web:
+    image: ubuntu:24.04
+    command: ["/bin/sh", "-c", "echo web-ready; sleep 30"]
+    depends_on:
+      - db
+    ports:
+      - "127.0.0.1:{host_port}:8080"
+    networks:
+      appnet:
+        aliases:
+          - api
+volumes:
+  data: {{}}
+networks:
+  appnet:
+    driver: bridge
+"#
+        ),
+    )
+    .unwrap();
+    let project = compose_project("twosvc");
+
+    run_compose(&sock, &compose, &project, &["up", "-d", "--remove-orphans"]);
+    let ps = run_compose_output(&sock, &compose, &project, &["ps"]);
+    let ps_stdout = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        ps_stdout.contains("db") && ps_stdout.contains("web"),
+        "compose ps did not list both services\nstdout:\n{ps_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    let logs = run_compose_output(&sock, &compose, &project, &["logs", "--no-color"]);
+    let logs_stdout = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs_stdout.contains("db-ready") && logs_stdout.contains("web-ready"),
+        "compose logs did not include both service outputs\nstdout:\n{logs_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+
+    let project_filter = format!("com.docker.compose.project={project}");
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let containers = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(containers.len(), 2, "Compose should create db and web");
+
+    let mut db_id = None;
+    let mut web_id = None;
+    for container in &containers {
+        match container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+            .map(String::as_str)
+        {
+            Some("db") => db_id = container.id.clone(),
+            Some("web") => web_id = container.id.clone(),
+            _ => {}
+        }
+    }
+    let db_id = db_id.expect("db container id");
+    let web_id = web_id.expect("web container id");
+    let db = docker.inspect_container(&db_id, None).await.unwrap();
+    let web = docker.inspect_container(&web_id, None).await.unwrap();
+    let network_name = format!("{project}_appnet");
+    let db_endpoint = db
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .and_then(|networks| networks.get(&network_name))
+        .unwrap_or_else(|| panic!("db missing endpoint for {network_name}"));
+    let web_endpoint = web
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .and_then(|networks| networks.get(&network_name))
+        .unwrap_or_else(|| panic!("web missing endpoint for {network_name}"));
+    let db_ip = db_endpoint.ip_address.as_deref().unwrap_or_default();
+    let web_ip = web_endpoint.ip_address.as_deref().unwrap_or_default();
+    assert!(db_ip.starts_with("172.31."), "db bridge IP: {db_ip:?}");
+    assert!(web_ip.starts_with("172.31."), "web bridge IP: {web_ip:?}");
+    assert_ne!(db_ip, web_ip);
+    assert!(
+        db_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"db".to_string()))
+    );
+    assert!(
+        db_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"database".to_string()))
+    );
+    assert!(
+        web_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"web".to_string()))
+    );
+    assert!(
+        web_endpoint
+            .dns_names
+            .as_ref()
+            .is_some_and(|names| names.contains(&"api".to_string()))
+    );
+    let web_ports = web
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.ports.as_ref())
+        .unwrap();
+    assert_eq!(
+        web_ports
+            .get("8080/tcp")
+            .and_then(|bindings| bindings.as_ref())
+            .and_then(|bindings| bindings.first())
+            .and_then(|binding| binding.host_port.as_deref()),
+        Some(host_port.to_string().as_str())
+    );
+
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let networks = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(networks.len(), 1);
+    assert_eq!(networks[0].name.as_deref(), Some(network_name.as_str()));
+
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let volumes = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].name, format!("{project}_data"));
+
+    run_compose(
+        &sock,
+        &compose,
+        &project,
+        &["down", "-v", "--remove-orphans"],
+    );
+
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let containers_after_down = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(
+        containers_after_down.is_empty(),
+        "compose down should remove project containers"
+    );
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![project_filter.clone()]);
+    let networks_after_down = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        networks_after_down.is_empty(),
+        "compose down should remove project networks"
+    );
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![project_filter]);
+    let volumes_after_down = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert!(
+        volumes_after_down.is_empty(),
+        "compose down -v should remove project volumes"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose client and boots multiple HVF guests"]
 async fn docker_compose_smoke_workflows() {
     if !docker_compose_available() {
-        panic!("docker compose is not available");
+        eprintln!("SKIP docker_compose_smoke_workflows: docker compose is not available");
+        return;
     }
 
     let (_server, sock, _dir) = spawn_server();
@@ -3194,6 +3421,56 @@ async fn create_then_start_runs() {
     let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
         .args(["rm", "-f", "m0start"])
         .output();
+}
+
+#[tokio::test]
+async fn start_container_waits_until_registry_leaves_created_for_compose_ps() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let _ = docker.remove_container("m0startsync", None).await;
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0startsync"])
+        .output();
+
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0startsync".to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/bin/sleep".to_string(), "30".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    docker
+        .start_container(
+            "m0startsync",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await
+        .unwrap();
+    let inspect = docker.inspect_container("m0startsync", None).await.unwrap();
+    assert!(
+        inspect.state.as_ref().and_then(|state| state.running) == Some(true),
+        "start returned before the container was running: {:?}",
+        inspect.state
+    );
+
+    let _ = docker
+        .remove_container(
+            "m0startsync",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
 }
 
 #[tokio::test]
