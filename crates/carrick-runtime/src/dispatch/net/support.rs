@@ -2176,6 +2176,250 @@ pub(in crate::dispatch) fn parse_host_scm_rights_fds(
 mod tests {
     use super::*;
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedRoute {
+        dst: Option<std::net::IpAddr>,
+        gateway: Option<std::net::IpAddr>,
+        oif: Option<u32>,
+    }
+
+    fn rtnetlink_request(nlmsg_type: u16) -> Vec<u8> {
+        LinuxNlMsgHdr {
+            nlmsg_len: std::mem::size_of::<LinuxNlMsgHdr>() as u32,
+            nlmsg_type,
+            nlmsg_flags: 0,
+            nlmsg_seq: 7,
+            nlmsg_pid: 0,
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn rtattr_payloads(mut attrs: &[u8], wanted: u16) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let header_len = std::mem::size_of::<LinuxRtAttr>();
+        while attrs.len() >= header_len {
+            let (attr, _) = LinuxRtAttr::read_from_prefix(attrs).unwrap();
+            let attr_len = attr.rta_len as usize;
+            if attr_len < header_len || attr_len > attrs.len() {
+                break;
+            }
+            if attr.rta_type == wanted {
+                out.push(attrs[header_len..attr_len].to_vec());
+            }
+            let aligned = attr_len.next_multiple_of(NLMSG_ALIGNTO);
+            if aligned == 0 || aligned > attrs.len() {
+                break;
+            }
+            attrs = &attrs[aligned..];
+        }
+        out
+    }
+
+    fn walk_netlink_messages(reply: &[u8], mut f: impl FnMut(u16, &[u8])) {
+        let header_len = std::mem::size_of::<LinuxNlMsgHdr>();
+        let mut offset = 0;
+        while offset + header_len <= reply.len() {
+            let (header, _) = LinuxNlMsgHdr::read_from_prefix(&reply[offset..]).unwrap();
+            if header.nlmsg_type == LINUX_NLMSG_DONE {
+                break;
+            }
+            let msg_len = header.nlmsg_len as usize;
+            assert!(msg_len >= header_len, "invalid netlink message length");
+            let end = offset + msg_len;
+            assert!(end <= reply.len(), "truncated netlink message");
+            f(header.nlmsg_type, &reply[offset + header_len..end]);
+            let aligned = msg_len.next_multiple_of(NLMSG_ALIGNTO);
+            if aligned == 0 {
+                break;
+            }
+            offset += aligned;
+        }
+    }
+
+    fn netlink_link_names(model: &NetworkLinkSnapshot) -> Vec<String> {
+        let reply =
+            build_netlink_reply_for_snapshot(&rtnetlink_request(LINUX_RTM_GETLINK), 42, model);
+        let ifinfo_len = std::mem::size_of::<LinuxIfInfoMsg>();
+        let mut names = Vec::new();
+        walk_netlink_messages(&reply, |kind, payload| {
+            if kind != LINUX_RTM_NEWLINK {
+                return;
+            }
+            for name in rtattr_payloads(&payload[ifinfo_len..], LINUX_IFLA_IFNAME) {
+                let nul = name
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(name.len());
+                names.push(String::from_utf8(name[..nul].to_vec()).unwrap());
+            }
+        });
+        names
+    }
+
+    fn netlink_addresses(model: &NetworkLinkSnapshot) -> Vec<std::net::IpAddr> {
+        let reply =
+            build_netlink_reply_for_snapshot(&rtnetlink_request(LINUX_RTM_GETADDR), 42, model);
+        let ifaddr_len = std::mem::size_of::<LinuxIfAddrMsg>();
+        let mut addrs = Vec::new();
+        walk_netlink_messages(&reply, |kind, payload| {
+            if kind != LINUX_RTM_NEWADDR {
+                return;
+            }
+            let (msg, _) = LinuxIfAddrMsg::read_from_prefix(payload).unwrap();
+            for addr in rtattr_payloads(&payload[ifaddr_len..], LINUX_IFA_ADDRESS) {
+                match msg.ifa_family as i32 {
+                    LINUX_AF_INET if addr.len() == 4 => addrs.push(std::net::IpAddr::V4(
+                        std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]),
+                    )),
+                    LINUX_AF_INET6 if addr.len() == 16 => {
+                        let bytes: [u8; 16] = addr.try_into().unwrap();
+                        addrs.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        addrs
+    }
+
+    fn netlink_routes(model: &NetworkLinkSnapshot) -> Vec<DecodedRoute> {
+        let reply =
+            build_netlink_reply_for_snapshot(&rtnetlink_request(LINUX_RTM_GETROUTE), 42, model);
+        let rtmsg_len = std::mem::size_of::<LinuxRtMsg>();
+        let mut routes = Vec::new();
+        walk_netlink_messages(&reply, |kind, payload| {
+            if kind != LINUX_RTM_NEWROUTE {
+                return;
+            }
+            let (msg, _) = LinuxRtMsg::read_from_prefix(payload).unwrap();
+            let attrs = &payload[rtmsg_len..];
+            let decode_ip = |bytes: &[u8]| match msg.rtm_family as i32 {
+                LINUX_AF_INET if bytes.len() == 4 => Some(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]),
+                )),
+                LINUX_AF_INET6 if bytes.len() == 16 => {
+                    let bytes: [u8; 16] = bytes.try_into().ok()?;
+                    Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes)))
+                }
+                _ => None,
+            };
+            let dst = rtattr_payloads(attrs, LINUX_RTA_DST)
+                .first()
+                .and_then(|bytes| decode_ip(bytes));
+            let gateway = rtattr_payloads(attrs, LINUX_RTA_GATEWAY)
+                .first()
+                .and_then(|bytes| decode_ip(bytes));
+            let oif = rtattr_payloads(attrs, LINUX_RTA_OIF)
+                .first()
+                .and_then(|bytes| bytes.as_slice().try_into().ok())
+                .map(u32::from_ne_bytes);
+            routes.push(DecodedRoute { dst, gateway, oif });
+        });
+        routes
+    }
+
+    #[test]
+    fn two_bridge_network_model_drives_guest_visible_renderers() {
+        let mut spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        spec.dns_search = vec!["svc.test".to_string()];
+        spec.dns_options = vec!["ndots:1".to_string()];
+        spec.attachments = vec![
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("front"),
+                Some("web".to_string()),
+                vec!["web-front".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 31, 0, 8)),
+            ),
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("back"),
+                Some("web".to_string()),
+                vec!["web-back".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 32, 0, 8)),
+            ),
+        ];
+        spec.bridge_id = spec.attachments[0].bridge_id.clone();
+        spec.ipv4 = spec.attachments[0].ipv4;
+        spec.gateway_v4 = spec.attachments[0].gateway_v4;
+
+        let model = NetworkLinkSnapshot::from_spec(&spec);
+        let expected_link_names = model
+            .links
+            .iter()
+            .map(|link| link.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(expected_link_names, vec!["lo", "eth0", "eth1"]);
+
+        let proc_dev = String::from_utf8(model.render_proc_net_dev()).unwrap();
+        for link in &model.links {
+            assert!(
+                proc_dev.contains(&format!("{:>6}:", link.name)),
+                "{} missing from /proc/net/dev: {proc_dev}",
+                link.name
+            );
+        }
+        assert_eq!(netlink_link_names(&model), expected_link_names);
+
+        let netlink_addrs = netlink_addresses(&model);
+        for address in &model.addresses {
+            assert!(
+                netlink_addrs.contains(&address.addr),
+                "{} missing from rtnetlink addresses: {netlink_addrs:?}",
+                address.addr
+            );
+        }
+
+        let proc_route = String::from_utf8(model.render_proc_net_route()).unwrap();
+        assert!(
+            proc_route.contains("eth0\t00000000\t01001FAC"),
+            "default route should use the primary bridge gateway: {proc_route}"
+        );
+        assert!(
+            proc_route.contains("eth1\t000020AC\t00000000"),
+            "secondary bridge connected route missing: {proc_route}"
+        );
+        let netlink_routes = netlink_routes(&model);
+        assert!(
+            netlink_routes.iter().any(|route| route.gateway
+                == Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 31, 0, 1)))
+                && route.oif == Some(2)),
+            "rtnetlink default route should use eth0 gateway: {netlink_routes:?}"
+        );
+        assert!(
+            netlink_routes.iter().any(|route| route.dst
+                == Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 32, 0, 0)))
+                && route.oif == Some(3)),
+            "rtnetlink secondary connected route should use eth1: {netlink_routes:?}"
+        );
+
+        let hosts = model
+            .hosts_config(
+                &spec,
+                [(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 31, 0, 9)),
+                    vec!["db".to_string()],
+                )],
+                &["cache=172.32.0.9".to_string()],
+                "surface-host",
+            )
+            .render();
+        assert!(hosts.contains("172.31.0.9\tdb\n"), "{hosts}");
+        assert!(
+            hosts.contains("172.31.0.1\thost.docker.internal gateway.docker.internal\n"),
+            "{hosts}"
+        );
+        assert!(hosts.contains("172.32.0.9\tcache\n"), "{hosts}");
+
+        let resolv = String::from_utf8(model.render_resolv_conf()).unwrap();
+        assert!(resolv.contains("nameserver 172.31.0.1\n"), "{resolv}");
+        assert!(resolv.contains("search svc.test\n"), "{resolv}");
+        assert!(resolv.contains("options ndots:1\n"), "{resolv}");
+    }
+
     #[test]
     fn host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes() {
         use std::os::unix::ffi::OsStrExt;

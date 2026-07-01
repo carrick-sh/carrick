@@ -5317,23 +5317,7 @@ fn should_mount_network_resolv_conf(model: &crate::network::model::LinuxNetworkM
 }
 
 fn resolv_conf_contents_for_network(model: &crate::network::model::LinuxNetworkModel) -> Vec<u8> {
-    let mut out = String::new();
-    for server in &model.resolver.nameservers {
-        out.push_str("nameserver ");
-        out.push_str(&server.to_string());
-        out.push('\n');
-    }
-    if !model.resolver.search.is_empty() {
-        out.push_str("search ");
-        out.push_str(&model.resolver.search.join(" "));
-        out.push('\n');
-    }
-    if !model.resolver.options.is_empty() {
-        out.push_str("options ");
-        out.push_str(&model.resolver.options.join(" "));
-        out.push('\n');
-    }
-    out.into_bytes()
+    model.render_resolv_conf()
 }
 
 #[cfg(test)]
