@@ -202,6 +202,10 @@ impl Runtime {
         // glibc's getenv returns the first match, silently overriding the
         // image's own ENV (e.g. PATH). The engine is the single source of env.
         let env: Vec<String> = spec.envp.clone();
+        let runtime_network = std::sync::Arc::new(
+            crate::network::RuntimeNetwork::create(&spec.network)
+                .map_err(|e| RuntimeError::Unsupported(format!("network setup failed: {e}")))?,
+        );
 
         let result = match spec.fs_backend {
             FsBackendKind::Host => {
@@ -253,7 +257,7 @@ impl Runtime {
                     })?;
                 }
 
-                let mut dispatcher = SyscallDispatcher::new();
+                let mut dispatcher = SyscallDispatcher::with_network(runtime_network.clone());
                 // Sandboxed container fs (extracted OCI layers on a cap-std
                 // overlay): forbid the execve host-fs fallback so a target
                 // absent from the container ENOENTs instead of escaping to the
