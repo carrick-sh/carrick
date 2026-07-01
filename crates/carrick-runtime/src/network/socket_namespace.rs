@@ -414,7 +414,29 @@ impl NetworkProvider for SocketNamespaceProvider {
         })
     }
 
-    fn destroy_namespace(&self, _lease_id: NetworkLeaseId) -> Result<(), String> {
+    fn destroy_namespace(&self, lease_id: NetworkLeaseId) -> Result<(), String> {
+        if let Ok(mut published_tcp) = self.published_tcp.lock() {
+            published_tcp.remove(&lease_id);
+        }
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.clear();
+        }
+        if let Ok(mut namespaces) = self.namespaces.lock() {
+            namespaces.clear();
+        }
+        if let Ok(mut socket_addrs) = self.socket_addrs.lock() {
+            socket_addrs.clear();
+        }
+        match fs::remove_dir_all(&*self.endpoint_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "failed to remove socket namespace endpoint directory {}: {err}",
+                    self.endpoint_dir.display()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -613,6 +635,41 @@ mod tests {
             .expect("record");
         let visible = provider.guest_visible_local_addr(7).expect("visible addr");
         assert_eq!(visible, Some(guest));
+    }
+
+    #[test]
+    fn destroy_namespace_removes_fork_coherent_endpoint_files() {
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        let peer = VirtualEndpoint {
+            bridge_id: spec.bridge_id.clone(),
+            addr: SocketAddr::new(IpAddr::V4(spec.ipv4), 8080),
+            protocol: PortProtocol::Tcp,
+        };
+        provider
+            .register_virtual_endpoint(
+                spec.bridge_id.clone(),
+                spec.namespace_id.clone().expect("namespace id"),
+                peer.addr,
+                peer.protocol,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50080),
+            )
+            .expect("register endpoint");
+        let endpoint_file = endpoint_path(&provider.endpoint_dir, &peer);
+        assert!(
+            endpoint_file.exists(),
+            "endpoint file must exist before cleanup"
+        );
+
+        provider
+            .destroy_namespace(lease.id)
+            .expect("destroy namespace");
+
+        assert!(
+            !provider.endpoint_dir.exists(),
+            "destroy_namespace must remove socket namespace endpoint dir"
+        );
     }
 
     #[test]
