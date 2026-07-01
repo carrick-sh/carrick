@@ -432,6 +432,13 @@ impl SyscallDispatcher {
             {
                 LINUX_EPOLLIN
             }
+            OpenDescription::HostSocket { base, .. } if base.pending_socket_error().is_some() => {
+                let mut ready = LINUX_EPOLLERR;
+                if requested_events & LINUX_EPOLLOUT != 0 {
+                    ready |= LINUX_EPOLLOUT;
+                }
+                ready
+            }
             _ => {
                 // For host-backed descriptions (HostPipe/HostSocket/HostFile/
                 // stdio) the in-memory arms above don't apply: readiness lives
@@ -740,8 +747,14 @@ impl SyscallDispatcher {
             let open = open_file.description.read();
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
-                | OpenDescription::HostSocket { host_fd, .. }
                 | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
+                OpenDescription::HostSocket { host_fd, base, .. } => {
+                    if base.pending_socket_error().is_some() {
+                        None
+                    } else {
+                        Some(host_fd.view())
+                    }
+                }
                 // eventfd is host-backed by a readiness pipe (read end readable
                 // iff counter > 0), so epoll/poll/select watch it natively via
                 // EVFILT_READ/POLLIN — no in-memory recompute or EVFILT_USER
@@ -1110,7 +1123,14 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLIN | LINUX_POLLHUP;
                 }
             }
-            OpenDescription::HostSocket { host_fd, .. } => {
+            OpenDescription::HostSocket { host_fd, base, .. } => {
+                if base.pending_socket_error().is_some() {
+                    let mut ready = LINUX_POLLERR;
+                    if requested_events & LINUX_POLLOUT != 0 {
+                        ready |= LINUX_POLLOUT;
+                    }
+                    return ready;
+                }
                 // Poll the real host fd so the guest's poll loop reflects
                 // actual kernel readiness for the socket.
                 let mut pfd = libc::pollfd {
@@ -1390,6 +1410,127 @@ impl SyscallDispatcher {
         }
     }
 
+    fn set_socket_pending_error(&self, fd: i32, errno: i32) {
+        if let Some(open_file) = self.open_file(fd)
+            && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
+        {
+            base.set_pending_socket_error(errno);
+        }
+    }
+
+    fn take_socket_pending_error(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_file(fd)?;
+        let mut open = open_file.description.write();
+        let OpenDescription::HostSocket { base, .. } = &mut *open else {
+            return None;
+        };
+        base.take_pending_socket_error()
+    }
+
+    fn set_socket_error_after_send(&self, fd: i32, errno: i32) {
+        if let Some(open_file) = self.open_file(fd)
+            && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
+        {
+            base.set_socket_error_after_send(errno);
+        }
+    }
+
+    fn clear_socket_error_after_send(&self, fd: i32) {
+        if let Some(open_file) = self.open_file(fd)
+            && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
+        {
+            base.clear_socket_error_after_send();
+        }
+    }
+
+    fn queue_socket_error_after_send(&self, fd: i32) {
+        if let Some(open_file) = self.open_file(fd)
+            && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
+            && let Some(errno) = base.socket_error_after_send()
+        {
+            base.set_pending_socket_error(errno);
+        }
+    }
+
+    fn record_rewritten_connect_addresses(
+        &self,
+        fd: i32,
+        family: i32,
+        host_fd: i32,
+        guest_peer: std::net::SocketAddr,
+        host_peer: HostSocketAddr,
+        protocol: PortProtocol,
+    ) {
+        let host_local = host_socket_addr(host_fd, family, false);
+        let guest_local = self
+            .network
+            .provider
+            .guest_visible_local_addr(fd)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                host_local.and_then(|local| {
+                    (family == libc::AF_INET
+                        && self.network.spec.mode == carrick_spec::NetworkMode::Bridge)
+                        .then_some(GuestSocketAddr(std::net::SocketAddr::new(
+                            std::net::IpAddr::V4(self.network.spec.ipv4),
+                            local.port(),
+                        )))
+                })
+            });
+        let _ = self.network.provider.record_socket_addresses(
+            fd,
+            guest_local,
+            host_local.map(HostSocketAddr).or(Some(host_peer)),
+            Some(GuestSocketAddr(guest_peer)),
+            protocol,
+        );
+    }
+
+    fn prepare_rewritten_connect_source(
+        &self,
+        fd: i32,
+        family: i32,
+        host_fd: i32,
+        guest_peer: std::net::SocketAddr,
+        host_peer: HostSocketAddr,
+        protocol: PortProtocol,
+    ) -> Result<(), i32> {
+        if family == libc::AF_INET
+            && self.network.spec.mode == carrick_spec::NetworkMode::Bridge
+            && self
+                .network
+                .provider
+                .guest_visible_local_addr(fd)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            let needs_autobind = host_socket_addr(host_fd, family, false)
+                .map(|addr| addr.port() == 0)
+                .unwrap_or(true);
+            if needs_autobind
+                && let Some(host_local) = socket_addr_to_host_sockaddr(std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+            {
+                let rc = unsafe {
+                    libc::bind(
+                        host_fd,
+                        host_local.as_ptr() as *const _,
+                        host_local.len() as u32,
+                    )
+                };
+                rc.host_syscall_errno()?;
+            }
+        }
+        self.record_rewritten_connect_addresses(
+            fd, family, host_fd, guest_peer, host_peer, protocol,
+        );
+        Ok(())
+    }
+
     /// True iff `fd` is a HostSocket with SO_PASSCRED enabled (audit M2).
     fn socket_so_passcred(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
@@ -1415,6 +1556,12 @@ impl SyscallDispatcher {
             OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
             _ => None,
         }
+    }
+
+    fn socket_reuseport(&self, fd: i32) -> bool {
+        self.open_file(fd).is_some_and(|of| {
+            matches!(&*of.description.read(), OpenDescription::HostSocket { base, .. } if base.so_reuseport())
+        })
     }
 
     fn socket_port_protocol(&self, fd: i32) -> Option<PortProtocol> {
@@ -1526,6 +1673,7 @@ impl SyscallDispatcher {
         // install needs &self, which blocking_io's &self closure can't hold).
         let nonblocking = self.io_is_nonblocking(fd, 0);
         // accept(2) has no SO_*TIMEO bound on Linux — no per-fd timeout.
+        let accepted_source = std::cell::RefCell::new(None::<Vec<u8>>);
         let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, None, || {
             let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
@@ -1539,11 +1687,9 @@ impl SyscallDispatcher {
             let new_host = new_host.host_syscall_errno()?;
             if addr_addr != 0 && addrlen_addr != 0 {
                 let used = (sa_len as usize).min(sa_storage.len());
-                let linux_bytes = host_to_linux_sockaddr(&sa_storage[..used], family, false);
-                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-                    unsafe { libc::close(new_host) };
-                    return Err(LINUX_EFAULT);
-                }
+                accepted_source
+                    .borrow_mut()
+                    .replace(sa_storage[..used].to_vec());
             }
             Ok(new_host as i64)
         });
@@ -1554,6 +1700,59 @@ impl SyscallDispatcher {
             other => return other,
         };
         crate::event_ring::rec(crate::event_ring::ACCEPT, host_fd, new_host, 0);
+        let accepted_source = accepted_source.into_inner();
+        let accept_protocol = (family == libc::AF_INET && type_ == libc::SOCK_STREAM)
+            .then_some(carrick_spec::PortProtocol::Tcp);
+        let listener_guest_local = self
+            .network
+            .provider
+            .guest_visible_local_addr(fd)
+            .ok()
+            .flatten();
+        let accepted_host_source = host_socket_addr(new_host, family, true).or_else(|| {
+            accepted_source
+                .as_ref()
+                .and_then(|host_source| host_sockaddr_to_socket_addr(host_source))
+        });
+        let guest_peer = accepted_host_source.and_then(|host_addr| {
+            accept_protocol
+                .zip(Some(host_addr))
+                .and_then(|(protocol, host_addr)| {
+                    self.network
+                        .provider
+                        .translate_recv_addr(HostSocketAddr(host_addr), protocol)
+                        .ok()
+                        .flatten()
+                        .or_else(|| {
+                            let listener_ip = listener_guest_local?.0.ip();
+                            (self.network.spec.mode == carrick_spec::NetworkMode::Bridge
+                                && host_addr.ip().is_loopback()
+                                && matches!(listener_ip, std::net::IpAddr::V4(ip) if !ip.is_loopback()))
+                            .then_some(GuestSocketAddr(std::net::SocketAddr::new(
+                                listener_ip,
+                                host_addr.port(),
+                            )))
+                        })
+                })
+        });
+        if addr_addr != 0 && addrlen_addr != 0 {
+            let linux_bytes = guest_peer
+                .and_then(|addr| socket_addr_to_linux_sockaddr(addr.0))
+                .or_else(|| accepted_host_source.and_then(socket_addr_to_linux_sockaddr))
+                .or_else(|| {
+                    accepted_source
+                        .as_ref()
+                        .map(|host_source| host_to_linux_sockaddr(host_source, family, false))
+                });
+            let Some(linux_bytes) = linux_bytes else {
+                unsafe { libc::close(new_host) };
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            };
+            if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                unsafe { libc::close(new_host) };
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            }
+        }
         let socket_flags = LinuxSocketTypeFlags::from_bits_retain(accept4_flags);
         let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
@@ -1578,6 +1777,22 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(linux_errno::EMFILE);
             }
         };
+        if let Some(protocol) = accept_protocol {
+            let guest_local = self
+                .network
+                .provider
+                .guest_visible_local_addr(fd)
+                .ok()
+                .flatten();
+            let host_local = host_socket_addr(new_host, family, false);
+            let _ = self.network.provider.record_socket_addresses(
+                linux_fd,
+                guest_local,
+                host_local.map(HostSocketAddr),
+                guest_peer,
+                protocol,
+            );
+        }
         DispatchOutcome::Returned {
             value: linux_fd as i64,
         }
@@ -3566,23 +3781,44 @@ impl SyscallDispatcher {
             };
             let mut host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             let mut rewritten_bind: Option<(std::net::SocketAddr, PortProtocol)> = None;
-            if family == libc::AF_INET
+            if family == LINUX_AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
             {
-                match this.network.provider.materialize_bind(
-                    this.network.spec.namespace_id.as_ref(),
-                    GuestSocketAddr(requested),
-                    protocol,
-                ) {
-                    Ok(BindTarget::Host(host)) => {
-                        if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
-                            host_addr = mapped;
-                            rewritten_bind = Some((requested, protocol));
+                if this.network.spec.mode == carrick_spec::NetworkMode::Bridge {
+                    match requested.ip() {
+                        std::net::IpAddr::V4(ip)
+                            if ip == this.network.spec.ipv4
+                                || ip == std::net::Ipv4Addr::UNSPECIFIED =>
+                        {
+                            if let Some(mapped) =
+                                socket_addr_to_host_sockaddr(std::net::SocketAddr::new(
+                                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                    0,
+                                ))
+                            {
+                                host_addr = mapped;
+                                rewritten_bind = Some((requested, protocol));
+                            }
                         }
+                        std::net::IpAddr::V4(ip) if ip.is_loopback() => {}
+                        _ => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
                     }
-                    Ok(BindTarget::Unchanged) => {}
-                    Err(_) => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
+                } else {
+                    match this.network.provider.materialize_bind(
+                        this.network.spec.namespace_id.as_ref(),
+                        GuestSocketAddr(requested),
+                        protocol,
+                    ) {
+                        Ok(BindTarget::Host(host)) => {
+                            if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
+                                host_addr = mapped;
+                                rewritten_bind = Some((requested, protocol));
+                            }
+                        }
+                        Ok(BindTarget::Unchanged) => {}
+                        Err(_) => return Ok(carrick_abi::LINUX_EADDRNOTAVAIL.into()),
+                    }
                 }
             }
             // AF_UNIX pathname sockets are bound at a stable host path (see
@@ -3614,11 +3850,42 @@ impl SyscallDispatcher {
                     host_addr.len() as u32,
                 )
             };
-            if let Err(errno) = rc.host_syscall_errno() {
+            let mut bind_result = rc.host_syscall_errno();
+            if let Err(errno) = bind_result
+                && errno == linux_errno::EADDRINUSE
+                && this.network.spec.mode == carrick_spec::NetworkMode::Bridge
+                && family == LINUX_AF_INET
+                && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
+                && matches!(
+                    requested.ip(),
+                    std::net::IpAddr::V4(ip)
+                        if ip == std::net::Ipv4Addr::UNSPECIFIED || ip == this.network.spec.ipv4
+                )
+                && let Some(protocol) = this.socket_port_protocol(fd)
+                && let Some(mapped) =
+                    socket_addr_to_host_sockaddr(std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        0,
+                    ))
+            {
+                host_addr = mapped;
+                let retry = unsafe {
+                    libc::bind(
+                        host_fd.get(),
+                        host_addr.as_ptr() as *const _,
+                        host_addr.len() as u32,
+                    )
+                };
+                bind_result = retry.host_syscall_errno();
+                if bind_result.is_ok() {
+                    rewritten_bind = Some((requested, protocol));
+                }
+            }
+            if let Err(errno) = bind_result {
                 return Ok(DispatchOutcome::errno(errno));
             }
             if let Some((guest_local, protocol)) = rewritten_bind
-                && let Some(host_local) = host_socket_addr(host_fd, family, false)
+                && let Some(host_local) = host_socket_addr(host_fd.get(), family, false)
             {
                 let guest_local = if guest_local.port() == 0 {
                     std::net::SocketAddr::new(guest_local.ip(), host_local.port())
@@ -3674,6 +3941,18 @@ impl SyscallDispatcher {
             let fd: Fd = fd;
             let backlog = backlog as i32;
             let (host_fd, _family) = this.host_socket_lookup(fd.0)?;
+            if let Some(protocol) = this.socket_port_protocol(fd.0)
+                && let Some(host_local) = host_socket_addr(host_fd.get(), libc::AF_INET, false)
+                && let Err(errno) = this.network.provider.prepare_listen(
+                    this.network.spec.namespace_id.as_ref(),
+                    this.network.provider.guest_visible_local_addr(fd.0).ok().flatten(),
+                    Some(HostSocketAddr(host_local)),
+                    protocol,
+                    this.socket_reuseport(fd.0),
+                )
+            {
+                return Ok(errno.into());
+            }
             let rc = unsafe { libc::listen(host_fd.get(), backlog) };
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(DispatchOutcome::errno(errno));
@@ -3716,7 +3995,8 @@ impl SyscallDispatcher {
                 HostSocketAddr,
                 PortProtocol,
             )> = None;
-            if family == libc::AF_INET
+            let mut synthetic_error_after_send = false;
+            if family == LINUX_AF_INET
                 && let Some(protocol) = this.socket_port_protocol(fd)
                 && let Some(requested) = host_sockaddr_to_socket_addr(&host_addr)
             {
@@ -3732,7 +4012,43 @@ impl SyscallDispatcher {
                         }
                     }
                     Ok(ConnectTarget::Unchanged) => {}
-                    Ok(ConnectTarget::Denied(errno)) => return Ok(errno.into()),
+                    Ok(ConnectTarget::Denied(errno)) => {
+                        if errno == carrick_abi::LINUX_ECONNREFUSED
+                            && protocol == PortProtocol::Tcp
+                            && this.socket_guest_type(fd) == Some(LINUX_SOCK_STREAM)
+                            && this.io_is_nonblocking(fd, 0)
+                        {
+                            this.set_socket_pending_error(fd, carrick_abi::LINUX_ECONNREFUSED);
+                            return Ok(LINUX_EINPROGRESS.into());
+                        }
+                        if errno == carrick_abi::LINUX_ECONNREFUSED
+                            && protocol == PortProtocol::Udp
+                            && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
+                        {
+                            let synthetic_host_peer = std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                requested.port(),
+                            );
+                            if let Some(mapped) = socket_addr_to_host_sockaddr(synthetic_host_peer)
+                            {
+                                host_addr = mapped;
+                                this.set_socket_error_after_send(
+                                    fd,
+                                    carrick_abi::LINUX_ECONNREFUSED,
+                                );
+                                synthetic_error_after_send = true;
+                                rewritten_connect = Some((
+                                    requested,
+                                    HostSocketAddr(synthetic_host_peer),
+                                    protocol,
+                                ));
+                            } else {
+                                return Ok(errno.into());
+                            }
+                        } else {
+                            return Ok(errno.into());
+                        }
+                    }
                     Err(_) => return Ok(carrick_abi::LINUX_ECONNREFUSED.into()),
                 }
             }
@@ -3771,6 +4087,19 @@ impl SyscallDispatcher {
             // mode (status_flags), so the host fd's real mode is immaterial.
             let nonblocking = this.io_is_nonblocking(fd, 0);
             set_host_nonblocking(host_fd.get());
+            if let Some((guest_peer, host_peer, protocol)) = rewritten_connect {
+                if let Err(errno) = this.prepare_rewritten_connect_source(
+                    fd,
+                    family,
+                    host_fd.get(),
+                    guest_peer,
+                    host_peer,
+                    protocol,
+                ) {
+                    return Ok(errno.into());
+                }
+                rewritten_connect = Some((guest_peer, host_peer, protocol));
+            }
             let rc = unsafe {
                 libc::connect(
                     host_fd.get(),
@@ -3792,6 +4121,9 @@ impl SyscallDispatcher {
                 );
             }
             if rc == 0 {
+                if !synthetic_error_after_send {
+                    this.clear_socket_error_after_send(fd);
+                }
                 // A non-blocking host connect reporting success does not prove the
                 // connection completed — consult SO_ERROR (see
                 // connect_success_or_pending_error).
@@ -3799,18 +4131,12 @@ impl SyscallDispatcher {
                 if matches!(outcome, DispatchOutcome::Returned { value: 0 })
                     && let Some((guest_peer, host_peer, protocol)) = rewritten_connect
                 {
-                    let guest_local = this
-                        .network
-                        .provider
-                        .guest_visible_local_addr(fd)
-                        .ok()
-                        .flatten();
-                    let host_local = host_socket_addr(host_fd, family, false);
-                    let _ = this.network.provider.record_socket_addresses(
+                    this.record_rewritten_connect_addresses(
                         fd,
-                        guest_local,
-                        host_local.map(HostSocketAddr).or(Some(host_peer)),
-                        Some(GuestSocketAddr(guest_peer)),
+                        family,
+                        host_fd.get(),
+                        guest_peer,
+                        host_peer,
                         protocol,
                     );
                 }
@@ -3831,11 +4157,34 @@ impl SyscallDispatcher {
             if e == LINUX_EISCONN {
                 if this.socket_connect_in_progress(fd) {
                     this.set_socket_connect_in_progress(fd, false);
-                    return Ok(connect_success_or_pending_error(host_fd.get()));
+                    let outcome = connect_success_or_pending_error(host_fd.get());
+                    if matches!(outcome, DispatchOutcome::Returned { value: 0 })
+                        && let Some((guest_peer, host_peer, protocol)) = rewritten_connect
+                    {
+                        this.record_rewritten_connect_addresses(
+                            fd,
+                            family,
+                            host_fd.get(),
+                            guest_peer,
+                            host_peer,
+                            protocol,
+                        );
+                    }
+                    return Ok(outcome);
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EISCONN));
             }
             if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
+                if let Some((guest_peer, host_peer, protocol)) = rewritten_connect {
+                    this.record_rewritten_connect_addresses(
+                        fd,
+                        family,
+                        host_fd.get(),
+                        guest_peer,
+                        host_peer,
+                        protocol,
+                    );
+                }
                 if nonblocking {
                     // Non-blocking guest: hand EINPROGRESS/EALREADY straight back.
                     return Ok(DispatchOutcome::errno(e));
@@ -4035,6 +4384,13 @@ impl SyscallDispatcher {
                         }
                     }
                     Ok(ConnectTarget::Unchanged) => {}
+                    Ok(ConnectTarget::Denied(errno))
+                        if errno == carrick_abi::LINUX_ECONNREFUSED
+                            && protocol == PortProtocol::Udp
+                            && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM) =>
+                    {
+                        return Ok(DispatchOutcome::Returned { value: len as i64 });
+                    }
                     Ok(ConnectTarget::Denied(errno)) => return Ok(errno.into()),
                     Err(_) => return Ok(carrick_abi::LINUX_ECONNREFUSED.into()),
                 }
@@ -4046,6 +4402,7 @@ impl SyscallDispatcher {
             let is_stream = this.socket_guest_type(fd) == Some(libc::SOCK_STREAM);
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
+            let connected_send = dest_addr == 0;
             let send_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read().send_timeout());
@@ -4077,6 +4434,9 @@ impl SyscallDispatcher {
                     other => other,
                 }
             });
+            if connected_send && matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
+                this.queue_socket_error_after_send(fd);
+            }
             Ok(outcome)
 
         }
@@ -4111,6 +4471,9 @@ impl SyscallDispatcher {
             // (from_bits_retain: recv IGNORES other unknown flag bits.)
             if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+            }
+            if let Some(errno) = this.take_socket_pending_error(fd) {
+                return Ok(errno.into());
             }
             // When the caller wants the source address back, Linux's
             // move_addr_to_user reads the in/out length as a *signed* int and
@@ -4251,13 +4614,14 @@ impl SyscallDispatcher {
                 }
             }
             let (host_fd, _family) = this.host_socket_lookup(fd)?;
-            // Record the GUEST-intended SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF so
+            // Record the GUEST-intended SO_REUSEADDR / SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF so
             // getsockopt reports what the guest set rather than carrick's
             // host-side widening (SO_REUSEADDR→SO_REUSEPORT for UDP; AF_UNIX
             // buffer widening). The value still passes through to the host
             // below. (audit M4, M5)
             if level == LINUX_SOL_SOCKET
-                && (optname == LINUX_SO_REUSEPORT
+                && (optname == LINUX_SO_REUSEADDR
+                    || optname == LINUX_SO_REUSEPORT
                     || optname == LINUX_SO_RCVBUF
                     || optname == LINUX_SO_SNDBUF)
                 && optlen >= 4
@@ -4268,7 +4632,9 @@ impl SyscallDispatcher {
                     && let OpenDescription::HostSocket { base, .. } =
                         &mut *open_file.description.write()
                 {
-                    if optname == LINUX_SO_REUSEPORT {
+                    if optname == LINUX_SO_REUSEADDR {
+                        base.set_so_reuseaddr(v != 0);
+                    } else if optname == LINUX_SO_REUSEPORT {
                         base.set_so_reuseport(v != 0);
                     } else if optname == LINUX_SO_RCVBUF {
                         base.set_so_rcvbuf(v);
@@ -4519,14 +4885,15 @@ impl SyscallDispatcher {
                 // Honor the guest's optlen (it offers 4; clamp defensively).
                 return write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes());
             }
-            // SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF: report the GUEST-intended
+            // SO_REUSEADDR / SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF: report the GUEST-intended
             // value, not carrick's host-side widening. REUSEPORT defaults to 0
             // unless the guest set it (so a SO_REUSEADDR→REUSEPORT widening on a
             // UDP socket is invisible here); RCVBUF/SNDBUF report Linux's doubled
             // (2×) value of what was set, or the default when never set.
             // (audit M4, M5)
             if level == LINUX_SOL_SOCKET
-                && (optname == LINUX_SO_REUSEPORT
+                && (optname == LINUX_SO_REUSEADDR
+                    || optname == LINUX_SO_REUSEPORT
                     || optname == LINUX_SO_RCVBUF
                     || optname == LINUX_SO_SNDBUF
                     || optname == crate::linux_abi::LINUX_SO_PASSCRED)
@@ -4538,7 +4905,9 @@ impl SyscallDispatcher {
                 let val: i32 = {
                     let open = open_file.description.read();
                     if let OpenDescription::HostSocket { base, .. } = &*open {
-                        if optname == LINUX_SO_REUSEPORT {
+                        if optname == LINUX_SO_REUSEADDR {
+                            i32::from(base.so_reuseaddr())
+                        } else if optname == LINUX_SO_REUSEPORT {
                             i32::from(base.so_reuseport())
                         } else if optname == crate::linux_abi::LINUX_SO_PASSCRED {
                             i32::from(base.so_passcred())
@@ -4612,6 +4981,14 @@ impl SyscallDispatcher {
             // table the rest of the ABI uses. (getsockopt itself still
             // succeeds; only the value is mapped.)
             if level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR {
+                if let Some(linux_err) = this.take_socket_pending_error(fd) {
+                    return write_sockopt_value(
+                        memory,
+                        optval_addr,
+                        optlen_addr,
+                        &linux_err.to_ne_bytes(),
+                    );
+                }
                 let mut host_err: i32 = 0;
                 let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
                 let rc = unsafe {

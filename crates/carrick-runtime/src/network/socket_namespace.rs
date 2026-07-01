@@ -1,6 +1,6 @@
 use super::{
-    BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr, NetworkCapabilities, NetworkLease,
-    NetworkLeaseId, NetworkProvider,
+    BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr, NetworkCapabilities,
+    NetworkHostsEntry, NetworkLease, NetworkLeaseId, NetworkProvider,
 };
 use carrick_spec::{BridgeId, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol};
 use std::collections::HashMap;
@@ -17,7 +17,9 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct SocketNamespaceProvider {
     registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
+    tcp_listeners: Mutex<HashMap<VirtualEndpoint, ListenerReservation>>,
     endpoint_dir: Arc<PathBuf>,
+    owned_endpoint_files: Mutex<Vec<OwnedEndpointFile>>,
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
     socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
     published_tcp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedTcpProxy>>>,
@@ -35,6 +37,18 @@ struct SocketAddressState {
     guest_local: Option<GuestSocketAddr>,
     _host_local: Option<HostSocketAddr>,
     guest_peer: Option<GuestSocketAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedEndpointFile {
+    path: PathBuf,
+    contents: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerReservation {
+    host_addr: HostSocketAddr,
+    reuse_port: bool,
 }
 
 #[derive(Debug)]
@@ -60,15 +74,13 @@ impl Default for SocketNamespaceProvider {
 
 impl SocketNamespaceProvider {
     pub fn new() -> Self {
-        let endpoint_dir = std::env::temp_dir().join(format!(
-            "carrick-netns-{}-{}",
-            std::process::id(),
-            NEXT_ENDPOINT_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
+        let endpoint_dir = shared_endpoint_dir();
         let _ = fs::create_dir_all(&endpoint_dir);
         Self {
             registry: Arc::new(Mutex::new(HashMap::new())),
+            tcp_listeners: Mutex::new(HashMap::new()),
             endpoint_dir: Arc::new(endpoint_dir),
+            owned_endpoint_files: Mutex::new(Vec::new()),
             namespaces: Mutex::new(HashMap::new()),
             socket_addrs: Mutex::new(HashMap::new()),
             published_tcp: Mutex::new(HashMap::new()),
@@ -96,6 +108,58 @@ impl SocketNamespaceProvider {
         drop(registry);
         self.write_endpoint_file(&key, host_addr)?;
         Ok(())
+    }
+
+    fn register_service_names(&self, spec: &NetworkNamespaceSpec) -> Result<(), String> {
+        let names = service_names(spec);
+        for name in names {
+            let path = service_name_path(&self.endpoint_dir, &spec.bridge_id, &name);
+            let contents = encode_service_name(spec.ipv4, &name);
+            fs::create_dir_all(&*self.endpoint_dir).map_err(|e| {
+                format!("failed to create socket namespace endpoint directory: {e}")
+            })?;
+            fs::write(&path, &contents)
+                .map_err(|e| format!("failed to record socket namespace service name: {e}"))?;
+            self.track_owned_file(path, contents)?;
+        }
+        Ok(())
+    }
+
+    fn service_hosts_entries(
+        &self,
+        spec: &NetworkNamespaceSpec,
+    ) -> Result<Vec<NetworkHostsEntry>, String> {
+        let mut entries = Vec::new();
+        let prefix = format!("service-{}-", spec.bridge_id.as_str());
+        let Ok(dir) = fs::read_dir(&*self.endpoint_dir) else {
+            return Ok(entries);
+        };
+        for entry in dir.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !file_name.starts_with(&prefix) {
+                continue;
+            }
+            let Some(raw) = read_live_namespace_file(&entry.path()) else {
+                continue;
+            };
+            if let Some((addr, name)) = decode_service_name(&raw) {
+                entries.push(NetworkHostsEntry {
+                    addr: IpAddr::V4(addr),
+                    names: vec![name],
+                });
+            }
+        }
+        entries.sort_by(|a, b| {
+            a.addr
+                .to_string()
+                .cmp(&b.addr.to_string())
+                .then_with(|| a.names.cmp(&b.names))
+        });
+        entries.dedup();
+        Ok(entries)
     }
 
     pub fn resolve_registered_connect(
@@ -275,6 +339,29 @@ impl SocketNamespaceProvider {
         Ok(registry.iter().find_map(|(endpoint, host)| {
             (*host == host_addr && endpoint.protocol == protocol).then_some(endpoint.addr)
         }))
+        .and_then(|resolved| {
+            if resolved.is_some() {
+                return Ok(resolved);
+            }
+            let Some(guest_addr) =
+                read_reverse_endpoint_file(&self.endpoint_dir, host_addr, protocol)
+            else {
+                return Ok(None);
+            };
+            let namespaces = self
+                .namespaces
+                .lock()
+                .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
+            let verified = namespaces.values().any(|spec| {
+                let endpoint = VirtualEndpoint {
+                    bridge_id: spec.bridge_id.clone(),
+                    addr: guest_addr,
+                    protocol,
+                };
+                read_endpoint_file(&self.endpoint_dir, &endpoint) == Some(host_addr)
+            });
+            Ok(verified.then_some(guest_addr))
+        })
     }
 
     fn first_namespace_spec(&self) -> Result<NetworkNamespaceSpec, String> {
@@ -340,11 +427,102 @@ impl SocketNamespaceProvider {
         endpoint: &VirtualEndpoint,
         host_addr: HostSocketAddr,
     ) -> Result<(), String> {
-        write_endpoint_file(&self.endpoint_dir, endpoint, host_addr)
+        let paths = write_endpoint_file(&self.endpoint_dir, endpoint, host_addr)?;
+        let mut owned = self
+            .owned_endpoint_files
+            .lock()
+            .map_err(|_| "owned endpoint registry lock poisoned".to_string())?;
+        for (path, contents) in paths {
+            if !owned.iter().any(|entry| entry.path == path) {
+                owned.push(OwnedEndpointFile { path, contents });
+            }
+        }
+        Ok(())
+    }
+
+    fn track_owned_file(&self, path: PathBuf, contents: String) -> Result<(), String> {
+        let mut owned = self
+            .owned_endpoint_files
+            .lock()
+            .map_err(|_| "owned endpoint registry lock poisoned".to_string())?;
+        if let Some(entry) = owned.iter_mut().find(|entry| entry.path == path) {
+            entry.contents = contents;
+        } else {
+            owned.push(OwnedEndpointFile { path, contents });
+        }
+        Ok(())
+    }
+
+    fn prepare_tcp_listen(
+        &self,
+        namespace_id: Option<&NetworkNamespaceId>,
+        guest_local: Option<GuestSocketAddr>,
+        host_local: Option<HostSocketAddr>,
+        reuse_port: bool,
+    ) -> Result<(), i32> {
+        let Some(namespace_id) = namespace_id else {
+            return Ok(());
+        };
+        let (Some(guest_local), Some(host_local)) = (guest_local, host_local) else {
+            return Ok(());
+        };
+        let spec = {
+            let namespaces = self
+                .namespaces
+                .lock()
+                .map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+            namespaces.get(namespace_id).cloned()
+        };
+        let Some(spec) = spec else {
+            return Ok(());
+        };
+        let IpAddr::V4(guest_ip) = guest_local.0.ip() else {
+            return Ok(());
+        };
+        if guest_ip != spec.ipv4 && guest_ip != Ipv4Addr::UNSPECIFIED {
+            return Ok(());
+        }
+        let virtual_ip = if guest_ip == Ipv4Addr::UNSPECIFIED {
+            spec.ipv4
+        } else {
+            guest_ip
+        };
+        let endpoint = VirtualEndpoint {
+            bridge_id: spec.bridge_id,
+            addr: GuestSocketAddr(SocketAddr::new(
+                IpAddr::V4(virtual_ip),
+                guest_local.0.port(),
+            )),
+            protocol: PortProtocol::Tcp,
+        };
+        let reservation = ListenerReservation {
+            host_addr: host_local,
+            reuse_port,
+        };
+        {
+            let mut listeners = self
+                .tcp_listeners
+                .lock()
+                .map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+            if let Some(existing) = listeners.get(&endpoint)
+                && !(existing.reuse_port && reuse_port)
+            {
+                return Err(carrick_abi::LINUX_EADDRINUSE);
+            }
+            listeners.insert(endpoint.clone(), reservation);
+        }
+        let contents = encode_listener_reservation(reservation);
+        let path = listener_path(&self.endpoint_dir, &endpoint);
+        fs::create_dir_all(&*self.endpoint_dir).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+        fs::write(&path, &contents).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+        self.track_owned_file(path, contents)
+            .map_err(|_| carrick_abi::LINUX_EADDRINUSE)
     }
 }
 
-static NEXT_ENDPOINT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn shared_endpoint_dir() -> PathBuf {
+    std::env::temp_dir().join("carrick-netns-socket-bridge")
+}
 
 fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
     let protocol = match endpoint.protocol {
@@ -359,23 +537,132 @@ fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
     ))
 }
 
+fn reverse_endpoint_path(
+    endpoint_dir: &Path,
+    host_addr: HostSocketAddr,
+    protocol: PortProtocol,
+) -> PathBuf {
+    let protocol = match protocol {
+        PortProtocol::Tcp => "tcp",
+        PortProtocol::Udp => "udp",
+    };
+    let ip = host_addr.0.ip().to_string().replace(':', "_");
+    endpoint_dir.join(format!("reverse-{ip}-{}-{protocol}", host_addr.0.port()))
+}
+
+fn listener_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
+    let ip = endpoint.addr.0.ip().to_string().replace(':', "_");
+    endpoint_dir.join(format!(
+        "listen-{}-{ip}-{}-tcp",
+        endpoint.bridge_id.as_str(),
+        endpoint.addr.0.port()
+    ))
+}
+
+fn service_name_path(endpoint_dir: &Path, bridge_id: &BridgeId, name: &str) -> PathBuf {
+    endpoint_dir.join(format!("service-{}-{}", bridge_id.as_str(), hex_name(name)))
+}
+
+fn hex_name(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len() * 2);
+    for byte in name.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn service_names(spec: &NetworkNamespaceSpec) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(name) = &spec.container_name
+        && !name.is_empty()
+    {
+        names.push(name.clone());
+    }
+    for alias in &spec.aliases {
+        if !alias.is_empty() && !names.iter().any(|name| name == alias) {
+            names.push(alias.clone());
+        }
+    }
+    names
+}
+
+fn encode_service_name(addr: Ipv4Addr, name: &str) -> String {
+    format!("{addr}\nname={name}\npid={}\n", std::process::id())
+}
+
+fn decode_service_name(raw: &str) -> Option<(Ipv4Addr, String)> {
+    let addr = raw.lines().next()?.trim().parse().ok()?;
+    let name = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("name="))?
+        .to_string();
+    Some((addr, name))
+}
+
+fn encode_listener_reservation(reservation: ListenerReservation) -> String {
+    format!(
+        "{}\nreuse_port={}\npid={}\n",
+        reservation.host_addr.0,
+        i32::from(reservation.reuse_port),
+        std::process::id()
+    )
+}
+
 fn write_endpoint_file(
     endpoint_dir: &Path,
     endpoint: &VirtualEndpoint,
     host_addr: HostSocketAddr,
-) -> Result<(), String> {
+) -> Result<Vec<(PathBuf, String)>, String> {
     fs::create_dir_all(endpoint_dir)
         .map_err(|e| format!("failed to create socket namespace endpoint directory: {e}"))?;
-    fs::write(
-        endpoint_path(endpoint_dir, endpoint),
-        host_addr.0.to_string(),
-    )
-    .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))
+    let path = endpoint_path(endpoint_dir, endpoint);
+    let contents = format!("{}\npid={}\n", host_addr.0, std::process::id());
+    fs::write(&path, &contents)
+        .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))?;
+    let reverse_path = reverse_endpoint_path(endpoint_dir, host_addr, endpoint.protocol);
+    let reverse_contents = format!("{}\npid={}\n", endpoint.addr.0, std::process::id());
+    fs::write(&reverse_path, &reverse_contents)
+        .map_err(|e| format!("failed to record socket namespace reverse endpoint: {e}"))?;
+    Ok(vec![(path, contents), (reverse_path, reverse_contents)])
 }
 
 fn read_endpoint_file(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> Option<HostSocketAddr> {
-    let raw = fs::read_to_string(endpoint_path(endpoint_dir, endpoint)).ok()?;
-    raw.trim().parse().ok().map(HostSocketAddr)
+    let path = endpoint_path(endpoint_dir, endpoint);
+    let raw = read_live_namespace_file(&path)?;
+    raw.lines().next()?.trim().parse().ok().map(HostSocketAddr)
+}
+
+fn read_reverse_endpoint_file(
+    endpoint_dir: &Path,
+    host_addr: HostSocketAddr,
+    protocol: PortProtocol,
+) -> Option<GuestSocketAddr> {
+    let path = reverse_endpoint_path(endpoint_dir, host_addr, protocol);
+    let raw = read_live_namespace_file(&path)?;
+    raw.lines().next()?.trim().parse().ok().map(GuestSocketAddr)
+}
+
+fn read_live_namespace_file(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let owner_pid = raw.lines().find_map(|line| line.strip_prefix("pid="))?;
+    let owner_pid = owner_pid.parse::<i32>().ok()?;
+    if process_is_alive(owner_pid) {
+        return Some(raw);
+    }
+    let _ = fs::remove_file(path);
+    None
+}
+
+fn process_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn published_tcp_accept_loop(
@@ -451,6 +738,7 @@ impl NetworkProvider for SocketNamespaceProvider {
                 .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
             namespaces.insert(namespace_id, spec.clone());
         }
+        self.register_service_names(spec)?;
         Ok(NetworkLease {
             id: NetworkLeaseId(1),
         })
@@ -463,22 +751,41 @@ impl NetworkProvider for SocketNamespaceProvider {
         if let Ok(mut registry) = self.registry.lock() {
             registry.clear();
         }
+        if let Ok(mut listeners) = self.tcp_listeners.lock() {
+            listeners.clear();
+        }
         if let Ok(mut namespaces) = self.namespaces.lock() {
             namespaces.clear();
         }
         if let Ok(mut socket_addrs) = self.socket_addrs.lock() {
             socket_addrs.clear();
         }
-        match fs::remove_dir_all(&*self.endpoint_dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(format!(
-                    "failed to remove socket namespace endpoint directory {}: {err}",
-                    self.endpoint_dir.display()
-                ));
+        if let Ok(mut owned) = self.owned_endpoint_files.lock() {
+            for entry in owned.drain(..) {
+                match fs::read_to_string(&entry.path) {
+                    Ok(contents) if contents == entry.contents => {}
+                    Ok(_) => continue,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to read socket namespace endpoint {}: {err}",
+                            entry.path.display()
+                        ));
+                    }
+                }
+                match fs::remove_file(&entry.path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to remove socket namespace endpoint {}: {err}",
+                            entry.path.display()
+                        ));
+                    }
+                }
             }
         }
+        let _ = fs::remove_dir(&*self.endpoint_dir);
         Ok(())
     }
 
@@ -561,6 +868,27 @@ impl NetworkProvider for SocketNamespaceProvider {
         protocol: PortProtocol,
     ) -> Result<Option<GuestSocketAddr>, String> {
         self.translate_host_source(host_addr, protocol)
+    }
+
+    fn prepare_listen(
+        &self,
+        namespace_id: Option<&NetworkNamespaceId>,
+        guest_local: Option<GuestSocketAddr>,
+        host_local: Option<HostSocketAddr>,
+        protocol: PortProtocol,
+        reuse_port: bool,
+    ) -> Result<(), i32> {
+        if protocol != PortProtocol::Tcp {
+            return Ok(());
+        }
+        self.prepare_tcp_listen(namespace_id, guest_local, host_local, reuse_port)
+    }
+
+    fn guest_hosts_entries(
+        &self,
+        spec: &NetworkNamespaceSpec,
+    ) -> Result<Vec<NetworkHostsEntry>, String> {
+        self.service_hosts_entries(spec)
     }
 }
 
@@ -743,9 +1071,45 @@ mod tests {
             .expect("destroy namespace");
 
         assert!(
-            !provider.endpoint_dir.exists(),
-            "destroy_namespace must remove socket namespace endpoint dir"
+            !endpoint_file.exists(),
+            "destroy_namespace must remove owned socket namespace endpoint file"
         );
+    }
+
+    #[test]
+    fn translate_host_source_reads_fork_coherent_endpoint_files() {
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let writer = SocketNamespaceProvider::new();
+        let reader = SocketNamespaceProvider::new();
+        reader.create_namespace(&spec).expect("reader namespace");
+        let guest_addr = guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 49152));
+        let host_addr = host(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            free_loopback_port(),
+        ));
+
+        writer
+            .register_virtual_endpoint(
+                spec.bridge_id.clone(),
+                spec.namespace_id.clone().expect("namespace id"),
+                guest_addr,
+                PortProtocol::Tcp,
+                host_addr,
+            )
+            .expect("register endpoint");
+
+        let translated = reader
+            .translate_host_source(host_addr, PortProtocol::Tcp)
+            .expect("translate")
+            .expect("fork coherent source translation");
+        assert_eq!(translated, guest_addr);
+
+        writer
+            .destroy_namespace(NetworkLeaseId(1))
+            .expect("writer cleanup");
+        reader
+            .destroy_namespace(NetworkLeaseId(1))
+            .expect("reader cleanup");
     }
 
     #[test]
@@ -755,7 +1119,7 @@ mod tests {
         let mapping = PortMapping {
             host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             host_port: Some(host_port),
-            container_port: 8080,
+            container_port: 8081,
             protocol: PortProtocol::Tcp,
         };
         let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
@@ -797,10 +1161,11 @@ mod tests {
     #[test]
     fn publish_tcp_forwards_after_container_endpoint_registers() {
         let host_port = free_loopback_port();
+        let container_port = 8081;
         let mapping = PortMapping {
             host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             host_port: Some(host_port),
-            container_port: 8080,
+            container_port,
             protocol: PortProtocol::Tcp,
         };
         let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
@@ -816,7 +1181,7 @@ mod tests {
             stream.read_exact(&mut buf).expect("read ping");
             stream.write_all(b"ok").expect("write ok");
         });
-        let peer = SocketAddr::new(IpAddr::V4(spec.ipv4), 8080);
+        let peer = SocketAddr::new(IpAddr::V4(spec.ipv4), container_port);
         provider
             .register_virtual_endpoint(
                 spec.bridge_id.clone(),
@@ -839,10 +1204,11 @@ mod tests {
     #[test]
     fn publish_tcp_forwards_from_fork_coherent_endpoint_file() {
         let host_port = free_loopback_port();
+        let container_port = 8082;
         let mapping = PortMapping {
             host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             host_port: Some(host_port),
-            container_port: 8080,
+            container_port,
             protocol: PortProtocol::Tcp,
         };
         let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
@@ -860,7 +1226,7 @@ mod tests {
         });
         let peer = VirtualEndpoint {
             bridge_id: spec.bridge_id.clone(),
-            addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 8080)),
+            addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
             protocol: PortProtocol::Tcp,
         };
         provider
@@ -881,5 +1247,68 @@ mod tests {
         server.join().expect("server thread");
 
         assert_eq!(&reply, b"ok");
+    }
+
+    #[test]
+    fn service_names_are_visible_from_separate_provider_instance() {
+        let mut spec = NetworkNamespaceSpec::bridge_default(
+            Some("db".to_string()),
+            vec!["postgres".to_string()],
+            Vec::new(),
+        );
+        spec.bridge_id = BridgeId::new(format!("test-service-{}", std::process::id()));
+        let writer = SocketNamespaceProvider::new();
+        writer.create_namespace(&spec).expect("create namespace");
+
+        let reader = SocketNamespaceProvider::new();
+        let entries = reader
+            .guest_hosts_entries(&spec)
+            .expect("read service hosts entries");
+
+        assert!(entries.iter().any(|entry| {
+            entry.addr == IpAddr::V4(spec.ipv4) && entry.names == vec!["db".to_string()]
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.addr == IpAddr::V4(spec.ipv4) && entry.names == vec!["postgres".to_string()]
+        }));
+    }
+
+    #[test]
+    fn translates_peer_source_from_different_bridge_namespace() {
+        let bridge = BridgeId::new(format!("test-peer-{}", std::process::id()));
+        let mut client_spec =
+            NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
+        client_spec.bridge_id = bridge.clone();
+        let mut server_spec =
+            NetworkNamespaceSpec::bridge_default(Some("db".to_string()), Vec::new(), Vec::new());
+        server_spec.bridge_id = bridge;
+
+        let writer = SocketNamespaceProvider::new();
+        writer
+            .create_namespace(&client_spec)
+            .expect("create client namespace");
+        let host_source = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49152));
+        let guest_source = guest(SocketAddr::new(IpAddr::V4(client_spec.ipv4), 34567));
+        writer
+            .record_socket_addresses(
+                10,
+                Some(guest_source),
+                Some(host_source),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record client source");
+
+        let reader = SocketNamespaceProvider::new();
+        reader
+            .create_namespace(&server_spec)
+            .expect("create server namespace");
+
+        assert_eq!(
+            reader
+                .translate_host_source(host_source, PortProtocol::Tcp)
+                .expect("translate host source"),
+            Some(guest_source)
+        );
     }
 }

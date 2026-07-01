@@ -65,6 +65,7 @@ fn main() {
                 platform: carrick_spec::Platform::default(),
                 pid: carrick_spec::PidMode::default(),
                 network: carrick_spec::NetworkNamespaceSpec::default(),
+                extra_hosts: Vec::new(),
                 uid: 0,
                 gid: 0,
             };

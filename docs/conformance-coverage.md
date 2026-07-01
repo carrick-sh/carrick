@@ -96,6 +96,18 @@ carrick-vs-Docker to confirm MATCH):
 | `rtsigtimedwaitsiginfo` | `rt_sigtimedwait` of a `sigqueue`'d signal fills si_signo + si_code(SI_QUEUE) + si_pid, not just si_signo. Was: only si_signo written (audit M9; **oracle-sensitive** — siginfo_t offsets). |
 | `fgetflcreate` | `fcntl(F_GETFL)` after open(O_CREAT\|O_TRUNC\|O_RDWR\|O_NONBLOCK) reports neither O_CREAT nor O_TRUNC, keeps the access mode + O_NONBLOCK. Was: creation flags leaked (audit M8). |
 
+**Bridge namespace probes** (run under `--net bridge` with dedicated harnesses so
+the guest sees Docker-like bridge identity rather than Carrick's default host
+network):
+
+| Probe | Gates |
+|---|---|
+| `bridge_tcp_nonblocking_refused` | Nonblocking TCP connect to the container's own bridge IP on an unused port reports `EINPROGRESS`, then `poll(POLLOUT)` wakes and `getsockopt(SO_ERROR)` returns `ECONNREFUSED`. Prevents the socket namespace provider from short-circuiting unresolved virtual bridge endpoints before event-loop clients observe Linux's async connect contract. |
+| `bridge_udp_connected_unreachable` | Connected UDP to the container's own bridge IP on an unused port allows `connect()` and `send()`, then reports the asynchronous unreachable through `poll(POLLERR)` and `recv()` returning `ECONNREFUSED`. Prevents the bridge provider from reporting a synchronous connect/send failure for Docker-style UDP clients. |
+| `bridge_udp_sendto_unreachable` | Unconnected UDP `sendto()` to the container's own bridge IP on an unused port reports the datagram length, does not arm `POLLERR`, and leaves immediate nonblocking `recv()` at `EAGAIN`. Prevents the bridge provider from turning dropped unconnected datagrams into synchronous send errors. |
+| `bridge_reuse_sockopts` | Bridge-local TCP/UDP `SO_REUSEADDR` and `SO_REUSEPORT` duplicate bind/listen behavior matches Docker: TCP `SO_REUSEADDR` permits duplicate bind but rejects the second listener, TCP `SO_REUSEPORT` permits both listeners, UDP permits duplicate binds for either option, and guest `getsockopt()` reports the values the guest set. Prevents the bridge socket provider from hiding duplicate virtual-port conflicts behind distinct loopback host ports or leaking host-side socket-option widening. |
+| `bridge_compose_server` + `bridge_compose_client` | Two independent bridge-mode Carrick guests named `db` and `web` exchange a TCP ping/pong after the client resolves `db` by service name through runtime-managed `/etc/hosts`; the guests receive stable distinct bridge IPs, and the server's `accept()` peer address is translated back to the client's bridge IP. Prevents Compose-shaped service graphs from depending on harness-passed IPs, in-process bridge state, or raw loopback peer addresses. |
+
 **Fixed this session** (probes that flipped from gap → MATCH because the
 underlying gap got fixed):
 

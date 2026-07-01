@@ -264,9 +264,10 @@ pub(super) struct OpenDescriptionBase {
     /// test_subprocess.test_pipesizes sets on the write end, reads on the read
     /// ends). `pipe2` hands the same `Arc` to both ends; `None` everywhere else.
     pipe_capacity_shared: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
-    /// Guest-intended SO_REUSEPORT, tracked so getsockopt reports what the guest
-    /// set — NOT the host SO_REUSEPORT carrick silently turns on to emulate
-    /// Linux UDP wildcard-rebind from SO_REUSEADDR. (audit M4)
+    /// Guest-intended SO_REUSEADDR / SO_REUSEPORT, tracked so getsockopt reports
+    /// what the guest set — NOT the host SO_REUSEPORT carrick silently turns on
+    /// to emulate Linux UDP wildcard-rebind from SO_REUSEADDR. (audit M4)
+    so_reuseaddr: bool,
     so_reuseport: bool,
     /// Guest-set SO_RCVBUF / SO_SNDBUF (the raw value passed to setsockopt).
     /// `None` = never set. getsockopt reports Linux's doubled value (2×) of what
@@ -287,17 +288,27 @@ pub(super) struct OpenDescriptionBase {
     /// (surface EISCONN to the guest, matching Linux connect01 case "already
     /// connected").
     connect_in_progress: bool,
+    /// Linux-visible pending socket error for synthetic networking paths whose
+    /// failure is not backed by the host socket's SO_ERROR state.
+    pending_socket_error: Option<i32>,
+    /// Synthetic connected UDP peers can only surface an asynchronous error
+    /// after a datagram is sent. Store that errno here and copy it into
+    /// `pending_socket_error` after each successful connected send.
+    socket_error_after_send: Option<i32>,
 }
 
 impl OpenDescriptionBase {
     pub(super) fn new(status_flags: u64) -> Self {
         Self {
             status_flags,
+            so_reuseaddr: false,
             so_reuseport: false,
             so_rcvbuf: None,
             so_sndbuf: None,
             so_passcred: false,
             connect_in_progress: false,
+            pending_socket_error: None,
+            socket_error_after_send: None,
             lease: crate::linux_abi::LINUX_F_UNLCK,
             recv_timeout: None,
             send_timeout: None,
@@ -382,7 +393,13 @@ impl OpenDescriptionBase {
         self.send_timeout = t;
     }
 
-    /// Guest-intended SO_REUSEPORT (audit M4).
+    /// Guest-intended SO_REUSEADDR / SO_REUSEPORT (audit M4).
+    pub(super) fn so_reuseaddr(&self) -> bool {
+        self.so_reuseaddr
+    }
+    pub(super) fn set_so_reuseaddr(&mut self, on: bool) {
+        self.so_reuseaddr = on;
+    }
     pub(super) fn so_reuseport(&self) -> bool {
         self.so_reuseport
     }
@@ -416,6 +433,24 @@ impl OpenDescriptionBase {
     }
     pub(super) fn set_connect_in_progress(&mut self, on: bool) {
         self.connect_in_progress = on;
+    }
+    pub(super) fn pending_socket_error(&self) -> Option<i32> {
+        self.pending_socket_error
+    }
+    pub(super) fn set_pending_socket_error(&mut self, errno: i32) {
+        self.pending_socket_error = Some(errno);
+    }
+    pub(super) fn take_pending_socket_error(&mut self) -> Option<i32> {
+        self.pending_socket_error.take()
+    }
+    pub(super) fn socket_error_after_send(&self) -> Option<i32> {
+        self.socket_error_after_send
+    }
+    pub(super) fn set_socket_error_after_send(&mut self, errno: i32) {
+        self.socket_error_after_send = Some(errno);
+    }
+    pub(super) fn clear_socket_error_after_send(&mut self) {
+        self.socket_error_after_send = None;
     }
 }
 
