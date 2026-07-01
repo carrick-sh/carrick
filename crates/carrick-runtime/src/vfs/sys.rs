@@ -14,9 +14,9 @@
 //!   constants or host-derived facts, not live kernel state.
 //! * **The `/sys/class/net` tree** — a small synthetic directory hierarchy
 //!   (`class` → `net` → per-interface dirs → per-attribute files) rendered from
-//!   the host's live network interfaces, so a guest that enumerates interfaces
-//!   via sysfs (rather than netlink) sees loopback and the host NICs with
-//!   matching `ifindex`/`address`/`mtu`/`flags`.
+//!   the active Linux network model when the runtime has one, otherwise from
+//!   the host's live network interfaces. Guests that enumerate interfaces via
+//!   sysfs therefore see the same `lo`/`ethN` model as procfs and rtnetlink.
 //!
 //! Like `/proc`, `/sys` is read-only here: the [`Vfs`] mutator defaults return
 //! their errors, and `open` for write is refused. The bar is the same — the
@@ -89,7 +89,7 @@ struct NetIface {
 /// record (which carries the name, index, MAC, and flags). Backs the synthetic
 /// `/sys/class/net` tree.
 #[cfg(target_os = "macos")]
-fn net_interfaces() -> Vec<NetIface> {
+fn host_net_interfaces() -> Vec<NetIface> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates a list we free with freeifaddrs below.
@@ -137,7 +137,7 @@ fn net_interfaces() -> Vec<NetIface> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn net_interfaces() -> Vec<NetIface> {
+fn host_net_interfaces() -> Vec<NetIface> {
     // Off-macOS the AF_LINK/getifaddrs walk above is not wired up (Linux uses
     // AF_PACKET/sockaddr_ll, not BSD's sockaddr_dl), so synthesize at least the
     // loopback interface — every Linux box has `lo`, and a wholly empty
@@ -153,12 +153,44 @@ fn net_interfaces() -> Vec<NetIface> {
     }]
 }
 
+fn net_interfaces_from_model(model: &crate::network::model::LinuxNetworkModel) -> Vec<NetIface> {
+    model
+        .links
+        .iter()
+        .map(|link| {
+            let flags = if link.loopback {
+                (libc::IFF_LOOPBACK | libc::IFF_UP | libc::IFF_RUNNING) as u32
+            } else {
+                (libc::IFF_UP | libc::IFF_RUNNING | libc::IFF_BROADCAST | libc::IFF_MULTICAST)
+                    as u32
+            };
+            NetIface {
+                name: link.name.clone(),
+                index: link.index,
+                mac: if link.loopback {
+                    [0, 0, 0, 0, 0, 0]
+                } else {
+                    [0x02, 0, 0, 0, 0, link.index as u8]
+                },
+                mac_len: 6,
+                flags,
+                is_loopback: link.loopback,
+            }
+        })
+        .collect()
+}
+
 /// Render `/sys/class/net/<if>/<attr>` for a live interface, or `None` if the
 /// path isn't a recognized attribute of a present interface.
+#[cfg(test)]
 fn synthetic_net_file(path: &str) -> Option<Vec<u8>> {
+    synthetic_net_file_from_interfaces(path, host_net_interfaces())
+}
+
+fn synthetic_net_file_from_interfaces(path: &str, interfaces: Vec<NetIface>) -> Option<Vec<u8>> {
     let rest = path.strip_prefix("/sys/class/net/")?;
     let (ifname, attr) = rest.split_once('/')?;
-    let iface = net_interfaces().into_iter().find(|i| i.name == ifname)?;
+    let iface = interfaces.into_iter().find(|i| i.name == ifname)?;
     let running = iface.flags as i32 & libc::IFF_RUNNING != 0;
     let body = match attr {
         "ifindex" => format!("{}\n", iface.index),
@@ -189,29 +221,52 @@ fn synthetic_net_file(path: &str) -> Option<Vec<u8>> {
     Some(body.into_bytes())
 }
 
-/// Classify a `/sys/class[/net[/<if>[/<attr>]]]` path, or `None` if it isn't a
-/// recognized node.
-fn net_path_kind(path: &str) -> Option<EntryKind> {
+fn net_path_kind_from_interfaces(path: &str, interfaces: &[NetIface]) -> Option<EntryKind> {
     if path == "/sys/class" || path == "/sys/class/net" {
         return Some(EntryKind::Directory);
     }
     let rest = path.strip_prefix("/sys/class/net/")?;
     match rest.split_once('/') {
-        None => net_interfaces()
+        None => interfaces
             .iter()
             .any(|i| i.name == rest)
             .then_some(EntryKind::Directory),
         Some((ifname, attr)) => (NET_ATTRS.contains(&attr)
-            && net_interfaces().iter().any(|i| i.name == ifname))
+            && interfaces.iter().any(|i| i.name == ifname))
         .then_some(EntryKind::File),
     }
 }
 
-pub struct SysVfs;
+pub struct SysVfs {
+    network_model: Option<crate::network::model::LinuxNetworkModel>,
+}
 
 impl SysVfs {
     pub fn new() -> Self {
-        Self
+        Self {
+            network_model: None,
+        }
+    }
+
+    pub(crate) fn from_network_model(model: crate::network::model::LinuxNetworkModel) -> Self {
+        Self {
+            network_model: Some(model),
+        }
+    }
+
+    fn net_interfaces(&self) -> Vec<NetIface> {
+        self.network_model
+            .as_ref()
+            .map_or_else(host_net_interfaces, net_interfaces_from_model)
+    }
+
+    fn synthetic_net_file(&self, path: &str) -> Option<Vec<u8>> {
+        synthetic_net_file_from_interfaces(path, self.net_interfaces())
+    }
+
+    fn net_path_kind(&self, path: &str) -> Option<EntryKind> {
+        let interfaces = self.net_interfaces();
+        net_path_kind_from_interfaces(path, &interfaces)
     }
 }
 
@@ -245,7 +300,7 @@ impl Vfs for SysVfs {
                 mtime_nanos: 0,
             });
         }
-        if let Some(kind) = net_path_kind(path) {
+        if let Some(kind) = self.net_path_kind(path) {
             let mode = if kind == EntryKind::Directory {
                 0o555
             } else {
@@ -274,7 +329,8 @@ impl Vfs for SysVfs {
             }]);
         }
         if path == "/sys/class/net" {
-            return Ok(net_interfaces()
+            return Ok(self
+                .net_interfaces()
                 .into_iter()
                 .map(|i| super::DirEnt {
                     name: i.name,
@@ -284,7 +340,7 @@ impl Vfs for SysVfs {
         }
         if let Some(rest) = path.strip_prefix("/sys/class/net/")
             && !rest.contains('/')
-            && net_interfaces().iter().any(|i| i.name == rest)
+            && self.net_interfaces().iter().any(|i| i.name == rest)
         {
             return Ok(NET_ATTRS
                 .iter()
@@ -303,7 +359,7 @@ impl Vfs for SysVfs {
         flags: OpenFlags,
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
-        let Some(contents) = synthetic_file(path).or_else(|| synthetic_net_file(path)) else {
+        let Some(contents) = synthetic_file(path).or_else(|| self.synthetic_net_file(path)) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);
         };
         if flags.write {
@@ -473,6 +529,58 @@ mod tests {
         assert_eq!(
             v.lookup("/sys/class/net/definitely-not-a-nic"),
             Err(LINUX_ENOENT)
+        );
+    }
+
+    #[test]
+    fn sys_class_net_can_render_from_linux_network_model() {
+        let mut network = carrick_spec::NetworkNamespaceSpec::bridge_default(
+            Some("web".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        network.attachments = vec![
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("front"),
+                Some("web".to_string()),
+                vec!["web-front".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 31, 0, 44)),
+            ),
+            carrick_spec::NetworkAttachmentSpec::bridge_default(
+                carrick_spec::BridgeId::new("back"),
+                Some("web".to_string()),
+                vec!["web-back".to_string()],
+                Some(std::net::Ipv4Addr::new(172, 32, 0, 44)),
+            ),
+        ];
+        network.bridge_id = network.attachments[0].bridge_id.clone();
+        network.ipv4 = network.attachments[0].ipv4;
+        network.gateway_v4 = network.attachments[0].gateway_v4;
+        let model = crate::network::model::LinuxNetworkModel::from_spec(&network);
+        let v = SysVfs::from_network_model(model);
+
+        let names = v
+            .readdir("/sys/class/net")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["lo", "eth0", "eth1"]);
+        let ifindex = v
+            .open(
+                "/sys/class/net/eth1/ifindex",
+                OpenFlags::default(),
+                &OpenContext::default(),
+            )
+            .unwrap();
+        let VfsHandle::Bytes { contents, .. } = ifindex else {
+            panic!("ifindex should open as synthetic bytes");
+        };
+        assert_eq!(String::from_utf8(contents).unwrap(), "3\n");
+        assert_eq!(
+            v.lookup("/sys/class/net/en0"),
+            Err(LINUX_ENOENT),
+            "model-backed sysfs must not leak host interface names"
         );
     }
 
