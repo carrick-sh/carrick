@@ -1803,8 +1803,8 @@ impl SyscallDispatcher {
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         let mut dispatcher = Self::new();
-        if should_mount_network_resolv_conf(&network.spec) {
-            let contents = resolv_conf_contents_for_network(&network.spec);
+        if should_mount_network_resolv_conf(&network.model) {
+            let contents = resolv_conf_contents_for_network(&network.model);
             dispatcher.fs.vfs_mounts.mount(
                 "/etc/resolv.conf",
                 Box::new(crate::vfs::ResolvConfVfs::from_contents(contents)),
@@ -5301,34 +5301,25 @@ fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String
     )?))
 }
 
-fn should_mount_network_resolv_conf(spec: &carrick_spec::NetworkNamespaceSpec) -> bool {
-    spec.mode == carrick_spec::NetworkMode::Bridge
-        || !spec.dns_servers.is_empty()
-        || !spec.dns_search.is_empty()
-        || !spec.dns_options.is_empty()
+fn should_mount_network_resolv_conf(model: &crate::network::model::LinuxNetworkModel) -> bool {
+    model.has_resolver_config()
 }
 
-fn resolv_conf_contents_for_network(spec: &carrick_spec::NetworkNamespaceSpec) -> Vec<u8> {
+fn resolv_conf_contents_for_network(model: &crate::network::model::LinuxNetworkModel) -> Vec<u8> {
     let mut out = String::new();
-    let nameservers =
-        if spec.dns_servers.is_empty() && spec.mode == carrick_spec::NetworkMode::Bridge {
-            vec![std::net::IpAddr::V4(spec.gateway_v4)]
-        } else {
-            spec.dns_servers.clone()
-        };
-    for server in nameservers {
+    for server in &model.resolver.nameservers {
         out.push_str("nameserver ");
         out.push_str(&server.to_string());
         out.push('\n');
     }
-    if !spec.dns_search.is_empty() {
+    if !model.resolver.search.is_empty() {
         out.push_str("search ");
-        out.push_str(&spec.dns_search.join(" "));
+        out.push_str(&model.resolver.search.join(" "));
         out.push('\n');
     }
-    if !spec.dns_options.is_empty() {
+    if !model.resolver.options.is_empty() {
         out.push_str("options ");
-        out.push_str(&spec.dns_options.join(" "));
+        out.push_str(&model.resolver.options.join(" "));
         out.push('\n');
     }
     out.into_bytes()
@@ -7625,7 +7616,8 @@ mod overlay_dispatch_tests {
             ..Default::default()
         };
 
-        let contents = String::from_utf8(resolv_conf_contents_for_network(&spec)).unwrap();
+        let model = crate::network::model::LinuxNetworkModel::from_spec(&spec);
+        let contents = String::from_utf8(resolv_conf_contents_for_network(&model)).unwrap();
         assert!(contents.contains("nameserver 1.1.1.1\n"));
         assert!(contents.contains("nameserver 9.9.9.9\n"));
         assert!(contents.contains("search example.test\n"));

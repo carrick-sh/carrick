@@ -1607,8 +1607,7 @@ impl SyscallDispatcher {
             };
             let dest_pid = if *pid != 0 { *pid } else { std::process::id() };
             if self.network.spec.mode == carrick_spec::NetworkMode::Bridge {
-                let snapshot = NetworkLinkSnapshot::from_spec(&self.network.spec);
-                build_netlink_reply_for_snapshot(request, dest_pid, &snapshot)
+                build_netlink_reply_for_snapshot(request, dest_pid, &self.network.model)
             } else {
                 build_netlink_reply(request, dest_pid)
             }

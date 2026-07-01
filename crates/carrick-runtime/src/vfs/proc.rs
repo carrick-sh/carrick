@@ -844,15 +844,11 @@ fn linux_interfaces(
     network: &carrick_spec::NetworkNamespaceSpec,
 ) -> Vec<(u32, String, bool, bool)> {
     if network.mode == carrick_spec::NetworkMode::Bridge {
-        let mut interfaces = vec![(1, "lo".to_owned(), true, true)];
-        interfaces.extend(
-            network
-                .effective_attachments()
-                .into_iter()
-                .enumerate()
-                .map(|(idx, _attachment)| ((idx + 2) as u32, format!("eth{idx}"), true, false)),
-        );
-        return interfaces;
+        return crate::network::model::LinuxNetworkModel::from_spec(network)
+            .links
+            .into_iter()
+            .map(|link| (link.index, link.name, link.has_ipv4, link.has_ipv6))
+            .collect();
     }
     host_linux_interfaces()
 }
@@ -968,18 +964,29 @@ fn synthetic_proc_net_route(network: &carrick_spec::NetworkNamespaceSpec) -> Vec
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n",
     );
     if network.mode == carrick_spec::NetworkMode::Bridge {
-        let attachments = network.effective_attachments();
-        let primary_gateway = attachments
-            .first()
-            .map_or(network.gateway_v4, |attachment| attachment.gateway_v4);
-        s.push_str(&format!(
-            "eth0\t00000000\t{}\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
-            proc_net_route_hex_v4(primary_gateway)
-        ));
-        for (idx, attachment) in attachments.iter().enumerate() {
+        let model = crate::network::model::LinuxNetworkModel::from_spec(network);
+        for route in model.routes {
+            let destination = match route.destination {
+                Some(std::net::IpAddr::V4(addr)) => addr,
+                Some(std::net::IpAddr::V6(_)) => continue,
+                None => std::net::Ipv4Addr::UNSPECIFIED,
+            };
+            let gateway = match route.gateway {
+                Some(std::net::IpAddr::V4(addr)) => addr,
+                Some(std::net::IpAddr::V6(_)) => continue,
+                None => std::net::Ipv4Addr::UNSPECIFIED,
+            };
+            let flags = if route.gateway.is_some() {
+                "0003"
+            } else {
+                "0001"
+            };
             s.push_str(&format!(
-                "eth{idx}\t{}\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n",
-                proc_net_route_hex_v4(proc_net_v4_24(attachment.ipv4))
+                "{}\t{}\t{}\t{flags}\t0\t0\t0\t{}\t0\t0\t0\n",
+                route.link_name,
+                proc_net_route_hex_v4(destination),
+                proc_net_route_hex_v4(gateway),
+                proc_net_route_hex_v4_mask(route.destination_prefix_len),
             ));
         }
         return s.into_bytes();
@@ -1005,9 +1012,14 @@ fn proc_net_route_hex_v4(addr: std::net::Ipv4Addr) -> String {
     )
 }
 
-fn proc_net_v4_24(addr: std::net::Ipv4Addr) -> std::net::Ipv4Addr {
-    let [a, b, c, _] = addr.octets();
-    std::net::Ipv4Addr::new(a, b, c, 0)
+fn proc_net_route_hex_v4_mask(prefix_len: u8) -> String {
+    let prefix = prefix_len.min(32);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    proc_net_route_hex_v4(std::net::Ipv4Addr::from(mask))
 }
 
 /// `/proc/net/ipv6_route`: loopback rows in the fixed 32-hex-digit layout, no
