@@ -15,6 +15,14 @@ homepage = "https://carrick.sh"
 description = "Run unmodified Linux binaries as host-native processes via a hardware-virtualized vCPU per guest thread and a Rust syscall-translation layer (experimental)."
 readme = "README.md"
 
+[workspace.lints.rust]
+# The AGENTS.md match-arm footgun: a LINUX_*/SYS_* constant used as a match
+# arm but NOT imported degrades to a catch-all binding that silently shadows
+# every later arm. rustc's default warn is easy to scroll past in a full
+# build; deny turns the whole class into a build failure.
+unreachable_patterns = "deny"
+bindings_with_variant_name = "deny"
+
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

@@ -130,7 +130,7 @@ each new site re-implements the mask test by hand.
 | Stage | Scope | Status |
 |---|---|---|
 | 1 | Audit (this doc) | done |
-| 2 | Deny `unreachable_patterns` workspace-wide; hoist function-local `LINUX_*` consts to carrick-abi | done (this series) |
+| 2 | Deny `unreachable_patterns` + `bindings_with_variant_name` workspace-wide | done (this series) |
 | 3 | `WaitSigMask` enum replaces `block_signals + mask_replaces` on the fd-wait outcomes | done (this series) |
 | 4 | `HostFd` newtype at the guest→host accessor seam (fd_helpers returns, splice/tee/sendfile plumbing) | done (this series) |
 | 5 | Stop `NsPid` carrying host pids (wait4/ptrace → `HostPid`) | done (this series) |
@@ -139,7 +139,7 @@ each new site re-implements the mask test by hand.
 | 8 | `CanonicalNr`/`NativeNr` newtypes on `RawSyscall`/`SyscallRequest` | TODO |
 | 9 | `GuestVa`/`Gpa`/`HostVa` in carrick-mem + engine translation chains | TODO — largest win for the memory subsystem, pairs with the durable-memory work |
 | 10 | `Errno` newtype with a single negation choke point | TODO — biggest churn, do last |
-| 11 | bitflags for epoll/splice/eventfd/msg/wait flag words | TODO — opportunistic per-file |
+| 11 | bitflags for epoll/splice/eventfd/msg/wait flag words; hoist function-local `LINUX_*` consts to carrick-abi | TODO — opportunistic per-file |
 
 Ground rules for every stage: newtypes are `#[repr(transparent)]`-equivalent
 zero-cost wrappers; constructors are NAMED for semantics (the `SigBlockMask::
