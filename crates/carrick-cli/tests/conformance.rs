@@ -143,6 +143,25 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // by their dedicated harness.
     "bridge_compose_server",
     "bridge_compose_client",
+    // host_gateway_client depends on a host-side listener and Docker Desktop
+    // host-gateway name injection. Covered by docker_compose_host_gateway_smoke
+    // and docker_compose_network_surface_smoke.
+    "host_gateway_client",
+    // multi_network_* are service-role probes for Compose/API workloads with
+    // named networks, aliases, and peer containers. Covered by the multi-network
+    // Compose smokes and runtime connect/disconnect tests.
+    "multi_network_client",
+    "multi_network_dns_client",
+    "multi_network_server",
+    // sidecar_loopback_* must be launched as a shared-network-namespace service
+    // group. Covered by docker_compose_shared_network_namespace_smoke.
+    "sidecar_loopback_client",
+    "sidecar_loopback_isolated_client",
+    "sidecar_loopback_server",
+    // udp_published_* require a peer service and a host UDP published-port
+    // mapping. Covered by docker_compose_udp_published_port_smoke.
+    "udp_published_client",
+    "udp_published_server",
 ];
 use std::time::{Duration, Instant};
 
