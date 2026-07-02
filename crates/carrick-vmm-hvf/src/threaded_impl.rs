@@ -38,6 +38,14 @@ impl SharedFutexSyscall for HvfShared {
         crate::probes::futex_route(host_addr as u64, 99, val as i32, host_value as u64);
     }
 
+    fn wait_start(&self, waiter_key: usize) {
+        carrick_host::ulock::waiter_enter(waiter_key);
+    }
+
+    fn wait_end(&self, waiter_key: usize) {
+        carrick_host::ulock::waiter_exit(waiter_key);
+    }
+
     /// One ≤20 ms `os_sync_wait_on_address` slice + its macOS-errno
     /// classification. `Woken` for a wake / at-entry value mismatch (the guest
     /// re-checks; Linux `FUTEX_WAIT` returns 0), `Retry` for a slice timeout or
@@ -87,23 +95,11 @@ impl SharedFutexSyscall for HvfShared {
         )
     }
 
-    /// Wake up to `n` waiters on the shared-page word. macOS's
-    /// `os_sync_wake_by_address_any` reports spurious successes when called
-    /// back-to-back on a SHARED address, so wake ONE at a time with a
-    /// `sched_yield` between iterations. Returns the count woken.
-    fn wake(&self, host_addr: usize, n: u32) -> i64 {
-        let mut woke = 0i64;
-        for _ in 0..n {
-            let rc = carrick_host::ulock::wake(host_addr, false);
-            if rc < 0 {
-                break;
-            }
-            woke += 1;
-            unsafe {
-                libc::sched_yield();
-            }
-        }
-        woke
+    /// Wake up to `n` waiters on the shared-page word. Darwin's os_sync wake API
+    /// reports success/failure rather than a Linux-style waiter count, so the
+    /// host ulock wrapper uses its fork-shared parked-waiter table.
+    fn wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64 {
+        carrick_host::ulock::wake_counted(host_addr, waiter_key, n)
     }
 }
 

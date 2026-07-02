@@ -719,6 +719,7 @@ fn run_address_space_with_hvf_and_dispatcher(
     dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
+    let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace placement (container runs only): fork the NsSupervisor
     // BEFORE creating the HVF VM. macOS HVF state is not fork-safe — a VM live
     // in the parent at fork(2) makes the child's hv_vm_create return HV_BUSY
@@ -1132,6 +1133,7 @@ where
             }
             DispatchOutcome::SharedFutexWait {
                 host_addr,
+                waiter_key,
                 value,
                 timeout,
             } => {
@@ -1142,15 +1144,20 @@ where
                 // legacy `dispatch_threaded`-only short-circuit was the
                 // root cause of LTP pause01 TBROKing on
                 // `tst_checkpoint_wake ETIMEDOUT`.
-                let retval = shared_futex_wait(HostVa(host_addr), value, timeout, this_tid);
+                let retval =
+                    shared_futex_wait(HostVa(host_addr), waiter_key, value, timeout, this_tid);
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
-            DispatchOutcome::SharedFutexWake { host_addr, count } => {
+            DispatchOutcome::SharedFutexWake {
+                host_addr,
+                waiter_key,
+                count,
+            } => {
                 // Cross-process MAP_SHARED futex wake from a single-threaded
                 // guest (LTP tst_checkpoint_wake). Same __ulock one-at-a-time +
                 // sched_yield as the threaded loop's PlatformFutex::shared_wake.
-                let retval = shared_futex_wake(host_addr, count);
+                let retval = shared_futex_wake(host_addr, waiter_key, count);
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -1553,6 +1560,14 @@ fn run_threaded_hvf_loop(
 // SINGLE-threaded loop below keeps its own free-fn `shared_futex_wait` (it has no
 // `PlatformFutex` handle and is HVF-local).
 
+struct SharedFutexWaiterGuard(usize);
+
+impl Drop for SharedFutexWaiterGuard {
+    fn drop(&mut self) {
+        crate::ulock::waiter_exit(self.0);
+    }
+}
+
 /// Block on a cross-process (`MAP_SHARED`) futex via the host `__ulock`,
 /// interruptibly. Returns 0 when woken (or the futex word already changed),
 /// `-EINTR` when a signal deliverable to THIS thread is pending, `-ETIMEDOUT` at
@@ -1561,11 +1576,14 @@ fn run_threaded_hvf_loop(
 /// `PlatformFutex::shared_wait` (which shares this logic in `HvfFutex`).
 fn shared_futex_wait(
     host_addr: HostVa,
+    waiter_key: usize,
     value: u32,
     timeout: Option<std::time::Duration>,
     this_tid: ThreadId,
 ) -> i64 {
     let host_addr = host_addr.raw();
+    crate::ulock::waiter_enter(waiter_key);
+    let _waiter_guard = SharedFutexWaiterGuard(waiter_key);
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
     let host_value = unsafe { (host_addr as *const u32).read() };
     crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
@@ -1602,25 +1620,13 @@ fn shared_futex_wait(
 
 /// Wake up to `count` waiters on a cross-process (`MAP_SHARED`) futex from a
 /// SINGLE-THREADED guest (an LTP test binary that forks + `tst_checkpoint_wake`s
-/// a child). The macOS `__ulock` analog of the threaded loop's
-/// `PlatformFutex::shared_wake`: wake ONE waiter per `__ulock_wake` call with a
-/// `sched_yield` between iterations (the cure for macOS `wake_by_address_any`
-/// reporting spurious back-to-back successes on a SHARED address). Returns the
-/// count actually woken. Byte-identical to the dispatcher's prior inline loop and
-/// to `HvfFutex::shared_wake`, so the `SharedFutexWake` outcome change preserves
-/// the single-threaded HVF behavior exactly.
-fn shared_futex_wake(host_addr: usize, count: u32) -> i64 {
-    let mut woke = 0i64;
-    for i in 0..count {
-        let rc = crate::ulock::wake(host_addr, false);
-        crate::probes::ulock_wake(host_addr as u64, i as i32, rc);
-        if rc < 0 {
-            break;
-        }
-        woke += 1;
-        unsafe { libc::sched_yield() };
-    }
-    woke
+/// a child). Darwin's shared-futex wake primitive does not report a Linux-style
+/// waiter count, so the host ulock wrapper pairs the wake with its fork-shared
+/// parked-waiter table.
+fn shared_futex_wake(host_addr: usize, waiter_key: usize, count: u32) -> i64 {
+    let woke = crate::ulock::wake_counted(host_addr, waiter_key, count);
+    crate::probes::ulock_wake(host_addr as u64, 0, woke);
+    woke.max(0)
 }
 
 /// Absolute host path to Apple's Rosetta 2 Linux ELF interpreter. This is an

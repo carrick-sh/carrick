@@ -161,13 +161,14 @@ mod tests {
         fn shared_wait(
             &self,
             _host_addr: usize,
+            _waiter_key: usize,
             _value: u32,
             _timeout: Option<Duration>,
             _interrupted: &dyn Fn() -> bool,
         ) -> i64 {
             0
         }
-        fn shared_wake(&self, _host_addr: usize, _n: u32) -> i64 {
+        fn shared_wake(&self, _host_addr: usize, _waiter_key: usize, _n: u32) -> i64 {
             0
         }
         fn requeue(&self, _from: u64, _to: u64, _wake: u32, _requeue: u32) -> (u32, u32) {

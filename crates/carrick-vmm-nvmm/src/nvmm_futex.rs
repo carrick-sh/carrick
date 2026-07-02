@@ -30,7 +30,7 @@ impl SharedFutexSyscall for NvmmSharedFutex {
         )
     }
 
-    fn wake(&self, host_addr: usize, n: u32) -> i64 {
+    fn wake(&self, host_addr: usize, _waiter_key: usize, n: u32) -> i64 {
         let all = n > 1;
         carrick_host::netbsd_futex::wake(host_addr, all).max(0)
     }

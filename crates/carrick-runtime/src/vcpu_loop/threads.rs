@@ -166,6 +166,7 @@ where
         &self,
         engine: &mut E,
         host_addr: usize,
+        waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
     ) -> Result<i64, RuntimeError> {
@@ -177,9 +178,13 @@ where
         let retval = loop {
             // Genuine guest block (cross-process MAP_SHARED FUTEX_WAIT).
             crate::run_state::publish(crate::run_state::RunState::Blocked);
-            let retval = self
-                .platform_futex
-                .shared_wait(host_addr, value, timeout, &interrupted);
+            let retval = self.platform_futex.shared_wait(
+                host_addr,
+                waiter_key,
+                value,
+                timeout,
+                &interrupted,
+            );
             if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
                 && crate::fork_quiesce::is_quiescing()
             {

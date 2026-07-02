@@ -1203,6 +1203,7 @@ pub enum DispatchOutcome {
     /// syscall. `value` is the expected futex word (the kernel re-compares).
     SharedFutexWait {
         host_addr: usize,
+        waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
     },
@@ -1218,6 +1219,7 @@ pub enum DispatchOutcome {
     /// with the number actually woken.
     SharedFutexWake {
         host_addr: usize,
+        waiter_key: usize,
         count: u32,
     },
     /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
@@ -3035,6 +3037,7 @@ fn dispatch_threaded_futex(
                 // completes the syscall with the count woken.
                 return DispatchOutcome::SharedFutexWake {
                     host_addr,
+                    waiter_key: address as usize,
                     count: value,
                 };
             }
@@ -3115,6 +3118,7 @@ fn dispatch_threaded_futex(
                 // generation snapshot is needed here.
                 return DispatchOutcome::SharedFutexWait {
                     host_addr,
+                    waiter_key: address as usize,
                     value,
                     timeout,
                 };
@@ -3188,6 +3192,7 @@ fn dispatch_threaded_futex(
                     .min(u32::MAX as u64) as u32;
                 return DispatchOutcome::SharedFutexWake {
                     host_addr,
+                    waiter_key: uaddr2 as usize,
                     count: total,
                 };
             }
@@ -7304,6 +7309,7 @@ mod overlay_dispatch_tests {
             outcome,
             DispatchOutcome::SharedFutexWake {
                 host_addr,
+                waiter_key: 0x10800,
                 count: 3,
             },
             "a shared FUTEX_WAKE must defer to the PlatformFutex::shared_wake seam"

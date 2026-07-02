@@ -313,11 +313,12 @@ pub trait PlatformFutex: Send + Sync {
     fn shared_wait(
         &self,
         host_addr: usize,
+        waiter_key: usize,
         val: u32,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64;
-    fn shared_wake(&self, host_addr: usize, n: u32) -> i64;
+    fn shared_wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64;
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32);
     /// Wake every private-futex waiter so it re-checks its interrupt predicate
     /// (a process-directed signal became pending, or a fork/exec quiesce was
