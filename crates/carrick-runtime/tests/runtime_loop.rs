@@ -245,10 +245,10 @@ impl SyscallTrap for ScriptedTrap {
             .pop_front()
             .map(|f| {
                 Some(carrick_runtime::trap::RawSyscall {
-                    number: f.x8,
+                    number: carrick_runtime::linux_abi::CanonicalNr(f.x8),
                     args: [f.x0, f.x1, f.x2, f.x3, f.x4, f.x5],
                     guest_abi: carrick_runtime::linux_abi::LinuxGuestAbi::Aarch64,
-                    native_number: f.x8,
+                    native_number: carrick_runtime::linux_abi::NativeNr(f.x8),
                 })
             })
             .ok_or_else(|| TrapError::Hypervisor("scripted trap stream exhausted".to_owned()))

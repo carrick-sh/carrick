@@ -553,13 +553,20 @@ where
         // The frame carries the RAW per-ISA number, so the name comes from this
         // engine's per-ISA table (Phase 1 T8), not the canonical aarch64 table.
         let name = <<E::Arch as carrick_hal::GuestArch>::Table as carrick_hal::SyscallTable>::name(
-            frame.number,
+            frame.number.raw(),
         )
         .unwrap_or("<unknown>");
         let a = frame.args;
         eprintln!(
             "tid#{} trap#{}: nr={} ({name}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x}",
-            self.this_tid, traps, frame.number, a[0], a[1], a[2], a[3], a[4]
+            self.this_tid,
+            traps,
+            frame.number.raw(),
+            a[0],
+            a[1],
+            a[2],
+            a[3],
+            a[4]
         );
     }
 
@@ -594,7 +601,7 @@ where
         // mprotect(226) — mutate the shared guest descriptors from the host.
         // With sibling vCPUs live, Pause-Modify-Resume them so none walks a
         // half-edited descriptor tree.
-        let _pt_pause = match frame.number {
+        let _pt_pause = match frame.number.raw() {
             215 | 216 | 222 | 226 if self.kicker.count() > 1 => Some(self.pt_pause()),
             _ => None,
         };
@@ -609,16 +616,17 @@ where
         loop {
             let request = SyscallRequest::from_raw(frame)
                 .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi());
-            let outcome = dispatch_with_panic_backstop(request.number, self.this_tid, || {
-                kernel.dispatcher.dispatch_threaded(
-                    request,
-                    engine,
-                    &kernel.reporter,
-                    self.this_tid,
-                    &self.registry,
-                    &self.futex,
-                )
-            })?;
+            let outcome =
+                dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
+                    kernel.dispatcher.dispatch_threaded(
+                        request,
+                        engine,
+                        &kernel.reporter,
+                        self.this_tid,
+                        &self.registry,
+                        &self.futex,
+                    )
+                })?;
             match outcome {
                 DispatchOutcome::BlockingHostWrite(mut write) => {
                     self.waiter.ensure_full();

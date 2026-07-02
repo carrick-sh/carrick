@@ -520,7 +520,7 @@ impl SyscallDispatcher {
         let write_consumed = positive;
         let a = |i: usize| request.arg(i) as i32;
         let write_eagain_targets: [Option<i32>; 2] = if eagain {
-            match request.number {
+            match request.number.raw() {
                 64 | 66 | 68 | 70 | 287 | 206 | 211 | 269 => [Some(a(0)), None],
                 71 => [Some(a(0)), None],
                 76 | 285 => [Some(a(2)), None],
@@ -531,7 +531,7 @@ impl SyscallDispatcher {
             [None, None]
         };
         // (fd, bits-to-clear) per direction the syscall consumed. aarch64 nrs.
-        let targets: [Option<(i32, u32)>; 2] = match request.number {
+        let targets: [Option<(i32, u32)>; 2] = match request.number.raw() {
             // read / readv / pread64 / preadv / preadv2, accept / accept4,
             // recvfrom / recvmsg / recvmmsg: consume the read side of arg0.
             63 | 65 | 67 | 69 | 286 | 202 | 242 | 207 | 212 | 243 if read_consumed => {

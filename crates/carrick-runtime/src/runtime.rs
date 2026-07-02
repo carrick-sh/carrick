@@ -901,13 +901,19 @@ where
             // Canonical (= aarch64) lookup: this single-threaded loop is generic
             // over `SyscallTrap` only (no `ThreadedEngine::Arch` to consult); a
             // per-ISA name needs the threaded loop's `Arch::Table` route.
-            let name = crate::syscall::lookup_aarch64(frame.number)
+            let name = crate::syscall::lookup_aarch64(frame.number.raw())
                 .map(|s| s.name)
                 .unwrap_or("<unknown>");
             let a = frame.args;
             eprintln!(
                 "trap#{traps}: nr={} ({name}) a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-                frame.number, a[0], a[1], a[2], a[3], a[4], a[5]
+                frame.number.raw(),
+                a[0],
+                a[1],
+                a[2],
+                a[3],
+                a[4],
+                a[5]
             );
         }
         let outcome = dispatch_single_threaded_syscall(
@@ -1224,10 +1230,11 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     let mut sleep_deadline: Option<Instant> = None;
     let mut poll_deadline: Option<Instant> = None;
     loop {
-        let outcome =
-            dispatch_with_panic_backstop(request.number, std::process::id() as ThreadId, || {
-                dispatcher.dispatch(request, memory, reporter)
-            })?;
+        let outcome = dispatch_with_panic_backstop(
+            request.number.raw(),
+            std::process::id() as ThreadId,
+            || dispatcher.dispatch(request, memory, reporter),
+        )?;
         match outcome {
             DispatchOutcome::BlockingHostWrite(mut write) => {
                 waiter.ensure_full();

@@ -58,7 +58,7 @@ pub fn run_elf_kvm(path: impl AsRef<Path>) -> Result<i32, String> {
                 x3: raw.args[3],
                 x4: raw.args[4],
                 x5: raw.args[5],
-                x8: raw.number,
+                x8: raw.number.raw(),
             },
             // A bare kick/halt with no pending syscall: nothing left to do.
             None => return Ok(0),

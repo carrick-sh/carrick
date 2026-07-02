@@ -464,7 +464,13 @@ pub mod runtime {
                 let a = frame.args;
                 eprintln!(
                     "trap#{traps}: nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-                    frame.number, a[0], a[1], a[2], a[3], a[4], a[5]
+                    frame.number.raw(),
+                    a[0],
+                    a[1],
+                    a[2],
+                    a[3],
+                    a[4],
+                    a[5]
                 );
             }
             // Dispatch, servicing any blocking-I/O wait inline (ppoll) and
