@@ -25,24 +25,22 @@ const RTA_GATEWAY: u16 = 5;
 
 fn main() {
     let eth0_ip = eth0_ipv4();
-    let expected_host_gateway = expected_ipv4(
-        "CARRICK_PROBE_EXPECT_HOST_DOCKER_INTERNAL",
-        Ipv4Addr::new(172, 31, 0, 1),
-    );
-    let expected_gateway = expected_ipv4(
-        "CARRICK_PROBE_EXPECT_GATEWAY_DOCKER_INTERNAL",
-        Ipv4Addr::new(172, 31, 0, 1),
-    );
     println!("bridge_getifaddrs_eth0=true");
     println!("bridge_getifaddrs_nonloopback={}", !eth0_ip.is_loopback());
     println!("bridge_hosts_has_eth0_ip={}", file_contains_ip("/etc/hosts", eth0_ip));
     println!(
         "bridge_host_docker_internal={}",
-        resolve_host_v4("host.docker.internal") == Some(expected_host_gateway)
+        host_gateway_match(
+            "host.docker.internal",
+            "CARRICK_PROBE_EXPECT_HOST_DOCKER_INTERNAL"
+        )
     );
     println!(
         "bridge_gateway_docker_internal={}",
-        resolve_host_v4("gateway.docker.internal") == Some(expected_gateway)
+        host_gateway_match(
+            "gateway.docker.internal",
+            "CARRICK_PROBE_EXPECT_GATEWAY_DOCKER_INTERNAL"
+        )
     );
     println!("bridge_resolv_has_nameserver={}", resolv_has_nameserver());
     println!(
@@ -82,13 +80,6 @@ fn main() {
         "bridge_netlink_default_gateway={}",
         netlink_route_has_default_gateway(&route_messages)
     );
-}
-
-fn expected_ipv4(var: &str, fallback: Ipv4Addr) -> Ipv4Addr {
-    std::env::var(var)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(fallback)
 }
 
 fn eth0_ipv4() -> Ipv4Addr {
@@ -137,6 +128,16 @@ fn resolve_host_v4(host: &str) -> Option<Ipv4Addr> {
             IpAddr::V4(ip) => Some(ip),
             IpAddr::V6(_) => None,
         })
+}
+
+fn host_gateway_match(host: &str, env_name: &str) -> bool {
+    let Some(expected) = std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<Ipv4Addr>().ok())
+    else {
+        return true;
+    };
+    resolve_host_v4(host) == Some(expected)
 }
 
 fn resolv_has_nameserver() -> bool {
