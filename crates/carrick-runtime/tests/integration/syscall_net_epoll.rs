@@ -113,14 +113,10 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
 
 #[test]
 fn siocgifname_on_socket_maps_interface_index_to_name() {
-    let (ifindex, ifname) = ["lo0", "lo"]
-        .iter()
-        .find_map(|name| {
-            let c_name = std::ffi::CString::new(*name).unwrap();
-            let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-            (index != 0).then_some((index, *name))
-        })
-        .expect("host loopback interface");
+    // A Linux guest sees carrick's NORMALIZED interface namespace (lo=1,
+    // eth0=2), not the host's Darwin names (`en0`/`lo0`) — the same guest-visible
+    // names rtnetlink and /proc/net expose. SIOCGIFNAME/SIOCGIFINDEX round-trip
+    // in that namespace via `linux_if_indextoname`/`linux_if_nametoindex`.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -140,45 +136,49 @@ fn siocgifname_on_socket_maps_interface_index_to_name() {
         other => panic!("socket(AF_INET): {other:?}"),
     };
 
-    let mut ifreq = [0u8; 40];
-    ifreq[16..20].copy_from_slice(&(ifindex as i32).to_le_bytes());
-    memory.write_bytes(0x4000, &ifreq).unwrap();
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(
-                    29,
-                    SyscallArgs::from([fd, LINUX_SIOCGIFNAME, 0x4000, 0, 0, 0])
-                ),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    let out = memory.read_bytes(0x4000, 16).unwrap();
-    let end = out.iter().position(|b| *b == 0).unwrap_or(out.len());
-    assert_eq!(&out[..end], ifname.as_bytes());
+    for (ifindex, ifname) in [(1i32, "lo"), (2i32, "eth0")] {
+        // SIOCGIFNAME: guest interface index -> Linux name.
+        let mut ifreq = [0u8; 40];
+        ifreq[16..20].copy_from_slice(&ifindex.to_le_bytes());
+        memory.write_bytes(0x4000, &ifreq).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        29,
+                        SyscallArgs::from([fd, LINUX_SIOCGIFNAME, 0x4000, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let out = memory.read_bytes(0x4000, 16).unwrap();
+        let end = out.iter().position(|b| *b == 0).unwrap_or(out.len());
+        assert_eq!(&out[..end], ifname.as_bytes());
 
-    let mut ifreq = [0u8; 40];
-    ifreq[..ifname.len()].copy_from_slice(ifname.as_bytes());
-    memory.write_bytes(0x4040, &ifreq).unwrap();
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(
-                    29,
-                    SyscallArgs::from([fd, LINUX_SIOCGIFINDEX, 0x4040, 0, 0, 0])
-                ),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    let out = memory.read_bytes(0x4050, 4).unwrap();
-    let got_index = i32::from_le_bytes(out.try_into().unwrap());
-    assert_eq!(got_index, ifindex as i32);
+        // SIOCGIFINDEX: Linux name -> guest interface index.
+        let mut ifreq = [0u8; 40];
+        ifreq[..ifname.len()].copy_from_slice(ifname.as_bytes());
+        memory.write_bytes(0x4040, &ifreq).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        29,
+                        SyscallArgs::from([fd, LINUX_SIOCGIFINDEX, 0x4040, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let out = memory.read_bytes(0x4050, 4).unwrap();
+        let got_index = i32::from_le_bytes(out.try_into().unwrap());
+        assert_eq!(got_index, ifindex);
+    }
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
 }
