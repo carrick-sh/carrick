@@ -311,6 +311,9 @@ mod tests {
 
     #[test]
     fn install_ignore_default_roundtrip_tracks_mask_identity() {
+        let _serialize = host_disposition::MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const SIG: i32 = 23; // SIGURG — routable, not claimed.
         assert!(is_routable::<IdentityGlue>(SIG));
         host_disposition::clear_installed(SIG);
@@ -345,6 +348,9 @@ mod tests {
 
     #[test]
     fn ignore_then_handler_reinstalls_route() {
+        let _serialize = host_disposition::MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const SIG: i32 = 10; // SIGUSR1
         host_disposition::clear_installed(SIG);
         set_host_ignore::<IdentityGlue>(SIG);
@@ -360,6 +366,9 @@ mod tests {
 
     #[test]
     fn execve_reset_preserves_ignored_mask() {
+        let _serialize = host_disposition::MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const SIG_KEEP: i32 = 10;
         const SIG_RESET: i32 = 12;
         host_disposition::clear_all();
@@ -390,6 +399,9 @@ mod tests {
     /// the SAME generic code KVM uses.
     #[test]
     fn translated_glue_keys_mask_on_linux_signum() {
+        let _serialize = host_disposition::MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const LIN: i32 = 12; // SIGUSR2 (linux); host would be 112.
         assert!(is_routable::<BsdLikeGlue>(LIN));
         assert!(!is_routable::<BsdLikeGlue>(15)); // SIGTERM claimed
