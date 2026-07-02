@@ -6299,7 +6299,7 @@ impl SyscallDispatcher {
 
         }
 
-        fn preadv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
+        fn preadv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, _rwf: u64) {
 
             let fd: Fd = fd;
             let iov = iov.0;
@@ -6311,12 +6311,10 @@ impl SyscallDispatcher {
             // the current file offset" — readv semantics. Plain preadv (69) has
             // no such case, and would hand -1 straight to the host preadv → EINVAL
             // (the preadv201 failure). The trailing RWF_* flags arg (raw_args[5])
-            // is advisory for our backing fds EXCEPT RWF_HIPRI, which requests
-            // polled completion the buffered page cache can't provide → EOPNOTSUPP
-            // (preadv202), matching Linux.
+            // is advisory for our host-file backing; RWF_HIPRI is a priority hint
+            // here, so preadv2(off, RWF_HIPRI) reads like preadv.
             let is_preadv2 = cx.number() == 286;
             let read_at_current = is_preadv2 && (pos_l as i64) == -1;
-            let rwf_hipri = is_preadv2 && (rwf & 0x1) != 0;
             let memory = &mut *cx.memory;
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
@@ -6328,9 +6326,6 @@ impl SyscallDispatcher {
             // as the kernel rejects it before touching the data.
             if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            if rwf_hipri {
-                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EOPNOTSUPP));
             }
             // Real host file: positional readv via libc::pread per iovec
             // (kernel offset untouched).
@@ -6503,7 +6498,7 @@ impl SyscallDispatcher {
 
         }
 
-        fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
+        fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, _rwf: u64) {
 
             let fd: Fd = fd;
             let iov = iov.0;
@@ -6512,11 +6507,10 @@ impl SyscallDispatcher {
             let offset = i64::from_ne_bytes(pos_l.to_ne_bytes());
             // pwritev2 (canonical 287) treats offset == -1 as "use (and advance)
             // the current file offset" — writev semantics. Plain pwritev (70) has
-            // no such case. The trailing RWF_* flags arg is advisory EXCEPT
-            // RWF_HIPRI → EOPNOTSUPP (pwritev202), matching Linux.
+            // no such case. The trailing RWF_* flags arg is advisory for our
+            // host-file backing; RWF_HIPRI writes like pwritev.
             let is_pwritev2 = cx.number() == 287;
             let write_at_current = is_pwritev2 && offset == -1;
-            let write_hipri = is_pwritev2 && (rwf & 0x1) != 0;
             let memory = &*cx.memory;
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             if offset < 0 && !write_at_current {
@@ -6540,9 +6534,6 @@ impl SyscallDispatcher {
             {
                 if !*writable {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                if write_hipri {
-                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EOPNOTSUPP));
                 }
                 let hfd = host_fd.raw();
                 if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
