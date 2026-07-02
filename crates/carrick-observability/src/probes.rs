@@ -16,9 +16,15 @@
 //!
 //! Layout:
 //!   * `real` — the genuine `#[usdt::provider]` plus its safe wrappers, compiled
-//!     where usdt can emit probe anchors (`macos`/`freebsd`/`linux`).
+//!     where usdt can emit probe anchors: `macos` (both arches — the HVF aarch64
+//!     path) and `x86_64` `linux`/`freebsd`. usdt 0.6's SDT backend emits x86
+//!     asm and keys the decision off the BUILD HOST, so an `aarch64`
+//!     `linux`/`freebsd` target cross-built from an x86_64 host would otherwise
+//!     emit `rdi`/`rsi`/… and fail with "invalid register" — those targets take
+//!     the stub instead.
 //!   * `stub` — a byte-for-byte signature mirror with empty bodies, compiled on
-//!     every OTHER target. The non-probe helpers (`guest_mem_probe_points`,
+//!     every OTHER target (NetBSD, and aarch64 linux/freebsd). The non-probe
+//!     helpers (`guest_mem_probe_points`,
 //!     `guest_mem_copy`, `guest_mem_point`) carry their REAL bodies in BOTH arms
 //!     so behaviour is identical regardless of platform.
 //!
@@ -27,12 +33,30 @@
 //! stub's `register_dtrace_probes` return type (the dispatcher calls it on every
 //! platform). See the crate manifest comment for why this is the correct choice.
 
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        target_arch = "x86_64"
+    )
+))]
 pub use real::*;
-#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        target_arch = "x86_64"
+    )
+)))]
 pub use stub::*;
 
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        target_arch = "x86_64"
+    )
+))]
 mod real {
     //! THEORY OF OPERATION
     //!
@@ -991,7 +1015,13 @@ mod real {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        target_arch = "x86_64"
+    )
+)))]
 mod stub {
     //! No-op probe surface for backends whose host OS does not support `usdt`
     //! (Linux, NetBSD). Every public item the `real` module exports is mirrored
