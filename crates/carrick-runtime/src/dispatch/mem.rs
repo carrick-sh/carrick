@@ -1261,6 +1261,11 @@ impl SyscallDispatcher {
                 if let Ok(len) = usize::try_from(length) {
                     let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
                     cx.memory.set_no_access(address.0, len, prot_none);
+                    cx.memory.set_no_write(
+                        address.0,
+                        len,
+                        !prot_none && prot & LINUX_PROT_WRITE == 0,
+                    );
                     // Make the new protection guest-VISIBLE (a violating access
                     // faults during EL0 execution) by editing the stage-1/PML4
                     // page tables. In the private mmap arena a failed edit is
