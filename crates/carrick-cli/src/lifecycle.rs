@@ -551,6 +551,7 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
     if matches!(state.config.fs, Some(carrick_spec::FsBackendKind::Memory)) {
         bail!("start requires a container created with --fs host");
     }
+    validate_published_port_availability(&state.config)?;
     // If a prior run populated the overlay (scratch_path set), attach it (skip
     // re-extraction, preserving the container's writes); otherwise this is the
     // first start and the runtime extracts the rootfs.
@@ -592,6 +593,42 @@ fn reset_for_relaunch(state: &mut ContainerState) {
     state.init_pid = 0;
     state.supervisor_pid = 0;
     state.config.region_path = None;
+}
+
+fn validate_published_port_availability(config: &RunConfig) -> anyhow::Result<()> {
+    if config.network != carrick_spec::NetworkMode::Bridge || config.network_container.is_some() {
+        return Ok(());
+    }
+    for mapping in &config.published_ports {
+        let Some(host_port) = mapping.host_port else {
+            continue;
+        };
+        let host_ip = mapping
+            .host_ip
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let addr = std::net::SocketAddr::new(host_ip, host_port);
+        match mapping.protocol {
+            carrick_spec::PortProtocol::Tcp => {
+                let listener = std::net::TcpListener::bind(addr).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AddrInUse => {
+                        anyhow::anyhow!("published TCP port {addr} is already in use")
+                    }
+                    _ => anyhow::anyhow!("failed to bind published TCP port {addr}: {e}"),
+                })?;
+                drop(listener);
+            }
+            carrick_spec::PortProtocol::Udp => {
+                let socket = std::net::UdpSocket::bind(addr).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AddrInUse => {
+                        anyhow::anyhow!("published UDP port {addr} is already in use")
+                    }
+                    _ => anyhow::anyhow!("failed to bind published UDP port {addr}: {e}"),
+                })?;
+                drop(socket);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `carrick restart` — stop (if running) then start, reusing the overlay.
@@ -1728,7 +1765,7 @@ mod tests {
     use super::{
         ContainerState, ContainerStatus, RunConfig, bridge_network_attachments, parse_signal,
         ps_row_json, rebuild_request_from_state, render_format, reset_for_relaunch,
-        resolve_stop_signal, select_tail, stop_grace_secs,
+        resolve_stop_signal, select_tail, stop_grace_secs, validate_published_port_availability,
     };
 
     fn sample_state() -> ContainerState {
@@ -2032,6 +2069,52 @@ mod tests {
         // configured --stop-signal / --stop-timeout across `restart`/`start`).
         assert_eq!(s.config.stop_signal, Some(libc::SIGQUIT));
         assert_eq!(s.config.stop_timeout, Some(15));
+    }
+
+    #[test]
+    fn start_preflight_rejects_occupied_tcp_published_port() {
+        let occupied =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("occupy port");
+        let host_port = occupied.local_addr().expect("local addr").port();
+        let mut config = sample_state().config;
+        config.network = carrick_spec::NetworkMode::Bridge;
+        config.published_ports = vec![carrick_spec::PortMapping {
+            host_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: carrick_spec::PortProtocol::Tcp,
+        }];
+
+        let err = validate_published_port_availability(&config)
+            .expect_err("occupied tcp port should fail preflight");
+
+        assert_eq!(
+            err.to_string(),
+            format!("published TCP port 127.0.0.1:{host_port} is already in use")
+        );
+    }
+
+    #[test]
+    fn start_preflight_rejects_occupied_udp_published_port() {
+        let occupied =
+            std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("occupy port");
+        let host_port = occupied.local_addr().expect("local addr").port();
+        let mut config = sample_state().config;
+        config.network = carrick_spec::NetworkMode::Bridge;
+        config.published_ports = vec![carrick_spec::PortMapping {
+            host_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 5353,
+            protocol: carrick_spec::PortProtocol::Udp,
+        }];
+
+        let err = validate_published_port_availability(&config)
+            .expect_err("occupied udp port should fail preflight");
+
+        assert_eq!(
+            err.to_string(),
+            format!("published UDP port 127.0.0.1:{host_port} is already in use")
+        );
     }
 
     #[test]
