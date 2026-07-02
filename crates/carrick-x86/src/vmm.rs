@@ -180,6 +180,14 @@ pub struct WindowRegion {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowPlan {
     pub regions: Vec<WindowRegion>,
+    /// Page-granular read-only spans of the loaded ELF images (the pages of
+    /// their non-writable `PT_LOAD` segments). The regions above carry the
+    /// MERGED image perms (write escalated to the union — the region-merge
+    /// workaround), so `build_pml4` re-applies these spans over the built
+    /// tables: the leaves lose R/W (and gain NX for non-exec spans), making a
+    /// guest store to its own `.text`/`.rodata` #PF (PFEC.P=1 → SEGV_ACCERR)
+    /// exactly as on Linux. VA-keyed: GPA compaction (NVMM) leaves them valid.
+    pub ro_spans: Vec<carrick_mem::elf::RoSpan>,
 }
 
 /// Capacity of the PML4 table region in bytes (448 pages × 4 KiB = 1.75 MiB).

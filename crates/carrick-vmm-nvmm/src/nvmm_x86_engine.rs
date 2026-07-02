@@ -1403,7 +1403,12 @@ fn compact_plan(plan: &WindowPlan, layout: BringupLayout) -> WindowPlan {
         };
         regions.push(WindowRegion { gpa, len, ..*r });
     }
-    WindowPlan { regions }
+    WindowPlan {
+        regions,
+        // VA-keyed read-only spans survive GPA compaction unchanged: build_pml4
+        // edits the leaf for each VA regardless of which compact GPA backs it.
+        ro_spans: plan.ro_spans.clone(),
+    }
 }
 
 // ─── bring_up ────────────────────────────────────────────────────────────────
@@ -1546,6 +1551,7 @@ mod tests {
                 user: true,
                 shared: false,
             }],
+            ..Default::default()
         };
 
         let compact = compact_plan(&plan, NVMM_X86_LAYOUT);
@@ -1594,6 +1600,7 @@ mod tests {
                     shared: false,
                 },
             ],
+            ..Default::default()
         };
         let compact = compact_plan(&plan, NVMM_X86_LAYOUT);
 
@@ -1614,6 +1621,7 @@ mod tests {
                 user: true,
                 shared: false,
             }],
+            ..Default::default()
         };
         let fault_offset = 0x4496_0000;
         let chunk = sparse_chunk_for_gpa(&plan.regions, COMPACT_GPA_BASE + fault_offset)
@@ -1637,6 +1645,7 @@ mod tests {
                 user: true,
                 shared: false,
             }],
+            ..Default::default()
         };
         let fault_offset = 0x4496_0000;
         let chunk = sparse_chunk_for_va(&plan.regions, LINUX_MMAP_BASE + fault_offset)

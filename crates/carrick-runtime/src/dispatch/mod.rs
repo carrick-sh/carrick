@@ -1145,6 +1145,14 @@ pub enum DispatchOutcome {
         /// the runtime owns and closes after mapping. `None` → anonymous (the
         /// high-VA / `payload`-snapshot path).
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        /// The guest asked for `PROT_NONE`: after installing the alias mapping
+        /// the runtime must make the range guest-INACCESSIBLE (invalidate the
+        /// fresh leaves), so the guest's own access faults (SIGSEGV/ACCERR)
+        /// instead of reaching the host backing — which for a PROT_NONE
+        /// `MAP_SHARED` file is itself mapped `PROT_NONE`, and a guest touch
+        /// through a present leaf crashes the vCPU (KVM_RUN EFAULT / stage-2
+        /// abort: LTP mmap05's TBROK).
+        prot_none: bool,
     },
     /// Guest invoked `rt_sigreturn(2)` (syscall 139). The runtime must
     /// pop the Carrick sigframe at SP_EL0, restore the saved register

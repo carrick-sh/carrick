@@ -117,6 +117,131 @@ pub struct SegmentPerms {
     pub execute: bool,
 }
 
+/// A page-granular guest-VA span that must be READ-ONLY in the guest's own
+/// page tables: the pages of an ELF image's non-writable `PT_LOAD` segments
+/// (.text / .rodata / RELRO-at-link-time). The host-side region mapping stays
+/// merged/escalated (the HVF stage-2 quirk workaround in
+/// `memory::regions_from_load_plan`), so per-segment write protection must be
+/// re-applied at the STAGE-1/PML4 leaf level from these spans — otherwise a
+/// guest store to its own `.rodata` silently succeeds (Go reflect
+/// `TestTypeFieldReadOnly`, LTP mmap fault-delivery family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RoSpan {
+    /// Page-aligned guest VA of the first read-only page.
+    pub start: u64,
+    /// Page-aligned length in bytes (never 0).
+    pub len: u64,
+    /// Whether the pages stay executable (PF_X text) — read-only either way.
+    pub exec: bool,
+}
+
+/// Compute the page-granular read-only spans for a load plan: every page
+/// covered by a non-writable `PT_LOAD` segment, MINUS any page a writable
+/// segment also touches (when an RO and an RW segment share a page, Linux's
+/// later RW mapping leaves that page writable — mirror that so the guest's
+/// own `.data` head never becomes read-only). 4 KiB pages — the stage-1/PML4
+/// leaf granule on both guest ISAs.
+pub fn ro_page_spans(plan: &LoadPlan) -> Vec<RoSpan> {
+    const PAGE: u64 = 0x1000;
+    let floor = |v: u64| v & !(PAGE - 1);
+    let ceil = |v: u64| v.checked_add(PAGE - 1).map(|c| c & !(PAGE - 1));
+
+    // Page-rounded extents of every writable segment.
+    let writable: Vec<(u64, u64)> = plan
+        .segments
+        .iter()
+        .filter(|seg| seg.perms.write && seg.memory_size > 0)
+        .filter_map(|seg| {
+            let end = seg.virtual_address.checked_add(seg.memory_size)?;
+            Some((floor(seg.virtual_address), ceil(end)?))
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for seg in &plan.segments {
+        if seg.perms.write || !seg.perms.read || seg.memory_size == 0 {
+            continue;
+        }
+        let Some(seg_end) = seg.virtual_address.checked_add(seg.memory_size) else {
+            continue;
+        };
+        let Some(seg_end) = ceil(seg_end) else {
+            continue;
+        };
+        // Subtract each writable page-extent; a clip can split a span in two.
+        let mut pieces = vec![(floor(seg.virtual_address), seg_end)];
+        for &(w_start, w_end) in &writable {
+            let mut next = Vec::with_capacity(pieces.len() + 1);
+            for (s, e) in pieces {
+                if w_end <= s || w_start >= e {
+                    next.push((s, e));
+                    continue;
+                }
+                if s < w_start {
+                    next.push((s, w_start));
+                }
+                if w_end < e {
+                    next.push((w_end, e));
+                }
+            }
+            pieces = next;
+        }
+        for (s, e) in pieces {
+            if e > s {
+                out.push(RoSpan {
+                    start: s,
+                    len: e - s,
+                    exec: seg.perms.execute,
+                });
+            }
+        }
+    }
+    // Two adjacent read-only segments (RX text, R rodata) can share a page.
+    // Executability must WIN on such a page — marking it NX would fault an
+    // instruction fetch from the text tail — so clip every non-exec span
+    // against the exec spans' page extents (write-protection is identical
+    // either way; only the NX bit differs).
+    let exec_extents: Vec<(u64, u64)> = out
+        .iter()
+        .filter(|s| s.exec)
+        .map(|s| (s.start, s.start + s.len))
+        .collect();
+    let mut resolved = Vec::with_capacity(out.len());
+    for span in out {
+        if span.exec {
+            resolved.push(span);
+            continue;
+        }
+        let mut pieces = vec![(span.start, span.start + span.len)];
+        for &(x_start, x_end) in &exec_extents {
+            let mut next = Vec::with_capacity(pieces.len() + 1);
+            for (s, e) in pieces {
+                if x_end <= s || x_start >= e {
+                    next.push((s, e));
+                    continue;
+                }
+                if s < x_start {
+                    next.push((s, x_start));
+                }
+                if x_end < e {
+                    next.push((x_end, e));
+                }
+            }
+            pieces = next;
+        }
+        for (s, e) in pieces {
+            if e > s {
+                resolved.push(RoSpan {
+                    start: s,
+                    len: e - s,
+                    exec: false,
+                });
+            }
+        }
+    }
+    resolved
+}
+
 #[derive(Debug, Error)]
 pub enum ElfInspectError {
     #[error("failed to read ELF binary: {0}")]
@@ -388,6 +513,109 @@ mod tests {
         assert_eq!(plan.load_bias, 0);
         assert_eq!(plan.entry, 0x400000);
         assert_eq!(plan.segments.len(), 1);
+    }
+
+    fn plan_with_segments(segments: Vec<LoadSegment>) -> LoadPlan {
+        LoadPlan {
+            entry: 0x400000,
+            interpreter: None,
+            program_header_address: None,
+            program_header_entry_size: 56,
+            program_header_count: segments.len() as u16,
+            segments,
+            load_bias: 0,
+            e_type: ElfType::Exec,
+        }
+    }
+
+    fn seg(vaddr: u64, memsz: u64, write: bool, exec: bool) -> LoadSegment {
+        LoadSegment {
+            file_offset: 0,
+            virtual_address: vaddr,
+            file_size: memsz,
+            memory_size: memsz,
+            alignment: 0x1000,
+            perms: SegmentPerms {
+                read: true,
+                write,
+                execute: exec,
+            },
+        }
+    }
+
+    #[test]
+    fn ro_page_spans_cover_readonly_segments_pagewise() {
+        // RX text + R rodata + RW data, all page-aligned: the two read-only
+        // segments become page-rounded RO spans with their exec bit; the RW
+        // segment contributes nothing.
+        let plan = plan_with_segments(vec![
+            seg(0x400000, 0x2000, false, true),  // text RX
+            seg(0x402000, 0x1000, false, false), // rodata R
+            seg(0x403000, 0x1000, true, false),  // data RW
+        ]);
+        let spans = ro_page_spans(&plan);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            (spans[0].start, spans[0].len, spans[0].exec),
+            (0x400000, 0x2000, true)
+        );
+        assert_eq!(
+            (spans[1].start, spans[1].len, spans[1].exec),
+            (0x402000, 0x1000, false)
+        );
+    }
+
+    #[test]
+    fn ro_page_spans_drop_pages_shared_with_a_writable_segment() {
+        // The rodata segment ends mid-page and the data segment starts on the
+        // same page: Linux's later RW mapping leaves that page writable, so
+        // the RO span must be clipped to the fully-read-only pages.
+        let plan = plan_with_segments(vec![
+            seg(0x400000, 0x1800, false, false), // R, ends mid-page 0x401xxx
+            seg(0x401800, 0x800, true, false),   // RW, starts on that page
+        ]);
+        let spans = ro_page_spans(&plan);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].len), (0x400000, 0x1000));
+    }
+
+    #[test]
+    fn ro_page_spans_exec_wins_on_a_page_shared_by_rx_and_r_segments() {
+        // RX text tail and R rodata head share a page: both are read-only, but
+        // the shared page must stay EXECUTABLE (NX would fault the text tail).
+        let plan = plan_with_segments(vec![
+            seg(0x400000, 0x1800, false, true),  // RX, ends mid-page 0x401xxx
+            seg(0x401800, 0x1800, false, false), // R, starts on that page
+        ]);
+        let mut spans = ro_page_spans(&plan);
+        spans.sort_by_key(|s| s.start);
+        // Every page is read-only; the shared page 0x401000 belongs to an
+        // exec span, and the non-exec remainder starts at 0x402000.
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.exec && s.start == 0x400000 && s.len == 0x2000)
+        );
+        assert!(
+            spans.iter().all(|s| s.exec || s.start >= 0x402000),
+            "non-exec span must not cover the shared text page: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn ro_page_spans_ignore_unreadable_and_empty_segments() {
+        let plan = plan_with_segments(vec![
+            seg(0x400000, 0, false, false), // empty
+            LoadSegment {
+                perms: SegmentPerms {
+                    read: false,
+                    write: false,
+                    execute: false,
+                },
+                ..seg(0x500000, 0x1000, false, false)
+            },
+        ]);
+        assert!(ro_page_spans(&plan).is_empty());
     }
 
     /// `plan_elf_load_bytes_for` with EM_AARCH64 rejects an x86_64 header —

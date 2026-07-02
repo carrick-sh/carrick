@@ -601,6 +601,16 @@ pub struct AddressSpace {
     /// until an initial stack is built.
     #[serde(skip)]
     linux_auxv_image: Vec<u8>,
+    /// Page-granular read-only spans of the loaded ELF images (main binary +
+    /// interpreter): the pages of their non-writable `PT_LOAD` segments. The
+    /// merged host regions escalate perms (the HVF stage-2 quirk workaround),
+    /// so guest-visible write protection for `.text`/`.rodata` is re-applied
+    /// from these spans at the page-table leaf level:
+    /// [`AddressSpace::with_stage1_page_tables`] bakes them into the aarch64
+    /// stage-1 boot image; the x86 backends bake them into the PML4 via
+    /// `plan_windows`/`build_pml4`. Empty for non-ELF images.
+    #[serde(skip)]
+    ro_spans: Vec<crate::elf::RoSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -736,11 +746,13 @@ impl AddressSpace {
 
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
         let linux_auxv = linux_auxv_from_load_plan(&plan, None);
+        let ro_spans = crate::elf::ro_page_spans(&plan);
         let mut regions = regions_from_load_plan(file, &plan)?;
         regions.extend(linux_runtime_regions()?);
 
         let mut image = Self::from_regions(plan.entry, regions)?;
         image.linux_auxv = linux_auxv;
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
@@ -753,12 +765,14 @@ impl AddressSpace {
         let mut regions = regions_from_load_plan(file, &plan)?;
         let mut entry = plan.entry;
         let mut interpreter_base = None;
+        let mut ro_spans = crate::elf::ro_page_spans(&plan);
 
         if let Some(interpreter_path) = plan.interpreter.as_deref() {
             let interpreter = read_interp(interpreter_path)
                 .ok_or_else(|| AddressSpaceError::Io(std::io::ErrorKind::NotFound.into()))?;
             let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)?
                 .with_load_bias(LINUX_INTERPRETER_BASE);
+            ro_spans.extend(crate::elf::ro_page_spans(&interpreter_plan));
             regions.extend(regions_from_load_plan(&interpreter, &interpreter_plan)?);
             entry = interpreter_plan.entry;
             interpreter_base = Some(LINUX_INTERPRETER_BASE);
@@ -768,6 +782,7 @@ impl AddressSpace {
         let linux_auxv = linux_auxv_from_load_plan(&plan, interpreter_base);
         let mut image = Self::from_regions(entry, regions)?;
         image.linux_auxv = linux_auxv;
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
@@ -831,6 +846,7 @@ impl AddressSpace {
             stage1_page_tables_base: None,
             linux_auxv: Vec::new(),
             linux_auxv_image: Vec::new(),
+            ro_spans: Vec::new(),
         })
     }
 
@@ -877,6 +893,14 @@ impl AddressSpace {
 
     pub fn regions(&self) -> &[MemoryRegion] {
         &self.regions
+    }
+
+    /// Page-granular read-only spans of the loaded ELF images (non-writable
+    /// `PT_LOAD` pages). The x86 backends bake these into the PML4 leaves
+    /// (`plan_windows` → `build_pml4`); the aarch64 stage-1 boot image bakes
+    /// them in [`AddressSpace::with_stage1_page_tables`].
+    pub fn ro_spans(&self) -> &[crate::elf::RoSpan] {
+        &self.ro_spans
     }
 
     pub fn initial_stack_pointer(&self) -> Option<u64> {
@@ -944,6 +968,7 @@ impl AddressSpace {
             linux_auxv_image,
             el1_vectors_base,
             stage1_page_tables_base,
+            ro_spans,
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -956,6 +981,7 @@ impl AddressSpace {
         image.el0_trampoline_entry = Some(LINUX_EL0_TRAMPOLINE_BASE);
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
@@ -1010,6 +1036,7 @@ impl AddressSpace {
             linux_auxv_image,
             el0_trampoline_entry,
             stage1_page_tables_base,
+            ro_spans,
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -1019,6 +1046,7 @@ impl AddressSpace {
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = Some(LINUX_EL1_VECTORS_BASE);
         image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
@@ -1065,6 +1093,7 @@ impl AddressSpace {
             el0_trampoline_entry,
             el1_vectors_base,
             stage1_page_tables_base,
+            ro_spans,
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -1074,14 +1103,52 @@ impl AddressSpace {
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
     /// Append the stage-1 identity-mapping page tables region. The vCPU
     /// uses these so EL0/EL1 data accesses are tagged as Normal cacheable
     /// memory (required for `ldaxr`/`stlxr`).
+    ///
+    /// The loaded ELF images' read-only spans (`.text`/`.rodata` pages — see
+    /// [`AddressSpace::ro_spans`]) are baked into the boot image here, BEFORE
+    /// it is mapped or any vCPU runs (so no TLB maintenance is owed): a guest
+    /// store to its own `.rodata` then takes a stage-1 permission fault →
+    /// SIGSEGV/SEGV_ACCERR, exactly as on Linux. Coalescing is suppressed
+    /// during the edit so the spare-table pool stays sequentially allocated —
+    /// the runtime `PageTableManager` is later rebuilt from these live bytes
+    /// and re-discovers its bump cursor from the last non-zero spare page.
     pub fn with_stage1_page_tables(self) -> Result<Self, AddressSpaceError> {
-        let bytes = stage1_identity_page_tables();
+        let bytes = if self.ro_spans.is_empty() {
+            stage1_identity_page_tables()
+        } else {
+            let mut mgr = crate::page_table::PageTableManager::new(
+                stage1_identity_page_tables(),
+                LINUX_PAGE_TABLES_BASE,
+            );
+            mgr.set_multi_vcpu(true); // no coalesce: keep spare allocation sequential
+            for span in &self.ro_spans {
+                // Clamp below the null guard (never mapped; nothing to protect).
+                let start = span.start.max(LINUX_NULL_GUARD_END);
+                let Some(end) = span.start.checked_add(span.len) else {
+                    continue;
+                };
+                if end <= start {
+                    continue;
+                }
+                let Ok(len) = usize::try_from(end - start) else {
+                    continue;
+                };
+                // Best-effort per span: a span the identity map cannot express
+                // (BadAddress) is skipped — protection is an upgrade and must
+                // never block boot. OutOfTables is likewise skipped: the spare
+                // pool comfortably covers real images, and a pathological one
+                // degrades to the historical (writable) behaviour.
+                let _ = mgr.set_readonly(start, len, span.exec);
+            }
+            mgr.into_bytes()
+        };
         let start = LINUX_PAGE_TABLES_BASE;
         let end =
             start
@@ -1125,6 +1192,7 @@ impl AddressSpace {
             linux_auxv_image,
             el0_trampoline_entry,
             el1_vectors_base,
+            ro_spans,
             ..
         } = self;
         let mut image =
@@ -1135,6 +1203,7 @@ impl AddressSpace {
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = Some(LINUX_PAGE_TABLES_BASE);
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
@@ -1196,6 +1265,7 @@ impl AddressSpace {
             el0_trampoline_entry,
             el1_vectors_base,
             stage1_page_tables_base,
+            ro_spans,
         } = self;
         let mut image =
             Self::from_regions(entry, regions.into_iter().chain([vvar, vdso]).collect())?;
@@ -1205,6 +1275,7 @@ impl AddressSpace {
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
@@ -1281,6 +1352,7 @@ impl AddressSpace {
             el0_trampoline_entry,
             el1_vectors_base,
             stage1_page_tables_base,
+            ro_spans,
             ..
         } = self;
         let argv = argv
@@ -1306,6 +1378,7 @@ impl AddressSpace {
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
         Ok(image)
     }
 
@@ -2536,6 +2609,37 @@ mod loader_tests {
         fill_random_bytes(&mut bytes).unwrap();
 
         assert_ne!(bytes, [0u8; 16]);
+    }
+
+    #[test]
+    fn load_elf_records_ro_spans_and_stage1_tables_bake_them_readonly() {
+        // The synthetic ELF has ONE non-writable (R+X) LOAD at 0x400000: the
+        // loader must record its page span, and `with_stage1_page_tables` must
+        // bake it into the boot image as AP=RO leaves — a guest store to its
+        // own .text/.rodata then takes a stage-1 permission fault (SIGSEGV/
+        // SEGV_ACCERR) instead of silently succeeding. Pages outside the span
+        // keep the identity map's default AP=RW.
+        let elf = synthetic_elf(ET_EXEC_TYPE, 183, 0x400000, 0x400000, None);
+        let image = AddressSpace::load_elf_bytes(&elf).unwrap();
+        assert_eq!(image.ro_spans().len(), 1);
+        let span = image.ro_spans()[0];
+        assert_eq!((span.start, span.len, span.exec), (0x400000, 0x1000, true));
+
+        let image = image.with_stage1_page_tables().unwrap();
+        let pt_region = image
+            .regions()
+            .iter()
+            .find(|r| r.start == LINUX_PAGE_TABLES_BASE)
+            .expect("stage-1 page-table region");
+        let mut mgr = crate::page_table::PageTableManager::new(
+            pt_region.bytes().to_vec(),
+            LINUX_PAGE_TABLES_BASE,
+        );
+        const AP_RO: u64 = 0b11 << 6; // AP[2:1]=11: RO at EL0+EL1
+        const AP_RW: u64 = 0b01 << 6; // AP[2:1]=01: RW at EL0+EL1
+        assert_eq!(mgr.ap_bits(0x400000), AP_RO, "RO span leaf is read-only");
+        assert_eq!(mgr.ap_bits(0x401000), AP_RW, "page past the span stays RW");
+        assert!(mgr.is_valid(0x400000), "RO leaf is still mapped");
     }
 
     #[test]
