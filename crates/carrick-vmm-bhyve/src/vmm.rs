@@ -732,18 +732,49 @@ impl BhyveSharedVm {
         Ok((BhyveVcpu { vcpu }, id))
     }
 
-    /// Re-open an ALREADY-activated vCPU id for the M:N reclaim re-bind: just the
-    /// handle — NO `vm_activate_cpu` (the id persists for the VM's life) and NO
-    /// `vcpu_reset` (a recycled vCPU keeps its long-mode control regs; the caller
-    /// restores only the per-thread GPRs/RSP/RFLAGS/FS-GS-base it saved).
-    pub fn reopen_vcpu(&self, id: c_int) -> Result<BhyveVcpu, OsError> {
+    /// Re-open a vCPU id for the M:N reclaim re-bind.
+    ///
+    /// For an id that was already materialized on this VM (a prior thread
+    /// spawned on it) this is just the handle — NO `vm_activate_cpu` (the id
+    /// persists for the VM's life) and NO `vcpu_reset` (a recycled vCPU keeps
+    /// its long-mode control regs; the caller restores only the per-thread
+    /// GPRs/RSP/RFLAGS/FS-GS-base it saved). Returns `fresh = false`.
+    ///
+    /// For a FRESH id — one the M:N pool granted to a reclaim re-bind before
+    /// any thread spawn ever materialized it (observed live under go-build: a
+    /// post-execve fresh VM has only vCPUs 0..k activated, and the LIFO free
+    /// list hands the rebinding thread a higher never-used id) — the kernel
+    /// vCPU is NOT in the VM's `active_cpus`, and `VM_RUN` refuses it with
+    /// EINVAL (its first check; register reads/WRITES on such a vCPU succeed,
+    /// so a restore never notices — proven by an on-box C probe and a live
+    /// dtrace capture: EINVAL on vcpuid 4 with active=0xf). Activate it here
+    /// (+ `vcpu_reset`, mirroring `add_sibling_vcpu`) and return
+    /// `fresh = true` so the caller performs the full long-mode bring-up
+    /// before restoring per-thread state into it.
+    ///
+    /// (A borrowed vfork-child inner treats every id as activated — a vfork
+    /// child never reclaims before its execve/_exit — so this stays a plain
+    /// reopen there, as before.)
+    pub fn reopen_vcpu(&self, id: c_int) -> Result<(BhyveVcpu, bool), OsError> {
         let vcpu = unsafe { vm_vcpu_open(self.0.ctx, id) };
         if vcpu.is_null() {
             return Err(OsError::new(format!(
                 "bhyve: reopen vm_vcpu_open({id}) NULL"
             )));
         }
-        Ok(BhyveVcpu { vcpu })
+        let bit = if id < 64 { 1u64 << id } else { 0 };
+        let fresh = bit != 0 && (self.0.activated.fetch_or(bit, Ordering::SeqCst) & bit) == 0;
+        if fresh {
+            // SAFETY: `vcpu` is the just-opened vcpu handle.
+            let rc = unsafe { vm_activate_cpu(vcpu) };
+            if rc != 0 {
+                self.0.activated.fetch_and(!bit, Ordering::SeqCst);
+                return Err(os_err("vm_activate_cpu (reclaim reopen)", rc));
+            }
+            // Power-on base state, exactly like a first `add_sibling_vcpu`.
+            let _ = unsafe { vcpu_reset(vcpu) };
+        }
+        Ok((BhyveVcpu { vcpu }, fresh))
     }
 }
 
