@@ -8,7 +8,7 @@
 //! vCPU — the SAME publish+kick the runtime's `timer_delivery::deliver` performs.
 use std::sync::Arc;
 
-use carrick_hal::{PosixTimerSpec, ThreadId, TimerArm, TimerDelivery, VcpuRegistry};
+use carrick_hal::{PosixTimerSpec, ThreadId, TimerArm, TimerDelivery, TimerSpecNs, VcpuRegistry};
 
 pub struct KvmTimerDelivery {
     /// The live-vCPU registry used to force the target out of `KVM_RUN` on a
@@ -28,8 +28,7 @@ impl TimerDelivery for KvmTimerDelivery {
     fn arm_itimer(
         &self,
         _which: usize,
-        _value_ns: u64,
-        _interval_ns: u64,
+        _spec: TimerSpecNs,
         _needs_periodic: bool,
         _signum: i32,
     ) -> bool {
@@ -40,9 +39,9 @@ impl TimerDelivery for KvmTimerDelivery {
         carrick_timer_core::itimer::disarm(which);
     }
 
-    fn arm_posix(&self, id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixTimerSpec> {
-        let armed = carrick_timer_core::posix::arm(id, value_ns, interval_ns)?;
-        if value_ns > 0 {
+    fn arm_posix(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
+        let armed = carrick_timer_core::posix::arm(id, spec)?;
+        if spec.value > 0 {
             let signum = armed.signum;
             let generation = armed.generation;
             let slot = armed.slot.clone();
@@ -58,13 +57,7 @@ impl TimerDelivery for KvmTimerDelivery {
             let _ = std::thread::Builder::new()
                 .name(format!("carrick-ptimer-{id}"))
                 .spawn(move || {
-                    carrick_timer_core::posix::run_fallback(
-                        slot,
-                        generation,
-                        value_ns,
-                        interval_ns,
-                        on_fire,
-                    );
+                    carrick_timer_core::posix::run_fallback(slot, generation, spec, on_fire);
                 });
         }
         Some(armed.old)
@@ -73,7 +66,7 @@ impl TimerDelivery for KvmTimerDelivery {
     fn disarm_posix(&self, id: i32) {
         // A zero-value arm disarms (bumps generation so the firing thread
         // retires); the previous spec is discarded.
-        let _ = carrick_timer_core::posix::arm(id, 0, 0);
+        let _ = carrick_timer_core::posix::arm(id, TimerSpecNs::DISARM);
     }
 
     fn current_arm(&self, which: usize) -> Option<TimerArm> {

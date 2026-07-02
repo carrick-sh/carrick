@@ -338,7 +338,7 @@ pub fn spawn_signal_pump(
                                 let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
                                     ident,
                                     libc::EV_ADD | libc::EV_ONESHOT,
-                                    i64::try_from(delay_ns.max(1)).unwrap_or(i64::MAX),
+                                    i64::try_from(delay_ns.raw().max(1)).unwrap_or(i64::MAX),
                                 )
                                 .with_udata_u64(crate::itimer::generation(which))]);
                                 continue;
@@ -347,14 +347,17 @@ pub fn spawn_signal_pump(
                             crate::probes::itimer_fire(signum, 0);
                             crate::host_signal::publish_process_signal(signum);
                             if cpu_timer {
+                                // The repeat interval of a CPU timer is a guest
+                                // CPU budget, converted to a wall-clock recheck.
                                 let interval = crate::itimer::interval_ns(which);
                                 if interval > 0 {
-                                    let delay_ns =
-                                        crate::itimer::cpu_timer_recheck_delay_ns(interval);
+                                    let delay_ns = crate::itimer::cpu_timer_recheck_delay_ns(
+                                        carrick_timer_core::CpuNs(interval),
+                                    );
                                     let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
                                         ident,
                                         libc::EV_ADD | libc::EV_ONESHOT,
-                                        i64::try_from(delay_ns).unwrap_or(i64::MAX),
+                                        i64::try_from(delay_ns.raw()).unwrap_or(i64::MAX),
                                     )
                                     .with_udata_u64(crate::itimer::generation(which))]);
                                 } else {

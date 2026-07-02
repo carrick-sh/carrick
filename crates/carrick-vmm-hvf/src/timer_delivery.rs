@@ -5,7 +5,8 @@
 //! wall-clock fallback thread. POSIX per-process timers delegate to the existing
 //! HVF `posix_timer::arm` (its own firing thread). The neutral slot mutation is
 //! the timer-core's; this struct only owns the kqueue glue.
-use carrick_hal::{PosixTimerSpec, TimerArm, TimerDelivery};
+use carrick_hal::{PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
+use carrick_timer_core::{CpuNs, WallNs};
 
 pub struct HvfTimerDelivery;
 
@@ -21,8 +22,7 @@ impl TimerDelivery for HvfTimerDelivery {
     fn arm_itimer(
         &self,
         which: usize,
-        value_ns: u64,
-        interval_ns: u64,
+        spec: TimerSpecNs,
         _needs_periodic: bool,
         _signum: i32,
     ) -> bool {
@@ -35,19 +35,20 @@ impl TimerDelivery for HvfTimerDelivery {
         // Darwin — re-arming it never counts down — so each arm uses a new ident.
         let ident = crate::itimer::live_ident(which);
         let cpu_timer = crate::itimer::is_cpu_timer(which);
-        // CPU timers can't fire on a wall-clock deadline; arm a recheck one-shot
-        // so the pump re-evaluates guest-CPU progress instead of consuming it.
+        // CPU timers can't fire on a wall-clock deadline (spec.value is a guest
+        // CPU budget there); arm a recheck one-shot so the pump re-evaluates
+        // guest-CPU progress instead of consuming it.
         let kqueue_value_ns = if cpu_timer {
-            crate::itimer::cpu_timer_recheck_delay_ns(value_ns)
+            crate::itimer::cpu_timer_recheck_delay_ns(CpuNs(spec.value))
         } else {
-            value_ns
+            WallNs(spec.value)
         };
-        let value_i64 = i64::try_from(kqueue_value_ns).unwrap_or(i64::MAX);
-        let interval_i64 = i64::try_from(interval_ns).unwrap_or(i64::MAX);
+        let value_i64 = i64::try_from(kqueue_value_ns.raw()).unwrap_or(i64::MAX);
+        let interval_i64 = i64::try_from(spec.interval).unwrap_or(i64::MAX);
         // Pure-periodic ⇔ it_value == it_interval (and not a CPU timer): one EV_ADD
         // periodic kevent covers every expiry. Otherwise (one-shot, or two-phase
         // it_value != it_interval) arm a one-shot; the pump re-arms as needed.
-        let periodic = interval_ns != 0 && value_ns == interval_ns && !cpu_timer;
+        let periodic = spec.interval != 0 && spec.value == spec.interval && !cpu_timer;
         let (flags, data) = if periodic {
             (libc::EV_ADD, interval_i64)
         } else {
@@ -86,15 +87,15 @@ impl TimerDelivery for HvfTimerDelivery {
         }
     }
 
-    fn arm_posix(&self, id: i32, value_ns: u64, interval_ns: u64) -> Option<PosixTimerSpec> {
+    fn arm_posix(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
         // The HVF posix arm already spawns its own wall-clock firing thread
         // (publish_process_signal on each expiry) and returns the previous spec.
-        crate::posix_timer::arm(id, value_ns, interval_ns)
+        crate::posix_timer::arm(id, spec)
     }
 
     fn disarm_posix(&self, id: i32) {
         // A zero-value arm disarms (generation bump retires the firing thread).
-        let _ = crate::posix_timer::arm(id, 0, 0);
+        let _ = crate::posix_timer::arm(id, TimerSpecNs::DISARM);
     }
 
     fn current_arm(&self, which: usize) -> Option<TimerArm> {
