@@ -283,10 +283,6 @@ fn forward_record_lock<M: GuestMemory>(
     linux_cmd: u64,
     arg: u64,
 ) -> DispatchOutcome {
-    const LINUX_F_RDLCK: i16 = 0;
-    const LINUX_F_WRLCK: i16 = 1;
-    const LINUX_F_UNLCK: i16 = 2;
-
     // OFD locks (F_OFD_*) are owned by the open file description, not the process.
     // macOS has them natively (F_OFD_SETLK/SETLKW/GETLK = 90/91/92), so we forward
     // exactly like the classic commands; the only divergence is that F_OFD_GETLK
@@ -318,8 +314,9 @@ fn forward_record_lock<M: GuestMemory>(
     }
     // struct flock.l_type is c_short (i16) on both OSes, but the libc F_*LCK
     // constants are i16 on Darwin / i32 on Linux — narrow to the field width.
+    // (The LINUX_F_*LCK consts are i32, so widen the guest i16 for the match.)
     #[allow(clippy::unnecessary_cast)] // libc F_*LCK: i16 on Darwin, i32 on Linux
-    let l_type_host: i16 = match l_type_linux {
+    let l_type_host: i16 = match i32::from(l_type_linux) {
         LINUX_F_RDLCK => libc::F_RDLCK as i16,
         LINUX_F_WRLCK => libc::F_WRLCK as i16,
         LINUX_F_UNLCK => libc::F_UNLCK as i16,
@@ -355,9 +352,10 @@ fn forward_record_lock<M: GuestMemory>(
             // except l_type = F_UNLCK — in particular l_pid keeps the value the
             // caller passed (LTP fcntl05 pre-sets l_pid = getpid() and checks it
             // survives). carrick previously rewrote the whole struct from the
-            // macOS flock result, which zeroes l_pid. Touch only l_type@0.
+            // macOS flock result, which zeroes l_pid. Touch only l_type@0
+            // (an i16 field, so narrow the i32 const to 2 wire bytes).
             if memory
-                .write_bytes(arg, &LINUX_F_UNLCK.to_le_bytes())
+                .write_bytes(arg, &(LINUX_F_UNLCK as i16).to_le_bytes())
                 .is_err()
             {
                 return DispatchOutcome::errno(LINUX_EFAULT);
@@ -366,9 +364,9 @@ fn forward_record_lock<M: GuestMemory>(
             // Conflicting lock found: report its full details (Linux fills the
             // whole struct, including the holder's l_pid).
             let l_type_back: i16 = if host_type == libc::F_RDLCK as i32 {
-                LINUX_F_RDLCK
+                LINUX_F_RDLCK as i16
             } else {
-                LINUX_F_WRLCK
+                LINUX_F_WRLCK as i16
             };
             let mut out = [0u8; 32];
             out[0..2].copy_from_slice(&l_type_back.to_le_bytes());
@@ -436,9 +434,18 @@ fn tee_host_passthrough(
     in_fd: HostFd,
     out_fd: HostFd,
     count: usize,
-    flags: u64,
+    flags: LinuxSpliceFlags,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let n = unsafe { libc::tee(in_fd.get(), out_fd.get(), count, flags as libc::c_uint) };
+    // Raw escape at the libc boundary: Linux SPLICE_F_* values are identical
+    // to the guest's, so the bits pass straight through.
+    let n = unsafe {
+        libc::tee(
+            in_fd.get(),
+            out_fd.get(),
+            count,
+            flags.bits() as libc::c_uint,
+        )
+    };
     Ok(DispatchOutcome::Returned {
         value: n.host_syscall_errno()? as i64,
     })
@@ -449,7 +456,7 @@ fn tee_host_passthrough(
     _in_fd: HostFd,
     _out_fd: HostFd,
     _count: usize,
-    _flags: u64,
+    _flags: LinuxSpliceFlags,
 ) -> Result<DispatchOutcome, DispatchError> {
     Ok(crate::linux_abi::LINUX_ENOSYS.into())
 }
@@ -676,20 +683,17 @@ fn host_inet4_interfaces() -> Vec<HostInet4Iface> {
 /// Linux; MULTICAST differs (BSD 0x8000 vs Linux 0x1000) — translate by name
 /// via the host's `libc::IFF_*` so this is correct on every host.
 fn host_iff_to_linux(flags_host: u32) -> u16 {
-    const LINUX_IFF_UP: u16 = 0x1;
-    const LINUX_IFF_BROADCAST: u16 = 0x2;
-    const LINUX_IFF_DEBUG: u16 = 0x4;
-    const LINUX_IFF_LOOPBACK: u16 = 0x8;
-    const LINUX_IFF_POINTOPOINT: u16 = 0x10;
-    const LINUX_IFF_RUNNING: u16 = 0x40;
-    const LINUX_IFF_NOARP: u16 = 0x80;
-    const LINUX_IFF_PROMISC: u16 = 0x100;
-    const LINUX_IFF_MULTICAST: u16 = 0x1000;
+    // The Linux IFF_* consts are u32 in carrick-abi; `ifr_flags` is a u16
+    // field, and every translated bit (<= 0x1000) fits the narrow width.
+    use crate::linux_abi::{
+        LINUX_IFF_BROADCAST, LINUX_IFF_DEBUG, LINUX_IFF_LOOPBACK, LINUX_IFF_MULTICAST,
+        LINUX_IFF_NOARP, LINUX_IFF_POINTOPOINT, LINUX_IFF_PROMISC, LINUX_IFF_RUNNING, LINUX_IFF_UP,
+    };
     let h = flags_host as i32;
     let mut out: u16 = 0;
-    let set = |out: &mut u16, host_bit: i32, linux_bit: u16| {
+    let set = |out: &mut u16, host_bit: i32, linux_bit: u32| {
         if h & host_bit != 0 {
-            *out |= linux_bit;
+            *out |= linux_bit as u16;
         }
     };
     set(&mut out, libc::IFF_UP, LINUX_IFF_UP);
@@ -6883,9 +6887,11 @@ impl SyscallDispatcher {
             // the host tee(2) — exact, fork-coherent semantics with no userspace
             // ring to peek. macOS has no tee(2): it stays ENOSYS (as before).
             let _ = cx;
-            if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
+            // `from_bits` rejects exactly the historical `& !SUPPORTED` set:
+            // the type's full set IS the supported set.
+            let Some(splice_flags) = LinuxSpliceFlags::from_bits(flags) else {
                 return Ok(LINUX_EINVAL.into());
-            }
+            };
             // Both fds must be pipes — fd_in a READ end, fd_out a WRITE end —
             // else EINVAL (tee01 setup). The read and write end of the SAME pipe
             // object is also EINVAL (tee02), detected via the shared pipe_id.
@@ -6902,7 +6908,7 @@ impl SyscallDispatcher {
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            tee_host_passthrough(in_fd, out_fd, count, flags)
+            tee_host_passthrough(in_fd, out_fd, count, splice_flags)
 
         }
 
@@ -6916,7 +6922,9 @@ impl SyscallDispatcher {
             let count =
                 usize::try_from(len).map_err(|_| DispatchError::LengthTooLarge(len))?;
             let memory = &mut *cx.memory;
-            if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
+            // `from_bits` rejects exactly the historical `& !SUPPORTED` set:
+            // the type's full set IS the supported set.
+            if LinuxSpliceFlags::from_bits(flags).is_none() {
                 return Ok(LINUX_EINVAL.into());
             }
             // A closed/negative fd_in is EBADF before any routing — the
@@ -7119,15 +7127,17 @@ impl SyscallDispatcher {
             // for our copy-based path (no zero-copy page stealing); SPLICE_F_NONBLOCK
             // forces EAGAIN rather than blocking. A valid non-pipe fd is EINVAL; a
             // bad fd is EBADF.
-            if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
+            // `from_bits` rejects exactly the historical `& !SUPPORTED` set:
+            // the type's full set IS the supported set.
+            let Some(splice_flags) = LinuxSpliceFlags::from_bits(flags) else {
                 return Ok(LINUX_EINVAL.into());
-            }
+            };
             let tid = cx.tid();
             let nr =
                 usize::try_from(nr_segs).map_err(|_| DispatchError::LengthTooLarge(nr_segs))?;
             let memory = &mut *cx.memory;
             let iovecs = read_iovecs(memory, iov.0, nr)?;
-            let nonblocking = flags & LINUX_SPLICE_F_NONBLOCK != 0;
+            let nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK);
 
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(LINUX_EBADF.into());
