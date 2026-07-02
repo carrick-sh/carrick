@@ -105,13 +105,15 @@ pub(super) fn read_epoll_event(
 /// always-reported EPOLLHUP/EPOLLERR edges (which ride the read filter) are
 /// observed; RDHUP/PRI also ride the read/oob filters. (Mirrors the old
 /// `epoll_kq_filters` read-fallback exactly.)
-pub(super) fn epoll_interest_for(events: u32) -> carrick_hal::event::Interest {
-    let write = events & LINUX_EPOLLOUT != 0;
-    let read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0 || !write;
+pub(super) fn epoll_interest_for(events: LinuxEpollEvents) -> carrick_hal::event::Interest {
+    let write = events.contains(LinuxEpollEvents::OUT);
+    let read = events
+        .intersects(LinuxEpollEvents::IN | LinuxEpollEvents::RDHUP | LinuxEpollEvents::PRI)
+        || !write;
     carrick_hal::event::Interest {
         read,
         write,
-        oob: events & LINUX_EPOLLPRI != 0,
+        oob: events.contains(LinuxEpollEvents::PRI),
     }
 }
 
@@ -124,8 +126,8 @@ pub(super) fn epoll_interest_for(events: u32) -> carrick_hal::event::Interest {
     ),
     allow(dead_code)
 )]
-pub(super) fn epoll_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode {
-    if events & LINUX_EPOLLET != 0 {
+pub(super) fn epoll_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event::TriggerMode {
+    if events.contains(LinuxEpollEvents::ET) {
         carrick_hal::event::TriggerMode::Edge
     } else {
         carrick_hal::event::TriggerMode::Level
@@ -144,7 +146,9 @@ pub(super) fn epoll_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
-pub(super) fn epoll_host_trigger_mode(_events: u32) -> carrick_hal::event::TriggerMode {
+pub(super) fn epoll_host_trigger_mode(
+    _events: LinuxEpollEvents,
+) -> carrick_hal::event::TriggerMode {
     carrick_hal::event::TriggerMode::Level
 }
 
@@ -153,7 +157,7 @@ pub(super) fn epoll_host_trigger_mode(_events: u32) -> carrick_hal::event::Trigg
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 )))]
-pub(super) fn epoll_host_trigger_mode(events: u32) -> carrick_hal::event::TriggerMode {
+pub(super) fn epoll_host_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event::TriggerMode {
     epoll_trigger_mode(events)
 }
 
@@ -950,32 +954,34 @@ fn masked_network(addr: &[u8], prefixlen: u8) -> Vec<u8> {
 }
 
 pub(super) fn linux_to_host_msg_flags(flags: i32) -> i32 {
+    // from_bits_retain: Linux send/recv IGNORE unknown msg_flags bits, and so
+    // does this translation (untranslated bits simply don't map to host bits).
+    let flags = LinuxMsgFlags::from_bits_retain(flags);
     let mut out = 0;
-    if flags & LINUX_MSG_OOB != 0 {
+    if flags.contains(LinuxMsgFlags::OOB) {
         out |= libc::MSG_OOB;
     }
-    if flags & LINUX_MSG_PEEK != 0 {
+    if flags.contains(LinuxMsgFlags::PEEK) {
         out |= libc::MSG_PEEK;
     }
-    if flags & LINUX_MSG_DONTROUTE != 0 {
+    if flags.contains(LinuxMsgFlags::DONTROUTE) {
         out |= libc::MSG_DONTROUTE;
     }
-    if flags & LINUX_MSG_TRUNC != 0 {
+    if flags.contains(LinuxMsgFlags::TRUNC) {
         out |= libc::MSG_TRUNC;
     }
-    if flags & LINUX_MSG_DONTWAIT != 0 {
+    if flags.contains(LinuxMsgFlags::DONTWAIT) {
         out |= libc::MSG_DONTWAIT;
     }
-    if flags & LINUX_MSG_EOR != 0 {
+    if flags.contains(LinuxMsgFlags::EOR) {
         out |= libc::MSG_EOR;
     }
-    if flags & LINUX_MSG_WAITALL != 0 {
+    if flags.contains(LinuxMsgFlags::WAITALL) {
         out |= libc::MSG_WAITALL;
     }
     // MSG_NOSIGNAL is Linux-only. macOS expresses the equivalent via
     // SO_NOSIGPIPE on the socket; ignoring the flag is the best we can
     // do here. Likewise MSG_CMSG_CLOEXEC has no macOS equivalent.
-    let _ = (LINUX_MSG_NOSIGNAL, LINUX_MSG_CMSG_CLOEXEC);
     out
 }
 
@@ -2228,15 +2234,16 @@ mod tests {
 
     #[test]
     fn message_flag_translation_maps_supported_flags_and_ignores_linux_only_flags() {
-        let flags = LINUX_MSG_OOB
-            | LINUX_MSG_PEEK
-            | LINUX_MSG_DONTROUTE
-            | LINUX_MSG_TRUNC
-            | LINUX_MSG_DONTWAIT
-            | LINUX_MSG_EOR
-            | LINUX_MSG_WAITALL
-            | LINUX_MSG_NOSIGNAL
-            | LINUX_MSG_CMSG_CLOEXEC;
+        let flags = (LinuxMsgFlags::OOB
+            | LinuxMsgFlags::PEEK
+            | LinuxMsgFlags::DONTROUTE
+            | LinuxMsgFlags::TRUNC
+            | LinuxMsgFlags::DONTWAIT
+            | LinuxMsgFlags::EOR
+            | LinuxMsgFlags::WAITALL
+            | LinuxMsgFlags::NOSIGNAL
+            | LinuxMsgFlags::CMSG_CLOEXEC)
+            .bits();
 
         let host = linux_to_host_msg_flags(flags);
         assert_eq!(host & libc::MSG_OOB, libc::MSG_OOB);
@@ -2333,7 +2340,7 @@ mod tests {
     fn epoll_interest_selection_preserves_hup_err_observability() {
         use carrick_hal::event::Interest;
         assert_eq!(
-            epoll_interest_for(0),
+            epoll_interest_for(LinuxEpollEvents::empty()),
             Interest {
                 read: true,
                 write: false,
@@ -2341,7 +2348,7 @@ mod tests {
             }
         );
         assert_eq!(
-            epoll_interest_for(LINUX_EPOLLIN),
+            epoll_interest_for(LinuxEpollEvents::IN),
             Interest {
                 read: true,
                 write: false,
@@ -2349,7 +2356,7 @@ mod tests {
             }
         );
         assert_eq!(
-            epoll_interest_for(LINUX_EPOLLOUT),
+            epoll_interest_for(LinuxEpollEvents::OUT),
             Interest {
                 read: false,
                 write: true,
@@ -2357,7 +2364,7 @@ mod tests {
             }
         );
         assert_eq!(
-            epoll_interest_for(LINUX_EPOLLIN | LINUX_EPOLLOUT),
+            epoll_interest_for(LinuxEpollEvents::IN | LinuxEpollEvents::OUT),
             Interest {
                 read: true,
                 write: true,
@@ -2365,7 +2372,7 @@ mod tests {
             }
         );
         assert_eq!(
-            epoll_interest_for(LINUX_EPOLLPRI),
+            epoll_interest_for(LinuxEpollEvents::PRI),
             Interest {
                 read: true,
                 write: false,

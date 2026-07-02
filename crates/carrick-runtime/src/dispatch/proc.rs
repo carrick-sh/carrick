@@ -1416,8 +1416,6 @@ impl SyscallDispatcher {
             let thread = cx.thread;
             let tid = cx.tid();
             let memory = &mut *cx.memory;
-            const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
-            const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
             let raw_command = operation & LINUX_FUTEX_CMD_MASK;
             let command = match raw_command {
                 LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
@@ -1854,13 +1852,13 @@ impl SyscallDispatcher {
         }
 
         fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
-            use crate::linux_abi::{
-                LINUX_WCONTINUED, LINUX_WEXITED, LINUX_WNOHANG, LINUX_WNOWAIT, LINUX_WSTOPPED,
-            };
-            if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
+            // Retain unknown bits so the supported-mask rejection below stays
+            // bit-identical to the raw `options & !SUPPORTED != 0` test.
+            let options = LinuxWaitOptions::from_bits_retain(options);
+            if !LinuxWaitOptions::WAITID_SUPPORTED.contains(options) {
                 return Ok(LINUX_EINVAL.into());
             }
-            if options & LINUX_WAITID_STATE_MASK == 0 {
+            if !options.intersects(LinuxWaitOptions::WAITID_STATE_MASK) {
                 return Ok(LINUX_EINVAL.into());
             }
             let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
@@ -1883,19 +1881,19 @@ impl SyscallDispatcher {
                 _ => return Ok(LINUX_EINVAL.into()),
             };
             let mut host_options: i32 = 0;
-            if options & LINUX_WEXITED != 0 {
+            if options.contains(LinuxWaitOptions::WEXITED) {
                 host_options |= libc::WEXITED;
             }
-            if options & LINUX_WSTOPPED != 0 {
+            if options.contains(LinuxWaitOptions::WSTOPPED) {
                 host_options |= libc::WSTOPPED;
             }
-            if options & LINUX_WCONTINUED != 0 {
+            if options.contains(LinuxWaitOptions::WCONTINUED) {
                 host_options |= libc::WCONTINUED;
             }
-            if options & LINUX_WNOWAIT != 0 {
+            if options.contains(LinuxWaitOptions::WNOWAIT) {
                 host_options |= libc::WNOWAIT;
             }
-            let guest_nohang = options & LINUX_WNOHANG != 0;
+            let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
 
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let r = unsafe {
@@ -1965,7 +1963,10 @@ impl SyscallDispatcher {
                 const CLD_KILLED: i32 = 2;
                 const CLD_DUMPED: i32 = 3;
                 let terminal = matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED);
-                if carrick_portable::si_pid(&info) != 0 && options & LINUX_WNOWAIT == 0 && terminal {
+                if carrick_portable::si_pid(&info) != 0
+                    && !options.contains(LinuxWaitOptions::WNOWAIT)
+                    && terminal
+                {
                     let child_guest_us =
                         crate::guest_cpu::reap_child_guest_ns(carrick_portable::si_pid(&info) as u32) / 1000;
                     crate::guest_cpu::add_reaped_child(child_guest_us, 0);
@@ -1998,7 +1999,10 @@ impl SyscallDispatcher {
 
         fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
             let memory = &mut *cx.memory;
-            if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
+            // Retain unknown bits so the supported-mask rejection stays
+            // bit-identical to the raw `options & !SUPPORTED != 0` test.
+            let options = LinuxWaitOptions::from_bits_retain(options);
+            if !LinuxWaitOptions::WAIT4_SUPPORTED.contains(options) {
                 return Ok(LINUX_EINVAL.into());
             }
             // PID namespace (§5.3): a positive `pid` arg names a child by its
@@ -2022,13 +2026,13 @@ impl SyscallDispatcher {
                 pid.0
             };
             let mut host_options: i32 = 0;
-            if options & crate::linux_abi::LINUX_WNOHANG != 0 {
+            if options.contains(LinuxWaitOptions::WNOHANG) {
                 host_options |= libc::WNOHANG;
             }
-            if options & crate::linux_abi::LINUX_WUNTRACED != 0 {
+            if options.contains(LinuxWaitOptions::WUNTRACED) {
                 host_options |= libc::WUNTRACED;
             }
-            if options & crate::linux_abi::LINUX_WCONTINUED != 0 {
+            if options.contains(LinuxWaitOptions::WCONTINUED) {
                 host_options |= libc::WCONTINUED;
             }
             let mut host_status: i32 = 0;
@@ -2038,8 +2042,7 @@ impl SyscallDispatcher {
             // that stop, so let Darwin's wait4 observe a published pending stop.
             let can_park_on_proc_exit = host_target > 0
                 && host_options & libc::WNOHANG == 0
-                && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
-                    == 0
+                && !options.intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED)
                 && !crate::guest_cpu::child_has_ptrace_stop_pending(host_target as u32);
             let result = if can_park_on_proc_exit {
                 let r = loop {
@@ -2563,7 +2566,7 @@ fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
 /// Darwin can report a stopped child from `waitid(WEXITED|WNOWAIT)`. Linux only
 /// reports SIGCHLD states selected by the caller's W* bits, so filter the host
 /// siginfo before deciding whether a child is waitable.
-fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: u64) -> bool {
+fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: LinuxWaitOptions) -> bool {
     if carrick_portable::si_pid(info) == 0 || waitid_state_requested(info.si_code, options) {
         return true;
     }
@@ -2571,7 +2574,7 @@ fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: u64) -> b
     false
 }
 
-fn waitid_state_requested(si_code: i32, options: u64) -> bool {
+fn waitid_state_requested(si_code: i32, options: LinuxWaitOptions) -> bool {
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
     const CLD_DUMPED: i32 = 3;
@@ -2580,9 +2583,9 @@ fn waitid_state_requested(si_code: i32, options: u64) -> bool {
     const CLD_CONTINUED: i32 = 6;
 
     match si_code {
-        CLD_EXITED | CLD_KILLED | CLD_DUMPED => options & crate::linux_abi::LINUX_WEXITED != 0,
-        CLD_TRAPPED | CLD_STOPPED => options & crate::linux_abi::LINUX_WSTOPPED != 0,
-        CLD_CONTINUED => options & crate::linux_abi::LINUX_WCONTINUED != 0,
+        CLD_EXITED | CLD_KILLED | CLD_DUMPED => options.contains(LinuxWaitOptions::WEXITED),
+        CLD_TRAPPED | CLD_STOPPED => options.contains(LinuxWaitOptions::WSTOPPED),
+        CLD_CONTINUED => options.contains(LinuxWaitOptions::WCONTINUED),
         _ => true,
     }
 }
@@ -2705,8 +2708,7 @@ mod futex_timeout_tests {
     /// (a deadline of `now`), never `None`.
     #[test]
     fn futex_wait_zero_but_present_timeout_parks_with_zero_deadline() {
-        const LINUX_FUTEX_WAIT: u64 = 0;
-        const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
+        use crate::linux_abi::LINUX_FUTEX_PRIVATE_FLAG;
 
         let dispatcher = SyscallDispatcher::new();
         let reporter = CompatReporter::default();
