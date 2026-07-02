@@ -2751,14 +2751,14 @@ async fn docker_compose_multi_network_dns_smoke() {
 services:
   db:
     image: ubuntu:24.04
-    command: ["/bin/sleep", "20"]
+    command: ["/bin/sleep", "120"]
     networks:
       backend:
         aliases:
           - database
   web:
     image: ubuntu:24.04
-    command: ["/bin/sleep", "20"]
+    command: ["/bin/sleep", "120"]
     depends_on:
       - db
       - cache
@@ -2771,7 +2771,7 @@ services:
           - app
   cache:
     image: ubuntu:24.04
-    command: ["/bin/sleep", "20"]
+    command: ["/bin/sleep", "120"]
     networks:
       frontend:
         aliases:
