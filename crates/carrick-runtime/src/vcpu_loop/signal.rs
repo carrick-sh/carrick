@@ -322,10 +322,13 @@ where
         dispatcher.mark_signal_pending(tid, pending);
         return Ok(Some(PendingSignalAction::ignored()));
     }
-    if dispatcher.signal_is_ignored(pending) {
+    let action = dispatcher
+        .take_pending_signal_action(tid, pending)
+        .or_else(|| dispatcher.registered_signal_handler(pending));
+    if action.is_none() && dispatcher.signal_is_ignored(pending) {
         return Ok(Some(PendingSignalAction::ignored()));
     }
-    match dispatcher.registered_signal_handler(pending) {
+    match action {
         Some(action) => {
             // A handler is about to run in the guest: real progress, resets the
             // trap watchdog (a busy-wait-for-signal loop is not a hang).
