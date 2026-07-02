@@ -2,6 +2,11 @@
 // allow-unwrap-in-tests heuristic does not exempt them. The no-panic gate targets
 // production code, so allow unwrap/expect across this integration test file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// This suite drives the macOS HVF syscall loop with scripted AArch64 frames
+// (run_syscall_loop / SyscallTrap / Aarch64SyscallFrame), which
+// carrick_runtime::runtime only exposes under platform-macos. Gate the whole
+// file so the non-macOS cross-checks (which build --all-targets) skip it.
+#![cfg(feature = "platform-macos")]
 
 #[path = "integration/common/syscall_support.rs"]
 mod support;
