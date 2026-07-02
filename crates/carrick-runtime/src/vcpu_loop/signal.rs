@@ -191,7 +191,11 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     } else {
         None
     };
-    let saved_sigmask = dispatcher.enter_signal_handler(this_tid, signum, action);
+    // The sigframe stores the saved mask in wire form; escape the typed set at
+    // the frame-build boundary.
+    let saved_sigmask = dispatcher
+        .enter_signal_handler(this_tid, signum, action)
+        .raw();
     let injected = engine.inject_signal(
         signum,
         action.sa_handler,
@@ -317,7 +321,8 @@ where
                 && last_syscall_retval == Some(-(crate::linux_abi::LINUX_EINTR as i64))
                 && action.sa_flags & crate::linux_abi::LINUX_SA_RESTART != 0
                 && trap.last_syscall_nr().is_some_and(is_restartable_syscall);
-            let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action);
+            // Wire form for the sigframe build (see the synchronous-fault arm).
+            let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action).raw();
             // If rt_sigqueueinfo queued a caller-supplied siginfo for this (tid,
             // signum), pop it now and hand it to inject_signal. Failing that,
             // synthesise an SI_USER siginfo with the sender's ns-pid.

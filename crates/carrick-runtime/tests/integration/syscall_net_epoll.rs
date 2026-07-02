@@ -2076,7 +2076,7 @@ fn dispatch_with_wait(
                 sig_mask,
             } => {
                 let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
-                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
+                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
@@ -2094,7 +2094,7 @@ fn dispatch_with_wait(
                 sig_mask,
             } => {
                 let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
-                match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
+                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
@@ -2246,7 +2246,7 @@ fn dispatch_threaded_with_wait_notify(
                     sender.send(fds.clone()).unwrap();
                 }
                 let waiter = ThreadWaiter::new(tid);
-                match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
+                match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
@@ -2267,7 +2267,7 @@ fn dispatch_threaded_with_wait_notify(
                     sender.send(fds.clone()).unwrap();
                 }
                 let waiter = ThreadWaiter::new(tid);
-                match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
+                match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {

@@ -672,7 +672,7 @@ fn rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal() {
         DispatchOutcome::Errno { errno: 4 }
     );
     // The pre-suspend mask (0) is restored, not left as the suspend mask.
-    assert_eq!(dispatcher.signal_mask_for(0), 0);
+    assert_eq!(dispatcher.signal_mask_for(0), carrick_abi::SigSet::EMPTY);
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs() {
     let mut dispatcher = SyscallDispatcher::new();
 
     // Original mask: block SIGRTMIN+... say signal 12 (bit 1<<11). Non-default.
-    let original = 1u64 << (12 - 1);
+    let original = carrick_abi::SigSet::EMPTY.with(12);
     dispatcher.restore_signal_mask(0, original);
 
     // Signal 10 pending for tid 0, NO handler installed (default disposition).

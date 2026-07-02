@@ -738,7 +738,7 @@ pub(super) enum OpenDescription {
     /// drains the process's pending masked signals is a tracked follow-up.
     SignalFd {
         base: OpenDescriptionBase,
-        mask: u64,
+        mask: carrick_abi::SigSet,
     },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the

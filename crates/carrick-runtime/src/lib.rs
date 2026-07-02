@@ -736,11 +736,11 @@ pub mod runtime {
                     fds,
                     timeout,
                     on_timeout,
-                    // The synchronous waiter blocks the raw mask bits directly;
+                    // The synchronous waiter blocks the carried set directly;
                     // the additive-vs-replace policy is for the threaded
                     // dispatcher pending-signal predicate only.
                     sig_mask,
-                } => match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
+                } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -771,7 +771,7 @@ pub mod runtime {
                             None
                         }
                     };
-                    match waiter.wait_poll(&fds, timeout, sig_mask.raw_block_bits()) {
+                    match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
                         WaitResult::Ready => continue,
                         WaitResult::TimedOut => {
                             return Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -787,7 +787,7 @@ pub mod runtime {
                     timeout,
                     sig_mask,
                     clear_on_timeout,
-                } => match waiter.wait(&fds, timeout, sig_mask.raw_block_bits()) {
+                } => match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => continue,
                     WaitResult::TimedOut => {
                         // select returns 0 with the fd-sets zeroed; the handler
@@ -803,7 +803,7 @@ pub mod runtime {
                     WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 },
                 DispatchOutcome::WaitOnSleep { duration } => {
-                    match waiter.wait(&[], Some(duration), 0) {
+                    match waiter.wait(&[], Some(duration), carrick_abi::SigBlockMask::NONE) {
                         // Empty fd set: only TimedOut (sleep elapsed) is expected.
                         WaitResult::Ready | WaitResult::TimedOut => {
                             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -822,7 +822,7 @@ pub mod runtime {
                             match waiter.wait(
                                 &[WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                                 None,
-                                0,
+                                carrick_abi::SigBlockMask::NONE,
                             ) {
                                 WaitResult::Ready => continue,
                                 WaitResult::Interrupted | WaitResult::TimedOut => {
@@ -857,7 +857,7 @@ pub mod runtime {
                     // timeout with nothing pending → EAGAIN, the sigtimedwait
                     // timeout return. Single-threaded: no in-process async
                     // source, so a finite timeout is deterministic.
-                    match waiter.wait(&[], timeout, block_mask.raw()) {
+                    match waiter.wait(&[], timeout, block_mask) {
                         WaitResult::Ready => continue,
                         WaitResult::Interrupted => {
                             if dispatcher.signal_wait_should_eintr(
@@ -881,7 +881,7 @@ pub mod runtime {
                     // wait4/waitid on a child. The single-vCPU backend has no
                     // guest children yet (fork/clone is Phase D), so this is a
                     // clean ECHILD rather than a hang.
-                    match waiter.wait_proc_exit(pid, sig_mask.raw_block_bits()) {
+                    match waiter.wait_proc_exit(pid, sig_mask.block_mask()) {
                         WaitResult::Ready => continue,
                         WaitResult::Interrupted | WaitResult::TimedOut => {
                             return Ok(DispatchOutcome::Errno {
@@ -1472,18 +1472,19 @@ pub mod host_signal {
     /// entry in the shared xsignal ring. Used by a parked thread to decide whether
     /// to break its wait so the loop can deliver.
     pub fn has_pending_for(tid: i32) -> bool {
-        if carrick_signal_core::xsig::xsig_has_unblocked_for_self(0) {
+        if carrick_signal_core::xsig::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE) {
             return true;
         }
         carrick_signal_core::has_pending_for(tid)
     }
 
-    /// Like [`has_pending_for`], but a signal blocked by `block_mask` (bit
-    /// `signum-1`) does NOT count as deliverable-for-waking. A queued cross-process
-    /// signal in the xsignal ring is peeked WITHOUT consuming it so a temporary
+    /// Like [`has_pending_for`], but a signal blocked by `block_mask` does NOT
+    /// count as deliverable-for-waking. A queued cross-process signal in the
+    /// xsignal ring is peeked WITHOUT consuming it so a temporary
     /// ppoll/epoll_pwait mask keeps genuinely blocked signals pending until the
-    /// syscall returns. `block_mask == 0` is identical to [`has_pending_for`].
-    pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
+    /// syscall returns. `SigBlockMask::NONE` is identical to
+    /// [`has_pending_for`].
+    pub fn has_unblocked_pending_for(tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
         if carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask) {
             return true;
         }
@@ -1725,6 +1726,7 @@ pub mod host_signal {
     feature = "platform-netbsd"
 ))]
 pub mod io_wait {
+    use carrick_abi::SigBlockMask;
     use std::os::fd::RawFd;
     use std::time::{Duration, Instant};
 
@@ -1808,7 +1810,7 @@ pub mod io_wait {
             &self,
             fds: &[WaitFd],
             timeout: Option<Duration>,
-            block_mask: u64,
+            block_mask: SigBlockMask,
         ) -> WaitResult {
             ppoll_wait(self.tid, fds, timeout, block_mask, || false)
         }
@@ -1817,7 +1819,7 @@ pub mod io_wait {
             &self,
             fds: &[WaitFd],
             timeout: Option<Duration>,
-            block_mask: u64,
+            block_mask: SigBlockMask,
             should_interrupt: F,
         ) -> WaitResult
         where
@@ -1832,7 +1834,7 @@ pub mod io_wait {
             &self,
             fds: &[WaitFd],
             timeout: Option<Duration>,
-            block_mask: u64,
+            block_mask: SigBlockMask,
         ) -> WaitResult {
             ppoll_wait_poll(self.tid, fds, timeout, block_mask, || false)
         }
@@ -1841,7 +1843,7 @@ pub mod io_wait {
             &self,
             fds: &[WaitFd],
             timeout: Option<Duration>,
-            block_mask: u64,
+            block_mask: SigBlockMask,
             should_interrupt: F,
         ) -> WaitResult
         where
@@ -1863,14 +1865,14 @@ pub mod io_wait {
         /// `Interrupted` rather than wedging the parent. `pid > 0` watches that
         /// specific child; `pid <= 0` watches ANY child (`P_ALL`), matching the
         /// guest `wait4(-1, …)` / `wait4(0, …)` "any child" forms.
-        pub fn wait_proc_exit(&self, pid: i32, block_mask: u64) -> WaitResult {
+        pub fn wait_proc_exit(&self, pid: i32, block_mask: SigBlockMask) -> WaitResult {
             self.wait_proc_exit_with_dispatch_pending(pid, block_mask, || false)
         }
 
         pub fn wait_proc_exit_with_dispatch_pending<F>(
             &self,
             pid: i32,
-            block_mask: u64,
+            block_mask: SigBlockMask,
             should_interrupt: F,
         ) -> WaitResult
         where
@@ -2056,7 +2058,7 @@ pub mod io_wait {
         tid: crate::thread::ThreadId,
         fds: &[WaitFd],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: SigBlockMask,
         should_interrupt: impl Fn() -> bool,
     ) -> WaitResult {
         ppoll_wait_inner(
@@ -2074,7 +2076,7 @@ pub mod io_wait {
         tid: crate::thread::ThreadId,
         fds: &[WaitFd],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: SigBlockMask,
         should_interrupt: impl Fn() -> bool,
     ) -> WaitResult {
         ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, false, true)
@@ -2084,7 +2086,7 @@ pub mod io_wait {
         tid: crate::thread::ThreadId,
         fds: &[WaitFd],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: SigBlockMask,
         should_interrupt: impl Fn() -> bool,
     ) -> WaitResult {
         ppoll_wait_inner(tid, fds, timeout, block_mask, should_interrupt, true, false)
@@ -2094,7 +2096,7 @@ pub mod io_wait {
         tid: crate::thread::ThreadId,
         fds: &[WaitFd],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: SigBlockMask,
         should_interrupt: impl Fn() -> bool,
         recheck_on_masked_interrupt: bool,
         retry_poll_slice: bool,
@@ -2299,7 +2301,7 @@ pub mod io_wait {
         fn unbounded_wait_checks_dispatch_pending_after_backstop_slice() {
             let checks = AtomicUsize::new(0);
 
-            let result = super::ppoll_wait(7, &[], None, 0, || {
+            let result = super::ppoll_wait(7, &[], None, carrick_abi::SigBlockMask::NONE, || {
                 checks.fetch_add(1, Ordering::SeqCst) > 0
             });
 

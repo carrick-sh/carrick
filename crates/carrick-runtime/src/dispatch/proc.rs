@@ -1933,9 +1933,7 @@ impl SyscallDispatcher {
                     let non_interrupting = this.non_interrupting_signal_mask(tid);
                     return Ok(DispatchOutcome::WaitOnProcExit {
                         pid: host_id as i32,
-                        sig_mask: carrick_abi::WaitSigMask::Additive(carrick_abi::SigSet::from_raw(
-                            non_interrupting,
-                        )),
+                        sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
                     });
                 }
                 loop {
@@ -2077,9 +2075,7 @@ impl SyscallDispatcher {
                         let non_interrupting = this.non_interrupting_signal_mask(tid);
                         return Ok(DispatchOutcome::WaitOnProcExit {
                             pid: host_target,
-                            sig_mask: carrick_abi::WaitSigMask::Additive(
-                                carrick_abi::SigSet::from_raw(non_interrupting),
-                            ),
+                            sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
                         });
                     }
                     Ok(value) => Ok(value),
