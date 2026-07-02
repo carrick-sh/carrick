@@ -261,6 +261,19 @@ impl<V: X86Vmm> X86EngineCore<V> {
         pc == self.layout.trampoline_base || pc == self.sysret_pc()
     }
 
+    /// Whether `pc` lies inside carrick's supervisor-only kernel window (LSTAR
+    /// trampoline, GDT, PML4 tables, fault IDT/stubs/TSS/stacks/records). Every
+    /// backend lays the window out contiguously from `trampoline_base` (KVM
+    /// `guest_setup_x86`, bhyve, NVMM), with the fault tables appended last —
+    /// see [`crate::fault::add_fault_windows`]. A signal context must NEVER
+    /// capture such a PC: the pages are supervisor-only, so a `rt_sigreturn`
+    /// resuming there at ring 3 takes an instruction-fetch #PF (SEGV_ACCERR).
+    fn is_kernel_window_pc(&self, pc: u64) -> bool {
+        let end =
+            crate::fault::fault_record_base(self.layout) + crate::fault::X86_FAULT_SLOTS * 4096;
+        pc >= self.layout.trampoline_base && pc < end
+    }
+
     fn sysret_resume_at(&self, live_rip: u64) -> Option<SysretResume> {
         self.is_syscall_trampoline_pc(live_rip)
             .then_some(self.sysret_resume)
@@ -876,7 +889,53 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                 // signal and resumes. (The backend already distinguishes a
                 // requested kick from a spurious VT-x re-entry before surfacing
                 // `Kicked`.)
-                X86Exit::Kicked => return Ok(None),
+                //
+                // EXCEPT when the kick lands while the vCPU is INSIDE carrick's
+                // supervisor-only kernel window — mid syscall-trampoline (the
+                // SYSCALL retired but the OUT doorbell has not trapped yet, or
+                // the completed syscall's SYSRETQ has not retired) or mid
+                // fault-stub. Reporting that as a deliverable kick makes the run
+                // loop capture the window PC into the sigframe; `rt_sigreturn`
+                // then resumes ring 3 on a supervisor page → instruction-fetch
+                // #PF, SEGV_ACCERR at 0x10000002 (the go-preempt SIGURG crash in
+                // go-debug_gosym / go-net_http on the KVM lane) — or, with a
+                // stale `sysret_resume`, silently LOSES the in-flight syscall.
+                // This is the x86 mirror of the aarch64 engine's EL1-vector kick
+                // guard (`Aarch64Exit::Kicked` + `is_carrick_el1_vector_va`).
+                X86Exit::Kicked => {
+                    let live_rip = self.vcpu.get_gpr(X86Reg::Rip)?;
+                    if live_rip == self.sysret_pc() {
+                        if self.sysret_resume.is_none() {
+                            // Parked at the trampoline SYSRETQ with no stashed
+                            // user context. The SYSRET semantics are fully
+                            // determined by the register file — RIP ← RCX,
+                            // RFLAGS ← R11 (bit 1 forced) — so synthesize the
+                            // stash; `current_pc()`/`interrupted_rflags()` then
+                            // report USER state and the delivered sigframe
+                            // resumes at the user PC. (One batched read, as in
+                            // `complete_sysret`.)
+                            let mut vals = [0u64; 2];
+                            self.vcpu.get_gprs(&[X86Reg::Rcx, X86Reg::R11], &mut vals)?;
+                            self.sysret_resume = Some(SysretResume {
+                                user_pc: vals[0],
+                                user_rflags: vals[1] | 0x2, // RFLAGS bit 1 is reserved-1
+                            });
+                        }
+                        return Ok(None);
+                    }
+                    if self.is_kernel_window_pc(live_rip) {
+                        // Mid-trampoline at the OUT doorbell (a guest SYSCALL is
+                        // in flight — any parked `sysret_resume` describes the
+                        // PREVIOUS syscall, so drop it) or mid fault-stub.
+                        // Swallow the kick and re-enter: the in-flight doorbell
+                        // traps within a couple of instructions and the pending
+                        // signal is delivered cleanly at the syscall/fault
+                        // boundary instead.
+                        self.sysret_resume = None;
+                        continue;
+                    }
+                    return Ok(None);
+                }
                 X86Exit::FpDoorbell => {
                     self.sysret_resume = None;
                     // The FP doorbell is only meaningful while `run_fp_stub` is
@@ -1338,6 +1397,8 @@ mod tests {
         prepared_sysret: bool,
         get_gprs_calls: std::cell::Cell<u32>,
         set_gprs_calls: u32,
+        /// Scripted `run()` exits, consumed front-to-back; empty ⇒ `Halt`.
+        exits: std::collections::VecDeque<X86Exit>,
     }
 
     impl GuestVmBackend for TestVmm {
@@ -1477,7 +1538,7 @@ mod tests {
         }
 
         fn run(&mut self) -> Result<X86Exit, TrapError> {
-            Ok(X86Exit::Halt)
+            Ok(self.exits.pop_front().unwrap_or(X86Exit::Halt))
         }
 
         fn enable_halt_exit(&mut self) -> Result<(), TrapError> {
@@ -1678,6 +1739,151 @@ mod tests {
         // Behavior preserved.
         assert_eq!(engine.current_pc().expect("pc"), 0x0040_1234);
         assert_eq!(engine.interrupted_rflags().expect("rflags"), 0x246);
+    }
+
+    /// A syscall frame whose rax is a plain (non-arch_prctl) x86 number, so
+    /// `next_syscall` surfaces it as `Ok(Some(_))`.
+    fn plain_syscall_exit(resume_pc: u64) -> X86Exit {
+        X86Exit::Syscall {
+            frame: carrick_guest_mem::X8664SyscallFrame {
+                rax: 39, // x86_64 getpid — normalizes to Plain
+                rdi: 0,
+                rsi: 0,
+                rdx: 0,
+                r10: 0,
+                r8: 0,
+                r9: 0,
+            },
+            resume_pc,
+        }
+    }
+
+    /// Regression (go-preempt 0x10000002 SEGV_ACCERR): a kick landing while the
+    /// vCPU is mid-trampoline at the OUT doorbell (a guest SYSCALL is in
+    /// flight) must be SWALLOWED — re-enter so the doorbell traps — never
+    /// reported as a deliverable kick at the supervisor-window PC. Any parked
+    /// `sysret_resume` at that point describes the PREVIOUS syscall and must be
+    /// dropped, or the signal frame captures a stale user PC and the in-flight
+    /// syscall is silently lost.
+    #[test]
+    fn kick_at_doorbell_out_is_swallowed_and_syscall_traps() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_9999, // the NEW syscall's user return
+            r11: 0x246,
+            rip: layout.trampoline_base, // at the OUT, pre-trap
+            rflags: 0x2,
+            exits: [X86Exit::Kicked, plain_syscall_exit(layout.trampoline_base)].into(),
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        // Stale stash from the PREVIOUS syscall.
+        engine.sysret_resume = Some(SysretResume {
+            user_pc: 0x0040_1111,
+            user_rflags: 0x246,
+        });
+
+        let trapped = engine.next_syscall().expect("next_syscall");
+        assert!(
+            trapped.is_some(),
+            "the kick must be swallowed so the in-flight doorbell traps"
+        );
+        assert!(
+            engine.vcpu.exits.is_empty(),
+            "both scripted exits consumed (kick swallowed, syscall trapped)"
+        );
+    }
+
+    /// Regression (go-preempt 0x10000002 SEGV_ACCERR): a kick landing while the
+    /// vCPU is parked at the trampoline SYSRETQ with NO stashed user context
+    /// must synthesize it from RCX/R11 (the architected SYSRET sources) so the
+    /// delivered signal frame resumes at the USER pc, never at the
+    /// supervisor-only trampoline page.
+    #[test]
+    fn kick_at_sysret_with_no_stash_synthesizes_user_context() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_1234,
+            r11: 0x244, // bit 1 clear — the synthesis must force it
+            rip: layout.trampoline_base + 2,
+            rflags: 0x2,
+            exits: [X86Exit::Kicked].into(),
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+
+        let trapped = engine.next_syscall().expect("next_syscall");
+        assert!(trapped.is_none(), "the kick is reported to the run loop");
+        assert_eq!(
+            engine.current_pc().expect("pc"),
+            0x0040_1234,
+            "current_pc must report the SYSRET target (RCX), not the trampoline"
+        );
+        assert_eq!(
+            engine.interrupted_rflags().expect("rflags"),
+            0x246,
+            "interrupted rflags = R11 with the reserved bit forced"
+        );
+    }
+
+    /// A kick parked at the SYSRETQ with a FRESH stash keeps it (no rewrite).
+    #[test]
+    fn kick_at_sysret_with_fresh_stash_keeps_it() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rcx: 0x0040_1234,
+            r11: 0x246,
+            rip: layout.trampoline_base + 2,
+            rflags: 0x2,
+            exits: [X86Exit::Kicked].into(),
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.pending_resume_pc = Some(layout.trampoline_base + 2);
+        engine.complete_syscall(7).expect("complete");
+
+        let trapped = engine.next_syscall().expect("next_syscall");
+        assert!(trapped.is_none());
+        assert_eq!(engine.current_pc().expect("pc"), 0x0040_1234);
+    }
+
+    /// A kick inside the fault-stub region of the kernel window is swallowed
+    /// (the in-flight fault record completes; delivery happens at the
+    /// boundary), same guard as the OUT doorbell.
+    #[test]
+    fn kick_at_fault_stub_pc_is_swallowed() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rip: crate::fault::fault_stub_base(layout) + 0x10,
+            exits: [X86Exit::Kicked, X86Exit::Halt].into(),
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+
+        let trapped = engine.next_syscall().expect("next_syscall");
+        assert!(trapped.is_none(), "Halt after the swallowed kick");
+        assert!(
+            engine.vcpu.exits.is_empty(),
+            "the kick was swallowed (re-entered) rather than reported"
+        );
+    }
+
+    /// A kick at an ordinary user PC is reported unchanged (the plain
+    /// async-delivery path a syscall-free spinning guest depends on).
+    #[test]
+    fn kick_at_user_pc_is_reported() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            rip: 0x0040_5000,
+            exits: [X86Exit::Kicked].into(),
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+
+        let trapped = engine.next_syscall().expect("next_syscall");
+        assert!(trapped.is_none());
+        assert_eq!(engine.current_pc().expect("pc"), 0x0040_5000);
+        assert!(engine.vcpu.exits.is_empty());
     }
 
     #[test]
