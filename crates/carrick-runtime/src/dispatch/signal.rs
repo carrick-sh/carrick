@@ -1167,8 +1167,12 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             let caller_euid = Some(this.cred_snapshot().euid);
+            // `pid` is the ns→host-translated kill(2) pid encoding here (see
+            // the translation block above): decompose it into the typed target.
             Ok(bootstrap_signal_send_as(
-                pid, /*tid_required=*/ false, signum, caller_euid,
+                SignalTarget::from_host_kill_pid(pid),
+                signum,
+                caller_euid,
             ))
         }
 
@@ -1244,7 +1248,10 @@ impl SyscallDispatcher {
                 let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
                 return Ok(this.raise_self(self_tid, signum));
             }
-            Ok(bootstrap_signal_send(tid, /*tid_required=*/ true, signum))
+            Ok(bootstrap_signal_send(
+                SignalTarget::GuestTid(NsPid(tid as i32)),
+                signum,
+            ))
         }
 
         /// tgkill(tgid, tid, sig): send `sig` to thread `tid` in group `tgid`.
@@ -1817,8 +1824,9 @@ impl SyscallDispatcher {
                 }
             }
             // Non-ring route (or ring full outside a private pid namespace):
-            // kill(2)-style host route.
-            return bootstrap_signal_send(ns_target, /*tid_required=*/ false, signum);
+            // kill(2)-style host route. `ns_target` is already the host-domain
+            // kill(2) pid encoding here (translated above when ns is active).
+            return bootstrap_signal_send(SignalTarget::from_host_kill_pid(ns_target), signum);
         }
 
         // Self-target (single-threaded, or no sibling registry hit): queue
@@ -1918,7 +1926,7 @@ fn signal_is_self_target(target: i64) -> bool {
     // includes child guest processes); it must fall through to
     // bootstrap_signal_send_as's host group-kill (LTP kill02 "Process 1 did not
     // receive"). names_self also excludes 0, so that group path is preserved.
-    // (tgkill/tkill pass tid_required=true and never 0.)
+    // (tgkill/tkill route tids as SignalTarget::GuestTid and never 0.)
     NsPid(target as i32).names_self()
 }
 
@@ -1933,12 +1941,75 @@ fn names_self_pid(x: i64) -> bool {
     NsPid(x as i32).names_self()
 }
 
-pub(crate) fn bootstrap_signal_send(
-    target: i64,
-    tid_required: bool,
-    signum: u64,
-) -> DispatchOutcome {
-    bootstrap_signal_send_as(target, tid_required, signum, /*caller_euid=*/ None)
+/// The target of a host-routed (cross-process) signal send — the typed
+/// replacement for the old `(target: i64, tid_required: bool)` convention,
+/// where a HOST pid, a kill(2) process-group/sentinel encoding, and a guest
+/// tid all shared one integer disambiguated by a bool. Each variant names the
+/// domain its payload actually lives in; [`Self::host_kill_encoding`] is the
+/// ONE raw escape back to the kill(2) wire value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalTarget {
+    /// One process named by its HOST pid: `kill(pid > 0)` after ns→host
+    /// translation, `pidfd_send_signal`'s registered host pid, fasync
+    /// `F_OWNER_PID` after ns→host translation.
+    HostProcess(HostPid),
+    /// A HOST process group: `kill(-pgid)` after ns→host-pgid translation,
+    /// fasync `F_OWNER_PGRP`. Holds the POSITIVE pgid; the kill(2) negative
+    /// encoding exists only inside [`Self::host_kill_encoding`].
+    HostProcessGroup(HostPid),
+    /// `kill(0)`: every process in the CALLER's own process group.
+    CallerProcessGroup,
+    /// `kill(-1)`: every process the caller has permission to signal.
+    Broadcast,
+    /// One thread named by a HOST-domain tid: fasync `F_OWNER_TID` after
+    /// ns→host translation. Cross-process, a main-thread tid is the target
+    /// process's host pid, which is how the host kill reaches it.
+    HostThread(HostPid),
+    /// tkill(2)'s cross-process fallthrough: the tid exactly as the GUEST
+    /// passed it (ns domain, deliberately untranslated — the pre-enum
+    /// behaviour, kept bit-identical; cross-process it names another guest
+    /// process's main thread, whose tid equals its pid). Always `> 0` (tkill
+    /// rejects the rest with EINVAL before routing here).
+    GuestTid(NsPid),
+}
+
+impl SignalTarget {
+    /// Decompose a kill(2)-style pid argument that is ALREADY in the HOST pid
+    /// domain (the caller has done any ns→host translation): `> 0` one host
+    /// process, `0` the caller's process group, `-1` broadcast, `< -1` a host
+    /// process group as `-pgid`. NOT for raw guest/ns values — translate
+    /// first.
+    pub(crate) fn from_host_kill_pid(pid: i64) -> Self {
+        if pid > 0 {
+            Self::HostProcess(HostPid(pid as u32))
+        } else if pid == 0 {
+            Self::CallerProcessGroup
+        } else if pid == -1 {
+            Self::Broadcast
+        } else {
+            Self::HostProcessGroup(HostPid(pid.unsigned_abs() as u32))
+        }
+    }
+
+    /// The kill(2) encoding of this target — the exact i64 the old raw
+    /// `target` parameter carried. Every comparison in
+    /// [`bootstrap_signal_send_as`] (self test, `0` = caller's group, the
+    /// i32-range ESRCH guard, the `> 0` xsig gate) and the final `libc::kill`
+    /// operate on this value, so the sign/sentinel semantics live in one
+    /// place.
+    fn host_kill_encoding(self) -> i64 {
+        match self {
+            Self::HostProcess(p) | Self::HostThread(p) => i64::from(p.0),
+            Self::HostProcessGroup(pg) => -i64::from(pg.0),
+            Self::CallerProcessGroup => 0,
+            Self::Broadcast => -1,
+            Self::GuestTid(t) => i64::from(t.0),
+        }
+    }
+}
+
+pub(crate) fn bootstrap_signal_send(target: SignalTarget, signum: u64) -> DispatchOutcome {
+    bootstrap_signal_send_as(target, signum, /*caller_euid=*/ None)
 }
 
 /// Same as [`bootstrap_signal_send`] but the caller passes its own current
@@ -1946,34 +2017,32 @@ pub(crate) fn bootstrap_signal_send(
 /// processes. `None` means "skip the check" (used by the self-target /
 /// process-group cases that don't cross processes).
 pub(crate) fn bootstrap_signal_send_as(
-    target: i64,
-    tid_required: bool,
+    target: SignalTarget,
     signum: u64,
     caller_euid: Option<u32>,
 ) -> DispatchOutcome {
     if !is_valid_signum(signum) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
+    // The raw kill(2) value this target denotes: every sign/sentinel test
+    // below and the final host kill read this single escape.
+    let target = target.host_kill_encoding();
     // getpid() exposes the host pid (std::process::id()) so glibc and
     // friends use that as the self-id when calling kill/tkill/tgkill.
     // Accept either that or LINUX_BOOTSTRAP_PID so existing callers
     // that hard-coded `1` keep working.
     let host_pid = std::process::id() as i64;
     let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-    let self_target = if tid_required {
-        target == host_pid || target == bootstrap_pid
-    } else {
-        // A specific self-pid (kill(getpid())) is self. kill(0) is NOT self: it
-        // targets the caller's whole PROCESS GROUP, which after a guest fork
-        // includes child guest processes (separate host pids in the same host
-        // group). It must reach them via the host group-kill below — the same
-        // path kill(-pgid) takes — not raise_for_self, which signals only the
-        // caller and made LTP kill02 TFAIL ("Process 1 did not receive the
-        // signal"). Self is still covered: the host group-kill delivers to the
-        // caller's own host process too, routed into the guest like any other
-        // cross-process signal (identical to how kill(-own_pgid) already works).
-        target == host_pid || target == bootstrap_pid
-    };
+    // A specific self-pid (kill(getpid())) is self. kill(0) — CallerProcessGroup
+    // — is NOT self: it targets the caller's whole PROCESS GROUP, which after a
+    // guest fork includes child guest processes (separate host pids in the same
+    // host group). It must reach them via the host group-kill below — the same
+    // path kill(-pgid) takes — not raise_for_self, which signals only the
+    // caller and made LTP kill02 TFAIL ("Process 1 did not receive the
+    // signal"). Self is still covered: the host group-kill delivers to the
+    // caller's own host process too, routed into the guest like any other
+    // cross-process signal (identical to how kill(-own_pgid) already works).
+    let self_target = target == host_pid || target == bootstrap_pid;
     if self_target {
         if signum == 0 {
             // POSIX: signum 0 is the null-signal "is this pid alive" probe.

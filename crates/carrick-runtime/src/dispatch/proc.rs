@@ -2332,9 +2332,11 @@ impl SyscallDispatcher {
             if !crate::dispatch::signal::is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
+            // A pidfd names exactly one process by the HOST pid recorded at
+            // creation (pidfd_open rejects pid <= 0; CLONE_PIDFD registers the
+            // fork child's host pid) — never a group or tid.
             Ok(crate::dispatch::signal::bootstrap_signal_send(
-                i64::from(host_pid),
-                /*tid_required=*/ false,
+                crate::dispatch::signal::SignalTarget::HostProcess(HostPid(host_pid as u32)),
                 signum,
             ))
         }
