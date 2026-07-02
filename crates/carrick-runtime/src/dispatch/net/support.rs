@@ -2438,7 +2438,7 @@ mod tests {
             "Linux-visible fd status must preserve blocking mode",
         );
         let host_fd = dispatcher.host_fd_for_poll(linux_fd).unwrap();
-        let flags = unsafe { libc::fcntl(host_fd, libc::F_GETFL) };
+        let flags = unsafe { libc::fcntl(host_fd.get(), libc::F_GETFL) };
         assert!(
             flags >= 0 && flags & libc::O_NONBLOCK != 0,
             "host fd must be nonblocking for dispatcher wait invariants",

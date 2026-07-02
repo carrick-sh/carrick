@@ -3,8 +3,28 @@
 //! a guest address. Zero-cost newtypes.
 use super::{DispatchError, GuestMemory, SyscallCtx};
 
+/// A **GUEST** file descriptor — a number in the guest's fd table (what the
+/// guest passed as a syscall argument), NOT a host kernel fd. Resolve it
+/// through the fd table (`open_file` and the typed accessors) to reach the
+/// backing [`HostFd`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fd(pub i32);
+/// A HOST kernel file descriptor — the other side of the fd seam from the
+/// GUEST-fd [`Fd`]. Guest and host fds previously both flowed as bare `i32`,
+/// and the splice/tee/sendfile paths juggle both under identical variable
+/// names; passing a guest fd to libc (or a host fd back into the guest fd
+/// table) compiled clean and operated on an unrelated descriptor. Escape to
+/// raw only at the libc boundary via [`HostFd::get`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostFd(pub i32);
+
+impl HostFd {
+    /// The raw fd for a host `libc` call.
+    #[inline]
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
 /// A PID/TID **argument supplied by the guest** — an ns-namespace value (what
 /// the guest's `getpid()`/`gettid()` reported), NOT a host pid. Operate on it
 /// only after translating to a [`HostPid`] via [`NsPid::to_host`]; test

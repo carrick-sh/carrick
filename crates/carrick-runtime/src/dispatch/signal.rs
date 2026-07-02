@@ -730,11 +730,11 @@ impl SyscallDispatcher {
     /// process pending sets.
     ///
     /// `sig_mask` selects the wait's effective block mask. For
-    /// `ppoll`/`pselect6`/`epoll_pwait`, [`WaitSigMask::Replace`] carries a
+    /// `ppoll`/`pselect6`/`epoll_pwait`, [`carrick_abi::WaitSigMask::Replace`] carries a
     /// POSIX sigmask that REPLACES the thread mask for the wait, so it is used
     /// ALONE — a signal the temp mask unblocks must interrupt even if
     /// persistently blocked (probe `ppollunblock`). For a plain
-    /// `read`/`recv`/`connect` ([`WaitSigMask::Additive`], usually with an
+    /// `read`/`recv`/`connect` ([`carrick_abi::WaitSigMask::Additive`], usually with an
     /// empty set), the thread's PERSISTENT mask gates the wait — a
     /// blocked-and-pending signal must NOT interrupt it (probe `maskfork`).
     /// Unioning the two would over-block the ppoll-unblock case, so the policy
