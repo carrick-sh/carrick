@@ -20,6 +20,7 @@
 //! vnode write so children created or removed after registration still surface
 //! Linux-style basename events. That dir-diff is macOS-only.
 
+use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOSPC, LinuxErrno};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 
@@ -89,9 +90,6 @@ pub(crate) const INOTIFY_EVENT_HEADER_SIZE: usize = carrick_abi::LINUX_INOTIFY_E
 /// `vfs/proc.rs`, so match it exactly — `inotify05` generates that many events
 /// expecting the overflow record).
 pub(crate) const INOTIFY_MAX_QUEUED_EVENTS: usize = 16384;
-
-const LINUX_EINVAL: i32 = 22;
-const LINUX_ENOSPC: i32 = 28;
 
 /// Event bits the kernel delivers to a watch regardless of the mask it was
 /// added with: `IN_IGNORED` (watch auto-/explicitly removed), `IN_Q_OVERFLOW`,
@@ -307,14 +305,14 @@ trait InotifyBackend: Send + Sync {
         watch_fds: Vec<crate::vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
-    ) -> Result<i32, i32>;
+    ) -> Result<i32, LinuxErrno>;
     /// Tear down the backend-side registration for one watched fd of a wd being
     /// removed. Called by `rm_watch`, which already holds the `inner` lock, so it
     /// takes `&mut Inner`.
     fn deregister(&self, host_fd: RawFd, wd: i32, inner: &mut Inner);
     /// Drain newly-ready changes and return up to `max_bytes` of encoded Linux
     /// `inotify_event` records; mirrors the old per-platform `read_records`.
-    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, i32>;
+    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, LinuxErrno>;
 }
 
 /// Native Linux backend: a real kernel `inotify` instance read directly.
@@ -336,7 +334,7 @@ impl InotifyBackend for NativeLinuxInotify {
         watch_fds: Vec<crate::vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
-    ) -> Result<i32, i32> {
+    ) -> Result<i32, LinuxErrno> {
         if watch_fds.is_empty() {
             return Err(LINUX_EINVAL);
         }
@@ -400,7 +398,7 @@ impl InotifyBackend for NativeLinuxInotify {
         }
     }
 
-    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, i32> {
+    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, LinuxErrno> {
         let mut inner = inner.lock();
         // Drain whatever the kernel has queued on the native inotify fd, rewrite
         // each record's wd from the host's space into the guest's, and enqueue
@@ -486,7 +484,7 @@ impl InotifyBackend for VnodeDiffInotify {
         watch_fds: Vec<crate::vfs::WatchFd>,
         mask: u32,
         inner: &Mutex<Inner>,
-    ) -> Result<i32, i32> {
+    ) -> Result<i32, LinuxErrno> {
         if watch_fds.is_empty() {
             return Err(LINUX_EINVAL);
         }
@@ -548,7 +546,7 @@ impl InotifyBackend for VnodeDiffInotify {
         let _ = self.mux.lock().deregister(host_fd);
     }
 
-    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, i32> {
+    fn read_records(&self, max_bytes: usize, inner: &Mutex<Inner>) -> Result<Vec<u8>, LinuxErrno> {
         // Non-blocking drain of newly-ready vnode changes, normalized to a list
         // of `(watched host fd, fired NOTE_* fflags)`. Always pump the kqueue
         // (even when dispatch-authoritative) so its edge-triggered EV_CLEAR
@@ -736,7 +734,7 @@ impl InotifyState {
     /// Register a watch on an already-open host fd, taking ownership of it.
     /// If `host_fd`'s vnode is already watched, updates the mask and returns the
     /// existing wd (matching inotify, which returns the same wd for a re-add).
-    pub(crate) fn add_watch(&self, host_fd: RawFd, mask: u32) -> Result<i32, i32> {
+    pub(crate) fn add_watch(&self, host_fd: RawFd, mask: u32) -> Result<i32, LinuxErrno> {
         self.add_watch_fds(vec![crate::vfs::WatchFd::unnamed(host_fd)], mask)
     }
 
@@ -744,7 +742,7 @@ impl InotifyState {
         &self,
         watch_fds: Vec<crate::vfs::WatchFd>,
         mask: u32,
-    ) -> Result<i32, i32> {
+    ) -> Result<i32, LinuxErrno> {
         self.backend.add_watch_fds(watch_fds, mask, &self.inner)
     }
 
@@ -770,7 +768,7 @@ impl InotifyState {
     }
 
     /// Remove a watch by descriptor; closes its fd. Unknown wd → EINVAL.
-    pub(crate) fn rm_watch(&self, wd: i32) -> Result<(), i32> {
+    pub(crate) fn rm_watch(&self, wd: i32) -> Result<(), LinuxErrno> {
         let mut inner = self.inner.lock();
         let Some(watch) = inner.watches.remove(&wd) else {
             return Err(LINUX_EINVAL);
@@ -831,7 +829,7 @@ impl InotifyState {
     /// An empty return means no events are ready (caller maps to EAGAIN / a
     /// wait on [`Self::poll_fd`]). A non-empty queue with `max_bytes` too small
     /// for a single record is signalled by `Err(EINVAL)`, matching Linux.
-    pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
+    pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, LinuxErrno> {
         self.backend.read_records(max_bytes, &self.inner)
     }
 
@@ -865,7 +863,7 @@ impl InotifyState {
 /// Pop whole `inotify_event` records from `inner.pending` up to `max_bytes`.
 /// Empty queue → empty Vec (caller maps to EAGAIN); a buffer too small for the
 /// first queued record → `Err(EINVAL)`, matching Linux.
-fn drain_pending(inner: &mut Inner, max_bytes: usize) -> Result<Vec<u8>, i32> {
+fn drain_pending(inner: &mut Inner, max_bytes: usize) -> Result<Vec<u8>, LinuxErrno> {
     if inner.pending.is_empty() {
         return Ok(Vec::new());
     }

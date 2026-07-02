@@ -16,6 +16,7 @@
 //! handle that). On non-macOS targets (the type-check-only stubs) this degrades
 //! to a bounded `poll` loop.
 
+use carrick_abi::LinuxErrno;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -71,7 +72,7 @@ pub enum WaitResult {
     Interrupted,
     /// Could not pin (dup) a watched fd — host fd table exhausted. Carries the
     /// LINUX errno to surface to the guest (LINUX_EMFILE / LINUX_ENFILE).
-    Errno(i32),
+    Errno(LinuxErrno),
 }
 
 struct PinnedWaitFd {
@@ -101,7 +102,7 @@ impl PinnedWaitFds {
     /// errno — never fall back to parking on the raw, unowned guest fd (the
     /// exact fd-reuse race this dup is meant to prevent). The partially-duped
     /// set is dropped via PinnedWaitFd::Drop (RAII rollback).
-    fn new(fds: &[WaitFd]) -> Result<Self, i32> {
+    fn new(fds: &[WaitFd]) -> Result<Self, LinuxErrno> {
         let mut wait_fds = Vec::with_capacity(fds.len());
         let mut pinned = Vec::with_capacity(fds.len());
         for wait_fd in fds {

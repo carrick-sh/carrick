@@ -114,7 +114,9 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
 
     memory
@@ -128,7 +130,9 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -185,7 +189,9 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -198,7 +204,9 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -211,7 +219,9 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -220,9 +230,9 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
 fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     const LINUX_CLOCK_REALTIME: u64 = 0;
     const LINUX_CLOCK_MONOTONIC: u64 = 1;
-    const LINUX_EPERM: i32 = 1;
-    const LINUX_EFAULT: i32 = 14;
-    const LINUX_EINVAL: i32 = 22;
+    const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
+    const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let reporter = CompatReporter::default();
@@ -320,8 +330,8 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
 
 #[test]
 fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
-    const LINUX_EFAULT: i32 = 14;
-    const LINUX_EINVAL: i32 = 22;
+    const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
@@ -446,7 +456,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
 
 #[test]
 fn timer_create_rejects_thread_cpu_sigev_thread_id() {
-    const LINUX_EINVAL: i32 = 22;
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
     const LINUX_SIGEV_THREAD_ID: i32 = 4;
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
@@ -505,9 +515,9 @@ fn timer_create_rejects_thread_cpu_sigev_thread_id() {
 fn adjtimex_and_clock_adjtime_return_eperm() {
     const LINUX_CLOCK_REALTIME: u64 = 0;
     const LINUX_CLOCK_MONOTONIC: u64 = 1;
-    const LINUX_EPERM: i32 = 1;
-    const LINUX_EFAULT: i32 = 14;
-    const LINUX_EINVAL: i32 = 22;
+    const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
+    const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
@@ -689,7 +699,9 @@ fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

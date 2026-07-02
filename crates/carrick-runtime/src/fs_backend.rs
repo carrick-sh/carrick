@@ -30,6 +30,7 @@
 //! current shape is the minimum-risk version that still lets the host
 //! backend live behind the same trait.
 
+use crate::linux_abi::LinuxErrno;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -336,7 +337,7 @@ pub trait FsBackend: Send + Sync {
     /// watches may include a host path so the inotify shim can snapshot/diff
     /// child names after a kqueue directory-write wakeup. Default:
     /// unsupported for backends with no real host namespace.
-    fn watch_fds(&self, _path: &str) -> Result<Vec<crate::vfs::WatchFd>, i32> {
+    fn watch_fds(&self, _path: &str) -> Result<Vec<crate::vfs::WatchFd>, LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOSYS)
     }
 
@@ -430,26 +431,32 @@ pub trait FsBackend: Send + Sync {
     /// Linux XATTR_CREATE/XATTR_REPLACE mask. Only the `user.*` namespace is
     /// supported (the conformance-relevant namespace); other namespaces and
     /// the in-memory backend return `Err(LINUX_ENOTSUP)` via the default.
-    fn set_xattr(&self, _path: &str, _name: &str, _value: &[u8], _flags: i32) -> Result<(), i32> {
+    fn set_xattr(
+        &self,
+        _path: &str,
+        _name: &str,
+        _value: &[u8],
+        _flags: i32,
+    ) -> Result<(), LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// Read the extended attribute `name` on `path`. Returns the raw value
     /// bytes. `Err(LINUX_ENODATA)` if absent. Default: unsupported.
-    fn get_xattr(&self, _path: &str, _name: &str) -> Result<Vec<u8>, i32> {
+    fn get_xattr(&self, _path: &str, _name: &str) -> Result<Vec<u8>, LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// List the `user.*` extended attribute names on `path` (names only, no
     /// trailing NUL — the caller assembles the NUL-separated list). Default:
     /// unsupported.
-    fn list_xattr(&self, _path: &str) -> Result<Vec<String>, i32> {
+    fn list_xattr(&self, _path: &str) -> Result<Vec<String>, LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// Remove the `user.*` extended attribute `name` from `path`.
     /// `Err(LINUX_ENODATA)` if the attribute is absent. Default: unsupported.
-    fn remove_xattr(&self, _path: &str, _name: &str) -> Result<(), i32> {
+    fn remove_xattr(&self, _path: &str, _name: &str) -> Result<(), LinuxErrno> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
@@ -568,11 +575,11 @@ fn cstring_from_osstr(os: &std::ffi::OsStr) -> Option<std::ffi::CString> {
     std::ffi::CString::new(os.as_bytes()).ok()
 }
 
-fn io_error_to_linux_errno(error: std::io::Error) -> i32 {
+fn io_error_to_linux_errno(error: std::io::Error) -> LinuxErrno {
     crate::host_to_linux_errno(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
-fn open_host_watch_fd(path: &Path) -> Result<i32, i32> {
+fn open_host_watch_fd(path: &Path) -> Result<i32, LinuxErrno> {
     let cpath = cstring_from_osstr(path.as_os_str()).ok_or(crate::linux_abi::LINUX_EINVAL)?;
     #[cfg(target_os = "macos")]
     let host_flags = libc::O_EVTONLY;
@@ -3601,7 +3608,7 @@ impl FsBackend for HostFsBackend {
         ))
     }
 
-    fn watch_fds(&self, path: &str) -> Result<Vec<crate::vfs::WatchFd>, i32> {
+    fn watch_fds(&self, path: &str) -> Result<Vec<crate::vfs::WatchFd>, LinuxErrno> {
         use std::os::unix::ffi::OsStrExt;
 
         let scratch = self
@@ -3970,7 +3977,13 @@ impl FsBackend for HostFsBackend {
         Some(target.to_string_lossy().into_owned())
     }
 
-    fn set_xattr(&self, path: &str, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
+    fn set_xattr(
+        &self,
+        path: &str,
+        name: &str,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), LinuxErrno> {
         // Accept the Linux VFS xattr namespaces (user./trusted./security./
         // system.); the guest is root so trusted.* is allowed, matching the
         // Docker-as-root oracle. Other prefixes report unsupported.
@@ -4019,7 +4032,7 @@ impl FsBackend for HostFsBackend {
         err
     }
 
-    fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, i32> {
+    fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, LinuxErrno> {
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
         }
@@ -4061,8 +4074,8 @@ impl FsBackend for HostFsBackend {
         result
     }
 
-    fn list_xattr(&self, path: &str) -> Result<Vec<String>, i32> {
-        fn list_xattr_fd(host_fd: std::os::fd::RawFd) -> Result<Vec<String>, i32> {
+    fn list_xattr(&self, path: &str) -> Result<Vec<String>, LinuxErrno> {
+        fn list_xattr_fd(host_fd: std::os::fd::RawFd) -> Result<Vec<String>, LinuxErrno> {
             // macOS may surface its own attribute names (e.g. resource forks);
             // we read the full NUL-separated list then filter to `user.*` so the
             // result is exactly the Linux-conformant namespace the guest set.
@@ -4115,7 +4128,7 @@ impl FsBackend for HostFsBackend {
             .ok_or(crate::linux_abi::LINUX_ENODATA)?
     }
 
-    fn remove_xattr(&self, path: &str, name: &str) -> Result<(), i32> {
+    fn remove_xattr(&self, path: &str, name: &str) -> Result<(), LinuxErrno> {
         // Mirror get_xattr: a non-`user.*` or carrick-internal name has no
         // guest-visible attribute to remove → ENODATA.
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {

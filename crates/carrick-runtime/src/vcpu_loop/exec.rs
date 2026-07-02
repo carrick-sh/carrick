@@ -62,7 +62,7 @@ where
                 Ok(())
             }
             Err(errno) => {
-                let retval = LinuxErrno::new(errno).guest_retval();
+                let retval = errno.guest_retval();
                 engine.complete_syscall(retval)?;
                 Ok(())
             }

@@ -85,7 +85,7 @@ use carrick_runtime::linux_abi::{LINUX_SI_TKILL, LinuxSiginfo};
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 use std::sync::Arc;
 
-const LINUX_EAGAIN: i32 = 11;
+const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
 const LINUX_SCHED_OTHER: i64 = 0;
 const SYS_SCHED_GETSCHEDULER: u64 = 120;
 const SYS_SCHED_GETPARAM: u64 = 121;
@@ -470,7 +470,7 @@ fn futex_unlock_pi_private_owned_by_self_clears_word() {
 
 // --- Sub-task B (P3): tgkill/tkill cross-thread routing ---
 
-const LINUX_ESRCH: i32 = 3;
+const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
 const LINUX_SIG_BLOCK: u64 = 0;
 const LINUX_SIG_UNBLOCK: u64 = 1;
 const SIGUSR1: u64 = 10;

@@ -308,7 +308,7 @@ impl SyscallDispatcher {
     define_syscall! {
             fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, advice: u64) {
                 if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
-                    return Ok(LINUX_EBADF.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
                 // Linux's generic_fadvise rejects a pipe/FIFO with ESPIPE (checked
                 // before the advice value), so posix_fadvise04 (a real pipe) → ESPIPE.
@@ -328,14 +328,14 @@ impl SyscallDispatcher {
                         _ => false,
                     };
                     if is_fifo {
-                        return Ok(LINUX_ESPIPE.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
                     }
                 }
                 // POSIX_FADV_{NORMAL,RANDOM,SEQUENTIAL,WILLNEED,DONTNEED,NOREUSE} =
                 // 0..=5 on aarch64 (asm-generic values); anything else is EINVAL
                 // (posix_fadvise03). advice is u64, so a negative arg is huge → caught.
                 if advice > 5 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -392,7 +392,7 @@ impl SyscallDispatcher {
                 // bad length — LTP mmap08 maps length 0 on a closed fd and expects
                 // EBADF, not EINVAL. (Anonymous mappings take no fd → skip.)
                 if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) && this.open_file(fd.0).is_none() {
-                    return Ok(LINUX_EBADF.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
 
                 // glibc's vDSO getrandom state page is mapped MAP_ANONYMOUS|
@@ -409,7 +409,7 @@ impl SyscallDispatcher {
                         // bits for back-compat). mmap20. Otherwise behaves like
                         // MAP_SHARED.
                         if flags & !LinuxMmapFlags::SUPPORTED_MASK != 0 {
-                            return Ok(crate::linux_abi::LINUX_EOPNOTSUPP.into());
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EOPNOTSUPP));
                         }
                         LINUX_MAP_SHARED
                     } else if t == 0 && map_flags.contains(LinuxMmapFlags::DROPPABLE) {
@@ -425,12 +425,12 @@ impl SyscallDispatcher {
                     || (!map_flags.contains(LinuxMmapFlags::ANONYMOUS) && !offset.is_multiple_of(LINUX_PAGE_SIZE))
                     || (map_flags.contains(LinuxMmapFlags::FIXED) && !requested.0.is_multiple_of(LINUX_PAGE_SIZE))
                 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
                     Some(length) => length,
                     None => {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                 };
                 let length_usize =
@@ -465,7 +465,7 @@ impl SyscallDispatcher {
                         )
                     };
                     let Some(overlay_va) = overlay_va else {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     // Anonymous => fresh zero page. Seed + stage-1 repoint atomically
                     // on the engine; on failure roll the slot back so it's reusable.
@@ -475,7 +475,7 @@ impl SyscallDispatcher {
                         .is_err()
                     {
                         this.mem.lock().overlay.free(overlay_va);
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     return Ok(DispatchOutcome::Returned {
                         value: requested.0 as i64,
@@ -501,7 +501,7 @@ impl SyscallDispatcher {
                 {
                     let dup_fd = {
                         let Some(open_file) = this.open_file(fd.0) else {
-                            return Ok(LINUX_EBADF.into());
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         };
                         let open = open_file.description.read();
                         match &*open {
@@ -526,7 +526,7 @@ impl SyscallDispatcher {
                         let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
                             // Alias arena exhausted: drop the dup, surface ENOMEM.
                             unsafe { libc::close(dup_fd) };
-                            return Ok(LINUX_ENOMEM.into());
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                         };
                         let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
                             + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
@@ -589,13 +589,13 @@ impl SyscallDispatcher {
                         }
                         return Ok(DispatchOutcome::Returned { value: addr as i64 });
                     }
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
 
                 let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
                     Some(pair) => pair,
                     None => {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                 };
 
@@ -632,7 +632,7 @@ impl SyscallDispatcher {
                     // must succeed); an out-of-arena protect_range failure is
                     // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
                     if memory.protect_range(address, length_usize, 0).is_err() && in_arena {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     return Ok(DispatchOutcome::Returned {
                         value: address as i64,
@@ -646,7 +646,7 @@ impl SyscallDispatcher {
                     // Unconditional (see the PROT_NONE arm above): reserve across
                     // the whole arena for demand-paged backends; fatal only in-arena.
                     if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     return Ok(DispatchOutcome::Returned {
                         value: address as i64,
@@ -658,7 +658,7 @@ impl SyscallDispatcher {
                 } else {
                     let mut bytes = vec![0; length_usize];
                     let Some(open_file) = this.open_file(fd.0) else {
-                        return Ok(LINUX_EBADF.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let open = open_file.description.read();
                     let offset_usize =
@@ -701,12 +701,12 @@ impl SyscallDispatcher {
                                 && (st.st_mode as u32 & libc::S_IFMT as u32)
                                     == libc::S_IFCHR as u32;
                             if !is_chardev {
-                                return Ok(linux_errno::ENODEV.into());
+                                return Ok(DispatchOutcome::errno(linux_errno::ENODEV));
                             }
                             // chardev zero-fill: keep `bytes` zeroed (no read).
                         }
                         _ => {
-                            return Ok(LINUX_EBADF.into());
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
                     }
                     bytes
@@ -727,9 +727,9 @@ impl SyscallDispatcher {
                     let bits_55_48 = (requested_raw >> 48) & 0xff;
                     if bits_55_48 != 0x00 && bits_55_48 != 0xff {
                         if map_flags.contains(LinuxMmapFlags::FIXED_NOREPLACE) {
-                            return Ok(linux_errno::EEXIST.into());
+                            return Ok(DispatchOutcome::errno(linux_errno::EEXIST));
                         }
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     // Reserve a FRESH alias IPA (2 MiB-block-aligned). Process-tree-
                     // global + monotonic, NEVER reused — the shared `hv_vm`'s stage-2
@@ -740,7 +740,7 @@ impl SyscallDispatcher {
                     // region's page-table entries. hv_vm_map's own 16 KiB IPA-size
                     // requirement is satisfied separately inside map_host_alias.
                     let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     // Alias mappings frequently overlay an earlier PROT_NONE
                     // reservation (Rosetta reserves the x86 stack/binary span anon
@@ -775,7 +775,7 @@ impl SyscallDispatcher {
                 // a reused range). prot==0 here means file-backed PROT_NONE.
                 // Unconditional: reserve across the whole arena; fatal only in-arena.
                 if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 Ok(DispatchOutcome::Returned {
                     value: address as i64,
@@ -788,10 +788,10 @@ impl SyscallDispatcher {
                 // address of a BSS global (8-aligned, not page-aligned) and that
                 // address + 8, expecting EINVAL — carrick lacked the alignment gate.
                 if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if length == 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 let freed = {
                     let mut mem = this.mem.lock();
@@ -838,7 +838,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 if !range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
                     let mut mem = this.mem.lock();
@@ -872,17 +872,17 @@ impl SyscallDispatcher {
 
             fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
                 if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 // msync requires a page-aligned start address (Linux checks this
                 // before anything else). CPython's mmap.flush(offset, size) calls
                 // msync(data + offset, size, ...), so flush(1, n) must EINVAL —
                 // test_mmap.test_flush_return_value asserts it on Linux.
                 if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if length == 0 {
                     return Ok(DispatchOutcome::Returned { value: 0 });
@@ -901,7 +901,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 if cx.memory.read_bytes(address.0, 1).is_err() {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -912,7 +912,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 if memory.read_bytes(address.0, 1).is_err() {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -923,14 +923,14 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 if memory.read_bytes(address.0, 1).is_err() {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
 
             fn mlockall(this, cx, flags: u64) {
                 if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -944,13 +944,13 @@ impl SyscallDispatcher {
                 // Linux requires a page-aligned start address, else EINVAL (this is
                 // what Go's TestMincoreErrorSign checks — the errno must be -EINVAL).
                 if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if length == 0 {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 if memory.read_bytes(address.0, 1).is_err() {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 // Linux returns ENOMEM unless the WHOLE [address, address+length)
                 // range is mapped. Require the END page to be mapped too (not just
@@ -962,10 +962,10 @@ impl SyscallDispatcher {
                 // actual mappings (≤ guest RAM), so `pages` stays small.
                 let last_page = match address.0.checked_add(length - 1) {
                     Some(end) => end & !(LINUX_PAGE_SIZE - 1),
-                    None => return Ok(LINUX_ENOMEM.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
                 };
                 if memory.read_bytes(last_page, 1).is_err() {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 let pages = length.div_ceil(LINUX_PAGE_SIZE);
                 let bytes = vec![1u8; pages as usize];
@@ -976,10 +976,10 @@ impl SyscallDispatcher {
             fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
                 let memory = &mut *cx.memory;
                 if new_size_req == 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                     // The mapping is not in the mmap arena: it's a MAP_SHARED file
@@ -998,20 +998,20 @@ impl SyscallDispatcher {
                     // coordination; no caller reads it. A grow would mean relocating
                     // a file/shared backing, which we don't do → EINVAL as before.)
                     let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     if memory.read_bytes(old_address.0, 1).is_err() {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     if new_size <= old_size {
                         return Ok(DispatchOutcome::Returned {
                             value: old_address.0 as i64,
                         });
                     }
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 if new_size <= old_size {
                     // Linux mremap shrink unmaps the freed tail [old+new_size,
@@ -1059,10 +1059,10 @@ impl SyscallDispatcher {
 
                 if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
                     let Some(old_end) = old_address.0.checked_add(old_size) else {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     let Some(new_end) = old_address.0.checked_add(new_size) else {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
                     if range_within(old_address.0, new_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                         {
@@ -1094,7 +1094,7 @@ impl SyscallDispatcher {
                                 .protect_range(old_end, grow_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
                                 .is_err()
                             {
-                                return Ok(LINUX_ENOMEM.into());
+                                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                             }
                         }
                         return Ok(DispatchOutcome::Returned {
@@ -1104,16 +1104,16 @@ impl SyscallDispatcher {
                 }
 
                 if flags & LINUX_MREMAP_MAYMOVE == 0 {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 let Some((new_addr, reused)) =
                     this.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
                 else {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 let new_len = match usize::try_from(new_size) {
                     Ok(n) => n,
-                    Err(_) => return Ok(LINUX_ENOMEM.into()),
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
                 };
                 // Clear stale no-access tracking on the destination — it may be a
                 // range reclaimed from a prior munmap (which marked it no-access).
@@ -1124,7 +1124,7 @@ impl SyscallDispatcher {
                 let copy_len = match usize::try_from(old_size) {
                     Ok(len) => len,
                     Err(_) => {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                 };
                 if copy_len > 0 {
@@ -1133,7 +1133,7 @@ impl SyscallDispatcher {
                             let _ = memory.write_bytes(new_addr, &bytes);
                         }
                         Err(_) => {
-                            return Ok(LINUX_EFAULT.into());
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
                     }
                 }
@@ -1146,7 +1146,7 @@ impl SyscallDispatcher {
                     .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
                     .is_err()
                 {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
                 // MREMAP_DONTUNMAP). carrick previously LEAKED it: the source VA
@@ -1195,13 +1195,13 @@ impl SyscallDispatcher {
 
             fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
                 if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if length == 0 {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 // Linux mprotect returns ENOMEM when the range covers unmapped VA
                 // (a hole in the address space). carrick previously SUCCEEDED on any
@@ -1220,7 +1220,7 @@ impl SyscallDispatcher {
                 // rejects a valid mapping. Probe BEFORE mutating no_access so we don't
                 // stamp tracking onto a foreign/unmapped range.
                 if cx.memory.read_bytes_raw(address.0, 1).is_err() {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 if let Ok(len) = usize::try_from(length) {
                     let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
@@ -1232,7 +1232,7 @@ impl SyscallDispatcher {
                     if range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size())
                         && cx.memory.protect_range(address.0, len, prot).is_err()
                     {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -1242,20 +1242,20 @@ impl SyscallDispatcher {
                 let memory = &mut *cx.memory;
 
                 if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if length == 0 {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
 
                 let Ok(length) = usize::try_from(length) else {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 let Some(last_address) = address.0.checked_add(length as u64 - 1) else {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 if memory.read_bytes(address.0, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
-                    return Ok(LINUX_ENOMEM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 if advice == LINUX_MADV_DONTNEED {
                     // MADV_DONTNEED zeroes the PHYSICAL backing — this is a
@@ -1266,7 +1266,7 @@ impl SyscallDispatcher {
                     // bytes; zero_backing writes the host backing directly (same call
                     // the MAP_FIXED/munmap-reuse scrub uses above).
                     if memory.zero_backing(address.0, length).is_err() {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -1292,7 +1292,7 @@ impl SyscallDispatcher {
             }
 
             fn io_uring_register(this, cx, _fd: Fd, _opcode: u64, _arg: GuestPtr, _nr_args: u64) {
-                Ok(LINUX_ENOSYS.into())
+                Ok(DispatchOutcome::errno(LINUX_ENOSYS))
             }
         }
 }
@@ -1462,7 +1462,9 @@ mod tests {
         let mut memory = LinearMemory::new(base, vec![0u8; LINUX_PAGE_SIZE as usize]);
         assert_eq!(
             mincore(&mut memory, base, 2 * LINUX_PAGE_SIZE),
-            DispatchOutcome::Errno { errno: 12 },
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(12),
+            },
             "a range whose end page is unmapped must be ENOMEM"
         );
     }
@@ -1476,7 +1478,9 @@ mod tests {
         let mut memory = LinearMemory::new(base, vec![0u8; LINUX_PAGE_SIZE as usize]);
         assert_eq!(
             mincore(&mut memory, base, u64::MAX),
-            DispatchOutcome::Errno { errno: 12 },
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(12),
+            },
             "a length that overflows the [address, address+length) range must be ENOMEM"
         );
     }

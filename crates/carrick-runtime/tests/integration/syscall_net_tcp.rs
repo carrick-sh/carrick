@@ -38,7 +38,8 @@ fn socket_syscalls_dispatch_to_real_host_handlers() {
             .unwrap();
         if let DispatchOutcome::Errno { errno } = outcome {
             assert_ne!(
-                errno, 38,
+                errno,
+                LinuxErrno::new(38),
                 "socket syscall {number} returned ENOSYS — handler not installed"
             );
         }
@@ -65,7 +66,9 @@ fn signalfd4_and_tee_return_einval_not_enosys_stub() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 },
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        },
         "signalfd4 with sizemask != 8 should return EINVAL"
     );
 
@@ -82,7 +85,9 @@ fn signalfd4_and_tee_return_einval_not_enosys_stub() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 },
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        },
         "tee with non-pipe fds should return EINVAL"
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());

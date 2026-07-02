@@ -898,7 +898,7 @@ struct PinnedHostFd {
 }
 
 impl PinnedHostFd {
-    fn new(fd: i32) -> Result<Self, i32> {
+    fn new(fd: i32) -> Result<Self, LinuxErrno> {
         let duped = unsafe { libc::dup(fd) };
         if duped < 0 {
             let host = std::io::Error::last_os_error()
@@ -948,7 +948,7 @@ impl BlockingHostWrite {
         offset: usize,
         tid: crate::thread::ThreadId,
         sigpipe_on_epipe: bool,
-    ) -> Result<Self, i32> {
+    ) -> Result<Self, LinuxErrno> {
         Ok(Self {
             host_fd: std::sync::Arc::new(PinnedHostFd::new(host_fd)?),
             bytes,
@@ -1057,7 +1057,7 @@ pub enum DispatchOutcome {
         value: i64,
     },
     Errno {
-        errno: i32,
+        errno: LinuxErrno,
     },
     Exit {
         code: i32,
@@ -1344,16 +1344,14 @@ pub enum DispatchOutcome {
 impl DispatchOutcome {
     /// Construct an errno outcome. The guest receives `-errno`.
     #[inline]
-    pub fn errno(errno: i32) -> Self {
+    pub fn errno(errno: LinuxErrno) -> Self {
         DispatchOutcome::Errno { errno }
     }
 
     fn retval_errno(&self) -> (i64, Option<i32>) {
         match self {
             DispatchOutcome::Returned { value } => (*value, None),
-            DispatchOutcome::Errno { errno } => {
-                (LinuxErrno::new(*errno).guest_retval(), Some(*errno))
-            }
+            DispatchOutcome::Errno { errno } => (errno.guest_retval(), Some(errno.get())),
             DispatchOutcome::Exit { code } => (*code as i64, None),
             DispatchOutcome::SignalDeath { signum } => ((128 + *signum) as i64, None),
             DispatchOutcome::Fork { .. } => (0, None),
@@ -1378,13 +1376,6 @@ impl DispatchOutcome {
             DispatchOutcome::WaitOnSignals { .. } => (0, None),
             DispatchOutcome::WaitOnSleep { .. } => (0, None),
         }
-    }
-}
-
-impl From<i32> for DispatchOutcome {
-    #[inline]
-    fn from(errno: i32) -> Self {
-        DispatchOutcome::Errno { errno }
     }
 }
 
@@ -1455,14 +1446,14 @@ pub enum DispatchError {
     /// `let x = helper()?;` instead of `match helper() { Err(e) => return
     /// Ok(e.into()), Ok(v) => v }` — collapsing the pervasive errno-forwarding
     /// boilerplate. The guest observes exactly the same `-errno` either way.
-    #[error("guest-visible errno: {0}")]
-    Errno(i32),
+    #[error("guest-visible errno: {}", .0.get())]
+    Errno(LinuxErrno),
 }
 
-impl From<i32> for DispatchError {
-    /// A raw Linux errno propagated via `?` becomes [`DispatchError::Errno`],
+impl From<LinuxErrno> for DispatchError {
+    /// A typed Linux errno propagated via `?` becomes [`DispatchError::Errno`],
     /// lowered back to a guest errno outcome at the dispatch boundary.
-    fn from(errno: i32) -> Self {
+    fn from(errno: LinuxErrno) -> Self {
         DispatchError::Errno(errno)
     }
 }
@@ -1471,9 +1462,9 @@ impl From<MemoryError> for DispatchError {
     /// A guest-memory access fault is the guest handing us a bad pointer →
     /// `EFAULT`. Lets handlers `?`-propagate `memory.read_bytes(..)` /
     /// `write_bytes(..)` directly instead of the `match { Err(_) => return
-    /// Ok(LINUX_EFAULT.into()) }` boilerplate (in handlers returning
-    /// `Result<_, DispatchError>`; helpers returning `Result<_, i32>` keep
-    /// `.map_err(|_| LINUX_EFAULT)?`).
+    /// Ok(DispatchOutcome::errno(LINUX_EFAULT)) }` boilerplate (in handlers
+    /// returning `Result<_, DispatchError>`; helpers returning
+    /// `Result<_, LinuxErrno>` keep `.map_err(|_| LINUX_EFAULT)?`).
     fn from(_: MemoryError) -> Self {
         DispatchError::Errno(LINUX_EFAULT)
     }
@@ -1497,7 +1488,7 @@ fn lower_handler_result(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VfsOpenAttempt {
     Installed(i32),
-    Errno(i32),
+    Errno(LinuxErrno),
     FallThrough,
 }
 
@@ -2222,8 +2213,17 @@ impl SyscallDispatcher {
             | crate::seccomp::SECCOMP_RET_TRACE => None,
             crate::seccomp::SECCOMP_RET_ERRNO => {
                 // RET_DATA is the errno, clamped to the kernel's 0..=4095 range.
+                // data == 0 is allowed by the ABI and makes the syscall return
+                // 0 (-0): not a LinuxErrno domain value, so surface it as a
+                // plain 0 return — the guest-visible retval is identical.
                 let errno = (ret & crate::seccomp::SECCOMP_RET_DATA).min(4095) as i32;
-                Some(DispatchOutcome::Errno { errno })
+                Some(if errno == 0 {
+                    DispatchOutcome::Returned { value: 0 }
+                } else {
+                    DispatchOutcome::Errno {
+                        errno: LinuxErrno::new(errno),
+                    }
+                })
             }
             // KILL_PROCESS / KILL_THREAD / TRAP (and any unmodelled action): fail
             // closed by KILLING the guest with SIGSYS — a real signal DEATH, so a
@@ -2487,7 +2487,7 @@ impl SyscallDispatcher {
                 // Mirrors the `gettid` macro handler (proc.rs). Identity when
                 // namespaces are off.
                 let Some(tid) = guest_visible_tid(tid, registry) else {
-                    return Some(Ok(LINUX_EINVAL.into()));
+                    return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
                 };
                 DispatchOutcome::Returned {
                     value: i64::from(tid),
@@ -2640,7 +2640,7 @@ fn write_into_file_contents(
     contents: &mut FileContents,
     offset: &mut usize,
     bytes: &[u8],
-) -> Result<(), i32> {
+) -> Result<(), LinuxErrno> {
     let end = (*offset).checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
     if end as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
         return Err(LINUX_EFBIG);
@@ -3258,7 +3258,7 @@ fn write_kernel_struct_raw<T: KernelAbi>(
 /// Type-safe read for Linux UAPI structs that implement [`KernelAbi`].
 /// Reads exactly the Linux wire size, then zero-fills any Rust-only tail
 /// bytes before returning the typed value.
-fn read_kernel_struct<T>(memory: &impl GuestMemory, address: u64) -> Result<T, i32>
+fn read_kernel_struct<T>(memory: &impl GuestMemory, address: u64) -> Result<T, LinuxErrno>
 where
     T: KernelAbi + FromBytes,
 {
@@ -3268,7 +3268,11 @@ where
 /// Lower-level ABI read for variable-length structs such as clone_args.
 /// `length` is the guest-provided prefix length and must fit inside the
 /// Linux ABI size carried by the type.
-fn read_kernel_prefix<T>(memory: &impl GuestMemory, address: u64, length: usize) -> Result<T, i32>
+fn read_kernel_prefix<T>(
+    memory: &impl GuestMemory,
+    address: u64,
+    length: usize,
+) -> Result<T, LinuxErrno>
 where
     T: KernelAbi + FromBytes,
 {
@@ -3364,7 +3368,7 @@ fn close_open_file(open_file: &OpenFile) {
     }
 }
 
-fn linux_min_fd(value: u64) -> Result<i32, i32> {
+fn linux_min_fd(value: u64) -> Result<i32, LinuxErrno> {
     i32::try_from(value).map_err(|_| LINUX_EINVAL)
 }
 
@@ -4122,7 +4126,7 @@ fn timerfd_expirations(
 
 fn itimerspec_durations(
     spec: LinuxItimerspec,
-) -> Result<(Option<Duration>, Option<Duration>), i32> {
+) -> Result<(Option<Duration>, Option<Duration>), LinuxErrno> {
     let interval = spec.it_interval;
     let value = spec.it_value;
     Ok((
@@ -4131,7 +4135,7 @@ fn itimerspec_durations(
     ))
 }
 
-fn duration_from_linux_timespec(timespec: LinuxTimespec) -> Result<Option<Duration>, i32> {
+fn duration_from_linux_timespec(timespec: LinuxTimespec) -> Result<Option<Duration>, LinuxErrno> {
     let seconds = timespec.tv_sec;
     let nanoseconds = timespec.tv_nsec;
     if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
@@ -4199,7 +4203,11 @@ fn read_pipe(
     }
 }
 
-fn take_pipe_bytes(pipe: &PipeRef, length: usize, _status_flags: u64) -> Result<Vec<u8>, i32> {
+fn take_pipe_bytes(
+    pipe: &PipeRef,
+    length: usize,
+    _status_flags: u64,
+) -> Result<Vec<u8>, LinuxErrno> {
     let mut pipe = pipe.lock();
     if pipe.buffer.is_empty() {
         if pipe.writers == 0 {
@@ -4223,7 +4231,7 @@ fn write_pipe(bytes: &[u8], pipe: &PipeRef) -> DispatchOutcome {
     }
 }
 
-pub(super) fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, i32> {
+pub(super) fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, LinuxErrno> {
     let mut buf = [0u8; 8];
     memory
         .read_into(address, &mut buf)
@@ -4231,7 +4239,7 @@ pub(super) fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, i
     Ok(u64::from_ne_bytes(buf))
 }
 
-pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i32> {
+pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, LinuxErrno> {
     let mut buf = [0u8; 4];
     memory
         .read_into(address, &mut buf)
@@ -4249,7 +4257,7 @@ pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i
 /// `futex_fatal_error()` (SIGABRT) on a VALID cross-process futex — observed in
 /// CPython multiprocessing SyncManager teardown, where a forked server child's
 /// `FUTEX_WAIT_BITSET|CLOCK_REALTIME` on a shared semaphore aborted the process.
-pub(super) fn read_futex_word(memory: &impl GuestMemory, address: u64) -> Result<u32, i32> {
+pub(super) fn read_futex_word(memory: &impl GuestMemory, address: u64) -> Result<u32, LinuxErrno> {
     match read_u32(memory, address) {
         Ok(word) => Ok(word),
         Err(errno) => match memory.shared_futex_host_addr(address) {
@@ -4267,25 +4275,25 @@ pub(super) fn write_u32(
     memory: &mut impl GuestMemory,
     address: u64,
     value: u32,
-) -> Result<(), i32> {
+) -> Result<(), LinuxErrno> {
     memory
         .write_bytes(address, &value.to_ne_bytes())
         .map_err(|_| LINUX_EFAULT)
 }
 
-fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, i32> {
+fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
-fn read_itimerval(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerval, i32> {
+fn read_itimerval(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerval, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
-fn read_timespec(memory: &impl GuestMemory, address: u64) -> Result<LinuxTimespec, i32> {
+fn read_timespec(memory: &impl GuestMemory, address: u64) -> Result<LinuxTimespec, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
-fn read_open_how(memory: &impl GuestMemory, address: u64) -> Result<LinuxOpenHow, i32> {
+fn read_open_how(memory: &impl GuestMemory, address: u64) -> Result<LinuxOpenHow, LinuxErrno> {
     read_kernel_struct(memory, address)
 }
 
@@ -4293,7 +4301,7 @@ fn read_iovecs(
     memory: &impl GuestMemory,
     address: u64,
     count: usize,
-) -> Result<Vec<LinuxIovec>, i32> {
+) -> Result<Vec<LinuxIovec>, LinuxErrno> {
     if count > LINUX_IOV_MAX {
         return Err(LINUX_EINVAL);
     }
@@ -4474,7 +4482,7 @@ pub(super) fn dac_check(
     file_mode: u32,
     is_dir: bool,
     mask: u64,
-) -> Result<(), i32> {
+) -> Result<(), LinuxErrno> {
     let need = (if mask & LINUX_R_OK != 0 { 4 } else { 0 })
         | (if mask & LINUX_W_OK != 0 { 2 } else { 0 })
         | (if mask & LINUX_X_OK != 0 { 1 } else { 0 });
@@ -4636,7 +4644,7 @@ fn display_rootfs_path(path: &Path) -> String {
     }
 }
 
-pub fn rootfs_errno(error: RootFsError) -> i32 {
+pub fn rootfs_errno(error: RootFsError) -> LinuxErrno {
     match error {
         RootFsError::NotFound(_) => LINUX_ENOENT,
         RootFsError::UnsafePath(_) | RootFsError::Utf8(_) | RootFsError::TooManySymlinks(_) => {
@@ -4684,7 +4692,7 @@ fn now_realtime_timespec() -> (i64, i64) {
 fn read_guest_string_array_bytes(
     memory: &impl GuestMemory,
     array_addr: u64,
-) -> Result<Vec<Vec<u8>>, i32> {
+) -> Result<Vec<Vec<u8>>, LinuxErrno> {
     if array_addr == 0 {
         return Ok(Vec::new());
     }
@@ -4727,8 +4735,9 @@ fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostSyscallError {
+    /// The HOST errno as read from the host libc — NOT a Linux errno.
     raw_errno: i32,
-    linux_errno: i32,
+    linux_errno: LinuxErrno,
 }
 
 impl HostSyscallError {
@@ -4746,7 +4755,7 @@ impl HostSyscallError {
         self.raw_errno
     }
 
-    pub(crate) fn linux_errno(self) -> i32 {
+    pub(crate) fn linux_errno(self) -> LinuxErrno {
         self.linux_errno
     }
 }
@@ -4754,7 +4763,7 @@ impl HostSyscallError {
 pub(crate) trait HostSyscallResult: Sized {
     fn host_syscall_result(self) -> Result<Self, HostSyscallError>;
 
-    fn host_syscall_errno(self) -> Result<Self, i32> {
+    fn host_syscall_errno(self) -> Result<Self, LinuxErrno> {
         self.host_syscall_result()
             .map_err(HostSyscallError::linux_errno)
     }
@@ -5157,7 +5166,7 @@ fn write_host_pipe_payload(
     }
 }
 
-fn try_small_nonblocking_write(host_fd: i32, bytes: &[u8]) -> Option<Result<usize, i32>> {
+fn try_small_nonblocking_write(host_fd: i32, bytes: &[u8]) -> Option<Result<usize, LinuxErrno>> {
     if bytes.len() <= 1 {
         return None;
     }
@@ -5199,7 +5208,7 @@ fn would_block_outcome(
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::anchored_one(host_fd, events, host_fd_owner),
             timeout: None,
-            on_timeout: LinuxErrno::new(LINUX_EAGAIN).guest_retval(),
+            on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
         }
     }
@@ -5210,7 +5219,10 @@ fn would_block_outcome(
 /// non-UTF-8 `PYTHONREGRTEST_UNICODE_GUARD` env var, which made an execve EINVAL
 /// when carrick required UTF-8. The execve argv/env path keeps these bytes
 /// verbatim; callers needing a Rust `String` (fs path lookup) use the wrapper.
-fn read_guest_c_string_bytes(memory: &impl GuestMemory, address: u64) -> Result<Vec<u8>, i32> {
+fn read_guest_c_string_bytes(
+    memory: &impl GuestMemory,
+    address: u64,
+) -> Result<Vec<u8>, LinuxErrno> {
     const CHUNK: usize = 256;
     let mut bytes = Vec::new();
     let mut offset = 0usize;
@@ -5243,7 +5255,7 @@ fn read_guest_c_string_bytes(memory: &impl GuestMemory, address: u64) -> Result<
 /// boundaries (getdents/readlink/getcwd). The encoded form also doubles as the
 /// durable host representation, since APFS rejects a raw non-UTF-8 name (EILSEQ).
 /// argv/env use the bytes form and never reach here.
-fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {
+fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, LinuxErrno> {
     Ok(crate::pathcodec::encode_bytes(&read_guest_c_string_bytes(
         memory, address,
     )?))
@@ -6071,7 +6083,7 @@ mod overlay_dispatch_tests {
 
     fn errno(outcome: DispatchOutcome) -> i32 {
         match outcome {
-            DispatchOutcome::Errno { errno } => errno,
+            DispatchOutcome::Errno { errno } => errno.get(),
             other => panic!("expected Errno, got {other:?}"),
         }
     }
@@ -6945,7 +6957,7 @@ mod overlay_dispatch_tests {
 
         let path = h.put_str("/etc/motd");
         let outcome = h.call(SYS_OPENAT, [AT_FDCWD, path, O_RDONLY, 0, 0, 0]);
-        assert_eq!(errno(outcome), LINUX_ENOENT);
+        assert_eq!(errno(outcome), LINUX_ENOENT.get());
     }
 
     #[test]
@@ -6970,7 +6982,7 @@ mod overlay_dispatch_tests {
         // Source must now ENOENT, destination must read back the data.
         let path = h.put_str("/var/lib/apt/lock");
         let outcome = h.call(SYS_OPENAT, [AT_FDCWD, path, O_RDONLY, 0, 0, 0]);
-        assert_eq!(errno(outcome), LINUX_ENOENT);
+        assert_eq!(errno(outcome), LINUX_ENOENT.get());
 
         let path = h.put_str("/var/lib/apt/lock.new");
         let outcome = h.call(SYS_OPENAT, [AT_FDCWD, path, O_RDONLY, 0, 0, 0]);
@@ -7041,7 +7053,7 @@ mod overlay_dispatch_tests {
         let err = (-1i32).host_syscall_result().unwrap_err();
         assert_eq!(err.raw_errno(), libc::EINPROGRESS);
         assert_eq!(err.linux_errno(), linux_errno::EINPROGRESS);
-        assert_ne!(err.linux_errno(), libc::EINPROGRESS);
+        assert_ne!(err.linux_errno().get(), libc::EINPROGRESS);
 
         carrick_portable::set_errno(libc::EAGAIN);
         assert_eq!(
@@ -7536,19 +7548,19 @@ mod overlay_dispatch_tests {
     #[test]
     fn linux_errno_constants_match_kernel_uapi() {
         use crate::dispatch::linux_errno::*;
-        assert_eq!(EPERM, 1);
-        assert_eq!(ENOENT, 2);
-        assert_eq!(EAGAIN, 11);
-        assert_eq!(ENOMEM, 12);
-        assert_eq!(EFAULT, 14);
-        assert_eq!(EINVAL, 22);
-        assert_eq!(ESPIPE, 29);
-        assert_eq!(EDEADLK, 35);
-        assert_eq!(ENAMETOOLONG, 36);
-        assert_eq!(ENOSYS, 38);
-        assert_eq!(EINPROGRESS, 115);
-        assert_eq!(ETIMEDOUT, 110);
-        assert_eq!(ECONNREFUSED, 111);
+        assert_eq!(EPERM.get(), 1);
+        assert_eq!(ENOENT.get(), 2);
+        assert_eq!(EAGAIN.get(), 11);
+        assert_eq!(ENOMEM.get(), 12);
+        assert_eq!(EFAULT.get(), 14);
+        assert_eq!(EINVAL.get(), 22);
+        assert_eq!(ESPIPE.get(), 29);
+        assert_eq!(EDEADLK.get(), 35);
+        assert_eq!(ENAMETOOLONG.get(), 36);
+        assert_eq!(ENOSYS.get(), 38);
+        assert_eq!(EINPROGRESS.get(), 115);
+        assert_eq!(ETIMEDOUT.get(), 110);
+        assert_eq!(ECONNREFUSED.get(), 111);
     }
 }
 

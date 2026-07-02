@@ -60,6 +60,7 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 syscall_table! {
     /// Per-module syscall routing for the `proc` subsystem (Task A1).
@@ -132,7 +133,7 @@ static IOPRIO_VALUE: std::sync::atomic::AtomicU32 =
 /// caller's `len` to equal this exactly; get_robust_list reports it.
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 
-fn translate_setpgid_args(pid: NsPid, pgid: NsPid) -> Result<(i32, i32), i32> {
+fn translate_setpgid_args(pid: NsPid, pgid: NsPid) -> Result<(i32, i32), LinuxErrno> {
     // A negative pgid is EINVAL, checked before any pid/pgid lookup (Linux
     // checks it first; under a namespace we translate, so the host would never
     // otherwise see the raw negative value — LTP setpgid02 case 1).
@@ -232,7 +233,7 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
         LINUX_SCHED_OTHER | LINUX_SCHED_BATCH | LINUX_SCHED_IDLE | LINUX_SCHED_DEADLINE => {
             DispatchOutcome::Returned { value: 0 }
         }
-        _ => LINUX_EINVAL.into(),
+        _ => DispatchOutcome::errno(LINUX_EINVAL),
     }
 }
 
@@ -321,7 +322,7 @@ fn ptrace_user_addr_is_invalid(addr: GuestPtr) -> bool {
 fn sched_read_param_priority<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
     address: GuestPtr,
-) -> Result<i32, i32> {
+) -> Result<i32, LinuxErrno> {
     if address.0 == 0 {
         // NULL param: kept as the legacy "-1" sentinel so the time-sharing
         // policies' prio!=0 check yields EINVAL (unchanged behavior).
@@ -588,14 +589,14 @@ impl SyscallDispatcher {
         // struct sock_fprog { unsigned short len; <pad>; sock_filter *filter; }
         // — `filter` is 8-byte aligned, so it sits at offset 8.
         let Ok(len_bytes) = memory.read_bytes(fprog_ptr, 2) else {
-            return LINUX_EFAULT.into();
+            return DispatchOutcome::errno(LINUX_EFAULT);
         };
         let len = u16::from_ne_bytes([len_bytes[0], len_bytes[1]]) as usize;
         if len == 0 || len > 4096 {
-            return LINUX_EINVAL.into();
+            return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let Ok(ptr_bytes) = memory.read_bytes(fprog_ptr.wrapping_add(8), 8) else {
-            return LINUX_EFAULT.into();
+            return DispatchOutcome::errno(LINUX_EFAULT);
         };
         let filter_ptr = u64::from_ne_bytes([
             ptr_bytes[0],
@@ -608,10 +609,10 @@ impl SyscallDispatcher {
             ptr_bytes[7],
         ]);
         let Ok(prog_bytes) = memory.read_bytes(filter_ptr, len * 8) else {
-            return LINUX_EFAULT.into();
+            return DispatchOutcome::errno(LINUX_EFAULT);
         };
         let Some(prog) = crate::seccomp::SockFilter::parse_program(&prog_bytes) else {
-            return LINUX_EINVAL.into();
+            return DispatchOutcome::errno(LINUX_EINVAL);
         };
         self.seccomp.install(prog);
         DispatchOutcome::Returned { value: 0 }
@@ -656,11 +657,11 @@ impl SyscallDispatcher {
         let kqueue = {
             let mut mux = match crate::event_mux::make_event_multiplexer() {
                 Ok(m) => m,
-                Err(_) => return crate::linux_abi::LINUX_EMFILE.into(),
+                Err(_) => return DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE),
             };
             if mux.watch_process_exit(host_pid, host_pid as u64).is_err() {
                 // No such process (already reaped, or never existed).
-                return crate::linux_abi::LINUX_ESRCH.into();
+                return DispatchOutcome::errno(crate::linux_abi::LINUX_ESRCH);
             }
             std::sync::Arc::new(PidfdWatch::new(mux))
         };
@@ -827,8 +828,8 @@ impl SyscallDispatcher {
                 }
                 // STRICT mode (allow only read/write/exit/sigreturn) is not
                 // emulated yet; unknown operations are EINVAL.
-                crate::seccomp::SECCOMP_SET_MODE_STRICT => Ok(LINUX_ENOSYS.into()),
-                _ => Ok(LINUX_EINVAL.into()),
+                crate::seccomp::SECCOMP_SET_MODE_STRICT => Ok(DispatchOutcome::errno(LINUX_ENOSYS)),
+                _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         }
 
@@ -840,14 +841,14 @@ impl SyscallDispatcher {
                 },
                 LINUX_PR_SET_DUMPABLE => {
                     if arg2 > 1 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     this.proc.lock().dumpable = arg2 as i64;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_SET_NAME => {
                     let Ok(bytes) = memory.read_bytes(arg2, LINUX_TASK_COMM_LEN) else {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     };
                     let task_name = linux_task_name_from_bytes(&bytes);
                     // PR_SET_NAME names the CALLING thread (Linux): record it
@@ -873,7 +874,7 @@ impl SyscallDispatcher {
                 }
                 LINUX_PR_SET_PDEATHSIG => {
                     if arg2 > 64 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     this.proc.lock().pdeathsig = arg2 as i64;
                     DispatchOutcome::Returned { value: 0 }
@@ -884,7 +885,7 @@ impl SyscallDispatcher {
                         .write_bytes(arg2, &(pdeathsig as i32).to_ne_bytes())
                         .is_err()
                     {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                     DispatchOutcome::Returned { value: 0 }
                 }
@@ -915,7 +916,7 @@ impl SyscallDispatcher {
                 // is EINVAL (the cap number must be a valid bit index).
                 LINUX_PR_CAPBSET_READ => {
                     if arg2 > 63 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     DispatchOutcome::Returned {
                         value: i64::from(crate::namespace::process::capbset_read(arg2 as u32)),
@@ -923,7 +924,7 @@ impl SyscallDispatcher {
                 }
                 LINUX_PR_CAPBSET_DROP => {
                     if arg2 > 63 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     crate::namespace::process::capbset_drop(arg2 as u32);
                     DispatchOutcome::Returned { value: 0 }
@@ -933,14 +934,14 @@ impl SyscallDispatcher {
                 // Precondition for an unprivileged seccomp filter install.
                 LINUX_PR_SET_NO_NEW_PRIVS => {
                     if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     this.proc.lock().no_new_privs = true;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_GET_NO_NEW_PRIVS => {
                     if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     DispatchOutcome::Returned {
                         value: i64::from(this.proc.lock().no_new_privs),
@@ -949,7 +950,7 @@ impl SyscallDispatcher {
                 // PR_SET_KEEPCAPS: arg2 ∈ {0,1}. Recorded; echoed by GET.
                 LINUX_PR_SET_KEEPCAPS => {
                     if arg2 > 1 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     this.proc.lock().keepcaps = arg2 as i64;
                     DispatchOutcome::Returned { value: 0 }
@@ -1011,10 +1012,10 @@ impl SyscallDispatcher {
             let node_value = 0u32.to_ne_bytes();
 
             if cpu_address.0 != 0 && memory.write_bytes(cpu_address.0, &cpu_value).is_err() {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             if node_address.0 != 0 && memory.write_bytes(node_address.0, &node_value).is_err() {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1098,7 +1099,7 @@ impl SyscallDispatcher {
             // has no robust-futex death-cleanup, so the head pointer is accepted
             // but not retained — this is purely the ABI-conformant validation.
             if len != ROBUST_LIST_HEAD_SIZE {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let _ = head;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1126,12 +1127,12 @@ impl SyscallDispatcher {
                     let rc = unsafe { libc::kill(pid as i32, 0) };
                     let exists = rc == 0
                         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-                    return Ok(if exists { LINUX_EPERM } else { LINUX_ESRCH }.into());
+                    return Ok(DispatchOutcome::errno(if exists { LINUX_EPERM } else { LINUX_ESRCH }));
                 }
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if head_ptr.0 == 0 || len_ptr.0 == 0 {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let memory = &mut *cx.memory;
             if memory.write_bytes(head_ptr.0, &0u64.to_le_bytes()).is_err()
@@ -1139,7 +1140,7 @@ impl SyscallDispatcher {
                     .write_bytes(len_ptr.0, &ROBUST_LIST_HEAD_SIZE.to_le_bytes())
                     .is_err()
             {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1154,7 +1155,7 @@ impl SyscallDispatcher {
             const PGRP: u64 = 2;
             const USER: u64 = 3;
             if !matches!(which, PROCESS | PGRP | USER) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let v = ioprio as u32;
             let class = v >> 13;
@@ -1165,16 +1166,16 @@ impl SyscallDispatcher {
             match class {
                 0 => {
                     if data != 0 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 }
                 3 => {} // IDLE: data ignored
                 1 | 2 => {
                     if data >= 8 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 }
-                _ => return Ok(LINUX_EINVAL.into()),
+                _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
             IOPRIO_VALUE.store(v, std::sync::atomic::Ordering::SeqCst);
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1189,7 +1190,7 @@ impl SyscallDispatcher {
             const PGRP: u64 = 2;
             const USER: u64 = 3;
             if !matches!(which, PROCESS | PGRP | USER) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let v = IOPRIO_VALUE.load(std::sync::atomic::Ordering::SeqCst);
             Ok(DispatchOutcome::Returned { value: v as i64 })
@@ -1202,7 +1203,7 @@ impl SyscallDispatcher {
         /// no-op.
         fn vhangup(this, cx) {
             if this.creds.lock().euid != 0 {
-                return Ok(LINUX_EPERM.into());
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1218,12 +1219,12 @@ impl SyscallDispatcher {
             // Resolve the target BEFORE borrowing cx.memory (resolve reads
             // cx.thread; the mutable memory borrow below would otherwise alias).
             if matches!(this.resolve_affinity_target(cx, pid), AffinityTarget::NotFound) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let memory = &mut *cx.memory;
             let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
             if size < kernel_bytes {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let mask = this.proc.lock().affinity.clone();
             let buf = affinity_to_bytes(&mask, kernel_bytes);
@@ -1241,10 +1242,10 @@ impl SyscallDispatcher {
             let bytes = memory.read_bytes(address.0, read_len)?;
             let target = this.resolve_affinity_target(cx, pid);
             if matches!(target, AffinityTarget::NotFound) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if matches!(target, AffinityTarget::OtherGuest) && this.creds.lock().euid != 0 {
-                return Ok(LINUX_EPERM.into());
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let ncpu = crate::host_facts::logical_cpu_count();
             let online = default_affinity(ncpu);
@@ -1255,7 +1256,7 @@ impl SyscallDispatcher {
                 .map(|(o, r)| o & r)
                 .collect();
             if effective.iter().all(|w| *w == 0) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if matches!(target, AffinityTarget::SelfProc) {
                 this.proc.lock().affinity = effective;
@@ -1284,10 +1285,10 @@ impl SyscallDispatcher {
         fn sched_getscheduler(this, cx, pid: u64) {
             // Linux rejects a negative pid with EINVAL before the ESRCH path.
             if (pid as i32) < 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !sched_pid_exists(cx, pid) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
         }
@@ -1301,13 +1302,13 @@ impl SyscallDispatcher {
             // value the guest reads back is the same regardless of which
             // valid pid it picks. A negative pid is EINVAL (before ESRCH).
             if (pid as i32) < 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !sched_pid_exists(cx, pid) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if address.0 == 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let memory = &mut *cx.memory;
             let prio: i32 = 0;
@@ -1325,21 +1326,21 @@ impl SyscallDispatcher {
             const SCHED_ATTR_SIZE_VER0: u64 = 48;
             // No sched_getattr flags are defined → any flag is EINVAL.
             if flags != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // The buffer must be at least the ver0 struct.
             if size < SCHED_ATTR_SIZE_VER0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // Linux returns EINVAL (not EFAULT) for a NULL attr pointer.
             if attr.0 == 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if (pid as i32) < 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !sched_pid_exists(cx, pid) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             // SCHED_OTHER, nice 0, priority 0 — a zeroed sched_attr with only
             // the leading `size` field populated (layout: size@0 u32,
@@ -1358,23 +1359,23 @@ impl SyscallDispatcher {
         /// as a no-op. Unknown policies are EINVAL.
         fn sched_setscheduler(this, cx, pid: u64, policy: u64, address: GuestPtr) {
             if (pid as i32) < 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !sched_pid_exists(cx, pid) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let policy_i = policy as i32;
             if !sched_policy_is_known(policy_i) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let prio = sched_read_param_priority(cx, address)?;
             if policy_i == LINUX_SCHED_FIFO || policy_i == LINUX_SCHED_RR {
                 // No CAP_SYS_NICE in carrick guest → mirror Linux's EPERM.
-                return Ok(LINUX_EPERM.into());
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             // Time-sharing policies require priority==0.
             if prio != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
         }
@@ -1384,14 +1385,14 @@ impl SyscallDispatcher {
         /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE).
         fn sched_setparam(this, cx, pid: u64, address: GuestPtr) {
             if (pid as i32) < 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !sched_pid_exists(cx, pid) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let prio = sched_read_param_priority(cx, address)?;
             if prio != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1401,10 +1402,10 @@ impl SyscallDispatcher {
         /// schedule; Linux returns {0, 0} (and 0). We mirror that.
         fn sched_rr_get_interval(this, cx, pid: u64, address: GuestPtr) {
             if !sched_pid_exists(cx, pid) {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if address.0 == 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let memory = &mut *cx.memory;
             // struct timespec on aarch64: i64 tv_sec, i64 tv_nsec.
@@ -1430,7 +1431,7 @@ impl SyscallDispatcher {
             let flags = operation & !LINUX_FUTEX_CMD_MASK;
             let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
             if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // Only WAIT / CMP_REQUEUE / PI ops consult the futex VALUE; WAKE and
             // plain REQUEUE are address-keyed (Linux FUTEX_WAKE computes only the
@@ -1476,7 +1477,7 @@ impl SyscallDispatcher {
                     LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
                     LINUX_FUTEX_WAIT => {
                         if word != value || timeout_address.0 == 0 {
-                            return Ok(LINUX_EAGAIN.into());
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
                         let timespec = read_timespec(memory, timeout_address.0)?;
                         let timeout = duration_from_linux_timespec(timespec)?;
@@ -1566,7 +1567,7 @@ impl SyscallDispatcher {
                         word
                     };
                     if current != value {
-                        return Ok(LINUX_EAGAIN.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
                     let timeout = if timeout_address.0 == 0 {
                         // NULL timespec ptr = no timeout (block indefinitely).
@@ -1616,13 +1617,13 @@ impl SyscallDispatcher {
                     // parking-lot generation/token model.
                     let nr_wake = value;
                     if (args.0[2] as i32) < 0 || (args.0[3] as i32) < 0 {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     let nr_requeue = args.0[3] as u32;
                     let uaddr2 = args.0[4];
                     let val3 = args.0[5] as u32;
                     if raw_command == LINUX_FUTEX_CMP_REQUEUE && word != val3 {
-                        return Ok(LINUX_EAGAIN.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
                     if let Some(host_addr) = shared_host_addr {
                         // Shared path: no native requeue → wake nr_wake+nr_requeue
@@ -1703,13 +1704,13 @@ impl SyscallDispatcher {
                             host_signal_data(),
                         )
                     },
-                    None => return Ok(LINUX_ESRCH.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
                 8 => match host_pid(pid) {
                     Some(host) => unsafe {
                         carrick_portable::ptrace(carrick_portable::PT_KILL, host, 0, 0)
                     },
-                    None => return Ok(LINUX_ESRCH.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
                 17 => match host_pid(pid) {
                     Some(host) => unsafe {
@@ -1720,7 +1721,7 @@ impl SyscallDispatcher {
                             host_signal_data(),
                         )
                     },
-                    None => return Ok(LINUX_ESRCH.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
                 LINUX_PTRACE_PEEKTEXT
                 | LINUX_PTRACE_PEEKDATA
@@ -1731,14 +1732,14 @@ impl SyscallDispatcher {
                             || std::io::Error::last_os_error().raw_os_error()
                                 == Some(libc::EPERM);
                         if !exists {
-                            return Ok(LINUX_ESRCH.into());
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
                         if ptrace_text_data_addr_is_invalid(addr) {
-                            return Ok(crate::linux_abi::LINUX_EIO.into());
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                         }
-                        return Ok(LINUX_ENOSYS.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
                     }
-                    _ => return Ok(LINUX_ESRCH.into()),
+                    _ => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
                 LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => match host_pid(pid) {
                     Some(host) if host > 0 => {
@@ -1746,16 +1747,16 @@ impl SyscallDispatcher {
                             || std::io::Error::last_os_error().raw_os_error()
                                 == Some(libc::EPERM);
                         if !exists {
-                            return Ok(LINUX_ESRCH.into());
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                         }
                         if ptrace_user_addr_is_invalid(addr) {
-                            return Ok(crate::linux_abi::LINUX_EIO.into());
+                            return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                         }
-                        return Ok(LINUX_ENOSYS.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
                     }
-                    _ => return Ok(LINUX_ESRCH.into()),
+                    _ => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 },
-                _ => return Ok(LINUX_ENOSYS.into()),
+                _ => return Ok(DispatchOutcome::errno(LINUX_ENOSYS)),
             };
             result.host_syscall_errno()?;
             if request == 0 {
@@ -1765,15 +1766,15 @@ impl SyscallDispatcher {
         }
 
         fn reboot(this, cx) {
-            Ok(LINUX_EPERM.into())
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
         fn sethostname(this, cx) {
-            Ok(LINUX_EPERM.into())
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
         fn setdomainname(this, cx) {
-            Ok(LINUX_EPERM.into())
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
         fn setpgid(this, cx, pid: Pid, pgid: Pid) {
@@ -1784,10 +1785,10 @@ impl SyscallDispatcher {
             // isn't a member is ESRCH. Identity when ns is off.
             let (hpid, hpgid) = match translate_setpgid_args(pid, pgid) {
                 Ok(args) => args,
-                Err(errno) => return Ok(errno.into()),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             if let Err(errno) = (unsafe { libc::setpgid(hpid, hpgid) }).host_syscall_errno() {
-                return Ok(errno.into());
+                return Ok(DispatchOutcome::errno(errno));
             }
             if crate::namespace::pid::enabled()
                 && pid.0 == 0
@@ -1806,7 +1807,7 @@ impl SyscallDispatcher {
             let hpid = if crate::namespace::pid::enabled() && pid.0 != 0 {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
                     Some(h) => h as i32,
-                    None => return Ok(LINUX_ESRCH.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 }
             } else {
                 pid.0
@@ -1826,7 +1827,7 @@ impl SyscallDispatcher {
             let hpid = if crate::namespace::pid::enabled() && pid.0 != 0 {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
                     Some(h) => h as i32,
-                    None => return Ok(LINUX_ESRCH.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 }
             } else {
                 pid.0
@@ -1861,10 +1862,10 @@ impl SyscallDispatcher {
             // bit-identical to the raw `options & !SUPPORTED != 0` test.
             let options = LinuxWaitOptions::from_bits_retain(options);
             if !LinuxWaitOptions::WAITID_SUPPORTED.contains(options) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !options.intersects(LinuxWaitOptions::WAITID_STATE_MASK) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
                 LINUX_P_ALL => (libc::P_ALL, 0),
@@ -1873,7 +1874,7 @@ impl SyscallDispatcher {
                     // (§5.3); an ns-pid that names no member is ECHILD.
                     match crate::namespace::pid::ns_to_host_or_self(id as u32) {
                         Some(h) => (libc::P_PID, h as libc::id_t),
-                        None => return Ok(crate::linux_abi::LINUX_ECHILD.into()),
+                        None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
                     }
                 }
                 // P_PGID stays host-level in Phase 2 (process groups are not yet
@@ -1881,9 +1882,9 @@ impl SyscallDispatcher {
                 LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
                 LINUX_P_PIDFD => match this.pidfd_host_pid(id as i32) {
                     Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
-                    None => return Ok(LINUX_EBADF.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 },
-                _ => return Ok(LINUX_EINVAL.into()),
+                _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
             let mut host_options: i32 = 0;
             if options.contains(LinuxWaitOptions::WEXITED) {
@@ -2008,7 +2009,7 @@ impl SyscallDispatcher {
             // bit-identical to the raw `options & !SUPPORTED != 0` test.
             let options = LinuxWaitOptions::from_bits_retain(options);
             if !LinuxWaitOptions::WAIT4_SUPPORTED.contains(options) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // PID namespace (§5.3): a positive `pid` arg names a child by its
             // ns-pid; translate it to the host pid the kernel knows. An ns-pid
@@ -2025,7 +2026,7 @@ impl SyscallDispatcher {
             let host_target: i32 = if crate::namespace::pid::enabled() && pid.0 > 0 {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
                     Some(h) => h as i32,
-                    None => return Ok(crate::linux_abi::LINUX_ECHILD.into()),
+                    None => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD)),
                 }
             } else {
                 pid.0
@@ -2120,9 +2121,9 @@ impl SyscallDispatcher {
                     // case — a valid pgid with no children stays ECHILD, and
                     // every other error passes through unchanged.
                     if host_target < -1 && errno == LINUX_EINVAL {
-                        return Ok(LINUX_ESRCH.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                     }
-                    return Ok(errno.into());
+                    return Ok(DispatchOutcome::errno(errno));
                 }
             };
             if result == 0 {
@@ -2150,7 +2151,7 @@ impl SyscallDispatcher {
                             if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
                                 continue;
                             }
-                            return Ok(errno.into());
+                            return Ok(DispatchOutcome::errno(errno));
                         }
                     }
                 }
@@ -2196,7 +2197,7 @@ impl SyscallDispatcher {
                     .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
                     .is_err()
                 {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
             let host_status = translate_child_wait_status(result as u32, host_status);
@@ -2246,7 +2247,7 @@ impl SyscallDispatcher {
                 });
                 match p {
                     Some(p) => p,
-                    None => return Ok(LINUX_EBADF.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 }
             } else {
                 this.resolve_at_path(dirfd, &path_str)?
@@ -2270,7 +2271,7 @@ impl SyscallDispatcher {
             if (flags & thread != 0 && flags & sighand == 0)
                 || (flags & sighand != 0 && flags & vm == 0)
             {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
             let thread_mask = LinuxCloneFlags::THREAD_MASK;
@@ -2308,10 +2309,10 @@ impl SyscallDispatcher {
         fn pidfd_open(this, cx, pid: Pid, flags: u64) {
             const PIDFD_NONBLOCK: u64 = 0o4000;
             if pid.0 <= 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if flags & !PIDFD_NONBLOCK != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // PID namespace (§5.3): the guest names the target by its ns-pid;
             // the pidfd must watch the underlying host pid. A foreign ns-pid is
@@ -2319,7 +2320,7 @@ impl SyscallDispatcher {
             let host_pid = if crate::namespace::pid::enabled() {
                 match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
                     Some(h) => h as i32,
-                    None => return Ok(LINUX_ESRCH.into()),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                 }
             } else {
                 pid.0
@@ -2329,13 +2330,13 @@ impl SyscallDispatcher {
 
         fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, _info: GuestPtr, _flags: u64) {
             let Some(host_pid) = this.pidfd_host_pid(fd.0) else {
-                return Ok(LINUX_EBADF.into());
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             if signum == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !crate::dispatch::signal::is_valid_signum(signum) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // A pidfd names exactly one process by the HOST pid recorded at
             // creation (pidfd_open rejects pid <= 0; CLONE_PIDFD registers the
@@ -2352,7 +2353,7 @@ impl SyscallDispatcher {
             // from the host CSPRNG regardless of the source/blocking flags.
             const GRND_SUPPORTED: u64 = 0x0001 | 0x0002 | 0x0004;
             if flags & !GRND_SUPPORTED != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
             // Linux caps getrandom at 2^31-1 and returns a short count; clamp so a

@@ -125,12 +125,12 @@ fn rt_sigaction_sig_dfl_resets_host_disposition_for_job_control() {
 
 #[test]
 fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
-    const LINUX_EINTR: i32 = 4;
-    const LINUX_EAGAIN: i32 = 11;
-    const LINUX_EFAULT: i32 = 14;
-    const LINUX_EINVAL: i32 = 22;
-    const LINUX_ESRCH: i32 = 3;
-    const LINUX_ENOSYS: i32 = 38;
+    const LINUX_EINTR: LinuxErrno = LinuxErrno::new(4);
+    const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
+    const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+    const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
+    const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
@@ -341,8 +341,8 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
 
 #[test]
 fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
-    const LINUX_EINVAL: i32 = 22;
-    const LINUX_ESRCH: i32 = 3;
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+    const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
     // Signal delivery is now real: kill / tkill / tgkill with a valid
     // self-target signum no longer return ENOSYS; they queue the
     // signal for the runtime's between-trap delivery pass.
@@ -535,8 +535,8 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
 
 #[test]
 fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
-    const LINUX_EINVAL: i32 = 22;
-    const LINUX_ENOMEM: i32 = 12;
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+    const LINUX_ENOMEM: LinuxErrno = LinuxErrno::new(12);
     const LINUX_SS_DISABLE: i32 = 2;
     const LINUX_SS_ONSTACK: i32 = 1;
     const LINUX_MINSIGSTKSZ: u64 = 2048;
@@ -672,7 +672,9 @@ fn rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 4 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(4)
+        }
     );
     // The pre-suspend mask (0) is restored, not left as the suspend mask.
     assert_eq!(
@@ -710,7 +712,9 @@ fn rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 4 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(4)
+        }
     );
     // No handler ran → rt_sigsuspend restored the original mask itself, NOT the
     // suspend mask (0). The bug left it at the suspend mask.
@@ -758,7 +762,9 @@ fn signalfd_read_drains_pending_masked_signals() {
     // No signal pending -> EAGAIN (not the old EINVAL).
     assert_eq!(
         read(&mut dispatcher, &mut memory, 128),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
 
     // Mark SIGUSR1 pending for tid 0 (the harness ctx_tid).
@@ -775,13 +781,17 @@ fn signalfd_read_drains_pending_masked_signals() {
     // Drained: a second read is EAGAIN again.
     assert_eq!(
         read(&mut dispatcher, &mut memory, 128),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
 
     // A buffer smaller than one signalfd_siginfo is EINVAL.
     assert_eq!(
         read(&mut dispatcher, &mut memory, 64),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 }
 

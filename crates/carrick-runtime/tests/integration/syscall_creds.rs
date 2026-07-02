@@ -115,7 +115,9 @@ fn capset_accepts_empty_sets_and_rejects_nonempty_sets() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 1 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(1)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -257,7 +259,9 @@ fn prctl_handles_bootstrap_process_controls() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -270,7 +274,9 @@ fn prctl_handles_bootstrap_process_controls() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
     assert_eq!(
         dispatcher
@@ -280,7 +286,9 @@ fn prctl_handles_bootstrap_process_controls() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -321,7 +329,9 @@ fn getcpu_writes_bootstrap_cpu_and_numa_node() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -370,7 +380,9 @@ fn rseq_reports_clean_bootstrap_fallback() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 38 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(38)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -412,7 +424,9 @@ fn membarrier_query_reports_no_bootstrap_commands() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -425,7 +439,9 @@ fn membarrier_query_reports_no_bootstrap_commands() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -481,7 +497,9 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -501,7 +519,9 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 3 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(3)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -555,7 +575,9 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
     assert_eq!(
         dispatcher
@@ -575,7 +597,9 @@ fn futex_wait_and_wake_cover_bootstrap_private_operations() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 110 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(110)
+        }
     );
     // FUTEX_WAKE never reads the futex word — Linux's futex_wake() only hashes
     // the (mm, uaddr) key and wakes matching waiters, so an unmapped address is
@@ -659,8 +683,8 @@ fn prlimit64_writes_packed_rlimit() {
 fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     const LINUX_RUSAGE_SELF: u64 = 0;
     const LINUX_RUSAGE_CHILDREN: u64 = (-1_i64) as u64;
-    const LINUX_EINVAL: i32 = 22;
-    const LINUX_EFAULT: i32 = 14;
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+    const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
 
     let mut memory = LinearMemory::new(0x4000, vec![0xff; core::mem::size_of::<LinuxRusage>()]);
     let reporter = CompatReporter::default();
@@ -821,7 +845,9 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     // setpriority for our pid succeeds.
     assert_eq!(
@@ -843,7 +869,9 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 3 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(3)
+        }
     );
 
     // getpriority returns the raw kernel ABI `20 - nice`. setpriority now
@@ -1012,7 +1040,9 @@ fn prctl_no_new_privs_keepcaps_subreaper_timerslack_round_trip() {
             1,
             7
         ),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     // KEEPCAPS: 0 → set 1 → 1; arg2 > 1 → EINVAL.
@@ -1058,7 +1088,9 @@ fn prctl_no_new_privs_keepcaps_subreaper_timerslack_round_trip() {
             2,
             0
         ),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     // TIMERSLACK: default 50000 ns → set 120000 → reads back 120000;
@@ -1281,7 +1313,9 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());

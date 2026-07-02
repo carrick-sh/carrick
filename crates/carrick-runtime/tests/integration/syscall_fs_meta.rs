@@ -436,7 +436,12 @@ fn proc_self_fdinfo_renders_pos_flags_ino() {
             &reporter,
         )
         .unwrap();
-    assert_eq!(missing, DispatchOutcome::Errno { errno: 2 });
+    assert_eq!(
+        missing,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
+    );
 }
 
 #[test]
@@ -723,7 +728,12 @@ fn missing_proc_file_records_compat_report_entry() {
         )
         .unwrap();
 
-    assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
+    );
     let report = reporter.finish();
     assert!(report.unhandled_syscalls.is_empty());
     assert_eq!(report.proc_read_unimplemented[0].path, "/proc/self/sched");
@@ -864,7 +874,12 @@ fn missing_sys_file_records_compat_report_entry() {
         )
         .unwrap();
 
-    assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
+    );
     let report = reporter.finish();
     assert!(report.unhandled_syscalls.is_empty());
     assert_eq!(
@@ -910,7 +925,9 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     assert_eq!(
@@ -938,7 +955,9 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -951,7 +970,9 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
 
     assert_eq!(
@@ -989,7 +1010,9 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -1029,7 +1052,9 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     assert_eq!(
@@ -1058,7 +1083,9 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1071,7 +1098,9 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     // The fchmodat syscall (nr 53) is SYSCALL_DEFINE3 in Linux and IGNORES
     // the 4th register, so a non-zero flags value must NOT fail. glibc leaves
@@ -1292,7 +1321,9 @@ fn non_root_chown_under_bind_mount_to_root_returns_eperm() {
             54,
             [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0],
         ),
-        DispatchOutcome::Errno { errno: 1 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(1)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -1537,7 +1568,9 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1550,7 +1583,9 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1563,7 +1598,9 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1573,7 +1610,9 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
 
     assert_eq!(
@@ -1609,7 +1648,9 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -1638,7 +1679,9 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(30)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1648,7 +1691,9 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 21 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(21)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1658,7 +1703,9 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1668,7 +1715,9 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1678,7 +1727,9 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -1718,7 +1769,9 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
                     &reporter,
                 )
                 .unwrap(),
-            DispatchOutcome::Errno { errno: 2 },
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(2)
+            },
             "path-variant xattr syscall {number} on a missing path should be ENOENT"
         );
     }
@@ -1739,7 +1792,9 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
                     &reporter,
                 )
                 .unwrap(),
-            DispatchOutcome::Errno { errno: 9 },
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(9)
+            },
             "fd-variant syscall {number} should return EBADF for an unopened fd"
         );
     }
@@ -1767,7 +1822,9 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 29 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(29)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1777,7 +1834,9 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1787,7 +1846,9 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1797,7 +1858,9 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1807,7 +1870,9 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert_eq!(
@@ -1860,7 +1925,9 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1870,7 +1937,9 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1880,7 +1949,9 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1890,7 +1961,9 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert_eq!(
@@ -1914,7 +1987,9 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -2057,7 +2132,9 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
             56,
             [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0],
         ),
-        DispatchOutcome::Errno { errno: 2 },
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        },
         "after unlink the detached injection must be ENOENT, not the synthetic file"
     );
     // newfstatat agrees: ENOENT.
@@ -2068,7 +2145,9 @@ fn guest_can_override_synthetic_etc_services_via_unlink_then_recreate() {
             79,
             [LINUX_AT_FDCWD, 0x4000, 0x4300, 0, 0, 0],
         ),
-        DispatchOutcome::Errno { errno: 2 },
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        },
         "stat after unlink must be ENOENT"
     );
 

@@ -66,7 +66,12 @@ fn unknown_syscall_returns_enosys_and_records_report_entry() {
         )
         .unwrap();
 
-    assert_eq!(outcome, DispatchOutcome::Errno { errno: 38 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(38)
+        }
+    );
     let report = reporter.finish();
     assert_eq!(report.unhandled_syscalls[0].number, 9999);
     assert_eq!(report.unhandled_syscalls[0].name, "unknown");
@@ -136,7 +141,9 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 38 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(38)
+        }
     );
     // reboot / sethostname / setdomainname / settimeofday → EPERM.
     for number in [142_u64, 161, 162, 170] {
@@ -148,7 +155,9 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
                     &reporter,
                 )
                 .unwrap(),
-            DispatchOutcome::Errno { errno: 1 },
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(1)
+            },
             "syscall {number} should return EPERM"
         );
     }
@@ -174,7 +183,9 @@ fn job_control_queries_match_host_process_group_state() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 3 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(3)
+        }
     );
     assert_eq!(
         dispatcher
@@ -184,7 +195,9 @@ fn job_control_queries_match_host_process_group_state() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     // Successful setpgid(0, 0) and setsid() mutate process-global state for the
     // test harness, so this unit test covers non-mutating host-backed queries
@@ -209,7 +222,9 @@ fn job_control_queries_match_host_process_group_state() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 3 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(3)
+        }
     );
     assert_eq!(
         dispatcher
@@ -231,7 +246,9 @@ fn job_control_queries_match_host_process_group_state() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 3 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(3)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -262,7 +279,12 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
             &reporter,
         )
         .unwrap();
-    assert_eq!(outcome, DispatchOutcome::Errno { errno: 38 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(38)
+        }
+    );
 
     let report = reporter.finish();
     // lookup_dcookie(18) is a number the aarch64 table recognises (Deferred),
@@ -288,8 +310,8 @@ fn wait_family_bootstrap_returns_echild() {
     const LINUX_P_ALL: u64 = 0;
     const LINUX_WNOHANG: u64 = 1;
     const LINUX_WEXITED: u64 = 4;
-    const LINUX_ECHILD: i32 = 10;
-    const LINUX_EINVAL: i32 = 22;
+    const LINUX_ECHILD: LinuxErrno = LinuxErrno::new(10);
+    const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let reporter = CompatReporter::default();
@@ -596,7 +618,9 @@ fn seccomp_filter_blocks_the_targeted_syscall_with_errno() {
     // getpid(172) is now denied with EPERM (1); getppid(173) still works.
     assert_eq!(
         run(&mut dispatcher, &mut memory, 172, [0; 6]),
-        DispatchOutcome::Errno { errno: 1 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(1)
+        }
     );
     assert!(matches!(
         run(&mut dispatcher, &mut memory, 173, [0; 6]),

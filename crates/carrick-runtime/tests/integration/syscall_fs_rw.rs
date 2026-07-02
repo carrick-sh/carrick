@@ -55,7 +55,12 @@ fn write_syscall_rejects_bad_guest_pointer_with_efault() {
         )
         .unwrap();
 
-    assert_eq!(outcome, DispatchOutcome::Errno { errno: 14 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
+    );
     assert!(dispatcher.stdout().is_empty());
 }
 
@@ -535,7 +540,9 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -851,7 +858,9 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 29 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(29)
+        }
     );
     assert_eq!(
         dispatcher
@@ -861,7 +870,9 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 29 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(29)
+        }
     );
     assert_eq!(
         dispatcher
@@ -871,7 +882,9 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
     assert_eq!(
         dispatcher
@@ -881,7 +894,9 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     write_iovecs(
@@ -897,7 +912,9 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(14)
+        }
     );
 
     assert_eq!(
@@ -921,7 +938,9 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -1577,7 +1596,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 29 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(29)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1587,7 +1608,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 29 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(29)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1597,7 +1620,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1607,7 +1632,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert_eq!(
@@ -1631,7 +1658,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     let pipe_pair_address = 0x4180;
@@ -1657,7 +1686,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 29 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(29)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1670,7 +1701,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 29 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(29)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -1761,7 +1794,9 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1771,7 +1806,9 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
