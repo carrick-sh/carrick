@@ -807,7 +807,7 @@ impl SyscallDispatcher {
                     host_fd,
                     pty: Some(role),
                     ..
-                } => Some((*role, *host_fd)),
+                } => Some((*role, host_fd.raw())),
                 _ => None,
             })
     }
@@ -865,7 +865,7 @@ impl SyscallDispatcher {
         match desc {
             OpenDescription::HostFile { host_fd, .. } => {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
+                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 {
                     Some(LeaseFileId::Inode {
                         dev: st.st_dev as u64,
                         ino: st.st_ino as u64,
@@ -1156,7 +1156,7 @@ impl SyscallDispatcher {
             if let Some(host_fd) = self.fs.rootfs_vfs.overlay.open_anon_fd(create_mode) {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
                 let description = OpenDescription::HostFile {
-                    host_fd,
+                    host_fd: HostFdRef::new(host_fd),
                     metadata: RootFsMetadata {
                         path: Path::new("/__carrick_o_tmpfile").to_path_buf(),
                         kind: RootFsEntryKind::File,
@@ -1166,10 +1166,9 @@ impl SyscallDispatcher {
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable: true,
                 };
-                let open_file = OpenFile::with_host_fd(
+                let open_file = OpenFile::new(
                     Arc::new(RwLock::new(description)),
                     linux_fd_flags_from_open_flags(flags),
-                    host_fd,
                 );
                 return match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => Ok(DispatchOutcome::Returned { value: fd as i64 }),
@@ -1437,13 +1436,13 @@ impl SyscallDispatcher {
                     crate::dispatch::fifo_beacon::register_open(host_fd, access_idx);
                     crate::dispatch::net::set_host_nonblocking(host_fd);
                     let description = OpenDescription::HostPipe {
-                        host_fd,
-                        is_read_end: access != LINUX_O_WRONLY,
                         // A named FIFO's two ends are opened separately but share
                         // ONE on-disk inode, so the host inode is a join key both
                         // ends agree on (the FASYNC arm/trigger across ends works
                         // for FIFOs as it does for anonymous pipes).
                         pipe_id: host_inode_pipe_id(host_fd),
+                        host_fd: HostFdRef::new(host_fd),
+                        is_read_end: access != LINUX_O_WRONLY,
                         base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                         pty: None,
                         bidirectional: access == LINUX_O_RDWR,
@@ -1452,7 +1451,6 @@ impl SyscallDispatcher {
                     let open_file = OpenFile {
                         description: Arc::new(RwLock::new(description)),
                         fd_flags: linux_fd_flags_from_open_flags(flags),
-                        host_fd_owner: Some(HostFdRef::new(host_fd)),
                     };
                     let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
                         return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
@@ -1542,71 +1540,55 @@ impl SyscallDispatcher {
             &dispatch_result,
             Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate)
         );
-        let (description, host_fd_owner) = match dispatch_result {
+        let description = match dispatch_result {
             Ok(crate::vfs::rootfs::OpenDispatchResult::File {
                 metadata,
                 contents,
                 writable,
-            }) => (
-                OpenDescription::File {
-                    path,
-                    metadata,
-                    contents: FileContents::dense(contents),
-                    offset: 0,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                    writable,
-                },
-                None,
-            ),
+            }) => OpenDescription::File {
+                path,
+                metadata,
+                contents: FileContents::dense(contents),
+                offset: 0,
+                base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                writable,
+            },
             Ok(crate::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
                 metadata,
                 contents,
                 writable,
-            }) => (
-                OpenDescription::File {
-                    path,
-                    metadata,
-                    contents: FileContents::shared_backed(
-                        contents.base,
-                        contents.dirty,
-                        contents.len,
-                    ),
-                    offset: 0,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                    writable,
-                },
-                None,
-            ),
+            }) => OpenDescription::File {
+                path,
+                metadata,
+                contents: FileContents::shared_backed(contents.base, contents.dirty, contents.len),
+                offset: 0,
+                base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                writable,
+            },
             Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile {
                 host_fd,
                 metadata,
                 writable,
             }) => {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
-                (
-                    OpenDescription::HostFile {
-                        host_fd,
-                        metadata,
-                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                        writable,
-                    },
-                    Some(HostFdRef::new(host_fd)),
-                )
+                OpenDescription::HostFile {
+                    host_fd: HostFdRef::new(host_fd),
+                    metadata,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                    writable,
+                }
             }
             Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
                 if writable_request {
                     return Ok(DispatchOutcome::errno(LINUX_EISDIR));
                 }
-                (
-                    OpenDescription::Directory {
-                        path,
-                        metadata,
-                        entries,
-                        offset: 0,
-                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                    },
-                    None,
-                )
+                OpenDescription::Directory {
+                    path,
+                    metadata,
+                    entries,
+                    offset: 0,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                }
             }
             Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
                 // O_CREAT path: validate the parent directory exists,
@@ -1671,20 +1653,17 @@ impl SyscallDispatcher {
                             .overlay
                             .set_owner(&path, create_uid, create_gid);
                     }
-                    (
-                        OpenDescription::HostFile {
-                            host_fd,
-                            metadata,
-                            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                            // A newly-created file's GUEST writability is its
-                            // access mode, NOT the O_CREAT flag: O_RDONLY|O_CREAT
-                            // creates the file but a later write/ftruncate on the
-                            // fd is EINVAL (ftruncate03 read_fd). The host fd is
-                            // still opened RW above so creation/overlay works.
-                            writable: writable_request,
-                        },
-                        Some(HostFdRef::new(host_fd)),
-                    )
+                    OpenDescription::HostFile {
+                        host_fd: HostFdRef::new(host_fd),
+                        metadata,
+                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                        // A newly-created file's GUEST writability is its
+                        // access mode, NOT the O_CREAT flag: O_RDONLY|O_CREAT
+                        // creates the file but a later write/ftruncate on the
+                        // fd is EINVAL (ftruncate03 read_fd). The host fd is
+                        // still opened RW above so creation/overlay works.
+                        writable: writable_request,
+                    }
                 } else {
                     if self.fs.rootfs_vfs.overlay.create_file(&path).is_err() {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -1697,19 +1676,16 @@ impl SyscallDispatcher {
                             .overlay
                             .set_owner(&path, create_uid, create_gid);
                     }
-                    (
-                        OpenDescription::File {
-                            path,
-                            metadata,
-                            contents: FileContents::dense(Vec::new()),
-                            offset: 0,
-                            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                            // Guest writability follows the access mode, not
-                            // O_CREAT (O_RDONLY|O_CREAT → read-only fd).
-                            writable: writable_request,
-                        },
-                        None,
-                    )
+                    OpenDescription::File {
+                        path,
+                        metadata,
+                        contents: FileContents::dense(Vec::new()),
+                        offset: 0,
+                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                        // Guest writability follows the access mode, not
+                        // O_CREAT (O_RDONLY|O_CREAT → read-only fd).
+                        writable: writable_request,
+                    }
                 }
             }
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -1723,7 +1699,6 @@ impl SyscallDispatcher {
         let open_file = OpenFile {
             description: Arc::new(RwLock::new(description)),
             fd_flags: linux_fd_flags_from_open_flags(flags),
-            host_fd_owner,
         };
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
@@ -1774,7 +1749,7 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile { offset, .. }
             | OpenDescription::Directory { offset, .. } => *offset as u64,
             OpenDescription::HostFile { host_fd, .. } => {
-                host_fd_offset(HostFd(*host_fd)).unwrap_or(0)
+                host_fd_offset(host_fd.view()).unwrap_or(0)
             }
             _ => 0,
         };
@@ -1876,18 +1851,19 @@ impl SyscallDispatcher {
                 && !slave_role.is_master
                 && slave_role.index == role.index
             {
-                return Some(*slave_host_fd);
+                return Some(slave_host_fd.raw());
             }
         }
         None
     }
 
     fn duplicate_fd(&self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
-        let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
-            Some(open_file) => (
-                Arc::clone(&open_file.description),
-                open_file.host_fd_owner.clone(),
-            ),
+        // The description Arc alone carries the backing host fd's liveness:
+        // the OWNED HostFdRef lives inside the description, so `Arc::clone`
+        // here is the whole dup — one refcount, no separate owner to keep in
+        // lockstep.
+        let description = match self.open_file(old_fd).as_ref() {
+            Some(open_file) => Arc::clone(&open_file.description),
             // A closed-and-not-reopened stdio fd is genuinely closed: dup is
             // EBADF, not a host-fd grab. (The closed check must precede the
             // is_stdio_fd grab below.)
@@ -1908,28 +1884,26 @@ impl SyscallDispatcher {
                 crate::dispatch::net::set_host_nonblocking(duped);
                 let write_kind = HostWriteKind::for_host_fd(duped);
                 let pty = self.dup_stdio_pty_role(old_fd);
-                (
-                    Arc::new(RwLock::new(OpenDescription::HostPipe {
-                        host_fd: duped,
-                        is_read_end: old_fd == 0,
-                        // A duped stdio fd has no separate pipe peer to coordinate
-                        // a FASYNC arm/trigger with; the host inode is still a
-                        // unique id (FASYNC is not exercised on bare stdio).
-                        pipe_id: host_inode_pipe_id(duped),
-                        base: OpenDescriptionBase::new(0),
-                        pty,
-                        bidirectional: false,
-                        write_kind,
-                    })),
-                    Some(HostFdRef::new(duped)),
-                )
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    // A duped stdio fd has no separate pipe peer to coordinate
+                    // a FASYNC arm/trigger with; the host inode is still a
+                    // unique id (FASYNC is not exercised on bare stdio).
+                    pipe_id: host_inode_pipe_id(duped),
+                    // `duped` is a genuinely NEW host fd, so this fresh owned
+                    // handle is its one owner.
+                    host_fd: HostFdRef::new(duped),
+                    is_read_end: old_fd == 0,
+                    base: OpenDescriptionBase::new(0),
+                    pty,
+                    bidirectional: false,
+                    write_kind,
+                }))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
         let open_file = OpenFile {
             description,
             fd_flags,
-            host_fd_owner,
         };
         let new_fd = match self.install_fd_at_or_above(min_fd, open_file) {
             Ok(fd) => fd,
@@ -1966,11 +1940,10 @@ impl SyscallDispatcher {
             };
         }
 
-        let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
-            Some(open_file) => (
-                Arc::clone(&open_file.description),
-                open_file.host_fd_owner.clone(),
-            ),
+        // As in `duplicate_fd`: the description Arc alone carries the host
+        // fd's liveness (the owned HostFdRef lives inside the description).
+        let description = match self.open_file(old_fd).as_ref() {
+            Some(open_file) => Arc::clone(&open_file.description),
             None if is_stdio_fd(old_fd) && self.stdio_is_closed(old_fd) => {
                 return DispatchOutcome::errno(LINUX_EBADF);
             }
@@ -1982,21 +1955,20 @@ impl SyscallDispatcher {
                 crate::dispatch::net::set_host_nonblocking(duped);
                 let write_kind = HostWriteKind::for_host_fd(duped);
                 let pty = self.dup_stdio_pty_role(old_fd);
-                (
-                    Arc::new(RwLock::new(OpenDescription::HostPipe {
-                        host_fd: duped,
-                        is_read_end: old_fd == 0,
-                        // A duped stdio fd has no separate pipe peer to coordinate
-                        // a FASYNC arm/trigger with; the host inode is still a
-                        // unique id (FASYNC is not exercised on bare stdio).
-                        pipe_id: host_inode_pipe_id(duped),
-                        base: OpenDescriptionBase::new(0),
-                        pty,
-                        bidirectional: false,
-                        write_kind,
-                    })),
-                    Some(HostFdRef::new(duped)),
-                )
+                Arc::new(RwLock::new(OpenDescription::HostPipe {
+                    // A duped stdio fd has no separate pipe peer to coordinate
+                    // a FASYNC arm/trigger with; the host inode is still a
+                    // unique id (FASYNC is not exercised on bare stdio).
+                    pipe_id: host_inode_pipe_id(duped),
+                    // `duped` is a genuinely NEW host fd, so this fresh owned
+                    // handle is its one owner.
+                    host_fd: HostFdRef::new(duped),
+                    is_read_end: old_fd == 0,
+                    base: OpenDescriptionBase::new(0),
+                    pty,
+                    bidirectional: false,
+                    write_kind,
+                }))
             }
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
@@ -2016,7 +1988,6 @@ impl SyscallDispatcher {
                 OpenFile {
                     description,
                     fd_flags,
-                    host_fd_owner,
                 },
             );
         }
@@ -2126,7 +2097,7 @@ impl SyscallDispatcher {
                 let is_regular = write_kind == HostWriteKind::RegularFile;
                 let description = if is_regular {
                     OpenDescription::HostFile {
-                        host_fd,
+                        host_fd: HostFdRef::new(host_fd),
                         metadata: crate::rootfs::RootFsMetadata {
                             path: std::path::PathBuf::from(path),
                             kind: RootFsEntryKind::File,
@@ -2138,11 +2109,11 @@ impl SyscallDispatcher {
                     }
                 } else {
                     OpenDescription::HostPipe {
-                        host_fd,
-                        is_read_end,
                         // A VFS host stream (e.g. /dev/null, a chardev) has no
                         // separate pipe peer; the host inode is a unique id.
                         pipe_id: host_inode_pipe_id(host_fd),
+                        host_fd: HostFdRef::new(host_fd),
+                        is_read_end,
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: None,
                         // A VFS stream opened O_RDWR must serve BOTH directions
@@ -2157,10 +2128,9 @@ impl SyscallDispatcher {
                         write_kind,
                     }
                 };
-                let open_file = OpenFile::with_host_fd(
+                let open_file = OpenFile::new(
                     Arc::new(RwLock::new(description)),
                     linux_fd_flags_from_open_flags(flags),
-                    host_fd,
                 );
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => fd,
@@ -2197,15 +2167,15 @@ impl SyscallDispatcher {
                 status_flags,
             } => {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
-                let open_file = OpenFile::with_host_fd(
+                let open_file = OpenFile::new(
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
-                        host_fd,
-                        // A pty end is bidirectional; route reads and
-                        // writes through the host fd like /dev/null.
-                        is_read_end: true,
                         // A pty end's host inode is a unique id (FASYNC is not
                         // exercised on ptys).
                         pipe_id: host_inode_pipe_id(host_fd),
+                        host_fd: HostFdRef::new(host_fd),
+                        // A pty end is bidirectional; route reads and
+                        // writes through the host fd like /dev/null.
+                        is_read_end: true,
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: Some(crate::vfs::PtyRole {
                             index: pts_index,
@@ -2216,7 +2186,6 @@ impl SyscallDispatcher {
                         write_kind: HostWriteKind::Other,
                     })),
                     linux_fd_flags_from_open_flags(flags),
-                    host_fd,
                 );
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => fd,
@@ -2301,7 +2270,7 @@ impl SyscallDispatcher {
         };
         let open = open_file.description.read();
         Ok(match &*open {
-            OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+            OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
             _ => None,
         })
     }
@@ -2321,7 +2290,7 @@ impl SyscallDispatcher {
             OpenDescription::HostPipe { pipe_id, .. } => {
                 return (*pipe_id != 0).then_some(*pipe_id);
             }
-            OpenDescription::HostSocket { host_fd, .. } => *host_fd,
+            OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
             _ => return None,
         };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -2573,7 +2542,7 @@ impl SyscallDispatcher {
                     host_fd,
                     writable: true,
                     ..
-                } => *host_fd,
+                } => host_fd.raw(),
                 OpenDescription::HostFile { .. } => return DispatchOutcome::errno(LINUX_EBADF),
                 _ => return DispatchOutcome::errno(LINUX_EINVAL),
             },
@@ -2692,7 +2661,7 @@ impl SyscallDispatcher {
                         // one-way pipe ends are gated by is_read_end.
                         #[cfg(feature = "trace-tty")]
                         if bytes.contains(&0x0a) {
-                            let hf = *host_fd;
+                            let hf = host_fd.raw();
                             let tt = unsafe { libc::isatty(hf) };
                             eprintln!(
                                 "[PTYWR2DBG-streamed] guest_fd={fd} desc_host_fd={hf} isatty={tt} pty={:?} is_read_end={is_read_end}",
@@ -2704,8 +2673,8 @@ impl SyscallDispatcher {
                         } else {
                             write_host_pipe(
                                 bytes,
-                                *host_fd,
-                                open_file.host_fd_owner.clone(),
+                                host_fd.raw(),
+                                Some(host_fd.clone()),
                                 nonblocking,
                                 *write_kind,
                                 tid,
@@ -2716,8 +2685,8 @@ impl SyscallDispatcher {
                     OpenDescription::HostSocket { host_fd, .. } => {
                         return write_host_pipe(
                             bytes,
-                            *host_fd,
-                            open_file.host_fd_owner.clone(),
+                            host_fd.raw(),
+                            Some(host_fd.clone()),
                             nonblocking,
                             HostWriteKind::SocketLike,
                             tid,
@@ -2734,12 +2703,12 @@ impl SyscallDispatcher {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         }
                         if base.status_flags() & LINUX_O_APPEND != 0 {
-                            unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
+                            unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                         }
                         return write_host_pipe(
                             bytes,
-                            *host_fd,
-                            open_file.host_fd_owner.clone(),
+                            host_fd.raw(),
+                            Some(host_fd.clone()),
                             nonblocking,
                             HostWriteKind::RegularFile,
                             tid,
@@ -2872,7 +2841,7 @@ impl SyscallDispatcher {
                 host_fd, metadata, ..
             } if is_anon_overlay_path(&metadata.path.to_string_lossy()) => {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(*host_fd, &mut st) } != 0 {
+                if unsafe { libc::fstat(host_fd.raw(), &mut st) } != 0 {
                     return Some(Err(LINUX_EBADF));
                 }
                 let size = st.st_size.max(0) as usize;
@@ -2881,7 +2850,7 @@ impl SyscallDispatcher {
                 while read < size {
                     let n = unsafe {
                         libc::pread(
-                            *host_fd,
+                            host_fd.raw(),
                             buf[read..].as_mut_ptr() as *mut libc::c_void,
                             size - read,
                             read as libc::off_t,
@@ -3101,7 +3070,7 @@ impl SyscallDispatcher {
                     },
                 };
                 let times = [to_ts(atime), to_ts(mtime)];
-                let rc = unsafe { libc::futimens(*host_fd, times.as_ptr()) };
+                let rc = unsafe { libc::futimens(host_fd.raw(), times.as_ptr()) };
                 if rc < 0 {
                     // Best-effort: don't abort the caller on a failed
                     // timestamp set (see the path-branch rationale).
@@ -3923,9 +3892,9 @@ impl SyscallDispatcher {
             // both ends inherit the SAME id. (macOS gives the two ends DIFFERENT
             // st_ino, so a per-fd inode key would never match across ends.)
             let pipe_id = host_inode_pipe_id(host_read);
-            let read_open = OpenFile::with_host_fd(
+            let read_open = OpenFile::new(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: host_read,
+                    host_fd: HostFdRef::new(host_read),
                     is_read_end: true,
                     pipe_id,
                     base: read_base,
@@ -3934,11 +3903,10 @@ impl SyscallDispatcher {
                     write_kind: HostWriteKind::PipeLike,
                 })),
                 fd_flags,
-                host_read,
             );
-            let write_open = OpenFile::with_host_fd(
+            let write_open = OpenFile::new(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: host_write,
+                    host_fd: HostFdRef::new(host_write),
                     is_read_end: false,
                     pipe_id,
                     base: write_base,
@@ -3947,7 +3915,6 @@ impl SyscallDispatcher {
                     write_kind: HostWriteKind::PipeLike,
                 })),
                 fd_flags,
-                host_write,
             );
             let Ok((read_fd, write_fd)) = this.install_fd_pair_at_or_above(3, read_open, write_open)
             else {
@@ -4232,7 +4199,7 @@ impl SyscallDispatcher {
                     // block under dispatcher locks.
                     if let Some(host_fd) = match &*open {
                         OpenDescription::HostPipe { host_fd, .. }
-                        | OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
+                        | OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.raw()),
                         _ => None,
                     } {
                         crate::dispatch::net::set_host_nonblocking(host_fd);
@@ -5006,7 +4973,8 @@ impl SyscallDispatcher {
                             OpenDescription::HostPipe { host_fd, .. }
                             | OpenDescription::HostSocket { host_fd, .. } => {
                                 let mut n: libc::c_int = 0;
-                                let rc = unsafe { libc::ioctl(*host_fd, libc::FIONREAD, &mut n) };
+                                let rc =
+                                    unsafe { libc::ioctl(host_fd.raw(), libc::FIONREAD, &mut n) };
                                 if rc == 0 { n as i32 } else { 0 }
                             }
                             _ => 0,
@@ -5033,7 +5001,7 @@ impl SyscallDispatcher {
                         let host_fd = match &*open {
                             OpenDescription::HostPipe { host_fd, .. }
                             | OpenDescription::HostSocket { host_fd, .. }
-                            | OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+                            | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
                             _ => None,
                         };
                         if let Some(host_fd) = host_fd {
@@ -5380,14 +5348,15 @@ impl SyscallDispatcher {
                         if grow {
                             let mut st: libc::stat = unsafe { core::mem::zeroed() };
                             if let Err(errno) =
-                                (unsafe { libc::fstat(*host_fd, &mut st) }).host_syscall_errno()
+                                (unsafe { libc::fstat(host_fd.raw(), &mut st) }).host_syscall_errno()
                             {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
                             if new_size > st.st_size as u64
-                                && let Err(errno) =
-                                    (unsafe { libc::ftruncate(*host_fd, new_size as libc::off_t) })
-                                        .host_syscall_errno()
+                                && let Err(errno) = (unsafe {
+                                    libc::ftruncate(host_fd.raw(), new_size as libc::off_t)
+                                })
+                                .host_syscall_errno()
                                 {
                                     return Ok(DispatchOutcome::errno(errno));
                                 }
@@ -5477,7 +5446,7 @@ impl SyscallDispatcher {
                         // Real fd: ftruncate the kernel file directly (the
                         // change is visible across fork).
                         if let Err(errno) =
-                            (unsafe { libc::ftruncate(*host_fd, length as libc::off_t) })
+                            (unsafe { libc::ftruncate(host_fd.raw(), length as libc::off_t) })
                                 .host_syscall_errno()
                         {
                             return Ok(DispatchOutcome::errno(errno));
@@ -5771,8 +5740,9 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 };
-                let r = (unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) })
-                    .host_syscall_errno()?;
+                let r =
+                    (unsafe { libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence) })
+                        .host_syscall_errno()?;
                 return Ok(DispatchOutcome::Returned { value: r as i64 });
             }
 
@@ -5785,7 +5755,7 @@ impl SyscallDispatcher {
             // pipes/fifos (S_IFIFO) fall through to the ESPIPE branch below.
             if let OpenDescription::HostPipe { host_fd, .. } = &*open {
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(*host_fd, &mut st) } == 0
+                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
                     && (st.st_mode & libc::S_IFMT) == libc::S_IFCHR
                 {
                     let host_whence = match whence {
@@ -5795,7 +5765,7 @@ impl SyscallDispatcher {
                         _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                     };
                     let r = (unsafe {
-                        libc::lseek(*host_fd, offset as libc::off_t, host_whence)
+                        libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence)
                     })
                     .host_syscall_errno()?;
                     return Ok(DispatchOutcome::Returned { value: r as i64 });
@@ -5921,7 +5891,6 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let host_fd_owner = open_file.host_fd_owner.clone();
             let mut open = open_file.description.write();
             // read() on a regular file opened write-only (O_WRONLY) → EBADF
             // (open09/creat01 read a creat()'d write-only fd). Only regular-file
@@ -6018,8 +5987,8 @@ impl SyscallDispatcher {
                         memory,
                         address,
                         length,
-                        *host_fd,
-                        host_fd_owner,
+                        host_fd.raw(),
+                        Some(host_fd.clone()),
                         nonblocking,
                     ));
                 }
@@ -6044,8 +6013,8 @@ impl SyscallDispatcher {
                         memory,
                         address,
                         length,
-                        *host_fd,
-                        host_fd_owner,
+                        host_fd.raw(),
+                        Some(host_fd.clone()),
                         nonblocking,
                     ));
                 }
@@ -6066,8 +6035,8 @@ impl SyscallDispatcher {
                         memory,
                         address,
                         length,
-                        *host_fd,
-                        host_fd_owner,
+                        host_fd.raw(),
+                        Some(host_fd.clone()),
                         nonblocking,
                     ));
                 }
@@ -6095,7 +6064,7 @@ impl SyscallDispatcher {
             // Real host file: readv via the kernel fd (advances the shared
             // offset). Fill each iovec sequentially.
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
-                let hfd = *host_fd;
+                let hfd = host_fd.raw();
                 if let Some(borrowed_iovecs) = prepare_readv_targets(memory, &iovecs)? {
                     if borrowed_iovecs.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
@@ -6143,8 +6112,8 @@ impl SyscallDispatcher {
                     if !*is_read_end && pty.is_none() && !*bidirectional {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
-                    let hfd = *host_fd;
-                    let owner = open_file.host_fd_owner.clone();
+                    let hfd = host_fd.raw();
+                    let owner = Some(host_fd.clone());
                     drop(open);
                     return Ok(Self::read_host_pipe_iovecs(
                         memory,
@@ -6155,8 +6124,8 @@ impl SyscallDispatcher {
                     ));
                 }
                 OpenDescription::HostSocket { host_fd, .. } => {
-                    let hfd = *host_fd;
-                    let owner = open_file.host_fd_owner.clone();
+                    let hfd = host_fd.raw();
+                    let owner = Some(host_fd.clone());
                     drop(open);
                     return Ok(Self::read_host_pipe_iovecs(
                         memory,
@@ -6237,7 +6206,7 @@ impl SyscallDispatcher {
                 let mut buf = vec![0u8; length];
                 let n = unsafe {
                     libc::pread(
-                        *host_fd,
+                        host_fd.raw(),
                         buf.as_mut_ptr() as *mut _,
                         length,
                         offset as libc::off_t,
@@ -6330,7 +6299,7 @@ impl SyscallDispatcher {
             // Real host file: positional readv via libc::pread per iovec
             // (kernel offset untouched).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
-                let hfd = *host_fd;
+                let hfd = host_fd.raw();
                 if let Some(borrowed_iovecs) = prepare_readv_targets(memory, &iovecs)? {
                     if borrowed_iovecs.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
@@ -6468,7 +6437,7 @@ impl SyscallDispatcher {
                 }
                 let n = unsafe {
                     libc::pwrite(
-                        *host_fd,
+                        host_fd.raw(),
                         bytes.as_ptr() as *const _,
                         length,
                         offset as libc::off_t,
@@ -6539,7 +6508,7 @@ impl SyscallDispatcher {
                 if write_hipri {
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EOPNOTSUPP));
                 }
-                let hfd = *host_fd;
+                let hfd = host_fd.raw();
                 if let PwritevPayloads::Borrowed(borrowed_iovecs) = &payloads {
                     if borrowed_iovecs.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
@@ -6736,7 +6705,7 @@ impl SyscallDispatcher {
                             // SAFETY: host_fd is a live regular-file fd owned by
                             // this guest fd; lseek to an absolute position is benign.
                             unsafe {
-                                libc::lseek(*host_fd, offset as libc::off_t, libc::SEEK_SET);
+                                libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET);
                             }
                         }
                         _ => {}
@@ -6823,7 +6792,7 @@ impl SyscallDispatcher {
                             host_fd,
                             writable: true,
                             ..
-                        } => *host_fd,
+                        } => host_fd.raw(),
                         OpenDescription::HostFile { .. } => {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
@@ -6863,7 +6832,9 @@ impl SyscallDispatcher {
                         OpenDescription::File { offset, .. }
                         | OpenDescription::SyntheticFile { offset, .. } => *offset = new_in,
                         OpenDescription::HostFile { host_fd, .. } => {
-                            unsafe { libc::lseek(*host_fd, new_in as libc::off_t, libc::SEEK_SET) };
+                            unsafe {
+                                libc::lseek(host_fd.raw(), new_in as libc::off_t, libc::SEEK_SET)
+                            };
                         }
                         _ => {}
                     }
@@ -7147,7 +7118,9 @@ impl SyscallDispatcher {
 
             enum VmDir {
                 Write,
-                ReadHost(i32, Option<HostFdRef>),
+                /// Borrowed [`HostFd`] view + the owned handle keeping it live
+                /// across the wait (mirrors the blocking-read plumbing).
+                ReadHost(HostFd, Option<HostFdRef>),
                 ReadMem,
             }
             let dir = {
@@ -7159,7 +7132,7 @@ impl SyscallDispatcher {
                         ..
                     } => {
                         if *is_read_end {
-                            VmDir::ReadHost(*host_fd, open_file.host_fd_owner.clone())
+                            VmDir::ReadHost(host_fd.view(), Some(host_fd.clone()))
                         } else {
                             VmDir::Write
                         }
@@ -7188,7 +7161,7 @@ impl SyscallDispatcher {
                 VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
                     memory,
                     &iovecs,
-                    hfd,
+                    hfd.get(),
                     owner,
                     nonblocking,
                 )),
@@ -7520,7 +7493,7 @@ impl SyscallDispatcher {
                 match &*open {
                     OpenDescription::HostFile { host_fd, .. } => {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        if unsafe { libc::fstat(*host_fd, &mut st) } != 0 {
+                        if unsafe { libc::fstat(host_fd.raw(), &mut st) } != 0 {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
                         st.st_size.max(0) as u64
@@ -7650,7 +7623,7 @@ impl SyscallDispatcher {
                             // real one-way pipe ends are gated by is_read_end.
                             #[cfg(feature = "trace-tty")]
                             if bytes.contains(&0x0a) {
-                                let hf = *host_fd;
+                                let hf = host_fd.raw();
                                 let tt = unsafe { libc::isatty(hf) };
                                 eprintln!(
                                     "[PTYWRDBG] guest_fd={fd} desc_host_fd={hf} isatty={tt} pty={:?} is_read_end={is_read_end} bidir={bidirectional}",
@@ -7664,8 +7637,8 @@ impl SyscallDispatcher {
                             // SIGPIPE on the writer (write05).
                             let out = write_host_pipe_owned(
                                 bytes,
-                                *host_fd,
-                                open_file.host_fd_owner.clone(),
+                                host_fd.raw(),
+                                Some(host_fd.clone()),
                                 nonblocking,
                                 *write_kind,
                                 cx.tid(),
@@ -7690,8 +7663,8 @@ impl SyscallDispatcher {
                             // their own ENOTCONN via the host.
                             let out = write_host_pipe_owned(
                                 bytes,
-                                *host_fd,
-                                open_file.host_fd_owner.clone(),
+                                host_fd.raw(),
+                                Some(host_fd.clone()),
                                 nonblocking,
                                 HostWriteKind::SocketLike,
                                 cx.tid(),
@@ -7722,14 +7695,14 @@ impl SyscallDispatcher {
                             // seek-then-write; single-writer, which covers the
                             // shell/dpkg append cases.)
                             if base.status_flags() & LINUX_O_APPEND != 0 {
-                                unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
+                                unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
                             // libc::write to the real fd: advances the
                             // kernel offset and is visible across fork.
                             return Ok(write_host_pipe_owned(
                                 bytes,
-                                *host_fd,
-                                open_file.host_fd_owner.clone(),
+                                host_fd.raw(),
+                                Some(host_fd.clone()),
                                 nonblocking,
                                 HostWriteKind::RegularFile,
                                 cx.tid(),
@@ -7874,16 +7847,16 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
                         Some(HostWritevTarget {
-                            host_fd: *host_fd,
-                            host_fd_owner: open_file.host_fd_owner.clone(),
+                            host_fd: host_fd.raw(),
+                            host_fd_owner: Some(host_fd.clone()),
                             write_kind: *write_kind,
                             sigpipe_on_epipe: true,
                             append: false,
                         })
                     }
                     OpenDescription::HostSocket { host_fd, .. } => Some(HostWritevTarget {
-                        host_fd: *host_fd,
-                        host_fd_owner: open_file.host_fd_owner.clone(),
+                        host_fd: host_fd.raw(),
+                        host_fd_owner: Some(host_fd.clone()),
                         write_kind: HostWriteKind::SocketLike,
                         sigpipe_on_epipe: false,
                         append: false,
@@ -7898,8 +7871,8 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         }
                         Some(HostWritevTarget {
-                            host_fd: *host_fd,
-                            host_fd_owner: open_file.host_fd_owner.clone(),
+                            host_fd: host_fd.raw(),
+                            host_fd_owner: Some(host_fd.clone()),
                             write_kind: HostWriteKind::RegularFile,
                             sigpipe_on_epipe: false,
                             append: base.status_flags() & LINUX_O_APPEND != 0,
@@ -7990,8 +7963,8 @@ impl SyscallDispatcher {
                                 }
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    *host_fd,
-                                    open_file.host_fd_owner.clone(),
+                                    host_fd.raw(),
+                                    Some(host_fd.clone()),
                                     nonblocking,
                                     *write_kind,
                                     cx.tid(),
@@ -8002,8 +7975,8 @@ impl SyscallDispatcher {
                             OpenDescription::HostSocket { host_fd, .. } => {
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    *host_fd,
-                                    open_file.host_fd_owner.clone(),
+                                    host_fd.raw(),
+                                    Some(host_fd.clone()),
                                     nonblocking,
                                     HostWriteKind::SocketLike,
                                     cx.tid(),
@@ -8025,12 +7998,12 @@ impl SyscallDispatcher {
                                 // kernel offset (visible across fork and to the
                                 // readv that follows).
                                 if base.status_flags() & LINUX_O_APPEND != 0 {
-                                    unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
+                                    unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                                 }
                                 outcome = write_host_pipe_owned(
                                     bytes,
-                                    *host_fd,
-                                    open_file.host_fd_owner.clone(),
+                                    host_fd.raw(),
+                                    Some(host_fd.clone()),
                                     nonblocking,
                                     HostWriteKind::RegularFile,
                                     cx.tid(),

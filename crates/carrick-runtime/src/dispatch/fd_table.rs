@@ -56,7 +56,7 @@ use crate::linux_abi::{
 };
 use crate::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
-use super::{EpollKqueue, Fd, GuestPtr, inode_for_path, linux_mode};
+use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode};
 
 #[derive(Debug, Clone)]
 pub(super) struct EpollInterest {
@@ -96,23 +96,29 @@ pub(super) struct EventFdState {
     /// (level-triggered -> can't be lost), so Go's netpollBreak wakes the poller
     /// without relying on the coarse `EVFILT_USER` broadcast — and that a
     /// BLOCKING guest read parks on (`WaitOnFds`), which a kernel-shared pipe
-    /// makes work across forked guest processes. `-1` if pipe creation failed
+    /// makes work across forked guest processes. `None` if pipe creation failed
     /// (then readiness falls back to the in-memory recompute + broadcast and
-    /// blocking reads degrade to EAGAIN). The bytes are managed entirely by
-    /// carrick (write_eventfd / read_eventfd); the guest never reads the pipe
-    /// directly.
-    pub(super) read_fd: std::os::fd::RawFd,
-    pub(super) write_fd: std::os::fd::RawFd,
+    /// blocking reads degrade to EAGAIN). The owned [`HostFdRef`]s close the two
+    /// ends when this state drops (replacing the historical bespoke `Drop`).
+    /// The bytes are managed entirely by carrick (write_eventfd / read_eventfd);
+    /// the guest never reads the pipe directly.
+    pub(super) read_fd: Option<HostFdRef>,
+    pub(super) write_fd: Option<HostFdRef>,
 }
 
 impl EventFdState {
     pub(super) fn new(counter: u64) -> Self {
-        let (read_fd, write_fd) = make_readiness_pipe().unwrap_or((-1, -1));
+        let (read_fd, write_fd) = match make_readiness_pipe() {
+            Some((read_fd, write_fd)) => (Some(read_fd), Some(write_fd)),
+            None => (None, None),
+        };
         // Reflect a non-zero initial value as "readable" right away.
-        if counter > 0 && write_fd >= 0 {
+        if counter > 0
+            && let Some(write_fd) = &write_fd
+        {
             let byte = [1u8];
             // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-            unsafe { libc::write(write_fd, byte.as_ptr().cast(), 1) };
+            unsafe { libc::write(write_fd.raw(), byte.as_ptr().cast(), 1) };
         }
         Self {
             slot: crate::eventfd_shm::alloc(counter),
@@ -141,20 +147,20 @@ impl EventFdState {
     /// shared counter — a concurrent writer's 0→n byte may have been eaten by
     /// this drain, and a parked reader would then sleep past a ready counter.
     pub(super) fn sync_readiness(&self, count: u64) {
-        if self.read_fd < 0 {
+        let (Some(read_fd), Some(write_fd)) = (&self.read_fd, &self.write_fd) else {
             return;
-        }
+        };
         if count > 0 {
             // Ensure a byte is present (idempotent: a full pipe EAGAINs).
             let byte = [1u8];
             // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-            unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), 1) };
+            unsafe { libc::write(write_fd.raw(), byte.as_ptr().cast(), 1) };
         } else {
             // Drain any bytes so the read end is not readable.
             let mut buf = [0u8; 64];
             loop {
                 // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-                let n = unsafe { libc::read(self.read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                let n = unsafe { libc::read(read_fd.raw(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n <= 0 {
                     break;
                 }
@@ -162,17 +168,7 @@ impl EventFdState {
             if self.counter_value() > 0 {
                 let byte = [1u8];
                 // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-                unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), 1) };
-            }
-        }
-    }
-}
-
-impl Drop for EventFdState {
-    fn drop(&mut self) {
-        for fd in [self.read_fd, self.write_fd] {
-            if fd >= 0 {
-                unsafe { libc::close(fd) };
+                unsafe { libc::write(write_fd.raw(), byte.as_ptr().cast(), 1) };
             }
         }
     }
@@ -180,8 +176,10 @@ impl Drop for EventFdState {
 
 /// A non-blocking, CLOEXEC host pipe relocated above the guest fd range, used as
 /// an eventfd's readiness channel. `None` on failure (caller degrades to the
-/// in-memory recompute + EVFILT_USER broadcast).
-fn make_readiness_pipe() -> Option<(std::os::fd::RawFd, std::os::fd::RawFd)> {
+/// in-memory recompute + EVFILT_USER broadcast). The returned [`HostFdRef`]s
+/// own the two ends; their `Drop`s close them (per process — each forked host
+/// process independently closes its inherited copies, as before).
+fn make_readiness_pipe() -> Option<(HostFdRef, HostFdRef)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return None;
@@ -200,7 +198,7 @@ fn make_readiness_pipe() -> Option<(std::os::fd::RawFd, std::os::fd::RawFd)> {
             }
         }
     }
-    Some((read_fd, write_fd))
+    Some((HostFdRef::new(read_fd), HostFdRef::new(write_fd)))
 }
 
 #[derive(Debug)]
@@ -762,7 +760,9 @@ pub(super) enum OpenDescription {
     /// can actually carry data across the carrick process boundary.
     HostPipe {
         base: OpenDescriptionBase,
-        host_fd: i32,
+        /// The OWNING handle to the backing host fd (see [`HostFdRef`]): the
+        /// last dropped clone closes the macOS descriptor.
+        host_fd: HostFdRef,
         is_read_end: bool,
         /// Globally-unique carrick id for the pipe OBJECT, identical on BOTH
         /// ends and inherited unchanged across `clone`/fork. This is the
@@ -797,7 +797,8 @@ pub(super) enum OpenDescription {
     /// SO_TYPE, etc.) can answer in Linux terms.
     HostSocket {
         base: OpenDescriptionBase,
-        host_fd: i32,
+        /// The OWNING handle to the backing host fd (see [`HostFdRef`]).
+        host_fd: HostFdRef,
         family: i32,
         type_: i32,
     },
@@ -810,7 +811,8 @@ pub(super) enum OpenDescription {
     /// `host_fd`; the kernel owns the offset.
     HostFile {
         base: OpenDescriptionBase,
-        host_fd: i32,
+        /// The OWNING handle to the backing host fd (see [`HostFdRef`]).
+        host_fd: HostFdRef,
         metadata: RootFsMetadata,
         writable: bool,
     },
@@ -839,20 +841,21 @@ pub(super) enum OpenDescription {
     /// A POSIX message-queue descriptor (`mq_open(3)`). macOS has no POSIX
     /// mqueue, so carrick emulates it on a real host file under
     /// `/tmp/carrick-mqueue/` (see [`crate::dispatch::mqueue`]): the `mqd_t` IS a
-    /// real fd (installed with a `host_fd_owner` so `close`/`dup`/`poll` work for
-    /// free), but the message data lives in the backing file, guarded by an OFD
-    /// lock. The mqueue syscalls (`mq_timedsend`/`mq_timedreceive`/…) operate on
-    /// the file by re-opening it through the fd here; ordinary `read`/`write` on
-    /// the fd are EINVAL/EBADF (Linux rejects them on a mqd too).
+    /// real fd (owned by the description's `host_fd` handle so `close`/`dup`/
+    /// `poll` work for free), but the message data lives in the backing file,
+    /// guarded by an OFD lock. The mqueue syscalls (`mq_timedsend`/
+    /// `mq_timedreceive`/…) operate on the file by re-opening it through the fd
+    /// here; ordinary `read`/`write` on the fd are EINVAL/EBADF (Linux rejects
+    /// them on a mqd too).
     Mqueue {
         base: OpenDescriptionBase,
-        /// Real host fd to the backing file under `/tmp/carrick-mqueue/`. Owned
-        /// for close by the `OpenFile::host_fd_owner` (installed via
-        /// `with_host_fd`), so this field is only read for poll/readiness. Every
-        /// read-modify-write opens a FRESH fd against `path` and takes an OFD
-        /// lock on it, so a `libc::fork`-shared description's OFD lock can never
-        /// be self-re-entrant and the serialization is true across processes.
-        host_fd: i32,
+        /// OWNING handle (see [`HostFdRef`]) to the real host fd of the backing
+        /// file under `/tmp/carrick-mqueue/`; only read for poll/readiness.
+        /// Every read-modify-write opens a FRESH fd against `path` and takes an
+        /// OFD lock on it, so a `libc::fork`-shared description's OFD lock can
+        /// never be self-re-entrant and the serialization is true across
+        /// processes.
+        host_fd: HostFdRef,
         /// Absolute host path of the backing file (under `/tmp/carrick-mqueue/`),
         /// re-opened per operation for the OFD-locked RMW.
         path: String,
@@ -871,18 +874,41 @@ struct HostFdOwner {
 
 impl Drop for HostFdOwner {
     fn drop(&mut self) {
+        // Deliberately a bare per-process close: carrick forks real host
+        // processes, and each address space independently closes its inherited
+        // copy of the fd. Fork-correctness depends on this staying a plain
+        // `libc::close` — never anything fancier.
         unsafe {
             libc::close(self.fd);
         }
     }
 }
 
+/// The OWNED, Arc-refcounted handle to a host kernel fd. The single owner of a
+/// host-backed [`OpenDescription`]'s fd lives IN the description (`host_fd`
+/// field); `Clone` bumps the refcount (never `dup(2)`s), and the last clone's
+/// drop closes the fd. Borrow the number for a libc call via [`HostFdRef::raw`]
+/// or as the Copy view type via [`HostFdRef::view`].
 #[derive(Debug, Clone)]
-pub(super) struct HostFdRef(#[allow(dead_code)] Arc<HostFdOwner>);
+pub(super) struct HostFdRef(Arc<HostFdOwner>);
 
 impl HostFdRef {
     pub(super) fn new(fd: i32) -> Self {
         Self(Arc::new(HostFdOwner { fd }))
+    }
+
+    /// The raw fd number for a host `libc` call (borrowed — the caller must
+    /// keep a `HostFdRef` alive for as long as the number is used).
+    #[inline]
+    pub(super) fn raw(&self) -> i32 {
+        self.0.fd
+    }
+
+    /// The Copy borrowed VIEW of this fd (see [`HostFd`]); same liveness
+    /// caveat as [`HostFdRef::raw`].
+    #[inline]
+    pub(super) fn view(&self) -> HostFd {
+        HostFd(self.0.fd)
     }
 }
 
@@ -890,7 +916,6 @@ impl HostFdRef {
 pub(super) struct OpenFile {
     pub(super) description: OpenDescriptionRef,
     pub(super) fd_flags: u64,
-    pub(super) host_fd_owner: Option<HostFdRef>,
 }
 
 impl OpenFile {
@@ -898,19 +923,6 @@ impl OpenFile {
         Self {
             description,
             fd_flags,
-            host_fd_owner: None,
-        }
-    }
-
-    pub(super) fn with_host_fd(
-        description: OpenDescriptionRef,
-        fd_flags: u64,
-        host_fd: i32,
-    ) -> Self {
-        Self {
-            description,
-            fd_flags,
-            host_fd_owner: Some(HostFdRef::new(host_fd)),
         }
     }
 }
@@ -1101,7 +1113,10 @@ impl StatRecord {
 pub(super) enum OpenStatSource {
     Record(StatRecord),
     HostFile {
-        host_fd: i32,
+        /// Borrowed Copy VIEW of the description's owned fd (see
+        /// [`HostFdRef::view`]) — valid while the caller's `OpenFile` clone
+        /// keeps the description alive.
+        host_fd: HostFd,
         metadata: RootFsMetadata,
     },
     /// A path-backed entry (an open Directory, or an in-memory File) whose
@@ -1129,7 +1144,9 @@ pub(super) enum OpenStatSource {
     /// host fd: a chardev reports `S_IFCHR`, a pipe `S_IFIFO`. `fallback_mode`
     /// is used if the host fstat fails.
     HostStream {
-        host_fd: i32,
+        /// Borrowed Copy VIEW of the description's owned fd (see
+        /// [`OpenStatSource::HostFile::host_fd`]).
+        host_fd: HostFd,
         label: String,
         fallback_mode: u32,
     },
@@ -1246,7 +1263,7 @@ impl OpenDescription {
             OpenDescription::HostFile {
                 host_fd, metadata, ..
             } => OpenStatSource::HostFile {
-                host_fd: *host_fd,
+                host_fd: host_fd.view(),
                 metadata: metadata.clone(),
             },
             OpenDescription::SyntheticFile { path, contents, .. } => {
@@ -1312,7 +1329,7 @@ impl OpenDescription {
                     // /dev/zero, …). fstat the real host fd to recover the true
                     // Linux file type instead of always claiming S_IFIFO.
                     OpenStatSource::HostStream {
-                        host_fd: *host_fd,
+                        host_fd: host_fd.view(),
                         label: "pipe:[carrick]".to_string(),
                         fallback_mode: LINUX_S_IFIFO | 0o600,
                     }

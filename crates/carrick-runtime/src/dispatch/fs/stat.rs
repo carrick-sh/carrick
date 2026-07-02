@@ -107,7 +107,7 @@ impl SyscallDispatcher {
                 // Linux. Falls back to `fallback_mode` if the host fstat fails.
                 let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
                 // SAFETY: host_fd is a live host fd; &host_st is a valid out-param.
-                let mode = if unsafe { libc::fstat(host_fd, &mut host_st) } == 0 {
+                let mode = if unsafe { libc::fstat(host_fd.get(), &mut host_st) } == 0 {
                     let type_bits = host_st.st_mode as u32 & LINUX_S_IFMT;
                     let perms = if type_bits == LINUX_S_IFCHR {
                         0o666
@@ -153,7 +153,7 @@ impl SyscallDispatcher {
             OpenStatSource::HostFile { host_fd, metadata } => {
                 let path = metadata.path.to_string_lossy().into_owned();
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
+                if unsafe { libc::fstat(host_fd.get(), &mut st) } == 0 {
                     let mut real = super::real_stat_from_libc(&st);
                     // The real file's mode was forced owner-accessible; the
                     // guest-visible mode + owner live in xattrs on the same fd.
@@ -161,14 +161,14 @@ impl SyscallDispatcher {
                     // FULL guest mode (S_IFCHR/S_IFBLK type bits); RealStat.mode is
                     // perms-only, so keep just the perms here and recover the
                     // device TYPE + st_rdev below via apply_device_node.
-                    let device = match crate::fs_backend::fget_mode_xattr(host_fd) {
+                    let device = match crate::fs_backend::fget_mode_xattr(host_fd.get()) {
                         Some(m) => {
                             real.mode = m & 0o7777;
                             let type_bits = m & LINUX_S_IFMT;
                             if type_bits == LINUX_S_IFCHR || type_bits == LINUX_S_IFBLK {
                                 Some((
                                     type_bits,
-                                    crate::fs_backend::fget_rdev_xattr(host_fd).unwrap_or(0),
+                                    crate::fs_backend::fget_rdev_xattr(host_fd.get()).unwrap_or(0),
                                 ))
                             } else {
                                 None
@@ -176,7 +176,7 @@ impl SyscallDispatcher {
                         }
                         None => None,
                     };
-                    let (uid, gid) = crate::fs_backend::fget_owner_xattr(host_fd);
+                    let (uid, gid) = crate::fs_backend::fget_owner_xattr(host_fd.get());
                     real.uid = uid.unwrap_or(0);
                     real.gid = gid.unwrap_or(0);
                     let mut record = StatRecord::from_real(&path, &real);
