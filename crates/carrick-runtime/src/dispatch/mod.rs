@@ -584,6 +584,7 @@ use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFs
 // table remaps raw numbers to canonical at the GuestArch seam — Phase 2 for
 // x86_64), so its own metadata lookups stay aarch64-keyed by design; only
 // raw-frame consumers (the vCPU-loop trace) use the per-ISA Arch::Table.
+use crate::linux_abi::{CanonicalNr, NativeNr};
 use crate::syscall::lookup_aarch64;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -754,14 +755,17 @@ fn threaded_independent_dispatch_supports(number: u64) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SyscallRequest {
-    pub number: u64,
+    /// The CANONICAL (asm-generic/aarch64) syscall number the dispatch tables
+    /// switch on. Typed [`CanonicalNr`] so it cannot be swapped with
+    /// [`native_number`](Self::native_number) at a constructor.
+    pub number: CanonicalNr,
     pub args: SyscallArgs,
     pub guest_abi: LinuxGuestAbi,
     /// The guest's architecture-native syscall number (see
     /// [`carrick_hal::RawSyscall::native_number`]): equals `number` for aarch64
     /// guests, the raw x86_64 UAPI number for x86_64 guests. seccomp filters are
     /// evaluated against this, not the normalized `number`.
-    pub native_number: u64,
+    pub native_number: NativeNr,
 }
 
 /// Uniform context handed to every *normalized* syscall handler, so all
@@ -786,7 +790,7 @@ pub struct SyscallCtx<'a, M: GuestMemory> {
 impl<M: GuestMemory> SyscallCtx<'_, M> {
     #[inline]
     pub fn number(&self) -> u64 {
-        self.request.number
+        self.request.number.raw()
     }
 
     #[inline]
@@ -845,12 +849,16 @@ pub(crate) fn guest_visible_tid(
 pub use carrick_guest_mem::{GuestMemory, MemoryError};
 
 impl SyscallRequest {
+    /// Build an aarch64-ABI request from a bare canonical number (aarch64
+    /// guests issue canonical numbers, so native == canonical). Takes `u64`
+    /// deliberately — the hundreds of literal-number test call sites stay
+    /// unchanged; the typed wrap happens here, in ONE place.
     pub fn new(number: u64, args: SyscallArgs) -> Self {
         Self {
-            number,
+            number: CanonicalNr(number),
             args,
             guest_abi: LinuxGuestAbi::Aarch64,
-            native_number: number,
+            native_number: NativeNr(number),
         }
     }
 
@@ -1732,7 +1740,7 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        let handler = resolve_handler(request.number)?;
+        let handler = resolve_handler(request.number.raw())?;
         let mut ctx = SyscallCtx {
             request,
             memory,
@@ -2196,7 +2204,7 @@ impl SyscallDispatcher {
         // x86_64 guest fail its own Docker/libseccomp profile, which gates on
         // `arch == AUDIT_ARCH_X86_64` then switches on x86_64 syscall numbers.
         let data = crate::seccomp::SeccompData::for_guest(
-            request.native_number as i32,
+            request.native_number.raw() as i32,
             request.guest_abi,
             request.args.0,
         );
@@ -2254,17 +2262,17 @@ impl SyscallDispatcher {
             return result;
         }
 
-        let syscall = lookup_aarch64(request.number);
+        let syscall = lookup_aarch64(request.number.raw());
         let name = syscall.map_or("unknown", |syscall| syscall.name);
         reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             args: request.args,
         });
 
         let outcome = {
             reporter.record(CompatEvent::unhandled_syscall(
-                request.number,
+                request.number.raw(),
                 name,
                 request.args,
             ));
@@ -2275,7 +2283,7 @@ impl SyscallDispatcher {
 
         let (retval, errno) = outcome.retval_errno();
         reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             retval,
             errno,
@@ -2302,26 +2310,33 @@ impl SyscallDispatcher {
             return Some(result);
         }
 
-        if request.number == 64 && !self.write_shared_supported(request.args.0[0] as i32) {
+        if request.number.raw() == 64 && !self.write_shared_supported(request.args.0[0] as i32) {
             return None;
         }
 
-        if !Self::dispatch_normalized_known(request.number) {
+        if !Self::dispatch_normalized_known(request.number.raw()) {
             return None;
         }
 
-        let syscall = lookup_aarch64(request.number);
+        let syscall = lookup_aarch64(request.number.raw());
         let name = syscall.map_or("unknown", |syscall| syscall.name);
 
         for (nr, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
-            if *nr == request.number {
+            if *nr == request.number.raw() {
                 let value = request.arg(*arg_index as usize);
-                check_syscall_flags(reporter, request.number, name, *arg_index, value, *mask);
+                check_syscall_flags(
+                    reporter,
+                    request.number.raw(),
+                    name,
+                    *arg_index,
+                    value,
+                    *mask,
+                );
             }
         }
 
         reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             args: request.args,
         });
@@ -2332,7 +2347,7 @@ impl SyscallDispatcher {
         {
             let mut le = [0u8; 8];
             le.copy_from_slice(&bytes[..8]);
-            crate::probes::mem_watch(request.number, addr, u64::from_le_bytes(le));
+            crate::probes::mem_watch(request.number.raw(), addr, u64::from_le_bytes(le));
         }
 
         let thread = Some(ThreadCtx {
@@ -2359,7 +2374,7 @@ impl SyscallDispatcher {
         self.epoll_rearm_after_io(&request, &outcome);
         let (retval, errno) = outcome.retval_errno();
         reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             retval,
             errno,
@@ -2381,10 +2396,10 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !threaded_independent_dispatch_supports(request.number) {
+        if !threaded_independent_dispatch_supports(request.number.raw()) {
             return None;
         }
-        match request.number {
+        match request.number.raw() {
             130 => {
                 let target = request.arg(0) as crate::thread::ThreadId;
                 let signum = request.arg(1);
@@ -2402,15 +2417,15 @@ impl SyscallDispatcher {
             _ => {}
         }
 
-        let syscall = lookup_aarch64(request.number);
+        let syscall = lookup_aarch64(request.number.raw());
         let name = syscall.map_or("unknown", |syscall| syscall.name);
         reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             args: request.args,
         });
 
-        let outcome = match request.number {
+        let outcome = match request.number.raw() {
             96 => {
                 let addr = request.arg(0);
                 registry.set_clear_child_tid(tid, addr);
@@ -2473,7 +2488,7 @@ impl SyscallDispatcher {
 
         let (retval, errno) = outcome.retval_errno();
         reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             retval,
             errno,
@@ -2489,11 +2504,11 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let syscall = lookup_aarch64(request.number);
+        let syscall = lookup_aarch64(request.number.raw());
         let name = syscall.map_or("unknown", |syscall| syscall.name);
 
         reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             args: request.args,
         });
@@ -2503,7 +2518,7 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.seccomp_precheck(&request) {
             let (retval, errno) = outcome.retval_errno();
             reporter.record(CompatEvent::SyscallReturn {
-                number: request.number,
+                number: request.number.raw(),
                 name: ::std::borrow::Cow::Borrowed(name),
                 retval,
                 errno,
@@ -2521,7 +2536,7 @@ impl SyscallDispatcher {
         {
             let mut le = [0u8; 8];
             le.copy_from_slice(&bytes[..8]);
-            crate::probes::mem_watch(request.number, addr, u64::from_le_bytes(le));
+            crate::probes::mem_watch(request.number.raw(), addr, u64::from_le_bytes(le));
         }
 
         // Systematic unknown-flag check. For each syscall whose flag
@@ -2530,9 +2545,16 @@ impl SyscallDispatcher {
         // (it makes its own EINVAL decisions); this just guarantees
         // a structured report entry whenever a bit drifts.
         for (nr, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
-            if *nr == request.number {
+            if *nr == request.number.raw() {
                 let value = request.arg(*arg_index as usize);
-                check_syscall_flags(reporter, request.number, name, *arg_index, value, *mask);
+                check_syscall_flags(
+                    reporter,
+                    request.number.raw(),
+                    name,
+                    *arg_index,
+                    value,
+                    *mask,
+                );
             }
         }
 
@@ -2545,7 +2567,7 @@ impl SyscallDispatcher {
             self.epoll_rearm_after_io(&request, &outcome);
             let (retval, errno) = outcome.retval_errno();
             reporter.record(CompatEvent::SyscallReturn {
-                number: request.number,
+                number: request.number.raw(),
                 name: ::std::borrow::Cow::Borrowed(name),
                 retval,
                 errno,
@@ -2559,7 +2581,7 @@ impl SyscallDispatcher {
         // must never panic on guest input — an unknown syscall is the guest's
         // problem to handle (it gets -ENOSYS), not ours to crash on.
         reporter.record(CompatEvent::unhandled_syscall(
-            request.number,
+            request.number.raw(),
             name,
             request.args,
         ));
@@ -2569,7 +2591,7 @@ impl SyscallDispatcher {
 
         let (retval, errno) = outcome.retval_errno();
         reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
+            number: request.number.raw(),
             name: ::std::borrow::Cow::Borrowed(name),
             retval,
             errno,

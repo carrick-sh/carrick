@@ -588,7 +588,7 @@ where
             Some(r) => r,
             None => return Ok(0),
         };
-        let canonical = raw.number;
+        let canonical = raw.number.raw();
         let args = raw.args;
 
         let ret: i64 = match canonical {

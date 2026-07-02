@@ -9,7 +9,7 @@
 //! `set_memory_model` and `map_host_alias` carry portable defaults so non-HVF
 //! backends inherit sane behavior.
 
-use carrick_abi::LinuxSiginfo;
+use carrick_abi::{CanonicalNr, LinuxSiginfo, NativeNr};
 use carrick_mem::memory::AddressSpace;
 use thiserror::Error;
 
@@ -24,7 +24,10 @@ use crate::error::OsError;
 /// moved into the backend (Phase 1, Task 3 of the x86_64 guest-ISA seam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawSyscall {
-    pub number: u64,
+    /// The CANONICAL (asm-generic/aarch64) syscall number the dispatcher
+    /// switches on. Typed [`CanonicalNr`] so it cannot be swapped with
+    /// [`native_number`](Self::native_number) at a constructor.
+    pub number: CanonicalNr,
     pub args: [u64; 6],
     /// The guest Linux UAPI struct-layout family for this syscall, stamped by
     /// the concrete backend's `GuestArch` at decode time. Carried as DATA (not
@@ -46,7 +49,7 @@ pub struct RawSyscall {
     /// guest ISA's native numbering: an x86_64 Docker/libseccomp profile gates
     /// on `arch == AUDIT_ARCH_X86_64` then switches on x86_64 numbers, so the
     /// dispatcher must hand the filter the native number, not the canonical one.
-    pub native_number: u64,
+    pub native_number: NativeNr,
 }
 
 /// A register/V-reg access through [`crate::RegAccess`] failed mid-sigframe

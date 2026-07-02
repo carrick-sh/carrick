@@ -22,6 +22,7 @@
 use crate::guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 use crate::trap::RawSyscall;
 use crate::{RegAccess, TrapError};
+use carrick_abi::{CanonicalNr, NativeNr};
 use carrick_guest_mem::{GuestMemory, X8664SyscallFrame};
 
 // ─── ELF machine tag ─────────────────────────────────────────────────────────
@@ -923,16 +924,16 @@ impl X8664GuestArch {
         if x86_number == X86_NR_FORK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_CLONE,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_CLONE),
                 args: [LINUX_SIGCHLD, 0, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_VFORK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_CLONE,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_CLONE),
                 args: [
                     LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
                     0,
@@ -950,8 +951,8 @@ impl X8664GuestArch {
             // timeout pointer → infinite wait (musl startup wedge).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_POLL,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_POLL),
                 args: [args[0], args[1], args[2], 0, 0, 0],
             });
         }
@@ -961,8 +962,8 @@ impl X8664GuestArch {
             // no sigmask. pselect6(72) keeps the *timespec + sigmask decode.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_SELECT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_SELECT),
                 args: [args[0], args[1], args[2], args[3], args[4], 0],
             });
         }
@@ -977,8 +978,8 @@ impl X8664GuestArch {
             // timeout_ms = return-now, which would re-introduce the spin).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_PPOLL,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_PPOLL),
                 args: [0, 0, 0, 0, 0, 0],
             });
         }
@@ -991,8 +992,8 @@ impl X8664GuestArch {
             // synthesised as NULL/0.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_EPOLL_PWAIT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_EPOLL_PWAIT),
                 args: [args[0], args[1], args[2], args[3], 0, 0],
             });
         }
@@ -1004,8 +1005,8 @@ impl X8664GuestArch {
             // lose that check (epoll-ltp / epoll_create02).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE),
                 args: [args[0], 0, 0, 0, 0, 0],
             });
         }
@@ -1013,8 +1014,8 @@ impl X8664GuestArch {
             // inotify_init() takes no args → inotify_init1(flags=0).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_INOTIFY_INIT1,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_INOTIFY_INIT1),
                 args: [0, 0, 0, 0, 0, 0],
             });
         }
@@ -1022,8 +1023,8 @@ impl X8664GuestArch {
             // signalfd(fd, mask, sizemask) → signalfd4(fd, mask, sizemask, 0).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_SIGNALFD4,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_SIGNALFD4),
                 args: [args[0], args[1], args[2], 0, 0, 0],
             });
         }
@@ -1031,8 +1032,8 @@ impl X8664GuestArch {
             // eventfd(initval) → eventfd2(initval, flags=0).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_EVENTFD2,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_EVENTFD2),
                 args: [args[0], 0, 0, 0, 0, 0],
             });
         }
@@ -1042,72 +1043,72 @@ impl X8664GuestArch {
             // process-group id instead of ENOSYS (-1).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_GETPGID,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_GETPGID),
                 args: [0, 0, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_DUP2 {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_DUP2,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_DUP2),
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_ALARM {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_ALARM,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_ALARM),
                 args: [args[0], 0, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_ACCESS {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_FACCESSAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_FACCESSAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
         }
         if x86_number == X86_NR_STAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_STAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_STAT),
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_FSTAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_FSTAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_FSTAT),
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_LSTAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_LSTAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_LSTAT),
                 args: [args[0], args[1], 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_NEWFSTATAT {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT),
                 args: [args[0], args[1], args[2], args[3], 0, 0],
             });
         }
         if x86_number == X86_NR_PIPE {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_PIPE2,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_PIPE2),
                 args: [args[0], 0, 0, 0, 0, 0],
             });
         }
@@ -1125,24 +1126,24 @@ impl X8664GuestArch {
             }
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_PIPE2,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_PIPE2),
                 args: [args[0], flags, 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_READLINK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_READLINKAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_READLINKAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
         }
         if x86_number == X86_NR_MKDIR {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_MKDIRAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_MKDIRAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
         }
@@ -1155,8 +1156,8 @@ impl X8664GuestArch {
             // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_OPENAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_OPENAT),
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
                     args[0],
@@ -1172,8 +1173,8 @@ impl X8664GuestArch {
             // but the x86 flags word needs the O_* bit translation.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_OPENAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_OPENAT),
                 args: [
                     args[0],
                     args[1],
@@ -1190,8 +1191,8 @@ impl X8664GuestArch {
             // (args[1]) lands in the openat MODE slot (a3), not the flags slot.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_OPENAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_OPENAT),
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
                     args[0],
@@ -1208,16 +1209,16 @@ impl X8664GuestArch {
         if x86_number == X86_NR_UNLINK {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_UNLINKAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_UNLINKAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], 0, 0, 0, 0],
             });
         }
         if x86_number == X86_NR_RMDIR {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_UNLINKAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_UNLINKAT),
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
                     args[0],
@@ -1232,8 +1233,8 @@ impl X8664GuestArch {
         if x86_number == X86_NR_RENAME {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_RENAMEAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_RENAMEAT),
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
                     args[0],
@@ -1248,8 +1249,8 @@ impl X8664GuestArch {
             // flags=0 mirrors link(2) (no AT_SYMLINK_FOLLOW).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_LINKAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_LINKAT),
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
                     args[0],
@@ -1265,8 +1266,8 @@ impl X8664GuestArch {
             // symlink(target, linkpath) → symlinkat(target, AT_FDCWD, linkpath).
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_SYMLINKAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_SYMLINKAT),
                 args: [args[0], carrick_abi::LINUX_AT_FDCWD, args[1], 0, 0, 0],
             });
         }
@@ -1274,8 +1275,8 @@ impl X8664GuestArch {
         if x86_number == X86_NR_MKNOD {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_MKNODAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_MKNODAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
         }
@@ -1283,8 +1284,8 @@ impl X8664GuestArch {
         if x86_number == X86_NR_CHMOD {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_FCHMODAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_FCHMODAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
             });
         }
@@ -1293,16 +1294,16 @@ impl X8664GuestArch {
             // flags=0: chown FOLLOWS symlinks. owner/group -1 sentinel passes through.
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_FCHOWNAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_FCHOWNAT),
                 args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], args[2], 0, 0],
             });
         }
         if x86_number == X86_NR_LCHOWN {
             return SyscallNorm::Plain(RawSyscall {
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-                native_number: x86_number,
-                number: CANONICAL_FCHOWNAT,
+                native_number: NativeNr(x86_number),
+                number: CanonicalNr(CANONICAL_FCHOWNAT),
                 args: [
                     carrick_abi::LINUX_AT_FDCWD,
                     args[0],
@@ -1333,8 +1334,8 @@ impl X8664GuestArch {
         }
         SyscallNorm::Plain(RawSyscall {
             guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
-            native_number: x86_number,
-            number: canonical,
+            native_number: NativeNr(x86_number),
+            number: CanonicalNr(canonical),
             args,
         })
     }
@@ -1363,7 +1364,7 @@ mod normalize_tests {
         // x86 fork = 57 → canonical clone(220) with flags=SIGCHLD(17), rest 0.
         match X8664GuestArch::normalize_syscall(&frame(57, [0; 6])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 220);
+                assert_eq!(rs.number.raw(), 220);
                 assert_eq!(rs.args, [17, 0, 0, 0, 0, 0]);
             }
             _ => panic!("fork must be Plain(clone)"),
@@ -1375,7 +1376,7 @@ mod normalize_tests {
         // x86 vfork = 58 → clone(220) flags = CLONE_VM|CLONE_VFORK|SIGCHLD.
         match X8664GuestArch::normalize_syscall(&frame(58, [0; 6])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 220);
+                assert_eq!(rs.number.raw(), 220);
                 assert_eq!(rs.args[0], 0x0000_0100 | 0x0000_4000 | 17);
             }
             _ => panic!("vfork must be Plain(clone)"),
@@ -1390,7 +1391,7 @@ mod normalize_tests {
         // raw args: flags=0x11, stack=0x22, ptid=0x33, child_tid=0xC, tls=0xT
         match X8664GuestArch::normalize_syscall(&frame(56, [0x11, 0x22, 0x33, 0xC, 0x7, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 220);
+                assert_eq!(rs.number.raw(), 220);
                 assert_eq!(rs.args[3], 0x7, "args[3] becomes tls");
                 assert_eq!(rs.args[4], 0xC, "args[4] becomes child_tid");
             }
@@ -1407,7 +1408,10 @@ mod normalize_tests {
         // validates size>0 before creating the instance).
         match X8664GuestArch::normalize_syscall(&frame(213, [128, 0, 0, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE);
+                assert_eq!(
+                    rs.number.raw(),
+                    carrick_abi::CARRICK_PRIVATE_X86_EPOLL_CREATE
+                );
                 assert_eq!(rs.args, [128, 0, 0, 0, 0, 0]);
             }
             _ => panic!("epoll_create must be Plain"),
@@ -1415,7 +1419,7 @@ mod normalize_tests {
         // inotify_init() → inotify_init1(26) flags=0.
         match X8664GuestArch::normalize_syscall(&frame(253, [0; 6])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 26);
+                assert_eq!(rs.number.raw(), 26);
                 assert_eq!(rs.args, [0, 0, 0, 0, 0, 0]);
             }
             _ => panic!("inotify_init must be Plain"),
@@ -1423,7 +1427,7 @@ mod normalize_tests {
         // signalfd(fd=5, mask=0x9, sizemask=8) → signalfd4(74) appending flags=0.
         match X8664GuestArch::normalize_syscall(&frame(282, [5, 0x9, 8, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 74);
+                assert_eq!(rs.number.raw(), 74);
                 assert_eq!(rs.args, [5, 0x9, 8, 0, 0, 0]);
             }
             _ => panic!("signalfd must be Plain"),
@@ -1431,7 +1435,7 @@ mod normalize_tests {
         // eventfd(initval=3) → eventfd2(19) appending flags=0.
         match X8664GuestArch::normalize_syscall(&frame(284, [3, 0, 0, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 19);
+                assert_eq!(rs.number.raw(), 19);
                 assert_eq!(rs.args, [3, 0, 0, 0, 0, 0]);
             }
             _ => panic!("eventfd must be Plain"),
@@ -1443,7 +1447,7 @@ mod normalize_tests {
         // x86 clone3 = 435 → canonical 435 (struct-based; no positional swap).
         match X8664GuestArch::normalize_syscall(&frame(435, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])) {
             SyscallNorm::Plain(rs) => {
-                assert_ne!(rs.number, 220);
+                assert_ne!(rs.number.raw(), 220);
                 assert_eq!(rs.args[3], 0xDD, "clone3 args untouched");
                 assert_eq!(rs.args[4], 0xEE);
             }
@@ -1468,7 +1472,7 @@ mod normalize_tests {
         // x86 write = 1 → canonical write = 64 (Direct). args pass through.
         match X8664GuestArch::normalize_syscall(&frame(1, [1, 0x100, 5, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 64); // canonical write
+                assert_eq!(rs.number.raw(), 64); // canonical write
                 assert_eq!(rs.args, [1, 0x100, 5, 0, 0, 0]);
             }
             _ => panic!("write must be Plain"),
@@ -1481,7 +1485,7 @@ mod normalize_tests {
         // normalized number plus a dispatcher shim preserving dup2(fd,fd).
         match X8664GuestArch::normalize_syscall(&frame(33, [3, 1, 0xBAD, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_DUP2);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_DUP2);
                 assert_eq!(rs.args, [3, 1, 0, 0, 0, 0]);
             }
             _ => panic!("dup2 must be Plain"),
@@ -1492,7 +1496,7 @@ mod normalize_tests {
     fn alarm_normalizes_to_private_legacy_dispatch_number() {
         match X8664GuestArch::normalize_syscall(&frame(37, [5, 0xBAD, 0, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_ALARM);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_ALARM);
                 assert_eq!(rs.args, [5, 0, 0, 0, 0, 0]);
             }
             _ => panic!("alarm must be Plain"),
@@ -1508,8 +1512,8 @@ mod normalize_tests {
         // int timeout. The args (fds, nfds, timeout_ms) pass through unchanged.
         match X8664GuestArch::normalize_syscall(&frame(7, [0x1000, 3, 0, 0xBAD, 0xBAD, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_POLL);
-                assert_ne!(rs.number, 73); // NOT canonical ppoll
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_POLL);
+                assert_ne!(rs.number.raw(), 73); // NOT canonical ppoll
                 assert_eq!(rs.args, [0x1000, 3, 0, 0, 0, 0]);
             }
             _ => panic!("poll must be Plain"),
@@ -1524,8 +1528,8 @@ mod normalize_tests {
         // (nfds, r, w, e, *timeval) pass through; the sigmask slot is zeroed.
         match X8664GuestArch::normalize_syscall(&frame(23, [3, 0x100, 0x200, 0, 0x300, 0xBAD])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_SELECT);
-                assert_ne!(rs.number, 72); // NOT canonical pselect6
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_SELECT);
+                assert_ne!(rs.number.raw(), 72); // NOT canonical pselect6
                 assert_eq!(rs.args, [3, 0x100, 0x200, 0, 0x300, 0]);
             }
             _ => panic!("select must be Plain"),
@@ -1540,7 +1544,7 @@ mod normalize_tests {
         // aarch64 libc uses for pause). Its garbage register args are dropped.
         match X8664GuestArch::normalize_syscall(&frame(34, [0xBAD, 0xBAD, 0xBAD, 7, 7, 7])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 73); // canonical ppoll, NOT mkdirat(34)
+                assert_eq!(rs.number.raw(), 73); // canonical ppoll, NOT mkdirat(34)
                 assert_eq!(rs.args, [0, 0, 0, 0, 0, 0]); // ppoll(NULL,0,NULL,NULL,0)
             }
             _ => panic!("pause must be Plain"),
@@ -1568,7 +1572,7 @@ mod normalize_tests {
         // openat(257) -> canonical openat(56), flags arg (a2) translated.
         match X8664GuestArch::normalize_syscall(&frame(257, [5, 0x1000, 0x10000, 0o644, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 56);
+                assert_eq!(rs.number.raw(), 56);
                 assert_eq!(rs.args, [5, 0x1000, 0x4000, 0o644, 0, 0]);
             }
             _ => panic!("openat must be Plain"),
@@ -1581,7 +1585,7 @@ mod normalize_tests {
         // asm-generic successor and append flags=0.
         match X8664GuestArch::normalize_syscall(&frame(22, [0x4000, 0xBAD, 0, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 59);
+                assert_eq!(rs.number.raw(), 59);
                 assert_eq!(rs.args, [0x4000, 0, 0, 0, 0, 0]);
             }
             _ => panic!("pipe must be Plain"),
@@ -1596,7 +1600,7 @@ mod normalize_tests {
         match X8664GuestArch::normalize_syscall(&frame(89, [0x1000, 0x2000, 64, 0xAA, 0xBB, 0xCC]))
         {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 78);
+                assert_eq!(rs.number.raw(), 78);
                 assert_eq!(
                     rs.args,
                     [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0x2000, 64, 0, 0]
@@ -1612,7 +1616,7 @@ mod normalize_tests {
         // Normalize access(path, mode) through faccessat(AT_FDCWD, path, mode).
         match X8664GuestArch::normalize_syscall(&frame(21, [0x1000, 4, 0xAA, 0xBB, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 48);
+                assert_eq!(rs.number.raw(), 48);
                 assert_eq!(rs.args, [carrick_abi::LINUX_AT_FDCWD, 0x1000, 4, 0, 0, 0]);
             }
             _ => panic!("access must be Plain"),
@@ -1627,7 +1631,7 @@ mod normalize_tests {
         // shared args pass through and the trailing sigmask pair is NULL/0.
         match X8664GuestArch::normalize_syscall(&frame(232, [3, 0x1000, 16, 1000, 0xBAD, 0xBAD])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 22);
+                assert_eq!(rs.number.raw(), 22);
                 assert_eq!(rs.args, [3, 0x1000, 16, 1000, 0, 0]);
             }
             _ => panic!("epoll_wait must be Plain"),
@@ -1640,7 +1644,7 @@ mod normalize_tests {
         // POSIX getpgrp() == getpgid(0); normalize to getpgid(0).
         match X8664GuestArch::normalize_syscall(&frame(111, [0xBAD, 0xBAD, 0, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 155);
+                assert_eq!(rs.number.raw(), 155);
                 assert_eq!(rs.args, [0, 0, 0, 0, 0, 0]);
             }
             _ => panic!("getpgrp must be Plain"),
@@ -1654,7 +1658,7 @@ mod normalize_tests {
         // pointer is not misinterpreted as a file descriptor.
         match X8664GuestArch::normalize_syscall(&frame(83, [0x1000, 0o755, 0xAA, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, 34);
+                assert_eq!(rs.number.raw(), 34);
                 assert_eq!(
                     rs.args,
                     [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0o755, 0, 0, 0]
@@ -1669,7 +1673,7 @@ mod normalize_tests {
     fn assert_plain(rax: u64, a: [u64; 6], num: u64, args: [u64; 6]) {
         match X8664GuestArch::normalize_syscall(&frame(rax, a)) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, num, "syscall {rax} canonical number");
+                assert_eq!(rs.number.raw(), num, "syscall {rax} canonical number");
                 assert_eq!(rs.args, args, "syscall {rax} args");
             }
             _ => panic!("x86 {rax} must normalize to a Plain RawSyscall"),
@@ -1828,7 +1832,10 @@ mod normalize_tests {
         // example here until it got its own private shim.)
         match X8664GuestArch::normalize_syscall(&frame(335, [0x1000, 3, 4, 5, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED);
+                assert_eq!(
+                    rs.number.raw(),
+                    carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED
+                );
                 assert_eq!(rs.args, [0x1000, 3, 4, 5, 0, 0]);
             }
             _ => panic!("unknown x86 syscall must be Plain unsupported"),
@@ -1843,7 +1850,7 @@ mod normalize_tests {
         // selected without weakening canonical newfstatat.
         match X8664GuestArch::normalize_syscall(&frame(4, [0x1000, 0x2000, 0xAA, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_STAT);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_STAT);
                 assert_eq!(rs.args, [0x1000, 0x2000, 0, 0, 0, 0]);
             }
             _ => panic!("stat must be Plain"),
@@ -1856,7 +1863,7 @@ mod normalize_tests {
         // struct stat, not canonical/aarch64 LinuxStat.
         match X8664GuestArch::normalize_syscall(&frame(5, [3, 0x2000, 0xAA, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_FSTAT);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_FSTAT);
                 assert_eq!(rs.args, [3, 0x2000, 0, 0, 0, 0]);
             }
             _ => panic!("fstat must be Plain"),
@@ -1869,7 +1876,7 @@ mod normalize_tests {
         // AT_SYMLINK_NOFOLLOW but writes x86_64's 144-byte struct stat.
         match X8664GuestArch::normalize_syscall(&frame(6, [0x1000, 0x2000, 0xAA, 0, 0, 0])) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_LSTAT);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_LSTAT);
                 assert_eq!(rs.args, [0x1000, 0x2000, 0, 0, 0, 0]);
             }
             _ => panic!("lstat must be Plain"),
@@ -1885,7 +1892,7 @@ mod normalize_tests {
             [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0x2000, 0x100, 0xAA, 0],
         )) {
             SyscallNorm::Plain(rs) => {
-                assert_eq!(rs.number, carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT);
+                assert_eq!(rs.number.raw(), carrick_abi::CARRICK_PRIVATE_X86_NEWFSTATAT);
                 assert_eq!(
                     rs.args,
                     [carrick_abi::LINUX_AT_FDCWD, 0x1000, 0x2000, 0x100, 0, 0]
@@ -1955,7 +1962,7 @@ mod normalize_tests {
         for n in 0..=max {
             let hits_sink = match X8664GuestArch::normalize_syscall(&frame(n, [0; 6])) {
                 SyscallNorm::ArchPrctl { .. } => false,
-                SyscallNorm::Plain(rs) => rs.number == CARRICK_PRIVATE_X86_UNSUPPORTED,
+                SyscallNorm::Plain(rs) => rs.number.raw() == CARRICK_PRIVATE_X86_UNSUPPORTED,
             };
             match (hits_sink, deferred.contains(&n)) {
                 (true, false) => unexpected_sinks.push(n),
