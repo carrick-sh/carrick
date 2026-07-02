@@ -814,7 +814,7 @@ impl<M: GuestMemory> SyscallCtx<'_, M> {
     pub fn tid(&self) -> crate::thread::ThreadId {
         self.thread
             .map(|t| t.tid)
-            .unwrap_or(std::process::id() as crate::thread::ThreadId)
+            .unwrap_or_else(crate::thread::ThreadId::main_from_host_pid)
     }
 }
 
@@ -831,7 +831,7 @@ pub(crate) fn guest_visible_tid(
     tid: crate::thread::ThreadId,
     registry: &crate::thread::ThreadRegistry,
 ) -> Option<u32> {
-    let tid = u32::try_from(tid).ok()?;
+    let tid = u32::try_from(tid.raw()).ok()?;
     if registry.live_count() > 1 {
         if tid == std::process::id() {
             Some(crate::namespace::pid::host_to_ns_or_self(tid))
@@ -1012,7 +1012,7 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
         if let Err(errno) = n.host_syscall_errno() {
             if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
                 if crate::host_signal::has_unblocked_pending_for(
-                    write.tid,
+                    write.tid.raw(),
                     carrick_abi::SigBlockMask::NONE,
                 ) {
                     return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
@@ -1039,8 +1039,10 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
                 value: write.bytes.len() as i64,
             });
         }
-        if crate::host_signal::has_unblocked_pending_for(write.tid, carrick_abi::SigBlockMask::NONE)
-        {
+        if crate::host_signal::has_unblocked_pending_for(
+            write.tid.raw(),
+            carrick_abi::SigBlockMask::NONE,
+        ) {
             return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
                 value: write.offset as i64,
             });
@@ -1171,7 +1173,7 @@ pub enum DispatchOutcome {
     /// delivers promptly. Completes the calling syscall with 0, or -ESRCH if
     /// the target raced to exit. Only emitted on the multi-threaded path.
     SignalThread {
-        tid: i32,
+        tid: crate::thread::ThreadId,
         signum: i32,
     },
     /// `FUTEX_WAIT` whose value-check passed under the dispatcher lock: the
@@ -2406,14 +2408,16 @@ impl SyscallDispatcher {
         }
         match request.number.raw() {
             130 => {
-                let target = request.arg(0) as crate::thread::ThreadId;
+                let target =
+                    crate::thread::ThreadId::from_guest_supplied_tid(request.arg(0) as i32);
                 let signum = request.arg(1);
                 if signum <= LINUX_MAX_SIGNUM && (target == tid || !registry.is_live(target)) {
                     return None;
                 }
             }
             131 => {
-                let target = request.arg(1) as crate::thread::ThreadId;
+                let target =
+                    crate::thread::ThreadId::from_guest_supplied_tid(request.arg(1) as i32);
                 let signum = request.arg(2);
                 if signum <= LINUX_MAX_SIGNUM && (target == tid || !registry.is_live(target)) {
                     return None;
@@ -2441,7 +2445,8 @@ impl SyscallDispatcher {
                 // `tid` is the caller's own live tid, so guest_visible_tid is
                 // always Some; worker tids (> main_tid) are per-process and not
                 // ns-translated. Identity when namespaces are off.
-                let visible = guest_visible_tid(tid, registry).map_or(tid as i64, i64::from);
+                let visible =
+                    guest_visible_tid(tid, registry).map_or(i64::from(tid.raw()), i64::from);
                 DispatchOutcome::Returned { value: visible }
             }
             98 => dispatch_threaded_futex(request, memory, reporter, futex, tid, registry),
@@ -2463,12 +2468,14 @@ impl SyscallDispatcher {
                 DispatchOutcome::Returned { value: 0 }
             }
             130 => {
-                let target = request.arg(0) as crate::thread::ThreadId;
+                let target =
+                    crate::thread::ThreadId::from_guest_supplied_tid(request.arg(0) as i32);
                 let signum = request.arg(1);
                 dispatch_threaded_signal_route(tid, registry, target, signum)?
             }
             131 => {
-                let target = request.arg(1) as crate::thread::ThreadId;
+                let target =
+                    crate::thread::ThreadId::from_guest_supplied_tid(request.arg(1) as i32);
                 let signum = request.arg(2);
                 dispatch_threaded_signal_route(tid, registry, target, signum)?
             }
@@ -5082,7 +5089,7 @@ fn write_host_pipe_payload(
                 }
                 if block_until_complete && offset > 0 {
                     if crate::host_signal::has_unblocked_pending_for(
-                        tid,
+                        tid.raw(),
                         carrick_abi::SigBlockMask::NONE,
                     ) {
                         return DispatchOutcome::Returned {
@@ -5118,7 +5125,7 @@ fn write_host_pipe_payload(
                 // returning the partial count; check between chunks so a long
                 // write doesn't ignore an armed alarm (or a pending quiesce).
                 if crate::host_signal::has_unblocked_pending_for(
-                    tid,
+                    tid.raw(),
                     carrick_abi::SigBlockMask::NONE,
                 ) || crate::fork_quiesce::is_quiescing()
                 {
@@ -5664,7 +5671,7 @@ mod overlay_dispatch_tests {
             None,
             false,
             HostWriteKind::PipeLike,
-            0x7FFE_0101,
+            crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
             true,
         );
 
@@ -5717,7 +5724,7 @@ mod overlay_dispatch_tests {
             None,
             true,
             HostWriteKind::PipeLike,
-            0x7FFE_0103,
+            crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
             false,
         );
 
@@ -5771,7 +5778,7 @@ mod overlay_dispatch_tests {
             None,
             true,
             HostWriteKind::SocketLike,
-            0x7FFE_0104,
+            crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
             false,
         );
 
@@ -5835,8 +5842,14 @@ mod overlay_dispatch_tests {
         let bytes = vec![0x5A; 4096];
         let expected_ptr = bytes.as_ptr();
         let expected_capacity = bytes.capacity();
-        let write = BlockingHostWrite::from_vec(fds[1], bytes, 128, 0x7FFE_0102, true)
-            .expect("blocking write continuation should be created");
+        let write = BlockingHostWrite::from_vec(
+            fds[1],
+            bytes,
+            128,
+            crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0102),
+            true,
+        )
+        .expect("blocking write continuation should be created");
 
         unsafe {
             libc::close(fds[0]);
@@ -6417,7 +6430,8 @@ mod overlay_dispatch_tests {
 
         let dispatcher = SyscallDispatcher::with_rootfs(empty_rootfs());
         let reporter = CompatReporter::default();
-        let registry = crate::thread::ThreadRegistry::new(1000);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
         let futex = crate::thread::FutexTable::new();
 
         // Create the shared epoll instance up front.
@@ -6428,7 +6442,7 @@ mod overlay_dispatch_tests {
                     SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
                     &mut mem,
                     &reporter,
-                    1,
+                    crate::thread::ThreadId::synthetic_for_tests(1),
                     &registry,
                     &futex,
                 )
@@ -6467,7 +6481,7 @@ mod overlay_dispatch_tests {
                             ),
                             &mut mem,
                             reporter,
-                            2,
+                            crate::thread::ThreadId::synthetic_for_tests(2),
                             registry,
                             futex,
                         )
@@ -6514,7 +6528,7 @@ mod overlay_dispatch_tests {
             for w in 0..NWORKERS {
                 s.spawn(move || {
                     let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
-                    let tid = 100 + w as crate::thread::ThreadId;
+                    let tid = crate::thread::ThreadId::synthetic_for_tests(100 + w as i32);
                     let pipe_out = MEM_BASE + 0x100;
                     let ev_in = MEM_BASE + 0x120;
                     let wbuf = MEM_BASE + 0x140;
@@ -6616,7 +6630,8 @@ mod overlay_dispatch_tests {
 
         let dispatcher = SyscallDispatcher::with_rootfs(empty_rootfs());
         let reporter = CompatReporter::default();
-        let registry = crate::thread::ThreadRegistry::new(1000);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
         let futex = crate::thread::FutexTable::new();
 
         let epfd = {
@@ -6626,7 +6641,7 @@ mod overlay_dispatch_tests {
                     SyscallRequest::new(20, SyscallArgs::from([0u64; 6])),
                     &mut mem,
                     &reporter,
-                    1,
+                    crate::thread::ThreadId::synthetic_for_tests(1),
                     &registry,
                     &futex,
                 )
@@ -6665,7 +6680,7 @@ mod overlay_dispatch_tests {
                             ),
                             &mut mem,
                             reporter,
-                            2,
+                            crate::thread::ThreadId::synthetic_for_tests(2),
                             registry,
                             futex,
                         )
@@ -6713,7 +6728,7 @@ mod overlay_dispatch_tests {
             for r in 0..RECYCLERS {
                 s.spawn(move || {
                     let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
-                    let tid = 200 + r as crate::thread::ThreadId;
+                    let tid = crate::thread::ThreadId::synthetic_for_tests(200 + r as i32);
                     let pipe_out = MEM_BASE + 0x100;
                     let ev_in = MEM_BASE + 0x120;
                     let call =
@@ -6755,7 +6770,7 @@ mod overlay_dispatch_tests {
             for w in 0..VICTIMS {
                 s.spawn(move || {
                     let mut mem = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
-                    let tid = 100 + w as crate::thread::ThreadId;
+                    let tid = crate::thread::ThreadId::synthetic_for_tests(100 + w as i32);
                     let pipe_out = MEM_BASE + 0x100;
                     let ev_in = MEM_BASE + 0x120;
                     let wbuf = MEM_BASE + 0x140;
@@ -7155,7 +7170,8 @@ mod overlay_dispatch_tests {
         memory.write_bytes(0x10800, &0u32.to_le_bytes()).unwrap();
         let reporter = CompatReporter::default();
         let futex = crate::thread::FutexTable::new();
-        let registry = crate::thread::ThreadRegistry::new(1000);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
         let request = SyscallRequest::new(
             98,
             SyscallArgs::from([
@@ -7168,8 +7184,14 @@ mod overlay_dispatch_tests {
             ]),
         );
 
-        let outcome =
-            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+        let outcome = dispatch_threaded_futex(
+            request,
+            &mut memory,
+            &reporter,
+            &futex,
+            crate::thread::ThreadId::synthetic_for_tests(1001),
+            &registry,
+        );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(memory.shared_futex_lookups.get(), 0);
@@ -7181,14 +7203,21 @@ mod overlay_dispatch_tests {
         memory.write_bytes(0x10800, &0u32.to_le_bytes()).unwrap();
         let reporter = CompatReporter::default();
         let futex = crate::thread::FutexTable::new();
-        let registry = crate::thread::ThreadRegistry::new(1000);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
         let request = SyscallRequest::new(
             98,
             SyscallArgs::from([0x10800, LINUX_FUTEX_WAKE, 1, 0, 0, 0]),
         );
 
-        let outcome =
-            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+        let outcome = dispatch_threaded_futex(
+            request,
+            &mut memory,
+            &reporter,
+            &futex,
+            crate::thread::ThreadId::synthetic_for_tests(1001),
+            &registry,
+        );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(memory.shared_futex_lookups.get(), 1);
@@ -7225,15 +7254,22 @@ mod overlay_dispatch_tests {
         let host_addr = &memory.word as *const u32 as usize;
         let reporter = CompatReporter::default();
         let futex = crate::thread::FutexTable::new();
-        let registry = crate::thread::ThreadRegistry::new(1000);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
         // Non-private FUTEX_WAKE (no PRIVATE flag) of up to 3 waiters.
         let request = SyscallRequest::new(
             98,
             SyscallArgs::from([0x10800, LINUX_FUTEX_WAKE, 3, 0, 0, 0]),
         );
 
-        let outcome =
-            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+        let outcome = dispatch_threaded_futex(
+            request,
+            &mut memory,
+            &reporter,
+            &futex,
+            crate::thread::ThreadId::synthetic_for_tests(1001),
+            &registry,
+        );
 
         assert_eq!(
             outcome,
@@ -7262,7 +7298,8 @@ mod overlay_dispatch_tests {
         memory.write_bytes(0x10810, &[0u8; 16]).unwrap();
         let reporter = CompatReporter::default();
         let futex = crate::thread::FutexTable::new();
-        let registry = crate::thread::ThreadRegistry::new(1000);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1000));
         // Private FUTEX_WAIT (no shared mapping) so the park stays in the
         // in-process parking-lot table and returns a `FutexWait` outcome.
         let request = SyscallRequest::new(
@@ -7277,8 +7314,14 @@ mod overlay_dispatch_tests {
             ]),
         );
 
-        let outcome =
-            dispatch_threaded_futex(request, &mut memory, &reporter, &futex, 1001, &registry);
+        let outcome = dispatch_threaded_futex(
+            request,
+            &mut memory,
+            &reporter,
+            &futex,
+            crate::thread::ThreadId::synthetic_for_tests(1001),
+            &registry,
+        );
 
         match outcome {
             DispatchOutcome::FutexWait { timeout, .. } => assert_eq!(

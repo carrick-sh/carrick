@@ -31,6 +31,13 @@ pub use carrick_runtime::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
 };
 pub use carrick_runtime::rootfs::{LayerSource, RootFs};
+pub use carrick_runtime::thread::ThreadId;
+
+/// Synthetic thread registry key for tests (`ThreadId`'s named-constructor
+/// discipline; production code never fabricates keys).
+pub fn test_tid(raw: i32) -> ThreadId {
+    ThreadId::synthetic_for_tests(raw)
+}
 pub use carrick_test_support::{gzip_tar, gzip_tar_with_links, gzip_tar_with_modes};
 pub use zerocopy::{FromBytes, IntoBytes};
 

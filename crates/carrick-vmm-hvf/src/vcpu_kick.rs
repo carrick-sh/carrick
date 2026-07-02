@@ -402,6 +402,9 @@ pub fn spawn_signal_pump(
                 for tid in pending_threads {
                     // A thread-directed signal belongs to one guest tid. Wake
                     // only that vCPU / futex waiter; siblings stay parked.
+                    // (The pending table stores raw keys exported with
+                    // `ThreadId::raw` at the publish sites.)
+                    let tid = carrick_hal::ThreadId::from_wire_key(tid);
                     kicker.kick(tid);
                     futex.notify_signal_pending_for(tid);
                 }
@@ -438,11 +441,11 @@ mod tests {
     fn register_unregister_is_consistent() {
         let kicker = VcpuKicker::new();
         // Unknown tid: kick is a harmless no-op.
-        kicker.kick(42);
-        kicker.unregister(42);
+        kicker.kick(carrick_hal::ThreadId::synthetic_for_tests(42));
+        kicker.unregister(carrick_hal::ThreadId::synthetic_for_tests(42));
         // kick_all on an empty registry does nothing.
         kicker.kick_all();
-        kicker.kick_all_except(1);
+        kicker.kick_all_except(carrick_hal::ThreadId::synthetic_for_tests(1));
     }
 
     #[test]

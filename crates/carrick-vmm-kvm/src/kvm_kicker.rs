@@ -125,6 +125,10 @@ mod tests {
         fn kick(&self) {}
     }
 
+    fn t(raw: i32) -> carrick_hal::ThreadId {
+        carrick_hal::ThreadId::synthetic_for_tests(raw)
+    }
+
     fn boxed() -> Box<dyn carrick_hal::VcpuKickDyn> {
         Box::new(InertHandle)
     }
@@ -136,22 +140,22 @@ mod tests {
         let k = KvmKicker::new();
         assert_eq!(k.count(), 0, "fresh kicker is empty");
 
-        k.register(10, boxed());
-        k.register(11, boxed());
+        k.register(t(10), boxed());
+        k.register(t(11), boxed());
         assert_eq!(k.count(), 2, "two handles registered");
 
         // Kicking an unknown tid, kick_all, kick_all_except are harmless no-ops
         // on inert handles (no pthread_kill fires).
-        k.kick(999);
+        k.kick(t(999));
         k.kick_all();
-        k.kick_all_except(10);
+        k.kick_all_except(t(10));
 
-        k.unregister(10);
+        k.unregister(t(10));
         assert_eq!(k.count(), 1, "one handle after unregister");
-        k.unregister(11);
+        k.unregister(t(11));
         assert_eq!(k.count(), 0, "empty after unregistering both");
         // Unregistering an absent tid is a no-op.
-        k.unregister(11);
+        k.unregister(t(11));
         assert_eq!(k.count(), 0);
     }
 
@@ -161,32 +165,32 @@ mod tests {
     fn set_in_guest_any_other_in_guest() {
         let k = KvmKicker::new();
         // Two threads register their in-guest flags.
-        let _f1 = k.register_in_guest(1);
-        let _f2 = k.register_in_guest(2);
+        let _f1 = k.register_in_guest(t(1));
+        let _f2 = k.register_in_guest(t(2));
 
         // Nobody in guest yet.
-        assert!(!k.any_other_in_guest(1), "no other thread in guest");
-        assert!(!k.any_other_in_guest(2));
+        assert!(!k.any_other_in_guest(t(1)), "no other thread in guest");
+        assert!(!k.any_other_in_guest(t(2)));
 
         // Thread 2 enters the guest.
-        k.set_in_guest(2, true);
+        k.set_in_guest(t(2), true);
         assert!(
-            k.any_other_in_guest(1),
+            k.any_other_in_guest(t(1)),
             "thread 1 must observe thread 2 in guest"
         );
         // Thread 2 asking "any OTHER" excludes itself -> still false.
         assert!(
-            !k.any_other_in_guest(2),
+            !k.any_other_in_guest(t(2)),
             "the in-guest thread excludes itself"
         );
 
         // Thread 2 leaves the guest.
-        k.set_in_guest(2, false);
-        assert!(!k.any_other_in_guest(1), "thread 2 left the guest");
+        k.set_in_guest(t(2), false);
+        assert!(!k.any_other_in_guest(t(1)), "thread 2 left the guest");
 
         // set_in_guest for an UNREGISTERED tid is a no-op (no panic, no insert).
-        k.set_in_guest(999, true);
-        assert!(!k.any_other_in_guest(1));
+        k.set_in_guest(t(999), true);
+        assert!(!k.any_other_in_guest(t(1)));
     }
 
     /// The handle returned by `register_in_guest` is the SAME `Arc<AtomicBool>`
@@ -195,9 +199,9 @@ mod tests {
     #[test]
     fn register_in_guest_returns_shared_flag() {
         let k = KvmKicker::new();
-        let flag = k.register_in_guest(7);
+        let flag = k.register_in_guest(t(7));
         assert!(!flag.load(Ordering::SeqCst));
-        k.set_in_guest(7, true);
+        k.set_in_guest(t(7), true);
         assert!(
             flag.load(Ordering::SeqCst),
             "the returned flag must alias the registry's flag"

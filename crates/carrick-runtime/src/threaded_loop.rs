@@ -133,7 +133,7 @@ where
     // handlers + a termios-restore guard); the guard is held for the loop.
     let _loop_guard = host.pre_loop_setup();
 
-    let main_tid: ThreadId = std::process::id() as ThreadId;
+    let main_tid: ThreadId = ThreadId::main_from_host_pid();
     let registry = Arc::new(ThreadRegistry::new(main_tid));
     // Publish for /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
     crate::thread::set_current_registry(Arc::clone(&registry));
@@ -168,7 +168,7 @@ where
     // 1..N-1 and never collide with the main vCPU. Held for the process's life
     // (released implicitly by `_exit`).
     carrick_hal::vcpu_sched::set_current_lease(
-        carrick_hal::vcpu_sched::global().acquire(main_tid as u64),
+        carrick_hal::vcpu_sched::global().acquire(main_tid.raw() as u64),
     );
 
     // The CONCRETE process-private futex table, threaded UNCHANGED through the

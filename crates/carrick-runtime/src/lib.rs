@@ -449,7 +449,7 @@ pub mod runtime {
     {
         let reporter = CompatReporter::default();
         let mut waiter =
-            crate::io_wait::ThreadWaiter::new(std::process::id() as crate::thread::ThreadId);
+            crate::io_wait::ThreadWaiter::new(crate::thread::ThreadId::main_from_host_pid());
         let trace_traps = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
         for traps in 1..=max_traps {
             // `next_syscall` returns `TrapError`, which the unified RuntimeError
@@ -2198,7 +2198,7 @@ pub mod io_wait {
                     None => {
                         if crate::fork_quiesce::is_quiescing()
                             || crate::fork_quiesce::exec_replacing_other_thread(tid)
-                            || crate::host_signal::has_unblocked_pending_for(tid, block_mask)
+                            || crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
                             || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
                             || should_interrupt()
                         {
@@ -2259,7 +2259,7 @@ pub mod io_wait {
                 {
                     return WaitResult::Interrupted;
                 }
-                if crate::host_signal::has_unblocked_pending_for(tid, block_mask)
+                if crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
                     || carrick_signal_core::xsig::xsig_has_unblocked_for_self(block_mask)
                     || should_interrupt()
                 {
@@ -2309,9 +2309,13 @@ pub mod io_wait {
         fn unbounded_wait_checks_dispatch_pending_after_backstop_slice() {
             let checks = AtomicUsize::new(0);
 
-            let result = super::ppoll_wait(7, &[], None, carrick_abi::SigBlockMask::NONE, || {
-                checks.fetch_add(1, Ordering::SeqCst) > 0
-            });
+            let result = super::ppoll_wait(
+                crate::thread::ThreadId::synthetic_for_tests(7),
+                &[],
+                None,
+                carrick_abi::SigBlockMask::NONE,
+                || checks.fetch_add(1, Ordering::SeqCst) > 0,
+            );
 
             assert_eq!(result, super::WaitResult::Interrupted);
             assert!(

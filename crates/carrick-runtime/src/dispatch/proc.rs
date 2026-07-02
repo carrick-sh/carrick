@@ -246,7 +246,9 @@ fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     // self cases (host pid, bootstrap, ns-pid) are the canonical
     // NsPid::names_self (which the old body lacked the ns-pid arm of).
     pid == 0
-        || cx.thread.is_some_and(|thread| pid == thread.tid as u64)
+        || cx
+            .thread
+            .is_some_and(|thread| pid == thread.tid.raw() as u64)
         || NsPid(pid as i32).names_self()
 }
 
@@ -255,8 +257,11 @@ fn sched_pid_is_live_guest_thread<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u
     if pid == 0 || pid > i32::MAX as u64 {
         return false;
     }
-    cx.thread
-        .is_some_and(|thread| thread.registry.is_live(pid as crate::thread::ThreadId))
+    cx.thread.is_some_and(|thread| {
+        thread
+            .registry
+            .is_live(crate::thread::ThreadId::from_guest_supplied_tid(pid as i32))
+    })
 }
 
 /// True when `pid` names a live process accessible to the guest: either
@@ -625,10 +630,10 @@ impl SyscallDispatcher {
     ) -> AffinityTarget {
         if pid == 0
             || pid == std::process::id() as u64
-            || cx
-                .thread
-                .as_ref()
-                .is_some_and(|t| t.registry.is_live(pid as crate::thread::ThreadId))
+            || cx.thread.as_ref().is_some_and(|t| {
+                t.registry
+                    .is_live(crate::thread::ThreadId::from_guest_supplied_tid(pid as i32))
+            })
         {
             AffinityTarget::SelfProc
         } else if crate::host_proc::is_guest_process(pid as u32) {
@@ -1023,7 +1028,7 @@ impl SyscallDispatcher {
                     // whose tid == its tgid). Worker tids (> main_tid) are
                     // per-process and not ns-translated (§5.3). Identity when
                     // namespaces are off.
-                    let tid = t.tid as u32;
+                    let tid = t.tid.raw() as u32;
                     let ns_tid = if tid == std::process::id() {
                         crate::namespace::pid::host_to_ns_or_self(tid)
                     } else {
@@ -1049,7 +1054,7 @@ impl SyscallDispatcher {
                 // falls back to 0, so an unregistered child (the test runs under
                 // `sh -c`) would diverge. Use the same source as getpid() for the
                 // main thread; worker tids stay per-process untranslated.
-                let tid = t.tid as u32;
+                let tid = t.tid.raw() as u32;
                 let ns_tid = if tid == std::process::id() {
                     crate::namespace::pid::self_ns_pid()
                 } else {
@@ -2714,7 +2719,7 @@ mod futex_timeout_tests {
 
         let dispatcher = SyscallDispatcher::new();
         let reporter = CompatReporter::default();
-        let registry = ThreadRegistry::new(10);
+        let registry = ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(10));
         let futex = FutexTable::new();
         // A live sibling so the process is genuinely multi-threaded.
         registry.register_child(0);
@@ -2729,7 +2734,7 @@ mod futex_timeout_tests {
         memory.write_bytes(timeout_addr, &[0u8; 16]).unwrap();
 
         let thread = ThreadCtx {
-            tid: 10,
+            tid: crate::thread::ThreadId::synthetic_for_tests(10),
             registry: &registry,
             futex: &futex,
         };

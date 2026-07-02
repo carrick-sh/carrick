@@ -40,7 +40,7 @@ where
         b.set_quiescing();
         let tid = self.this_tid;
         crate::probes::pt_pause_begin(
-            tid,
+            tid.raw(),
             i32::from(self.kicker.any_other_in_guest(self.this_tid)),
             self.kicker.count() as i32,
         );
@@ -53,13 +53,13 @@ where
         while self.kicker.any_other_in_guest(self.this_tid) {
             self.kicker.kick_all_except(self.this_tid);
             if std::time::Instant::now() >= deadline {
-                crate::probes::pt_pause_timeout(tid, start.elapsed().as_micros() as i64);
+                crate::probes::pt_pause_timeout(tid.raw(), start.elapsed().as_micros() as i64);
                 break;
             }
             spins = spins.saturating_add(1);
             std::thread::yield_now();
         }
-        crate::probes::pt_pause_ready(tid, spins, start.elapsed().as_micros() as i64);
+        crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);
         b.pause_guard(tid)
     }
 
@@ -122,7 +122,12 @@ where
         // Stop-the-world: a multithreaded guest can fork only if every OTHER guest
         // vCPU thread is first paused at its lock-safe run-loop top.
         let mut others = self.kicker.count().saturating_sub(1);
-        crate::probes::fork_quiesce(0, others as i64, self.kicker.count() as i64, self.this_tid);
+        crate::probes::fork_quiesce(
+            0,
+            others as i64,
+            self.kicker.count() as i64,
+            self.this_tid.raw(),
+        );
         let mut quiesced = false;
         if others > 0 {
             let barrier = fork_barrier();
@@ -175,7 +180,7 @@ where
                         kicker = self.kicker.count(),
                         paused = barrier.paused_count(),
                         pid = std::process::id(),
-                        forker_tid = self.this_tid,
+                        forker_tid = self.this_tid.raw(),
                         "fork quiesce drain: {others} sibling vCPU(s) failed to reach the \
                          run-loop barrier in 10s — a blocking wait arm is not surfacing \
                          is_quiescing(). Aborting (core: `bt all` names the stranded thread) \
@@ -187,7 +192,7 @@ where
                     1,
                     others as i64,
                     barrier.paused_count() as i64,
-                    self.this_tid,
+                    self.this_tid.raw(),
                 );
                 // Do not surface EAGAIN to the guest here. Keep nudging every wait
                 // class until all live vCPUs leave the kicker, sleeping briefly
@@ -368,7 +373,7 @@ where
                     // it exits.
                     crate::host_signal::register_child_exit_watch(
                         child_pid,
-                        self.this_tid,
+                        self.this_tid.raw(),
                         i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
                     );
                 }
@@ -484,7 +489,7 @@ where
                 // Don't inherit the parent's accumulated guest CPU time.
                 crate::guest_cpu::reset();
                 let parent_tid = self.this_tid;
-                self.this_tid = std::process::id() as ThreadId;
+                self.this_tid = ThreadId::main_from_host_pid();
                 // The child inherits the parent's blocked mask + alternate signal
                 // stack (POSIX) but has a NEW tid; re-key the dispatcher's per-tid
                 // signal state.
@@ -544,7 +549,7 @@ where
                 carrick_hal::vcpu_sched::take_current_lease();
                 carrick_hal::vcpu_sched::global().reset_for_fork();
                 carrick_hal::vcpu_sched::set_current_lease(
-                    carrick_hal::vcpu_sched::global().acquire(self.this_tid as u64),
+                    carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64),
                 );
                 // PID namespace: block until the parent registered our ns-pid
                 // before any guest code runs. No-op when ns off.

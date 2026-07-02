@@ -26,7 +26,9 @@ fn kqueue_wait_still_observes_readable_socket_with_listener_write_interest() {
 
     client.write_all(b"request").expect("write request bytes");
 
-    let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
+    let waiter = ThreadWaiter::new(carrick_runtime::thread::ThreadId::main_from_host_pid_value(
+        unsafe { libc::getpid() },
+    ));
     let result = waiter.wait(
         &[
             WaitFd::raw(server.as_raw_fd(), libc::POLLIN),
@@ -68,7 +70,9 @@ fn kqueue_wait_wakes_when_peer_writes_after_registration() {
     let server_fd: RawFd = server.as_raw_fd();
     let listener_fd: RawFd = listener.as_raw_fd();
     let waiter_thread = std::thread::spawn(move || {
-        let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
+        let waiter = ThreadWaiter::new(
+            carrick_runtime::thread::ThreadId::main_from_host_pid_value(unsafe { libc::getpid() }),
+        );
         waiter.wait(
             &[
                 WaitFd::raw(server_fd, libc::POLLIN),

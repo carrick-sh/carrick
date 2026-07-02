@@ -69,7 +69,11 @@ use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, RequeueOp, UnparkResult, UnparkToken};
 
-pub type ThreadId = i32;
+/// The process-local thread/vCPU registry key — see [`carrick_hal::ThreadId`]
+/// for the domain rules (named constructors only; `raw()` at wire boundaries).
+/// Re-exported so `carrick_thread::thread::ThreadId` call sites keep working
+/// and both crates name the ONE type.
+pub use carrick_hal::ThreadId;
 
 /// Mach port type alias used in the registry. On macOS `mach_port_t` is
 /// `u32`; we store it as a plain `u32` here so carrick-thread compiles on
@@ -145,13 +149,13 @@ impl ThreadRegistry {
             },
         );
         Self {
-            next_tid: AtomicI32::new(main_tid + 1),
+            next_tid: AtomicI32::new(main_tid.raw() + 1),
             inner: ParkingMutex::new(map),
         }
     }
 
     pub fn register_child(&self, clear_child_tid: u64) -> ThreadId {
-        let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
+        let tid = ThreadId::from_registry_allocation(self.next_tid.fetch_add(1, Ordering::Relaxed));
         self.inner.lock().insert(
             tid,
             ThreadEntry {
@@ -431,7 +435,10 @@ impl FutexTable {
         tid: ThreadId,
         interrupted: &dyn Fn() -> bool,
     ) -> FutexWaitOutcome {
-        let token = usize::try_from(tid).unwrap_or(0);
+        // Park-token namespace: a waiter's ParkToken is its tid's raw key
+        // (negative → 0, exactly as before); UnparkTokens 1/2 are the
+        // WAKE/SIGNAL discriminators, NOT ThreadIds.
+        let token = usize::try_from(tid.raw()).unwrap_or(0);
         self.wait_prepared_with_token(wait, timeout, ParkToken(token), interrupted)
     }
 
@@ -564,7 +571,7 @@ impl FutexTable {
     /// `tgkill`/`tkill` delivery. Waiters for other tids stay parked until a real
     /// `FUTEX_WAKE`, timeout, or process-directed signal reaches them.
     pub fn notify_signal_pending_for(&self, tid: ThreadId) {
-        let Ok(token) = usize::try_from(tid) else {
+        let Ok(token) = usize::try_from(tid.raw()) else {
             return;
         };
         let buckets = self.all_buckets();
@@ -792,25 +799,25 @@ mod tests {
 
     #[test]
     fn allocates_monotonic_tids_above_base() {
-        let reg = ThreadRegistry::new(/*main_tid=*/ 1000);
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(1000));
         assert_eq!(reg.live_count(), 1);
         let t = reg.register_child(/*clear_child_tid=*/ 0x4000);
-        assert!(t > 1000);
+        assert!(t > ThreadId::synthetic_for_tests(1000));
         assert_eq!(reg.live_count(), 2);
         assert_eq!(reg.clear_child_tid(t), Some(0x4000));
     }
 
     #[test]
     fn remove_all_except_keeps_exec_owner_live() {
-        let reg = ThreadRegistry::new(/*main_tid=*/ 1000);
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(1000));
         let a = reg.register_child(0);
         let b = reg.register_child(0);
 
         let mut removed = reg.remove_all_except(a);
         removed.sort_unstable();
 
-        assert_eq!(removed, vec![1000, b]);
-        assert!(!reg.is_live(1000));
+        assert_eq!(removed, vec![ThreadId::synthetic_for_tests(1000), b]);
+        assert!(!reg.is_live(ThreadId::synthetic_for_tests(1000)));
         assert!(reg.is_live(a));
         assert!(!reg.is_live(b));
         assert_eq!(reg.live_count(), 1);
@@ -818,10 +825,10 @@ mod tests {
 
     #[test]
     fn exit_removes_thread_and_reports_last() {
-        let reg = ThreadRegistry::new(1000);
+        let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(1000));
         let t = reg.register_child(0);
         assert!(!reg.exit(t)); // not last
-        assert!(reg.exit(1000)); // last live thread -> true
+        assert!(reg.exit(ThreadId::synthetic_for_tests(1000))); // last live thread -> true
     }
 
     #[test]
@@ -1083,8 +1090,8 @@ mod tests {
 
         let table = Arc::new(FutexTable::new());
         let addr = 0x5151_0000_u64;
-        let target_tid = 10;
-        let sibling_tid = 11;
+        let target_tid = ThreadId::synthetic_for_tests(10);
+        let sibling_tid = ThreadId::synthetic_for_tests(11);
         let target_pending = Arc::new(AtomicBool::new(false));
         let sibling_pending = Arc::new(AtomicBool::new(false));
 

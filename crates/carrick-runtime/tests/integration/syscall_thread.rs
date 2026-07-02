@@ -99,8 +99,8 @@ fn gettid_returns_per_thread_tid_not_pid() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     let tid = registry.register_child(0);
     // gettid is syscall 178.
@@ -114,7 +114,12 @@ fn gettid_returns_per_thread_tid_not_pid() {
             &futex,
         )
         .unwrap();
-    assert_eq!(outcome, DispatchOutcome::Returned { value: tid as i64 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: i64::from(tid.raw())
+        }
+    );
 }
 
 #[test]
@@ -122,8 +127,8 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     let tid = registry.register_child(0);
     // set_tid_address(addr) is syscall 96.
@@ -137,7 +142,12 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
             &futex,
         )
         .unwrap();
-    assert_eq!(outcome, DispatchOutcome::Returned { value: tid as i64 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: i64::from(tid.raw())
+        }
+    );
     assert_eq!(registry.clear_child_tid(tid), Some(0x10500));
 }
 
@@ -146,8 +156,8 @@ fn sched_getscheduler_accepts_live_sibling_tid() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
 
@@ -155,11 +165,11 @@ fn sched_getscheduler_accepts_live_sibling_tid() {
         .dispatch_threaded(
             SyscallRequest::new(
                 SYS_SCHED_GETSCHEDULER,
-                SyscallArgs::from([sibling as u64, 0, 0, 0, 0, 0]),
+                SyscallArgs::from([sibling.raw() as u64, 0, 0, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )
@@ -178,8 +188,8 @@ fn sched_getparam_accepts_live_sibling_tid() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
 
@@ -187,11 +197,11 @@ fn sched_getparam_accepts_live_sibling_tid() {
         .dispatch_threaded(
             SyscallRequest::new(
                 SYS_SCHED_GETPARAM,
-                SyscallArgs::from([sibling as u64, 0x10800, 0, 0, 0, 0]),
+                SyscallArgs::from([sibling.raw() as u64, 0x10800, 0, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )
@@ -206,8 +216,8 @@ fn sched_getscheduler_unknown_sibling_tid_is_esrch() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
 
     let outcome = dispatcher
@@ -218,7 +228,7 @@ fn sched_getscheduler_unknown_sibling_tid_is_esrch() {
             ),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )
@@ -232,8 +242,8 @@ fn futex_wait_value_mismatch_returns_eagain() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     // *uaddr = 5, but FUTEX_WAIT expects 7 -> EAGAIN immediately.
     write_u32_le(&mut memory, 0x10800, 5);
@@ -244,7 +254,7 @@ fn futex_wait_value_mismatch_returns_eagain() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 7, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -262,7 +272,7 @@ fn futex_wake_returns_count_and_advances_table() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     write_u32_le(&mut memory, 0x10800, 0);
     let op = LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG;
@@ -272,7 +282,7 @@ fn futex_wake_returns_count_and_advances_table() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -285,7 +295,7 @@ fn futex_wait_matching_value_blocks_via_outcome() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     // *uaddr == val -> the handler must NOT block under the dispatcher lock; it
     // surfaces a FutexWait outcome the runtime services with the lock dropped.
@@ -296,7 +306,7 @@ fn futex_wait_matching_value_blocks_via_outcome() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 42, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -315,7 +325,7 @@ fn futex_requeue_private_no_waiters_returns_zero() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     write_u32_le(&mut memory, 0x10800, 0);
     write_u32_le(&mut memory, 0x10900, 0);
@@ -326,7 +336,7 @@ fn futex_requeue_private_no_waiters_returns_zero() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 0])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -347,7 +357,7 @@ fn futex_cmp_requeue_matching_val3_no_waiters_returns_zero() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     write_u32_le(&mut memory, 0x10800, 77);
     write_u32_le(&mut memory, 0x10900, 0);
@@ -358,7 +368,7 @@ fn futex_cmp_requeue_matching_val3_no_waiters_returns_zero() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 77])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -380,8 +390,8 @@ fn futex_lock_pi_private_uncontended_records_owner_tid() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     write_u32_le(&mut memory, 0x10800, 0);
 
@@ -391,7 +401,7 @@ fn futex_lock_pi_private_uncontended_records_owner_tid() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -406,8 +416,8 @@ fn futex_trylock_pi_private_owned_by_self_is_deadlock() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     write_u32_le(&mut memory, 0x10800, 1001);
 
@@ -417,7 +427,7 @@ fn futex_trylock_pi_private_owned_by_self_is_deadlock() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -437,8 +447,8 @@ fn futex_unlock_pi_private_owned_by_self_clears_word() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
-    assert_eq!(registry.register_child(0), 1001);
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
+    assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     write_u32_le(&mut memory, 0x10800, 1001);
 
@@ -448,7 +458,7 @@ fn futex_unlock_pi_private_owned_by_self_clears_word() {
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1001,
+            test_tid(1001),
             &registry,
             &futex,
         )
@@ -475,7 +485,7 @@ fn tgkill_to_sibling_emits_signalthread() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
     // tgkill(tgid, tid=sibling, SIGUSR1) issued by the main thread (tid 1000).
@@ -483,11 +493,11 @@ fn tgkill_to_sibling_emits_signalthread() {
         .dispatch_threaded(
             SyscallRequest::new(
                 131,
-                SyscallArgs::from([1000, sibling as u64, SIGUSR1, 0, 0, 0]),
+                SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )
@@ -506,7 +516,7 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
 
@@ -514,11 +524,11 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
         .dispatch_threaded(
             SyscallRequest::new(
                 131,
-                SyscallArgs::from([1000, sibling as u64, SIGUSR1, 0, 0, 0]),
+                SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )
@@ -549,7 +559,7 @@ fn tgkill_to_self_raises_locally() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     // Targeting our own tid is a local raise, not a cross-thread kick and not
     // process-directed: a sibling must not be able to drain it.
@@ -558,7 +568,7 @@ fn tgkill_to_self_raises_locally() {
             SyscallRequest::new(131, SyscallArgs::from([1000, 1000, SIGUSR1, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )
@@ -577,7 +587,7 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x2000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
 
@@ -605,11 +615,11 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
         .dispatch_threaded(
             SyscallRequest::new(
                 131,
-                SyscallArgs::from([1000, sibling as u64, SIGUSR1, 0, 0, 0]),
+                SyscallArgs::from([1000, sibling.raw() as u64, SIGUSR1, 0, 0, 0]),
             ),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )
@@ -643,7 +653,7 @@ fn tkill_to_unknown_tid_is_esrch() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
-    let registry = Arc::new(ThreadRegistry::new(1000));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     let futex = Arc::new(FutexTable::new());
     // tkill(tid=424242, SIGUSR1): not a live sibling, not self (pid), not the
     // bootstrap pid -> ESRCH.
@@ -652,7 +662,7 @@ fn tkill_to_unknown_tid_is_esrch() {
             SyscallRequest::new(130, SyscallArgs::from([424242, SIGUSR1, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            1000,
+            test_tid(1000),
             &registry,
             &futex,
         )

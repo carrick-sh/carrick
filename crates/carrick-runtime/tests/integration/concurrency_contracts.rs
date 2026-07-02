@@ -8,6 +8,12 @@ use carrick_runtime::memory::LINUX_HEAP_BASE;
 use carrick_runtime::rootfs::{LayerSource, RootFs};
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 
+/// Synthetic registry keys for these harnesses (`ThreadId`'s named-constructor
+/// discipline: tests fabricate keys explicitly).
+fn t(raw: i32) -> carrick_runtime::thread::ThreadId {
+    carrick_runtime::thread::ThreadId::synthetic_for_tests(raw)
+}
+
 fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
@@ -56,11 +62,11 @@ fn compat_reporter_records_from_shared_threads() {
 fn shared_dispatcher_services_syscalls_from_multiple_host_threads() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = Arc::new(CompatReporter::default());
-    let registry = Arc::new(ThreadRegistry::new(1));
+    let registry = Arc::new(ThreadRegistry::new(t(1)));
     let futex = Arc::new(FutexTable::new());
-    assert_eq!(registry.register_child(0), 2);
+    assert_eq!(registry.register_child(0), t(2));
 
-    let handles: Vec<_> = [1, 2]
+    let handles: Vec<_> = [t(1), t(2)]
         .into_iter()
         .map(|tid| {
             let dispatcher = Arc::clone(&dispatcher);
@@ -112,7 +118,7 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
 
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     memory.write_bytes(0x10800, &0u32.to_le_bytes()).unwrap();
@@ -128,13 +134,13 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
             SyscallRequest::new(96, SyscallArgs::from([0x10840, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
         .unwrap();
     assert_eq!(set_tid, DispatchOutcome::Returned { value: 10 });
-    assert_eq!(registry.clear_child_tid(10), Some(0x10840));
+    assert_eq!(registry.clear_child_tid(t(10)), Some(0x10840));
 
     let futex_wait = dispatcher
         .dispatch_threaded(
@@ -151,7 +157,7 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
             ),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -168,17 +174,17 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
 fn shared_dispatcher_routes_sibling_thread_signals() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
-    assert_eq!(registry.register_child(0), 11);
+    assert_eq!(registry.register_child(0), t(11));
 
     let routed = dispatcher
         .dispatch_threaded(
             SyscallRequest::new(131, SyscallArgs::from([10, 11, 10, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -186,7 +192,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
     assert_eq!(
         routed,
         DispatchOutcome::SignalThread {
-            tid: 11,
+            tid: t(11),
             signum: 10
         }
     );
@@ -196,7 +202,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
 fn shared_dispatcher_services_credential_state() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
 
@@ -205,7 +211,7 @@ fn shared_dispatcher_services_credential_state() {
             SyscallRequest::new(147, SyscallArgs::from([100, 101, 102, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -217,7 +223,7 @@ fn shared_dispatcher_services_credential_state() {
             SyscallRequest::new(174, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -229,7 +235,7 @@ fn shared_dispatcher_services_credential_state() {
             SyscallRequest::new(175, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -244,7 +250,7 @@ fn shared_dispatcher_services_process_state() {
 
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
 
@@ -256,7 +262,7 @@ fn shared_dispatcher_services_process_state() {
             ),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -271,7 +277,7 @@ fn shared_dispatcher_services_process_state() {
             ),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -298,7 +304,7 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
 
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x4000]);
 
@@ -319,7 +325,7 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
             ),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -335,13 +341,13 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
         }
     );
 
-    assert_eq!(registry.register_child(0), 11);
+    assert_eq!(registry.register_child(0), t(11));
     let thread_exit = dispatcher
         .dispatch_threaded(
             SyscallRequest::new(93, SyscallArgs::from([7, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -353,7 +359,7 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
             SyscallRequest::new(94, SyscallArgs::from([9, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -365,7 +371,7 @@ fn shared_dispatcher_services_thread_lifecycle_syscalls() {
 fn shared_dispatcher_services_execve_request_without_serialized_fallback() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x4000]);
 
@@ -381,7 +387,7 @@ fn shared_dispatcher_services_execve_request_without_serialized_fallback() {
             SyscallRequest::new(221, SyscallArgs::from([0x10800, 0x10820, 0x10840, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -401,7 +407,7 @@ fn shared_dispatcher_services_execve_request_without_serialized_fallback() {
 fn shared_dispatcher_services_memory_state() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
 
@@ -410,7 +416,7 @@ fn shared_dispatcher_services_memory_state() {
             SyscallRequest::new(214, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -428,7 +434,7 @@ fn shared_dispatcher_services_memory_state() {
             SyscallRequest::new(214, SyscallArgs::from([next, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -440,7 +446,7 @@ fn shared_dispatcher_services_memory_state() {
 fn shared_dispatcher_services_readonly_fs_state() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x4000]);
 
@@ -449,7 +455,7 @@ fn shared_dispatcher_services_readonly_fs_state() {
             SyscallRequest::new(17, SyscallArgs::from([0x10800, 64, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -463,7 +469,7 @@ fn shared_dispatcher_services_readonly_fs_state() {
             SyscallRequest::new(79, SyscallArgs::from([0, 0x10900, 0x10a00, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -475,7 +481,7 @@ fn shared_dispatcher_services_readonly_fs_state() {
 fn shared_dispatcher_services_fd_table_open_read_close() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x4000]);
     memory.write_bytes(0x10800, b"/proc/self/status\0").unwrap();
@@ -488,7 +494,7 @@ fn shared_dispatcher_services_fd_table_open_read_close() {
             ),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -503,7 +509,7 @@ fn shared_dispatcher_services_fd_table_open_read_close() {
             SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x10900, 0x100, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -518,7 +524,7 @@ fn shared_dispatcher_services_fd_table_open_read_close() {
             SyscallRequest::new(57, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -530,7 +536,7 @@ fn shared_dispatcher_services_fd_table_open_read_close() {
 fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x4000]);
 
@@ -540,7 +546,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
             SyscallRequest::new(59, SyscallArgs::from([pipe_addr, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -556,7 +562,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
             SyscallRequest::new(24, SyscallArgs::from([write_fd as u64, 2, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -569,7 +575,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
             SyscallRequest::new(64, SyscallArgs::from([2, 0x10820, 2, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -581,7 +587,7 @@ fn shared_dispatcher_services_nested_pipe_redirect_syscalls() {
             SyscallRequest::new(63, SyscallArgs::from([read_fd as u64, 0x10840, 8, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -599,7 +605,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
     .unwrap();
     let dispatcher = Arc::new(SyscallDispatcher::with_rootfs(rootfs));
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x4000]);
     memory.write_bytes(0x10800, b"/etc/motd\0").unwrap();
@@ -612,7 +618,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
             ),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -627,7 +633,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
             SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x10900, 0x100, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -640,7 +646,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
             SyscallRequest::new(57, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -652,7 +658,7 @@ fn shared_dispatcher_opens_rootfs_file_without_serialized_fallback() {
 fn shared_dispatcher_services_stdio_write_buffers() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     memory.write_bytes(0x10800, b"shared\n").unwrap();
@@ -662,7 +668,7 @@ fn shared_dispatcher_services_stdio_write_buffers() {
             SyscallRequest::new(64, SyscallArgs::from([1, 0x10800, 7, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )
@@ -675,7 +681,7 @@ fn shared_dispatcher_services_stdio_write_buffers() {
 fn shared_dispatcher_reports_unknown_syscalls_without_serialized_fallback() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = CompatReporter::default();
-    let registry = ThreadRegistry::new(10);
+    let registry = ThreadRegistry::new(t(10));
     let futex = FutexTable::new();
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
 
@@ -684,7 +690,7 @@ fn shared_dispatcher_reports_unknown_syscalls_without_serialized_fallback() {
             SyscallRequest::new(9999, SyscallArgs::from([1, 2, 3, 4, 5, 6])),
             &mut memory,
             &reporter,
-            10,
+            t(10),
             &registry,
             &futex,
         )

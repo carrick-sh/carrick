@@ -750,9 +750,9 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
 fn blocking_timerfd_read_waits_until_timer_is_armed() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = Arc::new(CompatReporter::default());
-    let registry = Arc::new(ThreadRegistry::new(20));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(20)));
     let futex = Arc::new(FutexTable::new());
-    assert_eq!(registry.register_child(20), 21);
+    assert_eq!(registry.register_child(20), test_tid(21));
 
     let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let created = dispatcher
@@ -760,7 +760,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
             SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
             &mut setup_memory,
             &reporter,
-            20,
+            test_tid(20),
             &registry,
             &futex,
         )
@@ -781,7 +781,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
                 SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &read_reporter,
-                20,
+                test_tid(20),
                 &read_registry,
                 &read_futex,
             )
@@ -808,7 +808,7 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut arm_memory,
                 &reporter,
-                21,
+                test_tid(21),
                 &registry,
                 &futex,
             )
@@ -829,9 +829,9 @@ fn blocking_timerfd_read_waits_until_timer_is_armed() {
 fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = Arc::new(CompatReporter::default());
-    let registry = Arc::new(ThreadRegistry::new(30));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(30)));
     let futex = Arc::new(FutexTable::new());
-    assert_eq!(registry.register_child(30), 31);
+    assert_eq!(registry.register_child(30), test_tid(31));
 
     let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let created = dispatcher
@@ -839,7 +839,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
             SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
             &mut setup_memory,
             &reporter,
-            30,
+            test_tid(30),
             &registry,
             &futex,
         )
@@ -861,7 +861,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut setup_memory,
                 &reporter,
-                30,
+                test_tid(30),
                 &registry,
                 &futex,
             )
@@ -881,7 +881,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
                 SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
                 &read_reporter,
-                30,
+                test_tid(30),
                 &read_registry,
                 &read_futex,
             )
@@ -905,7 +905,7 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
                 SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
                 &mut rearm_memory,
                 &reporter,
-                31,
+                test_tid(31),
                 &registry,
                 &futex,
             )
@@ -930,9 +930,9 @@ fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
 fn blocking_eventfd_read_waits_until_writer_updates_counter() {
     let dispatcher = Arc::new(SyscallDispatcher::new());
     let reporter = Arc::new(CompatReporter::default());
-    let registry = Arc::new(ThreadRegistry::new(10));
+    let registry = Arc::new(ThreadRegistry::new(test_tid(10)));
     let futex = Arc::new(FutexTable::new());
-    assert_eq!(registry.register_child(10), 11);
+    assert_eq!(registry.register_child(10), test_tid(11));
 
     let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let eventfd = dispatcher
@@ -940,7 +940,7 @@ fn blocking_eventfd_read_waits_until_writer_updates_counter() {
             SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut setup_memory,
             &reporter,
-            10,
+            test_tid(10),
             &registry,
             &futex,
         )
@@ -959,7 +959,7 @@ fn blocking_eventfd_read_waits_until_writer_updates_counter() {
             SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            test_tid(10),
             &registry,
             &futex,
         )
@@ -979,7 +979,7 @@ fn blocking_eventfd_read_waits_until_writer_updates_counter() {
                 SyscallRequest::new(64, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
                 &mut write_memory,
                 &reporter,
-                11,
+                test_tid(11),
                 &registry,
                 &futex,
             )
@@ -994,7 +994,7 @@ fn blocking_eventfd_read_waits_until_writer_updates_counter() {
             SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
             &mut memory,
             &reporter,
-            10,
+            test_tid(10),
             &registry,
             &futex,
         )
@@ -1798,8 +1798,8 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
 #[test]
 fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
     let memory = Arc::new(Mutex::new(LinearMemory::new(0x4000, vec![0; 0x4000])));
-    let threaded = ThreadedDispatch::new(1000);
-    let server_tid = 1000;
+    let threaded = ThreadedDispatch::new(test_tid(1000));
+    let server_tid = test_tid(1000);
     let client_tid = threaded.registry.register_child(0);
     let wait_tid = threaded.registry.register_child(0);
 
@@ -2075,7 +2075,9 @@ fn dispatch_with_wait(
                 on_timeout,
                 sig_mask,
             } => {
-                let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
+                let waiter = ThreadWaiter::new(ThreadId::main_from_host_pid_value(unsafe {
+                    libc::getpid()
+                }));
                 match waiter.wait(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
@@ -2093,7 +2095,9 @@ fn dispatch_with_wait(
                 on_timeout,
                 sig_mask,
             } => {
-                let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
+                let waiter = ThreadWaiter::new(ThreadId::main_from_host_pid_value(unsafe {
+                    libc::getpid()
+                }));
                 match waiter.wait_poll(&fds, timeout, sig_mask.block_mask()) {
                     WaitResult::Ready => {}
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
@@ -2152,7 +2156,7 @@ struct ThreadedDispatch {
 
 #[cfg(target_os = "macos")]
 impl ThreadedDispatch {
-    fn new(main_tid: i32) -> Self {
+    fn new(main_tid: ThreadId) -> Self {
         Self {
             dispatcher: Arc::new(SyscallDispatcher::new()),
             reporter: Arc::new(CompatReporter::default()),
@@ -2166,7 +2170,7 @@ impl ThreadedDispatch {
 fn dispatch_threaded_once(
     threaded: &ThreadedDispatch,
     memory: &Arc<Mutex<LinearMemory>>,
-    tid: i32,
+    tid: ThreadId,
     request: SyscallRequest,
 ) -> DispatchOutcome {
     let mut memory = memory.lock().unwrap();
@@ -2187,7 +2191,7 @@ fn dispatch_threaded_once(
 fn add_epoll_interest_threaded(
     threaded: &ThreadedDispatch,
     memory: &Arc<Mutex<LinearMemory>>,
-    tid: i32,
+    tid: ThreadId,
     epfd: u64,
     fd: u64,
     event_addr: u64,
@@ -2219,7 +2223,7 @@ fn add_epoll_interest_threaded(
 fn dispatch_threaded_with_wait(
     threaded: &ThreadedDispatch,
     memory: &Arc<Mutex<LinearMemory>>,
-    tid: i32,
+    tid: ThreadId,
     request: SyscallRequest,
 ) -> DispatchOutcome {
     dispatch_threaded_with_wait_notify(threaded, memory, tid, request, None)
@@ -2229,7 +2233,7 @@ fn dispatch_threaded_with_wait(
 fn dispatch_threaded_with_wait_notify(
     threaded: &ThreadedDispatch,
     memory: &Arc<Mutex<LinearMemory>>,
-    tid: i32,
+    tid: ThreadId,
     request: SyscallRequest,
     mut wait_notify: Option<mpsc::Sender<WaitFds>>,
 ) -> DispatchOutcome {
