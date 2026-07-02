@@ -2238,6 +2238,28 @@ pub fn bring_up_x86_elf(
 
         let gpa = ram.add_bump(va, page_len, user, write, exec)?;
 
+        // A capped window leaves the region's TAIL [va+page_len, va+full_len)
+        // with neither a window nor a reservation. The AddressSpace contract
+        // for these zero-fill regions is "present, zeroed at boot" — HVF/KVM
+        // realize the whole extent lazily via host-anon backing, but bhyve's
+        // fixed lowmem segment cannot, so a guest's first touch past the eager
+        // prefix used to #PF → `demand_commit` → `NotReserved` → SIGSEGV. The
+        // load-bearing case is the 128 MiB brk HEAP capped to M2_HEAP_CAP
+        // (4 MiB): glibc malloc grows brk past 4 MiB on any non-trivial
+        // workload (every cpython extension import), and the dispatch `brk`
+        // handler only moves `brk_current` — nothing else re-registers the
+        // range. Realize the tail as a demand-commit RESERVATION with the
+        // region's protection: zero GPA cost until touched (fork copies only
+        // the live high-water sysmem, so fork cost is unchanged), one zeroed
+        // page committed per first touch — exactly the anon-mmap-arena shape.
+        // Excluded: `shared` regions (sysmem demand-commit is process-private
+        // and cannot honor MAP_SHARED fork semantics) and any region whose
+        // initialised bytes overflow the eager window (a zeroed page must
+        // never masquerade as truncated payload).
+        if full_len > page_len && !region.shared && region.bytes().len() <= page_len {
+            ram.reserve(va + page_len as u64, full_len - page_len, write, exec);
+        }
+
         // Write the region's initialised prefix into guest RAM.
         // Beyond `region.bytes().len()` the bump window is already zeroed
         // (bhyve's vm_setup_memory zeroes the sysmem segment).
