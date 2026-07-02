@@ -174,7 +174,10 @@ If it fails in Docker too, it's not carrick's bug.
   `baseline.kvm.jsonl` overlay, not the main baseline. A box without a local
   registry can still source images over an SSH tunnel
   (`ssh -R 5005:<registry-host>:5005 <box>`) since carrick treats `localhost:5005`
-  as insecure.
+  as insecure. When **multiple agents share one working tree**, sync a box with
+  ONLY the files you yourself changed (and `md5`-verify a dependency before
+  trusting box state) — a blanket `rsync crates/` ships another agent's mid-edit
+  breakage into your box build.
 - **The Docker oracle is cached** (`scripts/conformance/oracle-cache.jsonl`) so
   routine gates run carrick-only. Single-run gating is non-deterministic
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
@@ -204,7 +207,27 @@ If it fails in Docker too, it's not carrick's bug.
   suite the baseline had *completing* is a flake/timeout-under-load, not a content
   regression. (Worked example: the `cpython-socket` gating crash was a
   pre-existing `sendfile` partial-EAGAIN over-send, not the session's HVF work —
-  proven by reproducing it on the pre-session binary.)
+  proven by reproducing it on the pre-session binary.) (5) **A load-probabilistic
+  verdict makes a one-run-per-point bisect converge on the WRONG commit.** Sample
+  each bisect point ≥2×, check the report-only lanes (gnu / amd64) for the same
+  failure signature at "green" points, and suspect the PROBE itself before the
+  runtime: force the probe's race deterministic and run that variant under the
+  Docker oracle — if Linux fails it identically, the probe is the bug. (Worked
+  example: `expectcontinue` implicated a fd-ownership refactor via a clean
+  green/green/green/red bisect; the real defect was the probe's phase-local read
+  buffer dropping kernel-coalesced bytes — real Linux failed the forced-coalesce
+  variant identically, and the "green" stage-14 run's report-only gnu lane
+  already showed the same failure.)
+- **Probe-gate mechanics that silently lie:** the gate's logs contain binary
+  bytes — grep them with `-a` or your matches vanish without error. And run the
+  gate (`cargo test -p carrick-cli --test conformance conformance_probes`) from
+  the **repo root**: from any other cwd it finds no probe binaries, SKIPs every
+  lane, and reports `ok` in 0.04s — a green that gated nothing.
+- **LTP parity is NOT workload coverage.** LTP cases are small enough to miss
+  whole blocker classes: no LTP case pushes `brk` past 4 MiB, so the bhyve
+  heap-backing bug that crashed **100% of cpython** hid behind a healthy ~70%
+  LTP score for weeks. Rank fix work by running the real ecosystems
+  (go/cpython/node) on a lane — `--ecosystem` filters — not by LTP counts alone.
 - Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-conformance) (LTP
   triage), [`.agents/skills/carrick-trace`](.agents/skills/carrick-trace). Local
   oracle registries and suite wiring: [`docs/conformance-testing.md`](docs/conformance-testing.md).
