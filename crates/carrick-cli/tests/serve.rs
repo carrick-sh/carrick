@@ -1335,6 +1335,77 @@ networks:
 }
 
 #[tokio::test]
+#[ignore = "requires docker compose client and boots multiple HVF guests"]
+async fn docker_compose_recreate_cycles_leave_no_project_residue_smoke() {
+    if !docker_compose_available() {
+        eprintln!(
+            "SKIP docker_compose_recreate_cycles_leave_no_project_residue_smoke: docker compose is not available"
+        );
+        return;
+    }
+
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let compose = tmp.path().join("recreate.yml");
+    let host_port = free_loopback_port();
+    std::fs::write(
+        &compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/bin/sh", "-c", "echo db-started; sleep 30"]
+    networks:
+      appnet:
+        aliases:
+          - database
+    volumes:
+      - data:/data
+  web:
+    image: ubuntu:24.04
+    command: ["/bin/sh", "-c", "echo web-started; sleep 30"]
+    ports:
+      - "127.0.0.1:{host_port}:8080"
+    depends_on:
+      - db
+    networks:
+      appnet:
+        aliases:
+          - api
+volumes:
+  data: {{}}
+networks:
+  appnet:
+    driver: bridge
+"#
+        ),
+    )
+    .unwrap();
+    let project = compose_project("recreate");
+    let project_filter = format!("com.docker.compose.project={project}");
+
+    for cycle in 0..2 {
+        run_compose(&sock, &compose, &project, &["up", "-d", "--remove-orphans"]);
+        let logs = wait_for_compose_logs(&sock, &compose, &project, &["db-started", "web-started"]);
+        assert!(
+            logs.contains("db-started") && logs.contains("web-started"),
+            "compose cycle {cycle} did not start both services"
+        );
+        assert_compose_project_running(&docker, &project_filter, host_port).await;
+        run_compose(
+            &sock,
+            &compose,
+            &project,
+            &["down", "-v", "--remove-orphans"],
+        );
+        assert_compose_project_removed(&docker, &project_filter).await;
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires docker compose client, built aarch64 probes, and boots multiple HVF guests"]
 async fn docker_compose_probe_workload_smoke() {
     if !docker_compose_available() {
@@ -3443,6 +3514,160 @@ fn run_compose_output(
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+async fn assert_compose_project_running(
+    docker: &bollard::Docker,
+    project_filter: &str,
+    host_port: u16,
+) {
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.to_string()]);
+    let containers = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        containers.len(),
+        2,
+        "compose project should have two services"
+    );
+
+    let mut db_id = None;
+    let mut web_id = None;
+    for container in &containers {
+        match container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+            .map(String::as_str)
+        {
+            Some("db") => db_id = container.id.clone(),
+            Some("web") => web_id = container.id.clone(),
+            _ => {}
+        }
+    }
+    let db_id = db_id.unwrap_or_else(|| panic!("db container id"));
+    let web_id = web_id.unwrap_or_else(|| panic!("web container id"));
+    let db = docker.inspect_container(&db_id, None).await.unwrap();
+    let web = docker.inspect_container(&web_id, None).await.unwrap();
+    let db_networks = db
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .unwrap_or_else(|| panic!("db networks"));
+    let web_networks = web
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .unwrap_or_else(|| panic!("web networks"));
+    assert_eq!(db_networks.len(), 1, "db should have one project endpoint");
+    assert_eq!(
+        web_networks.len(),
+        1,
+        "web should have one project endpoint"
+    );
+    assert!(
+        db_networks
+            .values()
+            .any(|endpoint| endpoint.dns_names.as_ref().is_some_and(|names| {
+                names.contains(&"db".to_string()) && names.contains(&"database".to_string())
+            })),
+        "db endpoint should carry service and alias DNS names"
+    );
+    assert!(
+        web_networks
+            .values()
+            .any(|endpoint| endpoint.dns_names.as_ref().is_some_and(|names| {
+                names.contains(&"web".to_string()) && names.contains(&"api".to_string())
+            })),
+        "web endpoint should carry service and alias DNS names"
+    );
+
+    let ports = web
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.ports.as_ref())
+        .unwrap_or_else(|| panic!("web ports"));
+    assert_eq!(
+        ports
+            .get("8080/tcp")
+            .and_then(|bindings| bindings.as_ref())
+            .and_then(|bindings| bindings.first())
+            .and_then(|binding| binding.host_port.as_deref()),
+        Some(host_port.to_string().as_str())
+    );
+
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![project_filter.to_string()]);
+    let networks = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(networks.len(), 1, "compose project should have one network");
+
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![project_filter.to_string()]);
+    let volumes = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert_eq!(volumes.len(), 1, "compose project should have one volume");
+}
+
+async fn assert_compose_project_removed(docker: &bollard::Docker, project_filter: &str) {
+    let mut container_filters = std::collections::HashMap::new();
+    container_filters.insert("label".to_string(), vec![project_filter.to_string()]);
+    let containers = docker
+        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+            all: true,
+            filters: container_filters,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(
+        containers.is_empty(),
+        "compose down should remove project containers"
+    );
+
+    let mut network_filters = std::collections::HashMap::new();
+    network_filters.insert("label".to_string(), vec![project_filter.to_string()]);
+    let networks = docker
+        .list_networks(Some(bollard::network::ListNetworksOptions {
+            filters: network_filters,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        networks.is_empty(),
+        "compose down should remove project networks"
+    );
+
+    let mut volume_filters = std::collections::HashMap::new();
+    volume_filters.insert("label".to_string(), vec![project_filter.to_string()]);
+    let volumes = docker
+        .list_volumes(Some(bollard::volume::ListVolumesOptions {
+            filters: volume_filters,
+        }))
+        .await
+        .unwrap()
+        .volumes
+        .unwrap_or_default();
+    assert!(
+        volumes.is_empty(),
+        "compose down -v should remove project volumes"
+    );
 }
 
 fn wait_for_compose_logs(
