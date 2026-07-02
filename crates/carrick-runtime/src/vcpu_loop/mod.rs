@@ -1418,7 +1418,8 @@ where
                     file,
                 } => {
                     engine.map_host_alias(va, ipa, len, &payload, file)?;
-                    last_syscall_retval = Some(state.complete_returned(&mut engine, va as i64)?);
+                    last_syscall_retval =
+                        Some(state.complete_returned(&mut engine, va.raw() as i64)?);
                 }
             }
 
