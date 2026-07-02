@@ -892,7 +892,10 @@ where
                         }
                     }
                 }
-                DispatchOutcome::WaitOnSleep { duration } => {
+                DispatchOutcome::WaitOnSleep {
+                    duration,
+                    remaining,
+                } => {
                     // The fix for the multithreaded-fork deadlock: sleep via the
                     // waiter (NOT a blocking host nanosleep in the dispatcher) so
                     // a sleeping sibling reaches here, observes the fork-quiesce,
@@ -921,9 +924,11 @@ where
                                 self.release_and_park_vcpu_for_fork(engine)?;
                                 continue;
                             }
-                            break Ok(DispatchOutcome::Errno {
-                                errno: crate::linux_abi::LINUX_EINTR,
-                            });
+                            break Ok(crate::dispatch::complete_interrupted_sleep(
+                                engine,
+                                remaining,
+                                deadline.saturating_duration_since(Instant::now()),
+                            ));
                         }
                         crate::io_wait::WaitResult::Errno(errno) => {
                             break Ok(DispatchOutcome::Errno { errno });

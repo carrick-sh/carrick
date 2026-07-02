@@ -173,12 +173,14 @@ impl SyscallDispatcher {
             // waits via the per-thread waiter instead of a blocking host
             // nanosleep inside the dispatcher: a synchronous host sleep never
             // reaches the run-loop top, so a sleeping sibling would deadlock a
-            // multithreaded fork-quiesce. `rem` is not written on EINTR (the run
-            // loop owns the wait); callers that need it recompute from a deadline
-            // (glibc/CPython do). The `_ = rem_ptr` keeps the binding live.
-            let _ = rem_ptr;
+            // multithreaded fork-quiesce. The run loop owns EINTR completion, so
+            // carry the optional `rem` pointer there for remaining-time copyout.
+            let remaining = (rem_ptr.0 != 0).then_some(rem_ptr);
             match duration {
-                Some(duration) => Ok(DispatchOutcome::WaitOnSleep { duration }),
+                Some(duration) => Ok(DispatchOutcome::WaitOnSleep {
+                    duration,
+                    remaining,
+                }),
                 None => Ok(DispatchOutcome::Returned { value: 0 }),
             }
         }
@@ -205,12 +207,13 @@ impl SyscallDispatcher {
             // so it is fork-quiesce-parkable. ABSTIME is pre-converted to the
             // relative `sleep_duration` here; on a quiesce re-dispatch the run
             // loop keeps the original deadline, so it stays absolute-correct.
-            let _ = rem_ptr;
+            let remaining = (flags & LINUX_TIMER_ABSTIME == 0 && rem_ptr.0 != 0).then_some(rem_ptr);
             if sleep_duration.is_zero() {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             Ok(DispatchOutcome::WaitOnSleep {
                 duration: sleep_duration,
+                remaining,
             })
         }
 
