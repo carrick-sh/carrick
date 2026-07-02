@@ -45,7 +45,7 @@ pub trait SharedFutexSyscall: Send + Sync {
 
     /// Wake up to `n` waiters on the shared-page word at `host_addr`. Returns the
     /// count woken (≥0) or `-errno`.
-    fn wake(&self, host_addr: usize, n: u32) -> i64;
+    fn wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64;
 
     /// Optional once-before-wait hook (default no-op), run once at the top of
     /// [`FutexTableFutex::shared_wait`] before the slice loop. A host can use it
@@ -53,6 +53,12 @@ pub trait SharedFutexSyscall: Send + Sync {
     /// carrick-trace `futex_route` probe here, which is why it previously kept its
     /// own `PlatformFutex` copy — this hook lets it fold onto the shared one).
     fn pre_wait(&self, _host_addr: usize, _val: u32) {}
+
+    /// Optional logical-wait lifetime hooks. Hosts whose wake primitive does not
+    /// return a waiter count can use these to track the full guest FUTEX_WAIT
+    /// lifetime rather than a single host wait slice.
+    fn wait_start(&self, _waiter_key: usize) {}
+    fn wait_end(&self, _waiter_key: usize) {}
 }
 
 /// Classify one cross-process futex wait slice's raw host return into a
@@ -132,18 +138,22 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
     fn shared_wait(
         &self,
         host_addr: usize,
+        waiter_key: usize,
         value: u32,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> i64 {
         self.shared.pre_wait(host_addr, value);
-        shared_wait_sliced(timeout, interrupted, &|slice_ns| {
+        self.shared.wait_start(waiter_key);
+        let ret = shared_wait_sliced(timeout, interrupted, &|slice_ns| {
             self.shared.wait_one_slice(host_addr, value, slice_ns)
-        })
+        });
+        self.shared.wait_end(waiter_key);
+        ret
     }
 
-    fn shared_wake(&self, host_addr: usize, n: u32) -> i64 {
-        self.shared.wake(host_addr, n)
+    fn shared_wake(&self, host_addr: usize, waiter_key: usize, n: u32) -> i64 {
+        self.shared.wake(host_addr, waiter_key, n)
     }
 
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
