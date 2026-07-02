@@ -1157,6 +1157,12 @@ where
                     // GuestFault path. `from_el0_direct` selects whether the
                     // sigframe records the faulting PC as the resume target.
                     if let Some((signum, si_code, si_addr)) = lower_el0_fault(syndrome, elr, far) {
+                        // PROT_NONE is a non-present stage-1 leaf → the raw
+                        // DFSC decodes as MAPERR; Linux reports ACCERR for an
+                        // access to a live PROT_NONE mapping. Upgrade from the
+                        // tracked no-access set (LTP mmap05 / roprotect probe).
+                        let si_code =
+                            signal::upgrade_prot_none_si_code(&engine, signum, si_code, si_addr);
                         let interrupted_pc = if from_el0_direct { Some(elr) } else { None };
                         if let Some(outcome) = deliver_fault_signal(
                             &kernel,
@@ -1200,6 +1206,12 @@ where
                     // interrupted user context before surfacing the fault, so the
                     // live PC is the faulting instruction, not a syscall-return
                     // RCX path.
+                    // PROT_NONE is a non-present PML4 leaf → #PF PFEC.P=0
+                    // decodes as MAPERR; Linux reports ACCERR for an access to
+                    // a live PROT_NONE mapping. Upgrade from the tracked
+                    // no-access set (LTP mmap05 / roprotect probe).
+                    let si_code =
+                        signal::upgrade_prot_none_si_code(&engine, signum, si_code, fault_addr);
                     let interrupted_pc = Some(engine.current_pc()?);
                     if let Some(outcome) = deliver_fault_signal(
                         &kernel,
@@ -1421,8 +1433,21 @@ where
                     len,
                     payload,
                     file,
+                    prot_none,
                 } => {
                     engine.map_host_alias(va, ipa, len, &payload, file)?;
+                    if prot_none && let Ok(l) = usize::try_from(len) {
+                        // A PROT_NONE alias must be guest-INACCESSIBLE: clear
+                        // the fresh leaves' validity so the guest's own access
+                        // faults (SIGSEGV/SEGV_ACCERR via the no-access set)
+                        // instead of reaching the host backing — which for a
+                        // PROT_NONE MAP_SHARED file is itself unmapped-for-
+                        // access and crashes the vCPU (KVM_RUN EFAULT /
+                        // stage-2 abort: LTP mmap05 TBROK). Best-effort: on
+                        // failure the host-side no_access gate still EFAULTs
+                        // syscall buffers (the historical behaviour).
+                        let _ = engine.protect_range(va.raw(), l, 0);
+                    }
                     last_syscall_retval =
                         Some(state.complete_returned(&mut engine, va.raw() as i64)?);
                 }

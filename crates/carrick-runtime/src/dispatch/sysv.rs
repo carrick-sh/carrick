@@ -499,6 +499,8 @@ impl SyscallDispatcher {
                 len: map_len,
                 payload: Vec::new(),
                 file: Some((host_fd, 0, host_prot)),
+                // shmat is always at least readable (SHM_RDONLY or RW).
+                prot_none: false,
             })
         }
 

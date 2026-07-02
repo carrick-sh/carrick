@@ -1108,7 +1108,18 @@ impl GuestRam {
             LINUX_EL0_TRAMPOLINE_BASE,
             &<crate::trap_engine::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::entry_trampoline_bytes(),
         )?;
-        ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
+        // Seed pristine boot tables ONLY when the image did not carry its own
+        // stage-1 region: `with_stage1_page_tables` now bakes the ELF images'
+        // read-only spans (.text/.rodata write protection) into the region
+        // bytes the loop above already wrote — overwriting them here with the
+        // pristine identity image would silently strip that enforcement.
+        let image_carries_stage1 = image
+            .regions()
+            .iter()
+            .any(|region| region.start == LINUX_PAGE_TABLES_BASE && !region.bytes().is_empty());
+        if !image_carries_stage1 {
+            ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
+        }
         // 3. Our sentinel vector (NOT carrick-mem's hvc #2 variant).
         ram.write_gpa(LINUX_EL1_VECTORS_BASE, &el1_vectors_sentinel_bytes())?;
         // 4. Our stage-1 MAINTENANCE trampoline (NOT carrick-mem's hvc #1

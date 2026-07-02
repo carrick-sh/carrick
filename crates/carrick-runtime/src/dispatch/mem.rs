@@ -554,12 +554,20 @@ impl SyscallDispatcher {
                         if pf.contains(LinuxProtFlags::WRITE) {
                             host_prot |= libc::PROT_WRITE;
                         }
+                        // Host-side EFAULT gate for a PROT_NONE file mapping: a
+                        // syscall buffer here must fault (the host backing is
+                        // itself PROT_NONE — touching it would crash carrick).
+                        let prot_none = pf.is_empty();
+                        if let Ok(l) = usize::try_from(length) {
+                            memory.set_no_access(va, l, prot_none);
+                        }
                         return Ok(DispatchOutcome::MapHostAlias {
                             va: GuestVa(va),
                             ipa: Gpa(ipa),
                             len: length,
                             payload: Vec::new(),
                             file: Some((dup_fd, offset as libc::off_t, host_prot)),
+                            prot_none,
                         });
                     }
                 }
@@ -587,6 +595,17 @@ impl SyscallDispatcher {
                         if reused {
                             let _ = memory.zero_backing(addr, map_len_usize);
                         }
+                        // Make the REQUESTED protection guest-visible: the
+                        // aperture is boot-mapped RW, so without this a store
+                        // to a PROT_READ anon-shared mapping silently succeeds
+                        // (Go runtime/debug TestPanicOnFault: "write did not
+                        // fault"). Also restores RW for a recycled chunk whose
+                        // prior owner was read-only/none. Best-effort outside
+                        // the eager arena (mirrors the file-mmap arm); the
+                        // host-side no_access gate is kept in sync for EFAULT.
+                        let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
+                        memory.set_no_access(addr, map_len_usize, prot_none);
+                        let _ = memory.protect_range(addr, map_len_usize, prot);
                         return Ok(DispatchOutcome::Returned { value: addr as i64 });
                     }
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -757,6 +776,7 @@ impl SyscallDispatcher {
                         len: length,
                         payload: bytes,
                         file: None,
+                        prot_none,
                     });
                 }
 
@@ -1226,13 +1246,23 @@ impl SyscallDispatcher {
                     let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
                     cx.memory.set_no_access(address.0, len, prot_none);
                     // Make the new protection guest-VISIBLE (a violating access
-                    // faults during EL0 execution) by editing the stage-1 page
-                    // tables. Scoped to the private mmap arena for now — the shared
-                    // aperture and image/heap regions keep host-side checks only.
-                    if range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size())
-                        && cx.memory.protect_range(address.0, len, prot).is_err()
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    // faults during EL0 execution) by editing the stage-1/PML4
+                    // page tables. In the private mmap arena a failed edit is
+                    // fatal (eager backends must succeed there). The identity
+                    // image/heap/interpreter ranges are edited BEST-EFFORT: the
+                    // ELF loader now boots .text/.rodata read-only, so a guest
+                    // mprotect there (ld.so RELRO, a test unprotecting .rodata)
+                    // must actually flip the leaves — but a hole inside the
+                    // range (unmapped identity VA on x86) degrades to the
+                    // historical host-side-only behaviour instead of failing.
+                    // The shared/overlay apertures and high-VA aliases keep
+                    // host-side checks only (unchanged).
+                    if range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+                        if cx.memory.protect_range(address.0, len, prot).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                    } else if mprotect_range_in_identity_image(address.0, length) {
+                        let _ = cx.memory.protect_range(address.0, len, prot);
                     }
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -1325,6 +1355,35 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
         return false;
     };
     address >= base && end <= limit
+}
+
+/// Identity-mapped guest ranges where an `mprotect` edits the live page tables
+/// BEST-EFFORT (see the mprotect handler): the low image space (main ELF, up to
+/// but excluding the kernel region — its first 2 MiB block is EL1-only and must
+/// never be rewritten with user leaf flags), the brk heap, the dynamic
+/// interpreter window, and the anon `MAP_SHARED` aperture (whose mappings now
+/// boot with their REQUESTED protection, so a later mprotect must reach the
+/// leaves too; the stage-1 editor flips protection IN PLACE, preserving a
+/// `repoint_private` overlay leaf's output address). The ELF loader boots
+/// `.text`/`.rodata` read-only, so a guest `mprotect` on these ranges (ld.so
+/// RELRO; a handler unprotecting a faulted page) has to reach the real leaves —
+/// host-side-only tracking would leave the guest's own stores enforcing the OLD
+/// protection.
+fn mprotect_range_in_identity_image(address: u64, length: u64) -> bool {
+    use crate::memory::{
+        LINUX_HEAP_BASE as HEAP, LINUX_INTERPRETER_BASE as INTERP,
+        LINUX_KERNEL_REGION_BASE as KERNEL, LINUX_NULL_GUARD_END as GUARD_END,
+        LINUX_SHARED_FILE_BASE as SHARED,
+    };
+    range_within(address, length, GUARD_END, KERNEL - GUARD_END)
+        || range_within(address, length, HEAP, crate::memory::LINUX_HEAP_SIZE)
+        || range_within(address, length, INTERP, SHARED - INTERP)
+        || range_within(
+            address,
+            length,
+            SHARED,
+            crate::memory::LINUX_SHARED_FILE_SIZE,
+        )
 }
 
 fn mmap_address_uses_alias(address: u64, length: u64) -> bool {
