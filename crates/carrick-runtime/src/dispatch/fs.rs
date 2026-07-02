@@ -6686,7 +6686,7 @@ impl SyscallDispatcher {
                             DispatchOutcome::WaitOnFds {
                                 fds: WaitFds::raw_one(sock_fd.get(), libc::POLLOUT),
                                 timeout: None,
-                                on_timeout: -(LINUX_EAGAIN as i64),
+                                on_timeout: LinuxErrno::new(LINUX_EAGAIN).guest_retval(),
                                 sig_mask: carrick_abi::WaitSigMask::NONE,
                             }
                         });

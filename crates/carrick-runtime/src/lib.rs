@@ -487,7 +487,9 @@ pub mod runtime {
                     runtime.complete_syscall(value)?;
                 }
                 DispatchOutcome::Errno { errno } => {
-                    runtime.complete_syscall(-(errno as i64))?;
+                    runtime.complete_syscall(
+                        crate::linux_abi::LinuxErrno::new(errno).guest_retval(),
+                    )?;
                 }
                 DispatchOutcome::Exit { code } => {
                     return Ok(RunResult {

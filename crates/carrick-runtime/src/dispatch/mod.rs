@@ -584,7 +584,7 @@ use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFs
 // table remaps raw numbers to canonical at the GuestArch seam — Phase 2 for
 // x86_64), so its own metadata lookups stay aarch64-keyed by design; only
 // raw-frame consumers (the vCPU-loop trace) use the per-ISA Arch::Table.
-use crate::linux_abi::{CanonicalNr, NativeNr};
+use crate::linux_abi::{CanonicalNr, LinuxErrno, NativeNr};
 use crate::syscall::lookup_aarch64;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -1346,7 +1346,9 @@ impl DispatchOutcome {
     fn retval_errno(&self) -> (i64, Option<i32>) {
         match self {
             DispatchOutcome::Returned { value } => (*value, None),
-            DispatchOutcome::Errno { errno } => (-(*errno as i64), Some(*errno)),
+            DispatchOutcome::Errno { errno } => {
+                (LinuxErrno::new(*errno).guest_retval(), Some(*errno))
+            }
             DispatchOutcome::Exit { code } => (*code as i64, None),
             DispatchOutcome::SignalDeath { signum } => ((128 + *signum) as i64, None),
             DispatchOutcome::Fork { .. } => (0, None),
@@ -5189,7 +5191,7 @@ fn would_block_outcome(
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::anchored_one(host_fd, events, host_fd_owner),
             timeout: None,
-            on_timeout: -(LINUX_EAGAIN as i64),
+            on_timeout: LinuxErrno::new(LINUX_EAGAIN).guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
         }
     }
