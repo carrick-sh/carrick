@@ -2,6 +2,12 @@
 // covered by clippy's allow-unwrap-in-tests heuristic, so allow unwrap/expect
 // file-wide here, as the conformance integration test does.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// This suite exercises the HVF trap engine directly (`HvfTrapEngine`, the
+// AArch64 exception-class decoders, `new_hvf_trap_engine`), which
+// `carrick_runtime::trap` only re-exports under `platform-macos`. Gate the whole
+// file so the non-macOS cross-checks (`just check-freebsd`/`check-linux`, which
+// build `--all-targets`) don't try to resolve those macOS-only symbols.
+#![cfg(feature = "platform-macos")]
 
 use carrick_runtime::elf::SegmentPerms;
 use carrick_runtime::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE};
