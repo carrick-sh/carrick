@@ -21,6 +21,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
+use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_hal::{GuestVmBackend, TrapError};
 use carrick_mem::memory::AddressSpace;
 use carrick_x86::{
@@ -633,13 +634,15 @@ impl X86Vmm for NvmmVmm {
 
     fn map_host_alias(
         &mut self,
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
+
+        let (va, ipa) = (va.raw(), ipa.raw());
 
         let aligned_len = len
             .next_multiple_of(0x1000)
@@ -782,7 +785,7 @@ impl X86Vmm for NvmmVmm {
         page_tables
             // exec=true preserves NVMM's prior executable-leaf behaviour (its NX,
             // like KVM's, is applied by the backend protect_range/set_rw path).
-            .map_aliased(va, mapped_ipa, len, writable, true)
+            .map_aliased(GuestVa(va), Gpa(mapped_ipa), len, writable, true)
             .map_err(|e| TrapError::Hypervisor(format!("nvmm-x86: PML4 map_aliased: {e:?}")))?;
         let bytes = page_tables.bytes();
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pt_host, bytes.len()) };

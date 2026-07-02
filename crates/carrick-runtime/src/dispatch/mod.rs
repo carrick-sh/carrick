@@ -846,7 +846,7 @@ pub(crate) fn guest_visible_tid(
 // `crate::dispatch::{…}` / `carrick_runtime::dispatch::{…}` site is unchanged.
 // (The `Aarch64SyscallFrame` re-export is gone: the dispatcher is ISA-neutral —
 // backends decode raw frames behind `GuestArch` and hand over `RawSyscall`.)
-pub use carrick_guest_mem::{GuestMemory, MemoryError};
+pub use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
 
 impl SyscallRequest {
     /// Build an aarch64-ABI request from a bare canonical number (aarch64
@@ -1123,8 +1123,8 @@ pub enum DispatchOutcome {
     /// completes the `mmap` with `va`. The dispatcher has already reserved `ipa`
     /// from the low alias arena (`crate::memory::LINUX_ALIAS_IPA_BASE`).
     MapHostAlias {
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         /// Bytes to copy into the freshly-mapped region at offset 0 (the file
         /// content for a file-backed mmap; empty for anonymous, which the host

@@ -114,6 +114,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use carrick_guest_mem::{Gpa, GuestVa, HostVa};
+
 use crate::compat::CompatReporter;
 use crate::dispatch::{
     DispatchOutcome, GuestMemory, MemoryError, SyscallDispatcher, SyscallRequest,
@@ -1118,8 +1120,8 @@ where
             } => {
                 // Back a dynamic high-VA mmap; complete with the VA.
                 runtime.map_host_alias(va, ipa, len, &payload, file)?;
-                runtime.complete_syscall(va as i64)?;
-                last_syscall_retval = Some(va as i64);
+                runtime.complete_syscall(va.raw() as i64)?;
+                last_syscall_retval = Some(va.raw() as i64);
             }
             DispatchOutcome::SharedFutexWait {
                 host_addr,
@@ -1133,7 +1135,7 @@ where
                 // legacy `dispatch_threaded`-only short-circuit was the
                 // root cause of LTP pause01 TBROKing on
                 // `tst_checkpoint_wake ETIMEDOUT`.
-                let retval = shared_futex_wait(host_addr, value, timeout, this_tid);
+                let retval = shared_futex_wait(HostVa(host_addr), value, timeout, this_tid);
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -1551,11 +1553,12 @@ fn run_threaded_hvf_loop(
 /// single-threaded macOS run loop; the threaded loop uses
 /// `PlatformFutex::shared_wait` (which shares this logic in `HvfFutex`).
 fn shared_futex_wait(
-    host_addr: usize,
+    host_addr: HostVa,
     value: u32,
     timeout: Option<std::time::Duration>,
     this_tid: ThreadId,
 ) -> i64 {
+    let host_addr = host_addr.raw();
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
     let host_value = unsafe { (host_addr as *const u32).read() };
     crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
@@ -1863,8 +1866,8 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     }
     fn map_host_alias(
         &mut self,
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,

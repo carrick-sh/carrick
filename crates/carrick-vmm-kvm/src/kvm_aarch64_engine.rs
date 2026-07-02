@@ -26,9 +26,9 @@ use std::sync::{Arc, RwLock};
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
 };
-use carrick_guest_mem::MemoryError;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::zero_range_chunked;
+use carrick_guest_mem::{GuestVa, HostVa, MemoryError};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, TrapError,
     VcpuExit, VcpuRegistry,
@@ -360,8 +360,10 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         })
     }
 
-    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
-        self.ram.shared_futex_host_addr(guest_addr, 4)
+    fn shared_futex_host_addr(&self, guest_addr: GuestVa) -> Option<HostVa> {
+        self.ram
+            .shared_futex_host_addr(guest_addr.raw(), 4)
+            .map(HostVa)
     }
 
     fn add_alias(

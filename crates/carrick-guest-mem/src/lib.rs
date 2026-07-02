@@ -107,6 +107,67 @@ pub struct X8664SyscallFrame {
     pub r9: u64,
 }
 
+// ─── Address-domain newtypes (the mapping/translation seam) ─────────────────
+//
+// The three address domains a mapping call juggles — guest VIRTUAL, guest
+// PHYSICAL, host VIRTUAL — were all bare `u64`s sitting ADJACENT in the same
+// signatures (`map_aliased(va, gpa, len)`, `map_host_alias(va, ipa, len)`), so
+// transposing two of them compiles clean and, because both sides are
+// page-aligned, sails past every alignment guard. These wrappers make that
+// swap a type error at the seam; page-table internals unwrap with `raw()`.
+
+/// A GUEST VIRTUAL address (what guest code dereferences; stage-1 translated).
+///
+/// Distinct from [`Gpa`] and [`HostVa`] because the three were adjacent bare
+/// `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a va↔gpa
+/// transposition is page-aligned on both sides, so alignment guards cannot
+/// catch it; only the type can.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
+pub struct GuestVa(pub u64);
+
+impl GuestVa {
+    /// The raw guest-virtual address value.
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// A GUEST PHYSICAL address (stage-2 / memslot space; aarch64 calls it IPA).
+///
+/// Distinct from [`GuestVa`] and [`HostVa`] because the three were adjacent
+/// bare `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a
+/// va↔gpa transposition is page-aligned on both sides, so alignment guards
+/// cannot catch it; only the type can.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
+pub struct Gpa(pub u64);
+
+impl Gpa {
+    /// The raw guest-physical (IPA) address value.
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// A HOST VIRTUAL address (a real pointer in carrick's own address space).
+///
+/// Distinct from [`GuestVa`] and [`Gpa`] because the translation chain
+/// (guest VA → GPA → host pointer, e.g. `shared_futex_host_addr`) carried all
+/// three as adjacent bare integers — a swap is page-aligned and alignment
+/// guards cannot catch it; only the type can. Deref via `raw()` at the
+/// pointer boundary.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
+pub struct HostVa(pub usize);
+
+impl HostVa {
+    /// The raw host address value (cast to a pointer at the deref site).
+    #[inline]
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+}
+
 /// One page of zeros, streamed by the chunked guest-zeroing helpers. Zeroing a
 /// guest range must never allocate a `len`-sized temporary — a guest can ask
 /// `select`/`munmap`/`mremap` to clear a large range — so the helpers write

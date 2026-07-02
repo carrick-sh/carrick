@@ -32,7 +32,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_abi::LinuxProtFlags;
-use carrick_guest_mem::MemoryError;
+use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError};
 use carrick_hal::{GuestVmBackend, TrapError};
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
@@ -258,8 +258,8 @@ impl X86Vmm for KvmVmm {
     /// `GuestRam` already tracks this for the aarch64 lane; expose it on the x86
     /// `X86Vmm` seam so the shared engine routes the cross-process futex through
     /// the bare-`SYS_futex` shared path (`ltpcheckpoint` reverse direction).
-    fn shared_futex_host_addr(&self, gpa: u64, len: usize) -> Option<usize> {
-        self.ram.shared_futex_host_addr(gpa, len)
+    fn shared_futex_host_addr(&self, gpa: Gpa, len: usize) -> Option<HostVa> {
+        self.ram.shared_futex_host_addr(gpa.raw(), len).map(HostVa)
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
@@ -286,14 +286,16 @@ impl X86Vmm for KvmVmm {
 
     fn map_host_alias(
         &mut self,
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         use crate::guest_setup::AliasBacking;
         use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
+
+        let (va, ipa) = (va.raw(), ipa.raw());
 
         let alias_end = ipa.checked_add(len).ok_or_else(|| {
             TrapError::Hypervisor(format!("KVM x86 alias 0x{ipa:x}+{len} overflows"))
@@ -326,7 +328,7 @@ impl X86Vmm for KvmVmm {
             // exec=true: KVM is eager — the leaf's NX is (re)applied by the
             // backend `protect_range` → `set_rw`/`set_readonly` per the mmap prot,
             // so the alias leaf itself stays executable (prior behaviour).
-            .map_aliased(va, gpa, len, writable, true)
+            .map_aliased(GuestVa(va), Gpa(gpa), len, writable, true)
             .map_err(|e| TrapError::Hypervisor(format!("kvm-x86: PML4 map_aliased: {e:?}")))?;
         let bytes = page_tables.bytes();
         // SAFETY: `pt_host` backs the full PML4 table region in the live guest;
@@ -377,7 +379,7 @@ impl X86Vmm for KvmVmm {
             length: len,
         })?;
         self.edit_page_tables(va, len, |mgr| {
-            mgr.map_aliased(va, overlay_gpa, len_u64, true, true)
+            mgr.map_aliased(GuestVa(va), Gpa(overlay_gpa), len_u64, true, true)
                 .map(|()| true)
         })
     }
@@ -407,7 +409,7 @@ impl X86Vmm for KvmVmm {
         self.edit_page_tables(va, len, |mgr| {
             // exec=true: `back_fixed_anon` only seeds the leaf; the caller's
             // `protect_range`/`set_rw` re-applies the prot (incl. NX) for KVM.
-            mgr.map_aliased(va, va, len_u64, writable, true)
+            mgr.map_aliased(GuestVa(va), Gpa(va), len_u64, writable, true)
                 .map(|()| true)
         })
     }

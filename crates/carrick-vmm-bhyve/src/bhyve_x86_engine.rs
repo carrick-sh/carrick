@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxProtFlags;
-use carrick_guest_mem::MemoryError;
+use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError};
 use carrick_hal::GuestVmBackend;
 use carrick_hal::OsError;
 use carrick_hal::TrapError;
@@ -1040,7 +1040,7 @@ impl BhyveVmm {
             // GUEST's own execution permission (W^X / NX) is set independently by
             // the `#PF` `demand_commit` path, which honours the reservation's exec.
             self.with_live_pml4(|mgr| {
-                mgr.map_aliased(page, gpa, span as u64, true, true)
+                mgr.map_aliased(GuestVa(page), Gpa(gpa), span as u64, true, true)
                     .map_err(|_| MemoryError::OutOfBounds {
                         address: page,
                         length: span,
@@ -1266,7 +1266,7 @@ impl X86Vmm for BhyveVmm {
         Ok(())
     }
 
-    fn shared_futex_host_addr(&self, key: u64, _len: usize) -> Option<usize> {
+    fn shared_futex_host_addr(&self, key: Gpa, _len: usize) -> Option<HostVa> {
         // Cross-process futex coherence on bhyve: the per-VM guest word is NOT shared
         // across the fork (vmmapi limitation, see SHARED_FUTEX_MIRROR). `key` is the
         // futex-word VA (syscall_buffer_gpa is identity on bhyve) — stable across the
@@ -1281,7 +1281,7 @@ impl X86Vmm for BhyveVmm {
         // in-process table BEFORE reaching here (it recognises a live thread's
         // `clear_child_tid` address); see `dispatch/proc.rs`. Everything else — every
         // genuine `MAP_SHARED` (file or anon) cross-process futex — keeps the mirror.
-        shared_futex_mirror_slot(key)
+        shared_futex_mirror_slot(key.raw()).map(HostVa)
     }
 
     /// bhyve's `shared_futex_host_addr` returns a SEPARATE mirror slot (the per-VM
@@ -1399,7 +1399,7 @@ impl X86Vmm for BhyveVmm {
                 // (W^X). A writable+exec reservation commits RWX (the common
                 // anon-arena case).
                 self.with_live_pml4(|mgr| {
-                    mgr.map_aliased(page, gpa, 4096, writable, exec)
+                    mgr.map_aliased(GuestVa(page), Gpa(gpa), 4096, writable, exec)
                         .map_err(|_| MemoryError::OutOfBounds {
                             address: page,
                             length: 4096,
@@ -1434,12 +1434,13 @@ impl X86Vmm for BhyveVmm {
 
     fn map_host_alias(
         &mut self,
-        va: u64,
-        _ipa: u64,
+        va: GuestVa,
+        _ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
+        let va = va.raw();
         // bhyve IGNORES the dispatcher's `ipa` (it bumps its own GPA in the single
         // sysmem segment, which is already kernel-backed and host-visible via
         // map_gpa). The alias content is COPIED into that backing RAM: an anon
@@ -1564,11 +1565,12 @@ impl X86Vmm for BhyveVmm {
         let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
         // exec=true: a MAP_SHARED file/anon host alias maps executable (the
         // historical alias behaviour; shared-object text needs to execute).
-        mgr.map_aliased(va, gpa, len, writable, true).map_err(|_| {
-            TrapError::Hypervisor(format!(
-                "bhyve map_host_alias: map_aliased va=0x{va:x} gpa=0x{gpa:x} len=0x{len:x}"
-            ))
-        })?;
+        mgr.map_aliased(GuestVa(va), Gpa(gpa), len, writable, true)
+            .map_err(|_| {
+                TrapError::Hypervisor(format!(
+                    "bhyve map_host_alias: map_aliased va=0x{va:x} gpa=0x{gpa:x} len=0x{len:x}"
+                ))
+            })?;
         // SAFETY: both windows are X86_PML4_CAPACITY bytes.
         unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
         self.h
@@ -1631,7 +1633,7 @@ impl X86Vmm for BhyveVmm {
         // Repoint the live PML4 leaf for `va` at the fresh private GPA (4 KiB
         // precise; the engine reloads CR3 after this returns).
         self.with_live_pml4(|mgr| {
-            mgr.map_aliased(va & !0xFFF, gpa, span as u64, true, true)
+            mgr.map_aliased(GuestVa(va & !0xFFF), Gpa(gpa), span as u64, true, true)
                 .map_err(|_| MemoryError::OutOfBounds {
                     address: va,
                     length: span,
@@ -1664,7 +1666,7 @@ impl X86Vmm for BhyveVmm {
         self.with_live_pml4(|mgr| {
             // exec=true: the caller's `protect_range`/`set_rw` re-applies the prot
             // (incl. NX); the leaf itself stays executable here.
-            mgr.map_aliased(base, gpa, span as u64, writable, true)
+            mgr.map_aliased(GuestVa(base), Gpa(gpa), span as u64, writable, true)
                 .map_err(|_| MemoryError::OutOfBounds {
                     address: base,
                     length: span,

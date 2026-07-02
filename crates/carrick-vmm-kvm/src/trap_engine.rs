@@ -417,7 +417,7 @@ mod execve_tests {
     /// the high alias VA back to it (proving the VA-keyed window + the live slot).
     #[test]
     fn kvm_map_host_alias_anon_roundtrips() {
-        use carrick_guest_mem::GuestMemory;
+        use carrick_guest_mem::{Gpa, GuestMemory, GuestVa};
         use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         if !kvm_available() {
             eprintln!("SKIP kvm_map_host_alias_anon_roundtrips: no /dev/kvm");
@@ -428,7 +428,7 @@ mod execve_tests {
         let va = LINUX_HIGH_VA_THRESHOLD + 0x20_0000;
         let payload = b"carrick alias payload".to_vec();
         engine
-            .map_host_alias(va, 0, 0x1000, &payload, None)
+            .map_host_alias(GuestVa(va), Gpa(0), 0x1000, &payload, None)
             .expect("map_host_alias anon");
         let got = engine.read_bytes(va, payload.len()).expect("read alias VA");
         assert_eq!(
@@ -441,7 +441,7 @@ mod execve_tests {
     /// VA reads back the file's bytes (the MAP_SHARED-file coherence path).
     #[test]
     fn kvm_map_host_alias_file_roundtrips() {
-        use carrick_guest_mem::GuestMemory;
+        use carrick_guest_mem::{Gpa, GuestMemory, GuestVa};
         use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         if !kvm_available() {
             eprintln!("SKIP kvm_map_host_alias_file_roundtrips: no /dev/kvm");
@@ -461,8 +461,8 @@ mod execve_tests {
         let va = LINUX_HIGH_VA_THRESHOLD + 0x40_0000;
         engine
             .map_host_alias(
-                va,
-                0,
+                GuestVa(va),
+                Gpa(0),
                 0x1000,
                 &[],
                 Some((dup, 0, libc::PROT_READ | libc::PROT_WRITE)),
@@ -482,6 +482,7 @@ mod execve_tests {
     /// range) is rejected with an error, NOT silently mapped to a colliding GPA.
     #[test]
     fn kvm_map_host_alias_rejects_out_of_arena_va() {
+        use carrick_guest_mem::{Gpa, GuestVa};
         use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         if !kvm_available() {
             eprintln!("SKIP kvm_map_host_alias_rejects_out_of_arena_va: no /dev/kvm");
@@ -490,7 +491,7 @@ mod execve_tests {
         let mut engine = engine_for(INITIAL_ELF);
         // 1 TiB + ~6.4 TiB: well past the 64 GiB arena.
         let va = LINUX_HIGH_VA_THRESHOLD + 0x10_0000_0000u64 * 100;
-        let r = engine.map_host_alias(va, 0, 0x1000, &[1, 2, 3], None);
+        let r = engine.map_host_alias(GuestVa(va), Gpa(0), 0x1000, &[1, 2, 3], None);
         assert!(
             r.is_err(),
             "a VA outside the alias arena must be rejected, not corrupt memory"
