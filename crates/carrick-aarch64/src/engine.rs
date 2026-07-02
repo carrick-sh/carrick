@@ -626,7 +626,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.pt_edit_and_flush(|mgr| {
             if prot & LINUX_PROT_WRITE != 0 {
                 mgr.set_rw(address, len, exec)
-            } else if prot & LINUX_PROT_READ != 0 {
+            } else if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
                 mgr.set_readonly(address, len, exec)
             } else {
                 mgr.set_prot_none(address, len)
