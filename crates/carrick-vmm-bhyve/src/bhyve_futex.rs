@@ -37,7 +37,7 @@ impl SharedFutexSyscall for BhyveSharedFutex {
         )
     }
 
-    fn wake(&self, host_addr: usize, n: u32) -> i64 {
+    fn wake(&self, host_addr: usize, _waiter_key: usize, n: u32) -> i64 {
         let all = n > 1;
         let r = carrick_host::umtx::wake(host_addr, all);
         r.max(0)

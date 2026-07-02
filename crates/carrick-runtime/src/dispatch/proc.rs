@@ -1558,6 +1558,7 @@ impl SyscallDispatcher {
                         // uniformly. The loop completes with the count woken.
                         return Ok(DispatchOutcome::SharedFutexWake {
                             host_addr,
+                            waiter_key: address.0 as usize,
                             count: value,
                         });
                     }
@@ -1608,6 +1609,7 @@ impl SyscallDispatcher {
                     if let Some(host_addr) = shared_host_addr {
                         return Ok(DispatchOutcome::SharedFutexWait {
                             host_addr,
+                            waiter_key: address.0 as usize,
                             value,
                             timeout,
                         });
@@ -1650,6 +1652,7 @@ impl SyscallDispatcher {
                             .min(u32::MAX as u64) as u32;
                         return Ok(DispatchOutcome::SharedFutexWake {
                             host_addr,
+                            waiter_key: uaddr2 as usize,
                             count: total,
                         });
                     }

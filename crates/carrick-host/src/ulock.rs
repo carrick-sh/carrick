@@ -25,6 +25,8 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imp {
     use std::ffi::c_void;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     /// Cross-process, physical-page-keyed synchronization (the SHARED flag).
     /// Value confirmed from `<os/os_sync_wait_on_address.h>`.
@@ -35,6 +37,14 @@ mod imp {
     const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
     /// 32-bit futex word.
     const FUTEX_WORD_SIZE: libc::size_t = 4;
+    const WAITER_SLOTS: usize = 8192;
+
+    #[repr(C)]
+    struct WaiterSlot {
+        key: AtomicU64,
+        count: AtomicU32,
+        _pad: AtomicU32,
+    }
 
     #[link(name = "System")]
     unsafe extern "C" {
@@ -72,6 +82,93 @@ mod imp {
             .raw_os_error()
             .unwrap_or(libc::EINVAL);
         -(e as i64)
+    }
+
+    fn waiter_table() -> Option<&'static [WaiterSlot]> {
+        static CELL: OnceLock<usize> = OnceLock::new();
+        let base = *CELL.get_or_init(|| {
+            let bytes = WAITER_SLOTS.saturating_mul(std::mem::size_of::<WaiterSlot>());
+            if bytes == 0 {
+                return 0;
+            }
+            // SAFETY: a fresh anonymous shared mapping owned for process lifetime.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_SHARED,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED { 0 } else { p as usize }
+        });
+        if base == 0 {
+            return None;
+        }
+        // SAFETY: `base` points at WAITER_SLOTS zeroed WaiterSlot values for the
+        // process lifetime; MAP_SHARED makes them coherent across fork.
+        Some(unsafe { std::slice::from_raw_parts(base as *const WaiterSlot, WAITER_SLOTS) })
+    }
+
+    fn waiter_slot(host_addr: usize) -> Option<&'static WaiterSlot> {
+        let key = host_addr as u64;
+        if key == 0 {
+            return None;
+        }
+        let table = waiter_table()?;
+        let mut idx = (key as usize >> 2) & (WAITER_SLOTS - 1);
+        for _ in 0..WAITER_SLOTS {
+            let slot = &table[idx];
+            let seen = slot.key.load(Ordering::Acquire);
+            if seen == key {
+                return Some(slot);
+            }
+            if seen == 0
+                && slot
+                    .key
+                    .compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return Some(slot);
+            }
+            idx = (idx + 1) & (WAITER_SLOTS - 1);
+        }
+        None
+    }
+
+    fn waiter_count(host_addr: usize) -> u32 {
+        waiter_slot(host_addr)
+            .map(|slot| slot.count.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    pub fn preinit_waiter_table() -> bool {
+        waiter_table().is_some()
+    }
+
+    pub fn waiter_enter(host_addr: usize) {
+        if let Some(slot) = waiter_slot(host_addr) {
+            slot.count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub fn waiter_exit(host_addr: usize) {
+        if let Some(slot) = waiter_slot(host_addr) {
+            let mut cur = slot.count.load(Ordering::Acquire);
+            while cur != 0 {
+                match slot.count.compare_exchange_weak(
+                    cur,
+                    cur - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => cur = next,
+                }
+            }
+        }
     }
 
     /// Wait while `*host_addr == value`. `timeout_us` of 0 waits indefinitely.
@@ -118,6 +215,39 @@ mod imp {
         };
         if rc < 0 { neg_errno() } else { rc as i64 }
     }
+
+    /// Wake up to `n` waiters and return a Linux-style waiter count. Darwin's
+    /// os_sync wake calls report success/failure, not the number of waiters
+    /// released, so carrick counts waiters in a fork-shared side table while
+    /// they are parked in `wait`.
+    pub fn wake_counted(host_addr: usize, waiter_key: usize, n: u32) -> i64 {
+        if n == 0 {
+            return 0;
+        }
+        let parked = waiter_count(waiter_key);
+        if parked == 0 {
+            return 0;
+        }
+        let target = parked.min(n);
+        if target == 1 {
+            return if wake(host_addr, false) >= 0 { 1 } else { 0 };
+        }
+        if n >= parked {
+            return if wake(host_addr, true) >= 0 {
+                i64::from(target)
+            } else {
+                0
+            };
+        }
+        let mut woke = 0i64;
+        for _ in 0..target {
+            if wake(host_addr, false) < 0 {
+                break;
+            }
+            woke += 1;
+        }
+        woke
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -128,9 +258,17 @@ mod imp {
     pub fn wake(_host_addr: usize, _all: bool) -> i64 {
         -(libc::ENOSYS as i64)
     }
+    pub fn wake_counted(_host_addr: usize, _waiter_key: usize, _n: u32) -> i64 {
+        -(libc::ENOSYS as i64)
+    }
+    pub fn preinit_waiter_table() -> bool {
+        true
+    }
+    pub fn waiter_enter(_host_addr: usize) {}
+    pub fn waiter_exit(_host_addr: usize) {}
 }
 
-pub use imp::{wait, wake};
+pub use imp::{preinit_waiter_table, wait, waiter_enter, waiter_exit, wake, wake_counted};
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
