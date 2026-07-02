@@ -42,8 +42,8 @@ impl SyscallDispatcher {
             return Ok(None);
         }
         let (Some(input_offset), Some(output_offset)) = (
-            host_fd_offset(input.host_fd),
-            host_fd_offset(output.host_fd),
+            host_fd_offset(HostFd(input.host_fd)),
+            host_fd_offset(HostFd(output.host_fd)),
         ) else {
             return Ok(None);
         };
@@ -54,8 +54,8 @@ impl SyscallDispatcher {
         match crate::darwin_fs::copyfile_clone_or_data(input.host_fd, output.host_fd, input.size) {
             Ok(Some(result)) => {
                 let copied = result.bytes();
-                if !set_host_fd_offset(input.host_fd, copied)
-                    || !set_host_fd_offset(output.host_fd, copied)
+                if !set_host_fd_offset(HostFd(input.host_fd), copied)
+                    || !set_host_fd_offset(HostFd(output.host_fd), copied)
                 {
                     return Ok(None);
                 }

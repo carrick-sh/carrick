@@ -313,7 +313,7 @@ impl SyscallDispatcher {
         &self,
         kqueue: &Arc<EpollKqueue>,
         interest: &HashMap<i32, EpollInterest>,
-        host_fd: i32,
+        host_fd: HostFd,
     ) {
         let mut survivor: Option<(i32, u32)> = None;
         let mut union_events = 0u32;
@@ -338,14 +338,14 @@ impl SyscallDispatcher {
         kqueue.with_mux(|mux| match survivor {
             Some((sfd, sgen)) => {
                 let _ = mux.register_io(
-                    host_fd,
+                    host_fd.get(),
                     pack_epoll_udata(sfd, sgen),
                     union_interest,
                     epoll_host_trigger_mode(union_events),
                 );
             }
             None => {
-                let _ = mux.deregister(host_fd);
+                let _ = mux.deregister(host_fd.get());
             }
         });
     }
@@ -407,7 +407,7 @@ impl SyscallDispatcher {
                     interest |= libc::POLLPRI;
                 }
                 let mut pfd = libc::pollfd {
-                    fd: host_fd,
+                    fd: host_fd.get(),
                     events: interest,
                     revents: 0,
                 };
@@ -446,7 +446,7 @@ impl SyscallDispatcher {
                 // is a no-op on hosts whose native poll already handled POLLPRI.
                 if requested_events & LINUX_EPOLLPRI != 0
                     && ready & LINUX_EPOLLPRI == 0
-                    && host_fd_has_oob(host_fd)
+                    && host_fd_has_oob(host_fd.get())
                 {
                     ready |= LINUX_EPOLLPRI;
                 }
@@ -456,7 +456,7 @@ impl SyscallDispatcher {
                 // read-end registered for EPOLLOUT (Go's netpoller watches both
                 // directions) makes the host poll return rc>0 with a spurious
                 // POLLOUT, which must NOT mask the EOF (POLLIN|HUP) Linux delivers.
-                if crate::dispatch::fifo_beacon::read_end_at_eof(host_fd) {
+                if crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.get()) {
                     ready |= LINUX_EPOLLIN | LINUX_EPOLLHUP;
                 }
                 // Only report events the caller is watching, plus the
@@ -471,7 +471,7 @@ impl SyscallDispatcher {
             return 0;
         };
         let mut avail: libc::c_int = 0;
-        let rc = unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut avail) };
+        let rc = unsafe { libc::ioctl(host_fd.get(), libc::FIONREAD, &mut avail) };
         if rc == 0 && avail > 0 {
             avail as u64
         } else {
@@ -593,7 +593,7 @@ impl SyscallDispatcher {
                                         feature = "platform-netbsd"
                                     ))]
                                     if let Some(host_fd) = self.host_fd_for_poll(*fd) {
-                                        host_rearms.push(host_fd);
+                                        host_rearms.push(host_fd.get());
                                     }
                                 }
                             }
@@ -613,7 +613,7 @@ impl SyscallDispatcher {
                                     feature = "platform-netbsd"
                                 ))]
                                 if let Some(host_fd) = self.host_fd_for_poll(*fd) {
-                                    host_rearms.push(host_fd);
+                                    host_rearms.push(host_fd.get());
                                 }
                             }
                         }
@@ -626,7 +626,11 @@ impl SyscallDispatcher {
                             host_rearms.sort_unstable();
                             host_rearms.dedup();
                             for host_fd in host_rearms {
-                                self.rebind_epoll_host_registration(kqueue, interest, host_fd);
+                                self.rebind_epoll_host_registration(
+                                    kqueue,
+                                    interest,
+                                    HostFd(host_fd),
+                                );
                             }
                         }
                         // A waiter parked before this consumption holds a park
@@ -668,35 +672,37 @@ impl SyscallDispatcher {
     /// `Some(host_fd)` means we can hand this off to libc::poll.
     /// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)
     /// and ppoll has to fall back to the per-fd readiness loop.
-    pub(super) fn host_fd_for_poll(&self, fd: i32) -> Option<i32> {
+    pub(super) fn host_fd_for_poll(&self, fd: i32) -> Option<HostFd> {
         if fd < 0 {
             // Negative fd in a pollfd entry: libc::poll ignores it
             // (revents=0), which is the right semantic. Pass it through.
-            return Some(fd);
+            return Some(HostFd(fd));
         }
         if let Some(open_file) = self.open_file(fd) {
             let open = open_file.description.read();
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostSocket { host_fd, .. }
-                | OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+                | OpenDescription::HostFile { host_fd, .. } => Some(HostFd(*host_fd)),
                 // eventfd is host-backed by a readiness pipe (read end readable
                 // iff counter > 0), so epoll/poll/select watch it natively via
                 // EVFILT_READ/POLLIN — no in-memory recompute or EVFILT_USER
                 // broadcast needed (the robust path for Go's netpollBreak).
-                OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => Some(state.read_fd),
+                OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => {
+                    Some(HostFd(state.read_fd))
+                }
                 // A pidfd is read-ready when its process exits; the backing
                 // multiplexer's poll fd (the kqueue fd on macOS, the
                 // pidfd-bearing epoll fd on Linux) is what poll/epoll watch.
-                OpenDescription::Pidfd { kqueue, .. } => Some(kqueue.poll_fd()),
+                OpenDescription::Pidfd { kqueue, .. } => Some(HostFd(kqueue.poll_fd())),
                 // inotify readiness is the backing kqueue's fd, so poll/epoll/
                 // blocking-read wait on it natively.
-                OpenDescription::Inotify { state, .. } => Some(state.poll_fd()),
+                OpenDescription::Inotify { state, .. } => Some(HostFd(state.poll_fd())),
                 _ => None,
             };
         }
         if is_stdio_fd(fd) {
-            return Some(fd);
+            return Some(HostFd(fd));
         }
         // Unknown fd: do NOT pass the guest fd number through as a host fd
         // (host fds 3,4,5… belong to carrick itself — the cap-std rootfs dir,
@@ -1291,7 +1297,7 @@ impl SyscallDispatcher {
     }
 
     /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
-    pub(in crate::dispatch) fn host_socket_lookup(&self, fd: i32) -> Result<(i32, i32), i32> {
+    pub(in crate::dispatch) fn host_socket_lookup(&self, fd: i32) -> Result<(HostFd, i32), i32> {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
@@ -1299,7 +1305,7 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::HostSocket {
                 host_fd, family, ..
-            } => Ok((*host_fd, *family)),
+            } => Ok((HostFd(*host_fd), *family)),
             _ => Err(LINUX_ENOTSOCK),
         }
     }
@@ -1522,30 +1528,30 @@ impl SyscallDispatcher {
             Err(errno) => return errno.into(),
         };
         rewrite_unspecified_connect_loopback(family, &mut host_addr);
-        set_host_nonblocking(host_fd);
+        set_host_nonblocking(host_fd.get());
         let rc = unsafe {
             libc::connect(
-                host_fd,
+                host_fd.get(),
                 host_addr.as_ptr() as *const _,
                 host_addr.len() as u32,
             )
         };
         if rc == 0 {
-            return connect_success_or_pending_error(host_fd);
+            return connect_success_or_pending_error(host_fd.get());
         }
         let e = HostSyscallError::last().linux_errno();
         // See `fn connect` for why EISCONN is split on connect_in_progress.
         if e == LINUX_EISCONN {
             if self.socket_connect_in_progress(fd) {
                 self.set_socket_connect_in_progress(fd, false);
-                return connect_success_or_pending_error(host_fd);
+                return connect_success_or_pending_error(host_fd.get());
             }
             return LINUX_EISCONN.into();
         }
         if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
             self.set_socket_connect_in_progress(fd, true);
             return DispatchOutcome::WaitOnFds {
-                fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
+                fds: WaitFds::raw_one(host_fd.get(), libc::POLLOUT),
                 timeout: None,
                 on_timeout: -(LINUX_EINPROGRESS as i64),
                 sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -1911,7 +1917,7 @@ impl SyscallDispatcher {
                         let effective = this.epoll_effective_interest(fd, ev_events, 0, false);
                         kqueue.with_mux(|mux| {
                             let _ = mux.register_io(
-                                host_fd,
+                                host_fd.get(),
                                 pack_epoll_udata(fd, reg_gen),
                                 effective,
                                 epoll_host_trigger_mode(ev_events),
@@ -1920,7 +1926,7 @@ impl SyscallDispatcher {
                         crate::event_ring::rec(
                             crate::event_ring::EPADD,
                             kqueue.poll_fd(),
-                            host_fd,
+                            host_fd.get(),
                             ev_events as i32,
                         );
                     }
@@ -1957,7 +1963,7 @@ impl SyscallDispatcher {
                         let effective = this.epoll_effective_interest(fd, event.events, 0, false);
                         kqueue.with_mux(|mux| {
                             let _ = mux.register_io(
-                                host_fd,
+                                host_fd.get(),
                                 pack_epoll_udata(fd, reg_gen),
                                 effective,
                                 epoll_host_trigger_mode(event.events),
@@ -2025,14 +2031,14 @@ impl SyscallDispatcher {
                             kqueue.with_mux(|mux| match survivor {
                                 Some((sfd, sgen)) => {
                                     let _ = mux.register_io(
-                                        host_fd,
+                                        host_fd.get(),
                                         pack_epoll_udata(sfd, sgen),
                                         epoll_interest_for(union_events),
                                         epoll_host_trigger_mode(union_events),
                                     );
                                 }
                                 None => {
-                                    let _ = mux.deregister(host_fd);
+                                    let _ = mux.deregister(host_fd.get());
                                 }
                             });
                         }
@@ -2220,7 +2226,7 @@ impl SyscallDispatcher {
                                         info.insert(
                                             *gfd,
                                             (
-                                                hfd,
+                                                hfd.get(),
                                                 slot.event.events,
                                                 slot.event.data,
                                                 slot.reg_gen,
@@ -2229,7 +2235,7 @@ impl SyscallDispatcher {
                                                 slot.write_backpressured,
                                             ),
                                         );
-                                        rev.entry(hfd).or_default().push(*gfd);
+                                        rev.entry(hfd.get()).or_default().push(*gfd);
                                     }
                                 }
                             }
@@ -2472,7 +2478,7 @@ impl SyscallDispatcher {
                 // beacon pipe), so recompute it here so the notify_inmem_epoll
                 // wake on writer-close surfaces EOF instead of blocking forever.
                 if let Some(hfd) = this.host_fd_for_poll(*fd)
-                    && !crate::dispatch::fifo_beacon::read_end_at_eof(hfd) {
+                    && !crate::dispatch::fifo_beacon::read_end_at_eof(hfd.get()) {
                         continue;
                     }
                 let requested = interest.event.events;
@@ -2545,7 +2551,7 @@ impl SyscallDispatcher {
                                 && before != raw
                                 && let Some(host_fd) = this.host_fd_for_poll(fd)
                             {
-                                host_rearms.push(host_fd);
+                                host_rearms.push(host_fd.get());
                             }
                         }
                     }
@@ -2558,7 +2564,7 @@ impl SyscallDispatcher {
                         host_rearms.sort_unstable();
                         host_rearms.dedup();
                         for host_fd in host_rearms {
-                            this.rebind_epoll_host_registration(kqueue, interest, host_fd);
+                            this.rebind_epoll_host_registration(kqueue, interest, HostFd(host_fd));
                         }
                     }
                     for fd in &oneshot_fds {
@@ -2577,7 +2583,7 @@ impl SyscallDispatcher {
             for fd in &oneshot_fds {
                 if let Some(host_fd) = this.host_fd_for_poll(*fd) {
                     kq.with_mux(|mux| {
-                        let _ = mux.deregister(host_fd);
+                        let _ = mux.deregister(host_fd.get());
                     });
                 }
             }
@@ -2841,7 +2847,7 @@ impl SyscallDispatcher {
                 host_map.push(if w && this.fd_is_eventfd(fd_i32) {
                     None
                 } else {
-                    this.host_fd_for_poll(fd_i32)
+                    this.host_fd_for_poll(fd_i32).map(HostFd::get)
                 });
             }
 
@@ -3174,7 +3180,7 @@ impl SyscallDispatcher {
                     if (p.events & LINUX_POLLOUT) != 0 && this.fd_is_eventfd(p.fd) {
                         None
                     } else {
-                        this.host_fd_for_poll(p.fd)
+                        this.host_fd_for_poll(p.fd).map(HostFd::get)
                     }
                 })
                 .collect();
@@ -3417,7 +3423,11 @@ impl SyscallDispatcher {
                     }
                 }
                 let rc = unsafe {
-                    libc::bind(host_fd, sa.as_ptr() as *const libc::sockaddr, sa.len() as u32)
+                    libc::bind(
+                        host_fd.get(),
+                        sa.as_ptr() as *const libc::sockaddr,
+                        sa.len() as u32,
+                    )
                 };
                 return Ok(match rc.host_syscall_errno() {
                     Ok(_) => DispatchOutcome::Returned { value: 0 },
@@ -3496,7 +3506,7 @@ impl SyscallDispatcher {
             }
             let rc = unsafe {
                 libc::bind(
-                    host_fd,
+                    host_fd.get(),
                     host_addr.as_ptr() as *const _,
                     host_addr.len() as u32,
                 )
@@ -3513,7 +3523,7 @@ impl SyscallDispatcher {
                 crate::event_ring::rec(
                     crate::event_ring::BIND,
                     fd,
-                    host_fd,
+                    host_fd.get(),
                     crate::event_ring::path_hash(&host_addr[2..end]),
                 );
                 // Stamp the guest sun_path onto the just-created host node so a
@@ -3545,17 +3555,17 @@ impl SyscallDispatcher {
             let fd: Fd = fd;
             let backlog = backlog as i32;
             let (host_fd, _family) = this.host_socket_lookup(fd.0)?;
-            let rc = unsafe { libc::listen(host_fd, backlog) };
+            let rc = unsafe { libc::listen(host_fd.get(), backlog) };
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(errno.into());
             }
-            crate::event_ring::rec(crate::event_ring::LISTEN, host_fd, 0, 0);
+            crate::event_ring::rec(crate::event_ring::LISTEN, host_fd.get(), 0, 0);
             // A listen socket exists only to accept(2); make the HOST socket
             // non-blocking so accept never blocks under the dispatcher lock — the
             // guest's blocking intent is emulated by blocking_io's WaitOnFds
             // hand-off (the one idiomatic, targeted non-blocking exception; data
             // sockets keep their native mode + per-call MSG_DONTWAIT).
-            set_host_nonblocking(host_fd);
+            set_host_nonblocking(host_fd.get());
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -3616,10 +3626,10 @@ impl SyscallDispatcher {
             // the dispatcher lock. recv/send use MSG_DONTWAIT + the guest's intended
             // mode (status_flags), so the host fd's real mode is immaterial.
             let nonblocking = this.io_is_nonblocking(fd, 0);
-            set_host_nonblocking(host_fd);
+            set_host_nonblocking(host_fd.get());
             let rc = unsafe {
                 libc::connect(
-                    host_fd,
+                    host_fd.get(),
                     host_addr.as_ptr() as *const _,
                     host_addr.len() as u32,
                 )
@@ -3632,7 +3642,7 @@ impl SyscallDispatcher {
                     .unwrap_or(host_addr.len());
                 crate::event_ring::rec(
                     crate::event_ring::CONNECT,
-                    host_fd,
+                    host_fd.get(),
                     rc,
                     crate::event_ring::path_hash(&host_addr[2..end]),
                 );
@@ -3641,7 +3651,7 @@ impl SyscallDispatcher {
                 // A non-blocking host connect reporting success does not prove the
                 // connection completed — consult SO_ERROR (see
                 // connect_success_or_pending_error).
-                return Ok(connect_success_or_pending_error(host_fd));
+                return Ok(connect_success_or_pending_error(host_fd.get()));
             }
             let e = HostSyscallError::last().linux_errno();
             // EISCONN: macOS reports it BOTH when an async connect we deferred
@@ -3658,7 +3668,7 @@ impl SyscallDispatcher {
             if e == LINUX_EISCONN {
                 if this.socket_connect_in_progress(fd) {
                     this.set_socket_connect_in_progress(fd, false);
-                    return Ok(connect_success_or_pending_error(host_fd));
+                    return Ok(connect_success_or_pending_error(host_fd.get()));
                 }
                 return Ok(LINUX_EISCONN.into());
             }
@@ -3673,7 +3683,7 @@ impl SyscallDispatcher {
                 // we expect on re-dispatch is recognised as async-completion above.
                 this.set_socket_connect_in_progress(fd, true);
                 return Ok(DispatchOutcome::WaitOnFds {
-                    fds: WaitFds::raw_one(host_fd, libc::POLLOUT),
+                    fds: WaitFds::raw_one(host_fd.get(), libc::POLLOUT),
                     timeout: None,
                     on_timeout: -(LINUX_EINPROGRESS as i64),
                     sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -3723,7 +3733,7 @@ impl SyscallDispatcher {
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
             let rc =
-                unsafe { libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
+                unsafe { libc::getsockname(host_fd.get(), sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(errno.into());
             }
@@ -3746,7 +3756,7 @@ impl SyscallDispatcher {
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
             let rc =
-                unsafe { libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
+                unsafe { libc::getpeername(host_fd.get(), sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(errno.into());
             }
@@ -3839,11 +3849,11 @@ impl SyscallDispatcher {
             let send_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read().send_timeout());
-            let outcome = this.blocking_io(host_fd, IoDir::Write, nonblocking, send_to, || {
+            let outcome = this.blocking_io(host_fd.get(), IoDir::Write, nonblocking, send_to, || {
                 let n = match &host_addr {
                     None => unsafe {
                         libc::sendto(
-                            host_fd,
+                            host_fd.get(),
                             data_ptr as *const _,
                             len,
                             host_flags,
@@ -3853,7 +3863,7 @@ impl SyscallDispatcher {
                     },
                     Some(a) => unsafe {
                         libc::sendto(
-                            host_fd,
+                            host_fd.get(),
                             data_ptr as *const _,
                             len,
                             host_flags,
@@ -3939,14 +3949,14 @@ impl SyscallDispatcher {
             let recv_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read().recv_timeout());
-            let outcome = this.blocking_io(host_fd, IoDir::Read, nonblocking, recv_to, || {
+            let outcome = this.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
                 let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
                 let (n, used_addr) = if src_addr == 0 {
                     (
                         unsafe {
                             libc::recvfrom(
-                                host_fd,
+                                host_fd.get(),
                                 dst_ptr as *mut _,
                                 len,
                                 host_flags,
@@ -3960,7 +3970,7 @@ impl SyscallDispatcher {
                     (
                         unsafe {
                             libc::recvfrom(
-                                host_fd,
+                                host_fd.get(),
                                 dst_ptr as *mut _,
                                 len,
                                 host_flags,
@@ -4140,7 +4150,7 @@ impl SyscallDispatcher {
                     let one: i32 = 1;
                     unsafe {
                         libc::setsockopt(
-                            host_fd,
+                            host_fd.get(),
                             libc::SOL_SOCKET,
                             libc::SO_REUSEPORT,
                             &one as *const i32 as *const libc::c_void,
@@ -4203,7 +4213,7 @@ impl SyscallDispatcher {
             };
             let rc = unsafe {
                 libc::setsockopt(
-                    host_fd,
+                    host_fd.get(),
                     host_level,
                     host_opt,
                     if bytes.is_empty() {
@@ -4363,7 +4373,7 @@ impl SyscallDispatcher {
                 // Best-effort peer creds, resolved per host (Linux: SO_PEERCRED
                 // -> ucred; Darwin: LOCAL_PEERCRED + LOCAL_PEERPID). Returns 0s
                 // if the socket isn't connected, matching the guest's tolerance.
-                let (pid, uid, gid) = carrick_portable::peer_ucred(host_fd);
+                let (pid, uid, gid) = carrick_portable::peer_ucred(host_fd.get());
                 let mut ucred = [0u8; crate::linux_abi::LINUX_UCRED_SIZE];
                 ucred[0..4].copy_from_slice(&pid.to_ne_bytes());
                 ucred[4..8].copy_from_slice(&uid.to_ne_bytes());
@@ -4386,7 +4396,7 @@ impl SyscallDispatcher {
                 let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
                 let rc = unsafe {
                     libc::getsockopt(
-                        host_fd,
+                        host_fd.get(),
                         libc::SOL_SOCKET,
                         libc::SO_ERROR,
                         (&mut host_err as *mut i32).cast(),
@@ -4432,7 +4442,7 @@ impl SyscallDispatcher {
             let mut buf = vec![0u8; cap];
             let rc = unsafe {
                 libc::getsockopt(
-                    host_fd,
+                    host_fd.get(),
                     host_level,
                     host_opt,
                     buf.as_mut_ptr() as *mut _,
@@ -4461,7 +4471,7 @@ impl SyscallDispatcher {
             let fd: Fd = fd;
             let how = how as i32;
             let (host_fd, _family) = this.host_socket_lookup(fd.0)?;
-            let rc = unsafe { libc::shutdown(host_fd, how) };
+            let rc = unsafe { libc::shutdown(host_fd.get(), how) };
             Ok(if let Err(errno) = rc.host_syscall_errno() {
                 DispatchOutcome::errno(errno)
             } else {
@@ -4503,7 +4513,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let is_netlink = self.fd_is_netlink(fd);
         let (host_fd, family) = if is_netlink {
-            (-1, LINUX_AF_NETLINK)
+            (HostFd(-1), LINUX_AF_NETLINK)
         } else {
             self.host_socket_lookup(fd)?
         };
@@ -4575,7 +4585,7 @@ impl SyscallDispatcher {
         let send_to = self
             .open_file(fd)
             .and_then(|f| f.description.read().send_timeout());
-        let outcome = self.blocking_io(host_fd, IoDir::Write, nonblocking, send_to, || {
+        let outcome = self.blocking_io(host_fd.get(), IoDir::Write, nonblocking, send_to, || {
             // Use a real sendmsg so the host control buffer (SCM_RIGHTS) is
             // delivered. A single iovec over the assembled `data` is fine —
             // the byte stream is identical to the guest's scattered iovecs.
@@ -4594,7 +4604,7 @@ impl SyscallDispatcher {
                 hmsg.msg_control = host_control.as_ptr() as *mut libc::c_void;
                 hmsg.msg_controllen = host_control.len() as _;
             }
-            let n = unsafe { libc::sendmsg(host_fd, &hmsg as *const _, host_flags) };
+            let n = unsafe { libc::sendmsg(host_fd.get(), &hmsg as *const _, host_flags) };
             n.host_syscall_errno().map(|value| value as i64)
         });
         Ok(outcome)
@@ -4609,7 +4619,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let is_netlink = self.fd_is_netlink(fd);
         let (host_fd, family) = if is_netlink {
-            (-1, LINUX_AF_NETLINK)
+            (HostFd(-1), LINUX_AF_NETLINK)
         } else {
             self.host_socket_lookup(fd)?
         };
@@ -4685,7 +4695,7 @@ impl SyscallDispatcher {
         // returned, as (linux_cmsg_type, data) — forwarded to the guest below.
         let received_ipv6_cmsgs = std::cell::RefCell::new(Vec::<(i32, Vec<u8>)>::new());
         let guest_msg_flags = std::cell::Cell::new(0i32);
-        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, recv_to, || {
+        let outcome = self.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
             // A retry must not leak fds from a prior partial attempt.
             for stale in received_host_fds.borrow_mut().drain(..) {
                 unsafe { libc::close(stale) };
@@ -4723,7 +4733,7 @@ impl SyscallDispatcher {
             // host_flags carries MSG_DONTWAIT and this runs inside blocking_io
             // (host_fd is O_NONBLOCK; EAGAIN -> WaitOnFds with the dispatcher lock
             // released), so this recvmsg never blocks under the lock.
-            let n = unsafe { libc::recvmsg(host_fd, &mut hmsg as *mut _, host_flags) };
+            let n = unsafe { libc::recvmsg(host_fd.get(), &mut hmsg as *mut _, host_flags) };
             let n = n.host_syscall_errno()?;
             // Stash any received fds (host-layout cmsg) for installation after
             // the closure returns; the guest-facing rewrite happens below.
@@ -4804,7 +4814,7 @@ impl SyscallDispatcher {
                 // budget. (audit M2)
                 let mut cred_trunc = false;
                 if !is_netlink && self.socket_so_passcred(fd) {
-                    let (pid, uid, gid) = self.peer_ucred(host_fd);
+                    let (pid, uid, gid) = self.peer_ucred(host_fd.get());
                     let remaining = (msg.controllen as usize).saturating_sub(scm.len());
                     let (creds, t) = build_linux_scm_creds(pid, uid, gid, remaining);
                     scm.extend_from_slice(&creds);

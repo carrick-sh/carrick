@@ -529,6 +529,7 @@ dependencies = [
 name = "carrick-signal-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "libc",
 ]
 

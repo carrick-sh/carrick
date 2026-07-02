@@ -433,12 +433,12 @@ fn check_path_length(path: &str) -> Result<(), i32> {
 /// (macOS) there is no tee(2), so it stays ENOSYS as before.
 #[cfg(target_os = "linux")]
 fn tee_host_passthrough(
-    in_fd: i32,
-    out_fd: i32,
+    in_fd: HostFd,
+    out_fd: HostFd,
     count: usize,
     flags: u64,
 ) -> Result<DispatchOutcome, DispatchError> {
-    let n = unsafe { libc::tee(in_fd, out_fd, count, flags as libc::c_uint) };
+    let n = unsafe { libc::tee(in_fd.get(), out_fd.get(), count, flags as libc::c_uint) };
     Ok(DispatchOutcome::Returned {
         value: n.host_syscall_errno()? as i64,
     })
@@ -446,8 +446,8 @@ fn tee_host_passthrough(
 
 #[cfg(not(target_os = "linux"))]
 fn tee_host_passthrough(
-    _in_fd: i32,
-    _out_fd: i32,
+    _in_fd: HostFd,
+    _out_fd: HostFd,
     _count: usize,
     _flags: u64,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -1765,7 +1765,9 @@ impl SyscallDispatcher {
             OpenDescription::File { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. }
             | OpenDescription::Directory { offset, .. } => *offset as u64,
-            OpenDescription::HostFile { host_fd, .. } => host_fd_offset(*host_fd).unwrap_or(0),
+            OpenDescription::HostFile { host_fd, .. } => {
+                host_fd_offset(HostFd(*host_fd)).unwrap_or(0)
+            }
             _ => 0,
         };
         drop(desc);
@@ -2593,7 +2595,7 @@ impl SyscallDispatcher {
     fn take_splice_pipe_bytes(
         &self,
         guest_fd: i32,
-        host_fd: i32,
+        host_fd: HostFd,
         count: usize,
     ) -> Result<Vec<u8>, DispatchError> {
         let mut buf = Vec::new();
@@ -2624,7 +2626,7 @@ impl SyscallDispatcher {
         // the lockless wait is a tracked follow-up, not a server hot path.
         let n = unsafe {
             libc::read(
-                host_fd,
+                host_fd.get(),
                 buf[offset..].as_mut_ptr().cast::<libc::c_void>(),
                 count - offset,
             )
@@ -5285,7 +5287,7 @@ impl SyscallDispatcher {
             // through; EWOULDBLOCK maps to Linux EAGAIN via host_syscall_errno.
             // A non-host fd (in-memory backend) keeps the single-tenant no-op.
             if let Some(host_fd) = this.regular_host_file_fd(fd.0) {
-                let rc = unsafe { libc::flock(host_fd, operation as i32) };
+                let rc = unsafe { libc::flock(host_fd.get(), operation as i32) };
                 return Ok(match rc.host_syscall_errno() {
                     Ok(_) => DispatchOutcome::Returned { value: 0 },
                     Err(errno) => DispatchOutcome::errno(errno),
@@ -6642,7 +6644,12 @@ impl SyscallDispatcher {
                 // (4-arg, swapped fds) signature: returns bytes sent, or -1
                 // (errno set), so `host_syscall_errno()` below still works.
                 let rc = unsafe {
-                    carrick_portable::sendfile_to_socket(file_fd, sock_fd, offset as i64, count)
+                    carrick_portable::sendfile_to_socket(
+                        file_fd.get(),
+                        sock_fd.get(),
+                        offset as i64,
+                        count,
+                    )
                 };
                 let sent = rc.max(0) as usize;
                 let advance_and_return = |offset: usize,
@@ -6654,7 +6661,7 @@ impl SyscallDispatcher {
                         // macOS sendfile takes an explicit `offset` and does NOT
                         // advance the file's kernel offset; do it so a follow-up
                         // read/sendfile (no explicit offset) continues correctly.
-                        unsafe { libc::lseek(file_fd, new_off as libc::off_t, libc::SEEK_SET) };
+                        unsafe { libc::lseek(file_fd.get(), new_off as libc::off_t, libc::SEEK_SET) };
                     } else if memory
                         .write_bytes(offset_address, &(new_off as u64).to_ne_bytes())
                         .is_err()
@@ -6675,7 +6682,7 @@ impl SyscallDispatcher {
                             DispatchOutcome::errno(LINUX_EAGAIN)
                         } else {
                             DispatchOutcome::WaitOnFds {
-                                fds: WaitFds::raw_one(sock_fd, libc::POLLOUT),
+                                fds: WaitFds::raw_one(sock_fd.get(), libc::POLLOUT),
                                 timeout: None,
                                 on_timeout: -(LINUX_EAGAIN as i64),
                                 sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -7005,7 +7012,7 @@ impl SyscallDispatcher {
                 // under the dispatcher lock; EAGAIN is surfaced, not awaited here.
                 let n = unsafe {
                     libc::recv(
-                        host_fd,
+                        host_fd.get(),
                         buf.as_mut_ptr() as *mut _,
                         want,
                         libc::MSG_PEEK | libc::MSG_DONTWAIT,
@@ -7035,7 +7042,7 @@ impl SyscallDispatcher {
                     // under the dispatcher lock.
                     let cn = unsafe {
                         libc::recv(
-                            host_fd,
+                            host_fd.get(),
                             buf.as_mut_ptr().add(consumed) as *mut _,
                             written - consumed,
                             libc::MSG_DONTWAIT,
