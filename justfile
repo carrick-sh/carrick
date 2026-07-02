@@ -77,6 +77,21 @@ clippy *ARGS:
     # --workspace --features is rejected on a virtual workspace).
     exec cargo clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
 
+# Typed-domain semgrep gate: blocks the bug SHAPES the newtypes exist to kill
+# (raw wait-set complements, bit=signum masks, host pids in NsPid, hand-numbered
+# private syscall numbers, function-local LINUX_* consts, inline errno
+# negation). Skips with a warning if semgrep is not installed (brew install
+# semgrep) so contributors without it are not blocked locally; CI should have it.
+lint-domains:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v semgrep >/dev/null 2>&1; then
+        echo "warning: semgrep not installed — skipping typed-domain gate (brew install semgrep)" >&2
+        exit 0
+    fi
+    semgrep --config .semgrep/typed-domains.yml crates/ --severity ERROR --error --quiet
+
+
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
 # allowlist. Install once with `cargo install cargo-deny`.
 deny:
@@ -155,6 +170,7 @@ ci:
     j() { just --justfile {{justfile()}} "$@"; }
     j fmt-check
     j clippy
+    j lint-domains
     j deny
     if [ "{{os()}}" = "macos" ]; then
         j check --workspace
