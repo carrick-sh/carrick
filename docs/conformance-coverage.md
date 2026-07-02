@@ -276,6 +276,7 @@ underlying gap got fixed):
 | `mincore` errno edges: invalid residency vector returns `EFAULT`, and a range with mapped first/last pages but an unmapped middle page returns `ENOMEM`; `munmap` stamps syscall-visible no-access state so unmapped pages are not reported resident | ✅ `mincoreedge` | mincore01 |
 | MADV_HUGEPAGE / MADV_NOHUGEPAGE return 0 (advisory; allocators must not treat the hint as an error) | ✅ `hugepage` | madvise/THP-hint conformance |
 | **mmap/munmap errno ordering + behavior: a file mapping on a bad fd → EBADF even when length is also invalid (Linux `fget` precedes `do_mmap`, so EBADF beats EINVAL); munmap of a MAP_SHARED-file mapping (a high-VA alias) succeeds; munmap requires a page-aligned address (else EINVAL) and rejects out-of-address-space ranges with EINVAL** | ✅ `mmapmunmap` | mmap08 (len-0 bad-fd→EBADF), munmap01/02 (unmap a valid MAP_SHARED/MAP_PRIVATE file region), munmap03 (unaligned addr / len 0 / out-of-range → EINVAL) |
+| `mmap` / `mprotect` executable permissions: non-exec pages fault on instruction fetch, `PROT_EXEC` pages fetch successfully, dropping exec faults, adding exec succeeds, and execute-only `mprotect(PROT_EXEC)` remains fetchable | ✅ `mprotectexec` | mprotect04 |
 
 ## time (clocks + nanosleep + accounting)
 

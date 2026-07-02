@@ -107,12 +107,17 @@ fn main() {
             libc::PROT_READ | libc::PROT_WRITE,
             Some(libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC),
         );
+        // Case 5: mmap RW, then mprotect to EXEC-only → jump executes. LTP
+        // mprotect04 copies a function into an anonymous page, protects it with
+        // PROT_EXEC, then calls it.
+        let exec_only = child_exec(libc::PROT_READ | libc::PROT_WRITE, Some(libc::PROT_EXEC));
 
         report!(
             nonexec_mmap_faults = sig_segv(rw),
             exec_mmap_fetch_allowed = fetch_allowed(rwx),
             mprotect_drop_exec_faults = sig_segv(drop_exec),
             mprotect_add_exec_fetch_allowed = fetch_allowed(add_exec),
+            mprotect_exec_only_fetch_allowed = fetch_allowed(exec_only),
         );
     }
 }
