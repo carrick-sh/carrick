@@ -5041,6 +5041,70 @@ async fn create_container_lowers_compose_port_bindings() {
 }
 
 #[tokio::test]
+async fn start_container_rejects_occupied_published_tcp_port() {
+    let (_server, sock, _dir) = spawn_server();
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+
+    let _ = docker.remove_container("m0portbusy", None).await;
+    let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
+        .args(["rm", "-f", "m0portbusy"])
+        .output();
+
+    let occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let host_port = occupied.local_addr().unwrap().port();
+    let mut port_bindings = std::collections::HashMap::new();
+    port_bindings.insert(
+        "8080/tcp".to_string(),
+        Some(vec![bollard::models::PortBinding {
+            host_ip: Some("127.0.0.1".to_string()),
+            host_port: Some(host_port.to_string()),
+        }]),
+    );
+
+    docker
+        .create_container(
+            Some(bollard::container::CreateContainerOptions {
+                name: "m0portbusy".to_string(),
+                ..Default::default()
+            }),
+            bollard::container::Config {
+                image: Some("ubuntu:24.04".to_string()),
+                cmd: Some(vec!["/bin/sleep".to_string(), "30".to_string()]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some("bridge".to_string()),
+                    port_bindings: Some(port_bindings),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let start = docker
+        .start_container(
+            "m0portbusy",
+            None::<bollard::container::StartContainerOptions<String>>,
+        )
+        .await;
+    assert!(
+        start.is_err(),
+        "Docker API start should fail while published TCP port {host_port} is occupied"
+    );
+
+    let _ = docker
+        .remove_container(
+            "m0portbusy",
+            Some(bollard::container::RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
 async fn compose_bridge_graph_exposes_ips_ports_and_restart_cleanup() {
     let (_server, sock, _dir) = spawn_server();
     let docker =
