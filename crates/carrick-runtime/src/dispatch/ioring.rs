@@ -488,7 +488,12 @@ impl SyscallDispatcher {
                 let len = sqe.len as usize;
                 let mut buf = vec![0u8; len];
                 let n = unsafe {
-                    libc::pread(hfd, buf.as_mut_ptr() as *mut _, len, sqe.off as libc::off_t)
+                    libc::pread(
+                        hfd.get(),
+                        buf.as_mut_ptr() as *mut _,
+                        len,
+                        sqe.off as libc::off_t,
+                    )
                 };
                 match n.host_syscall_errno() {
                     Ok(got) => {
@@ -514,7 +519,7 @@ impl SyscallDispatcher {
                 };
                 let n = unsafe {
                     libc::pwrite(
-                        hfd,
+                        hfd.get(),
                         buf.as_ptr() as *const _,
                         buf.len(),
                         sqe.off as libc::off_t,
@@ -536,7 +541,7 @@ impl SyscallDispatcher {
                 let mut buf = vec![0u8; total];
                 let n = unsafe {
                     libc::pread(
-                        hfd,
+                        hfd.get(),
                         buf.as_mut_ptr() as *mut _,
                         total,
                         sqe.off as libc::off_t,
@@ -571,7 +576,7 @@ impl SyscallDispatcher {
                 };
                 let n = unsafe {
                     libc::pwrite(
-                        hfd,
+                        hfd.get(),
                         buf.as_ptr() as *const _,
                         buf.len(),
                         sqe.off as libc::off_t,
@@ -586,7 +591,7 @@ impl SyscallDispatcher {
                 let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
                     return -LINUX_EINVAL;
                 };
-                match unsafe { libc::fsync(hfd) }.host_syscall_errno() {
+                match unsafe { libc::fsync(hfd.get()) }.host_syscall_errno() {
                     Ok(_) => 0,
                     Err(e) => -e,
                 }
@@ -625,8 +630,14 @@ impl SyscallDispatcher {
                 };
                 let len = sqe.len as usize;
                 let mut buf = vec![0u8; len];
-                let n =
-                    unsafe { libc::recv(hfd, buf.as_mut_ptr() as *mut _, len, libc::MSG_DONTWAIT) };
+                let n = unsafe {
+                    libc::recv(
+                        hfd.get(),
+                        buf.as_mut_ptr() as *mut _,
+                        len,
+                        libc::MSG_DONTWAIT,
+                    )
+                };
                 match n.host_syscall_errno() {
                     Ok(got) => {
                         let got = got as usize;
@@ -635,7 +646,7 @@ impl SyscallDispatcher {
                         }
                         AsyncOutcome::Ready(got as i32)
                     }
-                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLIN),
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLIN),
                     Err(e) => AsyncOutcome::Ready(-e),
                 }
             }
@@ -647,11 +658,16 @@ impl SyscallDispatcher {
                     return AsyncOutcome::Ready(-LINUX_EFAULT);
                 };
                 let n = unsafe {
-                    libc::send(hfd, buf.as_ptr() as *const _, buf.len(), libc::MSG_DONTWAIT)
+                    libc::send(
+                        hfd.get(),
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
                 };
                 match n.host_syscall_errno() {
                     Ok(put) => AsyncOutcome::Ready(put as i32),
-                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLOUT),
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLOUT),
                     Err(e) => AsyncOutcome::Ready(-e),
                 }
             }
@@ -665,7 +681,12 @@ impl SyscallDispatcher {
                 let total: usize = iovs.iter().map(|v| v.iov_len as usize).sum();
                 let mut buf = vec![0u8; total];
                 let n = unsafe {
-                    libc::recv(hfd, buf.as_mut_ptr() as *mut _, total, libc::MSG_DONTWAIT)
+                    libc::recv(
+                        hfd.get(),
+                        buf.as_mut_ptr() as *mut _,
+                        total,
+                        libc::MSG_DONTWAIT,
+                    )
                 };
                 match n.host_syscall_errno() {
                     Ok(got) => {
@@ -675,7 +696,7 @@ impl SyscallDispatcher {
                         }
                         AsyncOutcome::Ready(got as i32)
                     }
-                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLIN),
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLIN),
                     Err(e) => AsyncOutcome::Ready(-e),
                 }
             }
@@ -690,11 +711,16 @@ impl SyscallDispatcher {
                     return AsyncOutcome::Ready(-LINUX_EFAULT);
                 };
                 let n = unsafe {
-                    libc::send(hfd, buf.as_ptr() as *const _, buf.len(), libc::MSG_DONTWAIT)
+                    libc::send(
+                        hfd.get(),
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
                 };
                 match n.host_syscall_errno() {
                     Ok(put) => AsyncOutcome::Ready(put as i32),
-                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLOUT),
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd.get(), libc::POLLOUT),
                     Err(e) => AsyncOutcome::Ready(-e),
                 }
             }
@@ -714,7 +740,7 @@ impl SyscallDispatcher {
                     DispatchOutcome::Returned { value } => AsyncOutcome::Ready(value as i32),
                     DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN => {
                         match self.host_socket_fd(sqe.fd) {
-                            Some(h) => AsyncOutcome::Block(h, libc::POLLIN),
+                            Some(h) => AsyncOutcome::Block(h.get(), libc::POLLIN),
                             None => AsyncOutcome::Ready(-LINUX_EINVAL),
                         }
                     }
@@ -748,14 +774,14 @@ impl SyscallDispatcher {
                 };
                 let want = (sqe.op_flags & 0xFFFF) as i16;
                 let mut pfd = libc::pollfd {
-                    fd: hfd,
+                    fd: hfd.get(),
                     events: want,
                     revents: 0,
                 };
                 if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
                     AsyncOutcome::Ready(i32::from(pfd.revents))
                 } else {
-                    AsyncOutcome::Block(hfd, want)
+                    AsyncOutcome::Block(hfd.get(), want)
                 }
             }
             _ => AsyncOutcome::Ready(-LINUX_EINVAL),

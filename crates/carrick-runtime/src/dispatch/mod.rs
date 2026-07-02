@@ -668,7 +668,7 @@ mod time;
 pub use proctitle::{init as proctitle_init, set_host_process_name};
 
 pub use crate::vfs::ProcMapsEntry;
-pub use abi_args::{Fd, GuestLen, GuestPtr, HostPid, NsPid, Pid, Signal};
+pub use abi_args::{Fd, GuestLen, GuestPtr, HostFd, HostPid, NsPid, Pid, Signal};
 use fd_table::*;
 
 #[derive(Debug, Clone)]
@@ -6079,7 +6079,7 @@ mod overlay_dispatch_tests {
                 .host_fd_for_poll(reader)
                 .expect("reader should be host-backed");
             kqueue.with_mux(|mux| {
-                mux.deregister(host_fd)
+                mux.deregister(host_fd.get())
                     .expect("test setup should remove host wake filter");
             });
         }

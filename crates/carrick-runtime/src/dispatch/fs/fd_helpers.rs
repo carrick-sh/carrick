@@ -171,11 +171,11 @@ impl SyscallDispatcher {
 
     /// Host fd of `fd` iff it is a real regular file (HostFile) — the source
     /// macOS `sendfile(2)` can stream.
-    pub(in crate::dispatch) fn regular_host_file_fd(&self, fd: i32) -> Option<i32> {
+    pub(in crate::dispatch) fn regular_host_file_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
-            OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+            OpenDescription::HostFile { host_fd, .. } => Some(HostFd(*host_fd)),
             _ => None,
         }
     }
@@ -183,7 +183,7 @@ impl SyscallDispatcher {
     /// Writable host fd of `fd` iff it is a guest-writable HostFile. The host
     /// fd may be broader than guest access mode for HVF mmap max-protection, so
     /// write-side callers must use this helper rather than `regular_host_file_fd`.
-    pub(in crate::dispatch) fn regular_host_file_write_fd(&self, fd: i32) -> Option<i32> {
+    pub(in crate::dispatch) fn regular_host_file_write_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
@@ -191,18 +191,18 @@ impl SyscallDispatcher {
                 host_fd,
                 writable: true,
                 ..
-            } => Some(*host_fd),
+            } => Some(HostFd(*host_fd)),
             _ => None,
         }
     }
 
     /// Host fd of `fd` iff it is a host socket — the destination macOS
     /// `sendfile(2)` streams to.
-    pub(in crate::dispatch) fn host_socket_fd(&self, fd: i32) -> Option<i32> {
+    pub(in crate::dispatch) fn host_socket_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
-            OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
+            OpenDescription::HostSocket { host_fd, .. } => Some(HostFd(*host_fd)),
             _ => None,
         }
     }
@@ -413,7 +413,7 @@ impl SyscallDispatcher {
 
     /// The raw host fd backing `fd` if it is a [`OpenDescription::HostPipe`]
     /// read end, else `None`. Lets `splice` drain a real host pipe.
-    pub(in crate::dispatch) fn host_pipe_read_fd(&self, fd: i32) -> Option<i32> {
+    pub(in crate::dispatch) fn host_pipe_read_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
@@ -421,7 +421,7 @@ impl SyscallDispatcher {
                 host_fd,
                 is_read_end: true,
                 ..
-            } => Some(*host_fd),
+            } => Some(HostFd(*host_fd)),
             _ => None,
         }
     }
@@ -434,7 +434,7 @@ impl SyscallDispatcher {
         &self,
         fd: i32,
         want_read: bool,
-    ) -> Option<(i32, u64)> {
+    ) -> Option<(HostFd, u64)> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
@@ -443,7 +443,7 @@ impl SyscallDispatcher {
                 is_read_end,
                 pipe_id,
                 ..
-            } if *is_read_end == want_read => Some((*host_fd, *pipe_id)),
+            } if *is_read_end == want_read => Some((HostFd(*host_fd), *pipe_id)),
             _ => None,
         }
     }
