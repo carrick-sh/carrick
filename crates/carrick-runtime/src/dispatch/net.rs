@@ -2075,9 +2075,10 @@ impl SyscallDispatcher {
             }
             let max_events = max_events_signed as usize;
             // The sigmask temporarily blocks signals for the duration of the wait;
-            // capture it as a u64 bitmask (bit signum-1) to carry into WaitOnFds so
-            // a blocked signal doesn't interrupt the wait (LTP epoll_pwait01).
-            let block_signals: u64 = if sigmask_ptr != 0 {
+            // capture it as a typed SigSet (converted at the guest sigset_t read)
+            // to carry into WaitOnFds so a blocked signal doesn't interrupt the
+            // wait (LTP epoll_pwait01).
+            let block_signals: carrick_abi::SigSet = if sigmask_ptr != 0 {
                 if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -2085,18 +2086,18 @@ impl SyscallDispatcher {
                     Ok(bytes) => {
                         let mut le = [0u8; 8];
                         le.copy_from_slice(&bytes[..8]);
-                        u64::from_le_bytes(le)
+                        carrick_abi::SigSet::from_raw(u64::from_le_bytes(le))
                     }
                     Err(_) => return Ok(LINUX_EFAULT.into()),
                 }
             } else {
-                0
+                carrick_abi::SigSet::EMPTY
             };
             // epoll_pwait's sigmask (when present) REPLACES the thread's
             // persistent mask for the wait; epoll_wait (NULL mask) is a plain
             // additive wait.
             let sig_mask = if sigmask_ptr != 0 {
-                carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_signals))
+                carrick_abi::WaitSigMask::Replace(block_signals)
             } else {
                 carrick_abi::WaitSigMask::NONE
             };
@@ -2709,32 +2710,32 @@ impl SyscallDispatcher {
             // for the bitmask. NULL outer arg means "no mask change". This bit
             // mask gates the waiter via `block_signals`: a blocked signal stays
             // pending instead of EINTR-ing the wait (LTP pselect02 case).
-            let block_signals: u64 = if sigmask_addr != 0 {
+            let block_signals: carrick_abi::SigSet = if sigmask_addr != 0 {
                 match memory.read_bytes(sigmask_addr, 16) {
                     Ok(pack) => {
                         let ss_ptr = u64::from_le_bytes(pack[0..8].try_into().unwrap_or([0; 8]));
                         let ss_len = u64::from_le_bytes(pack[8..16].try_into().unwrap_or([0; 8]));
                         if ss_ptr != 0 && ss_len == crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                             match memory.read_bytes(ss_ptr, ss_len as usize) {
-                                Ok(bytes) => u64::from_le_bytes(
+                                Ok(bytes) => carrick_abi::SigSet::from_raw(u64::from_le_bytes(
                                     bytes.try_into().unwrap_or([0; 8]),
-                                ),
+                                )),
                                 Err(_) => return Ok(LINUX_EFAULT.into()),
                             }
                         } else {
-                            0
+                            carrick_abi::SigSet::EMPTY
                         }
                     }
                     Err(_) => return Ok(LINUX_EFAULT.into()),
                 }
             } else {
-                0
+                carrick_abi::SigSet::EMPTY
             };
             // pselect6's sigmask (when the outer argpack pointer is non-NULL)
             // REPLACES the thread's persistent mask for the wait; select /
             // NULL-mask pselect6 is a plain additive wait.
             let sig_mask = if sigmask_addr != 0 {
-                carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_signals))
+                carrick_abi::WaitSigMask::Replace(block_signals)
             } else {
                 carrick_abi::WaitSigMask::NONE
             };
@@ -3111,14 +3112,14 @@ impl SyscallDispatcher {
                 }
             };
 
-            // ppoll(fds, nfds, timeout, sigmask, sigsetsize): capture the sigmask as
-            // a u64 bitmask (bit signum-1) so a blocked signal doesn't interrupt the
-            // wait (it stays pending, delivered after the syscall). Mirrors
-            // epoll_pwait. Read before the pollfd loop (returns an owned Vec, so the
-            // `memory` borrow is released).
-            let block_signals: u64 = if is_poll {
+            // ppoll(fds, nfds, timeout, sigmask, sigsetsize): capture the sigmask
+            // as a typed SigSet (converted at the guest sigset_t read) so a blocked
+            // signal doesn't interrupt the wait (it stays pending, delivered after
+            // the syscall). Mirrors epoll_pwait. Read before the pollfd loop
+            // (returns an owned Vec, so the `memory` borrow is released).
+            let block_signals: carrick_abi::SigSet = if is_poll {
                 // poll(2) has no sigmask argument.
-                0
+                carrick_abi::SigSet::EMPTY
             } else if sigmask_addr != 0 {
                 if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                     return Ok(LINUX_EINVAL.into());
@@ -3130,18 +3131,18 @@ impl SyscallDispatcher {
                     Ok(bytes) => {
                         let mut le = [0u8; 8];
                         le.copy_from_slice(&bytes[..8]);
-                        u64::from_le_bytes(le)
+                        carrick_abi::SigSet::from_raw(u64::from_le_bytes(le))
                     }
                     Err(_) => return Ok(LINUX_EFAULT.into()),
                 }
             } else {
-                0
+                carrick_abi::SigSet::EMPTY
             };
             // ppoll's sigmask (when present) REPLACES the thread's persistent
             // mask for the wait; poll(2) / NULL-mask ppoll is a plain additive
             // wait.
             let sig_mask = if !is_poll && sigmask_addr != 0 {
-                carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(block_signals))
+                carrick_abi::WaitSigMask::Replace(block_signals)
             } else {
                 carrick_abi::WaitSigMask::NONE
             };

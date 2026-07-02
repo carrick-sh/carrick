@@ -304,7 +304,7 @@ impl ThreadWaiter {
         self.wake_pipe_dead.store(true, Ordering::SeqCst);
     }
 
-    fn should_interrupt(&self, block_mask: u64) -> bool {
+    fn should_interrupt(&self, block_mask: carrick_abi::SigBlockMask) -> bool {
         crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
             || crate::fork_quiesce::is_quiescing()
             || crate::fork_quiesce::exec_replacing_other_thread(self.tid)
@@ -350,11 +350,17 @@ impl ThreadWaiter {
     /// ready, `timeout` elapses, or a signal becomes pending. The dispatcher lock
     /// MUST NOT be held by the caller. `fds` may be empty (a pure sleep).
     ///
-    /// `block_mask` is the set of signals (bit `signum-1`) the caller's syscall
-    /// temporarily blocks (an `epoll_pwait`/`ppoll`/`pselect6` sigmask); a signal
-    /// blocked by it does not interrupt the wait (it stays pending for delivery
-    /// after the syscall, per the persistent mask). `0` = no extra blocking.
-    pub fn wait(&self, fds: &[WaitFd], timeout: Option<Duration>, block_mask: u64) -> WaitResult {
+    /// `block_mask` is the set of signals the caller's syscall temporarily
+    /// blocks (an `epoll_pwait`/`ppoll`/`pselect6` sigmask); a signal blocked
+    /// by it does not interrupt the wait (it stays pending for delivery after
+    /// the syscall, per the persistent mask). `SigBlockMask::NONE` = no extra
+    /// blocking.
+    pub fn wait(
+        &self,
+        fds: &[WaitFd],
+        timeout: Option<Duration>,
+        block_mask: carrick_abi::SigBlockMask,
+    ) -> WaitResult {
         let fd0 = fds.first().map_or(-1, WaitFd::fd);
         let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
         let fd1 = fds.get(1).map_or(-1, WaitFd::fd);
@@ -430,7 +436,7 @@ impl ThreadWaiter {
         &self,
         fds: &[WaitFd],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: carrick_abi::SigBlockMask,
         should_interrupt: F,
     ) -> WaitResult
     where
@@ -449,7 +455,7 @@ impl ThreadWaiter {
         &self,
         fds: &[WaitFd],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: carrick_abi::SigBlockMask,
     ) -> WaitResult {
         let fd0 = fds.first().map_or(-1, WaitFd::fd);
         let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
@@ -505,7 +511,7 @@ impl ThreadWaiter {
         &self,
         fds: &[WaitFd],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: carrick_abi::SigBlockMask,
         should_interrupt: F,
     ) -> WaitResult
     where
@@ -524,7 +530,7 @@ impl ThreadWaiter {
     /// interruptible by the self-pipe poke — instead of an uninterruptible
     /// `libc::waitid`. The runtime re-dispatches the waitid on `Ready` to reap.
     #[cfg(target_os = "macos")]
-    pub fn wait_proc_exit(&self, pid: i32, block_mask: u64) -> WaitResult {
+    pub fn wait_proc_exit(&self, pid: i32, block_mask: carrick_abi::SigBlockMask) -> WaitResult {
         if self.should_interrupt(block_mask) {
             return WaitResult::Interrupted;
         }
@@ -553,7 +559,7 @@ impl ThreadWaiter {
     pub fn wait_proc_exit_with_dispatch_pending<F>(
         &self,
         pid: i32,
-        block_mask: u64,
+        block_mask: carrick_abi::SigBlockMask,
         should_interrupt: F,
     ) -> WaitResult
     where
@@ -570,7 +576,12 @@ impl ThreadWaiter {
     /// (without touching the kqueue further) if `kevent` reports the kqueue fd
     /// itself is invalid — the caller then falls back to a direct poll.
     #[cfg(target_os = "macos")]
-    fn wait_proc_exit_kqueue(&self, kq: &Kqueue, pid: i32, block_mask: u64) -> ProcExitWait {
+    fn wait_proc_exit_kqueue(
+        &self,
+        kq: &Kqueue,
+        pid: i32,
+        block_mask: carrick_abi::SigBlockMask,
+    ) -> ProcExitWait {
         let mut changes = vec![Kevent::proc_exit(pid)];
         let cap = (1 + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
@@ -673,7 +684,11 @@ impl ThreadWaiter {
     /// `Ready` when the child is reapable, `Interrupted` on a pending signal or
     /// fork quiesce. Not a busy spin: each idle slice sleeps in `poll()`.
     #[cfg(target_os = "macos")]
-    fn wait_proc_exit_fallback(&self, pid: i32, block_mask: u64) -> WaitResult {
+    fn wait_proc_exit_fallback(
+        &self,
+        pid: i32,
+        block_mask: carrick_abi::SigBlockMask,
+    ) -> WaitResult {
         loop {
             if self.should_interrupt(block_mask) {
                 return WaitResult::Interrupted;
@@ -695,7 +710,7 @@ impl ThreadWaiter {
     /// Non-macOS stub: no kqueue, so report interrupted and let the caller
     /// fall back to a bounded retry.
     #[cfg(not(target_os = "macos"))]
-    pub fn wait_proc_exit(&self, _pid: i32, _block_mask: u64) -> WaitResult {
+    pub fn wait_proc_exit(&self, _pid: i32, _block_mask: carrick_abi::SigBlockMask) -> WaitResult {
         WaitResult::Interrupted
     }
 
@@ -703,7 +718,7 @@ impl ThreadWaiter {
     pub fn wait_proc_exit_with_dispatch_pending<F>(
         &self,
         _pid: i32,
-        _block_mask: u64,
+        _block_mask: carrick_abi::SigBlockMask,
         _should_interrupt: F,
     ) -> WaitResult
     where
@@ -718,7 +733,7 @@ impl ThreadWaiter {
         kq: &Kqueue,
         fds: &[(i32, i16)],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: carrick_abi::SigBlockMask,
     ) -> WaitResult {
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut changes: Vec<Kevent> = Vec::with_capacity(fds.len() * 2);
@@ -853,7 +868,7 @@ impl ThreadWaiter {
         &self,
         fds: &[(i32, i16)],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: carrick_abi::SigBlockMask,
     ) -> WaitResult {
         self.poll_with_signal(fds, timeout, block_mask)
     }
@@ -862,7 +877,7 @@ impl ThreadWaiter {
         &self,
         fds: &[(i32, i16)],
         timeout: Option<Duration>,
-        block_mask: u64,
+        block_mask: carrick_abi::SigBlockMask,
     ) -> WaitResult {
         const SLICE_MS: i32 = 50;
         let deadline = timeout.map(|d| Instant::now() + d);
@@ -1126,7 +1141,11 @@ mod tests {
 
         std::thread::spawn(move || {
             let waiter = super::ThreadWaiter::new(7);
-            let result = waiter.wait_poll(&[super::WaitFd::raw(read_fd, libc::POLLIN)], None, 0);
+            let result = waiter.wait_poll(
+                &[super::WaitFd::raw(read_fd, libc::POLLIN)],
+                None,
+                carrick_abi::SigBlockMask::NONE,
+            );
             let _ = tx.send(result);
             unsafe {
                 libc::close(read_fd);
@@ -1163,7 +1182,7 @@ mod tests {
             let result = waiter.wait_poll(
                 &[super::WaitFd::raw(read_fd, libc::POLLIN)],
                 Some(std::time::Duration::from_secs(60)),
-                0,
+                carrick_abi::SigBlockMask::NONE,
             );
             let _ = tx.send(result);
             unsafe {
@@ -1198,7 +1217,7 @@ mod tests {
         let result = waiter.wait_poll(
             &[super::WaitFd::raw(fds[0], libc::POLLIN)],
             Some(std::time::Duration::from_millis(10)),
-            0,
+            carrick_abi::SigBlockMask::NONE,
         );
 
         assert_eq!(result, super::WaitResult::TimedOut);

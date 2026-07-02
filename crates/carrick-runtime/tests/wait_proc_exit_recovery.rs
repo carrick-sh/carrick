@@ -40,7 +40,7 @@ fn wait_proc_exit_recovers_when_kqueue_fd_closed_mid_wait() {
         waiter.debug_close_kqueue();
         // The old busy-spin would never return here; the fix falls back to a
         // bounded waitid poll and returns Ready once the child exits.
-        let r = waiter.wait_proc_exit(child, 0);
+        let r = waiter.wait_proc_exit(child, carrick_abi::SigBlockMask::NONE);
         let _ = tx.send(r);
     });
 

@@ -1000,7 +1000,10 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
         crate::probes::host_pipe_io(write.host_fd(), 1, n as i64);
         if let Err(errno) = n.host_syscall_errno() {
             if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
-                if crate::host_signal::has_unblocked_pending_for(write.tid, 0) {
+                if crate::host_signal::has_unblocked_pending_for(
+                    write.tid,
+                    carrick_abi::SigBlockMask::NONE,
+                ) {
                     return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
                         value: write.offset as i64,
                     });
@@ -1025,7 +1028,8 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
                 value: write.bytes.len() as i64,
             });
         }
-        if crate::host_signal::has_unblocked_pending_for(write.tid, 0) {
+        if crate::host_signal::has_unblocked_pending_for(write.tid, carrick_abi::SigBlockMask::NONE)
+        {
             return BlockingHostWriteStep::Done(DispatchOutcome::Returned {
                 value: write.offset as i64,
             });
@@ -3815,7 +3819,11 @@ impl SyscallDispatcher {
     }
 
     fn synthetic_proc_context(&self) -> crate::vfs::SyntheticProcContext {
+        // /proc/<pid>/status renders hex words; escape the typed sets at the
+        // render boundary.
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
+        let (sig_ignored, sig_caught, sig_shdpnd) =
+            (sig_ignored.raw(), sig_caught.raw(), sig_shdpnd.raw());
         let proc = self.proc.lock();
         let mem = self.mem_snapshot();
         let creds = self.cred_snapshot();
@@ -5048,7 +5056,10 @@ fn write_host_pipe_payload(
                     };
                 }
                 if block_until_complete && offset > 0 {
-                    if crate::host_signal::has_unblocked_pending_for(tid, 0) {
+                    if crate::host_signal::has_unblocked_pending_for(
+                        tid,
+                        carrick_abi::SigBlockMask::NONE,
+                    ) {
                         return DispatchOutcome::Returned {
                             value: offset as i64,
                         };
@@ -5081,8 +5092,10 @@ fn write_host_pipe_payload(
                 // A signal that arrives mid-write interrupts it on Linux,
                 // returning the partial count; check between chunks so a long
                 // write doesn't ignore an armed alarm (or a pending quiesce).
-                if crate::host_signal::has_unblocked_pending_for(tid, 0)
-                    || crate::fork_quiesce::is_quiescing()
+                if crate::host_signal::has_unblocked_pending_for(
+                    tid,
+                    carrick_abi::SigBlockMask::NONE,
+                ) || crate::fork_quiesce::is_quiescing()
                 {
                     if crate::fork_quiesce::is_quiescing() {
                         return match BlockingHostWrite::from_vec(

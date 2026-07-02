@@ -309,15 +309,42 @@ impl SigSet {
         }
     }
 
+    /// `self` minus `signum` (1..=64; out-of-range is a no-op — it was never
+    /// in the set).
+    #[inline]
+    pub fn without(self, signum: i32) -> SigSet {
+        match signum {
+            1..=64 => SigSet(self.0 & !(1u64 << (signum - 1))),
+            _ => self,
+        }
+    }
+
     #[inline]
     pub const fn intersect(self, other: SigSet) -> SigSet {
         SigSet(self.0 & other.0)
+    }
+
+    /// The signals in `self` that are NOT in `other` (`self & !other`).
+    #[inline]
+    pub const fn difference(self, other: SigSet) -> SigSet {
+        SigSet(self.0 & !other.0)
     }
 
     /// Every signal NOT in `self`.
     #[inline]
     pub const fn complement(self) -> SigSet {
         SigSet(!self.0)
+    }
+
+    /// The lowest-numbered signal in the set (Linux delivers lowest-first), or
+    /// `None` when the set is empty.
+    #[inline]
+    pub const fn lowest_signum(self) -> Option<i32> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(self.0.trailing_zeros() as i32 + 1)
+        }
     }
 }
 
@@ -364,6 +391,17 @@ impl SigBlockMask {
         SigSet(self.0 | wait_set.0)
     }
 
+    /// A park that must not be woken by EXACTLY the signals in `set` — the
+    /// wait's complete effective block mask, already fully composed by the
+    /// caller (a `sigsuspend` temporary thread mask, or a
+    /// [`SigBlockMask::non_eintr_union`] product fed back into a pending
+    /// check). Named so construction sites state that the whole set blocks;
+    /// there is deliberately no bare `from_raw` (see the type docs).
+    #[inline]
+    pub const fn blocking_all_of(set: SigSet) -> SigBlockMask {
+        SigBlockMask(set.0)
+    }
+
     /// The waiter/backend boundary representation (bit `signum-1` blocked).
     #[inline]
     pub const fn raw(self) -> u64 {
@@ -401,6 +439,18 @@ impl WaitSigMask {
     pub const fn raw_block_bits(self) -> u64 {
         match self {
             WaitSigMask::Additive(s) | WaitSigMask::Replace(s) => s.raw(),
+        }
+    }
+
+    /// The typed park block mask for the waiter boundary: in EITHER policy the
+    /// waiter blocks the carried set for the duration of the park (the
+    /// additive-vs-replace distinction only matters to the dispatcher's
+    /// pending-signal predicate, which sees the full [`WaitSigMask`]). Same
+    /// bits as [`raw_block_bits`](Self::raw_block_bits).
+    #[inline]
+    pub const fn block_mask(self) -> SigBlockMask {
+        match self {
+            WaitSigMask::Additive(s) | WaitSigMask::Replace(s) => SigBlockMask(s.0),
         }
     }
 }

@@ -139,8 +139,8 @@ pub fn xsig_has_pending() -> bool {
 }
 
 /// Whether the SHARED ring holds at least one entry targeting THIS process whose
-/// signum is deliverable given `block_mask` (bit `signum-1`). Used by the backend
-/// waiter so a parked thread only wakes for a signal it can actually deliver.
+/// signum is deliverable given `block_mask`. Used by the backend waiter so a
+/// parked thread only wakes for a signal it can actually deliver.
 ///
 /// RING-AUTHORITATIVE: this scans the `MAP_SHARED` ring directly and does NOT
 /// consult the process-local `XSIG_DIRTY` hint. `XSIG_DIRTY` is set only by the
@@ -151,7 +151,7 @@ pub fn xsig_has_pending() -> bool {
 /// waiter (the Linux/KVM `do_sys_poll` wedge). Since the sender reliably writes
 /// the shared ring before nudging, scanning the ring is the authoritative test;
 /// `XSIG_DIRTY` survives only as a fast-path hint for [`xsig_has_pending`].
-pub fn xsig_has_unblocked_for_self(block_mask: u64) -> bool {
+pub fn xsig_has_unblocked_for_self(block_mask: carrick_abi::SigBlockMask) -> bool {
     let Some(ring) = xsig_ring() else {
         return false;
     };
@@ -274,11 +274,13 @@ mod tests {
         // A parked waiter's recheck must STILL see the entry (ring-authoritative),
         // so it wakes despite the lost nudge — this is the anti-wedge invariant.
         assert!(
-            xsig_has_unblocked_for_self(0),
+            xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE),
             "recheck must scan the shared ring, not the losable DIRTY flag"
         );
         // A fully-blocking mask correctly hides it (not deliverable yet).
-        assert!(!xsig_has_unblocked_for_self(u64::MAX));
+        assert!(!xsig_has_unblocked_for_self(
+            carrick_abi::SigBlockMask::blocking_all_of(carrick_abi::SigSet::EMPTY.complement())
+        ));
         reset_ring();
     }
 
