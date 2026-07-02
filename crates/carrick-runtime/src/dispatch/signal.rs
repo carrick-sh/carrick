@@ -1312,7 +1312,7 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Some(routed) = this.route_thread_signal(cx, tid, signum, true) {
+            if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
             }
             // raise()/pthread_kill name the caller as tkill(gettid()). Under a
@@ -1347,7 +1347,7 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Some(routed) = this.route_thread_signal(cx, tid, signum, true) {
+            if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
             }
             // raise()/pthread_kill name the caller as tgkill(getpid(), gettid()).
@@ -1797,7 +1797,7 @@ impl SyscallDispatcher {
         tid: i64,
         signum: u64,
         record_synthetic: bool,
-    ) -> Option<DispatchOutcome> {
+    ) -> Option<(DispatchOutcome, crate::thread::ThreadId)> {
         let t = ctx.thread.as_ref()?;
         let raw_target = crate::thread::ThreadId::from_guest_supplied_tid(tid as i32);
         let target = if t.registry.is_live(raw_target) {
@@ -1819,7 +1819,7 @@ impl SyscallDispatcher {
             if record_synthetic {
                 self.record_tkill_siginfo(t.tid, signum as i32);
             }
-            return Some(self.raise_thread_directed_self(t.tid, signum));
+            return Some((self.raise_thread_directed_self(t.tid, signum), target));
         }
         if t.registry.is_live(target) {
             let signum_i32 = signum as i32;
@@ -1828,15 +1828,18 @@ impl SyscallDispatcher {
             }
             if self.signal_blocked(target, signum_i32) {
                 self.mark_signal_pending(target, signum_i32);
-                return Some(DispatchOutcome::Returned { value: 0 });
+                return Some((DispatchOutcome::Returned { value: 0 }, target));
             }
             if let Some(action) = self.registered_signal_handler(signum_i32) {
                 self.record_pending_signal_action(target, signum_i32, action);
             }
-            return Some(DispatchOutcome::SignalThread {
-                tid: target,
-                signum: signum_i32,
-            });
+            return Some((
+                DispatchOutcome::SignalThread {
+                    tid: target,
+                    signum: signum_i32,
+                },
+                target,
+            ));
         }
         None
     }
@@ -1875,8 +1878,9 @@ impl SyscallDispatcher {
 
         // Sibling-thread route: deliver directly so the SA_SIGINFO frame carries
         // the original si_value (LTP rt_sigqueueinfo01 / rt_tgsigqueueinfo01).
-        if let Some(routed) = self.route_thread_signal(ctx, route_target, signum, false) {
-            let target_tid = crate::thread::ThreadId::from_guest_supplied_tid(route_target as i32);
+        if let Some((routed, target_tid)) =
+            self.route_thread_signal(ctx, route_target, signum, false)
+        {
             if let Some(info) = user_info {
                 self.record_pending_siginfo(target_tid, s, info);
             }
@@ -2589,8 +2593,8 @@ mod tests {
         let routed = d.route_thread_signal(&cx, i64::from(target.raw()), 34, true);
         assert!(matches!(
             routed,
-            Some(crate::dispatch::DispatchOutcome::SignalThread { tid, signum })
-                if tid == target && signum == 34
+            Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved))
+                if tid == target && signum == 34 && resolved == target
         ));
 
         let mut ignored = LinuxSigaction::empty();
@@ -2640,10 +2644,56 @@ mod tests {
         let routed = d.route_thread_signal(&cx, guest_main_tid, 34, true);
         assert!(matches!(
             routed,
-            Some(crate::dispatch::DispatchOutcome::SignalThread { tid, signum })
-                if tid == main && signum == 34
+            Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved))
+                if tid == main && signum == 34 && resolved == main
         ));
         assert!(d.take_pending_signal_action(main, 34).is_some());
+    }
+
+    #[test]
+    fn sigqueueinfo_payload_uses_resolved_guest_main_thread_key() {
+        use zerocopy::IntoBytes;
+
+        let d = SyscallDispatcher::new();
+        let main = crate::thread::ThreadId::synthetic_for_tests(1000);
+        let registry = crate::thread::ThreadRegistry::new(main);
+        let caller = registry.register_child(0);
+        let futex = crate::thread::FutexTable::new();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let reporter = crate::compat::CompatReporter::default();
+        let guest_main_tid = i64::from(std::process::id());
+        let siginfo = LinuxSiginfo::rt_queue(34, 1234, 0, 0x00ca_fe42);
+        memory.write_bytes(0x400, siginfo.as_bytes()).unwrap();
+        let cx = crate::dispatch::SyscallCtx {
+            request: crate::dispatch::SyscallRequest::new(
+                129,
+                crate::dispatch::SyscallArgs::from([guest_main_tid as u64, 34, 0x400, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: Some(crate::dispatch::ThreadCtx {
+                tid: caller,
+                registry: &registry,
+                futex: &futex,
+            }),
+        };
+
+        let routed =
+            d.sigqueueinfo_common(&cx, guest_main_tid, guest_main_tid, 34, GuestPtr(0x400));
+        assert!(matches!(
+            routed,
+            crate::dispatch::DispatchOutcome::SignalThread { tid, signum }
+                if tid == main && signum == 34
+        ));
+        assert!(
+            d.take_pending_siginfo(
+                crate::thread::ThreadId::from_guest_supplied_tid(guest_main_tid as i32),
+                34
+            )
+            .is_none()
+        );
+        let queued = d.take_pending_siginfo(main, 34).unwrap();
+        assert_eq!(queued._pad[0..8], siginfo._pad[0..8]);
     }
 
     #[test]
