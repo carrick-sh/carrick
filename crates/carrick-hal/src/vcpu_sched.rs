@@ -51,6 +51,30 @@ pub trait VcpuScheduler: Send + Sync + 'static {
         let _ = preferred;
         self.acquire(tid)
     }
+    /// BOUNDED reclaim re-acquire: like [`acquire_preferring`](Self::acquire_preferring)
+    /// (or [`acquire`](Self::acquire) when `preferred` is `None`) but gives up
+    /// after `timeout`, returning `None`.
+    ///
+    /// The bound exists so the CALLER (the runtime's reclaim re-bind) can
+    /// interleave the wait with fork-quiesce parking: fork-parked threads KEEP
+    /// their slot leases, so a thread that waits in here UNBOUNDED while the
+    /// pool is exhausted deadlocks the forker's stop-the-world drain against
+    /// its own acquire (observed live under go-build: the 10 s quiesce-drain
+    /// abort with the stranded sibling in `acquire_preferring`). Default: a
+    /// plain (unbounded) acquire — correct for backends whose `acquire` never
+    /// blocks (the Noop scheduler).
+    fn acquire_timeout(
+        &self,
+        tid: u64,
+        preferred: Option<SlotId>,
+        timeout: Duration,
+    ) -> Option<SlotLease> {
+        let _ = timeout;
+        Some(match preferred {
+            Some(p) => self.acquire_preferring(tid, p),
+            None => self.acquire(tid),
+        })
+    }
     /// True if any thread is currently blocked waiting for a slot (contention).
     /// The runtime only reclaims-on-block when this holds — with spare slots a
     /// blocking thread KEEPS its vCPU (no save/release/rebind), the fast path that
@@ -171,6 +195,48 @@ impl VcpuScheduler for HostCondvarScheduler {
             let (g, _) = self
                 .cv
                 .wait_timeout(st, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            self.blocked.fetch_sub(1, Ordering::SeqCst);
+            st = g;
+        }
+    }
+
+    fn acquire_timeout(
+        &self,
+        _tid: u64,
+        preferred: Option<SlotId>,
+        timeout: Duration,
+    ) -> Option<SlotLease> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            // Reuse the thread's OWN just-released slot if it is still free.
+            if let Some(p) = preferred
+                && let Some(pos) = st.free.iter().position(|&s| s == p)
+            {
+                st.free.remove(pos);
+                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
+                st.generations[p as usize] = generation;
+                return Some(SlotLease {
+                    slot: p,
+                    generation,
+                });
+            }
+            if let Some(slot) = st.free.pop() {
+                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
+                st.generations[slot as usize] = generation;
+                return Some(SlotLease { slot, generation });
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            // Count as a waiter (has_waiters drives siblings' reclaim-on-block
+            // decision) exactly like the unbounded acquire paths do.
+            self.blocked.fetch_add(1, Ordering::SeqCst);
+            let (g, _) = self
+                .cv
+                .wait_timeout(st, deadline - now)
                 .unwrap_or_else(|e| e.into_inner());
             self.blocked.fetch_sub(1, Ordering::SeqCst);
             st = g;
@@ -370,6 +436,36 @@ mod tests {
         );
         s.release(b, Yield::Exited);
         s.release(c, Yield::Exited);
+    }
+
+    #[test]
+    fn acquire_timeout_returns_none_on_exhausted_pool_and_prefers_own_slot() {
+        let s = HostCondvarScheduler::new(2);
+        let a = s.acquire(1);
+        let b = s.acquire(2);
+        // Exhausted pool: a bounded acquire gives up instead of blocking
+        // forever (the fork-quiesce-vs-reclaim deadlock guard).
+        let start = std::time::Instant::now();
+        assert!(
+            s.acquire_timeout(3, Some(a.slot), Duration::from_millis(30))
+                .is_none(),
+            "exhausted pool must time out, not block"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(25));
+        // Freed preferred slot is granted immediately.
+        let a_slot = a.slot;
+        s.release(a, Yield::Blocked);
+        let got = s
+            .acquire_timeout(3, Some(a_slot), Duration::from_millis(30))
+            .unwrap();
+        assert_eq!(got.slot, a_slot, "preferred freed slot is reused");
+        // No preference: any free slot works.
+        s.release(b, Yield::Blocked);
+        assert!(
+            s.acquire_timeout(4, None, Duration::from_millis(30))
+                .is_some()
+        );
+        s.release(got, Yield::Exited);
     }
 
     #[test]

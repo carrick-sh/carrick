@@ -2704,6 +2704,130 @@ pub fn program_x86_vcpu_longmode_entry(
     Ok(())
 }
 
+/// Ring-0 MSR/XCR0 install blob for a RECLAIM re-bind onto a FRESH vCPU:
+/// WRMSR LSTAR/STAR/SFMASK, XSETBV(XCR0 = x87|SSE|AVX), then the FP doorbell
+/// `out` and a park `jmp .` — NO `iretq`.
+///
+/// Unlike the boot/sibling [`msr_init_blob`], control returns to the HOST at
+/// the doorbell: the caller (`rebind_to_slot`) then restores the thread's full
+/// saved register file over the parked state, so nothing the blob clobbers
+/// (RAX/RCX/RDX/RFLAGS) survives — which sidesteps the iretq-blob's entry-ABI
+/// constraints (clone's `rax = 0`, the entry-RDX/RCX repair) entirely. No
+/// `ldmxcsr` either: the restore's XRSTOR reloads MXCSR from the saved image
+/// (and a snapshot without FP leaves the `vcpu_reset` default 0x1F80, masked).
+///
+/// Encodings (Intel SDM vol. 2 / AMD64 APM vol. 3), matching
+/// [`msr_init_blob`]'s WRMSR/XSETBV sequences byte for byte:
+/// ```text
+///   mov ecx, msr   B9 id ; mov eax, lo  B8 id ; mov edx, hi  BA id ; wrmsr 0F 30
+///   xor ecx, ecx   31 C9 ; mov eax, 7   B8 07 00 00 00 ; xor edx, edx 31 D2
+///   xsetbv         0F 01 D1
+///   out %al, $0xC6 E6 C6      ; FP_STUB_DOORBELL_PORT — host retakes control
+///   jmp .          EB FE      ; park (never reached: host rewrites RIP)
+/// ```
+pub fn reclaim_msr_blob(lstar: u64, star: u64, sfmask: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(64);
+    let mut wrmsr = |msr: u32, val: u64| {
+        let lo = (val & 0xFFFF_FFFF) as u32;
+        let hi = (val >> 32) as u32;
+        b.push(0xB9); // mov ecx, msr_num
+        b.extend_from_slice(&msr.to_le_bytes());
+        b.push(0xB8); // mov eax, lo
+        b.extend_from_slice(&lo.to_le_bytes());
+        b.push(0xBA); // mov edx, hi
+        b.extend_from_slice(&hi.to_le_bytes());
+        b.push(0x0F); // wrmsr
+        b.push(0x30);
+    };
+    wrmsr(MSR_LSTAR, lstar);
+    wrmsr(MSR_STAR, star);
+    wrmsr(MSR_SF_MASK, sfmask);
+    // XCR0 = x87(0)|SSE(1)|AVX(2) = 0x7 (SSE MUST accompany AVX or XSETBV
+    // #GPs). Same rationale as msr_init_blob: bhyve has no host XCR0 API.
+    //   xor ecx,ecx ; mov eax,7 ; xor edx,edx ; xsetbv
+    b.extend_from_slice(&[0x31, 0xC9]);
+    b.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+    b.extend_from_slice(&[0x31, 0xD2]);
+    b.extend_from_slice(&[0x0F, 0x01, 0xD1]);
+    // out %al, $FP_STUB_DOORBELL_PORT ; jmp .
+    b.extend_from_slice(&[0xE6, FP_STUB_DOORBELL_PORT as u8, 0xEB, 0xFE]);
+    b
+}
+
+/// Bring a FRESH vCPU (just `vm_activate_cpu`d + `vcpu_reset` by
+/// [`BhyveSharedVm::reopen_vcpu`](crate::vmm::BhyveSharedVm::reopen_vcpu)) far
+/// enough into carrick's long mode that a reclaim re-bind can restore a saved
+/// thread onto it: the SAME invariant the first bring-up establishes.
+///
+/// A `vcpu_reset` vCPU is at power-on: real mode, no GDT, no SYSCALL MSRs,
+/// XCR0 = x87-only. `rebind_to_slot`'s restore assumes a long-mode ring-0
+/// vCPU (the snapshot was captured parked at the ring-0 LSTAR-stub syscall
+/// boundary): the XRSTOR stub needs CR4.OSXSAVE + XCR0.AVX (else the YMM_Hi
+/// component is silently dropped), and the guest's next `sysretq` needs STAR
+/// (STAR = 0 loads CS = 0x13 → triple fault). So: program the process-wide
+/// control regs / ring-0 segments / GDTR / fault tables (mirroring
+/// [`program_x86_vcpu_longmode_entry`], minus its clone-entry iretq blob), and
+/// point RIP at a doorbell-terminated [`reclaim_msr_blob`] in this vCPU's
+/// init-blob slot. The caller drives ONE run to the FP doorbell (installing
+/// LSTAR/STAR/SFMASK + XCR0 in-guest), then restores the saved thread state
+/// over the parked blob.
+pub fn program_x86_vcpu_reclaim_entry(
+    vcpu: &mut crate::vmm::BhyveVcpu,
+    vm: &BhyveVm,
+    id: c_int,
+) -> Result<(), OsError> {
+    let regs = X8664GuestArch::bootstrap_sysregs();
+
+    // Per-vCPU blob slot in the post-boot-free init-blob page (identity-mapped,
+    // same carve as program_x86_vcpu_longmode_entry).
+    let slot = id as u64 * 256;
+    if slot + 256 > 4096 {
+        return Err(OsError::new(format!(
+            "bhyve: reclaim re-bind vCPU id {id} exceeds the init-blob page"
+        )));
+    }
+    let blob_gpa = X86_INIT_BLOB_GPA + slot;
+    let ring0_rsp = blob_gpa + 256;
+    write_gpa(
+        vm,
+        blob_gpa,
+        &reclaim_msr_blob(regs.lstar, regs.star, regs.sfmask),
+    )?;
+
+    // Control registers + blob entry (mirror bring_up_x86_elf Step 4 /
+    // program_x86_vcpu_longmode_entry; CR3 = the SHARED PML4).
+    vcpu.set_reg_raw(VM_REG_GUEST_CR0, regs.cr0)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR3, X86_PML4_GPA)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CR4, regs.cr4)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_EFER, regs.efer)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RIP, blob_gpa)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RSP, ring0_rsp)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_RFLAGS, regs.rflags)?;
+
+    // Ring-0 segment descriptors + selectors (the blob runs at CPL 0; the
+    // restore that follows keeps ring 0 — the snapshot was taken there).
+    vcpu.set_desc(VM_REG_GUEST_CS, 0, 0xFFFF_FFFF, ACCESS_RING0_CS64)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_CS, KERN_CS64_SEL)?;
+    vcpu.set_desc(VM_REG_GUEST_SS, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_SS, KERN_SS_SEL)?;
+    for reg in [
+        VM_REG_GUEST_DS,
+        VM_REG_GUEST_ES,
+        VM_REG_GUEST_FS,
+        VM_REG_GUEST_GS,
+    ] {
+        vcpu.set_desc(reg, 0, 0xFFFF_FFFF, ACCESS_RING0_SS)?;
+        vcpu.set_reg_raw(reg, KERN_SS_SEL)?;
+    }
+    vcpu.set_desc(VM_REG_GUEST_GDTR, X86_GDT_GPA, (GDT_LEN * 8 - 1) as u32, 0)?;
+    vcpu.set_desc(VM_REG_GUEST_LDTR, 0, 0, ACCESS_LDT_UNUSABLE)?;
+    vcpu.set_reg_raw(VM_REG_GUEST_LDTR, 0)?;
+    program_fault_tables(vcpu, vm, id)?;
+
+    vcpu.set_capability(VM_CAP_HALT_EXIT, 1)?;
+    Ok(())
+}
+
 /// Derive a child snapshot from a parent's, applying the clone/fork entry ABI.
 ///
 /// Inherits the parent's full integer state, then overrides only the registers
@@ -3086,6 +3210,47 @@ mod tests {
         let n = blob.len();
         assert_eq!(blob[n - 2], 0x48, "penultimate byte = REX.W (iretq)");
         assert_eq!(blob[n - 1], 0xCF, "last byte = CF (iretq)");
+    }
+
+    /// The reclaim (fresh-slot re-bind) blob: three WRMSRs (LSTAR first),
+    /// the XSETBV(XCR0=7) sequence, then the FP doorbell `out` + park `jmp .`
+    /// — and NO iretq (the host retakes control at the doorbell and restores
+    /// the saved thread state over the parked blob).
+    #[test]
+    fn reclaim_msr_blob_structure() {
+        let regs = X8664GuestArch::bootstrap_sysregs();
+        let blob = reclaim_msr_blob(regs.lstar, regs.star, regs.sfmask);
+        // Fits the per-vCPU 256-byte init-blob slot with room to spare.
+        assert!(
+            blob.len() <= 96,
+            "reclaim blob fits the slot (got {})",
+            blob.len()
+        );
+        // First instruction: mov ecx, MSR_LSTAR.
+        assert_eq!(blob[0], 0xB9, "first byte = mov ecx, imm32");
+        assert_eq!(
+            &blob[1..5],
+            &MSR_LSTAR.to_le_bytes(),
+            "first imm32 = MSR_LSTAR"
+        );
+        // Three WRMSRs (0F 30).
+        let wrmsrs = blob.windows(2).filter(|w| *w == [0x0F, 0x30]).count();
+        assert_eq!(wrmsrs, 3, "LSTAR/STAR/SFMASK wrmsr trio");
+        // XSETBV sequence: xor ecx,ecx ; mov eax,7 ; xor edx,edx ; xsetbv.
+        let xsetbv = [
+            0x31, 0xC9, 0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xD2, 0x0F, 0x01, 0xD1,
+        ];
+        assert!(
+            blob.windows(xsetbv.len()).any(|w| w == xsetbv),
+            "XCR0=7 xsetbv sequence present"
+        );
+        // Tail: out %al,$FP_STUB_DOORBELL_PORT ; jmp . — and NOT an iretq.
+        let n = blob.len();
+        assert_eq!(
+            &blob[n - 4..],
+            &[0xE6, FP_STUB_DOORBELL_PORT as u8, 0xEB, 0xFE],
+            "ends with the FP doorbell out + park"
+        );
     }
 
     /// msr_init_blob: iretq frame embeds correct selector values.

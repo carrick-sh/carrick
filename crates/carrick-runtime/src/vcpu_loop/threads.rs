@@ -70,10 +70,32 @@ where
             if let Some((st, old_slot)) = snapshot {
                 // Prefer the thread's OWN just-released slot (reuse its clean vCPU,
                 // no re-bind) over reclaiming another thread's — esp. an exited one.
-                let new = match old_slot {
-                    Some(p) => carrick_hal::vcpu_sched::global()
-                        .acquire_preferring(self.this_tid.raw() as u64, p),
-                    None => carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64),
+                //
+                // BOUNDED acquire + quiesce parking: fork-parked siblings KEEP
+                // their slot leases, so an unbounded wait here while a fork
+                // quiesce drains deadlocks the forker against us — it waits for
+                // OUR kicker entry to park while we wait for THEIR slots
+                // (observed live under go-build: the 10 s quiesce-drain abort
+                // with the stranded sibling in `acquire_preferring`). We hold no
+                // slot while waiting, so on quiesce we drop out of the kicker
+                // (letting the drain complete), park at the fork barrier, and
+                // resume waiting once the fork is done.
+                let mut kicker_dropped = engine.reclaim_refreshes_kicker();
+                let new = loop {
+                    if let Some(l) = carrick_hal::vcpu_sched::global().acquire_timeout(
+                        self.this_tid.raw() as u64,
+                        old_slot,
+                        Duration::from_millis(50),
+                    ) {
+                        break l;
+                    }
+                    if crate::fork_quiesce::is_quiescing() {
+                        if !kicker_dropped {
+                            self.kicker.unregister(self.this_tid);
+                            kicker_dropped = true;
+                        }
+                        fork_barrier().park_if_quiescing();
+                    }
                 };
                 carrick_hal::vcpu_sched::set_current_lease(new);
                 if engine.reclaim_refreshes_kicker() {
@@ -89,6 +111,27 @@ where
                     let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
                     self.kicker.register(self.this_tid, handle);
                 } else {
+                    // If a fork quiesce began while (or right after) we
+                    // acquired, park FIRST — slot-less threads must not
+                    // re-bind mid-freeze: the re-bind drives vm_run (the
+                    // fresh-slot MSR blob / XRSTOR stub) and writes guest RAM,
+                    // which must not overlap the forker's stop-the-world RAM
+                    // snapshot. Unregister before parking so the forker's
+                    // drain (kicker count → 1) can complete.
+                    if crate::fork_quiesce::is_quiescing() {
+                        if !kicker_dropped {
+                            self.kicker.unregister(self.this_tid);
+                            kicker_dropped = true;
+                        }
+                        fork_barrier().park_if_quiescing();
+                    }
+                    // Re-register BEFORE the re-bind so a quiesce that starts
+                    // mid-re-bind waits for us to reach the run-loop-top park
+                    // (the pre-reclaim drain contract); a kick landing during
+                    // the stub drive is handled (Kicked → re-run).
+                    if kicker_dropped {
+                        self.register_vcpu(engine);
+                    }
                     engine
                         .rebind_to_slot(new.slot, &st)
                         .map_err(RuntimeError::Trap)?;
