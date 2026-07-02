@@ -93,7 +93,7 @@ impl SyscallDispatcher {
             return None;
         };
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(*host_fd, st.as_mut_ptr()) } != 0 {
+        if unsafe { libc::fstat(host_fd.raw(), st.as_mut_ptr()) } != 0 {
             return None;
         }
         let st = unsafe { st.assume_init() };
@@ -114,7 +114,7 @@ impl SyscallDispatcher {
             return None;
         };
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(*host_fd, st.as_mut_ptr()) } != 0 {
+        if unsafe { libc::fstat(host_fd.raw(), st.as_mut_ptr()) } != 0 {
             return None;
         }
         let st = unsafe { st.assume_init() };
@@ -122,7 +122,7 @@ impl SyscallDispatcher {
             return None;
         }
         Some(HostFileCopyInfo {
-            host_fd: *host_fd,
+            host_fd: host_fd.raw(),
             size: st.st_size as u64,
             writable: *writable,
         })
@@ -152,7 +152,9 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
             // HostFile: current offset is the kernel's; query via lseek.
             OpenDescription::HostFile { host_fd, .. } => {
-                match (unsafe { libc::lseek(*host_fd, 0, libc::SEEK_CUR) }).host_syscall_errno() {
+                match (unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) })
+                    .host_syscall_errno()
+                {
                     Ok(cur) => Ok(Ok(cur as usize)),
                     Err(errno) => Ok(Err(errno)),
                 }
@@ -194,7 +196,7 @@ impl SyscallDispatcher {
             let mut buf = vec![0u8; want];
             let n = unsafe {
                 libc::pread(
-                    *host_fd,
+                    host_fd.raw(),
                     buf.as_mut_ptr() as *mut _,
                     want,
                     offset as libc::off_t,

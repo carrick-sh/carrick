@@ -320,7 +320,7 @@ impl SyscallDispatcher {
                         OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
                         OpenDescription::HostPipe { host_fd, .. } => {
                             let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                            let fstat_ok = unsafe { libc::fstat(*host_fd, &mut st) } == 0;
+                            let fstat_ok = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0;
                             fstat_ok
                                 && (st.st_mode as u32 & libc::S_IFMT as u32)
                                     == libc::S_IFIFO as u32
@@ -506,7 +506,7 @@ impl SyscallDispatcher {
                         let open = open_file.description.read();
                         match &*open {
                             OpenDescription::HostFile { host_fd, .. } => {
-                                let d = unsafe { libc::dup(*host_fd) };
+                                let d = unsafe { libc::dup(host_fd.raw()) };
                                 if d < 0 { None } else { Some(d) }
                             }
                             _ => None,
@@ -678,7 +678,7 @@ impl SyscallDispatcher {
                         OpenDescription::HostFile { host_fd, .. } => {
                             let n = unsafe {
                                 libc::pread(
-                                    *host_fd,
+                                    host_fd.raw(),
                                     bytes.as_mut_ptr() as *mut _,
                                     length_usize,
                                     offset as libc::off_t,
@@ -697,7 +697,7 @@ impl SyscallDispatcher {
                         // fstat S_IFCHR so a real pipe still fails.
                         OpenDescription::HostPipe { host_fd, .. } => {
                             let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                            let is_chardev = unsafe { libc::fstat(*host_fd, &mut st) } == 0
+                            let is_chardev = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
                                 && (st.st_mode as u32 & libc::S_IFMT as u32)
                                     == libc::S_IFCHR as u32;
                             if !is_chardev {

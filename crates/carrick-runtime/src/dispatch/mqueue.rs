@@ -307,7 +307,7 @@ impl SyscallDispatcher {
             } => {
                 let flags = base.status_flags();
                 Ok(MqFd {
-                    host_fd: *host_fd,
+                    host_fd: host_fd.raw(),
                     path: path.clone(),
                     msg_size: *msg_size,
                     max_msg: *max_msg,
@@ -438,15 +438,14 @@ impl SyscallDispatcher {
             let status_flags = access | (oflag & LINUX_O_NONBLOCK);
             let description = OpenDescription::Mqueue {
                 base: OpenDescriptionBase::new(status_flags),
-                host_fd,
+                host_fd: HostFdRef::new(host_fd),
                 path: path_str,
                 msg_size: msgsize as usize,
                 max_msg: maxmsg as usize,
             };
-            let open_file = OpenFile::with_host_fd(
+            let open_file = OpenFile::new(
                 std::sync::Arc::new(parking_lot::RwLock::new(description)),
                 linux_fd_flags_from_open_flags(oflag),
-                host_fd,
             );
             match this.install_fd_at_or_above(0, open_file) {
                 Ok(fd) => Ok(DispatchOutcome::Returned { value: fd as i64 }),
