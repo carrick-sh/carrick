@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{Aarch64SyscallFrame, MemoryError};
+use carrick_guest_mem::{Aarch64SyscallFrame, GuestVa, HostVa, MemoryError};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick,
     VcpuRegistry,
@@ -345,7 +345,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// the shared host-`SYS_futex` path on the same physical page (inherited across
     /// `fork(2)`). `None` for a private/COW word (those stay in-process via the
     /// parking-lot `FutexTable`).
-    fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+    fn shared_futex_host_addr(&self, _guest_addr: GuestVa) -> Option<HostVa> {
         None
     }
 

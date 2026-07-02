@@ -32,8 +32,8 @@ use std::sync::Arc;
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
 };
-use carrick_guest_mem::MemoryError;
 use carrick_guest_mem::protections::MemoryProtections;
+use carrick_guest_mem::{GuestVa, HostVa, MemoryError};
 use carrick_hal::{GuestEntryRegs, GuestVmBackend, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
 use carrick_mem::memory::AddressSpace;
 
@@ -400,8 +400,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.zero_guest_backing(address, len)
     }
 
-    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
-        self.state.shared_futex_host_addr(guest_addr)
+    fn shared_futex_host_addr(&self, guest_addr: GuestVa) -> Option<HostVa> {
+        self.state
+            .shared_futex_host_addr(guest_addr.raw())
+            .map(HostVa)
     }
 
     fn on_unmap(&mut self, va: u64, len: usize) {

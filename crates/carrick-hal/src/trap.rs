@@ -10,6 +10,7 @@
 //! backends inherit sane behavior.
 
 use carrick_abi::{CanonicalNr, LinuxSiginfo, NativeNr};
+use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_mem::memory::AddressSpace;
 use thiserror::Error;
 
@@ -156,13 +157,14 @@ pub trait SyscallTrap {
     /// the hook (HVF and KVM do).
     fn map_host_alias(
         &mut self,
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         let _ = (payload, file);
+        let (va, ipa) = (va.raw(), ipa.raw());
         // A genuine, immediate abort (SIGABRT) — the codebase's deterministic
         // failure mechanism (see the panic-backstop note in the workspace
         // Cargo.toml). NOT a `panic!`/`unimplemented!` (both are workspace-denied

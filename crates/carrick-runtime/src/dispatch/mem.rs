@@ -555,8 +555,8 @@ impl SyscallDispatcher {
                             host_prot |= libc::PROT_WRITE;
                         }
                         return Ok(DispatchOutcome::MapHostAlias {
-                            va,
-                            ipa,
+                            va: GuestVa(va),
+                            ipa: Gpa(ipa),
                             len: length,
                             payload: Vec::new(),
                             file: Some((dup_fd, offset as libc::off_t, host_prot)),
@@ -752,8 +752,8 @@ impl SyscallDispatcher {
                     // wrongly EFAULT.
                     memory.set_no_access(address, length_usize, prot_none);
                     return Ok(DispatchOutcome::MapHostAlias {
-                        va: address,
-                        ipa,
+                        va: GuestVa(address),
+                        ipa: Gpa(ipa),
                         len: length,
                         payload: bytes,
                         file: None,
@@ -1662,7 +1662,7 @@ mod tests {
         else {
             panic!("expected high-VA alias outcome, got {outcome:?}");
         };
-        assert_eq!(mapped_va, va);
+        assert_eq!(mapped_va, GuestVa(va));
         assert_eq!(len, LINUX_PAGE_SIZE);
         assert!(file.is_none(), "anonymous alias should not carry a file");
         assert!(
@@ -1748,7 +1748,7 @@ mod tests {
         else {
             panic!("expected protected high advisory hint to map an alias, got {outcome:?}");
         };
-        assert_eq!(mapped_va, va);
+        assert_eq!(mapped_va, GuestVa(va));
         assert_eq!(mapped_len, len);
         assert!(payload.is_empty());
         assert!(file.is_none());

@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 
-use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
 use carrick_hal::{
@@ -286,11 +286,12 @@ impl<V: X86Vmm> X86EngineCore<V> {
     /// is correct there. A walk miss falls back to `address` (identity),
     /// preserving prior behaviour for an unmapped VA. Mirrors the aarch64
     /// engine's `syscall_buffer_ipa`.
-    fn syscall_buffer_gpa(&self, address: u64, len: usize) -> u64 {
-        if !carrick_mem::memory::needs_stage1_translation(address, len as u64) {
-            return address;
+    fn syscall_buffer_gpa(&self, address: GuestVa, len: usize) -> Gpa {
+        let raw = address.raw();
+        if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
+            return Gpa(raw);
         }
-        self.vm.translate_va(address).unwrap_or(address)
+        Gpa(self.vm.translate_va(raw).unwrap_or(raw))
     }
 
     fn flush_current_tlb(&mut self) -> Result<(), MemoryError> {
@@ -392,9 +393,10 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     /// lot — a forked child's `FUTEX_WAKE` never reached a parent parked in
     /// `FUTEX_WAIT` on the same `/dev/shm` page (`ltpcheckpoint` reverse direction).
     fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
-        // A futex word is a 4-byte u32.
-        let gpa = self.syscall_buffer_gpa(guest_addr, 4);
-        self.vm.shared_futex_host_addr(gpa, 4)
+        // A futex word is a 4-byte u32. (The `GuestMemory` trait method itself
+        // stays raw — stage-9 scope — but the VA→GPA→host chain below is typed.)
+        let gpa = self.syscall_buffer_gpa(GuestVa(guest_addr), 4);
+        self.vm.shared_futex_host_addr(gpa, 4).map(HostVa::raw)
     }
 
     /// True only on a VMM whose `shared_futex_host_addr` returns a SEPARATE
@@ -446,7 +448,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         // the shared aperture (the identity GPA still backs the STALE shared
         // page). The overlay slot is contiguous, so translating the base and
         // adding the offset addresses the whole buffer.
-        let gpa_base = self.syscall_buffer_gpa(address, length);
+        let gpa_base = self.syscall_buffer_gpa(GuestVa(address), length).raw();
         let mut out = vec![0u8; length];
         let mut off = 0usize;
         while off < length {
@@ -490,7 +492,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         // Resolve the GPA the guest's OWN access hits (see `read_bytes_raw`): for
         // a `repoint_private` overlay VA this lands the syscall write in the
         // PRIVATE overlay backing the guest reads, not the stale shared aperture.
-        let gpa_base = self.syscall_buffer_gpa(address, length);
+        let gpa_base = self.syscall_buffer_gpa(GuestVa(address), length).raw();
         let mut off = 0usize;
         while off < length {
             let addr = gpa_base + off as u64;
@@ -1023,8 +1025,8 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
 
     fn map_host_alias(
         &mut self,
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
@@ -1039,7 +1041,8 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         let read_only = file.is_some_and(|(_, _, prot)| prot & libc::PROT_WRITE == 0);
         self.vm.map_host_alias(va, ipa, len, payload, file)?;
         if let Ok(len_usize) = usize::try_from(len) {
-            self.protections.set_no_write(va, len_usize, read_only);
+            self.protections
+                .set_no_write(va.raw(), len_usize, read_only);
         }
         Ok(())
     }

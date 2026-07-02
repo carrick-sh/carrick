@@ -490,8 +490,8 @@ impl SyscallDispatcher {
             }
 
             Ok(DispatchOutcome::MapHostAlias {
-                va,
-                ipa,
+                va: GuestVa(va),
+                ipa: Gpa(ipa),
                 len: map_len,
                 payload: Vec::new(),
                 file: Some((host_fd, 0, host_prot)),

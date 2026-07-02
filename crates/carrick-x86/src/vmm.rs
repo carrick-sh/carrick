@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use carrick_guest_mem::{MemoryError, X8664SyscallFrame};
+use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, X8664SyscallFrame};
 use carrick_hal::{GuestVmBackend, TrapError, VcpuKick, VcpuRegistry};
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
@@ -242,7 +242,7 @@ pub trait X86Vmm: Sized + GuestVmBackend {
     /// per-process parking lot and a forked child's `FUTEX_WAKE` never reached a
     /// parent parked in `FUTEX_WAIT` on the same `/dev/shm` page (`ltpcheckpoint`'s
     /// reverse direction, gating ~10 LTP signal tests via `tst_checkpoint`).
-    fn shared_futex_host_addr(&self, _gpa: u64, _len: usize) -> Option<usize> {
+    fn shared_futex_host_addr(&self, _gpa: Gpa, _len: usize) -> Option<HostVa> {
         None
     }
 
@@ -308,15 +308,16 @@ pub trait X86Vmm: Sized + GuestVmBackend {
     /// Backends that can receive `DispatchOutcome::MapHostAlias` override this.
     fn map_host_alias(
         &mut self,
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         let _ = (ipa, payload, file);
         Err(TrapError::Hypervisor(format!(
-            "carrick-x86: map_host_alias not implemented for this backend (va=0x{va:x} len=0x{len:x})"
+            "carrick-x86: map_host_alias not implemented for this backend (va=0x{:x} len=0x{len:x})",
+            va.raw()
         )))
     }
 

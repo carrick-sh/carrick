@@ -12,7 +12,7 @@
 //! dependency (which keeps this crate cycle-free and Linux-compilable).
 use std::path::Path;
 
-use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory};
+use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, GuestMemory};
 use carrick_hal::{ForkOutcome, SyscallTrap};
 use carrick_mem::memory::AddressSpace;
 
@@ -191,7 +191,7 @@ fn read_guest_cstr(engine: &KvmTrapEngine, gpa: u64) -> Result<String, String> {
     let mut addr = gpa;
     loop {
         let chunk = engine
-            .read_guest(addr, CHUNK)
+            .read_guest(Gpa(addr), CHUNK)
             .map_err(|e| format!("execve path read: {e}"))?;
         if let Some(nul) = chunk.iter().position(|&b| b == 0) {
             bytes.extend_from_slice(&chunk[..nul]);
@@ -288,7 +288,7 @@ fn sys_wait4(engine: &mut KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<
 /// `write(fd, buf, count)` — copy the guest buffer to a host fd.
 fn sys_write(engine: &KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<i64, String> {
     let buf = engine
-        .read_guest(frame.x1, frame.x2 as usize)
+        .read_guest(Gpa(frame.x1), frame.x2 as usize)
         .map_err(|e| format!("write: {e}"))?;
     Ok(host_write(frame.x0 as i32, &buf))
 }
@@ -303,7 +303,7 @@ fn sys_writev(engine: &KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<i64
     let mut total: i64 = 0;
     for i in 0..iovcnt {
         let ent = engine
-            .read_guest(iov_base + (i as u64) * IOVEC_SIZE, IOVEC_SIZE as usize)
+            .read_guest(Gpa(iov_base + (i as u64) * IOVEC_SIZE), IOVEC_SIZE as usize)
             .map_err(|e| format!("writev iov[{i}]: {e}"))?;
         let to_u64 = |b: &[u8]| -> Result<u64, String> {
             b.try_into()
@@ -316,7 +316,7 @@ fn sys_writev(engine: &KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<i64
             continue;
         }
         let buf = engine
-            .read_guest(base, len)
+            .read_guest(Gpa(base), len)
             .map_err(|e| format!("writev buf[{i}]: {e}"))?;
         let n = host_write(fd, &buf);
         if n < 0 {

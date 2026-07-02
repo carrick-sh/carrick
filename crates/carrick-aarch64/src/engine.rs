@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::{
     ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SlotId, SysReg, SyscallTrap,
@@ -227,8 +227,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// Read `len` bytes of live guest memory at guest-physical `gpa` (e.g. a
     /// `write(2)` buffer the guest passed). Backed by the same host RAM the vCPU
     /// sees, so guest writes are visible. (The standalone run-elf loop uses this.)
-    pub fn read_guest(&self, gpa: u64, len: usize) -> Result<Vec<u8>, TrapError> {
-        self.vm.read_gpa(gpa, len)
+    pub fn read_guest(&self, gpa: Gpa, len: usize) -> Result<Vec<u8>, TrapError> {
+        self.vm.read_gpa(gpa.raw(), len)
     }
 
     // ── test / bring-up setters (used by the backend crates' unit tests) ──
@@ -470,12 +470,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// identity is correct and re-basing on the IPA would miss the window. A walk
     /// miss falls back to `va` (identity), preserving prior behaviour for an
     /// unmapped VA.
-    fn syscall_buffer_ipa(&self, va: u64, len: usize) -> u64 {
-        if !carrick_mem::memory::needs_stage1_translation(va, len as u64) {
-            return va;
+    fn syscall_buffer_ipa(&self, va: GuestVa, len: usize) -> Gpa {
+        let raw = va.raw();
+        if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
+            return Gpa(raw);
         }
         let guard = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().and_then(|m| m.translate(va)).unwrap_or(va)
+        Gpa(guard.as_ref().and_then(|m| m.translate(raw)).unwrap_or(raw))
     }
 }
 
@@ -537,7 +538,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // / high-VA alias resolves to the page the guest's OWN EL0 accesses hit —
         // NOT the stale shared-aperture backing the VA still covers. Identity VAs:
         // ipa==address (skips the walk). The copy stays glue (in the backend).
-        let ipa = self.syscall_buffer_ipa(address, length);
+        let ipa = self.syscall_buffer_ipa(GuestVa(address), length).raw();
         self.vm.translated_read(address, ipa, length)
     }
 
@@ -545,7 +546,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // No-alloc fixed-size read (`read_u32`/`read_u64`/struct headers). The
         // backend may `volatile`-copy straight into `dst` (HVF); the default copies
         // through a `Vec`. PROT_NONE was already gated in `read_into`.
-        let ipa = self.syscall_buffer_ipa(address, dst.len());
+        let ipa = self.syscall_buffer_ipa(GuestVa(address), dst.len()).raw();
         self.vm.translated_read_into(address, ipa, dst)
     }
 
@@ -556,7 +557,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // backing the guest reads, not the shared aperture. The backend's
         // `translated_write` ALSO enforces the guest-visible WRITE permission (HVF
         // returns EFAULT on a read-only mapping — audit M1); KVM models none.
-        let ipa = self.syscall_buffer_ipa(address, bytes.len());
+        let ipa = self.syscall_buffer_ipa(GuestVa(address), bytes.len()).raw();
         self.vm.translated_write(address, ipa, bytes)
     }
 
@@ -566,7 +567,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // permission (the host page is writable). PROT_NONE is NOT re-gated (the
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
-        let ipa = self.syscall_buffer_ipa(address, bytes.len());
+        let ipa = self.syscall_buffer_ipa(GuestVa(address), bytes.len()).raw();
         self.vm.translated_write_unchecked(address, ipa, bytes)
     }
 
@@ -603,7 +604,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// host-`SYS_futex` path on the same physical page. `None` for a private/COW
     /// word (those stay in-process via the parking-lot `FutexTable`).
     fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
-        self.vm.shared_futex_host_addr(guest_addr)
+        // The `GuestMemory` trait method itself stays raw (stage-9 scope); the
+        // backend seam below is typed GuestVa → HostVa.
+        self.vm
+            .shared_futex_host_addr(GuestVa(guest_addr))
+            .map(HostVa::raw)
     }
 
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the
@@ -997,8 +1002,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
 
     fn map_host_alias(
         &mut self,
-        va: u64,
-        ipa: u64,
+        va: GuestVa,
+        ipa: Gpa,
         len: u64,
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
@@ -1013,8 +1018,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // and derives the gpa from the VA inside its <1 TiB arena. No TLBI: the alias
         // VA is brand-new (no stale TLB entry), so the guest's first access walks the
         // just-written tables — the same fresh-page argument as `protect_range`.
-        let (gpa, writable) = self.vm.add_alias(va, ipa, len, payload, file)?;
-        self.pt_edit(|mgr| mgr.map_aliased(va, gpa, len, writable))
+        let (gpa, writable) = self.vm.add_alias(va.raw(), ipa.raw(), len, payload, file)?;
+        self.pt_edit(|mgr| mgr.map_aliased(va.raw(), gpa, len, writable))
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 

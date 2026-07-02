@@ -15,6 +15,8 @@
 //! can allocate missing 4 KiB page-table pages from the same sequential table
 //! arena and install VA→GPA leaves.
 
+use carrick_guest_mem::{Gpa, GuestVa};
+
 // ─── Granule (the spec §4.4 symmetry: identical to aarch64 stage-1) ─────────
 
 /// log2 of the page size (4 KiB pages).
@@ -585,12 +587,13 @@ impl Pml4Manager {
     /// controls only the R/W bit.
     pub fn map_aliased(
         &mut self,
-        va: u64,
-        gpa: u64,
+        va: GuestVa,
+        gpa: Gpa,
         len: u64,
         writable: bool,
         exec: bool,
     ) -> Result<(), Pml4Error> {
+        let (va, gpa) = (va.raw(), gpa.raw());
         if va & PAGE_MASK != 0 || gpa & PAGE_MASK != 0 {
             return Err(Pml4Error::Misaligned);
         }
@@ -697,10 +700,10 @@ mod tests {
         pml4_tables(maps, BASE, CAP).expect("table build")
     }
 
-    fn user_rw_nx(va: u64, gpa: u64, len: u64) -> Pml4MapSpec {
+    fn user_rw_nx(va: GuestVa, gpa: Gpa, len: u64) -> Pml4MapSpec {
         Pml4MapSpec {
-            va,
-            gpa,
+            va: va.raw(),
+            gpa: gpa.raw(),
             len,
             user: true,
             write: true,
@@ -732,7 +735,7 @@ mod tests {
         // map 0x40_0000 → 0x40_0000 user-RW-NX: translate returns the GPA;
         // walk_descriptors shows P|U/S at every level and NX on the leaf.
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x1000)]);
         let mgr = Pml4Manager::new(bytes.clone(), BASE);
         assert_eq!(mgr.translate(va), Some(va));
         assert_eq!(mgr.translate(va + 0xabc), Some(va + 0xabc));
@@ -794,7 +797,7 @@ mod tests {
                 write: true,
                 exec: false,
             },
-            user_rw_nx(usr_va, usr_va, 0x1000),
+            user_rw_nx(GuestVa(usr_va), Gpa(usr_va), 0x1000),
         ]);
         let usr_walk = walk_descriptors(&bytes, BASE, usr_va);
         for (level, desc) in usr_walk.iter().enumerate() {
@@ -809,7 +812,7 @@ mod tests {
         // The PML4 decouples VA from GPA (the high-GPA fallback lever).
         let va = 0x40_0000;
         let gpa = 0x9_0000_0000; // 36 GiB — nowhere near the VA
-        let bytes = build(&[user_rw_nx(va, gpa, 0x2000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(gpa), 0x2000)]);
         let mgr = Pml4Manager::new(bytes, BASE);
         assert_eq!(mgr.translate(va), Some(gpa));
         assert_eq!(mgr.translate(va + 0x1234), Some(gpa + 0x1234));
@@ -820,7 +823,7 @@ mod tests {
     #[test]
     fn aligned_bulk_map_uses_2m_leaf() {
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, LARGE_2M)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), LARGE_2M)]);
         let mgr = Pml4Manager::new(bytes.clone(), BASE);
 
         assert_eq!(mgr.translate(va), Some(va));
@@ -838,7 +841,7 @@ mod tests {
     #[test]
     fn editing_large_leaf_splits_to_4k_and_restores() {
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, LARGE_2M)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), LARGE_2M)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
 
         assert_eq!(mgr.set_prot_none(va + 0x1000, 0x1000), Ok(true));
@@ -868,7 +871,7 @@ mod tests {
     fn full_mmap_arena_sized_region_fits_with_large_leaves() {
         let va = 0x60_0000_0000;
         let len = 32 * 1024 * 1024 * 1024u64;
-        let bytes = pml4_tables(&[user_rw_nx(va, va, len)], BASE, 64 * PT_PAGE)
+        let bytes = pml4_tables(&[user_rw_nx(GuestVa(va), Gpa(va), len)], BASE, 64 * PT_PAGE)
             .expect("large leaves keep the table footprint bounded");
         let mgr = Pml4Manager::new(bytes, BASE);
 
@@ -881,12 +884,12 @@ mod tests {
     #[test]
     fn map_aliased_allocates_missing_high_va_tables() {
         let low_va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(low_va, low_va, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(low_va), Gpa(low_va), 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         let high_va = 0x0100_0000_0000 + 0x20_0000;
         let alias_gpa = 0xA0_0000_0000;
 
-        mgr.map_aliased(high_va, alias_gpa, 0x2000, true, true)
+        mgr.map_aliased(GuestVa(high_va), Gpa(alias_gpa), 0x2000, true, true)
             .expect("map high alias");
 
         assert_eq!(mgr.translate(high_va), Some(alias_gpa));
@@ -915,11 +918,11 @@ mod tests {
         let x_va = nx_va + 0x1000;
         let x_gpa = nx_gpa + 0x1000;
 
-        let bytes = build(&[user_rw_nx(low_va, low_va, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(low_va), Gpa(low_va), 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
 
         // Non-exec demand leaf -> NX set.
-        mgr.map_aliased(nx_va, nx_gpa, 0x1000, true, false)
+        mgr.map_aliased(GuestVa(nx_va), Gpa(nx_gpa), 0x1000, true, false)
             .expect("map non-exec demand leaf");
         let walk = walk_descriptors(mgr.bytes(), BASE, nx_va);
         assert_ne!(walk[3] & PML4_NX, 0, "exec=false leaf is NX (W^X)");
@@ -930,7 +933,7 @@ mod tests {
         }
 
         // Exec demand leaf -> NX clear.
-        mgr.map_aliased(x_va, x_gpa, 0x1000, true, true)
+        mgr.map_aliased(GuestVa(x_va), Gpa(x_gpa), 0x1000, true, true)
             .expect("map exec demand leaf");
         let walk = walk_descriptors(mgr.bytes(), BASE, x_va);
         assert_eq!(walk[3] & PML4_NX, 0, "exec=true leaf is executable");
@@ -947,13 +950,13 @@ mod tests {
         // returned BadAddress (the x86 mapfixed/mapfixedfork SEGV/leak).
         let va = 0x90_0000_0000u64; // 2 MiB-aligned, mapped as a 2 MiB PS block
         let overlay_gpa = 0x98_0000_0000u64; // distinct overlay GPA
-        let bytes = build(&[user_rw_nx(va, va, LARGE_2M)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), LARGE_2M)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         // Precondition: the covering PD entry is a 2 MiB PS leaf.
         let pre = walk_descriptors(mgr.bytes(), BASE, va);
         assert_ne!(pre[2] & PML4_PS, 0, "region starts as a 2 MiB PS block");
 
-        mgr.map_aliased(va, overlay_gpa, 0x1000, true, true)
+        mgr.map_aliased(GuestVa(va), Gpa(overlay_gpa), 0x1000, true, true)
             .expect("repoint one page inside the 2 MiB block");
 
         // The repointed page now resolves to the overlay GPA; its neighbour in the
@@ -988,7 +991,7 @@ mod tests {
         let two_gib = 2 * 1024 * 1024 * 1024u64;
         let len = two_gib + 0x4000; // 2 GiB + a 16 KiB sub-2-MiB tail
 
-        mgr.map_aliased(va, gpa, len, true, true)
+        mgr.map_aliased(GuestVa(va), Gpa(gpa), len, true, true)
             .expect("2 GiB+tail 2 MiB-aligned alias must fit via PD block leaves");
 
         assert_eq!(mgr.translate(va), Some(gpa));
@@ -1015,7 +1018,7 @@ mod tests {
     #[test]
     fn set_prot_none_clears_p_and_set_rw_restores() {
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, 0x3000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x3000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         assert_eq!(mgr.set_prot_none(va, 0x1000), Ok(true));
         assert_eq!(mgr.translate(va), None, "P cleared: no translation");
@@ -1039,7 +1042,7 @@ mod tests {
     fn whole_large_leaf_edits_preserve_2m_entries() {
         let va = 0x60_0000_0000;
         let len = 512 * 1024 * 1024;
-        let bytes = pml4_tables(&[user_rw_nx(va, va, len)], BASE, 4 * PT_PAGE)
+        let bytes = pml4_tables(&[user_rw_nx(GuestVa(va), Gpa(va), len)], BASE, 4 * PT_PAGE)
             .expect("large leaves keep this mapping compact");
         let mut mgr = Pml4Manager::new(bytes, BASE);
         let before = walk_descriptors(mgr.bytes(), BASE, va);
@@ -1069,7 +1072,7 @@ mod tests {
     #[test]
     fn set_rw_exec_toggles_nx() {
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, 0x1000)]); // built NX
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x1000)]); // built NX
         let mut mgr = Pml4Manager::new(bytes, BASE);
         assert_eq!(mgr.set_rw(va, 0x1000, true), Ok(true), "exec=true edits");
         let walk = walk_descriptors(mgr.bytes(), BASE, va);
@@ -1082,7 +1085,7 @@ mod tests {
     #[test]
     fn set_readonly_clears_rw_and_preserves_present_mapping() {
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
 
         assert_eq!(mgr.set_readonly(va, 0x1000, false), Ok(true));
@@ -1102,7 +1105,7 @@ mod tests {
     fn set_rw_on_never_mapped_leaf_errors() {
         // No GPA was ever recorded for this page: nothing to restore.
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         assert_eq!(
             mgr.set_rw(va + 0x1000, 0x1000, false),
@@ -1113,7 +1116,7 @@ mod tests {
     #[test]
     fn set_ops_on_unmapped_subtree_error() {
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         // A VA whose PDPT/PD path was never built.
         assert_eq!(
@@ -1127,15 +1130,19 @@ mod tests {
         // carrick's layout is low-half canonical: VAs must sit below 1 << 47.
         let high = 1u64 << 47;
         assert_eq!(
-            pml4_tables(&[user_rw_nx(high, 0x1000, 0x1000)], BASE, CAP),
+            pml4_tables(&[user_rw_nx(GuestVa(high), Gpa(0x1000), 0x1000)], BASE, CAP),
             Err(Pml4Error::NonCanonical)
         );
         // A range that CROSSES the boundary is rejected too.
         assert_eq!(
-            pml4_tables(&[user_rw_nx(high - 0x1000, 0x1000, 0x2000)], BASE, CAP),
+            pml4_tables(
+                &[user_rw_nx(GuestVa(high - 0x1000), Gpa(0x1000), 0x2000)],
+                BASE,
+                CAP
+            ),
             Err(Pml4Error::NonCanonical)
         );
-        let bytes = build(&[user_rw_nx(0x40_0000, 0x40_0000, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(0x40_0000), Gpa(0x40_0000), 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         assert_eq!(mgr.translate(high), None);
         assert_eq!(
@@ -1151,17 +1158,29 @@ mod tests {
     #[test]
     fn misaligned_spec_rejected() {
         assert_eq!(
-            pml4_tables(&[user_rw_nx(0x40_0800, 0x40_0000, 0x1000)], BASE, CAP),
+            pml4_tables(
+                &[user_rw_nx(GuestVa(0x40_0800), Gpa(0x40_0000), 0x1000)],
+                BASE,
+                CAP
+            ),
             Err(Pml4Error::Misaligned),
             "unaligned VA"
         );
         assert_eq!(
-            pml4_tables(&[user_rw_nx(0x40_0000, 0x40_0800, 0x1000)], BASE, CAP),
+            pml4_tables(
+                &[user_rw_nx(GuestVa(0x40_0000), Gpa(0x40_0800), 0x1000)],
+                BASE,
+                CAP
+            ),
             Err(Pml4Error::Misaligned),
             "unaligned GPA"
         );
         assert_eq!(
-            pml4_tables(&[user_rw_nx(0x40_0000, 0x40_0000, 0x800)], BASE, CAP),
+            pml4_tables(
+                &[user_rw_nx(GuestVa(0x40_0000), Gpa(0x40_0000), 0x800)],
+                BASE,
+                CAP
+            ),
             Err(Pml4Error::Misaligned),
             "unaligned length"
         );
@@ -1172,7 +1191,7 @@ mod tests {
         // Root + PDPT + PD + PT = 4 pages minimum; 2 pages can't hold a map.
         assert_eq!(
             pml4_tables(
-                &[user_rw_nx(0x40_0000, 0x40_0000, 0x1000)],
+                &[user_rw_nx(GuestVa(0x40_0000), Gpa(0x40_0000), 0x1000)],
                 BASE,
                 2 * 0x1000
             ),
@@ -1183,7 +1202,7 @@ mod tests {
     #[test]
     fn into_bytes_preserves_edits() {
         let va = 0x40_0000;
-        let bytes = build(&[user_rw_nx(va, va, 0x1000)]);
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x1000)]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         mgr.set_prot_none(va, 0x1000).expect("edit");
         let bytes = mgr.into_bytes();
