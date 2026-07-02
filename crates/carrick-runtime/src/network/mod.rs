@@ -1,3 +1,4 @@
+use carrick_abi::LinuxErrno;
 use carrick_spec::{
     NetworkMode, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping, PortProtocol,
 };
@@ -60,7 +61,7 @@ pub enum BindTarget {
 pub enum ConnectTarget {
     Host(HostSocketAddr),
     Unchanged,
-    Denied(i32),
+    Denied(LinuxErrno),
 }
 
 pub trait NetworkProvider: Send + Sync {
@@ -111,7 +112,7 @@ pub trait NetworkProvider: Send + Sync {
         _host_local: Option<HostSocketAddr>,
         _protocol: PortProtocol,
         _reuse_port: bool,
-    ) -> Result<(), i32> {
+    ) -> Result<(), LinuxErrno> {
         Ok(())
     }
     fn guest_hosts_entries(

@@ -6,13 +6,13 @@ use carrick_spec::{
     BridgeId, NetworkAttachmentSpec, NetworkNamespaceId, NetworkNamespaceSpec, PortMapping,
     PortProtocol,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -22,8 +22,11 @@ pub struct SocketNamespaceProvider {
     registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
     tcp_listeners: Mutex<HashMap<VirtualEndpoint, ListenerReservation>>,
     endpoint_dir: Arc<PathBuf>,
-    owned_endpoint_files: Mutex<Vec<OwnedEndpointFile>>,
+    next_lease_id: AtomicU64,
+    owned_endpoint_files: Mutex<HashMap<NetworkLeaseId, Vec<OwnedEndpointFile>>>,
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
+    namespace_leases: Mutex<HashMap<NetworkNamespaceId, NetworkLeaseId>>,
+    lease_specs: Mutex<HashMap<NetworkLeaseId, NetworkNamespaceSpec>>,
     socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
     published_tcp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedTcpProxy>>>,
     published_udp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedUdpProxy>>>,
@@ -44,6 +47,7 @@ enum EndpointScope {
 
 #[derive(Debug, Clone, Default)]
 struct SocketAddressState {
+    lease_id: Option<NetworkLeaseId>,
     guest_local: Option<GuestSocketAddr>,
     _host_local: Option<HostSocketAddr>,
     guest_peer: Option<GuestSocketAddr>,
@@ -111,8 +115,11 @@ impl SocketNamespaceProvider {
             registry: Arc::new(Mutex::new(HashMap::new())),
             tcp_listeners: Mutex::new(HashMap::new()),
             endpoint_dir: Arc::new(endpoint_dir),
-            owned_endpoint_files: Mutex::new(Vec::new()),
+            next_lease_id: AtomicU64::new(1),
+            owned_endpoint_files: Mutex::new(HashMap::new()),
             namespaces: Mutex::new(HashMap::new()),
+            namespace_leases: Mutex::new(HashMap::new()),
+            lease_specs: Mutex::new(HashMap::new()),
             socket_addrs: Mutex::new(HashMap::new()),
             published_tcp: Mutex::new(HashMap::new()),
             published_udp: Mutex::new(HashMap::new()),
@@ -128,7 +135,7 @@ impl SocketNamespaceProvider {
         host_addr: HostSocketAddr,
     ) -> Result<(), String> {
         let key = VirtualEndpoint {
-            scope: endpoint_scope(bridge_id, namespace_id, virtual_addr),
+            scope: endpoint_scope(bridge_id, namespace_id.clone(), virtual_addr),
             addr: virtual_addr,
             protocol,
         };
@@ -138,11 +145,19 @@ impl SocketNamespaceProvider {
             .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
         registry.insert(key.clone(), host_addr);
         drop(registry);
-        self.write_endpoint_file(&key, host_addr)?;
+        if let Some(lease_id) = self.lease_for_namespace(&namespace_id)? {
+            self.write_endpoint_file_for_lease(lease_id, &key, host_addr)?;
+        } else {
+            self.write_endpoint_file(&key, host_addr)?;
+        }
         Ok(())
     }
 
-    fn register_service_names(&self, spec: &NetworkNamespaceSpec) -> Result<(), String> {
+    fn register_service_names(
+        &self,
+        lease_id: NetworkLeaseId,
+        spec: &NetworkNamespaceSpec,
+    ) -> Result<(), String> {
         for attachment in effective_attachments(spec) {
             let names = service_names_for(attachment.container_name.as_ref(), &attachment.aliases);
             for name in names {
@@ -158,7 +173,7 @@ impl SocketNamespaceProvider {
                 })?;
                 fs::write(&path, &contents)
                     .map_err(|e| format!("failed to record socket namespace service name: {e}"))?;
-                self.track_owned_file(path, contents)?;
+                self.track_owned_file(lease_id, path, contents)?;
             }
         }
         Ok(())
@@ -398,6 +413,10 @@ impl SocketNamespaceProvider {
         guest_peer: Option<GuestSocketAddr>,
         protocol: PortProtocol,
     ) -> Result<(), String> {
+        let lease_id = namespace_id
+            .map(|namespace_id| self.lease_for_namespace(namespace_id))
+            .transpose()?
+            .flatten();
         let mut socket_addrs = self
             .socket_addrs
             .lock()
@@ -405,6 +424,7 @@ impl SocketNamespaceProvider {
         socket_addrs.insert(
             guest_fd,
             SocketAddressState {
+                lease_id,
                 guest_local,
                 _host_local: host_local,
                 guest_peer,
@@ -567,20 +587,24 @@ impl SocketNamespaceProvider {
         })
     }
 
-    fn first_namespace_spec(&self) -> Result<NetworkNamespaceSpec, String> {
-        let namespaces = self
-            .namespaces
+    fn namespace_spec_for_lease(
+        &self,
+        lease_id: NetworkLeaseId,
+    ) -> Result<NetworkNamespaceSpec, String> {
+        let lease_specs = self
+            .lease_specs
             .lock()
             .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
-        namespaces
-            .values()
-            .next()
-            .cloned()
-            .ok_or_else(|| "no network namespace exists for published port".to_string())
+        lease_specs.get(&lease_id).cloned().ok_or_else(|| {
+            format!(
+                "no network namespace exists for published lease {}",
+                lease_id.0
+            )
+        })
     }
 
     fn publish_tcp(&self, lease_id: NetworkLeaseId, mapping: PortMapping) -> Result<(), String> {
-        let spec = self.first_namespace_spec()?;
+        let spec = self.namespace_spec_for_lease(lease_id)?;
         let host_ip = mapping.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let host_port = mapping.host_port.unwrap_or(0);
         let listener =
@@ -626,7 +650,7 @@ impl SocketNamespaceProvider {
     }
 
     fn publish_udp(&self, lease_id: NetworkLeaseId, mapping: PortMapping) -> Result<(), String> {
-        let spec = self.first_namespace_spec()?;
+        let spec = self.namespace_spec_for_lease(lease_id)?;
         let host_ip = mapping.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let host_port = mapping.host_port.unwrap_or(0);
         let socket =
@@ -684,11 +708,21 @@ impl SocketNamespaceProvider {
         endpoint: &VirtualEndpoint,
         host_addr: HostSocketAddr,
     ) -> Result<(), String> {
+        self.write_endpoint_file_for_lease(NetworkLeaseId(0), endpoint, host_addr)
+    }
+
+    fn write_endpoint_file_for_lease(
+        &self,
+        lease_id: NetworkLeaseId,
+        endpoint: &VirtualEndpoint,
+        host_addr: HostSocketAddr,
+    ) -> Result<(), String> {
         let paths = write_endpoint_file(&self.endpoint_dir, endpoint, host_addr)?;
         let mut owned = self
             .owned_endpoint_files
             .lock()
             .map_err(|_| "owned endpoint registry lock poisoned".to_string())?;
+        let owned = owned.entry(lease_id).or_default();
         for (path, contents) in paths {
             if !owned.iter().any(|entry| entry.path == path) {
                 owned.push(OwnedEndpointFile { path, contents });
@@ -697,11 +731,17 @@ impl SocketNamespaceProvider {
         Ok(())
     }
 
-    fn track_owned_file(&self, path: PathBuf, contents: String) -> Result<(), String> {
+    fn track_owned_file(
+        &self,
+        lease_id: NetworkLeaseId,
+        path: PathBuf,
+        contents: String,
+    ) -> Result<(), String> {
         let mut owned = self
             .owned_endpoint_files
             .lock()
             .map_err(|_| "owned endpoint registry lock poisoned".to_string())?;
+        let owned = owned.entry(lease_id).or_default();
         if let Some(entry) = owned.iter_mut().find(|entry| entry.path == path) {
             entry.contents = contents;
         } else {
@@ -710,13 +750,24 @@ impl SocketNamespaceProvider {
         Ok(())
     }
 
+    fn lease_for_namespace(
+        &self,
+        namespace_id: &NetworkNamespaceId,
+    ) -> Result<Option<NetworkLeaseId>, String> {
+        let leases = self
+            .namespace_leases
+            .lock()
+            .map_err(|_| "socket namespace lease registry lock poisoned".to_string())?;
+        Ok(leases.get(namespace_id).copied())
+    }
+
     fn prepare_tcp_listen(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
         guest_local: Option<GuestSocketAddr>,
         host_local: Option<HostSocketAddr>,
         reuse_port: bool,
-    ) -> Result<(), i32> {
+    ) -> Result<(), carrick_abi::LinuxErrno> {
         let Some(namespace_id) = namespace_id else {
             return Ok(());
         };
@@ -731,6 +782,12 @@ impl SocketNamespaceProvider {
             namespaces.get(namespace_id).cloned()
         };
         let Some(spec) = spec else {
+            return Ok(());
+        };
+        let lease_id = self
+            .lease_for_namespace(namespace_id)
+            .map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+        let Some(lease_id) = lease_id else {
             return Ok(());
         };
         let IpAddr::V4(guest_ip) = guest_local.0.ip() else {
@@ -794,7 +851,7 @@ impl SocketNamespaceProvider {
         for endpoint in endpoints {
             let path = listener_path(&self.endpoint_dir, &endpoint);
             fs::write(&path, &contents).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
-            self.track_owned_file(path, contents.clone())
+            self.track_owned_file(lease_id, path, contents.clone())
                 .map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
         }
         Ok(())
@@ -1150,17 +1207,28 @@ impl NetworkProvider for SocketNamespaceProvider {
     }
 
     fn create_namespace(&self, spec: &NetworkNamespaceSpec) -> Result<NetworkLease, String> {
+        let lease_id = NetworkLeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
+        self.register_service_names(lease_id, spec)?;
+        let mut lease_specs = self
+            .lease_specs
+            .lock()
+            .map_err(|_| "socket namespace lease registry lock poisoned".to_string())?;
+        lease_specs.insert(lease_id, spec.clone());
+        drop(lease_specs);
         if let Some(namespace_id) = spec.namespace_id.clone() {
             let mut namespaces = self
                 .namespaces
                 .lock()
                 .map_err(|_| "socket namespace registry lock poisoned".to_string())?;
-            namespaces.insert(namespace_id, spec.clone());
+            namespaces.insert(namespace_id.clone(), spec.clone());
+            drop(namespaces);
+            let mut namespace_leases = self
+                .namespace_leases
+                .lock()
+                .map_err(|_| "socket namespace lease registry lock poisoned".to_string())?;
+            namespace_leases.insert(namespace_id, lease_id);
         }
-        self.register_service_names(spec)?;
-        Ok(NetworkLease {
-            id: NetworkLeaseId(1),
-        })
+        Ok(NetworkLease { id: lease_id })
     }
 
     fn destroy_namespace(&self, lease_id: NetworkLeaseId) -> Result<(), String> {
@@ -1170,20 +1238,15 @@ impl NetworkProvider for SocketNamespaceProvider {
         if let Ok(mut published_udp) = self.published_udp.lock() {
             published_udp.remove(&lease_id);
         }
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.clear();
+        if let Ok(mut lease_specs) = self.lease_specs.lock() {
+            lease_specs.remove(&lease_id);
         }
-        if let Ok(mut listeners) = self.tcp_listeners.lock() {
-            listeners.clear();
-        }
-        if let Ok(mut namespaces) = self.namespaces.lock() {
-            namespaces.clear();
-        }
-        if let Ok(mut socket_addrs) = self.socket_addrs.lock() {
-            socket_addrs.clear();
-        }
-        if let Ok(mut owned) = self.owned_endpoint_files.lock() {
-            for entry in owned.drain(..) {
+        let mut removed_paths = HashSet::new();
+        if let Ok(mut owned) = self.owned_endpoint_files.lock()
+            && let Some(entries) = owned.remove(&lease_id)
+        {
+            for entry in entries {
+                removed_paths.insert(entry.path.clone());
                 match fs::read_to_string(&entry.path) {
                     Ok(contents) if contents == entry.contents => {}
                     Ok(_) => continue,
@@ -1206,6 +1269,38 @@ impl NetworkProvider for SocketNamespaceProvider {
                     }
                 }
             }
+        }
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.retain(|endpoint, host_addr| {
+                !removed_paths.contains(&endpoint_path(&self.endpoint_dir, endpoint))
+                    && !removed_paths.contains(&reverse_endpoint_path(
+                        &self.endpoint_dir,
+                        *host_addr,
+                        endpoint.protocol,
+                    ))
+            });
+        }
+        if let Ok(mut listeners) = self.tcp_listeners.lock() {
+            listeners.retain(|endpoint, _| {
+                !removed_paths.contains(&listener_path(&self.endpoint_dir, endpoint))
+            });
+        }
+        let mut removed_namespaces = HashSet::new();
+        if let Ok(mut namespace_leases) = self.namespace_leases.lock() {
+            namespace_leases.retain(|namespace_id, owner| {
+                if *owner == lease_id {
+                    removed_namespaces.insert(namespace_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if let Ok(mut namespaces) = self.namespaces.lock() {
+            namespaces.retain(|namespace_id, _| !removed_namespaces.contains(namespace_id));
+        }
+        if let Ok(mut socket_addrs) = self.socket_addrs.lock() {
+            socket_addrs.retain(|_, state| state.lease_id != Some(lease_id));
         }
         let _ = fs::remove_dir(&*self.endpoint_dir);
         Ok(())
@@ -1304,7 +1399,7 @@ impl NetworkProvider for SocketNamespaceProvider {
         host_local: Option<HostSocketAddr>,
         protocol: PortProtocol,
         reuse_port: bool,
-    ) -> Result<(), i32> {
+    ) -> Result<(), carrick_abi::LinuxErrno> {
         if protocol != PortProtocol::Tcp {
             return Ok(());
         }
@@ -2083,6 +2178,118 @@ mod tests {
 
         let _socket =
             UdpSocket::bind((Ipv4Addr::LOCALHOST, host_port)).expect("published port released");
+    }
+
+    #[test]
+    fn destroy_namespace_keeps_other_leases_alive() {
+        let suffix = std::process::id();
+        let mut first = NetworkNamespaceSpec::bridge_default(
+            Some("api-one".to_string()),
+            vec!["api".to_string()],
+            Vec::new(),
+        );
+        first.bridge_id = BridgeId::new(format!("lease-one-{suffix}"));
+        first.namespace_id = Some(NetworkNamespaceId::new(format!("lease-one-ns-{suffix}")));
+        first.ipv4 = Ipv4Addr::new(172, 31, 80, 10);
+
+        let host_port = free_loopback_port();
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: PortProtocol::Tcp,
+        };
+        let mut second = NetworkNamespaceSpec::bridge_default(
+            Some("api-two".to_string()),
+            vec!["api".to_string()],
+            vec![mapping.clone()],
+        );
+        second.bridge_id = BridgeId::new(format!("lease-two-{suffix}"));
+        second.namespace_id = Some(NetworkNamespaceId::new(format!("lease-two-ns-{suffix}")));
+        second.ipv4 = Ipv4Addr::new(172, 31, 80, 11);
+
+        let provider = SocketNamespaceProvider::new();
+        let first_lease = provider.create_namespace(&first).expect("first namespace");
+        let second_lease = provider
+            .create_namespace(&second)
+            .expect("second namespace");
+        provider
+            .publish_port(second_lease.id, mapping)
+            .expect("publish second namespace port");
+        provider
+            .record_socket_addresses(
+                first.namespace_id.as_ref(),
+                10,
+                Some(guest(SocketAddr::new(IpAddr::V4(first.ipv4), 49152))),
+                Some(host(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    free_loopback_port(),
+                ))),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record first socket");
+        let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let target = thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("target accept");
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).expect("read ping");
+            stream.write_all(b"ok").expect("write ok");
+        });
+        let second_guest_addr = guest(SocketAddr::new(IpAddr::V4(second.ipv4), 8080));
+        provider
+            .record_socket_addresses(
+                second.namespace_id.as_ref(),
+                11,
+                Some(second_guest_addr),
+                Some(host(target_addr)),
+                None,
+                PortProtocol::Tcp,
+            )
+            .expect("record second socket");
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port))
+            .expect("connect second published port");
+        client.write_all(b"ping").expect("write ping");
+        let mut reply = [0_u8; 2];
+        client.read_exact(&mut reply).expect("read reply");
+        target.join().expect("target thread");
+        assert_eq!(&reply, b"ok");
+
+        provider
+            .destroy_namespace(first_lease.id)
+            .expect("destroy first namespace");
+
+        assert_eq!(
+            provider
+                .guest_visible_local_addr(10)
+                .expect("first socket state"),
+            None
+        );
+        assert_eq!(
+            provider
+                .guest_visible_local_addr(11)
+                .expect("second socket state"),
+            Some(second_guest_addr)
+        );
+        assert_eq!(
+            provider
+                .resolve_dns_name(&second, "api")
+                .expect("resolve second service"),
+            vec![second.ipv4]
+        );
+        assert!(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, host_port)).is_ok(),
+            "test must use TCP conflict check"
+        );
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, host_port)).is_err(),
+            "destroying another namespace must not release this TCP published port"
+        );
+
+        provider
+            .destroy_namespace(second_lease.id)
+            .expect("destroy second namespace");
     }
 
     #[test]
