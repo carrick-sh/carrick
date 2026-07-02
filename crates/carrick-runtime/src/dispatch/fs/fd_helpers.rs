@@ -176,7 +176,7 @@ impl SyscallDispatcher {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
-            OpenDescription::HostFile { host_fd, .. } => Some(HostFd(*host_fd)),
+            OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
             _ => None,
         }
     }
@@ -192,7 +192,7 @@ impl SyscallDispatcher {
                 host_fd,
                 writable: true,
                 ..
-            } => Some(HostFd(*host_fd)),
+            } => Some(host_fd.view()),
             _ => None,
         }
     }
@@ -203,7 +203,7 @@ impl SyscallDispatcher {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
-            OpenDescription::HostSocket { host_fd, .. } => Some(HostFd(*host_fd)),
+            OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.view()),
             _ => None,
         }
     }
@@ -422,7 +422,7 @@ impl SyscallDispatcher {
                 host_fd,
                 is_read_end: true,
                 ..
-            } => Some(HostFd(*host_fd)),
+            } => Some(host_fd.view()),
             _ => None,
         }
     }
@@ -444,7 +444,7 @@ impl SyscallDispatcher {
                 is_read_end,
                 pipe_id,
                 ..
-            } if *is_read_end == want_read => Some((HostFd(*host_fd), *pipe_id)),
+            } if *is_read_end == want_read => Some((host_fd.view(), *pipe_id)),
             _ => None,
         }
     }

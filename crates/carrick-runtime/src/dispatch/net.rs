@@ -685,13 +685,15 @@ impl SyscallDispatcher {
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostSocket { host_fd, .. }
-                | OpenDescription::HostFile { host_fd, .. } => Some(HostFd(*host_fd)),
+                | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
                 // eventfd is host-backed by a readiness pipe (read end readable
                 // iff counter > 0), so epoll/poll/select watch it natively via
                 // EVFILT_READ/POLLIN — no in-memory recompute or EVFILT_USER
                 // broadcast needed (the robust path for Go's netpollBreak).
-                OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => {
-                    Some(HostFd(state.read_fd))
+                // No readiness pipe (creation failed) yields `None` here →
+                // the synthetic path, exactly like the historical `-1` guard.
+                OpenDescription::EventFd { state, .. } => {
+                    state.read_fd.as_ref().map(|fd| fd.view())
                 }
                 // A pidfd is read-ready when its process exits; the backing
                 // multiplexer's poll fd (the kqueue fd on macOS, the
@@ -1017,7 +1019,7 @@ impl SyscallDispatcher {
                 // epoll path's host_fd_is_oneway_pipe_read_end suppression).
                 let suppress_pollout = *is_read_end && !*bidirectional && pty.is_none();
                 let mut pfd = libc::pollfd {
-                    fd: *host_fd,
+                    fd: host_fd.raw(),
                     events: 0,
                     revents: 0,
                 };
@@ -1047,7 +1049,7 @@ impl SyscallDispatcher {
                 // fifo_beacon). Surface the POLLIN|POLLHUP (read→EOF) Linux gives.
                 if requested_events & LINUX_POLLIN != 0
                     && ready & LINUX_POLLIN == 0
-                    && crate::dispatch::fifo_beacon::read_end_at_eof(*host_fd)
+                    && crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.raw())
                 {
                     ready |= LINUX_POLLIN | LINUX_POLLHUP;
                 }
@@ -1056,7 +1058,7 @@ impl SyscallDispatcher {
                 // Poll the real host fd so the guest's poll loop reflects
                 // actual kernel readiness for the socket.
                 let mut pfd = libc::pollfd {
-                    fd: *host_fd,
+                    fd: host_fd.raw(),
                     events: 0,
                     revents: 0,
                 };
@@ -1100,7 +1102,7 @@ impl SyscallDispatcher {
                 host_fd, max_msg, ..
             } => {
                 let (readable, writable) =
-                    crate::dispatch::mqueue::poll_readiness(*host_fd, *max_msg);
+                    crate::dispatch::mqueue::poll_readiness(host_fd.raw(), *max_msg);
                 if requested_events & LINUX_POLLIN != 0 && readable {
                     ready |= LINUX_POLLIN;
                 }
@@ -1177,15 +1179,14 @@ impl SyscallDispatcher {
         widen_unix_stream_buffers(host_fd, family, base_type);
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let open_file = OpenFile::with_host_fd(
+        let open_file = OpenFile::new(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
-                host_fd,
+                host_fd: HostFdRef::new(host_fd),
                 family,
                 type_: base_type,
                 base: OpenDescriptionBase::new(status_flags),
             })),
             fd_flags,
-            host_fd,
         );
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
@@ -1210,7 +1211,7 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::HostPipe { host_fd, .. }
             | OpenDescription::HostSocket { host_fd, .. }
-            | OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+            | OpenDescription::HostFile { host_fd, .. } => Some(host_fd.raw()),
             _ => None,
         }
     }
@@ -1247,7 +1248,7 @@ impl SyscallDispatcher {
             // macOS and Linux (1/2/3/5), so the host SO_TYPE value is already a
             // valid Linux socket type.
             OpenDescription::HostSocket {
-                host_fd,
+                host_fd: HostFdRef::new(host_fd),
                 family: libc::AF_UNIX,
                 type_: so_type,
                 base: OpenDescriptionBase::new(LINUX_O_RDWR),
@@ -1260,7 +1261,7 @@ impl SyscallDispatcher {
             // forkserver passes both ends; CPython only uses each in one
             // direction, so a conservative bidirectional flag is safe.
             OpenDescription::HostPipe {
-                host_fd,
+                host_fd: HostFdRef::new(host_fd),
                 is_read_end: false,
                 // A pipe end received over SCM_RIGHTS: its host inode (already
                 // fstat'd above) is the same kernel-object identity in this
@@ -1284,7 +1285,7 @@ impl SyscallDispatcher {
                 size: st.st_size.max(0) as usize,
             };
             OpenDescription::HostFile {
-                host_fd,
+                host_fd: HostFdRef::new(host_fd),
                 metadata,
                 writable: true,
                 base: OpenDescriptionBase::new(0),
@@ -1292,8 +1293,10 @@ impl SyscallDispatcher {
         };
         // MSG_CMSG_CLOEXEC: install the received fd close-on-exec. (audit M3)
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let open_file =
-            OpenFile::with_host_fd(Arc::new(RwLock::new(description)), fd_flags, host_fd);
+        // On an install failure (EMFILE) the dropped OpenFile's description —
+        // the fd's ONE owner — closes the received host fd; the caller must
+        // not close it again.
+        let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);
         self.install_fd_at_or_above(3, open_file).ok()
     }
 
@@ -1309,7 +1312,7 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::HostSocket {
                 host_fd, family, ..
-            } => Ok((HostFd(*host_fd), *family)),
+            } => Ok((host_fd.view(), *family)),
             _ => Err(LINUX_ENOTSOCK),
         }
     }
@@ -1440,7 +1443,7 @@ impl SyscallDispatcher {
                     family,
                     type_,
                     ..
-                } => (*host_fd, *family, *type_),
+                } => (host_fd.raw(), *family, *type_),
                 _ => {
                     return DispatchOutcome::errno(LINUX_ENOTSOCK);
                 }
@@ -1491,15 +1494,14 @@ impl SyscallDispatcher {
         widen_unix_stream_buffers(new_host, family, type_);
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let open_file = OpenFile::with_host_fd(
+        let open_file = OpenFile::new(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
-                host_fd: new_host,
+                host_fd: HostFdRef::new(new_host),
                 family,
                 type_,
                 base: OpenDescriptionBase::new(status_flags),
             })),
             fd_flags,
-            new_host,
         );
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
@@ -3345,25 +3347,23 @@ impl SyscallDispatcher {
             set_host_nonblocking(host_fds[1]);
             let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
             let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-            let first = OpenFile::with_host_fd(
+            let first = OpenFile::new(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
-                    host_fd: host_fds[0],
+                    host_fd: HostFdRef::new(host_fds[0]),
                     family,
                     type_: base_type,
                     base: OpenDescriptionBase::new(status_flags),
                 })),
                 fd_flags,
-                host_fds[0],
             );
-            let second = OpenFile::with_host_fd(
+            let second = OpenFile::new(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
-                    host_fd: host_fds[1],
+                    host_fd: HostFdRef::new(host_fds[1]),
                     family,
                     type_: base_type,
                     base: OpenDescriptionBase::new(status_flags),
                 })),
                 fd_flags,
-                host_fds[1],
             );
             let (read_fd, write_fd) = match this.install_fd_pair_at_or_above(3, first, second) {
                 Ok(pair) => pair,
@@ -4816,11 +4816,13 @@ impl SyscallDispatcher {
                 LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::CMSG_CLOEXEC);
             let mut guest_fds = Vec::with_capacity(host_fds.len());
             for hfd in host_fds {
-                match self.install_received_host_fd(hfd, cloexec) {
-                    Some(gfd) => guest_fds.push(gfd),
-                    None => unsafe {
-                        libc::close(hfd);
-                    },
+                // An install failure (None) already closed `hfd`: the
+                // freshly-built description became the fd's ONE owner, and
+                // dropping it ran the close. (Historically the owner's drop
+                // AND an explicit close here both fired — a latent EMFILE
+                // double-close.)
+                if let Some(gfd) = self.install_received_host_fd(hfd, cloexec) {
+                    guest_fds.push(gfd);
                 }
             }
             let mut linux_flags = guest_msg_flags.get();

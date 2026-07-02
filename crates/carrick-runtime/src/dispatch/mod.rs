@@ -2078,7 +2078,7 @@ impl SyscallDispatcher {
         if last_ref {
             match &*open_file.description.read() {
                 OpenDescription::HostPipe { pty, host_fd, .. } => {
-                    fifo_host_fd = Some(*host_fd);
+                    fifo_host_fd = Some(host_fd.raw());
                     if let Some(role) = pty
                         && role.is_master
                     {
@@ -3911,7 +3911,12 @@ fn read_eventfd(
     loop {
         let current = counter.load(std::sync::atomic::Ordering::SeqCst);
         if current == 0 {
-            return would_block_outcome(state.read_fd, libc::POLLIN, nonblocking, None);
+            // No readiness pipe (creation failed) keeps the historical `-1`
+            // park fd: poll ignores a negative fd, preserving the degraded
+            // behavior exactly. Owner stays `None` — the `Arc<EventFdState>`
+            // held by the description keeps the pipe alive; no lifetime change.
+            let park_fd = state.read_fd.as_ref().map_or(-1, |fd| fd.raw());
+            return would_block_outcome(park_fd, libc::POLLIN, nonblocking, None);
         }
         let taken = if semaphore { 1 } else { current };
         if counter
@@ -5812,10 +5817,11 @@ mod overlay_dispatch_tests {
     fn anchored_wait_fds_keep_host_fd_live_after_open_file_drop() {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let open_file = OpenFile::with_host_fd(
+        let owner = HostFdRef::new(fds[0]);
+        let open_file = OpenFile::new(
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 base: OpenDescriptionBase::new(0),
-                host_fd: fds[0],
+                host_fd: owner.clone(),
                 is_read_end: true,
                 pipe_id: 0,
                 pty: None,
@@ -5823,9 +5829,8 @@ mod overlay_dispatch_tests {
                 write_kind: HostWriteKind::PipeLike,
             })),
             0,
-            fds[0],
         );
-        let wait_fds = WaitFds::anchored_one(fds[0], libc::POLLIN, open_file.host_fd_owner.clone());
+        let wait_fds = WaitFds::anchored_one(fds[0], libc::POLLIN, Some(owner));
         drop(open_file);
 
         let mut pollfd = libc::pollfd {
