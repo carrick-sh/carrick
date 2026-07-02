@@ -656,10 +656,10 @@ fn linux_iff_flags(mac: u32) -> u32 {
     out
 }
 
-/// Enumerate the host's interfaces + addresses via macOS `getifaddrs(3)` and
-/// translate them to Linux-shaped records, so the synthetic rtnetlink reports
-/// the REAL interfaces (all of them, IPv4 + IPv6) rather than a fixed loopback.
-/// Empty on failure (caller falls back to a synthetic loopback).
+/// Enumerate the host's interfaces + addresses via `getifaddrs(3)` and translate
+/// them to the Linux-facing names Carrick exposes elsewhere (`lo`, first `en*`
+/// uplink as `eth0`). Empty on failure (caller falls back to a synthetic
+/// loopback).
 fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
     let mut ifaces: Vec<HostIface> = Vec::new();
     let mut addrs: Vec<HostAddr> = Vec::new();
@@ -805,7 +805,59 @@ fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
     }
     // SAFETY: free the list getifaddrs allocated.
     unsafe { libc::freeifaddrs(head) };
-    (ifaces, addrs)
+    linux_guest_interfaces(ifaces, addrs)
+}
+
+fn linux_guest_interfaces(
+    ifaces: Vec<HostIface>,
+    addrs: Vec<HostAddr>,
+) -> (Vec<HostIface>, Vec<HostAddr>) {
+    let eth_host_name = ifaces
+        .iter()
+        .map(|iface| iface.name.as_str())
+        .filter(|name| name.starts_with("en"))
+        .min()
+        .map(str::to_owned);
+
+    let mut out_ifaces = Vec::new();
+    let mut have_lo = false;
+    let mut have_eth = false;
+    for mut iface in ifaces {
+        if iface.name == "lo0" || iface.name == "lo" {
+            if have_lo {
+                continue;
+            }
+            have_lo = true;
+            iface.name = "lo".to_owned();
+            iface.index = 1;
+            iface.arphrd = LINUX_ARPHRD_LOOPBACK;
+            out_ifaces.push(iface);
+        } else if eth_host_name.as_deref() == Some(iface.name.as_str()) {
+            if have_eth {
+                continue;
+            }
+            have_eth = true;
+            iface.name = "eth0".to_owned();
+            iface.index = 2;
+            iface.arphrd = LINUX_ARPHRD_ETHER;
+            out_ifaces.push(iface);
+        }
+    }
+
+    let mut out_addrs = Vec::new();
+    for mut addr in addrs {
+        if addr.name == "lo0" || addr.name == "lo" {
+            addr.name = "lo".to_owned();
+            addr.index = 1;
+            out_addrs.push(addr);
+        } else if eth_host_name.as_deref() == Some(addr.name.as_str()) {
+            addr.name = "eth0".to_owned();
+            addr.index = 2;
+            out_addrs.push(addr);
+        }
+    }
+
+    (out_ifaces, out_addrs)
 }
 
 /// Build the synthetic rtnetlink reply for a guest's request. We inspect
@@ -2204,6 +2256,83 @@ mod tests {
             "expected at least the loopback connected route"
         );
         assert!(saw_done, "route dump must terminate with NLMSG_DONE");
+    }
+
+    #[test]
+    fn guest_interface_view_uses_linux_names() {
+        let ifaces = vec![
+            HostIface {
+                name: "lo0".to_owned(),
+                index: 10,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING,
+                hw_addr: Vec::new(),
+            },
+            HostIface {
+                name: "utun0".to_owned(),
+                index: 11,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: LINUX_IFF_UP,
+                hw_addr: Vec::new(),
+            },
+            HostIface {
+                name: "en4".to_owned(),
+                index: 12,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: LINUX_IFF_UP | LINUX_IFF_RUNNING | LINUX_IFF_MULTICAST,
+                hw_addr: vec![2, 0, 0, 0, 0, 1],
+            },
+            HostIface {
+                name: "en0".to_owned(),
+                index: 13,
+                arphrd: LINUX_ARPHRD_ETHER,
+                linux_flags: LINUX_IFF_UP | LINUX_IFF_RUNNING | LINUX_IFF_MULTICAST,
+                hw_addr: vec![2, 0, 0, 0, 0, 2],
+            },
+        ];
+        let addrs = vec![
+            HostAddr {
+                index: 10,
+                name: "lo0".to_owned(),
+                family: LINUX_AF_INET6 as u8,
+                addr: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                prefixlen: 128,
+                scope: LINUX_RT_SCOPE_HOST,
+            },
+            HostAddr {
+                index: 11,
+                name: "utun0".to_owned(),
+                family: LINUX_AF_INET6 as u8,
+                addr: vec![0; 16],
+                prefixlen: 128,
+                scope: LINUX_RT_SCOPE_LINK,
+            },
+            HostAddr {
+                index: 13,
+                name: "en0".to_owned(),
+                family: LINUX_AF_INET6 as u8,
+                addr: vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                prefixlen: 64,
+                scope: LINUX_RT_SCOPE_LINK,
+            },
+            HostAddr {
+                index: 12,
+                name: "en4".to_owned(),
+                family: LINUX_AF_INET6 as u8,
+                addr: vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                prefixlen: 64,
+                scope: LINUX_RT_SCOPE_LINK,
+            },
+        ];
+
+        let (ifaces, addrs) = linux_guest_interfaces(ifaces, addrs);
+        let iface_names: Vec<_> = ifaces.iter().map(|iface| iface.name.as_str()).collect();
+        assert_eq!(iface_names, ["lo", "eth0"]);
+        assert_eq!(ifaces[0].index, 1);
+        assert_eq!(ifaces[1].index, 2);
+        let addr_names: Vec<_> = addrs.iter().map(|addr| addr.name.as_str()).collect();
+        assert_eq!(addr_names, ["lo", "eth0"]);
+        assert!(addrs.iter().all(|addr| addr.index == 1 || addr.index == 2));
     }
 
     #[test]

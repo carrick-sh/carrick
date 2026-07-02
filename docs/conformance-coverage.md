@@ -304,6 +304,7 @@ underlying gap got fixed):
 | **recv/recvfrom with MSG_ERRQUEUE on a socket with no queued error → EAGAIN (carrick has no error queue, so it returned 0 / a normal recv)** | ✅ `recverrqueue` | recv01 (recvfrom01's invalid-addrlen leg remains) |
 | socket/socketpair/bind/listen/connect/accept/getsockname/setsockopt/getsockopt across AF_UNIX/INET/INET6/NETLINK | ✅ `net` | socket01/02, socketpair01–04, bind01/06, listen01, connect01/02, accept01/04, getsockname01, setsockopt01–10, getsockopt01–07 |
 | rtnetlink `RTM_GETROUTE` dump: at least one `RTM_NEWROUTE` followed by `NLMSG_DONE` | ✅ `netlink_route` | (rtnetlink shape conformance) |
+| Guest interface enumeration, if_nameindex/ioctl name-index translation, and `/proc/net/igmp6` expose the same Linux-facing names (`lo`, `eth0`), so `Interface.MulticastAddrs` and symbolic IPv6 scope IDs can join rtnetlink/ioctl/procfs facts | ✅ `netifmcast` | Go `net` `TestInterfaceMulticastAddrs`; CPython `testInterfaceNameIndex`, symbolic IPv6 scope-id tests |
 | Unprivileged `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` ping socket sends an echo request to loopback | ✅ `icmp` | (unprivileged ICMP / ping_group_range path) |
 | pty pair round-trip: posix_openpt → grantpt → unlockpt → ptsname → open slave → write master/read slave (+ reverse) | ✅ `ptypair` | openpt01, grantpt01, ptsname01, posix_openpt01 |
 
