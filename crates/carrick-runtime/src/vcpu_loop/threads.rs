@@ -212,6 +212,9 @@ where
             0
         };
         let tid = self.registry.register_child(clear_addr);
+        kernel
+            .dispatcher
+            .inherit_thread_signal_mask(self.this_tid, tid);
         let tid_bytes = tid.raw().to_le_bytes();
         if parent_tid_addr != 0 {
             let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
