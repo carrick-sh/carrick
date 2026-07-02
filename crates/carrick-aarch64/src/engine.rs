@@ -764,12 +764,12 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     let (number, args) = <Self as ThreadedEngine>::Arch::decode_syscall(&frame);
                     let guest_abi = <Self as ThreadedEngine>::Arch::linux_guest_abi();
                     return Ok(Some(RawSyscall {
-                        number,
+                        number: carrick_abi::CanonicalNr(number),
                         args,
                         guest_abi,
                         // aarch64 guests already issue canonical numbers, so the
                         // ISA-native number equals the dispatch number.
-                        native_number: number,
+                        native_number: carrick_abi::NativeNr(number),
                     }));
                 }
                 Aarch64Exit::EL0Fault {

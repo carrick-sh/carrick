@@ -855,7 +855,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
                         SyscallNorm::Plain(raw) => {
                             // Track the CANONICAL number for SA_RESTART (see
                             // `last_syscall_canonical` / `last_syscall_nr`).
-                            self.last_syscall_canonical = Some(raw.number);
+                            self.last_syscall_canonical = Some(raw.number.raw());
                             return Ok(Some(raw));
                         }
                     }

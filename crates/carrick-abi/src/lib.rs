@@ -2411,6 +2411,39 @@ pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
 pub const LINUX_F_ADD_SEALS: u64 = 1033;
 pub const LINUX_F_GET_SEALS: u64 = 1034;
 pub const LINUX_FD_CLOEXEC: u64 = 1;
+/// A CANONICAL syscall number — the asm-generic/aarch64 numbering every guest
+/// ISA is normalized to before dispatch (plus the `CARRICK_PRIVATE_*` range).
+/// Distinct from [`NativeNr`]: the two were adjacent bare u64 fields, so a
+/// constructor swap compiled clean and mis-routed dispatch/seccomp — the same
+/// silent class as the historical x86 uname(63)-as-read(63) collision.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalNr(pub u64);
+
+impl CanonicalNr {
+    /// The bare canonical number, for match scrutinees / table lookups /
+    /// formatting. All syscall-table arms stay integer-literal patterns; the
+    /// conversion happens ONCE at each scrutinee.
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// The guest ISA's own ("native"/raw) syscall number as trapped, BEFORE
+/// normalization — kept alongside [`CanonicalNr`] for seccomp filtering and
+/// diagnostics that must speak the guest's numbering.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NativeNr(pub u64);
+
+impl NativeNr {
+    /// The bare guest-native number (what the guest put in its syscall
+    /// register), for seccomp `seccomp_data.nr` and diagnostics.
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Ordinals for the carrick-internal ("private") normalized x86 syscall
 /// numbers below. Each public constant derives its value from THIS enum's
 /// sequential discriminants via [`private_x86_number`], so two entries can

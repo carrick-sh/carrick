@@ -276,7 +276,7 @@ mod execve_tests {
         );
         assert_eq!(
             engine.last_syscall_nr(),
-            Some(frame.number),
+            Some(frame.number.raw()),
             "last_syscall_nr latched from frame x8"
         );
     }
