@@ -648,12 +648,12 @@ fn gettimeofday_writes_packed_linux_timeval_and_timezone() {
 }
 
 #[test]
-fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
+fn times_bootstrap_writes_tms_and_returns_monotonic_clock() {
     let mut memory = LinearMemory::new(0x4000, vec![0xff; core::mem::size_of::<LinuxTms>()]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    // Valid buffer: write zeroed tms, return positive clock value.
+    // Valid buffer: write tms accounting, return positive clock value.
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(153, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
@@ -671,8 +671,8 @@ fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
     let stime = tms.tms_stime;
     let cutime = tms.tms_cutime;
     let cstime = tms.tms_cstime;
-    assert_eq!(utime, 0);
-    assert_eq!(stime, 0);
+    assert!(utime >= 0);
+    assert!(stime >= 0);
     assert_eq!(cutime, 0);
     assert_eq!(cstime, 0);
 
