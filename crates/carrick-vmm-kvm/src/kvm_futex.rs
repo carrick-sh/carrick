@@ -166,7 +166,13 @@ mod tests {
         const ADDR: u64 = 0x4000;
         let f2 = Arc::clone(&futex);
         let waiter = thread::spawn(move || {
-            f2.private_wait(ADDR, 0, 1, Some(Duration::from_secs(5)), &|| false)
+            f2.private_wait(
+                ADDR,
+                0,
+                carrick_hal::ThreadId::synthetic_for_tests(1),
+                Some(Duration::from_secs(5)),
+                &|| false,
+            )
         });
         thread::sleep(Duration::from_millis(50));
         let woke = futex.private_wake(ADDR, 1);
@@ -186,7 +192,7 @@ mod tests {
         let outcome = futex.private_wait(
             0x5000,
             0,
-            1,
+            carrick_hal::ThreadId::synthetic_for_tests(1),
             Some(Duration::from_millis(50)),
             &never_interrupted(),
         );
@@ -201,7 +207,13 @@ mod tests {
     #[test]
     fn private_wait_interrupted() {
         let futex = make_kvm_futex(Arc::new(FutexTable::new()));
-        let outcome = futex.private_wait(0x6000, 0, 1, Some(Duration::from_secs(5)), &|| true);
+        let outcome = futex.private_wait(
+            0x6000,
+            0,
+            carrick_hal::ThreadId::synthetic_for_tests(1),
+            Some(Duration::from_secs(5)),
+            &|| true,
+        );
         assert_eq!(
             outcome,
             FutexOutcome::Interrupted,

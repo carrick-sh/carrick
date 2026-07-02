@@ -233,7 +233,7 @@ impl ThreadWaiter {
     pub fn new(tid: crate::thread::ThreadId) -> Self {
         let kq = Kqueue::new_internal();
         let process_pipe_read = crate::host_signal::pending_pipe_read_fd();
-        let thread_wake = crate::host_signal::register_thread_waiter(tid);
+        let thread_wake = crate::host_signal::register_thread_waiter(tid.raw());
         if let Some(kq) = kq.as_ref() {
             let mut changes = Vec::with_capacity(2);
             if process_pipe_read >= 0 {
@@ -305,7 +305,7 @@ impl ThreadWaiter {
     }
 
     fn should_interrupt(&self, block_mask: carrick_abi::SigBlockMask) -> bool {
-        crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+        crate::host_signal::has_unblocked_pending_for(self.tid.raw(), block_mask)
             || crate::fork_quiesce::is_quiescing()
             || crate::fork_quiesce::exec_replacing_other_thread(self.tid)
     }
@@ -365,7 +365,7 @@ impl ThreadWaiter {
         let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
         let fd1 = fds.get(1).map_or(-1, WaitFd::fd);
         crate::probes::io_wait_begin(
-            self.tid,
+            self.tid.raw(),
             fds.len() as i32,
             timeout
                 .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
@@ -378,7 +378,7 @@ impl ThreadWaiter {
         // (unless it's blocked by this wait's sigmask).
         if self.should_interrupt(block_mask) {
             crate::probes::io_wait_end(
-                self.tid,
+                self.tid.raw(),
                 wait_result_code(WaitResult::Interrupted),
                 fds.len() as i32,
                 fd0,
@@ -391,7 +391,7 @@ impl ThreadWaiter {
             Ok(p) => p,
             Err(errno) => {
                 crate::probes::io_wait_end(
-                    self.tid,
+                    self.tid.raw(),
                     wait_result_code(WaitResult::Errno(errno)),
                     fds.len() as i32,
                     fd0,
@@ -410,7 +410,7 @@ impl ThreadWaiter {
             {
                 result = self.wait_kqueue(kq, wait_fds, timeout, block_mask);
                 crate::probes::io_wait_end(
-                    self.tid,
+                    self.tid.raw(),
                     wait_result_code(result),
                     fds.len() as i32,
                     fd0,
@@ -422,7 +422,7 @@ impl ThreadWaiter {
         }
         result = self.fallback_poll(wait_fds, timeout, block_mask);
         crate::probes::io_wait_end(
-            self.tid,
+            self.tid.raw(),
             wait_result_code(result),
             fds.len() as i32,
             fd0,
@@ -461,7 +461,7 @@ impl ThreadWaiter {
         let events0 = fds.first().map_or(0, |fd| i32::from(fd.events()));
         let fd1 = fds.get(1).map_or(-1, WaitFd::fd);
         crate::probes::io_wait_begin(
-            self.tid,
+            self.tid.raw(),
             fds.len() as i32,
             timeout
                 .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
@@ -472,7 +472,7 @@ impl ThreadWaiter {
         );
         if self.should_interrupt(block_mask) {
             crate::probes::io_wait_end(
-                self.tid,
+                self.tid.raw(),
                 wait_result_code(WaitResult::Interrupted),
                 fds.len() as i32,
                 fd0,
@@ -485,7 +485,7 @@ impl ThreadWaiter {
             Ok(p) => p,
             Err(errno) => {
                 crate::probes::io_wait_end(
-                    self.tid,
+                    self.tid.raw(),
                     wait_result_code(WaitResult::Errno(errno)),
                     fds.len() as i32,
                     fd0,
@@ -497,7 +497,7 @@ impl ThreadWaiter {
         };
         let result = self.poll_with_signal(pinned_fds.as_wait_fds(), timeout, block_mask);
         crate::probes::io_wait_end(
-            self.tid,
+            self.tid.raw(),
             wait_result_code(result),
             fds.len() as i32,
             fd0,
@@ -1140,7 +1140,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            let waiter = super::ThreadWaiter::new(7);
+            let waiter = super::ThreadWaiter::new(carrick_hal::ThreadId::synthetic_for_tests(7));
             let result = waiter.wait_poll(
                 &[super::WaitFd::raw(read_fd, libc::POLLIN)],
                 None,
@@ -1178,7 +1178,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            let waiter = super::ThreadWaiter::new(7);
+            let waiter = super::ThreadWaiter::new(carrick_hal::ThreadId::synthetic_for_tests(7));
             let result = waiter.wait_poll(
                 &[super::WaitFd::raw(read_fd, libc::POLLIN)],
                 Some(std::time::Duration::from_secs(60)),
@@ -1212,7 +1212,7 @@ mod tests {
         crate::host_signal::reset_after_supervisor_fork();
         let mut fds = [-1, -1];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let waiter = super::ThreadWaiter::new(7);
+        let waiter = super::ThreadWaiter::new(carrick_hal::ThreadId::synthetic_for_tests(7));
 
         let result = waiter.wait_poll(
             &[super::WaitFd::raw(fds[0], libc::POLLIN)],

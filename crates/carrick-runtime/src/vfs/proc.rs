@@ -1095,7 +1095,7 @@ fn synthetic_proc_net_igmp6() -> Vec<u8> {
 /// isn't a guest we expose.
 pub(crate) fn synthetic_task_dir(pid: u32) -> Option<Vec<String>> {
     let own = crate::current_thread_states();
-    if own.iter().any(|(t, _)| *t as u32 == pid) {
+    if own.iter().any(|(t, _)| t.raw() as u32 == pid) {
         return Some(own.iter().map(|(t, _)| t.to_string()).collect());
     }
     if crate::host_proc::is_guest_process(pid) {
@@ -2166,7 +2166,7 @@ fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<
     };
     if let Some(&(tid, state)) = own_threads
         .iter()
-        .find(|(t, _)| *t as u32 == pid || *t as u32 == host_pid)
+        .find(|(t, _)| t.raw() as u32 == pid || t.raw() as u32 == host_pid)
     {
         let ppid = unsafe { libc::getppid() } as u32;
         let me = std::process::id();

@@ -170,7 +170,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
             "[FAULTDBG tid={this_tid:?}] signum={signum} si_code={si_code} si_addr={si_addr:#x} interrupted_pc={interrupted_pc:?}"
         );
     }
-    crate::probes::signal_deliver(this_tid, signum);
+    crate::probes::signal_deliver(this_tid.raw(), signum);
 
     // A synchronous fault with the signal blocked, or no handler installed,
     // forces the default action (terminate) on Linux.
@@ -228,7 +228,7 @@ where
         signum: i32,
     ) -> Result<i64, RuntimeError> {
         let retval: i64 = if self.registry.is_live(target) {
-            crate::host_signal::publish_pending_for(target, signum);
+            crate::host_signal::publish_pending_for(target.raw(), signum);
             self.kicker.kick(target);
             0
         } else {
@@ -274,7 +274,7 @@ where
     // normal delivery below runs each with the sender's identity.
     dispatcher.drain_xsignals_for_tid(tid);
 
-    let pending = crate::host_signal::take_pending_for(tid);
+    let pending = crate::host_signal::take_pending_for(tid.raw());
     let pending = if pending == 0 {
         // Nothing newly arrived in the host slot. Deliver the next signal that was
         // raised while blocked and has since been unblocked.
@@ -285,7 +285,7 @@ where
     } else {
         pending
     };
-    crate::probes::signal_deliver(tid, pending);
+    crate::probes::signal_deliver(tid.raw(), pending);
     // A blocked signal must not be delivered — hold it pending until the guest
     // unblocks it.
     if dispatcher.signal_blocked(tid, pending) {
@@ -330,7 +330,7 @@ where
             let queued_siginfo = dispatcher
                 .take_pending_siginfo(tid, pending)
                 .or_else(|| {
-                    crate::host_signal::take_child_exit_siginfo(tid, pending).map(|info| {
+                    crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(|info| {
                         const CLD_EXITED: i32 = 1;
                         let ns_pid =
                             crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32) as i32;

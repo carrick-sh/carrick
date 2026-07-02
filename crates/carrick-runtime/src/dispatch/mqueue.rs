@@ -771,7 +771,7 @@ fn read_queue_owner(path: &str) -> Option<u32> {
 fn mq_wait_interrupted(this: &SyscallDispatcher, tid: crate::thread::ThreadId) -> bool {
     this.has_deliverable_dispatch_pending_for_wait(tid, carrick_abi::WaitSigMask::NONE)
         || carrick_signal_core::xsig::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
-        || carrick_signal_core::has_pending_for(tid)
+        || carrick_signal_core::has_pending_for(tid.raw())
 }
 
 /// Parse an absolute-timeout `struct timespec` pointer for a timed mq op. NULL

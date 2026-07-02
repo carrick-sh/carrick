@@ -860,7 +860,7 @@ where
     // it.
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
-    let this_tid = std::process::id() as ThreadId;
+    let this_tid = ThreadId::main_from_host_pid();
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
     let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
@@ -1002,7 +1002,7 @@ where
                         // handler, which would break wait4's host-waitpid reap.
                         crate::host_signal::register_child_exit_watch(
                             child_pid,
-                            this_tid as i32,
+                            this_tid.raw(),
                             i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
                         );
                         // CLONE_PIDFD: hand the parent a pidfd for the new child.
@@ -1043,7 +1043,7 @@ where
                         // process-directed signals immediately, then upgrades
                         // to a per-thread kqueue only if it parks.
                         waiter = crate::io_wait::ThreadWaiter::process_only(
-                            std::process::id() as ThreadId
+                            ThreadId::main_from_host_pid(),
                         );
                         0
                     }
@@ -1235,7 +1235,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     loop {
         let outcome = dispatch_with_panic_backstop(
             request.number.raw(),
-            std::process::id() as ThreadId,
+            ThreadId::main_from_host_pid(),
             || dispatcher.dispatch(request, memory, reporter),
         )?;
         match outcome {
@@ -1564,7 +1564,7 @@ fn shared_futex_wait(
     let host_value = unsafe { (host_addr as *const u32).read() };
     crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
     loop {
-        if crate::host_signal::has_pending_for(this_tid)
+        if crate::host_signal::has_pending_for(this_tid.raw())
             || crate::fork_quiesce::is_quiescing()
             || crate::fork_quiesce::exec_replacing_other_thread(this_tid)
         {

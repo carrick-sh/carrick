@@ -1342,7 +1342,7 @@ where
                         parent_tid_addr,
                         child_tid_addr,
                     )?;
-                    state.complete_returned(&mut engine, tid as i64)?;
+                    state.complete_returned(&mut engine, i64::from(tid.raw()))?;
                 }
                 DispatchOutcome::ThreadExit { code } => {
                     return Ok(state.handle_thread_exit(&kernel, &mut engine, code, traps));

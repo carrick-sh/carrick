@@ -134,17 +134,17 @@ pub fn exit_cleanups_in_flight() -> i32 {
 /// terminates every other task in the thread group. Low-level wait paths use
 /// this marker as an interrupt predicate so they can return to the run-loop top
 /// and exit cooperatively before the execing thread destroys the HVF VM.
-pub fn begin_exec_replacement(owner_tid: i32) {
-    exec_owner().store(owner_tid, Ordering::SeqCst);
+pub fn begin_exec_replacement(owner_tid: carrick_hal::ThreadId) {
+    exec_owner().store(owner_tid.raw(), Ordering::SeqCst);
 }
 
 pub fn end_exec_replacement() {
     exec_owner().store(0, Ordering::SeqCst);
 }
 
-pub fn exec_replacing_other_thread(tid: i32) -> bool {
+pub fn exec_replacing_other_thread(tid: carrick_hal::ThreadId) -> bool {
     let owner = exec_owner().load(Ordering::SeqCst);
-    owner != 0 && owner != tid
+    owner != 0 && owner != tid.raw()
 }
 
 #[derive(Debug)]
@@ -358,7 +358,7 @@ impl PtQuiesce {
     /// for siblings to leave guest. Dropping the guard calls `end`, so the pause
     /// is released on EVERY exit path of the editing syscall (incl. `?`-errors).
     /// `tid` is the editor, recorded so the drop can fire `pt-pause-end`.
-    pub fn pause_guard(&'static self, tid: i32) -> PtPauseGuard {
+    pub fn pause_guard(&'static self, tid: carrick_hal::ThreadId) -> PtPauseGuard {
         PtPauseGuard { barrier: self, tid }
     }
 }
@@ -367,13 +367,13 @@ impl PtQuiesce {
 /// dropped. Held for the duration of the table-editing syscall.
 pub struct PtPauseGuard {
     barrier: &'static PtQuiesce,
-    tid: i32,
+    tid: carrick_hal::ThreadId,
 }
 
 impl Drop for PtPauseGuard {
     fn drop(&mut self) {
         self.barrier.end();
-        probes::pt_pause_end(self.tid);
+        probes::pt_pause_end(self.tid.raw());
     }
 }
 

@@ -393,6 +393,7 @@ dependencies = [
  "carrick-signal-core",
  "carrick-timer-core",
  "libc",
+ "serde",
  "thiserror",
  "zerocopy",
 ]

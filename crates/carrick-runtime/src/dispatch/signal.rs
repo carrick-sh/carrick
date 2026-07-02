@@ -814,7 +814,7 @@ impl SyscallDispatcher {
         // persistent thread mask is folded in, not unioned again).
         let non_eintr = block_mask.non_eintr_union(wait_set);
         let non_eintr_block = SigBlockMask::blocking_all_of(non_eintr);
-        crate::host_signal::has_unblocked_pending_for(tid, non_eintr_block)
+        crate::host_signal::has_unblocked_pending_for(tid.raw(), non_eintr_block)
             || carrick_signal_core::xsig::xsig_has_unblocked_for_self(non_eintr_block)
             || self.has_deliverable_dispatch_pending_for_wait(
                 tid,
@@ -983,14 +983,17 @@ impl SyscallDispatcher {
         if self.signal_blocked(tid, s) {
             self.mark_signal_pending(tid, s);
         } else {
-            crate::host_signal::publish_pending_for(tid, s);
+            crate::host_signal::publish_pending_for(tid.raw(), s);
         }
         DispatchOutcome::Returned { value: 0 }
     }
 
     /// The calling guest thread's tid (or `0` if no thread context).
     pub(crate) fn ctx_tid<M: GuestMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
-        ctx.thread.as_ref().map(|t| t.tid).unwrap_or(0)
+        ctx.thread
+            .as_ref()
+            .map(|t| t.tid)
+            .unwrap_or(crate::thread::ThreadId::NONE)
     }
 
     /// Deliver a PROCESS-directed signal (`kill(getpid(), sig)`), honoring the
@@ -1245,7 +1248,11 @@ impl SyscallDispatcher {
             // would send the ns-pid to a nonexistent host tid → ESRCH). Mirrors
             // tgkill below (LTP tkill01).
             if names_self_pid(tid) {
-                let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
+                let self_tid = cx
+                    .thread
+                    .as_ref()
+                    .map(|t| t.tid)
+                    .unwrap_or(crate::thread::ThreadId::NONE);
                 return Ok(this.raise_self(self_tid, signum));
             }
             Ok(bootstrap_signal_send(
@@ -1277,7 +1284,11 @@ impl SyscallDispatcher {
             if !valid_self {
                 return Ok(LINUX_ESRCH.into());
             }
-            let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
+            let self_tid = cx
+                .thread
+                .as_ref()
+                .map(|t| t.tid)
+                .unwrap_or(crate::thread::ThreadId::NONE);
             Ok(this.raise_self(self_tid, signum))
         }
 
@@ -1285,7 +1296,11 @@ impl SyscallDispatcher {
         fn sigaltstack(this, cx, ss: GuestPtr, old_ss: GuestPtr) {
             let ss = ss.0;
             let old_ss = old_ss.0;
-            let tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
+            let tid = cx
+                .thread
+                .as_ref()
+                .map(|t| t.tid)
+                .unwrap_or(crate::thread::ThreadId::NONE);
             let memory = &mut *cx.memory;
 
             let on_altstack = this.is_on_altstack(tid);
@@ -1391,7 +1406,7 @@ impl SyscallDispatcher {
                 // it WITHOUT consuming, so the post-EINTR delivery cycle injects
                 // the handler under suspend_mask. (audit M3; probe sigsuspendxthread)
                 if crate::host_signal::has_unblocked_pending_for(
-                    tid,
+                    tid.raw(),
                     SigBlockMask::blocking_all_of(suspend_mask),
                 ) {
                     break;
@@ -1418,7 +1433,7 @@ impl SyscallDispatcher {
             // wake re-raised above, so a handler will run there too. (audit M1)
             if this.sigsuspend_caught_handler_deliverable(tid, suspend_mask)
                 || crate::host_signal::has_unblocked_pending_for(
-                    tid,
+                    tid.raw(),
                     SigBlockMask::blocking_all_of(suspend_mask),
                 )
             {
@@ -1626,7 +1641,7 @@ impl SyscallDispatcher {
                 let queued = this.take_pending_siginfo(tid, signum);
                 return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
             }
-            let signum = crate::host_signal::take_pending_in_for(tid, wait_set);
+            let signum = crate::host_signal::take_pending_in_for(tid.raw(), wait_set);
             if signum != crate::host_signal::NO_PENDING_SIGNAL {
                 // A host-delivered signal carries no carrick-queued payload.
                 let queued = this.take_pending_siginfo(tid, signum);
@@ -1709,8 +1724,8 @@ impl SyscallDispatcher {
         record_synthetic: bool,
     ) -> Option<DispatchOutcome> {
         let t = ctx.thread.as_ref()?;
-        let target = tid as crate::thread::ThreadId;
-        if i64::from(t.tid) == tid {
+        let target = crate::thread::ThreadId::from_guest_supplied_tid(tid as i32);
+        if i64::from(t.tid.raw()) == tid {
             // tkill/tgkill carry no payload, so they synthesize an SI_TKILL
             // siginfo here. rt_sigqueueinfo/rt_tgsigqueueinfo pass `false`: they
             // record the caller's REAL payload siginfo themselves, and recording
@@ -1774,7 +1789,7 @@ impl SyscallDispatcher {
         // Sibling-thread route: deliver directly so the SA_SIGINFO frame carries
         // the original si_value (LTP rt_sigqueueinfo01 / rt_tgsigqueueinfo01).
         if let Some(routed) = self.route_thread_signal(ctx, route_target, signum, false) {
-            let target_tid = route_target as crate::thread::ThreadId;
+            let target_tid = crate::thread::ThreadId::from_guest_supplied_tid(route_target as i32);
             if let Some(info) = user_info {
                 self.record_pending_siginfo(target_tid, s, info);
             }
@@ -2181,7 +2196,7 @@ mod tests {
     #[test]
     fn rt_signals_queue_while_standard_signals_coalesce() {
         let d = SyscallDispatcher::new();
-        let tid: crate::thread::ThreadId = 1;
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         // A standard signal (10) sent 3× while pending coalesces to one delivery.
         d.mark_signal_pending(tid, 10);
@@ -2223,8 +2238,8 @@ mod tests {
         // (the main thread) is parked in sigwait. Pinning to the sender's tid
         // stranded that sibling forever (probe sigwaitthread).
         let d = SyscallDispatcher::new();
-        let sender: crate::thread::ThreadId = 7;
-        let waiter: crate::thread::ThreadId = 42;
+        let sender = crate::thread::ThreadId::synthetic_for_tests(7);
+        let waiter = crate::thread::ThreadId::synthetic_for_tests(42);
         let usr1 = 10i32;
         let set = SigSet::EMPTY.with(usr1);
 
@@ -2259,7 +2274,7 @@ mod tests {
         use carrick_abi::WaitSigMask;
 
         let d = SyscallDispatcher::new();
-        let tid: crate::thread::ThreadId = 42;
+        let tid = crate::thread::ThreadId::synthetic_for_tests(42);
         let usr1 = 10;
         let blocked = SigSet::EMPTY.with(usr1);
 
@@ -2287,7 +2302,7 @@ mod tests {
     #[test]
     fn child_exit_signal_pump_predicate_tracks_observable_dispositions() {
         let d = SyscallDispatcher::new();
-        let tid: crate::thread::ThreadId = 7;
+        let tid = crate::thread::ThreadId::synthetic_for_tests(7);
 
         assert!(
             !d.child_exit_signal_needs_pump(tid, crate::linux_abi::LINUX_SIGCHLD as u32),
@@ -2336,7 +2351,7 @@ mod tests {
     #[test]
     fn execve_resets_caught_handlers_preserves_sig_ign_and_clears_altstack() {
         let d = SyscallDispatcher::new();
-        let tid: crate::thread::ThreadId = 1;
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
         {
             let mut s = d.signal.lock();
             // A CAUGHT SIGCHLD handler (a real address) — must reset to default.
@@ -2389,7 +2404,7 @@ mod tests {
     #[test]
     fn sa_resethand_resets_disposition_to_default_on_handler_entry() {
         let d = SyscallDispatcher::new();
-        let tid: crate::thread::ThreadId = 1;
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         // A one-shot (SA_RESETHAND) handler for SIGUSR1 (10).
         let mut oneshot = LinuxSigaction::empty();
@@ -2430,7 +2445,7 @@ mod tests {
     #[test]
     fn sigaltstack_reports_ss_onstack_and_rejects_reconfigure_while_on_stack() {
         let d = SyscallDispatcher::new();
-        let tid: crate::thread::ThreadId = 1;
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         // Configure an alt stack for the thread.
         d.signal.lock().altstack.insert(
@@ -2473,7 +2488,7 @@ mod tests {
     #[test]
     fn rt_sigsuspend_keeps_temp_mask_only_when_a_caught_handler_will_run() {
         let d = SyscallDispatcher::new();
-        let tid: crate::thread::ThreadId = 1;
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
         let unblock_all = SigSet::EMPTY;
 
         // Spurious / timeout wake: nothing pending → DON'T keep the temp mask

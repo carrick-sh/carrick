@@ -27,3 +27,6 @@ carrick-signal-core = { path = "../carrick-signal-core" }
 thiserror.workspace = true
 libc.workspace = true
 zerocopy.workspace = true
+# `ThreadId` serializes as its bare i32 key so diagnostics payloads that embed
+# tids (carrick-runtime's Serialize-derived outcomes) keep their wire shape.
+serde.workspace = true
