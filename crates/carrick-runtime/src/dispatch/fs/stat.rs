@@ -2,6 +2,7 @@
 //! the synthetic stdio (label, st_mode) probe and the fstat/statx
 //! buffer writers + StatRecord builder. Pure `impl SyscallDispatcher` move.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 impl SyscallDispatcher {
     /// The synthetic `(label, st_mode)` for a bare stdio fd (0/1/2) with no
@@ -59,7 +60,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(super) fn fd_stat_record(&self, fd: i32) -> Result<StatRecord, i32> {
+    pub(super) fn fd_stat_record(&self, fd: i32) -> Result<StatRecord, LinuxErrno> {
         let Some(open_file) = self.open_file(fd) else {
             // A stdio fd the guest explicitly closed (and did not reopen) is
             // genuinely closed: report EBADF, not our still-open host stream.

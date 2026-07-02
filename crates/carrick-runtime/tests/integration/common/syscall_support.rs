@@ -22,10 +22,10 @@ pub use carrick_runtime::linux_abi::{
     LINUX_EPOLLET, LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFMT,
     LINUX_S_IFREG, LINUX_S_IFSOCK, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_TIOCGPTN,
     LINUX_TIOCSPTLCK, LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header,
-    LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxItimerval,
-    LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx,
-    LinuxTermios, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
-    LinuxUtsname, LinuxWinsize, LinuxX8664Stat,
+    LinuxEpollEvent, LinuxErrno, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec,
+    LinuxItimerval, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaltstack, LinuxStat,
+    LinuxStatfs, LinuxStatx, LinuxTermios, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval,
+    LinuxTimezone, LinuxTms, LinuxUtsname, LinuxWinsize, LinuxX8664Stat,
 };
 pub use carrick_runtime::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
@@ -67,7 +67,7 @@ pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 pub const LINUX_PERSONALITY_QUERY: u64 = 0xffff_ffff;
 pub const LINUX_ADDR_NO_RANDOMIZE: u64 = 0x0040_0000;
 pub const LINUX_BOOTSTRAP_AFFINITY_BYTES: usize = 8;
-pub const LINUX_EDEADLK: i32 = 35;
+pub const LINUX_EDEADLK: LinuxErrno = LinuxErrno::new(35);
 pub const LINUX_FUTEX_WAIT: u64 = 0;
 pub const LINUX_FUTEX_WAKE: u64 = 1;
 pub const LINUX_FUTEX_REQUEUE: u64 = 3;

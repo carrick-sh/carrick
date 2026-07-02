@@ -895,7 +895,7 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         const SIGINFO_LEN: usize = 128;
         if length < SIGINFO_LEN {
-            return LINUX_EINVAL.into();
+            return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let max = length / SIGINFO_LEN;
         let mut out: Vec<u8> = Vec::new();
@@ -919,10 +919,10 @@ impl SyscallDispatcher {
             out.extend_from_slice(&rec);
         }
         if out.is_empty() {
-            return LINUX_EAGAIN.into();
+            return DispatchOutcome::errno(LINUX_EAGAIN);
         }
         if memory.write_bytes(address, &out).is_err() {
-            return LINUX_EFAULT.into();
+            return DispatchOutcome::errno(LINUX_EFAULT);
         }
         DispatchOutcome::Returned {
             value: out.len() as i64,
@@ -1051,7 +1051,7 @@ impl SyscallDispatcher {
         fn kill(this, cx, pid: Pid, sig: Signal) {
             let signum = sig.0 as u64;
             if !is_valid_signum(signum) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // PID namespace (§5.3, §6.6): translate the guest target.
             //  - pid > 0: an ns-pid → its host pid (kill(1) hits the ns-init);
@@ -1065,13 +1065,13 @@ impl SyscallDispatcher {
                 if pid.0 > 0 {
                     match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
                         Some(h) => i64::from(h as i32),
-                        None => return Ok(LINUX_ESRCH.into()),
+                        None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                     }
                 } else if pid.0 < -1 {
                     let ns_pgid = (-(pid.0 as i64)) as u32;
                     match crate::namespace::pid::ns_to_host_or_self(ns_pgid) {
                         Some(h) => -(i64::from(h as i32)),
-                        None => return Ok(LINUX_ESRCH.into()),
+                        None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
                     }
                 } else {
                     i64::from(pid.0)
@@ -1188,7 +1188,7 @@ impl SyscallDispatcher {
         /// process's pending masked signals is a tracked follow-up.
         fn signalfd4(this, cx, fd: Fd, mask: GuestPtr, sizemask: u64, flags: u64) {
             if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // The kernel sigset_t ABI is exactly 8 bytes (_NSIG/8 on aarch64); any
             // other sizemask is rejected with EINVAL BEFORE the mask pointer is
@@ -1196,7 +1196,7 @@ impl SyscallDispatcher {
             // -EINVAL`). Verified vs docker linux/arm64. (glibc's signalfd() always
             // passes 8 here regardless of its 128-byte userspace sigset_t.)
             if sizemask != 8 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // sigset_t is 8 bytes; read it (EFAULT on bad ptr).
             let mask_val = match cx.memory.read_bytes(mask.0, 8) {
@@ -1204,7 +1204,7 @@ impl SyscallDispatcher {
                     let arr: [u8; 8] = b.as_slice().try_into().unwrap_or([0u8; 8]);
                     SigSet::from_raw(u64::from_le_bytes(arr))
                 }
-                Err(_) => return Ok(LINUX_EFAULT.into()),
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
             };
             if fd.0 == -1 {
                 let description = OpenDescription::SignalFd {
@@ -1214,7 +1214,7 @@ impl SyscallDispatcher {
                 Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
             } else {
                 let Some(open_file) = this.open_file(fd.0) else {
-                    return Ok(LINUX_EBADF.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 let mut open = open_file.description.write();
                 match &mut *open {
@@ -1222,7 +1222,7 @@ impl SyscallDispatcher {
                         *mask = mask_val;
                         Ok(DispatchOutcome::Returned { value: fd.0 as i64 })
                     }
-                    _ => Ok(LINUX_EINVAL.into()),
+                    _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                 }
             }
         }
@@ -1232,10 +1232,10 @@ impl SyscallDispatcher {
             let tid = i64::from(tid.0);
             let signum = sig.0 as u64;
             if tid <= 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !is_valid_signum(signum) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Some(routed) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
@@ -1267,10 +1267,10 @@ impl SyscallDispatcher {
             let tid = i64::from(tid.0);
             let signum = sig.0 as u64;
             if tgid <= 0 || tid <= 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !is_valid_signum(signum) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let Some(routed) = this.route_thread_signal(cx, tid, signum, true) {
                 return Ok(routed);
@@ -1282,7 +1282,7 @@ impl SyscallDispatcher {
             // route_thread_signal above.)
             let valid_self = names_self_pid(tgid) && names_self_pid(tid);
             if !valid_self {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let self_tid = cx
                 .thread
@@ -1324,30 +1324,30 @@ impl SyscallDispatcher {
                 // Linux forbids changing the alt stack while executing ON it
                 // (the running handler would have the rug pulled out). (M13)
                 if on_altstack {
-                    return Ok(LINUX_EPERM.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 let bytes = match memory.read_bytes(ss, core::mem::size_of::<LinuxSigaltstack>()) {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
                 let new_stack = match LinuxSigaltstack::read_from_bytes(&bytes) {
                     Ok(stack) => stack,
                     Err(_) => {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
                 let flags = new_stack.ss_flags as u32 as u64;
                 if flags & !LINUX_SS_DISABLE != 0 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if flags & LINUX_SS_DISABLE != 0 {
                     this.signal.lock().altstack.remove(&tid);
                 } else {
                     let size = new_stack.ss_size;
                     if size < LINUX_MINSIGSTKSZ {
-                        return Ok(LINUX_ENOMEM.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     this.signal.lock().altstack.insert(tid, new_stack);
                 }
@@ -1362,7 +1362,7 @@ impl SyscallDispatcher {
             let tid = Self::ctx_tid(cx);
             let memory = &*cx.memory;
             if sigset_size != LINUX_RT_SIGSET_SIZE {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let mask_bytes = memory.read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize)?;
             let suspend_mask = sanitize_signal_mask(SigSet::from_raw(u64::from_le_bytes(
@@ -1441,7 +1441,7 @@ impl SyscallDispatcher {
             } else {
                 this.restore_signal_mask(tid, original);
             }
-            Ok(LINUX_EINTR.into())
+            Ok(DispatchOutcome::errno(LINUX_EINTR))
         }
 
         /// rt_sigaction(signum, new_action, old_action, sigset_size): configure handler.
@@ -1451,21 +1451,21 @@ impl SyscallDispatcher {
             let old_action = old_action.0;
             let memory = &mut *cx.memory;
             if sigset_size != LINUX_RT_SIGSET_SIZE {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !(1..=64).contains(&signum) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let new_sa = if new_action != 0 {
                 let bytes =
                     match memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>()) {
                         Ok(bytes) => bytes,
                         Err(_) => {
-                            return Ok(LINUX_EFAULT.into());
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
                     };
                 if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 match LinuxSigaction::ref_from_bytes(&bytes) {
                     Ok(sa) => {
@@ -1480,7 +1480,7 @@ impl SyscallDispatcher {
                         Some(*sa)
                     }
                     Err(_) => {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 }
             } else {
@@ -1495,7 +1495,7 @@ impl SyscallDispatcher {
                     .copied()
                     .unwrap_or_else(LinuxSigaction::empty);
                 if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
             if let Some(sa) = new_sa {
@@ -1542,7 +1542,7 @@ impl SyscallDispatcher {
             let tid = Self::ctx_tid(cx);
             let memory = &mut *cx.memory;
             if sigset_size != LINUX_RT_SIGSET_SIZE {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let previous_mask = this.signal.lock().mask_for(tid);
             if old_set != 0
@@ -1550,13 +1550,13 @@ impl SyscallDispatcher {
                     .write_bytes(old_set, &previous_mask.raw().to_le_bytes())
                     .is_err()
             {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             if new_set != 0 {
                 let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
                 let set = SigSet::from_raw(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])));
@@ -1565,7 +1565,7 @@ impl SyscallDispatcher {
                     LINUX_SIG_UNBLOCK => previous_mask.difference(set),
                     LINUX_SIG_SETMASK => set,
                     _ => {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 };
                 this.signal
@@ -1582,7 +1582,7 @@ impl SyscallDispatcher {
             let tid = Self::ctx_tid(cx);
             let memory = &mut *cx.memory;
             if sigset_size != LINUX_RT_SIGSET_SIZE {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let signal = this.signal.lock();
             // Pending = this thread's per-thread set UNION the shared process
@@ -1599,7 +1599,7 @@ impl SyscallDispatcher {
                     .write_bytes(set_ptr, &pending.raw().to_le_bytes())
                     .is_err()
             {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -1612,12 +1612,12 @@ impl SyscallDispatcher {
             let tid = Self::ctx_tid(cx);
             let memory = &*cx.memory;
             if sigset_size != LINUX_RT_SIGSET_SIZE {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let set_bytes = match memory.read_bytes(set_ptr, LINUX_RT_SIGSET_SIZE as usize) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             };
             let wait_set =
@@ -1628,7 +1628,7 @@ impl SyscallDispatcher {
                 let tv_sec = ts.tv_sec;
                 let tv_nsec = ts.tv_nsec;
                 if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
             }
@@ -1649,7 +1649,7 @@ impl SyscallDispatcher {
             }
             install_host_handlers_for_wait_set(wait_set);
             match timeout {
-                Some(d) if d.is_zero() => Ok(LINUX_EAGAIN.into()),
+                Some(d) if d.is_zero() => Ok(DispatchOutcome::errno(LINUX_EAGAIN)),
                 _ => Ok(DispatchOutcome::WaitOnSignals {
                     wait_set,
                     // The named constructor states the park policy: wait-set
@@ -1770,7 +1770,7 @@ impl SyscallDispatcher {
         info_ptr: GuestPtr,
     ) -> DispatchOutcome {
         if !is_valid_signum(signum) {
-            return LINUX_EINVAL.into();
+            return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let s = signum as i32;
 
@@ -1802,7 +1802,7 @@ impl SyscallDispatcher {
         let ns_target = if crate::namespace::pid::enabled() && ns_target > 0 {
             match crate::namespace::pid::ns_to_host_or_self(ns_target as u32) {
                 Some(h) => i64::from(h as i32),
-                None => return LINUX_ESRCH.into(),
+                None => return DispatchOutcome::errno(LINUX_ESRCH),
             }
         } else {
             ns_target
@@ -1922,7 +1922,7 @@ fn rt_sigtimedwait_deliver(
         // made glibc's sigwaitinfo copy its own buffer to the bad pointer in
         // USERSPACE — killing the guest with SIGSEGV where Linux returns -1.
         if memory.write_bytes(info_ptr, si.as_bytes()).is_err() {
-            return LINUX_EFAULT.into();
+            return DispatchOutcome::errno(LINUX_EFAULT);
         }
     }
     DispatchOutcome::Returned {

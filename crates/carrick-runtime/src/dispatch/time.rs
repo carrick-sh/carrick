@@ -102,7 +102,7 @@ impl SyscallDispatcher {
             if linux_clock_duration(clock_id).is_none()
                 || flags & !(LINUX_TFD_NONBLOCK | LINUX_TFD_CLOEXEC) != 0
             {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let description = OpenDescription::TimerFd {
                 state: Arc::new(TimerFdState::new(clock_id)),
@@ -114,16 +114,16 @@ impl SyscallDispatcher {
         fn timerfd_settime(this, cx, fd: Fd, flags: u64, new_value: u64, old_value: u64) {
             let memory = &mut *cx.memory;
             if flags & !LINUX_TIMER_ABSTIME != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let spec = read_itimerspec(memory, new_value)?;
             let (next_interval, next_value) = itimerspec_durations(spec)?;
             let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(LINUX_EBADF.into());
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let open = open_file.description.read();
             let OpenDescription::TimerFd { state, .. } = &*open else {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let state = Arc::clone(state);
             drop(open);
@@ -132,7 +132,7 @@ impl SyscallDispatcher {
             if old_value != 0 {
                 let previous = timerfd_itimerspec(timer.clock_id, timer.interval, timer.deadline);
                 if write_kernel_struct_raw(memory, old_value, &previous).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
 
@@ -153,11 +153,11 @@ impl SyscallDispatcher {
         fn timerfd_gettime(this, cx, fd: Fd, current_value: u64) {
             let memory = &mut *cx.memory;
             let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(LINUX_EBADF.into());
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let open = open_file.description.read();
             let OpenDescription::TimerFd { state, .. } = &*open else {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let mut timer = state.inner.lock();
             refresh_timerfd_locked(&mut timer);
@@ -186,15 +186,15 @@ impl SyscallDispatcher {
         fn clock_nanosleep(this, cx, clock_id: u64, flags: u64, request_address: GuestPtr, rem_ptr: GuestPtr) {
             let memory = &*cx.memory;
             if flags & !LINUX_TIMER_ABSTIME != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let Some(now) = linux_clock_duration(clock_id) else {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let timespec = read_timespec(memory, request_address.0)?;
             let requested = match duration_from_linux_timespec(timespec) {
                 Ok(duration) => duration.unwrap_or(Duration::ZERO),
-                Err(errno) => return Ok(errno.into()),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             let sleep_duration = if flags & LINUX_TIMER_ABSTIME != 0 {
                 requested.saturating_sub(now)
@@ -217,7 +217,7 @@ impl SyscallDispatcher {
         fn clock_gettime(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &mut *cx.memory;
             let Some(duration) = linux_clock_duration(clock_id) else {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let timespec = linux_timespec_from_duration(duration);
             Ok(write_kernel_struct(memory, address.0, &timespec))
@@ -226,7 +226,7 @@ impl SyscallDispatcher {
         fn clock_getres(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &mut *cx.memory;
             if linux_clock_duration(clock_id).is_none() {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if address.0 == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -248,26 +248,26 @@ impl SyscallDispatcher {
         fn clock_settime(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &*cx.memory;
             if !linux_clock_is_known(clock_id) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let timespec = read_timespec(memory, address.0)?;
             let tv_nsec = timespec.tv_nsec;
             if !(0..1_000_000_000).contains(&tv_nsec) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if !linux_clock_is_settable(clock_id) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            Ok(LINUX_EPERM.into())
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
         fn getitimer(this, cx, which: u64, address: GuestPtr) {
             let memory = &mut *cx.memory;
             if !linux_itimer_which_is_valid(which) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if address.0 == 0 {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let current = itimerval_from_state(this.proc.lock().itimers[which as usize]);
             Ok(write_kernel_struct(memory, address.0, &current))
@@ -276,14 +276,14 @@ impl SyscallDispatcher {
         fn setitimer(this, cx, which: u64, new_address: GuestPtr, old_address: GuestPtr) {
             let memory = &mut *cx.memory;
             if !linux_itimer_which_is_valid(which) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let new_value = if new_address.0 != 0 {
                 let v = read_itimerval(memory, new_address.0)?;
                 if !linux_timeval_usec_is_valid(v.it_interval)
                     || !linux_timeval_usec_is_valid(v.it_value)
                 {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 Some(v)
             } else {
@@ -407,10 +407,10 @@ impl SyscallDispatcher {
             let memory = &mut *cx.memory;
             // Validate the clock — we only support the same set as clock_gettime.
             if linux_clock_duration(clock_id).is_none() {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if id_out.0 == 0 {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let mut signum = crate::linux_abi::LINUX_SIGALRM;
             if sevp.0 != 0 {
@@ -439,19 +439,19 @@ impl SyscallDispatcher {
                     if notify == LINUX_SIGEV_THREAD_ID
                         && clock_id == LINUX_CLOCK_THREAD_CPUTIME_ID
                     {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     if !(1..=64).contains(&signo) {
-                        return Ok(LINUX_EINVAL.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     signum = signo;
                 } else if notify == LINUX_SIGEV_THREAD {
                     // SIGEV_THREAD: never seen by the kernel on real Linux
                     // (glibc swaps it for SIGEV_THREAD_ID). A raw syscall
                     // passing it gets EINVAL.
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 } else {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
             let timer_id = crate::posix_timer::create(clock_id as i32, signum);
@@ -460,7 +460,7 @@ impl SyscallDispatcher {
             let id_bytes = (timer_id as i64 as u64).to_le_bytes();
             if memory.write_bytes(id_out.0, &id_bytes).is_err() {
                 let _ = crate::posix_timer::delete(timer_id);
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -473,14 +473,14 @@ impl SyscallDispatcher {
             let memory = &mut *cx.memory;
             let id = timer_id as i64 as i32;
             if !crate::posix_timer::exists(id) {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // Only TIMER_ABSTIME is a valid flag; reject any other bit. (audit M4)
             if flags & !LINUX_TIMER_ABSTIME != 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if new_ptr.0 == 0 {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let spec = read_itimerspec(memory, new_ptr.0)?;
             // Validate the timespec (EINVAL on tv_nsec>=1e9 or negative) via the
@@ -534,7 +534,7 @@ impl SyscallDispatcher {
                     .write_bytes(old_ptr.0, old_spec.as_bytes())
                     .is_err()
                 {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -545,10 +545,10 @@ impl SyscallDispatcher {
             let memory = &mut *cx.memory;
             let id = timer_id as i64 as i32;
             let Some(remaining) = crate::posix_timer::remaining(id) else {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             if cur_ptr.0 == 0 {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let spec = build_itimerspec_ns(remaining);
             memory.write_bytes(cur_ptr.0, spec.as_bytes())?;
@@ -561,7 +561,7 @@ impl SyscallDispatcher {
             if crate::posix_timer::delete(id) {
                 Ok(DispatchOutcome::Returned { value: 0 })
             } else {
-                Ok(LINUX_EINVAL.into())
+                Ok(DispatchOutcome::errno(LINUX_EINVAL))
             }
         }
 
@@ -570,7 +570,7 @@ impl SyscallDispatcher {
             let id = timer_id as i64 as i32;
             match crate::posix_timer::getoverrun(id) {
                 Some(n) => Ok(DispatchOutcome::Returned { value: n as i64 }),
-                None => Ok(LINUX_EINVAL.into()),
+                None => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         }
 
@@ -581,7 +581,7 @@ impl SyscallDispatcher {
         fn clock_adjtime(this, cx, clock_id: u64, address: GuestPtr) {
             let memory = &*cx.memory;
             if clock_id != LINUX_CLOCK_REALTIME {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             Ok(adjtimex_bootstrap(memory, address.0))
         }
@@ -595,7 +595,7 @@ impl SyscallDispatcher {
                     .write_bytes(timeval.0, tv.as_bytes())
                     .is_err()
                 {
-                    return Ok(LINUX_EFAULT.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
             if timezone.0 != 0
@@ -603,13 +603,13 @@ impl SyscallDispatcher {
                     .write_bytes(timezone.0, LinuxTimezone::utc().abi_bytes())
                     .is_err()
             {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn settimeofday(this, cx, _timeval: GuestPtr, _timezone: GuestPtr) {
-            Ok(LINUX_EPERM.into())
+            Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
         fn sysinfo(this, cx, info_ptr: GuestPtr) {
@@ -632,7 +632,7 @@ impl SyscallDispatcher {
                 _f: [0; 4],
             };
             if write_kernel_struct_raw(memory, info_ptr.0, &info).is_err() {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -661,7 +661,7 @@ impl SyscallDispatcher {
                 tms_cstime: to_ticks(crate::guest_cpu::child_system_us()),
             };
             if buf.0 != 0 && memory.write_bytes(buf.0, tms.abi_bytes()).is_err() {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: clock })
         }
@@ -672,11 +672,11 @@ impl SyscallDispatcher {
             match who {
                 LINUX_RUSAGE_SELF | LINUX_RUSAGE_CHILDREN | LINUX_RUSAGE_THREAD => {}
                 _ => {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             }
             if usage.0 == 0 {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let host = crate::host_proc::self_resource_usage().unwrap_or_default();
             // On Linux/KVM, `self_resource_usage` is a no-op stub; source the
@@ -715,13 +715,13 @@ impl SyscallDispatcher {
         // Rosetta still use. Equivalent to prlimit64 reading the current limit.
         fn getrlimit(this, cx, resource: u64, rlimit: GuestPtr) {
             if resource >= LINUX_RLIM_NLIMITS {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let nofile_soft = this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed);
             let limit = effective_rlimit(resource, nofile_soft, &this.proc.lock().rlimit_overrides);
             let memory = &mut *cx.memory;
             if rlimit.0 != 0 && write_kernel_struct_raw(memory, rlimit.0, &limit).is_err() {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -749,7 +749,7 @@ impl SyscallDispatcher {
                                     == Some(libc::EPERM)
                         };
                     if !exists {
-                        return Ok(LINUX_ESRCH.into());
+                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                     }
                 }
             }
@@ -759,25 +759,25 @@ impl SyscallDispatcher {
             // previously treated unknown resources as RLIM_INFINITY and
             // "succeeded".
             if resource >= LINUX_RLIM_NLIMITS {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let nofile_soft = this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed);
             // The old (current) limit is reported BEFORE the new one is applied.
             let old = effective_rlimit(resource, nofile_soft, &this.proc.lock().rlimit_overrides);
             if old_limit.0 != 0 && write_kernel_struct_raw(memory, old_limit.0, &old).is_err() {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             if new_limit.0 != 0 {
                 let bytes = match memory.read_bytes(new_limit.0, 16) {
                     Ok(b) => b,
                     Err(_) => {
-                        return Ok(LINUX_EFAULT.into());
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
                 let rlim_cur = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
                 let rlim_max = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
                 if rlim_cur > rlim_max {
-                    return Ok(LINUX_EINVAL.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 if resource == LINUX_RLIMIT_NOFILE {
                     // Honor the guest raising (or lowering) its fd soft limit,

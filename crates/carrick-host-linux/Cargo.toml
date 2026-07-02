@@ -21,5 +21,6 @@ workspace = true
 # KVM backend (carrick-vmm-kvm) and this host layer are wired together by
 # carrick-runtime under the `platform-linux` feature.
 [dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }
 libc.workspace = true

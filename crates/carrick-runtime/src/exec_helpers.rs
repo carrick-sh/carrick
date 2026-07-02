@@ -18,6 +18,7 @@
 //! platform (Rosetta/EL-bring-up on macOS vs the KVM image builder on Linux).
 
 use crate::dispatch::SyscallDispatcher;
+use crate::linux_abi::LinuxErrno;
 
 /// Resolve `#!` shebang scripts the way the Linux kernel does: if `path` names
 /// a file starting with `#!`, re-target at the interpreter with the script path
@@ -33,7 +34,7 @@ pub(crate) fn resolve_shebang(
     dispatcher: &SyscallDispatcher,
     mut path: String,
     mut argv: Vec<Vec<u8>>,
-) -> Result<(String, Vec<Vec<u8>>), i32> {
+) -> Result<(String, Vec<Vec<u8>>), LinuxErrno> {
     for _ in 0..4 {
         let Some(head) = dispatcher.read_exec_file(&path) else {
             break;
@@ -110,7 +111,7 @@ pub(crate) fn resolve_entrypoint_program(
     env: &[String],
     argv: Vec<Vec<u8>>,
     dispatcher: &SyscallDispatcher,
-) -> Result<(String, Vec<Vec<u8>>), i32> {
+) -> Result<(String, Vec<Vec<u8>>), LinuxErrno> {
     let resolved = resolve_entrypoint_path(path, env, dispatcher);
     resolve_shebang(dispatcher, resolved, argv)
 }

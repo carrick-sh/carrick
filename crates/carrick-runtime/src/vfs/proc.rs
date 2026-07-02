@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
+use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, LinuxErrno};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
     LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_RLIMIT_STACK_SOFT,
@@ -154,7 +154,7 @@ pub(crate) fn is_writable_tunable_path(path: &str) -> bool {
 /// "consumed" per kernel behavior), or `Err(positive_errno)` (EPERM / EINVAL)
 /// to be returned as a negative errno. The write-once, setgroups-gate, ≤5-line
 /// and unprivileged-single-id rules are enforced by [`crate::namespace::user`].
-pub(crate) fn write_userns_map(path: &str, data: &[u8]) -> Result<usize, i64> {
+pub(crate) fn write_userns_map(path: &str, data: &[u8]) -> Result<usize, LinuxErrno> {
     let text = std::str::from_utf8(data).map_err(|_| crate::namespace::user::EINVAL)?;
     let privileged = crate::namespace::process::is_map_write_privileged();
     // The writer's outside id for the unprivileged single-id rule. carrick runs
@@ -191,7 +191,7 @@ const OOM_SCORE_ADJ_MAX: i32 = 1000;
 /// `/proc/<self-pid>/` form to `/proc/self/` (the framework writes the explicit
 /// pid, e.g. `/proc/1/oom_score_adj`), then dispatches: oom_score_adj persists
 /// the value; the rest carrick has no live state for, so accept-and-ignore.
-pub(crate) fn write_tunable(path: &str, data: &[u8]) -> Result<usize, i64> {
+pub(crate) fn write_tunable(path: &str, data: &[u8]) -> Result<usize, LinuxErrno> {
     match normalize_self_pid_path(path).as_ref() {
         "/proc/self/oom_score_adj" => write_oom_score_adj(data),
         _ => Ok(data.len()),
@@ -200,7 +200,7 @@ pub(crate) fn write_tunable(path: &str, data: &[u8]) -> Result<usize, i64> {
 
 /// Store a write to `/proc/self/oom_score_adj`. Returns EINVAL (negative errno)
 /// for an unparseable or out-of-range value, mirroring Linux.
-pub(crate) fn write_oom_score_adj(data: &[u8]) -> Result<usize, i64> {
+pub(crate) fn write_oom_score_adj(data: &[u8]) -> Result<usize, LinuxErrno> {
     let value: i32 = std::str::from_utf8(data)
         .map_err(|_| crate::namespace::user::EINVAL)?
         .trim()

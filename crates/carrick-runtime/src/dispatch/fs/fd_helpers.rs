@@ -3,6 +3,7 @@
 //! accessors (host file/socket/pipe, inotify, splice). Pure `impl
 //! SyscallDispatcher` move — `self.…` resolution is type-based.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 impl SyscallDispatcher {
     fn first_free_fd(
@@ -390,7 +391,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(in crate::dispatch) fn fd_is_pipe_writer(&self, fd: i32) -> Result<bool, i32> {
+    pub(in crate::dispatch) fn fd_is_pipe_writer(&self, fd: i32) -> Result<bool, LinuxErrno> {
         let Some(open_file) = self.open_file(fd) else {
             return if is_stdio_fd(fd) {
                 Ok(false)
@@ -448,7 +449,7 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(in crate::dispatch) fn splice_output_errno(&self, fd: i32) -> Option<i32> {
+    pub(in crate::dispatch) fn splice_output_errno(&self, fd: i32) -> Option<LinuxErrno> {
         if is_stdio_fd(fd) {
             return None;
         }

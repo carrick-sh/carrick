@@ -4,6 +4,7 @@
 //! as `impl SyscallDispatcher` methods; `self.…` resolution is type-based so
 //! the move is transparent to callers.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 impl SyscallDispatcher {
     /// Resolve the first argument of an xattr syscall to the rootfs path it
@@ -14,7 +15,7 @@ impl SyscallDispatcher {
         &self,
         memory: &impl GuestMemory,
         target: XattrTarget,
-    ) -> Result<String, i32> {
+    ) -> Result<String, LinuxErrno> {
         match target {
             XattrTarget::Path(path_ptr) => {
                 let path = read_guest_c_string(memory, path_ptr.0)?;
@@ -100,7 +101,7 @@ impl SyscallDispatcher {
             });
         }
         if value.len() > size {
-            return Ok(LINUX_ERANGE.into());
+            return Ok(DispatchOutcome::errno(LINUX_ERANGE));
         }
         memory
             .write_bytes(buf_addr, &value)
@@ -134,7 +135,7 @@ impl SyscallDispatcher {
             });
         }
         if list.len() > size {
-            return Ok(LINUX_ERANGE.into());
+            return Ok(DispatchOutcome::errno(LINUX_ERANGE));
         }
         memory
             .write_bytes(buf_addr, &list)

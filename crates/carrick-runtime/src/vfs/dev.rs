@@ -254,7 +254,7 @@ impl Vfs for DevVfs {
     }
 }
 
-pub(crate) fn host_open_errno() -> i32 {
+pub(crate) fn host_open_errno() -> crate::linux_abi::LinuxErrno {
     let raw = carrick_portable::errno();
 
     if raw == libc::ENOENT {

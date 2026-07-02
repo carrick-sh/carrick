@@ -12,17 +12,17 @@
 //!   `setgroups` is locked read-only `"deny"`.
 //!
 //! The pure logic is decoupled from the dispatcher: writers return
-//! `Result<(), i64>` where the error is the *positive* Linux errno number
-//! (`errno(2)`), which the `/proc` write path converts into the guest-visible
-//! `write(2)` return.
+//! `Result<(), LinuxErrno>` (the typed positive Linux errno), which the
+//! `/proc` write path converts into the guest-visible `write(2)` return.
 
 use super::{NsId, OVERFLOW_ID};
+use crate::linux_abi::LinuxErrno;
 
 /// `EPERM` (`errno(2)`). Write-once violation, setgroups gate, unprivileged
 /// over-broad map.
-pub const EPERM: i64 = 1;
+pub const EPERM: LinuxErrno = crate::linux_abi::LINUX_EPERM;
 /// `EINVAL` (`errno(2)`). Malformed map / setgroups value.
-pub const EINVAL: i64 = 22;
+pub const EINVAL: LinuxErrno = crate::linux_abi::LINUX_EINVAL;
 
 /// A single `uid_map`/`gid_map` line: ids `[inside, inside+length)` inside the
 /// namespace map to `[outside, outside+length)` in the parent namespace.
@@ -68,7 +68,7 @@ pub enum IdMapError {
 
 impl IdMapError {
     /// The positive Linux errno this maps to.
-    pub fn errno(self) -> i64 {
+    pub fn errno(self) -> LinuxErrno {
         EINVAL
     }
 }
@@ -292,7 +292,7 @@ impl UserNs {
     /// Write `/proc/[pid]/setgroups`. Value must be `"allow"` or `"deny"`
     /// (trailing whitespace ignored). Fails `EPERM` once the gate is locked
     /// (after `gid_map` is written). (Design §4.3 rule 4.)
-    pub fn write_setgroups(&mut self, value: &str) -> Result<(), i64> {
+    pub fn write_setgroups(&mut self, value: &str) -> Result<(), LinuxErrno> {
         if self.setgroups_locked {
             return Err(EPERM);
         }
@@ -313,7 +313,7 @@ impl UserNs {
         text: &str,
         privileged: bool,
         euid_outside: u32,
-    ) -> Result<(), i64> {
+    ) -> Result<(), LinuxErrno> {
         if self.uid_map.is_some() {
             return Err(EPERM);
         }
@@ -334,7 +334,7 @@ impl UserNs {
         text: &str,
         privileged: bool,
         egid_outside: u32,
-    ) -> Result<(), i64> {
+    ) -> Result<(), LinuxErrno> {
         if self.gid_map.is_some() {
             return Err(EPERM);
         }
@@ -356,7 +356,7 @@ impl UserNs {
 
 /// The unprivileged single-id rule: exactly one line, `length == 1`, `outside
 /// == the writer's effective id in the parent ns`. Otherwise `EPERM`.
-fn check_unprivileged_single_id(map: &IdMap, expected_outside: u32) -> Result<(), i64> {
+fn check_unprivileged_single_id(map: &IdMap, expected_outside: u32) -> Result<(), LinuxErrno> {
     match map.entries() {
         [e] if e.length == 1 && e.outside == expected_outside => Ok(()),
         _ => Err(EPERM),

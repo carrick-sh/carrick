@@ -107,16 +107,12 @@ where
             }
             let outcome = match raw {
                 FutexWaitOutcome::Woken => 0,
-                FutexWaitOutcome::TimedOut => {
-                    LinuxErrno::new(crate::linux_abi::LINUX_ETIMEDOUT).guest_retval()
-                }
+                FutexWaitOutcome::TimedOut => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
                 FutexWaitOutcome::Interrupted if crate::fork_quiesce::is_quiescing() => {
                     self.release_and_park_vcpu_for_fork(engine)?;
                     continue;
                 }
-                FutexWaitOutcome::Interrupted => {
-                    LinuxErrno::new(crate::linux_abi::LINUX_EINTR).guest_retval()
-                }
+                FutexWaitOutcome::Interrupted => crate::linux_abi::LINUX_EINTR.guest_retval(),
             };
             break outcome;
         };
@@ -141,7 +137,7 @@ where
             let retval = self
                 .platform_futex
                 .shared_wait(host_addr, value, timeout, &interrupted);
-            if retval == LinuxErrno::new(crate::linux_abi::LINUX_EINTR).guest_retval()
+            if retval == crate::linux_abi::LINUX_EINTR.guest_retval()
                 && crate::fork_quiesce::is_quiescing()
             {
                 self.release_and_park_vcpu_for_fork(engine)?;

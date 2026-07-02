@@ -61,7 +61,9 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
     // read with no events queued -> EAGAIN (11).
     assert_eq!(
         run(&mut dispatcher, &mut memory, 63, [ifd, 0x4100, 64, 0, 0, 0]),
-        DispatchOutcome::Errno { errno: 11 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(11)
+        }
     );
 
     // add_watch on an existing in-memory path -> a valid wd (>= 1). The
@@ -131,7 +133,9 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
             27,
             [ifd, 0x4280, IN_MODIFY, 0, 0, 0]
         ),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
 
     // add_watch on an empty path -> ENOENT (2); unlike fstatat-style metadata
@@ -144,19 +148,25 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
             27,
             [ifd, 0x4300, IN_MODIFY, 0, 0, 0]
         ),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
 
     // rm_watch of an unknown wd -> EINVAL (22).
     assert_eq!(
         run(&mut dispatcher, &mut memory, 28, [ifd, 99, 0, 0, 0, 0]),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     // add_watch / rm_watch on a non-inotify fd -> EINVAL (22).
     assert_eq!(
         run(&mut dispatcher, &mut memory, 28, [0, 1, 0, 0, 0, 0]),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 }
 
@@ -600,7 +610,9 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 17 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(17)
+        }
     );
     assert_eq!(
         dispatcher
@@ -633,7 +645,9 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -648,7 +662,9 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -668,7 +684,9 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -700,7 +718,9 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 17 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(17)
+        }
     );
     assert_eq!(
         dispatcher
@@ -713,7 +733,9 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(30)
+        }
     );
     assert_eq!(
         dispatcher
@@ -726,7 +748,9 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -739,7 +763,9 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -791,7 +817,9 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -806,7 +834,9 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -821,7 +851,9 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -871,7 +903,9 @@ fn renameat2_exchange_swaps_content_and_rejects_invalid_flag_combos() {
                 0
             ]
         ),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     // Mutually-exclusive flag combos → EINVAL.
     assert_eq!(
@@ -888,7 +922,9 @@ fn renameat2_exchange_swaps_content_and_rejects_invalid_flag_combos() {
                 0
             ]
         ),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
     assert_eq!(
         run(
@@ -904,7 +940,9 @@ fn renameat2_exchange_swaps_content_and_rejects_invalid_flag_combos() {
                 0
             ]
         ),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     // The swap itself: a.txt <-> b.txt.
@@ -977,7 +1015,9 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 20 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(20)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1007,7 +1047,9 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 21 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(21)
+        }
     );
     // rmdir of a non-empty directory (/etc/conf.d holds .gitkeep) is ENOTEMPTY,
     // matching real Linux on the writable overlay (no longer read-only EROFS).
@@ -1022,7 +1064,9 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 39 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(39)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1035,7 +1079,9 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1048,7 +1094,9 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1061,7 +1109,9 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(22)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -1092,7 +1142,9 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 17 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(17)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1121,7 +1173,9 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
@@ -1154,7 +1208,9 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 17 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(17)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1167,7 +1223,9 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 17 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(17)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1195,7 +1253,9 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 2 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(2)
+        }
     );
     assert_eq!(
         dispatcher
@@ -1205,7 +1265,9 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(9)
+        }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());

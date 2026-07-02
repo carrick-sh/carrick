@@ -4,6 +4,8 @@
 //! `libc::E*` constants (resolved per target), NOT off numeric equality, so it
 //! compiles correctly for FreeBSD even though high extension errnos differ.
 
+use carrick_abi::LinuxErrno;
+
 /// Linux UAPI errno values, re-exported under their bare names from the
 /// canonical table in `carrick-abi`. The Linux numbers live in exactly one
 /// place (`carrick_abi::LINUX_E*`) so the translation can't drift from the ABI.
@@ -50,7 +52,10 @@ pub mod linux_errno {
 /// Sources:
 /// - macOS/FreeBSD: <sys/errno.h>
 /// - Linux: asm-generic/errno-base.h + asm-generic/errno.h
-pub fn bsd_to_linux_errno(host: i32) -> i32 {
+///
+/// Takes the RAW host errno (`i32` — the host domain) and returns the typed
+/// Linux-domain [`LinuxErrno`]: this function IS the domain boundary.
+pub fn bsd_to_linux_errno(host: i32) -> LinuxErrno {
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -119,7 +124,7 @@ pub fn bsd_to_linux_errno(host: i32) -> i32 {
             // Codes 1..=34 overlap; unmapped BSD extension errnos above that
             // range are not Linux numbers, so collapse them to EIO rather than
             // leaking host-specific values to the guest.
-            other if (1..=34).contains(&other) => other,
+            other if (1..=34).contains(&other) => LinuxErrno::new(other),
             _ => EIO,
         }
     }
@@ -132,7 +137,7 @@ pub fn bsd_to_linux_errno(host: i32) -> i32 {
         target_os = "dragonfly"
     )))]
     {
-        host
+        LinuxErrno::new(host)
     }
 }
 
@@ -158,7 +163,7 @@ mod tests {
             }
             assert_eq!(
                 bsd_to_linux_errno(code),
-                code,
+                carrick_abi::LinuxErrno::new(code),
                 "code {} should be identity in overlap zone",
                 code
             );
@@ -169,7 +174,7 @@ mod tests {
         );
         assert_ne!(
             bsd_to_linux_errno(libc::EINPROGRESS),
-            36,
+            carrick_abi::LinuxErrno::new(36),
             "EINPROGRESS != Linux ENAMETOOLONG"
         );
         assert_eq!(bsd_to_linux_errno(libc::EAGAIN), linux_errno::EAGAIN);
@@ -232,7 +237,7 @@ mod tests {
             bsd_to_linux_errno(libc::EDEADLK),
             carrick_abi::LINUX_EDEADLK
         );
-        assert_eq!(bsd_to_linux_errno(libc::EDEADLK), 35);
+        assert_eq!(bsd_to_linux_errno(libc::EDEADLK).get(), 35);
         assert_ne!(
             bsd_to_linux_errno(libc::EDEADLK),
             linux_errno::EAGAIN,
@@ -255,10 +260,10 @@ mod freebsd_errno_tests {
         // passthrough unchanged and reach the guest as Linux 35 = EDEADLK.
         assert_eq!(
             bsd_to_linux_errno(libc::EAGAIN),
-            carrick_abi::LINUX_EAGAIN as i32,
+            carrick_abi::LINUX_EAGAIN,
             "BSD EAGAIN({}) must map to Linux EAGAIN({})",
             libc::EAGAIN,
-            carrick_abi::LINUX_EAGAIN
+            carrick_abi::LINUX_EAGAIN.get()
         );
 
         // FreeBSD EDEADLK = 11; Linux EDEADLK = 35.
@@ -266,19 +271,19 @@ mod freebsd_errno_tests {
         // reaches the guest as Linux 11 = EAGAIN.
         assert_eq!(
             bsd_to_linux_errno(libc::EDEADLK),
-            carrick_abi::LINUX_EDEADLK as i32,
+            carrick_abi::LINUX_EDEADLK,
             "BSD EDEADLK({}) must map to Linux EDEADLK({})",
             libc::EDEADLK,
-            carrick_abi::LINUX_EDEADLK
+            carrick_abi::LINUX_EDEADLK.get()
         );
 
         // FreeBSD ENOATTR ("attribute not found") → Linux ENODATA.
         assert_eq!(
             bsd_to_linux_errno(libc::ENOATTR),
-            carrick_abi::LINUX_ENODATA as i32,
+            carrick_abi::LINUX_ENODATA,
             "BSD ENOATTR({}) must map to Linux ENODATA({})",
             libc::ENOATTR,
-            carrick_abi::LINUX_ENODATA
+            carrick_abi::LINUX_ENODATA.get()
         );
     }
 }

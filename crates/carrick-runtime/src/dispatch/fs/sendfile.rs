@@ -3,6 +3,7 @@
 //! fast path. Split out of `dispatch/fs.rs` (WS-F3) as `impl SyscallDispatcher`
 //! methods; the move is type-transparent to `self.…` callers.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 impl SyscallDispatcher {
     /// copy_file_range(2): like sendfile but file-to-file with independent
@@ -132,7 +133,7 @@ impl SyscallDispatcher {
         in_fd: i32,
         offset_address: u64,
         memory: &impl GuestMemory,
-    ) -> Result<Result<usize, i32>, DispatchError> {
+    ) -> Result<Result<usize, LinuxErrno>, DispatchError> {
         if offset_address != 0 {
             return match read_u64(memory, offset_address) {
                 Ok(offset) => {
@@ -177,7 +178,7 @@ impl SyscallDispatcher {
         in_fd: i32,
         offset: usize,
         count: usize,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<Vec<u8>, LinuxErrno> {
         let Some(in_file) = self.open_file(in_fd) else {
             return Err(LINUX_EBADF);
         };

@@ -2169,17 +2169,24 @@ assert_layout!(LinuxSigevent, sigev_value @ 0, sigev_signo @ 8, sigev_notify @ 1
 /// ([`LinuxErrno::guest_retval`]) so a pre-negated value can never be
 /// double-negated and a positive errno can never leak as a "success" retval.
 /// Debug builds assert the 1..=4095 kernel errno range at construction.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Serializes transparently as the positive errno number (a serde newtype
+/// struct is its inner value on the wire), so reporter/JSON output is
+/// unchanged by the typing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 pub struct LinuxErrno(i32);
 
 impl LinuxErrno {
-    /// Wrap a positive errno constant/translation result.
+    /// Wrap a positive errno constant/translation result. `const` so the
+    /// `LINUX_E*` table is a set of typed constants (usable in const items and
+    /// match patterns) with zero per-site wrapping.
     #[inline]
     #[track_caller]
-    pub fn new(errno: i32) -> Self {
+    pub const fn new(errno: i32) -> Self {
+        // `RangeInclusive::contains` and format captures are not const;
+        // spell the range check out so the assert works in const fn.
         debug_assert!(
-            (1..=4095).contains(&errno),
-            "errno {errno} outside the kernel's 1..=4095 range"
+            errno >= 1 && errno <= 4095,
+            "errno outside the kernel's 1..=4095 range"
         );
         LinuxErrno(errno)
     }
@@ -2211,30 +2218,30 @@ impl LinuxErrno {
 }
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
-pub const LINUX_EPERM: i32 = 1;
-pub const LINUX_ENOENT: i32 = 2;
-pub const LINUX_ESRCH: i32 = 3;
+pub const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
+pub const LINUX_ENOENT: LinuxErrno = LinuxErrno::new(2);
+pub const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
 /// No such device or address — e.g. `open("/dev/tty")` with no controlling tty.
-pub const LINUX_ENXIO: i32 = 6;
-pub const LINUX_EBADF: i32 = 9;
-pub const LINUX_ECHILD: i32 = 10;
-pub const LINUX_EAGAIN: i32 = 11;
-pub const LINUX_EINTR: i32 = 4;
+pub const LINUX_ENXIO: LinuxErrno = LinuxErrno::new(6);
+pub const LINUX_EBADF: LinuxErrno = LinuxErrno::new(9);
+pub const LINUX_ECHILD: LinuxErrno = LinuxErrno::new(10);
+pub const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
+pub const LINUX_EINTR: LinuxErrno = LinuxErrno::new(4);
 /// Non-blocking `connect(2)` in progress / already in progress / completed.
-pub const LINUX_EINPROGRESS: i32 = 115;
-pub const LINUX_EALREADY: i32 = 114;
-pub const LINUX_EISCONN: i32 = 106;
-pub const LINUX_ENOMEM: i32 = 12;
-pub const LINUX_EACCES: i32 = 13;
-pub const LINUX_EFAULT: i32 = 14;
-pub const LINUX_EEXIST: i32 = 17;
-pub const LINUX_EPIPE: i32 = 32;
-pub const LINUX_ESPIPE: i32 = 29;
-pub const LINUX_EROFS: i32 = 30;
-pub const LINUX_ENOTSUP: i32 = 95;
-pub const LINUX_ENOTSOCK: i32 = 88;
-pub const LINUX_ENOPROTOOPT: i32 = 92;
-pub const LINUX_ESOCKTNOSUPPORT: i32 = 94;
+pub const LINUX_EINPROGRESS: LinuxErrno = LinuxErrno::new(115);
+pub const LINUX_EALREADY: LinuxErrno = LinuxErrno::new(114);
+pub const LINUX_EISCONN: LinuxErrno = LinuxErrno::new(106);
+pub const LINUX_ENOMEM: LinuxErrno = LinuxErrno::new(12);
+pub const LINUX_EACCES: LinuxErrno = LinuxErrno::new(13);
+pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
+pub const LINUX_EEXIST: LinuxErrno = LinuxErrno::new(17);
+pub const LINUX_EPIPE: LinuxErrno = LinuxErrno::new(32);
+pub const LINUX_ESPIPE: LinuxErrno = LinuxErrno::new(29);
+pub const LINUX_EROFS: LinuxErrno = LinuxErrno::new(30);
+pub const LINUX_ENOTSUP: LinuxErrno = LinuxErrno::new(95);
+pub const LINUX_ENOTSOCK: LinuxErrno = LinuxErrno::new(88);
+pub const LINUX_ENOPROTOOPT: LinuxErrno = LinuxErrno::new(92);
+pub const LINUX_ESOCKTNOSUPPORT: LinuxErrno = LinuxErrno::new(94);
 // Linux's `type & SOCK_NONBLOCK` and `& SOCK_CLOEXEC` bits sit in the
 // type argument to socket(2)/socketpair(2)/accept4(2). macOS doesn't
 // have these; we strip them before calling libc and apply the effect
@@ -2256,158 +2263,166 @@ pub const LINUX_FALLOC_FL_SUPPORTED: u64 = LINUX_FALLOC_FL_KEEP_SIZE
     | LINUX_FALLOC_FL_ZERO_RANGE
     | LINUX_FALLOC_FL_INSERT_RANGE
     | LINUX_FALLOC_FL_UNSHARE_RANGE;
-pub const LINUX_ENOTDIR: i32 = 20;
-pub const LINUX_EISDIR: i32 = 21;
-pub const LINUX_EINVAL: i32 = 22;
-pub const LINUX_ENOTTY: i32 = 25;
-pub const LINUX_EFBIG: i32 = 27;
-pub const LINUX_ERANGE: i32 = 34;
-pub const LINUX_ENAMETOOLONG: i32 = 36;
-pub const LINUX_ENOSYS: i32 = 38;
-pub const LINUX_ENOTEMPTY: i32 = 39;
-pub const LINUX_ENODATA: i32 = 61;
-pub const LINUX_E2BIG: i32 = 7;
+pub const LINUX_ENOTDIR: LinuxErrno = LinuxErrno::new(20);
+pub const LINUX_EISDIR: LinuxErrno = LinuxErrno::new(21);
+pub const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+pub const LINUX_ENOTTY: LinuxErrno = LinuxErrno::new(25);
+pub const LINUX_EFBIG: LinuxErrno = LinuxErrno::new(27);
+pub const LINUX_ERANGE: LinuxErrno = LinuxErrno::new(34);
+pub const LINUX_ENAMETOOLONG: LinuxErrno = LinuxErrno::new(36);
+pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
+pub const LINUX_ENOTEMPTY: LinuxErrno = LinuxErrno::new(39);
+pub const LINUX_ENODATA: LinuxErrno = LinuxErrno::new(61);
+pub const LINUX_E2BIG: LinuxErrno = LinuxErrno::new(7);
 // Remaining Linux UAPI errno values (asm-generic/errno-base.h + errno.h),
 // canonical home for the `linux_errno` re-export table in dispatch/mod.rs.
-pub const LINUX_EIO: i32 = 5;
-pub const LINUX_ENOEXEC: i32 = 8;
-pub const LINUX_ENOTBLK: i32 = 15;
-pub const LINUX_EBUSY: i32 = 16;
-pub const LINUX_EXDEV: i32 = 18;
-pub const LINUX_ENODEV: i32 = 19;
-pub const LINUX_ENFILE: i32 = 23;
-pub const LINUX_EMFILE: i32 = 24;
-pub const LINUX_ETXTBSY: i32 = 26;
-pub const LINUX_ENOSPC: i32 = 28;
-pub const LINUX_EMLINK: i32 = 31;
-pub const LINUX_EDOM: i32 = 33;
+pub const LINUX_EIO: LinuxErrno = LinuxErrno::new(5);
+pub const LINUX_ENOEXEC: LinuxErrno = LinuxErrno::new(8);
+pub const LINUX_ENOTBLK: LinuxErrno = LinuxErrno::new(15);
+pub const LINUX_EBUSY: LinuxErrno = LinuxErrno::new(16);
+pub const LINUX_EXDEV: LinuxErrno = LinuxErrno::new(18);
+pub const LINUX_ENODEV: LinuxErrno = LinuxErrno::new(19);
+pub const LINUX_ENFILE: LinuxErrno = LinuxErrno::new(23);
+pub const LINUX_EMFILE: LinuxErrno = LinuxErrno::new(24);
+pub const LINUX_ETXTBSY: LinuxErrno = LinuxErrno::new(26);
+pub const LINUX_ENOSPC: LinuxErrno = LinuxErrno::new(28);
+pub const LINUX_EMLINK: LinuxErrno = LinuxErrno::new(31);
+pub const LINUX_EDOM: LinuxErrno = LinuxErrno::new(33);
 // ----- Linux SysV-style codes; macOS diverges -----
-pub const LINUX_EDEADLK: i32 = 35;
-pub const LINUX_ENOLCK: i32 = 37;
-pub const LINUX_ELOOP: i32 = 40;
-pub const LINUX_ENOMSG: i32 = 42;
-pub const LINUX_EIDRM: i32 = 43;
-pub const LINUX_ENOLINK: i32 = 67;
-pub const LINUX_EBADMSG: i32 = 74;
-pub const LINUX_EOVERFLOW: i32 = 75;
-pub const LINUX_EILSEQ: i32 = 84;
-pub const LINUX_EDESTADDRREQ: i32 = 89;
-pub const LINUX_EMSGSIZE: i32 = 90;
-pub const LINUX_EPROTOTYPE: i32 = 91;
-pub const LINUX_EPROTONOSUPPORT: i32 = 93;
-pub const LINUX_EOPNOTSUPP: i32 = 95; // ≡ ENOTSUP
-pub const LINUX_EPFNOSUPPORT: i32 = 96;
-pub const LINUX_EADDRINUSE: i32 = 98;
-pub const LINUX_EADDRNOTAVAIL: i32 = 99;
-pub const LINUX_ENETDOWN: i32 = 100;
-pub const LINUX_ENETUNREACH: i32 = 101;
-pub const LINUX_ENETRESET: i32 = 102;
-pub const LINUX_ECONNABORTED: i32 = 103;
-pub const LINUX_ECONNRESET: i32 = 104;
-pub const LINUX_ENOBUFS: i32 = 105;
-pub const LINUX_ENOTCONN: i32 = 107;
-pub const LINUX_ESHUTDOWN: i32 = 108;
-pub const LINUX_ETOOMANYREFS: i32 = 109;
-pub const LINUX_ECONNREFUSED: i32 = 111;
-pub const LINUX_EHOSTDOWN: i32 = 112;
-pub const LINUX_EHOSTUNREACH: i32 = 113;
-pub const LINUX_ESTALE: i32 = 116;
-pub const LINUX_EUCLEAN: i32 = 117;
-pub const LINUX_EREMOTE: i32 = 121;
-pub const LINUX_EDQUOT: i32 = 122;
-pub const LINUX_ECANCELED: i32 = 125;
+pub const LINUX_EDEADLK: LinuxErrno = LinuxErrno::new(35);
+pub const LINUX_ENOLCK: LinuxErrno = LinuxErrno::new(37);
+pub const LINUX_ELOOP: LinuxErrno = LinuxErrno::new(40);
+pub const LINUX_ENOMSG: LinuxErrno = LinuxErrno::new(42);
+pub const LINUX_EIDRM: LinuxErrno = LinuxErrno::new(43);
+pub const LINUX_ENOLINK: LinuxErrno = LinuxErrno::new(67);
+pub const LINUX_EBADMSG: LinuxErrno = LinuxErrno::new(74);
+pub const LINUX_EOVERFLOW: LinuxErrno = LinuxErrno::new(75);
+pub const LINUX_EILSEQ: LinuxErrno = LinuxErrno::new(84);
+pub const LINUX_EDESTADDRREQ: LinuxErrno = LinuxErrno::new(89);
+pub const LINUX_EMSGSIZE: LinuxErrno = LinuxErrno::new(90);
+pub const LINUX_EPROTOTYPE: LinuxErrno = LinuxErrno::new(91);
+pub const LINUX_EPROTONOSUPPORT: LinuxErrno = LinuxErrno::new(93);
+pub const LINUX_EOPNOTSUPP: LinuxErrno = LinuxErrno::new(95); // ≡ ENOTSUP
+pub const LINUX_EPFNOSUPPORT: LinuxErrno = LinuxErrno::new(96);
+pub const LINUX_EADDRINUSE: LinuxErrno = LinuxErrno::new(98);
+pub const LINUX_EADDRNOTAVAIL: LinuxErrno = LinuxErrno::new(99);
+pub const LINUX_ENETDOWN: LinuxErrno = LinuxErrno::new(100);
+pub const LINUX_ENETUNREACH: LinuxErrno = LinuxErrno::new(101);
+pub const LINUX_ENETRESET: LinuxErrno = LinuxErrno::new(102);
+pub const LINUX_ECONNABORTED: LinuxErrno = LinuxErrno::new(103);
+pub const LINUX_ECONNRESET: LinuxErrno = LinuxErrno::new(104);
+pub const LINUX_ENOBUFS: LinuxErrno = LinuxErrno::new(105);
+pub const LINUX_ENOTCONN: LinuxErrno = LinuxErrno::new(107);
+pub const LINUX_ESHUTDOWN: LinuxErrno = LinuxErrno::new(108);
+pub const LINUX_ETOOMANYREFS: LinuxErrno = LinuxErrno::new(109);
+pub const LINUX_ECONNREFUSED: LinuxErrno = LinuxErrno::new(111);
+pub const LINUX_EHOSTDOWN: LinuxErrno = LinuxErrno::new(112);
+pub const LINUX_EHOSTUNREACH: LinuxErrno = LinuxErrno::new(113);
+pub const LINUX_ESTALE: LinuxErrno = LinuxErrno::new(116);
+pub const LINUX_EUCLEAN: LinuxErrno = LinuxErrno::new(117);
+pub const LINUX_EREMOTE: LinuxErrno = LinuxErrno::new(121);
+pub const LINUX_EDQUOT: LinuxErrno = LinuxErrno::new(122);
+pub const LINUX_ECANCELED: LinuxErrno = LinuxErrno::new(125);
 // Linux setxattr(2) flags. Same semantics as the macOS XATTR_CREATE/
 // XATTR_REPLACE options (which carry different numeric values).
 pub const LINUX_XATTR_CREATE: i32 = 0x1;
 pub const LINUX_XATTR_REPLACE: i32 = 0x2;
-pub const LINUX_ETIMEDOUT: i32 = 110;
+pub const LINUX_ETIMEDOUT: LinuxErrno = LinuxErrno::new(110);
 
-/// Map a Linux (aarch64 generic) errno number to its symbolic name, for
+/// Symbolic names for the typed errno constants. Name↔value linkage goes
+/// through the `LINUX_E*` constants themselves (no bare numeric literals),
+/// so the table cannot drift from the ABI values.
+const ERRNO_NAMES: &[(LinuxErrno, &str)] = &[
+    (LINUX_EPERM, "EPERM"),
+    (LINUX_ENOENT, "ENOENT"),
+    (LINUX_ESRCH, "ESRCH"),
+    (LINUX_EINTR, "EINTR"),
+    (LINUX_EIO, "EIO"),
+    (LINUX_ENXIO, "ENXIO"),
+    (LINUX_E2BIG, "E2BIG"),
+    (LINUX_ENOEXEC, "ENOEXEC"),
+    (LINUX_EBADF, "EBADF"),
+    (LINUX_ECHILD, "ECHILD"),
+    (LINUX_EAGAIN, "EAGAIN"),
+    (LINUX_ENOMEM, "ENOMEM"),
+    (LINUX_EACCES, "EACCES"),
+    (LINUX_EFAULT, "EFAULT"),
+    (LINUX_ENOTBLK, "ENOTBLK"),
+    (LINUX_EBUSY, "EBUSY"),
+    (LINUX_EEXIST, "EEXIST"),
+    (LINUX_EXDEV, "EXDEV"),
+    (LINUX_ENODEV, "ENODEV"),
+    (LINUX_ENOTDIR, "ENOTDIR"),
+    (LINUX_EISDIR, "EISDIR"),
+    (LINUX_EINVAL, "EINVAL"),
+    (LINUX_ENFILE, "ENFILE"),
+    (LINUX_EMFILE, "EMFILE"),
+    (LINUX_ENOTTY, "ENOTTY"),
+    (LINUX_ETXTBSY, "ETXTBSY"),
+    (LINUX_EFBIG, "EFBIG"),
+    (LINUX_ENOSPC, "ENOSPC"),
+    (LINUX_ESPIPE, "ESPIPE"),
+    (LINUX_EROFS, "EROFS"),
+    (LINUX_EMLINK, "EMLINK"),
+    (LINUX_EPIPE, "EPIPE"),
+    (LINUX_EDOM, "EDOM"),
+    (LINUX_ERANGE, "ERANGE"),
+    (LINUX_EDEADLK, "EDEADLK"),
+    (LINUX_ENAMETOOLONG, "ENAMETOOLONG"),
+    (LINUX_ENOLCK, "ENOLCK"),
+    (LINUX_ENOSYS, "ENOSYS"),
+    (LINUX_ENOTEMPTY, "ENOTEMPTY"),
+    (LINUX_ELOOP, "ELOOP"),
+    (LINUX_ENOMSG, "ENOMSG"),
+    (LINUX_EIDRM, "EIDRM"),
+    (LINUX_ENODATA, "ENODATA"),
+    (LINUX_ENOLINK, "ENOLINK"),
+    (LINUX_EBADMSG, "EBADMSG"),
+    (LINUX_EOVERFLOW, "EOVERFLOW"),
+    (LINUX_EILSEQ, "EILSEQ"),
+    (LINUX_ENOTSOCK, "ENOTSOCK"),
+    (LINUX_EDESTADDRREQ, "EDESTADDRREQ"),
+    (LINUX_EMSGSIZE, "EMSGSIZE"),
+    (LINUX_EPROTOTYPE, "EPROTOTYPE"),
+    (LINUX_ENOPROTOOPT, "ENOPROTOOPT"),
+    (LINUX_EPROTONOSUPPORT, "EPROTONOSUPPORT"),
+    (LINUX_ESOCKTNOSUPPORT, "ESOCKTNOSUPPORT"),
+    (LINUX_EOPNOTSUPP, "EOPNOTSUPP"),
+    (LINUX_EPFNOSUPPORT, "EPFNOSUPPORT"),
+    (LINUX_EADDRINUSE, "EADDRINUSE"),
+    (LINUX_EADDRNOTAVAIL, "EADDRNOTAVAIL"),
+    (LINUX_ENETDOWN, "ENETDOWN"),
+    (LINUX_ENETUNREACH, "ENETUNREACH"),
+    (LINUX_ENETRESET, "ENETRESET"),
+    (LINUX_ECONNABORTED, "ECONNABORTED"),
+    (LINUX_ECONNRESET, "ECONNRESET"),
+    (LINUX_ENOBUFS, "ENOBUFS"),
+    (LINUX_EISCONN, "EISCONN"),
+    (LINUX_ENOTCONN, "ENOTCONN"),
+    (LINUX_ESHUTDOWN, "ESHUTDOWN"),
+    (LINUX_ETOOMANYREFS, "ETOOMANYREFS"),
+    (LINUX_ETIMEDOUT, "ETIMEDOUT"),
+    (LINUX_ECONNREFUSED, "ECONNREFUSED"),
+    (LINUX_EHOSTDOWN, "EHOSTDOWN"),
+    (LINUX_EHOSTUNREACH, "EHOSTUNREACH"),
+    (LINUX_EALREADY, "EALREADY"),
+    (LINUX_EINPROGRESS, "EINPROGRESS"),
+    (LINUX_ESTALE, "ESTALE"),
+    (LINUX_EUCLEAN, "EUCLEAN"),
+    (LINUX_EREMOTE, "EREMOTE"),
+    (LINUX_EDQUOT, "EDQUOT"),
+    (LINUX_ECANCELED, "ECANCELED"),
+];
+
+/// Map a Linux (aarch64 generic) errno to its symbolic name, for
 /// human-readable trace/diagnostic output. Returns None for unknown values.
 /// Numbers follow asm-generic/errno{,-base}.h, which aarch64 uses verbatim.
-pub fn errno_name(e: u32) -> Option<&'static str> {
-    Some(match e as i32 {
-        LINUX_EPERM => "EPERM",
-        LINUX_ENOENT => "ENOENT",
-        LINUX_ESRCH => "ESRCH",
-        LINUX_EINTR => "EINTR",
-        LINUX_EIO => "EIO",
-        LINUX_ENXIO => "ENXIO",
-        7 => "E2BIG",
-        LINUX_ENOEXEC => "ENOEXEC",
-        LINUX_EBADF => "EBADF",
-        LINUX_ECHILD => "ECHILD",
-        LINUX_EAGAIN => "EAGAIN",
-        LINUX_ENOMEM => "ENOMEM",
-        LINUX_EACCES => "EACCES",
-        LINUX_EFAULT => "EFAULT",
-        LINUX_ENOTBLK => "ENOTBLK",
-        LINUX_EBUSY => "EBUSY",
-        LINUX_EEXIST => "EEXIST",
-        LINUX_EXDEV => "EXDEV",
-        LINUX_ENODEV => "ENODEV",
-        LINUX_ENOTDIR => "ENOTDIR",
-        LINUX_EISDIR => "EISDIR",
-        LINUX_EINVAL => "EINVAL",
-        LINUX_ENFILE => "ENFILE",
-        LINUX_EMFILE => "EMFILE",
-        LINUX_ENOTTY => "ENOTTY",
-        LINUX_ETXTBSY => "ETXTBSY",
-        LINUX_EFBIG => "EFBIG",
-        LINUX_ENOSPC => "ENOSPC",
-        LINUX_ESPIPE => "ESPIPE",
-        LINUX_EROFS => "EROFS",
-        LINUX_EMLINK => "EMLINK",
-        LINUX_EPIPE => "EPIPE",
-        LINUX_EDOM => "EDOM",
-        LINUX_ERANGE => "ERANGE",
-        LINUX_EDEADLK => "EDEADLK",
-        LINUX_ENAMETOOLONG => "ENAMETOOLONG",
-        LINUX_ENOLCK => "ENOLCK",
-        LINUX_ENOSYS => "ENOSYS",
-        LINUX_ENOTEMPTY => "ENOTEMPTY",
-        LINUX_ELOOP => "ELOOP",
-        LINUX_ENOMSG => "ENOMSG",
-        LINUX_EIDRM => "EIDRM",
-        LINUX_ENODATA => "ENODATA",
-        LINUX_ENOLINK => "ENOLINK",
-        LINUX_EBADMSG => "EBADMSG",
-        LINUX_EOVERFLOW => "EOVERFLOW",
-        LINUX_EILSEQ => "EILSEQ",
-        LINUX_ENOTSOCK => "ENOTSOCK",
-        LINUX_EDESTADDRREQ => "EDESTADDRREQ",
-        LINUX_EMSGSIZE => "EMSGSIZE",
-        LINUX_EPROTOTYPE => "EPROTOTYPE",
-        LINUX_ENOPROTOOPT => "ENOPROTOOPT",
-        LINUX_EPROTONOSUPPORT => "EPROTONOSUPPORT",
-        LINUX_ESOCKTNOSUPPORT => "ESOCKTNOSUPPORT",
-        LINUX_EOPNOTSUPP => "EOPNOTSUPP",
-        LINUX_EPFNOSUPPORT => "EPFNOSUPPORT",
-        LINUX_EADDRINUSE => "EADDRINUSE",
-        LINUX_EADDRNOTAVAIL => "EADDRNOTAVAIL",
-        LINUX_ENETDOWN => "ENETDOWN",
-        LINUX_ENETUNREACH => "ENETUNREACH",
-        LINUX_ENETRESET => "ENETRESET",
-        LINUX_ECONNABORTED => "ECONNABORTED",
-        LINUX_ECONNRESET => "ECONNRESET",
-        LINUX_ENOBUFS => "ENOBUFS",
-        LINUX_EISCONN => "EISCONN",
-        LINUX_ENOTCONN => "ENOTCONN",
-        LINUX_ESHUTDOWN => "ESHUTDOWN",
-        LINUX_ETOOMANYREFS => "ETOOMANYREFS",
-        LINUX_ETIMEDOUT => "ETIMEDOUT",
-        LINUX_ECONNREFUSED => "ECONNREFUSED",
-        LINUX_EHOSTDOWN => "EHOSTDOWN",
-        LINUX_EHOSTUNREACH => "EHOSTUNREACH",
-        LINUX_EALREADY => "EALREADY",
-        LINUX_EINPROGRESS => "EINPROGRESS",
-        LINUX_ESTALE => "ESTALE",
-        LINUX_EUCLEAN => "EUCLEAN",
-        LINUX_EREMOTE => "EREMOTE",
-        LINUX_EDQUOT => "EDQUOT",
-        LINUX_ECANCELED => "ECANCELED",
-        _ => return None,
-    })
+/// Diagnostics-only, so the linear scan is fine.
+pub fn errno_name(e: LinuxErrno) -> Option<&'static str> {
+    ERRNO_NAMES
+        .iter()
+        .find(|(value, _)| *value == e)
+        .map(|(_, name)| *name)
 }
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -2778,7 +2793,7 @@ pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
 pub const LINUX_RUSAGE_THREAD: i32 = 1;
 pub const LINUX_CLK_TCK: i64 = 100;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
-pub const LINUX_EAFNOSUPPORT: i32 = 97;
+pub const LINUX_EAFNOSUPPORT: LinuxErrno = LinuxErrno::new(97);
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, private set, now pub) =====
 pub const LINUX_EFD_SEMAPHORE: u64 = 0x1;

@@ -38,6 +38,7 @@
 //! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
+use crate::linux_abi::LinuxErrno;
 
 syscall_table! {
     /// Per-module syscall routing for the `creds` subsystem (Task A1).
@@ -382,7 +383,7 @@ impl SyscallDispatcher {
                 // the right version (LTP capget02). version is the first u32.
                 let pref = crate::linux_abi::LINUX_CAPABILITY_VERSION_3;
                 let _ = memory.write_bytes(header_address.0, &pref.to_le_bytes());
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // pid < 0 is EINVAL (not ESRCH). A positive pid that isn't the caller
             // is ESRCH. The guest sees NS-pids — getpid() returns self_ns_pid()
@@ -391,14 +392,14 @@ impl SyscallDispatcher {
             // helper does) must be matched against the ns-pid, not
             // std::process::id(). pid 0 means "the calling process".
             if header.pid < 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if header.pid > 0
                 && header.pid != crate::namespace::pid::self_ns_pid() as i32
                 && header.pid != std::process::id() as i32
                 && header.pid != LINUX_BOOTSTRAP_PID as i32
             {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if data_address.0 == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -415,7 +416,7 @@ impl SyscallDispatcher {
                 .write_bytes(data_address.0, capability_data_bytes(&data).as_slice())
                 .is_err()
             {
-                return Ok(LINUX_EFAULT.into());
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -429,10 +430,10 @@ impl SyscallDispatcher {
                 // then EINVAL (capset02).
                 let pref = crate::linux_abi::LINUX_CAPABILITY_VERSION_3;
                 let _ = memory.write_bytes(header_address.0, &pref.to_le_bytes());
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if header.pid < 0 {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             // capset (unlike capget) can only modify the CALLING process: a
             // nonzero pid that isn't the caller is EPERM, even for root
@@ -442,7 +443,7 @@ impl SyscallDispatcher {
                 && header.pid != std::process::id() as i32
                 && header.pid != LINUX_BOOTSTRAP_PID as i32
             {
-                return Ok(LINUX_EPERM.into());
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let words = linux_capability_data_words(header.version);
             let data = read_capability_data(memory, data_address.0, words)?;
@@ -461,7 +462,7 @@ impl SyscallDispatcher {
             let mut caps = crate::namespace::process::caps();
             let (eff, prm, inh) = capability_set_from_words(&data);
             if (eff & !prm) != 0 || (prm & !caps.permitted) != 0 {
-                return Ok(LINUX_EPERM.into());
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             caps.effective = eff;
             caps.permitted = prm;
@@ -484,12 +485,12 @@ impl SyscallDispatcher {
             use std::sync::atomic::Ordering;
             let prio = prio as i32;
             if which > LINUX_PRIO_USER {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // A negative id (pid/pgid/uid) names no target → ESRCH for every
             // PRIO_* class (setpriority02).
             if who.0 < 0 {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             // PRIO_PROCESS names a process OR a thread (Linux nice is per-thread);
             // a live sibling guest thread tid is a valid self-process target.
@@ -501,7 +502,7 @@ impl SyscallDispatcher {
                         .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who.0))
                 });
             if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             // Linux CLAMPS the nice value to [-20,19] (it does NOT reject an
             // out-of-range value with EINVAL): glibc's nice() passes
@@ -515,7 +516,7 @@ impl SyscallDispatcher {
             if which == LINUX_PRIO_PROCESS {
                 let current = NICE_VALUE.load(Ordering::Relaxed);
                 if clamped < current && this.cred_snapshot().euid != 0 {
-                    return Ok(LINUX_EACCES.into());
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
                 }
                 NICE_VALUE.store(clamped, Ordering::Relaxed);
             }
@@ -525,12 +526,12 @@ impl SyscallDispatcher {
         fn getpriority(this, cx, which: u64, who: Pid) {
             use std::sync::atomic::Ordering;
             if which > LINUX_PRIO_USER {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // A negative id names no target → ESRCH, for every PRIO_* class
             // (getpriority02); PRIO_PROCESS additionally resolves only self/init.
             if who.0 < 0 {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let sibling = cx
                 .thread
@@ -540,7 +541,7 @@ impl SyscallDispatcher {
                         .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who.0))
                 });
             if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
-                return Ok(LINUX_ESRCH.into());
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             // Kernel ABI: getpriority returns `20 - nice` (so the value is never
             // negative); glibc converts it back. Report the calling process's
@@ -561,7 +562,7 @@ impl SyscallDispatcher {
             match setid::setres(priv_, (creds.ruid, creds.euid, creds.suid),
                                  keep_or(r), keep_or(e), keep_or(s)) {
                 Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
-                Err(()) => return Ok(LINUX_EPERM.into()),
+                Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
             }
             let new_euid = creds.euid;
             let snap = *creds;
@@ -577,7 +578,7 @@ impl SyscallDispatcher {
             match setid::setres(priv_, (creds.rgid, creds.egid, creds.sgid),
                                  keep_or(r), keep_or(e), keep_or(s)) {
                 Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
-                Err(()) => return Ok(LINUX_EPERM.into()),
+                Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
             }
             let snap = *creds;
             drop(creds);
@@ -591,7 +592,7 @@ impl SyscallDispatcher {
             match setid::setre(priv_, (creds.ruid, creds.euid, creds.suid),
                                keep_or(r), keep_or(e)) {
                 Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
-                Err(()) => return Ok(LINUX_EPERM.into()),
+                Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
             }
             let new_euid = creds.euid;
             let snap = *creds;
@@ -607,7 +608,7 @@ impl SyscallDispatcher {
             match setid::setre(priv_, (creds.rgid, creds.egid, creds.sgid),
                                keep_or(r), keep_or(e)) {
                 Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
-                Err(()) => return Ok(LINUX_EPERM.into()),
+                Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
             }
             let snap = *creds;
             drop(creds);
@@ -620,7 +621,7 @@ impl SyscallDispatcher {
             let priv_ = creds.is_privileged();
             match setid::set(priv_, (creds.ruid, creds.euid, creds.suid), u as u32) {
                 Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
-                Err(()) => return Ok(LINUX_EPERM.into()),
+                Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
             }
             let new_euid = creds.euid;
             let snap = *creds;
@@ -635,7 +636,7 @@ impl SyscallDispatcher {
             let priv_ = creds.is_privileged();
             match setid::set(priv_, (creds.rgid, creds.egid, creds.sgid), g as u32) {
                 Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
-                Err(()) => return Ok(LINUX_EPERM.into()),
+                Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
             }
             let snap = *creds;
             drop(creds);
@@ -676,7 +677,7 @@ impl SyscallDispatcher {
         fn getgroups(this, cx, size: u64, list: GuestPtr) {
             let size = size as i32;
             if size < 0 {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // A prior setgroups(2) replaced the set verbatim; otherwise fall
             // back to the /etc/group-derived membership (id(1) compatibility).
@@ -689,7 +690,7 @@ impl SyscallDispatcher {
             }
             if (size as usize) < groups.len() {
                 // Buffer too small to hold the whole set (Linux EINVAL).
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let mut bytes = Vec::with_capacity(groups.len() * 4);
             for g in &groups {
@@ -744,7 +745,7 @@ impl SyscallDispatcher {
             // Linux caps the supplementary set at NGROUPS_MAX (65536).
             const NGROUPS_MAX: u64 = 65536;
             if size > NGROUPS_MAX {
-                return Ok(LINUX_EINVAL.into());
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let n = size as usize;
             let mut groups = Vec::with_capacity(n);
@@ -817,7 +818,7 @@ impl SyscallDispatcher {
 fn read_capability_header(
     memory: &impl GuestMemory,
     address: u64,
-) -> Result<LinuxCapabilityHeader, i32> {
+) -> Result<LinuxCapabilityHeader, LinuxErrno> {
     let bytes = memory
         .read_bytes(address, core::mem::size_of::<LinuxCapabilityHeader>())
         .map_err(|_| LINUX_EFAULT)?;
@@ -828,7 +829,7 @@ fn read_capability_data(
     memory: &impl GuestMemory,
     address: u64,
     count: usize,
-) -> Result<Vec<LinuxCapabilityData>, i32> {
+) -> Result<Vec<LinuxCapabilityData>, LinuxErrno> {
     let size = core::mem::size_of::<LinuxCapabilityData>();
     let length = count.checked_mul(size).ok_or(LINUX_EINVAL)?;
     let bytes = memory
