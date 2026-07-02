@@ -829,6 +829,11 @@ impl SyscallDispatcher {
                     // SharedFile backings write dirty bytes back and close the dup;
                     // SharedAnon frees are pure bookkeeping. The aperture stays
                     // stage-2 mapped — no hv_vm_unmap.
+                    if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
+                        && let Ok(len_usize) = usize::try_from(len)
+                    {
+                        cx.memory.set_no_access(address.0, len_usize, true);
+                    }
                     this.writeback_shared(cx, &alloc, true);
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
@@ -854,6 +859,7 @@ impl SyscallDispatcher {
                         // its own 2 MiB block + L3 table) — else the spare pool leaks
                         // one table per alias and a churning guest hits OutOfTables.
                         let _ = cx.memory.unmap_alias_range(address.0, len_usize);
+                        cx.memory.set_no_access(address.0, len_usize, true);
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
@@ -872,6 +878,7 @@ impl SyscallDispatcher {
                     // behavior).
                     if let Ok(len_usize) = usize::try_from(len) {
                         let _ = cx.memory.unmap_range(address.0, len_usize);
+                        cx.memory.set_no_access(address.0, len_usize, true);
                     }
                     if address.0.checked_add(len) == Some(mem.mmap_next) {
                         mem.mmap_next = address.0;
@@ -973,19 +980,28 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 // Linux returns ENOMEM unless the WHOLE [address, address+length)
-                // range is mapped. Require the END page to be mapped too (not just
-                // the first): an overflowing or unmapped end is ENOMEM. This also
-                // BOUNDS the residency vec below — without it a guest-controlled
+                // range is mapped. Validate the last page first to reject overflow
+                // and bound the residency vec below — without it a guest-controlled
                 // `length` (up to u64::MAX) forces a petabyte `vec![1u8; pages]`
                 // that aborts the carrick process (alloc failure is not a
-                // catchable panic). A mapped end caps the range to the guest's
-                // actual mappings (≤ guest RAM), so `pages` stays small.
+                // catchable panic). Then walk each page start so mapped first+last
+                // pages with a hole in the middle still report ENOMEM.
                 let last_page = match address.0.checked_add(length - 1) {
                     Some(end) => end & !(LINUX_PAGE_SIZE - 1),
                     None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
                 };
                 if memory.read_bytes(last_page, 1).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+                let mut page = address.0;
+                while page <= last_page {
+                    if memory.read_bytes(page, 1).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                    page = match page.checked_add(LINUX_PAGE_SIZE) {
+                        Some(next) => next,
+                        None => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
+                    };
                 }
                 let pages = length.div_ceil(LINUX_PAGE_SIZE);
                 let bytes = vec![1u8; pages as usize];
@@ -1500,7 +1516,7 @@ mod tests {
     // `vec![1u8; pages]` is uncatchable on alloc failure). Both arms must report
     // ENOMEM (errno 12), never panic/abort. The success path is covered by the
     // integration test `mm_lock_msync_mincore_stubs_validate_args_and_succeed`.
-    fn mincore(memory: &mut LinearMemory, address: u64, length: u64) -> DispatchOutcome {
+    fn mincore(memory: &mut impl GuestMemory, address: u64, length: u64) -> DispatchOutcome {
         let reporter = CompatReporter::default();
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher
@@ -1510,6 +1526,45 @@ mod tests {
                 &reporter,
             )
             .expect("mincore dispatch must not be a fatal DispatchError")
+    }
+
+    struct GapMemory {
+        base: u64,
+    }
+
+    impl GapMemory {
+        fn page_is_mapped(&self, address: u64, length: usize) -> bool {
+            let Some(end) = address.checked_add(length as u64) else {
+                return false;
+            };
+            let first_start = self.base;
+            let first_end = self.base + LINUX_PAGE_SIZE;
+            let last_start = self.base + 2 * LINUX_PAGE_SIZE;
+            let last_end = self.base + 3 * LINUX_PAGE_SIZE;
+            (address >= first_start && end <= first_end)
+                || (address >= last_start && end <= last_end)
+        }
+    }
+
+    impl GuestMemory for GapMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if self.page_is_mapped(address, length) {
+                Ok(vec![0; length])
+            } else {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            if self.page_is_mapped(address, bytes.len()) {
+                Ok(())
+            } else {
+                Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                })
+            }
+        }
     }
 
     #[test]
@@ -1525,6 +1580,19 @@ mod tests {
                 errno: LinuxErrno::new(12),
             },
             "a range whose end page is unmapped must be ENOMEM"
+        );
+    }
+
+    #[test]
+    fn mincore_mapped_first_and_last_with_hole_is_enomem() {
+        let base = LINUX_MMAP_BASE;
+        let mut memory = GapMemory { base };
+        assert_eq!(
+            mincore(&mut memory, base, 3 * LINUX_PAGE_SIZE),
+            DispatchOutcome::Errno {
+                errno: LinuxErrno::new(12),
+            },
+            "a range with a mapped first and last page but an unmapped middle page must be ENOMEM"
         );
     }
 
