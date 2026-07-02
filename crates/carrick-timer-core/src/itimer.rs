@@ -23,6 +23,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::{CpuNs, TimerSpecNs, WallNs};
+
 /// The 3 itimer `which` values (REAL=0, VIRTUAL=1, PROF=2).
 pub const ITIMER_COUNT: usize = 3;
 
@@ -129,7 +131,12 @@ pub fn is_cpu_timer(which: usize) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuTimerDecision {
     Fire,
-    Wait { delay_ns: u64 },
+    /// Not enough guest CPU has elapsed yet; re-check after this WALL-CLOCK
+    /// sleep delay (already converted from the remaining CPU quantity by
+    /// [`cpu_timer_recheck_delay_ns`]).
+    Wait {
+        delay_ns: WallNs,
+    },
 }
 
 /// Complete EVFILT_TIMER arm state for an armed interval timer.
@@ -153,20 +160,21 @@ pub fn generation(which: usize) -> u64 {
         .map_or(0, |slot| slot.generation.load(Ordering::SeqCst))
 }
 
-/// Mark `which` armed with the given repeat interval (0 = one-shot) and whether
-/// the pump must transition a one-shot to periodic on its first fire. Called by
-/// `setitimer`. Out-of-range `which` is ignored. Returns the new generation.
-pub fn arm(which: usize, value_ns: u64, interval_ns: u64, needs_periodic: bool) -> u64 {
+/// Mark `which` armed with the given `spec` (`spec.interval == 0` = one-shot)
+/// and whether the pump must transition a one-shot to periodic on its first
+/// fire. Called by `setitimer`. Out-of-range `which` is ignored. Returns the
+/// new generation.
+pub fn arm(which: usize, spec: TimerSpecNs, needs_periodic: bool) -> u64 {
     if let Some(slot) = SLOTS.get(which) {
         let generation = slot
             .generation
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
-        slot.value_ns.store(value_ns, Ordering::SeqCst);
-        slot.interval_ns.store(interval_ns, Ordering::SeqCst);
+        slot.value_ns.store(spec.value, Ordering::SeqCst);
+        slot.interval_ns.store(spec.interval, Ordering::SeqCst);
         slot.needs_periodic.store(needs_periodic, Ordering::SeqCst);
         let cpu_due_ns = if is_cpu_timer(which) {
-            carrick_host::guest_cpu::total_ns_including_active().saturating_add(value_ns)
+            carrick_host::guest_cpu::total_ns_including_active().saturating_add(spec.value)
         } else {
             0
         };
@@ -279,7 +287,7 @@ pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
     let now_ns = carrick_host::guest_cpu::total_ns_including_active();
     if now_ns < due_ns {
         return Some(CpuTimerDecision::Wait {
-            delay_ns: cpu_timer_recheck_delay_ns(due_ns - now_ns),
+            delay_ns: cpu_timer_recheck_delay_ns(CpuNs(due_ns - now_ns)),
         });
     }
     let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
@@ -293,15 +301,16 @@ pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
 }
 
 /// Convert remaining aggregate guest CPU time into a wall-clock delay for the
-/// signal pump's next CPU-timer check.
-pub fn cpu_timer_recheck_delay_ns(remaining_cpu_ns: u64) -> u64 {
+/// signal pump's next CPU-timer check. This is THE sanctioned [`CpuNs`] →
+/// [`WallNs`] crossing: everywhere else the two domains must not mix.
+pub fn cpu_timer_recheck_delay_ns(remaining_cpu_ns: CpuNs) -> WallNs {
     let active_vcpus = carrick_host::guest_cpu::active_count() as u64;
     let scaled = if active_vcpus > 1 {
-        remaining_cpu_ns.div_ceil(active_vcpus)
+        remaining_cpu_ns.raw().div_ceil(active_vcpus)
     } else {
-        remaining_cpu_ns
+        remaining_cpu_ns.raw()
     };
-    scaled.clamp(1, CPU_TIMER_MAX_RECHECK_NS)
+    WallNs(scaled.clamp(1, CPU_TIMER_MAX_RECHECK_NS))
 }
 
 /// Current kqueue timer arm for `which`, if it is armed. This is used when a
@@ -326,14 +335,16 @@ pub fn current_arm(which: usize) -> Option<TimerArm> {
             carrick_portable::EV_ADD | carrick_portable::EV_ONESHOT
         };
     let delay_ns = if is_cpu_timer(which) {
-        cpu_timer_recheck_delay_ns(value_ns)
+        // `value_ns` is a guest-CPU budget here; the kqueue delay is the
+        // wall-clock RECHECK, not the budget itself.
+        cpu_timer_recheck_delay_ns(CpuNs(value_ns))
     } else {
-        value_ns
+        WallNs(value_ns)
     };
     Some(TimerArm {
         ident: live_ident(which),
         flags,
-        delay_ns: i64::try_from(delay_ns).unwrap_or(i64::MAX),
+        delay_ns: i64::try_from(delay_ns.raw()).unwrap_or(i64::MAX),
         generation: generation(which),
     })
 }
@@ -346,9 +357,9 @@ pub fn current_arms() -> impl Iterator<Item = TimerArm> {
 ///
 /// * Wall-time (`ITIMER_REAL`): sleeps to the first deadline, then (if still
 ///   armed with this `generation`) invokes `on_fire`, repeating every
-///   `interval_ns` until the timer is disarmed or re-armed (generation bump) or
-///   `!is_armed`. `value_ns`/`interval_ns` of 0 sleep for zero time (fire
-///   immediately / one-shot, respectively).
+///   `spec.interval` until the timer is disarmed or re-armed (generation bump)
+///   or `!is_armed`. `spec.value`/`spec.interval` of 0 sleep for zero time
+///   (fire immediately / one-shot, respectively).
 ///
 /// * CPU-time (`ITIMER_VIRTUAL`/`ITIMER_PROF`): does NOT sleep the wall-clock
 ///   `value`/`interval`. Instead it POLLS [`cpu_timer_decision`], which compares
@@ -363,28 +374,22 @@ pub fn current_arms() -> impl Iterator<Item = TimerArm> {
 ///
 /// The THREAD SPAWN and the actual `on_fire` (publish signal + kick) are
 /// per-backend; only this timing loop is shared.
-pub fn run_fallback(
-    which: usize,
-    generation: u64,
-    value_ns: u64,
-    interval_ns: u64,
-    on_fire: impl Fn(),
-) {
+pub fn run_fallback(which: usize, generation: u64, spec: TimerSpecNs, on_fire: impl Fn()) {
     if is_cpu_timer(which) {
         run_fallback_cpu(which, generation, &on_fire);
         return;
     }
-    std::thread::sleep(Duration::from_nanos(value_ns));
+    std::thread::sleep(Duration::from_nanos(spec.value));
     loop {
         if !generation_matches(which, generation) || !is_armed(which) {
             break;
         }
         on_fire();
-        if interval_ns == 0 {
+        if spec.interval == 0 {
             complete_fire(which);
             break;
         }
-        std::thread::sleep(Duration::from_nanos(interval_ns));
+        std::thread::sleep(Duration::from_nanos(spec.interval));
     }
 }
 
@@ -410,7 +415,7 @@ fn run_fallback_cpu(which: usize, generation: u64, on_fire: &impl Fn()) {
                 }
             }
             Some(CpuTimerDecision::Wait { delay_ns }) => {
-                std::thread::sleep(Duration::from_nanos(delay_ns));
+                std::thread::sleep(Duration::from_nanos(delay_ns.raw()));
             }
             None => break,
         }
@@ -447,10 +452,24 @@ mod tests {
     fn arm_disarm_generation() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
-        let g0 = arm(0, 1_000_000, 0, false);
+        let g0 = arm(
+            0,
+            TimerSpecNs {
+                value: 1_000_000,
+                interval: 0,
+            },
+            false,
+        );
         assert!(is_armed(0));
         assert_eq!(interval_ns(0), 0);
-        let g1 = arm(0, 2_000_000, 500_000, true);
+        let g1 = arm(
+            0,
+            TimerSpecNs {
+                value: 2_000_000,
+                interval: 500_000,
+            },
+            true,
+        );
         assert_ne!(g0, g1, "re-arm bumps generation");
         disarm(0);
         assert!(!is_armed(0));
@@ -461,7 +480,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
         carrick_host::guest_cpu::reset();
-        arm(1, 0, 0, false); // VIRTUAL, due now (value_ns == 0 => cpu_due_ns == 0)
+        arm(1, TimerSpecNs::DISARM, false); // VIRTUAL, due now (value == 0 => cpu_due_ns == 0)
         match cpu_timer_decision(1) {
             Some(CpuTimerDecision::Fire) => {}
             other => panic!("expected Fire, got {other:?}"),
@@ -473,7 +492,14 @@ mod tests {
     fn one_shot_fire_retires_armed_slot() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
-        arm(0, 1_000_000, 0, false);
+        arm(
+            0,
+            TimerSpecNs {
+                value: 1_000_000,
+                interval: 0,
+            },
+            false,
+        );
 
         assert!(complete_fire(0));
         assert!(!is_armed(0));
@@ -483,7 +509,14 @@ mod tests {
     fn periodic_fire_keeps_armed_slot() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
-        arm(0, 1_000_000, 1_000_000, false);
+        arm(
+            0,
+            TimerSpecNs {
+                value: 1_000_000,
+                interval: 1_000_000,
+            },
+            false,
+        );
 
         assert!(!complete_fire(0));
         assert!(is_armed(0));
@@ -497,14 +530,18 @@ mod tests {
         carrick_host::guest_cpu::reset();
         let which = 1; // VIRTUAL, one-shot
         // Arm for a small CPU budget; cpu_due_ns = 0 + 1_000 since CPU total is 0.
-        let generation = arm(which, 1_000, 0, false);
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let generation = arm(which, spec, false);
         // Charge enough guest CPU that the one-shot is due.
         carrick_host::guest_cpu::begin_active();
         carrick_host::guest_cpu::finish_active(10_000);
         let fires = Arc::new(AtomicUsize::new(0));
         let fires2 = Arc::clone(&fires);
         // run_fallback should Fire exactly once (one-shot) then return.
-        run_fallback(which, generation, 1_000, 0, move || {
+        run_fallback(which, generation, spec, move || {
             fires2.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(
@@ -523,16 +560,20 @@ mod tests {
         clear();
         carrick_host::guest_cpu::reset();
         let which = 2; // PROF, periodic — would loop forever if not retired.
-        let stale_generation = arm(which, 1_000, 1_000, false);
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 1_000,
+        };
+        let stale_generation = arm(which, spec, false);
         // Bump the generation (re-arm) so the stale fallback must retire.
-        let _new_generation = arm(which, 1_000, 1_000, false);
+        let _new_generation = arm(which, spec, false);
         let fires = Arc::new(AtomicUsize::new(0));
         let fires2 = Arc::clone(&fires);
         // Even with CPU charged past due, the stale-generation loop must exit
         // immediately (generation mismatch) rather than fire/loop.
         carrick_host::guest_cpu::begin_active();
         carrick_host::guest_cpu::finish_active(1_000_000);
-        run_fallback(which, stale_generation, 1_000, 1_000, move || {
+        run_fallback(which, stale_generation, spec, move || {
             fires2.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(
@@ -550,16 +591,20 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
         let which = 0; // REAL, wall-clock periodic — would loop forever if not retired.
-        let stale_generation = arm(which, 1_000, 1_000, false);
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 1_000,
+        };
+        let stale_generation = arm(which, spec, false);
         // Bump the generation (re-arm) so the stale fallback must retire.
-        let _new_generation = arm(which, 1_000, 1_000, false);
+        let _new_generation = arm(which, spec, false);
         let fires = Arc::new(AtomicUsize::new(0));
         let fires2 = Arc::clone(&fires);
         // The stale-generation loop must exit at its first guard (generation
         // mismatch) and return promptly rather than fire/loop. Determinism comes
         // from the generation guard, not the 1µs sleep — even if the sleep were
         // instantaneous the guard would still break before any on_fire().
-        run_fallback(which, stale_generation, 1_000, 1_000, move || {
+        run_fallback(which, stale_generation, spec, move || {
             fires2.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(
@@ -569,10 +614,14 @@ mod tests {
         );
 
         // Prove the CURRENT generation still fires exactly once (one-shot).
-        let g = arm(which, 1_000, 0, false);
+        let one_shot = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let g = arm(which, one_shot, false);
         let cur = Arc::new(AtomicUsize::new(0));
         let cur2 = Arc::clone(&cur);
-        run_fallback(which, g, 1_000, 0, move || {
+        run_fallback(which, g, one_shot, move || {
             cur2.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(
@@ -630,12 +679,16 @@ mod tests {
         let which = 0;
         // Disarmed (clear): live_ident falls back to the base ident.
         assert_eq!(live_ident(which), ident_for(which));
-        arm(which, 1_000_000, 0, false);
+        let spec = TimerSpecNs {
+            value: 1_000_000,
+            interval: 0,
+        };
+        arm(which, spec, false);
         let armed_ident = live_ident(which);
         assert!(armed_ident >= TIMER_IDENT_BASE);
         assert_eq!(which_for_ident(armed_ident), Some(which));
         // A second arm takes a DIFFERENT (fresh) ident — never the poisoned one.
-        arm(which, 1_000_000, 0, false);
+        arm(which, spec, false);
         assert_ne!(
             live_ident(which),
             armed_ident,
@@ -665,9 +718,12 @@ mod tests {
     fn cpu_timer_recheck_delay_is_bounded() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         carrick_host::guest_cpu::reset();
-        assert_eq!(cpu_timer_recheck_delay_ns(0), 1);
-        assert_eq!(cpu_timer_recheck_delay_ns(500_000), 500_000);
-        assert_eq!(cpu_timer_recheck_delay_ns(10_000_000), 1_000_000);
+        assert_eq!(cpu_timer_recheck_delay_ns(CpuNs(0)), WallNs(1));
+        assert_eq!(cpu_timer_recheck_delay_ns(CpuNs(500_000)), WallNs(500_000));
+        assert_eq!(
+            cpu_timer_recheck_delay_ns(CpuNs(10_000_000)),
+            WallNs(1_000_000)
+        );
     }
 
     #[test]
@@ -690,7 +746,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         started.wait();
-        assert_eq!(cpu_timer_recheck_delay_ns(800_000), 400_000);
+        assert_eq!(cpu_timer_recheck_delay_ns(CpuNs(800_000)), WallNs(400_000));
         release.wait();
         for handle in handles {
             handle
@@ -709,7 +765,14 @@ mod tests {
         assert!(!is_armed(which));
         assert_eq!(interval_ns(which), 0);
 
-        arm(which, 10_000, 5_000, true);
+        arm(
+            which,
+            TimerSpecNs {
+                value: 10_000,
+                interval: 5_000,
+            },
+            true,
+        );
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 5_000);
         // First take consumes the flag; the second sees it cleared.
@@ -727,7 +790,14 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let which = 1; // VIRTUAL
         disarm(which);
-        arm(which, 5_000, 0, false);
+        arm(
+            which,
+            TimerSpecNs {
+                value: 5_000,
+                interval: 0,
+            },
+            false,
+        );
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 0);
         assert!(!take_needs_periodic(which));
@@ -739,7 +809,14 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let which = 0; // REAL
         disarm(which);
-        arm(which, 50_000_000, 0, false);
+        arm(
+            which,
+            TimerSpecNs {
+                value: 50_000_000,
+                interval: 0,
+            },
+            false,
+        );
         assert_eq!(
             current_arm(which),
             Some(TimerArm {
@@ -757,7 +834,14 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let which = 0; // REAL
         disarm(which);
-        arm(which, 25_000_000, 25_000_000, false);
+        arm(
+            which,
+            TimerSpecNs {
+                value: 25_000_000,
+                interval: 25_000_000,
+            },
+            false,
+        );
         assert_eq!(
             current_arm(which),
             Some(TimerArm {
@@ -776,7 +860,14 @@ mod tests {
         carrick_host::guest_cpu::reset();
         let which = 1; // VIRTUAL
         disarm(which);
-        arm(which, 25_000_000, 25_000_000, false);
+        arm(
+            which,
+            TimerSpecNs {
+                value: 25_000_000,
+                interval: 25_000_000,
+            },
+            false,
+        );
         assert_eq!(
             current_arm(which),
             Some(TimerArm {
