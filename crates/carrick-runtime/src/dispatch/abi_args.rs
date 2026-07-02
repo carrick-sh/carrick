@@ -119,7 +119,7 @@ impl HostPid {
 /// A signal number argument (`int` in the kernel ABI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signal(pub i32);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct GuestPtr(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestLen(pub usize);

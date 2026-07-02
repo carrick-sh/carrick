@@ -1439,7 +1439,10 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     }
                 }
             }
-            DispatchOutcome::WaitOnSleep { duration } => {
+            DispatchOutcome::WaitOnSleep {
+                duration,
+                remaining,
+            } => {
                 // Single-vCPU path: no fork-quiesce, but still wait via the
                 // waiter so a guest signal interrupts the sleep (EINTR). The
                 // deadline is preserved across re-dispatch (signal re-wait).
@@ -1458,9 +1461,11 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         continue;
                     }
                     WaitResult::Interrupted => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        });
+                        return Ok(crate::dispatch::complete_interrupted_sleep(
+                            memory,
+                            remaining,
+                            deadline.saturating_duration_since(Instant::now()),
+                        ));
                     }
                     WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
